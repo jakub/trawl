@@ -5,14 +5,15 @@
 //! Native contract tests over the COMMITTED vendor artifacts
 //! (jakub/coastwatch#308, ADR-0012).
 //!
-//! The vendored `paper-shaders.js` bundle is consumed by wasm-bindgen
-//! at RUNTIME — a malformed bundle, a missing export, or a broken
-//! interop path agreement produces a backdrop that silently never
-//! appears, with no compile-time signal on any target. `include_str!`
-//! over the committed artifacts turns those failure modes into
-//! `cargo nextest` reds. The CI vendor-drift job guarantees the
-//! committed bundle matches `build.sh` output, so asserting on the
-//! committed bytes IS asserting on the build.
+//! wasm-bindgen inlines the vendored `paper-shaders.js` at compile
+//! time, so a missing or renamed file is already a build error. What
+//! it cannot see is the bundle's CONTENTS: a malformed module shape, a
+//! renamed export, or a stale attribution banner produces a backdrop
+//! that silently never appears, with no compile-time signal on any
+//! target. `include_str!` over the committed artifacts turns those
+//! failure modes into `cargo nextest` reds. The CI vendor-drift job
+//! guarantees the committed bundle matches `build.sh` output, so
+//! asserting on the committed bytes IS asserting on the build.
 
 const BUNDLE: &str = include_str!("../vendor/paper-shaders.js");
 const PACKAGE_JSON: &str = include_str!("../vendor/package.json");
@@ -113,22 +114,14 @@ fn bundle_exports_the_wrapper_api() {
 
 #[test]
 fn interop_path_agrees_with_the_vendored_filename() {
-    // Three names must agree or the import 404s at runtime with no
-    // compile signal: the wasm-bindgen module path in interop.rs, the
-    // committed vendor file (whose existence include_str! proves), and
-    // the copy-file directive target in index.html.
+    // The wasm-bindgen module path is a compile-time snippet path
+    // resolved against the crate root, so it must name the committed
+    // file (whose existence include_str! proves). The compiler enforces
+    // this on wasm32 only; this test carries it onto native builds.
     assert!(
         INTEROP.contains(r#"module = "/vendor/paper-shaders.js""#),
         "interop.rs must bind module = \"/vendor/paper-shaders.js\" — \
-         the runtime path the copy-file directive materializes"
-    );
-    let index_html = include_str!("../index.html");
-    assert!(
-        index_html.contains(r#"rel="copy-file" href="vendor/paper-shaders.js""#)
-            && index_html.contains(r#"data-target-path="vendor""#),
-        "index.html must copy-file vendor/paper-shaders.js into \
-         dist/vendor/ — without the directive the module import 404s \
-         at runtime with no compile-time signal"
+         the crate-root-relative path of the committed bundle"
     );
 }
 

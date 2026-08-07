@@ -12,18 +12,18 @@
 //! `None` here. Colors are plain `#rrggbb` strings; the wrapper does
 //! the vec4 conversion.
 //!
-//! CONSUMER CONTRACT (ADR-0012): `module = "/vendor/paper-shaders.js"`
-//! resolves at RUNTIME against the consumer's dist root. Every app
-//! that mounts [`crate::Atmosphere`] must copy the bundle into place
-//! via a Trunk directive in its own `index.html` — in-repo:
-//!
-//! ```html
-//! <link data-trunk rel="copy-file" href="../fleet-ui/vendor/paper-shaders.js" data-target-path="vendor"/>
-//! ```
-//!
-//! (coastwatch uses the same line with its cross-repo relative path,
-//! the `fleet-ui.css` model). A missing directive is a runtime
-//! module-load failure with no compile-time signal.
+//! MODULE RESOLUTION (ADR-0012): the leading `/` in `module =
+//! "/vendor/paper-shaders.js"` makes it a path-shaped specifier, which
+//! wasm-bindgen reads as a LOCAL JS SNIPPET — resolved at COMPILE TIME
+//! against this crate's root (`crates/fleet-ui/vendor/paper-shaders.js`),
+//! inlined into the wasm custom section, and re-emitted beside the
+//! generated shim under `snippets/fleet-ui-<hash>/vendor/`, which the
+//! shim imports by relative path. It is never fetched from a dist-root
+//! URL, so consumers owe nothing beyond the dependency itself: no
+//! `copy-file` directive, no path bookkeeping. A missing or renamed
+//! vendor file is a build failure, not a runtime 404 — the only thing
+//! left worth pinning is that the path and the committed filename
+//! agree, which `tests/atmosphere_vendor_contract.rs` does.
 
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::*;

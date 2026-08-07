@@ -21,13 +21,11 @@
     <!-- The design system under test — the exact CSS the demo's Shell,
          Rail, TopBar and Toasts render against. -->
     <link data-trunk rel="css" href="styles/fleet-ui.css"/>
-    <!-- Vendored JS bundle copied into dist/vendor/ so wasm-bindgen's
-         `module = "/vendor/paper-shaders.js"` path resolves at runtime
-         (same contract as trawl-web-ui's codemirror/uplot copy-file
-         lines). A missing directive is a runtime module-load failure
-         with no compile-time signal — the fleet-ui trunk-build CI step
-         is the only automated check that this resolves. -->
-    <link data-trunk rel="copy-file" href="vendor/paper-shaders.js" data-target-path="vendor"/>
+    <!-- No copy-file line for vendor/paper-shaders.js, deliberately:
+         `module = "/vendor/paper-shaders.js"` is path-shaped, so
+         wasm-bindgen inlines the bundle at COMPILE time and re-emits it
+         under dist/snippets/ — a copied dist/vendor/ duplicate would be
+         dead bytes nothing imports (ADR-0012). -->
 </head>
 <body>
 </body>

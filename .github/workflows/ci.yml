@@ -203,16 +203,16 @@ jobs:
       - name: Build SPA
         working-directory: crates/trawl-web-ui
         run: trunk build --release
-      # The fleet-ui workbench trunk build is the ONLY automated check
-      # that its index.html copy-file directive resolves: wasm-bindgen's
-      # `module = "/vendor/paper-shaders.js"` import fails at runtime
-      # with no compile-time signal if the bundle isn't copied into
-      # dist/vendor/ (ADR-0012 consumer contract).
+      # The workbench is the only wasm-target build of the Atmosphere
+      # backdrop. wasm-bindgen inlines `module = "/vendor/paper-shaders.js"`
+      # as a compile-time snippet, so a missing bundle already fails the
+      # build; the assertion pins the emission path the generated shim
+      # imports (ADR-0012).
       - name: Build fleet-ui workbench
         working-directory: crates/fleet-ui
         run: |
           trunk build
-          test -f dist/vendor/paper-shaders.js
+          test -f dist/snippets/*/vendor/paper-shaders.js
       - name: Precompress SPA + enforce wire-size budgets
         run: cargo xtask compress-web
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

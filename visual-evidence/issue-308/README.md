@@ -57,8 +57,9 @@ tree (`feat/issue-308-shader-atmosphere`).
   fleet-ui native tests: palette parity, vendor contract, chrome
   parity, class contracts).
 - `cargo check -p fleet-ui --target wasm32-unknown-unknown` clean;
-  fleet-ui `trunk build` produces `dist/vendor/paper-shaders.js`
-  (the copy-file contract resolves).
+  fleet-ui `trunk build` emits the vendored bundle as a wasm-bindgen
+  snippet at `dist/snippets/fleet-ui-<hash>/vendor/paper-shaders.js`,
+  which the generated shim imports on its first line.
 
 ## .login-shell zero-delta check (trawl-web-ui)
 

@@ -16,9 +16,9 @@
 //! - **content & data** — `Badge`, `StatusDot`, `Sparkline`, `Tabs`,
 //!   `Loaded`, `Pager`, `LoadMore`, `When`, `ErrorBanner`, `IconView`;
 //! - **decoration** — `Atmosphere`, the WebGL mesh-gradient backdrop
-//!   over the vendored `@paper-design/shaders` bundle (ADR-0012);
-//!   consumers owe the `copy-file` directive documented in
-//!   [`atmosphere`].
+//!   over the vendored `@paper-design/shaders` bundle, which rides
+//!   along as a wasm-bindgen snippet — no consumer build wiring
+//!   (ADR-0012, [`atmosphere`]).
 //!
 //! Consumed by trawl-web-ui and the future coastwatch-web via
 //! workspace path deps; CSS is consumed via Trunk's `data-trunk

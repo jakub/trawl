@@ -96,25 +96,28 @@ Theme flips re-color the mounted mesh in place via `setUniforms`
 (never a remount), which is what makes the backdrop feel continuous
 across the toggle.
 
-### The consumer contract: copy-file, checked only by a build
+### The bundle rides along; consumers wire nothing
 
-`module = "/vendor/paper-shaders.js"` resolves at **runtime** against
-the consumer's dist root. Every app that mounts `Atmosphere` must copy
-the bundle into place in its own `index.html`:
+`module = "/vendor/paper-shaders.js"` is **path-shaped**, and
+wasm-bindgen reads a leading `/`, `./` or `../` as a **local JS
+snippet**: the file is resolved at **compile time** against the crate
+root (`crates/fleet-ui/vendor/paper-shaders.js`), inlined into the wasm
+custom section, and re-emitted under `dist/snippets/fleet-ui-<hash>/`,
+which the generated shim imports by relative path. Verified on the
+workbench build — `dist/shell_demo-<hash>.js` line 1 is `import {
+createShader } from './snippets/fleet-ui-<hash>/vendor/paper-shaders.js'`.
 
-```html
-<link data-trunk rel="copy-file" href="../fleet-ui/vendor/paper-shaders.js" data-target-path="vendor"/>
-```
-
-(in-repo consumers use the relative path shown; fleet-ui's own
-workbench uses `href="vendor/paper-shaders.js"`). A missing directive
-is a runtime module-load failure with **no compile-time signal** — the
-wasm target type-checks fine. That is why CI's `trunk-build` job gains
-a fleet-ui workbench build with a `test -f dist/vendor/
-paper-shaders.js`: a trunk build is the only automated act that
-exercises the directive. `tests/atmosphere_vendor_contract.rs` pins the
-three names (interop path, committed filename, directive target) into
-agreement.
+So `Atmosphere` costs a consumer exactly one component: **no
+`copy-file` directive, no dist-root URL, no cross-repo path
+bookkeeping** — unlike `fleet-ui.css`, which really is a runtime asset
+Trunk must copy. A missing or renamed bundle is a **build failure**,
+not a silent runtime 404, so there is no failure mode here for a CI
+gate to catch. CI's `trunk-build` job still gains a fleet-ui workbench
+build because it is the only wasm-target build of this code, with an
+assertion on the emitted `dist/snippets/*/vendor/paper-shaders.js`
+pinning that emission path. `tests/atmosphere_vendor_contract.rs`
+carries the path↔filename agreement onto native builds, where the
+wasm32 compiler never looks.
 
 The workbench (`src/bin/shell_demo.rs`, served by `trunk serve`) is
 also the evidence venue: the xtask design-cards pages are static HTML
@@ -153,9 +156,9 @@ build time, and the contract test asserts banner == pin.
   shipped look is an explicit placeholder.
 - The palette mirror drifts by construction outside the two pinned
   anchors; a retheme owes the mesh a manual glance.
-- Consumers owe one `copy-file` line each; forgetting it fails only at
-  runtime (silently — the floor paints), caught in-repo by the
-  workbench build gate and cross-repo by eyeballs.
+- Consumers owe no build wiring for the JS: the snippet travels with
+  the crate. The cost is that the 142 KB bundle lands in every
+  consumer's dist whether or not it mounts `Atmosphere`.
 - A lost WebGL context downgrades to the static floor for the session.
   Permanent, silent, by design.
 - trawl-web-ui mounting and coastwatch wiring are deliberately out of

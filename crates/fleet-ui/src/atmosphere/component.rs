@@ -30,10 +30,9 @@
 //! the `.atmosphere` section of `fleet-ui.css`). Consumers compose
 //! content ABOVE it, e.g. coastwatch's login card.
 //!
-//! CONSUMER CONTRACT: the vendored bundle must be copied into the
-//! consumer's dist — see the module doc of [`super::interop`] for the
-//! required `data-trunk rel="copy-file"` line. Without it the module
-//! import fails at runtime with no compile-time signal.
+//! Mounting this costs a consumer nothing but the component: the
+//! vendored JS rides along as a compile-time wasm-bindgen snippet —
+//! see the module doc of [`super::interop`].
 
 use leptos::html::Div;
 use leptos::prelude::*;
