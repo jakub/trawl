@@ -1,0 +1,35 @@
+# Feature-gated snippet emission (ADR-0012) — the 142 KB vendored
+# bundle lands ONLY in the dist of a consumer that opts into the
+# default-off `atmosphere` feature. Both builds from a purged
+# target/wasm-bindgen (wasm-bindgen appends to its output dir and
+# never prunes it, so a stale orphan would read as a leak).
+
+$ cd crates/trawl-web-ui   # does NOT enable the feature
+$ trunk build --release --dist /tmp/ev-spa
+2026-08-07T20:31:05.670403Z  INFO 🚀 Starting trunk 0.21.14
+2026-08-07T20:31:05.670542Z  INFO 📦 starting build
+    Finished `release` profile [optimized] target(s) in 29.51s
+2026-08-07T20:32:06.048487Z  INFO applying new distribution
+2026-08-07T20:32:06.048659Z  INFO ✅ success
+
+$ find /tmp/ev-spa -name paper-shaders.js
+(no output — the bundle is absent from the SPA dist)
+
+$ grep -c paper-shaders /tmp/ev-spa/index.html
+0
+(0 — no modulepreload; before the gate this was 1, for 144,920 bytes)
+
+$ cd crates/fleet-ui   # opts in via data-cargo-features="atmosphere"
+$ trunk build --dist /tmp/ev-wb
+2026-08-07T20:32:06.070362Z  INFO 🚀 Starting trunk 0.21.14
+2026-08-07T20:32:06.070462Z  INFO 📦 starting build
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+2026-08-07T20:32:07.327110Z  INFO applying new distribution
+2026-08-07T20:32:07.327270Z  INFO ✅ success
+
+$ ls -l /tmp/ev-wb/snippets/*/vendor/paper-shaders.js
+-rw-r--r-- 1 jakub jakub 144920 Aug  7 13:32 dist/snippets/fleet-ui-a4958b1237180ea1/vendor/paper-shaders.js
+
+$ head -1 /tmp/ev-wb/shell_demo-*.js
+import { createShader } from './snippets/fleet-ui-a4958b1237180ea1/vendor/paper-shaders.js';
+(the workbench — the evidence venue — still imports and paints it)

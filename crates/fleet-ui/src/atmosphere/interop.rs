@@ -24,6 +24,14 @@
 //! vendor file is a build failure, not a runtime 404 — the only thing
 //! left worth pinning is that the path and the committed filename
 //! agree, which `tests/atmosphere_vendor_contract.rs` does.
+//!
+//! The flip side, and why this module sits behind the default-off
+//! `atmosphere` feature: snippet emission keys off LINKING the extern
+//! block, not off calling it. An unconditional extern block here plants
+//! the 142 KB bundle in the dist of every fleet-ui consumer and gets it
+//! `modulepreload`ed from their `index.html`, even one whose glue
+//! never references it. So the gate lives on the extern block; feature
+//! off, no snippet.
 
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::*;

@@ -96,7 +96,7 @@ Theme flips re-color the mounted mesh in place via `setUniforms`
 (never a remount), which is what makes the backdrop feel continuous
 across the toggle.
 
-### The bundle rides along; consumers wire nothing
+### The bundle rides along, behind a default-off feature
 
 `module = "/vendor/paper-shaders.js"` is **path-shaped**, and
 wasm-bindgen reads a leading `/`, `./` or `../` as a **local JS
@@ -107,15 +107,43 @@ which the generated shim imports by relative path. Verified on the
 workbench build — `dist/shell_demo-<hash>.js` line 1 is `import {
 createShader } from './snippets/fleet-ui-<hash>/vendor/paper-shaders.js'`.
 
-So `Atmosphere` costs a consumer exactly one component: **no
-`copy-file` directive, no dist-root URL, no cross-repo path
-bookkeeping** — unlike `fleet-ui.css`, which really is a runtime asset
-Trunk must copy. A missing or renamed bundle is a **build failure**,
-not a silent runtime 404, so there is no failure mode here for a CI
-gate to catch. CI's `trunk-build` job still gains a fleet-ui workbench
-build because it is the only wasm-target build of this code, with an
-assertion on the emitted `dist/snippets/*/vendor/paper-shaders.js`
-pinning that emission path. `tests/atmosphere_vendor_contract.rs`
+So `Atmosphere` costs a consumer no *build wiring*: **no `copy-file`
+directive, no dist-root URL, no cross-repo path bookkeeping** — unlike
+`fleet-ui.css`, which really is a runtime asset Trunk must copy. A
+missing or renamed bundle is a **build failure**, not a silent runtime
+404.
+
+But "rides along" cuts both ways, and this is the sharp edge of a
+compile-time snippet: emission keys off **linking** the extern block,
+not off calling it. An unconditional `extern` in fleet-ui therefore
+plants all 142 KB in the dist of *every* consumer of the crate and gets
+it `modulepreload`ed from their `index.html`, even one whose generated
+glue contains zero references to it. Measured on trawl-web-ui, which
+does not mount the backdrop: `snippets/fleet-ui-<hash>/vendor/
+paper-shaders.js` (144,920 bytes) present, preload emitted, `grep -c
+paper-shaders` on the glue = 0. That is a pure wire-size regression on
+the SPA whose budgets `cargo xtask compress-web` enforces one step
+later in the same CI job.
+
+So the extern block and the component over it sit behind a **default-off
+`atmosphere` cargo feature**. Only a consumer that mounts the backdrop
+enables it — `features = ["atmosphere"]` on the dep, or
+`data-cargo-features="atmosphere"` on Trunk's `rel="rust"` link, which
+is how the workbench opts in. `atmosphere::palette` stays unconditional:
+pure native data with no snippet attached, and the parity tests name it
+under default features. A cargo feature rather than a `cfg` because the
+decision belongs to the *consumer*, not to fleet-ui's build.
+
+Both legs are gated in CI. `wasm-check` compiles fleet-ui for wasm32
+twice, feature off and on, so the non-mounting shape can't rot. The
+`trunk-build` job asserts the emitted
+`dist/snippets/*/vendor/paper-shaders.js` on the fleet-ui workbench
+(the only wasm-target build of this code, and where the path must hold)
+and asserts its **absence** from the trawl-web-ui dist — feature
+unification is silent, so the negative needs a gate of its own. That
+step first purges `target/wasm-bindgen/release/snippets`: wasm-bindgen
+appends to its output dir and never prunes it, so an orphan from an
+earlier build reads as a leak. `tests/atmosphere_vendor_contract.rs`
 carries the path↔filename agreement onto native builds, where the
 wasm32 compiler never looks.
 
@@ -156,9 +184,12 @@ build time, and the contract test asserts banner == pin.
   shipped look is an explicit placeholder.
 - The palette mirror drifts by construction outside the two pinned
   anchors; a retheme owes the mesh a manual glance.
-- Consumers owe no build wiring for the JS: the snippet travels with
-  the crate. The cost is that the 142 KB bundle lands in every
-  consumer's dist whether or not it mounts `Atmosphere`.
+- Consumers owe no build wiring for the JS — the snippet travels with
+  the crate — but they do owe one feature flag, because linking the
+  extern block is what emits the bundle. The cost of the gate is that
+  `Atmosphere` is not reachable from a plain `fleet-ui` dep and
+  forgetting the flag is a *compile* error (a missing name), which is
+  the failure direction worth having.
 - A lost WebGL context downgrades to the static floor for the session.
   Permanent, silent, by design.
 - trawl-web-ui mounting and coastwatch wiring are deliberately out of

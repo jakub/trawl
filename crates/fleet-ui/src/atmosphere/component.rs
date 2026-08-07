@@ -30,9 +30,13 @@
 //! the `.atmosphere` section of `fleet-ui.css`). Consumers compose
 //! content ABOVE it, e.g. coastwatch's login card.
 //!
-//! Mounting this costs a consumer nothing but the component: the
-//! vendored JS rides along as a compile-time wasm-bindgen snippet —
-//! see the module doc of [`super::interop`].
+//! Mounting this costs a consumer one feature flag and the component:
+//! the vendored JS rides along as a compile-time wasm-bindgen snippet
+//! — no build wiring — but linking that snippet is exactly what the
+//! default-off `atmosphere` feature gates, so a consumer that wants
+//! the backdrop declares `fleet-ui = { …, features = ["atmosphere"] }`
+//! (Trunk apps: `data-cargo-features` on the `rel="rust"` link). See
+//! the module doc of [`super::interop`].
 
 use leptos::html::Div;
 use leptos::prelude::*;

@@ -17,8 +17,10 @@
 //!   `Loaded`, `Pager`, `LoadMore`, `When`, `ErrorBanner`, `IconView`;
 //! - **decoration** — `Atmosphere`, the WebGL mesh-gradient backdrop
 //!   over the vendored `@paper-design/shaders` bundle, which rides
-//!   along as a wasm-bindgen snippet — no consumer build wiring
-//!   (ADR-0012, [`atmosphere`]).
+//!   along as a wasm-bindgen snippet — no consumer build wiring, but
+//!   behind the **default-off `atmosphere` cargo feature**, because
+//!   linking the snippet plants its 142 KB in the dist of every
+//!   consumer, mounted or not (ADR-0012, [`atmosphere`]).
 //!
 //! Consumed by trawl-web-ui and the future coastwatch-web via
 //! workspace path deps; CSS is consumed via Trunk's `data-trunk
@@ -99,7 +101,7 @@ pub use toast::{Toast, ToastKind, ToastStack};
 
 #[cfg(target_arch = "wasm32")]
 pub use actions_menu::{ActionItem, ActionsMenu};
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "atmosphere"))]
 pub use atmosphere::Atmosphere;
 #[cfg(target_arch = "wasm32")]
 pub use badge::Badge;

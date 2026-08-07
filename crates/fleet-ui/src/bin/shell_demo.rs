@@ -34,8 +34,8 @@ fn main() {
 // TopBar and Rail are exported via fleet-ui but mounted internally by
 // Shell — referencing them here would duplicate the chrome.
 use fleet_ui::{
-    AppLink, Atmosphere, Btn, ConfirmWithReasonModal, Drawer, ErrorBanner, Icon, Login, Modal,
-    ModeTab, RailItem, Shell, Size, TabItem, Tabs, ToastBus, UserInfo, Variant, install,
+    AppLink, Btn, ConfirmWithReasonModal, Drawer, ErrorBanner, Icon, Login, Modal, ModeTab,
+    RailItem, Shell, Size, TabItem, Tabs, Theme, ToastBus, UserInfo, Variant, install,
 };
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
@@ -43,6 +43,24 @@ use leptos::prelude::*;
 use leptos_router::components::{Route, Router, Routes};
 #[cfg(target_arch = "wasm32")]
 use leptos_router::path;
+
+/// The shader backdrop, behind fleet-ui's default-off `atmosphere`
+/// feature — `index.html` turns it on via `data-cargo-features`, so
+/// the trunk-served workbench (the evidence venue) always paints it.
+///
+/// The feature-off arm is not dead weight: it is the shape every
+/// non-mounting consumer compiles, and it is what `cargo check -p
+/// fleet-ui --target wasm32-unknown-unknown` (default features) keeps
+/// building. Without the feature the vendored bundle is never linked,
+/// so wasm-bindgen emits no snippet into the dist (ADR-0012).
+#[cfg(all(target_arch = "wasm32", feature = "atmosphere"))]
+fn backdrop(theme: impl Into<Signal<Theme>>) -> impl IntoView {
+    use fleet_ui::Atmosphere;
+    view! { <Atmosphere theme=theme/> }
+}
+
+#[cfg(all(target_arch = "wasm32", not(feature = "atmosphere")))]
+fn backdrop(_theme: impl Into<Signal<Theme>>) -> impl IntoView {}
 
 #[cfg(target_arch = "wasm32")]
 fn rail_items() -> Vec<RailItem> {
@@ -300,7 +318,7 @@ fn DemoApp() -> impl IntoView {
                     // — the coastwatch#308 target arrangement, and the
                     // trunk-served evidence venue for ACs 3–6 (the
                     // static design-cards workbench cannot host WebGL).
-                    <Atmosphere theme=prefs.theme()/>
+                    {backdrop(prefs.theme())}
                     <Login
                         brand="demo"
                         brand_accent="·"

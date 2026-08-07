@@ -56,10 +56,18 @@ tree (`feat/issue-308-shader-atmosphere`).
   **2622 tests run: 2622 passed, 0 skipped** (includes the 153
   fleet-ui native tests: palette parity, vendor contract, chrome
   parity, class contracts).
-- `cargo check -p fleet-ui --target wasm32-unknown-unknown` clean;
-  fleet-ui `trunk build` emits the vendored bundle as a wasm-bindgen
-  snippet at `dist/snippets/fleet-ui-<hash>/vendor/paper-shaders.js`,
-  which the generated shim imports on its first line.
+- `cargo check -p fleet-ui --target wasm32-unknown-unknown` clean both
+  with and without `--features atmosphere`; fleet-ui `trunk build`
+  emits the vendored bundle as a wasm-bindgen snippet at
+  `dist/snippets/fleet-ui-<hash>/vendor/paper-shaders.js`, which the
+  generated shim imports on its first line.
+- `snippet-scoping-transcript.txt` — the snippet is scoped to consumers
+  that opt in. wasm-bindgen emits a local snippet for anything that
+  *links* the extern block, so the default-off `atmosphere` feature is
+  what keeps it out of a non-mounting consumer: trawl-web-ui's release
+  dist contains **no** `paper-shaders.js` and **no** modulepreload for
+  it (grep = 0), while the workbench dist carries all 144,920 bytes and
+  imports them on line 1. CI asserts both directions.
 
 ## .login-shell zero-delta check (trawl-web-ui)
 

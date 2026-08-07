@@ -112,6 +112,41 @@ fn bundle_exports_the_wrapper_api() {
     }
 }
 
+const ATMOSPHERE_MOD: &str = include_str!("../src/atmosphere/mod.rs");
+const CARGO_TOML: &str = include_str!("../Cargo.toml");
+
+#[test]
+fn the_snippet_binding_stays_behind_the_default_off_atmosphere_feature() {
+    // wasm-bindgen emits a local snippet for every consumer that LINKS
+    // the extern block — calling it is irrelevant. Ungated, `interop`
+    // therefore plants 142 KB in the dist of every fleet-ui consumer
+    // and modulepreloads it, trawl-web-ui included, which never mounts
+    // the backdrop. The cfg is the only thing keeping those bytes
+    // opt-in (ADR-0012), and native builds cannot observe the emission,
+    // so pin the gate itself here.
+    assert!(
+        ATMOSPHERE_MOD.contains(
+            "#[cfg(all(target_arch = \"wasm32\", feature = \"atmosphere\"))]\npub mod interop;"
+        ),
+        "atmosphere/mod.rs must gate `pub mod interop` on \
+         `all(target_arch = \"wasm32\", feature = \"atmosphere\")` — \
+         linking the extern block is what ships the 142 KB bundle to \
+         every consumer's dist, mounted or not"
+    );
+    assert!(
+        CARGO_TOML.contains("[features]\natmosphere = []"),
+        "fleet-ui must declare `atmosphere` as a feature with no \
+         dependants of its own"
+    );
+    assert!(
+        !CARGO_TOML.contains("default ="),
+        "the `atmosphere` feature must stay OUT of fleet-ui's default \
+         feature set — defaulting it on puts the shader bundle back in \
+         every consumer's dist, which is the regression the gate exists \
+         to prevent"
+    );
+}
+
 #[test]
 fn interop_path_agrees_with_the_vendored_filename() {
     // The wasm-bindgen module path is a compile-time snippet path
