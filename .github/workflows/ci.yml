@@ -204,23 +204,24 @@ jobs:
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
-      # The SPA depends on fleet-ui but does not mount Atmosphere, so it must
-      # not ship (or modulepreload) the 142 KB shader bundle. That holds only
-      # while the `atmosphere` feature stays off here — feature unification
-      # would silently re-plant the snippet — so assert the dist is clean
-      # (ADR-0012).
+      # The SPA mounts Atmosphere on /login (dep-level `atmosphere` feature,
+      # ADR-0012), so exactly one emitted shader snippet must ship — zero
+      # means the feature fell off (the mount would be a compile error, but
+      # the emission path is wasm-bindgen's, so pin it), more than one means
+      # stale staging leaked into dist.
       - name: Build SPA
         working-directory: crates/trawl-web-ui
         run: |
           # wasm-bindgen appends to its output dir and never prunes it, and
           # rust-cache restores that dir — so an orphaned snippet from an
-          # earlier build would be copied into dist and read as a leak.
-          # Purge the staging snippets so the assertion below sees only what
-          # THIS build emitted.
+          # earlier build would be copied into dist and miscount below.
+          # Purge the staging snippets so the assertion sees only what THIS
+          # build emitted.
           rm -rf ../../target/wasm-bindgen/release/snippets
           trunk build --release
-          if ls dist/snippets/fleet-ui-*/vendor/paper-shaders.js >/dev/null 2>&1; then
-            echo "::error::trawl-web-ui dist ships the fleet-ui shader snippet — the atmosphere feature leaked on"
+          count=$(ls dist/snippets/fleet-ui-*/vendor/paper-shaders.js 2>/dev/null | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly one fleet-ui shader snippet in trawl-web-ui dist, found $count (ADR-0012)"
             exit 1
           fi
       # The workbench is the only wasm-target build of the Atmosphere

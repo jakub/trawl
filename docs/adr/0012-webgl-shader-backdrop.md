@@ -2,6 +2,16 @@
 
 status: accepted (2026-08-07)
 
+> **amendment (2026-08-07):** both intended consumers have since
+> adopted the backdrop — coastwatch on its login + auth-boot surfaces
+> (coastwatch#311) and trawl-web-ui on `/login`. trawl-web-ui now
+> enables the `atmosphere` feature dep-level, so the CI negative gate
+> described below (snippet absent from the trawl-web-ui dist) is
+> flipped: `trunk-build` asserts **exactly one** emitted snippet in
+> both dists. the feature stays default-off in fleet-ui; the
+> feature-off compile shape is still guarded by the bare
+> `cargo check -p fleet-ui` wasm gate.
+
 jakub/coastwatch#308 asks fleet-ui for a decorative animated backdrop —
 a slow-drifting mesh gradient behind the login card, themed with the
 Mira Blue ramp (ADR-0007) — rendered with `@paper-design/shaders`, a

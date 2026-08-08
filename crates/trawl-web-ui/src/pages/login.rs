@@ -5,7 +5,17 @@
 //! `/login` — thin wrapper over [`fleet_ui::Login`]: error mapping +
 //! hard redirect to `/search` on success. The empty-key check lives in
 //! the fleet component.
+//!
+//! The `Atmosphere` mesh-gradient backdrop (ADR-0012) mounts as a
+//! sibling above `<Login/>`, the `shell_demo.rs` / coastwatch#311
+//! arrangement: the backdrop layer is fixed, full-viewport,
+//! `z-index: -1`, so the login card composes above it with no stacking
+//! work here. That only paints because fleet-ui's `.login-shell`
+//! deliberately declares NO opaque background (an opaque normal-flow
+//! block would occlude the z-index:-1 canvas) — don't reintroduce one
+//! in `main.css`.
 
+use fleet_ui::{Atmosphere, UiPrefs};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -13,6 +23,7 @@ use crate::api;
 
 #[component]
 pub fn Login() -> impl IntoView {
+    let prefs = expect_context::<UiPrefs>();
     let (error, set_error) = signal::<Option<String>>(None);
     let (submitting, set_submitting) = signal(false);
 
@@ -43,6 +54,7 @@ pub fn Login() -> impl IntoView {
     // h1 was plain accent "trawl" with no accent glyph, and zero visual
     // change is the contract. The empty accent span renders nothing.
     view! {
+        <Atmosphere theme=prefs.theme()/>
         <fleet_ui::Login
             brand="trawl"
             brand_accent=""

@@ -21,7 +21,12 @@ coastwatch-api-types = { workspace = true }
 # Unconditional (like coastwatch): fleet-ui's pure-native modules
 # (theme::prefs, toast::kinds) ride along for host builds; the leptos
 # component surface only enters the graph on wasm32.
-fleet-ui = { workspace = true }
+# `atmosphere` opts into fleet-ui's default-off WebGL backdrop gate
+# (ADR-0012): linking the vendored paper-shaders snippet is exactly what
+# the feature controls. Enabled dep-level (not Trunk's
+# data-cargo-features) so cargo check / clippy / trunk all build one
+# feature set — the coastwatch#311 arrangement.
+fleet-ui = { workspace = true, features = ["atmosphere"] }
 
 # Wasm-only deps — leptos, web-sys, gloo-net, etc. `cargo check --workspace`
 # on native skips these entirely, but the binary compiles against them when
