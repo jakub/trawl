@@ -193,11 +193,13 @@ pub fn emit_with_pins(
 /// Two pin sets, two roles, never conflated (ADR-0011 slice A):
 ///
 /// - `hot_pins` — the catalog's pins intersected with the snapshot's
-///   observed keys: each pinned field is conformed on the HOT branch only
-///   (`TRY_CAST` for typed pins, the untyped json path for VARCHAR), so a
-///   hot value disagreeing with the write-time pin degrades to NULL
-///   instead of throwing the union. An intersected set, because the
-///   `REPLACE` list must never name a column absent from the snapshot.
+///   observed keys: each pinned field is conformed on the HOT branch only,
+///   through the same text-first guarded cast compaction writes with
+///   ([`crate::conform`]), so a hot value disagreeing with the write-time
+///   pin degrades to NULL instead of throwing the union — and one that
+///   agrees reads exactly as it will once compacted. An intersected set,
+///   because the `REPLACE` list must never name a column absent from the
+///   snapshot.
 /// - `pins` — the FULL catalog snapshot typing the search-stage
 ///   comparisons (see [`emit_with_pins`]). Full, because a cold-only
 ///   field's comparison semantics must not depend on ingest timing.
@@ -1411,11 +1413,23 @@ mod tests {
         )
         .unwrap()
         .sql;
-        // Typed pin: TRY_CAST on the hot branch (NULL on mismatch, never a
-        // union throw — ADR-0008).
+        // Typed pin: the guarded cast over the column's TEXT form, exactly
+        // what compaction writes (NULL on mismatch, never a union throw —
+        // ADR-0008). The cast never touches the column itself, so the
+        // domain cannot vary with read_json's inference.
+        let duration_text = r#"json_extract_string(to_json("duration"), '$')"#;
+        assert_eq!(
+            sql.matches(&format!(
+                "{} AS \"duration\"",
+                crate::conform::guarded_cast(duration_text, crate::schema::CanonicalType::BigInt)
+            ))
+            .count(),
+            1,
+            "hot branch must conform the BIGINT pin through the shared guard: {sql}"
+        );
         assert!(
-            sql.contains(r#"TRY_CAST("duration" AS BIGINT) AS "duration""#),
-            "hot branch must conform the BIGINT pin: {sql}"
+            !sql.contains(r#"TRY_CAST("duration""#),
+            "no cast may bind the raw hot column: {sql}"
         );
         // VARCHAR pin: the untyped json path, so strings land unquoted
         // whatever the snapshot column inferred as.
@@ -1423,10 +1437,9 @@ mod tests {
             sql.contains(r#"json_extract_string(to_json("note"), '$') AS "note""#),
             "hot branch must conform the VARCHAR pin untyped: {sql}"
         );
-        // The pin casts appear ONCE — on the hot branch only. The cold
-        // branch is plain: parquet is write-time conformant, and a
-        // defensive cold cast would mask a real invariant breach.
-        assert_eq!(sql.matches(r#"TRY_CAST("duration""#).count(), 1);
+        // The conform appears on the hot branch only. The cold branch is
+        // plain: parquet is write-time conformant, and a defensive cold
+        // cast would mask a real invariant breach.
         assert!(
             sql.contains("(SELECT * FROM read_parquet("),
             "cold branch must have no REPLACE: {sql}"
@@ -1477,7 +1490,13 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.contains(r#"TRY_CAST("cafÉ" AS BIGINT) AS "cafÉ""#),
+            sql.contains(&format!(
+                "{} AS \"cafÉ\"",
+                crate::conform::guarded_cast(
+                    r#"json_extract_string(to_json("cafÉ"), '$')"#,
+                    crate::schema::CanonicalType::BigInt
+                )
+            )),
             "{sql}"
         );
     }

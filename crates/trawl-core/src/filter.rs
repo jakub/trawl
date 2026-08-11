@@ -703,30 +703,37 @@ fn extract_f64(v: &Value) -> Option<f64> {
 /// pattern form — the in-memory mirror of the SQL side's `pattern_target`.
 ///
 /// `None` is a NULL pattern target: every typed pin can produce one, for a
-/// value the matching `TRY_CAST` would also null out (a non-string JSON
-/// value for TIMESTAMP; a value with no numeric reading for DOUBLE or
-/// BIGINT; a value outside the boolean vocabulary for BOOLEAN), which is
-/// exactly what conformance already wrote to disk.
+/// value the conform would also null out, which is exactly what the corpus
+/// already holds.
 ///
-/// Each typed reading mirrors what conformance stored, not what the wire
-/// carried — the wire text is only the same string when the value already
-/// reads as its pin, and the divergences are silent (a live tail firing on
-/// events the equivalent batch query drops):
+/// Each typed reading mirrors what [`crate::conform`] stored, not what the
+/// wire carried — the wire text is only the same string when the value
+/// already reads as its pin, and the divergences are silent (a live tail
+/// firing on events the equivalent batch query drops). Conformance casts
+/// the value's TEXT form under a round-trip guard, so the readings here are
+/// text readings too, and each is total on exactly the shapes that guard
+/// admits:
 ///
-/// - DOUBLE: a JSON number is its own double, a JSON string goes through
-///   `DuckDB`'s cast domain ([`compare::try_cast_double`], so `"200"` is
-///   the same `200.0` the conform wrote);
-/// - BIGINT: a JSON integer is itself, a JSON fractional number rounds
-///   half to even and a JSON string goes through the wider VARCHAR domain
-///   ([`compare::try_cast_bigint`], so `"0404"` globs as `404`);
-/// - BOOLEAN: a JSON bool is itself, a number is its zero test and a
-///   string goes through `DuckDB`'s boolean vocabulary
-///   ([`compare::try_cast_boolean`], so `"TRUE"` globs as `true`).
+/// - DOUBLE: a JSON number is its own double (the conform is the bare cast
+///   — the round trip through text is the identity), and a JSON string
+///   goes through `DuckDB`'s cast domain ([`compare::try_cast_double`], so
+///   `"200"` is the same `200.0` the conform wrote);
+/// - BIGINT: a JSON integer is itself, and every other numeric or string
+///   shape goes through the guarded reading
+///   ([`compare::conformed_bigint`], so `"0404"` globs as `404` while
+///   `"1.5"` and a fractional JSON number have no reading at all — the
+///   cast would round them, so the conform stores NULL);
+/// - BOOLEAN: a JSON bool is itself (`to_json` renders it as the very text
+///   the guard demands), and a string must BE `true`/`false`
+///   ([`compare::conformed_boolean`], so `"TRUE"` has no reading).
 ///
-/// A JSON bool under a numeric pin reads 1/0, which is its cast in both
-/// inference classes that keep it a bool (BOOLEAN, JSON); an array or
-/// object — stringified at ingest, so never a pinned column's live shape —
-/// is the NULL that cast writes.
+/// A JSON bool under a numeric pin, and a number under the BOOLEAN pin,
+/// have no reading either: `'true'` is not a number to any cast, and
+/// `CAST(TRY_CAST('200' AS BOOLEAN) AS VARCHAR)` is `'true'`, not `'200'`.
+/// (Before the conform went text-first, a numeric under a BOOLEAN pin read
+/// TRUE in a JSON-inferred hot column and NULL everywhere else — the
+/// state-dependence ADR-0011 removed.) An array or object — stringified at
+/// ingest, so never a pinned column's live shape — is likewise NULL.
 fn pattern_text(v: &Value, form: PatternForm) -> Option<String> {
     match form {
         PatternForm::Native => Some(json_to_string(v)),
@@ -737,23 +744,23 @@ fn pattern_text(v: &Value, form: PatternForm) -> Option<String> {
         PatternForm::DoubleText => match v {
             Value::Number(n) => n.as_f64(),
             Value::String(s) => compare::try_cast_double(s),
-            Value::Bool(b) => Some(f64::from(u8::from(*b))),
             _ => None,
         }
         .map(compare::canonical_double_text),
         PatternForm::BigIntText => match v {
-            Value::Number(n) => n
-                .as_i64()
-                .or_else(|| n.as_f64().and_then(compare::double_to_bigint)),
-            Value::String(s) => compare::try_cast_bigint(s),
-            Value::Bool(b) => Some(i64::from(*b)),
+            // A JSON integer is exact and needs no guard; every other
+            // number is read through the text the conform would see.
+            Value::Number(n) => n.as_i64().or_else(|| {
+                n.as_f64()
+                    .and_then(|f| compare::conformed_bigint(&compare::canonical_double_text(f)))
+            }),
+            Value::String(s) => compare::conformed_bigint(s),
             _ => None,
         }
         .map(|i| i.to_string()),
         PatternForm::BooleanText => match v {
             Value::Bool(b) => Some(*b),
-            Value::Number(n) => n.as_f64().map(compare::double_to_boolean),
-            Value::String(s) => compare::try_cast_boolean(s),
+            Value::String(s) => compare::conformed_boolean(s),
             _ => None,
         }
         .map(|b| b.to_string()),

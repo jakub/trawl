@@ -2,13 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Engine-assumption probe (ADR-0009 slice 2): the untyped VARCHAR-pin
-//! conform expression `json_extract_string(to_json(x), '$')` must yield
-//! UNQUOTED strings over `read_json` columns of every inference class the
-//! hot snapshot can produce (VARCHAR, JSON from mixed values, BIGINT).
-//! The emitter has no DESCRIBE, so this expression is applied untyped.
+//! Engine-assumption probe (ADR-0009 slice 2, ADR-0011): every claim the
+//! conform path makes about `DuckDB` is executed here against the bundled
+//! engine, never assumed — the cast domains, the round-trip guard, the
+//! `read_json` inference classes a hot snapshot can produce, and the
+//! agreement between the two conform lanes and their live mirrors.
 
 use std::io::Write as _;
+
+use trawl_core::conform::{guarded_cast, untyped_text};
+use trawl_core::schema::CanonicalType;
 
 fn hot_reader(path: &std::path::Path) -> String {
     format!(
@@ -16,6 +19,34 @@ fn hot_reader(path: &std::path::Path) -> String {
          auto_detect=true, field_appearance_threshold=0)",
         path.display()
     )
+}
+
+/// A connection configured the way every conforming connection is
+/// ([`trawl_core::conform::SESSION_TIME_ZONE_SQL`]).
+fn conn() -> duckdb::Connection {
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .unwrap();
+    conn
+}
+
+/// The conform compaction emits for a column it `DESCRIBE`d — the typed
+/// text form, then the shared guard. Mirrors
+/// `trawl_server::ingest::compaction::canonical_text`, which is the ONLY
+/// thing the two lanes do differently.
+fn compaction_conform(quoted: &str, dtype: &str, pin: CanonicalType) -> String {
+    let text = if dtype == "JSON" {
+        format!("json_extract_string({quoted}, '$')")
+    } else {
+        format!("TRY_CAST({quoted} AS VARCHAR)")
+    };
+    guarded_cast(&text, pin)
+}
+
+/// The conform the emitter's hot-branch `REPLACE` list emits — the untyped
+/// text form, then the same guard.
+fn hot_conform(quoted: &str, pin: CanonicalType) -> String {
+    guarded_cast(&untyped_text(quoted), pin)
 }
 
 #[test]
@@ -81,24 +112,23 @@ fn untyped_varchar_conform_expression_is_unquoted_across_inference_classes() {
 ///
 /// 1. the PREMISE: the unguarded cast really does round (a `DuckDB` bump
 ///    that makes it fail instead would let the guard be simplified), and
-/// 2. the GUARD as compaction emits it (`conform_expr`): BIGINT compares
-///    the cast against the value's canonical text re-parsed as
-///    `DECIMAL(38,6)` — exact across the whole BIGINT range, where a
-///    DOUBLE-space comparison is blind above 2^53 (both sides collapse to
-///    one double, so `1735689600123456710.7` conformed BIGINT silently);
-///    representation drift is still tolerated (`4.0 → 4`, `"042" → 42`),
-///    as is a fraction below DECIMAL(38,6)'s half-microstep
-///    (`4.0000001 → 4` — the residual, documented tolerance). DOUBLE
-///    compares in DOUBLE space (`u64::MAX` → DOUBLE with precision loss,
-///    which the AC requires); TIMESTAMP compares in TIMESTAMP space
-///    (tolerating format drift — RFC 3339 `T`/`Z` vs `DuckDB`'s
-///    space-separated rendering); BOOLEAN compares strict text
-///    (`true`/`false` only, so `1` never conforms to a BOOLEAN pin).
+/// 2. the GUARD as both lanes emit it
+///    ([`trawl_core::conform::guarded_cast`]): BIGINT compares the cast
+///    against the value's canonical text re-parsed as `DECIMAL(38,6)` —
+///    exact across the whole BIGINT range, where a DOUBLE-space comparison
+///    is blind above 2^53 (both sides collapse to one double, so
+///    `1735689600123456710.7` conformed BIGINT silently); representation
+///    drift is still tolerated (`4.0 → 4`, `"042" → 42`), as is a fraction
+///    below DECIMAL(38,6)'s half-microstep (`4.0000001 → 4` — the
+///    residual, documented tolerance). DOUBLE stays in DOUBLE space
+///    (`u64::MAX` → DOUBLE with precision loss, which the AC requires);
+///    BOOLEAN compares strict text (`true`/`false` only, so `1` never
+///    conforms to a BOOLEAN pin).
 #[test]
 #[allow(clippy::too_many_lines)] // one probe per comparison-space decision, kept together
 fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     let dir = tempfile::tempdir().unwrap();
-    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let conn = conn();
 
     let describe_type = |sql: &str| -> String {
         let mut stmt = conn.prepare(&format!("DESCRIBE {sql}")).unwrap();
@@ -152,12 +182,8 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
         "the JSON class rounds through the real reader as well"
     );
 
-    // --- the guard, exactly as conform_expr emits it ---
-    // canon(x) is json_extract_string(x,'$') for a JSON column, else
-    // CAST(x AS VARCHAR).
-    let guard_bigint_json = "(CASE WHEN TRY_CAST(json_extract_string(m, '$') AS DECIMAL(38,6)) = \
-          TRY_CAST(TRY_CAST(m AS BIGINT) AS DECIMAL(38,6)) \
-          THEN TRY_CAST(m AS BIGINT) END)";
+    // --- the guard, exactly as the shared builder emits it ---
+    let guard_bigint_json = compaction_conform("m", "JSON", CanonicalType::BigInt);
     let rows: Vec<(String, Option<i64>)> = {
         let mut stmt = conn
             .prepare(&format!(
@@ -178,13 +204,12 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
 
     // VARCHAR class: strings that survive vs strings that round.
     let varchar_cases: Vec<(String, Option<i64>)> = {
+        let guard = compaction_conform("v", "VARCHAR", CanonicalType::BigInt);
         let mut stmt = conn
-            .prepare(
-                "SELECT v, (CASE WHEN TRY_CAST(CAST(v AS VARCHAR) AS DECIMAL(38,6)) = \
-                 TRY_CAST(TRY_CAST(v AS BIGINT) AS DECIMAL(38,6)) \
-                 THEN TRY_CAST(v AS BIGINT) END) \
-                 FROM (VALUES ('42'), ('042'), ('1.5'), ('n/a')) t(v) ORDER BY v",
-            )
+            .prepare(&format!(
+                "SELECT v, {guard} \
+                 FROM (VALUES ('42'), ('042'), ('1.5'), ('n/a')) t(v) ORDER BY v"
+            ))
             .unwrap();
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
@@ -202,26 +227,25 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
         "VARCHAR class: numeric-space round-trip"
     );
 
-    // HUGEINT class: u64::MAX must fail BIGINT but pass the DOUBLE guard —
-    // DOUBLE-space comparison deliberately tolerates the precision loss the
-    // AC requires (a u64-range batch pins DOUBLE).
-    let (bi_ok, db_ok): (i64, i64) = conn
+    // HUGEINT class: u64::MAX must fail the BIGINT guard but still conform
+    // to DOUBLE — the DOUBLE rung deliberately tolerates the precision loss
+    // the AC requires (a u64-range batch pins DOUBLE).
+    let (bigint, double): (Option<i64>, Option<f64>) = conn
         .query_row(
             &format!(
-                "SELECT count(CASE WHEN TRY_CAST(CAST(u AS VARCHAR) AS DECIMAL(38,6)) = \
-                        TRY_CAST(TRY_CAST(u AS BIGINT) AS DECIMAL(38,6)) THEN 1 END)::BIGINT, \
-                        count(CASE WHEN TRY_CAST(CAST(u AS VARCHAR) AS DOUBLE) = \
-                        TRY_CAST(u AS DOUBLE) THEN 1 END)::BIGINT FROM {reader} \
-                 WHERE CAST(u AS VARCHAR) = '18446744073709551615'"
+                "SELECT {}, {} FROM {reader} \
+                 WHERE CAST(u AS VARCHAR) = '18446744073709551615'",
+                compaction_conform("u", "HUGEINT", CanonicalType::BigInt),
+                compaction_conform("u", "HUGEINT", CanonicalType::Double),
             ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(
-        (bi_ok, db_ok),
-        (0, 1),
-        "u64::MAX: BIGINT round-trip fails (cast NULLs), DOUBLE round-trip passes"
+        (bigint, double),
+        (None, Some(18_446_744_073_709_551_615.0)),
+        "u64::MAX: the BIGINT cast NULLs, the DOUBLE rung keeps it lossily"
     );
 
     // BOOLEAN: TRY_CAST(true AS BIGINT) = 1 makes the BIGINT rung score
@@ -250,10 +274,9 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
         .query_row(
             &format!(
                 "SELECT count(TRY_CAST(b AS BIGINT))::BIGINT, \
-                        count(CASE WHEN TRY_CAST(json_extract_string(b,'$') AS DECIMAL(38,6)) = \
-                        TRY_CAST(TRY_CAST(b AS BIGINT) AS DECIMAL(38,6)) THEN 1 END)::BIGINT, \
-                        count(CASE WHEN CAST(TRY_CAST(b AS BOOLEAN) AS VARCHAR) = \
-                        json_extract_string(b,'$') THEN 1 END)::BIGINT FROM {breader}"
+                        count({})::BIGINT, count({})::BIGINT FROM {breader}",
+                compaction_conform("b", "JSON", CanonicalType::BigInt),
+                compaction_conform("b", "JSON", CanonicalType::Boolean),
             ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -266,16 +289,18 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     );
     assert_eq!((ok_bi, ok_bool), (0, 19), "guarded: booleans pin BOOLEAN");
 
-    // TIMESTAMP: TIMESTAMP-space comparison tolerates format drift (RFC
-    // 3339 'T'/'Z' vs DuckDB's rendering) — a parse failure still NULLs.
-    let ts_cases: Vec<(String, bool)> = {
+    // TIMESTAMP: the rung reads the format drift a wire timestamp carries
+    // (RFC 3339 `T`/`Z`, DuckDB's own space-separated rendering, a bare
+    // date) and NULLs a text no parser reads. Zone handling has its own
+    // probe (`timestamp_conform_applies_the_offset...`).
+    let ts_cases: Vec<(String, Option<String>)> = {
+        let guard = compaction_conform("v", "VARCHAR", CanonicalType::Timestamp);
         let mut stmt = conn
-            .prepare(
-                "SELECT v, (TRY_CAST(CAST(v AS VARCHAR) AS TIMESTAMP) = \
-                 TRY_CAST(v AS TIMESTAMP)) IS NOT DISTINCT FROM true \
-                 FROM (VALUES ('2024-01-15T09:00:00Z'), ('2024-01-15'), ('yesterday-ish')) t(v) \
-                 ORDER BY v",
-            )
+            .prepare(&format!(
+                "SELECT v, CAST({guard} AS VARCHAR) \
+                 FROM (VALUES ('2024-01-15T09:00:00Z'), ('2024-01-15 09:00:00'), \
+                              ('2024-01-15'), ('yesterday-ish')) t(v) ORDER BY v"
+            ))
             .unwrap();
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
@@ -285,11 +310,18 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     assert_eq!(
         ts_cases,
         vec![
-            ("2024-01-15".into(), true),
-            ("2024-01-15T09:00:00Z".into(), true),
-            ("yesterday-ish".into(), false),
+            ("2024-01-15".into(), Some("2024-01-15 00:00:00".into())),
+            (
+                "2024-01-15 09:00:00".into(),
+                Some("2024-01-15 09:00:00".into())
+            ),
+            (
+                "2024-01-15T09:00:00Z".into(),
+                Some("2024-01-15 09:00:00".into())
+            ),
+            ("yesterday-ish".into(), None),
         ],
-        "TIMESTAMP round-trip is format-tolerant, parse failures still fail"
+        "TIMESTAMP conform is format-tolerant, parse failures still NULL"
     );
 }
 
@@ -307,7 +339,7 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
 /// documented, not an accident a bump may silently change.
 #[test]
 fn bigint_round_trip_is_exact_in_decimal_space_beyond_2_pow_53() {
-    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let conn = conn();
 
     // The DOUBLE-space blindness this replaces, kept as the premise.
     let blind: bool = conn
@@ -325,17 +357,16 @@ fn bigint_round_trip_is_exact_in_decimal_space_beyond_2_pow_53() {
     );
 
     let cases: Vec<(String, Option<i64>)> = {
+        let guard = compaction_conform("v", "VARCHAR", CanonicalType::BigInt);
         let mut stmt = conn
-            .prepare(
-                "SELECT v, (CASE WHEN TRY_CAST(CAST(v AS VARCHAR) AS DECIMAL(38,6)) = \
-                 TRY_CAST(TRY_CAST(v AS BIGINT) AS DECIMAL(38,6)) \
-                 THEN TRY_CAST(v AS BIGINT) END) \
+            .prepare(&format!(
+                "SELECT v, {guard} \
                  FROM (VALUES ('9007199254740991'), ('9007199254740992'), \
                               ('9007199254740993'), ('1735689600123456710.7'), \
                               ('1735689600123456710'), ('18446744073709551615'), \
                               ('9223372036854775807'), ('-9223372036854775808'), \
-                              ('4.0000001'), ('4.5')) t(v)",
-            )
+                              ('4.0000001'), ('4.5')) t(v)"
+            ))
             .unwrap();
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
@@ -908,13 +939,18 @@ fn cast_text_patterns_match_bigint_text_form() {
 }
 
 /// The BIGINT pin's pattern text is the CONFORMED integer's rendering, and
-/// the live mirror (`compare::try_cast_bigint`) must read the same value
+/// the live mirror (`compare::conformed_bigint`) must read the same value
 /// out of the same wire text — stringifying the wire text instead answers
 /// `status=0*` TRUE for a stored 404 and `status=a*` TRUE for a value the
 /// column stores as NULL.
+///
+/// Both sides are the GUARDED reading, not the bare cast: the value a
+/// pinned column holds is what the guard admitted, so a text the cast
+/// would round (`'1.5'`) or respell (`'0x10'`) has no pattern text at all.
 #[test]
 fn bigint_pattern_text_is_the_cast_reading_on_both_engines() {
-    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let conn = conn();
+    let guard = compaction_conform("v", "VARCHAR", CanonicalType::BigInt);
     let inputs = [
         // Plain integers, incl. the leading-zero case the wire text and the
         // stored value spell differently.
@@ -982,37 +1018,34 @@ fn bigint_pattern_text_is_the_cast_reading_on_both_engines() {
     for input in inputs {
         let sql: Option<String> = conn
             .query_row(
-                "SELECT CAST(TRY_CAST(? AS BIGINT) AS VARCHAR)",
+                &format!("SELECT CAST({guard} AS VARCHAR) FROM (SELECT ? AS v) t"),
                 [input],
                 |r| r.get(0),
             )
             .unwrap();
-        let live = trawl_core::compare::try_cast_bigint(input).map(|i| i.to_string());
+        let live = trawl_core::compare::conformed_bigint(input).map(|i| i.to_string());
         assert_eq!(live, sql, "BIGINT pattern text disagrees for {input:?}");
     }
 
-    // Documented residual: the fractional rung reads through f64, so a
-    // fractional text within a half-ULP of ±2^63 loses to DuckDB's exact
-    // decimal rounding. Integer texts — what a BIGINT-pinned field
-    // actually carries — are exact across the whole range (above).
-    let sql: Option<String> = conn
-        .query_row(
-            "SELECT CAST(TRY_CAST('9223372036854775807.4' AS BIGINT) AS VARCHAR)",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(sql.as_deref(), Some("9223372036854775807"));
-    assert_eq!(
-        trawl_core::compare::try_cast_bigint("9223372036854775807.4"),
-        None
-    );
+    // The guard's residuals, on both engines: a text the cast rounds has
+    // no reading, and neither does one the DECIMAL space cannot re-read.
+    for input in ["9223372036854775807.4", "1.5", "0x10"] {
+        let sql: Option<String> = conn
+            .query_row(
+                &format!("SELECT CAST({guard} AS VARCHAR) FROM (SELECT ? AS v) t"),
+                [input],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sql, None, "{input:?} must not conform");
+        assert_eq!(trawl_core::compare::conformed_bigint(input), None);
+    }
 
     // The whole point: a stored 404 renders `404`, so the wire text's own
     // leading zero matches on neither side.
     let matched: bool = conn
         .query_row(
-            "SELECT CAST(TRY_CAST('0404' AS BIGINT) AS VARCHAR) GLOB '0*'",
+            &format!("SELECT CAST({guard} AS VARCHAR) GLOB '0*' FROM (SELECT '0404' AS v) t"),
             [],
             |row| row.get(0),
         )
@@ -1020,55 +1053,15 @@ fn bigint_pattern_text_is_the_cast_reading_on_both_engines() {
     assert!(!matched, "the stored BIGINT is 404, so `0*` misses");
 }
 
-/// A JSON number `read_json` typed DOUBLE still conforms to a BIGINT pin —
-/// and that cast rounds half to EVEN, where the VARCHAR cast above rounds
-/// half AWAY FROM ZERO. Two rungs, two roundings, both mirrored.
-#[test]
-fn double_to_bigint_rounds_half_to_even_on_both_engines() {
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-    let inputs = [
-        1.5,
-        2.5,
-        3.5,
-        -1.5,
-        -2.5,
-        0.4,
-        -0.4,
-        0.0,
-        -0.0,
-        200.0,
-        1e18,
-        1e19,
-        1e300,
-        9.223_372_036_854_776e18,
-        f64::NAN,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-    ];
-    for input in inputs {
-        let sql: Option<String> = conn
-            .query_row(
-                "SELECT CAST(TRY_CAST(CAST(? AS DOUBLE) AS BIGINT) AS VARCHAR)",
-                [input],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let live = trawl_core::compare::double_to_bigint(input).map(|i| i.to_string());
-        assert_eq!(live, sql, "DOUBLE→BIGINT disagrees for {input}");
-    }
-    // The two rungs really do disagree on a tie, so the mirror cannot
-    // share one rounding rule.
-    assert_eq!(trawl_core::compare::double_to_bigint(2.5), Some(2));
-    assert_eq!(trawl_core::compare::try_cast_bigint("2.5"), Some(3));
-}
-
-/// The BOOLEAN pin's pattern text is `true`/`false`, lowercase, over a
-/// closed vocabulary — a wire `"TRUE"` stores as `true`, so a matcher that
-/// stringified the wire value would answer `flag=TRUE*` TRUE where the
-/// batch query answers FALSE.
+/// The BOOLEAN pin's pattern text is `true`/`false` and nothing else: the
+/// CAST takes a wide case-insensitive vocabulary, and the round-trip guard
+/// keeps only the two spellings `DuckDB` writes back. A matcher reading
+/// the CAST instead of the CONFORM would answer `flag=/^true$/` TRUE for a
+/// wire `"TRUE"`/`"yes"`/`1` the column stores as NULL.
 #[test]
 fn boolean_pattern_text_is_the_cast_reading_on_both_engines() {
-    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let conn = conn();
+    let guard = compaction_conform("v", "VARCHAR", CanonicalType::Boolean);
     let texts = [
         "true",
         "TRUE",
@@ -1107,40 +1100,39 @@ fn boolean_pattern_text_is_the_cast_reading_on_both_engines() {
     for input in texts {
         let sql: Option<String> = conn
             .query_row(
-                "SELECT CAST(TRY_CAST(? AS BOOLEAN) AS VARCHAR)",
+                &format!("SELECT CAST({guard} AS VARCHAR) FROM (SELECT ? AS v) t"),
                 [input],
                 |r| r.get(0),
             )
             .unwrap();
-        let live = trawl_core::compare::try_cast_boolean(input).map(|b| b.to_string());
+        let live = trawl_core::compare::conformed_boolean(input).map(|b| b.to_string());
         assert_eq!(live, sql, "BOOLEAN pattern text disagrees for {input:?}");
     }
 
-    // A numeric wire value is its zero test — total, so it never NULLs out.
-    for input in [1.0, 0.0, -0.0, 2.0, -1.0, 1.5, f64::NAN, f64::INFINITY] {
-        let sql: Option<String> = conn
-            .query_row(
-                "SELECT CAST(TRY_CAST(CAST(? AS DOUBLE) AS BOOLEAN) AS VARCHAR)",
-                [input],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let live = trawl_core::compare::double_to_boolean(input).to_string();
-        assert_eq!(Some(live), sql, "DOUBLE→BOOLEAN disagrees for {input}");
-    }
-
-    // The whole point: a stored `true` renders lowercase.
-    let matched: bool = conn
+    // The premise the guard exists for: the CAST reads far more than the
+    // conform keeps, so reading the cast would invent values the corpus
+    // does not hold.
+    let cast_reads: i64 = conn
         .query_row(
-            "SELECT CAST(TRY_CAST('TRUE' AS BOOLEAN) AS VARCHAR) GLOB 'TRUE*'",
+            "SELECT count(TRY_CAST(v AS BOOLEAN))::BIGINT \
+             FROM (VALUES ('TRUE'), ('t'), ('yes'), ('1'), ('no')) t(v)",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert!(
-        !matched,
-        "the stored BOOLEAN renders `true`, so `TRUE*` misses"
-    );
+    assert_eq!(cast_reads, 5, "premise: the CAST's vocabulary is wide");
+
+    // A numeric wire value has NO boolean reading once the guard applies:
+    // the cast answers `true` for `'200'` in a JSON-inferred column, and
+    // `'true'` is not the text `'200'`.
+    let numeric: Option<String> = conn
+        .query_row(
+            &format!("SELECT CAST({guard} AS VARCHAR) FROM (SELECT '200' AS v) t"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(numeric, None, "a numeric text must not conform to BOOLEAN");
 }
 
 /// The DOUBLE pin's pattern text is `DuckDB`'s DOUBLE rendering, and the
@@ -1358,4 +1350,363 @@ fn pinned_rules_hold_over_read_json_columns() {
         .unwrap(),
         1
     );
+}
+
+/// The two conform lanes must read one value out of one event: whatever
+/// the hot branch shows a query is what compaction will durably store, or
+/// a result flips minutes later when the compactor runs (ADR-0011).
+///
+/// The matrix is the shapes that used to disagree — a boolean spelling the
+/// cast reads but the rendering does not round-trip, a fraction the cast
+/// rounds, a leading-zero integer, the whitespace and `_` widenings, a
+/// numeric that a JSON-inferred column casts to `true` — read three ways
+/// over the same texts:
+///
+/// 1. through a snapshot where the field holds ONLY strings (VARCHAR), and
+/// 2. through one where a JSON number shares the field (JSON), and
+/// 3. through the live mirror (`compare::conformed_*`).
+///
+/// All three must agree, in both lanes. The PREMISE the probe carries with
+/// it is why that is not automatic: the bare cast — what the hot branch
+/// applied before it went text-first — answers differently in the two
+/// classes, so one event's reading depended on what happened to share its
+/// buffer.
+#[test]
+#[allow(clippy::too_many_lines)] // one matrix, kept in one place to stay readable
+fn hot_and_compaction_conform_agree_across_inference_classes() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("hot.ndjson");
+    // `s` holds only strings (VARCHAR); `m` holds the same texts beside a
+    // JSON number (JSON). `n` is the number itself, for the BOOLEAN case.
+    let texts = ["TRUE", "true", "1.5", "0404", " 200", "200_000", "nan"];
+    {
+        let mut f = std::fs::File::create(&file).unwrap();
+        for (idx, text) in texts.iter().enumerate() {
+            writeln!(f, r#"{{"i":{idx},"s":"{text}","m":"{text}","n":200}}"#).unwrap();
+        }
+        writeln!(f, r#"{{"i":99,"s":"x","m":200,"n":200}}"#).unwrap();
+        f.sync_all().unwrap();
+    }
+    let reader = hot_reader(&file);
+    let conn = conn();
+
+    // The inference classes this probe exists to tell apart.
+    let types: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare(&format!("DESCRIBE SELECT s, m, n FROM {reader}"))
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        types,
+        vec![
+            ("s".into(), "VARCHAR".into()),
+            ("m".into(), "JSON".into()),
+            ("n".into(), "BIGINT".into()),
+        ],
+        "read_json inference classes changed under us"
+    );
+
+    let read = |expr: &str| -> Vec<Option<String>> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT CAST(({expr}) AS VARCHAR) FROM {reader} WHERE i < 90 ORDER BY i"
+            ))
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+
+    for (pin, expected) in [
+        (
+            CanonicalType::BigInt,
+            vec![
+                None,
+                None,
+                None,
+                Some("404"),
+                Some("200"),
+                Some("200000"),
+                None,
+            ],
+        ),
+        (
+            CanonicalType::Boolean,
+            vec![None, Some("true"), None, None, None, None, None],
+        ),
+        (
+            CanonicalType::Double,
+            vec![
+                None,
+                None,
+                Some("1.5"),
+                Some("404.0"),
+                Some("200.0"),
+                Some("200000.0"),
+                Some("nan"),
+            ],
+        ),
+    ] {
+        let expected: Vec<Option<String>> =
+            expected.into_iter().map(|v| v.map(str::to_owned)).collect();
+        // The premise: the bare cast the hot branch used to apply reads
+        // the two inference classes differently.
+        if pin == CanonicalType::BigInt {
+            assert_ne!(
+                read(&format!("TRY_CAST(m AS {})", pin.as_duckdb())),
+                read(&format!("TRY_CAST(s AS {})", pin.as_duckdb())),
+                "premise: the bare cast is inference-dependent"
+            );
+        }
+        for (lane, expr) in [
+            ("hot/VARCHAR", hot_conform("s", pin)),
+            ("hot/JSON", hot_conform("m", pin)),
+            (
+                "compaction/VARCHAR",
+                compaction_conform("s", "VARCHAR", pin),
+            ),
+            ("compaction/JSON", compaction_conform("m", "JSON", pin)),
+        ] {
+            assert_eq!(read(&expr), expected, "{lane} conform for {pin:?}");
+        }
+        // The live mirror answers the same for every one of those texts.
+        let live: Vec<Option<String>> = texts
+            .iter()
+            .map(|t| match pin {
+                CanonicalType::BigInt => {
+                    trawl_core::compare::conformed_bigint(t).map(|i| i.to_string())
+                }
+                CanonicalType::Boolean => {
+                    trawl_core::compare::conformed_boolean(t).map(|b| b.to_string())
+                }
+                CanonicalType::Double => trawl_core::compare::try_cast_double(t)
+                    .map(trawl_core::compare::canonical_double_text),
+                _ => unreachable!("only typed pins"),
+            })
+            .collect();
+        assert_eq!(live, expected, "live mirror for {pin:?}");
+    }
+
+    // A JSON NUMBER under a BOOLEAN pin: the bare cast reads it as `true`
+    // in the JSON class and NULL in the VARCHAR class — the sharpest form
+    // of the state-dependence — while both conform lanes answer NULL.
+    let numeric_row = |expr: &str| -> Option<String> {
+        conn.query_row(
+            &format!("SELECT CAST(({expr}) AS VARCHAR) FROM {reader} WHERE i = 99"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        numeric_row("TRY_CAST(m AS BOOLEAN)").as_deref(),
+        Some("true"),
+        "premise: a JSON numeric casts to BOOLEAN true"
+    );
+    for expr in [
+        hot_conform("m", CanonicalType::Boolean),
+        hot_conform("n", CanonicalType::Boolean),
+        compaction_conform("m", "JSON", CanonicalType::Boolean),
+        compaction_conform("n", "BIGINT", CanonicalType::Boolean),
+    ] {
+        assert_eq!(
+            numeric_row(&expr),
+            None,
+            "a number is not a boolean: {expr}"
+        );
+    }
+}
+
+/// The TIMESTAMP rung is ZONE-AWARE: an offset in the text is applied, a
+/// zoneless text reads as UTC — the semantics ingest already ratified for
+/// `_time` (ADR-0008), now the same in every lane that conforms.
+///
+/// Both halves are pinned, because both were wrong before: the plain
+/// TIMESTAMP cast IGNORES an offset (storing `09:00` for
+/// `09:00:00+05:30`, where `read_json`'s own inference stored `03:30`),
+/// and the `TIMESTAMPTZ` parse that fixes it reads the SESSION zone — which
+/// the bundled `DuckDB` links ICU for and defaults to the HOST zone. Under
+/// a hostile session the same conform writes a different instant, which is
+/// what `conform::SESSION_TIME_ZONE_SQL` exists to prevent.
+#[test]
+fn timestamp_conform_applies_the_offset_under_the_pinned_session() {
+    let conn = conn();
+    let guard = compaction_conform("v", "VARCHAR", CanonicalType::Timestamp);
+    let read = |conn: &duckdb::Connection, text: &str| -> Option<String> {
+        conn.query_row(
+            &format!("SELECT CAST(({guard}) AS VARCHAR) FROM (SELECT ? AS v) t"),
+            [text],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    // The premise: the plain cast drops the offset instead of applying it.
+    let wall: Option<String> = conn
+        .query_row(
+            "SELECT CAST(TRY_CAST('2026-01-15T09:00:00+05:30' AS TIMESTAMP) AS VARCHAR)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        wall.as_deref(),
+        Some("2026-01-15 09:00:00"),
+        "premise: TRY_CAST(text AS TIMESTAMP) is a wall-clock parse"
+    );
+
+    for (text, expected) in [
+        // Offsets are applied, in both directions and in the basic form.
+        ("2026-01-15T09:00:00+05:30", "2026-01-15 03:30:00"),
+        ("2026-01-15T09:00:00-08:00", "2026-01-15 17:00:00"),
+        ("2026-01-15T09:00:00+02", "2026-01-15 07:00:00"),
+        // Zoneless is UTC — the wall clock, unmoved.
+        ("2026-01-15T09:00:00Z", "2026-01-15 09:00:00"),
+        ("2026-01-15 09:00:00", "2026-01-15 09:00:00"),
+        ("2026/01/15 09:00:00", "2026-01-15 09:00:00"),
+        ("2026-01-15", "2026-01-15 00:00:00"),
+        ("2026-01-15T09:00:00.1234567", "2026-01-15 09:00:00.123456"),
+    ] {
+        assert_eq!(read(&conn, text).as_deref(), Some(expected), "{text:?}");
+    }
+    // No reading at all — epoch numerals included, which are not
+    // timestamps to DuckDB.
+    for text in ["yesterday-ish", "", "1737000000", "2026-01-15T"] {
+        assert_eq!(read(&conn, text), None, "{text:?}");
+    }
+
+    // The session pin is load-bearing, not decoration: without it the
+    // same expression writes a different instant on a non-UTC host.
+    let hostile = duckdb::Connection::open_in_memory().unwrap();
+    hostile
+        .execute_batch("SET TimeZone='Asia/Kolkata'")
+        .unwrap();
+    assert_eq!(
+        read(&hostile, "2026-01-15T09:00:00+05:30").as_deref(),
+        Some("2026-01-15 09:00:00"),
+        "an unpinned session renders the instant in ITS zone"
+    );
+    hostile
+        .execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .unwrap();
+    assert_eq!(
+        read(&hostile, "2026-01-15T09:00:00+05:30").as_deref(),
+        Some("2026-01-15 03:30:00"),
+        "the pin restores UTC on a connection that had drifted"
+    );
+}
+
+/// A `_time` conform can never produce NULL on a standing file, zone-aware
+/// rung or not: a NULL partition key sorts first and falls outside every
+/// `last=Xh` filter, so the row would survive the rewrite yet become
+/// permanently unqueryable by time (ADR-0008).
+///
+/// This is the composition `guard_partition_key` writes — the conform
+/// wrapped in `COALESCE(…, <the file's own partition instant>)` — proved
+/// total over every shape the rung can refuse.
+#[test]
+fn time_conform_never_nulls_the_partition_key() {
+    let conn = conn();
+    let guarded = compaction_conform("v", "VARCHAR", CanonicalType::Timestamp);
+    let fallback = "TIMESTAMP '2026-01-15 07:00:00.000000'";
+    for text in [
+        "2026-01-15T09:00:00.000000Z",
+        "2026-01-15T09:00:00+05:30",
+        "2026-01-15",
+        "yesterday-ish",
+        "1737000000",
+        "",
+    ] {
+        let value: Option<String> = conn
+            .query_row(
+                &format!(
+                    "SELECT CAST(COALESCE({guarded}, {fallback}) AS VARCHAR) \
+                     FROM (SELECT ? AS v) t"
+                ),
+                [text],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(value.is_some(), "partition key NULLed for {text:?}");
+    }
+    // And a genuinely NULL input still takes the fallback.
+    let value: Option<String> = conn
+        .query_row(
+            &format!(
+                "SELECT CAST(COALESCE({guarded}, {fallback}) AS VARCHAR) \
+                 FROM (SELECT CAST(NULL AS VARCHAR) AS v) t"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(value.as_deref(), Some("2026-01-15 07:00:00"));
+}
+
+/// The two lanes derive the column's TEXT differently — compaction knows
+/// the observed type and renders it with `CAST(x AS VARCHAR)`, the emitter
+/// does not and renders through `to_json` — and for exactly one class
+/// those spellings differ: a DOUBLE is `1.7356896001234568e+18` to one and
+/// `1735689600123456800.0` to the other.
+///
+/// They must still conform to the SAME value, or the lanes disagree by the
+/// back door. They do, because both renderings are shortest-round-trip and
+/// every rung's cast reads them alike — which is what lets compaction keep
+/// the cheaper rendering instead of paying for JSON on every value of
+/// every ladder candidate of every column.
+#[test]
+fn the_two_lane_text_forms_conform_a_double_identically() {
+    let conn = conn();
+    let doubles = [
+        "1735689600123456710.7",
+        "1e20",
+        "1e-7",
+        "9007199254740993.0",
+        "200.0",
+        "1e17",
+        "12345678901234567.0",
+        "-0.0",
+        "0.5",
+    ];
+    let values = doubles
+        .iter()
+        .map(|d| format!("(CAST({d} AS DOUBLE))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for pin in [
+        CanonicalType::BigInt,
+        CanonicalType::Double,
+        CanonicalType::Boolean,
+        CanonicalType::Timestamp,
+    ] {
+        let read = |expr: &str| -> Vec<Option<String>> {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT CAST(({expr}) AS VARCHAR) FROM (VALUES {values}) t(v)"
+                ))
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        // The premise: the spellings really are different.
+        if pin == CanonicalType::BigInt {
+            assert_ne!(
+                read("CAST(v AS VARCHAR)"),
+                read(&untyped_text("v")),
+                "premise: the two text renderings of a DOUBLE differ"
+            );
+        }
+        assert_eq!(
+            read(&compaction_conform("v", "DOUBLE", pin)),
+            read(&hot_conform("v", pin)),
+            "the lanes must conform a DOUBLE identically under {pin:?}"
+        );
+    }
 }

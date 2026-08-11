@@ -30,7 +30,8 @@ impl Executor {
     ///
     /// Sets `temp_directory` to the system temp dir so `DuckDB` can spill
     /// to disk even when the process working directory is read-only (e.g.
-    /// container overlay filesystems).
+    /// container overlay filesystems), and pins the session time zone
+    /// ([`Self::configure`]).
     pub fn new() -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory()?;
         let tmp = std::env::temp_dir();
@@ -38,6 +39,7 @@ impl Executor {
             "SET temp_directory='{}'",
             tmp.to_string_lossy().replace('\'', "''")
         ))?;
+        Self::configure(&conn)?;
         Ok(Self { conn })
     }
 
@@ -45,10 +47,28 @@ impl Executor {
     ///
     /// The cloned connection benefits from `DuckDB`'s internal metadata
     /// caching (parquet file stats, column statistics) accumulated by
-    /// other connections to the same database.
+    /// other connections to the same database. Settings are NOT inherited
+    /// (probed by execution), so the clone is configured in its own right.
     pub fn try_clone(&self) -> Result<Self, EngineError> {
         let conn = self.conn.try_clone()?;
+        Self::configure(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Pin the settings a query's ANSWER depends on — currently the session
+    /// time zone, which must be UTC on every connection.
+    ///
+    /// The bundled `DuckDB` links ICU and defaults `TimeZone` to the HOST
+    /// zone, and two things read it: the hot branch's TIMESTAMP conform
+    /// (`trawl_core::conform`, which parses through `TIMESTAMPTZ` so an
+    /// offset in the text is applied and a zoneless text is UTC), and
+    /// `now()::TIMESTAMP` — the anchor of every `last=Xh` window, compared
+    /// against `_time` values ingest canonicalized to UTC. On a host in
+    /// `Asia/Kolkata` an unpinned session anchored that window 5h30m into
+    /// the future and dropped every fresh event from it.
+    fn configure(conn: &Connection) -> Result<(), EngineError> {
+        conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)?;
+        Ok(())
     }
 
     /// Get an interrupt handle for cancelling in-flight queries from another thread.

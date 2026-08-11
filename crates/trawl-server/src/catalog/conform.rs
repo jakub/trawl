@@ -539,7 +539,9 @@ fn publish_marker(data_dir: &Path, catalog_id: &str) -> Result<(), String> {
 
 /// Open an in-memory `DuckDB` connection bounded like compaction's: temp
 /// directory on the data root (spill-to-disk works on read-only container
-/// overlays), capped memory, two threads.
+/// overlays), capped memory, two threads — and the UTC session zone every
+/// conform depends on
+/// ([`trawl_core::conform::SESSION_TIME_ZONE_SQL`]).
 fn open_bounded_connection(
     data_dir: &Path,
     memory_limit: &str,
@@ -556,6 +558,8 @@ fn open_bounded_connection(
         memory_limit.replace('\'', "''")
     ))
     .map_err(|e| format!("SET memory_limit/threads failed: {e}"))?;
+    conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .map_err(|e| format!("SET TimeZone failed: {e}"))?;
     Ok(conn)
 }
 

@@ -23,6 +23,10 @@ pub mod format;
 /// In-memory expression evaluator for streaming pipeline stages.
 pub mod compare;
 
+/// Write-time conformance: the guarded cast binding a pinned column to
+/// its catalog type, shared by compaction and the hot branch.
+pub mod conform;
+
 pub mod eval;
 
 /// In-memory event filter compiled from the search stage.

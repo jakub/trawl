@@ -201,20 +201,19 @@ fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
 /// UNTYPED — the emitter has no `DESCRIBE`, so the expression must be valid
 /// whatever type `read_json` inferred for the column.
 ///
-/// Typed pins (`BIGINT`/`DOUBLE`/`TIMESTAMP`/`BOOLEAN`) use `TRY_CAST`:
-/// a nonconforming hot value degrades to NULL instead of throwing the
-/// hot+cold union (ADR-0008). The VARCHAR pin uses
-/// `json_extract_string(to_json(x), '$')`, which yields UNQUOTED strings
-/// over every inference class the snapshot can produce (VARCHAR, JSON from
-/// mixed values, BIGINT) — probed by execution in
-/// `trawl-engine/tests/duckdb_probe.rs`; a plain `CAST(x AS VARCHAR)` on a
-/// JSON-inferred column would keep the quotes.
+/// Text first, then the guarded cast, exactly as compaction conforms the
+/// same event on its way to parquet ([`crate::conform`]): the hot value a
+/// query reads is the one the corpus will durably hold, so a result cannot
+/// flip when the compactor runs. Both halves matter — the text form pins
+/// the cast domain to VARCHAR whatever `read_json` inferred from the rest
+/// of the snapshot, and the guard refuses a cast that would ALTER the value
+/// (`'1.5'` is not 2, `'TRUE'` is not `true`) instead of silently
+/// rewriting it.
+///
+/// A hot value that does not conform degrades to NULL, which is also what
+/// keeps it from throwing the hot+cold union (ADR-0008).
 fn conform_untyped(quoted: &str, pin: crate::schema::CanonicalType) -> String {
-    use crate::schema::CanonicalType;
-    match pin {
-        CanonicalType::Varchar => format!("json_extract_string(to_json({quoted}), '$')"),
-        typed => format!("TRY_CAST({quoted} AS {})", typed.as_duckdb()),
-    }
+    crate::conform::guarded_cast(&crate::conform::untyped_text(quoted), pin)
 }
 
 /// The pins that get their own `REPLACE` entry: everything except the
@@ -289,9 +288,11 @@ impl EmitterState {
     ///
     /// - both envelope TIMESTAMP columns get their unconditional `TRY_CAST`s
     ///   (ADR-0008 — survives empty `pins`, so catalog-less callers keep the
-    ///   timestamp guarantee), and
+    ///   timestamp guarantee; ingest already canonicalized them to UTC, so
+    ///   they need none of the zone-aware rung's work), and
     /// - every pinned field (excluding the timestamp columns, already
-    ///   handled) gets its [`conform_untyped`] expression, so a hot value
+    ///   handled) gets its [`conform_untyped`] expression — the same
+    ///   text-first guarded cast compaction writes with — so a hot value
     ///   that disagrees with the write-time pin degrades to NULL instead of
     ///   throwing the union.
     ///

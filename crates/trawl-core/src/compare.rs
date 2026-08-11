@@ -104,20 +104,21 @@ pub enum CompareForm {
 ///
 /// A pattern needs ONE text per pinned type, or batch and live disagree:
 /// the SQL side matches the CONFORMED value's rendering (the column is
-/// `TRY_CAST` to its pin on the hot branch and already typed on disk)
-/// while the live matcher only ever sees the wire JSON. Stringifying the
-/// wire value is that same text only when the value already reads as its
-/// pin — a JSON int under a BIGINT pin, a JSON bool under a BOOLEAN pin.
-/// For every other shape the two diverge, so each typed pin renders the
-/// value's own cast reading:
+/// conformed to its pin on the hot branch by [`crate::conform`] and
+/// already typed on disk) while the live matcher only ever sees the wire
+/// JSON. Stringifying the wire value is that same text only when the value
+/// already reads as its pin — a JSON int under a BIGINT pin, a JSON bool
+/// under a BOOLEAN pin. For every other shape the two diverge, so each
+/// typed pin renders the value's own conformed reading:
 ///
 /// - `"0404"` conforms to the BIGINT `404`, so `status=0*` matches the
-///   wire text and misses the column, and `"accepted"` conforms to NULL
-///   where the wire text matches `a*`. [`Self::BigIntText`] renders
-///   [`try_cast_bigint`]/[`double_to_bigint`] instead.
-/// - `"TRUE"` conforms to the BOOLEAN `true`, whose rendering is
-///   lowercase. [`Self::BooleanText`] renders the value's boolean reading
-///   ([`try_cast_boolean`]/[`double_to_boolean`]).
+///   wire text and misses the column, while `"accepted"` and `"1.5"`
+///   conform to NULL where the wire text matches `a*` and `1*`.
+///   [`Self::BigIntText`] renders [`conformed_bigint`] instead.
+/// - `"true"` conforms to the BOOLEAN `true` and `"TRUE"` conforms to
+///   NULL — the cast reads both, the round-trip guard keeps only the
+///   spelling `DuckDB` writes back. [`Self::BooleanText`] renders
+///   [`conformed_boolean`].
 /// - `DuckDB` renders a TIMESTAMP space-separated and zoneless
 ///   (`2026-01-15 09:00:00`) where the event carries RFC 3339
 ///   (`2026-01-15T09:00:00.000000Z`), so `_time=/T09:/` would match live
@@ -138,12 +139,13 @@ pub enum PatternForm {
     Native,
     /// The BIGINT pin's canonical text: the conformed integer in decimal —
     /// `CAST(col AS VARCHAR)` on the SQL side (the column already IS
-    /// BIGINT), the value's own `TRY_CAST` reading rendered through
-    /// `i64`'s `Display` on the live side.
+    /// BIGINT), the value's own [`conformed_bigint`] reading rendered
+    /// through `i64`'s `Display` on the live side.
     BigIntText,
     /// The BOOLEAN pin's canonical text — `true`/`false`, lowercase:
-    /// `CAST(col AS VARCHAR)` on the SQL side, the value's own `TRY_CAST`
-    /// reading rendered through `bool`'s `Display` on the live side.
+    /// `CAST(col AS VARCHAR)` on the SQL side, the value's own
+    /// [`conformed_boolean`] reading rendered through `bool`'s `Display`
+    /// on the live side.
     BooleanText,
     /// The TIMESTAMP pin's canonical text: RFC 3339, UTC, always six
     /// fractional digits — `strftime` on the SQL side,
@@ -265,14 +267,144 @@ pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
     }
 }
 
+/// The BIGINT a BIGINT-pinned column CONFORMS a stored text to — the live
+/// mirror of [`crate::conform::guarded_cast`]'s BIGINT rung, which is
+/// `TRY_CAST` under a `DECIMAL(38,6)` round-trip guard.
+///
+/// The guard is the whole point: the cast alone ROUNDS (`'1.5'` → 2), so
+/// the conformed reading exists only where the cast PRESERVED the value.
+/// Spelling drift is fine — `'0404'`, `'4.0'`, `'1e3'`, `' 200'`,
+/// `'200_000'` all conform to the integer they denote — while a value the
+/// cast would alter (`'1.5'`, `'2.5'`) conforms to NULL and is findable in
+/// `_raw` instead.
+///
+/// `'0x10'` is the instructive rejection: `TRY_CAST` reads it as 16, and
+/// the guard refuses it because `DECIMAL` does not read hex at all. That
+/// is the guard working as specified — `16` is a value `DuckDB` would
+/// never render back as `0x10` — not a mirror artefact; the SQL writes
+/// NULL for it too.
+///
+/// Residual: the cast's fractional rung reads through `f64`, so a
+/// fractional text within a half-ULP of ±2^63 is refused where `DuckDB`'s
+/// exact decimal rounding keeps it — invisible through the guard, which
+/// rejects every fractional text anyway. Integer texts are exact across
+/// the whole BIGINT range.
+#[must_use]
+pub fn conformed_bigint(text: &str) -> Option<i64> {
+    let value = try_cast_bigint(text)?;
+    // `dec(text) = dec(cast)`: NULL on either side is UNKNOWN, which the
+    // CASE answers with NULL — so a text outside DECIMAL's domain has no
+    // conformed reading even when the cast produced one.
+    decimal_micros(text)
+        .filter(|micros| *micros == i128::from(value) * 1_000_000)
+        .map(|_| value)
+}
+
+/// The `DECIMAL(38,6)` reading `DuckDB` takes from a stored text, scaled
+/// by 10^6 — the space [`conformed_bigint`]'s guard compares in.
+///
+/// Exact by construction (i128 over the digit string, never `f64`): that
+/// is the point of the DECIMAL space, which stays exact across the whole
+/// BIGINT range where a DOUBLE comparison goes blind above 2^53.
+///
+/// The accepted syntax is the numeric-cast domain — C `isspace` trimmed
+/// off both ends, `_` separators strictly between ASCII digits, optional
+/// sign, digits with an optional fraction, optional `e`/`E` exponent —
+/// minus the radix prefixes (`'0x10'` is NULL here and 16 to the BIGINT
+/// cast) and minus `nan`/`inf`. Digits below the sixth decimal are
+/// ROUNDED, half away from zero (`'4.0000005'` → `4.000001`,
+/// `'4.0000001'` → `4.000000` — the documented tolerance that lets a
+/// sub-microstep fraction conform as its integer), and a magnitude at or
+/// above 10^32 overflows the type and reads NULL. All probed by execution.
+fn decimal_micros(text: &str) -> Option<i128> {
+    /// `DECIMAL(38,6)` holds magnitudes strictly below this, scaled.
+    const LIMIT: i128 = 10i128.pow(38);
+
+    let trimmed = text.trim_matches(is_c_space);
+    let normalized = if trimmed.contains('_') {
+        std::borrow::Cow::Owned(strip_digit_separators(trimmed)?)
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    };
+    let (negative, unsigned) = match normalized.as_bytes().first() {
+        Some(b'+') => (false, &normalized[1..]),
+        Some(b'-') => (true, &normalized[1..]),
+        _ => (false, &normalized[..]),
+    };
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        // Exponents beyond i32 are not typos to reject: they are simply
+        // far outside the type, so they saturate the same way the
+        // magnitude checks below already handle.
+        Some(idx) => (
+            &unsigned[..idx],
+            unsigned[idx + 1..]
+                .parse::<i32>()
+                .ok()
+                .filter(|_| !unsigned[idx + 1..].is_empty())?,
+        ),
+        None => (unsigned, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+
+    // value = digits * 10^shift, so the scaled-by-10^6 target is
+    // digits * 10^(shift + 6).
+    let digits = format!("{int_part}{frac_part}");
+    let digits = digits.trim_start_matches('0');
+    let shift = i64::from(exponent) - i64::try_from(frac_part.len()).ok()? + 6;
+    let magnitude = if digits.is_empty() {
+        0
+    } else if shift >= 0 {
+        let width = i64::try_from(digits.len()).ok()? + shift;
+        if width > 38 {
+            return None;
+        }
+        digits.parse::<i128>().ok()? * 10i128.pow(u32::try_from(shift).ok()?)
+    } else {
+        let dropped = usize::try_from(-shift).ok()?;
+        // A digit at or above 5 in the first dropped place rounds the
+        // magnitude up — half away from zero, matching DuckDB.
+        let round_up = |first_dropped: u8| i128::from(first_dropped >= b'5');
+        match digits.len().checked_sub(dropped) {
+            Some(0) | None => {
+                // Every digit is below the microstep: the reading is 0
+                // unless the very first one rounds it up to one step.
+                if digits.len() == dropped {
+                    round_up(digits.as_bytes()[0])
+                } else {
+                    0
+                }
+            }
+            Some(kept_len) => {
+                if kept_len > 38 {
+                    return None;
+                }
+                digits[..kept_len].parse::<i128>().ok()? + round_up(digits.as_bytes()[kept_len])
+            }
+        }
+    };
+    if magnitude >= LIMIT {
+        return None;
+    }
+    Some(if negative { -magnitude } else { magnitude })
+}
+
 /// The BIGINT `DuckDB` reads out of a stored text under
-/// `TRY_CAST(col AS BIGINT)` — the live mirror of the BIGINT pin's pattern
-/// target, and deliberately NOT `str::parse::<i64>`.
+/// `TRY_CAST(col AS BIGINT)` — the unguarded cast, and deliberately NOT
+/// `str::parse::<i64>`. [`conformed_bigint`] is what a pinned column
+/// actually stores; this is the ingredient its guard filters.
 ///
 /// `DuckDB`'s VARCHAR → BIGINT domain is wider than an integer parse in
-/// four ways (all executed in `trawl-engine/tests/duckdb_probe.rs`), and
-/// each one costs a live match otherwise — batch renders a number, the
-/// stream matches the raw text or nothing:
+/// four ways (all executed in `trawl-engine/tests/duckdb_probe.rs`):
 ///
 /// - leading/trailing ASCII whitespace is trimmed and `_` separators are
 ///   accepted between digits, exactly as for DOUBLE ([`try_cast_double`]);
@@ -280,17 +412,10 @@ pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
 ///   prefix, so no sign and no surrounding whitespace (`' 0x10 '` and
 ///   `'-0x10'` are both NULL to `DuckDB`);
 /// - fractional and exponent forms ROUND rather than fail, half AWAY FROM
-///   ZERO (`'1.5'` → 2, `'2.5'` → 3, `'-2.5'` → -3) — unlike the DOUBLE →
-///   BIGINT rung, which rounds half to EVEN ([`double_to_bigint`]);
+///   ZERO (`'1.5'` → 2, `'2.5'` → 3, `'-2.5'` → -3);
 /// - the result must fit BIGINT: an integer-syntax literal too large is
 ///   NULL, never a saturated approximation.
-///
-/// Residual: the fractional rung reads through `f64`, so a fractional text
-/// within a half-ULP of ±2^63 (`'9223372036854775807.4'`) is refused where
-/// `DuckDB`'s exact decimal rounding keeps it. Integer texts — the shape a
-/// BIGINT-pinned field actually carries — are exact across the whole range.
-#[must_use]
-pub fn try_cast_bigint(text: &str) -> Option<i64> {
+fn try_cast_bigint(text: &str) -> Option<i64> {
     // Radix prefixes bind on the RAW text: DuckDB reads '0x10' but not
     // ' 0x10 ', so trimming has to come after this.
     for (prefix, radix) in [("0x", 16u32), ("0X", 16), ("0b", 2), ("0B", 2)] {
@@ -320,19 +445,6 @@ pub fn try_cast_bigint(text: &str) -> Option<i64> {
     bigint_in_range(normalized.parse::<f64>().ok()?.round())
 }
 
-/// The BIGINT `DuckDB` reads out of a stored DOUBLE under
-/// `TRY_CAST(col AS BIGINT)` — a JSON number that `read_json` typed DOUBLE
-/// (any fractional wire value) still conforms to the BIGINT pin.
-///
-/// Rounds half to EVEN — `DuckDB`'s DOUBLE → BIGINT cast, which is NOT the
-/// half-away-from-zero rounding of its VARCHAR → BIGINT cast (`2.5` is 2
-/// from a double and 3 from the text `'2.5'`; both probed). Out of range,
-/// infinite and NaN inputs are the NULL the cast writes.
-#[must_use]
-pub fn double_to_bigint(x: f64) -> Option<i64> {
-    bigint_in_range(x.round_ties_even())
-}
-
 /// A rounded double narrowed to BIGINT, or `None` outside its range.
 /// ±2^63 is exactly representable, so the bounds are exact.
 #[allow(clippy::cast_possible_truncation)] // guarded by the range check
@@ -342,34 +454,22 @@ fn bigint_in_range(rounded: f64) -> Option<i64> {
         .then_some(rounded as i64)
 }
 
-/// The BOOLEAN `DuckDB` reads out of a stored text under
-/// `TRY_CAST(col AS BOOLEAN)` — the live mirror of the BOOLEAN pin's
-/// pattern target.
+/// The BOOLEAN a BOOLEAN-pinned column CONFORMS a stored text to — the
+/// live mirror of [`crate::conform::guarded_cast`]'s BOOLEAN rung.
 ///
-/// A closed, case-insensitive vocabulary with NO whitespace trimming
-/// (`' true '` is NULL, unlike the numeric casts) and no numeric texts
-/// beyond `1`/`0` (`'2'`, `'1.0'` and `'on'`/`'off'` are all NULL) — every
-/// member and every rejection probed by execution.
+/// Exactly two texts, lowercase, untrimmed. The CAST itself takes a wide
+/// case-insensitive vocabulary (`'TRUE'`, `'t'`, `'yes'`, `'1'`, `'0'`,
+/// `'no'`, …), and the round-trip guard — `CAST(cast AS VARCHAR) = text` —
+/// keeps only the two spellings `DuckDB` writes back. Everything else
+/// conforms to NULL and stays findable in `_raw`, which is what makes a
+/// BOOLEAN pin mean the column holds booleans rather than a synonym table.
 #[must_use]
-pub fn try_cast_boolean(text: &str) -> Option<bool> {
-    const TRUE_WORDS: [&str; 5] = ["true", "t", "yes", "y", "1"];
-    const FALSE_WORDS: [&str; 5] = ["false", "f", "no", "n", "0"];
-    if TRUE_WORDS.iter().any(|w| text.eq_ignore_ascii_case(w)) {
-        return Some(true);
+pub fn conformed_boolean(text: &str) -> Option<bool> {
+    match text {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
     }
-    if FALSE_WORDS.iter().any(|w| text.eq_ignore_ascii_case(w)) {
-        return Some(false);
-    }
-    None
-}
-
-/// The BOOLEAN `DuckDB` reads out of a stored number: zero is false and
-/// everything else — negative, fractional, NaN — is true. Total, so a
-/// numeric wire value under a BOOLEAN pin never NULLs out.
-#[must_use]
-#[allow(clippy::float_cmp)] // intentional: mirrors DuckDB's zero test
-pub fn double_to_boolean(x: f64) -> bool {
-    x != 0.0
 }
 
 /// Render a DOUBLE in the pattern text `DuckDB`'s `CAST(col AS VARCHAR)`
@@ -797,7 +897,8 @@ mod tests {
     }
 
     /// Every expectation here is the value `DuckDB`'s
-    /// `TRY_CAST(v AS BIGINT)` returns for the same text (executed side by
+    /// `TRY_CAST(v AS BIGINT)` returns for the same text — the UNGUARDED
+    /// cast, which [`conformed_bigint`] then filters (executed side by
     /// side in `trawl-engine/tests/duckdb_probe.rs`).
     #[test]
     fn try_cast_bigint_mirrors_duckdb_cast_domain() {
@@ -847,43 +948,141 @@ mod tests {
         }
     }
 
-    /// The DOUBLE rung rounds half to EVEN where the VARCHAR rung rounds
-    /// half AWAY FROM ZERO — two casts, two roundings (both probe-pinned).
+    /// The conformed BIGINT reading keeps every SPELLING drift and refuses
+    /// every VALUE change — the round-trip guard, mirrored (each
+    /// expectation executed against the guard SQL in
+    /// `trawl-engine/tests/duckdb_probe.rs`).
     #[test]
-    fn double_to_bigint_rounds_half_to_even() {
-        assert_eq!(double_to_bigint(1.5), Some(2));
-        assert_eq!(double_to_bigint(2.5), Some(2));
-        assert_eq!(double_to_bigint(3.5), Some(4));
-        assert_eq!(double_to_bigint(-2.5), Some(-2));
-        assert_eq!(double_to_bigint(0.4), Some(0));
-        assert_eq!(double_to_bigint(200.0), Some(200));
-        for x in [1e19, 1e300, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(double_to_bigint(x), None, "{x}");
+    fn conformed_bigint_preserves_value_not_spelling() {
+        // Spelling drift: same value, different text.
+        for (text, value) in [
+            ("404", 404),
+            ("0404", 404),
+            ("00200", 200),
+            ("+5", 5),
+            ("-0", 0),
+            (" 200", 200),
+            ("\t404\n", 404),
+            ("200_000", 200_000),
+            ("1e3", 1000),
+            ("1e1_0", 10_000_000_000),
+            ("4.0", 4),
+            ("0404.000000", 404),
+            ("1.5e1", 15),
+            ("9223372036854775807", i64::MAX),
+            ("-9223372036854775808", i64::MIN),
+            // Below DECIMAL(38,6)'s half-microstep: quantizes to the
+            // integer, the documented residual tolerance.
+            ("4.0000001", 4),
+            ("4.0000004999", 4),
+        ] {
+            assert_eq!(conformed_bigint(text), Some(value), "{text:?}");
+        }
+        // Value changes the cast would have made silently.
+        for text in [
+            "1.5",
+            "1.4",
+            "2.5",
+            "-2.5",
+            ".5",
+            "1_0.5",
+            // Half a microstep and up rounds away from zero, so the
+            // DECIMAL reading is no longer the integer.
+            "4.0000005",
+            "-4.0000005",
+            // Above 2^53, where a DOUBLE-space guard went blind.
+            "1735689600123456710.7",
+        ] {
+            assert_eq!(conformed_bigint(text), None, "{text:?}");
+        }
+        // Radix prefixes: read by the CAST, refused by the guard —
+        // DECIMAL does not read hex, and `16` is not a value DuckDB would
+        // ever write back as `0x10`.
+        for text in ["0x10", "0B101", "-0x10", " 0x10 "] {
+            assert_eq!(conformed_bigint(text), None, "{text:?}");
+        }
+        // No reading at all, and out of BIGINT range.
+        for text in [
+            "accepted",
+            "",
+            "true",
+            "nan",
+            "inf",
+            "1,000",
+            "4 04",
+            "9223372036854775808",
+            "-9223372036854775809",
+            "1e19",
+            "1e400",
+        ] {
+            assert_eq!(conformed_bigint(text), None, "{text:?}");
         }
     }
 
-    /// A closed, case-insensitive vocabulary with NO trimming and no
-    /// numeric texts beyond `1`/`0` (probe-pinned).
+    /// The guard's comparison space, exact by construction: `DuckDB`'s
+    /// `TRY_CAST(v AS DECIMAL(38,6))` scaled by 10^6 (probe-pinned).
     #[test]
-    fn try_cast_boolean_mirrors_duckdb_vocabulary() {
-        for text in ["true", "TRUE", "tRuE", "t", "T", "yes", "yEs", "Y", "1"] {
-            assert_eq!(try_cast_boolean(text), Some(true), "{text:?}");
+    fn decimal_micros_mirrors_duckdb_decimal_domain() {
+        for (text, micros) in [
+            ("200", Some(200_000_000)),
+            (" 200 ", Some(200_000_000)),
+            ("200_000", Some(200_000_000_000)),
+            ("0404", Some(404_000_000)),
+            ("+.5", Some(500_000)),
+            ("1.", Some(1_000_000)),
+            ("-0", Some(0)),
+            ("-0.0", Some(0)),
+            ("1e3", Some(1_000_000_000)),
+            ("1E3", Some(1_000_000_000)),
+            ("1e+3", Some(1_000_000_000)),
+            ("0.5e1", Some(5_000_000)),
+            ("1e-40", Some(0)),
+            // Rounding at the sixth decimal, half away from zero.
+            ("0.0000001", Some(0)),
+            ("0.0000005", Some(1)),
+            ("-0.0000005", Some(-1)),
+            ("4.0000015", Some(4_000_002)),
+            ("4.00000050000000001", Some(4_000_001)),
+            ("4.0000004999", Some(4_000_000)),
+            // Outside the syntax, or outside DECIMAL(38,6)'s magnitude.
+            ("0x10", None),
+            ("nan", None),
+            ("inf", None),
+            (" ", None),
+            ("", None),
+            ("1e", None),
+            ("1,000", None),
+            ("1.5.6", None),
+            ("1e32", None),
+            ("\u{a0}200", None),
+        ] {
+            assert_eq!(decimal_micros(text), micros, "{text:?}");
         }
-        for text in ["false", "FALSE", "f", "F", "no", "nO", "N", "0"] {
-            assert_eq!(try_cast_boolean(text), Some(false), "{text:?}");
-        }
+        // The exact edges of the type: 10^32 - 10^-6 fits, 10^32 does not.
+        assert_eq!(
+            decimal_micros("99999999999999999999999999999999.999999"),
+            Some(10i128.pow(38) - 1)
+        );
+        assert_eq!(decimal_micros("1e31"), Some(10i128.pow(37)));
+        assert_eq!(
+            decimal_micros("99999999999999999999999999999999999999"),
+            None
+        );
+    }
+
+    /// Exactly two conformed texts, lowercase and untrimmed: the CAST's
+    /// vocabulary is wide, and the round-trip guard keeps only what
+    /// `DuckDB` renders back (probe-pinned).
+    #[test]
+    fn conformed_boolean_keeps_only_the_rendered_spellings() {
+        assert_eq!(conformed_boolean("true"), Some(true));
+        assert_eq!(conformed_boolean("false"), Some(false));
         for text in [
-            "on", "off", "", " true ", "\ttrue\n", "accepted", "2", "-1", "1.0", "01", "+1",
+            "TRUE", "tRuE", "t", "T", "yes", "yEs", "Y", "1", "FALSE", "f", "F", "no", "nO", "N",
+            "0", "on", "off", "", " true ", "\ttrue\n", "accepted", "2", "-1", "1.0", "01", "+1",
             "true1",
         ] {
-            assert_eq!(try_cast_boolean(text), None, "{text:?}");
-        }
-        // The numeric reading is TOTAL: zero is false, everything else —
-        // negative, fractional, NaN — is true.
-        assert!(!double_to_boolean(0.0));
-        assert!(!double_to_boolean(-0.0));
-        for x in [1.0, 2.0, -1.0, 1.5, f64::NAN, f64::INFINITY] {
-            assert!(double_to_boolean(x), "{x}");
+            assert_eq!(conformed_boolean(text), None, "{text:?}");
         }
     }
 
