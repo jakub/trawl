@@ -4,9 +4,9 @@ expression: format_result(&result)
 ---
 SELECT *
 FROM (SELECT * FROM read_parquet('/data/**/*.parquet', union_by_name=true) UNION ALL BY NAME SELECT * REPLACE (TRY_CAST("_time" AS TIMESTAMP) AS "_time", TRY_CAST("_ingested" AS TIMESTAMP) AS "_ingested", (CASE WHEN TRY_CAST(json_extract_string(to_json("duration"), '$') AS DECIMAL(38,6)) = TRY_CAST(TRY_CAST(json_extract_string(to_json("duration"), '$') AS BIGINT) AS DECIMAL(38,6)) THEN TRY_CAST(json_extract_string(to_json("duration"), '$') AS BIGINT) END) AS "duration") FROM read_json('/tmp/hot_abc123.ndjson', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0))
-WHERE ("status" = ? OR COALESCE(TRY_CAST("status" AS DOUBLE) = ?, FALSE)) AND "duration" > ?
+WHERE ("status" = ? OR COALESCE(TRY_CAST("status" AS DECIMAL(38,6)) = TRY_CAST(? AS DECIMAL(38,6)), FALSE)) AND "duration" > ?
 ---
 params:
   0: '200'
-  1: 200
+  1: '200'
   2: 5

@@ -4,6 +4,7 @@
 
 use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken, Spanned};
 use crate::compare::{self, CompareForm, PatternForm};
+use crate::conform;
 
 use super::SqlValue;
 use super::fields::quote_field;
@@ -206,13 +207,16 @@ fn emit_field_filter(
                 }
                 _ => match compare::compare_form(pin, ff.op, v) {
                     // VARCHAR pin + ordered numeric literal: numeric
-                    // comparison over the text column — TRY_CAST so a
-                    // non-numeric stored value is NULL (no match), never a
+                    // comparison over the text column, in the ONE
+                    // comparison space (`crate::conform`) — TRY_CAST so a
+                    // stored text outside it is NULL (no match), never a
                     // Conversion throw.
-                    CompareForm::NumericOnText(n) => {
-                        let placeholder = state.push_param(SqlValue::Float(n));
+                    CompareForm::NumericOnText(literal) => {
+                        let placeholder = state.push_param(SqlValue::String(literal));
                         state.push_where(format!(
-                            "TRY_CAST({field} AS DOUBLE) {sql_op} {placeholder}"
+                            "{} {sql_op} {}",
+                            conform::decimal_reading(&field),
+                            conform::decimal_reading(&placeholder)
                         ));
                     }
                     // VARCHAR pin + equality-class numeric literal: the
@@ -220,8 +224,8 @@ fn emit_field_filter(
                     // the stored text of a number is `read_json`'s
                     // inference rendered (`"200.0"`), not the wire spelling
                     // the live matcher sees (`crate::compare`).
-                    CompareForm::TextOrNumeric { text, number } => {
-                        let predicate = text_or_numeric(&field, ff.op, text, number, state);
+                    CompareForm::TextOrNumeric(literal) => {
+                        let predicate = text_or_numeric(&field, ff.op, literal, state);
                         if ff.op == FilterOp::Ne {
                             // Same NULL policy as the plain `!=` shape
                             // below: a NULL column matches.
@@ -270,13 +274,13 @@ fn emit_in_list(
         .collect();
     if forms
         .iter()
-        .any(|f| matches!(f, CompareForm::TextOrNumeric { .. }))
+        .any(|f| matches!(f, CompareForm::TextOrNumeric(_)))
     {
         let predicates: Vec<String> = forms
             .into_iter()
             .map(|form| match form {
-                CompareForm::TextOrNumeric { text, number } => {
-                    text_or_numeric(field, FilterOp::Eq, text, number, state)
+                CompareForm::TextOrNumeric(literal) => {
+                    text_or_numeric(field, FilterOp::Eq, literal, state)
                 }
                 other => {
                     let placeholder = state.push_param(comparable_value(other));
@@ -322,28 +326,33 @@ fn pattern_target(field: &str, pin: Option<crate::schema::CanonicalType>) -> Str
 /// The equality predicate for a VARCHAR-pinned numeric literal
 /// (ADR-0011 slice A): the stored text OR the column's numeric reading.
 ///
-/// `=` is `(col = '200' OR COALESCE(TRY_CAST(col AS DOUBLE) = 200, FALSE))`
-/// and `!=` is its exact complement over non-NULL values. Both `COALESCE`s
-/// are load-bearing: without them a value with no numeric reading
-/// (`'accepted'`) would make the whole predicate UNKNOWN — `status=200`
-/// would then be filtered out AND survive `NOT`, and `status!=200` would
-/// stop returning the enum-shaped rows that motivate the VARCHAR pin. A
-/// NULL column stays UNKNOWN either way (`NULL = ? OR FALSE` is NULL),
-/// which is what the live matcher answers for an absent key.
-fn text_or_numeric(
-    field: &str,
-    op: FilterOp,
-    text: String,
-    number: f64,
-    state: &mut EmitterState,
-) -> String {
-    let text_param = state.push_param(SqlValue::String(text));
-    let num_param = state.push_param(SqlValue::Float(number));
-    let cast = format!("TRY_CAST({field} AS DOUBLE)");
+/// `=` is
+/// `(col = '200' OR COALESCE(dec(col) = dec('200'), FALSE))` and `!=` is
+/// its exact complement over non-NULL values, where `dec` is
+/// [`conform::decimal_reading`] — the same expression on the column and on
+/// the literal, which is what keeps the literal off the `f64` path that
+/// made every id above 2^53 equal to its neighbours (ADR-0011 ruling #6).
+/// The literal is therefore bound TWICE, as the same string: once as the
+/// text arm's value, once as the numeric arm's cast input.
+///
+/// Both `COALESCE`s are load-bearing: without them a value with no numeric
+/// reading (`'accepted'`) would make the whole predicate UNKNOWN —
+/// `status=200` would then be filtered out AND survive `NOT`, and
+/// `status!=200` would stop returning the enum-shaped rows that motivate
+/// the VARCHAR pin. They also absorb a literal the space cannot read
+/// (`nan`, `1e40`): its cast is NULL, so the numeric arm contributes
+/// nothing and the text arm decides alone. A NULL column stays UNKNOWN
+/// either way (`NULL = ? OR FALSE` is NULL), which is what the live
+/// matcher answers for an absent key.
+fn text_or_numeric(field: &str, op: FilterOp, literal: String, state: &mut EmitterState) -> String {
+    let text_param = state.push_param(SqlValue::String(literal.clone()));
+    let num_param = state.push_param(SqlValue::String(literal));
+    let column = conform::decimal_reading(field);
+    let number = conform::decimal_reading(&num_param);
     if op == FilterOp::Ne {
-        format!("({field} != {text_param} AND COALESCE({cast} != {num_param}, TRUE))")
+        format!("({field} != {text_param} AND COALESCE({column} != {number}, TRUE))")
     } else {
-        format!("({field} = {text_param} OR COALESCE({cast} = {num_param}, FALSE))")
+        format!("({field} = {text_param} OR COALESCE({column} = {number}, FALSE))")
     }
 }
 
@@ -354,7 +363,7 @@ fn comparable_value(form: CompareForm) -> SqlValue {
     match form {
         CompareForm::Native(val) => val,
         CompareForm::Text(s) => SqlValue::String(s),
-        CompareForm::NumericOnText(_) | CompareForm::TextOrNumeric { .. } => {
+        CompareForm::NumericOnText(_) | CompareForm::TextOrNumeric(_) => {
             debug_assert!(
                 false,
                 "the pinned numeric forms have their own emission shape"

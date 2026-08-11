@@ -17,8 +17,8 @@
 //! only a final `Some(true)` is a match. Collapsing UNKNOWN to `false`
 //! at the leaf would survive a top-level filter but invert under `NOT`:
 //! `NOT status>=400` over a VARCHAR-pinned `status="accepted"` is a live
-//! match while `NOT (TRY_CAST(status AS DOUBLE) >= 400)` stays NULL and
-//! is filtered out — a false-positive live alert.
+//! match while `NOT (TRY_CAST(status AS DECIMAL(38,6)) >= …)` stays NULL
+//! and is filtered out — a false-positive live alert.
 
 use aho_corasick::AhoCorasick;
 use regex::Regex;
@@ -170,21 +170,23 @@ enum CoercedValue {
     Int(i64),
     Float(f64),
     Str(String),
-    /// The VARCHAR-pinned ordered-numeric form: the SQL side is
-    /// `TRY_CAST(col AS DOUBLE) op ?`, so a non-numeric stored value is
-    /// NULL — UNKNOWN, not FALSE. Kept apart from [`CoercedValue::Float`]
-    /// so the unpinned literal-driven path stays byte-identical.
-    NumericOnText(f64),
+    /// The VARCHAR-pinned ordered-numeric form: the literal's reading in
+    /// the one comparison space ([`crate::conform::decimal_reading`]),
+    /// scaled by 10^6 and exact — so a stored value with no reading is
+    /// NULL (UNKNOWN, not FALSE), and so is a LITERAL with none, which is
+    /// what `None` here means. Kept apart from [`CoercedValue::Float`] so
+    /// the unpinned literal-driven path stays byte-identical.
+    NumericOnText(Option<i128>),
     /// The VARCHAR-pinned equality form for a numeric literal: the SQL
-    /// side is `(col = ? OR COALESCE(TRY_CAST(col AS DOUBLE) = ?, FALSE))`
-    /// (and its complement for `!=`), because a number's STORED text is
+    /// side is `(col = ? OR COALESCE(dec(col) = dec(?), FALSE))` (and its
+    /// complement for `!=`), because a number's STORED text is
     /// `read_json`'s inference rendered — `"200.0"` for a wire `200` that
     /// shared a batch with a fractional value — while this matcher only
     /// ever sees the wire JSON. The numeric reading is the half the two
     /// sides can agree on; see [`crate::compare`].
     TextOrNumeric {
         text: String,
-        number: f64,
+        number: Option<i128>,
     },
 }
 
@@ -458,20 +460,31 @@ fn compile_op(op: FilterOp) -> CompareOp {
 /// - `Native` — today's literal-driven coercion, verbatim.
 /// - `Text` — string comparison against the event value's text form,
 ///   mirroring the SQL side's `col = '200'` on the VARCHAR column.
-/// - `NumericOnText` — float comparison over the value's text form,
-///   read through [`compare::try_cast_double`] so the domain is
-///   `DuckDB`'s cast domain; a value outside it mirrors
-///   `TRY_CAST(col AS DOUBLE)` degrading to NULL: UNKNOWN, so `NOT`
+/// - `NumericOnText` — comparison over the value's text form in the one
+///   comparison space, read through [`compare::decimal_micros`] so the
+///   domain is `DuckDB`'s cast domain; a value outside it mirrors
+///   `TRY_CAST(col AS DECIMAL(38,6))` degrading to NULL: UNKNOWN, so `NOT`
 ///   leaves it unmatched.
 /// - `TextOrNumeric` — the equality-class form under a VARCHAR pin: the
-///   value's text form OR its `TRY_CAST(… AS DOUBLE)` reading, mirroring
-///   the SQL side's `COALESCE`d two-armed predicate.
+///   value's text form OR its DECIMAL reading, mirroring the SQL side's
+///   `COALESCE`d two-armed predicate.
+///
+/// The literal's own reading is taken HERE, once per compiled filter,
+/// from the same text the SQL binds — the batch side casts that string
+/// with the identical expression, so a literal the space cannot read
+/// (`nan`, `1e40`) is `None` on both sides rather than a special case on
+/// either.
 fn coerce_form(form: CompareForm) -> CoercedValue {
     match form {
         CompareForm::Native(SqlValue::Int(i)) => CoercedValue::Int(i),
         CompareForm::Native(SqlValue::Float(f)) => CoercedValue::Float(f),
-        CompareForm::NumericOnText(f) => CoercedValue::NumericOnText(f),
-        CompareForm::TextOrNumeric { text, number } => CoercedValue::TextOrNumeric { text, number },
+        CompareForm::NumericOnText(literal) => {
+            CoercedValue::NumericOnText(compare::decimal_micros(&literal))
+        }
+        CompareForm::TextOrNumeric(literal) => CoercedValue::TextOrNumeric {
+            number: compare::decimal_micros(&literal),
+            text: literal,
+        },
         CompareForm::Native(SqlValue::String(s)) | CompareForm::Text(s) => CoercedValue::Str(s),
         // coerce_filter_value never yields Bool; keep the match total.
         CompareForm::Native(SqlValue::Bool(b)) => CoercedValue::Str(b.to_string()),
@@ -614,11 +627,11 @@ impl TextMatcher {
 /// - Int filter: try to extract event value as i64 (number or string parse)
 /// - Float filter: try to extract event value as f64
 /// - String filter: compare as strings (convert event value to string if needed)
-/// - `NumericOnText` filter: `TRY_CAST(col AS DOUBLE)` over the value's
-///   text form — a value outside `DuckDB`'s cast domain is NULL, so the
+/// - `NumericOnText` filter: the DECIMAL(38,6) reading of the value's
+///   text form — a text outside `DuckDB`'s cast domain is NULL, so the
 ///   comparison is UNKNOWN
-/// - `TextOrNumeric` filter: the value's text form OR its `TRY_CAST(…
-///   AS DOUBLE)` reading, both `COALESCE`d exactly as the SQL is
+/// - `TextOrNumeric` filter: the value's text form OR that same DECIMAL
+///   reading, both `COALESCE`d exactly as the SQL is
 fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -> Truth {
     match filter_val {
         CoercedValue::Int(fv) => {
@@ -643,14 +656,17 @@ fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -
         }
         // The TRY_CAST rung: the column is VARCHAR under the pin, so the
         // batch side casts the value's TEXT form — and DuckDB's cast
-        // domain is wider than Rust's float parser (whitespace, `_`
-        // separators) while its DOUBLE ordering is total (NaN above
-        // everything). Both are mirrored in `compare`, or the stream
-        // silently drops rows the batch query returns. Text outside the
-        // domain is NULL, so UNKNOWN — the one place a non-null event
-        // value can still be UNKNOWN.
-        CoercedValue::NumericOnText(fv) => compare::try_cast_double(&json_to_string(event_val))
-            .map(|ev| apply_ord(compare::double_cmp(ev, *fv), op)),
+        // domain is wider than Rust's number parser (whitespace, `_`
+        // separators, `0404`), which `compare::decimal_micros` mirrors, or
+        // the stream silently drops rows the batch query returns. A text
+        // outside the domain is NULL, so UNKNOWN — the one place a
+        // non-null event value can still be UNKNOWN — and a LITERAL
+        // outside it (`fv` is `None`) makes every row UNKNOWN, exactly as
+        // the SQL's NULL right-hand side does.
+        CoercedValue::NumericOnText(fv) => (*fv).and_then(|literal| {
+            compare::decimal_micros(&json_to_string(event_val))
+                .map(|ev| apply_ord(ev.cmp(&literal), op))
+        }),
         CoercedValue::Str(fv) => {
             let ev = json_to_string(event_val);
             Some(apply_ord(ev.as_str().cmp(fv.as_str()), op))
@@ -664,8 +680,10 @@ fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -
         CoercedValue::TextOrNumeric { text, number } => {
             let ev = json_to_string(event_val);
             let text_eq = ev.as_str() == text.as_str();
-            let number_eq = compare::try_cast_double(&ev)
-                .map(|read| compare::double_cmp(read, *number).is_eq());
+            // UNKNOWN when EITHER side has no reading, which is what
+            // `dec(col) = dec(?)` answers when either cast is NULL.
+            let number_eq =
+                number.and_then(|literal| compare::decimal_micros(&ev).map(|read| read == literal));
             match op {
                 CompareOp::Eq => Some(text_eq || number_eq.unwrap_or(false)),
                 CompareOp::Ne => Some(!text_eq && number_eq.is_none_or(|eq| !eq)),
@@ -1462,8 +1480,8 @@ mod tests {
 
     #[test]
     fn pinned_not_over_unknown_is_never_a_match() {
-        // A TRY_CAST miss is NULL, so `NOT (TRY_CAST(status AS DOUBLE)
-        // >= 400)` is NULL and the batch query drops the row — the live
+        // A TRY_CAST miss is NULL, so `NOT (TRY_CAST(status AS
+        // DECIMAL(38,6)) >= …)` is NULL and the batch query drops the row — the live
         // stream must not fire on it (executed against DuckDB in
         // tests/filter_parity.rs::pinned_varchar_matrix_parity).
         assert!(!matches_event_pinned(

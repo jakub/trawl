@@ -68,6 +68,37 @@ use crate::schema::CanonicalType;
 /// them has to agree.
 pub const SESSION_TIME_ZONE_SQL: &str = "SET TimeZone='UTC'";
 
+/// The ONE numeric comparison space (ADR-0011 ruling #6).
+///
+/// Two questions in this codebase compare a TEXT against a number, and
+/// both are answered here so they cannot drift apart: the BIGINT rung's
+/// round-trip guard below, and the VARCHAR-pinned comparison rules in
+/// [`crate::compare`] (`status=200` matching a stored `"200.0"`,
+/// `id>1737000000123456789` ordering ids).
+///
+/// `DECIMAL(38,6)` because it is EXACT over every `i64` and far past it
+/// (magnitudes below 10^32), where a DOUBLE comparison goes blind above
+/// 2^53 and silently equates neighbours: `id=1737000000123456789` matched
+/// three distinct stored ids, and `id!=9007199254740993` suppressed the
+/// genuinely different `9007199254740992` — snowflake ids and nanosecond
+/// epochs are exactly that shape. The costs are stated where they bite
+/// ([`crate::compare`]'s module doc): fractions quantize at 10^-6, and a
+/// magnitude at or above 10^32 — like `nan` and `inf` — has no reading at
+/// all, which is a NULL, never a false match.
+pub const DECIMAL_COMPARISON_SPACE: &str = "DECIMAL(38,6)";
+
+/// `expr`'s reading in [`DECIMAL_COMPARISON_SPACE`] — NULL for a text the
+/// space cannot hold, which every caller treats as UNKNOWN rather than
+/// inventing an answer.
+///
+/// The live mirror is [`crate::compare::decimal_micros`], exact in `i128`
+/// and executed against this expression in
+/// `trawl-engine/tests/duckdb_probe.rs`.
+#[must_use]
+pub fn decimal_reading(expr: &str) -> String {
+    format!("TRY_CAST({expr} AS {DECIMAL_COMPARISON_SPACE})")
+}
+
 /// The canonical TEXT of a column whose physical type the caller does not
 /// know — the hot lane's case, since the emitter has no `DESCRIBE`.
 ///
@@ -94,8 +125,8 @@ pub fn untyped_text(quoted: &str) -> String {
 /// executed against the bundled `DuckDB` in
 /// `trawl-engine/tests/duckdb_probe.rs`:
 ///
-/// - `BIGINT` compares the cast against the text re-parsed as
-///   `DECIMAL(38,6)` — an EXACT integer space across the whole BIGINT
+/// - `BIGINT` compares the cast against the text re-parsed in
+///   [`DECIMAL_COMPARISON_SPACE`] — an EXACT integer space across the whole BIGINT
 ///   range, where a DOUBLE-space comparison goes blind above 2^53 (both
 ///   sides collapse to the same double, so `1735689600123456710.7`
 ///   conformed to `…711` with no conflict). It keeps every representation
@@ -137,8 +168,9 @@ pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
         CanonicalType::BigInt => {
             let cast = format!("TRY_CAST({text} AS BIGINT)");
             format!(
-                "(CASE WHEN TRY_CAST({text} AS DECIMAL(38,6)) \
-                 = TRY_CAST({cast} AS DECIMAL(38,6)) THEN {cast} END)"
+                "(CASE WHEN {} = {} THEN {cast} END)",
+                decimal_reading(text),
+                decimal_reading(&cast)
             )
         }
         CanonicalType::Boolean => {

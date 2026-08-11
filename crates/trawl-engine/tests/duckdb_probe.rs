@@ -36,7 +36,7 @@
 
 use std::io::Write as _;
 
-use trawl_core::conform::{guarded_cast, untyped_text};
+use trawl_core::conform::{decimal_reading, guarded_cast, untyped_text};
 use trawl_core::schema::CanonicalType;
 
 fn hot_reader(path: &std::path::Path) -> String {
@@ -734,45 +734,52 @@ fn varchar_text_equality_matches_exact_string_only() {
     );
 }
 
-/// Rule: VARCHAR pin + ordered numeric literal → `TRY_CAST(v AS DOUBLE)`.
-/// Numeric-looking strings order numerically, non-numeric values are NULL
-/// (excluded), and nothing throws.
+/// Rule: VARCHAR pin + ordered numeric literal → both sides read through
+/// [`decimal_reading`]. Numeric-looking strings order numerically,
+/// values outside the space are NULL (excluded), and nothing throws.
+///
+/// The comparison is built from the shared expression rather than a
+/// hand-written cast, so a change to the space fails here instead of
+/// silently leaving this probe testing an expression nothing emits.
 #[test]
-fn varchar_try_cast_double_orders_numerically_and_nulls_words() {
+fn varchar_ordered_rung_compares_in_the_decimal_space() {
     let conn = varchar_status_conn();
-    assert_eq!(
+    let ordered = |op: &str, literal: &str| {
         count(
             &conn,
-            "SELECT count(*)::BIGINT FROM t WHERE TRY_CAST(v AS DOUBLE) >= 400"
+            &format!(
+                "SELECT count(*)::BIGINT FROM t WHERE {} {op} {}",
+                decimal_reading("v"),
+                decimal_reading(&format!("'{literal}'"))
+            ),
         )
-        .unwrap(),
+        .unwrap()
+    };
+    assert_eq!(
+        ordered(">=", "400"),
         2, // '404', '500'; 'accepted' NULLs out, '200'/'1.5' below
     );
     assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*)::BIGINT FROM t WHERE TRY_CAST(v AS DOUBLE) > 1"
-        )
-        .unwrap(),
-        4, // everything numeric except nothing — '1.5','200','404','500'
+        ordered(">", "1"),
+        4, // '1.5', '200', '404', '500' — the fraction survives the space
     );
-    // TRY_CAST(v) of 'accepted' is NULL: excluded from BOTH sides of the
+    // The reading of 'accepted' is NULL: excluded from BOTH sides of the
     // comparison, never an error.
-    assert_eq!(
-        count(
-            &conn,
-            "SELECT count(*)::BIGINT FROM t WHERE TRY_CAST(v AS DOUBLE) < 1000"
-        )
-        .unwrap(),
-        4
-    );
+    assert_eq!(ordered("<", "1000"), 4);
+    // A LITERAL the space cannot read needs no special case: its own cast
+    // is NULL, so every row is UNKNOWN and none match.
+    for literal in ["nan", "inf", "1e40"] {
+        assert_eq!(ordered(">", literal), 0, "{literal}");
+        assert_eq!(ordered("<", literal), 0, "{literal}");
+    }
 }
 
-/// The ordered-numeric rung's DOMAIN, run on both engines side by side:
+/// The DOUBLE cast's DOMAIN, run on both engines side by side:
 /// `TRY_CAST(v AS DOUBLE)` in `DuckDB` against `compare::try_cast_double`
-/// in the live matcher. `str::parse::<f64>` is NOT that domain — `DuckDB`
-/// trims ASCII whitespace and honours `_` digit separators — and every
-/// disagreement costs the stream a row the batch query returns.
+/// in the live matcher — the reading behind the DOUBLE pin's pattern text
+/// and the `tonumber()` scalar. `str::parse::<f64>` is NOT that domain —
+/// `DuckDB` trims ASCII whitespace and honours `_` digit separators — and
+/// every disagreement costs the stream a row the batch query returns.
 #[test]
 fn try_cast_double_domain_matches_the_live_mirror() {
     let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -860,63 +867,27 @@ fn try_cast_double_domain_matches_the_live_mirror() {
     }
 }
 
-/// `DuckDB`'s DOUBLE ordering is TOTAL — NaN sits above every value
-/// (including `inf`) and equals itself, `-0.0` equals `0.0` — where
-/// Rust's own operators answer FALSE to every NaN comparison. So a
-/// stored `'nan'` matches `dur>1` in batch and must match live too:
-/// `compare::double_cmp` is that ordering.
+/// Why the comparison space is never a per-literal BIGINT domain:
+/// `TRY_CAST('1.5' AS BIGINT)` ROUNDS to 2, so an integer space would make
+/// `dur>1` and `dur>1.5` disagree about the same stored value.
+/// `DECIMAL(38,6)` keeps 1.5 as 1.5 — and unlike DOUBLE it also keeps
+/// every `i64` distinct. (The rounding premise itself is also pinned by
+/// the conform-guard probes above.)
 #[test]
-fn double_ordering_is_total_with_nan_on_top() {
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-    let vals = [
-        ("'nan'", f64::NAN),
-        ("'inf'", f64::INFINITY),
-        ("'-inf'", f64::NEG_INFINITY),
-        ("1.0", 1.0),
-        ("-1e308", -1e308),
-        ("'-0'", -0.0),
-        ("0.0", 0.0),
-    ];
-    for (a_sql, a) in vals {
-        for (b_sql, b) in vals {
-            let sql: (bool, bool, bool) = conn
-                .query_row(
-                    &format!(
-                        "SELECT CAST({a_sql} AS DOUBLE) > CAST({b_sql} AS DOUBLE), \
-                                CAST({a_sql} AS DOUBLE) < CAST({b_sql} AS DOUBLE), \
-                                CAST({a_sql} AS DOUBLE) = CAST({b_sql} AS DOUBLE)"
-                    ),
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .unwrap();
-            let ord = trawl_core::compare::double_cmp(a, b);
-            assert_eq!(
-                (ord.is_gt(), ord.is_lt(), ord.is_eq()),
-                sql,
-                "ordering disagrees for {a_sql} vs {b_sql}"
-            );
-        }
-    }
-}
-
-/// Why DOUBLE uniformly and never a per-literal BIGINT domain:
-/// `TRY_CAST('1.5' AS BIGINT)` ROUNDS to 2, so a BIGINT domain would make
-/// `dur>1` and `dur>1.5` disagree about the same stored value. DOUBLE
-/// keeps 1.5 as 1.5. (The rounding premise itself is also pinned by the
-/// conform-guard probes above.)
-#[test]
-fn try_cast_bigint_rounds_where_double_preserves() {
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-    let (as_bigint, as_double): (i64, f64) = conn
+fn try_cast_bigint_rounds_where_the_comparison_space_preserves() {
+    let conn = conn();
+    let (as_bigint, as_decimal): (i64, String) = conn
         .query_row(
-            "SELECT TRY_CAST('1.5' AS BIGINT), TRY_CAST('1.5' AS DOUBLE)",
+            &format!(
+                "SELECT TRY_CAST('1.5' AS BIGINT), CAST({} AS VARCHAR)",
+                decimal_reading("'1.5'")
+            ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(as_bigint, 2, "TRY_CAST to BIGINT rounds");
-    assert!((as_double - 1.5).abs() < f64::EPSILON, "DOUBLE preserves");
+    assert_eq!(as_decimal, "1.500000", "the comparison space preserves");
 }
 
 /// PRE-existing behavior on the pattern rule: GLOB and `regexp_matches`

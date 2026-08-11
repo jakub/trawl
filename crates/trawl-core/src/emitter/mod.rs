@@ -171,8 +171,10 @@ pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
 ///
 /// `pins` is the FULL catalog snapshot (not intersected with any hot key
 /// set): a VARCHAR-pinned field compares as text under `=`/`!=`/IN,
-/// numerically via `TRY_CAST(col AS DOUBLE)` for ordered numeric
-/// literals, and typed pins glob/regex through `CAST(col AS VARCHAR)` —
+/// numerically in [`crate::conform::DECIMAL_COMPARISON_SPACE`] for
+/// ordered numeric literals (both sides cast, so the literal never
+/// round-trips through `f64`), and typed pins glob/regex through
+/// `CAST(col AS VARCHAR)` —
 /// see [`crate::compare`] for the rule table. Empty `pins` emits exactly
 /// what [`emit`] emits.
 pub fn emit_with_pins(
@@ -1600,8 +1602,12 @@ mod tests {
         ));
     }
 
+    /// The ordered rung casts BOTH sides into the one comparison space:
+    /// binding the literal as a number would put it back on the `f64`
+    /// path that made every id above 2^53 equal to its neighbours
+    /// (ADR-0011 ruling #6).
     #[test]
-    fn pinned_varchar_ordered_numeric_try_casts_double() {
+    fn pinned_varchar_ordered_numeric_compares_in_decimal_space() {
         assert_snapshot!(emit_dsl_with_pins(
             "status>=400",
             &[("status", CT::Varchar)]
@@ -1634,9 +1640,10 @@ mod tests {
     /// the same (ingest-folded, DuckDB-case-insensitive) column and must
     /// find the same pin — never silently fall back to unpinned. The
     /// identifier keeps the user's spelling (`DuckDB` folds it), so the
-    /// evidence is the bound parameters: the text arm and its numeric
-    /// reading under the VARCHAR pin, where an unpinned emission binds
-    /// the number alone.
+    /// evidence is the bound parameters: under the VARCHAR pin the same
+    /// literal text binds twice — once for the text arm, once as the
+    /// numeric arm's cast input — where an unpinned emission binds the
+    /// coerced number alone.
     #[test]
     fn pinned_lookup_is_case_folded() {
         let ft = pins(&[("status", CT::Varchar)]);
@@ -1645,7 +1652,10 @@ mod tests {
             let emitted = emit_with_pins(&query, SRC, &ft).expect("emit should succeed");
             assert_eq!(
                 emitted.params,
-                vec![SqlValue::String("200".into()), SqlValue::Float(200.0)],
+                vec![
+                    SqlValue::String("200".into()),
+                    SqlValue::String("200".into())
+                ],
                 "{dsl} must bind the pinned two-armed equality"
             );
         }

@@ -18,8 +18,8 @@
 //! |---|---|---|
 //! | unpinned | all | [`CompareForm::Native`] — literal-driven, unchanged |
 //! | VARCHAR | `=` / `!=` / IN element, non-numeric literal | [`CompareForm::Text`] — compare as text (`'accepted'`) |
-//! | VARCHAR | `=` / `!=` / IN element, numeric literal | [`CompareForm::TextOrNumeric`] — the text OR the value's `TRY_CAST(col AS DOUBLE)` reading |
-//! | VARCHAR | ordered + numeric literal | [`CompareForm::NumericOnText`] — `TRY_CAST(col AS DOUBLE)`; non-numeric values NULL out |
+//! | VARCHAR | `=` / `!=` / IN element, numeric literal | [`CompareForm::TextOrNumeric`] — the text OR both sides' [`crate::conform::DECIMAL_COMPARISON_SPACE`] reading |
+//! | VARCHAR | ordered + numeric literal | [`CompareForm::NumericOnText`] — the same DECIMAL reading, both sides; a text without one NULLs out |
 //! | VARCHAR | ordered + non-numeric literal | [`CompareForm::Native`] — lexical, unchanged |
 //! | VARCHAR | glob / regex | [`PatternForm::Native`] — unchanged |
 //! | `TIMESTAMP` | glob / regex | [`PatternForm::Rfc3339Text`] — the canonical RFC 3339 UTC-microsecond text |
@@ -46,8 +46,8 @@
 //! silent divergence [`crate::filter`]'s invariant forbids.
 //!
 //! The numeric reading is the inference-independent half: every rendering
-//! `DuckDB` can produce for a number (`200`, `200.0`, `2e2`) casts back to
-//! that same DOUBLE, and the wire value's own reading equals it. So an
+//! `DuckDB` can produce for a number (`200`, `200.0`, `2e2`) reads back to
+//! that same value, and the wire value's own reading equals it. So an
 //! equality against a numeric literal matches on EITHER — the exact text
 //! (`"200"`, the enum-shaped case ADR-0011 is about) or the numeric reading
 //! (`"200.0"`, the same value spelled by `read_json`'s inference). `!=` is
@@ -63,16 +63,50 @@
 //! before this rule table existed) and is a write-path fidelity question,
 //! not a comparison rule.
 //!
-//! The ordered-numeric rung is `DuckDB`'s cast domain, not Rust's float
-//! parser: [`try_cast_double`] and [`double_cmp`] are the live mirrors of
-//! `TRY_CAST(col AS DOUBLE)` and of `DuckDB`'s total DOUBLE ordering, and
-//! every widening they carry (whitespace, `_` separators, NaN ordering)
-//! is a value batch would return and the stream would otherwise drop.
+//! ## One comparison space: `DECIMAL(38,6)`
 //!
-//! `DOUBLE` uniformly for the ordered-numeric rule, never `BIGINT`:
-//! `TRY_CAST('1.5' AS BIGINT)` ROUNDS to 2 (pinned by
-//! `trawl-engine/tests/duckdb_probe.rs`), so a per-literal-type domain
-//! would make `dur>1` and `dur>1.5` disagree about a stored `"1.5"`.
+//! Both numeric rungs — the equality arm and the ordered one — read the
+//! COLUMN and the LITERAL through the same
+//! [`crate::conform::decimal_reading`], which is the space the conform
+//! guard already compares in (ADR-0011 ruling #6). The literal binds as
+//! its own text and is cast by the identical expression the column is, so
+//! it never round-trips through `f64` and neither side can read one string
+//! differently from the other.
+//!
+//! That is a correctness property, not tidiness. A DOUBLE comparison
+//! collapses every integer above 2^53 onto the nearest representable
+//! neighbour — in both engines alike, so parity testing could never see
+//! it: `id=1737000000123456789` returned THREE distinct stored ids, and
+//! `id!=9007199254740993` silently suppressed the genuinely different
+//! `9007199254740992`. Snowflake ids and nanosecond epochs sit in
+//! VARCHAR-pinned fields in exactly that shape. `DECIMAL(38,6)` is exact
+//! for every `i64` and out to 10^32.
+//!
+//! Never `BIGINT`, for the reason that rules it out of the conform ladder
+//! too: `TRY_CAST('1.5' AS BIGINT)` ROUNDS to 2 (pinned by
+//! `trawl-engine/tests/duckdb_probe.rs`), so an integer space would make
+//! `dur>1` and `dur>1.5` disagree about a stored `"1.5"`.
+//!
+//! Two costs, and both are paid by the two engines TOGETHER — they narrow
+//! what matches, never what agrees:
+//!
+//! 1. **fractions quantize at 10^-6**, rounded half away from zero, so
+//!    `"0.0000005"` reads as `0.000001` and two values a nanosecond apart
+//!    compare equal. Sub-microsecond ordering is not something a
+//!    VARCHAR-pinned field can express;
+//! 2. **`nan`, `inf` and magnitudes at or above 10^32 have no reading at
+//!    all**, which is a NULL — UNKNOWN, never a false match, and `NOT`
+//!    cannot invert it into one. DOUBLE's ordering is total and used to
+//!    sort a stored `"nan"` above every number, so `dur>1` returned it;
+//!    now it matches nothing.
+//!
+//! The domain is `DuckDB`'s cast domain, not Rust's number parser:
+//! [`decimal_micros`] is its live mirror — ASCII whitespace trimmed, `_`
+//! separators between digits, `"0404"`, `"1e3"` and `".5"` read, radix
+//! prefixes refused — executed side by side in
+//! `trawl-engine/tests/duckdb_probe.rs`. [`try_cast_double`] survives only
+//! for the DOUBLE pin's PATTERN text, which renders what the column stores
+//! instead of comparing anything.
 
 use crate::ast::FilterOp;
 use crate::emitter::SqlValue;
@@ -87,17 +121,26 @@ pub enum CompareForm {
     /// Compare as text: the literal binds as a string (`'accepted'`).
     Text(String),
     /// The VARCHAR-pinned equality form for a NUMERIC literal: the value
-    /// matches when its stored TEXT is the literal **or** its
-    /// `TRY_CAST(… AS DOUBLE)` reading is the literal's number.
+    /// matches when its stored TEXT is the literal **or** the two
+    /// [`crate::conform::DECIMAL_COMPARISON_SPACE`] readings agree.
     ///
     /// The text half is ADR-0011's rule; the numeric half is what makes it
     /// mirrorable, because the stored text of a number is `read_json`'s
     /// inference rendered, not the wire spelling (see the module doc).
-    TextOrNumeric { text: String, number: f64 },
-    /// Ordered numeric comparison over a VARCHAR column:
-    /// `TRY_CAST(col AS DOUBLE) op ?` with the literal bound as DOUBLE —
-    /// non-numeric stored values become NULL and don't match.
-    NumericOnText(f64),
+    ///
+    /// One string, carried once: the numeric arm casts the SAME literal
+    /// text the text arm compares, so the two arms cannot disagree about
+    /// what the literal is.
+    TextOrNumeric(String),
+    /// Ordered numeric comparison over a VARCHAR column: both sides read
+    /// through [`crate::conform::decimal_reading`], so a stored text
+    /// outside that domain is NULL and doesn't match.
+    ///
+    /// A LITERAL outside it (`nan`, `inf`, `1e40`) needs no special case:
+    /// its own reading is NULL too, and the comparison is UNKNOWN for
+    /// every row — the same answer on both engines, and one `NOT` cannot
+    /// invert into a match.
+    NumericOnText(String),
 }
 
 /// How one glob/regex pattern binds its column.
@@ -562,19 +605,21 @@ pub fn compare_form(pin: Option<CanonicalType>, op: FilterOp, literal: &str) -> 
         return CompareForm::Native(coerce_filter_value(literal));
     }
     match op {
-        FilterOp::Eq | FilterOp::Ne => numeric_literal(literal).map_or_else(
-            || CompareForm::Text(literal.to_owned()),
-            |number| CompareForm::TextOrNumeric {
-                text: literal.to_owned(),
-                number,
-            },
-        ),
-        FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => numeric_literal(literal)
-            .map_or_else(
-                || CompareForm::Native(coerce_filter_value(literal)),
-                CompareForm::NumericOnText,
-            ),
-        FilterOp::Glob | FilterOp::Regex => CompareForm::Native(coerce_filter_value(literal)),
+        FilterOp::Eq | FilterOp::Ne if is_numeric_literal(literal) => {
+            CompareForm::TextOrNumeric(literal.to_owned())
+        }
+        FilterOp::Eq | FilterOp::Ne => CompareForm::Text(literal.to_owned()),
+        FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte
+            if is_numeric_literal(literal) =>
+        {
+            CompareForm::NumericOnText(literal.to_owned())
+        }
+        FilterOp::Gt
+        | FilterOp::Gte
+        | FilterOp::Lt
+        | FilterOp::Lte
+        | FilterOp::Glob
+        | FilterOp::Regex => CompareForm::Native(coerce_filter_value(literal)),
     }
 }
 
@@ -628,12 +673,20 @@ pub fn conformed_bigint(text: &str) -> Option<i64> {
         .map(|_| value)
 }
 
-/// The `DECIMAL(38,6)` reading `DuckDB` takes from a stored text, scaled
-/// by 10^6 — the space [`conformed_bigint`]'s guard compares in.
+/// The `DECIMAL(38,6)` reading `DuckDB` takes from a text, scaled by 10^6
+/// — the live mirror of [`crate::conform::decimal_reading`], and so of
+/// BOTH things that compare a text against a number:
+/// [`conformed_bigint`]'s round-trip guard and the VARCHAR-pinned
+/// comparison rungs ([`CompareForm::TextOrNumeric`],
+/// [`CompareForm::NumericOnText`]).
 ///
 /// Exact by construction (i128 over the digit string, never `f64`): that
 /// is the point of the DECIMAL space, which stays exact across the whole
-/// BIGINT range where a DOUBLE comparison goes blind above 2^53.
+/// BIGINT range and out to 10^32, where a DOUBLE comparison goes blind
+/// above 2^53.
+///
+/// `None` is the NULL the cast writes — UNKNOWN on both engines, never a
+/// false match.
 ///
 /// The accepted syntax is the numeric-cast domain — C `isspace` trimmed
 /// off both ends, `_` separators strictly between ASCII digits, optional
@@ -644,7 +697,8 @@ pub fn conformed_bigint(text: &str) -> Option<i64> {
 /// `'4.0000001'` → `4.000000` — the documented tolerance that lets a
 /// sub-microstep fraction conform as its integer), and a magnitude at or
 /// above 10^32 overflows the type and reads NULL. All probed by execution.
-fn decimal_micros(text: &str) -> Option<i128> {
+#[must_use]
+pub fn decimal_micros(text: &str) -> Option<i128> {
     /// `DECIMAL(38,6)` holds magnitudes strictly below this, scaled.
     const LIMIT: i128 = 10i128.pow(38);
 
@@ -815,8 +869,13 @@ pub fn canonical_double_text(x: f64) -> String {
 }
 
 /// The DOUBLE `DuckDB` reads out of a stored text under
-/// `TRY_CAST(col AS DOUBLE)` — the live mirror of the ordered-numeric
-/// rung, and deliberately NOT `str::parse::<f64>`.
+/// `TRY_CAST(col AS DOUBLE)` — the live mirror of the DOUBLE pin's own
+/// cast, and deliberately NOT `str::parse::<f64>`.
+///
+/// Its remaining caller is the DOUBLE pin's PATTERN text
+/// ([`PatternForm::DoubleText`]): what the conformed column holds, to be
+/// rendered and globbed. Nothing COMPARES through it any more — that is
+/// [`decimal_micros`]' job (ADR-0011 ruling #6).
 ///
 /// `DuckDB`'s cast domain is strictly wider than Rust's float parser in
 /// two ways (both executed in `trawl-engine/tests/duckdb_probe.rs`), and
@@ -872,31 +931,20 @@ fn strip_digit_separators(text: &str) -> Option<String> {
     Some(out)
 }
 
-/// `DuckDB`'s ordering over DOUBLE, which is TOTAL: NaN sits above every
-/// other value (including `inf`) and equals itself, while `-0.0` equals
-/// `0.0`. Rust's own operators answer FALSE to every NaN comparison, so
-/// a stored `'nan'` under the ordered-numeric rung matches `dur>1` in
-/// batch and would miss in the stream without this.
-#[must_use]
-pub fn double_cmp(a: f64, b: f64) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    // partial_cmp is None only when a NaN is involved.
-    a.partial_cmp(&b).unwrap_or(match (a.is_nan(), b.is_nan()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Greater,
-        _ => Ordering::Less,
-    })
-}
-
-/// Whether the literal's content is numeric, under the same i64-then-f64
-/// ladder [`coerce_filter_value`] uses — so the pinned and unpinned paths
-/// agree on what counts as a number.
-#[allow(clippy::cast_precision_loss)] // i64 → f64: same collapse DuckDB's DOUBLE comparison applies
-fn numeric_literal(s: &str) -> Option<f64> {
-    if let Ok(i) = s.parse::<i64>() {
-        return Some(i as f64);
-    }
-    s.parse::<f64>().ok()
+/// Whether the literal's content is a number, over exactly the set
+/// [`coerce_filter_value`]'s i64-then-f64 ladder answers numerically — so
+/// the pinned and unpinned paths agree on what counts as one. (Every
+/// i64-shaped text parses as `f64` too, so the ladder's two rungs are one
+/// membership question; only the BINDING differed, and neither pinned
+/// form binds through a float any more.)
+///
+/// It stays Rust's parser rather than the DECIMAL domain the readings use,
+/// because this decides which RULE applies, not what the literal is worth.
+/// `dur>1e40` is a numeric comparison whose answer happens to be UNKNOWN
+/// for every row; routing it to the lexical rule instead would silently
+/// turn it into a string comparison against `"1e40"` and return rows.
+fn is_numeric_literal(s: &str) -> bool {
+    s.parse::<f64>().is_ok()
 }
 
 #[cfg(test)]
@@ -934,15 +982,6 @@ mod tests {
         matches!(native, SqlValue::Int(_) | SqlValue::Float(_))
     }
 
-    fn as_f64(native: &SqlValue) -> f64 {
-        #[allow(clippy::cast_precision_loss)]
-        match native {
-            SqlValue::Int(i) => *i as f64,
-            SqlValue::Float(f) => *f,
-            _ => unreachable!("only numeric shapes"),
-        }
-    }
-
     // ── unpinned: everything stays literal-driven ─────────────────────
 
     #[test]
@@ -968,10 +1007,7 @@ mod tests {
             // stored text of a number is `read_json`'s inference rendered,
             // so exact text alone is unmirrorable live (see the module doc).
             let expected = if is_numeric(&native) {
-                CompareForm::TextOrNumeric {
-                    text: lit.to_owned(),
-                    number: as_f64(&native),
-                }
+                CompareForm::TextOrNumeric(lit.to_owned())
             } else {
                 CompareForm::Text(lit.to_owned())
             };
@@ -997,7 +1033,7 @@ mod tests {
         {
             let eq_numeric = matches!(
                 compare_form(Some(CanonicalType::Varchar), FilterOp::Eq, lit),
-                CompareForm::TextOrNumeric { .. }
+                CompareForm::TextOrNumeric(_)
             );
             let ordered_numeric = matches!(
                 compare_form(Some(CanonicalType::Varchar), FilterOp::Gt, lit),
@@ -1007,8 +1043,12 @@ mod tests {
         }
     }
 
+    /// The ordered rung carries the literal's own TEXT, never a parsed
+    /// number: the SQL binds that string and casts it with the same
+    /// expression it casts the column with, so the literal never
+    /// round-trips through `f64` (ADR-0011 ruling #6).
     #[test]
-    fn varchar_ordered_numeric_literal_compares_numerically_on_text() {
+    fn varchar_ordered_numeric_literal_carries_the_literal_text() {
         for (lit, native) in literal_shapes() {
             if !is_numeric(&native) {
                 continue;
@@ -1016,11 +1056,21 @@ mod tests {
             for op in ORDERED {
                 assert_eq!(
                     compare_form(Some(CanonicalType::Varchar), op, lit),
-                    CompareForm::NumericOnText(as_f64(&native)),
+                    CompareForm::NumericOnText(lit.to_owned()),
                     "varchar {op:?} {lit:?}"
                 );
             }
         }
+        // The reported id: exact through the form, where the old f64
+        // binding equated it with both neighbours.
+        assert_eq!(
+            compare_form(
+                Some(CanonicalType::Varchar),
+                FilterOp::Gt,
+                "1737000000123456789"
+            ),
+            CompareForm::NumericOnText("1737000000123456789".to_owned())
+        );
     }
 
     #[test]
@@ -1638,20 +1688,37 @@ mod tests {
         }
     }
 
-    /// `DuckDB` orders DOUBLE totally: NaN above everything and equal to
-    /// itself, `-0.0` equal to `0.0` (probe-pinned).
+    /// The comparison space is EXACT where a DOUBLE one collapses: the
+    /// ids from the reported finding read as three distinct values, and
+    /// `2^53 ± 1` are distinguishable at all (executed against `DuckDB`
+    /// in `trawl-engine/tests/duckdb_probe.rs`).
     #[test]
-    fn double_cmp_puts_nan_on_top() {
-        use std::cmp::Ordering;
-        let nan = f64::NAN;
-        assert_eq!(double_cmp(nan, nan), Ordering::Equal);
-        for other in [1.0, 0.0, -1e308, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(double_cmp(nan, other), Ordering::Greater, "{other}");
-            assert_eq!(double_cmp(other, nan), Ordering::Less, "{other}");
+    fn decimal_micros_separates_ids_a_double_would_equate() {
+        let ids = [
+            "1737000000123456788",
+            "1737000000123456789",
+            "1737000000123456790",
+            "9007199254740992",
+            "9007199254740993",
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(decimal_micros(a), decimal_micros(b), "{a} vs {b}");
+            }
         }
-        assert_eq!(double_cmp(-0.0, 0.0), Ordering::Equal);
-        assert_eq!(double_cmp(f64::INFINITY, 1e308), Ordering::Greater);
-        assert_eq!(double_cmp(1.0, 2.0), Ordering::Less);
+        // The premise of the finding: the DOUBLE reading these used to be
+        // compared through equates each pair, so the collision was in the
+        // comparison space and not in either engine.
+        for (a, b) in [
+            ("1737000000123456788", "1737000000123456789"),
+            ("1737000000123456789", "1737000000123456790"),
+            ("9007199254740992", "9007199254740993"),
+        ] {
+            assert_eq!(try_cast_double(a), try_cast_double(b), "{a} vs {b}");
+        }
+        // Both spellings of the same value still meet — the enum-shaped
+        // case the numeric arm exists for.
+        assert_eq!(decimal_micros("200"), decimal_micros("200.0"));
     }
 
     // ── the numeric-literal ladder mirrors coerce_filter_value ────────
@@ -1659,20 +1726,24 @@ mod tests {
     #[test]
     fn numeric_detection_follows_the_coercion_ladder() {
         // i64 rung.
-        assert_eq!(numeric_literal("42"), Some(42.0));
-        assert_eq!(numeric_literal("-7"), Some(-7.0));
+        assert!(is_numeric_literal("42"));
+        assert!(is_numeric_literal("-7"));
         // f64 rung (i64 overflow, fractions).
-        assert_eq!(numeric_literal("1.5"), Some(1.5));
-        assert_eq!(
-            numeric_literal("9999999999999999999"),
-            Some(9_999_999_999_999_999_999.0)
-        );
+        assert!(is_numeric_literal("1.5"));
+        assert!(is_numeric_literal("9999999999999999999"));
+        // Numeric to the ladder, unreadable in the comparison space: the
+        // rule still applies, and both engines answer UNKNOWN through it
+        // rather than falling back to a lexical comparison.
+        for lit in ["nan", "inf", "-inf", "1e40"] {
+            assert!(is_numeric_literal(lit), "{lit:?}");
+            assert_eq!(decimal_micros(lit), None, "{lit:?}");
+        }
         // Non-numeric.
-        assert_eq!(numeric_literal("accepted"), None);
-        assert_eq!(numeric_literal(""), None);
-        assert_eq!(numeric_literal("1.5s"), None);
+        assert!(!is_numeric_literal("accepted"));
+        assert!(!is_numeric_literal(""));
+        assert!(!is_numeric_literal("1.5s"));
         // Whitespace is NOT trimmed — mirrors coerce_filter_value, which
         // would bind " 200 " as a string.
-        assert_eq!(numeric_literal(" 200 "), None);
+        assert!(!is_numeric_literal(" 200 "));
     }
 }

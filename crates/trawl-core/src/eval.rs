@@ -1006,7 +1006,7 @@ fn eval_tonumber(args: &[EvalValue]) -> EvalValue {
         Some(EvalValue::Float(n)) => EvalValue::Float(*n),
         // One owner for the cast domain — whitespace trimming and `_`
         // digit separators alike (see `compare::try_cast_double`), so the
-        // scalar and the search stage's ordered-numeric rung can't drift.
+        // scalar and the DOUBLE pin's pattern text can't drift.
         Some(EvalValue::Str(s)) => {
             crate::compare::try_cast_double(s).map_or(EvalValue::Null, EvalValue::Float)
         }
