@@ -35,8 +35,47 @@ env=prod                        # environment (path-pruned)
 
 On a server, every stored field carries a type pin in the field catalog
 (the envelope columns are pinned on install; custom fields pin at first
-typed sight). Search-stage field filters consult the pin, so a
-comparison means the same thing whatever the query literal looks like:
+typed sight). Two rules follow, and they are one rule seen from either
+end:
+
+- **What is stored** is the value's reading under the pin — but only when
+  that reading is *value-preserving*. A cast that would silently alter the
+  value is refused: the column holds NULL, the disagreement is recorded as
+  a conflict (`trawl schema conflicts`), and the original text stays
+  findable in `_raw`. Spelling drift is not alteration, so `"0404"` under
+  a BIGINT pin stores as `404`, but `"1.5"` stores as NULL rather than
+  rounding to `2`.
+- **What matches** is decided by the pin, not by the shape of the query
+  literal, so a comparison means the same thing however you spell it.
+
+An event answers the same way the moment it lands as it will hours later:
+the hot buffer conforms through the identical expression compaction writes
+with. Live tail (SSE) applies the same rules again, so a streamed query,
+its batch form, and the same query after the compactor runs all agree
+event for event.
+
+##### The numeric reading
+
+Both VARCHAR-pinned numeric rungs below read the column *and* the literal
+through the same `DECIMAL(38,6)` cast, so the two sides can never disagree
+about what a string means. That space is **exact for every 64-bit
+integer** and out to 10^32 — `id=1737000000123456789` matches that id and
+no neighbour.
+
+What has a reading: surrounding whitespace is ignored (`" 200"` is 200),
+`_` between digits is a separator (`"200_000"` is 200000), leading zeros
+are fine (`"0404"` is 404), and `"+5"`, `"1."`, `".5"`, `"1e3"` and
+`"1E-3"` all read.
+
+What has **no** reading — and no reading means *unknown*, never a false
+match, and `NOT` cannot invert it into one: `"nan"`, `"inf"`,
+`"infinity"`, radix prefixes like `"0x10"`, grouped digits like
+`"1,000"`, empty or blank text, and any magnitude at or above 10^32.
+Fractions quantize at 10^-6 (rounded half away from zero), so two values a
+nanosecond apart compare equal — sub-microsecond ordering is not something
+a VARCHAR-pinned field can express.
+
+##### The rules, per pin
 
 - **VARCHAR-pinned field, `=` / `!=` / IN list** — compares **as text**:
   `status=accepted` matches the stored string `"accepted"`, exactly. A
@@ -47,54 +86,68 @@ comparison means the same thing whatever the query literal looks like:
   fractional value anywhere in the batch stores `200` as `"200.0"`), and
   live tail must answer the same as a batch query. `!=` is the exact
   complement: `status!=200` returns `"accepted"` and every other
-  non-200 value.
+  non-200 value. A literal the numeric space can't read (`status=nan`,
+  `id=1e40`) falls back to the text comparison alone.
 - **VARCHAR-pinned field, ordered comparison with a numeric literal** —
-  compares **numerically** via `TRY_CAST(col AS DOUBLE)`: `status>=400`
-  matches `"404"`/`"500"`, and non-numeric values like `"accepted"`
-  simply don't match (they never error the query). A value the cast
-  can't answer is *unknown*, not *false*, exactly as in SQL — so
-  `NOT status>=400` doesn't match those rows either. "Numeric" here is
-  the cast's own reading, which is a little wider than it looks:
-  surrounding whitespace is ignored (`" 200"` is 200), `_` between
-  digits is a separator (`"200_000"` is 200000), and `"nan"` sorts
-  *above* every number, so it matches `status>400`.
+  compares **numerically** in that same space: `status>=400` matches
+  `"404"`/`"500"`, and values with no numeric reading like `"accepted"`
+  simply don't match (they never error the query). Such a value is
+  *unknown*, not *false*, exactly as in SQL — so `NOT status>=400`
+  doesn't match those rows either. A *literal* with no reading
+  (`dur>1e40`) matches nothing at all, on either side.
 - **VARCHAR-pinned field, ordered comparison with a non-numeric
   literal** — lexical string comparison, unchanged.
 - **Integer-pinned field, glob or regex** — matches the **stored
   integer's** text form, which is not always how the event spelled it:
   `status=4*` finds 404 in a BIGINT column, and a wire `"0404"` is stored
-  as 404, so it matches `status=4*` and *not* `status=0*`. A value with no
-  integer reading (`"accepted"`) is stored as NULL and is *unknown*, not
-  false.
-- **Boolean-pinned field, glob or regex** — matches `true`/`false`,
-  lowercase. DuckDB's boolean vocabulary is case-insensitive and wider
-  than the wire spelling (`"TRUE"`, `"t"`, `"yes"`, `"1"` all store as
-  `true`), but the *stored* text is always the lowercase word — so
-  `flag=/^true$/` matches all of them and `flag=TRUE*` matches none. A
-  value outside the vocabulary is stored as NULL and is *unknown*, not
-  false.
+  as 404, so it matches `status=4*` and *not* `status=0*`. The same holds
+  for `"4.0"`, `" 200"`, `"200_000"` and `"1e3"` — value-preserving
+  spellings, stored as the integer. A value the cast would *rewrite* —
+  `"1.5"` (rounded to 2), or `"0x10"` (read as 16, but a spelling DuckDB
+  would never write back) — and one it can't read at all (`"accepted"`)
+  are stored as NULL and are *unknown*, not false.
+- **Boolean-pinned field, glob or regex** — matches `true` or `false`,
+  lowercase, and only genuine ones. DuckDB's boolean vocabulary is wider
+  than what it writes back (`"TRUE"`, `"t"`, `"yes"`, `"1"` are all inside
+  the cast), but none of those survive the round trip, so they are stored
+  as NULL and counted as conflicts — the stored column holds exactly the
+  values the wire spelled `true` or `false`. `flag=/^true$/` matches
+  those; `flag=TRUE*` matches nothing. A NULL is *unknown*, not false.
 - **Double-pinned field, glob or regex** — matches the value's text form
   too, but a double's text form is not what the event's JSON looked like:
   it always carries a fraction, and switches to a signed, two-digit
   exponent outside `1e-4 … 1e16` (`200.0`, `0.0`, `-3.0`, `1e-07`,
   `1.2345678901234568e+17`). So `dur=/^200$/` matches nothing while
-  `dur=/^200\.0$/` matches — the same on both sides, batch and live. A
+  `dur=/^200\.0$/` matches — the same on both sides, batch and live.
+  Pinning DOUBLE *means* accepting DOUBLE's precision, so this is the one
+  rung with no round-trip guard: anything the cast reads is stored. A
   value with no numeric reading is stored as NULL and is *unknown*, not
   false.
 - **Timestamp-pinned field, glob or regex** — matches the **RFC 3339
-  UTC-microsecond form** the event carries on the wire, always with a `T`
-  separator, six fractional digits and a trailing `Z`
-  (`2026-01-15T09:00:00.000000Z`). So `_time=2026-01-15*`,
+  UTC-microsecond form** of the instant, always with a `T` separator, six
+  fractional digits and a trailing `Z`
+  (`2026-01-15T09:00:00.000000Z`). The parse is **zone-aware**: an offset
+  in the wire text is *applied*, so `2026-01-15T09:00:00+05:30` is stored
+  and matched as `2026-01-15T03:30:00.000000Z` — `_time=/T03:30/`, not
+  `/T09:00/`. Text without an offset is read as UTC, a bare date is
+  midnight, and fractions truncate at six digits. So `_time=2026-01-15*`,
   `_time=/T09:/` and `_time=/\.123456Z$/` all mean the same thing in a
   batch query and in live tail. A value with no timestamp reading is
   stored as NULL and is *unknown*, not false — `NOT _time=/T09:/` doesn't
-  match it either.
+  match it either. (The envelope's own `_time`/`_ingested` are already
+  canonicalized to UTC at ingest, so this only changes how a *custom*
+  timestamp-pinned field reads.)
 - Everything else — numeric pins with numeric literals, and every
   comparison on an **unpinned** field — keeps plain literal-driven
   behavior.
 
-Live tail (SSE) applies exactly the same rules, so a streamed query and
-its batch form agree event for event.
+:::caution[Changed in the ADR-0011 release]
+The zone-aware timestamp parse applies to values conformed **from this
+release onward**. A custom timestamp field that received offset-bearing
+values before it may hold wall-clock instants in already-compacted
+partitions; those are not rewritten, so a glob over such a field can span
+both readings until the old partitions age out.
+:::
 
 #### Missing fields and nulls
 

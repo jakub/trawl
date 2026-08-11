@@ -15,8 +15,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   numeric literal additionally matching any spelling of the same number
   (`"0200"`, `"200.0"`) — the text a number is stored under depends on the
   batch it arrived in, so the reading is what keeps live tail and `/query`
-  answering alike — and `status>=400` compares **numerically** via
-  `TRY_CAST(col AS DOUBLE)` —
+  answering alike — and `status>=400` compares **numerically** in
+  `DECIMAL(38,6)`, the same space on the column and on the literal (see the
+  exact-integer entry below) —
   `"404"` matches, `"accepted"` quietly doesn't, and nothing errors where the
   pin-blind emission previously threw a Conversion/Binder error. Glob and
   regex against numeric/boolean pins match the **stored** value's text
@@ -24,14 +25,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   error) — which is not always how the event spelled it: a wire `"0404"`
   is stored as the integer 404 (so `status=0*` matches nothing),
   `"accepted"` under an integer pin is stored as NULL, a **boolean** pin
-  renders the lowercase word whatever the wire case was (`"TRUE"` is
-  `true`, so `flag=TRUE*` matches nothing and `flag=/^true$/` matches
-  everything truthy), and for a **double** pin that text is DuckDB's own
+  holds only the values DuckDB writes back — the lowercase words `true`
+  and `false`, so `flag=/^true$/` matches those and `flag=TRUE*` matches
+  nothing (a wire `"TRUE"`/`"t"`/`"yes"`/`"1"` does not survive the
+  conform's round-trip guard and is stored as NULL) — and for a **double**
+  pin that text is DuckDB's own
   double rendering, which always carries a fraction and a signed
   two-digit exponent (`200.0`, `1e-07`), so `dur=/^200$/` matches nothing
   on either side while `dur=/^200\.0$/` matches both — and
   against a **timestamp** pin they match the RFC 3339 UTC-microsecond form
-  the event carries on the wire (`_time=/T09:/`, `_time=/\.123456Z$/`) —
+  of the stored *instant*, offsets applied
+  (`_time=/T09:/`, `_time=/\.123456Z$/`; see the zone-aware entry below) —
   the same text batch and live, not DuckDB's space-separated rendering.
   **This is live on day one for every install**: the envelope seed pins
   `host`/`service`/`env`/`message`/`severity_text`/`_raw` as VARCHAR, so e.g.
@@ -42,7 +46,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   *coercion* — how the literal binds is unchanged there — but the live-tail
   NULL rules in the next entry change for **every** query, pinned or not.
   Both are documented in the DSL reference. This lands **before** the repin
-  engine (#53) so a future type repin changes storage, not query meaning.
+  engine (#53) so a future type repin changes storage, not query meaning —
+  in the search stage. The pipeline `| where` / `| let` stages are still
+  pin-blind, so that promise is not complete until they follow; ADR-0011's
+  amendment sequences that slice ahead of the engine.
 
 - **Live tail (SSE) evaluates the search stage in SQL's three-valued logic
   — two NULL reversals, on unpinned fields as much as pinned ones
@@ -66,6 +73,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     because `NOT (NULL)` is NULL and the batch query has always dropped
     those rows. **A live alert written as `NOT f=x` to catch events missing
     `f` stops firing**; use `f!=x`, whose emitted form is the total one.
+
+- **The hot window now matches what compacted storage holds (ADR-0011, #63).**
+  A freshly ingested event was conformed to its pin with a bare `TRY_CAST`
+  while it sat in the hot buffer, and with the catalog's lossless round-trip
+  guard once compaction wrote it to parquet. The two disagree in exactly the
+  cases the guard exists for: `"1.5"` under a BIGINT pin read as `2` for the
+  minutes it was hot and NULL thereafter, `"TRUE"` under a BOOLEAN pin read
+  as `true` and then NULL. So `dur=2` was a hit, then a miss, with nothing in the
+  request to explain the change — and on a busy install the flip landed
+  mid-dashboard-refresh. Both lanes now build the same expression, and both
+  read the column's *text* form rather than whatever type `read_json`
+  inferred for the batch (JSON's cast domain is narrower than VARCHAR's for
+  a fractional string and wider for a number under a BOOLEAN pin, so the
+  inferred-type cast made one event's reading depend on what else shared its
+  snapshot). Expect **fewer** hot matches on values that never conformed:
+  they are now NULL — and therefore *unknown*, not false — from the moment
+  they land, exactly as the corpus has always held them. Nothing about what
+  is written to parquet changes.
+
+- **Custom timestamp fields are conformed zone-aware, in UTC (ADR-0011, #63).**
+  A TIMESTAMP-pinned custom field whose value carried an offset was conformed
+  with `TRY_CAST(text AS TIMESTAMP)`, a **wall-clock** parse that ignores the
+  offset: `2026-01-15T09:00:00+05:30` stored `09:00`, while the same value
+  arriving in a batch DuckDB happened to infer as TIMESTAMP stored `03:30`.
+  Every conform — compaction, the boot conformance pass, the hot branch, and
+  the live-tail pattern text — now parses through `TIMESTAMPTZ`, so an offset
+  is **applied** and a zoneless text reads as UTC; `_time`-style globs on such
+  a field follow (`/T03:30/` where `/T09:00/` used to match). Because that
+  parse consults the session zone, every DuckDB connection that conforms,
+  scores the pin ladder, or reads a hot snapshot now sets `TimeZone='UTC'` —
+  previously the bundled ICU build defaulted to the **host** zone, so a stored
+  instant could depend on `/etc/localtime`. **Data compacted before this
+  release keeps its wall-clock values**; they are not rewritten, and mixed
+  history is possible for a field that received offset-bearing values (the
+  ADR-0011 repin rewrite is the mechanism that would restate them). The
+  envelope's own `_time`/`_ingested` are unaffected — ingest canonicalizes
+  them to RFC 3339 UTC before storage (ADR-0008).
+
+- **VARCHAR-pinned numeric comparison is exact for every 64-bit integer
+  (ADR-0011, #63).** The numeric arm of `=`/`!=`/IN and the ordered rungs
+  compared through DOUBLE, which is blind above 2^53 — and blind identically
+  in both engines, so live/batch parity looked perfect while both answers
+  were wrong. `id=1737000000123456789` returned **three** distinct stored
+  ids, and `id!=9007199254740993` silently suppressed the genuinely different
+  `9007199254740992`; snowflake ids and nanosecond epochs sit in VARCHAR
+  fields in exactly that shape. Both rungs now read the column *and* the
+  literal through the same `DECIMAL(38,6)` cast (the literal binds as its own
+  text, so it never round-trips through `f64`), which is exact for every
+  `i64` and out to 10^32 and is also the space the conform guard compares in.
+  Two deliberate narrowings come with it, and both narrow what *matches*, not
+  what agrees: a stored `"nan"`/`"inf"` no longer sorts above every number
+  (`dur>1` used to return it, and now matches nothing — no reading is
+  *unknown*, never a false match), and stored or queried magnitudes at or
+  above 10^32 likewise have no reading. Fractions quantize at 10^-6, rounded
+  half away from zero, so two VARCHAR-stored values a nanosecond apart now
+  compare equal.
 
 ### Added
 - **Self-telemetry gets a bounded retry queue and first-class loss metrics (#56).** A failed telemetry WAL flush now *retains* its batch on a FIFO retry queue instead of dropping it, and drains oldest-first once the volume recovers — coalescing consecutive queued batches into WAL writes of at most 4 MiB (one file, one `batch_id`, one published batch) so a long outage recovers in a handful of fsynced writes instead of one per flush tick, while nothing merges until a write has actually succeeded — with the WAL write (and both fsync barriers) moved off the async executor onto Tokio's blocking pool. The durability-before-visibility invariant is unchanged and now exactly-once: a batch reaches the hot buffer and SSE strictly after its WAL write succeeds. Retained memory is capped by the new `[ingest] telemetry_buffer_max_bytes` (default 16 MiB, an estimated charge like `hot_buffer_max_bytes`) — one budget over the active buffer, the retry queue *and* the batch in flight through a write, enforced as events arrive so a wedged write cannot let the active buffer grow unbounded; over budget the *oldest* queued batches are shed first and then the incoming event itself, all with exact accounting, and the previously-silent pre-init bootstrap cap now counts its drops too. New Prometheus series — `trawl_telemetry_wal_write_failures_total`, `trawl_telemetry_{events,bytes}_dropped_total{reason="preinit_cap"|"buffer_cap"}`, and the `trawl_telemetry_buffer_{events,bytes}` depth gauges — stay scrapeable precisely while self-ingestion is unavailable; the searchable `telemetry_dropped` recovery event now carries event counts and per-reason totals. Graceful shutdown attempts a final flush under a 5-second budget so an unhealthy volume cannot hang the daemon.
