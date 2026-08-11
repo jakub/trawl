@@ -1853,55 +1853,30 @@ fn run_pin_ladders(
 /// The SQL expression conforming one column to its pin, or `None` when the
 /// observed type already matches (pass-through).
 ///
-/// The cast itself is [`trawl_core::conform::guarded_cast`] — literally the
-/// same builder the emitter's hot-branch `REPLACE` list uses, because a
-/// value that reads one way while it is hot and another once it compacts is
-/// a query whose answer changes with a background timer. All that is
-/// decided here is the column's canonical TEXT form ([`canonical_text`]),
-/// which compaction can choose per observed type where the emitter (no
-/// `DESCRIBE`) cannot.
+/// Literally the emitter's hot-branch expression: the same text form
+/// ([`trawl_core::conform::untyped_text`]) under the same guard
+/// ([`trawl_core::conform::guarded_cast`]), because a value that reads one
+/// way while it is hot and another once it compacts is a query whose answer
+/// changes with a background timer. The `DESCRIBE`d type decides ONLY
+/// whether the column already is its pin — never how it is read, which is
+/// what makes the reading independent of what `read_json` inferred for the
+/// batch (see [`trawl_core::conform`] for the two rules and their
+/// execution evidence).
 ///
-/// A typed pin therefore never casts the column: it casts the column's
-/// text. That is what makes the reading independent of what `read_json`
-/// inferred for the batch — see [`trawl_core::conform`] for the two rules
-/// and their execution evidence.
+/// Choosing the text form per observed type — which compaction could and
+/// the emitter cannot — is exactly what made the lanes disagree: under a
+/// VARCHAR pin the guard is the identity, so the text form IS the stored
+/// value, and `TRY_CAST(col AS VARCHAR)` spells a DOUBLE `1e20` as
+/// `1e+20` where `to_json` spells it `100000000000000000000.0`. Same
+/// value, two corpora, and `note=/^1e/` flipped when the compactor ran.
 pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Option<String> {
     if dtype == pin.as_duckdb() {
         return None;
     }
-    let upper = dtype.trim().to_ascii_uppercase();
     Some(trawl_core::conform::guarded_cast(
-        &canonical_text(quoted, &upper),
+        &trawl_core::conform::untyped_text(quoted),
         pin,
     ))
-}
-
-/// The canonical TEXT of a column whose observed type the caller
-/// `DESCRIBE`d — the typed counterpart of
-/// [`trawl_core::conform::untyped_text`], and the only place the two
-/// conform lanes differ:
-///
-/// - `JSON` goes through `json_extract_string(col, '$')` so strings land
-///   UNQUOTED (`n/a`, not `"n/a"`) while numbers/objects become their text;
-/// - legacy complex types (STRUCT/MAP/LIST from pre-stringification WAL)
-///   go through `to_json()` so the VARCHAR is real JSON text, reachable
-///   with `json_extract_string`;
-/// - everything else is its own `VARCHAR` rendering. `TRY_CAST`, not
-///   `CAST`: a type whose stringification could fail must degrade to NULL
-///   here (and count as a conflict) rather than throw the batch.
-fn canonical_text(quoted: &str, upper_dtype: &str) -> String {
-    let is_complex = upper_dtype.starts_with("STRUCT")
-        || upper_dtype.starts_with("MAP")
-        || upper_dtype.starts_with("LIST")
-        || upper_dtype.starts_with("UNION")
-        || upper_dtype.ends_with("[]");
-    if upper_dtype == "JSON" {
-        format!("json_extract_string({quoted}, '$')")
-    } else if is_complex {
-        format!("CAST(to_json({quoted}) AS VARCHAR)")
-    } else {
-        format!("TRY_CAST({quoted} AS VARCHAR)")
-    }
 }
 
 /// Wrap a TIMESTAMP-pinned envelope column's conform in a never-NULL last

@@ -56,22 +56,12 @@ fn conn() -> duckdb::Connection {
     conn
 }
 
-/// The conform compaction emits for a column it `DESCRIBE`d — the typed
-/// text form, then the shared guard. Mirrors
-/// `trawl_server::ingest::compaction::canonical_text`, which is the ONLY
-/// thing the two lanes do differently.
-fn compaction_conform(quoted: &str, dtype: &str, pin: CanonicalType) -> String {
-    let text = if dtype == "JSON" {
-        format!("json_extract_string({quoted}, '$')")
-    } else {
-        format!("TRY_CAST({quoted} AS VARCHAR)")
-    };
-    guarded_cast(&text, pin)
-}
-
-/// The conform the emitter's hot-branch `REPLACE` list emits — the untyped
-/// text form, then the same guard.
-fn hot_conform(quoted: &str, pin: CanonicalType) -> String {
+/// The conform BOTH lanes emit: one text form, one guard. Mirrors
+/// `trawl_server::ingest::compaction::conform_expr`, which now differs
+/// from the emitter's hot-branch `REPLACE` list in nothing at all — the
+/// `dtype` it `DESCRIBE`s decides only whether a column is already its
+/// pin, never how the column is read.
+fn conform(quoted: &str, pin: CanonicalType) -> String {
     guarded_cast(&untyped_text(quoted), pin)
 }
 
@@ -209,7 +199,7 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     );
 
     // --- the guard, exactly as the shared builder emits it ---
-    let guard_bigint_json = compaction_conform("m", "JSON", CanonicalType::BigInt);
+    let guard_bigint_json = conform("m", CanonicalType::BigInt);
     let rows: Vec<(String, Option<i64>)> = {
         let mut stmt = conn
             .prepare(&format!(
@@ -230,7 +220,7 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
 
     // VARCHAR class: strings that survive vs strings that round.
     let varchar_cases: Vec<(String, Option<i64>)> = {
-        let guard = compaction_conform("v", "VARCHAR", CanonicalType::BigInt);
+        let guard = conform("v", CanonicalType::BigInt);
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT v, {guard} \
@@ -261,8 +251,8 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
             &format!(
                 "SELECT {}, {} FROM {reader} \
                  WHERE CAST(u AS VARCHAR) = '18446744073709551615'",
-                compaction_conform("u", "HUGEINT", CanonicalType::BigInt),
-                compaction_conform("u", "HUGEINT", CanonicalType::Double),
+                conform("u", CanonicalType::BigInt),
+                conform("u", CanonicalType::Double),
             ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -301,8 +291,8 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
             &format!(
                 "SELECT count(TRY_CAST(b AS BIGINT))::BIGINT, \
                         count({})::BIGINT, count({})::BIGINT FROM {breader}",
-                compaction_conform("b", "JSON", CanonicalType::BigInt),
-                compaction_conform("b", "JSON", CanonicalType::Boolean),
+                conform("b", CanonicalType::BigInt),
+                conform("b", CanonicalType::Boolean),
             ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -320,7 +310,7 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     // date) and NULLs a text no parser reads. Zone handling has its own
     // probe (`timestamp_conform_applies_the_offset...`).
     let ts_cases: Vec<(String, Option<String>)> = {
-        let guard = compaction_conform("v", "VARCHAR", CanonicalType::Timestamp);
+        let guard = conform("v", CanonicalType::Timestamp);
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT v, CAST({guard} AS VARCHAR) \
@@ -383,7 +373,7 @@ fn bigint_round_trip_is_exact_in_decimal_space_beyond_2_pow_53() {
     );
 
     let cases: Vec<(String, Option<i64>)> = {
-        let guard = compaction_conform("v", "VARCHAR", CanonicalType::BigInt);
+        let guard = conform("v", CanonicalType::BigInt);
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT v, {guard} \
@@ -1359,7 +1349,7 @@ const BIGINT_PATTERN_INPUTS: &[&str] = &[
 #[test]
 fn bigint_pattern_text_is_the_cast_reading_on_both_engines() {
     let conn = conn();
-    let guard = compaction_conform("v", "VARCHAR", CanonicalType::BigInt);
+    let guard = conform("v", CanonicalType::BigInt);
     for input in BIGINT_PATTERN_INPUTS.iter().copied() {
         let sql: Option<String> = conn
             .query_row(
@@ -1406,7 +1396,7 @@ fn bigint_pattern_text_is_the_cast_reading_on_both_engines() {
 #[test]
 fn boolean_pattern_text_is_the_cast_reading_on_both_engines() {
     let conn = conn();
-    let guard = compaction_conform("v", "VARCHAR", CanonicalType::Boolean);
+    let guard = conform("v", CanonicalType::Boolean);
     let texts = [
         "true",
         "TRUE",
@@ -1826,7 +1816,7 @@ const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
 fn timestamp_pattern_text_is_rfc3339_micros_on_both_engines() {
     let conn = conn();
     let fmt = trawl_core::compare::TIMESTAMP_PATTERN_SQL_FORMAT;
-    let conform = compaction_conform("v", "VARCHAR", CanonicalType::Timestamp);
+    let conform = conform("v", CanonicalType::Timestamp);
     let residuals = timestamp_mirror_residuals();
 
     for input in TIMESTAMP_TEXT_MATRIX {
@@ -1899,7 +1889,7 @@ fn timestamp_pattern_text_is_rfc3339_micros_on_both_engines() {
 fn the_timestamp_mirror_residuals_are_one_directional() {
     let conn = conn();
     let fmt = trawl_core::compare::TIMESTAMP_PATTERN_SQL_FORMAT;
-    let conform = compaction_conform("v", "VARCHAR", CanonicalType::Timestamp);
+    let conform = conform("v", CanonicalType::Timestamp);
 
     for input in timestamp_mirror_residuals() {
         let sql: Option<String> = conn
@@ -2061,11 +2051,11 @@ fn pinned_rules_hold_over_read_json_columns() {
 /// 2. through one where a JSON number shares the field (JSON), and
 /// 3. through the live mirror (`compare::conformed_*`).
 ///
-/// All three must agree, in both lanes. The PREMISE the probe carries with
-/// it is why that is not automatic: the bare cast — what the hot branch
-/// applied before it went text-first — answers differently in the two
-/// classes, so one event's reading depended on what happened to share its
-/// buffer.
+/// All three must agree — in ONE expression, since both lanes now build
+/// the same one. The PREMISE the probe carries with it is why that is not
+/// automatic: the bare cast — what the hot branch applied before it went
+/// text-first — answers differently in the two classes, so one event's
+/// reading depended on what happened to share its buffer.
 #[test]
 #[allow(clippy::too_many_lines)] // one matrix, kept in one place to stay readable
 fn hot_and_compaction_conform_agree_across_inference_classes() {
@@ -2158,16 +2148,8 @@ fn hot_and_compaction_conform_agree_across_inference_classes() {
                 "premise: the bare cast is inference-dependent"
             );
         }
-        for (lane, expr) in [
-            ("hot/VARCHAR", hot_conform("s", pin)),
-            ("hot/JSON", hot_conform("m", pin)),
-            (
-                "compaction/VARCHAR",
-                compaction_conform("s", "VARCHAR", pin),
-            ),
-            ("compaction/JSON", compaction_conform("m", "JSON", pin)),
-        ] {
-            assert_eq!(read(&expr), expected, "{lane} conform for {pin:?}");
+        for (class, expr) in [("VARCHAR", conform("s", pin)), ("JSON", conform("m", pin))] {
+            assert_eq!(read(&expr), expected, "{class} conform for {pin:?}");
         }
         // The live mirror answers the same for every one of those texts.
         let live: Vec<Option<String>> = texts
@@ -2204,10 +2186,8 @@ fn hot_and_compaction_conform_agree_across_inference_classes() {
         "premise: a JSON numeric casts to BOOLEAN true"
     );
     for expr in [
-        hot_conform("m", CanonicalType::Boolean),
-        hot_conform("n", CanonicalType::Boolean),
-        compaction_conform("m", "JSON", CanonicalType::Boolean),
-        compaction_conform("n", "BIGINT", CanonicalType::Boolean),
+        conform("m", CanonicalType::Boolean),
+        conform("n", CanonicalType::Boolean),
     ] {
         assert_eq!(
             numeric_row(&expr),
@@ -2231,7 +2211,7 @@ fn hot_and_compaction_conform_agree_across_inference_classes() {
 #[test]
 fn timestamp_conform_applies_the_offset_under_the_pinned_session() {
     let conn = conn();
-    let guard = compaction_conform("v", "VARCHAR", CanonicalType::Timestamp);
+    let guard = conform("v", CanonicalType::Timestamp);
     let read = |conn: &duckdb::Connection, text: &str| -> Option<String> {
         conn.query_row(
             &format!("SELECT CAST(({guard}) AS VARCHAR) FROM (SELECT ? AS v) t"),
@@ -2307,7 +2287,7 @@ fn timestamp_conform_applies_the_offset_under_the_pinned_session() {
 #[test]
 fn time_conform_never_nulls_the_partition_key() {
     let conn = conn();
-    let guarded = compaction_conform("v", "VARCHAR", CanonicalType::Timestamp);
+    let guarded = conform("v", CanonicalType::Timestamp);
     let fallback = "TIMESTAMP '2026-01-15 07:00:00.000000'";
     for text in [
         "2026-01-15T09:00:00.000000Z",
@@ -2343,19 +2323,21 @@ fn time_conform_never_nulls_the_partition_key() {
     assert_eq!(value.as_deref(), Some("2026-01-15 07:00:00"));
 }
 
-/// The two lanes derive the column's TEXT differently — compaction knows
-/// the observed type and renders it with `CAST(x AS VARCHAR)`, the emitter
-/// does not and renders through `to_json` — and for exactly one class
-/// those spellings differ: a DOUBLE is `1.7356896001234568e+18` to one and
-/// `1735689600123456800.0` to the other.
+/// The two text forms a DOUBLE can take are NOT the same string —
+/// `CAST(v AS VARCHAR)` writes `1e+20` and `1.7356896001234568e+18` where
+/// `json_extract_string(to_json(v), '$')` writes `100000000000000000000.0`
+/// and `1735689600123456800.0` — which is why the lanes cannot each pick
+/// their own.
 ///
-/// They must still conform to the SAME value, or the lanes disagree by the
-/// back door. They do, because both renderings are shortest-round-trip and
-/// every rung's cast reads them alike — which is what lets compaction keep
-/// the cheaper rendering instead of paying for JSON on every value of
-/// every ladder candidate of every column.
+/// Under the TYPED pins it would not have mattered: both renderings are
+/// shortest-round-trip and every rung's guarded cast reads them alike, so
+/// the conformed value is the same either way. Under the VARCHAR pin there
+/// IS no cast — [`guarded_cast`] is the identity — so the text form is the
+/// stored value itself, and a per-lane spelling is a per-lane corpus: a hot
+/// `note=/^1e/` matched and the same query stopped matching minutes later,
+/// when the compactor rewrote the value it had already shown.
 #[test]
-fn the_two_lane_text_forms_conform_a_double_identically() {
+fn the_varchar_pin_stores_the_text_form_so_both_lanes_must_share_one() {
     let conn = conn();
     let doubles = [
         "1735689600123456710.7",
@@ -2373,35 +2355,48 @@ fn the_two_lane_text_forms_conform_a_double_identically() {
         .map(|d| format!("(CAST({d} AS DOUBLE))"))
         .collect::<Vec<_>>()
         .join(", ");
+    let read = |expr: &str| -> Vec<Option<String>> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT CAST(({expr}) AS VARCHAR) FROM (VALUES {values}) t(v)"
+            ))
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    // The premise: the spellings really are different.
+    let cast_text = "TRY_CAST(v AS VARCHAR)";
+    assert_ne!(
+        read(cast_text),
+        read(&untyped_text("v")),
+        "premise: the two text renderings of a DOUBLE differ"
+    );
+    // Under the VARCHAR pin that difference IS the stored value — the
+    // regression this test exists for.
+    assert_ne!(
+        read(&guarded_cast(cast_text, CanonicalType::Varchar)),
+        read(&conform("v", CanonicalType::Varchar)),
+        "the VARCHAR pin has no guard to absorb a per-lane spelling"
+    );
+    assert_eq!(
+        read(&conform("v", CanonicalType::Varchar)),
+        read(&untyped_text("v")),
+        "the VARCHAR conform is the shared text form, verbatim"
+    );
+    // Under the typed pins the guard absorbs the spelling, which is why
+    // the divergence hid for as long as it did.
     for pin in [
         CanonicalType::BigInt,
         CanonicalType::Double,
         CanonicalType::Boolean,
         CanonicalType::Timestamp,
     ] {
-        let read = |expr: &str| -> Vec<Option<String>> {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT CAST(({expr}) AS VARCHAR) FROM (VALUES {values}) t(v)"
-                ))
-                .unwrap();
-            stmt.query_map([], |row| row.get(0))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        };
-        // The premise: the spellings really are different.
-        if pin == CanonicalType::BigInt {
-            assert_ne!(
-                read("CAST(v AS VARCHAR)"),
-                read(&untyped_text("v")),
-                "premise: the two text renderings of a DOUBLE differ"
-            );
-        }
         assert_eq!(
-            read(&compaction_conform("v", "DOUBLE", pin)),
-            read(&hot_conform("v", pin)),
-            "the lanes must conform a DOUBLE identically under {pin:?}"
+            read(&guarded_cast(cast_text, pin)),
+            read(&conform("v", pin)),
+            "the guard must absorb the spelling under {pin:?}"
         );
     }
 }

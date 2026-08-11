@@ -32,9 +32,10 @@
 //!    execution in `trawl-engine/tests/duckdb_probe.rs`). Casting the
 //!    inferred type would make one event's reading a function of what
 //!    happened to share its batch. Every pinned column therefore goes
-//!    through its TEXT form first ([`untyped_text`] on the hot side, the
-//!    caller's `DESCRIBE`-driven equivalent in compaction), and the guarded
-//!    cast applies to that text: the cast domain is VARCHAR, always.
+//!    through its TEXT form first ([`untyped_text`], in BOTH lanes — a
+//!    per-lane spelling is a per-lane stored value under the VARCHAR pin,
+//!    whose guard is the identity), and the guarded cast applies to that
+//!    text: the cast domain is VARCHAR, always.
 //! 2. **The guard is the cast.** A bare `TRY_CAST` to a typed pin ROUNDS
 //!    rather than fails (`'1.5'` → 2) and reads a vocabulary the rendering
 //!    does not round-trip (`'TRUE'` → `true`), so every typed rung is
@@ -99,19 +100,24 @@ pub fn decimal_reading(expr: &str) -> String {
     format!("TRY_CAST({expr} AS {DECIMAL_COMPARISON_SPACE})")
 }
 
-/// The canonical TEXT of a column whose physical type the caller does not
-/// know — the hot lane's case, since the emitter has no `DESCRIBE`.
+/// The canonical TEXT of a pinned column, in BOTH conform lanes.
 ///
 /// `json_extract_string(to_json(x), '$')` yields UNQUOTED strings
 /// (`n/a`, not `"n/a"`) over every inference class a hot snapshot can
 /// produce — VARCHAR, JSON from mixed values, and the homogeneous numeric,
 /// boolean and timestamp classes — where a plain `CAST(x AS VARCHAR)` on a
-/// JSON-inferred column would keep the quotes. Probed by execution.
+/// JSON-inferred column would keep the quotes. It is also total over the
+/// physical types a standing parquet file can hold (BLOB, INTERVAL, UUID,
+/// DECIMAL, nested), rendering the complex ones as the JSON text
+/// `json_extract_string` can read back. All probed by execution.
 ///
-/// The rendering is not always `CAST(x AS VARCHAR)`'s (a DOUBLE `1e20`
-/// stringifies as `100000000000000000000.0` here and `1e+20` there), which
-/// costs nothing: the guard below is value-preserving, so two spellings of
-/// one value conform to one reading.
+/// The hot lane has no choice — the emitter has no `DESCRIBE` — and
+/// compaction, which does, must not use it: this rendering is NOT
+/// `CAST(x AS VARCHAR)`'s (a DOUBLE `1e20` is `100000000000000000000.0`
+/// here and `1e+20` there), and under the VARCHAR pin [`guarded_cast`] is
+/// the IDENTITY, so the text form is the stored value itself. Two
+/// spellings there are two corpora: `note=/^1e/` matched while the event
+/// was hot and stopped matching minutes later, when the compactor ran.
 #[must_use]
 pub fn untyped_text(quoted: &str) -> String {
     format!("json_extract_string(to_json({quoted}), '$')")
