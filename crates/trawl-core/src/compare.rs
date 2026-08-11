@@ -26,7 +26,7 @@
 //! | `DOUBLE` | glob / regex | [`PatternForm::DoubleText`] — `DuckDB`'s DOUBLE rendering (`200.0`, `1e-07`) |
 //! | `BIGINT` | glob / regex | [`PatternForm::BigIntText`] — the conformed integer's decimal text (`"0404"` globs as `404`) |
 //! | `BOOLEAN` | glob / regex | [`PatternForm::BooleanText`] — `true`/`false` (`"TRUE"` globs as `true`) |
-//! | typed pins | everything else | [`CompareForm::Native`] — unchanged (already correct) |
+//! | typed pins | everything else | [`CompareForm::Conformed`] — the literal binds natively (SQL unchanged); the LIVE mirror conforms the value first |
 //!
 //! "Numeric literal" is decided by content (the same i64-then-f64 ladder as
 //! [`coerce_filter_value`]): the AST discards quote provenance, so

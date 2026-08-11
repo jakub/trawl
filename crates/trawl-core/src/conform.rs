@@ -44,9 +44,10 @@
 //!    in `_raw` — instead of being silently rewritten.
 //!
 //! The live mirror of these readings — what the in-memory SSE matcher must
-//! answer for the same wire value — lives in [`crate::compare`]
-//! ([`crate::compare::conformed_bigint`],
+//! answer for the same wire value, before it compares or globs anything —
+//! lives in [`crate::compare`] ([`crate::compare::conformed_bigint`],
 //! [`crate::compare::conformed_boolean`],
+//! [`crate::compare::conformed_timestamp`],
 //! [`crate::compare::try_cast_double`]), and every pairing is executed
 //! side by side against the bundled `DuckDB`, never assumed.
 

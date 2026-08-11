@@ -174,9 +174,12 @@ pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
 /// numerically in [`crate::conform::DECIMAL_COMPARISON_SPACE`] for
 /// ordered numeric literals (both sides cast, so the literal never
 /// round-trips through `f64`), and typed pins glob/regex through
-/// `CAST(col AS VARCHAR)` —
-/// see [`crate::compare`] for the rule table. Empty `pins` emits exactly
-/// what [`emit`] emits.
+/// `CAST(col AS VARCHAR)`. A typed pin's COMPARISONS emit exactly what the
+/// unpinned path emits — the column on disk already is the pinned type —
+/// and travel to the live matcher, which has to conform the wire value
+/// before it can answer the same question ([`crate::filter`]). See
+/// [`crate::compare`] for the rule table. Empty `pins` emits exactly what
+/// [`emit`] emits.
 pub fn emit_with_pins(
     query: &Query,
     source: &str,

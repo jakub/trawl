@@ -137,8 +137,19 @@ a VARCHAR-pinned field can express.
   match it either. (The envelope's own `_time`/`_ingested` are already
   canonicalized to UTC at ingest, so this only changes how a *custom*
   timestamp-pinned field reads.)
-- Everything else — numeric pins with numeric literals, and every
-  comparison on an **unpinned** field — keeps plain literal-driven
+- **Typed-pinned field (BIGINT / DOUBLE / BOOLEAN / TIMESTAMP),
+  comparison** — compares what the column **stores**, which is the
+  conformed value: a wire `1.5` under a BIGINT pin is NULL there, so
+  `duration>1` does not match it, `NOT duration>1` does not either
+  (*unknown*, not false), and `duration!=2` does — a NULL column matches
+  `!=` by design. The literal binds exactly as on an unpinned field
+  (the column already has the pinned type) and DuckDB reads it against
+  that type, so `flag=TRUE` and `flag=yes` both match a stored `true`
+  even though those same texts *stored* conform to NULL, and an offset
+  spelled in a timestamp literal is ignored where the same offset in a
+  stored value is applied. Live tail answers the same way, event for
+  event.
+- Every comparison on an **unpinned** field keeps plain literal-driven
   behavior.
 
 :::caution[Changed in the ADR-0011 release]
