@@ -946,17 +946,26 @@ fn mixed_case_field_reference_parity() {
 /// A value with no timestamp reading is NULL on disk and UNKNOWN in
 /// memory, including under `NOT`.
 ///
-/// The stored column here is the WALL-CLOCK cast, which is what
-/// [`compare::canonical_timestamp_text`] still mirrors — one step behind
-/// [`trawl_core::conform::guarded_cast`], whose TIMESTAMP rung now parses
-/// through `TIMESTAMPTZ` and APPLIES an offset in the text (ADR-0011). The
-/// two agree on every zoneless shape, which is every shape ingest writes
-/// for `_time`; they part on the offset-carrying case this matrix keeps
-/// deliberately (`…T09:00:00+05:30`), and the harness must move onto the
-/// conform expression the moment the mirror does.
+/// The parquet is written through [`trawl_core::conform::guarded_cast`]
+/// itself — what compaction and the hot `REPLACE` both emit — so this is
+/// end-to-end evidence for ADR-0011 ruling #1 rather than a re-statement
+/// of the mirror: a zone-bearing value is stored as the UTC instant, and
+/// `…T09:00:00+05:30` therefore matches `/T03:30/` on BOTH sides and
+/// `/T09:/` on neither. That rung parses through `TIMESTAMPTZ`, so the
+/// writing session is pinned to UTC exactly as every conforming
+/// connection is.
+///
+/// The value list is the shapes ADR-0011 ruling #4 turned up by
+/// execution — `epoch`, a trailing zone NAME, hour-24 rollover, and the
+/// seconds-less `T09:00+00:00` that used to fire live while batch stored
+/// NULL — beside the ordinary ones. The exhaustive text matrix lives in
+/// `trawl-engine/tests/duckdb_probe.rs`; this test proves the same
+/// agreement survives the whole pipeline (pin → emit → parquet → GLOB).
 #[test]
 fn pinned_timestamp_pattern_parity() {
     let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .unwrap();
     let ft = pinned(&[("_time", CanonicalType::Timestamp)]);
     let values = [
         // The canonical wire form ingest writes.
@@ -965,25 +974,42 @@ fn pinned_timestamp_pattern_parity() {
         Value::String("2026-01-15T22:00:00.000000Z".into()),
         // Shapes a custom TIMESTAMP-pinned field can carry.
         Value::String("2026-01-15 09:00:00".into()),
-        Value::String("2026-01-15T09:00:00+05:30".into()),
         Value::String("2026-01-15".into()),
+        // Zone-bearing: the offset is APPLIED, so the stored hour moves.
+        Value::String("2026-01-15T09:00:00+05:30".into()),
+        Value::String("2026-01-15T09:00:00-08:00".into()),
+        Value::String("2026-01-15T09:00:00+0530".into()),
+        Value::String("2026-01-15T09:00:00+02".into()),
+        // The ruling #4 shapes.
+        Value::String("epoch".into()),
+        Value::String("2026-01-15 09:00:00 UTC".into()),
+        Value::String("2026-01-15 24:00:00".into()),
+        Value::String("2026-01-15T09:00+00:00".into()),
         // No timestamp reading → NULL column / UNKNOWN matcher.
         Value::String("yesterday-ish".into()),
+        Value::String("1737000000".into()),
         Value::Null,
     ];
     let dsls = [
         // separator-anchored, both ways round
         "_time=/T09:/",
         "_time=/ 09:/",
+        // the hour an applied offset moves the value to
+        "_time=/T03:30/",
+        "_time=/T17:00/",
+        "_time=/T07:00/",
         // zone suffix
         "_time=/Z$/",
         // fractional seconds
         r"_time=/\.000000Z$/",
         r"_time=/\.123456Z$/",
-        // date prefix (glob and regex)
+        // date prefix (glob and regex), incl. the day hour-24 rolls into
         "_time=2026-01-15*",
+        "_time=2026-01-16*",
         "_time=2026-01-15T09*",
         "_time=/^2026-01-15/",
+        // the keyword instant's own date
+        "_time=1970-01-01*",
         // NOT over each shape: UNKNOWN must not invert into a live match
         "NOT _time=/T09:/",
         "NOT _time=/Z$/",
@@ -1002,11 +1028,11 @@ fn pinned_timestamp_pattern_parity() {
         let path = tmp.path().to_str().unwrap().to_owned();
         let wire = match value {
             Value::String(s) => format!("'{s}'"),
-            _ => "NULL".to_owned(),
+            _ => "CAST(NULL AS VARCHAR)".to_owned(),
         };
+        let stored = trawl_core::conform::guarded_cast(&wire, CanonicalType::Timestamp);
         conn.execute_batch(&format!(
-            "COPY (SELECT TRY_CAST({wire} AS TIMESTAMP) AS _time, 'hello' AS message) \
-             TO '{path}' (FORMAT PARQUET)"
+            "COPY (SELECT {stored} AS _time, 'hello' AS message) TO '{path}' (FORMAT PARQUET)"
         ))
         .expect("write timestamp parquet");
 

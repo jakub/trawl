@@ -7,6 +7,32 @@
 //! engine, never assumed — the cast domains, the round-trip guard, the
 //! `read_json` inference classes a hot snapshot can produce, and the
 //! agreement between the two conform lanes and their live mirrors.
+//!
+//! # The probe matrix is the contract
+//!
+//! Where a live mirror in [`trawl_core::compare`] claims to reproduce a
+//! `DuckDB` reading, the pair runs here side by side over a matrix of
+//! inputs, and **a divergence the matrix does not name is a bug in the
+//! mirror** — not a tolerance, not an edge case, and never something to
+//! be worked around at the call site. The reason is that both engines
+//! answer the same user question: the batch query reads the CONFORMED
+//! column off disk while the live tail reads the wire JSON, so a mirror
+//! that is merely close makes a stream fire on events the equivalent
+//! query drops (or drop events it returns) with nothing in the request
+//! to explain it.
+//!
+//! When a new divergence turns up: add the input to the matrix, then fix
+//! the mirror against what the engine actually does. Every divergence
+//! that survives is a DELIBERATE, one-directional residual with its cost
+//! written down and its own test asserting it stays one-directional (see
+//! [`the_timestamp_mirror_residuals_are_one_directional`]) — the mirror
+//! may under-read what `DuckDB` reads, never the reverse.
+//!
+//! Establishing ground truth by execution comes FIRST. The four
+//! timestamp divergences ADR-0011 ruling #4 fixed (`epoch`, a trailing
+//! ` UTC`, hour-24 rollover, and `T09:00+00:00` firing live while batch
+//! stored NULL) were all in a mirror whose rules had been reasoned out
+//! from a parser's documentation instead.
 
 use std::io::Write as _;
 
@@ -1207,65 +1233,264 @@ fn timestamp_cast_text_form_is_space_separated() {
     assert_eq!(rendered, "2026-01-15 09:00:00");
 }
 
-/// The rule: a TIMESTAMP pin globs/regexes against ONE canonical text —
-/// `strftime(col, TIMESTAMP_PATTERN_SQL_FORMAT)` in SQL, `compare::
-/// canonical_timestamp_text` in the live matcher — so both engines answer
-/// the same string for the same wire value. This runs the matrix through
-/// `DuckDB` and the Rust mirror side by side; each conform is written the
-/// way compaction writes it (`TRY_CAST` to the pin), so a value with no
-/// reading is NULL on disk and `None` in memory.
+/// Every text shape whose TIMESTAMP reading the two engines must agree on
+/// — THE MATRIX referred to by the module doc's contract.
 ///
-/// The shapes cover the separator (`T` vs space), the zone suffix (`Z`,
-/// `±HH:MM`, `±HH`, none — `DuckDB` stores the WALL CLOCK and drops the
-/// offset), fractional seconds (absent, short, over-long) and the
-/// date-only/slash forms.
+/// Grouped by the rule each row exercises, and deliberately including the
+/// shapes nobody would write on purpose: the ones that cost us were
+/// `epoch`, a trailing ` UTC`, hour-24 rollover and `T09:00+00:00`, none
+/// of which anyone predicted. Add rather than replace.
+const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
+    // The wire form ingest canonicalizes _time into, and its variants.
+    "2026-01-15T09:00:00.000000Z",
+    "2026-01-15T09:00:00Z",
+    "2026-01-15 09:00:00",
+    "2026-01-15T09:00",
+    "  2026-01-15 09:00:00  ",
+    "\t2026-01-15T09:00:00Z\n",
+    "2026-01-15T09:00:00Z   ",
+    "2026-01-15  09:00:00",
+    "2026-01-15T 09:00:00",
+    "2026-01-15\t09:00:00",
+    "2026-01-15\n09:00:00",
+    "2026-01-15 T09:00:00",
+    // Offsets, in every spelling and both directions.
+    "2026-01-15T09:00:00+05:30",
+    "2026-01-15T09:00:00-08:00",
+    "2026-01-15T09:00:00+02",
+    "2026-01-15T09:00:00-02",
+    "2026-01-15T09:00:00+0530",
+    "2026-01-15T09:00:00-0800",
+    "2026-01-15T09:00:00-0000",
+    "2026-01-15T09:00:00-00:00",
+    "2026-01-15T09:00:00+00",
+    "2026-01-15T09:00:00+05:30:15",
+    "2026-01-15T09:00:00-00:00:01",
+    "2026-01-15T09:00:00+99:99",
+    "2026-01-15T09:00:00+24:00",
+    "2026-01-15T09:00:00-99:00",
+    "2026-01-15T09:00:00+14:00",
+    "2026-01-15T09:00:00-12:00",
+    "2026-01-15T09:00:00+05:30 ",
+    "2026-01-15T09:00:00.123456+05:30",
+    "2026-01-15T09:00:00.123456+0530",
+    "2026-01-15 9:0:0.5+05:30",
+    "2026-01-15T09:00:00.-08:00",
+    // Malformed offsets: components are exactly two digits, `Z` is
+    // uppercase, nothing follows the zone.
+    "2026-01-15t09:00:00z",
+    "2026-01-15T09:00:00z",
+    "2026-01-15T09:00:00ZZ",
+    "2026-01-15T09:00:00 +05:30",
+    "2026-01-15T09:00:00+5:30",
+    "2026-01-15T09:00:00+5",
+    "2026-01-15T09:00:00+053",
+    "2026-01-15T09:00:00+05:3",
+    "2026-01-15T09:00:00+053015",
+    "2026-01-15T09:00:00+0530:15",
+    "2026-01-15T09:00:00+100:00",
+    "2026-01-15T09:00:00+005:30",
+    "2026-01-15T09:00:00+999",
+    "2026-01-15T09:00:00+05:30:1",
+    "2026-01-15T09:00:00+05:30:155",
+    "2026-01-15T09:00:00+",
+    "2026-01-15T09:00:00-",
+    "2026-01-15T09:00:00.123-",
+    "2026-01-15T09:00:00,123Z",
+    // Fractional seconds: padded, truncated, empty, absurd.
+    "2026-01-15T09:00:00.123Z",
+    "2026-01-15T09:00:00.1234567",
+    "2026-01-15T09:00:00.0000000000Z",
+    "2026-01-15T09:00:00.123456789Z",
+    "2026-01-15T09:00:00.9999999Z",
+    "2026-01-15T09:00:00.000000999Z",
+    "2026-01-15T09:00:00.1234567890123456789012345Z",
+    "2026-01-15T09:00:00.5Z",
+    "2026-01-15T09:00:00.0Z",
+    "2026-01-15T09:00:00.Z",
+    "2026-01-15T09:00:00.",
+    // Dates: slash form, unpadded and over-padded components, junk.
+    "2026-01-15",
+    "  2026-01-15",
+    "2026/01/15",
+    "2026/01/15 09:00:00",
+    "2026/01/15T09:00:00",
+    "2026-1-5",
+    "2026-1-5 9:0:0",
+    "02026-01-15",
+    "2026-01-15T009:00:00Z",
+    "2026-01-15T0009:00:00Z",
+    "2026-011-15",
+    "2026-01-015",
+    "2026-01/15",
+    "2026/01-15",
+    "2026.01.15",
+    "20260115",
+    "2026-02-30",
+    "2026-13-01",
+    "+2026-01-15",
+    "2026-01-15T09:000:00Z",
+    "2026-01-15T09:00:000Z",
+    // A date/time separator commits the text to carrying a time.
+    "2026-01-15T",
+    "2026-01-15 ",
+    "2026-01-15\t",
+    "2026-01-15\n",
+    "2026-01-15T09",
+    "2026-01-15 09",
+    "2026-01-15Z",
+    "2026-01-15+05:30",
+    "2026-01-15TT09:00:00",
+    // A seconds-less time must END the text — the false-POSITIVE
+    // direction, where the mirror used to fire and batch NULLed.
+    "2026-01-15T09:00Z",
+    "2026-01-15T09:00+05:30",
+    "2026-01-15T09:00 UTC",
+    "2026-01-15T09:00 ",
+    "2026-01-15T09:00\t",
+    "2026-01-15T09:00.5",
+    "2026-01-15T09:00.",
+    "2026-01-15 9:0Z",
+    "2026-01-15T24:00Z",
+    "2026-01-15T24:00 ",
+    // Hour 24 rolls the date over, and only from an exact midnight.
+    "2026-01-15 24:00:00",
+    "2026-01-15T24:00:00",
+    "2026-01-15T24:00:00Z",
+    "2026-01-15 24:00",
+    "2026-01-15 24:00:00.000000",
+    "2026-01-15 24:00:00 UTC",
+    "2026-01-15 24:00:00+05:30",
+    "2026-12-31 24:00:00",
+    "2026-01-15 24:00:01",
+    "2026-01-15 24:01:00",
+    "2026-01-15T24:00:00.000001",
+    "2026-01-15 25:00:00",
+    "2026-01-15 23:59:60",
+    "2026-01-15T09:60:00Z",
+    "2026-01-15T09:00:60Z",
+    // Keyword instants — including the two that render as words.
+    "epoch",
+    "EpOcH",
+    " epoch ",
+    "epoch+1",
+    "infinity",
+    "INFINITY",
+    "Infinity",
+    "inf",
+    "INF",
+    " infinity ",
+    "-infinity",
+    "-inf",
+    "+infinity",
+    "now",
+    "today",
+    "tomorrow",
+    "yesterday",
+    // Zone NAMES that mean UTC for all time, and the near-misses.
+    "2026-01-15 09:00:00 UTC",
+    "2026-01-15T09:00:00 UTC",
+    "2026-01-15 09:00:00 uTc",
+    "2026-01-15 09:00:00 GMT",
+    "2026-01-15 09:00:00 gmt",
+    "2026-01-15 09:00:00 Zulu",
+    "2026-01-15 09:00:00 zulu",
+    "2026-01-15 09:00:00 UCT",
+    "2026-01-15 09:00:00 Universal",
+    "2026-01-15 09:00:00 Greenwich",
+    "2026-01-15 09:00:00 GMT0",
+    "2026-01-15 09:00:00 GMT+0",
+    "2026-01-15 09:00:00 GMT-0",
+    "2026-01-15 09:00:00 Etc/UTC",
+    "2026-01-15 09:00:00 Etc/GMT",
+    "2026-01-15 09:00:00 Etc/GMT+0",
+    "2026-01-15 09:00:00 Etc/GMT-0",
+    "2026-01-15 09:00:00 Etc/GMT0",
+    "2026-01-15 09:00:00 Etc/Greenwich",
+    "2026-01-15 09:00:00 Etc/UCT",
+    "2026-01-15 09:00:00 Etc/Universal",
+    "2026-01-15 09:00:00 Etc/Zulu",
+    "2026-01-15 09:00:00 etc/utc",
+    "2026-01-15 09:00:00 UTC ",
+    "2026-01-15 09:00:00 UTC  ",
+    "2026-01-15 09:00:00 UTC\t",
+    "2026-01-15T09:00:00.123456789 UTC",
+    "2026-01-15 09:00:00UTC",
+    "2026-01-15 09:00:00  UTC",
+    "2026-01-15 09:00:00\tUTC",
+    "2026-01-15 09:00:00\nUTC",
+    "2026-01-15 09:00:00 Z",
+    "2026-01-15 09:00:00 UT",
+    "2026-01-15 09:00:00 GMT+2",
+    "2026-01-15 09:00:00 Narnia/Cair_Paravel",
+    // Years outside four digits, and outside DuckDB's own range.
+    "0001-01-01 00:00:00",
+    "1-01-01",
+    "0-01-01",
+    "0000-01-01 00:00:00",
+    "-0001-01-01 00:00:00",
+    "-0100-01-01 00:00:00",
+    "10000-01-01 00:00:00",
+    "100000-01-01 00:00:00",
+    "9999-12-31 24:00:00",
+    "9999-12-31T23:59:59.999999Z",
+    "1969-12-31T23:59:59Z",
+    "300000-01-01 00:00:00",
+    "-290308-01-01 00:00:00",
+    // Not timestamps at all — epoch numerals included.
+    "yesterday-ish",
+    "",
+    "accepted",
+    "0404",
+    "1737000000",
+    "1737000000123",
+    "\u{a0}2026-01-15T09:00:00Z",
+];
+
+/// The rule: a TIMESTAMP pin globs/regexes against ONE canonical text —
+/// `strftime(<the conform>, TIMESTAMP_PATTERN_SQL_FORMAT)` in SQL,
+/// `compare::canonical_timestamp_text` in the live matcher — so both
+/// engines answer the same string for the same wire value.
+///
+/// The conform is [`trawl_core::conform::guarded_cast`] itself, not a
+/// hand-written cast: the mirror owes its answer to what the corpus
+/// DURABLY holds, so a change to the rung has to break this test rather
+/// than quietly retire it. That rung parses through `TIMESTAMPTZ`, so the
+/// session must be pinned to UTC ([`conn`]) or the expectations move with
+/// `/etc/localtime`.
+///
+/// Every row of [`TIMESTAMP_TEXT_MATRIX`] runs through both engines. A
+/// mismatch is a MIRROR bug — see the module doc.
 #[test]
 fn timestamp_pattern_text_is_rfc3339_micros_on_both_engines() {
-    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let conn = conn();
     let fmt = trawl_core::compare::TIMESTAMP_PATTERN_SQL_FORMAT;
-    let inputs = [
-        "2026-01-15T09:00:00.000000Z",
-        "2026-01-15T09:00:00Z",
-        "2026-01-15 09:00:00",
-        "2026-01-15T09:00",
-        "  2026-01-15 09:00:00  ",
-        "2026-01-15T09:00:00+05:30",
-        "2026-01-15T09:00:00-08:00",
-        "2026-01-15T09:00:00+02",
-        "2026-01-15T09:00:00.123Z",
-        "2026-01-15T09:00:00.1234567",
-        "2026-01-15T09:00:00.0000000000Z",
-        "2026-01-15",
-        "2026/01/15",
-        "2026/01/15 09:00:00",
-        // No reading: NULL on the SQL side, None in memory.
-        "yesterday-ish",
-        "",
-        "2026-01-15T",
-        "2026-01-15 ",
-        // Epoch numerals are not timestamps to DuckDB.
-        "1737000000",
-        "1737000000123",
-    ];
-    for input in inputs {
+    let conform = compaction_conform("v", "VARCHAR", CanonicalType::Timestamp);
+    let residuals = timestamp_mirror_residuals();
+
+    for input in TIMESTAMP_TEXT_MATRIX {
         let sql: Option<String> = conn
             .query_row(
-                "SELECT strftime(TRY_CAST(? AS TIMESTAMP), ?)",
-                [input, fmt],
+                &format!("SELECT strftime({conform}, ?) FROM (SELECT ? AS v) t"),
+                [fmt, *input],
                 |row| row.get(0),
             )
             .unwrap();
         let live = trawl_core::compare::canonical_timestamp_text(input);
+        assert!(
+            !residuals.contains(input),
+            "{input:?} is in the matrix AND in the residual list — pick one"
+        );
         assert_eq!(live, sql, "canonical pattern text disagrees for {input:?}");
     }
 
-    // The whole point: an anchored pattern now means the same thing on
-    // both sides of the same value.
+    // The whole point: an anchored pattern means the same thing on both
+    // sides of the same value.
     let matched: bool = conn
         .query_row(
             &format!(
-                "SELECT strftime(TRY_CAST('2026-01-15T09:00:00.000000Z' AS TIMESTAMP), '{fmt}') \
-                 GLOB '*T09:*'"
+                "SELECT strftime({conform}, '{fmt}') GLOB '*T09:*' \
+                 FROM (SELECT '2026-01-15T09:00:00.000000Z' AS v) t"
             ),
             [],
             |row| row.get(0),
@@ -1278,13 +1503,121 @@ fn timestamp_pattern_text_is_rfc3339_micros_on_both_engines() {
     let unknown: Option<bool> = conn
         .query_row(
             &format!(
-                "SELECT strftime(TRY_CAST('yesterday-ish' AS TIMESTAMP), '{fmt}') GLOB '2026*'"
+                "SELECT strftime({conform}, '{fmt}') GLOB '2026*' \
+                 FROM (SELECT 'yesterday-ish' AS v) t"
             ),
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(unknown, None);
+}
+
+/// The shapes the live mirror deliberately does NOT read, pinned as
+/// EXPECTED divergences so they stay a known cost.
+///
+/// Both classes are one-directional: `DuckDB` has a reading, the mirror
+/// answers `None`, so a live tail under-matches a batch query and can
+/// never invent a match it does not have.
+///
+/// 1. **zone names beyond the definitionally-UTC set.** `DuckDB` links ICU
+///    and resolves all 638 of `pg_timezone_names()` — with DST rules and
+///    pre-1970 local mean time, which is why an offset TABLE cannot stand
+///    in for it (`Africa/Abidjan` is +00:00 today and +00:16:08 in 1800).
+///    Mirroring it means a tz database inside `trawl-core`, which compiles
+///    to wasm for the SPA, and two tzdata versions drifting apart would be
+///    a SILENT divergence in place of this loud one.
+/// 2. **years outside chrono's calendar** (±262 143) where `DuckDB`'s
+///    microsecond range reaches ±~290 000.
+///
+/// This test also proves the first residual is drawn where the mirror
+/// claims: every name in its table really is UTC to `DuckDB`, at two
+/// instants a century apart.
+#[test]
+fn the_timestamp_mirror_residuals_are_one_directional() {
+    let conn = conn();
+    let fmt = trawl_core::compare::TIMESTAMP_PATTERN_SQL_FORMAT;
+    let conform = compaction_conform("v", "VARCHAR", CanonicalType::Timestamp);
+
+    for input in timestamp_mirror_residuals() {
+        let sql: Option<String> = conn
+            .query_row(
+                &format!("SELECT strftime({conform}, ?) FROM (SELECT ? AS v) t"),
+                [fmt, input],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.is_some(),
+            "{input:?} is not a residual: DuckDB NULLs it"
+        );
+        assert_eq!(
+            trawl_core::compare::canonical_timestamp_text(input),
+            None,
+            "{input:?} left the residual list — move it into the matrix"
+        );
+    }
+
+    // The residual line is drawn at names that are UTC for ALL time, so
+    // the mirror's table has to hold at an instant far from today's rules.
+    for name in [
+        "Etc/GMT",
+        "Etc/GMT+0",
+        "Etc/GMT-0",
+        "Etc/GMT0",
+        "Etc/Greenwich",
+        "Etc/UCT",
+        "Etc/UTC",
+        "Etc/Universal",
+        "Etc/Zulu",
+        "GMT",
+        "GMT+0",
+        "GMT-0",
+        "GMT0",
+        "Greenwich",
+        "UCT",
+        "UTC",
+        "Universal",
+        "Zulu",
+    ] {
+        for (wall, expected) in [
+            ("2026-07-15 09:00:00", "2026-07-15T09:00:00.000000Z"),
+            ("1890-01-15 09:00:00", "1890-01-15T09:00:00.000000Z"),
+        ] {
+            let text = format!("{wall} {name}");
+            let sql: Option<String> = conn
+                .query_row(
+                    &format!("SELECT strftime({conform}, ?) FROM (SELECT ? AS v) t"),
+                    [fmt, text.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sql.as_deref(), Some(expected), "{text:?} is not UTC");
+            assert_eq!(
+                trawl_core::compare::canonical_timestamp_text(&text).as_deref(),
+                Some(expected),
+                "the mirror lost {text:?}"
+            );
+        }
+    }
+}
+
+/// The inputs [`the_timestamp_mirror_residuals_are_one_directional`] owns,
+/// kept out of [`TIMESTAMP_TEXT_MATRIX`] because the two engines are
+/// EXPECTED to disagree on them.
+fn timestamp_mirror_residuals() -> Vec<&'static str> {
+    vec![
+        "2026-01-15 09:00:00 America/New_York",
+        "2026-01-15 09:00:00 Asia/Kolkata",
+        "2026-01-15 09:00:00 EST",
+        "2026-01-15 09:00:00 PST8PDT",
+        "2026-01-15 09:00:00 US/Eastern",
+        "2026-01-15 09:00:00 Etc/GMT+5",
+        "2026-01-15 09:00:00 UTC+2",
+        "1800-01-01 00:00:00 Africa/Abidjan",
+        "262144-01-01 00:00:00",
+        "294247-01-01 00:00:00",
+    ]
 }
 
 /// The rules over `read_json` columns — the hot-only fallback's untyped

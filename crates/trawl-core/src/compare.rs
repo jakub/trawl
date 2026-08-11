@@ -167,59 +167,380 @@ pub enum PatternForm {
 /// `trawl-engine/tests/duckdb_probe.rs`, not assumed.
 pub const TIMESTAMP_PATTERN_SQL_FORMAT: &str = "%Y-%m-%dT%H:%M:%S.%fZ";
 
+/// The zone NAMES that denote UTC for all time, exactly as
+/// `pg_timezone_names()` spells them (matched case-insensitively, which is
+/// how `DuckDB` matches them).
+///
+/// Deliberately the *definitionally* fixed set, not "every name whose
+/// offset is zero today": `Africa/Abidjan` is +00:00 now and +00:16:08 in
+/// 1800, so resolving it needs a zone HISTORY, not a table. See
+/// [`canonical_timestamp_text`] for the residual that leaves.
+const UTC_ZONE_NAMES: [&str; 18] = [
+    "Etc/GMT",
+    "Etc/GMT+0",
+    "Etc/GMT-0",
+    "Etc/GMT0",
+    "Etc/Greenwich",
+    "Etc/UCT",
+    "Etc/UTC",
+    "Etc/Universal",
+    "Etc/Zulu",
+    "GMT",
+    "GMT+0",
+    "GMT-0",
+    "GMT0",
+    "Greenwich",
+    "UCT",
+    "UTC",
+    "Universal",
+    "Zulu",
+];
+
+/// The instant a TIMESTAMP-pinned column holds for one stored text.
+///
+/// `DuckDB`'s TIMESTAMP carries two values no calendar date can express,
+/// and `strftime` renders them as the literal words `infinity` and
+/// `-infinity` — texts a glob can match, so the mirror has to produce them
+/// too.
+enum Instant {
+    At(chrono::NaiveDateTime),
+    Infinity,
+    NegInfinity,
+}
+
 /// Render a live event's value in the TIMESTAMP pin's canonical pattern
 /// text — the in-memory mirror of
-/// `strftime(col, TIMESTAMP_PATTERN_SQL_FORMAT)`.
+/// `strftime(col, TIMESTAMP_PATTERN_SQL_FORMAT)` over the conformed
+/// column.
 ///
 /// `None` means the value has no timestamp reading, which is what the
-/// batch side stores: conformance `TRY_CAST`s the field to TIMESTAMP, so
-/// a value with no reading is NULL on disk and `strftime` of NULL is NULL
-/// — UNKNOWN, never a false pattern miss that `NOT` could invert.
+/// batch side stores: [`crate::conform::guarded_cast`]'s TIMESTAMP rung is
+/// NULL for it, and `strftime` of NULL is NULL — UNKNOWN, never a false
+/// pattern miss that `NOT` could invert.
 ///
-/// The reading mirrors `DuckDB`'s `TRY_CAST(… AS TIMESTAMP)`, which is a
-/// WALL-CLOCK parse: `T` or space separator, optional fractional seconds
-/// (truncated to microseconds), `-` or `/` date separators, and an
-/// optional zone suffix that is **ignored**, not applied
-/// (`09:00:00+05:30` stores `09:00:00`, probe-pinned). Epoch numerals are
-/// not timestamps to `DuckDB` and are not read as such here.
+/// # The reading is `TRY_CAST(text AS TIMESTAMPTZ)` under a UTC session
+///
+/// Not the plain `TRY_CAST(… AS TIMESTAMP)` wall-clock parse: an offset in
+/// the text is APPLIED (ADR-0011 ruling #1), which is also the only way
+/// the mirror can agree with a corpus `read_json` typed for itself. Every
+/// rule below is established by execution in
+/// `trawl-engine/tests/duckdb_probe.rs`, never from a specification:
+///
+/// - **keywords**: `epoch` → 1970-01-01, `infinity`/`inf` and
+///   `-infinity`/`-inf` → the infinite instants — all case-insensitive,
+///   surrounding whitespace allowed. `+infinity` is not one of them;
+/// - **date**: `[-]Y+{sep}M{1,2}{sep}D{1,2}` with `{sep}` either `-` or
+///   `/` *and the same both times*. The year is any run of digits
+///   (`02026` is 2026), month and day are one or two — a third digit is a
+///   different shape, refused, never truncated. A date alone is midnight,
+///   and then the text must END: `2026-01-15 ` is not a date;
+/// - **separator**: one `T` or one ASCII space (then any run of further
+///   whitespace), and a TIME is then mandatory;
+/// - **time**: `H+:M{1,2}[:S{1,2}[.f*]]`. Hour ≤ 24, minute and second
+///   ≤ 59; hour 24 is midnight of the NEXT day and only when everything
+///   below it is zero. The fraction TRUNCATES to microseconds
+///   (`.9999999` → `.999999`) and may be empty (`09:00:00.` parses);
+/// - **zone, only when SECONDS are present**: `Z` (uppercase),
+///   `±HH`, `±HHMM`, `±HH:MM`, `±HH:MM:SS` — each component EXACTLY two
+///   digits, unvalidated in range (`+99:99` is a real offset) — or one
+///   space and a zone name. Without seconds the text must end where the
+///   time does: `09:00Z`, `09:00 UTC` and even `09:00 ` are all refused,
+///   the false-positive direction the wall-clock mirror used to get
+///   wrong;
+/// - **whitespace**: ASCII only (` \t\n\r\x0b\x0c`, never `\u{a0}`),
+///   skipped before the value and after a complete time.
+///
+/// # Two residuals, both in the safe direction
+///
+/// Both make the mirror answer `None` where `DuckDB` has a reading, so a
+/// live tail UNDER-matches; neither can invent a match the batch query
+/// does not have. They are pinned as expected divergences in the probe
+/// matrix rather than left to be rediscovered:
+///
+/// 1. **zone names other than the [`UTC_ZONE_NAMES`]**. `DuckDB` links ICU
+///    and resolves all 638 of `pg_timezone_names()`, with DST rules and
+///    pre-1970 local-mean-time offsets. Mirroring that means shipping a
+///    zone database inside `trawl-core` — which compiles to wasm for the
+///    SPA — and two tzdata versions that drift apart would be a *silent*
+///    divergence in place of this loud one;
+/// 2. **years outside chrono's calendar** (below -262144 or above
+///    262143), where `DuckDB`'s microsecond range reaches ±~290 000.
 #[must_use]
 pub fn canonical_timestamp_text(value: &str) -> Option<String> {
-    let wall = wall_clock(value)?;
-    Some(wall.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
+    match parse_instant(value)? {
+        Instant::Infinity => Some("infinity".to_owned()),
+        Instant::NegInfinity => Some("-infinity".to_owned()),
+        Instant::At(at) => Some(render_pattern_text(at)),
+    }
 }
 
-/// The wall clock `DuckDB` would store for this text, or `None`.
+/// `strftime`'s rendering of a finite timestamp under
+/// [`TIMESTAMP_PATTERN_SQL_FORMAT`].
 ///
-/// Only LEADING whitespace is trimmed up front: a separator with nothing
-/// after it (`"2026-01-15 "`, `"2026-01-15T"`) is not a date to `DuckDB`,
-/// so the split has to see the separator before any trimming can hide it.
-fn wall_clock(value: &str) -> Option<chrono::NaiveDateTime> {
-    let text = value.trim_start();
-    let (date, time) = match text.find(['T', ' ']) {
-        Some(idx) => (&text[..idx], Some(text[idx + 1..].trim())),
-        None => (text, None),
+/// Built field by field rather than through chrono's own `%Y`, which
+/// disagrees with `DuckDB`'s outside the four-digit years: chrono writes
+/// `+10000` and `-0001` where `DuckDB` writes `10000` and `-1`.
+fn render_pattern_text(at: chrono::NaiveDateTime) -> String {
+    use chrono::{Datelike as _, Timelike as _};
+
+    let year = at.year();
+    let year = if year < 0 {
+        year.to_string()
+    } else {
+        format!("{year:04}")
     };
-    let date = chrono::NaiveDate::parse_from_str(&date.replace('/', "-"), "%Y-%m-%d").ok()?;
-    let Some(time) = time else {
-        return Some(date.into());
-    };
-    // A trailing zone designator is dropped, not applied.
-    let time = strip_zone(time);
-    let parsed = chrono::NaiveTime::parse_from_str(time, "%H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveTime::parse_from_str(time, "%H:%M"))
-        .ok()?;
-    Some(date.and_time(parsed))
+    format!(
+        "{year}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}Z",
+        month = at.month(),
+        day = at.day(),
+        hour = at.hour(),
+        minute = at.minute(),
+        second = at.second(),
+        micros = at.nanosecond() / 1_000,
+    )
 }
 
-/// Strip a trailing `Z` or `±HH[:MM]` offset from a time-of-day text.
-fn strip_zone(time: &str) -> &str {
-    if let Some(rest) = time.strip_suffix('Z') {
-        return rest;
+/// The instant `DuckDB` reads out of this text, or `None`.
+fn parse_instant(value: &str) -> Option<Instant> {
+    let text = &value[leading_space(value.as_bytes(), 0)..];
+    keyword_instant(text).or_else(|| parse_datetime(text).map(Instant::At))
+}
+
+/// The keyword instants, case-insensitive, trailing whitespace allowed.
+fn keyword_instant(text: &str) -> Option<Instant> {
+    let token = text.trim_end_matches(is_c_space);
+    if token.eq_ignore_ascii_case("epoch") {
+        return chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(Instant::At);
     }
-    match time.rfind(['+', '-']) {
-        Some(idx) => &time[..idx],
-        None => time,
+    if token.eq_ignore_ascii_case("infinity") || token.eq_ignore_ascii_case("inf") {
+        return Some(Instant::Infinity);
     }
+    if token.eq_ignore_ascii_case("-infinity") || token.eq_ignore_ascii_case("-inf") {
+        return Some(Instant::NegInfinity);
+    }
+    None
+}
+
+/// One parsed time of day. `has_seconds` is load-bearing, not bookkeeping:
+/// a zone suffix is legal only after a `:SS` field.
+struct TimeOfDay {
+    hour: u32,
+    minute: u32,
+    second: u32,
+    micros: u32,
+    has_seconds: bool,
+}
+
+/// The calendar form: a date, optionally a time, optionally a zone.
+fn parse_datetime(text: &str) -> Option<chrono::NaiveDateTime> {
+    let bytes = text.as_bytes();
+    let mut pos = 0;
+    let date = parse_date(bytes, &mut pos)?;
+    if pos == bytes.len() {
+        return date.and_hms_opt(0, 0, 0);
+    }
+    // Whatever follows a date is a date/time SEPARATOR, which commits the
+    // text to carrying a time: `2026-01-15 ` is not a date to DuckDB, so
+    // trailing whitespace cannot be trimmed away before this point.
+    if bytes[pos] != b'T' && !is_c_space(bytes[pos] as char) {
+        return None;
+    }
+    pos += 1;
+    pos = leading_space(bytes, pos);
+
+    let time = parse_time(bytes, &mut pos)?;
+    let offset = if time.has_seconds {
+        parse_zone_offset(text, &mut pos)?
+    } else if pos == bytes.len() {
+        0
+    } else {
+        // A seconds-less time takes no zone and no trailing anything.
+        return None;
+    };
+    if leading_space(bytes, pos) != bytes.len() {
+        return None;
+    }
+
+    let wall = if time.hour == 24 {
+        // Hour 24 is the next midnight, and only when it IS midnight:
+        // `24:00:01` has no reading at all.
+        if time.minute != 0 || time.second != 0 || time.micros != 0 {
+            return None;
+        }
+        date.succ_opt()?.and_hms_opt(0, 0, 0)?
+    } else {
+        date.and_hms_micro_opt(time.hour, time.minute, time.second, time.micros)?
+    };
+    // The offset is seconds EAST of UTC, so the instant is the wall clock
+    // minus it.
+    wall.checked_sub_signed(chrono::TimeDelta::try_seconds(offset)?)
+}
+
+fn parse_date(bytes: &[u8], pos: &mut usize) -> Option<chrono::NaiveDate> {
+    let negative = bytes.get(*pos) == Some(&b'-');
+    if negative {
+        *pos += 1;
+    }
+    let year = take_digits(bytes, pos, 1, usize::MAX)?;
+    // The two date separators must be the SAME character: `2026-01/15` is
+    // not a date.
+    let separator = *bytes.get(*pos)?;
+    if separator != b'-' && separator != b'/' {
+        return None;
+    }
+    *pos += 1;
+    let month = take_digits(bytes, pos, 1, 2)?;
+    if *bytes.get(*pos)? != separator {
+        return None;
+    }
+    *pos += 1;
+    let day = take_digits(bytes, pos, 1, 2)?;
+
+    let year = i32::try_from(if negative { -year } else { year }).ok()?;
+    chrono::NaiveDate::from_ymd_opt(year, u32::try_from(month).ok()?, u32::try_from(day).ok()?)
+}
+
+fn parse_time(bytes: &[u8], pos: &mut usize) -> Option<TimeOfDay> {
+    // The hour is a free run of digits where minute and second are one or
+    // two: `T009:00:00` is 09:00:00, `T09:000:00` is nothing.
+    let hour = take_digits(bytes, pos, 1, usize::MAX)?;
+    if *bytes.get(*pos)? != b':' {
+        return None;
+    }
+    *pos += 1;
+    let minute = take_digits(bytes, pos, 1, 2)?;
+
+    let mut second = 0;
+    let mut micros = 0;
+    let has_seconds = bytes.get(*pos) == Some(&b':');
+    if has_seconds {
+        *pos += 1;
+        second = take_digits(bytes, pos, 1, 2)?;
+        if bytes.get(*pos) == Some(&b'.') {
+            *pos += 1;
+            let start = *pos;
+            while bytes.get(*pos).is_some_and(u8::is_ascii_digit) {
+                *pos += 1;
+            }
+            micros = fraction_micros(&bytes[start..*pos]);
+        }
+    }
+    if hour > 24 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some(TimeOfDay {
+        hour: u32::try_from(hour).ok()?,
+        minute: u32::try_from(minute).ok()?,
+        second: u32::try_from(second).ok()?,
+        micros,
+        has_seconds,
+    })
+}
+
+/// The zone suffix, as SECONDS EAST of UTC. Absent is `Some(0)`; only a
+/// malformed one is `None`.
+fn parse_zone_offset(text: &str, pos: &mut usize) -> Option<i64> {
+    let bytes = text.as_bytes();
+    match bytes.get(*pos) {
+        None => Some(0),
+        Some(b'Z') => {
+            *pos += 1;
+            Some(0)
+        }
+        Some(&sign @ (b'+' | b'-')) => {
+            *pos += 1;
+            let hours = take_fixed_digits(bytes, pos, 2)?;
+            let mut minutes = 0;
+            let mut seconds = 0;
+            if bytes.get(*pos) == Some(&b':') {
+                *pos += 1;
+                minutes = take_fixed_digits(bytes, pos, 2)?;
+                if bytes.get(*pos) == Some(&b':') {
+                    *pos += 1;
+                    seconds = take_fixed_digits(bytes, pos, 2)?;
+                }
+            } else if bytes.get(*pos).is_some_and(u8::is_ascii_digit) {
+                // The basic form: `+0530`, four digits and no colon.
+                minutes = take_fixed_digits(bytes, pos, 2)?;
+            }
+            // Ranges are DuckDB's, which is to say none: `+99:99` is a
+            // real (if absurd) offset, so no bound is imposed here either.
+            let magnitude = hours * 3600 + minutes * 60 + seconds;
+            Some(if sign == b'-' { -magnitude } else { magnitude })
+        }
+        Some(&c) if is_c_space(c as char) => {
+            // A zone NAME is separated by EXACTLY one space (`  UTC` and
+            // `\tUTC` are both refused) and runs to the end of the text.
+            if c == b' ' {
+                let name = text[*pos + 1..].trim_end_matches(is_c_space);
+                if UTC_ZONE_NAMES
+                    .iter()
+                    .any(|zone| zone.eq_ignore_ascii_case(name))
+                {
+                    *pos = bytes.len();
+                    return Some(0);
+                }
+            }
+            // Otherwise this is trailing whitespace (or a zone the mirror
+            // cannot resolve, which the caller's end-of-text check
+            // refuses).
+            Some(0)
+        }
+        Some(_) => None,
+    }
+}
+
+/// The index of the first byte at or after `from` that is not ASCII
+/// whitespace.
+fn leading_space(bytes: &[u8], from: usize) -> usize {
+    let mut pos = from;
+    while bytes.get(pos).is_some_and(|&c| is_c_space(c as char)) {
+        pos += 1;
+    }
+    pos
+}
+
+/// Read a run of ASCII digits of length `min..=max`.
+///
+/// The run must END inside the bound: a longer one is a different shape
+/// and is refused, never silently truncated (`2026-011-15` is not a date).
+fn take_digits(bytes: &[u8], pos: &mut usize, min: usize, max: usize) -> Option<i64> {
+    let start = *pos;
+    let mut value: i64 = 0;
+    while bytes.get(*pos).is_some_and(u8::is_ascii_digit) {
+        if *pos - start == max {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add(i64::from(bytes[*pos] - b'0'))?;
+        *pos += 1;
+    }
+    (*pos - start >= min).then_some(value)
+}
+
+/// Read EXACTLY `count` digits without caring what follows — the offset
+/// fields, where `+0530` packs hours and minutes into one run.
+fn take_fixed_digits(bytes: &[u8], pos: &mut usize, count: usize) -> Option<i64> {
+    let mut value: i64 = 0;
+    for _ in 0..count {
+        let digit = bytes.get(*pos).filter(|c| c.is_ascii_digit())?;
+        value = value * 10 + i64::from(digit - b'0');
+        *pos += 1;
+    }
+    Some(value)
+}
+
+/// A fractional-seconds digit run as microseconds, TRUNCATED (never
+/// rounded) past the sixth digit and zero-filled short of it.
+fn fraction_micros(digits: &[u8]) -> u32 {
+    digits
+        .iter()
+        .chain(std::iter::repeat(&b'0'))
+        .take(6)
+        .fold(0, |acc, digit| acc * 10 + u32::from(digit - b'0'))
 }
 
 /// Resolve the binding for a comparison (`=`, `!=`, ordered) or an IN-list
@@ -784,63 +1105,287 @@ mod tests {
 
     // ── the TIMESTAMP pin's canonical pattern text ────────────────────
 
-    /// Every shape that has a reading renders the ONE canonical text —
-    /// `T` separator, six fractional digits, `Z`. Each expectation here is
-    /// the string `DuckDB`'s `strftime(TRY_CAST(v AS TIMESTAMP), fmt)`
-    /// returns for the same input (executed in
-    /// `trawl-engine/tests/duckdb_probe.rs`).
+    /// The shapes that HAVE a reading, each with the ONE canonical text —
+    /// `T` separator, six fractional digits, `Z`.
+    ///
+    /// Every expectation is the string `DuckDB` returns for `strftime`
+    /// over the same input under [`crate::conform::guarded_cast`]'s
+    /// TIMESTAMP rung, executed side by side in
+    /// `trawl-engine/tests/duckdb_probe.rs`, which is the CONTRACT: a case
+    /// that disagrees there is a bug in this function, never a tolerance.
+    const TIMESTAMP_RENDERINGS: &[(&str, &str)] = &[
+        // The wire form ingest canonicalizes _time into.
+        ("2026-01-15T09:00:00.000000Z", "2026-01-15T09:00:00.000000Z"),
+        // Separator and whitespace variants of the same instant.
+        ("2026-01-15T09:00:00Z", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15 09:00:00", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15T09:00", "2026-01-15T09:00:00.000000Z"),
+        ("  2026-01-15 09:00:00  ", "2026-01-15T09:00:00.000000Z"),
+        ("\t2026-01-15T09:00:00Z\n", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15  09:00:00", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15T 09:00:00", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15\t09:00:00", "2026-01-15T09:00:00.000000Z"),
+        // An offset is APPLIED, not dropped (ADR-0011 ruling #1), in
+        // every spelling DuckDB accepts — and the components are
+        // unvalidated, so `+99:99` really is 99h99m.
+        ("2026-01-15T09:00:00+05:30", "2026-01-15T03:30:00.000000Z"),
+        ("2026-01-15T09:00:00-08:00", "2026-01-15T17:00:00.000000Z"),
+        ("2026-01-15T09:00:00+02", "2026-01-15T07:00:00.000000Z"),
+        ("2026-01-15T09:00:00-02", "2026-01-15T11:00:00.000000Z"),
+        ("2026-01-15T09:00:00+0530", "2026-01-15T03:30:00.000000Z"),
+        ("2026-01-15T09:00:00-0800", "2026-01-15T17:00:00.000000Z"),
+        ("2026-01-15T09:00:00-0000", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15T09:00:00+00", "2026-01-15T09:00:00.000000Z"),
+        (
+            "2026-01-15T09:00:00+05:30:15",
+            "2026-01-15T03:29:45.000000Z",
+        ),
+        (
+            "2026-01-15T09:00:00-00:00:01",
+            "2026-01-15T09:00:01.000000Z",
+        ),
+        ("2026-01-15T09:00:00+99:99", "2026-01-11T04:21:00.000000Z"),
+        ("2026-01-15T09:00:00+24:00", "2026-01-14T09:00:00.000000Z"),
+        ("2026-01-15T09:00:00-99:00", "2026-01-19T12:00:00.000000Z"),
+        ("2026-01-15T09:00:00+05:30 ", "2026-01-15T03:30:00.000000Z"),
+        (
+            "2026-01-15T09:00:00.123456+05:30",
+            "2026-01-15T03:30:00.123456Z",
+        ),
+        ("2026-01-15 9:0:0.5+05:30", "2026-01-15T03:30:00.500000Z"),
+        // Fractions pad to six digits and TRUNCATE beyond them; the
+        // `.` may carry no digits at all.
+        ("2026-01-15T09:00:00.123Z", "2026-01-15T09:00:00.123000Z"),
+        ("2026-01-15T09:00:00.1234567", "2026-01-15T09:00:00.123456Z"),
+        (
+            "2026-01-15T09:00:00.9999999Z",
+            "2026-01-15T09:00:00.999999Z",
+        ),
+        (
+            "2026-01-15T09:00:00.000000999Z",
+            "2026-01-15T09:00:00.000000Z",
+        ),
+        (
+            "2026-01-15T09:00:00.0000000000Z",
+            "2026-01-15T09:00:00.000000Z",
+        ),
+        ("2026-01-15T09:00:00.Z", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15T09:00:00.-08:00", "2026-01-15T17:00:00.000000Z"),
+        // Date-only, slash dates, and unpadded/overpadded components.
+        ("2026-01-15", "2026-01-15T00:00:00.000000Z"),
+        ("  2026-01-15", "2026-01-15T00:00:00.000000Z"),
+        ("2026/01/15", "2026-01-15T00:00:00.000000Z"),
+        ("2026/01/15 09:00:00", "2026-01-15T09:00:00.000000Z"),
+        ("2026/01/15T09:00:00", "2026-01-15T09:00:00.000000Z"),
+        ("2026-1-5", "2026-01-05T00:00:00.000000Z"),
+        ("2026-1-5 9:0:0", "2026-01-05T09:00:00.000000Z"),
+        ("02026-01-15", "2026-01-15T00:00:00.000000Z"),
+        ("2026-01-15T009:00:00Z", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15T0009:00:00Z", "2026-01-15T09:00:00.000000Z"),
+        // Hour 24 is the next midnight — and only when it IS midnight.
+        ("2026-01-15 24:00:00", "2026-01-16T00:00:00.000000Z"),
+        ("2026-01-15T24:00:00", "2026-01-16T00:00:00.000000Z"),
+        ("2026-01-15T24:00:00Z", "2026-01-16T00:00:00.000000Z"),
+        ("2026-01-15 24:00", "2026-01-16T00:00:00.000000Z"),
+        ("2026-01-15 24:00:00.000000", "2026-01-16T00:00:00.000000Z"),
+        ("2026-01-15 24:00:00 UTC", "2026-01-16T00:00:00.000000Z"),
+        ("2026-01-15 24:00:00+05:30", "2026-01-15T18:30:00.000000Z"),
+        ("2026-12-31 24:00:00", "2027-01-01T00:00:00.000000Z"),
+        // Keyword instants, case-insensitive, whitespace-tolerant.
+        ("epoch", "1970-01-01T00:00:00.000000Z"),
+        ("EpOcH", "1970-01-01T00:00:00.000000Z"),
+        (" epoch ", "1970-01-01T00:00:00.000000Z"),
+        ("infinity", "infinity"),
+        ("INFINITY", "infinity"),
+        ("inf", "infinity"),
+        ("INF", "infinity"),
+        (" infinity ", "infinity"),
+        ("-infinity", "-infinity"),
+        ("-inf", "-infinity"),
+        // Zone NAMES that mean UTC for all time — one space, any case.
+        ("2026-01-15 09:00:00 UTC", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15T09:00:00 UTC", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15 09:00:00 uTc", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15 09:00:00 GMT", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15 09:00:00 gmt", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15 09:00:00 Zulu", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15 09:00:00 UCT", "2026-01-15T09:00:00.000000Z"),
+        (
+            "2026-01-15 09:00:00 Universal",
+            "2026-01-15T09:00:00.000000Z",
+        ),
+        (
+            "2026-01-15 09:00:00 Greenwich",
+            "2026-01-15T09:00:00.000000Z",
+        ),
+        ("2026-01-15 09:00:00 GMT0", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15 09:00:00 GMT+0", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15 09:00:00 GMT-0", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15 09:00:00 Etc/UTC", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15 09:00:00 Etc/GMT", "2026-01-15T09:00:00.000000Z"),
+        (
+            "2026-01-15 09:00:00 Etc/Zulu",
+            "2026-01-15T09:00:00.000000Z",
+        ),
+        ("2026-01-15 09:00:00 etc/utc", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15 09:00:00 UTC  ", "2026-01-15T09:00:00.000000Z"),
+        (
+            "2026-01-15T09:00:00.123456789 UTC",
+            "2026-01-15T09:00:00.123456Z",
+        ),
+        // Years outside four digits: `%Y` pads a non-negative year to
+        // four and writes a negative one bare, unlike chrono's own.
+        ("0001-01-01 00:00:00", "0001-01-01T00:00:00.000000Z"),
+        ("1-01-01", "0001-01-01T00:00:00.000000Z"),
+        ("0-01-01", "0000-01-01T00:00:00.000000Z"),
+        ("-0001-01-01 00:00:00", "-1-01-01T00:00:00.000000Z"),
+        ("-0100-01-01 00:00:00", "-100-01-01T00:00:00.000000Z"),
+        ("10000-01-01 00:00:00", "10000-01-01T00:00:00.000000Z"),
+        ("100000-01-01 00:00:00", "100000-01-01T00:00:00.000000Z"),
+        ("9999-12-31 24:00:00", "10000-01-01T00:00:00.000000Z"),
+        ("9999-12-31T23:59:59.999999Z", "9999-12-31T23:59:59.999999Z"),
+        ("1969-12-31T23:59:59Z", "1969-12-31T23:59:59.000000Z"),
+    ];
+
     #[test]
     fn canonical_timestamp_text_mirrors_duckdb_rendering() {
-        let cases = [
-            // The wire form ingest canonicalizes _time into.
-            ("2026-01-15T09:00:00.000000Z", "2026-01-15T09:00:00.000000Z"),
-            // Zone-suffixed and separator variants of the same wall clock.
-            ("2026-01-15T09:00:00Z", "2026-01-15T09:00:00.000000Z"),
-            ("2026-01-15 09:00:00", "2026-01-15T09:00:00.000000Z"),
-            ("2026-01-15T09:00", "2026-01-15T09:00:00.000000Z"),
-            ("  2026-01-15 09:00:00  ", "2026-01-15T09:00:00.000000Z"),
-            // A zone offset is DROPPED, not applied — DuckDB stores the
-            // wall clock, so 09:00 stays 09:00.
-            ("2026-01-15T09:00:00+05:30", "2026-01-15T09:00:00.000000Z"),
-            ("2026-01-15T09:00:00-08:00", "2026-01-15T09:00:00.000000Z"),
-            ("2026-01-15T09:00:00+02", "2026-01-15T09:00:00.000000Z"),
-            // Fractions pad to six digits and truncate beyond them.
-            ("2026-01-15T09:00:00.123Z", "2026-01-15T09:00:00.123000Z"),
-            ("2026-01-15T09:00:00.1234567", "2026-01-15T09:00:00.123456Z"),
-            (
-                "2026-01-15T09:00:00.0000000000Z",
-                "2026-01-15T09:00:00.000000Z",
-            ),
-            // Date-only and slash dates land at midnight.
-            ("2026-01-15", "2026-01-15T00:00:00.000000Z"),
-            ("2026/01/15", "2026-01-15T00:00:00.000000Z"),
-            ("2026/01/15 09:00:00", "2026-01-15T09:00:00.000000Z"),
-        ];
-        for (input, expected) in cases {
+        for (input, expected) in TIMESTAMP_RENDERINGS {
             assert_eq!(
                 canonical_timestamp_text(input).as_deref(),
-                Some(expected),
+                Some(*expected),
                 "{input:?}"
             );
         }
     }
 
-    /// No reading → `None`, the UNKNOWN that mirrors the NULL conformance
+    /// No reading → `None`, the UNKNOWN that mirrors the NULL the conform
     /// wrote for the same value. Epoch numerals are not timestamps to
     /// `DuckDB` and must not become one here.
+    ///
+    /// The `HH:MM` rows are the false-POSITIVE direction the wall-clock
+    /// mirror used to get wrong: a seconds-less time takes no zone and no
+    /// trailing anything, so `09:00Z` fires live and NULLs in batch unless
+    /// the mirror refuses it too.
     #[test]
     fn canonical_timestamp_text_is_none_without_a_reading() {
         for input in [
             "yesterday-ish",
             "",
+            "accepted",
+            "0404",
             "1737000000",
             "1737000000123",
-            "accepted",
+            // Relative keywords are not timestamps; `epoch` is the only
+            // word-shaped instant, and it takes no arithmetic.
+            "now",
+            "today",
+            "tomorrow",
+            "yesterday",
+            "epoch+1",
+            "+infinity",
             // A separator with no time after it: not a date to DuckDB
             // either, so trailing whitespace must not be trimmed away
             // before the split.
             "2026-01-15T",
             "2026-01-15 ",
+            "2026-01-15\t",
+            "2026-01-15\n",
+            "2026-01-15T09",
+            "2026-01-15 09",
+            "2026-01-15Z",
+            "2026-01-15+05:30",
+            // A seconds-less time must END the text.
+            "2026-01-15T09:00Z",
+            "2026-01-15T09:00+05:30",
+            "2026-01-15T09:00 UTC",
+            "2026-01-15T09:00 ",
+            "2026-01-15T09:00\t",
+            "2026-01-15T09:00.5",
+            "2026-01-15T09:00.",
+            "2026-01-15 9:0Z",
+            "2026-01-15T24:00Z",
+            "2026-01-15T24:00 ",
+            // Out-of-range clock fields, hour 24 included: it rolls over
+            // only from an exact midnight.
+            "2026-01-15 25:00:00",
+            "2026-01-15 24:00:01",
+            "2026-01-15 24:01:00",
+            "2026-01-15T24:00:00.000001",
+            "2026-01-15 23:59:60",
+            "2026-01-15T09:60:00Z",
+            "2026-01-15T09:00:60Z",
+            // Malformed offsets: each component is EXACTLY two digits,
+            // `Z` is uppercase, and nothing may follow the zone.
+            "2026-01-15t09:00:00z",
+            "2026-01-15T09:00:00z",
+            "2026-01-15T09:00:00ZZ",
+            "2026-01-15T09:00:00 +05:30",
+            "2026-01-15T09:00:00+5:30",
+            "2026-01-15T09:00:00+5",
+            "2026-01-15T09:00:00+053",
+            "2026-01-15T09:00:00+05:3",
+            "2026-01-15T09:00:00+053015",
+            "2026-01-15T09:00:00+100:00",
+            "2026-01-15T09:00:00+005:30",
+            "2026-01-15T09:00:00+999",
+            "2026-01-15T09:00:00+05:30:1",
+            "2026-01-15T09:00:00+05:30:155",
+            "2026-01-15T09:00:00+",
+            "2026-01-15T09:00:00-",
+            "2026-01-15T09:00:00.123-",
+            "2026-01-15T09:00:00,123Z",
+            // A zone NAME takes exactly one space before it.
+            "2026-01-15 09:00:00UTC",
+            "2026-01-15 09:00:00  UTC",
+            "2026-01-15 09:00:00\tUTC",
+            "2026-01-15 09:00:00\nUTC",
+            "2026-01-15 09:00:00 Z",
+            "2026-01-15 09:00:00 UT",
+            "2026-01-15 09:00:00 GMT+2",
+            "2026-01-15 09:00:00 Narnia/Cair_Paravel",
+            // Malformed dates: month and day are one or two digits, both
+            // separators are the same character, and the year takes no
+            // leading `+`.
+            "2026-011-15",
+            "2026-01-015",
+            "2026-01/15",
+            "2026/01-15",
+            "20260115",
+            "2026-02-30",
+            "2026-13-01",
+            "+2026-01-15",
+            "2026-01-15T09:000:00Z",
+            "2026-01-15T09:00:000Z",
+            // Non-ASCII whitespace is not whitespace to DuckDB.
+            "\u{a0}2026-01-15T09:00:00Z",
+            // Outside DuckDB's own microsecond range.
+            "300000-01-01 00:00:00",
+            "-290308-01-01 00:00:00",
+        ] {
+            assert_eq!(canonical_timestamp_text(input), None, "{input:?}");
+        }
+    }
+
+    /// The two shapes the mirror deliberately does NOT read, asserted here
+    /// so a later change to either has to say so out loud.
+    ///
+    /// `DuckDB` has a reading for all of them, so each is a live tail that
+    /// UNDER-matches a batch query — never the reverse. The reasons are on
+    /// [`canonical_timestamp_text`]; the divergence itself is pinned
+    /// against the engine in `trawl-engine/tests/duckdb_probe.rs`, so it
+    /// stays a known cost rather than becoming a rediscovery.
+    #[test]
+    fn canonical_timestamp_text_declines_the_documented_residuals() {
+        for input in [
+            // A zone whose offset needs a zone HISTORY, not a table.
+            "2026-01-15 09:00:00 America/New_York",
+            "2026-01-15 09:00:00 EST",
+            "2026-01-15 09:00:00 Etc/GMT+5",
+            "2026-01-15 09:00:00 UTC+2",
+            "1800-01-01 00:00:00 Africa/Abidjan",
+            // A year outside chrono's calendar but inside DuckDB's.
+            "262144-01-01 00:00:00",
+            "294247-01-01 00:00:00",
         ] {
             assert_eq!(canonical_timestamp_text(input), None, "{input:?}");
         }
