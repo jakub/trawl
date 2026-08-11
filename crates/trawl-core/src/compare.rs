@@ -224,7 +224,14 @@ enum Instant {
 /// the text is APPLIED (ADR-0011 ruling #1), which is also the only way
 /// the mirror can agree with a corpus `read_json` typed for itself. Every
 /// rule below is established by execution in
-/// `trawl-engine/tests/duckdb_probe.rs`, never from a specification:
+/// `trawl-engine/tests/duckdb_probe.rs`, never from a specification —
+/// and that matrix is the CONTRACT: an input where this function and the
+/// engine disagree is a bug HERE, to be added to the matrix and fixed,
+/// not a tolerance to be absorbed at the call site. Four of the rules
+/// below (`epoch`, the ` UTC` suffix, hour-24 rollover, and the
+/// seconds-less form that used to fire live while batch stored NULL) were
+/// missing precisely because an earlier version reasoned them out instead
+/// of running them:
 ///
 /// - **keywords**: `epoch` → 1970-01-01, `infinity`/`inf` and
 ///   `-infinity`/`-inf` → the infinite instants — all case-insensitive,

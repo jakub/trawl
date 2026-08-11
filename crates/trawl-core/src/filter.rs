@@ -725,7 +725,12 @@ fn extract_f64(v: &Value) -> Option<f64> {
 ///   cast would round them, so the conform stores NULL);
 /// - BOOLEAN: a JSON bool is itself (`to_json` renders it as the very text
 ///   the guard demands), and a string must BE `true`/`false`
-///   ([`compare::conformed_boolean`], so `"TRUE"` has no reading).
+///   ([`compare::conformed_boolean`], so `"TRUE"` has no reading);
+/// - TIMESTAMP: only a JSON string has a reading at all — an epoch numeral
+///   is not a timestamp to any cast — and it goes through
+///   [`compare::canonical_timestamp_text`], which APPLIES a zone offset
+///   the way the conform's `TIMESTAMPTZ` rung does (ADR-0011 ruling #1),
+///   so `"…T09:00:00+05:30"` globs as `03:30`, the hour the corpus holds.
 ///
 /// A JSON bool under a numeric pin, and a number under the BOOLEAN pin,
 /// have no reading either: `'true'` is not a number to any cast, and
