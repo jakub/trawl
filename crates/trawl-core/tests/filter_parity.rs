@@ -943,9 +943,17 @@ fn mixed_case_field_reference_parity() {
 /// the same text from the wire value, so a pattern anchored on the
 /// separator, the zone suffix or the fraction means ONE thing.
 ///
-/// The column is written the way compaction writes it — `TRY_CAST` of the
-/// wire text to the pin — so a value with no timestamp reading is NULL on
-/// disk and UNKNOWN in memory, including under `NOT`.
+/// A value with no timestamp reading is NULL on disk and UNKNOWN in
+/// memory, including under `NOT`.
+///
+/// The stored column here is the WALL-CLOCK cast, which is what
+/// [`compare::canonical_timestamp_text`] still mirrors — one step behind
+/// [`trawl_core::conform::guarded_cast`], whose TIMESTAMP rung now parses
+/// through `TIMESTAMPTZ` and APPLIES an offset in the text (ADR-0011). The
+/// two agree on every zoneless shape, which is every shape ingest writes
+/// for `_time`; they part on the offset-carrying case this matrix keeps
+/// deliberately (`…T09:00:00+05:30`), and the harness must move onto the
+/// conform expression the moment the mirror does.
 #[test]
 fn pinned_timestamp_pattern_parity() {
     let conn = Connection::open_in_memory().unwrap();
