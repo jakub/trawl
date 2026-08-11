@@ -279,9 +279,12 @@ enum Instant {
 /// missing precisely because an earlier version reasoned them out instead
 /// of running them:
 ///
-/// - **keywords**: `epoch` → 1970-01-01, `infinity`/`inf` and
-///   `-infinity`/`-inf` → the infinite instants — all case-insensitive,
-///   surrounding whitespace allowed. `+infinity` is not one of them;
+/// - **keywords**: `epoch` and `-epoch` → 1970-01-01, `infinity`/`inf`
+///   and `-infinity`/`-inf` → the infinite instants, all
+///   case-insensitive. The leading `-` is consumed before the keyword is
+///   read, which is why `-epoch` IS epoch and `+infinity` is nothing.
+///   Trailing whitespace is allowed after the FULL spellings only:
+///   `'epoch '` and `'-infinity\t'` parse, `'inf '` does not;
 /// - **date**: `[-]Y+{sep}M{1,2}{sep}D{1,2}` with `{sep}` either `-` or
 ///   `/` *and the same both times*. The year is any run of digits
 ///   (`02026` is 2026), month and day are one or two — a third digit is a
@@ -296,10 +299,13 @@ enum Instant {
 /// - **zone, only when SECONDS are present**: `Z` (uppercase),
 ///   `±HH`, `±HHMM`, `±HH:MM`, `±HH:MM:SS` — each component EXACTLY two
 ///   digits, unvalidated in range (`+99:99` is a real offset) — or one
-///   space and a zone name. Without seconds the text must end where the
-///   time does: `09:00Z`, `09:00 UTC` and even `09:00 ` are all refused,
-///   the false-positive direction the wall-clock mirror used to get
-///   wrong;
+///   space and a zone name. A SPACE is the only whitespace that can close
+///   a zoneless time, because it is where a zone name would start:
+///   `09:00:00 ` and `09:00:00 \t` parse where `09:00:00\t` is NULL,
+///   while past a zone any trailing whitespace goes (`09:00:00Z\t`).
+///   Without seconds the text must end where the time does: `09:00Z`,
+///   `09:00 UTC` and even `09:00 ` are all refused, the false-positive
+///   direction the wall-clock mirror used to get wrong;
 /// - **whitespace**: ASCII only (` \t\n\r\x0b\x0c`, never `\u{a0}`),
 ///   skipped before the value and after a complete time.
 ///
@@ -316,8 +322,9 @@ enum Instant {
 ///    zone database inside `trawl-core` — which compiles to wasm for the
 ///    SPA — and two tzdata versions that drift apart would be a *silent*
 ///    divergence in place of this loud one;
-/// 2. **years outside chrono's calendar** (below -262144 or above
-///    262143), where `DuckDB`'s microsecond range reaches ±~290 000.
+/// 2. **years outside chrono's calendar** (before `-262143-01-01` or
+///    after `+262142-12-31`, its `NaiveDate` bounds in this build), where
+///    `DuckDB`'s microsecond range reaches ±~290 000.
 #[must_use]
 pub fn canonical_timestamp_text(value: &str) -> Option<String> {
     match parse_instant(value)? {
@@ -359,18 +366,32 @@ fn parse_instant(value: &str) -> Option<Instant> {
     keyword_instant(text).or_else(|| parse_datetime(text).map(Instant::At))
 }
 
-/// The keyword instants, case-insensitive, trailing whitespace allowed.
+/// The keyword instants, case-insensitive.
+///
+/// The leading `-` is consumed before the keyword is matched, so `-epoch`
+/// is epoch (only `infinity` reads the sign as a sign), and trailing
+/// whitespace is tolerated after the FULL spellings ONLY: `'epoch '` and
+/// `'-infinity\t'` parse where `'inf '` and `'-inf '` are NULL. Both rules
+/// are the cast's, established by execution — an `inf` abbreviation with a
+/// trailing space read as `infinity` here while the corpus held NULL,
+/// which is the over-match direction this mirror forbids itself.
 fn keyword_instant(text: &str) -> Option<Instant> {
     let token = text.trim_end_matches(is_c_space);
-    if token.eq_ignore_ascii_case("epoch") {
+    if token.eq_ignore_ascii_case("epoch") || token.eq_ignore_ascii_case("-epoch") {
         return chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
             .and_then(|d| d.and_hms_opt(0, 0, 0))
             .map(Instant::At);
     }
-    if token.eq_ignore_ascii_case("infinity") || token.eq_ignore_ascii_case("inf") {
+    if token.eq_ignore_ascii_case("infinity") {
         return Some(Instant::Infinity);
     }
-    if token.eq_ignore_ascii_case("-infinity") || token.eq_ignore_ascii_case("-inf") {
+    if token.eq_ignore_ascii_case("-infinity") {
+        return Some(Instant::NegInfinity);
+    }
+    if text.eq_ignore_ascii_case("inf") {
+        return Some(Instant::Infinity);
+    }
+    if text.eq_ignore_ascii_case("-inf") {
         return Some(Instant::NegInfinity);
     }
     None
@@ -523,18 +544,22 @@ fn parse_zone_offset(text: &str, pos: &mut usize) -> Option<i64> {
             let magnitude = hours * 3600 + minutes * 60 + seconds;
             Some(if sign == b'-' { -magnitude } else { magnitude })
         }
-        Some(&c) if is_c_space(c as char) => {
-            // A zone NAME is separated by EXACTLY one space (`  UTC` and
-            // `\tUTC` are both refused) and runs to the end of the text.
-            if c == b' ' {
-                let name = text[*pos + 1..].trim_end_matches(is_c_space);
-                if UTC_ZONE_NAMES
-                    .iter()
-                    .any(|zone| zone.eq_ignore_ascii_case(name))
-                {
-                    *pos = bytes.len();
-                    return Some(0);
-                }
+        // A SPACE is where a zone NAME would start, and it is therefore
+        // the only whitespace that can close a zoneless time: `09:00:00 `
+        // and `09:00:00 \t` parse where `09:00:00\t` is NULL. Past a zone
+        // (`Z`, `+05:30`, a name) any trailing whitespace goes, which the
+        // arms above already allow.
+        Some(b' ') => {
+            // The name runs to the end of the text, and only one space
+            // introduces it (`  UTC` is refused by the recursion into
+            // this same arm).
+            let name = text[*pos + 1..].trim_end_matches(is_c_space);
+            if UTC_ZONE_NAMES
+                .iter()
+                .any(|zone| zone.eq_ignore_ascii_case(name))
+            {
+                *pos = bytes.len();
+                return Some(0);
             }
             // Otherwise this is trailing whitespace (or a zone the mirror
             // cannot resolve, which the caller's end-of-text check
@@ -1414,6 +1439,25 @@ mod tests {
         ("9999-12-31 24:00:00", "10000-01-01T00:00:00.000000Z"),
         ("9999-12-31T23:59:59.999999Z", "9999-12-31T23:59:59.999999Z"),
         ("1969-12-31T23:59:59Z", "1969-12-31T23:59:59.000000Z"),
+        // The full keyword spellings tolerate trailing whitespace, and a
+        // leading `-` is consumed before the keyword is read at all.
+        ("epoch ", "1970-01-01T00:00:00.000000Z"),
+        ("epoch\t", "1970-01-01T00:00:00.000000Z"),
+        ("-epoch", "1970-01-01T00:00:00.000000Z"),
+        ("-epoch ", "1970-01-01T00:00:00.000000Z"),
+        ("-EPOCH", "1970-01-01T00:00:00.000000Z"),
+        ("infinity ", "infinity"),
+        ("-infinity\t", "-infinity"),
+        (" inf", "infinity"),
+        ("\tinf", "infinity"),
+        // A space closes a zoneless time; further whitespace after it is
+        // then trailing, and past a real zone anything goes.
+        ("2026-01-15T09:00:00 ", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15T09:00:00  ", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15T09:00:00 \t", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15T09:00:00Z\t", "2026-01-15T09:00:00.000000Z"),
+        ("2026-01-15T09:00:00+05:30\t", "2026-01-15T03:30:00.000000Z"),
+        ("2026-01-15T09:00:00 UTC\t", "2026-01-15T09:00:00.000000Z"),
     ];
 
     #[test]
@@ -1527,6 +1571,27 @@ mod tests {
             "2026-01-15T09:00:000Z",
             // Non-ASCII whitespace is not whitespace to DuckDB.
             "\u{a0}2026-01-15T09:00:00Z",
+            // The `inf` abbreviations take NO trailing whitespace, where
+            // the full spellings do — the over-match this mirror had.
+            "inf ",
+            "inf\t",
+            "-inf ",
+            "INF\n",
+            " inf ",
+            "- epoch",
+            "--epoch",
+            "epochx",
+            "infx",
+            "infinityx",
+            // A zoneless time is closed by a SPACE (where a zone name
+            // would start) and by nothing else.
+            "2026-01-15T09:00:00\t",
+            "2026-01-15T09:00:00\n",
+            "2026-01-15T09:00:00\r",
+            "2026-01-15T09:00:00\x0b",
+            "2026-01-15T09:00:00\x0c",
+            "2026-01-15 09:00:00\t",
+            "2026-01-15T09:00:00.123\t",
             // Outside DuckDB's own microsecond range.
             "300000-01-01 00:00:00",
             "-290308-01-01 00:00:00",

@@ -1764,6 +1764,48 @@ const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
     "1737000000",
     "1737000000123",
     "\u{a0}2026-01-15T09:00:00Z",
+    // The keyword instants: the FULL spellings tolerate trailing
+    // whitespace, the `inf` abbreviations do NOT, and the leading `-` is
+    // consumed before the keyword is read (so `-epoch` is epoch).
+    "inf",
+    " inf",
+    "\tinf",
+    "inf ",
+    "inf\t",
+    "-inf",
+    "-inf ",
+    "INF\n",
+    "Inf",
+    "infinity ",
+    "infinity\t",
+    " infinity ",
+    "-infinity ",
+    "epoch ",
+    "epoch\t",
+    "-epoch",
+    "-epoch ",
+    "-EPOCH",
+    "- epoch",
+    "--epoch",
+    "+inf",
+    "+infinity",
+    "epochx",
+    "infx",
+    // Trailing whitespace after a ZONELESS time: a space is where a zone
+    // name would start and closes the time, any other whitespace is NULL.
+    "2026-01-15T09:00:00 ",
+    "2026-01-15T09:00:00  ",
+    "2026-01-15T09:00:00 \t",
+    "2026-01-15T09:00:00\t",
+    "2026-01-15T09:00:00\n",
+    "2026-01-15T09:00:00\r",
+    "2026-01-15T09:00:00\x0b",
+    "2026-01-15T09:00:00\x0c",
+    "2026-01-15 09:00:00\t",
+    "2026-01-15T09:00:00.123\t",
+    "2026-01-15T09:00:00Z\t",
+    "2026-01-15T09:00:00+05:30\t",
+    "2026-01-15T09:00:00 UTC\t",
 ];
 
 /// The rule: a TIMESTAMP pin globs/regexes against ONE canonical text —
@@ -1846,7 +1888,8 @@ fn timestamp_pattern_text_is_rfc3339_micros_on_both_engines() {
 ///    Mirroring it means a tz database inside `trawl-core`, which compiles
 ///    to wasm for the SPA, and two tzdata versions drifting apart would be
 ///    a SILENT divergence in place of this loud one.
-/// 2. **years outside chrono's calendar** (±262 143) where `DuckDB`'s
+/// 2. **years outside chrono's calendar** (`NaiveDate` spans
+///    `-262143-01-01` to `+262142-12-31` in this build) where `DuckDB`'s
 ///    microsecond range reaches ±~290 000.
 ///
 /// This test also proves the first residual is drawn where the mirror
