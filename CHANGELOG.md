@@ -89,8 +89,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   inferred-type cast made one event's reading depend on what else shared its
   snapshot). Expect **fewer** hot matches on values that never conformed:
   they are now NULL — and therefore *unknown*, not false — from the moment
-  they land, exactly as the corpus has always held them. Nothing about what
-  is written to parquet changes.
+  they land, exactly as the corpus has always held them.
+
+  Two things about what is **written** change with it, both permanent:
+  - the pin ladder scores its candidates through that same guard over that
+    same text, so a column of integral doubles beyond 2^53 now pins
+    **BIGINT** where it pinned DOUBLE — `1735689600123456710.7` conforms
+    as `1735689600123456800`, the integer its own DOUBLE rendering names.
+    A pin slot is spent for the life of the install, so this is a durable
+    change of both the column's type and the value stored in it;
+  - a field pinned **VARCHAR** whose batch `read_json` typed DOUBLE (or
+    DECIMAL, or nested) is stored in the `to_json` spelling:
+    `100000000000000000000.0` rather than `1e+20`, `1e-7` rather than
+    `1e-07`. Under that pin the guard is the identity, so the text form
+    *is* the stored value, and a lane that picked its own spelling was a
+    lane with its own corpus — the same flip this entry is about, one
+    level down.
+
+- **The live tail conforms a value before comparing it (ADR-0011, #63).**
+  Under a BIGINT/DOUBLE/BOOLEAN/TIMESTAMP pin, `GET /api/v1/stream`
+  compared the value the *sender* wrote while `/api/v1/query` compared the
+  value the *catalog stored*, so everything the round-trip guard nulls out
+  answered differently on the two paths. A wire `1.5` under a BIGINT pin
+  matched `duration>1` on the stream and was unknown to the query; `"abc"`
+  matched `duration!=2` in batch (the emitted form carries
+  `OR col IS NULL`) and not on the stream; `"TRUE"` under a BOOLEAN pin
+  made `NOT flag=true` fire live while `/api/v1/query` returned nothing.
+  The stream now reads the conformed value, so **a live tail on a pinned
+  field matches exactly what the equivalent query matches** — expect fewer
+  stream hits on values that never conformed, and `!=` to start matching
+  them. Nothing about `/api/v1/query` changes: the emitted SQL is
+  unchanged byte for byte. The same round closed the remaining places the
+  in-memory mirror read a text differently from DuckDB's own casts — the
+  DECIMAL cast forgiving a scan that whitespace cut short (`"- "` reads
+  zero), its exponent path rounding on the leading digit (`5e-8` reads one
+  microstep where `0.00000005` reads zero), and `inf ` reading as infinity
+  where the cast NULLs it — each of which was a live match the query did
+  not have.
 
 - **Custom timestamp fields are conformed zone-aware, in UTC (ADR-0011, #63).**
   A TIMESTAMP-pinned custom field whose value carried an offset was conformed

@@ -203,12 +203,18 @@ under a BIGINT pin therefore read `2` while the event was hot and NULL a
 few minutes later — a query whose answer changes with a background timer,
 with nothing in the request to explain it. Both lanes now build their SQL
 from one function (`trawl_core::conform::guarded_cast`); the compaction
-copy (`lossless_cast`) is deleted, and the only thing each lane still
-decides for itself is how to spell the column's text (compaction knows the
-physical type from `DESCRIBE`; the emitter does not and uses
-`json_extract_string(to_json(x), '$')`). The guard is therefore the
-authority everywhere: a cast that would ALTER the value writes NULL,
-counts as a conflict, and leaves the original findable in `_raw`.
+copy (`lossless_cast`) is deleted, and neither lane decides anything for
+itself, down to the spelling of the column's text
+(`json_extract_string(to_json(x), '$')`, in both). Letting compaction
+choose that spelling from its `DESCRIBE` — which it briefly did, since it
+alone knows the physical type — left the flip alive under the **VARCHAR**
+pin, where the guard is the identity and the text form therefore IS the
+stored value: `TRY_CAST(col AS VARCHAR)` spells a DOUBLE `1e20` as
+`1e+20` and `to_json` spells it `100000000000000000000.0`, so
+`note=/^1e/` matched while the event was hot and stopped matching once
+the compactor ran. The guard is the authority everywhere it exists: a
+cast that would ALTER the value writes NULL, counts as a conflict, and
+leaves the original findable in `_raw`.
 
 ### 3. One deterministic cast domain: the text form, always VARCHAR
 
