@@ -842,7 +842,7 @@ const DECIMAL_SCALE: i64 = 6;
 ///    end-of-text refuses ([`terminated_scan`]): `'- '` reads 0 and
 ///    `'1e '` reads 1 where `'-'` and `'1e'` are NULL;
 /// 2. **a negative exponent rounds on the leading SIGNIFICANT digit** when
-///    its shift drops every digit the mantissa has ([`drop_digits`]), so
+///    its shift drops every digit the mantissa has ([`shift_digits`]), so
 ///    `'5e-8'` is one microstep while the same value spelled
 ///    `'0.00000005'` is zero;
 /// 3. **the literal exponent is bounded** by the type's integer digits
