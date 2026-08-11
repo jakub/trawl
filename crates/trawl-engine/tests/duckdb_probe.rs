@@ -867,6 +867,229 @@ fn try_cast_double_domain_matches_the_live_mirror() {
     }
 }
 
+/// The comparison space's DOMAIN, run on both engines side by side:
+/// [`decimal_reading`] in `DuckDB` against `compare::decimal_micros` in
+/// the live matcher. It is `DuckDB`'s cast domain, not Rust's number
+/// parser — whitespace is trimmed, `_` separates digits, `'0404'` is 404 —
+/// and every disagreement is a row the stream and the batch query answer
+/// differently.
+///
+/// The engine side is read back as TEXT: `DECIMAL(38,6)` renders with
+/// exactly six fractional digits, which is the scaled integer the mirror
+/// carries with the point put back.
+#[test]
+fn decimal_comparison_space_domain_matches_the_live_mirror() {
+    let conn = conn();
+    let inputs = [
+        // Whitespace: trimmed both ends, ASCII only.
+        " 200",
+        "200 ",
+        "\t200\n",
+        "\x0b200\x0c",
+        "  200  ",
+        "\u{a0}200",
+        "2 00",
+        " ",
+        "",
+        // `_` digit separators, only between ASCII digits.
+        "200_000",
+        "1_000.5",
+        "1e1_0",
+        "_200",
+        "200_",
+        "1__0",
+        "1_.5",
+        // Spelling drift that denotes the same number.
+        "200",
+        "200.0",
+        "200.000000",
+        "0404",
+        "+5",
+        "1.",
+        ".5",
+        "-0",
+        "-0.0",
+        "1e3",
+        "1E3",
+        "1e-3",
+        "00200",
+        // Exact where a DOUBLE reading collapses.
+        "1737000000123456788",
+        "1737000000123456789",
+        "1737000000123456790",
+        "9007199254740992",
+        "9007199254740993",
+        "9223372036854775807",
+        "-9223372036854775808",
+        // The scale boundary: rounded half away from zero at 10^-6.
+        "0.0000001",
+        "0.00000049",
+        "0.0000005",
+        "0.0000015",
+        "-0.0000005",
+        "4.0000001",
+        "4.0000005",
+        // The magnitude boundary: below 10^32 reads, at it does not.
+        "1e31",
+        "99999999999999999999999999999999.999999",
+        "-99999999999999999999999999999999.999999",
+        "1e32",
+        "1e40",
+        "1e400",
+        "1e-400",
+        // No reading at all — the DOUBLE domain read the first three.
+        "nan",
+        "NaN",
+        "inf",
+        "-inf",
+        "infinity",
+        "0x10",
+        "0b101",
+        "1,000",
+        "accepted",
+        "1d",
+        "true",
+    ];
+    for input in inputs {
+        let sql: Option<String> = conn
+            .query_row(
+                &format!("SELECT CAST({} AS VARCHAR)", decimal_reading("?")),
+                [input],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let live = trawl_core::compare::decimal_micros(input).map(render_micros);
+        assert_eq!(
+            sql, live,
+            "comparison space disagrees for {input:?}: sql={sql:?} live={live:?}"
+        );
+    }
+}
+
+/// `DECIMAL(38,6)`'s own rendering, rebuilt from the scaled integer the
+/// live mirror carries — six fractional digits, sign on the whole value.
+fn render_micros(micros: i128) -> String {
+    let sign = if micros < 0 { "-" } else { "" };
+    let magnitude = micros.unsigned_abs();
+    format!(
+        "{sign}{}.{:06}",
+        magnitude / 1_000_000,
+        magnitude % 1_000_000
+    )
+}
+
+/// The emitter binds the query literal as a STRING and casts it with the
+/// same expression it casts the column with, so this pins what a bound
+/// parameter does inside that cast: `DuckDB` keeps it VARCHAR and the
+/// `TRY_CAST` degrades to NULL. It must not resolve the parameter's type
+/// from the cast target — that would make an unreadable literal a
+/// conversion ERROR at execution time instead of an UNKNOWN row, turning
+/// `status=nan` from "matches the text `nan`" into a failed query.
+#[test]
+fn a_bound_literal_casts_as_text_and_nulls_instead_of_throwing() {
+    let conn = conn();
+    for (literal, expected) in [
+        ("200", Some("200.000000".to_owned())),
+        (
+            "1737000000123456789",
+            Some("1737000000123456789.000000".to_owned()),
+        ),
+        ("nan", None),
+        ("1e40", None),
+        ("accepted", None),
+    ] {
+        let sql: Option<String> = conn
+            .query_row(
+                &format!("SELECT CAST({} AS VARCHAR)", decimal_reading("?")),
+                [literal],
+                |row| row.get(0),
+            )
+            .expect("a bound literal must never throw inside the cast");
+        assert_eq!(sql, expected, "{literal:?}");
+    }
+}
+
+/// The reported finding, as a regression: the VARCHAR-pinned equality and
+/// `!=` shapes the emitter builds, run over ids that differ by one.
+///
+/// In DOUBLE space every id above 2^53 collapses onto its neighbours, so
+/// `id=1737000000123456789` returned THREE distinct stored ids and
+/// `id!=9007199254740993` silently suppressed `9007199254740992`. Both
+/// engines collapsed identically, which is why parity testing never saw
+/// it — only execution against stored data does. The DOUBLE half is kept
+/// as the premise, not as nostalgia: it is what makes the DECIMAL
+/// assertions mean something.
+#[test]
+fn the_decimal_comparison_space_separates_ids_a_double_equates() {
+    let conn = conn();
+    conn.execute_batch(
+        "CREATE TABLE t AS SELECT unnest([\
+         '1737000000123456788', '1737000000123456789', '1737000000123456790', \
+         '9007199254740992', '9007199254740993', '200', '200.0', 'accepted']) AS v",
+    )
+    .unwrap();
+
+    // The two shapes the emitter builds, with the numeric arm in each
+    // space. `!=` carries its OR-IS-NULL policy and is asked which rows it
+    // EXCLUDES, because a suppressed row is invisible rather than wrong.
+    let equality = |space: &dyn Fn(&str) -> String, literal: &str| {
+        format!(
+            "(v = '{literal}' OR COALESCE({} = {}, FALSE))",
+            space("v"),
+            space(&format!("'{literal}'"))
+        )
+    };
+    let excluded_by_inequality = |space: &dyn Fn(&str) -> String, literal: &str| {
+        format!(
+            "NOT ((v != '{literal}' AND COALESCE({} != {}, TRUE)) OR v IS NULL)",
+            space("v"),
+            space(&format!("'{literal}'"))
+        )
+    };
+    let rows = |predicate: &str| -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("SELECT v FROM t WHERE {predicate} ORDER BY v"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let double = |expr: &str| format!("TRY_CAST({expr} AS DOUBLE)");
+
+    assert_eq!(
+        rows(&equality(&double, "1737000000123456789")).len(),
+        3,
+        "the premise: DOUBLE space equates the two neighbours"
+    );
+    assert_eq!(
+        rows(&equality(&decimal_reading, "1737000000123456789")),
+        ["1737000000123456789"],
+        "the comparison space must match exactly the stored id"
+    );
+    // The rule the numeric arm exists for still holds: one number, two
+    // spellings, both matched.
+    assert_eq!(
+        rows(&equality(&decimal_reading, "200")),
+        ["200", "200.0"],
+        "a number's other spelling must still meet its literal"
+    );
+
+    assert_eq!(
+        rows(&excluded_by_inequality(&double, "9007199254740993")),
+        ["9007199254740992", "9007199254740993"],
+        "the premise: DOUBLE space suppresses a genuinely different id"
+    );
+    assert_eq!(
+        rows(&excluded_by_inequality(
+            &decimal_reading,
+            "9007199254740993"
+        )),
+        ["9007199254740993"],
+        "the comparison space must exclude exactly the named id"
+    );
+}
+
 /// Why the comparison space is never a per-literal BIGINT domain:
 /// `TRY_CAST('1.5' AS BIGINT)` ROUNDS to 2, so an integer space would make
 /// `dur>1` and `dur>1.5` disagree about the same stored value.

@@ -608,7 +608,18 @@ fn pinned(entries: &[(&str, CanonicalType)]) -> FieldTypes {
 /// (the canonicalizer only fills envelope fields), so the two must answer
 /// identically or `/query` and `/stream` disagree on every field-less
 /// event.
-fn assert_pinned_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>, ft: &FieldTypes) {
+///
+/// Returns the answer the two engines agreed on, because agreement is not
+/// always the whole property: the DOUBLE comparison space ADR-0011 ruling
+/// #6 replaced collapsed every id above 2^53 in the SQL and in the matcher
+/// IDENTICALLY, so a parity assertion alone watched both sides agree on
+/// the wrong row. A caller that knows what the answer must BE says so.
+fn assert_pinned_parity(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    ft: &FieldTypes,
+) -> bool {
     let query = parser::parse(dsl).expect("dsl parses");
     let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
     let filter_result = filter.matches(event);
@@ -651,6 +662,7 @@ fn assert_pinned_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>
         "pinned parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nsql: {}\nparams: {:?}",
         emitted.sql, emitted.params
     );
+    filter_result
 }
 
 /// Assert filter and pin-aware SQL agree for one (dsl, event, pins)
@@ -662,13 +674,16 @@ fn assert_pinned_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>
 /// `200.0`, and no `read_json` inference reproduces that. So the stored
 /// value is spelled out — exactly the column compaction wrote — while the
 /// matcher still sees the wire event.
+///
+/// Returns the agreed answer, for the same reason
+/// [`assert_pinned_parity`] does.
 fn assert_pinned_parity_over_column(
     conn: &Connection,
     dsl: &str,
     event: &Map<String, Value>,
     ft: &FieldTypes,
     stored_sql: &str,
-) {
+) -> bool {
     let query = parser::parse(dsl).expect("dsl parses");
     let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
     let filter_result = filter.matches(event);
@@ -692,6 +707,7 @@ fn assert_pinned_parity_over_column(
         "pinned parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nstored: {stored_sql}\nsql: {}\nparams: {:?}",
         emitted.sql, emitted.params
     );
+    filter_result
 }
 
 fn status_event(value: &Value) -> Map<String, Value> {
@@ -722,19 +738,25 @@ fn pinned_varchar_matrix_parity() {
         Value::String("accepted".into()),
         Value::String("0".into()),
         Value::String("1.5".into()),
-        // Values inside DuckDB's TRY_CAST(… AS DOUBLE) domain but outside
-        // `str::parse::<f64>` — batch counts them as numbers, so the live
-        // matcher must too (whitespace, `_` separators). 'nan' additionally
-        // orders ABOVE every literal in DuckDB's total DOUBLE ordering
-        // where Rust's operators answer false.
+        // Values inside DuckDB's DECIMAL(38,6) cast domain but outside
+        // `str::parse` — batch counts them as numbers, so the live matcher
+        // must too (whitespace, `_` separators, leading zeros).
         Value::String(" 200".into()),
         Value::String("200_000".into()),
+        Value::String("0404".into()),
+        Value::String("+5".into()),
+        Value::String("1e3".into()),
+        // Numbers to Rust's parser with NO reading in the comparison
+        // space: 'nan' and 'inf' used to order above every literal in
+        // DuckDB's total DOUBLE ordering, and now match nothing at all —
+        // on both sides (ADR-0011 ruling #6).
         Value::String("nan".into()),
         Value::String("inf".into()),
         Value::String("-inf".into()),
-        Value::String("+5".into()),
-        Value::String("1e3".into()),
-        // Outside both domains: still UNKNOWN on both sides.
+        // Past the space's magnitude, and past 2^53 inside it.
+        Value::String("1e40".into()),
+        Value::String("9007199254740993".into()),
+        // Outside every domain: still UNKNOWN on both sides.
         Value::String("0x10".into()),
         Value::Null,
     ];
@@ -757,6 +779,18 @@ fn pinned_varchar_matrix_parity() {
         // ordered, non-numeric literal (lexical rule, unchanged)
         "status>accepted",
         "status<accepted",
+        // numeric literals with no reading in the comparison space: the
+        // numeric RULE still applies (never the lexical one), and its
+        // right-hand cast is NULL, so every row is UNKNOWN on both sides.
+        "status>nan",
+        "status<inf",
+        "status>=1e40",
+        "status=nan",
+        "status!=nan",
+        // past 2^53, where a DOUBLE space equated neighbours
+        "status=9007199254740993",
+        "status!=9007199254740993",
+        "status>9007199254740992",
         // glob / regex (unchanged under the VARCHAR pin)
         "status=2*",
         "status=/2.*/",
@@ -1266,6 +1300,83 @@ fn pinned_varchar_eq_over_conformed_number_spellings() {
         let event = status_event(&wire);
         for dsl in VARCHAR_EQ_DSLS {
             assert_pinned_parity_over_column(&conn, dsl, &event, &ft, stored);
+        }
+    }
+}
+
+/// Ids a `DOUBLE` comparison space cannot tell apart (ADR-0011 ruling #6).
+///
+/// Consecutive above 2^53, where the gap between representable doubles is
+/// 2 (and 256 up at 2^60): every pair here collapses onto one double.
+const COLLIDING_IDS: [&str; 5] = [
+    "1737000000123456788",
+    "1737000000123456789",
+    "1737000000123456790",
+    "9007199254740992",
+    "9007199254740993",
+];
+
+/// Numeric comparison against a VARCHAR-pinned field is EXACT past 2^53 —
+/// asserted against the ANSWER, not merely against agreement.
+///
+/// This is the one place a parity assertion could not have done the job.
+/// The old `TRY_CAST(col AS DOUBLE)` arm bound the literal as an `f64` and
+/// compared in double space; the live matcher mirrored it faithfully, so
+/// both engines returned `1737000000123456788` and `…790` for
+/// `status=1737000000123456789` and both suppressed `9007199254740992`
+/// for `status!=9007199254740993`. Perfect parity, wrong rows. Snowflake
+/// ids and nanosecond epochs land in VARCHAR-pinned fields exactly like
+/// this, and the resulting query is silently, plausibly wrong.
+///
+/// So each case states the truth an operator would expect — the value is
+/// the id or it isn't — and the helper still asserts the two engines agree
+/// on the way there. Both wire shapes are covered: the string a text field
+/// carries, and the JSON integer whose conformed column is that same text.
+#[test]
+fn pinned_varchar_numeric_comparison_is_exact_above_2_pow_53() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::Varchar)]);
+    for stored in COLLIDING_IDS {
+        let value: i128 = stored.parse().unwrap();
+        let event = status_event(&Value::String(stored.into()));
+        for probe in COLLIDING_IDS {
+            let literal: i128 = probe.parse().unwrap();
+            for (dsl, expected) in [
+                (format!("status={probe}"), value == literal),
+                (format!("status!={probe}"), value != literal),
+                (format!("status>{probe}"), value > literal),
+                (format!("status>={probe}"), value >= literal),
+                (format!("status<{probe}"), value < literal),
+                (format!("status<={probe}"), value <= literal),
+            ] {
+                assert_eq!(
+                    assert_pinned_parity(&conn, &dsl, &event, &ft),
+                    expected,
+                    "both engines agreed on the wrong answer: stored {stored}, {dsl}"
+                );
+            }
+        }
+    }
+
+    // The wire JSON integer, whose conformed column is the same text: the
+    // matcher reads a `serde_json` number where the query reads a string,
+    // and both must land on the same exact reading.
+    for stored in COLLIDING_IDS {
+        let value: i128 = stored.parse().unwrap();
+        let event = status_event(&Value::from(i64::try_from(value).unwrap()));
+        for probe in COLLIDING_IDS {
+            let expected = value == probe.parse::<i128>().unwrap();
+            assert_eq!(
+                assert_pinned_parity_over_column(
+                    &conn,
+                    &format!("status={probe}"),
+                    &event,
+                    &ft,
+                    &format!("'{stored}'"),
+                ),
+                expected,
+                "wire integer {stored} vs literal {probe}"
+            );
         }
     }
 }
