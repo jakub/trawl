@@ -2433,6 +2433,57 @@ fn timestamp_conform_applies_the_offset_under_the_pinned_session() {
     );
 }
 
+/// `Executor::configure` runs on every connection the pool makes, clones
+/// included, and that is load-bearing rather than defensive: `try_clone()`
+/// shares the DATABASE, not the session, so a clone starts from the
+/// process default — which the bundled ICU build takes from the HOST — and
+/// would read a zoneless text in `/etc/localtime`'s zone.
+///
+/// Written host-independently: the assertion is that a clone reports the
+/// default a FRESH connection reports, whatever the parent was set to, and
+/// that at least one of the two zones exercised really did differ from
+/// that default, so the test cannot pass by the host happening to match.
+#[test]
+fn a_cloned_connection_starts_from_the_process_default_not_the_parent() {
+    let zone_of = |conn: &duckdb::Connection| -> String {
+        conn.query_row("SELECT current_setting('TimeZone')", [], |row| row.get(0))
+            .unwrap()
+    };
+    let default = zone_of(&duckdb::Connection::open_in_memory().unwrap());
+    assert!(
+        !default.is_empty(),
+        "the bundled build links ICU, so a session always has a zone"
+    );
+
+    let parent = duckdb::Connection::open_in_memory().unwrap();
+    let mut differed_from_the_default = false;
+    for zone in ["Asia/Kolkata", "America/Phoenix"] {
+        parent
+            .execute_batch(&format!("SET TimeZone='{zone}'"))
+            .unwrap();
+        assert_eq!(zone_of(&parent), zone, "the parent's own SET must hold");
+        let clone = parent.try_clone().unwrap();
+        assert_eq!(
+            zone_of(&clone),
+            default,
+            "a clone must not inherit the parent's {zone}"
+        );
+        differed_from_the_default |= zone != default;
+    }
+    assert!(
+        differed_from_the_default,
+        "neither probe zone differed from the host default — the test proved nothing"
+    );
+
+    // The pin is what makes the answer independent of the host, and it
+    // has to be applied to the clone itself.
+    let clone = parent.try_clone().unwrap();
+    clone
+        .execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .unwrap();
+    assert_eq!(zone_of(&clone), "UTC");
+}
+
 /// A `_time` conform can never produce NULL on a standing file, zone-aware
 /// rung or not: a NULL partition key sorts first and falls outside every
 /// `last=Xh` filter, so the row would survive the rewrite yet become

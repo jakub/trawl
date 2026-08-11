@@ -47,8 +47,11 @@ impl Executor {
     ///
     /// The cloned connection benefits from `DuckDB`'s internal metadata
     /// caching (parquet file stats, column statistics) accumulated by
-    /// other connections to the same database. Settings are NOT inherited
-    /// (probed by execution), so the clone is configured in its own right.
+    /// other connections to the same database. A clone shares the
+    /// DATABASE, not the session: settings are NOT inherited — it starts
+    /// from the process default — so the clone is configured in its own
+    /// right (`a_cloned_connection_starts_from_the_process_default_not_the_parent`
+    /// in `trawl-engine/tests/duckdb_probe.rs`).
     pub fn try_clone(&self) -> Result<Self, EngineError> {
         let conn = self.conn.try_clone()?;
         Self::configure(&conn)?;
@@ -59,7 +62,8 @@ impl Executor {
     /// time zone, which must be UTC on every connection.
     ///
     /// The bundled `DuckDB` links ICU and defaults `TimeZone` to the HOST
-    /// zone, and two things read it: the hot branch's TIMESTAMP conform
+    /// zone (probed with the clone behaviour above), and two things read
+    /// it: the hot branch's TIMESTAMP conform
     /// (`trawl_core::conform`, which parses through `TIMESTAMPTZ` so an
     /// offset in the text is applied and a zoneless text is UTC), and
     /// `now()::TIMESTAMP` — the anchor of every `last=Xh` window, compared
