@@ -1381,6 +1381,158 @@ fn pinned_varchar_numeric_comparison_is_exact_above_2_pow_53() {
     }
 }
 
+/// COMPARISONS under a typed pin, over the hot-only lane — the same
+/// event read by the matcher and by the query, which is the strictest
+/// form of the batch/live contract.
+///
+/// The gap this closes: the pattern rules conformed the wire value and
+/// the comparison rules did not, so every value the round-trip guard
+/// nulls out answered one way live and another in batch. A wire `1.5`
+/// under a BIGINT pin is NULL in both batch lanes — `duration>1` is
+/// UNKNOWN there and was TRUE here — and `"TRUE"` under a BOOLEAN pin
+/// made `NOT flag=true` fire on a stream while `/query` returned nothing.
+///
+/// Literals a typed column cannot be compared against at all (a word
+/// against a numeric pin) are deliberately absent: `DuckDB` answers those
+/// with a conversion ERROR, so there is no row set to agree with.
+#[test]
+#[allow(clippy::too_many_lines)] // one matrix, kept in one place to stay readable
+fn pinned_typed_comparison_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .unwrap();
+    let cases: [(CanonicalType, &[&str], &[Value]); 4] = [
+        (
+            CanonicalType::BigInt,
+            &[
+                "status>1",
+                "status>=1",
+                "status<9",
+                "status<=9",
+                "status=2",
+                "status!=2",
+                "status=404",
+                "status!=404",
+                "status>1.5",
+                "status=2,404",
+                "NOT status>1",
+                "NOT status!=2",
+            ],
+            &[
+                // Values the round-trip guard nulls out: the cast would
+                // round them, or read them as something it cannot write
+                // back.
+                Value::from(1.5),
+                Value::from("1.5"),
+                Value::from(2.5),
+                Value::from("accepted"),
+                Value::from(true),
+                Value::Null,
+                // …and values that DO conform, spelled unlike the wire.
+                Value::from("0404"),
+                Value::from(" 200"),
+                Value::from("2"),
+                Value::from(404),
+                Value::from(2),
+                // Integral above 2^53, where the deleted `f64` cast rung
+                // read nothing.
+                Value::from("9007199254740993.0"),
+            ],
+        ),
+        (
+            CanonicalType::Boolean,
+            &[
+                "status=true",
+                "status!=true",
+                "status=false",
+                "status=1",
+                "status=yes",
+                "status>0",
+                "NOT status=true",
+            ],
+            &[
+                // The cast's vocabulary is wide and the guard is narrow,
+                // so only the two rendered spellings conform.
+                Value::from("TRUE"),
+                Value::from("1"),
+                Value::from("no"),
+                Value::from("accepted"),
+                Value::from(1),
+                Value::from(200),
+                Value::Null,
+                Value::from(true),
+                Value::from(false),
+                Value::from("true"),
+                Value::from("false"),
+            ],
+        ),
+        (
+            CanonicalType::Double,
+            &[
+                "status>1",
+                "status>=200",
+                "status=1.5",
+                "status!=1.5",
+                "status<0",
+                "NOT status>1",
+            ],
+            &[
+                Value::from(1.5),
+                Value::from("1.5"),
+                Value::from(" 200"),
+                Value::from("200"),
+                Value::from("accepted"),
+                Value::from(true),
+                Value::from(404),
+                Value::Null,
+            ],
+        ),
+        (
+            CanonicalType::Timestamp,
+            &[
+                r#"status>"2026-01-15T00:00:00Z""#,
+                r#"status<"2026-01-16T00:00:00Z""#,
+                r#"status="2026-01-15T09:00:00Z""#,
+                r#"status!="2026-01-15T09:00:00Z""#,
+                r#"status>="2026-01-15 09:00:00""#,
+                r#"NOT status>"2026-01-15T00:00:00Z""#,
+            ],
+            &[
+                Value::from("2026-01-15T09:00:00Z"),
+                Value::from("2026-01-15T09:00:00+05:30"),
+                Value::from("2026-01-15 09:00:00"),
+                Value::from("2026-01-15"),
+                Value::from("infinity"),
+                Value::from("-infinity"),
+                Value::from("accepted"),
+                Value::from(1_735_689_600),
+                Value::Null,
+            ],
+        ),
+    ];
+    // A string sibling fixes the snapshot's inference at VARCHAR/JSON, so
+    // the conform reads the text the wire carried rather than whatever
+    // `read_json` would have parsed a lone value into — the conform is
+    // text-first, but the reader in front of it is not.
+    let mut sibling = status_event(&Value::from("sentinel"));
+    sibling.insert("message".into(), Value::from("sibling"));
+    sibling.insert("_time".into(), Value::from("2026-01-01T12:00:00Z"));
+    sibling.insert("_ingested".into(), Value::from("2026-01-01T12:00:01Z"));
+
+    for (pin, dsls, values) in cases {
+        let ft = pinned(&[("status", pin)]);
+        for wire in values {
+            let mut event = status_event(wire);
+            // The REPLACE list always names both envelope timestamps.
+            event.insert("_time".into(), Value::from("2026-01-01T12:00:00Z"));
+            event.insert("_ingested".into(), Value::from("2026-01-01T12:00:01Z"));
+            for dsl in dsls {
+                assert_hot_only_parity_beside(&conn, dsl, &event, &ft, &[sibling.clone()]);
+            }
+        }
+    }
+}
+
 /// Patterns over the hot-only lane, where the matcher and the query read
 /// the SAME event — the strictest form of the batch/live contract, and the
 /// one that catches a pattern text taken from the wire instead of from the

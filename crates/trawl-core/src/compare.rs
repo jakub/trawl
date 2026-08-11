@@ -119,8 +119,24 @@ use crate::schema::CanonicalType;
 /// How one search-stage comparison binds its literal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompareForm {
-    /// Today's literal-driven binding — the unpinned/typed-pin default.
+    /// Today's literal-driven binding — the unpinned default.
     Native(SqlValue),
+    /// A TYPED pin: the literal binds exactly as [`Self::Native`] would —
+    /// the SQL is byte-identical, because the column on disk already IS
+    /// the pinned type — but the live matcher must read the value's
+    /// CONFORMED value first and compare THAT.
+    ///
+    /// Batch compares what conformance stored; the wire value is only the
+    /// same thing when it already reads as its pin. Every value the
+    /// round-trip guard nulls out answered differently otherwise: a wire
+    /// `1.5` under a BIGINT pin is NULL in both batch lanes, so
+    /// `duration>1` is UNKNOWN there and was TRUE live, and `"TRUE"`
+    /// under a BOOLEAN pin made `NOT flag=true` fire on a stream while
+    /// `/query` returned nothing.
+    Conformed {
+        pin: CanonicalType,
+        literal: SqlValue,
+    },
     /// Compare as text: the literal binds as a string (`'accepted'`).
     Text(String),
     /// The VARCHAR-pinned equality form for a NUMERIC literal: the value
@@ -242,16 +258,76 @@ const UTC_ZONE_NAMES: [&str; 18] = [
     "Zulu",
 ];
 
-/// The instant a TIMESTAMP-pinned column holds for one stored text.
+/// The instant a `DuckDB` TIMESTAMP holds — what a TIMESTAMP-pinned column
+/// conformed a stored text to ([`conformed_timestamp`]), and what a query
+/// literal reads as when it is compared against one ([`literal_timestamp`]).
 ///
 /// `DuckDB`'s TIMESTAMP carries two values no calendar date can express,
 /// and `strftime` renders them as the literal words `infinity` and
 /// `-infinity` — texts a glob can match, so the mirror has to produce them
 /// too.
-enum Instant {
+///
+/// The variant ORDER is the type's ordering: `-infinity` sorts below every
+/// date and `infinity` above, which is what `ts>'2026-01-01'` answers for
+/// a column holding them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Instant {
+    NegInfinity,
     At(chrono::NaiveDateTime),
     Infinity,
-    NegInfinity,
+}
+
+impl Instant {
+    /// This instant in the TIMESTAMP pin's canonical pattern text — the
+    /// in-memory mirror of `strftime(col, TIMESTAMP_PATTERN_SQL_FORMAT)`.
+    #[must_use]
+    pub fn pattern_text(self) -> String {
+        match self {
+            Self::Infinity => "infinity".to_owned(),
+            Self::NegInfinity => "-infinity".to_owned(),
+            Self::At(at) => render_pattern_text(at),
+        }
+    }
+}
+
+/// Whether a zone in the text is APPLIED or ignored — the one thing the
+/// conform's cast and a bound literal's cast do differently.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZoneRule {
+    /// `TRY_CAST(TRY_CAST(text AS TIMESTAMPTZ) AS TIMESTAMP)`, the conform
+    /// (ADR-0011 ruling #1): an offset shifts the instant and a zoneless
+    /// text is read in the session zone, which is pinned to UTC.
+    Apply,
+    /// `TRY_CAST(text AS TIMESTAMP)`, what `DuckDB` casts a bound STRING
+    /// parameter with when it is compared against a TIMESTAMP column: the
+    /// WALL-CLOCK parse, which reads the same syntax and then throws the
+    /// offset away (`'…T09:00:00+05:30'` is 09:00, probed).
+    Ignore,
+}
+
+/// The instant a TIMESTAMP-pinned column CONFORMS a stored text to — the
+/// live mirror of [`crate::conform::guarded_cast`]'s TIMESTAMP rung.
+#[must_use]
+pub fn conformed_timestamp(text: &str) -> Option<Instant> {
+    parse_instant(text, ZoneRule::Apply)
+}
+
+/// The instant `DuckDB` reads a query LITERAL as when it is compared
+/// against a TIMESTAMP column.
+///
+/// Deliberately not [`conformed_timestamp`]: the emitter binds the literal
+/// as a string and leaves the cast to `DuckDB`, whose implicit
+/// VARCHAR → TIMESTAMP conversion is the wall-clock parse. The two agree
+/// on every zoneless text — which is every literal that does not spell an
+/// offset out — and the SQL side is what decides, so the mirror follows it
+/// rather than the reading it would prefer.
+///
+/// It also resolves a NARROWER set of zone names: exactly `UTC`, where the
+/// conform's ICU-backed cast takes every name in `pg_timezone_names()`.
+/// Probed, both ways.
+#[must_use]
+pub fn literal_timestamp(text: &str) -> Option<Instant> {
+    parse_instant(text, ZoneRule::Ignore)
 }
 
 /// Render a live event's value in the TIMESTAMP pin's canonical pattern
@@ -327,11 +403,7 @@ enum Instant {
 ///    `DuckDB`'s microsecond range reaches ±~290 000.
 #[must_use]
 pub fn canonical_timestamp_text(value: &str) -> Option<String> {
-    match parse_instant(value)? {
-        Instant::Infinity => Some("infinity".to_owned()),
-        Instant::NegInfinity => Some("-infinity".to_owned()),
-        Instant::At(at) => Some(render_pattern_text(at)),
-    }
+    conformed_timestamp(value).map(Instant::pattern_text)
 }
 
 /// `strftime`'s rendering of a finite timestamp under
@@ -361,9 +433,9 @@ fn render_pattern_text(at: chrono::NaiveDateTime) -> String {
 }
 
 /// The instant `DuckDB` reads out of this text, or `None`.
-fn parse_instant(value: &str) -> Option<Instant> {
+fn parse_instant(value: &str, zone: ZoneRule) -> Option<Instant> {
     let text = &value[leading_space(value.as_bytes(), 0)..];
-    keyword_instant(text).or_else(|| parse_datetime(text).map(Instant::At))
+    keyword_instant(text).or_else(|| parse_datetime(text, zone).map(Instant::At))
 }
 
 /// The keyword instants, case-insensitive.
@@ -408,7 +480,7 @@ struct TimeOfDay {
 }
 
 /// The calendar form: a date, optionally a time, optionally a zone.
-fn parse_datetime(text: &str) -> Option<chrono::NaiveDateTime> {
+fn parse_datetime(text: &str, zone: ZoneRule) -> Option<chrono::NaiveDateTime> {
     let bytes = text.as_bytes();
     let mut pos = 0;
     let date = parse_date(bytes, &mut pos)?;
@@ -426,7 +498,7 @@ fn parse_datetime(text: &str) -> Option<chrono::NaiveDateTime> {
 
     let time = parse_time(bytes, &mut pos)?;
     let offset = if time.has_seconds {
-        parse_zone_offset(text, &mut pos)?
+        parse_zone_offset(text, &mut pos, zone)?
     } else if pos == bytes.len() {
         0
     } else {
@@ -447,6 +519,11 @@ fn parse_datetime(text: &str) -> Option<chrono::NaiveDateTime> {
     } else {
         date.and_hms_micro_opt(time.hour, time.minute, time.second, time.micros)?
     };
+    if zone == ZoneRule::Ignore {
+        // The wall-clock cast reads the offset's SYNTAX (a malformed one
+        // is still NULL) and then discards its value.
+        return Some(wall);
+    }
     // The offset is seconds EAST of UTC, so the instant is the wall clock
     // minus it.
     wall.checked_sub_signed(chrono::TimeDelta::try_seconds(offset)?)
@@ -515,7 +592,7 @@ fn parse_time(bytes: &[u8], pos: &mut usize) -> Option<TimeOfDay> {
 
 /// The zone suffix, as SECONDS EAST of UTC. Absent is `Some(0)`; only a
 /// malformed one is `None`.
-fn parse_zone_offset(text: &str, pos: &mut usize) -> Option<i64> {
+fn parse_zone_offset(text: &str, pos: &mut usize, zone: ZoneRule) -> Option<i64> {
     let bytes = text.as_bytes();
     match bytes.get(*pos) {
         None => Some(0),
@@ -553,11 +630,19 @@ fn parse_zone_offset(text: &str, pos: &mut usize) -> Option<i64> {
             // The name runs to the end of the text, and only one space
             // introduces it (`  UTC` is refused by the recursion into
             // this same arm).
+            //
+            // The two casts resolve different sets: the conform's
+            // `TIMESTAMPTZ` rung reaches ICU and takes every name, of
+            // which the mirror keeps the definitionally-UTC ones
+            // ([`UTC_ZONE_NAMES`]); the wall-clock cast a bound literal
+            // gets takes exactly one, `UTC`, and NULLs even `GMT` and
+            // `Etc/UTC` (probed).
             let name = text[*pos + 1..].trim_end_matches(is_c_space);
-            if UTC_ZONE_NAMES
-                .iter()
-                .any(|zone| zone.eq_ignore_ascii_case(name))
-            {
+            let accepted: &[&str] = match zone {
+                ZoneRule::Apply => &UTC_ZONE_NAMES,
+                ZoneRule::Ignore => &["UTC"],
+            };
+            if accepted.iter().any(|zone| zone.eq_ignore_ascii_case(name)) {
                 *pos = bytes.len();
                 return Some(0);
             }
@@ -629,8 +714,17 @@ fn fraction_micros(digits: &[u8]) -> u32 {
 /// branch defensively.
 #[must_use]
 pub fn compare_form(pin: Option<CanonicalType>, op: FilterOp, literal: &str) -> CompareForm {
-    if pin != Some(CanonicalType::Varchar) {
-        return CompareForm::Native(coerce_filter_value(literal));
+    match pin {
+        None => return CompareForm::Native(coerce_filter_value(literal)),
+        // A typed pin binds the same literal and emits the same SQL; only
+        // the live mirror changes, because only it has to conform first.
+        Some(typed) if typed != CanonicalType::Varchar => {
+            return CompareForm::Conformed {
+                pin: typed,
+                literal: coerce_filter_value(literal),
+            };
+        }
+        Some(_) => {}
     }
     match op {
         FilterOp::Eq | FilterOp::Ne if is_numeric_literal(literal) => {
@@ -989,6 +1083,34 @@ pub fn conformed_boolean(text: &str) -> Option<bool> {
     }
 }
 
+/// The BOOLEAN `DuckDB` reads out of a text it CASTS — the wide
+/// vocabulary, which is what a query LITERAL gets when it is compared
+/// against a BOOLEAN column (`flag=TRUE` and `flag=yes` both match a
+/// stored `true`, probed).
+///
+/// Not what a pinned COLUMN holds: there the round-trip guard keeps only
+/// the two spellings `DuckDB` writes back ([`conformed_boolean`]). The
+/// asymmetry is deliberate — a stored `'yes'` is data the corpus must not
+/// silently restate as `true`, while a literal is the user's own token and
+/// `DuckDB` reads it generously.
+///
+/// A closed, case-insensitive vocabulary with NO whitespace trimming
+/// (`' true '` is NULL, unlike the numeric casts) and no numeric texts
+/// beyond `1`/`0` (`'2'`, `'1.0'` and `'on'`/`'off'` are all NULL) — every
+/// member and every rejection probed by execution.
+#[must_use]
+pub fn try_cast_boolean(text: &str) -> Option<bool> {
+    const TRUE_WORDS: [&str; 5] = ["true", "t", "yes", "y", "1"];
+    const FALSE_WORDS: [&str; 5] = ["false", "f", "no", "n", "0"];
+    if TRUE_WORDS.iter().any(|w| text.eq_ignore_ascii_case(w)) {
+        return Some(true);
+    }
+    if FALSE_WORDS.iter().any(|w| text.eq_ignore_ascii_case(w)) {
+        return Some(false);
+    }
+    None
+}
+
 /// Render a DOUBLE in the pattern text `DuckDB`'s `CAST(col AS VARCHAR)`
 /// produces — the live mirror of the DOUBLE pin's pattern target, and the
 /// same renderer `tostring()` uses in streaming eval (one renderer, so
@@ -1233,14 +1355,21 @@ mod tests {
 
     // ── typed pins ────────────────────────────────────────────────────
 
+    /// A typed pin binds the literal exactly as the unpinned path does —
+    /// the emitted SQL stays byte-identical, since the column on disk IS
+    /// the pinned type — and carries the pin so the LIVE matcher can
+    /// conform the wire value before comparing.
     #[test]
-    fn typed_pins_keep_native_comparisons() {
+    fn typed_pins_bind_natively_and_carry_the_pin() {
         for pin in TYPED_PINS {
             for (lit, native) in literal_shapes() {
                 for op in ORDERED.iter().chain(EQ_CLASS.iter()) {
                     assert_eq!(
                         compare_form(Some(pin), *op, lit),
-                        CompareForm::Native(native.clone()),
+                        CompareForm::Conformed {
+                            pin,
+                            literal: native.clone()
+                        },
                         "{pin:?} {op:?} {lit:?}"
                     );
                 }

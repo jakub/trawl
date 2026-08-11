@@ -27,6 +27,7 @@ use serde_json::Value;
 use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken};
 use crate::compare::{self, CompareForm, PatternForm};
 use crate::emitter::{EmitError, SqlValue};
+use crate::schema::CanonicalType;
 use crate::schema::FieldTypes;
 
 /// A compiled filter that can match JSON events in memory.
@@ -151,7 +152,7 @@ enum FieldPredicate {
     Regex { regex: Regex, form: PatternForm },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CompareOp {
     Eq,
     Ne,
@@ -188,6 +189,39 @@ enum CoercedValue {
         text: String,
         number: Option<i128>,
     },
+    /// The TYPED-pin form: the column the SQL compares is the CONFORMED
+    /// one, so this matcher reads the wire value's own conformed value
+    /// first and compares that, in the pin's domain.
+    ///
+    /// Without it every value the round-trip guard nulls out answered
+    /// differently on the two sides — a wire `1.5` under a BIGINT pin is
+    /// NULL in both batch lanes, so `duration>1` is UNKNOWN there and was
+    /// TRUE here.
+    Conformed {
+        pin: CanonicalType,
+        literal: PinLiteral,
+    },
+}
+
+/// A literal read into a TYPED pin's own domain, once per compiled filter.
+///
+/// The emitter binds the literal exactly as the unpinned path does and
+/// leaves the cast to `DuckDB`, which resolves it against the pinned
+/// COLUMN's type — a string literal against a BOOLEAN column takes the
+/// cast's wide vocabulary (`flag=TRUE` matches), and against a TIMESTAMP
+/// column the wall-clock parse (`compare::literal_timestamp`). All probed.
+#[derive(Clone, Copy, Debug)]
+enum PinLiteral {
+    Int(i64),
+    Double(f64),
+    Bool(bool),
+    Time(compare::Instant),
+    /// `DuckDB` cannot compare the two at all — a word against a numeric
+    /// column, a number against a TIMESTAMP one — and raises a conversion
+    /// or binder ERROR, which returns no rows at all. UNKNOWN is the
+    /// closest total answer: it matches nothing, and `NOT` cannot invert
+    /// it into a match the failed query never had.
+    Unreadable,
 }
 
 struct TextMatcher {
@@ -488,6 +522,52 @@ fn coerce_form(form: CompareForm) -> CoercedValue {
         CompareForm::Native(SqlValue::String(s)) | CompareForm::Text(s) => CoercedValue::Str(s),
         // coerce_filter_value never yields Bool; keep the match total.
         CompareForm::Native(SqlValue::Bool(b)) => CoercedValue::Str(b.to_string()),
+        CompareForm::Conformed { pin, literal } => CoercedValue::Conformed {
+            pin,
+            literal: pin_literal(pin, &literal),
+        },
+    }
+}
+
+/// Read a bound literal the way `DuckDB` reads it against a column of the
+/// pinned type — the other half of [`CoercedValue::Conformed`].
+fn pin_literal(pin: CanonicalType, literal: &SqlValue) -> PinLiteral {
+    match (pin, literal) {
+        // Numeric columns take numeric literals directly, and DuckDB
+        // promotes BIGINT to DOUBLE to meet a fractional one (so an id
+        // above 2^53 collapses onto its neighbour — in both engines
+        // alike, which is why the comparison stays here rather than in
+        // the exact DECIMAL space the VARCHAR rungs use).
+        // A BOOLEAN column meeting a number casts ITSELF to the number,
+        // so the three numeric pins take a numeric literal alike.
+        (
+            CanonicalType::BigInt | CanonicalType::Double | CanonicalType::Boolean,
+            SqlValue::Int(i),
+        ) => PinLiteral::Int(*i),
+        (
+            CanonicalType::BigInt | CanonicalType::Double | CanonicalType::Boolean,
+            SqlValue::Float(f),
+        ) => PinLiteral::Double(*f),
+        // A BOOLEAN column casts a string literal through the WIDE
+        // vocabulary: `TRUE`, `yes` and `1` all match a stored `true`,
+        // where the same texts STORED conform to NULL.
+        (CanonicalType::Boolean, SqlValue::String(s)) => {
+            compare::try_cast_boolean(s).map_or(PinLiteral::Unreadable, PinLiteral::Bool)
+        }
+        (CanonicalType::Boolean, SqlValue::Bool(b)) => PinLiteral::Bool(*b),
+        // A TIMESTAMP column casts a string literal WALL-CLOCK, so an
+        // offset spelled in the literal is ignored where the same offset
+        // in a STORED value shifts the instant.
+        (CanonicalType::Timestamp, SqlValue::String(s)) => {
+            compare::literal_timestamp(s).map_or(PinLiteral::Unreadable, PinLiteral::Time)
+        }
+        // Everything else is a comparison DuckDB refuses outright: a word
+        // against a numeric column, a number against a TIMESTAMP one.
+        (CanonicalType::Varchar, _) => {
+            debug_assert!(false, "the VARCHAR pin takes the text rules, not a conform");
+            PinLiteral::Unreadable
+        }
+        _ => PinLiteral::Unreadable,
     }
 }
 
@@ -671,6 +751,15 @@ fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -
             let ev = json_to_string(event_val);
             Some(apply_ord(ev.as_str().cmp(fv.as_str()), op))
         }
+        // The typed-pin rung: the SQL compares the CONFORMED column, so
+        // read the wire value's conformed value and compare THAT. A value
+        // with no reading is the NULL the guard wrote — and the emitted
+        // `!=` carries `OR col IS NULL`, so it answers exactly as an
+        // absent key does.
+        CoercedValue::Conformed { pin, literal } => match conformed_reading(event_val, *pin) {
+            Some(reading) => compare_conformed(reading, op, *literal),
+            None => (op == CompareOp::Ne).then_some(true),
+        },
         // The two-armed equality rung. The wire text is only the stored
         // text when `read_json` did not widen the column, so the numeric
         // reading carries the cases where it did (`200` stored `"200.0"`).
@@ -717,6 +806,128 @@ fn extract_f64(v: &Value) -> Option<f64> {
     }
 }
 
+/// What a TYPED-pinned column HOLDS for one wire value — the reading
+/// [`crate::conform`] stored, which is what a comparison and a pattern
+/// must both see.
+///
+/// `None` is the NULL the guard wrote: the value is in `_raw`, the column
+/// is empty, and every comparison over it is UNKNOWN.
+#[derive(Clone, Copy, Debug)]
+enum Conformed {
+    Int(i64),
+    Double(f64),
+    Bool(bool),
+    Time(compare::Instant),
+}
+
+impl Conformed {
+    /// The conformed value's own text — `CAST(col AS VARCHAR)` on the SQL
+    /// side for the three scalar pins, `strftime` for TIMESTAMP.
+    fn text(self) -> String {
+        match self {
+            Self::Int(i) => i.to_string(),
+            Self::Double(d) => compare::canonical_double_text(d),
+            Self::Bool(b) => b.to_string(),
+            Self::Time(t) => t.pattern_text(),
+        }
+    }
+}
+
+/// Conform one wire value to a pin, exactly as the batch lanes conform the
+/// column it lands in.
+///
+/// Conformance casts the value's TEXT form under a round-trip guard, so
+/// the readings here are text readings too, and each is total on exactly
+/// the shapes that guard admits:
+///
+/// - DOUBLE: a JSON number is its own double (the conform is the bare cast
+///   — the round trip through text is the identity), and a JSON string
+///   goes through `DuckDB`'s cast domain ([`compare::try_cast_double`], so
+///   `"200"` is the same `200.0` the conform wrote);
+/// - BIGINT: a JSON integer is itself, and every other numeric or string
+///   shape goes through the guarded reading
+///   ([`compare::conformed_bigint`], so `"0404"` reads `404` while
+///   `"1.5"` and a fractional JSON number have no reading at all — the
+///   cast would round them, so the conform stores NULL);
+/// - BOOLEAN: a JSON bool is itself (`to_json` renders it as the very text
+///   the guard demands), and a string must BE `true`/`false`
+///   ([`compare::conformed_boolean`], so `"TRUE"` has no reading);
+/// - TIMESTAMP: only a JSON string has a reading at all — an epoch numeral
+///   is not a timestamp to any cast, probed — and it goes through
+///   [`compare::conformed_timestamp`], which APPLIES a zone offset the way
+///   the conform's `TIMESTAMPTZ` rung does (ADR-0011 ruling #1), so
+///   `"…T09:00:00+05:30"` reads `03:30`, the hour the corpus holds.
+///
+/// A JSON bool under a numeric pin, and a number under the BOOLEAN pin,
+/// have no reading either: `'true'` is not a number to any cast, and the
+/// BOOLEAN cast's vocabulary stops at `1`/`0`, so `'200'` is NULL to it.
+/// (Before the conform went text-first, a numeric under a BOOLEAN pin read
+/// TRUE in a JSON-inferred hot column and NULL everywhere else — the
+/// state-dependence ADR-0011 removed.) An array or object — stringified at
+/// ingest, so never a pinned column's live shape — is likewise NULL.
+fn conformed_reading(v: &Value, pin: CanonicalType) -> Option<Conformed> {
+    match pin {
+        CanonicalType::BigInt => match v {
+            // A JSON integer is exact and needs no guard; every other
+            // number is read through the text the conform would see.
+            Value::Number(n) => n.as_i64().or_else(|| {
+                n.as_f64()
+                    .and_then(|f| compare::conformed_bigint(&compare::canonical_double_text(f)))
+            }),
+            Value::String(s) => compare::conformed_bigint(s),
+            _ => None,
+        }
+        .map(Conformed::Int),
+        CanonicalType::Double => match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => compare::try_cast_double(s),
+            _ => None,
+        }
+        .map(Conformed::Double),
+        CanonicalType::Boolean => match v {
+            Value::Bool(b) => Some(*b),
+            Value::String(s) => compare::conformed_boolean(s),
+            _ => None,
+        }
+        .map(Conformed::Bool),
+        CanonicalType::Timestamp => match v {
+            Value::String(s) => compare::conformed_timestamp(s),
+            _ => None,
+        }
+        .map(Conformed::Time),
+        // The VARCHAR pin has no conform — its comparisons take the text
+        // rules and its patterns match the column directly.
+        CanonicalType::Varchar => None,
+    }
+}
+
+/// Compare a conformed reading against the literal in the pin's own
+/// domain — the promotions `DuckDB` performs between the pinned COLUMN's
+/// type and the bound parameter's, each one probed.
+#[allow(clippy::cast_precision_loss)] // mirrors DuckDB's own BIGINT → DOUBLE promotion
+fn compare_conformed(reading: Conformed, op: CompareOp, literal: PinLiteral) -> Truth {
+    match (reading, literal) {
+        (Conformed::Int(value), PinLiteral::Int(lit)) => Some(apply_ord(value.cmp(&lit), op)),
+        (Conformed::Int(value), PinLiteral::Double(lit)) => Some(apply_f64(value as f64, lit, op)),
+        (Conformed::Double(value), PinLiteral::Int(lit)) => Some(apply_f64(value, lit as f64, op)),
+        (Conformed::Double(value), PinLiteral::Double(lit)) => Some(apply_f64(value, lit, op)),
+        (Conformed::Bool(value), PinLiteral::Bool(lit)) => Some(apply_ord(value.cmp(&lit), op)),
+        // A BOOLEAN column meeting a NUMBER casts itself to the number.
+        (Conformed::Bool(value), PinLiteral::Int(lit)) => {
+            Some(apply_ord(i64::from(value).cmp(&lit), op))
+        }
+        (Conformed::Bool(value), PinLiteral::Double(lit)) => {
+            Some(apply_f64(f64::from(u8::from(value)), lit, op))
+        }
+        (Conformed::Time(value), PinLiteral::Time(lit)) => Some(apply_ord(value.cmp(&lit), op)),
+        (_, PinLiteral::Unreadable) => None,
+        (_, _) => {
+            debug_assert!(false, "pin_literal resolves a literal per pin");
+            None
+        }
+    }
+}
+
 /// The text a glob/regex matches for one event value, under the pin's
 /// pattern form — the in-memory mirror of the SQL side's `pattern_target`.
 ///
@@ -758,36 +969,14 @@ fn extract_f64(v: &Value) -> Option<f64> {
 /// state-dependence ADR-0011 removed.) An array or object — stringified at
 /// ingest, so never a pinned column's live shape — is likewise NULL.
 fn pattern_text(v: &Value, form: PatternForm) -> Option<String> {
-    match form {
-        PatternForm::Native => Some(json_to_string(v)),
-        PatternForm::Rfc3339Text => match v {
-            Value::String(s) => compare::canonical_timestamp_text(s),
-            _ => None,
-        },
-        PatternForm::DoubleText => match v {
-            Value::Number(n) => n.as_f64(),
-            Value::String(s) => compare::try_cast_double(s),
-            _ => None,
-        }
-        .map(compare::canonical_double_text),
-        PatternForm::BigIntText => match v {
-            // A JSON integer is exact and needs no guard; every other
-            // number is read through the text the conform would see.
-            Value::Number(n) => n.as_i64().or_else(|| {
-                n.as_f64()
-                    .and_then(|f| compare::conformed_bigint(&compare::canonical_double_text(f)))
-            }),
-            Value::String(s) => compare::conformed_bigint(s),
-            _ => None,
-        }
-        .map(|i| i.to_string()),
-        PatternForm::BooleanText => match v {
-            Value::Bool(b) => Some(*b),
-            Value::String(s) => compare::conformed_boolean(s),
-            _ => None,
-        }
-        .map(|b| b.to_string()),
-    }
+    let pin = match form {
+        PatternForm::Native => return Some(json_to_string(v)),
+        PatternForm::BigIntText => CanonicalType::BigInt,
+        PatternForm::DoubleText => CanonicalType::Double,
+        PatternForm::BooleanText => CanonicalType::Boolean,
+        PatternForm::Rfc3339Text => CanonicalType::Timestamp,
+    };
+    conformed_reading(v, pin).map(Conformed::text)
 }
 
 /// Convert a JSON value to its string representation for comparison.

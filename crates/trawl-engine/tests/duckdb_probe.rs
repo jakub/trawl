@@ -1864,6 +1864,163 @@ fn timestamp_pattern_text_is_rfc3339_micros_on_both_engines() {
     assert_eq!(unknown, None);
 }
 
+/// A bound LITERAL meets a typed column through the COLUMN's cast, and
+/// that cast is not always the conform's — which is why
+/// `compare::literal_timestamp` exists beside `conformed_timestamp`.
+///
+/// Every row here is what the live matcher's `pin_literal` claims
+/// (`crate::filter`), executed: a BOOLEAN column takes the cast's WIDE
+/// vocabulary from a string literal (`flag=TRUE` and `flag=yes` match a
+/// stored `true`, where the same texts STORED conform to NULL) and casts
+/// ITSELF to meet a number; a TIMESTAMP column casts the literal
+/// wall-clock, so an offset spelled in the literal is IGNORED where the
+/// same offset in a stored value is applied; and the pairs `DuckDB`
+/// refuses outright raise a conversion or binder ERROR, which returns no
+/// rows at all.
+#[test]
+fn a_typed_columns_literal_takes_the_columns_own_cast() {
+    let conn = conn();
+    conn.execute_batch(
+        "CREATE TABLE t(b BIGINT, d DOUBLE, f BOOLEAN, ts TIMESTAMP);
+         INSERT INTO t VALUES (404, 200.5, true, TIMESTAMP '2026-01-15 09:00:00');",
+    )
+    .unwrap();
+    let text_param = |sql: &str, param: &str| -> Result<bool, duckdb::Error> {
+        conn.query_row(sql, [param], |row| row.get(0))
+    };
+
+    // BOOLEAN: the wide cast vocabulary, on the LITERAL side only.
+    for (literal, expected) in [("true", true), ("TRUE", true), ("yes", true), ("1", true)] {
+        assert_eq!(
+            text_param("SELECT f = ? FROM t", literal).unwrap(),
+            expected,
+            "BOOLEAN literal {literal:?}"
+        );
+        assert_eq!(
+            trawl_core::compare::try_cast_boolean(literal),
+            Some(expected),
+            "the mirror reads the literal the same way"
+        );
+    }
+    // …and the same texts STORED conform to NULL under the guard, which
+    // is the asymmetry the mirror encodes.
+    for stored in ["TRUE", "yes", "1"] {
+        assert_eq!(trawl_core::compare::conformed_boolean(stored), None);
+    }
+    // BOOLEAN meeting a NUMBER: the column casts itself.
+    assert!(
+        conn.query_row("SELECT f = ? FROM t", [1i64], |row| row.get::<_, bool>(0))
+            .unwrap()
+    );
+    assert!(
+        !conn
+            .query_row("SELECT f = ? FROM t", [0i64], |row| row.get::<_, bool>(0))
+            .unwrap()
+    );
+    assert!(
+        conn.query_row("SELECT f > ? FROM t", [0i64], |row| row.get::<_, bool>(0))
+            .unwrap()
+    );
+    assert!(
+        conn.query_row("SELECT f = ? FROM t", [1.0f64], |row| row.get::<_, bool>(0))
+            .unwrap()
+    );
+
+    // BIGINT meeting a fractional literal: promoted to DOUBLE, so the
+    // mirror's `as f64` promotion is DuckDB's own.
+    assert!(
+        conn.query_row("SELECT b > ? FROM t", [1.5f64], |row| row.get::<_, bool>(0))
+            .unwrap()
+    );
+
+    // TIMESTAMP: the literal is cast WALL-CLOCK — an offset in it is
+    // ignored, where the same offset in a stored value shifts the instant.
+    assert!(
+        text_param("SELECT ts = ? FROM t", "2026-01-15T09:00:00+05:30").unwrap(),
+        "a literal's offset is ignored"
+    );
+    assert!(text_param("SELECT ts = ? FROM t", "2026-01-15T09:00:00Z").unwrap());
+    assert!(text_param("SELECT ts > ? FROM t", "2026-01-15").unwrap());
+
+    // The comparisons DuckDB refuses: no row set to agree with, which the
+    // mirror answers with UNKNOWN.
+    for (sql, param) in [
+        ("SELECT b = ? FROM t", "accepted"),
+        ("SELECT d = ? FROM t", "accepted"),
+        ("SELECT f = ? FROM t", "accepted"),
+        ("SELECT ts = ? FROM t", "accepted"),
+    ] {
+        assert!(
+            text_param(sql, param).is_err(),
+            "{sql} [{param}] must be an error"
+        );
+    }
+    for sql in ["SELECT ts = ? FROM t", "SELECT ts > ? FROM t"] {
+        assert!(
+            conn.query_row(sql, [1i64], |row| row.get::<_, bool>(0))
+                .is_err(),
+            "{sql} with a number must be an error"
+        );
+    }
+}
+
+/// The literal's wall-clock cast reads the SAME syntax the conform does
+/// and differs only in what it does with a zone — run over the whole
+/// timestamp matrix, so a syntax rule cannot drift between the two.
+#[test]
+fn the_literal_timestamp_cast_differs_from_the_conform_only_in_the_zone() {
+    let conn = conn();
+    let fmt = trawl_core::compare::TIMESTAMP_PATTERN_SQL_FORMAT;
+    let residuals = timestamp_mirror_residuals();
+    for input in TIMESTAMP_TEXT_MATRIX {
+        if residuals.contains(input) {
+            continue;
+        }
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT strftime(TRY_CAST(? AS TIMESTAMP), ?)",
+                [*input, fmt],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let live = trawl_core::compare::literal_timestamp(input)
+            .map(trawl_core::compare::Instant::pattern_text);
+        assert_eq!(live, sql, "literal timestamp cast disagrees for {input:?}");
+    }
+    // The one syntax rule that IS different: the wall-clock cast resolves
+    // exactly one zone NAME, where the conform's ICU-backed cast takes
+    // every name `pg_timezone_names()` lists.
+    for name in ["UTC", "utc"] {
+        assert!(
+            trawl_core::compare::literal_timestamp(&format!("2026-01-15 09:00:00 {name}"))
+                .is_some()
+        );
+    }
+    for name in [
+        "GMT",
+        "Etc/UTC",
+        "Zulu",
+        "Universal",
+        "Greenwich",
+        "Asia/Kolkata",
+    ] {
+        let text = format!("2026-01-15 09:00:00 {name}");
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT strftime(TRY_CAST(? AS TIMESTAMP), ?)",
+                [text.as_str(), fmt],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sql, None, "the wall-clock cast must not resolve {name}");
+        assert_eq!(
+            trawl_core::compare::literal_timestamp(&text),
+            None,
+            "{name}"
+        );
+    }
+}
+
 /// The shapes the live mirror deliberately does NOT read, pinned as
 /// EXPECTED divergences so they stay a known cost.
 ///

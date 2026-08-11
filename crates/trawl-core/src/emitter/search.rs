@@ -361,7 +361,11 @@ fn text_or_numeric(field: &str, op: FilterOp, literal: String, state: &mut Emitt
 /// before this is called.
 fn comparable_value(form: CompareForm) -> SqlValue {
     match form {
-        CompareForm::Native(val) => val,
+        // A typed pin binds exactly as the unpinned path does: the column
+        // on disk IS the pinned type, so `DuckDB` compares against it
+        // directly. The pin travels for the LIVE matcher's sake
+        // (`crate::filter`), which has to conform the wire value first.
+        CompareForm::Native(val) | CompareForm::Conformed { literal: val, .. } => val,
         CompareForm::Text(s) => SqlValue::String(s),
         CompareForm::NumericOnText(_) | CompareForm::TextOrNumeric(_) => {
             debug_assert!(
