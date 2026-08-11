@@ -867,6 +867,177 @@ fn try_cast_double_domain_matches_the_live_mirror() {
     }
 }
 
+/// The texts [`decimal_comparison_space_domain_matches_the_live_mirror`]
+/// runs through both engines — hoisted so the matrix can grow without the
+/// test body growing with it.
+const DECIMAL_DOMAIN_INPUTS: &[&str] = &[
+    // Whitespace: trimmed both ends, ASCII only.
+    " 200",
+    "200 ",
+    "\t200\n",
+    "\x0b200\x0c",
+    "  200  ",
+    "\u{a0}200",
+    "2 00",
+    " ",
+    "",
+    // `_` digit separators, only between ASCII digits.
+    "200_000",
+    "1_000.5",
+    "1e1_0",
+    "_200",
+    "200_",
+    "1__0",
+    "1_.5",
+    // Spelling drift that denotes the same number.
+    "200",
+    "200.0",
+    "200.000000",
+    "0404",
+    "+5",
+    "1.",
+    ".5",
+    "-0",
+    "-0.0",
+    "1e3",
+    "1E3",
+    "1e-3",
+    "00200",
+    // Exact where a DOUBLE reading collapses.
+    "1737000000123456788",
+    "1737000000123456789",
+    "1737000000123456790",
+    "9007199254740992",
+    "9007199254740993",
+    "9223372036854775807",
+    "-9223372036854775808",
+    // The scale boundary: rounded half away from zero at 10^-6.
+    "0.0000001",
+    "0.00000049",
+    "0.0000005",
+    "0.0000015",
+    "-0.0000005",
+    "4.0000001",
+    "4.0000005",
+    // The magnitude boundary: below 10^32 reads, at it does not.
+    "1e31",
+    "99999999999999999999999999999999.999999",
+    "-99999999999999999999999999999999.999999",
+    "1e32",
+    "1e40",
+    "1e400",
+    "1e-400",
+    // No reading at all — the DOUBLE domain read the first three.
+    "nan",
+    "NaN",
+    "inf",
+    "-inf",
+    "infinity",
+    "0x10",
+    "0b101",
+    "1,000",
+    "accepted",
+    "1d",
+    "true",
+    // A scan whitespace cut short is FORGIVEN in three states and no
+    // others, and a `.` right after exponent digits terminates the
+    // same way. `'- '` is a realistic missing-value token from a
+    // fixed-width log format, and a mirror that refuses it reports
+    // `status!=0` as a live match on a row the batch query drops.
+    "-",
+    "- ",
+    "-\t",
+    "- x",
+    "+ ",
+    "+\n",
+    "1e",
+    "1e ",
+    "1e\t",
+    "1E ",
+    "1e+ ",
+    "1e- ",
+    "1e+x",
+    "1.e",
+    "1.e ",
+    "1e0.",
+    "1e0. ",
+    "1e0.5",
+    "1e0..",
+    "1e0.0",
+    "1e5.",
+    "1e-5.",
+    "1e-.",
+    "1e-. ",
+    "1.5.",
+    "1..",
+    ".",
+    ". ",
+    "-.",
+    "-. ",
+    "e ",
+    "-e ",
+    "-- ",
+    "-+ ",
+    "1_ ",
+    "1e0 5",
+    // A negative exponent whose shift drops every mantissa digit
+    // rounds on the LEADING significant digit; the same value spelled
+    // without an exponent does not, and neither does a positive one.
+    // The discriminator is the SPELLING, not the value.
+    "5e-7",
+    "5e-8",
+    "5e-9",
+    "5e-30",
+    "4e-8",
+    "6e-8",
+    "1e-8",
+    "45e-9",
+    "54e-9",
+    "50e-9",
+    "500e-10",
+    "1.5e-8",
+    "5.5e-8",
+    "0.5e-8",
+    "0.05e-7",
+    "0.00000005",
+    "0.000000005",
+    "0.00000000000000000005",
+    "0.0000005e-1",
+    "0.00000005e-1",
+    "0.00000005e+1",
+    "0.000000005e+1",
+    "0.00000000005e2",
+    // …and one whose shift lands INSIDE the mantissa, where the
+    // boundary digit decides as everywhere else.
+    "15e-7",
+    "14e-7",
+    "1.5e-6",
+    "1.4e-6",
+    "1000005e-8",
+    "1000005e-9",
+    "1000005e-13",
+    "123456789.987654321e-3",
+    "0.9999995e-1",
+    "9999995e-7",
+    // The exponent CEILING: the type's integer digits raised by the
+    // mantissa's own excessive decimals, refusing magnitudes the type
+    // would otherwise hold.
+    "0.5e32",
+    "0.05e32",
+    "0.01e32",
+    "0.01e33",
+    "0.001e33",
+    "0.001e34",
+    "0.000000005e35",
+    "0.000000005e36",
+    "0.000000005e39",
+    "0.000000005e40",
+    "0e40",
+    "0.1e33",
+    "5e31",
+    "9.9e31",
+];
+
 /// The comparison space's DOMAIN, run on both engines side by side:
 /// [`decimal_reading`] in `DuckDB` against `compare::decimal_micros` in
 /// the live matcher. It is `DuckDB`'s cast domain, not Rust's number
@@ -880,77 +1051,7 @@ fn try_cast_double_domain_matches_the_live_mirror() {
 #[test]
 fn decimal_comparison_space_domain_matches_the_live_mirror() {
     let conn = conn();
-    let inputs = [
-        // Whitespace: trimmed both ends, ASCII only.
-        " 200",
-        "200 ",
-        "\t200\n",
-        "\x0b200\x0c",
-        "  200  ",
-        "\u{a0}200",
-        "2 00",
-        " ",
-        "",
-        // `_` digit separators, only between ASCII digits.
-        "200_000",
-        "1_000.5",
-        "1e1_0",
-        "_200",
-        "200_",
-        "1__0",
-        "1_.5",
-        // Spelling drift that denotes the same number.
-        "200",
-        "200.0",
-        "200.000000",
-        "0404",
-        "+5",
-        "1.",
-        ".5",
-        "-0",
-        "-0.0",
-        "1e3",
-        "1E3",
-        "1e-3",
-        "00200",
-        // Exact where a DOUBLE reading collapses.
-        "1737000000123456788",
-        "1737000000123456789",
-        "1737000000123456790",
-        "9007199254740992",
-        "9007199254740993",
-        "9223372036854775807",
-        "-9223372036854775808",
-        // The scale boundary: rounded half away from zero at 10^-6.
-        "0.0000001",
-        "0.00000049",
-        "0.0000005",
-        "0.0000015",
-        "-0.0000005",
-        "4.0000001",
-        "4.0000005",
-        // The magnitude boundary: below 10^32 reads, at it does not.
-        "1e31",
-        "99999999999999999999999999999999.999999",
-        "-99999999999999999999999999999999.999999",
-        "1e32",
-        "1e40",
-        "1e400",
-        "1e-400",
-        // No reading at all — the DOUBLE domain read the first three.
-        "nan",
-        "NaN",
-        "inf",
-        "-inf",
-        "infinity",
-        "0x10",
-        "0b101",
-        "1,000",
-        "accepted",
-        "1d",
-        "true",
-    ];
-    for input in inputs {
+    for input in DECIMAL_DOMAIN_INPUTS.iter().copied() {
         let sql: Option<String> = conn
             .query_row(
                 &format!("SELECT CAST({} AS VARCHAR)", decimal_reading("?")),
@@ -1158,6 +1259,94 @@ fn cast_text_patterns_match_bigint_text_form() {
     );
 }
 
+/// The wire texts [`bigint_pattern_text_is_the_cast_reading_on_both_engines`]
+/// runs through both engines — hoisted so the matrix can grow without the
+/// test body growing with it.
+const BIGINT_PATTERN_INPUTS: &[&str] = &[
+    // Plain integers, incl. the leading-zero case the wire text and the
+    // stored value spell differently.
+    "404",
+    "0404",
+    "00200",
+    "+5",
+    "-0",
+    "9223372036854775807",
+    "-9223372036854775808",
+    // Whitespace and `_` separators, as for the DOUBLE domain.
+    " 404 ",
+    "\t404\n",
+    "404_000",
+    "1_0",
+    "1_0.5",
+    "1e1_0",
+    // Fractional / exponent texts ROUND, half AWAY FROM ZERO.
+    "1.5",
+    "1.4",
+    "2.5",
+    "3.5",
+    "-1.5",
+    "-2.5",
+    "0.5",
+    "-0.5",
+    ".5",
+    "1.",
+    "0.0",
+    "1e3",
+    "1.9e2",
+    "1e18",
+    "1.5e18",
+    "1.0000000000000001",
+    // Radix prefixes bind on the raw text: no sign, no whitespace.
+    "0x10",
+    "0X10",
+    "0b101",
+    "0B101",
+    "-0x10",
+    " 0x10 ",
+    "0xzz",
+    "0x+10",
+    "0x1.5",
+    "0o17",
+    "010",
+    // No reading at all.
+    "accepted",
+    "",
+    "true",
+    "nan",
+    "inf",
+    "1,000",
+    "4 04",
+    "\u{a0}404",
+    "1e",
+    "e1",
+    "-",
+    // Out of BIGINT range: NULL, never a saturated approximation.
+    "9223372036854775808",
+    "-9223372036854775809",
+    "1e19",
+    "1e400",
+    // Integral values ABOVE 2^53 written as a fraction or an
+    // exponent. The mirror used to read these through `f64` and
+    // answered nothing where both batch lanes hold the integer —
+    // including the value the pin ladder's own text-first test
+    // blesses (`compaction::pin_ladder_beyond_2_pow_53_*`).
+    "1.7356896001234568e+18",
+    "1735689600123456800.0",
+    "9007199254740993.0",
+    "9007199254740993",
+    "9007199254740992.0",
+    "9223372036854775807.0",
+    "9223372036854775808.0",
+    "-9223372036854775808.0",
+    "1735689600123456710.7",
+    // …and the lax terminators, which reach the BIGINT reading
+    // through its DECIMAL guard.
+    "- ",
+    "1e ",
+    "1e0.",
+    "5e-8",
+];
+
 /// The BIGINT pin's pattern text is the CONFORMED integer's rendering, and
 /// the live mirror (`compare::conformed_bigint`) must read the same value
 /// out of the same wire text — stringifying the wire text instead answers
@@ -1171,71 +1360,7 @@ fn cast_text_patterns_match_bigint_text_form() {
 fn bigint_pattern_text_is_the_cast_reading_on_both_engines() {
     let conn = conn();
     let guard = compaction_conform("v", "VARCHAR", CanonicalType::BigInt);
-    let inputs = [
-        // Plain integers, incl. the leading-zero case the wire text and the
-        // stored value spell differently.
-        "404",
-        "0404",
-        "00200",
-        "+5",
-        "-0",
-        "9223372036854775807",
-        "-9223372036854775808",
-        // Whitespace and `_` separators, as for the DOUBLE domain.
-        " 404 ",
-        "\t404\n",
-        "404_000",
-        "1_0",
-        "1_0.5",
-        "1e1_0",
-        // Fractional / exponent texts ROUND, half AWAY FROM ZERO.
-        "1.5",
-        "1.4",
-        "2.5",
-        "3.5",
-        "-1.5",
-        "-2.5",
-        "0.5",
-        "-0.5",
-        ".5",
-        "1.",
-        "0.0",
-        "1e3",
-        "1.9e2",
-        "1e18",
-        "1.5e18",
-        "1.0000000000000001",
-        // Radix prefixes bind on the raw text: no sign, no whitespace.
-        "0x10",
-        "0X10",
-        "0b101",
-        "0B101",
-        "-0x10",
-        " 0x10 ",
-        "0xzz",
-        "0x+10",
-        "0x1.5",
-        "0o17",
-        "010",
-        // No reading at all.
-        "accepted",
-        "",
-        "true",
-        "nan",
-        "inf",
-        "1,000",
-        "4 04",
-        "\u{a0}404",
-        "1e",
-        "e1",
-        "-",
-        // Out of BIGINT range: NULL, never a saturated approximation.
-        "9223372036854775808",
-        "-9223372036854775809",
-        "1e19",
-        "1e400",
-    ];
-    for input in inputs {
+    for input in BIGINT_PATTERN_INPUTS.iter().copied() {
         let sql: Option<String> = conn
             .query_row(
                 &format!("SELECT CAST({guard} AS VARCHAR) FROM (SELECT ? AS v) t"),

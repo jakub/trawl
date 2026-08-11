@@ -103,10 +103,13 @@
 //! The domain is `DuckDB`'s cast domain, not Rust's number parser:
 //! [`decimal_micros`] is its live mirror — ASCII whitespace trimmed, `_`
 //! separators between digits, `"0404"`, `"1e3"` and `".5"` read, radix
-//! prefixes refused — executed side by side in
-//! `trawl-engine/tests/duckdb_probe.rs`. [`try_cast_double`] survives only
-//! for the DOUBLE pin's PATTERN text, which renders what the column stores
-//! instead of comparing anything.
+//! prefixes refused, and the cast's own laxness reproduced down to
+//! `'- '` reading zero — executed side by side in
+//! `trawl-engine/tests/duckdb_probe.rs`. Nothing COMPARES through
+//! [`try_cast_double`] any more: it renders what a DOUBLE-pinned column
+//! stores, for the pin's PATTERN text ([`PatternForm::DoubleText`]) and
+//! for `tonumber()` in streaming eval, which reads the same cast domain
+//! (`crate::eval`).
 
 use crate::ast::FilterOp;
 use crate::emitter::SqlValue;
@@ -644,8 +647,16 @@ pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
 /// mirror of [`crate::conform::guarded_cast`]'s BIGINT rung, which is
 /// `TRY_CAST` under a `DECIMAL(38,6)` round-trip guard.
 ///
-/// The guard is the whole point: the cast alone ROUNDS (`'1.5'` → 2), so
-/// the conformed reading exists only where the cast PRESERVED the value.
+/// Derived from [`decimal_micros`] alone, because the guard leaves nothing
+/// else to decide: it keeps the cast only where
+/// `dec(text) = dec(TRY_CAST(text AS BIGINT))`, `dec` of a BIGINT is
+/// exact, and so the guard passes exactly when the text's own DECIMAL
+/// reading is a whole number of microsteps naming an integer `BIGINT` can
+/// hold. Mirroring the CAST separately — the `f64` rung this replaces —
+/// could only disagree with `DuckDB`'s exact decimal rounding above 2^53,
+/// which it did: `'1.7356896001234568e+18'` and `'9007199254740993.0'`
+/// conform in both batch lanes and read as nothing here.
+///
 /// Spelling drift is fine — `'0404'`, `'4.0'`, `'1e3'`, `' 200'`,
 /// `'200_000'` all conform to the integer they denote — while a value the
 /// cast would alter (`'1.5'`, `'2.5'`) conforms to NULL and is findable in
@@ -657,21 +668,27 @@ pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
 /// never render back as `0x10` — not a mirror artefact; the SQL writes
 /// NULL for it too.
 ///
-/// Residual: the cast's fractional rung reads through `f64`, so a
-/// fractional text within a half-ULP of ±2^63 is refused where `DuckDB`'s
-/// exact decimal rounding keeps it — invisible through the guard, which
-/// rejects every fractional text anyway. Integer texts are exact across
-/// the whole BIGINT range.
+/// Residual tolerance, shared with the SQL guard rather than added here: a
+/// fraction below `DECIMAL(38,6)`'s half-microstep (`'4.0000001'`)
+/// quantizes to the integer and conforms; `'4.0000005'` rounds away and is
+/// refused.
 #[must_use]
 pub fn conformed_bigint(text: &str) -> Option<i64> {
-    let value = try_cast_bigint(text)?;
-    // `dec(text) = dec(cast)`: NULL on either side is UNKNOWN, which the
-    // CASE answers with NULL — so a text outside DECIMAL's domain has no
-    // conformed reading even when the cast produced one.
-    decimal_micros(text)
-        .filter(|micros| *micros == i128::from(value) * 1_000_000)
-        .map(|_| value)
+    let micros = decimal_micros(text)?;
+    (micros % MICROS_PER_UNIT == 0)
+        .then_some(micros / MICROS_PER_UNIT)
+        .and_then(|units| i64::try_from(units).ok())
 }
+
+/// The scale of [`crate::conform::DECIMAL_COMPARISON_SPACE`]: readings are
+/// carried as whole microsteps.
+const MICROS_PER_UNIT: i128 = 1_000_000;
+
+/// `DECIMAL(38,6)`'s width — the total number of digits it holds.
+const DECIMAL_DIGITS: usize = 38;
+
+/// `DECIMAL(38,6)`'s scale, as a shift.
+const DECIMAL_SCALE: i64 = 6;
 
 /// The `DECIMAL(38,6)` reading `DuckDB` takes from a text, scaled by 10^6
 /// — the live mirror of [`crate::conform::decimal_reading`], and so of
@@ -680,8 +697,8 @@ pub fn conformed_bigint(text: &str) -> Option<i64> {
 /// comparison rungs ([`CompareForm::TextOrNumeric`],
 /// [`CompareForm::NumericOnText`]).
 ///
-/// Exact by construction (i128 over the digit string, never `f64`): that
-/// is the point of the DECIMAL space, which stays exact across the whole
+/// Exact by construction (digit strings and `i128`, never `f64`): that is
+/// the point of the DECIMAL space, which stays exact across the whole
 /// BIGINT range and out to 10^32, where a DOUBLE comparison goes blind
 /// above 2^53.
 ///
@@ -696,144 +713,237 @@ pub fn conformed_bigint(text: &str) -> Option<i64> {
 /// ROUNDED, half away from zero (`'4.0000005'` → `4.000001`,
 /// `'4.0000001'` → `4.000000` — the documented tolerance that lets a
 /// sub-microstep fraction conform as its integer), and a magnitude at or
-/// above 10^32 overflows the type and reads NULL. All probed by execution.
+/// above 10^32 overflows the type and reads NULL.
+///
+/// Three of the cast's own quirks are REPRODUCED rather than corrected,
+/// because the SQL side has them and a tidier mirror is a divergence — all
+/// three established by execution in `trawl-engine/tests/duckdb_probe.rs`:
+///
+/// 1. **a scan cut short by whitespace is forgiven** in states an
+///    end-of-text refuses ([`terminated_scan`]): `'- '` reads 0 and
+///    `'1e '` reads 1 where `'-'` and `'1e'` are NULL;
+/// 2. **a negative exponent rounds on the leading SIGNIFICANT digit** when
+///    its shift drops every digit the mantissa has ([`drop_digits`]), so
+///    `'5e-8'` is one microstep while the same value spelled
+///    `'0.00000005'` is zero;
+/// 3. **the literal exponent is bounded** by the type's integer digits
+///    plus the mantissa's own excessive decimals, so `'0.01e33'` is NULL
+///    even though the 10^31 it denotes fits comfortably.
 #[must_use]
 pub fn decimal_micros(text: &str) -> Option<i128> {
-    /// `DECIMAL(38,6)` holds magnitudes strictly below this, scaled.
-    const LIMIT: i128 = 10i128.pow(38);
+    let parsed = NumericText::parse(text)?;
+    if parsed.digits.is_empty() {
+        return Some(0);
+    }
+    // The mantissa's decimals beyond the scale are `excessive_decimals` to
+    // the cast, and it raises its exponent ceiling by exactly that many.
+    let excess = (parsed.frac_len - DECIMAL_SCALE).max(0);
+    let ceiling = i64::try_from(DECIMAL_DIGITS).ok()? - DECIMAL_SCALE + excess;
+    if parsed.exponent > ceiling {
+        return None;
+    }
 
-    let trimmed = text.trim_matches(is_c_space);
-    let normalized = if trimmed.contains('_') {
-        std::borrow::Cow::Owned(strip_digit_separators(trimmed)?)
+    let scaled = if parsed.exponent >= 0 {
+        // One shift: the exponent and the scale are applied together, and
+        // a mantissa carrying more decimals than the scale rounds on the
+        // first dropped digit.
+        let shift = parsed.exponent - parsed.frac_len + DECIMAL_SCALE;
+        shift_digits(&parsed.digits, shift, Rounding::Standard)?
     } else {
-        std::borrow::Cow::Borrowed(trimmed)
+        // Two shifts, because the cast takes them in two passes and they
+        // round differently: the mantissa reaches the scale first, then
+        // the negative exponent divides what is left.
+        let mantissa = shift_digits(
+            &parsed.digits,
+            DECIMAL_SCALE - parsed.frac_len,
+            Rounding::Standard,
+        )?;
+        shift_digits(&mantissa, parsed.exponent, Rounding::LeadingDigit)?
     };
-    let (negative, unsigned) = match normalized.as_bytes().first() {
-        Some(b'+') => (false, &normalized[1..]),
-        Some(b'-') => (true, &normalized[1..]),
-        _ => (false, &normalized[..]),
-    };
-    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
-        // Exponents beyond i32 are not typos to reject: they are simply
-        // far outside the type, so they saturate the same way the
-        // magnitude checks below already handle.
-        Some(idx) => (
-            &unsigned[..idx],
-            unsigned[idx + 1..]
-                .parse::<i32>()
-                .ok()
-                .filter(|_| !unsigned[idx + 1..].is_empty())?,
-        ),
-        None => (unsigned, 0),
-    };
-    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if int_part.is_empty() && frac_part.is_empty() {
+    if scaled.len() > DECIMAL_DIGITS {
         return None;
     }
-    if !int_part
-        .bytes()
-        .chain(frac_part.bytes())
-        .all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
+    let magnitude: i128 = scaled.parse().ok()?;
+    Some(if parsed.negative {
+        -magnitude
+    } else {
+        magnitude
+    })
+}
 
-    // value = digits * 10^shift, so the scaled-by-10^6 target is
-    // digits * 10^(shift + 6).
-    let digits = format!("{int_part}{frac_part}");
-    let digits = digits.trim_start_matches('0');
-    let shift = i64::from(exponent) - i64::try_from(frac_part.len()).ok()? + 6;
-    let magnitude = if digits.is_empty() {
-        0
-    } else if shift >= 0 {
-        let width = i64::try_from(digits.len()).ok()? + shift;
-        if width > 38 {
+/// One numeric text, split the way `DuckDB`'s cast scans it.
+struct NumericText {
+    negative: bool,
+    /// Every mantissa digit with leading zeros stripped; empty is zero.
+    digits: String,
+    /// How many of those digits sit after the decimal point.
+    frac_len: i64,
+    exponent: i64,
+}
+
+impl NumericText {
+    fn parse(text: &str) -> Option<Self> {
+        let trimmed = text.trim_matches(is_c_space);
+        let completed = terminated_scan(text, trimmed);
+        let normalized = if completed.contains('_') {
+            std::borrow::Cow::Owned(strip_digit_separators(&completed)?)
+        } else {
+            completed
+        };
+        let (negative, unsigned) = match normalized.as_bytes().first() {
+            Some(b'+') => (false, &normalized[1..]),
+            Some(b'-') => (true, &normalized[1..]),
+            _ => (false, &normalized[..]),
+        };
+        let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+            // Exponents beyond i32 are not typos to reject: they are
+            // simply far outside the type, so they saturate the same way
+            // the magnitude checks already handle.
+            Some(idx) => (
+                &unsigned[..idx],
+                i64::from(
+                    unsigned[idx + 1..]
+                        .parse::<i32>()
+                        .ok()
+                        .filter(|_| !unsigned[idx + 1..].is_empty())?,
+                ),
+            ),
+            None => (unsigned, 0),
+        };
+        let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if int_part.is_empty() && frac_part.is_empty() {
             return None;
         }
-        digits.parse::<i128>().ok()? * 10i128.pow(u32::try_from(shift).ok()?)
-    } else {
-        let dropped = usize::try_from(-shift).ok()?;
-        // A digit at or above 5 in the first dropped place rounds the
-        // magnitude up — half away from zero, matching DuckDB.
-        let round_up = |first_dropped: u8| i128::from(first_dropped >= b'5');
-        match digits.len().checked_sub(dropped) {
-            Some(0) | None => {
-                // Every digit is below the microstep: the reading is 0
-                // unless the very first one rounds it up to one step.
-                if digits.len() == dropped {
-                    round_up(digits.as_bytes()[0])
-                } else {
-                    0
-                }
-            }
-            Some(kept_len) => {
-                if kept_len > 38 {
-                    return None;
-                }
-                digits[..kept_len].parse::<i128>().ok()? + round_up(digits.as_bytes()[kept_len])
-            }
+        if !int_part
+            .bytes()
+            .chain(frac_part.bytes())
+            .all(|b| b.is_ascii_digit())
+        {
+            return None;
         }
-    };
-    if magnitude >= LIMIT {
-        return None;
+        let all = format!("{int_part}{frac_part}");
+        Some(Self {
+            negative,
+            digits: all.trim_start_matches('0').to_owned(),
+            frac_len: i64::try_from(frac_part.len()).ok()?,
+            exponent,
+        })
     }
-    Some(if negative { -magnitude } else { magnitude })
 }
 
-/// The BIGINT `DuckDB` reads out of a stored text under
-/// `TRY_CAST(col AS BIGINT)` — the unguarded cast, and deliberately NOT
-/// `str::parse::<i64>`. [`conformed_bigint`] is what a pinned column
-/// actually stores; this is the ingredient its guard filters.
+/// Complete a text whose numeric scan `DuckDB` cut short but still
+/// finalized — the cast is lax where an end-of-text is strict, and the
+/// mirror has to be lax in exactly the same places or a stored value the
+/// batch query reads as a number is UNKNOWN to the live tail (which `!=`
+/// then reports as a match).
 ///
-/// `DuckDB`'s VARCHAR → BIGINT domain is wider than an integer parse in
-/// four ways (all executed in `trawl-engine/tests/duckdb_probe.rs`):
-///
-/// - leading/trailing ASCII whitespace is trimmed and `_` separators are
-///   accepted between digits, exactly as for DOUBLE ([`try_cast_double`]);
-/// - `0x`/`0b` prefixes are read as hex/binary — but ONLY as an exact
-///   prefix, so no sign and no surrounding whitespace (`' 0x10 '` and
-///   `'-0x10'` are both NULL to `DuckDB`);
-/// - fractional and exponent forms ROUND rather than fail, half AWAY FROM
-///   ZERO (`'1.5'` → 2, `'2.5'` → 3, `'-2.5'` → -3);
-/// - the result must fit BIGINT: an integer-syntax literal too large is
-///   NULL, never a saturated approximation.
-fn try_cast_bigint(text: &str) -> Option<i64> {
-    // Radix prefixes bind on the RAW text: DuckDB reads '0x10' but not
-    // ' 0x10 ', so trimming has to come after this.
-    for (prefix, radix) in [("0x", 16u32), ("0X", 16), ("0b", 2), ("0B", 2)] {
-        if let Some(digits) = text.strip_prefix(prefix) {
-            // `from_str_radix` would take a sign here; `DuckDB` does not.
-            if digits.starts_with(['+', '-']) {
-                return None;
-            }
-            return i64::from_str_radix(digits, radix).ok();
-        }
+/// Two terminators do it, both probed: ASCII whitespace anywhere in the
+/// scan (the rest must be whitespace too, which trimming already
+/// encodes), and a `.` immediately after exponent DIGITS. What the cast
+/// forgives at that point is a missing sign body (`'- '` → 0), a missing
+/// exponent body (`'1e '`, `'1e+ '` → the mantissa) and the dangling `.`
+/// itself (`'1e0.'` → the mantissa). It forgives nothing else: `'-'`,
+/// `'1e'`, `'. '`, `'1.5.'` and `'1e0.5'` are all NULL.
+fn terminated_scan<'a>(text: &str, trimmed: &'a str) -> std::borrow::Cow<'a, str> {
+    // `1e0.` — a `.` right after exponent digits ends the scan, with or
+    // without trailing whitespace behind it.
+    if let Some(head) = trimmed.strip_suffix('.')
+        && let Some(marker) = head.rfind(['e', 'E'])
+        && head[marker + 1..]
+            .strip_prefix(['+', '-'])
+            .is_none_or(|body| !body.is_empty())
+        && head[marker + 1..]
+            .trim_start_matches(['+', '-'])
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+        && !head[marker + 1..].is_empty()
+    {
+        return std::borrow::Cow::Owned(head.to_owned());
     }
-    let trimmed = text.trim_matches(is_c_space);
-    let normalized = if trimmed.contains('_') {
-        std::borrow::Cow::Owned(strip_digit_separators(trimmed)?)
-    } else {
-        std::borrow::Cow::Borrowed(trimmed)
-    };
-    if let Ok(i) = normalized.parse::<i64>() {
-        return Some(i);
+    if trimmed.len() == text.trim_start_matches(is_c_space).len() {
+        // Nothing was trimmed off the end, so no whitespace terminated the
+        // scan and the strict reading stands.
+        return std::borrow::Cow::Borrowed(trimmed);
     }
-    // Integer syntax `i64` cannot hold is out of BIGINT range, and the f64
-    // rung below would answer with a saturated approximation instead of
-    // the NULL `DuckDB` writes.
-    if !normalized.contains(['.', 'e', 'E']) {
-        return None;
+    if trimmed == "-" || trimmed == "+" {
+        return std::borrow::Cow::Borrowed("0");
     }
-    bigint_in_range(normalized.parse::<f64>().ok()?.round())
+    if trimmed
+        .strip_suffix(['+', '-'])
+        .unwrap_or(trimmed)
+        .ends_with(['e', 'E'])
+    {
+        return std::borrow::Cow::Owned(format!("{trimmed}0"));
+    }
+    std::borrow::Cow::Borrowed(trimmed)
 }
 
-/// A rounded double narrowed to BIGINT, or `None` outside its range.
-/// ±2^63 is exactly representable, so the bounds are exact.
-#[allow(clippy::cast_possible_truncation)] // guarded by the range check
-fn bigint_in_range(rounded: f64) -> Option<i64> {
-    (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0)
-        .contains(&rounded)
-        .then_some(rounded as i64)
+/// Which digit decides a shift that drops more digits than the mantissa
+/// has — the one place the cast's two passes disagree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rounding {
+    /// The digit at the boundary, which past the end of the digit run is a
+    /// leading ZERO: nothing rounds up. The mantissa pass, so
+    /// `'0.00000005'` reads zero.
+    Standard,
+    /// The leading SIGNIFICANT digit, wherever the boundary fell. The
+    /// negative-exponent pass, so `'5e-8'` reads one microstep — the same
+    /// value, the other spelling, a different answer.
+    LeadingDigit,
+}
+
+/// `digits` (leading-zero-free, empty for zero) multiplied by `10^shift`,
+/// rounded half away from zero when `shift` drops digits.
+///
+/// Returns the result as a digit string so a mantissa far wider than
+/// `i128` can still be shifted back into range; `None` only when padding
+/// would exceed the type outright.
+fn shift_digits(digits: &str, shift: i64, rounding: Rounding) -> Option<String> {
+    if digits.is_empty() {
+        return Some("0".to_owned());
+    }
+    if shift >= 0 {
+        let pad = usize::try_from(shift).ok()?;
+        if digits.len().checked_add(pad)? > DECIMAL_DIGITS {
+            return None;
+        }
+        return Some(format!("{digits}{}", "0".repeat(pad)));
+    }
+    let dropped = usize::try_from(-shift).unwrap_or(usize::MAX);
+    let kept_len = digits.len().saturating_sub(dropped);
+    let boundary = if kept_len > 0 || digits.len() == dropped {
+        digits.as_bytes().get(kept_len).copied()
+    } else if rounding == Rounding::LeadingDigit {
+        digits.as_bytes().first().copied()
+    } else {
+        None
+    };
+    let kept = &digits[..kept_len];
+    Some(if boundary.is_some_and(|digit| digit >= b'5') {
+        increment_digits(kept)
+    } else if kept.is_empty() {
+        "0".to_owned()
+    } else {
+        kept.to_owned()
+    })
+}
+
+/// The decimal string one greater than `digits`, carrying into a new
+/// leading digit when every kept digit was a 9 (`""` is zero, so `"1"`).
+fn increment_digits(digits: &str) -> String {
+    let mut out = digits.as_bytes().to_vec();
+    for byte in out.iter_mut().rev() {
+        if *byte == b'9' {
+            *byte = b'0';
+        } else {
+            *byte += 1;
+            return String::from_utf8(out).unwrap_or_else(|_| unreachable!());
+        }
+    }
+    let mut carried = String::with_capacity(out.len() + 1);
+    carried.push('1');
+    carried.extend(out.iter().map(|_| '0'));
+    carried
 }
 
 /// The BOOLEAN a BOOLEAN-pinned column CONFORMS a stored text to — the
@@ -872,10 +982,12 @@ pub fn canonical_double_text(x: f64) -> String {
 /// `TRY_CAST(col AS DOUBLE)` — the live mirror of the DOUBLE pin's own
 /// cast, and deliberately NOT `str::parse::<f64>`.
 ///
-/// Its remaining caller is the DOUBLE pin's PATTERN text
-/// ([`PatternForm::DoubleText`]): what the conformed column holds, to be
-/// rendered and globbed. Nothing COMPARES through it any more — that is
-/// [`decimal_micros`]' job (ADR-0011 ruling #6).
+/// Two callers, one cast domain: the DOUBLE pin's PATTERN text
+/// ([`PatternForm::DoubleText`]) — what the conformed column holds, to be
+/// rendered and globbed — and `crate::eval`'s `tonumber()` scalar, whose
+/// SQL counterpart is the same `TRY_CAST(… AS DOUBLE)`. Nothing COMPARES
+/// through it any more: that is [`decimal_micros`]' job (ADR-0011 ruling
+/// #6).
 ///
 /// `DuckDB`'s cast domain is strictly wider than Rust's float parser in
 /// two ways (both executed in `trawl-engine/tests/duckdb_probe.rs`), and
@@ -1498,56 +1610,46 @@ mod tests {
         }
     }
 
-    /// Every expectation here is the value `DuckDB`'s
-    /// `TRY_CAST(v AS BIGINT)` returns for the same text — the UNGUARDED
-    /// cast, which [`conformed_bigint`] then filters (executed side by
-    /// side in `trawl-engine/tests/duckdb_probe.rs`).
+    /// The BIGINT reading is DERIVED from the comparison space, so the
+    /// guard's algebra is the test: a text conforms exactly when its
+    /// DECIMAL reading is a whole number of microsteps that `BIGINT` can
+    /// hold. Every pairing is executed against the guard SQL in
+    /// `trawl-engine/tests/duckdb_probe.rs`.
     #[test]
-    fn try_cast_bigint_mirrors_duckdb_cast_domain() {
-        // Plain integers, including the leading-zero text whose stored
-        // value is spelled differently — the reported divergence.
-        assert_eq!(try_cast_bigint("404"), Some(404));
-        assert_eq!(try_cast_bigint("0404"), Some(404));
-        assert_eq!(try_cast_bigint("00200"), Some(200));
-        assert_eq!(try_cast_bigint("+5"), Some(5));
-        assert_eq!(try_cast_bigint("-0"), Some(0));
-        assert_eq!(try_cast_bigint("9223372036854775807"), Some(i64::MAX));
-        assert_eq!(try_cast_bigint("-9223372036854775808"), Some(i64::MIN));
-        // Whitespace and `_` separators, as for the DOUBLE domain.
-        assert_eq!(try_cast_bigint(" 404 "), Some(404));
-        assert_eq!(try_cast_bigint("\t404\n"), Some(404));
-        assert_eq!(try_cast_bigint("404_000"), Some(404_000));
-        assert_eq!(try_cast_bigint("1e1_0"), Some(10_000_000_000));
-        // Fractional / exponent texts ROUND, half AWAY FROM ZERO.
-        assert_eq!(try_cast_bigint("1.5"), Some(2));
-        assert_eq!(try_cast_bigint("1.4"), Some(1));
-        assert_eq!(try_cast_bigint("2.5"), Some(3));
-        assert_eq!(try_cast_bigint("-2.5"), Some(-3));
-        assert_eq!(try_cast_bigint(".5"), Some(1));
-        assert_eq!(try_cast_bigint("1e3"), Some(1000));
-        assert_eq!(try_cast_bigint("1_0.5"), Some(11));
-        // Radix prefixes bind on the RAW text: no sign, no whitespace.
-        assert_eq!(try_cast_bigint("0x10"), Some(16));
-        assert_eq!(try_cast_bigint("0B101"), Some(5));
-        for text in ["-0x10", " 0x10 ", "0x+10", "0xzz", "0x1.5", "0o17"] {
-            assert_eq!(try_cast_bigint(text), None, "{text:?}");
-        }
-        // No reading, and out of range — NULL, never a saturated value.
+    fn conformed_bigint_is_the_whole_microsteps_of_the_decimal_reading() {
         for text in [
+            "404",
+            "0404",
+            "4.0",
+            "1e3",
+            " 200",
+            "200_000",
+            "1.7356896001234568e+18",
+            "9007199254740993.0",
+            "9223372036854775807",
+            "1.5",
+            "0x10",
             "accepted",
-            "",
-            "true",
-            "nan",
-            "inf",
-            "1,000",
-            "4 04",
-            "9223372036854775808",
-            "-9223372036854775809",
             "1e19",
-            "1e400",
+            "5e-8",
         ] {
-            assert_eq!(try_cast_bigint(text), None, "{text:?}");
+            let expected = decimal_micros(text).and_then(|micros| {
+                (micros % 1_000_000 == 0)
+                    .then_some(micros / 1_000_000)
+                    .and_then(|units| i64::try_from(units).ok())
+            });
+            assert_eq!(conformed_bigint(text), expected, "{text:?}");
         }
+        // The `f64` cast rung this replaces went blind above 2^53: both
+        // batch lanes hold these integers where the mirror read nothing.
+        assert_eq!(
+            conformed_bigint("1.7356896001234568e+18"),
+            Some(1_735_689_600_123_456_800)
+        );
+        assert_eq!(
+            conformed_bigint("9007199254740993.0"),
+            Some(9_007_199_254_740_993)
+        );
     }
 
     /// The conformed BIGINT reading keeps every SPELLING drift and refuses
@@ -1577,6 +1679,11 @@ mod tests {
             // integer, the documented residual tolerance.
             ("4.0000001", 4),
             ("4.0000004999", 4),
+            // Above 2^53, where the deleted `f64` cast rung read nothing
+            // and both batch lanes hold the integer.
+            ("1.7356896001234568e+18", 1_735_689_600_123_456_800),
+            ("1735689600123456800.0", 1_735_689_600_123_456_800),
+            ("9007199254740993.0", 9_007_199_254_740_993),
         ] {
             assert_eq!(conformed_bigint(text), Some(value), "{text:?}");
         }
@@ -1657,6 +1764,53 @@ mod tests {
             ("1.5.6", None),
             ("1e32", None),
             ("\u{a0}200", None),
+            // The cast forgives a scan that whitespace cut short, in the
+            // three states it can end in and nowhere else.
+            ("- ", Some(0)),
+            ("+\n", Some(0)),
+            ("1e ", Some(1_000_000)),
+            ("1e+ ", Some(1_000_000)),
+            ("1e- ", Some(1_000_000)),
+            ("1.e ", Some(1_000_000)),
+            ("1e0.", Some(1_000_000)),
+            ("1e0. ", Some(1_000_000)),
+            ("1e5.", Some(100_000_000_000)),
+            ("-", None),
+            ("1e0.5", None),
+            ("1e0..", None),
+            ("1.5.", None),
+            (". ", None),
+            ("-. ", None),
+            ("1e-. ", None),
+            ("- x", None),
+            // A negative exponent that drops every mantissa digit rounds
+            // on the LEADING one; the same values without an exponent do
+            // not, and neither does a positive exponent.
+            ("5e-8", Some(1)),
+            ("5e-30", Some(1)),
+            ("0.5e-8", Some(1)),
+            ("54e-9", Some(1)),
+            ("45e-9", Some(0)),
+            ("1.5e-8", Some(0)),
+            ("5.5e-8", Some(1)),
+            ("0.00000005", Some(0)),
+            ("0.000000005", Some(0)),
+            ("0.00000005e-1", Some(0)),
+            ("0.000000005e+1", Some(0)),
+            ("0.00000005e+1", Some(1)),
+            // A negative exponent whose shift lands INSIDE the mantissa
+            // rounds on the boundary digit, as everywhere else.
+            ("15e-7", Some(2)),
+            ("14e-7", Some(1)),
+            ("1000005e-8", Some(10_000)),
+            ("1000005e-13", Some(0)),
+            // The exponent ceiling: the type's integer digits, raised by
+            // the mantissa's own excessive decimals. Both of these name a
+            // magnitude the type holds.
+            ("0.01e33", None),
+            ("0.000000005e40", None),
+            ("0.5e32", Some(5 * 10i128.pow(37))),
+            ("0.000000005e35", Some(5 * 10i128.pow(32))),
         ] {
             assert_eq!(decimal_micros(text), micros, "{text:?}");
         }
