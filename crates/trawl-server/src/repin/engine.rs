@@ -237,10 +237,23 @@ impl RepinEngine {
         // layout whose cutover can only exit the process would be a lie.
         // Post-claim, so the refusal is a terminal job row the status
         // surface reports rather than a stranded running slot.
-        if let Err(msg) = crate::repin::marker::check_staging_filesystem(&self.data_dir) {
-            self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
-                .await;
-            return Err(ServerError::BadRequest(msg));
+        let data_dir = self.data_dir.clone();
+        match on_blocking_pool("staging pre-flight", move || {
+            crate::repin::marker::check_staging_filesystem(&data_dir)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => {
+                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                    .await;
+                return Err(ServerError::BadRequest(msg));
+            }
+            Err(msg) => {
+                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                    .await;
+                return Err(ServerError::Internal(msg));
+            }
         }
 
         let (counts, tallies) = match self.run_scan(&field, to).await {
@@ -427,7 +440,16 @@ impl RepinEngine {
         // `sweep_pre_swap_staging`). Removing the marker over a failed
         // sweep strands whichever root survived, which suppresses
         // retention forever. Keep it and let the replay retry.
-        if sweep_pre_swap_staging(&self.data_dir) {
+        let data_dir = self.data_dir.clone();
+        let swept = on_blocking_pool("abandon sweep", move || sweep_pre_swap_staging(&data_dir))
+            .await
+            .unwrap_or_else(|msg| {
+                // A panicked sweep is a sweep that did not finish: keep the
+                // marker, exactly as a failed one does.
+                tracing::warn!(event_type = "repin_sweep_failed", error = %msg, "abandon sweep task failed");
+                false
+            });
+        if swept {
             if let Err(e) = remove_marker(&self.data_dir) {
                 tracing::warn!(event_type = "repin_marker_error", error = %e, "marker removal failed");
             }
@@ -465,7 +487,11 @@ impl RepinEngine {
         // disk-only problem here: building into it would publish that
         // job's files — and rows retention has since deleted — into the
         // live corpus at the swap. Refuse rather than layer.
-        let shadow = prepare_shadow_root(&self.data_dir).map_err(JobAbort::Failed)?;
+        let data_dir = self.data_dir.clone();
+        let shadow = on_blocking_pool("shadow prepare", move || prepare_shadow_root(&data_dir))
+            .await
+            .map_err(JobAbort::Failed)?
+            .map_err(JobAbort::Failed)?;
 
         // The one-entry-flipped pin map every rewrite conforms against.
         let mut flipped = self.cache.snapshot();
@@ -632,7 +658,14 @@ impl RepinEngine {
         // as a failure of the JOB: the corpus is the new generation and
         // the pin is flipped, so an undeletable marker is leftover disk,
         // not a repin that "left the corpus untouched".
-        finish_post_swap_staging(&self.data_dir);
+        let data_dir = self.data_dir.clone();
+        if let Err(msg) = on_blocking_pool("post-swap sweep", move || {
+            finish_post_swap_staging(&data_dir);
+        })
+        .await
+        {
+            tracing::warn!(event_type = "repin_sweep_failed", error = %msg, "post-swap sweep task failed");
+        }
         Ok(())
     }
 
@@ -729,6 +762,27 @@ impl RepinEngine {
             );
         }
     }
+}
+
+/// Run one whole-corpus filesystem step on the blocking pool.
+///
+/// These steps are proportional to the SIZE OF THE ARCHIVE, not to the
+/// repin: the staging pre-flight lstats every file under every env dir,
+/// and each sweep is a `remove_dir_all` over a whole corpus generation —
+/// tens of seconds to minutes on a multi-hundred-thousand-file archive.
+/// Called inline from an async fn, each parks a tokio worker thread for
+/// that whole time and degrades unrelated request handling, which is the
+/// same reason the scan and every build pass already go through
+/// `spawn_blocking`. A panicked task surfaces as an `Err` here so the
+/// caller decides, rather than vanishing into a dropped `JoinHandle`.
+async fn on_blocking_pool<T, F>(what: &'static str, f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("repin {what} task panicked: {e}"))
 }
 
 /// Why a job stopped short of the swap.
