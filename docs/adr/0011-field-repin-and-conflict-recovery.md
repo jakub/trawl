@@ -341,3 +341,51 @@ disagree about a stored `"1.5"`.
   as a positive IN list, and an invalid glob/regex dropping silently out
   of a live filter. None of them are new in this slice, and none is a
   repin hazard.
+
+## Amendment (2026-08-11): slice A′ shipped
+
+Issue #66 landed slice A′ as prepped: `| where` and `| let`
+field-vs-literal comparisons are pin-aware in the SQL emitter, the SSE
+streaming lane, and the `rust_stages` batch tail, via one compile-time
+pin-scope walk (`trawl-core/src/pin_scope.rs`) and one shared in-memory
+comparison core (`trawl-core/src/pin_match.rs`, the relocated
+`filter.rs` machinery, now also behind `eval.rs`). The SQL renderers
+live once in `emitter/compare.rs` behind `NullPolicy` — the search stage
+keeps its `!=` NULL widening (`NeMatchesNull`), the pipeline lane is
+`Strict` on purpose: plain SQL null propagation is what the pin-blind
+`| where` always answered, so a repin never changes missing-field
+semantics. `compare.rs` gained the parsed-literal door
+(`compare_form_bound`), which discards quote provenance by content —
+`where status == "400"` IS `where status == 400`, matching the search
+stage where the two are one AST.
+
+Two scope-table calls the prep left open were resolved during
+implementation, both from the issue's own mechanism text:
+
+- **`extract kv` passes the scope through.** The acceptance contract
+  requires the kv tail pin-aware (`… | extract kv | where <pinned cmp>`
+  must answer as the split-free query), which a cleared scope cannot do.
+  The residual — a kv key shadowing a pinned name is read under that
+  pin — is accepted and documented in the DSL reference; it cannot
+  diverge between lanes because both consume the same walk.
+- **`pivot` keeps its group-by keys** (like `stats`/`timechart`), per
+  "aggregation stages keep group-by keys"; the dynamic pivoted value
+  columns are cleared.
+
+Also recorded: sibling references inside one `let`
+(`let a = status, b = a`) resolve against the PRE-stage scope — the SQL
+desugars to one parallel SELECT, so `b` reads the original (unpinned)
+`a` column; a conservative miss, identical in both lanes. The
+`EmittedQuery` carries `rust_stage_pins`, the scope stamped at the kv
+split, so the batch tail inherits every rename/let/stats scope change
+before the split. `stream_query` feeds ONE `field_catalog.all()`
+snapshot to both the search filter and the pipeline plan.
+
+Deliberately parked, named: the stream lane applies `let` assignments
+sequentially where SQL is parallel (a pre-existing divergence unrelated
+to pins), per-event `CompiledExpr` precompilation for SSE, and the
+`field!=a,b` / silent-invalid-glob residuals from the previous
+amendment.
+
+**The invisibility property now covers the pipeline: #53 (the repin
+engine) is unblocked.**

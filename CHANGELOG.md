@@ -7,6 +7,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed — behavior
+- **`| where` and `| let` comparisons follow the field catalog's pins
+  (ADR-0011 slice A′, #66).** Bare field-vs-literal comparisons in the
+  pipeline stages now consult the same pin snapshot and the same rule
+  table the search stage adopted in slice A — in batch SQL, live tail
+  (SSE), and the post-`extract kv` batch tail alike. Concretely: over a
+  VARCHAR-pinned field, `| where status > 400` stops raising a
+  Conversion error and starts filtering in `DECIMAL(38,6)`;
+  `| where status == 200` gains the numeric arm and now matches a stored
+  `"200.0"`; `| where status in (…)` routes each element through the
+  equality rule; `matches`/`like`/`ilike` against typed pins match the
+  stored value's canonical text (on TIMESTAMP pins, live-tail ordered
+  comparisons become the instant comparison batch always performed,
+  instead of lexical text). Which pin applies follows the pipeline:
+  `rename` remaps it, a computed `let` removes it (a bare alias copies
+  it), aggregations keep group-by keys only, `extract kv` passes the
+  scope through. Quote provenance is discarded (`where status == "400"`
+  is `where status == 400`). The pipeline `!=` keeps plain SQL null
+  propagation — no `OR field IS NULL` widening — so a repin never
+  changes missing-field semantics. Field-vs-field, function-wrapped and
+  arithmetic comparisons, unpinned fields, and embedded `--data` mode
+  are byte-for-byte unchanged. The envelope seed pins
+  `host`/`service`/`env`/`message`/`severity_text`/`_raw` VARCHAR, so
+  this is live on day one of every install. Unblocks the repin engine
+  (#53).
 - **Comparisons follow the field catalog's type pins (ADR-0011 slice A, #63).**
   Search-stage field filters — batch queries, exports, *and* live tail (SSE) —
   now consult the field's pinned type instead of guessing from the query
