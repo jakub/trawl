@@ -136,7 +136,7 @@ const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30
 /// progress: without this, an operator watching a multi-thousand-file
 /// corpus cannot tell a working boot from a wedged one (and a supervisor
 /// start timeout looks identical to both).
-struct Progress {
+pub(crate) struct Progress {
     phase: &'static str,
     total: usize,
     done: usize,
@@ -145,7 +145,7 @@ struct Progress {
 }
 
 impl Progress {
-    fn new(phase: &'static str, total: usize) -> Self {
+    pub(crate) fn new(phase: &'static str, total: usize) -> Self {
         let now = std::time::Instant::now();
         Self {
             phase,
@@ -157,7 +157,7 @@ impl Progress {
     }
 
     /// Count one file, logging at most once per [`PROGRESS_INTERVAL`].
-    fn tick(&mut self) {
+    pub(crate) fn tick(&mut self) {
         self.done += 1;
         if self.last.elapsed() < PROGRESS_INTERVAL {
             return;
@@ -542,7 +542,7 @@ fn publish_marker(data_dir: &Path, catalog_id: &str) -> Result<(), String> {
 /// overlays), capped memory, two threads — and the UTC session zone every
 /// conform depends on
 /// ([`trawl_core::conform::SESSION_TIME_ZONE_SQL`]).
-fn open_bounded_connection(
+pub(crate) fn open_bounded_connection(
     data_dir: &Path,
     memory_limit: &str,
 ) -> Result<duckdb::Connection, String> {
@@ -633,13 +633,13 @@ fn scan_corpus(
 }
 
 /// Where one standing file sits in trawl's own storage layout.
-struct LayoutPath {
+pub(crate) struct LayoutPath {
     /// The service the path names — read off the layout, not guessed from a
     /// file stem, so it is the same string ingest wrote verbatim.
-    service: String,
+    pub(crate) service: String,
     /// The instant this file's partition directory claims (see
     /// [`ConformPolicy::StandingFile`]).
-    instant: chrono::DateTime<chrono::Utc>,
+    pub(crate) instant: chrono::DateTime<chrono::Utc>,
 }
 
 /// Read `path` back as trawl's own storage layout — `{env}/{date}/{HH}/
@@ -664,7 +664,7 @@ struct LayoutPath {
 /// has no WAL filename to recover an ingest instant from, but it does sit in
 /// a directory that already claims an hour — the closest honest answer
 /// available, and by construction inside the window the row was pruned to.
-fn layout_path(data_dir: &Path, path: &Path) -> Option<LayoutPath> {
+pub(crate) fn layout_path(data_dir: &Path, path: &Path) -> Option<LayoutPath> {
     let rel = path.strip_prefix(data_dir).ok()?;
     let mut parts: Vec<&str> = Vec::new();
     for component in rel.components() {
