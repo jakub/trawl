@@ -111,7 +111,7 @@
 //! for `tonumber()` in streaming eval, which reads the same cast domain
 //! (`crate::eval`).
 
-use crate::ast::FilterOp;
+use crate::ast::{FilterOp, LiteralValue};
 use crate::emitter::SqlValue;
 use crate::emitter::coerce_filter_value;
 use crate::schema::CanonicalType;
@@ -721,13 +721,23 @@ pub fn compare_form(pin: Option<CanonicalType>, op: FilterOp, literal: &str) -> 
 /// PARSED — the pipeline lane's door (`| where` / `| let`, ADR-0011 slice
 /// A′), sharing one rule table with [`compare_form`].
 ///
+/// `None` for [`LiteralValue::Null`]: `== null` is not a comparison this
+/// table binds, and the caller takes the generic path.
+///
 /// Quote provenance is discarded, deliberately: the VARCHAR-pin rules read
-/// the literal's CONTENT ([`literal_text`]), and a string literal binds
-/// through the same content coercion the search stage applies — so
-/// `where status == "400"` is `status == 400`, exactly as `status="400"`
-/// is `status=400` in the search stage (the two are one AST there).
-/// Honouring the AST's quoting would make adjacent stages of one query
-/// disagree about the same comparison.
+/// the literal's CONTENT, and a string literal binds through the same
+/// content coercion the search stage applies — so `where status == "400"`
+/// is `status == 400`, exactly as `status="400"` is `status=400` in the
+/// search stage (the two are one AST there). Honouring the AST's quoting
+/// would make adjacent stages of one query disagree about the same
+/// comparison.
+///
+/// That promise is why the literal's text comes from the AST and not from
+/// re-rendering a parsed number: a float literal carries its source token
+/// ([`crate::ast::FloatLiteral::text`]), so `where id > 9007199254740993.0` binds the
+/// digits the user wrote instead of the `f64`-rounded `…992` — which would
+/// match the ADJACENT identifier, and disagree with the quoted spelling of
+/// the same literal. `i64` and the wire text are already exact.
 ///
 /// A non-string literal binds unchanged under a typed pin (`flag == true`
 /// stays `Bool(true)`, byte-identical SQL); only the live mirror conforms.
@@ -735,29 +745,19 @@ pub fn compare_form(pin: Option<CanonicalType>, op: FilterOp, literal: &str) -> 
 pub fn compare_form_bound(
     pin: Option<CanonicalType>,
     op: FilterOp,
-    literal: &SqlValue,
-) -> CompareForm {
-    let text = literal_text(literal);
-    form_over(pin, op, &text, || match literal {
-        SqlValue::String(s) => coerce_filter_value(s),
-        other => other.clone(),
-    })
-}
-
-/// The content text of a parsed literal — the same text the search stage
-/// would have carried for it, which is what every VARCHAR-pin rule reads
-/// and what the ordered-numeric shapes bind (the literal never round-trips
-/// through `f64`, ADR-0011 ruling #6).
-#[must_use]
-pub fn literal_text(literal: &SqlValue) -> String {
-    match literal {
-        SqlValue::String(s) => s.clone(),
-        SqlValue::Int(i) => i.to_string(),
-        // Rust `Display` renders the shortest round-tripping decimal, so
-        // the DECIMAL space reads back exactly the value that was bound.
-        SqlValue::Float(f) => f.to_string(),
-        SqlValue::Bool(b) => b.to_string(),
-    }
+    literal: &LiteralValue,
+) -> Option<CompareForm> {
+    // (the text every VARCHAR-pin rule reads — the same text the search
+    // stage would have carried for this literal — and the value the
+    // native/typed branches bind)
+    let (text, native): (String, SqlValue) = match literal {
+        LiteralValue::String(s) => (s.clone(), coerce_filter_value(s)),
+        LiteralValue::Int(i) => (i.to_string(), SqlValue::Int(*i)),
+        LiteralValue::Float(f) => (f.text().to_owned(), SqlValue::Float(f.value())),
+        LiteralValue::Bool(b) => (b.to_string(), SqlValue::Bool(*b)),
+        LiteralValue::Null => return None,
+    };
+    Some(form_over(pin, op, &text, || native))
 }
 
 /// The one rule table behind both doors: `text` is the literal's content,
@@ -1311,17 +1311,34 @@ mod tests {
 
     // ── the bound door (ADR-0011 slice A′) ────────────────────────────
 
-    /// `literal_text` recovers the content text the search stage would
-    /// have carried — the text every VARCHAR-pin rule reads.
+    fn lit_str(s: &str) -> LiteralValue {
+        LiteralValue::String(s.to_owned())
+    }
+
+    /// A float literal as the parser builds it: value plus source token.
+    fn lit_float(text: &str) -> LiteralValue {
+        LiteralValue::Float(crate::ast::FloatLiteral::new(
+            text.parse::<f64>().expect("test literal parses"),
+            text,
+        ))
+    }
+
+    /// `== null` binds no comparison form — the caller falls through to
+    /// the generic, pin-blind path.
     #[test]
-    fn literal_text_renders_the_content() {
-        assert_eq!(literal_text(&SqlValue::Int(400)), "400");
-        assert_eq!(literal_text(&SqlValue::Float(1.5)), "1.5");
-        assert_eq!(literal_text(&SqlValue::Bool(true)), "true");
-        assert_eq!(
-            literal_text(&SqlValue::String("accepted".to_owned())),
-            "accepted"
-        );
+    fn bound_null_literal_has_no_form() {
+        for pin in [None, Some(CanonicalType::Varchar)]
+            .into_iter()
+            .chain(TYPED_PINS.into_iter().map(Some))
+        {
+            for op in ORDERED.iter().chain(EQ_CLASS.iter()) {
+                assert_eq!(
+                    compare_form_bound(pin, *op, &LiteralValue::Null),
+                    None,
+                    "{pin:?} {op:?}"
+                );
+            }
+        }
     }
 
     /// A typed pin binds the AST's own literal unchanged — the SQL the
@@ -1331,11 +1348,11 @@ mod tests {
     fn bound_typed_pin_binds_the_ast_literal_unchanged() {
         for pin in TYPED_PINS {
             assert_eq!(
-                compare_form_bound(Some(pin), FilterOp::Eq, &SqlValue::Int(400)),
-                CompareForm::Conformed {
+                compare_form_bound(Some(pin), FilterOp::Eq, &LiteralValue::Int(400)),
+                Some(CompareForm::Conformed {
                     pin,
                     literal: SqlValue::Int(400)
-                },
+                }),
                 "{pin:?}"
             );
         }
@@ -1343,23 +1360,23 @@ mod tests {
             compare_form_bound(
                 Some(CanonicalType::Boolean),
                 FilterOp::Eq,
-                &SqlValue::Bool(true)
+                &LiteralValue::Bool(true)
             ),
-            CompareForm::Conformed {
+            Some(CompareForm::Conformed {
                 pin: CanonicalType::Boolean,
                 literal: SqlValue::Bool(true)
-            }
+            })
         );
         assert_eq!(
             compare_form_bound(
                 Some(CanonicalType::Timestamp),
                 FilterOp::Gt,
-                &SqlValue::String("2026-01-01".to_owned())
+                &lit_str("2026-01-01")
             ),
-            CompareForm::Conformed {
+            Some(CompareForm::Conformed {
                 pin: CanonicalType::Timestamp,
                 literal: SqlValue::String("2026-01-01".to_owned())
-            }
+            })
         );
     }
 
@@ -1375,29 +1392,64 @@ mod tests {
         {
             for op in ORDERED.iter().chain(EQ_CLASS.iter()) {
                 assert_eq!(
-                    compare_form_bound(pin, *op, &SqlValue::String("400".to_owned())),
-                    compare_form_bound(pin, *op, &SqlValue::Int(400)),
+                    compare_form_bound(pin, *op, &lit_str("400")),
+                    compare_form_bound(pin, *op, &LiteralValue::Int(400)),
                     "{pin:?} {op:?}"
                 );
             }
         }
     }
 
+    /// Quote-insensitivity holds ABOVE 2^53, where `f64` stops being able
+    /// to name the number: a float literal binds its SOURCE TOKEN, so the
+    /// unquoted spelling resolves to the same form the quoted one does.
+    /// Re-rendering the parsed double would bind `…992` and answer for the
+    /// ADJACENT identifier (ADR-0011 ruling #6).
+    #[test]
+    fn bound_float_literal_above_2_53_binds_its_source_token() {
+        const HUGE: &str = "9007199254740993.0";
+        // The premise: the parsed double cannot express this literal.
+        assert_eq!(
+            HUGE.parse::<f64>().unwrap().to_string(),
+            "9007199254740992",
+            "premise: f64 rounds this literal"
+        );
+        for op in ORDERED.iter().chain(EQ_CLASS.iter()) {
+            let quoted = compare_form_bound(Some(CanonicalType::Varchar), *op, &lit_str(HUGE));
+            assert_eq!(
+                compare_form_bound(Some(CanonicalType::Varchar), *op, &lit_float(HUGE)),
+                quoted,
+                "varchar {op:?} {HUGE}"
+            );
+        }
+        assert_eq!(
+            compare_form_bound(Some(CanonicalType::Varchar), FilterOp::Gt, &lit_float(HUGE)),
+            Some(CompareForm::NumericOnText(HUGE.to_owned()))
+        );
+        assert_eq!(
+            compare_form_bound(Some(CanonicalType::Varchar), FilterOp::Eq, &lit_float(HUGE)),
+            Some(CompareForm::TextOrNumeric(HUGE.to_owned()))
+        );
+    }
+
     /// The bound door and the text door agree on every VARCHAR-pin rule:
     /// one rule table, however the literal arrives.
     #[test]
     fn bound_varchar_rules_mirror_compare_form() {
-        let cases: &[(SqlValue, &str)] = &[
-            (SqlValue::Int(200), "200"),
-            (SqlValue::Float(1.5), "1.5"),
-            (SqlValue::String("accepted".to_owned()), "accepted"),
-            (SqlValue::String("0200".to_owned()), "0200"),
+        let cases: &[(LiteralValue, &str)] = &[
+            (LiteralValue::Int(200), "200"),
+            (lit_float("1.5"), "1.5"),
+            // A trailing zero is content, not noise: the token is what the
+            // search stage would have carried for the same text.
+            (lit_float("1.50"), "1.50"),
+            (lit_str("accepted"), "accepted"),
+            (lit_str("0200"), "0200"),
         ];
         for (bound, text) in cases {
             for op in ORDERED.iter().chain(EQ_CLASS.iter()) {
                 assert_eq!(
                     compare_form_bound(Some(CanonicalType::Varchar), *op, bound),
-                    compare_form(Some(CanonicalType::Varchar), *op, text),
+                    Some(compare_form(Some(CanonicalType::Varchar), *op, text)),
                     "varchar {op:?} {bound:?}"
                 );
             }
@@ -1407,8 +1459,8 @@ mod tests {
         // falls through to generic (literal-driven) emission.
         for op in EQ_CLASS {
             assert_eq!(
-                compare_form_bound(Some(CanonicalType::Varchar), op, &SqlValue::Bool(true)),
-                compare_form(Some(CanonicalType::Varchar), op, "true"),
+                compare_form_bound(Some(CanonicalType::Varchar), op, &LiteralValue::Bool(true)),
+                Some(compare_form(Some(CanonicalType::Varchar), op, "true")),
                 "varchar {op:?} Bool(true)"
             );
         }
@@ -1416,42 +1468,42 @@ mod tests {
             compare_form_bound(
                 Some(CanonicalType::Varchar),
                 FilterOp::Gt,
-                &SqlValue::Bool(true)
+                &LiteralValue::Bool(true)
             ),
-            CompareForm::Native(SqlValue::Bool(true))
+            Some(CompareForm::Native(SqlValue::Bool(true)))
         );
         // The specific shapes, pinned:
         assert_eq!(
             compare_form_bound(
                 Some(CanonicalType::Varchar),
                 FilterOp::Eq,
-                &SqlValue::Int(200)
+                &LiteralValue::Int(200)
             ),
-            CompareForm::TextOrNumeric("200".to_owned())
+            Some(CompareForm::TextOrNumeric("200".to_owned()))
         );
         assert_eq!(
             compare_form_bound(
                 Some(CanonicalType::Varchar),
                 FilterOp::Gt,
-                &SqlValue::Int(400)
+                &LiteralValue::Int(400)
             ),
-            CompareForm::NumericOnText("400".to_owned())
+            Some(CompareForm::NumericOnText("400".to_owned()))
         );
         assert_eq!(
             compare_form_bound(
                 Some(CanonicalType::Varchar),
                 FilterOp::Gt,
-                &SqlValue::String("alpha".to_owned())
+                &lit_str("alpha")
             ),
-            CompareForm::Native(SqlValue::String("alpha".to_owned()))
+            Some(CompareForm::Native(SqlValue::String("alpha".to_owned())))
         );
         assert_eq!(
             compare_form_bound(
                 Some(CanonicalType::Varchar),
                 FilterOp::Eq,
-                &SqlValue::Bool(true)
+                &LiteralValue::Bool(true)
             ),
-            CompareForm::Text("true".to_owned())
+            Some(CompareForm::Text("true".to_owned()))
         );
     }
 

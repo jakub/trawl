@@ -19,7 +19,7 @@ use std::io::Write as _;
 use duckdb::Connection;
 use serde_json::{Map, Value};
 
-use trawl_core::ast::PipeStage;
+use trawl_core::ast::{FloatLiteral, LiteralValue, PipeStage};
 use trawl_core::compare::{self, CompareForm, PatternForm};
 use trawl_core::emitter::{self, SqlValue};
 use trawl_core::eval::{EvalValue, eval_expr_with_pins};
@@ -137,7 +137,7 @@ fn compare_form_coverage_in_both_pipeline_lanes() {
         CanonicalType,
         &str,
         trawl_core::ast::FilterOp,
-        SqlValue,
+        LiteralValue,
         Value,
     )] = &[
         // VARCHAR: TextOrNumeric (eq + numeric), Text (eq + word),
@@ -146,28 +146,28 @@ fn compare_form_coverage_in_both_pipeline_lanes() {
             CanonicalType::Varchar,
             "* | where f == 200",
             trawl_core::ast::FilterOp::Eq,
-            SqlValue::Int(200),
+            LiteralValue::Int(200),
             Value::from("200"),
         ),
         (
             CanonicalType::Varchar,
             "* | where f == \"accepted\"",
             trawl_core::ast::FilterOp::Eq,
-            SqlValue::String("accepted".into()),
+            LiteralValue::String("accepted".into()),
             Value::from("accepted"),
         ),
         (
             CanonicalType::Varchar,
             "* | where f > 400",
             trawl_core::ast::FilterOp::Gt,
-            SqlValue::Int(400),
+            LiteralValue::Int(400),
             Value::from("404"),
         ),
         (
             CanonicalType::Varchar,
             "* | where f > \"alpha\"",
             trawl_core::ast::FilterOp::Gt,
-            SqlValue::String("alpha".into()),
+            LiteralValue::String("alpha".into()),
             Value::from("beta"),
         ),
         // Typed pins: Conformed, one per pin.
@@ -175,27 +175,28 @@ fn compare_form_coverage_in_both_pipeline_lanes() {
             CanonicalType::BigInt,
             "* | where f > 400",
             trawl_core::ast::FilterOp::Gt,
-            SqlValue::Int(400),
+            LiteralValue::Int(400),
             Value::from(404),
         ),
         (
             CanonicalType::Double,
             "* | where f > 1.5",
             trawl_core::ast::FilterOp::Gt,
-            SqlValue::Float(1.5),
+            LiteralValue::Float(FloatLiteral::new(1.5, "1.5")),
             Value::from(2.5),
         ),
         (
             CanonicalType::Boolean,
             "* | where f == true",
             trawl_core::ast::FilterOp::Eq,
-            SqlValue::Bool(true),
+            LiteralValue::Bool(true),
             Value::from(true),
         ),
     ];
 
     for (pin, dsl, op, literal, value) in cells {
-        let form = compare::compare_form_bound(Some(*pin), *op, literal);
+        let form = compare::compare_form_bound(Some(*pin), *op, literal)
+            .expect("matrix literals are never null");
         seen.insert(form_name(&form));
         let mut ft = FieldTypes::new();
         ft.insert("f", *pin);
@@ -308,4 +309,47 @@ fn pattern_form_coverage_in_both_pipeline_lanes() {
         seen, expected,
         "every PatternForm variant must be exercised in both pipeline lanes"
     );
+}
+
+/// A pipeline float literal above 2^53 binds the digits the user WROTE, in
+/// both lanes, and answers the same whether or not it was quoted.
+///
+/// `f64` cannot name `9007199254740993`: it parses as the adjacent
+/// `…992`. Binding the re-rendered double would make the unquoted literal
+/// match the neighbouring identifier while the quoted spelling — carried
+/// verbatim as a string — matched the right one, contradicting the
+/// quote-insensitivity the bound door promises (ADR-0011 ruling #6).
+#[test]
+fn float_literal_above_2_53_binds_its_source_token_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let mut ft = FieldTypes::new();
+    ft.insert("f", CanonicalType::Varchar);
+
+    // The premise: the two literals below are ONE f64.
+    assert_eq!(
+        "9007199254740993.0".parse::<f64>().unwrap().to_bits(),
+        "9007199254740992.0".parse::<f64>().unwrap().to_bits(),
+        "premise: f64 collapses these neighbours"
+    );
+
+    let stored = event_with("f", Value::from("9007199254740993"));
+    // (dsl, expected answer) — quoted and unquoted spellings of each.
+    let cells: &[(&str, bool)] = &[
+        ("* | where f == 9007199254740993.0", true),
+        ("* | where f == \"9007199254740993.0\"", true),
+        // The adjacent identifier is a different number, not a rounding.
+        ("* | where f == 9007199254740992.0", false),
+        ("* | where f == \"9007199254740992.0\"", false),
+        ("* | where f > 9007199254740992.0", true),
+        ("* | where f > \"9007199254740992.0\"", true),
+        ("* | where f > 9007199254740993.0", false),
+        ("* | where f > \"9007199254740993.0\"", false),
+    ];
+    for (dsl, expected) in cells {
+        assert_eq!(
+            run_cell(&conn, dsl, &stored, &ft),
+            Some(*expected),
+            "{dsl} against {stored:?}"
+        );
+    }
 }

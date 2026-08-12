@@ -357,7 +357,12 @@ keeps its `!=` NULL widening (`NeMatchesNull`), the pipeline lane is
 semantics. `compare.rs` gained the parsed-literal door
 (`compare_form_bound`), which discards quote provenance by content —
 `where status == "400"` IS `where status == 400`, matching the search
-stage where the two are one AST.
+stage where the two are one AST. Content means the literal's SOURCE TEXT,
+so a float literal carries its token through the AST (`FloatLiteral`):
+`f64` cannot name `9007199254740993`, and re-rendering the parsed double
+would bind the adjacent `…992` — quoted and unquoted spellings of one
+literal answering differently, and the ordered rung round-tripping through
+the very `f64` ruling #6 removed it from.
 
 Two scope-table calls the prep left open were resolved during
 implementation, both from the issue's own mechanism text:

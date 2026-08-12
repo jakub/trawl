@@ -310,13 +310,12 @@ pub fn eval_expr_with_pins(
     }
 }
 
-/// A non-null bare literal as the value the SQL lane would bind.
-fn literal_sql_value(expr: &Expr) -> Option<SqlValue> {
+/// A bare literal, exactly as the SQL lane's door takes it — the AST value,
+/// so a float literal keeps its source token rather than a re-rendered
+/// double (ADR-0011 ruling #6, [`crate::ast::FloatLiteral`]).
+fn bare_literal(expr: &Expr) -> Option<&LiteralValue> {
     match expr {
-        Expr::Literal(LiteralValue::String(s)) => Some(SqlValue::String(s.clone())),
-        Expr::Literal(LiteralValue::Int(n)) => Some(SqlValue::Int(*n)),
-        Expr::Literal(LiteralValue::Float(n)) => Some(SqlValue::Float(*n)),
-        Expr::Literal(LiteralValue::Bool(b)) => Some(SqlValue::Bool(*b)),
+        Expr::Literal(lit) => Some(lit),
         _ => None,
     }
 }
@@ -394,7 +393,7 @@ fn try_pinned_comparison(
         _ => return None,
     };
     let (name, filter_op, literal) = match (&lhs.node, &rhs.node) {
-        (Expr::FieldRef(name), rhs) => (name, filter_op, literal_sql_value(rhs)?),
+        (Expr::FieldRef(name), rhs) => (name, filter_op, bare_literal(rhs)?),
         // `400 < status` is `status > 400`.
         (lhs, Expr::FieldRef(name)) => {
             let flipped = match filter_op {
@@ -404,12 +403,12 @@ fn try_pinned_comparison(
                 FilterOp::Lte => FilterOp::Gte,
                 other => other,
             };
-            (name, flipped, literal_sql_value(lhs)?)
+            (name, flipped, bare_literal(lhs)?)
         }
         _ => return None,
     };
     let pin = pins.pin_for(name)?;
-    let form = crate::compare::compare_form_bound(Some(pin), filter_op, &literal);
+    let form = crate::compare::compare_form_bound(Some(pin), filter_op, literal)?;
     // Native(String) is the VARCHAR pin's lexical rule — the stored text
     // compares as text, whatever JSON shape the wire value took (the SQL
     // side's generic emission compares the VARCHAR column against a
@@ -451,15 +450,17 @@ fn try_pinned_in_list(
         return None;
     };
     let pin = pins.pin_for(name)?;
-    let literals: Vec<SqlValue> = list
+    let forms: Vec<crate::compare::CompareForm> = list
         .iter()
-        .map(|item| literal_sql_value(&item.node))
+        .map(|item| {
+            let element = bare_literal(&item.node)?;
+            crate::compare::compare_form_bound(Some(pin), FilterOp::Eq, element)
+        })
         .collect::<Option<_>>()?;
     let Some(value) = pinned_event_value(event, name) else {
         return Some(EvalValue::Null);
     };
-    let truth = pin_match::or_any(literals.iter().map(|lit| {
-        let form = crate::compare::compare_form_bound(Some(pin), FilterOp::Eq, lit);
+    let truth = pin_match::or_any(forms.into_iter().map(|form| {
         pin_match::compare_values(
             value,
             pin_match::CompareOp::Eq,
@@ -534,7 +535,7 @@ fn eval_literal(lit: &LiteralValue) -> EvalValue {
         LiteralValue::Null => EvalValue::Null,
         LiteralValue::Bool(b) => EvalValue::Bool(*b),
         LiteralValue::Int(n) => EvalValue::Int(*n),
-        LiteralValue::Float(n) => EvalValue::Float(*n),
+        LiteralValue::Float(n) => EvalValue::Float(n.value()),
         LiteralValue::String(s) => EvalValue::Str(s.clone()),
     }
 }
@@ -1761,7 +1762,7 @@ mod tests {
     }
 
     fn lit_float(n: f64) -> Spanned<Expr> {
-        span(Expr::Literal(LiteralValue::Float(n)))
+        span(Expr::Literal(LiteralValue::Float(n.into())))
     }
 
     fn lit_str(s: &str) -> Spanned<Expr> {

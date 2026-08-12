@@ -132,13 +132,12 @@ fn flip_filter_op(op: FilterOp) -> FilterOp {
     }
 }
 
-/// A non-null literal as the value it binds.
-fn literal_sql_value(expr: &Expr) -> Option<SqlValue> {
+/// A bare literal, as the rule table's door wants it — the AST value, not
+/// a re-rendered one, so a float literal keeps its source token (ADR-0011
+/// ruling #6, [`crate::ast::FloatLiteral`]).
+fn bare_literal(expr: &Expr) -> Option<&LiteralValue> {
     match expr {
-        Expr::Literal(LiteralValue::String(s)) => Some(SqlValue::String(s.clone())),
-        Expr::Literal(LiteralValue::Int(n)) => Some(SqlValue::Int(*n)),
-        Expr::Literal(LiteralValue::Float(n)) => Some(SqlValue::Float(*n)),
-        Expr::Literal(LiteralValue::Bool(b)) => Some(SqlValue::Bool(*b)),
+        Expr::Literal(lit) => Some(lit),
         _ => None,
     }
 }
@@ -190,12 +189,12 @@ fn try_pinned_comparison(
 
     let filter_op = comparison_filter_op(op)?;
     let (name, filter_op, literal) = match (&lhs.node, &rhs.node) {
-        (Expr::FieldRef(name), rhs) => (name, filter_op, literal_sql_value(rhs)?),
-        (lhs, Expr::FieldRef(name)) => (name, flip_filter_op(filter_op), literal_sql_value(lhs)?),
+        (Expr::FieldRef(name), rhs) => (name, filter_op, bare_literal(rhs)?),
+        (lhs, Expr::FieldRef(name)) => (name, flip_filter_op(filter_op), bare_literal(lhs)?),
         _ => return None,
     };
     let pin = state.compare_pin(name)?;
-    let form = compare::compare_form_bound(Some(pin), filter_op, &literal);
+    let form = compare::compare_form_bound(Some(pin), filter_op, literal)?;
     if matches!(form, CompareForm::Native(_)) {
         // The rule table leaves the shape literal-driven (VARCHAR pin,
         // ordered non-numeric literal) — generic emission is the rule.
@@ -229,14 +228,13 @@ fn try_pinned_in_list(
         return None;
     };
     let pin = state.compare_pin(name)?;
-    let literals: Vec<SqlValue> = list
+    let forms: Vec<CompareForm> = list
         .iter()
-        .map(|item| literal_sql_value(&item.node))
+        .map(|item| {
+            let element = bare_literal(&item.node)?;
+            compare::compare_form_bound(Some(pin), FilterOp::Eq, element)
+        })
         .collect::<Option<_>>()?;
-    let forms: Vec<CompareForm> = literals
-        .iter()
-        .map(|lit| compare::compare_form_bound(Some(pin), FilterOp::Eq, lit))
-        .collect();
     let clause = in_list_sql(&quote_field(name), forms, state);
     if clause.starts_with('(') {
         Some(clause)
@@ -264,7 +262,7 @@ fn emit_literal(lit: &LiteralValue, state: &mut EmitterState) -> String {
         LiteralValue::Null => "NULL".to_string(),
         LiteralValue::String(s) => state.push_param(SqlValue::String(s.clone())),
         LiteralValue::Int(n) => state.push_param(SqlValue::Int(*n)),
-        LiteralValue::Float(n) => state.push_param(SqlValue::Float(*n)),
+        LiteralValue::Float(n) => state.push_param(SqlValue::Float(n.value())),
         LiteralValue::Bool(b) => state.push_param(SqlValue::Bool(*b)),
     }
 }
