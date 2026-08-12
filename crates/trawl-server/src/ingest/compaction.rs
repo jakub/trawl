@@ -1932,6 +1932,56 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
     ))
 }
 
+/// The repin target column's expression, in the ONE place both consumers
+/// read it from: [`ConformPlan::build`] under [`ConformPolicy::Repin`]
+/// (the rewrite) and the repin scan's dry-run counting
+/// (`crate::repin::plan`) — the plan predicts with the same SQL the
+/// rewrite writes, by the same doctrine that makes the hot branch and
+/// compaction one builder.
+pub(crate) fn repin_target_expr(
+    quoted: &str,
+    has_raw: bool,
+    folded: &str,
+    pin: CanonicalType,
+) -> String {
+    if has_raw {
+        trawl_core::conform::resurrection_expr(
+            quoted,
+            &quote_ident(trawl_core::schema::RAW),
+            folded,
+            pin,
+        )
+    } else {
+        trawl_core::conform::guarded_cast(&trawl_core::conform::untyped_text(quoted), pin)
+    }
+}
+
+/// The repin scan/rewrite counting expressions, built over
+/// [`repin_target_expr`] so the dry-run numbers and the rewrite outcome
+/// are the same computation: `(carrying, kept, resurrectable)` —
+/// stored values, stored values the new pin keeps (resurrection arm
+/// included), and shelved (`NULL`-stored) values `_raw` gives back.
+pub(crate) fn repin_count_exprs(
+    quoted: &str,
+    has_raw: bool,
+    folded: &str,
+    pin: CanonicalType,
+) -> (String, String, String) {
+    let target = repin_target_expr(quoted, has_raw, folded, pin);
+    let carrying = format!("count({quoted})");
+    let kept = format!("count(CASE WHEN {quoted} IS NOT NULL THEN {target} END)");
+    let resurrectable = if has_raw {
+        let raw_read = trawl_core::conform::guarded_cast(
+            &trawl_core::conform::raw_extract(&quote_ident(trawl_core::schema::RAW), folded),
+            pin,
+        );
+        format!("count(CASE WHEN {quoted} IS NULL THEN {raw_read} END)")
+    } else {
+        "0".to_owned()
+    };
+    (carrying, kept, resurrectable)
+}
+
 /// Wrap a TIMESTAMP-pinned envelope column's conform in a never-NULL last
 /// arm, so conforming a standing file can never manufacture a NULL partition
 /// key (the boot-pass counterpart of [`repair_expr`]'s third arm, ADR-0008).
@@ -2100,19 +2150,7 @@ impl ConformPlan {
                     // Unconditional — never the `conform_expr` noop check:
                     // the resurrection-only pass rewrites a column whose
                     // physical type already IS the pin.
-                    let expr = if has_raw {
-                        trawl_core::conform::resurrection_expr(
-                            &quoted,
-                            &quote_ident(trawl_core::schema::RAW),
-                            &folded,
-                            pin,
-                        )
-                    } else {
-                        trawl_core::conform::guarded_cast(
-                            &trawl_core::conform::untyped_text(&quoted),
-                            pin,
-                        )
-                    };
+                    let expr = repin_target_expr(&quoted, has_raw, &folded, pin);
                     let written = guard_partition_key(policy, is_time_col, pin, &expr);
                     plan.select_list
                         .push(format!("{written} AS {}", quote_ident(&folded)));

@@ -45,6 +45,10 @@ pub struct AppState {
     /// Latest dashboard snapshot, updated every ~1s by the snapshot collector.
     /// Available even when the terminal monitor is disabled (systemd, `--no-monitor`).
     pub dashboard_snapshot: Arc<Mutex<Option<DashboardSnapshot>>>,
+    /// The repin engine (ADR-0011 slice B). `Some` exactly when ingest is
+    /// enabled: a query-only node owns nothing under the data root, so
+    /// `POST /api/v1/schema/repin` answers 503 there.
+    pub repin: Option<Arc<crate::repin::RepinEngine>>,
 }
 
 /// Maximum concurrent admin dashboard-stats SSE streams. Hard-coded (no
@@ -453,6 +457,7 @@ impl AppState {
     /// database (both eagerly — trawld fails fast at startup when either
     /// backend is unreachable; the app-state boot also takes the sole-writer
     /// advisory lock and runs migrations).
+    #[allow(clippy::too_many_lines)] // linear assembly, clearer unsplit
     pub async fn from_config(
         config: &Config,
         metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
@@ -469,6 +474,12 @@ impl AppState {
             ))
         })?;
         field_catalog.replace(pins);
+
+        let repin_coordinator = if config.ingest.enabled {
+            Some(Arc::new(crate::repin::RepinCoordinator::new()))
+        } else {
+            None
+        };
 
         let (wal_writer, event_bus, hot_buffer, pipeline) = if config.ingest.enabled {
             let writer = Arc::new(WalWriter::new(config.wal_dir()));
@@ -541,16 +552,29 @@ impl AppState {
                 envs: config.ingest.effective_envs().into(),
                 default_env: config.ingest.default_env.as_str().into(),
                 trusted_relays: parse_trusted_relays(&config.ingest.trusted_relays)?,
-                repin_coordinator: if config.ingest.enabled {
-                    Some(Arc::new(crate::repin::RepinCoordinator::new()))
-                } else {
-                    None
-                },
+                repin_coordinator: repin_coordinator.clone(),
             },
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),
             metrics_handle,
             dashboard_snapshot: Arc::new(Mutex::new(None)),
+            repin: None,
+        };
+        let state = {
+            let mut state = state;
+            state.repin = repin_coordinator.map(|coordinator| {
+                Arc::new(crate::repin::RepinEngine::new(
+                    state.storage.repin.clone(),
+                    state.storage.catalog.clone(),
+                    Arc::clone(&state.query.field_catalog),
+                    coordinator,
+                    state.query.pool.clone(),
+                    config.data.base_dir(),
+                    config.ingest.compaction_memory_limit.clone(),
+                    config.retention.min_free_disk_bytes,
+                ))
+            });
+            state
         };
 
         let http = HttpConfig {

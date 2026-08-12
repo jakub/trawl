@@ -132,6 +132,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // ADR-0011 slice B, filesystem half: an interrupted repin must be
+    // finished BEFORE the epoch gate forms an opinion of the data root —
+    // a half-swapped corpus does not error, it silently promotes. One
+    // stat on the marker-less fast path.
+    let recovered_repin = trawl_server::repin::recover::recover_filesystem(
+        &config.data.base_dir(),
+        config.ingest.enabled,
+    )?;
+
     // ADR-0009 storage-epoch gate: runs before any component touches the
     // data root. Refuses to start on the ambiguous branch.
     let epoch_outcome = trawl_server::epoch::ensure_current_epoch(
@@ -201,6 +210,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
+    // ADR-0011 slice B, postgres half: finish the recovered job row
+    // (idempotent flip or failure), re-arm the conformance pass for a
+    // recovered cutover, sweep the aside, reconcile orphaned running rows.
+    // Runs BEFORE the conformance pass so a cleared conformed_at re-proves
+    // the corpus in this very boot.
+    trawl_server::repin::recover::reconcile_store(
+        &state.storage,
+        &state.query.field_catalog,
+        &config.data.base_dir(),
+        recovered_repin,
+    )
+    .await?;
 
     // ADR-0009 boot conformance pass: make the write-time invariant true
     // over the standing corpus before anything reads or writes it. Only on
