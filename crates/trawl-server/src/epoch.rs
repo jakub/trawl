@@ -325,17 +325,35 @@ fn is_legacy_partition_dir(name: &str) -> bool {
 /// place — so a crash can never publish a half-written marker (which the
 /// next boot would reject as an unrecognized epoch).
 fn adopt_in_place(data_root: &Path) -> Result<(), String> {
-    let staged = data_root.join(format!("{EPOCH_FILE}{NEXT_SUFFIX}"));
-    std::fs::write(&staged, format!("{CURRENT_EPOCH}\n"))
+    publish_marker_staged(data_root, EPOCH_FILE, &format!("{CURRENT_EPOCH}\n"))
+}
+
+/// Publish a small marker file into a directory via the staged-write
+/// idiom, durable before it is visible: staged temp name → fsync → atomic
+/// rename → dir fsync. A crash can then never publish a half-written
+/// marker — every reader sees either the previous content or the new one.
+///
+/// This is the ONE implementation of that sequence: the epoch marker
+/// ([`EPOCH_FILE`]), the catalog identity marker
+/// (`catalog::conform::publish_marker`) and the repin marker
+/// (`repin::marker::write_marker`) all publish through it, so a future
+/// hardening of the sequence lands on all three at once.
+///
+/// The staged name is PID-unique: concurrent publishers (test harnesses
+/// share a fixture corpus) must not clobber each other's staged file
+/// between the write and the rename.
+pub(crate) fn publish_marker_staged(dir: &Path, name: &str, body: &str) -> Result<(), String> {
+    let staged = dir.join(format!("{name}{NEXT_SUFFIX}.{}", std::process::id()));
+    std::fs::write(&staged, body)
         .map_err(|e| format!("failed to write {}: {e}", staged.display()))?;
     std::fs::File::open(&staged)
         .and_then(|f| f.sync_all())
         .map_err(|e| format!("failed to fsync {}: {e}", staged.display()))?;
 
-    let marker = data_root.join(EPOCH_FILE);
+    let marker = dir.join(name);
     std::fs::rename(&staged, &marker)
         .map_err(|e| format!("failed to publish {}: {e}", marker.display()))?;
-    fsync_dir_best_effort(data_root);
+    fsync_dir_best_effort(dir);
     Ok(())
 }
 

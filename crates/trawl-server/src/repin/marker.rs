@@ -5,8 +5,9 @@
 //! The repin operation marker and staging-root layout (ADR-0011 slice B).
 //!
 //! `data/REPIN` is a small JSON document naming the job, the field, the
-//! two types and the current phase. It is written via the staged-write
-//! idiom (temp name → fsync → atomic rename → dir fsync) BEFORE any
+//! two types and the current phase. It is written via the shared
+//! staged-write idiom ([`crate::epoch::publish_marker_staged`]: temp name
+//! → fsync → atomic rename → dir fsync) BEFORE any
 //! visible change and removed as the job's final act, so boot recovery
 //! reads exactly one file to know whether — and where — a repin died.
 //!
@@ -104,21 +105,12 @@ pub fn read_marker(data_dir: &Path) -> Result<Option<RepinMarker>, String> {
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))
 }
 
-/// Write (or rewrite) the marker via the staged-write idiom, durable
-/// before it is visible: temp name → fsync → atomic rename → dir fsync.
+/// Write (or rewrite) the marker through the shared staged-write idiom
+/// ([`crate::epoch::publish_marker_staged`]), durable before it is
+/// visible: temp name → fsync → atomic rename → dir fsync.
 pub fn write_marker(data_dir: &Path, marker: &RepinMarker) -> Result<(), String> {
-    let staged = data_dir.join(format!("{REPIN_MARKER}.next.{}", std::process::id()));
     let body = serde_json::to_string(marker).map_err(|e| format!("marker serialize: {e}"))?;
-    std::fs::write(&staged, body)
-        .map_err(|e| format!("failed to write {}: {e}", staged.display()))?;
-    std::fs::File::open(&staged)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| format!("failed to fsync {}: {e}", staged.display()))?;
-    let path = marker_path(data_dir);
-    std::fs::rename(&staged, &path)
-        .map_err(|e| format!("failed to publish {}: {e}", path.display()))?;
-    crate::epoch::fsync_dir_best_effort(data_dir);
-    Ok(())
+    crate::epoch::publish_marker_staged(data_dir, REPIN_MARKER, &body)
 }
 
 /// Remove the marker — the job's final act.

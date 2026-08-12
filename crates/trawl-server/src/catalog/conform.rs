@@ -516,25 +516,13 @@ fn read_marker(data_dir: &Path) -> Option<String> {
         .map(|s| s.trim().to_owned())
 }
 
-/// Publish the marker via the epoch idiom: staged write → fsync → atomic
-/// rename, so a crash can never leave a half-written identity.
+/// Publish the marker through the shared staged-write idiom
+/// ([`crate::epoch::publish_marker_staged`]), so a crash can never leave a
+/// half-written identity.
 fn publish_marker(data_dir: &Path, catalog_id: &str) -> Result<(), String> {
     std::fs::create_dir_all(data_dir)
         .map_err(|e| format!("failed to create data root for marker: {e}"))?;
-    // PID-unique staged name: concurrent publishers (test harnesses share
-    // a fixture corpus) must not clobber each other's staged file between
-    // write and rename.
-    let staged = data_dir.join(format!("{CATALOG_MARKER}.next.{}", std::process::id()));
-    std::fs::write(&staged, format!("{catalog_id}\n"))
-        .map_err(|e| format!("failed to write {}: {e}", staged.display()))?;
-    std::fs::File::open(&staged)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| format!("failed to fsync {}: {e}", staged.display()))?;
-    let marker = data_dir.join(CATALOG_MARKER);
-    std::fs::rename(&staged, &marker)
-        .map_err(|e| format!("failed to publish {}: {e}", marker.display()))?;
-    crate::epoch::fsync_dir_best_effort(data_dir);
-    Ok(())
+    crate::epoch::publish_marker_staged(data_dir, CATALOG_MARKER, &format!("{catalog_id}\n"))
 }
 
 /// Open an in-memory `DuckDB` connection bounded like compaction's: temp
