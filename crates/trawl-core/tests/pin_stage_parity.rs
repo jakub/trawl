@@ -117,6 +117,63 @@ fn run_cell(
     eval_result
 }
 
+/// Run a WHOLE pipeline through both lanes and assert the event either
+/// survives in both or in neither — unlike [`run_cell`], which evaluates
+/// the `where` condition alone at root scope, this applies every earlier
+/// stage, so a stage that RENAMES the row's keys is exercised.
+fn run_pipeline_cell(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    ft: &FieldTypes,
+) -> bool {
+    let query = parser::parse(dsl).expect("dsl parses");
+
+    let plan = compile_stream_plan(&query.pipeline, &PinScope::root(ft)).expect("plan compiles");
+    let StreamPlan::PassThrough(mut stages) = plan else {
+        panic!("{dsl:?} must compile to a per-event plan");
+    };
+    let mut streamed = event.clone();
+    let mut live_result = true;
+    for stage in &mut stages {
+        match apply_stage(stage, &mut streamed) {
+            StageResult::Pass => {}
+            StageResult::Filtered | StageResult::Done => {
+                live_result = false;
+                break;
+            }
+        }
+    }
+
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".ndjson")
+        .tempfile()
+        .unwrap();
+    writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
+    tmp.flush().unwrap();
+    let source = tmp.path().to_str().unwrap().to_owned();
+    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let count_sql = format!("SELECT count(*)::BIGINT FROM ({}) AS _sub", emitted.sql);
+    let params = bind_params(&emitted.params);
+    let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+    let count: i64 = conn
+        .query_row(&count_sql, param_refs.as_slice(), |row| row.get(0))
+        .unwrap_or_else(|e| {
+            panic!(
+                "pinned pipeline must not error: {e}\ndsl: {dsl:?}\nsql: {}",
+                emitted.sql
+            )
+        });
+    let batch_result = count > 0;
+
+    assert_eq!(
+        live_result, batch_result,
+        "lane divergence\ndsl: {dsl:?}\nevent: {event:?}\nlive: {live_result}\nsql: {}",
+        emitted.sql
+    );
+    batch_result
+}
+
 /// Run one `| let` pipeline through both lanes and assert the named
 /// output columns carry the same value.
 fn run_let_cell(
@@ -433,4 +490,72 @@ fn let_assignments_are_parallel_in_both_lanes() {
     // column reads the column. A reference to a name the corpus carries
     // nowhere is the documented residual — batch takes the sibling's
     // freshly computed value, live has no column to read and answers NULL.
+}
+
+/// A pinned comparison reads the row under the spelling the ROW uses.
+///
+/// Ingest ASCII-folds every key it writes, so `where Status>400` over a
+/// stored `status` needs the fold — but the pipeline lanes carry
+/// user-chosen names VERBATIM (`rename status as St` keys the live event
+/// `St` and names the SQL result column `"St"`), so a mixed-case alias
+/// must not be folded away into a lookup that misses and drops the row.
+#[test]
+fn mixed_case_aliases_resolve_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let mut ft = FieldTypes::new();
+    ft.insert("status", CanonicalType::Varchar);
+
+    let event = event_with("status", Value::from("404"));
+
+    // The ingest-written key needs the fold.
+    assert!(run_pipeline_cell(
+        &conn,
+        "* | where Status > 400",
+        &event,
+        &ft
+    ));
+    assert!(!run_pipeline_cell(
+        &conn,
+        "* | where Status > 500",
+        &event,
+        &ft
+    ));
+    // A pipeline alias is verbatim, and the pin rides along with it.
+    assert!(run_pipeline_cell(
+        &conn,
+        "* | rename status as St | where St > 400",
+        &event,
+        &ft
+    ));
+    assert!(!run_pipeline_cell(
+        &conn,
+        "* | rename status as St | where St > 500",
+        &event,
+        &ft
+    ));
+    assert!(run_pipeline_cell(
+        &conn,
+        "* | let S2 = status | where S2 > 400",
+        &event,
+        &ft
+    ));
+    assert!(!run_pipeline_cell(
+        &conn,
+        "* | let S2 = status | where S2 > 500",
+        &event,
+        &ft
+    ));
+    // Same through the IN-list and pattern arms.
+    assert!(run_pipeline_cell(
+        &conn,
+        "* | rename status as St | where St in (404)",
+        &event,
+        &ft
+    ));
+    assert!(run_pipeline_cell(
+        &conn,
+        "* | rename status as St | where St matches /^404$/",
+        &event,
+        &ft
+    ));
 }

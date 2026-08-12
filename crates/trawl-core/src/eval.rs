@@ -320,12 +320,23 @@ fn bare_literal(expr: &Expr) -> Option<&LiteralValue> {
     }
 }
 
-/// The event value a pinned comparison reads: the catalog-key spelling
-/// (alias resolution + ASCII fold — `DuckDB` binds `"Status"` to the real
-/// `status` column, and ingest folds every stored key), non-null.
+/// The event value a pinned comparison reads, non-null.
+///
+/// The verbatim (alias-resolved) spelling wins, then the catalog key
+/// (that spelling ASCII-folded) — the same order `DuckDB` binds a column
+/// reference: an exact match first, case-insensitively otherwise. Both
+/// halves are load-bearing. Pipeline lanes key events by USER-CHOSEN
+/// names carried verbatim (`rename status as St` gives the row an `St`
+/// key, in the SQL result columns and in `stream::apply_stage` alike), so
+/// folding first would miss the value and drop the row — while ingest
+/// folds every key it writes, so an unrenamed `where Status>400` finds
+/// `status` only through the fold. Presence — not non-nullness — decides
+/// the fallback: a verbatim key holding JSON null is that field's own
+/// NULL (UNKNOWN), never a reason to read a differently-cased sibling.
 fn pinned_event_value<'e>(event: &'e Map<String, Value>, name: &str) -> Option<&'e Value> {
     event
-        .get(&crate::schema::catalog_key(name))
+        .get(map_field_name(name))
+        .or_else(|| event.get(&crate::schema::catalog_key(name)))
         .filter(|v| !v.is_null())
 }
 
