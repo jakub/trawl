@@ -450,6 +450,14 @@ corpus.
 
 ### Also recorded
 
+- The narrow pause stops WAL *draining* (a compaction batch cannot start
+  under the corpus gate) but nothing an operator can observe as a missing
+  event: ingest takes neither the gate nor an executor permit, so events
+  keep landing in the WAL and the hot buffer throughout, undrained and
+  therefore still queryable, and they are in the corpus exactly once past
+  the cutover — the ADR-0008 prohibition, evidenced end to end by
+  `trawl-server/tests/repin.rs::events_ingested_during_the_final_pause_stay_visible_exactly_once`.
+  The file-relocating rollup, by contrast, stands down for the WHOLE job.
 - The resurrection expression lives in `trawl_core::conform`
   (`resurrection_expr`: guarded stored reading, then the guarded `_raw`
   re-extraction — an exact-key RFC 6901 JSON Pointer, never JSONPath,

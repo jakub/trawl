@@ -28,6 +28,20 @@ use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, watch};
 pub struct RepinCoordinator {
     corpus_gate: RwLock<()>,
     rollup_pause: watch::Sender<bool>,
+    /// Test-only widening of the cutover pause, held on the coordinator
+    /// rather than in a static so one test's widened pause cannot leak
+    /// into another test's job in the same binary.
+    #[cfg(any(test, feature = "test-support"))]
+    cutover_hold: CutoverHold,
+}
+
+/// Test-only pause widening: how long the cutover sleeps under both
+/// exclusion guards, and whether it is sleeping right now.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+struct CutoverHold {
+    millis: std::sync::atomic::AtomicU64,
+    active: std::sync::atomic::AtomicBool,
 }
 
 impl Default for RepinCoordinator {
@@ -44,6 +58,8 @@ impl RepinCoordinator {
         Self {
             corpus_gate: RwLock::new(()),
             rollup_pause,
+            #[cfg(any(test, feature = "test-support"))]
+            cutover_hold: CutoverHold::default(),
         }
     }
 
@@ -75,6 +91,47 @@ impl RepinCoordinator {
     #[must_use]
     pub fn rollup_paused(&self) -> bool {
         *self.rollup_pause.borrow()
+    }
+
+    /// Test-only: widen this coordinator's cutover pause to `millis`, so a
+    /// test can ingest and inspect the hot buffer inside the one window
+    /// that stops WAL draining.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_cutover_hold_ms(&self, millis: u64) {
+        self.cutover_hold
+            .millis
+            .store(millis, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: whether the cutover is sleeping in that widened pause
+    /// right now — the test's rising edge into it, and its proof that an
+    /// assertion landed inside it.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn cutover_hold_active(&self) -> bool {
+        self.cutover_hold
+            .active
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Test-only: the cutover's own side of that hold, called with both
+    /// exclusion guards held.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn hold_cutover_for_tests(&self) {
+        let millis = self
+            .cutover_hold
+            .millis
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if millis == 0 {
+            return;
+        }
+        self.cutover_hold
+            .active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+        self.cutover_hold
+            .active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

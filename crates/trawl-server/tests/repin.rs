@@ -662,6 +662,139 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     assert!(metrics.contains("trawl_catalog_repin_duration_seconds"));
 }
 
+/// The final pause stops WAL draining — and nothing else an operator can
+/// observe. Inside the held pause (corpus gate + every executor permit)
+/// ingest still lands, the hot buffer still holds those events undrained
+/// (a drain follows a compaction batch, and no batch may run), and a query
+/// issued into the pause waits rather than erroring or missing them. Past
+/// the cutover the same events are in the corpus exactly once, including
+/// after the compaction tick that finally drains them: ADR-0008's
+/// invisible-events prohibition across ADR-0011 slice B's one stopped
+/// world.
+#[sqlx::test(migrations = false)]
+async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    let hot = h
+        .server
+        .state
+        .query
+        .hot_buffer
+        .clone()
+        .expect("ingest-enabled server has a hot buffer");
+    let coordinator = h
+        .server
+        .state
+        .ingest
+        .repin_coordinator
+        .clone()
+        .expect("ingest-enabled server has a repin coordinator");
+
+    h.ingest_and_compact(&[
+        event("api", &json!({"status": 200})),
+        event("api", &json!({"status": 404})),
+    ])
+    .await;
+    assert_eq!(h.count("last=1h | stats count()").await, 2);
+    assert_eq!(
+        hot.event_count(),
+        0,
+        "the seed batch drained after compaction"
+    );
+
+    // Widen the pause so the test can act inside it.
+    coordinator.set_cutover_hold_ms(3_000);
+    let started = match h
+        .schema_admin
+        .schema_repin("status", "VARCHAR", false, false)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+
+    // Wait for the rising edge into the pause.
+    let mut entered = false;
+    for _ in 0..600 {
+        if coordinator.cutover_hold_active() {
+            entered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(entered, "the cutover never entered its pause");
+
+    // Ingest INTO the pause: the WAL writer and the hot buffer take
+    // neither the corpus gate nor an executor permit, so this must not
+    // block on the cutover.
+    let resp = tokio::time::timeout(
+        Duration::from_secs(2),
+        h.ingest.ingest(&[event("api", &json!({"status": 418}))]),
+    )
+    .await
+    .expect("ingest must not block on the cutover")
+    .expect("ingest during the pause");
+    assert_eq!(resp.accepted, 1);
+    assert_eq!(
+        hot.event_count(),
+        1,
+        "the event ingested during the pause is held in the hot buffer"
+    );
+
+    // A query issued into the pause waits for a permit; it must answer,
+    // and it must see that event. Spawned, because the pause is exactly
+    // what it is waiting on.
+    let paused_query = {
+        let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
+        tokio::spawn(async move {
+            client
+                .query_paginated("status=418 last=1h | stats count()", None, None)
+                .await
+        })
+    };
+
+    // Nothing drains while the pause is held: a drain only follows a
+    // compaction batch, and no batch may start under the corpus gate.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        hot.event_count(),
+        1,
+        "no drain may make an undrained event invisible during the pause"
+    );
+    assert!(
+        coordinator.cutover_hold_active(),
+        "the assertions above must land inside the pause window"
+    );
+
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+
+    let answered = paused_query
+        .await
+        .expect("query task")
+        .expect("a query issued into the pause waits, it does not error");
+    assert_eq!(
+        answered.result.rows[0][0],
+        trawl_engine::value::Value::Integer(1),
+        "the paused query sees the event ingested during the pause"
+    );
+
+    // Exactly once post-cutover — from the hot buffer first, then from the
+    // repinned corpus once compaction has folded the WAL in and drained.
+    assert_eq!(h.pinned_type("status").await, "VARCHAR");
+    assert_eq!(h.count("last=1h | stats count()").await, 3);
+    assert_eq!(h.count("status=418 last=1h | stats count()").await, 1);
+
+    h.compact_tick().await;
+    assert_eq!(
+        hot.event_count(),
+        0,
+        "the pause only deferred the drain; the tick after it completes"
+    );
+    assert_eq!(h.count("last=1h | stats count()").await, 3);
+    assert_eq!(h.count("status=418 last=1h | stats count()").await, 1);
+}
+
 /// The postgres half of boot recovery over a real storage state: a marker
 /// in the cutover phase finishes the job transactionally, flips the pin,
 /// re-arms the conformance pass, sweeps the aside, and removes the

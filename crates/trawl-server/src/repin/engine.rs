@@ -515,6 +515,11 @@ impl RepinEngine {
             }
         };
 
+        // Test-only widening of the pause, so a test can act inside the
+        // one window that stops WAL draining.
+        #[cfg(any(test, feature = "test-support"))]
+        self.coordinator.hold_cutover_for_tests().await;
+
         // Final increment under exclusion: nothing can write or read the
         // corpus now, so this pass is the last word.
         self.run_pass(field, to, &flipped, scanned, &mut state)
