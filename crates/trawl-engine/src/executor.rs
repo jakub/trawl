@@ -109,7 +109,11 @@ impl Executor {
         let emitted = emitter::emit_with_pins(&ast, source, pins)?;
         let mut result = self.execute_emitted(&emitted, max_rows, utc_offset_secs)?;
         if !emitted.rust_stages.is_empty() {
-            result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
+            result = crate::post_process::apply_rust_stages(
+                result,
+                &emitted.rust_stages,
+                &emitted.rust_stage_pins,
+            )?;
         }
         if emitted.needs_column_reorder {
             result.reorder_log_columns();
@@ -223,7 +227,11 @@ impl Executor {
             outcome?
         };
         if !emitted.rust_stages.is_empty() {
-            result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
+            result = crate::post_process::apply_rust_stages(
+                result,
+                &emitted.rust_stages,
+                &emitted.rust_stage_pins,
+            )?;
         }
         if emitted.needs_column_reorder {
             result.reorder_log_columns();

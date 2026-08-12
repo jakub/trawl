@@ -43,6 +43,36 @@ pub(crate) enum CompareOp {
     Lte,
 }
 
+impl CompareOp {
+    /// The comparison subset of [`crate::ast::FilterOp`]; `None` for the
+    /// pattern operators, which never reach the comparison core.
+    pub(crate) fn from_filter(op: crate::ast::FilterOp) -> Option<Self> {
+        use crate::ast::FilterOp;
+        match op {
+            FilterOp::Eq => Some(Self::Eq),
+            FilterOp::Ne => Some(Self::Ne),
+            FilterOp::Gt => Some(Self::Gt),
+            FilterOp::Gte => Some(Self::Gte),
+            FilterOp::Lt => Some(Self::Lt),
+            FilterOp::Lte => Some(Self::Lte),
+            FilterOp::Glob | FilterOp::Regex => None,
+        }
+    }
+}
+
+/// What a stored NULL — a value the conform's round-trip guard nulled out
+/// — answers under `!=`. The same per-lane split as the SQL side's
+/// `emitter::compare::NullPolicy`: the search stage's emitted `!=` carries
+/// `OR col IS NULL` (a stored NULL matches), while the pipeline's keeps
+/// plain SQL null propagation (UNKNOWN for every operator).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NullReadPolicy {
+    /// Search-stage rule: a stored NULL matches `!=`.
+    NeMatches,
+    /// Pipeline rule: a stored NULL is UNKNOWN, `!=` included.
+    Unknown,
+}
+
 /// A filter value coerced to the most specific numeric type.
 ///
 /// Mirrors the coercion in `emitter::fields::coerce_filter_value()`, plus
@@ -230,7 +260,12 @@ pub(crate) fn or_any(items: impl IntoIterator<Item = Truth>) -> Truth {
 ///   comparison is UNKNOWN
 /// - `TextOrNumeric` filter: the value's text form OR that same DECIMAL
 ///   reading, both `COALESCE`d exactly as the SQL is
-pub(crate) fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -> Truth {
+pub(crate) fn compare_values(
+    event_val: &Value,
+    op: CompareOp,
+    filter_val: &CoercedValue,
+    null_read: NullReadPolicy,
+) -> Truth {
     match filter_val {
         CoercedValue::Int(fv) => {
             if let Some(ev) = extract_i64(event_val) {
@@ -271,12 +306,16 @@ pub(crate) fn compare_values(event_val: &Value, op: CompareOp, filter_val: &Coer
         }
         // The typed-pin rung: the SQL compares the CONFORMED column, so
         // read the wire value's conformed value and compare THAT. A value
-        // with no reading is the NULL the guard wrote — and the emitted
-        // `!=` carries `OR col IS NULL`, so it answers exactly as an
-        // absent key does.
+        // with no reading is the NULL the guard wrote — the caller's lane
+        // decides what a stored NULL answers under `!=` (the search
+        // stage's emitted form carries `OR col IS NULL`; the pipeline's
+        // does not), so it answers exactly as an absent key does there.
         CoercedValue::Conformed { pin, literal } => match conformed_reading(event_val, *pin) {
             Some(reading) => compare_conformed(reading, op, *literal),
-            None => (op == CompareOp::Ne).then_some(true),
+            None => match null_read {
+                NullReadPolicy::NeMatches => (op == CompareOp::Ne).then_some(true),
+                NullReadPolicy::Unknown => None,
+            },
         },
         // The two-armed equality rung. The wire text is only the stored
         // text when `read_json` did not widen the column, so the numeric

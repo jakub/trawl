@@ -28,8 +28,8 @@ use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken};
 use crate::compare::{self, PatternForm};
 use crate::emitter::EmitError;
 use crate::pin_match::{
-    CoercedValue, CompareOp, Truth, and_all, apply_ord, coerce_form, compare_values, extract_i64,
-    or_any, pattern_text,
+    CoercedValue, CompareOp, NullReadPolicy, Truth, and_all, apply_ord, coerce_form,
+    compare_values, extract_i64, or_any, pattern_text,
 };
 use crate::schema::FieldTypes;
 
@@ -462,12 +462,14 @@ impl FieldMatcher {
         };
 
         match &self.predicate {
-            FieldPredicate::Compare { op, value } => compare_values(event_val, *op, value),
-            FieldPredicate::InList { values } => or_any(
-                values
-                    .iter()
-                    .map(|v| compare_values(event_val, CompareOp::Eq, v)),
-            ),
+            FieldPredicate::Compare { op, value } => {
+                compare_values(event_val, *op, value, NullReadPolicy::NeMatches)
+            }
+            FieldPredicate::InList { values } => {
+                or_any(values.iter().map(|v| {
+                    compare_values(event_val, CompareOp::Eq, v, NullReadPolicy::NeMatches)
+                }))
+            }
             FieldPredicate::Glob { regex, form } | FieldPredicate::Regex { regex, form } => {
                 // No canonical text (a TIMESTAMP pin over a value with no
                 // timestamp reading) is a NULL column in batch, and

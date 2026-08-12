@@ -27,7 +27,8 @@ use crate::emitter::{
     format_literal_position, map_field_name, unit_literal_positions, validate_format_literal,
     validate_unit_literal,
 };
-use crate::eval::eval_expr;
+use crate::eval::eval_expr_with_pins;
+use crate::pin_scope::PinScope;
 
 // ── stream plan ────────────────────────────────────────────────────
 
@@ -88,7 +89,19 @@ impl std::error::Error for StreamPlanError {}
 ///
 /// Rejects unsupported stages (sort, pivot, multiple aggregations)
 /// with an error before the stream starts.
-pub fn compile_stream_plan(pipeline: &[Spanned<PipeStage>]) -> Result<StreamPlan, StreamPlanError> {
+///
+/// `pins` is the pin scope in force at the FIRST stage of `pipeline`
+/// (ADR-0011 slice A′): the catalog snapshot's root for a whole-pipeline
+/// SSE stream, or the scope stamped at the kv split for a `rust_stages`
+/// batch tail. The compiler walks the SAME per-stage scope table the SQL
+/// emitter consumes (`crate::pin_scope`), stamping each `where`/`let`
+/// with the scope it must evaluate under — no default parameter, so
+/// pin-blindness is always explicit at the call site
+/// (`&PinScope::unpinned()`).
+pub fn compile_stream_plan(
+    pipeline: &[Spanned<PipeStage>],
+    pins: &PinScope,
+) -> Result<StreamPlan, StreamPlanError> {
     // `level` is a filter-only alias for the numeric `severity` column
     // (ADR-0009), so every other use of the name — `stats … by level`,
     // `table level`, `where level in (…)`, `where "error" == level`,
@@ -103,6 +116,9 @@ pub fn compile_stream_plan(pipeline: &[Spanned<PipeStage>]) -> Result<StreamPlan
     // Find the first aggregation stage index (if any).
     let agg_idx = pipeline.iter().position(|s| is_agg_stage(&s.node));
 
+    // The scope advances per stage — one walk, shared with the emitter.
+    let mut scope = pins.clone();
+
     if let Some(idx) = agg_idx {
         // Check for a second aggregation stage (not supported).
         if pipeline[idx + 1..].iter().any(|s| is_agg_stage(&s.node)) {
@@ -114,14 +130,17 @@ pub fn compile_stream_plan(pipeline: &[Spanned<PipeStage>]) -> Result<StreamPlan
 
         let mut pre_stages = Vec::new();
         for spanned in &pipeline[..idx] {
-            pre_stages.push(compile_per_event_stage(spanned)?);
+            pre_stages.push(compile_per_event_stage(spanned, &scope)?);
+            scope.advance(&spanned.node);
         }
 
         let aggregation = compile_aggregation(&pipeline[idx].node)?;
+        scope.advance(&pipeline[idx].node);
 
         let mut post_stages = Vec::new();
         for spanned in &pipeline[idx + 1..] {
-            post_stages.push(compile_per_event_stage(spanned)?);
+            post_stages.push(compile_per_event_stage(spanned, &scope)?);
+            scope.advance(&spanned.node);
         }
 
         Ok(StreamPlan::Aggregate {
@@ -132,7 +151,8 @@ pub fn compile_stream_plan(pipeline: &[Spanned<PipeStage>]) -> Result<StreamPlan
     } else {
         let mut stages = Vec::new();
         for spanned in pipeline {
-            stages.push(compile_per_event_stage(spanned)?);
+            stages.push(compile_per_event_stage(spanned, &scope)?);
+            scope.advance(&spanned.node);
         }
         Ok(StreamPlan::PassThrough(stages))
     }
@@ -150,15 +170,18 @@ fn is_agg_stage(stage: &PipeStage) -> bool {
     )
 }
 
-fn compile_per_event_stage(spanned: &Spanned<PipeStage>) -> Result<CompiledStage, StreamPlanError> {
+fn compile_per_event_stage(
+    spanned: &Spanned<PipeStage>,
+    scope: &PinScope,
+) -> Result<CompiledStage, StreamPlanError> {
     match &spanned.node {
         PipeStage::Table(s) => Ok(compile_table(s)),
         PipeStage::Drop(s) => Ok(compile_drop(s)),
         PipeStage::Rename(s) => Ok(compile_rename(s)),
         PipeStage::Limit(s) => Ok(compile_limit(s)),
         PipeStage::Tail(s) => Ok(CompiledStage::Tail { count: s.count }),
-        PipeStage::Where(s) => compile_where(s),
-        PipeStage::Let(s) => compile_let(s),
+        PipeStage::Where(s) => compile_where(s, scope),
+        PipeStage::Let(s) => compile_let(s, scope),
         PipeStage::Extract(s) => compile_extract(s),
         PipeStage::Dedup(s) => Ok(compile_dedup(s)),
 
@@ -234,10 +257,14 @@ pub enum CompiledStage {
     /// Filter events by condition.
     Where {
         condition: Spanned<crate::ast::Expr>,
+        /// The pin scope in force at this stage (ADR-0011 slice A′).
+        pins: PinScope,
     },
     /// Compute derived fields.
     Let {
         assignments: Vec<(String, Spanned<crate::ast::Expr>)>,
+        /// The pin scope in force at this stage (ADR-0011 slice A′).
+        pins: PinScope,
     },
     /// Extract fields via regex.
     ExtractRegex {
@@ -269,7 +296,7 @@ impl fmt::Debug for CompiledStage {
                 .finish(),
             Self::Tail { count } => f.debug_struct("Tail").field("count", count).finish(),
             Self::Where { .. } => f.debug_struct("Where").finish_non_exhaustive(),
-            Self::Let { assignments } => f
+            Self::Let { assignments, .. } => f
                 .debug_struct("Let")
                 .field("num_assignments", &assignments.len())
                 .finish(),
@@ -347,19 +374,21 @@ fn compile_limit(s: &LimitStage) -> CompiledStage {
     }
 }
 
-fn compile_where(s: &WhereStage) -> Result<CompiledStage, StreamPlanError> {
+fn compile_where(s: &WhereStage, scope: &PinScope) -> Result<CompiledStage, StreamPlanError> {
     validate_expr(&s.condition)?;
     Ok(CompiledStage::Where {
         condition: s.condition.clone(),
+        pins: scope.clone(),
     })
 }
 
-fn compile_let(s: &LetStage) -> Result<CompiledStage, StreamPlanError> {
+fn compile_let(s: &LetStage, scope: &PinScope) -> Result<CompiledStage, StreamPlanError> {
     for (_, expr) in &s.assignments {
         validate_expr(expr)?;
     }
     Ok(CompiledStage::Let {
         assignments: s.assignments.clone(),
+        pins: scope.clone(),
     })
 }
 
@@ -505,8 +534,8 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
             StageResult::Pass
         }
 
-        CompiledStage::Where { condition } => {
-            let result = eval_expr(condition, event);
+        CompiledStage::Where { condition, pins } => {
+            let result = eval_expr_with_pins(condition, event, pins);
             if result.is_truthy() {
                 StageResult::Pass
             } else {
@@ -514,9 +543,9 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
             }
         }
 
-        CompiledStage::Let { assignments } => {
+        CompiledStage::Let { assignments, pins } => {
             for (name, expr) in assignments {
-                let result = eval_expr(expr, event);
+                let result = eval_expr_with_pins(expr, event, pins);
                 event.insert(name.clone(), Value::from(result));
             }
             StageResult::Pass
@@ -1338,7 +1367,7 @@ mod tests {
                 direction: crate::ast::SortDirection::Desc,
             }],
         }))];
-        let err = compile_stream_plan(&pipeline).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
         assert!(err.to_string().contains("sort"));
         assert!(err.to_string().contains("arrival order"));
     }
@@ -1354,13 +1383,13 @@ mod tests {
             on_field: "status".into(),
             by: vec![],
         }))];
-        let err = compile_stream_plan(&pipeline).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
         assert!(err.to_string().contains("pivot"));
     }
 
     #[test]
     fn accepts_empty_pipeline() {
-        let plan = compile_stream_plan(&[]).unwrap();
+        let plan = compile_stream_plan(&[], &PinScope::unpinned()).unwrap();
         assert!(matches!(plan, StreamPlan::PassThrough(stages) if stages.is_empty()));
     }
 
@@ -1514,7 +1543,7 @@ mod tests {
             op: BinaryOp::Gt,
             rhs: Box::new(span(Expr::Literal(LiteralValue::Int(400)))),
         });
-        let mut stage = compile_where(&WhereStage { condition }).unwrap();
+        let mut stage = compile_where(&WhereStage { condition }, &PinScope::unpinned()).unwrap();
         let mut ev = event(&json!({"status": 500}));
         assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
     }
@@ -1526,7 +1555,7 @@ mod tests {
             op: BinaryOp::Gt,
             rhs: Box::new(span(Expr::Literal(LiteralValue::Int(400)))),
         });
-        let mut stage = compile_where(&WhereStage { condition }).unwrap();
+        let mut stage = compile_where(&WhereStage { condition }, &PinScope::unpinned()).unwrap();
         let mut ev = event(&json!({"status": 200}));
         assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Filtered);
     }
@@ -1538,7 +1567,7 @@ mod tests {
             op: BinaryOp::Gt,
             rhs: Box::new(span(Expr::Literal(LiteralValue::Int(0)))),
         });
-        let mut stage = compile_where(&WhereStage { condition }).unwrap();
+        let mut stage = compile_where(&WhereStage { condition }, &PinScope::unpinned()).unwrap();
         let mut ev = event(&json!({"host": "web-1"}));
         assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Filtered);
     }
@@ -1546,13 +1575,16 @@ mod tests {
     /// `where level == "..."` reads the numeric `severity` column, exactly
     /// like the SQL band predicate — `level` itself is never stored.
     fn level_where(op: BinaryOp, token: &str) -> Result<CompiledStage, StreamPlanError> {
-        compile_where(&WhereStage {
-            condition: span(Expr::Binary {
-                lhs: Box::new(span(Expr::FieldRef("level".into()))),
-                op,
-                rhs: Box::new(span(Expr::Literal(LiteralValue::String(token.into())))),
-            }),
-        })
+        compile_where(
+            &WhereStage {
+                condition: span(Expr::Binary {
+                    lhs: Box::new(span(Expr::FieldRef("level".into()))),
+                    op,
+                    rhs: Box::new(span(Expr::Literal(LiteralValue::String(token.into())))),
+                }),
+            },
+            &PinScope::unpinned(),
+        )
     }
 
     #[test]
@@ -1622,7 +1654,7 @@ mod tests {
             "* | let lvl = level",
         ] {
             let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
-            let err = compile_stream_plan(&pipeline).unwrap_err();
+            let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
             assert!(
                 matches!(err, StreamPlanError::InvalidLevel(_)),
                 "{dsl}: expected InvalidLevel, got {err:?}"
@@ -1637,7 +1669,7 @@ mod tests {
         let ok = crate::parser::parse(r#"* | where level >= "warn""#)
             .expect("parses")
             .pipeline;
-        assert!(compile_stream_plan(&ok).is_ok());
+        assert!(compile_stream_plan(&ok, &PinScope::unpinned()).is_ok());
     }
 
     // ── tier 2: let ────────────────────────────────────────────────
@@ -1652,10 +1684,13 @@ mod tests {
                 rhs: Box::new(span(Expr::Literal(LiteralValue::Int(1000)))),
             }),
         )];
-        let mut stage = compile_let(&LetStage {
-            assignments,
-            keyword: "let",
-        })
+        let mut stage = compile_let(
+            &LetStage {
+                assignments,
+                keyword: "let",
+            },
+            &PinScope::unpinned(),
+        )
         .unwrap();
         let mut ev = event(&json!({"duration": 2}));
         apply_stage(&mut stage, &mut ev);
@@ -1671,10 +1706,13 @@ mod tests {
                 args: vec![span(Expr::FieldRef("service".into()))],
             }),
         )];
-        let mut stage = compile_let(&LetStage {
-            assignments,
-            keyword: "let",
-        })
+        let mut stage = compile_let(
+            &LetStage {
+                assignments,
+                keyword: "let",
+            },
+            &PinScope::unpinned(),
+        )
         .unwrap();
         let mut ev = event(&json!({"service": "nginx"}));
         apply_stage(&mut stage, &mut ev);
@@ -1912,7 +1950,7 @@ mod tests {
                 renames: vec![("service".into(), "svc".into())],
             })),
         ];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::PassThrough(mut stages) = plan else {
             panic!("expected PassThrough");
         };
@@ -1942,7 +1980,7 @@ mod tests {
                 keyword: "limit",
             })),
         ];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::PassThrough(mut stages) = plan else {
             panic!("expected PassThrough");
         };
@@ -2004,7 +2042,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         assert!(matches!(plan, StreamPlan::Aggregate { .. }));
     }
 
@@ -2029,7 +2067,7 @@ mod tests {
                 keyword: "limit",
             })),
         ];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             pre_stages,
             post_stages,
@@ -2054,7 +2092,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2082,7 +2120,7 @@ mod tests {
             }],
             group_by: vec!["host".into()],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2133,7 +2171,7 @@ mod tests {
             ],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2172,7 +2210,7 @@ mod tests {
             ],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2208,7 +2246,7 @@ mod tests {
             ],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2236,7 +2274,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2262,7 +2300,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2287,7 +2325,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2315,7 +2353,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2342,7 +2380,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2365,7 +2403,7 @@ mod tests {
             field: "host".into(),
             by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2396,7 +2434,7 @@ mod tests {
             field: "host".into(),
             by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -2425,7 +2463,7 @@ mod tests {
             }],
             group_by: vec!["host".into()],
         }))];
-        let plan = compile_stream_plan(&pipeline).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
         let StreamPlan::Aggregate { aggregation, .. } = plan else {
             panic!("expected Aggregate");
         };
@@ -2475,7 +2513,7 @@ mod tests {
         ] {
             let pipeline = vec![make_date_part_stage(unit)];
             assert!(
-                compile_stream_plan(&pipeline).is_ok(),
+                compile_stream_plan(&pipeline, &PinScope::unpinned()).is_ok(),
                 "date_part should accept unit {unit:?} in streaming path"
             );
         }
@@ -2488,7 +2526,7 @@ mod tests {
         ] {
             let pipeline = vec![make_date_trunc_stage(unit)];
             assert!(
-                compile_stream_plan(&pipeline).is_ok(),
+                compile_stream_plan(&pipeline, &PinScope::unpinned()).is_ok(),
                 "date_trunc should accept unit {unit:?} in streaming path"
             );
         }
@@ -2497,7 +2535,7 @@ mod tests {
     #[test]
     fn stream_date_part_rejects_unknown_unit() {
         let pipeline = vec![make_date_part_stage("nanosecond")];
-        let err = compile_stream_plan(&pipeline).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
         assert!(
             matches!(err, StreamPlanError::InvalidUnit(ref msg) if msg.contains("nanosecond")),
             "unexpected error: {err}"
@@ -2508,7 +2546,7 @@ mod tests {
     fn stream_date_trunc_rejects_dow() {
         // dow is in DATE_PART_UNITS but NOT in DATE_UNITS (date_trunc allowlist)
         let pipeline = vec![make_date_trunc_stage("dow")];
-        let err = compile_stream_plan(&pipeline).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
         assert!(
             matches!(err, StreamPlanError::InvalidUnit(_)),
             "unexpected: {err}"
@@ -2533,7 +2571,7 @@ mod tests {
             )],
             keyword: "let",
         }))];
-        let err = compile_stream_plan(&pipeline).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
         assert!(
             matches!(err, StreamPlanError::InvalidUnit(ref msg) if msg.contains("literal")),
             "unexpected: {err}"
@@ -2555,7 +2593,7 @@ mod tests {
             rhs: Box::new(span(Expr::Literal(LiteralValue::Int(0)))),
         });
         let pipeline = vec![span(PipeStage::Where(WhereStage { condition }))];
-        let err = compile_stream_plan(&pipeline).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
         assert!(matches!(err, StreamPlanError::InvalidUnit(_)));
     }
 
@@ -2596,13 +2634,13 @@ mod tests {
     #[test]
     fn stream_strftime_accepts_standard_format() {
         let pipeline = vec![make_strftime_stage("%Y-%m-%d %H:%M:%S")];
-        assert!(compile_stream_plan(&pipeline).is_ok());
+        assert!(compile_stream_plan(&pipeline, &PinScope::unpinned()).is_ok());
     }
 
     #[test]
     fn stream_strftime_rejects_invalid_format() {
         let pipeline = vec![make_strftime_stage("%Q")];
-        let err = compile_stream_plan(&pipeline).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
         assert!(
             matches!(err, StreamPlanError::InvalidFormat(ref msg) if msg.contains("%Q")),
             "unexpected error: {err}"
@@ -2612,7 +2650,7 @@ mod tests {
     #[test]
     fn stream_strptime_rejects_invalid_format() {
         let pipeline = vec![make_strptime_stage("%Q")];
-        let err = compile_stream_plan(&pipeline).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
         assert!(matches!(err, StreamPlanError::InvalidFormat(_)), "{err}");
     }
 
@@ -2631,7 +2669,7 @@ mod tests {
             rhs: Box::new(span(Expr::Literal(LiteralValue::String("x".to_string())))),
         });
         let pipeline = vec![span(PipeStage::Where(WhereStage { condition }))];
-        let err = compile_stream_plan(&pipeline).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
         assert!(matches!(err, StreamPlanError::InvalidFormat(_)), "{err}");
     }
 }
