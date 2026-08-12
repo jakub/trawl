@@ -558,4 +558,24 @@ fn mixed_case_aliases_resolve_in_both_lanes() {
         &event,
         &ft
     ));
+    // ...and through plain equality against a string literal — the shape a
+    // `rename`/`let` of an envelope pin is most often read back with.
+    assert!(run_pipeline_cell(
+        &conn,
+        "* | rename status as St | where St == \"404\"",
+        &event,
+        &ft
+    ));
+    assert!(!run_pipeline_cell(
+        &conn,
+        "* | rename status as St | where St == \"405\"",
+        &event,
+        &ft
+    ));
+    assert!(run_pipeline_cell(
+        &conn,
+        "* | let S2 = status | where S2 == \"404\"",
+        &event,
+        &ft
+    ));
 }
