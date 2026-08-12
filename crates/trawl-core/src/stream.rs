@@ -490,6 +490,35 @@ fn compile_dedup(s: &DedupStage) -> CompiledStage {
 
 // ── stage application ──────────────────────────────────────────────
 
+/// Apply a `rename` stage in place, with the SQL's parallel semantics.
+///
+/// The batch lane emits `* EXCLUDE (sources), src AS tgt, …`, so every
+/// target reads the PRE-stage row: `rename a as b, b as c` gives `b` the
+/// original `a` and `c` the original `b`, never the just-renamed value.
+/// A source this event does not carry makes its target absent (the SQL
+/// column would be NULL) rather than leaving the target's own stale
+/// value behind — the same rule [`PinScope::advance`] applies to pins,
+/// so value and pin can never come from different columns.
+fn apply_rename(renames: &[(String, String)], event: &mut Map<String, Value>) {
+    let resolved: Vec<(&str, Option<Value>)> = renames
+        .iter()
+        .map(|(from, to)| (to.as_str(), event.get(from.as_str()).cloned()))
+        .collect();
+    for (from, _) in renames {
+        event.remove(from.as_str());
+    }
+    for (to, value) in resolved {
+        match value {
+            Some(v) => {
+                event.insert(to.to_string(), v);
+            }
+            None => {
+                event.remove(to);
+            }
+        }
+    }
+}
+
 /// Apply a compiled stage to an event, mutating it in place.
 ///
 /// Returns whether the event should pass through, be filtered, or
@@ -509,11 +538,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
         }
 
         CompiledStage::Rename { renames } => {
-            for (from, to) in renames {
-                if let Some(v) = event.remove(from.as_str()) {
-                    event.insert(to.clone(), v);
-                }
-            }
+            apply_rename(renames, event);
             StageResult::Pass
         }
 
@@ -1494,6 +1519,56 @@ mod tests {
         assert!(ev.contains_key("svc"));
         assert!(ev.contains_key("hostname"));
         assert!(!ev.contains_key("service"));
+        assert!(!ev.contains_key("host"));
+    }
+
+    #[test]
+    fn rename_chain_reads_the_pre_stage_event() {
+        // SQL: `* EXCLUDE (a, b), a AS b, b AS c` — `b` takes the
+        // original `a`, `c` the original `b`, never the just-renamed one.
+        let mut stage = compile_rename(&RenameStage {
+            renames: vec![("a".into(), "b".into()), ("b".into(), "c".into())],
+        });
+        let mut ev = event(&json!({"a": 1, "b": 2}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("b").unwrap(), 1);
+        assert_eq!(ev.get("c").unwrap(), 2);
+        assert!(!ev.contains_key("a"));
+    }
+
+    #[test]
+    fn rename_swap_exchanges_values() {
+        let mut stage = compile_rename(&RenameStage {
+            renames: vec![("a".into(), "b".into()), ("b".into(), "a".into())],
+        });
+        let mut ev = event(&json!({"a": 1, "b": 2}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("a").unwrap(), 2);
+        assert_eq!(ev.get("b").unwrap(), 1);
+    }
+
+    #[test]
+    fn rename_collision_on_one_target_takes_the_last_source() {
+        let mut stage = compile_rename(&RenameStage {
+            renames: vec![("a".into(), "x".into()), ("b".into(), "x".into())],
+        });
+        let mut ev = event(&json!({"a": 1, "b": 2}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("x").unwrap(), 2);
+        assert!(!ev.contains_key("a"));
+        assert!(!ev.contains_key("b"));
+    }
+
+    #[test]
+    fn rename_from_absent_source_scrubs_the_target() {
+        // The SQL column exists corpus-wide even when THIS event lacks
+        // it: the target becomes NULL, so it must not keep its own
+        // pre-stage value.
+        let mut stage = compile_rename(&RenameStage {
+            renames: vec![("nonexistent".into(), "host".into())],
+        });
+        let mut ev = event(&json!({"host": "web-1"}));
+        apply_stage(&mut stage, &mut ev);
         assert!(!ev.contains_key("host"));
     }
 

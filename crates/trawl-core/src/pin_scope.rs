@@ -67,7 +67,10 @@ impl PinScope {
     /// pin. The rules (issue #66 / ADR-0011 slice A′ prep rulings):
     ///
     /// - `rename` remaps the pin from the old name to the new one (and an
-    ///   unpinned source scrubs any pin the target name held).
+    ///   unpinned source scrubs any pin the target name held). All
+    ///   sources resolve against the PRE-stage scope — the SQL aliases
+    ///   them off the pre-stage row, so `rename a as b, b as c` gives
+    ///   `b` the original `a` and `c` the original `b`.
     /// - `table`/`fields` restrict to the named columns; `drop` removes.
     /// - `let` resolves ALL assignments against the PRE-stage scope — the
     ///   SQL desugars to one parallel SELECT (`COLUMNS(c -> c NOT IN …)`),
@@ -103,12 +106,25 @@ impl PinScope {
                 }
             }
             PipeStage::Rename(r) => {
-                for (old, new) in &r.renames {
-                    let pin = self.pin_for(old);
+                // Parallel, like `let`: every source resolves against the
+                // PRE-stage scope, because the SQL aliases every source
+                // off the pre-stage row (`* EXCLUDE (sources), src AS
+                // tgt, …`). In a chain (`rename a as b, b as c`) the row
+                // gives `b` the original `a` and `c` the original `b`;
+                // resolving sequentially would instead hand `c` the
+                // original `a`'s pin and leave `b` unpinned.
+                let resolved: Vec<(String, Option<CanonicalType>)> = r
+                    .renames
+                    .iter()
+                    .map(|(old, new)| (catalog_key(new), self.pin_for(old)))
+                    .collect();
+                for (old, _) in &r.renames {
                     self.pins.remove(&catalog_key(old));
+                }
+                for (target, pin) in resolved {
                     match pin {
-                        Some(pin) => self.pins.insert(&catalog_key(new), pin),
-                        None => self.pins.remove(&catalog_key(new)),
+                        Some(pin) => self.pins.insert(&target, pin),
+                        None => self.pins.remove(&target),
                     }
                 }
             }
@@ -274,6 +290,33 @@ mod tests {
     fn rename_onto_pinned_target_takes_the_source_pin() {
         let scope = walk("* | rename dur as status", ROOT);
         assert_eq!(scope.pin_for("status"), Some(CT::BigInt));
+        assert_eq!(scope.pin_for("dur"), None);
+    }
+
+    #[test]
+    fn rename_chain_resolves_against_the_pre_stage_scope() {
+        // SQL: `* EXCLUDE (status, dur), status AS dur, dur AS d2` —
+        // `dur` is the original `status`, `d2` the original `dur`.
+        let scope = walk("* | rename status as dur, dur as d2", ROOT);
+        assert_eq!(scope.pin_for("dur"), Some(CT::Varchar));
+        assert_eq!(scope.pin_for("d2"), Some(CT::BigInt));
+        assert_eq!(scope.pin_for("status"), None);
+    }
+
+    #[test]
+    fn rename_swap_exchanges_the_pins() {
+        let scope = walk("* | rename status as dur, dur as status", ROOT);
+        assert_eq!(scope.pin_for("status"), Some(CT::BigInt));
+        assert_eq!(scope.pin_for("dur"), Some(CT::Varchar));
+    }
+
+    #[test]
+    fn rename_collision_on_one_target_takes_the_last_source() {
+        // Two sources onto one target: the later mapping wins, as the
+        // later `AS` does in the emitted projection.
+        let scope = walk("* | rename status as x, dur as x", ROOT);
+        assert_eq!(scope.pin_for("x"), Some(CT::BigInt));
+        assert_eq!(scope.pin_for("status"), None);
         assert_eq!(scope.pin_for("dur"), None);
     }
 
