@@ -222,8 +222,18 @@ impl RepinEngine {
         // Free-space pre-flight: the job holds the affected bytes TWICE
         // until the aside sweep, and retention is suppressed for its whole
         // life — it must not create pressure retention cannot relieve.
-        let available = fs4::available_space(&self.data_dir)
-            .map_err(|e| ServerError::Internal(format!("failed to check free disk space: {e}")))?;
+        // A post-claim failure must terminalize the claimed job: the
+        // running slot is unique, so an early return would 409 every
+        // later repin until a restart reconciles the orphan.
+        let available = match fs4::available_space(&self.data_dir) {
+            Ok(available) => available,
+            Err(e) => {
+                let msg = format!("failed to check free disk space: {e}");
+                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                    .await;
+                return Err(ServerError::Internal(msg));
+            }
+        };
         let needed = counts
             .affected_bytes
             .saturating_add(self.min_free_disk_bytes);
