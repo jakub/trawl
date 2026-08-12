@@ -103,6 +103,28 @@ trawl schema field duration --limit 500
 trawl schema field duration --limit 500 --after '2026-08-02T10:00:00.000000Z|nginx'
 ```
 
+### Repin
+
+`schema repin` changes a wrongly-pinned field's type by rewriting the
+corpus (ADR-0011): affected files are rebuilt to the new type with
+conflict-shelved values resurrected from `_raw`, unaffected files are
+hardlinked, and the switch is atomic and crash-recoverable. It needs the
+`schema_write` permission.
+
+```bash
+trawl schema repin status --to varchar --dry-run   # mandatory first look
+trawl schema repin status --to varchar --yes       # execute (background job)
+trawl schema repin status --to varchar --yes --wait  # poll to completion
+trawl schema repin dur --to bigint --yes --force   # accept a lossy projection
+trawl schema repin-status                          # the running/last job
+```
+
+An executing repin confirms interactively; off a TTY it refuses without
+`--yes`. A repin whose dry run projects nulled values refuses without
+`--force` and prints the plan (the values it would null stay findable in
+`_raw`). `--to <current type> --force` runs a resurrection-only pass.
+Both commands honour `-f table|json|csv`.
+
 Embedded mode works for the field listing only — a plain `DESCRIBE` over
 local parquet, no server or postgres needed:
 

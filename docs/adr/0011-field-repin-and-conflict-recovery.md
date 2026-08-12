@@ -1,7 +1,8 @@
 # Field repin and conflict recovery
 
 status: accepted (2026-08-05), amended (2026-08-10) after the slice-A
-implementation review — see Amendment
+implementation review and (2026-08-12) as slice B shipped — see
+Amendments
 
 ADR-0009 made the field catalog the install-wide write-time type authority:
 one pinned type per field name, decided at first typed sight, permanent. That
@@ -394,3 +395,82 @@ amendment.
 
 **The invisibility property now covers the pipeline: #53 (the repin
 engine) is unblocked.**
+
+## Amendment (2026-08-12): slice B shipped — two mechanism corrections,
+both forced by execution evidence
+
+Issue #53 landed the engine as designed, with two deviations from this
+ADR's literal mechanism text, each recorded here with the evidence that
+forced it:
+
+### 1. Sibling staging and a per-env swap, not a whole-root rename
+
+The ADR said "rename live root aside, rename shadow onto the canonical
+path". Two facts killed that:
+
+- **The WAL lives inside the data root by default**
+  (`wal_dir = {data.base_dir}/wal/`), as do `scheduled/`, `EPOCH` and
+  `CATALOG`. A whole-root swap either strands the live WAL mid-write or
+  forces WAL-writer gating plus a graft of four subtrees between the two
+  renames — strictly more machinery and a wider stopped world.
+- **In-root staging of any spelling is unsafe**: DuckDB's recursive glob
+  descends into dot-directories (probed in
+  `trawl-engine/tests/duckdb_probe.rs`), so a `data/.repin-next/` would
+  be unioned into every fallback-glob query as duplicate rows.
+
+The shadow and aside roots are therefore SIBLINGS of the data root
+(`data.repin-next/`, `data.repin-aside/` — the epoch set-aside pattern:
+same filesystem, so hardlinks and renames are guaranteed, and invisible
+to every data-root glob and walk by construction), and the swap is two
+renames per env directory, idempotent and forward-only, shared verbatim
+by the live cutover and the boot marker replay. Same property — no
+reachable state in which queries observe a mixed-type corpus — different
+mechanism.
+
+### 2. The atomicity budget rests entirely on exclusion — union errors
+protect nothing
+
+The design could have leaned on "a mixed-type corpus errors loudly".
+Probed by execution: every mixed scalar ladder pair under
+`read_parquet(union_by_name=true)` **silently promotes** (`BIGINT ∪
+VARCHAR` reads VARCHAR, `BIGINT ∪ BOOLEAN` reads the booleans as 0/1) —
+it does not error. A query straddling the swap would return wrong
+answers, not a 500. The cutover therefore holds BOTH exclusion
+primitives across the final increment, the swap and the pin flip: a
+corpus gate whose read side wraps every compaction batch's
+pin-snapshot → conform → publish phase, and exclusivity over every
+executor-pool permit (every parquet-reading lane — query, from-saved,
+export — computes its source and snapshots its comparison pins inside
+the permit-holding task). The drain is bounded: a wedged query aborts
+the job to the terminal `blocked` outcome rather than starving the
+cutover. Past the cutover marker the engine is forward-only — a swap or
+flip failure terminates the process crash-consistent (the marker replay
+completes it) rather than releasing exclusivity over a half-swapped
+corpus.
+
+### Also recorded
+
+- The resurrection expression lives in `trawl_core::conform`
+  (`resurrection_expr`: guarded stored reading, then the guarded `_raw`
+  re-extraction — an exact-key RFC 6901 JSON Pointer, never JSONPath,
+  with a best-effort case-variant fallback), and the dry run counts with
+  the same expression the rewrite writes — the one-builder doctrine of
+  the 2026-08-10 amendment, extended to the plan/report pair.
+- Retention stands down ENTIRELY (age and pressure) while the marker or
+  staging exists, not just the pressure sweep; the job pre-flights its
+  double-held bytes against `min_free_disk_bytes` in exchange.
+- Dry run, force gate and execution are one code path: every request
+  claims the one-running job row and runs the same scan; a lossy plan
+  without force parks terminal `refused_needs_force` with the plan as
+  the 409 body. `to == current` plus force is the resurrection-only
+  pass — the supported repair for a boot-conformed interrupted repin.
+- Named residuals: an SSE stream keeps its pin snapshot until reconnect
+  (a repin reaches live tails at their next connect); catch-up
+  increments can null values a forced plan did not predict (counted,
+  never aborted — the values remain in `_raw`); a query-only node
+  pointed at a repinned archive keeps stale pins until restart; and a
+  catch-up that cannot converge within its bounded passes fails the job
+  cleanly with the corpus untouched.
+
+**The manual `UPDATE field_types` surgery escape hatch is retired: the
+supported path is `trawl schema repin` / `POST /api/v1/schema/repin`.**

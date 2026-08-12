@@ -190,6 +190,13 @@ trawld migrates this database automatically at boot (it is the sole writer) and 
 | `min_free_disk_bytes` | byte size | `"1G"` | Delete oldest data when free disk drops below; `0` disables |
 | `retention_interval_secs` | integer | `3600` | Retention check frequency (default: 1 hour) |
 
+Both sweeps stand down while a repin job's marker or staging roots exist
+(`data/REPIN`, `data.repin-next/`, `data.repin-aside/`): the job
+double-holds its affected bytes until its final sweep and pre-flights
+against `min_free_disk_bytes` before starting, so retention could neither
+relieve the pressure nor safely delete files out from under the shadow
+build. They resume the tick after the job (or its boot replay) finishes.
+
 Disk-pressure deletion is suppressed while a pre-cutover `data.pre-schema-v2/` set-aside directory exists (it sits outside `data/`, so deleting partitions could never reclaim it); each tick under pressure logs `retention_disk_pressure_suppressed` instead. Remove the set-aside to reclaim the space and re-enable the policy. Age-based retention is unaffected.
 
 ### `[scheduler]`

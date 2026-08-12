@@ -130,10 +130,10 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         CATALOG_PINNED_FIELDS,
-        "Field-catalog pins in use. A pin is permanent until the repin \
-         rewrite (#53), so this only ever climbs — alert on it against \
-         trawl_catalog_pin_capacity, well before the cap starts denying \
-         pins"
+        "Field-catalog pins in use. A pin slot is permanent (a repin \
+         retypes a pin, nothing reclaims one), so this only ever climbs — \
+         alert on it against trawl_catalog_pin_capacity, well before the \
+         cap starts denying pins"
     );
     describe_gauge!(
         CATALOG_PIN_CAPACITY,
