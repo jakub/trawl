@@ -119,6 +119,12 @@ pub(crate) struct ProcessTally {
 ///
 /// Idempotent per file: a pre-existing shadow entry (an earlier catch-up
 /// pass's output for a since-replaced source) is removed first.
+///
+/// `precounted` is the scan's own tally for THIS byte-identical file (see
+/// [`crate::repin::plan::ScanTallies`]); supplying it skips the aggregate
+/// recount, and supplying a stale one would misreport the rewrite, so the
+/// caller owns the signature check.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_file(
     conn: &duckdb::Connection,
     data_dir: &Path,
@@ -127,6 +133,7 @@ pub(crate) fn process_file(
     field: &str,
     to: CanonicalType,
     flipped_pins: &HashMap<String, CanonicalType>,
+    precounted: Option<RepinEffect>,
 ) -> Result<ProcessTally, String> {
     let src = data_dir.join(rel);
     let dst = shadow.join(rel);
@@ -152,7 +159,17 @@ pub(crate) fn process_file(
         return Ok(ProcessTally::default());
     };
 
-    rewrite_affected(conn, &src, &dst, &schema, layout, field, to, flipped_pins)
+    rewrite_affected(
+        conn,
+        &src,
+        &dst,
+        &schema,
+        layout,
+        field,
+        to,
+        flipped_pins,
+        precounted,
+    )
 }
 
 /// Decide affectedness: a file is rewritten only when it is (a) at a path
@@ -200,10 +217,18 @@ fn rewrite_affected(
     field: &str,
     to: CanonicalType,
     flipped_pins: &HashMap<String, CanonicalType>,
+    precounted: Option<RepinEffect>,
 ) -> Result<ProcessTally, String> {
     let safe = src.to_string_lossy().replace('\'', "''");
     let source = format!("read_parquet('{safe}')");
-    let counts = count_repin_effect(conn, &source, schema, field, to)?;
+    // The tally is a full aggregate scan of the file, and the mandatory
+    // pre-build scan just ran the IDENTICAL SQL over it. Reuse that
+    // reading when the source has not changed a byte since — the numbers
+    // are equal by construction, not by approximation.
+    let counts = match precounted {
+        Some(counts) => counts,
+        None => count_repin_effect(conn, &source, schema, field, to)?,
+    };
 
     let plan = ConformPlan::build(
         schema,
@@ -258,6 +283,7 @@ fn staging_path(dst: &Path) -> PathBuf {
 /// The three per-file numbers the plan reports and the rewrite achieves,
 /// computed with the SAME expressions the rewrite writes
 /// (`repin_count_exprs` — see `ingest::compaction::repin_target_expr`).
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct RepinEffect {
     /// Total rows in the file.
     pub(crate) rows: u64,

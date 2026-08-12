@@ -13,13 +13,31 @@
 //! `rows_nulled`/`rows_resurrected` over an unchanged corpus — a report
 //! that can only drift by the events that arrive between scan and
 //! rewrite, which the catch-up loop then counts for real.
+//!
+//! Because those numbers are equal by construction rather than by
+//! approximation, the scan hands its PER-FILE readings ([`ScanTallies`])
+//! to the build instead of letting the first pass re-measure a corpus
+//! nothing has touched: an unchanged `(ino, len, mtime)` reuses the
+//! reading, anything else recounts.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use trawl_core::schema::CanonicalType;
 
 use crate::catalog::conform::{Progress, open_bounded_connection};
-use crate::repin::rewrite::{affected_schema, count_repin_effect};
+use crate::repin::rewrite::{FileSig, RepinEffect, affected_schema, count_repin_effect};
+
+/// The scan's PER-FILE readings, keyed by data-root-relative path and
+/// stamped with the signature they were measured at.
+///
+/// The build begins synchronously after the scan returns, so in the common
+/// case every affected file is still byte-identical and its tally — the
+/// same aggregate SQL the rewrite would run again — is reusable as-is.
+/// Only the signature licenses that: a file compaction replaced between
+/// scan and build gets a new `(ino, len, mtime)` and is recounted, exactly
+/// as a catch-up pass recounts it.
+pub(crate) type ScanTallies = BTreeMap<PathBuf, (FileSig, RepinEffect)>;
 
 /// What the scan found — the dry-run report's numbers.
 #[derive(Debug, Clone, Copy, Default)]
@@ -51,13 +69,14 @@ pub(crate) fn scan(
     memory_limit: &str,
     field: &str,
     to: CanonicalType,
-) -> Result<ScanCounts, String> {
+) -> Result<(ScanCounts, ScanTallies), String> {
     let sources = crate::repin::rewrite::snapshot_env_files(data_dir)?;
     let conn = open_bounded_connection(data_dir, memory_limit)?;
 
     let mut counts = ScanCounts::default();
+    let mut tallies = ScanTallies::new();
     let mut progress = Progress::new("repin-scan", sources.len());
-    for (rel, _sig) in sources {
+    for (rel, sig) in sources {
         progress.tick();
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -84,6 +103,7 @@ pub(crate) fn scan(
         counts.projected_nulls += effect.nulled;
         counts.resurrectable += effect.resurrected;
         counts.affected_bytes += std::fs::metadata(&path).map_or(0, |m| m.len());
+        tallies.insert(rel, (sig, effect));
     }
-    Ok(counts)
+    Ok((counts, tallies))
 }

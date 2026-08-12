@@ -40,7 +40,7 @@ use crate::repin::gate::RepinCoordinator;
 use crate::repin::marker::{
     RepinMarker, RepinPhase, aside_root, remove_marker, shadow_root, write_marker,
 };
-use crate::repin::plan::{ScanCounts, scan};
+use crate::repin::plan::{ScanCounts, ScanTallies, scan};
 use crate::repin::rewrite::{FileSig, ProcessTally, process_file, snapshot_env_files};
 use crate::store::{CatalogStore, FieldConflict, RepinJob, RepinJobStatus, RepinStore};
 
@@ -227,8 +227,8 @@ impl RepinEngine {
         dry_run: bool,
         force: bool,
     ) -> Result<StartOutcome, ServerError> {
-        let counts = match self.run_scan(&field, to).await {
-            Ok(counts) => counts,
+        let (counts, tallies) = match self.run_scan(&field, to).await {
+            Ok(measured) => measured,
             Err(e) => {
                 self.finish(job_id, RepinJobStatus::Failed, Some(&e)).await;
                 return Err(ServerError::Internal(format!("repin scan failed: {e}")));
@@ -296,13 +296,20 @@ impl RepinEngine {
         }
 
         let engine = Arc::clone(&self);
+        let tallies = Arc::new(tallies);
         tokio::spawn(async move {
-            engine.run_job(job_id, field, from, to, force).await;
+            engine
+                .run_job(job_id, field, from, to, force, tallies)
+                .await;
         });
         Ok(StartOutcome::Started(self.job(job_id).await?))
     }
 
-    async fn run_scan(&self, field: &str, to: CanonicalType) -> Result<ScanCounts, String> {
+    async fn run_scan(
+        &self,
+        field: &str,
+        to: CanonicalType,
+    ) -> Result<(ScanCounts, ScanTallies), String> {
         let data_dir = self.data_dir.clone();
         let memory_limit = self.memory_limit.clone();
         let field = field.to_owned();
@@ -336,6 +343,10 @@ impl RepinEngine {
     }
 
     /// The background half: build, catch up, cut over, sweep.
+    ///
+    /// `scanned` carries the mandatory pre-build scan's per-file readings
+    /// so the build does not immediately re-measure a corpus nothing has
+    /// touched (see [`ScanTallies`]).
     async fn run_job(
         self: Arc<Self>,
         job_id: i64,
@@ -343,12 +354,15 @@ impl RepinEngine {
         from: CanonicalType,
         to: CanonicalType,
         force: bool,
+        scanned: Arc<ScanTallies>,
     ) {
         let started = std::time::Instant::now();
         let _rollup_pause = self.coordinator.pause_rollup();
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(1.0);
 
-        let outcome = self.run_job_inner(job_id, &field, from, to, force).await;
+        let outcome = self
+            .run_job_inner(job_id, &field, from, to, force, &scanned)
+            .await;
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(0.0);
         metrics::histogram!(crate::metrics::CATALOG_REPIN_DURATION_SECONDS)
             .record(started.elapsed().as_secs_f64());
@@ -416,6 +430,7 @@ impl RepinEngine {
         from: CanonicalType,
         to: CanonicalType,
         force: bool,
+        scanned: &Arc<ScanTallies>,
     ) -> Result<(), JobAbort> {
         let marker = RepinMarker {
             job_id,
@@ -442,7 +457,7 @@ impl RepinEngine {
         let mut converged = false;
         for pass in 0..MAX_CATCHUP_PASSES {
             let changed = self
-                .run_pass(field, to, &flipped, &mut state)
+                .run_pass(field, to, &flipped, scanned, &mut state)
                 .await
                 .map_err(JobAbort::Failed)?;
             self.publish_progress(job_id, &state).await;
@@ -488,7 +503,7 @@ impl RepinEngine {
 
         // Final increment under exclusion: nothing can write or read the
         // corpus now, so this pass is the last word.
-        self.run_pass(field, to, &flipped, &mut state)
+        self.run_pass(field, to, &flipped, scanned, &mut state)
             .await
             .map_err(JobAbort::Failed)?;
         self.publish_progress(job_id, &state).await;
@@ -602,6 +617,7 @@ impl RepinEngine {
         field: &str,
         to: CanonicalType,
         flipped: &Arc<HashMap<String, CanonicalType>>,
+        scanned: &Arc<ScanTallies>,
         state: &mut BuildState,
     ) -> Result<usize, String> {
         let data_dir = self.data_dir.clone();
@@ -609,6 +625,7 @@ impl RepinEngine {
         let memory_limit = self.memory_limit.clone();
         let field = field.to_owned();
         let flipped = Arc::clone(flipped);
+        let scanned = Arc::clone(scanned);
         let mut taken = std::mem::take(state);
         let (returned, changed) = tokio::task::spawn_blocking(move || {
             let changed = run_pass_blocking(
@@ -618,6 +635,7 @@ impl RepinEngine {
                 &field,
                 to,
                 &flipped,
+                &scanned,
                 &mut taken,
             )?;
             Ok::<_, String>((taken, changed))
@@ -739,6 +757,7 @@ impl BuildState {
 
 /// One pass, blocking: diff the source tree against what the shadow
 /// already reflects, (re)process the delta, retire removals.
+#[allow(clippy::too_many_arguments)]
 fn run_pass_blocking(
     data_dir: &Path,
     shadow: &Path,
@@ -746,6 +765,7 @@ fn run_pass_blocking(
     field: &str,
     to: CanonicalType,
     flipped: &HashMap<String, CanonicalType>,
+    scanned: &ScanTallies,
     state: &mut BuildState,
 ) -> Result<usize, String> {
     let sources = snapshot_env_files(data_dir)?;
@@ -783,7 +803,17 @@ fn run_pass_blocking(
                 std::thread::sleep(Duration::from_millis(delay));
             }
         }
-        let tally = process_file(&conn, data_dir, shadow, &rel, field, to, flipped)?;
+        // The scan measured this very file moments ago; reuse its reading
+        // when the source is still byte-identical, so the build does not
+        // pay a second full aggregate scan per file before it has
+        // rewritten anything. A signature the scan never saw — or one it
+        // saw at other bytes — recounts.
+        let precounted = scanned
+            .get(&rel)
+            .and_then(|(scanned_sig, effect)| (*scanned_sig == sig).then_some(*effect));
+        let tally = process_file(
+            &conn, data_dir, shadow, &rel, field, to, flipped, precounted,
+        )?;
         state.results.insert(rel.clone(), tally);
         state.processed.insert(rel, sig);
     }
