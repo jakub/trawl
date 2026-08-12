@@ -22,6 +22,29 @@ fn now_ts() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
+/// One `/metrics` scrape off the running server (unauthenticated route).
+async fn scrape_metrics(url: &str) -> String {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!("{url}/metrics"))
+        .send()
+        .await
+        .expect("metrics scrape")
+        .text()
+        .await
+        .unwrap()
+}
+
+/// Read an unlabelled gauge's value out of a scrape body.
+fn gauge_value(scrape: &str, name: &str) -> Option<f64> {
+    scrape.lines().find_map(|line| {
+        let rest = line.strip_prefix(name)?.strip_prefix(' ')?;
+        rest.trim().parse().ok()
+    })
+}
+
 fn catalog_ctx(server: &TestServer) -> CatalogContext {
     CatalogContext {
         store: server.state.storage.catalog.clone(),
@@ -553,7 +576,10 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPo
 /// envelope (not a refusal plan); ingest and queries ride through the
 /// slowed rewrite — events land in the hot buffer immediately and exactly
 /// once in the post-cutover corpus, and a query loop across the whole job
-/// (build, cutover, sweep) never errors.
+/// (build, cutover, sweep) never errors. That loop also scrapes `/metrics`
+/// from INSIDE the slowed rewrite: the running gauge is up and the
+/// `files_total`/`files_done` progress pair is readable while the job is still
+/// running, with the outcome counter landing only at the terminal state.
 #[sqlx::test(migrations = false)]
 async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -609,13 +635,18 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     // gate, so it can never straddle the cutover).
     h.compact_tick().await;
 
-    // Query in a loop across the whole job: no query may ever error.
+    // Query in a loop across the whole job: no query may ever error. The
+    // same loop scrapes /metrics while the job row still says Running and
+    // keeps the first body that shows the running gauge up — progress is
+    // observed MID-JOB, not reconstructed from the terminal state.
     let query_loop = {
         let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
         let engine_store = h.server.state.storage.repin.clone();
+        let url = h.server.url.clone();
         let id = started.id;
         tokio::spawn(async move {
             let mut queries = 0u32;
+            let mut mid_job: Option<String> = None;
             loop {
                 let result = client
                     .query_paginated("last=1h | stats count()", None, None)
@@ -624,7 +655,19 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
                 queries += 1;
                 let job = engine_store.get(id).await.expect("job row").expect("job");
                 if job.status != trawl_server::store::RepinJobStatus::Running {
-                    return queries;
+                    return (queries, mid_job);
+                }
+                if mid_job.is_none() {
+                    let scrape = scrape_metrics(&url).await;
+                    let running =
+                        gauge_value(&scrape, trawl_server::metrics::CATALOG_REPIN_RUNNING)
+                            .is_some_and(|v| v >= 1.0);
+                    let progressed =
+                        gauge_value(&scrape, trawl_server::metrics::CATALOG_REPIN_FILES_DONE)
+                            .is_some_and(|v| v >= 1.0);
+                    if running && progressed {
+                        mid_job = Some(scrape);
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -635,7 +678,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     trawl_server::repin::engine::TEST_FILE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
 
-    let queries = query_loop.await.expect("query loop");
+    let (queries, mid_job) = query_loop.await.expect("query loop");
     assert!(queries > 0, "the loop observed the running job");
 
     // Exactly once: everything ingested before and during the job.
@@ -643,18 +686,25 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     assert_eq!(h.count("last=1h | stats count()").await, 7);
     assert_eq!(h.count("status=418 last=1h | stats count()").await, 1);
 
-    // Progress metrics were scrapeable mid-job and the outcome landed.
-    let metrics = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap()
-        .get(format!("{}/metrics", h.server.url))
-        .send()
-        .await
-        .expect("metrics scrape")
-        .text()
-        .await
-        .unwrap();
+    // Progress was scrapeable MID-JOB: that body was taken while the
+    // rewrite was still running, with real progress already on it.
+    let mid_job = mid_job.expect("a progress scrape landed while the job was running");
+    let total_files = gauge_value(&mid_job, trawl_server::metrics::CATALOG_REPIN_FILES_TOTAL)
+        .expect("mid-job scrape must carry the planned file count");
+    let done_files = gauge_value(&mid_job, trawl_server::metrics::CATALOG_REPIN_FILES_DONE)
+        .expect("mid-job scrape must carry the per-file progress gauge");
+    assert!(
+        (1.0..=total_files).contains(&done_files),
+        "mid-job progress {done_files} outside 1..={total_files}"
+    );
+
+    // ...and the outcome landed once the job terminalized.
+    let metrics = scrape_metrics(&h.server.url).await;
+    assert_eq!(
+        gauge_value(&metrics, trawl_server::metrics::CATALOG_REPIN_RUNNING),
+        Some(0.0),
+        "the running gauge must fall back to 0 at the terminal state"
+    );
     assert!(
         metrics.contains("trawl_catalog_repin_jobs_total{outcome=\"succeeded\"}"),
         "outcome counter missing"
