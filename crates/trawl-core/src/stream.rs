@@ -27,7 +27,7 @@ use crate::emitter::{
     format_literal_position, map_field_name, unit_literal_positions, validate_format_literal,
     validate_unit_literal,
 };
-use crate::eval::eval_expr_with_pins;
+use crate::eval::{bind_event_key, eval_expr_with_pins};
 use crate::pin_scope::PinScope;
 
 // ── stream plan ────────────────────────────────────────────────────
@@ -499,13 +499,31 @@ fn compile_dedup(s: &DedupStage) -> CompiledStage {
 /// column would be NULL) rather than leaving the target's own stale
 /// value behind — the same rule [`PinScope::advance`] applies to pins,
 /// so value and pin can never come from different columns.
+///
+/// Each source binds to the row's OWN spelling ([`bind_event_key`]), for
+/// the same reason [`PinScope::advance`] resolves its pin through
+/// [`crate::schema::catalog_key`]: `DuckDB` binds the emitted
+/// `"Status" AS "st"` to an ingest-folded `status` column
+/// case-insensitively, so `rename Status as st` has to carry the value
+/// across in this lane too — and the key REMOVED is the one that bound,
+/// never the verbatim source.
 fn apply_rename(renames: &[(String, String)], event: &mut Map<String, Value>) {
+    let sources: Vec<Option<String>> = renames
+        .iter()
+        .map(|(from, _)| bind_event_key(event, from).map(str::to_owned))
+        .collect();
     let resolved: Vec<(&str, Option<Value>)> = renames
         .iter()
-        .map(|(from, to)| (to.as_str(), event.get(from.as_str()).cloned()))
+        .zip(&sources)
+        .map(|((_, to), source)| {
+            (
+                to.as_str(),
+                source.as_ref().and_then(|key| event.get(key)).cloned(),
+            )
+        })
         .collect();
-    for (from, _) in renames {
-        event.remove(from.as_str());
+    for source in sources.iter().flatten() {
+        event.remove(source.as_str());
     }
     for (to, value) in resolved {
         match value {

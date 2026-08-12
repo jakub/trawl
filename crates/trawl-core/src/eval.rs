@@ -320,24 +320,45 @@ fn bare_literal(expr: &Expr) -> Option<&LiteralValue> {
     }
 }
 
+/// Bind a field reference to the key the ROW actually carries, the way
+/// `DuckDB` binds a column reference: an exact match wins, and any
+/// ASCII-case-insensitive match binds otherwise.
+///
+/// Both halves are load-bearing, in both directions. Ingest ASCII-folds
+/// every key it writes, so `where Status>400` over a stored `status`
+/// finds its value only case-insensitively — but the pipeline lanes key
+/// rows by USER-CHOSEN names carried VERBATIM (`rename status as St`
+/// gives the row an `St` key, in the SQL result columns and in
+/// [`crate::stream::apply_stage`] alike), so a later `where st>400` —
+/// which `DuckDB` resolves to that `St` column — must find it too, and a
+/// fold-only lookup would miss. Exact-first keeps a row carrying two
+/// case-variant keys reading the one the reference names.
+///
+/// A residual ambiguity (several case-variants, none exact) has no
+/// `DuckDB` answer to mirror — it errors — so this picks the
+/// lexicographically-first variant: deterministic regardless of map
+/// order, and the same tie-break ingest's own fold-collision rule uses.
+pub(crate) fn bind_event_key<'e>(event: &'e Map<String, Value>, name: &str) -> Option<&'e str> {
+    if let Some((key, _)) = event.get_key_value(name) {
+        return Some(key.as_str());
+    }
+    event
+        .keys()
+        .filter(|k| k.eq_ignore_ascii_case(name))
+        .min()
+        .map(String::as_str)
+}
+
 /// The event value a pinned comparison reads, non-null.
 ///
-/// The verbatim (alias-resolved) spelling wins, then the catalog key
-/// (that spelling ASCII-folded) — the same order `DuckDB` binds a column
-/// reference: an exact match first, case-insensitively otherwise. Both
-/// halves are load-bearing. Pipeline lanes key events by USER-CHOSEN
-/// names carried verbatim (`rename status as St` gives the row an `St`
-/// key, in the SQL result columns and in `stream::apply_stage` alike), so
-/// folding first would miss the value and drop the row — while ingest
-/// folds every key it writes, so an unrenamed `where Status>400` finds
-/// `status` only through the fold. Presence — not non-nullness — decides
-/// the fallback: a verbatim key holding JSON null is that field's own
-/// NULL (UNKNOWN), never a reason to read a differently-cased sibling.
+/// The name is alias-resolved (`timestamp` → `_time`) and then bound
+/// against the row's own spelling by [`bind_event_key`]. Binding — not
+/// non-nullness — decides which key is read: a bound key holding JSON
+/// null is that field's own NULL (UNKNOWN), never a reason to read a
+/// differently-cased sibling.
 fn pinned_event_value<'e>(event: &'e Map<String, Value>, name: &str) -> Option<&'e Value> {
-    event
-        .get(map_field_name(name))
-        .or_else(|| event.get(&crate::schema::catalog_key(name)))
-        .filter(|v| !v.is_null())
+    let key = bind_event_key(event, map_field_name(name))?;
+    event.get(key).filter(|v| !v.is_null())
 }
 
 /// Truth → `EvalValue`: UNKNOWN is SQL NULL, which the existing
@@ -1706,6 +1727,42 @@ mod tests {
                     "* | where dur matches \"^4\"",
                     r#"{"dur": "4.5"}"#,
                     BIGINT_DUR
+                ),
+                EvalValue::Null
+            );
+        }
+
+        /// A pinned comparison binds the row's key the way `DuckDB` binds
+        /// a column reference — either case direction, because a pipeline
+        /// stage can MAKE a mixed-case key (`rename status as St`) that a
+        /// later stage names differently (`where st>400`).
+        #[test]
+        fn pinned_lookup_binds_the_rows_key_case_insensitively() {
+            for event in [r#"{"status": "404"}"#, r#"{"Status": "404"}"#] {
+                for dsl in ["* | where status > 400", "* | where StAtUs > 400"] {
+                    assert_eq!(
+                        eval_where(dsl, event, VARCHAR_STATUS),
+                        EvalValue::Bool(true),
+                        "{dsl} over {event}"
+                    );
+                }
+            }
+            // An exact key wins over a case-variant sibling...
+            assert_eq!(
+                eval_where(
+                    "* | where status > 400",
+                    r#"{"Status": "500", "status": "200"}"#,
+                    VARCHAR_STATUS
+                ),
+                EvalValue::Bool(false)
+            );
+            // ...and binding, not non-nullness, picks the key: an exact
+            // key holding null is that field's own NULL.
+            assert_eq!(
+                eval_where(
+                    "* | where status > 400",
+                    r#"{"Status": "500", "status": null}"#,
+                    VARCHAR_STATUS
                 ),
                 EvalValue::Null
             );

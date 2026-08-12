@@ -589,4 +589,24 @@ fn mixed_case_aliases_resolve_in_both_lanes() {
         &event,
         &ft
     ));
+    // ...and the OTHER direction: a stage MAKES a mixed-case key and a
+    // later stage names it in a different case. `DuckDB` binds its own
+    // `"St"` column for `st`/`sT`, so the live lane must bind the row's
+    // key the same way instead of missing and dropping the event.
+    for dsl in [
+        "* | rename status as St | where st > 400",
+        "* | rename status as St | where sT > 400",
+        "* | let S2 = status | where s2 > 400",
+        // The source of a rename binds case-insensitively too: `Status`
+        // is the ingest-folded `status` column in both lanes.
+        "* | rename Status as st | where st > 400",
+    ] {
+        assert!(run_pipeline_cell(&conn, dsl, &event, &ft), "{dsl}");
+    }
+    assert!(!run_pipeline_cell(
+        &conn,
+        "* | rename status as St | where st > 500",
+        &event,
+        &ft
+    ));
 }
