@@ -31,6 +31,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `host`/`service`/`env`/`message`/`severity_text`/`_raw` VARCHAR, so
   this is live on day one of every install. Unblocks the repin engine
   (#53).
+- **Sibling references inside one `| let` resolve column-first,
+  alias-second (ADR-0011 slice A′, #66).** The in-memory stage — live
+  tail (SSE) and the post-`extract kv` batch tail — now mirrors what
+  DuckDB does with the single projection the batch lane emits
+  (`COLUMNS(c -> c NOT IN (targets)), (expr) AS tgt, …`): a target
+  naming a column the row already carries stays invisible to its
+  siblings, so `let a = 1, b = a` and `let a = a + 1, b = a` give `b`
+  the **original** `a` where the previous sequential evaluation handed
+  it the just-computed one; a target the row does *not* carry — the
+  ordinary case, since `let` usually names something new — is the
+  lateral column alias a later sibling reads, so
+  `let ms = 1000, total = ms * 2` answers `2000` in every lane, as it
+  always did in SQL. Which column a name binds is DuckDB's own
+  case-insensitive rule (`let A = 1, b = A` shadows an `a`), and a
+  pipeline field *read* now binds the same way whether or not the field
+  is pinned, so a reference does not change meaning with the pin. Pins
+  never follow the alias — an alias-bound sibling is unpinned in both
+  lanes. One residual: a column the *corpus* carries but *this row*
+  leaves absent (a sparse custom field) is a NULL column read in batch,
+  while the live lane, seeing no key, binds the alias.
 - **Comparisons follow the field catalog's type pins (ADR-0011 slice A, #63).**
   Search-stage field filters — batch queries, exports, *and* live tail (SSE) —
   now consult the field's pinned type instead of guessing from the query

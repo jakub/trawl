@@ -554,6 +554,14 @@ fn let_sibling_references_bind_column_then_alias_in_both_lanes() {
     );
     // Same, chained through a bare alias of a real column.
     run_let_cell(&conn, "* | let x = a, y = x", &event, &ft, &["x", "y"]);
+    // "Carries the column" is DuckDB's own case-insensitive binding, not
+    // an exact key match: `A` names the row's `a`, so the target shadows
+    // it and the sibling still reads the ORIGINAL value. Only `b` is
+    // compared — the emitted exclusion list compares names as STRINGS, so
+    // the `a` column survives a target spelled `A` and DuckDB
+    // disambiguates the alias to `A_1`; that naming residual is the
+    // pre-existing name-set divergence class, not this rule.
+    run_let_cell(&conn, "* | let A = 1, b = A", &event, &ft, &["b"]);
     // The residual is the row-vs-relation gap, not the alias: a column
     // the corpus carries but THIS row leaves absent reads NULL in batch
     // while the live lane, seeing no key, binds the alias.

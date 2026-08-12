@@ -549,7 +549,9 @@ fn apply_rename(renames: &[(String, String)], event: &mut Map<String, Value>) {
 ///
 /// - a target that SHADOWS a column the row carries never feeds its
 ///   siblings — `let a = 1, b = a` and `let a = a + 1, b = a` over a row
-///   with an `a` both give `b` the ORIGINAL `a`;
+///   with an `a` both give `b` the ORIGINAL `a`; "carries" is `DuckDB`'s
+///   own case-insensitive binding ([`bind_event_key`]), so `let A = 1,
+///   b = A` shadows an `a` too;
 /// - a target the row does NOT carry — the ordinary case, since `let`
 ///   usually names something new — IS the sibling's binding:
 ///   `let ms = 1000, total = ms * 2` gives `total = 2000`, matching
@@ -572,9 +574,13 @@ fn apply_let(
     // Decided against the PRE-stage row, before any alias lands: these
     // targets name a real column, so they stay invisible to their
     // siblings and their new values are applied only at the end.
+    // "Names a real column" is `DuckDB`'s own binding rule
+    // ([`bind_event_key`]), not an exact key match: a target spelled
+    // `Dur` shadows the row's `dur` exactly as a reference to it would
+    // bind that column.
     let shadowing: Vec<bool> = assignments
         .iter()
-        .map(|(name, _)| event.contains_key(name.as_str()))
+        .map(|(name, _)| bind_event_key(event, name).is_some())
         .collect();
     let mut resolved: Vec<(&str, Value)> = Vec::with_capacity(assignments.len());
     for ((name, expr), shadows_column) in assignments.iter().zip(shadowing) {
@@ -1914,6 +1920,31 @@ mod tests {
         let mut ev = event(&json!({"a": 5}));
         apply_stage(&mut stage, &mut ev);
         assert_eq!(ev.get("a").unwrap(), 1);
+        assert_eq!(ev.get("b").unwrap(), 5);
+    }
+
+    #[test]
+    fn let_target_shadows_a_case_variant_column() {
+        // `let A = 1, b = A` — DuckDB binds `A` to the input column `a`,
+        // so the target shadows it and `b` reads the ORIGINAL 5. An
+        // exact-key shadowing test would have made `A` a fresh alias and
+        // handed `b` the 1.
+        let assignments = vec![
+            ("A".into(), span(Expr::Literal(LiteralValue::Int(1)))),
+            ("b".into(), span(Expr::FieldRef("A".into()))),
+        ];
+        let mut stage = compile_let(
+            &LetStage {
+                assignments,
+                keyword: "let",
+            },
+            &PinScope::unpinned(),
+        )
+        .unwrap();
+        let mut ev = event(&json!({"a": 5}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("A").unwrap(), 1);
+        assert_eq!(ev.get("a").unwrap(), 5);
         assert_eq!(ev.get("b").unwrap(), 5);
     }
 

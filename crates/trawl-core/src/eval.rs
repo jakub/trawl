@@ -273,8 +273,15 @@ pub fn eval_expr_with_pins(
     match &expr.node {
         Expr::Literal(lit) => eval_literal(lit),
         Expr::FieldRef(name) => {
+            // Bound the way `DuckDB` binds a column reference — and the
+            // way the PINNED read beside it already binds: a bare
+            // `let b = A` over a row carrying `a` reads that column
+            // rather than answering NULL, so a reference does not change
+            // meaning with the pin.
             let mapped = map_field_name(name);
-            event.get(mapped).map_or(EvalValue::Null, EvalValue::from)
+            bind_event_key(event, mapped)
+                .and_then(|key| event.get(key))
+                .map_or(EvalValue::Null, EvalValue::from)
         }
         Expr::Binary { lhs, op, rhs } => eval_level_comparison(lhs, *op, rhs, event)
             .or_else(|| try_pinned_comparison(lhs, *op, rhs, event, pins))
@@ -1783,6 +1790,31 @@ mod tests {
                     VARCHAR_STATUS
                 ),
                 EvalValue::Null
+            );
+        }
+
+        /// The PIN-BLIND read binds the same way, so a reference does not
+        /// change meaning with the pin: `lower(Status)` and a bare
+        /// `let b = Status` reach the row's `status` exactly as the pinned
+        /// arm beside them does.
+        #[test]
+        fn unpinned_lookup_binds_the_rows_key_case_insensitively() {
+            assert_eq!(
+                eval_where(
+                    "* | where lower(Status) == \"ok\"",
+                    r#"{"status": "OK"}"#,
+                    &[]
+                ),
+                EvalValue::Bool(true)
+            );
+            // An exact key still wins over a case-variant sibling.
+            assert_eq!(
+                eval_where(
+                    "* | where status == \"exact\"",
+                    r#"{"Status": "variant", "status": "exact"}"#,
+                    &[]
+                ),
+                EvalValue::Bool(true)
             );
         }
 
