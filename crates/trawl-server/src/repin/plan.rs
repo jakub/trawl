@@ -5,7 +5,9 @@
 //! The repin scan (ADR-0011 slice B): the dry-run report, and the
 //! mandatory first phase of every executing job.
 //!
-//! Counts with the SAME expressions the rewrite writes
+//! Counts over the SAME files the rewrite rewrites
+//! (`rewrite::affected_schema` — one affectedness gate, not two agreeing
+//! predicates) with the SAME expressions the rewrite writes
 //! (`ingest::compaction::repin_count_exprs` over `repin_target_expr`), so
 //! the plan's `projected_nulls`/`resurrectable` are the rewrite's
 //! `rows_nulled`/`rows_resurrected` over an unchanged corpus — a report
@@ -16,9 +18,8 @@ use std::path::Path;
 
 use trawl_core::schema::CanonicalType;
 
-use crate::catalog::conform::{Progress, layout_path, open_bounded_connection};
-use crate::ingest::compaction::describe_source;
-use crate::repin::rewrite::count_repin_effect;
+use crate::catalog::conform::{Progress, open_bounded_connection};
+use crate::repin::rewrite::{affected_schema, count_repin_effect};
 
 /// What the scan found — the dry-run report's numbers.
 #[derive(Debug, Clone, Copy, Default)]
@@ -39,9 +40,12 @@ pub struct ScanCounts {
 /// Scan the corpus for `field` repinned to `to`.
 ///
 /// Blocking (`DuckDB` + filesystem) — callers run it on the blocking
-/// pool. Unreadable or foreign paths are simply not affected files: the
-/// rewrite never touches them either (they ride the swap verbatim), so
-/// skipping them here keeps the plan honest rather than optimistic.
+/// pool. Which files count is [`affected_schema`]'s decision, the very
+/// one the rewrite makes: non-parquet, foreign and unreadable paths are
+/// not affected files there either (they ride the swap verbatim), so the
+/// plan is honest rather than optimistic, and a file `read_parquet`
+/// cannot open at all fails the scan exactly as it would fail the
+/// rewrite — before anything has been staged.
 pub(crate) fn scan(
     data_dir: &Path,
     memory_limit: &str,
@@ -63,22 +67,11 @@ pub(crate) fn scan(
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
         }
-        if rel.extension().is_none_or(|e| e != "parquet") {
-            continue;
-        }
         let path = data_dir.join(&rel);
-        if layout_path(data_dir, &path).is_none() {
-            continue;
-        }
-        let safe = path.to_string_lossy().replace('\'', "''");
-        let Ok(schema) = describe_source(&conn, &format!("SELECT * FROM read_parquet('{safe}')"))
-        else {
-            // Unreadable: not an affected file (and not rewritable).
+        let Some((schema, _layout)) = affected_schema(&conn, data_dir, &path, field)? else {
             continue;
         };
-        if !schema.iter().any(|c| c.name.eq_ignore_ascii_case(field)) {
-            continue;
-        }
+        let safe = path.to_string_lossy().replace('\'', "''");
         let effect = count_repin_effect(
             &conn,
             &format!("read_parquet('{safe}')"),

@@ -160,7 +160,11 @@ pub(crate) fn process_file(
 /// boot pass; a foreign file is NEVER rewritten however it parses) and
 /// (b) a readable parquet whose schema carries the target column under
 /// its folded name.
-fn affected_schema(
+///
+/// THE affectedness decision — the scan (`repin::plan`) asks this same
+/// function, so the dry run's file set is the rewrite's file set by
+/// construction rather than by two predicates agreeing.
+pub(crate) fn affected_schema(
     conn: &duckdb::Connection,
     data_dir: &Path,
     src: &Path,
