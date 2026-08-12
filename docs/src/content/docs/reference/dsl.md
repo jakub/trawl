@@ -224,8 +224,12 @@ fields are unchanged everywhere.
   (and `status` no longer resolves the pin).
 - `let status = <expr> | where status > 400` is literal-driven — a
   computed value has no pin. A **bare alias** copies the pin:
-  `let s2 = status | where s2 > 400` is pin-aware. All assignments in one
-  `let` read the *pre-stage* columns (parallel, like the SQL), so
+  `let s2 = status | where s2 > 400` is pin-aware. Within one `let`, a
+  reference to a sibling target resolves the way the SQL does — an
+  existing *column* of that name wins (so `let a = 1, b = a` gives `b`
+  the original `a`, not `1`), and only a name the row doesn't carry reads
+  the sibling's freshly computed value (`let ms = 1000, total = ms * 2`
+  gives `total = 2000`). *Pins* stay strictly pre-stage either way, so
   `let a = status, b = a` gives `b` no pin.
 - Aggregations keep their group-by keys and nothing else:
   `stats count() by status | where status == 200` stays pin-aware, while

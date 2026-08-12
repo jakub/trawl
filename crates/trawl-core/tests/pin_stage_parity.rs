@@ -464,32 +464,43 @@ fn float_literal_above_2_53_binds_its_source_token_in_both_lanes() {
     }
 }
 
-/// `| let` assigns in parallel in BOTH lanes: every expression reads the
-/// pre-stage row, so a sibling reference sees the original column and an
-/// overwrite never feeds the assignment beside it.
+/// `| let` resolves a sibling reference column-then-alias in BOTH lanes:
+/// an input COLUMN wins (so an overwrite never feeds the assignment
+/// beside it), and only a name resolving to no column binds the LATERAL
+/// COLUMN ALIAS the sibling just defined.
 ///
 /// The batch lane has no choice — the stage desugars to one projection
-/// (`COLUMNS(c -> c NOT IN (targets)), (expr) AS tgt, …`) — so the live
-/// lane is the one that must not drift, and `PinScope::advance` resolves
-/// the pins the same parallel way.
+/// (`COLUMNS(c -> c NOT IN (targets)), (expr) AS tgt, …`) and `DuckDB`
+/// binds the names in it — so the live lane is the one that must not
+/// drift. `PinScope::advance` stays strictly parallel on top of this: an
+/// alias-bound sibling is unpinned in both lanes.
 #[test]
-fn let_assignments_are_parallel_in_both_lanes() {
+fn let_sibling_references_bind_column_then_alias_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
     let mut ft = FieldTypes::new();
     ft.insert("a", CanonicalType::BigInt);
 
     let event = event_with("a", Value::from(5));
 
-    // A sibling reference reads the ORIGINAL `a`, not the new one.
+    // The row carries `a`: the input column wins over the alias, so the
+    // sibling reads the ORIGINAL `a`.
     run_let_cell(&conn, "* | let a = 1, b = a", &event, &ft, &["a", "b"]);
-    // An overwrite does not feed the assignment beside it.
+    // An overwrite does not feed the assignment beside it either.
     run_let_cell(&conn, "* | let a = a + 1, b = a", &event, &ft, &["a", "b"]);
-    // Both cells above assign to a name the row DOES carry, which is the
-    // whole contract: DuckDB's lateral column alias only binds a name that
-    // resolves to no input column, so a `let` target shadowing a real
-    // column reads the column. A reference to a name the corpus carries
-    // nowhere is the documented residual — batch takes the sibling's
-    // freshly computed value, live has no column to read and answers NULL.
+    // The row carries no `ms`: the alias binds, in both lanes. This is
+    // the ordinary shape — `let` targets are usually new names.
+    run_let_cell(
+        &conn,
+        "* | let ms = 1000, total = ms * 2",
+        &event,
+        &ft,
+        &["ms", "total"],
+    );
+    // Same, chained through a bare alias of a real column.
+    run_let_cell(&conn, "* | let x = a, y = x", &event, &ft, &["x", "y"]);
+    // The residual is the row-vs-relation gap, not the alias: a column
+    // the corpus carries but THIS row leaves absent reads NULL in batch
+    // while the live lane, seeing no key, binds the alias.
 }
 
 /// A pinned comparison reads the row under the spelling the ROW uses.

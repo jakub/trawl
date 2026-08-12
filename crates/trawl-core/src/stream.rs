@@ -519,37 +519,55 @@ fn apply_rename(renames: &[(String, String)], event: &mut Map<String, Value>) {
     }
 }
 
-/// Apply a `let` stage in place, with the SQL's parallel semantics.
+/// Apply a `let` stage in place, with the SQL's column-then-alias
+/// resolution.
 ///
 /// The batch lane desugars the whole stage into ONE projection
-/// (`COLUMNS(c -> c NOT IN (targets)), (expr) AS tgt, …`), so every
-/// assignment reads the PRE-stage row: `let a = 1, b = a` gives `b` the
-/// ORIGINAL `a`, and `let a = a + 1, b = a` gives `b` the original `a`
-/// too, never the value the sibling just computed. Evaluating each
-/// expression against the already-mutated event would answer differently
-/// here than `/api/v1/query` does — and [`PinScope::advance`] resolves the
-/// pins in parallel, so a sequential value would be typed by a pin
-/// belonging to the column it no longer came from.
+/// (`COLUMNS(c -> c NOT IN (targets)), (expr) AS tgt, …`), and `DuckDB`
+/// binds a name inside it the way it binds any name in a `SELECT` list:
+/// an INPUT COLUMN wins, and only a name resolving to no input column
+/// falls through to the LATERAL COLUMN ALIAS a sibling just defined. Both
+/// halves are load-bearing, so this mirrors both:
 ///
-/// The residual: `DuckDB`'s lateral column alias binds a name that
-/// resolves to NO input column, so `let c = 1, d = c` over a corpus
-/// carrying no `c` gives the batch `d = 1` while the live lane, having no
-/// column to read, answers NULL. A target that shadows a real column —
-/// the case the pins care about — reads the column in both lanes.
+/// - a target that SHADOWS a column the row carries never feeds its
+///   siblings — `let a = 1, b = a` and `let a = a + 1, b = a` over a row
+///   with an `a` both give `b` the ORIGINAL `a`;
+/// - a target the row does NOT carry — the ordinary case, since `let`
+///   usually names something new — IS the sibling's binding:
+///   `let ms = 1000, total = ms * 2` gives `total = 2000`, matching
+///   `/api/v1/query` (this lane is also the `rust_stages` batch tail
+///   behind `extract kv`, where there is no SQL lane to fall back on).
+///
+/// Pins do NOT follow the alias: [`PinScope::advance`] resolves every
+/// assignment's pin against the PRE-stage scope, so an alias-bound
+/// sibling is unpinned — conservative, and identical in both lanes
+/// because both consume that one walk.
+///
+/// The residual is the row-vs-relation gap: a column the CORPUS carries
+/// but this row leaves absent (a sparse custom field) is a NULL column
+/// read in batch, while the live lane, seeing no key, binds the alias.
 fn apply_let(
     assignments: &[(String, Spanned<crate::ast::Expr>)],
     pins: &PinScope,
     event: &mut Map<String, Value>,
 ) {
-    let resolved: Vec<(&str, Value)> = assignments
+    // Decided against the PRE-stage row, before any alias lands: these
+    // targets name a real column, so they stay invisible to their
+    // siblings and their new values are applied only at the end.
+    let shadowing: Vec<bool> = assignments
         .iter()
-        .map(|(name, expr)| {
-            (
-                name.as_str(),
-                Value::from(eval_expr_with_pins(expr, event, pins)),
-            )
-        })
+        .map(|(name, _)| event.contains_key(name.as_str()))
         .collect();
+    let mut resolved: Vec<(&str, Value)> = Vec::with_capacity(assignments.len());
+    for ((name, expr), shadows_column) in assignments.iter().zip(shadowing) {
+        let value = Value::from(eval_expr_with_pins(expr, event, pins));
+        if !shadows_column {
+            // The lateral alias: a later sibling naming this target finds
+            // no input column and reads what was just computed.
+            event.insert(name.clone(), value.clone());
+        }
+        resolved.push((name.as_str(), value));
+    }
     for (name, value) in resolved {
         event.insert(name.to_string(), value);
     }
@@ -1828,9 +1846,41 @@ mod tests {
     }
 
     #[test]
+    fn let_sibling_binds_the_alias_when_the_row_has_no_such_column() {
+        // `let ms = 1000, total = ms * 2` — the row carries no `ms`, so
+        // DuckDB binds the LATERAL COLUMN ALIAS and the batch answers
+        // 2000. This lane is also the `rust_stages` batch tail, so a NULL
+        // here would be a silent wrong answer on /api/v1/query.
+        let assignments = vec![
+            ("ms".into(), span(Expr::Literal(LiteralValue::Int(1000)))),
+            (
+                "total".into(),
+                span(Expr::Binary {
+                    lhs: Box::new(span(Expr::FieldRef("ms".into()))),
+                    op: BinaryOp::Mul,
+                    rhs: Box::new(span(Expr::Literal(LiteralValue::Int(2)))),
+                }),
+            ),
+        ];
+        let mut stage = compile_let(
+            &LetStage {
+                assignments,
+                keyword: "let",
+            },
+            &PinScope::unpinned(),
+        )
+        .unwrap();
+        let mut ev = event(&json!({"service": "nginx"}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("ms").unwrap(), 1000);
+        assert_eq!(ev.get("total").unwrap(), 2000);
+    }
+
+    #[test]
     fn let_siblings_read_the_pre_stage_event() {
-        // SQL: one projection, `(1) AS a, (a) AS b` — both expressions
-        // read the pre-stage row, so `b` takes the ORIGINAL `a`.
+        // SQL: one projection, `(1) AS a, (a) AS b` — the row carries an
+        // `a`, so the input COLUMN wins over the alias and `b` takes the
+        // ORIGINAL `a`.
         let assignments = vec![
             ("a".into(), span(Expr::Literal(LiteralValue::Int(1)))),
             ("b".into(), span(Expr::FieldRef("a".into()))),

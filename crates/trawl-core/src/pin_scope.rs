@@ -72,12 +72,16 @@ impl PinScope {
     ///   them off the pre-stage row, so `rename a as b, b as c` gives
     ///   `b` the original `a` and `c` the original `b`.
     /// - `table`/`fields` restrict to the named columns; `drop` removes.
-    /// - `let` resolves ALL assignments against the PRE-stage scope — the
-    ///   SQL desugars to one parallel SELECT (`COLUMNS(c -> c NOT IN …)`),
-    ///   so `let a = status, b = a` reads the ORIGINAL `a` column for `b`:
-    ///   a sibling reference is a conservative miss in both lanes. A bare
-    ///   field-ref alias copies the source's pin to the target; any other
-    ///   expression kills the target's pin (the value is derived).
+    /// - `let` resolves ALL assignments' pins against the PRE-stage scope.
+    ///   A bare field-ref alias copies the source's pin to the target; any
+    ///   other expression kills the target's pin (the value is derived).
+    ///   The pins stay parallel even where the VALUES do not: the SQL
+    ///   desugars to one projection (`COLUMNS(c -> c NOT IN …)`) in which
+    ///   `DuckDB` binds an input COLUMN first and a sibling's lateral
+    ///   alias only when the name resolves to no column (see
+    ///   [`crate::stream`]'s `apply_let`), so `let a = status, b = a`
+    ///   hands `b` the pin of the pre-stage `a` — none, when the alias is
+    ///   what bound. A conservative miss, identical in both lanes.
     /// - aggregation stages (`stats`/`timechart`/`top`/`rare`/`pivot`)
     ///   keep their group-by keys and kill every derived output
     ///   (aggregate aliases, the `timechart` `_time` bucket, `count`).
@@ -353,8 +357,10 @@ mod tests {
 
     #[test]
     fn let_sibling_reference_resolves_against_the_pre_stage_scope() {
-        // `b = a` reads the ORIGINAL `a` column (parallel SELECT), which
-        // is unpinned — the conservative miss both lanes agree on.
+        // `b = a` names no pre-stage column here, so its VALUE comes from
+        // the sibling's lateral alias — but its pin resolves against the
+        // pre-stage scope, where `a` is unpinned: the conservative miss
+        // both lanes agree on.
         let scope = walk("* | let a = status, b = a", ROOT);
         assert_eq!(scope.pin_for("a"), Some(CT::Varchar));
         assert_eq!(scope.pin_for("b"), None);

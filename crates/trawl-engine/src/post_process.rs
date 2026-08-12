@@ -365,6 +365,49 @@ mod tests {
         );
     }
 
+    /// The kv tail is the ONLY lane behind `extract kv`: a `let` sibling
+    /// reference naming no column of the pre-stage row binds the sibling's
+    /// value here exactly as `DuckDB`'s lateral column alias does in the
+    /// SQL lane, so `| extract kv | let ms = 1000, total = ms * 2` cannot
+    /// answer NULL where the same pipeline without `extract kv` answers
+    /// 2000.
+    #[test]
+    fn kv_tail_let_sibling_binds_the_alias() {
+        let result = make_result(
+            &["message"],
+            vec![vec![crate::value::Value::String("method=GET".into())]],
+        );
+
+        let stages = vec![
+            span(PipeStage::Extract(ExtractStage {
+                mode: ExtractMode::KeyValue { separator: '=' },
+                source_field: None,
+                keyword: "extract",
+            })),
+            span(PipeStage::Let(LetStage {
+                assignments: vec![
+                    ("ms".into(), span(Expr::Literal(LiteralValue::Int(1000)))),
+                    (
+                        "total".into(),
+                        span(Expr::Binary {
+                            lhs: Box::new(span(Expr::FieldRef("ms".into()))),
+                            op: BinaryOp::Mul,
+                            rhs: Box::new(span(Expr::Literal(LiteralValue::Int(2)))),
+                        }),
+                    ),
+                ],
+                keyword: "let",
+            })),
+        ];
+
+        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
+        let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
+        assert_eq!(
+            out.rows[0][col_idx("total")],
+            crate::value::Value::Integer(2000)
+        );
+    }
+
     #[test]
     fn kv_with_stats() {
         let result = make_result(
