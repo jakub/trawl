@@ -27,8 +27,9 @@ pub enum RepinJobStatus {
     /// Terminal: errored (recorded); the live corpus was never mutated in
     /// place, so it stands at the pre-repin generation.
     Failed,
-    /// Terminal: the scan projected nulled values and the request carried
-    /// no force flag.
+    /// Terminal: nulled values without a force flag — either projected by
+    /// the pre-build scan, or actually written by the finished shadow
+    /// (data ingested after the scan), refused at the cutover gate.
     RefusedNeedsForce,
     /// Terminal: the cutover could not drain queries within its budget.
     Blocked,

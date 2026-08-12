@@ -22,7 +22,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ingested during the rewrite land exactly once. A mandatory-by-shape
   dry run reports affected files/rows, projected nulls and resurrectable
   values; a lossy repin refuses without `--force` (409 with the plan)
-  and accounts its losses as conflict evidence when forced;
+  and accounts its losses as conflict evidence when forced — and
+  because ingest keeps running for the whole job, the same gate is
+  re-asked of the finished rewrite, so a started job still ends
+  `refused_needs_force` (corpus untouched) when data that landed after
+  the scan turns out to be unreadable under the new type;
   `--to <current> --force` runs a resurrection-only pass. One job at a
   time install-wide (postgres-enforced), progress and outcomes on
   `trawl_catalog_repin_*` metrics; retention stands down while a job is

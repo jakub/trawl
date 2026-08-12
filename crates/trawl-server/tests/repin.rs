@@ -380,6 +380,99 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it(pool: sqlx::PgPo
     assert_eq!(h.count("oops last=1h | stats count()").await, 1);
 }
 
+/// The force gate is asked of the FINISHED shadow, not just the pre-build
+/// scan: a lossless plan whose corpus grows a non-conforming value while
+/// the rewrite runs is refused at the cutover, corpus untouched — and the
+/// same repin proceeds under force.
+#[sqlx::test(migrations = false)]
+async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    // Pin VARCHAR on a text value, then retire that file: what remains is
+    // an all-numeric-text corpus, so the scan projects no loss at all.
+    h.ingest_and_compact(&[event("seed", &json!({"dur": "oops"}))])
+        .await;
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+    let seed_file = walk(&h.data_dir)
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "seed.parquet"))
+        .expect("seed.parquet exists");
+    std::fs::remove_file(&seed_file).unwrap();
+
+    // Enough affected files that the build is still running when the late
+    // event lands.
+    let services = ["api", "web", "worker", "edge", "db", "cache"];
+    for svc in services {
+        h.ingest_and_compact(&[event(svc, &json!({"dur": "12"}))])
+            .await;
+    }
+    let dry = match h
+        .schema_admin
+        .schema_repin("dur", "BIGINT", true, false)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a dry-run report, got {other:?}"),
+    };
+    assert_eq!(dry.projected_nulls, 0, "the scanned corpus is all numeric");
+
+    // Execute without force on that lossless plan.
+    trawl_server::repin::engine::TEST_FILE_DELAY_MS
+        .store(400, std::sync::atomic::Ordering::Relaxed);
+    let started = match h
+        .schema_admin
+        .schema_repin("dur", "BIGINT", false, false)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+
+    // A value the new pin cannot read, ingested and compacted DURING the
+    // build: the catch-up folds it in and the rewrite would null it.
+    h.ingest_and_compact(&[event("api", &json!({"dur": "nope"}))])
+        .await;
+
+    let done = h.wait_terminal(started.id).await;
+    trawl_server::repin::engine::TEST_FILE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        done.status, "refused_needs_force",
+        "loss that appeared after the scan still needs force (error: {:?})",
+        done.error
+    );
+    assert!(done.rows_nulled > 0, "the refusal reports the actual loss");
+
+    // Corpus untouched: the old pin, every row, and no staging left.
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+    assert_eq!(h.count("last=1h | stats count()").await, 7);
+    assert_eq!(
+        h.count("last=1h | where dur == \"nope\" | stats count()")
+            .await,
+        1
+    );
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+
+    // The operator's answer: the same repin, forced, accepts the loss.
+    let forced = match h
+        .schema_admin
+        .schema_repin("dur", "BIGINT", false, true)
+        .await
+        .expect("forced execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(forced.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(done.rows_nulled, 1);
+    assert_eq!(h.pinned_type("dur").await, "BIGINT");
+    assert_eq!(h.count("last=1h | stats count()").await, 7);
+}
+
 /// One repin at a time: a concurrent second request 409s with the error
 /// envelope (not a refusal plan); ingest and queries ride through the
 /// slowed rewrite — events land in the hot buffer immediately and exactly

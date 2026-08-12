@@ -607,11 +607,14 @@ pub async fn run_repin(
         trawl_client::RepinStart::Refused(job) => ("refused: needs --force", job),
     };
 
-    let refused = job.status == "refused_needs_force";
     let mut job = job;
-    if flags.wait && !refused && job.status == "running" {
+    if flags.wait && job.status == "running" {
         job = wait_for_terminal(&client, job).await?;
     }
+    // Computed AFTER the wait: a started job can still refuse at the
+    // cutover gate when data ingested after the scan turns out to be
+    // unreadable under the new type.
+    let refused = job.status == "refused_needs_force";
 
     if format == OutputFormat::Table {
         writeln!(out, "repin {}: {verdict}", job.field)?;
@@ -619,10 +622,16 @@ pub async fn run_repin(
     let (columns, rows) = repin_job_to_rows(&job);
     render_driver_results(&columns, &rows, format, out)?;
     if refused {
-        return Err(CliError::Usage(format!(
-            "repin would null {} stored value(s); re-run with --force to \
-             accept the loss (originals remain findable in _raw)",
+        // A pre-scan refusal reports its projection; a cutover refusal
+        // reports what the finished rewrite actually nulled.
+        let lost = if job.rows_nulled > 0 {
+            job.rows_nulled
+        } else {
             job.projected_nulls
+        };
+        return Err(CliError::Usage(format!(
+            "repin would null {lost} stored value(s); re-run with --force to \
+             accept the loss (originals remain findable in _raw)"
         )));
     }
     Ok(())

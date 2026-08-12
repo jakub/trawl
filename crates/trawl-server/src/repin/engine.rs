@@ -8,7 +8,13 @@
 //!
 //! Every job — dry or real — runs the same scan with the same expressions
 //! the rewrite writes; "mandatory dry run" and the force gate are one code
-//! path. The build stages the new generation in a SIBLING shadow root
+//! path. The gate is then re-asked of the FINISHED shadow under the
+//! cutover exclusion, because the scan describes a corpus that ingest and
+//! compaction keep changing underneath the build: a file written after
+//! the scan can carry values the new pin cannot read, and only the
+//! shadow's own accounting can be what the omitted force flag governs.
+//!
+//! The build stages the new generation in a SIBLING shadow root
 //! (`marker.rs` explains why it cannot live inside the data root), the
 //! catch-up loop folds in files compaction writes meanwhile (additive by
 //! construction: the rollup is paused for the whole job), and the cutover
@@ -236,7 +242,7 @@ impl RepinEngine {
 
         let engine = Arc::clone(self);
         tokio::spawn(async move {
-            engine.run_job(job_id, field, from, to).await;
+            engine.run_job(job_id, field, from, to, force).await;
         });
         Ok(StartOutcome::Started(self.job(job_id).await?))
     }
@@ -281,12 +287,13 @@ impl RepinEngine {
         field: String,
         from: CanonicalType,
         to: CanonicalType,
+        force: bool,
     ) {
         let started = std::time::Instant::now();
         let _rollup_pause = self.coordinator.pause_rollup();
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(1.0);
 
-        let outcome = self.run_job_inner(job_id, &field, from, to).await;
+        let outcome = self.run_job_inner(job_id, &field, from, to, force).await;
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(0.0);
         metrics::histogram!(crate::metrics::CATALOG_REPIN_DURATION_SECONDS)
             .record(started.elapsed().as_secs_f64());
@@ -305,6 +312,10 @@ impl RepinEngine {
             }
             Err(JobAbort::Blocked(msg)) => {
                 self.abandon_build(job_id, RepinJobStatus::Blocked, &msg)
+                    .await;
+            }
+            Err(JobAbort::RefusedNeedsForce(msg)) => {
+                self.abandon_build(job_id, RepinJobStatus::RefusedNeedsForce, &msg)
                     .await;
             }
             Err(JobAbort::Failed(msg)) => {
@@ -338,6 +349,7 @@ impl RepinEngine {
         field: &str,
         from: CanonicalType,
         to: CanonicalType,
+        force: bool,
     ) -> Result<(), JobAbort> {
         let marker = RepinMarker {
             job_id,
@@ -414,6 +426,25 @@ impl RepinEngine {
             .await
             .map_err(JobAbort::Failed)?;
         self.publish_progress(job_id, &state).await;
+
+        // The AUTHORITATIVE loss gate. The pre-build scan only describes
+        // the corpus as it stood before the build; ingest and compaction
+        // run for the whole job, so a file written after the scan can
+        // carry values the new pin cannot read. Deciding on the finished
+        // shadow's OWN accounting is the only check the operator's
+        // omitted force flag can actually govern — and it is safe to
+        // refuse here because nothing visible has moved yet.
+        let (_, _, nulled, _) = state.totals();
+        if nulled > 0 && !force {
+            return Err(JobAbort::RefusedNeedsForce(format!(
+                "the completed rewrite nulled {nulled} stored value(s) the \
+                 pre-build scan did not project — data ingested after the \
+                 scan cannot be read as {}; the cutover is refused and the \
+                 corpus stands at its pre-repin generation. Re-run the dry \
+                 run for the current plan, then pass force to accept the loss",
+                to.as_duckdb()
+            )));
+        }
 
         // Point of no return.
         let marker = RepinMarker {
@@ -593,6 +624,9 @@ impl RepinEngine {
 enum JobAbort {
     Failed(String),
     Blocked(String),
+    /// The finished shadow nulled values the pre-build scan did not
+    /// project (concurrent ingest), and the request carried no force.
+    RefusedNeedsForce(String),
 }
 
 /// Everything a pass needs to remember between passes: which source file

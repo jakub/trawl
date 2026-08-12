@@ -189,6 +189,12 @@ case:
   the body is the plan the refusal is based on. (A second repin while one
   runs also 409s, with the ordinary error envelope.)
 
+The same gate is asked again of the finished rewrite: ingest keeps running
+for the whole job, so a file written after the scan can carry values the
+new type cannot read. A job that started with 202 therefore still ends
+`refused_needs_force` — corpus untouched, `rows_nulled` carrying what the
+rewrite would have lost — when that happens without `force`.
+
 A forced lossy repin records its losses as `field_conflicts` evidence and
 in `trawl_catalog_repin_rows_nulled_total`; the originals stay findable
 in `_raw`. Queries never observe a mixed-type corpus (the cutover holds
