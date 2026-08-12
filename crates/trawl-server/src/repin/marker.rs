@@ -25,11 +25,17 @@
 //! the data root's own for the shipped packaging (the volume is mounted
 //! at `/var/lib/trawl`, data at `/var/lib/trawl/data`) but not when an
 //! operator mounts a volume AT the data dir (`[data] path = "/mnt/logs"`)
-//! — and then no hardlink and no rename can cross. That is not a
+//! — and then no hardlink and no rename can cross. Nor is the root the
+//! only place a mount can sit: everything the engine touches lives
+//! arbitrarily deep under it (the shadow build hardlinks
+//! `{env}/{date}/{HH}/{service}.parquet`, the swap renames `{env}`), so a
+//! volume mounted at ANY env/date/hour subtree — tiered storage, a
+//! plausible archive layout — breaks the same two halves. That is not a
 //! survivable discovery mid-cutover (the swap is forward-only past the
-//! marker, so an `EXDEV` there costs the process and every subsequent
-//! boot replays the same `EXDEV`), so [`check_staging_filesystem`] proves
-//! it BEFORE a job is allowed to build anything.
+//! marker, so an `EXDEV`/`EBUSY` there costs the process and every
+//! subsequent boot replays it), so [`check_staging_filesystem`] proves
+//! the WHOLE env subtree is one filesystem BEFORE a job is allowed to
+//! build anything.
 
 use std::path::{Path, PathBuf};
 
@@ -100,34 +106,107 @@ pub fn marker_path(data_dir: &Path) -> PathBuf {
 }
 
 /// Prove the staging siblings will land on the data root's OWN filesystem
-/// — i.e. that the data root is not itself a mount point.
+/// AND that the whole env subtree the engine moves lives on that same
+/// filesystem — i.e. that neither the data root nor anything nested under
+/// an env directory is a mount point.
 ///
 /// The whole staging design is renames and hardlinks between the data root
 /// and its siblings, neither of which crosses a filesystem. Discovering
 /// that mid-job is only ever bad: a hardlink `EXDEV` fails the build
 /// (clean, but late), and a corpus where nothing needed hardlinking builds
-/// fine and then meets the SAME `EXDEV` in the forward-only swap, where
+/// fine and then meets the SAME failure in the forward-only swap, where
 /// the only safe answer is to exit the process — after which every boot
-/// replays the marker into the identical failure and refuses to start.
-/// One `stat` pair up front turns all of that into a refusal that changes
+/// replays the marker into the identical failure and refuses to start. A
+/// nested mount fails identically and even more opaquely: renaming a
+/// directory that CONTAINS a mount point is `EBUSY`, not `EXDEV`. One
+/// stat walk up front turns all of that into a refusal that changes
 /// nothing.
 pub fn check_staging_filesystem(data_dir: &Path) -> Result<(), String> {
     let parent = data_dir.parent().filter(|p| !p.as_os_str().is_empty());
     let parent = parent.unwrap_or_else(|| Path::new("."));
-    if device_of(data_dir)? == device_of(parent)? {
-        return Ok(());
+    let root_dev = device_of(data_dir)?;
+    if root_dev != device_of(parent)? {
+        return Err(format!(
+            "the data root {} is a mount point, so the repin staging roots \
+             ({}, {}) would sit on the parent filesystem — the hardlinks and \
+             the atomic per-env swap a repin is built from cannot cross \
+             filesystems (EXDEV). Mount the volume one level up and put the \
+             data root inside it (the packaged layout: volume at \
+             /var/lib/trawl, [data] path = \"/var/lib/trawl/data\")",
+            data_dir.display(),
+            shadow_root(data_dir).display(),
+            aside_root(data_dir).display()
+        ));
     }
-    Err(format!(
-        "the data root {} is a mount point, so the repin staging roots \
-         ({}, {}) would sit on the parent filesystem — the hardlinks and \
-         the atomic per-env swap a repin is built from cannot cross \
-         filesystems (EXDEV). Mount the volume one level up and put the \
-         data root inside it (the packaged layout: volume at \
-         /var/lib/trawl, [data] path = \"/var/lib/trawl/data\")",
+    check_env_subtree_devices(data_dir, root_dev, &|meta| device_of_meta(meta))
+}
+
+/// Walk the env directories the swap moves and the shadow build
+/// hardlinks, refusing the first entry that does not share `root_dev`.
+///
+/// The device function is injected so the walk itself is testable without
+/// a mount (creating one needs privileges the test suite does not have);
+/// production always passes [`device_of_meta`].
+fn check_env_subtree_devices<F>(data_dir: &Path, root_dev: u64, dev_of: &F) -> Result<(), String>
+where
+    F: Fn(&std::fs::Metadata) -> u64,
+{
+    for (_env, env_dir) in crate::env_dirs::try_list_env_dirs(data_dir)
+        .map_err(|e| format!("failed to list env dirs under {}: {e}", data_dir.display()))?
+    {
+        walk_devices(&env_dir, data_dir, root_dev, dev_of)?;
+    }
+    Ok(())
+}
+
+fn walk_devices<F>(dir: &Path, data_dir: &Path, root_dev: u64, dev_of: &F) -> Result<(), String>
+where
+    F: Fn(&std::fs::Metadata) -> u64,
+{
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| format!("failed to stat {}: {e}", dir.display()))?;
+    if dev_of(&meta) != root_dev {
+        return Err(nested_mount_message(data_dir, dir));
+    }
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
+        let path = entry.path();
+        // `DirEntry::metadata` is an `lstat`, so a symlink reports the
+        // device of the directory holding it rather than of its target —
+        // which is what this check wants: the shadow build refuses
+        // symlinks outright (`rewrite::snapshot_env_files`), and a link's
+        // target is never hardlinked or renamed by this engine.
+        let meta = entry
+            .metadata()
+            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+        if dev_of(&meta) != root_dev {
+            return Err(nested_mount_message(data_dir, &path));
+        }
+        if meta.is_dir() {
+            walk_devices(&path, data_dir, root_dev, dev_of)?;
+        }
+    }
+    Ok(())
+}
+
+fn nested_mount_message(data_dir: &Path, offender: &Path) -> String {
+    format!(
+        "{} is on a different filesystem than the data root {} (a volume \
+         mounted at a subdirectory of the corpus), which a repin cannot \
+         stage: the shadow build hardlinks every unaffected file into {} \
+         (EXDEV across filesystems) and the cutover renames each env \
+         directory, which fails with EBUSY once it contains a mount point \
+         — and that half runs past the point where the only safe answer is \
+         to exit, so every subsequent boot would replay it. Move the nested \
+         volume out of the data root (one filesystem for the whole corpus; \
+         the packaged layout: volume at /var/lib/trawl, [data] path = \
+         \"/var/lib/trawl/data\") and retry",
+        offender.display(),
         data_dir.display(),
-        shadow_root(data_dir).display(),
-        aside_root(data_dir).display()
-    ))
+        shadow_root(data_dir).display()
+    )
 }
 
 /// The filesystem a path lives on. Non-unix has no device identity to
@@ -135,14 +214,18 @@ pub fn check_staging_filesystem(data_dir: &Path) -> Result<(), String> {
 fn device_of(path: &Path) -> Result<u64, String> {
     let meta =
         std::fs::metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    Ok(device_of_meta(&meta))
+}
+
+fn device_of_meta(meta: &std::fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
-        Ok(std::os::unix::fs::MetadataExt::dev(&meta))
+        std::os::unix::fs::MetadataExt::dev(meta)
     }
     #[cfg(not(unix))]
     {
         let _ = meta;
-        Ok(0)
+        0
     }
 }
 
@@ -240,13 +323,109 @@ mod tests {
     }
 
     /// The shipped shape — a data root that is an ordinary directory
-    /// inside its volume — passes the pre-flight.
+    /// inside its volume, corpus and all — passes the pre-flight, walk
+    /// included.
     #[test]
     fn a_data_root_inside_its_volume_passes_the_staging_check() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         check_staging_filesystem(&data).expect("siblings share the parent's filesystem");
+
+        std::fs::create_dir_all(data.join("prod/2026-01-01/10")).unwrap();
+        std::fs::write(data.join("prod/2026-01-01/10/svc.parquet"), b"rows").unwrap();
+        std::fs::create_dir_all(data.join("wal/prod")).unwrap();
+        check_staging_filesystem(&data).expect("one filesystem for the whole corpus");
+    }
+
+    /// A volume mounted at an env/date/hour SUBTREE breaks both halves of
+    /// the engine exactly as a mount at the root does — the shadow build
+    /// hardlinks out of it (EXDEV) and the cutover renames the env
+    /// directory containing it (EBUSY, past the point of no return) — so
+    /// the pre-flight walks the whole env subtree, not just the root.
+    /// A mount cannot be created in the test suite, so the device lookup
+    /// is injected; [`check_staging_filesystem`] wires the real one.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_point_nested_under_the_data_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("prod/2026-01-01/10")).unwrap();
+        std::fs::write(data.join("prod/2026-01-01/10/svc.parquet"), b"rows").unwrap();
+        let tiered = data.join("prod/2026-01-01/10");
+
+        let foreign_ino = inode(&tiered);
+        let dev_of = |meta: &std::fs::Metadata| {
+            if inode_of(meta) == foreign_ino {
+                7777
+            } else {
+                0
+            }
+        };
+        let err = check_env_subtree_devices(&data, 0, &dev_of)
+            .expect_err("a nested mount must be refused before anything is built");
+        assert!(err.contains(&tiered.display().to_string()), "{err}");
+        assert!(err.contains("EXDEV"), "{err}");
+        assert!(err.contains("EBUSY"), "{err}");
+    }
+
+    /// A bind-mounted FILE is the same defect one level down: the shadow
+    /// build hardlinks it, so a different device is EXDEV all the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_foreign_file_under_an_env_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("prod/2026-01-01/10")).unwrap();
+        let file = data.join("prod/2026-01-01/10/svc.parquet");
+        std::fs::write(&file, b"rows").unwrap();
+
+        let foreign_ino = inode(&file);
+        let dev_of = |meta: &std::fs::Metadata| {
+            if inode_of(meta) == foreign_ino {
+                7777
+            } else {
+                0
+            }
+        };
+        let err = check_env_subtree_devices(&data, 0, &dev_of).expect_err("EXDEV in waiting");
+        assert!(err.contains(&file.display().to_string()), "{err}");
+    }
+
+    /// Only what the engine MOVES is in scope: `wal/` and `scheduled/`
+    /// never leave the data root, so a volume mounted there is not this
+    /// job's business and must not refuse it.
+    #[cfg(unix)]
+    #[test]
+    fn a_foreign_filesystem_outside_the_env_dirs_is_not_this_checks_business() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("prod/2026-01-01/10")).unwrap();
+        std::fs::create_dir_all(data.join("wal/prod")).unwrap();
+        std::fs::write(data.join("wal/prod/batch.ndjson"), b"{}").unwrap();
+
+        let foreign_ino = inode(&data.join("wal/prod"));
+        let dev_of = |meta: &std::fs::Metadata| {
+            if inode_of(meta) == foreign_ino {
+                7777
+            } else {
+                0
+            }
+        };
+        check_env_subtree_devices(&data, 0, &dev_of).expect("wal/ never rides the swap");
+    }
+
+    /// Singles one entry out of a tempdir where everything really does
+    /// share a device: inode identity stands in for "this one is the
+    /// mount point".
+    #[cfg(unix)]
+    fn inode(path: &Path) -> u64 {
+        inode_of(&std::fs::symlink_metadata(path).unwrap())
+    }
+
+    #[cfg(unix)]
+    fn inode_of(meta: &std::fs::Metadata) -> u64 {
+        std::os::unix::fs::MetadataExt::ino(meta)
     }
 
     /// A data root that is itself a mount point is refused BEFORE anything

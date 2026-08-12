@@ -82,27 +82,41 @@ pub(crate) fn swap_envs(data_dir: &Path, shadow: &Path, aside: &Path) -> Result<
     Ok(())
 }
 
-/// The one failure this text must explain rather than merely report: a
-/// data root that is itself a mount point puts the staging siblings on the
-/// parent filesystem, so no rename can cross.
+/// The two failures this text must explain rather than merely report,
+/// both of them a mount in the wrong place: a data root that is itself a
+/// mount point puts the staging siblings on the parent filesystem so no
+/// rename can cross (`EXDEV`), and a volume mounted at a subtree of an env
+/// directory makes that directory unrenameable (`EBUSY`).
 /// [`check_staging_filesystem`](crate::repin::marker::check_staging_filesystem)
-/// refuses a job that would meet this, but a marker written before the
-/// data root was remounted (or by an older build) still replays here at
-/// every boot, where the bare `Invalid cross-device link` says nothing
-/// about why the node will not start or what to do about it. Nothing has
-/// moved when this fires — every rename fails alike — so the corpus stands
-/// at its pre-repin generation.
+/// refuses a job that would meet either, but a marker written before the
+/// volume was mounted (or by an older build) still replays here at
+/// every boot, where the bare `Invalid cross-device link` / `Device or
+/// resource busy` says nothing about why the node will not start or what
+/// to do about it. Nothing has moved when the `EXDEV` fires — every rename
+/// fails alike — so the corpus stands at its pre-repin generation; the
+/// `EBUSY` is per env, so envs without a nested mount may already serve
+/// the new generation and finishing the swap (not undoing it) is the way
+/// out.
 fn cross_device_hint(e: &std::io::Error) -> &'static str {
-    if e.kind() == std::io::ErrorKind::CrossesDevices {
-        " — the repin staging root is on a DIFFERENT filesystem than the \
-         data root (the data root is itself a mount point), so no rename \
-         in this swap can complete and the corpus stands at its pre-repin \
-         generation. Mount the volume one level up so the data root is a \
-         directory INSIDE it (the packaged layout: volume at \
-         /var/lib/trawl, data at /var/lib/trawl/data), then restart to let \
-         the marker replay finish the swap"
-    } else {
-        ""
+    match e.kind() {
+        std::io::ErrorKind::CrossesDevices => {
+            " — the repin staging root is on a DIFFERENT filesystem than the \
+             data root (the data root is itself a mount point), so no rename \
+             in this swap can complete and the corpus stands at its pre-repin \
+             generation. Mount the volume one level up so the data root is a \
+             directory INSIDE it (the packaged layout: volume at \
+             /var/lib/trawl, data at /var/lib/trawl/data), then restart to let \
+             the marker replay finish the swap"
+        }
+        std::io::ErrorKind::ResourceBusy => {
+            " — this env directory CONTAINS a mount point (a volume mounted \
+             at a date/hour subtree of the corpus), and a directory holding \
+             one cannot be renamed. Unmount that volume and move its contents \
+             onto the data root's own filesystem — one filesystem for the \
+             whole corpus — then restart to let the marker replay finish the \
+             swap"
+        }
+        _ => "",
     }
 }
 
