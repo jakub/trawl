@@ -999,7 +999,7 @@ fn rewrite_file(
     let plan = ConformPlan::build(
         &file.schema,
         pins,
-        ConformPolicy::StandingFile {
+        &ConformPolicy::StandingFile {
             time_fallback: file.time_fallback,
         },
     );

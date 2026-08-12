@@ -1888,13 +1888,14 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
 /// TIMESTAMP: a `_time` pinned VARCHAR is plain text and needs no partition
 /// guard (and could not take a TIMESTAMP literal anyway).
 fn guard_partition_key(
-    policy: ConformPolicy,
+    policy: &ConformPolicy,
     is_time_col: bool,
     pin: CanonicalType,
     expr: &str,
 ) -> String {
     match policy {
         ConformPolicy::StandingFile { time_fallback }
+        | ConformPolicy::Repin { time_fallback, .. }
             if is_time_col && pin == CanonicalType::Timestamp =>
         {
             format!(
@@ -1909,7 +1910,7 @@ fn guard_partition_key(
 /// Which corpus a [`ConformPlan`] is being built over. The two conform
 /// sites agree on every rule except these, so the difference is named
 /// rather than duplicated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConformPolicy {
     /// A freshly-read WAL batch (compaction). `_time`/`_ingested` pass
     /// through untouched — the ADR-0008 repair ladder already made them
@@ -1937,6 +1938,32 @@ pub(crate) enum ConformPolicy {
     /// partition instant (its `{date}/{HH}` directory), or the conform
     /// instant when the path carries none.
     StandingFile {
+        time_fallback: chrono::DateTime<chrono::Utc>,
+    },
+    /// A repin rewrite over an affected standing file (ADR-0011 slice B):
+    /// [`ConformPolicy::StandingFile`] in every rule but one — the column
+    /// whose FOLDED name is `resurrect_field` routes through
+    /// [`trawl_core::conform::resurrection_expr`] UNCONDITIONALLY, even
+    /// when its physical type already matches the pin (the forced
+    /// resurrection-only pass, `to == current`, exists precisely to
+    /// rewrite a column the ordinary conform would call a noop). The pin
+    /// map handed in is the live one with the target entry flipped to the
+    /// NEW type, so every other column takes the pass-through arm — a
+    /// conformant corpus casts nothing else.
+    ///
+    /// Defensive residual: a file with no `_raw` column (impossible for
+    /// canonicalized events, reachable for a hand-planted file at a valid
+    /// layout path) falls back to the plain guarded conform — no
+    /// resurrection arm, rather than a rewrite-failing reference to a
+    /// missing column.
+    // Constructed by the repin engine (`crate::repin`); until that module
+    // lands in this slice's later milestone the only constructors are
+    // tests, which the lib-only lint pass cannot see.
+    #[allow(dead_code)]
+    Repin {
+        /// The repinned field (catalog key, folded).
+        resurrect_field: String,
+        /// Same role as [`ConformPolicy::StandingFile::time_fallback`].
         time_fallback: chrono::DateTime<chrono::Utc>,
     },
 }
@@ -1985,7 +2012,7 @@ impl ConformPlan {
     pub(crate) fn build(
         schema: &[ColInfo],
         pins: &HashMap<String, CanonicalType>,
-        policy: ConformPolicy,
+        policy: &ConformPolicy,
     ) -> Self {
         let mut plan = Self {
             select_list: Vec::with_capacity(schema.len()),
@@ -1994,17 +2021,56 @@ impl ConformPlan {
             casts: Vec::new(),
             renamed: 0,
         };
+        // The resurrection arm reads `_raw`, so it exists only where the
+        // file carries the column (see [`ConformPolicy::Repin`]).
+        let has_raw = schema
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(trawl_core::schema::RAW));
         for col in schema {
             let quoted = quote_ident(&col.name);
             let folded = col.name.to_ascii_lowercase();
             let is_time_col = trawl_core::schema::TIMESTAMP_COLUMNS.contains(&folded.as_str());
-            if policy == ConformPolicy::WalBatch && is_time_col {
+            if matches!(policy, ConformPolicy::WalBatch) && is_time_col {
                 plan.keep(col, &folded, quoted);
                 continue;
             }
+            let repin_target = matches!(
+                policy,
+                ConformPolicy::Repin { resurrect_field, .. } if *resurrect_field == folded
+            );
             match pins.get(&folded).copied() {
-                None if policy == ConformPolicy::WalBatch => plan.dropped.push(col.name.clone()),
+                None if matches!(policy, ConformPolicy::WalBatch) => {
+                    plan.dropped.push(col.name.clone());
+                }
                 None => plan.keep(col, &folded, quoted),
+                Some(pin) if repin_target => {
+                    // Unconditional — never the `conform_expr` noop check:
+                    // the resurrection-only pass rewrites a column whose
+                    // physical type already IS the pin.
+                    let expr = if has_raw {
+                        trawl_core::conform::resurrection_expr(
+                            &quoted,
+                            &quote_ident(trawl_core::schema::RAW),
+                            &folded,
+                            pin,
+                        )
+                    } else {
+                        trawl_core::conform::guarded_cast(
+                            &trawl_core::conform::untyped_text(&quoted),
+                            pin,
+                        )
+                    };
+                    let written = guard_partition_key(policy, is_time_col, pin, &expr);
+                    plan.select_list
+                        .push(format!("{written} AS {}", quote_ident(&folded)));
+                    plan.retained.push(folded.clone());
+                    plan.casts.push(CastEntry {
+                        name: folded,
+                        dtype: col.dtype.clone(),
+                        pin,
+                        expr,
+                    });
+                }
                 Some(pin) => match conform_expr(&quoted, &col.dtype, pin) {
                     None => plan.keep(col, &folded, quoted),
                     Some(expr) => {
@@ -2245,7 +2311,7 @@ fn conform_wal_batch(
     pins: &HashMap<String, CanonicalType>,
     service: &str,
 ) -> Result<(Vec<FieldConflict>, Vec<String>), String> {
-    let plan = ConformPlan::build(schema, pins, ConformPolicy::WalBatch);
+    let plan = ConformPlan::build(schema, pins, &ConformPolicy::WalBatch);
     if plan.select_list.is_empty() {
         return Err("conform produced an empty column list".to_owned());
     }
@@ -3007,7 +3073,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         assert_eq!(plan.cast_count(), 2, "both columns disagree with their pin");
 
         let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
@@ -3043,7 +3109,7 @@ mod tests {
         let pins: HashMap<String, CanonicalType> = (0..cols)
             .map(|i| (format!("f{i}"), CanonicalType::BigInt))
             .collect();
-        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         assert_eq!(plan.cast_count(), cols, "every VARCHAR column casts");
 
         let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
@@ -3294,7 +3360,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
         assert_eq!(conflicts.len(), 1);
         assert_eq!(
@@ -3375,7 +3441,7 @@ mod tests {
         let plan = ConformPlan::build(
             &schema,
             &pins,
-            ConformPolicy::StandingFile {
+            &ConformPolicy::StandingFile {
                 time_fallback: chrono::Utc::now(),
             },
         );
@@ -3391,9 +3457,147 @@ mod tests {
 
         // WalBatch: an unpinned mixed-case column is judged by its FOLDED
         // name — pinned under `dur`, so it is conformed, not dropped.
-        let wal_plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let wal_plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         assert!(wal_plan.dropped.is_empty(), "{:?}", wal_plan.dropped);
         assert_eq!(wal_plan.retained, vec!["dur", "note"]);
+    }
+
+    /// The repin policy (ADR-0011 slice B): the target column routes
+    /// through the resurrection expression — stored guarded reading first,
+    /// then the `_raw` re-extraction — while every already-conformant
+    /// column passes through untouched.
+    #[test]
+    fn repin_policy_routes_the_target_through_resurrection() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE f AS SELECT * FROM (VALUES \
+             (404::BIGINT, 'svc', '{\"status\":404}'), \
+             (NULL::BIGINT, 'svc', '{\"status\":\"accepted\"}')) \
+             t(status, service, _raw)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "f").unwrap();
+        // The one-entry-flipped pin map: status now VARCHAR.
+        let pins: HashMap<String, CanonicalType> = [
+            ("status".to_owned(), CanonicalType::Varchar),
+            ("service".to_owned(), CanonicalType::Varchar),
+            ("_raw".to_owned(), CanonicalType::Varchar),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(
+            &schema,
+            &pins,
+            &ConformPolicy::Repin {
+                resurrect_field: "status".to_owned(),
+                time_fallback: chrono::Utc::now(),
+            },
+        );
+        assert!(!plan.is_noop());
+        assert_eq!(plan.cast_count(), 1, "only the target column is cast");
+        assert!(
+            plan.select_list.iter().any(|s| s == "\"service\""),
+            "conformant columns pass through untouched: {:?}",
+            plan.select_list
+        );
+
+        let rows: Vec<(Option<String>, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {} FROM f ORDER BY _raw",
+                    plan.select_list.join(", ")
+                ))
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    Some("accepted".to_owned()),
+                    Some("{\"status\":\"accepted\"}".to_owned())
+                ),
+                (Some("404".to_owned()), Some("{\"status\":404}".to_owned())),
+            ],
+            "the stored value keeps its text and the shelved value resurrects"
+        );
+    }
+
+    /// The forced resurrection-only pass (`to == current` + force): the
+    /// column's physical type already IS the pin, which the ordinary
+    /// conform would treat as a noop — the repin target must still be
+    /// rewritten so shelved values come back.
+    #[test]
+    fn repin_policy_fires_even_when_the_dtype_already_matches_the_pin() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE f AS SELECT * FROM (VALUES \
+             (NULL::BIGINT, '{\"dur\":7}')) t(dur, _raw)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "f").unwrap();
+        let pins: HashMap<String, CanonicalType> = [
+            ("dur".to_owned(), CanonicalType::BigInt),
+            ("_raw".to_owned(), CanonicalType::Varchar),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(
+            &schema,
+            &pins,
+            &ConformPolicy::Repin {
+                resurrect_field: "dur".to_owned(),
+                time_fallback: chrono::Utc::now(),
+            },
+        );
+        assert!(!plan.is_noop(), "a resurrection-only pass is a rewrite");
+        assert_eq!(plan.cast_count(), 1);
+        let got: Option<i64> = conn
+            .query_row(
+                &format!("SELECT {} FROM f", plan.select_list[0]),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(got, Some(7), "the shelved value comes back");
+    }
+
+    /// Defensive: an affected file that (against the envelope invariant)
+    /// carries no `_raw` column falls back to the plain guarded conform —
+    /// a resurrection arm referencing a missing column would fail the
+    /// whole rewrite.
+    #[test]
+    fn repin_policy_without_raw_column_falls_back_to_plain_conform() {
+        let schema = vec![ColInfo {
+            name: "status".to_owned(),
+            dtype: "BIGINT".to_owned(),
+        }];
+        let pins: HashMap<String, CanonicalType> = [("status".to_owned(), CanonicalType::Varchar)]
+            .into_iter()
+            .collect();
+        let plan = ConformPlan::build(
+            &schema,
+            &pins,
+            &ConformPolicy::Repin {
+                resurrect_field: "status".to_owned(),
+                time_fallback: chrono::Utc::now(),
+            },
+        );
+        assert_eq!(plan.cast_count(), 1);
+        assert!(
+            !plan.select_list[0].contains("_raw"),
+            "no resurrection arm without a _raw column: {}",
+            plan.select_list[0]
+        );
     }
 
     /// Conform-time lossless guarantee: a batch disagreeing with an
@@ -3418,7 +3622,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         assert_eq!(plan.cast_count(), 2);
 
         // The tally counts the rounded values as NULLED — they are losses.
