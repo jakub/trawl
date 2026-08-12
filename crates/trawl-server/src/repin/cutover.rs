@@ -14,7 +14,7 @@
 //! renames per env dir; `wal/`, `scheduled/`, `EPOCH`, `CATALOG` and the
 //! `REPIN` marker never move.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Move every env dir the shadow generation carries into place:
 /// `data/{env}` → `aside/{env}`, then `shadow/{env}` → `data/{env}`.
@@ -183,6 +183,33 @@ pub(crate) fn sweep_dir(path: &Path, what: &'static str) -> bool {
     }
 }
 
+/// Clear the shadow root and hand back an EMPTY one for a build to fill.
+///
+/// This is the one sweep that is not best-effort. Elsewhere a surviving
+/// staging root only costs disk, because nothing writes into it again;
+/// here `create_dir_all` succeeds on the survivor and the build layers
+/// its generation onto whatever it holds. Nothing downstream repairs
+/// that: a pass only retires shadow entries whose source it has seen in
+/// THIS job's `BuildState` (empty on pass 0), so a survivor's files —
+/// conformed to an earlier job's pin, or copied from live data that
+/// retention has since deleted — ride [`swap_envs`] into the live corpus
+/// as a resurrected, mixed-type generation. Refuse the build instead and
+/// leave the root for the operator (the marker replay retries the
+/// sweep).
+pub(crate) fn prepare_shadow_root(data_dir: &Path) -> Result<PathBuf, String> {
+    let shadow = crate::repin::marker::shadow_root(data_dir);
+    if !sweep_dir(&shadow, "stale shadow") {
+        return Err(format!(
+            "a previous repin's shadow root survived its sweep at {} — \
+             building over it would publish that generation's files into \
+             the live corpus at the swap; remove it to unblock repins",
+            shadow.display()
+        ));
+    }
+    std::fs::create_dir_all(&shadow).map_err(|e| format!("failed to create shadow root: {e}"))?;
+    Ok(shadow)
+}
+
 /// Sweep BOTH staging roots for a job that ends before any swap — the
 /// live abandon path and the boot replay of a `building` marker — and
 /// report whether both are gone (the signal marker removal is gated on).
@@ -255,6 +282,46 @@ mod tests {
             sweep_pre_swap_staging(&data),
             "with the permissions repaired the retry finishes"
         );
+    }
+
+    /// A shadow root that survives its sweep REFUSES the next build rather
+    /// than letting it layer on top: nothing retires the survivor's files
+    /// (a pass only retires sources it has seen in its own state), so the
+    /// swap would publish an earlier job's generation into the live corpus.
+    #[cfg(unix)]
+    #[test]
+    fn a_surviving_shadow_refuses_the_next_build_instead_of_layering() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let shadow = crate::repin::marker::shadow_root(&data);
+        write(
+            &shadow.join("prod/2026-01-01/10/svc.parquet"),
+            b"earlier job",
+        );
+
+        let stuck = shadow.join("prod/2026-01-01/10");
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::remove_file(stuck.join("svc.parquet")).is_ok() {
+            // Running as root: mode bits are not enforced.
+            let _ = std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755));
+            return;
+        }
+
+        let err = prepare_shadow_root(&data).expect_err("the build is refused");
+        assert!(err.contains("survived its sweep"), "{err}");
+        assert_eq!(
+            std::fs::read(stuck.join("svc.parquet")).unwrap(),
+            b"earlier job",
+            "the survivor is left for the operator, not built over"
+        );
+
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = prepare_shadow_root(&data).expect("with the permissions repaired it proceeds");
+        assert_eq!(root, shadow);
+        assert!(root.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "empty root");
     }
 
     /// A leftover `aside/{env}` from an earlier job's failed sweep must not

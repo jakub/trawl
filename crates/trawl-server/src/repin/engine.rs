@@ -35,7 +35,7 @@ use crate::catalog::FieldCatalog;
 use crate::catalog::conform::open_bounded_connection;
 use crate::error::ServerError;
 use crate::pool::ExecutorPool;
-use crate::repin::cutover::{swap_envs, sweep_dir, sweep_pre_swap_staging};
+use crate::repin::cutover::{prepare_shadow_root, swap_envs, sweep_dir, sweep_pre_swap_staging};
 use crate::repin::gate::RepinCoordinator;
 use crate::repin::marker::{
     RepinMarker, RepinPhase, aside_root, remove_marker, shadow_root, write_marker,
@@ -459,10 +459,11 @@ impl RepinEngine {
         };
         write_marker(&self.data_dir, &marker).map_err(JobAbort::Failed)?;
 
-        let shadow = shadow_root(&self.data_dir);
-        sweep_dir(&shadow, "stale shadow");
-        std::fs::create_dir_all(&shadow)
-            .map_err(|e| JobAbort::Failed(format!("failed to create shadow root: {e}")))?;
+        // A shadow root that outlived an earlier job's sweep is NOT a
+        // disk-only problem here: building into it would publish that
+        // job's files — and rows retention has since deleted — into the
+        // live corpus at the swap. Refuse rather than layer.
+        let shadow = prepare_shadow_root(&self.data_dir).map_err(JobAbort::Failed)?;
 
         // The one-entry-flipped pin map every rewrite conforms against.
         let mut flipped = self.cache.snapshot();
