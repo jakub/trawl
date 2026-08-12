@@ -73,16 +73,27 @@ first-typed-sight pinning tenable at multi-team scale.
   affected files/rows, projected nulls, and resurrectable values; a repin
   that would null values requires an explicit force. VARCHAR is simply the
   always-lossless case.
-- **Catch-up, then a narrow pause.** A catch-up loop folds in files written
-  during the build. Only the final increment runs under a pause, and the
+- **Catch-up, then a narrow pause that DEFERS draining.** A catch-up loop
+  folds in files written during the build. Only the final increment runs
+  under a pause, and that pause takes the corpus gate's write side, so it
+  excludes whole compaction batches for its few seconds: WAL→parquet
+  draining is deferred, never dropped and never starved. A batch that
+  starts inside the pause blocks at the gate holding its WAL files and its
+  hot batch and resumes itself the moment the pause lifts, with no new tick
+  and no operator action. Ingest takes neither the gate nor an executor
+  permit, so events keep landing in the WAL and the hot buffer throughout
+  and stay queryable undrained — the invisible-events prohibition of
+  ADR-0008 holds, and an event ingested into the pause is in the corpus
+  exactly once past the cutover.
+  *(Ratified 2026-08-12, replacing this bullet's original mechanism — "the
   pause gates only the file-replacing rollup half of compaction — WAL
-  draining continues throughout, so the hot buffer never evicts unqueryable
-  events (the invisible-events prohibition of ADR-0008 holds).
-  *(Superseded on the mechanism, not the property, by the 2026-08-12
-  amendment §2 and its "Also recorded" note: the pause takes the corpus
-  gate's write side, so it DEFERS whole compaction batches for its few
-  seconds instead of gating the rollup half alone. Draining is deferred,
-  never dropped or starved; the ADR-0008 property is unchanged.)*
+  draining continues throughout" — which amendment §2 below disproved by
+  execution: mixed scalar unions silently promote instead of erring, so a
+  batch that kept draining would conform under the OLD pin and publish
+  after the flip. Only the mechanism changed; the ADR-0008 property the
+  original clause protected is unchanged and evidenced by
+  `trawl-server/tests/repin.rs::events_ingested_during_the_final_pause_stay_visible_exactly_once`.
+  Issue #53's matching acceptance criterion carries the same amendment.)*
 - **Atomic, crash-recoverable cutover.** An operation marker is written
   before any visible change; the switch is the epoch.rs discipline — rename
   live root aside, rename shadow onto the canonical path, then flip the pin
@@ -463,9 +474,12 @@ corpus.
   the cutover — the ADR-0008 prohibition, evidenced end to end by
   `trawl-server/tests/repin.rs::events_ingested_during_the_final_pause_stay_visible_exactly_once`.
   This is the one place the shipped engine reads narrower than issue #53's
-  acceptance criterion, which said draining *continues* through the pause;
-  the criterion is amended to what §2 above forces and the test proves —
-  a batch that starts inside the pause is deferred, not starved and not
+  original acceptance criterion, which said draining *continues* through
+  the pause. That criterion, the issue's matching design paragraph and the
+  Decisions bullet above are all amended to what §2 forces and the test
+  proves — the ratification is recorded, not deferred, so nothing in the
+  decision record still asserts the disproved mechanism. A batch that
+  starts inside the pause is deferred, not starved and not
   dropped: it blocks at the gate holding its WAL files and its hot batch,
   resumes on its own the moment the pause lifts (no new tick, no operator
   action) and drains exactly those events, whose count is 3-total /
