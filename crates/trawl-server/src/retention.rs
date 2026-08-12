@@ -105,6 +105,24 @@ fn retention_tick(
     config: &RetentionConfig,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
 ) -> Result<(), String> {
+    // ADR-0011 slice B: a repin in flight — marker, shadow sibling, or
+    // aside sibling — suppresses BOTH sweeps, not just pressure. Age
+    // deletion would remove affected files out from under the shadow
+    // build (the catch-up diff treats disappearance as an operator act,
+    // not a normal event), and pressure deletion can never reclaim the
+    // bytes the job is deliberately double-holding. The job's own
+    // free-space pre-flight is what keeps this suppression affordable.
+    if let Some(what) = repin_in_flight(data_dir) {
+        tracing::info!(
+            event_type = "retention_repin_suppressed",
+            evidence = what,
+            "retention sweeps suppressed while a repin job's marker or \
+             staging exists; they resume when the job completes (or its \
+             boot replay finishes)"
+        );
+        return Ok(());
+    }
+
     let today = chrono::Utc::now().date_naive();
     let today_str = today.format("%Y-%m-%d").to_string();
 
@@ -253,6 +271,19 @@ fn disk_pressure_sweep(
     }
 
     Ok((total_bytes_freed, total_dirs_deleted))
+}
+
+/// Evidence that a repin job owns this data root right now, if any.
+fn repin_in_flight(data_dir: &Path) -> Option<&'static str> {
+    if crate::repin::marker_path(data_dir).exists() {
+        Some("marker")
+    } else if crate::repin::shadow_root(data_dir).exists() {
+        Some("shadow root")
+    } else if crate::repin::aside_root(data_dir).exists() {
+        Some("aside root")
+    } else {
+        None
+    }
 }
 
 /// Enumerate date-formatted directories across every env directory in
@@ -589,6 +620,65 @@ mod tests {
         retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
 
         assert!(!old_dir.exists(), "age-based retention still applies");
+    }
+
+    /// ADR-0011 slice B: while a repin job exists on this root — marker,
+    /// shadow sibling, or aside sibling — BOTH sweeps stand down. Age
+    /// deletion would yank affected files out from under the shadow build
+    /// (the catch-up diff sees additions, not disappearances, as normal),
+    /// and pressure deletion could never reclaim the double-held bytes the
+    /// job itself is holding.
+    #[test]
+    fn both_sweeps_suppressed_while_a_repin_is_in_flight() {
+        let today = chrono::Utc::now().date_naive();
+        let old_date = today - chrono::Duration::days(200);
+
+        for staging in ["marker", "shadow", "aside"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().join("data");
+            let old_dir = data_dir
+                .join("prod")
+                .join(old_date.format("%Y-%m-%d").to_string());
+            std::fs::create_dir_all(&old_dir).unwrap();
+            std::fs::write(old_dir.join("svc.parquet"), b"affected bytes").unwrap();
+            match staging {
+                "marker" => {
+                    std::fs::write(data_dir.join("REPIN"), b"{}").unwrap();
+                }
+                "shadow" => {
+                    std::fs::create_dir_all(tmp.path().join("data.repin-next")).unwrap();
+                }
+                _ => {
+                    std::fs::create_dir_all(tmp.path().join("data.repin-aside")).unwrap();
+                }
+            }
+
+            // Age AND pressure both armed, both hungry.
+            let config = make_config(90, 1_000_000);
+            retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
+            assert!(
+                old_dir.exists(),
+                "{staging}: no sweep may run while a repin is in flight"
+            );
+        }
+    }
+
+    /// And both resume once the job's staging is gone.
+    #[test]
+    fn sweeps_resume_after_the_repin_ends() {
+        let today = chrono::Utc::now().date_naive();
+        let old_date = today - chrono::Duration::days(200);
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let old_dir = data_dir
+            .join("prod")
+            .join(old_date.format("%Y-%m-%d").to_string());
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("svc.parquet"), b"old").unwrap();
+
+        let config = make_config(90, 0);
+        retention_tick(&data_dir, &config, |_| Ok(u64::MAX)).unwrap();
+        assert!(!old_dir.exists(), "age sweep resumes");
     }
 
     #[test]
