@@ -267,6 +267,40 @@ new slice takes over as the engine's gate:
   shipping an archive rewrite that breaks saved queries. Nothing else in
   slice B's design changes.
 
+The A′ prep (2026-08-11) resolved the three design forks the brief left
+open:
+
+- **Pins resolve through a compile-time pin scope, not a flat lookup.**
+  A field ref in a pipeline stage carries a pin only if its name still
+  traces to the raw source column at that point. One shared stage-walk in
+  trawl-core computes this: `rename` remaps the pin to the new name, a
+  `let` binding kills it (a bare field-ref alias copies it, like rename),
+  aggregation stages keep group-by keys and kill aggregate outputs, and
+  selection/order stages pass the scope through. Both the SQL emitter and
+  the stream compiler consume the same walk, so batch/live parity of
+  *which* pin applies holds by construction. The flat lookup was wrong in
+  both directions — `rename status as st | where st>400` lost the pin,
+  and `let status=<expr> | where status>400` would have applied the
+  original pin to a derived value — and a positional cutoff was rejected
+  because `stats count() by status | where status=...`, the most common
+  saved shape, needs the pin to survive the stats stage.
+- **One comparison core.** `filter.rs` (search-stage live matcher) and
+  `eval.rs` (pipeline streaming/`rust_stages` evaluator) each hand-mirror
+  DuckDB comparison semantics; that duplication is the #22 failure mode
+  and would have to be pin-threaded twice. A′ unifies the two comparison
+  cores into one shared, pin-aware module beside `compare.rs`'s rule
+  table, and extends the ADR-0001 coverage discipline: every
+  `CompareForm` shape must be exercised identically in the SQL lane and
+  the in-memory lane, asserted by test, not vigilance.
+- **Shape scope is slice A's surface, one stage later.** Bare
+  field-vs-literal comparisons (eq/ne/ordered, IN lists, and the pattern
+  ops `matches`/LIKE/ILIKE), either operand order, composing under
+  `not`/`and`/`or`. Field-vs-field comparisons, function-wrapped fields
+  (`lower(status)==...`), and arithmetic on pinned columns stay
+  literal-driven and are documented as such — an enum-shaped field is
+  compared, not multiplied, and inventing arithmetic semantics for
+  repinned columns is new surface slice A never had.
+
 ### 6. One numeric comparison space: `DECIMAL(38,6)`
 
 Slice A's VARCHAR-pinned numeric rungs compared through DOUBLE, which is
