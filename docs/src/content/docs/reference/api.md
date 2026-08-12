@@ -37,14 +37,24 @@ The migration converts the former static tiers into these roles:
 | `trawl-ingest` | `ingest` |
 
 Handlers gate on permissions, never role names — reshape the tiers with
-`fleet-admin roles` without a deploy.
+`fleet-admin roles` without a deploy. A valid key that lacks the
+permission a route asks for is refused **401** (the whole per-route gate
+answers alike); **403** is reserved for the grant gate in front of it — a
+key resolving *no* recognized trawl permission at all.
 
 One permission exists outside the converted tiers: `schema_write` gates
 the repin trigger (the first data-mutating schema action) and is
 deliberately granted to **no** role by default — a schema-admin role is
-one `fleet-admin roles create trawl-schema-admin` with
-`trawl:schema_read`, `trawl:schema_write` away, and needs no
-`server_manage`.
+one `fleet-admin roles create` away:
+
+```bash
+fleet-admin roles create --name trawl-schema-admin \
+  --perm trawl:schema_read --perm trawl:schema_write
+fleet-admin keys assign-role <key-prefix> trawl-schema-admin
+```
+
+No `server_manage` rides along, and no deploy is involved: the migration
+only registers `trawl:schema_write` in the permission vocabulary.
 
 ## Endpoints
 
