@@ -150,6 +150,9 @@ fn retention_tick(
             .collect();
 
         for path in &age_targets {
+            if repin_claimed_mid_sweep(data_dir) {
+                return Ok(());
+            }
             match delete_date_dir(path) {
                 Ok(bytes) => {
                     let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
@@ -250,6 +253,10 @@ fn disk_pressure_sweep(
             break;
         }
 
+        if repin_claimed_mid_sweep(data_dir) {
+            break;
+        }
+
         // Delete the oldest remaining dir.
         let (date, path) = candidates.remove(0);
         match delete_date_dir(&path) {
@@ -278,6 +285,30 @@ fn disk_pressure_sweep(
     }
 
     Ok((total_bytes_freed, total_dirs_deleted))
+}
+
+/// Re-read the repin claim immediately before a deletion, and say so if
+/// it has appeared since the tick opened.
+///
+/// The tick-opening check only says that no job owned the data root when
+/// the tick STARTED. A job admitted mid-tick writes its marker before it
+/// touches anything and keeps it until it is completely done, so re-reading
+/// it here means a `remove_dir_all` can only overlap a shadow build or a
+/// swap if that single directory removal outlives the whole job — as
+/// opposed to any sweep that merely started before the marker landed.
+fn repin_claimed_mid_sweep(data_dir: &Path) -> bool {
+    let Some(what) = repin_in_flight(data_dir) else {
+        return false;
+    };
+    metrics::gauge!(crate::metrics::RETENTION_SUPPRESSED).set(1.0);
+    tracing::info!(
+        event_type = "retention_repin_suppressed",
+        evidence = what,
+        "retention sweep stood down mid-tick: a repin job claimed the data \
+         root while this tick was running; sweeps resume when the job \
+         completes"
+    );
+    true
 }
 
 /// Evidence that a repin job owns this data root right now, if any.
@@ -669,6 +700,46 @@ mod tests {
                 "{staging}: no sweep may run while a repin is in flight"
             );
         }
+    }
+
+    /// A job admitted MID-TICK stops the sweep too. The tick-opening check
+    /// only speaks for the moment the tick started; a sweep that got past
+    /// it would keep calling `remove_dir_all` right through the shadow
+    /// build and the swap. The claim is therefore re-read before every
+    /// deletion — here the marker appears (via the injected free-space
+    /// probe) after the first directory is already gone.
+    #[test]
+    fn a_repin_admitted_mid_tick_stops_the_sweep_at_the_next_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let oldest = data_dir.join("prod/2026-01-01");
+        let middle = data_dir.join("prod/2026-01-15");
+        let newest = data_dir.join("prod/2026-02-01");
+        for dir in [&oldest, &middle, &newest] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("data.parquet"), b"some data").unwrap();
+        }
+
+        // Permanently below threshold: only the mid-sweep claim can stop
+        // this loop before it eats every candidate.
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let marker = crate::repin::marker_path(&data_dir);
+        let config = make_config(0, 1_000_000);
+        retention_tick(&data_dir, &config, |_| {
+            let n = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 1 {
+                // A job claims the data root while the sweep is running.
+                std::fs::write(&marker, b"{}").unwrap();
+            }
+            Ok(500_000)
+        })
+        .unwrap();
+
+        assert!(!oldest.exists(), "the pre-claim deletion stands");
+        assert!(
+            middle.exists() && newest.exists(),
+            "no directory may be deleted once a repin owns the data root"
+        );
     }
 
     /// Suppression is alertable, not just loggable. `repin_running` is 0

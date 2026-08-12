@@ -142,7 +142,10 @@ pub async fn compact_once(
 /// the coordinator's corpus-gate READ guard (so no batch can straddle a
 /// repin cutover), and the file-RELOCATING daily rollup is suppressed for
 /// as long as the coordinator holds a rollup pause (so the shadow build's
-/// catch-up diff stays additive). WAL→parquet draining itself is never
+/// catch-up diff stays additive) — suppressed BEFORE it starts by the
+/// pause, and mid-pass by the same corpus gate, which every relocating
+/// unit takes so a pass already running when the job began can neither
+/// straddle the cutover nor continue past it. WAL→parquet draining itself is never
 /// suppressed — it only waits out the seconds the cutover holds the write
 /// guard.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
@@ -316,7 +319,7 @@ pub async fn compact_once_coordinated(
         );
     }
     let rollup_failures = if daily_rollup && !rollup_suppressed {
-        match rollup_once(data_dir, memory_limit).await {
+        match rollup_once(data_dir, memory_limit, repin).await {
             Ok(n) => n,
             Err(e) => {
                 tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
@@ -335,17 +338,64 @@ pub async fn compact_once_coordinated(
 /// For each date-directory older than today, collects all
 /// `{hour}/{service}.parquet` files, merges them (sorted by timestamp)
 /// into `{date}/{service}.parquet`, then removes the hourly sources.
-async fn rollup_once(data_dir: &Path, memory_limit: &str) -> Result<u64, String> {
+///
+/// Every unit of that relocation runs under the repin corpus gate (see
+/// [`rollup_unit`]), so a pass already running when a repin job starts
+/// stands down instead of moving files across a cutover.
+async fn rollup_once(
+    data_dir: &Path,
+    memory_limit: &str,
+    repin: Option<&Arc<RepinCoordinator>>,
+) -> Result<u64, String> {
     let mut total: u64 = 0;
     for (_env, env_data_dir) in list_env_dirs(data_dir) {
-        total += rollup_env_once(&env_data_dir, memory_limit).await?;
+        if repin.is_some_and(|c| c.rollup_paused()) {
+            break;
+        }
+        total += rollup_env_once(&env_data_dir, memory_limit, repin).await?;
     }
     Ok(total)
 }
 
+/// Whether one file-relocating rollup unit may proceed, and the
+/// corpus-gate read guard that keeps a repin cutover out of it while it
+/// does. Without a coordinator (tests, embedded-style callers) there is no
+/// repin engine to exclude and every unit proceeds ungated.
+enum RollupUnit<'a> {
+    Proceed(Option<tokio::sync::RwLockReadGuard<'a, ()>>),
+    StandDown,
+}
+
+/// Claim the corpus for one relocating unit. See
+/// [`RepinCoordinator::rollup_unit_guard`] for why the pause is read under
+/// the guard rather than before it.
+async fn rollup_unit(repin: Option<&Arc<RepinCoordinator>>) -> RollupUnit<'_> {
+    match repin {
+        None => RollupUnit::Proceed(None),
+        Some(c) => match c.rollup_unit_guard().await {
+            Some(guard) => RollupUnit::Proceed(Some(guard)),
+            None => RollupUnit::StandDown,
+        },
+    }
+}
+
+/// Log the mid-pass stand-down once, on the unit that saw the claim.
+fn log_rollup_stand_down() {
+    tracing::info!(
+        event_type = "rollup_suppressed",
+        "daily rollup stood down mid-pass: a repin job claimed the corpus \
+         while this pass was running; hourly files consolidate on the first \
+         tick after the job ends"
+    );
+}
+
 /// Roll up one env root (`data_dir/{env}`): consolidate each historical
 /// date's hourly files into per-service daily files. Never crosses envs.
-async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, String> {
+async fn rollup_env_once(
+    data_dir: &Path,
+    memory_limit: &str,
+    repin: Option<&Arc<RepinCoordinator>>,
+) -> Result<u64, String> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let mut failures: u64 = 0;
     let mut quarantined_total: u64 = 0;
@@ -377,6 +427,16 @@ async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, Str
         // Recover any interrupted rollups from previous runs before
         // starting new ones. This ensures crash-orphaned hourly files
         // are cleaned up without re-merging already-consolidated data.
+        // Recovery relocates files too (it deletes the hourly sources of a
+        // merge that already completed), so it is a gated unit like the
+        // merges below.
+        let recovery_guard = match rollup_unit(repin).await {
+            RollupUnit::Proceed(guard) => guard,
+            RollupUnit::StandDown => {
+                log_rollup_stand_down();
+                return Ok(failures + quarantined_total);
+            }
+        };
         if let Err(e) = recover_rollup_markers(&path) {
             // A wedged recovery is data-loss-adjacent (an interrupted rollup
             // left orphaned hourlies/tmp that couldn't be cleaned up), so count
@@ -392,6 +452,7 @@ async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, Str
                 "rollup recovery failed"
             );
         }
+        drop(recovery_guard);
 
         // Collect hourly subdirs. If none exist, this day is already consolidated.
         let hour_dirs = collect_hour_dirs(&path);
@@ -406,6 +467,21 @@ async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, Str
         }
 
         for (service, files) in &service_files {
+            // One merge = one gated unit: it reads the day's hourlies,
+            // renames the merged daily into place and deletes the sources,
+            // so a cutover swapping the shadow in between those steps would
+            // republish this file's pre-repin types into the new
+            // generation. Held for the merge, re-taken per service, so the
+            // cutover waits out at most one merge and the rest of the pass
+            // stands down.
+            let unit_guard = match rollup_unit(repin).await {
+                RollupUnit::Proceed(guard) => guard,
+                RollupUnit::StandDown => {
+                    log_rollup_stand_down();
+                    return Ok(failures + quarantined_total);
+                }
+            };
+
             let day_dir = path.clone();
             let svc = service.clone();
             let files = files.clone();
@@ -416,6 +492,7 @@ async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, Str
             })
             .await
             .map_err(|e| format!("rollup task panicked: {e}"))?;
+            drop(unit_guard);
 
             // Quarantined inputs are data-loss whether or not the merge then
             // succeeded — fold the count in unconditionally so it lands on the
@@ -435,6 +512,9 @@ async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, Str
         }
 
         // Remove empty hour-directories after all services are rolled up.
+        // Deliberately ungated: `remove_dir` fails on a non-empty
+        // directory, so this can never take a parquet file — of either
+        // generation — with it.
         for hour_dir in &hour_dirs {
             if is_dir_empty(hour_dir) {
                 let _ = std::fs::remove_dir(hour_dir);
@@ -4309,6 +4389,89 @@ mod tests {
         assert!(
             !daily.exists() && hourly.exists(),
             "no file may relocate while the repin pause is held"
+        );
+
+        drop(pause);
+        compact_once_coordinated(
+            &wal_dir,
+            &data_dir,
+            Duration::from_secs(1),
+            true,
+            None,
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+            Some(&coordinator),
+        )
+        .await
+        .unwrap();
+        assert!(
+            daily.exists(),
+            "consolidation resumes on the first tick after the job ends"
+        );
+    }
+
+    /// The other half of that interlock (ADR-0011 slice B): a rollup pass
+    /// that was ALREADY RUNNING when the job started. The pause flag alone
+    /// only stops a pass that has not begun — a pass in flight would keep
+    /// relocating files straight through `swap_envs` and republish
+    /// pre-repin types into the new generation. So every relocating unit
+    /// takes the corpus gate: the cutover waits it out, and the rest of the
+    /// pass stands down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_rollup_pass_is_gated_by_the_cutover_and_stands_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let r1 = format!(
+            r#"{{"_time":"{yesterday}T01:00:00Z","_ingested":"{yesterday}T01:00:00Z","service":"nginx","msg":"a"}}"#
+        );
+        let hourly =
+            write_hourly_parquet(&data_dir.join("prod"), &yesterday, "01", "nginx", &[&r1]);
+        let daily = data_dir.join("prod").join(&yesterday).join("nginx.parquet");
+
+        let coordinator = Arc::new(RepinCoordinator::new());
+
+        // The cutover holds the corpus gate — as it does across the swap.
+        let cutover = coordinator.cutover_guard().await;
+
+        let c = Arc::clone(&coordinator);
+        let (w, d) = (wal_dir.clone(), data_dir.clone());
+        let tick = tokio::spawn(async move {
+            compact_once_coordinated(
+                &w,
+                &d,
+                Duration::from_secs(1),
+                true,
+                None,
+                DEFAULT_CHUNK_SIZE,
+                "2GB",
+                None,
+                Some(&c),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !tick.is_finished() && !daily.exists(),
+            "a relocating rollup unit may not run under the cutover's guard"
+        );
+
+        // The job claims the rollup while that pass sits on the gate, then
+        // the cutover completes.
+        let pause = coordinator.pause_rollup();
+        drop(cutover);
+        tick.await.unwrap().unwrap();
+        assert!(
+            !daily.exists() && hourly.exists(),
+            "the pass in flight must stand down, not relocate a pre-repin \
+             file into the generation the cutover just published"
         );
 
         drop(pause);

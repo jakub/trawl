@@ -457,7 +457,16 @@ corpus.
   therefore still queryable, and they are in the corpus exactly once past
   the cutover — the ADR-0008 prohibition, evidenced end to end by
   `trawl-server/tests/repin.rs::events_ingested_during_the_final_pause_stay_visible_exactly_once`.
-  The file-relocating rollup, by contrast, stands down for the WHOLE job.
+  The file-relocating rollup, by contrast, stands down for the WHOLE job
+  — and takes BOTH primitives to do it, because the job claims the pause
+  only after a minutes-long scan a rollup pass may already be running
+  behind. The flag alone would stop a pass that had not STARTED; a pass
+  in flight would keep merging day/service units straight through
+  `swap_envs` and rename a pre-repin daily into the new generation. So
+  every relocating unit (each merge, and the interrupted-rollup
+  recovery) runs under the corpus gate and reads the pause under it: the
+  cutover waits out the one unit in flight, and every later unit stands
+  down mid-pass.
 - The resurrection expression lives in `trawl_core::conform`
   (`resurrection_expr`: guarded stored reading, then the guarded `_raw`
   re-extraction — an exact-key RFC 6901 JSON Pointer, never JSONPath,
@@ -466,7 +475,10 @@ corpus.
   the 2026-08-10 amendment, extended to the plan/report pair.
 - Retention stands down ENTIRELY (age and pressure) while the marker or
   staging exists, not just the pressure sweep; the job pre-flights its
-  double-held bytes against `min_free_disk_bytes` in exchange.
+  double-held bytes against `min_free_disk_bytes` in exchange. The claim
+  is re-read immediately before every directory deletion, not once per
+  tick, so a job admitted mid-tick is not raced by a sweep that started
+  before its marker landed.
 - Dry run, force gate and execution are one code path: every request
   claims the one-running job row and runs the same scan; a lossy plan
   without force parks terminal `refused_needs_force` with the plan as
