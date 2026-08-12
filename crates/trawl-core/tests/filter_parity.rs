@@ -2177,9 +2177,9 @@ fn wire_pool(pin: CanonicalType) -> Vec<Value> {
 /// exception — its rules are the ones that take a literal of either shape.
 fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
     match pin {
-        CanonicalType::BigInt => &["1", "2", "404", "1.5", "9007199254740992"],
+        CanonicalType::BigInt => &["1", "2", "404", "1.5", "-1", "9007199254740992"],
         CanonicalType::Boolean => &["true", "false"],
-        CanonicalType::Double => &["0", "1.5", "200", "404"],
+        CanonicalType::Double => &["0", "1.5", "-1.5", "200", "404"],
         CanonicalType::Timestamp => &[
             "\"2026-01-15T00:00:00Z\"",
             "\"2026-01-15T09:00:00Z\"",
@@ -2190,6 +2190,12 @@ fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
             "400",
             "1.5",
             "9007199254740993",
+            // The parser hands a negative literal over as a unary
+            // negation, not a signed literal — a shape the pinned door
+            // has to fold, and the one the pools originally missed.
+            "-400",
+            "-1.5",
+            "\"-400\"",
             "\"200\"",
             "\"accepted\"",
             "\"nan\"",
@@ -2209,7 +2215,7 @@ fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
 /// instead of re-litigating it here.
 fn in_list_pool(pin: CanonicalType) -> &'static [&'static str] {
     match pin {
-        CanonicalType::BigInt => &["1", "2", "404", "9007199254740992"],
+        CanonicalType::BigInt => &["1", "2", "404", "-1", "9007199254740992"],
         other => literal_pool(other),
     }
 }

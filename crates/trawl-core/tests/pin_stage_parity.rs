@@ -464,6 +464,62 @@ fn float_literal_above_2_53_binds_its_source_token_in_both_lanes() {
     }
 }
 
+/// A NEGATIVE numeric literal binds pin-aware in both lanes, and answers
+/// the same whether or not it was quoted.
+///
+/// The parser hands `-400` over as `Unary{Neg, Literal(Int)}`, never as a
+/// signed literal, so a door that only took `Expr::Literal` left the whole
+/// negative class on the pin-blind path: against a VARCHAR pin that is a
+/// `DuckDB` binder error (`VARCHAR` vs `BIGINT`) or a conversion error on
+/// the first non-numeric row — exactly what slice A′ removes — while the
+/// quoted spelling of the same number bound pin-aware and answered.
+#[test]
+fn negative_literals_bind_pin_aware_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let mut ft = FieldTypes::new();
+    ft.insert("f", CanonicalType::Varchar);
+
+    let stored = event_with("f", Value::from("-200"));
+    // (dsl, expected answer) — quoted and unquoted spellings of each.
+    let cells: &[(&str, bool)] = &[
+        ("* | where f > -400", true),
+        ("* | where f > \"-400\"", true),
+        ("* | where f < -400", false),
+        ("* | where f < \"-400\"", false),
+        // A VARCHAR pin's `=` reads the number, not the spelling.
+        ("* | where f == -200", true),
+        ("* | where f == \"-200.0\"", true),
+        ("* | where f == -200.0", true),
+        ("* | where f != -200", false),
+        ("* | where f in (-400, -200)", true),
+        ("* | where f in (-400, 200)", false),
+        // Ordered against a negative FLOAT literal, both spellings.
+        ("* | where f > -200.5", true),
+        ("* | where f > \"-200.5\"", true),
+        ("* | where f < -199.5", true),
+    ];
+    for (dsl, expected) in cells {
+        assert_eq!(
+            run_cell(&conn, dsl, &stored, &ft),
+            Some(*expected),
+            "{dsl} against {stored:?}"
+        );
+    }
+
+    // A row the pin-blind path could not even read: the ordered form is
+    // UNKNOWN (no numeric reading), not the conversion error it used to
+    // raise, and equality still answers through the text half.
+    let unreadable = event_with("f", Value::from("accepted"));
+    assert_eq!(
+        run_cell(&conn, "* | where f > -400", &unreadable, &ft),
+        None
+    );
+    assert_eq!(
+        run_cell(&conn, "* | where f == -400", &unreadable, &ft),
+        Some(false)
+    );
+}
+
 /// `| let` resolves a sibling reference column-then-alias in BOTH lanes:
 /// an input COLUMN wins (so an overwrite never feeds the assignment
 /// beside it), and only a name resolving to no column binds the LATERAL

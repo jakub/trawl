@@ -8,7 +8,9 @@
 //! rather than emitting SQL. This is the runtime analog of
 //! `emitter/expr.rs`.
 
-use crate::ast::{BinaryOp, Expr, FilterOp, LiteralValue, Spanned, UnaryOp};
+use std::borrow::Cow;
+
+use crate::ast::{BinaryOp, Expr, FilterOp, FloatLiteral, LiteralValue, Spanned, UnaryOp};
 use crate::emitter::{SqlValue, map_field_name};
 use crate::pin_match::{self, NullReadPolicy};
 use crate::pin_scope::PinScope;
@@ -312,10 +314,26 @@ pub fn eval_expr_with_pins(
 
 /// A bare literal, exactly as the SQL lane's door takes it — the AST value,
 /// so a float literal keeps its source token rather than a re-rendered
-/// double (ADR-0011 ruling #6, [`crate::ast::FloatLiteral`]).
-fn bare_literal(expr: &Expr) -> Option<&LiteralValue> {
+/// double (ADR-0011 ruling #6, [`crate::ast::FloatLiteral`]) — including
+/// the sign fold for a negative number, which the parser hands over as
+/// `Unary{Neg, Literal}`. The two doors must adopt the same shapes or the
+/// batch and live lanes answer one query differently
+/// (`emitter::expr::bare_literal`).
+fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
     match expr {
-        Expr::Literal(lit) => Some(lit),
+        Expr::Literal(lit) => Some(Cow::Borrowed(lit)),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } => match &operand.node {
+            Expr::Literal(LiteralValue::Int(n)) => {
+                Some(Cow::Owned(LiteralValue::Int(n.checked_neg()?)))
+            }
+            Expr::Literal(LiteralValue::Float(f)) => Some(Cow::Owned(LiteralValue::Float(
+                FloatLiteral::new(-f.value(), format!("-{}", f.text())),
+            ))),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -440,7 +458,7 @@ fn try_pinned_comparison(
         _ => return None,
     };
     let pin = pins.pin_for(name)?;
-    let form = crate::compare::compare_form_bound(Some(pin), filter_op, literal)?;
+    let form = crate::compare::compare_form_bound(Some(pin), filter_op, &literal)?;
     // Native(String) is the VARCHAR pin's lexical rule — the stored text
     // compares as text, whatever JSON shape the wire value took (the SQL
     // side's generic emission compares the VARCHAR column against a
@@ -486,7 +504,7 @@ fn try_pinned_in_list(
         .iter()
         .map(|item| {
             let element = bare_literal(&item.node)?;
-            crate::compare::compare_form_bound(Some(pin), FilterOp::Eq, element)
+            crate::compare::compare_form_bound(Some(pin), FilterOp::Eq, &element)
         })
         .collect::<Option<_>>()?;
     let Some(value) = pinned_event_value(event, name) else {

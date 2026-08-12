@@ -2,7 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use crate::ast::{BinaryOp, Expr, FilterOp, LiteralValue, Spanned, UnaryOp};
+use std::borrow::Cow;
+
+use crate::ast::{BinaryOp, Expr, FilterOp, FloatLiteral, LiteralValue, Spanned, UnaryOp};
 use crate::compare::{self, CompareForm, PatternForm};
 
 use super::EmitError;
@@ -135,9 +137,33 @@ fn flip_filter_op(op: FilterOp) -> FilterOp {
 /// A bare literal, as the rule table's door wants it — the AST value, not
 /// a re-rendered one, so a float literal keeps its source token (ADR-0011
 /// ruling #6, [`crate::ast::FloatLiteral`]).
-fn bare_literal(expr: &Expr) -> Option<&LiteralValue> {
+///
+/// A NEGATIVE numeric literal reaches the parser as `Unary{Neg, Literal}`,
+/// never as a signed `Literal`, so the sign is folded back in here — into
+/// the `i64` and into the float's SOURCE TOKEN alike, keeping the DECIMAL
+/// binding exact. Without the fold every negative literal would fall
+/// through to pin-blind emission and raise exactly the VARCHAR-pin binder
+/// error slice A′ removes, while its quoted spelling (`> "-400"`, a plain
+/// `Literal`) bound pin-aware — two spellings of one number disagreeing.
+/// Only `Int`/`Float` fold: `-"400"` and `-true` are arithmetic on a
+/// non-number and keep their generic emission.
+fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
     match expr {
-        Expr::Literal(lit) => Some(lit),
+        Expr::Literal(lit) => Some(Cow::Borrowed(lit)),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } => match &operand.node {
+            // `i64::MIN`'s magnitude has no `i64` negation to fold into;
+            // it declines, exactly as any other unfoldable shape does.
+            Expr::Literal(LiteralValue::Int(n)) => {
+                Some(Cow::Owned(LiteralValue::Int(n.checked_neg()?)))
+            }
+            Expr::Literal(LiteralValue::Float(f)) => Some(Cow::Owned(LiteralValue::Float(
+                FloatLiteral::new(-f.value(), format!("-{}", f.text())),
+            ))),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -194,7 +220,7 @@ fn try_pinned_comparison(
         _ => return None,
     };
     let pin = state.compare_pin(name)?;
-    let form = compare::compare_form_bound(Some(pin), filter_op, literal)?;
+    let form = compare::compare_form_bound(Some(pin), filter_op, &literal)?;
     if matches!(form, CompareForm::Native(_)) {
         // The rule table leaves the shape literal-driven (VARCHAR pin,
         // ordered non-numeric literal) — generic emission is the rule.
@@ -232,7 +258,7 @@ fn try_pinned_in_list(
         .iter()
         .map(|item| {
             let element = bare_literal(&item.node)?;
-            compare::compare_form_bound(Some(pin), FilterOp::Eq, element)
+            compare::compare_form_bound(Some(pin), FilterOp::Eq, &element)
         })
         .collect::<Option<_>>()?;
     let clause = in_list_sql(&quote_field(name), forms, state);
