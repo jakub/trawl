@@ -335,9 +335,20 @@ impl RepinEngine {
             error = %msg,
             "repin job abandoned before any visible change; corpus untouched"
         );
-        sweep_dir(&shadow_root(&self.data_dir), "abandoned shadow");
-        if let Err(e) = remove_marker(&self.data_dir) {
-            tracing::warn!(event_type = "repin_marker_error", error = %e, "marker removal failed");
+        // The marker is what licenses the next boot to delete this shadow:
+        // removing it over a failed sweep strands the staging root, which
+        // suppresses retention forever. Keep it and let the replay retry.
+        if sweep_dir(&shadow_root(&self.data_dir), "abandoned shadow") {
+            if let Err(e) = remove_marker(&self.data_dir) {
+                tracing::warn!(event_type = "repin_marker_error", error = %e, "marker removal failed");
+            }
+        } else {
+            tracing::warn!(
+                event_type = "repin_recovery_incomplete",
+                job_id,
+                "the abandoned shadow survived its sweep; keeping the marker \
+                 so the next boot retries the cleanup"
+            );
         }
         self.finish(job_id, status, Some(msg)).await;
     }
@@ -518,11 +529,12 @@ impl RepinEngine {
         // Evidence + metrics for what the rewrite actually did.
         self.record_outcome(job_id, field, from, to, &state).await;
 
-        // Sweep: disk-only from here. A failed sweep keeps the marker so
-        // the boot replay retries it.
-        let swept = sweep_dir(&aside_root(&self.data_dir), "aside");
-        sweep_dir(&shadow, "shadow remnant");
-        if swept {
+        // Sweep: disk-only from here. A failed sweep of EITHER staging root
+        // keeps the marker so the boot replay retries it — a leftover root
+        // suppresses retention until it is gone.
+        let aside_swept = sweep_dir(&aside_root(&self.data_dir), "aside");
+        let shadow_swept = sweep_dir(&shadow, "shadow remnant");
+        if aside_swept && shadow_swept {
             remove_marker(&self.data_dir).map_err(JobAbort::Failed)?;
         }
         Ok(())

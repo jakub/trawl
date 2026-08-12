@@ -196,6 +196,11 @@ double-holds its affected bytes until its final sweep and pre-flights
 against `min_free_disk_bytes` before starting, so retention could neither
 relieve the pressure nor safely delete files out from under the shadow
 build. They resume the tick after the job (or its boot replay) finishes.
+A staging root that survives its sweep — a permission or I/O error —
+deliberately keeps the marker, since the marker is what licenses trawl to
+delete that root: the cleanup is retried at the next boot
+(`repin_recovery_incomplete` meanwhile), and retention stays suppressed
+until the root is actually gone.
 
 Disk-pressure deletion is suppressed while a pre-cutover `data.pre-schema-v2/` set-aside directory exists (it sits outside `data/`, so deleting partitions could never reclaim it); each tick under pressure logs `retention_disk_pressure_suppressed` instead. Remove the set-aside to reclaim the space and re-enable the policy. Age-based retention is unaffected.
 

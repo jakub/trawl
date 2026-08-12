@@ -50,6 +50,12 @@ pub struct Recovered {
     pub marker: RepinMarker,
     /// What was done.
     pub action: RecoveredAction,
+    /// Whether every staging sweep this half owed actually left the
+    /// staging root gone. A failed sweep KEEPS the marker (see
+    /// `reconcile_store`): the leftover root suppresses retention and
+    /// would make the next cutover's forward-only swap ambiguous, so the
+    /// replay must run again at the next boot rather than be forgotten.
+    pub swept: bool,
 }
 
 /// The filesystem half of the decision table.
@@ -114,19 +120,21 @@ pub fn recover_filesystem(
         };
     }
 
-    let action = match marker.phase {
-        RepinPhase::Building => {
-            sweep_dir(&shadow, "abandoned build shadow");
-            RecoveredAction::AbandonedBuild
-        }
+    let (action, swept) = match marker.phase {
+        RepinPhase::Building => (
+            RecoveredAction::AbandonedBuild,
+            sweep_dir(&shadow, "abandoned build shadow"),
+        ),
         RepinPhase::Cutover => {
             swap_envs(data_dir, &shadow, &aside)?;
-            RecoveredAction::CompletedCutover
+            // `swap_envs` removes the spent shadow best-effort; ask the
+            // filesystem rather than trust the warn.
+            (RecoveredAction::CompletedCutover, !shadow.exists())
         }
-        RepinPhase::Cleanup => {
-            sweep_dir(&shadow, "cleanup shadow remnant");
-            RecoveredAction::SweptCleanup
-        }
+        RepinPhase::Cleanup => (
+            RecoveredAction::SweptCleanup,
+            sweep_dir(&shadow, "cleanup shadow remnant"),
+        ),
     };
     tracing::info!(
         event_type = "repin_recovered",
@@ -134,9 +142,14 @@ pub fn recover_filesystem(
         field = %marker.field,
         phase = ?marker.phase,
         action = ?action,
+        swept,
         "interrupted repin job recovered on the filesystem side"
     );
-    Ok(Some(Recovered { marker, action }))
+    Ok(Some(Recovered {
+        marker,
+        action,
+        swept,
+    }))
 }
 
 /// The postgres half: finish the recovered job, re-arm conformance for a
@@ -151,6 +164,7 @@ pub async fn reconcile_store(
 ) -> Result<(), String> {
     if let Some(recovered) = recovered {
         let marker = &recovered.marker;
+        let mut swept = recovered.swept;
         match recovered.action {
             RecoveredAction::AbandonedBuild => {
                 storage
@@ -180,10 +194,29 @@ pub async fn reconcile_store(
                     .clear_conformed()
                     .await
                     .map_err(|e| format!("failed to re-arm the conformance pass: {e}"))?;
-                sweep_dir(&aside_root(data_dir), "recovered aside");
+                swept &= sweep_dir(&aside_root(data_dir), "recovered aside");
             }
         }
-        remove_marker(data_dir)?;
+        // The marker is the ONLY record that a staging root is trawl's to
+        // delete: dropping it over a failed sweep strands the leftover
+        // root forever (retention stays suppressed by its mere existence,
+        // and a later cutover meets an aside beside a live env and refuses
+        // the forward-only swap). The store side is idempotent by
+        // construction, so keeping the marker just replays this at the
+        // next boot — which is exactly the retry.
+        if swept {
+            remove_marker(data_dir)?;
+        } else {
+            tracing::warn!(
+                event_type = "repin_recovery_incomplete",
+                job_id = marker.job_id,
+                field = %marker.field,
+                action = ?recovered.action,
+                "a repin staging root survived the recovery sweep; keeping \
+                 the marker so the next boot retries the cleanup (retention \
+                 stays suppressed until it is gone)"
+            );
+        }
     }
 
     let orphaned = storage
@@ -244,6 +277,7 @@ mod tests {
         for _ in 0..2 {
             let recovered = recover_filesystem(&data, true).unwrap().expect("marker");
             assert_eq!(recovered.action, RecoveredAction::AbandonedBuild);
+            assert!(recovered.swept, "the shadow is gone, so the sweep is done");
             assert!(!shadow.exists(), "the shadow is disposable");
             assert_eq!(
                 std::fs::read(data.join("prod/2026-01-01/10/svc.parquet")).unwrap(),
@@ -251,6 +285,36 @@ mod tests {
                 "the live corpus is untouched"
             );
         }
+    }
+
+    /// A staging root that survives its sweep reports `swept == false` —
+    /// the signal `reconcile_store` gates marker removal on, so the
+    /// leftover root keeps its marker and the next boot retries.
+    #[cfg(unix)]
+    #[test]
+    fn a_surviving_staging_root_reports_an_unfinished_sweep() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = live_root(tmp.path());
+        let shadow = shadow_with_new_generation(&data);
+        let stuck = shadow.join("prod/2026-01-01/10");
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::remove_file(stuck.join("svc.parquet")).is_ok() {
+            // Running as root: mode bits are not enforced.
+            let _ = std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755));
+            return;
+        }
+        write_marker(&data, &marker(RepinPhase::Building)).unwrap();
+
+        let recovered = recover_filesystem(&data, true).unwrap().expect("marker");
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(recovered.action, RecoveredAction::AbandonedBuild);
+        assert!(
+            !recovered.swept,
+            "an undeletable shadow must not report a finished sweep"
+        );
+        assert!(shadow.exists(), "the staging root is still on disk");
     }
 
     /// The cutover crash windows: before any rename, between the two

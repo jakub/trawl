@@ -679,6 +679,55 @@ async fn boot_reconciliation_completes_a_recovered_cutover(pool: sqlx::PgPool) {
         "a recovered cutover re-arms the boot conformance pass"
     );
 
+    // A staging root that survives its sweep KEEPS the marker: the marker
+    // is the only thing licensing trawl to delete it, and a stranded root
+    // suppresses retention and makes the next cutover's forward-only swap
+    // ambiguous.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let aside = trawl_server::repin::aside_root(&data);
+        let stuck = aside.join("prod/2026-01-01/10");
+        std::fs::create_dir_all(&stuck).unwrap();
+        std::fs::write(stuck.join("svc.parquet"), b"previous generation").unwrap();
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::remove_file(stuck.join("svc.parquet")).is_ok() {
+            // Running as root: mode bits are not enforced.
+            let _ = std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755));
+            std::fs::remove_dir_all(&aside).unwrap();
+        } else {
+            trawl_server::repin::marker::write_marker(
+                &data,
+                &trawl_server::repin::RepinMarker {
+                    job_id,
+                    field: "status".to_owned(),
+                    from_type: "BIGINT".to_owned(),
+                    to_type: "VARCHAR".to_owned(),
+                    phase: trawl_server::repin::RepinPhase::Cleanup,
+                },
+            )
+            .unwrap();
+            let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
+                .unwrap()
+                .expect("marker present");
+            trawl_server::repin::recover::reconcile_store(
+                &h.server.state.storage,
+                &h.server.state.query.field_catalog,
+                &data,
+                Some(recovered),
+            )
+            .await
+            .expect("store reconciliation");
+            assert!(
+                trawl_server::repin::marker_path(&data).exists(),
+                "a failed aside sweep must keep the marker for the next boot"
+            );
+            std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::remove_dir_all(&aside).unwrap();
+            trawl_server::repin::marker::remove_marker(&data).unwrap();
+        }
+    }
+
     // An orphaned running row (no marker) fails at the same boot step.
     let orphan_id = h
         .server
