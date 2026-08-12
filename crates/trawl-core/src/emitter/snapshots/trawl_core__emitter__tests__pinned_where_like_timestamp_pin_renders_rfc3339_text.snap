@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_with_pins(\"* | where ts like \\\"2026-01-%\\\"\",\n&[(\"ts\", CT::Timestamp)])"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE (strftime("ts", '%Y-%m-%dT%H:%M:%S.%fZ') LIKE ?)
+---
+params:
+  0: '2026-01-%'

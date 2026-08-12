@@ -1,0 +1,16 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_with_pins(\"* | stats count() by status | where status == 200\",\n&[(\"status\", CT::Varchar)])"
+---
+WITH _s0 AS (
+  SELECT "status", COUNT(*) AS "count"
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+  GROUP BY "status"
+)
+SELECT *
+FROM "_s0"
+WHERE ("status" = ? OR COALESCE(TRY_CAST("status" AS DECIMAL(38,6)) = TRY_CAST(? AS DECIMAL(38,6)), FALSE))
+---
+params:
+  0: '200'
+  1: '200'

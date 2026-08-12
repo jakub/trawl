@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_with_pins(\"* | where dur matches \\\"^4\\\"\", &[(\"dur\", CT::BigInt)])"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE regexp_matches(CAST("dur" AS VARCHAR), ?)
+---
+params:
+  0: '^4'

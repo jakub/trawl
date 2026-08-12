@@ -47,6 +47,12 @@ pub struct EmittedQuery {
     /// The executor runs the SQL prefix, then applies these stages
     /// to the result set using the streaming engine.
     pub rust_stages: Vec<Spanned<PipeStage>>,
+    /// The pin scope in force at the kv split point (ADR-0011 slice A′):
+    /// the interpretation [`rust_stages`](Self::rust_stages) must be
+    /// evaluated under, carried so the batch tail's `where`/`let` use the
+    /// SAME pins the SQL prefix used — including every rename/let/stats
+    /// scope change before the split. Empty for pin-blind emission.
+    pub rust_stage_pins: crate::pin_scope::PinScope,
     /// Whether the executor should reorder result columns to put well-known
     /// fields first. `true` when the pipeline has no explicit column selection
     /// or aggregation — i.e. the column set comes from `SELECT *`.
@@ -287,10 +293,13 @@ fn emit_from_state(
     search::emit_search(&query.search, &mut state)?;
 
     let mut rust_stages = Vec::new();
+    let mut rust_stage_pins = crate::pin_scope::PinScope::unpinned();
 
     for (i, stage) in query.pipeline.iter().enumerate() {
         // Check if this stage is a kv extraction — can't be expressed as SQL.
-        // Collect it and all remaining stages into rust_stages.
+        // Collect it and all remaining stages into rust_stages, stamping
+        // the pin scope in force at the split so the batch tail evaluates
+        // under the same interpretation the SQL prefix used (slice A′).
         if matches!(
             stage.node,
             PipeStage::Extract(crate::ast::ExtractStage {
@@ -299,6 +308,7 @@ fn emit_from_state(
             })
         ) {
             rust_stages = query.pipeline[i..].to_vec();
+            rust_stage_pins = state.pin_scope().clone();
             break;
         }
 
@@ -309,6 +319,9 @@ fn emit_from_state(
             state.flush_pivot_to_cte();
         }
         pipeline::process_stage(&stage.node, &mut state)?;
+        // AFTER the stage: its own expressions resolve against the
+        // incoming schema; the next stage sees this one's output scope.
+        state.advance_pin_scope(&stage.node);
     }
 
     let needs_column_reorder = state.needs_column_reorder();
@@ -321,6 +334,7 @@ fn emit_from_state(
             sql,
             params,
             rust_stages,
+            rust_stage_pins,
             needs_column_reorder,
             raw_free_sql: None,
         },
@@ -1685,6 +1699,191 @@ mod tests {
         assert_snapshot!(format_result(&result));
     }
 
+    // -----------------------------------------------------------------------
+    // pin-aware pipeline comparisons (ADR-0011 slice A′)
+    // -----------------------------------------------------------------------
+
+    /// `| where` over a VARCHAR pin compares ordered-numeric in the one
+    /// DECIMAL space — the Conversion error the pin-blind emission raised
+    /// becomes an answer.
+    #[test]
+    fn pinned_where_varchar_ordered_numeric_compares_in_decimal_space() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "* | where status > 400",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// `| where` equality against a VARCHAR pin binds text + reading,
+    /// exactly like the search stage's `status=200`.
+    #[test]
+    fn pinned_where_varchar_eq_numeric_binds_text_and_reading() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "* | where status == 200",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// The pipeline `!=` keeps plain SQL null propagation: NO
+    /// `OR field IS NULL` widening — a repin must not change
+    /// missing-field semantics (`NullPolicy::Strict`).
+    #[test]
+    fn pinned_where_varchar_ne_keeps_strict_null_policy() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "* | where status != 200",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// `where f in (…)` over a VARCHAR pin expands numeric elements to
+    /// the two-armed equalities, like the search stage's IN list.
+    #[test]
+    fn pinned_where_in_list_expands_numeric_elements() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "* | where status in (200, \"accepted\")",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// Either operand order: `400 < status` is `status > 400`.
+    #[test]
+    fn pinned_where_reversed_operands_bind_the_field_rule() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "* | where 400 < status",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// Quote provenance is discarded: `where status > "400"` binds like
+    /// `status > 400` (content decides, per the rule table).
+    #[test]
+    fn pinned_where_quoted_numeric_literal_binds_content() {
+        let a = emit_dsl_with_pins("* | where status > \"400\"", &[("status", CT::Varchar)]);
+        let b = emit_dsl_with_pins("* | where status > 400", &[("status", CT::Varchar)]);
+        assert_eq!(a, b);
+    }
+
+    /// Pattern ops against a typed pin target the canonical text form —
+    /// `matches` over a BIGINT column casts to VARCHAR.
+    #[test]
+    fn pinned_where_matches_typed_pin_targets_canonical_text() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "* | where dur matches \"^4\"",
+            &[("dur", CT::BigInt)]
+        ));
+    }
+
+    /// LIKE over a TIMESTAMP pin matches the RFC 3339 strftime text.
+    #[test]
+    fn pinned_where_like_timestamp_pin_renders_rfc3339_text() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "* | where ts like \"2026-01-%\"",
+            &[("ts", CT::Timestamp)]
+        ));
+    }
+
+    /// The same rules apply inside `| let` — the comparison is a
+    /// SELECT-list value there (TRUE/FALSE/NULL).
+    #[test]
+    fn pinned_let_comparison_adopts_the_rule_table() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "* | let is_err = status >= 400",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// The scope walk: `rename status as st` carries the pin to `st`.
+    #[test]
+    fn pinned_where_after_rename_is_pin_aware_under_new_name() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "* | rename status as st | where st > 400",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// The scope walk: a computed `let` kills the pin, so the following
+    /// `where` is literal-driven (byte-identical to unpinned emission).
+    #[test]
+    fn pinned_where_after_computed_let_is_literal_driven() {
+        let query = parser::parse("* | let status = length(status) | where status > 400")
+            .expect("parse should succeed");
+        let pinned =
+            emit_with_pins(&query, SRC, &pins(&[("status", CT::Varchar)])).expect("pinned emit");
+        let unpinned = emit(&query, SRC).expect("unpinned emit");
+        assert_eq!(pinned.sql, unpinned.sql);
+        assert_eq!(pinned.params, unpinned.params);
+    }
+
+    /// The scope walk: a stats group-by key keeps its pin.
+    #[test]
+    fn pinned_where_after_stats_group_key_stays_pin_aware() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "* | stats count() by status | where status == 200",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// Excluded shapes stay literal-driven, structurally: field-vs-field,
+    /// function-wrapped fields, arithmetic on the field, `== null`, and a
+    /// pattern with the field as the RIGHT operand.
+    #[test]
+    fn pinned_where_excluded_shapes_emit_byte_identical_sql() {
+        for dsl in [
+            "* | where status == other",
+            "* | where lower(status) == \"a\"",
+            "* | where status * 2 > 400",
+            "* | where status == null",
+            "* | where \"x\" matches status",
+        ] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            let pinned = emit_with_pins(
+                &query,
+                SRC,
+                &pins(&[("status", CT::Varchar), ("other", CT::Varchar)]),
+            )
+            .expect("pinned emit");
+            let unpinned = emit(&query, SRC).expect("unpinned emit");
+            assert_eq!(pinned.sql, unpinned.sql, "{dsl}");
+            assert_eq!(pinned.params, unpinned.params, "{dsl}");
+        }
+    }
+
+    /// A typed pin's plain comparisons emit byte-identical SQL to the
+    /// unpinned emission — the column on disk already IS the type; the
+    /// pin travels for the live mirror's sake.
+    #[test]
+    fn pinned_where_typed_pin_comparison_is_byte_identical() {
+        for dsl in ["* | where dur > 400", "* | where dur == 400"] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            let pinned =
+                emit_with_pins(&query, SRC, &pins(&[("dur", CT::BigInt)])).expect("pinned emit");
+            let unpinned = emit(&query, SRC).expect("unpinned emit");
+            assert_eq!(pinned.sql, unpinned.sql, "{dsl}");
+            assert_eq!(pinned.params, unpinned.params, "{dsl}");
+        }
+    }
+
+    /// The kv split stamps the scope in force at the boundary, so the
+    /// `rust_stages` tail evaluates with the same pins the SQL prefix used
+    /// — including a rename's remap before the split.
+    #[test]
+    fn kv_split_stamps_rust_stage_pins_at_the_boundary() {
+        let query = parser::parse("* | rename status as st | extract kv | where st > 400").unwrap();
+        let ft = pins(&[("status", CT::Varchar)]);
+        let emitted = emit_with_pins(&query, SRC, &ft).unwrap();
+        assert_eq!(emitted.rust_stages.len(), 2);
+        assert_eq!(
+            emitted.rust_stage_pins.pin_for("st"),
+            Some(CT::Varchar),
+            "the boundary scope carries the renamed pin"
+        );
+        assert_eq!(emitted.rust_stage_pins.pin_for("status"), None);
+
+        // The pin-blind door stamps an empty scope.
+        let blind = emit(&query, SRC).unwrap();
+        assert!(blind.rust_stage_pins.is_empty());
+    }
+
     /// Minimality is a tested invariant: outside the changed cells of the
     /// ADR-0011 slice A table, pinned emission is byte-identical to
     /// unpinned emission — a repin changes no other query's meaning.
@@ -1737,6 +1936,68 @@ mod tests {
                             // ordered numeric literals move to TRY_CAST.
                             !is_pattern && numeric
                         }
+                        Some(_) => is_pattern,
+                        None => false,
+                    };
+                    let identical = pinned.sql == unpinned.sql && pinned.params == unpinned.params;
+                    assert_eq!(
+                        identical, !changed,
+                        "{dsl:?} under pin {pin:?}: expected changed={changed}\n\
+                         unpinned sql: {}\nparams: {:?}\n\
+                         pinned sql: {}\nparams: {:?}",
+                        unpinned.sql, unpinned.params, pinned.sql, pinned.params
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same minimality invariant over the PIPELINE lane (slice A′):
+    /// outside the changed cells — VARCHAR pin × numeric literal for
+    /// comparisons, typed pins for patterns — a `| where` emits
+    /// byte-identical SQL under pins.
+    #[test]
+    fn pinned_pipeline_emission_is_byte_identical_outside_the_changed_cells() {
+        let pin_states: [Option<CT>; 6] = [
+            None,
+            Some(CT::Varchar),
+            Some(CT::BigInt),
+            Some(CT::Double),
+            Some(CT::Timestamp),
+            Some(CT::Boolean),
+        ];
+        // (template, is_pattern) — `{}` replaced by the literal, quoted
+        // for non-numeric values (a bare word is a field ref in `where`).
+        let cases: [(&str, bool); 8] = [
+            ("* | where f == {}", false),
+            ("* | where f != {}", false),
+            ("* | where f > {}", false),
+            ("* | where f <= {}", false),
+            ("* | where f in ({}, {})", false),
+            ("* | let x = f >= {}", false),
+            ("* | where f matches \"^a\"", true),
+            ("* | where f like \"a%\"", true),
+        ];
+        let literals: [(&str, bool); 4] = [
+            ("200", true),
+            ("1.5", true),
+            ("\"accepted\"", false),
+            ("9999999999999999999", true),
+        ];
+
+        for pin in pin_states {
+            for (template, is_pattern) in cases {
+                for (lit, numeric) in literals {
+                    let dsl = template.replace("{}", lit);
+                    let Ok(query) = parser::parse(&dsl) else {
+                        continue;
+                    };
+                    let unpinned = emit(&query, SRC).expect("unpinned emit");
+                    let entries: Vec<(&str, CT)> = pin.map(|t| ("f", t)).into_iter().collect();
+                    let pinned = emit_with_pins(&query, SRC, &pins(&entries)).expect("pinned emit");
+
+                    let changed = match pin {
+                        Some(CT::Varchar) => !is_pattern && numeric,
                         Some(_) => is_pattern,
                         None => false,
                     };

@@ -1,0 +1,13 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_with_pins(\"* | let is_err = status >= 400\",\n&[(\"status\", CT::Varchar)])"
+---
+WITH _s0 AS (
+  SELECT *
+  FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+)
+SELECT COLUMNS(c -> c NOT IN ('is_err')), ((TRY_CAST("status" AS DECIMAL(38,6)) >= TRY_CAST(? AS DECIMAL(38,6)))) AS "is_err"
+FROM "_s0"
+---
+params:
+  0: '400'

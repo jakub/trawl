@@ -34,9 +34,6 @@ pub(crate) enum NullPolicy {
     NeMatchesNull,
     /// Pipeline rule: plain SQL three-valued logic — NULL is UNKNOWN and
     /// the row is filtered, for `!=` like every other operator.
-    // Constructed by the pipeline lane (slice A′ M5); the enum ships with
-    // the extraction so the search lane names its policy explicitly.
-    #[allow(dead_code)]
     Strict,
 }
 

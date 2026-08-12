@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_with_pins(\"* | where status > 400\", &[(\"status\", CT::Varchar)])"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE (TRY_CAST("status" AS DECIMAL(38,6)) > TRY_CAST(? AS DECIMAL(38,6)))
+---
+params:
+  0: '400'

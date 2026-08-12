@@ -64,11 +64,16 @@ pub(crate) struct EmitterState {
     params: Vec<SqlValue>,
     /// How text search binds `_raw` in this pass (see [`RawBinding`]).
     raw_binding: RawBinding,
-    /// The full catalog pin set typing search-stage comparisons (ADR-0011
-    /// slice A). Distinct from the hot-branch conformance pins passed to
+    /// The pin scope typing comparisons at the CURRENT point of emission
+    /// (ADR-0011 slices A/A′): seeded with the full catalog snapshot by
+    /// [`Self::with_compare_pins`] — during search emission the scope IS
+    /// the root — and advanced per pipe stage by
+    /// [`Self::advance_pin_scope`], so a `where` after a `rename` or a
+    /// computed `let` resolves against the schema actually in force.
+    /// Distinct from the hot-branch conformance pins passed to
     /// [`Self::with_hot_source`] — empty for pin-blind emission
     /// (embedded mode, [`super::emit`]).
-    compare_pins: crate::schema::FieldTypes,
+    pin_scope: crate::pin_scope::PinScope,
 }
 
 /// How the `_raw` column is bound by text search in one emission pass.
@@ -360,7 +365,7 @@ impl EmitterState {
             ctes: Vec::new(),
             params: Vec::new(),
             raw_binding: RawBinding::Available,
-            compare_pins: crate::schema::FieldTypes::new(),
+            pin_scope: crate::pin_scope::PinScope::unpinned(),
         }
     }
 
@@ -373,14 +378,28 @@ impl EmitterState {
     /// raw-free fallback takes a second, and the executor's pruned-retry /
     /// hot-only ladder can re-emit a third time for one logical query.
     pub(crate) fn with_compare_pins(mut self, pins: &crate::schema::FieldTypes) -> Self {
-        self.compare_pins = pins.clone();
+        self.pin_scope = crate::pin_scope::PinScope::root(pins);
         self
     }
 
-    /// The pin typing a comparison against `dsl_name`, looked up through
-    /// [`crate::schema::catalog_key`] (alias resolution + ASCII fold).
+    /// The pin typing a comparison against `dsl_name` at the current point
+    /// of emission, looked up through [`crate::schema::catalog_key`]
+    /// (alias resolution + ASCII fold).
     pub(crate) fn compare_pin(&self, dsl_name: &str) -> Option<crate::schema::CanonicalType> {
-        self.compare_pins.pin_for(dsl_name)
+        self.pin_scope.pin_for(dsl_name)
+    }
+
+    /// Advance the pin scope over one processed pipe stage (ADR-0011
+    /// slice A′) — called AFTER the stage's own expressions were emitted,
+    /// so they resolved against the incoming schema.
+    pub(crate) fn advance_pin_scope(&mut self, stage: &crate::ast::PipeStage) {
+        self.pin_scope.advance(stage);
+    }
+
+    /// The scope currently in force — stamped onto
+    /// [`super::EmittedQuery::rust_stage_pins`] at the kv split.
+    pub(crate) fn pin_scope(&self) -> &crate::pin_scope::PinScope {
+        &self.pin_scope
     }
 
     /// Emit the raw-free variant of this query: text search binds a typed
