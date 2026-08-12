@@ -37,6 +37,10 @@ pub mod filter;
 /// expression evaluator.
 mod pin_match;
 
+/// The compile-time pin scope walk: which catalog pin applies at each
+/// pipeline stage, shared by the SQL emitter and the stream compiler.
+pub mod pin_scope;
+
 /// The declared event envelope: field names, reserved keys, wire aliases.
 pub mod schema;
 
