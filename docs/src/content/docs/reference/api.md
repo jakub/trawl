@@ -189,6 +189,12 @@ case:
   the body is the plan the refusal is based on. (A second repin while one
   runs also 409s, with the ordinary error envelope.)
 
+The request holds open for the whole scan, which is a full-corpus pass —
+minutes on a large archive, past most client and proxy timeouts. A
+disconnect does not cancel anything: the claimed job runs to a terminal
+status on its own and the verdict is readable from the status route, so a
+timed-out repin is polled, never retried blind.
+
 The same gate is asked again of the finished rewrite: ingest keeps running
 for the whole job, so a file written after the scan can carry values the
 new type cannot read. A job that started with 202 therefore still ends

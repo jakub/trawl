@@ -473,6 +473,82 @@ async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool
     assert_eq!(h.count("last=1h | stats count()").await, 7);
 }
 
+/// A caller that walks away mid-scan must not strand the one-running
+/// slot. The scan is a full-corpus `DuckDB` pass, so a client or proxy
+/// timeout drops the request future long before it finishes: the claimed
+/// job's whole ladder therefore runs detached, terminalizes on its own,
+/// and leaves the next repin acceptable instead of 409ing every request
+/// until a daemon restart reconciles the orphan.
+#[sqlx::test(migrations = false)]
+async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPool) {
+    use std::sync::atomic::Ordering;
+    use trawl_server::repin::engine::TEST_SCAN_DELAY_MS;
+
+    let h = harness(pool).await;
+    for svc in ["api", "web", "worker"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+
+    let engine = h
+        .server
+        .state
+        .repin
+        .clone()
+        .expect("an ingest-enabled node owns a repin engine");
+    TEST_SCAN_DELAY_MS.store(500, Ordering::Relaxed);
+    let mut start = Box::pin(engine.start("status", "VARCHAR", true, false, Some("op")));
+    // Let the claim land and the scan begin, then drop the future exactly
+    // as hyper drops a handler whose connection went away.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(600), &mut start)
+            .await
+            .is_err(),
+        "the scan must still be running when the caller disconnects"
+    );
+    drop(start);
+    TEST_SCAN_DELAY_MS.store(0, Ordering::Relaxed);
+
+    // The abandoned job still reaches a terminal state on its own. Polled
+    // through the store, not the status route: an orphaned slot would
+    // otherwise spend the poller's rate-limit bucket before the deadline
+    // and report a 429 instead of the stranded job.
+    let store = h.server.state.storage.repin.clone();
+    let id = store
+        .latest()
+        .await
+        .expect("latest job")
+        .expect("the claim left a job row")
+        .id;
+    let mut terminal = None;
+    for _ in 0..300 {
+        let job = store.get(id).await.expect("job row").expect("job");
+        if job.status != trawl_server::store::RepinJobStatus::Running {
+            terminal = Some(job);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let done = terminal.expect("the detached job must terminalize without its caller");
+    assert_eq!(
+        done.status,
+        trawl_server::store::RepinJobStatus::Succeeded,
+        "error: {:?}",
+        done.error
+    );
+
+    // And the slot is free: the next repin is served, not 409ed.
+    match h
+        .schema_admin
+        .schema_repin("status", "VARCHAR", true, false)
+        .await
+        .expect("the running slot is free again")
+    {
+        RepinStart::Report(_) => {}
+        other => panic!("expected a dry-run report, got {other:?}"),
+    }
+}
+
 /// One repin at a time: a concurrent second request 409s with the error
 /// envelope (not a refusal plan); ingest and queries ride through the
 /// slowed rewrite — events land in the hot buffer immediately and exactly

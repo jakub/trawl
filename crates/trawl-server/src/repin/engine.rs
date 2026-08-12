@@ -64,6 +64,11 @@ const FLIP_ATTEMPTS: u32 = 3;
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_FILE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Test-only per-file delay in the SCAN (`plan::scan`), so integration
+/// tests can walk away from a request while the scan is still running.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_SCAN_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What `start` decided.
 #[derive(Debug)]
 pub enum StartOutcome {
@@ -126,7 +131,6 @@ impl RepinEngine {
     ///
     /// Refusals are side-effect-free on the corpus; every claim leaves a
     /// job row (the dry-run report IS the row).
-    #[allow(clippy::too_many_lines)] // one decision ladder, clearer unsplit
     pub async fn start(
         self: &Arc<Self>,
         field: &str,
@@ -182,6 +186,47 @@ impl RepinEngine {
             "repin job claimed; scanning the corpus"
         );
 
+        // Everything past the claim runs in a DETACHED task, never in the
+        // caller's future. The scan is a full-corpus DuckDB pass — minutes
+        // on a real archive, well past `trawl-client`'s two-minute
+        // timeout and any proxy's — and axum drops the handler future the
+        // moment the connection goes away. Cancelled between the claim and
+        // the terminal transition, the unique running slot would be
+        // stranded until a daemon restart (only boot reconciliation ever
+        // clears it), 409ing every later repin and reporting a phantom
+        // running job. Detached, the ladder always terminalizes; a caller
+        // that walked away merely loses the response and reads the verdict
+        // from `/schema/repin/status`.
+        let engine = Arc::clone(self);
+        let decided =
+            tokio::spawn(
+                async move { engine.decide(job_id, field, from, to, dry_run, force).await },
+            );
+        match decided.await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                let msg = format!("repin job task failed: {e}");
+                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                    .await;
+                Err(ServerError::Internal(msg))
+            }
+        }
+    }
+
+    /// The claimed job's decision ladder: scan → report (dry run) → refuse
+    /// (lossy without force) → pre-flight → start the background rewrite.
+    ///
+    /// Runs detached from the request (see `start`), so every exit path
+    /// terminalizes the job row itself.
+    async fn decide(
+        self: Arc<Self>,
+        job_id: i64,
+        field: String,
+        from: CanonicalType,
+        to: CanonicalType,
+        dry_run: bool,
+        force: bool,
+    ) -> Result<StartOutcome, ServerError> {
         let counts = match self.run_scan(&field, to).await {
             Ok(counts) => counts,
             Err(e) => {
@@ -250,7 +295,7 @@ impl RepinEngine {
             return Err(ServerError::BadRequest(msg));
         }
 
-        let engine = Arc::clone(self);
+        let engine = Arc::clone(&self);
         tokio::spawn(async move {
             engine.run_job(job_id, field, from, to, force).await;
         });

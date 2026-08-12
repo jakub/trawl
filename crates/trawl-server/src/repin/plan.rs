@@ -55,6 +55,14 @@ pub(crate) fn scan(
     let mut progress = Progress::new("repin-scan", sources.len());
     for (rel, _sig) in sources {
         progress.tick();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let delay =
+                crate::repin::engine::TEST_SCAN_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+        }
         if rel.extension().is_none_or(|e| e != "parquet") {
             continue;
         }
