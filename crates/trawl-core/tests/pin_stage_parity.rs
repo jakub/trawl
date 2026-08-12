@@ -26,6 +26,7 @@ use trawl_core::eval::{EvalValue, eval_expr_with_pins};
 use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
+use trawl_core::stream::{StageResult, StreamPlan, apply_stage, compile_stream_plan};
 
 fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
     params
@@ -114,6 +115,58 @@ fn run_cell(
         emitted.params
     );
     eval_result
+}
+
+/// Run one `| let` pipeline through both lanes and assert the named
+/// output columns carry the same value.
+fn run_let_cell(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    ft: &FieldTypes,
+    outputs: &[&str],
+) {
+    let query = parser::parse(dsl).expect("dsl parses");
+
+    // live lane: compile the plan under the catalog root and apply it.
+    let plan = compile_stream_plan(&query.pipeline, &PinScope::root(ft)).expect("plan compiles");
+    let StreamPlan::PassThrough(mut stages) = plan else {
+        panic!("{dsl:?} must compile to a per-event plan");
+    };
+    let mut streamed = event.clone();
+    for stage in &mut stages {
+        assert_eq!(
+            apply_stage(stage, &mut streamed),
+            StageResult::Pass,
+            "{dsl:?} must not filter the event"
+        );
+    }
+
+    // batch lane: emit the SQL and read the single row back as JSON.
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".ndjson")
+        .tempfile()
+        .unwrap();
+    writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
+    tmp.flush().unwrap();
+    let source = tmp.path().to_str().unwrap().to_owned();
+    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let row_sql = format!("SELECT to_json(_sub) FROM ({}) AS _sub", emitted.sql);
+    let params = bind_params(&emitted.params);
+    let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+    let row_json: String = conn
+        .query_row(&row_sql, param_refs.as_slice(), |row| row.get(0))
+        .unwrap_or_else(|e| panic!("pinned let must not error: {e}\ndsl: {dsl:?}\nsql: {row_sql}"));
+    let batch: Map<String, Value> = serde_json::from_str(&row_json).expect("row is a JSON object");
+
+    for name in outputs {
+        let batch_value = batch.get(*name).unwrap_or(&Value::Null);
+        let streamed_value = streamed.get(*name).unwrap_or(&Value::Null);
+        assert_eq!(
+            streamed_value, batch_value,
+            "lane divergence on {name:?}\ndsl: {dsl:?}\nevent: {event:?}\nbatch row: {batch:?}"
+        );
+    }
 }
 
 fn event_with(field: &str, value: Value) -> Map<String, Value> {
@@ -352,4 +405,32 @@ fn float_literal_above_2_53_binds_its_source_token_in_both_lanes() {
             "{dsl} against {stored:?}"
         );
     }
+}
+
+/// `| let` assigns in parallel in BOTH lanes: every expression reads the
+/// pre-stage row, so a sibling reference sees the original column and an
+/// overwrite never feeds the assignment beside it.
+///
+/// The batch lane has no choice — the stage desugars to one projection
+/// (`COLUMNS(c -> c NOT IN (targets)), (expr) AS tgt, …`) — so the live
+/// lane is the one that must not drift, and `PinScope::advance` resolves
+/// the pins the same parallel way.
+#[test]
+fn let_assignments_are_parallel_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let mut ft = FieldTypes::new();
+    ft.insert("a", CanonicalType::BigInt);
+
+    let event = event_with("a", Value::from(5));
+
+    // A sibling reference reads the ORIGINAL `a`, not the new one.
+    run_let_cell(&conn, "* | let a = 1, b = a", &event, &ft, &["a", "b"]);
+    // An overwrite does not feed the assignment beside it.
+    run_let_cell(&conn, "* | let a = a + 1, b = a", &event, &ft, &["a", "b"]);
+    // Both cells above assign to a name the row DOES carry, which is the
+    // whole contract: DuckDB's lateral column alias only binds a name that
+    // resolves to no input column, so a `let` target shadowing a real
+    // column reads the column. A reference to a name the corpus carries
+    // nowhere is the documented residual — batch takes the sibling's
+    // freshly computed value, live has no column to read and answers NULL.
 }

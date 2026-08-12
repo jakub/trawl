@@ -519,6 +519,42 @@ fn apply_rename(renames: &[(String, String)], event: &mut Map<String, Value>) {
     }
 }
 
+/// Apply a `let` stage in place, with the SQL's parallel semantics.
+///
+/// The batch lane desugars the whole stage into ONE projection
+/// (`COLUMNS(c -> c NOT IN (targets)), (expr) AS tgt, …`), so every
+/// assignment reads the PRE-stage row: `let a = 1, b = a` gives `b` the
+/// ORIGINAL `a`, and `let a = a + 1, b = a` gives `b` the original `a`
+/// too, never the value the sibling just computed. Evaluating each
+/// expression against the already-mutated event would answer differently
+/// here than `/api/v1/query` does — and [`PinScope::advance`] resolves the
+/// pins in parallel, so a sequential value would be typed by a pin
+/// belonging to the column it no longer came from.
+///
+/// The residual: `DuckDB`'s lateral column alias binds a name that
+/// resolves to NO input column, so `let c = 1, d = c` over a corpus
+/// carrying no `c` gives the batch `d = 1` while the live lane, having no
+/// column to read, answers NULL. A target that shadows a real column —
+/// the case the pins care about — reads the column in both lanes.
+fn apply_let(
+    assignments: &[(String, Spanned<crate::ast::Expr>)],
+    pins: &PinScope,
+    event: &mut Map<String, Value>,
+) {
+    let resolved: Vec<(&str, Value)> = assignments
+        .iter()
+        .map(|(name, expr)| {
+            (
+                name.as_str(),
+                Value::from(eval_expr_with_pins(expr, event, pins)),
+            )
+        })
+        .collect();
+    for (name, value) in resolved {
+        event.insert(name.to_string(), value);
+    }
+}
+
 /// Apply a compiled stage to an event, mutating it in place.
 ///
 /// Returns whether the event should pass through, be filtered, or
@@ -569,10 +605,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
         }
 
         CompiledStage::Let { assignments, pins } => {
-            for (name, expr) in assignments {
-                let result = eval_expr_with_pins(expr, event, pins);
-                event.insert(name.clone(), Value::from(result));
-            }
+            apply_let(assignments, pins, event);
             StageResult::Pass
         }
 
@@ -1792,6 +1825,57 @@ mod tests {
         let mut ev = event(&json!({"service": "nginx"}));
         apply_stage(&mut stage, &mut ev);
         assert_eq!(ev.get("svc").unwrap(), "NGINX");
+    }
+
+    #[test]
+    fn let_siblings_read_the_pre_stage_event() {
+        // SQL: one projection, `(1) AS a, (a) AS b` — both expressions
+        // read the pre-stage row, so `b` takes the ORIGINAL `a`.
+        let assignments = vec![
+            ("a".into(), span(Expr::Literal(LiteralValue::Int(1)))),
+            ("b".into(), span(Expr::FieldRef("a".into()))),
+        ];
+        let mut stage = compile_let(
+            &LetStage {
+                assignments,
+                keyword: "let",
+            },
+            &PinScope::unpinned(),
+        )
+        .unwrap();
+        let mut ev = event(&json!({"a": 5}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("a").unwrap(), 1);
+        assert_eq!(ev.get("b").unwrap(), 5);
+    }
+
+    #[test]
+    fn let_overwrite_does_not_feed_its_siblings() {
+        // `let a = a + 1, b = a` — the overwrite lands on `a`, but `b`
+        // still reads the pre-stage `a`.
+        let assignments = vec![
+            (
+                "a".into(),
+                span(Expr::Binary {
+                    lhs: Box::new(span(Expr::FieldRef("a".into()))),
+                    op: BinaryOp::Add,
+                    rhs: Box::new(span(Expr::Literal(LiteralValue::Int(1)))),
+                }),
+            ),
+            ("b".into(), span(Expr::FieldRef("a".into()))),
+        ];
+        let mut stage = compile_let(
+            &LetStage {
+                assignments,
+                keyword: "let",
+            },
+            &PinScope::unpinned(),
+        )
+        .unwrap();
+        let mut ev = event(&json!({"a": 5}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("a").unwrap(), 6);
+        assert_eq!(ev.get("b").unwrap(), 5);
     }
 
     // ── tier 2: extract regex ──────────────────────────────────────
