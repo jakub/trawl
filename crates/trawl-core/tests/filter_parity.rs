@@ -1600,3 +1600,420 @@ fn pinned_hot_only_pattern_parity() {
         }
     }
 }
+
+// ── Pinned pipeline where/let parity (ADR-0011 slice A′) ──────────────
+
+/// Extract the sole `| where` condition of `dsl`.
+fn where_condition(
+    dsl: &str,
+) -> (
+    trawl_core::ast::Query,
+    trawl_core::ast::Spanned<trawl_core::ast::Expr>,
+) {
+    let query = parser::parse(dsl).expect("dsl parses");
+    let condition = query
+        .pipeline
+        .iter()
+        .find_map(|s| match &s.node {
+            PipeStage::Where(w) => Some(w.condition.clone()),
+            _ => None,
+        })
+        .expect("dsl has a where stage");
+    (query, condition)
+}
+
+/// An `EvalValue` boolean answer as SQL truth.
+fn eval_truth(v: &trawl_core::eval::EvalValue) -> Option<bool> {
+    match v {
+        trawl_core::eval::EvalValue::Bool(b) => Some(*b),
+        trawl_core::eval::EvalValue::Null => None,
+        other => panic!("a comparison must answer Bool/Null, got {other:?}"),
+    }
+}
+
+/// Assert the pin-aware streaming evaluator and pin-aware SQL agree on one
+/// `| where` (dsl, event, pins) triple, and return the three-valued eval
+/// answer so callers can pin what it must BE (agreement alone would let
+/// both lanes be wrong together — the ruling-#6 lesson).
+///
+/// Same source strategy as [`assert_pinned_parity`]: ndjson when the wire
+/// shape already infers the pin's physical type, a typed-NULL parquet for
+/// the null/absent case.
+fn assert_pinned_where_parity(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    ft: &FieldTypes,
+) -> Option<bool> {
+    let (query, condition) = where_condition(dsl);
+    let scope = trawl_core::pin_scope::PinScope::root(ft);
+    let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
+        &condition, event, &scope,
+    ));
+
+    let _guard: Box<dyn std::any::Any>;
+    let source = if matches!(event.get("status"), None | Some(&Value::Null)) {
+        let tmp = tempfile::Builder::new()
+            .suffix(".parquet")
+            .tempfile()
+            .unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
+        let ty = match ft.get("status") {
+            Some(t) => t.as_duckdb(),
+            None => "VARCHAR",
+        };
+        conn.execute_batch(&format!(
+            "COPY (SELECT CAST(NULL AS {ty}) AS status, 'hello' AS message) \
+             TO '{path}' (FORMAT PARQUET)"
+        ))
+        .expect("write typed-null parquet");
+        _guard = Box::new(tmp);
+        path
+    } else {
+        let mut tmp = tempfile::Builder::new()
+            .suffix(".ndjson")
+            .tempfile()
+            .unwrap();
+        writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
+        _guard = Box::new(tmp);
+        path
+    };
+    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let sql_result = sql_matches_strict(conn, &emitted);
+
+    assert_eq!(
+        eval_result == Some(true),
+        sql_result,
+        "pinned where parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\neval: {eval_result:?}\nsql: {}\nparams: {:?}",
+        emitted.sql,
+        emitted.params
+    );
+    eval_result
+}
+
+/// [`assert_pinned_where_parity`] over an explicitly-stored column: the
+/// wire shape the evaluator sees and the conformed column batch reads are
+/// spelled out separately, exactly as compaction separates them.
+fn assert_pinned_where_parity_over_column(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    ft: &FieldTypes,
+    stored_sql: &str,
+) -> Option<bool> {
+    let (query, condition) = where_condition(dsl);
+    let scope = trawl_core::pin_scope::PinScope::root(ft);
+    let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
+        &condition, event, &scope,
+    ));
+
+    let tmp = tempfile::Builder::new()
+        .suffix(".parquet")
+        .tempfile()
+        .unwrap();
+    let source = tmp.path().to_str().unwrap().to_owned();
+    conn.execute_batch(&format!(
+        "COPY (SELECT {stored_sql} AS status, 'hello' AS message) \
+         TO '{source}' (FORMAT PARQUET)"
+    ))
+    .expect("write typed parquet");
+
+    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let sql_result = sql_matches_strict(conn, &emitted);
+
+    assert_eq!(
+        eval_result == Some(true),
+        sql_result,
+        "pinned where parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nstored: {stored_sql}\nsql: {}\nparams: {:?}",
+        emitted.sql,
+        emitted.params
+    );
+    eval_result
+}
+
+/// Assert the pinned `| let x = <cmp>` SELECT-list value agrees between the
+/// lanes and IS `expected` — TRUE/FALSE/NULL as a stored value, not a row
+/// filter, so UNKNOWN is directly observable in batch too.
+fn assert_pinned_let_parity(
+    conn: &Connection,
+    expr_dsl: &str,
+    event: &Map<String, Value>,
+    ft: &FieldTypes,
+    expected: Option<bool>,
+) {
+    let dsl = format!("* | let x = {expr_dsl}");
+    let query = parser::parse(&dsl).expect("dsl parses");
+    let assignment = query
+        .pipeline
+        .iter()
+        .find_map(|s| match &s.node {
+            PipeStage::Let(l) => Some(l.assignments[0].1.clone()),
+            _ => None,
+        })
+        .expect("dsl has a let stage");
+    let scope = trawl_core::pin_scope::PinScope::root(ft);
+    let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
+        &assignment,
+        event,
+        &scope,
+    ));
+    assert_eq!(
+        eval_result, expected,
+        "pinned let eval answer\nexpr: {expr_dsl:?}\nevent: {event:?}"
+    );
+
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".ndjson")
+        .tempfile()
+        .unwrap();
+    writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
+    tmp.flush().unwrap();
+    let source = tmp.path().to_str().unwrap().to_owned();
+    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+
+    let select_sql = format!("SELECT \"x\" FROM ({}) AS _sub", emitted.sql);
+    let params = bind_params(&emitted.params);
+    let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+    let sql_result: Option<bool> = conn
+        .query_row(&select_sql, param_refs.as_slice(), |row| row.get(0))
+        .unwrap_or_else(|e| {
+            panic!(
+                "pinned let must not error: {e}\nsql: {select_sql}\nparams: {:?}",
+                emitted.params
+            )
+        });
+    assert_eq!(
+        sql_result, expected,
+        "pinned let batch answer\nexpr: {expr_dsl:?}\nevent: {event:?}\nsql: {}",
+        emitted.sql
+    );
+}
+
+/// The slice-A′ deterministic matrix: pin-aware `| where` over the same
+/// value × operator grid the search stage runs, strict SQL (an error is a
+/// broken rule, never a "no match").
+#[test]
+fn pinned_where_varchar_matrix_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::Varchar)]);
+    let values = [
+        Value::String("200".into()),
+        Value::String("404".into()),
+        Value::String("accepted".into()),
+        Value::String("1.5".into()),
+        Value::String("0404".into()),
+        Value::String("200_000".into()),
+        Value::String("nan".into()),
+        Value::String("1e40".into()),
+        Value::String("9007199254740993".into()),
+        Value::String("0x10".into()),
+        Value::Null,
+    ];
+    let dsls = [
+        "* | where status == 200",
+        "* | where status != 200",
+        "* | where status > 400",
+        "* | where status >= 400",
+        "* | where status < 400",
+        "* | where status <= 400",
+        "* | where 400 < status",
+        "* | where status == \"accepted\"",
+        "* | where status != \"accepted\"",
+        "* | where status in (200, 301)",
+        "* | where status in (200, \"accepted\")",
+        "* | where status > \"nan\"",
+        "* | where status >= \"1e40\"",
+        "* | where status == 9007199254740993",
+        "* | where status > 9007199254740992",
+        "* | where not (status > 400)",
+        "* | where not (status == 200)",
+        "* | where not (status in (200, 301))",
+        "* | where status matches \"^2\"",
+        "* | where status like \"2%\"",
+        "* | where not (status matches \"^2\")",
+    ];
+    let events = values
+        .iter()
+        .map(status_event)
+        .chain(std::iter::once(absent_status_event()));
+    for event in events {
+        for dsl in dsls {
+            assert_pinned_where_parity(&conn, dsl, &event, &ft);
+        }
+    }
+}
+
+/// Expected values pinned, not just agreement (the ruling-#6 lesson):
+/// the headline slice-A′ answers over a VARCHAR pin.
+#[test]
+fn pinned_where_expected_answers() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::Varchar)]);
+
+    // 'accepted' has no reading: UNKNOWN, and NOT does not invert it.
+    let accepted = status_event(&Value::from("accepted"));
+    assert_eq!(
+        assert_pinned_where_parity(&conn, "* | where status > 400", &accepted, &ft),
+        None
+    );
+    assert_eq!(
+        assert_pinned_where_parity(&conn, "* | where not (status > 400)", &accepted, &ft),
+        None
+    );
+
+    // A readable value answers, and NOT genuinely inverts.
+    let s404 = status_event(&Value::from("404"));
+    assert_eq!(
+        assert_pinned_where_parity(&conn, "* | where status > 400", &s404, &ft),
+        Some(true)
+    );
+    assert_eq!(
+        assert_pinned_where_parity(&conn, "* | where not (status > 400)", &s404, &ft),
+        Some(false)
+    );
+
+    // Strict `!=` NULL policy: absent/null is UNKNOWN (the search stage's
+    // widening does NOT apply in the pipeline).
+    assert_eq!(
+        assert_pinned_where_parity(
+            &conn,
+            "* | where status != 200",
+            &absent_status_event(),
+            &ft
+        ),
+        None
+    );
+    assert_eq!(
+        assert_pinned_where_parity(
+            &conn,
+            "* | where status != 200",
+            &status_event(&Value::Null),
+            &ft
+        ),
+        None
+    );
+
+    // The stored text of a wire 200 that shared a batch with a fraction is
+    // "200.0" — the numeric arm still answers `== 200` TRUE.
+    assert_eq!(
+        assert_pinned_where_parity_over_column(
+            &conn,
+            "* | where status == 200",
+            &status_event(&Value::from(200)),
+            &ft,
+            "'200.0'"
+        ),
+        Some(true)
+    );
+
+    // Exact above 2^53: neighbours stay distinct in the DECIMAL space.
+    assert_eq!(
+        assert_pinned_where_parity(
+            &conn,
+            "* | where status > 9007199254740992",
+            &status_event(&Value::from("9007199254740993")),
+            &ft
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        assert_pinned_where_parity(
+            &conn,
+            "* | where status == 9007199254740993",
+            &status_event(&Value::from("9007199254740992")),
+            &ft
+        ),
+        Some(false)
+    );
+
+    // A literal with no reading (`nan`, `1e40`) makes every row UNKNOWN.
+    for dsl in ["* | where status > \"nan\"", "* | where status >= \"1e40\""] {
+        assert_eq!(
+            assert_pinned_where_parity(&conn, dsl, &status_event(&Value::from("200")), &ft),
+            None,
+            "{dsl}"
+        );
+    }
+}
+
+/// TIMESTAMP pin: the conform is zone-aware, so an offset-bearing wire
+/// value compares (and pattern-matches) at its UTC instant, while a query
+/// literal parses wall-clock (offset ignored) — both probed in slice A.
+#[test]
+fn pinned_where_timestamp_offset_instant() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::Timestamp)]);
+    // Wire value carries +05:30; the corpus holds the 03:30 UTC instant.
+    let event = status_event(&Value::from("2026-01-15T09:00:00+05:30"));
+    let stored = "TIMESTAMP '2026-01-15 03:30:00'";
+
+    assert_eq!(
+        assert_pinned_where_parity_over_column(
+            &conn,
+            "* | where status == \"2026-01-15T03:30:00\"",
+            &event,
+            &ft,
+            stored
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        assert_pinned_where_parity_over_column(
+            &conn,
+            "* | where status == \"2026-01-15T09:00:00\"",
+            &event,
+            &ft,
+            stored
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        assert_pinned_where_parity_over_column(
+            &conn,
+            "* | where status like \"2026-01-15T03:30%\"",
+            &event,
+            &ft,
+            stored
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        assert_pinned_where_parity_over_column(
+            &conn,
+            "* | where status matches \"T09:\"",
+            &event,
+            &ft,
+            stored
+        ),
+        Some(false)
+    );
+}
+
+/// The pinned comparison as a SELECT-list value: `| let` stores
+/// TRUE/FALSE/NULL, three-valued in batch exactly as in memory.
+#[test]
+fn pinned_let_matrix_with_expected_values() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[("status", CanonicalType::Varchar)]);
+    let cases: &[(&str, &str, Option<bool>)] = &[
+        ("status >= 400", r#"{"status": "404"}"#, Some(true)),
+        ("status >= 400", r#"{"status": "200"}"#, Some(false)),
+        ("status >= 400", r#"{"status": "accepted"}"#, None),
+        ("status == 200", r#"{"status": "200"}"#, Some(true)),
+        ("status == 200", r#"{"status": "accepted"}"#, Some(false)),
+        ("status != 200", r#"{"status": "accepted"}"#, Some(true)),
+        ("status in (200, 301)", r#"{"status": "301"}"#, Some(true)),
+        (
+            "status in (200, 301)",
+            r#"{"status": "accepted"}"#,
+            Some(false),
+        ),
+        ("status > \"nan\"", r#"{"status": "200"}"#, None),
+    ];
+    for (expr, event_json, expected) in cases {
+        let event: Map<String, Value> = serde_json::from_str(event_json).unwrap();
+        assert_pinned_let_parity(&conn, expr, &event, &ft, *expected);
+    }
+}

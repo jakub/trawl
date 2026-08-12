@@ -1647,3 +1647,89 @@ fn export_hot_only_fallback_conforms_hot_columns_to_the_pin() {
          JSON-inferred type"
     );
 }
+
+// ── pinned rust_stages tail (ADR-0011 slice A′) ───────────────────────
+
+/// A source with a VARCHAR `status` column and kv-free messages, plus the
+/// VARCHAR pin for it.
+fn setup_pinned_kv() -> (Executor, String, FieldTypes, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pinned.parquet");
+    {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT unnest(['200', '404', '500', 'accepted', '1.5']) AS status, \
+             'plain text line' AS message) TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+    }
+    let mut ft = FieldTypes::new();
+    ft.insert("status", trawl_core::schema::CanonicalType::Varchar);
+    let exec = Executor::new().expect("executor should initialize");
+    (exec, format!("{}", path.display()), ft, dir)
+}
+
+/// The `rust_stages` lane is pin-aware: `… | extract kv | where <pinned
+/// cmp>` returns the same rows as the equivalent query without the kv
+/// split — the tail's `where` runs under the scope stamped at the split,
+/// not pin-blind.
+#[test]
+fn extract_kv_tail_where_is_pin_aware() {
+    let (exec, src, ft, _dir) = setup_pinned_kv();
+    let with_kv = exec
+        .run_query("* | extract kv | where status > 400", &src, &ft, 1000, 0)
+        .unwrap();
+    let without_kv = exec
+        .run_query("* | where status > 400", &src, &ft, 1000, 0)
+        .unwrap();
+    // '404' and '500' compare in the DECIMAL space; 'accepted' and '1.5'
+    // vs 400 are UNKNOWN/false; '200' is below.
+    assert_eq!(without_kv.row_count(), 2);
+    assert_eq!(
+        with_kv.row_count(),
+        without_kv.row_count(),
+        "the kv tail must answer exactly as the split-free query"
+    );
+
+    // The equality rung too: '200' matches == 200 as text.
+    let eq_kv = exec
+        .run_query("* | extract kv | where status == 200", &src, &ft, 1000, 0)
+        .unwrap();
+    assert_eq!(eq_kv.row_count(), 1);
+}
+
+/// A rename BEFORE the kv split remaps the pin in the stamped scope, so
+/// the tail's `where` under the new name stays pin-aware.
+#[test]
+fn extract_kv_tail_after_rename_carries_the_remapped_pin() {
+    let (exec, src, ft, _dir) = setup_pinned_kv();
+    let result = exec
+        .run_query(
+            "* | rename status as st | extract kv | where st > 400",
+            &src,
+            &ft,
+            1000,
+            0,
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 2, "the pin travels under the new name");
+}
+
+/// The pin-blind door stays pin-blind: the same tail without pins keeps
+/// literal-driven evaluation (a string status has no numeric reading in
+/// the streaming evaluator, so nothing matches).
+#[test]
+fn extract_kv_tail_without_pins_stays_literal_driven() {
+    let (exec, src, _ft, _dir) = setup_pinned_kv();
+    let result = exec
+        .run_query(
+            "* | extract kv | where status > 400",
+            &src,
+            &FieldTypes::new(),
+            1000,
+            0,
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 0, "embedded mode keeps today's answer");
+}

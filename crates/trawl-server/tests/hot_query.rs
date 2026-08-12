@@ -530,3 +530,161 @@ async fn query_works_without_hot_buffer() {
         query_result.rows.len()
     );
 }
+
+/// Slice A′ end to end: pinned `| where`/`| let` through the REAL query
+/// plumbing — catalog → pool → emitter — over the hot buffer, then over
+/// parquet after compaction, plus the SSE plan lane over the same events
+/// with the same single snapshot the handler feeds it. The scope shapes
+/// ride along: a rename remaps the pin, a bare-alias let copies it, a
+/// computed let kills it.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one linear end-to-end narrative
+async fn pinned_where_let_hot_cold_and_stream_agree() {
+    use trawl_core::filter::CompiledFilter;
+    use trawl_core::pin_scope::PinScope;
+    use trawl_core::stream::{StreamPlan, apply_stage, compile_stream_plan};
+    use trawl_server::catalog::FieldCatalog;
+
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let wal_dir = tmp.path().join("wal");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // The envelope seed pins VARCHAR day-one; here the pin is seeded
+    // directly into the in-process cache the pool and the stream read.
+    let catalog = Arc::new(FieldCatalog::new());
+    catalog.merge([(
+        "status".to_string(),
+        trawl_core::schema::CanonicalType::Varchar,
+    )]);
+
+    let hot_buffer = Arc::new(
+        HotBuffer::new(HotBufferConfig {
+            max_events: 10_000,
+            max_bytes: 10_000_000,
+        })
+        .with_field_catalog(Arc::clone(&catalog)),
+    );
+    let pool = ExecutorPool::new(
+        data_dir.to_str().unwrap().to_owned(),
+        1,
+        1000,
+        Some(Arc::clone(&hot_buffer)),
+    )
+    .with_field_catalog(Arc::clone(&catalog));
+
+    // Three events: numeric-text, below-threshold, and no-reading.
+    let events: Vec<Map<String, Value>> = [("404", "a"), ("200", "b"), ("accepted", "c")]
+        .into_iter()
+        .map(|(status, msg)| {
+            let mut m = make_event("nginx", msg);
+            m.insert("status".into(), json!(status));
+            m
+        })
+        .collect();
+
+    let wal_writer = WalWriter::new(wal_dir.clone());
+    wal_writer.ensure_dir().unwrap();
+    let ndjson = events_to_ndjson(&events);
+    let wal_path = wal_writer.write("prod", "nginx", &ndjson).unwrap();
+    hot_buffer.insert(Arc::new(IngestBatch {
+        batch_id: format!("prod/{}", wal_path.file_stem().unwrap().to_str().unwrap()).into(),
+        service: "nginx".into(),
+        byte_size: ndjson.len(),
+        events: events.clone(),
+    }));
+
+    let run = |dsl: &'static str| {
+        let pool = &pool;
+        async move {
+            pool.execute(
+                pool.allocate_query_id(),
+                dsl,
+                Duration::from_secs(10),
+                false,
+                0,
+            )
+            .await
+            .result
+            .unwrap_or_else(|e| panic!("{dsl:?} must succeed: {e}"))
+            .rows
+            .len()
+        }
+    };
+
+    // (dsl, expected rows) — the SSE plan below must agree on each.
+    let cases: [(&'static str, usize); 4] = [
+        // '404' has the only reading above 400; 'accepted' is UNKNOWN.
+        ("* | where status > 400", 1),
+        // NOT does not invert UNKNOWN: only '200' answers FALSE→TRUE.
+        ("* | where not (status > 400)", 1),
+        // rename remaps the pin to the new name.
+        ("* | rename status as st | where st > 400", 1),
+        // a bare-alias let COPIES the pin — a broken walk would emit the
+        // literal-driven comparison here, which throws over 'accepted'.
+        ("* | let s2 = status | where s2 > 400", 1),
+    ];
+
+    // Hot lane (pre-compaction).
+    for (dsl, expected) in cases {
+        assert_eq!(run(dsl).await, expected, "hot: {dsl}");
+    }
+
+    // The SSE plan lane: ONE snapshot feeds filter + plan, exactly as
+    // stream_query wires it.
+    let stream_matches = |dsl: &str| -> usize {
+        let ast = trawl_core::parser::parse(dsl).expect("parses");
+        let pins = catalog.all();
+        let filter = CompiledFilter::compile(&ast.search, &pins).expect("filter compiles");
+        let plan =
+            compile_stream_plan(&ast.pipeline, &PinScope::root(&pins)).expect("plan compiles");
+        let StreamPlan::PassThrough(mut stages) = plan else {
+            panic!("pass-through pipelines only in this test");
+        };
+        let now = chrono::Utc::now();
+        events
+            .iter()
+            .filter(|event| {
+                if !filter.matches_at(event, now) {
+                    return false;
+                }
+                let mut event = (*event).clone();
+                stages.iter_mut().all(|stage| {
+                    matches!(
+                        apply_stage(stage, &mut event),
+                        trawl_core::stream::StageResult::Pass
+                    )
+                })
+            })
+            .count()
+    };
+    for (dsl, expected) in cases {
+        assert_eq!(stream_matches(dsl), expected, "stream: {dsl}");
+    }
+    // The computed-let kill, observable stream-side without an error
+    // channel: the derived value is literal-driven, so nothing matches.
+    assert_eq!(
+        stream_matches("* | let status = lower(status) | where status > 400"),
+        0,
+        "a computed let kills the pin"
+    );
+
+    // Cold lane (post-compaction): same answers off parquet.
+    trawl_server::ingest::compaction::compact_once(
+        &wal_dir,
+        &data_dir,
+        Duration::ZERO,
+        false,
+        Some(&hot_buffer),
+        500,
+        "2GB",
+        None,
+    )
+    .await
+    .expect("compaction should succeed");
+    assert_eq!(hot_buffer.event_count(), 0);
+    for (dsl, expected) in cases {
+        assert_eq!(run(dsl).await, expected, "cold: {dsl}");
+    }
+}
