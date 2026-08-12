@@ -37,6 +37,13 @@ pub(crate) struct FileSig {
 /// Only VALID env directories are covered: the per-env swap moves exactly
 /// these, so `wal/`, `scheduled/`, the markers, and any non-env top-level
 /// entry stay in the live root untouched.
+///
+/// `*.tmp` is the ONE exclusion: a staging file belongs to the writer
+/// holding it open (compaction's `{service}.parquet.tmp`, this module's
+/// own), is never evidence, and hardlinking one into the shadow would
+/// make a second name for an inode a live writer is about to rewrite.
+/// Anything left behind is an orphan compaction's own stale-tmp sweep
+/// reclaims.
 pub(crate) fn snapshot_env_files(data_dir: &Path) -> Result<BTreeMap<PathBuf, FileSig>, String> {
     let mut out = BTreeMap::new();
     for (_env, env_dir) in crate::env_dirs::try_list_env_dirs(data_dir)
@@ -63,6 +70,9 @@ fn walk_files(
         if meta.is_dir() {
             walk_files(&path, data_dir, out)?;
         } else if meta.is_file() {
+            if path.extension().is_some_and(|ext| ext == "tmp") {
+                continue;
+            }
             let rel = path
                 .strip_prefix(data_dir)
                 .map_err(|e| format!("path outside data root: {e}"))?
@@ -203,7 +213,7 @@ fn rewrite_affected(
         .iter()
         .any(|c| c.name.eq_ignore_ascii_case(trawl_core::schema::TIME));
     let order = if has_time { " ORDER BY \"_time\"" } else { "" };
-    let tmp = dst.with_extension("parquet.tmp");
+    let tmp = staging_path(dst);
     conn.execute_batch(&format!(
         "COPY (SELECT {} FROM {source}{order}) TO '{}' \
          (FORMAT PARQUET, COMPRESSION SNAPPY, \
@@ -225,6 +235,20 @@ fn rewrite_affected(
         resurrected: counts.resurrected,
         service: Some(layout.service),
     })
+}
+
+/// Where a rewrite stages its output before the rename onto `dst`.
+///
+/// Deliberately NOT `{service}.parquet.tmp` — that is byte-for-byte the
+/// path hourly compaction stages at, and `DuckDB`'s `COPY` opens its target
+/// `O_CREAT|O_TRUNC` without unlinking first, so a shadow entry that is a
+/// hardlink to a live staging file would be truncated and rewritten IN
+/// the live data root. The pid keeps two processes sharing a shadow root
+/// (a would-be operator mistake) off each other's staging file, and the
+/// `.tmp` extension keeps a crash leftover inert and inside compaction's
+/// stale-tmp sweep once the shadow is published.
+fn staging_path(dst: &Path) -> PathBuf {
+    dst.with_extension(format!("parquet.repin-{}.tmp", std::process::id()))
 }
 
 /// The three per-file numbers the plan reports and the rewrite achieves,
@@ -273,4 +297,45 @@ pub(crate) fn count_repin_effect(
         nulled: u64::try_from(carrying - kept).unwrap_or(0),
         resurrected: u64::try_from(resurrected).unwrap_or(0),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A live staging file must never enter the shadow: hardlinking one
+    /// gives the shadow a second name for an inode compaction is about to
+    /// rewrite (or has already renamed into place), and the next pass's
+    /// `COPY` would truncate it through the link. Everything else — parquet
+    /// and non-parquet evidence alike — still rides.
+    #[test]
+    fn snapshot_skips_staging_files_and_keeps_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let hour = data.join("prod/2026-08-12/10");
+        std::fs::create_dir_all(&hour).unwrap();
+        std::fs::write(hour.join("nginx.parquet"), b"p").unwrap();
+        std::fs::write(hour.join("nginx.parquet.tmp"), b"staging").unwrap();
+        std::fs::write(hour.join("nginx.parquet.corrupt"), b"evidence").unwrap();
+
+        let seen: Vec<String> = snapshot_env_files(data)
+            .unwrap()
+            .keys()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(seen, vec!["nginx.parquet", "nginx.parquet.corrupt"]);
+    }
+
+    /// The rewrite must not stage where compaction stages.
+    #[test]
+    fn staging_path_cannot_collide_with_compactions() {
+        let dst = Path::new("/data/prod/2026-08-12/10/nginx.parquet");
+        let staged = staging_path(dst);
+        assert_ne!(staged, dst.with_extension("parquet.tmp"));
+        assert_eq!(staged.parent(), dst.parent());
+        assert_eq!(staged.extension().unwrap(), "tmp");
+        // And it is itself excluded from the source enumeration, so a
+        // crash leftover can never be hardlinked forward.
+        assert!(staged.extension().is_some_and(|e| e == "tmp"));
+    }
 }
