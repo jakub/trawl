@@ -35,7 +35,7 @@ use crate::catalog::FieldCatalog;
 use crate::catalog::conform::open_bounded_connection;
 use crate::error::ServerError;
 use crate::pool::ExecutorPool;
-use crate::repin::cutover::{swap_envs, sweep_dir};
+use crate::repin::cutover::{swap_envs, sweep_dir, sweep_pre_swap_staging};
 use crate::repin::gate::RepinCoordinator;
 use crate::repin::marker::{
     RepinMarker, RepinPhase, aside_root, remove_marker, shadow_root, write_marker,
@@ -409,7 +409,8 @@ impl RepinEngine {
     }
 
     /// Abandon a job whose corpus is still untouched (pre-swap): sweep the
-    /// disposable shadow, drop the marker, record the outcome.
+    /// disposable shadow and any leftover aside, drop the marker, record
+    /// the outcome.
     async fn abandon_build(&self, job_id: i64, status: RepinJobStatus, msg: &str) {
         tracing::warn!(
             event_type = "repin_abandoned",
@@ -418,10 +419,13 @@ impl RepinEngine {
             error = %msg,
             "repin job abandoned before any visible change; corpus untouched"
         );
-        // The marker is what licenses the next boot to delete this shadow:
-        // removing it over a failed sweep strands the staging root, which
-        // suppresses retention forever. Keep it and let the replay retry.
-        if sweep_dir(&shadow_root(&self.data_dir), "abandoned shadow") {
+        // The marker is what licenses the next boot to delete the staging
+        // roots — BOTH of them, since a leftover aside from an earlier
+        // job's failed sweep outlives its own marker (see
+        // `sweep_pre_swap_staging`). Removing the marker over a failed
+        // sweep strands whichever root survived, which suppresses
+        // retention forever. Keep it and let the replay retry.
+        if sweep_pre_swap_staging(&self.data_dir) {
             if let Err(e) = remove_marker(&self.data_dir) {
                 tracing::warn!(event_type = "repin_marker_error", error = %e, "marker removal failed");
             }
@@ -429,8 +433,8 @@ impl RepinEngine {
             tracing::warn!(
                 event_type = "repin_recovery_incomplete",
                 job_id,
-                "the abandoned shadow survived its sweep; keeping the marker \
-                 so the next boot retries the cleanup"
+                "a repin staging root survived the abandoned job's sweep; \
+                 keeping the marker so the next boot retries the cleanup"
             );
         }
         self.finish(job_id, status, Some(msg)).await;

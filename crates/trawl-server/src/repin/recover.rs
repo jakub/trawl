@@ -23,7 +23,7 @@ use std::path::Path;
 use trawl_core::schema::CanonicalType;
 
 use crate::catalog::FieldCatalog;
-use crate::repin::cutover::{swap_envs, sweep_dir};
+use crate::repin::cutover::{swap_envs, sweep_dir, sweep_pre_swap_staging};
 use crate::repin::marker::{
     RepinMarker, RepinPhase, aside_root, read_marker, remove_marker, shadow_root,
 };
@@ -121,9 +121,12 @@ pub fn recover_filesystem(
     }
 
     let (action, swept) = match marker.phase {
+        // Both staging roots: this job made no aside (it died before the
+        // swap), so a leftover one is an earlier job's, and this marker is
+        // the last license to delete it — see `sweep_pre_swap_staging`.
         RepinPhase::Building => (
             RecoveredAction::AbandonedBuild,
-            sweep_dir(&shadow, "abandoned build shadow"),
+            sweep_pre_swap_staging(data_dir),
         ),
         RepinPhase::Cutover => {
             swap_envs(data_dir, &shadow, &aside)?;
@@ -285,6 +288,40 @@ mod tests {
                 "the live corpus is untouched"
             );
         }
+    }
+
+    /// A leftover aside from an EARLIER job's failed sweep is reclaimed by
+    /// the abandoned build rather than inherited: the marker standing over
+    /// it is the last one that will ever name it, and leaving it while the
+    /// marker goes strands it (retention stays suppressed by its mere
+    /// existence, and nothing deletes a marker-less aside).
+    #[test]
+    fn an_abandoned_build_reclaims_a_leftover_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = live_root(tmp.path());
+        let shadow = shadow_with_new_generation(&data);
+        let aside = aside_root(&data);
+        std::fs::create_dir_all(aside.join("prod/2026-01-01/10")).unwrap();
+        std::fs::write(
+            aside.join("prod/2026-01-01/10/svc.parquet"),
+            b"superseded generation",
+        )
+        .unwrap();
+        write_marker(&data, &marker(RepinPhase::Building)).unwrap();
+
+        let recovered = recover_filesystem(&data, true).unwrap().expect("marker");
+        assert_eq!(recovered.action, RecoveredAction::AbandonedBuild);
+        assert!(
+            recovered.swept,
+            "both staging roots are gone, so the marker may be dropped"
+        );
+        assert!(!shadow.exists());
+        assert!(!aside.exists(), "the leftover aside is reclaimed too");
+        assert_eq!(
+            std::fs::read(data.join("prod/2026-01-01/10/svc.parquet")).unwrap(),
+            b"old generation",
+            "the live corpus is untouched"
+        );
     }
 
     /// A staging root that survives its sweep reports `swept == false` —

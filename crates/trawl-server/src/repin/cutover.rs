@@ -183,6 +183,34 @@ pub(crate) fn sweep_dir(path: &Path, what: &'static str) -> bool {
     }
 }
 
+/// Sweep BOTH staging roots for a job that ends before any swap — the
+/// live abandon path and the boot replay of a `building` marker — and
+/// report whether both are gone (the signal marker removal is gated on).
+///
+/// Such a job made no aside of its own, so anything under the aside root
+/// is an EARLIER job's outgoing generation whose best-effort sweep
+/// failed. It is superseded data by construction (an aside exists only
+/// past a cutover, and the swap is forward-only: the corpus already
+/// serves the generation that replaced it), and the marker standing right
+/// now is the LAST license to delete it — a marker-less aside is never
+/// removed ([`crate::repin::recover::recover_filesystem`] leaves it for
+/// an operator). Sweeping only the shadow and then dropping the marker is
+/// what strands it forever, with retention suppressed the whole time
+/// because [`crate::retention`] treats either staging root as a repin in
+/// flight.
+pub(crate) fn sweep_pre_swap_staging(data_dir: &Path) -> bool {
+    // Not `&&`: a shadow that survives must not skip the aside sweep.
+    let shadow_swept = sweep_dir(
+        &crate::repin::marker::shadow_root(data_dir),
+        "abandoned shadow",
+    );
+    let aside_swept = sweep_dir(
+        &crate::repin::marker::aside_root(data_dir),
+        "leftover aside",
+    );
+    shadow_swept && aside_swept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +218,43 @@ mod tests {
     fn write(path: &Path, body: &[u8]) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
+    }
+
+    /// The pre-swap sweep takes BOTH roots, and an undeletable shadow does
+    /// not short-circuit the aside sweep — a leftover aside would then keep
+    /// suppressing retention with no marker left to license its removal.
+    #[cfg(unix)]
+    #[test]
+    fn the_pre_swap_sweep_takes_the_aside_even_when_the_shadow_survives() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let shadow = crate::repin::marker::shadow_root(&data);
+        let aside = crate::repin::marker::aside_root(&data);
+        write(&data.join("prod/2026-01-01/10/svc.parquet"), b"current");
+        write(&shadow.join("prod/2026-01-01/10/svc.parquet"), b"new");
+        write(&aside.join("prod/2026-01-01/10/svc.parquet"), b"leftover");
+
+        let stuck = shadow.join("prod/2026-01-01/10");
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::remove_file(stuck.join("svc.parquet")).is_ok() {
+            // Running as root: mode bits are not enforced.
+            let _ = std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755));
+            return;
+        }
+
+        assert!(
+            !sweep_pre_swap_staging(&data),
+            "a surviving shadow keeps the marker"
+        );
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!aside.exists(), "the aside is swept regardless");
+        assert!(shadow.exists());
+        assert!(
+            sweep_pre_swap_staging(&data),
+            "with the permissions repaired the retry finishes"
+        );
     }
 
     /// A leftover `aside/{env}` from an earlier job's failed sweep must not
