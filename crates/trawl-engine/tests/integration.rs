@@ -1647,3 +1647,262 @@ fn export_hot_only_fallback_conforms_hot_columns_to_the_pin() {
          JSON-inferred type"
     );
 }
+
+// ── pinned rust_stages tail (ADR-0011 slice A′) ───────────────────────
+
+/// A source with a VARCHAR `status` column and kv-free messages, plus the
+/// VARCHAR pin for it.
+fn setup_pinned_kv() -> (Executor, String, FieldTypes, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pinned.parquet");
+    {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT unnest(['200', '404', '500', 'accepted', '1.5']) AS status, \
+             'plain text line' AS message) TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+    }
+    let mut ft = FieldTypes::new();
+    ft.insert("status", trawl_core::schema::CanonicalType::Varchar);
+    let exec = Executor::new().expect("executor should initialize");
+    (exec, format!("{}", path.display()), ft, dir)
+}
+
+/// The `rust_stages` lane is pin-aware: `… | extract kv | where <pinned
+/// cmp>` returns the same rows as the equivalent query without the kv
+/// split — the tail's `where` runs under the scope stamped at the split,
+/// not pin-blind.
+#[test]
+fn extract_kv_tail_where_is_pin_aware() {
+    let (exec, src, ft, _dir) = setup_pinned_kv();
+    let with_kv = exec
+        .run_query("* | extract kv | where status > 400", &src, &ft, 1000, 0)
+        .unwrap();
+    let without_kv = exec
+        .run_query("* | where status > 400", &src, &ft, 1000, 0)
+        .unwrap();
+    // '404' and '500' compare in the DECIMAL space; 'accepted' and '1.5'
+    // vs 400 are UNKNOWN/false; '200' is below.
+    assert_eq!(without_kv.row_count(), 2);
+    assert_eq!(
+        with_kv.row_count(),
+        without_kv.row_count(),
+        "the kv tail must answer exactly as the split-free query"
+    );
+
+    // The equality rung too: '200' matches == 200 as text.
+    let eq_kv = exec
+        .run_query("* | extract kv | where status == 200", &src, &ft, 1000, 0)
+        .unwrap();
+    assert_eq!(eq_kv.row_count(), 1);
+}
+
+/// A rename BEFORE the kv split remaps the pin in the stamped scope, so
+/// the tail's `where` under the new name stays pin-aware.
+#[test]
+fn extract_kv_tail_after_rename_carries_the_remapped_pin() {
+    let (exec, src, ft, _dir) = setup_pinned_kv();
+    let result = exec
+        .run_query(
+            "* | rename status as st | extract kv | where st > 400",
+            &src,
+            &ft,
+            1000,
+            0,
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 2, "the pin travels under the new name");
+}
+
+/// The pin-blind door stays pin-blind: the same tail without pins keeps
+/// literal-driven evaluation (a string status has no numeric reading in
+/// the streaming evaluator, so nothing matches).
+#[test]
+fn extract_kv_tail_without_pins_stays_literal_driven() {
+    let (exec, src, _ft, _dir) = setup_pinned_kv();
+    let result = exec
+        .run_query(
+            "* | extract kv | where status > 400",
+            &src,
+            &FieldTypes::new(),
+            1000,
+            0,
+        )
+        .unwrap();
+    assert_eq!(result.row_count(), 0, "embedded mode keeps today's answer");
+}
+
+/// A source holding one row at `_time = 2026-01-01 05:30:00` UTC, plus
+/// the TIMESTAMP pin the envelope seed gives `_time` on every install.
+fn setup_pinned_time() -> (Executor, String, FieldTypes, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("timed.parquet");
+    {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT TIMESTAMP '2026-01-01 05:30:00' AS _time, \
+             'plain text line' AS message) TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+    }
+    let mut ft = FieldTypes::new();
+    ft.insert("_time", trawl_core::schema::CanonicalType::Timestamp);
+    let exec = Executor::new().expect("executor should initialize");
+    (exec, format!("{}", path.display()), ft, dir)
+}
+
+/// The tail's pin-aware TIMESTAMP comparison reads the STORED instant, not
+/// the caller's display shift: `utc_offset_secs` is a rendering knob, so
+/// the same query must answer the same rows in every display zone — and
+/// exactly what the split-free query answers.
+#[test]
+fn extract_kv_tail_timestamp_compare_ignores_the_display_offset() {
+    let (exec, src, ft, _dir) = setup_pinned_time();
+    let dsl = "* | extract kv | where _time > \"2026-01-01T05:00:00Z\"";
+    for offset in [0, -18_000, 19_800] {
+        let result = exec.run_query(dsl, &src, &ft, 1000, offset).unwrap();
+        assert_eq!(
+            result.row_count(),
+            1,
+            "05:30Z is after 05:00Z whatever zone the client displays in (offset {offset})"
+        );
+    }
+    // The threshold that genuinely excludes the row excludes it everywhere.
+    let after = "* | extract kv | where _time > \"2026-01-01T06:00:00Z\"";
+    for offset in [0, -18_000, 19_800] {
+        assert_eq!(
+            exec.run_query(after, &src, &ft, 1000, offset)
+                .unwrap()
+                .row_count(),
+            0,
+            "offset {offset}"
+        );
+    }
+    // And it agrees with the same predicate without the kv split.
+    assert_eq!(
+        exec.run_query(
+            "* | where _time > \"2026-01-01T05:00:00Z\"",
+            &src,
+            &ft,
+            1000,
+            -18_000,
+        )
+        .unwrap()
+        .row_count(),
+        1,
+    );
+}
+
+/// Running the tail over UTC does not cost the caller its display zone:
+/// the surviving TIMESTAMP columns are shifted back afterwards, so the
+/// rendered cell is the same one the split-free query prints.
+#[test]
+fn extract_kv_tail_still_renders_timestamps_in_the_display_zone() {
+    let (exec, src, ft, _dir) = setup_pinned_time();
+    let with_kv = exec
+        .run_query("* | extract kv | head 5", &src, &ft, 1000, -18_000)
+        .unwrap();
+    let without_kv = exec
+        .run_query("* | head 5", &src, &ft, 1000, -18_000)
+        .unwrap();
+    let cell = |result: &QueryResult| {
+        let idx = result
+            .columns
+            .iter()
+            .position(|c| c.name == "_time")
+            .expect("_time column");
+        result.rows[0][idx].clone()
+    };
+    assert_eq!(cell(&with_kv), Value::String("2026-01-01 00:30:00".into()));
+    assert_eq!(cell(&with_kv), cell(&without_kv));
+}
+
+/// The display shift follows the tail's own lineage: a timestamp column
+/// renamed INSIDE the tail still renders in the caller's zone under its
+/// new name — the value is untransformed, only the label moved.
+#[test]
+fn extract_kv_tail_rename_keeps_the_display_zone() {
+    let (exec, src, ft, _dir) = setup_pinned_time();
+    let result = exec
+        .run_query(
+            "* | extract kv | rename _time as t | table t",
+            &src,
+            &ft,
+            1000,
+            -18_000,
+        )
+        .unwrap();
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(result.columns[0].name, "t");
+    assert_eq!(
+        result.rows[0][0],
+        Value::String("2026-01-01 00:30:00".into()),
+        "the renamed column is still the stored instant and shifts with it"
+    );
+}
+
+/// The reviewer's repro: `let t2 = _time` copies the value verbatim, so
+/// both columns must show the SAME rendering in the caller's zone — never
+/// one local and one UTC side by side.
+#[test]
+fn extract_kv_tail_alias_copy_keeps_the_display_zone() {
+    let (exec, src, ft, _dir) = setup_pinned_time();
+    let result = exec
+        .run_query(
+            "* | extract kv | let t2 = _time | table _time, t2",
+            &src,
+            &ft,
+            1000,
+            -18_000,
+        )
+        .unwrap();
+    let cell = |name: &str| {
+        let idx = result
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{name} column"));
+        result.rows[0][idx].clone()
+    };
+    assert_eq!(cell("_time"), Value::String("2026-01-01 00:30:00".into()));
+    assert_eq!(
+        cell("t2"),
+        cell("_time"),
+        "an alias copy is the same instant and must display in the same zone"
+    );
+}
+
+/// A COMPUTED value is the tail's own, not the stored rendering: the
+/// lineage kills it and it stays exactly as the tail produced it (UTC
+/// text here) — the honest reading for a transformed value, never a
+/// re-shifted guess.
+#[test]
+fn extract_kv_tail_computed_value_stays_as_rendered() {
+    let (exec, src, ft, _dir) = setup_pinned_time();
+    let result = exec
+        .run_query(
+            "* | extract kv | let t3 = coalesce(_time, _time) | table _time, t3",
+            &src,
+            &ft,
+            1000,
+            -18_000,
+        )
+        .unwrap();
+    let cell = |name: &str| {
+        let idx = result
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{name} column"));
+        result.rows[0][idx].clone()
+    };
+    assert_eq!(cell("_time"), Value::String("2026-01-01 00:30:00".into()));
+    assert_eq!(
+        cell("t3"),
+        Value::String("2026-01-01 05:30:00".into()),
+        "a derived value keeps the tail's own rendering"
+    );
+}

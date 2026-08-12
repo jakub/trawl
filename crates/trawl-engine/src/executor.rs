@@ -12,12 +12,17 @@ use std::sync::Arc;
 
 use duckdb::Connection;
 use duckdb::types::{TimeUnit, ValueRef};
+use trawl_core::ast::{PipeStage, Spanned};
 use trawl_core::emitter::{self, EmittedQuery, SqlValue};
 use trawl_core::parser;
-use trawl_core::schema::FieldTypes;
+use trawl_core::pin_scope::PinScope;
+use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::error::EngineError;
 use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value};
+
+/// Names of the result columns `DuckDB` returned as TIMESTAMP.
+type TimestampColumns = Vec<String>;
 
 /// Query executor backed by an in-memory `DuckDB` connection.
 #[derive(Debug)]
@@ -107,9 +112,17 @@ impl Executor {
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit_with_pins(&ast, source, pins)?;
-        let mut result = self.execute_emitted(&emitted, max_rows, utc_offset_secs)?;
+        let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
+        let (mut result, timestamp_columns) =
+            self.execute_emitted_tracked(&emitted, max_rows, sql_offset)?;
         if !emitted.rust_stages.is_empty() {
-            result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
+            result = crate::post_process::apply_rust_stages(
+                result,
+                &emitted.rust_stages,
+                &emitted.rust_stage_pins,
+            )?;
+            let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
+            shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
         }
         if emitted.needs_column_reorder {
             result.reorder_log_columns();
@@ -145,7 +158,8 @@ impl Executor {
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, hot_pins, pins)?;
-        let mut outcome = self.execute_emitted(&emitted, max_rows, utc_offset_secs);
+        let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
+        let mut outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset);
 
         // A hot value disagreeing with a catalog pin is already conformed on
         // the union's hot branch by the emitter (TRY_CAST to NULL), and
@@ -165,19 +179,19 @@ impl Executor {
         // pointing at hour dirs holding no file of its own. Retry over just
         // the elements that match a file, so the cold rows that do exist are
         // never silently dropped (ADR-0008).
-        if matches!(&outcome, Ok(r) if r.columns.is_empty())
+        if matches!(&outcome, Ok((r, _)) if r.columns.is_empty())
             && let Some(pruned) = self.pruned_cold_source(source)
         {
             let pruned_emitted =
                 emitter::emit_with_hot_source(&ast, &pruned, hot_source, hot_pins, pins)?;
-            outcome = self.execute_emitted(&pruned_emitted, max_rows, utc_offset_secs);
+            outcome = self.execute_emitted_tracked(&pruned_emitted, max_rows, sql_offset);
         }
 
         // Classify the (possibly retried) outcome, then route on the pure
         // `cold_action` decision so the outcome policy stays unit-testable.
         let class = match &outcome {
             // Columns present → real result (possibly empty rows).
-            Ok(r) if !r.columns.is_empty() => HotColdOutcome::Columns,
+            Ok((r, _)) if !r.columns.is_empty() => HotColdOutcome::Columns,
             // No columns: the source matched no file at all, or the prune
             // above could not narrow it. Hot-only is safe only if a presence
             // check confirms there is no cold data to hide.
@@ -198,7 +212,7 @@ impl Executor {
             // when there is no cold data it could hide.
             ColdAction::HotOnlyIfNoColdFiles => !self.cold_files_present(source),
         };
-        let mut result = if hot_only {
+        let (mut result, timestamp_columns) = if hot_only {
             // Hot-only keeps BOTH halves of the interpretation: the same
             // comparison pins, and the same hot-column conformance the
             // union's hot branch applies. Reading the raw ndjson would let
@@ -206,10 +220,10 @@ impl Executor {
             // over a VARCHAR-pinned field would match a hot numeric `200`
             // here and stop matching the moment a parquet file appeared.
             let hot_emitted = emitter::emit_hot_only(&ast, hot_source, hot_pins, pins)?;
-            match self.execute_emitted(&hot_emitted, max_rows, utc_offset_secs) {
+            match self.execute_emitted_tracked(&hot_emitted, max_rows, sql_offset) {
                 // Hot-only also hit a binder/emit error (e.g. empty ndjson
                 // between compaction cycles). Treat as empty, not error.
-                Err(EngineError::Emit(_)) => QueryResult::empty(),
+                Err(EngineError::Emit(_)) => (QueryResult::empty(), TimestampColumns::new()),
                 other => other?,
             }
         } else if class == HotColdOutcome::NoColumns {
@@ -223,7 +237,13 @@ impl Executor {
             outcome?
         };
         if !emitted.rust_stages.is_empty() {
-            result = crate::post_process::apply_rust_stages(result, &emitted.rust_stages)?;
+            result = crate::post_process::apply_rust_stages(
+                result,
+                &emitted.rust_stages,
+                &emitted.rust_stage_pins,
+            )?;
+            let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
+            shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
         }
         if emitted.needs_column_reorder {
             result.reorder_log_columns();
@@ -243,6 +263,22 @@ impl Executor {
         max_rows: usize,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
+        self.execute_emitted_tracked(query, max_rows, utc_offset_secs)
+            .map(|(result, _)| result)
+    }
+
+    /// [`Self::execute_emitted`], additionally reporting which result
+    /// columns `DuckDB` returned as TIMESTAMP.
+    ///
+    /// Only the Rust-tail lane needs that: it runs over an unshifted
+    /// rendering and re-applies the display offset afterwards
+    /// ([`shift_timestamp_columns`]).
+    fn execute_emitted_tracked(
+        &self,
+        query: &EmittedQuery,
+        max_rows: usize,
+        utc_offset_secs: i32,
+    ) -> Result<(QueryResult, TimestampColumns), EngineError> {
         with_raw_fallback(query, |q| {
             self.execute_emitted_once(q, max_rows, utc_offset_secs)
         })
@@ -253,10 +289,12 @@ impl Executor {
         query: &EmittedQuery,
         max_rows: usize,
         utc_offset_secs: i32,
-    ) -> Result<QueryResult, EngineError> {
+    ) -> Result<(QueryResult, TimestampColumns), EngineError> {
         let mut stmt = match self.conn.prepare(&query.sql) {
             Ok(s) => s,
-            Err(e) if is_no_files_error(&e) => return Ok(QueryResult::empty()),
+            Err(e) if is_no_files_error(&e) => {
+                return Ok((QueryResult::empty(), TimestampColumns::new()));
+            }
             Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
             Err(e) => return Err(e.into()),
         };
@@ -268,7 +306,9 @@ impl Executor {
         // after DuckDB resolves table-valued functions like read_parquet()
         let mut result_rows = match stmt.query(param_refs.as_slice()) {
             Ok(r) => r,
-            Err(e) if is_no_files_error(&e) => return Ok(QueryResult::empty()),
+            Err(e) if is_no_files_error(&e) => {
+                return Ok((QueryResult::empty(), TimestampColumns::new()));
+            }
             Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
             Err(e) => return Err(e.into()),
         };
@@ -286,19 +326,35 @@ impl Executor {
             .map(|name| Column { name })
             .collect();
 
+        // A column is TIMESTAMP the first time a non-NULL cell of it comes
+        // back as one — cheaper than asking for the declared type, and an
+        // all-NULL column has nothing to shift anyway. The extra
+        // `get_ref_unwrap` costs one lookup per column until it is flagged.
+        let mut is_timestamp = vec![false; col_count];
+
         let mut rows = Vec::new();
         while let Some(row) = result_rows.next()? {
             if rows.len() >= max_rows {
                 return Err(EngineError::ResultTooLarge(max_rows));
             }
             let mut cells = Vec::with_capacity(col_count);
-            for i in 0..col_count {
+            for (i, seen) in is_timestamp.iter_mut().enumerate() {
+                if !*seen && matches!(row.get_ref_unwrap(i), ValueRef::Timestamp(..)) {
+                    *seen = true;
+                }
                 cells.push(extract_value(row, i, utc_offset_secs));
             }
             rows.push(cells);
         }
 
-        Ok(QueryResult { columns, rows })
+        let timestamp_columns: TimestampColumns = columns
+            .iter()
+            .zip(&is_timestamp)
+            .filter(|&(_, &ts)| ts)
+            .map(|(col, _)| col.name.clone())
+            .collect();
+
+        Ok((QueryResult { columns, rows }, timestamp_columns))
     }
 
     /// Whether the cold source has any concrete files behind it.
@@ -1069,6 +1125,98 @@ fn format_timestamp(unit: TimeUnit, val: i64, utc_offset_secs: i32) -> String {
         let trimmed = frac.trim_end_matches('0');
         format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}.{trimmed}")
     }
+}
+
+/// The offset the SQL result is RENDERED with, given the display offset
+/// the caller asked for.
+///
+/// Zero whenever a Rust tail follows, because that tail is a second
+/// evaluator, not a printer: its `| where`/`| let` are pin-aware
+/// (ADR-0011 slice A′) and read a TIMESTAMP cell through
+/// `compare::conformed_timestamp`, which takes a zoneless text as UTC. A
+/// display-shifted rendering handed to it would compare local wall-clock
+/// text against a UTC instant and skew every timestamp comparison by the
+/// client's offset — silently dropping rows for any non-UTC client. So
+/// the tail runs over UTC and the shift is re-applied afterwards
+/// ([`shift_timestamp_columns`]), which is the all-SQL path's order too:
+/// compare the stored instant, shift last.
+fn sql_render_offset(emitted: &EmittedQuery, utc_offset_secs: i32) -> i32 {
+    if emitted.rust_stages.is_empty() {
+        utc_offset_secs
+    } else {
+        0
+    }
+}
+
+/// Follow the SQL result's TIMESTAMP columns through the Rust tail's own
+/// rename/alias lineage.
+///
+/// The tail re-uses the pin-scope walk ([`PinScope::advance`], ADR-0011
+/// slice A′) with a scope holding exactly the tracked columns: a
+/// `rename`d timestamp column carries its tracking to the new name, a
+/// bare-alias `let t2 = _time` copies it, and a computed value or
+/// aggregate output — the tail's own, no longer the stored rendering —
+/// is killed by the walk and stays as the tail rendered it. Both display
+/// lineage and comparison pins follow the SAME stage rules, so they can
+/// never disagree about which column is "still `_time`".
+fn tail_timestamp_scope(timestamp_columns: &[String], stages: &[Spanned<PipeStage>]) -> PinScope {
+    let mut seed = FieldTypes::new();
+    for name in timestamp_columns {
+        seed.insert(name, CanonicalType::Timestamp);
+    }
+    let mut scope = PinScope::root(&seed);
+    for stage in stages {
+        scope.advance(&stage.node);
+    }
+    scope
+}
+
+/// Re-apply the display offset to the TIMESTAMP columns that survived the
+/// Rust tail, resolved through the tail's lineage
+/// ([`tail_timestamp_scope`]).
+///
+/// A column the lineage cannot vouch for — an aggregate output, a
+/// computed `let` — displays UTC: the honest reading for a value the
+/// tail has already transformed, and never a wrong instant. Cells the
+/// tail replaced with non-timestamp text are guarded per-cell by
+/// [`shift_display_timestamp`]'s parse.
+fn shift_timestamp_columns(result: &mut QueryResult, tracked: &PinScope, utc_offset_secs: i32) {
+    if utc_offset_secs == 0 || tracked.is_empty() {
+        return;
+    }
+    let targets: Vec<usize> = result
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, col)| tracked.pin_for(&col.name).is_some())
+        .map(|(idx, _)| idx)
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    for row in &mut result.rows {
+        for &idx in &targets {
+            if let Some(Value::String(text)) = row.get_mut(idx)
+                && let Some(shifted) = shift_display_timestamp(text, utc_offset_secs)
+            {
+                *text = shifted;
+            }
+        }
+    }
+}
+
+/// Re-render [`format_timestamp`]'s UTC output in the display offset.
+///
+/// `None` when the text is not that rendering — a cell the tail replaced
+/// with something else, or a year outside `chrono`'s parse — in which
+/// case it is left exactly as it stands.
+fn shift_display_timestamp(text: &str, utc_offset_secs: i32) -> Option<String> {
+    let naive = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").ok()?;
+    Some(format_timestamp(
+        TimeUnit::Microsecond,
+        naive.and_utc().timestamp_micros(),
+        utc_offset_secs,
+    ))
 }
 
 /// Convert a date (days since Unix epoch) to YYYY-MM-DD.

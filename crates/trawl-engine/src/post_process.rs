@@ -15,6 +15,7 @@
 use indexmap::IndexSet;
 use serde_json::{Map, Value};
 use trawl_core::ast::{PipeStage, SortDirection, Spanned};
+use trawl_core::pin_scope::PinScope;
 use trawl_core::stream::{self, CompiledStage, StageResult, StreamPlan};
 
 use crate::error::EngineError;
@@ -24,9 +25,16 @@ use crate::value::{Column, QueryResult};
 ///
 /// Converts the columnar `QueryResult` into JSON events, compiles a
 /// stream plan from the given stages, runs it, and converts back.
+///
+/// `pins` is the pin scope stamped at the kv split
+/// (`EmittedQuery::rust_stage_pins`, ADR-0011 slice A′), so the tail's
+/// `where`/`let` evaluate under the same interpretation the SQL prefix
+/// used. Sort stages are partitioned out below without walking the scope
+/// — they pass it through unchanged.
 pub fn apply_rust_stages(
     result: QueryResult,
     stages: &[Spanned<PipeStage>],
+    pins: &PinScope,
 ) -> Result<QueryResult, EngineError> {
     if stages.is_empty() {
         return Ok(result);
@@ -42,7 +50,7 @@ pub fn apply_rust_stages(
         .cloned()
         .partition(|s| !matches!(s.node, PipeStage::Sort(_)));
 
-    let plan = stream::compile_stream_plan(&plan_stages).map_err(|e| {
+    let plan = stream::compile_stream_plan(&plan_stages, pins).map_err(|e| {
         EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
             message: format!("post-processing: {e}"),
         })
@@ -306,7 +314,7 @@ mod tests {
             keyword: "extract",
         }))];
 
-        let out = apply_rust_stages(result, &stages).unwrap();
+        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
         assert_eq!(out.columns.len(), 3); // message, user, status
         assert_eq!(out.rows.len(), 2);
 
@@ -348,12 +356,55 @@ mod tests {
             })),
         ];
 
-        let out = apply_rust_stages(result, &stages).unwrap();
+        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
         assert_eq!(out.rows.len(), 1);
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
         assert_eq!(
             out.rows[0][col_idx("method")],
             crate::value::Value::String("POST".into())
+        );
+    }
+
+    /// The kv tail is the ONLY lane behind `extract kv`: a `let` sibling
+    /// reference naming no column of the pre-stage row binds the sibling's
+    /// value here exactly as `DuckDB`'s lateral column alias does in the
+    /// SQL lane, so `| extract kv | let ms = 1000, total = ms * 2` cannot
+    /// answer NULL where the same pipeline without `extract kv` answers
+    /// 2000.
+    #[test]
+    fn kv_tail_let_sibling_binds_the_alias() {
+        let result = make_result(
+            &["message"],
+            vec![vec![crate::value::Value::String("method=GET".into())]],
+        );
+
+        let stages = vec![
+            span(PipeStage::Extract(ExtractStage {
+                mode: ExtractMode::KeyValue { separator: '=' },
+                source_field: None,
+                keyword: "extract",
+            })),
+            span(PipeStage::Let(LetStage {
+                assignments: vec![
+                    ("ms".into(), span(Expr::Literal(LiteralValue::Int(1000)))),
+                    (
+                        "total".into(),
+                        span(Expr::Binary {
+                            lhs: Box::new(span(Expr::FieldRef("ms".into()))),
+                            op: BinaryOp::Mul,
+                            rhs: Box::new(span(Expr::Literal(LiteralValue::Int(2)))),
+                        }),
+                    ),
+                ],
+                keyword: "let",
+            })),
+        ];
+
+        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
+        let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
+        assert_eq!(
+            out.rows[0][col_idx("total")],
+            crate::value::Value::Integer(2000)
         );
     }
 
@@ -384,7 +435,7 @@ mod tests {
             })),
         ];
 
-        let out = apply_rust_stages(result, &stages).unwrap();
+        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
         assert_eq!(out.rows.len(), 2);
 
         // Find GET row — should have count=2.
@@ -422,7 +473,7 @@ mod tests {
             })),
         ];
 
-        let out = apply_rust_stages(result, &stages).unwrap();
+        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
         let scores: Vec<_> = out.rows.iter().map(|r| &r[col_idx("score")]).collect();
         assert_eq!(
@@ -450,7 +501,7 @@ mod tests {
             keyword: "extract",
         }))];
 
-        let out = apply_rust_stages(result, &stages).unwrap();
+        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
         assert_eq!(
             out.rows[0][col_idx("user")],
@@ -477,7 +528,7 @@ mod tests {
             keyword: "extract",
         }))];
 
-        let out = apply_rust_stages(result, &stages).unwrap();
+        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
         assert_eq!(
             out.rows[0][col_idx("count")],
@@ -505,7 +556,7 @@ mod tests {
             source_field: None,
             keyword: "extract",
         }))];
-        let out = apply_rust_stages(result, &stages).unwrap();
+        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
         assert!(out.is_empty());
     }
 }

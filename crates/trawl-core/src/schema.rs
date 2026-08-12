@@ -288,6 +288,27 @@ impl FieldTypes {
         self.get(&catalog_key(dsl_name))
     }
 
+    /// Remove a field's pin, if present.
+    ///
+    /// No-op fast path when the name isn't pinned, so an unshared map is
+    /// never copied for nothing — the pin-scope walk (`crate::pin_scope`)
+    /// removes client-chosen names that mostly aren't in the catalog.
+    pub fn remove(&mut self, field: &str) {
+        if self.entries.contains_key(field) {
+            std::sync::Arc::make_mut(&mut self.entries).remove(field);
+        }
+    }
+
+    /// Restrict the map to the given field names, dropping every other
+    /// pin. Same fast path as [`Self::remove`]: when nothing would be
+    /// dropped, the shared map is left untouched.
+    pub fn restrict_to(&mut self, keep: &[String]) {
+        if self.entries.keys().all(|k| keep.contains(k)) {
+            return;
+        }
+        std::sync::Arc::make_mut(&mut self.entries).retain(|k, _| keep.contains(k));
+    }
+
     /// Whether the map holds no pins.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -523,6 +544,30 @@ mod tests {
         );
         assert!(!ft.is_empty());
         assert!(FieldTypes::new().is_empty());
+    }
+
+    #[test]
+    fn remove_and_restrict_edit_copy_on_write_with_noop_fast_paths() {
+        let mut ft = FieldTypes::new();
+        ft.insert("status", CanonicalType::Varchar);
+        ft.insert("dur", CanonicalType::BigInt);
+        let shared = ft.clone();
+
+        // No-op paths leave the shared Arc untouched.
+        ft.remove("absent");
+        ft.restrict_to(&["status".into(), "dur".into(), "extra".into()]);
+        assert!(std::sync::Arc::ptr_eq(&ft.entries, &shared.entries));
+
+        // Real removals copy and don't reach the other handle.
+        ft.remove("status");
+        assert_eq!(ft.get("status"), None);
+        assert_eq!(shared.get("status"), Some(CanonicalType::Varchar));
+
+        let mut ft2 = shared.clone();
+        ft2.restrict_to(&["dur".into()]);
+        assert_eq!(ft2.get("status"), None);
+        assert_eq!(ft2.get("dur"), Some(CanonicalType::BigInt));
+        assert_eq!(shared.get("status"), Some(CanonicalType::Varchar));
     }
 
     #[test]

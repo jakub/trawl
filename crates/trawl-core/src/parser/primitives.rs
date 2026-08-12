@@ -9,7 +9,7 @@
 
 use chumsky::prelude::*;
 
-use crate::ast::{FilterOp, LiteralValue, Spanned, TimeUnit, TrawlDuration};
+use crate::ast::{FilterOp, FloatLiteral, LiteralValue, Spanned, TimeUnit, TrawlDuration};
 
 /// Shorthand for our parser type — `&str` input, `Rich` errors.
 pub(crate) type ParserInput<'src> = &'src str;
@@ -58,8 +58,12 @@ pub(crate) fn int<'src>() -> impl Parser<'src, ParserInput<'src>, i64, ParserExt
 }
 
 /// Parse a float (must contain a `.` to distinguish from int).
-pub(crate) fn float<'src>() -> impl Parser<'src, ParserInput<'src>, f64, ParserExtra<'src>> + Clone
-{
+///
+/// The token is kept beside the parsed double: `f64` is lossy past 53 bits
+/// and pin-aware pipeline comparison binds the literal's TEXT, never the
+/// re-rendered double (ADR-0011 ruling #6, [`FloatLiteral`]).
+pub(crate) fn float<'src>()
+-> impl Parser<'src, ParserInput<'src>, FloatLiteral, ParserExtra<'src>> + Clone {
     just('-')
         .or_not()
         .then(text::int(10))
@@ -67,6 +71,7 @@ pub(crate) fn float<'src>() -> impl Parser<'src, ParserInput<'src>, f64, ParserE
         .to_slice()
         .try_map(|s: &str, span| {
             s.parse::<f64>()
+                .map(|value| FloatLiteral::new(value, s))
                 .map_err(|e| Rich::custom(span, format!("invalid float: {e}")))
         })
         .labelled("float")
@@ -339,9 +344,27 @@ mod tests {
     #[test]
     fn test_float() {
         let v = float().parse("3.25").into_result().unwrap();
-        assert!((v - 3.25).abs() < f64::EPSILON);
+        assert!((v.value() - 3.25).abs() < f64::EPSILON);
+        assert_eq!(v.text(), "3.25");
         let v = float().parse("-0.5").into_result().unwrap();
-        assert!((v - -0.5).abs() < f64::EPSILON);
+        assert!((v.value() - -0.5).abs() < f64::EPSILON);
+        assert_eq!(v.text(), "-0.5");
+    }
+
+    /// The token survives the parse verbatim, trailing zeros and all —
+    /// `f64` is lossy past 53 bits and pin-aware comparison binds the TEXT
+    /// (ADR-0011 ruling #6), so re-rendering the double would silently
+    /// answer for a different number.
+    #[test]
+    fn test_float_keeps_source_token() {
+        let v = float().parse("9007199254740993.0").into_result().unwrap();
+        assert_eq!(v.text(), "9007199254740993.0");
+        // …which the parsed double cannot express: it rounds to the
+        // adjacent even.
+        assert_eq!(v.value().to_string(), "9007199254740992");
+
+        let v = float().parse("1.50").into_result().unwrap();
+        assert_eq!(v.text(), "1.50");
     }
 
     #[test]

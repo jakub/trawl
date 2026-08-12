@@ -191,12 +191,80 @@ Two deliberate boundaries:
 
 - **Numeric-literal detection is by content, not quoting**: the parser
   discards quote provenance, so `status>"400"` and `status>400` are the
-  same query.
-- **Embedded mode (`--data`) and the pipeline `| where` stage stay
-  literal-driven** — there is no catalog behind `--data`, and `| where`
-  is a typed expression evaluated after the search stage. `| where
-  status > 400` over a VARCHAR-pinned column can therefore still error
-  where the search-stage `status>400` filters cleanly.
+  same query — in the search stage and in `| where` alike (`where
+  status == "400"` binds exactly as `where status == 400`).
+- **Embedded mode (`--data`) stays literal-driven** — there is no
+  catalog behind `--data`, so every comparison keeps its pre-catalog
+  behavior there.
+
+#### Pin-aware `| where` and `| let` (ADR-0011 slice A′)
+
+A **bare field-vs-literal comparison** inside `| where` or `| let`
+consults the same catalog pin the search stage does, and adopts exactly
+the same rule table: on a VARCHAR pin `where status > 400` compares in
+`DECIMAL(38,6)` (a value with no reading is unknown, never an error),
+`where status == 200` matches the stored text *or* its numeric reading,
+`where status in (200, "accepted")` routes each element through the
+equality rule; pattern operators (`matches`, `like`, `ilike`) against a
+typed pin target the same canonical text form globs do. Both operand
+orders bind (`400 < status` is `status > 400`); for pattern operators
+only the *left* operand is a subject — the right operand is the pattern.
+Live tail (SSE) and the batch tail behind `extract kv` evaluate the same
+rules, so a pipeline means one thing in every lane.
+
+**Excluded shapes** stay literal-driven, structurally: field-vs-field
+(`where a == b`), function-wrapped fields (`where lower(status) == "a"`),
+arithmetic on the field (`where status * 2 > 400`), `== null`, and a
+pattern with the field on the right (`where "x" matches f`). Unpinned
+fields are unchanged everywhere.
+
+**Which pin applies follows the pipeline**, not a flat name lookup:
+
+- `rename status as st | where st > 400` is pin-aware under the new name
+  (and `status` no longer resolves the pin).
+- `let status = <expr> | where status > 400` is literal-driven — a
+  computed value has no pin. A **bare alias** copies the pin:
+  `let s2 = status | where s2 > 400` is pin-aware. Within one `let`, a
+  reference to a sibling target resolves the way the SQL does — an
+  existing *column* of that name wins (so `let a = 1, b = a` gives `b`
+  the original `a`, not `1`), and only a name the row doesn't carry reads
+  the sibling's freshly computed value (`let ms = 1000, total = ms * 2`
+  gives `total = 2000`). *Pins* stay strictly pre-stage either way, so
+  `let a = status, b = a` gives `b` no pin.
+- Aggregations keep their group-by keys and nothing else:
+  `stats count() by status | where status == 200` stays pin-aware, while
+  aggregate outputs (`count`, aliases, the `timechart` time bucket) are
+  never pinned.
+- `extract <regex>` unpins its capture-group names; `extract kv` passes
+  the scope through — with one caveat: a kv key that *shadows* a pinned
+  field name is read under that pin. Confine kv extraction to fields
+  that don't collide with pinned names if that matters.
+- `from saved` reads another query's output: no pins apply.
+
+**Timestamps in the `extract kv` tail** are compared as stored instants
+and shifted to your display timezone *last*, like every other lane. The
+shift follows the tail's own lineage: `rename _time as t` and a bare
+alias `let t2 = _time` still render in your zone, while a *computed*
+value (`let t = coalesce(_time, x)`, aggregate outputs) is a value the
+tail derived and renders as UTC text.
+
+**One NULL-policy difference from the search stage, kept on purpose**:
+the pipeline `!=` does *not* carry the search stage's `OR field IS NULL`
+widening. `| where f != x` over an event without `f` is unknown and
+filtered — exactly what the pin-blind `| where` always answered — so a
+repin never changes missing-field semantics. Use the search-stage `f!=x`
+when you want the missing-field net.
+
+:::caution[Changed in the ADR-0011 slice A′ release]
+`| where` and `| let` comparisons on pinned fields change answers:
+`| where status > 400` over a VARCHAR pin stops raising a Conversion
+error and starts filtering; `== 200` gains the numeric arm (it now
+matches a stored `"200.0"`); on TIMESTAMP pins live-tail ordered
+comparisons become the instant comparison batch always performed instead
+of lexical text. The envelope seed pins `host`/`service`/`env`/`message`/
+`severity_text`/`_raw` as VARCHAR on every install, so this is live on
+day one.
+:::
 
 ### Severity: the `level` alias
 

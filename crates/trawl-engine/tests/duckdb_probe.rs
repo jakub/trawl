@@ -2608,3 +2608,122 @@ fn the_varchar_pin_stores_the_text_form_so_both_lanes_must_share_one() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Slice A′ (issue #66): the pinned comparison shapes in NEW positions —
+// SELECT-list values (`| let`) and the LIKE/ILIKE pattern operators.
+// ---------------------------------------------------------------------------
+
+/// The VARCHAR-pin comparison shapes as SELECT-LIST values: `| let x =
+/// status >= 400` stores TRUE/FALSE/NULL per row, three-valued exactly as
+/// the where-position shapes filter — UNKNOWN is a stored NULL, not an
+/// error and not FALSE.
+#[test]
+fn pinned_comparison_shapes_as_select_list_values() {
+    let conn = varchar_status_conn();
+    let read = |expr: &str, row_filter: &str| -> Option<bool> {
+        conn.query_row(
+            &format!("SELECT {expr} FROM t WHERE v = '{row_filter}'"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    // NumericOnText (`status >= 400`): the DECIMAL space on both sides.
+    let ordered = format!("{} >= {}", decimal_reading("v"), decimal_reading("'400'"));
+    assert_eq!(read(&ordered, "404"), Some(true));
+    assert_eq!(read(&ordered, "200"), Some(false));
+    assert_eq!(read(&ordered, "accepted"), None, "no reading = stored NULL");
+
+    // TextOrNumeric (`status == 200`): text arm OR COALESCEd reading.
+    let eq = format!(
+        "(v = '200' OR COALESCE({} = {}, FALSE))",
+        decimal_reading("v"),
+        decimal_reading("'200'")
+    );
+    assert_eq!(read(&eq, "200"), Some(true));
+    assert_eq!(read(&eq, "404"), Some(false));
+    assert_eq!(
+        read(&eq, "accepted"),
+        Some(false),
+        "COALESCE keeps it total"
+    );
+
+    // The Strict `!=` complement — total over non-NULL values, and NULL
+    // over a NULL column (no `OR v IS NULL` widening in the pipeline).
+    let ne = format!(
+        "(v != '200' AND COALESCE({} != {}, TRUE))",
+        decimal_reading("v"),
+        decimal_reading("'200'")
+    );
+    assert_eq!(read(&ne, "accepted"), Some(true));
+    assert_eq!(read(&ne, "200"), Some(false));
+    let over_null: Option<bool> = conn
+        .query_row(
+            &format!("SELECT {ne} FROM (SELECT CAST(NULL AS VARCHAR) AS v)"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        over_null, None,
+        "a NULL column stays UNKNOWN under strict !="
+    );
+}
+
+/// PRE-A′ regression, pinned: the pin-blind SELECT-list comparison a
+/// `| let x = status > 400` emitted binds an INTEGER against the VARCHAR
+/// column and REFUSES to bind — the whole query errors. This is the
+/// error the slice-A′ rules replace with the three-valued answer above.
+#[test]
+fn pin_blind_select_list_comparison_on_varchar_column_errors() {
+    let conn = varchar_status_conn();
+    let outcome: Result<Option<bool>, _> =
+        conn.query_row("SELECT (v > ?) FROM t WHERE v = '404'", [400i64], |row| {
+            row.get(0)
+        });
+    let err = outcome.expect_err("VARCHAR-vs-BIGINT must refuse to bind in a SELECT list");
+    assert!(
+        err.to_string().contains("Binder Error"),
+        "expected a binder refusal, got {err}"
+    );
+}
+
+/// The where-position pattern targets under LIKE/ILIKE — the operators
+/// the pipeline lane adds beyond the search stage's GLOB/regexp: a typed
+/// pin's canonical text form takes LIKE patterns exactly as it takes
+/// globs.
+#[test]
+fn pattern_targets_take_like_and_ilike() {
+    let conn = conn();
+    conn.execute_batch(
+        "CREATE TABLE p AS SELECT 404::BIGINT AS b, 200.5::DOUBLE AS d, TRUE AS f, \
+         TIMESTAMP '2026-01-15 03:30:00' AS ts",
+    )
+    .unwrap();
+    let matched = |clause: &str| -> i64 {
+        conn.query_row(
+            &format!("SELECT count(*)::BIGINT FROM p WHERE {clause}"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(matched("CAST(b AS VARCHAR) LIKE '4%'"), 1);
+    assert_eq!(matched("CAST(b AS VARCHAR) LIKE '2%'"), 0);
+    assert_eq!(matched("CAST(d AS VARCHAR) LIKE '200._'"), 1);
+    assert_eq!(matched("CAST(f AS VARCHAR) ILIKE 'TRU%'"), 1);
+    // The TIMESTAMP target is the strftime RFC 3339 text, so a LIKE can
+    // anchor on the `T` separator the wire form carries.
+    assert_eq!(
+        matched("strftime(ts, '%Y-%m-%dT%H:%M:%S.%fZ') LIKE '2026-01-15T03:30%'"),
+        1
+    );
+    assert_eq!(
+        matched("strftime(ts, '%Y-%m-%dT%H:%M:%S.%fZ') LIKE '2026-01-15 03:30%'"),
+        0,
+        "the space-separated CAST rendering is NOT the pattern text"
+    );
+}

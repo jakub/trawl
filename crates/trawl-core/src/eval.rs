@@ -8,8 +8,12 @@
 //! rather than emitting SQL. This is the runtime analog of
 //! `emitter/expr.rs`.
 
-use crate::ast::{BinaryOp, Expr, FilterOp, LiteralValue, Spanned, UnaryOp};
-use crate::emitter::map_field_name;
+use std::borrow::Cow;
+
+use crate::ast::{BinaryOp, Expr, FilterOp, FloatLiteral, LiteralValue, Spanned, UnaryOp};
+use crate::emitter::{SqlValue, map_field_name};
+use crate::pin_match::{self, NullReadPolicy};
+use crate::pin_scope::PinScope;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use serde_json::{Map, Value};
 
@@ -242,27 +246,70 @@ impl From<&Value> for EvalValue {
 }
 
 /// Evaluate an expression AST node against an event map.
+///
+/// The documented PIN-BLIND door: every comparison stays literal-driven,
+/// exactly as before ADR-0011 slice A′ — embedded mode's behavior, and the
+/// zero-cost path when no catalog exists. Catalog-backed callers go
+/// through [`eval_expr_with_pins`].
 pub fn eval_expr(expr: &Spanned<Expr>, event: &Map<String, Value>) -> EvalValue {
+    static EMPTY: std::sync::LazyLock<PinScope> = std::sync::LazyLock::new(PinScope::unpinned);
+    eval_expr_with_pins(expr, event, &EMPTY)
+}
+
+/// Evaluate an expression with the catalog's pin scope typing bare
+/// field-vs-literal comparisons (ADR-0011 slice A′).
+///
+/// `pins` is the scope in force at THIS stage of the pipeline (see
+/// [`crate::pin_scope::PinScope`]); the same rule table the SQL emitter
+/// renders decides how each comparison binds, wherever the walk meets one
+/// — inside `if()` conditions, under `not`/`and`/`or`, in `| let` values.
+/// An empty scope short-circuits every pinned check, so the pin-blind
+/// path stays zero-cost.
+pub fn eval_expr_with_pins(
+    expr: &Spanned<Expr>,
+    event: &Map<String, Value>,
+    pins: &PinScope,
+) -> EvalValue {
     match &expr.node {
         Expr::Literal(lit) => eval_literal(lit),
         Expr::FieldRef(name) => {
+            // Bound the way `DuckDB` binds a column reference — and the
+            // way the PINNED read beside it already binds: a bare
+            // `let b = A` over a row carrying `a` reads that column
+            // rather than answering NULL, so a reference does not change
+            // meaning with the pin.
             let mapped = map_field_name(name);
-            event.get(mapped).map_or(EvalValue::Null, EvalValue::from)
+            bind_event_key(event, mapped)
+                .and_then(|key| event.get(key))
+                .map_or(EvalValue::Null, EvalValue::from)
         }
         Expr::Binary { lhs, op, rhs } => eval_level_comparison(lhs, *op, rhs, event)
-            .unwrap_or_else(|| eval_binary(&eval_expr(lhs, event), *op, &eval_expr(rhs, event))),
-        Expr::Unary { op, operand } => eval_unary(*op, eval_expr(operand, event)),
+            .or_else(|| try_pinned_comparison(lhs, *op, rhs, event, pins))
+            .unwrap_or_else(|| {
+                eval_binary(
+                    &eval_expr_with_pins(lhs, event, pins),
+                    *op,
+                    &eval_expr_with_pins(rhs, event, pins),
+                )
+            }),
+        Expr::Unary { op, operand } => eval_unary(*op, eval_expr_with_pins(operand, event, pins)),
         Expr::FunctionCall { name, args } => {
-            let evaluated: Vec<EvalValue> = args.iter().map(|a| eval_expr(a, event)).collect();
+            let evaluated: Vec<EvalValue> = args
+                .iter()
+                .map(|a| eval_expr_with_pins(a, event, pins))
+                .collect();
             eval_scalar_fn(name, &evaluated).unwrap_or(EvalValue::Null)
         }
         Expr::InList { expr: target, list } => {
-            let target_val = eval_expr(target, event);
+            if let Some(answer) = try_pinned_in_list(target, list, event, pins) {
+                return answer;
+            }
+            let target_val = eval_expr_with_pins(target, event, pins);
             if matches!(target_val, EvalValue::Null) {
                 return EvalValue::Null;
             }
             for item in list {
-                let item_val = eval_expr(item, event);
+                let item_val = eval_expr_with_pins(item, event, pins);
                 if eval_eq(&target_val, &item_val) == EvalValue::Bool(true) {
                     return EvalValue::Bool(true);
                 }
@@ -270,6 +317,215 @@ pub fn eval_expr(expr: &Spanned<Expr>, event: &Map<String, Value>) -> EvalValue 
             EvalValue::Bool(false)
         }
     }
+}
+
+/// A bare literal, exactly as the SQL lane's door takes it — the AST value,
+/// so a float literal keeps its source token rather than a re-rendered
+/// double (ADR-0011 ruling #6, [`crate::ast::FloatLiteral`]) — including
+/// the sign fold for a negative number, which the parser hands over as
+/// `Unary{Neg, Literal}`. The two doors must adopt the same shapes or the
+/// batch and live lanes answer one query differently
+/// (`emitter::expr::bare_literal`).
+fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
+    match expr {
+        Expr::Literal(lit) => Some(Cow::Borrowed(lit)),
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } => match &operand.node {
+            Expr::Literal(LiteralValue::Int(n)) => {
+                Some(Cow::Owned(LiteralValue::Int(n.checked_neg()?)))
+            }
+            Expr::Literal(LiteralValue::Float(f)) => Some(Cow::Owned(LiteralValue::Float(
+                FloatLiteral::new(-f.value(), format!("-{}", f.text())),
+            ))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Bind a field reference to the key the ROW actually carries, the way
+/// `DuckDB` binds a column reference: an exact match wins, and any
+/// ASCII-case-insensitive match binds otherwise.
+///
+/// Both halves are load-bearing, in both directions. Ingest ASCII-folds
+/// every key it writes, so `where Status>400` over a stored `status`
+/// finds its value only case-insensitively — but the pipeline lanes key
+/// rows by USER-CHOSEN names carried VERBATIM (`rename status as St`
+/// gives the row an `St` key, in the SQL result columns and in
+/// [`crate::stream::apply_stage`] alike), so a later `where st>400` —
+/// which `DuckDB` resolves to that `St` column — must find it too, and a
+/// fold-only lookup would miss. Exact-first keeps a row carrying two
+/// case-variant keys reading the one the reference names.
+///
+/// A residual ambiguity (several case-variants, none exact) has no
+/// `DuckDB` answer to mirror — it errors — so this picks the
+/// lexicographically-first variant: deterministic regardless of map
+/// order, and the same tie-break ingest's own fold-collision rule uses.
+pub(crate) fn bind_event_key<'e>(event: &'e Map<String, Value>, name: &str) -> Option<&'e str> {
+    if let Some((key, _)) = event.get_key_value(name) {
+        return Some(key.as_str());
+    }
+    event
+        .keys()
+        .filter(|k| k.eq_ignore_ascii_case(name))
+        .min()
+        .map(String::as_str)
+}
+
+/// The event value a pinned comparison reads, non-null.
+///
+/// The name is alias-resolved (`timestamp` → `_time`) and then bound
+/// against the row's own spelling by [`bind_event_key`]. Binding — not
+/// non-nullness — decides which key is read: a bound key holding JSON
+/// null is that field's own NULL (UNKNOWN), never a reason to read a
+/// differently-cased sibling.
+fn pinned_event_value<'e>(event: &'e Map<String, Value>, name: &str) -> Option<&'e Value> {
+    let key = bind_event_key(event, map_field_name(name))?;
+    event.get(key).filter(|v| !v.is_null())
+}
+
+/// Truth → `EvalValue`: UNKNOWN is SQL NULL, which the existing
+/// `not`/`and`/`or`/`is_truthy` machinery already propagates three-valued.
+fn truth_to_eval(truth: Option<bool>) -> EvalValue {
+    truth.map_or(EvalValue::Null, EvalValue::Bool)
+}
+
+/// The in-memory mirror of the emitter's pinned-comparison arm (ADR-0011
+/// slice A′): detect a bare field-vs-literal comparison whose field
+/// resolves to a pin and answer it through the shared comparison core.
+/// `None` falls through to literal-driven evaluation — same structural
+/// scope as the SQL side (`emitter::expr::try_pinned_comparison`), so the
+/// two lanes adopt and decline exactly the same shapes.
+///
+/// NULL policy is the pipeline's (strict): an absent field, a JSON null,
+/// or a value the conform would null out is UNKNOWN for every operator —
+/// no `!=` widening.
+fn try_pinned_comparison(
+    lhs: &Spanned<Expr>,
+    op: BinaryOp,
+    rhs: &Spanned<Expr>,
+    event: &Map<String, Value>,
+    pins: &PinScope,
+) -> Option<EvalValue> {
+    if pins.is_empty() {
+        return None;
+    }
+    // Pattern operators: the field is a subject on the LEFT only — the
+    // right operand is the pattern.
+    if matches!(op, BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike) {
+        let Expr::FieldRef(name) = &lhs.node else {
+            return None;
+        };
+        let Expr::Literal(LiteralValue::String(pattern)) = &rhs.node else {
+            return None;
+        };
+        let pin = pins.pin_for(name)?;
+        let form = crate::compare::pattern_form(Some(pin));
+        let Some(value) = pinned_event_value(event, name) else {
+            return Some(EvalValue::Null);
+        };
+        // No canonical text (a BIGINT pin over "4.5") is a NULL pattern
+        // target in batch — UNKNOWN, not false.
+        let Some(text) = pin_match::pattern_text(value, form) else {
+            return Some(EvalValue::Null);
+        };
+        let subject = EvalValue::Str(text);
+        let pattern = EvalValue::Str(pattern.clone());
+        return Some(match op {
+            BinaryOp::Matches => eval_matches(&subject, &pattern),
+            BinaryOp::Like => eval_like(&subject, &pattern, false),
+            _ => eval_like(&subject, &pattern, true),
+        });
+    }
+
+    let filter_op = match op {
+        BinaryOp::Eq => FilterOp::Eq,
+        BinaryOp::Ne => FilterOp::Ne,
+        BinaryOp::Gt => FilterOp::Gt,
+        BinaryOp::Gte => FilterOp::Gte,
+        BinaryOp::Lt => FilterOp::Lt,
+        BinaryOp::Lte => FilterOp::Lte,
+        _ => return None,
+    };
+    let (name, filter_op, literal) = match (&lhs.node, &rhs.node) {
+        (Expr::FieldRef(name), rhs) => (name, filter_op, bare_literal(rhs)?),
+        // `400 < status` is `status > 400`.
+        (lhs, Expr::FieldRef(name)) => {
+            let flipped = match filter_op {
+                FilterOp::Gt => FilterOp::Lt,
+                FilterOp::Gte => FilterOp::Lte,
+                FilterOp::Lt => FilterOp::Gt,
+                FilterOp::Lte => FilterOp::Gte,
+                other => other,
+            };
+            (name, flipped, bare_literal(lhs)?)
+        }
+        _ => return None,
+    };
+    let pin = pins.pin_for(name)?;
+    let form = crate::compare::compare_form_bound(Some(pin), filter_op, &literal)?;
+    // Native(String) is the VARCHAR pin's lexical rule — the stored text
+    // compares as text, whatever JSON shape the wire value took (the SQL
+    // side's generic emission compares the VARCHAR column against a
+    // string parameter, which is the same lexical answer). Any other
+    // Native form is degenerate under a pin and falls through to
+    // literal-driven evaluation, mirroring the SQL side's fall-through.
+    match &form {
+        crate::compare::CompareForm::Native(SqlValue::String(_)) => {}
+        crate::compare::CompareForm::Native(_) => return None,
+        _ => {}
+    }
+    let coerced = pin_match::coerce_form(form);
+    let compare_op = pin_match::CompareOp::from_filter(filter_op)?;
+    let Some(value) = pinned_event_value(event, name) else {
+        // Plain SQL null propagation — strict, no `!=` widening.
+        return Some(EvalValue::Null);
+    };
+    Some(truth_to_eval(pin_match::compare_values(
+        value,
+        compare_op,
+        &coerced,
+        NullReadPolicy::Unknown,
+    )))
+}
+
+/// The in-memory mirror of the emitter's pinned IN-list arm: a pinned
+/// bare-field target with an all-literal list routes each element through
+/// the equality rule, OR-combined in SQL's three-valued logic.
+fn try_pinned_in_list(
+    target: &Spanned<Expr>,
+    list: &[Spanned<Expr>],
+    event: &Map<String, Value>,
+    pins: &PinScope,
+) -> Option<EvalValue> {
+    if pins.is_empty() {
+        return None;
+    }
+    let Expr::FieldRef(name) = &target.node else {
+        return None;
+    };
+    let pin = pins.pin_for(name)?;
+    let forms: Vec<crate::compare::CompareForm> = list
+        .iter()
+        .map(|item| {
+            let element = bare_literal(&item.node)?;
+            crate::compare::compare_form_bound(Some(pin), FilterOp::Eq, &element)
+        })
+        .collect::<Option<_>>()?;
+    let Some(value) = pinned_event_value(event, name) else {
+        return Some(EvalValue::Null);
+    };
+    let truth = pin_match::or_any(forms.into_iter().map(|form| {
+        pin_match::compare_values(
+            value,
+            pin_match::CompareOp::Eq,
+            &pin_match::coerce_form(form),
+            NullReadPolicy::Unknown,
+        )
+    }));
+    Some(truth_to_eval(truth))
 }
 
 /// Evaluate `level <cmp> "token"` against the numeric `severity` column.
@@ -336,7 +592,7 @@ fn eval_literal(lit: &LiteralValue) -> EvalValue {
         LiteralValue::Null => EvalValue::Null,
         LiteralValue::Bool(b) => EvalValue::Bool(*b),
         LiteralValue::Int(n) => EvalValue::Int(*n),
-        LiteralValue::Float(n) => EvalValue::Float(*n),
+        LiteralValue::Float(n) => EvalValue::Float(n.value()),
         LiteralValue::String(s) => EvalValue::Str(s.clone()),
     }
 }
@@ -1313,12 +1569,318 @@ mod tests {
         Spanned { node, span: 0..0 }
     }
 
+    // ── pinned where/let comparisons (ADR-0011 slice A′) ─────────────
+
+    mod pinned {
+        use super::*;
+        use crate::parser;
+        use crate::pin_scope::PinScope;
+        use crate::schema::CanonicalType as CT;
+        use crate::schema::FieldTypes;
+
+        /// Evaluate the sole `where` condition of `dsl` against `event`
+        /// under `pins`.
+        fn eval_where(dsl: &str, event: &str, pins: &[(&str, CT)]) -> EvalValue {
+            let mut ft = FieldTypes::new();
+            for (field, ty) in pins {
+                ft.insert(field, *ty);
+            }
+            let query = parser::parse(dsl).expect("dsl parses");
+            let cond = query
+                .pipeline
+                .iter()
+                .find_map(|s| match &s.node {
+                    crate::ast::PipeStage::Where(w) => Some(w.condition.clone()),
+                    _ => None,
+                })
+                .expect("dsl has a where stage");
+            let event: Map<String, Value> = serde_json::from_str(event).expect("valid event");
+            eval_expr_with_pins(&cond, &event, &PinScope::root(&ft))
+        }
+
+        const VARCHAR_STATUS: &[(&str, CT)] = &[("status", CT::Varchar)];
+        const BIGINT_DUR: &[(&str, CT)] = &[("dur", CT::BigInt)];
+
+        #[test]
+        fn varchar_ordered_numeric_compares_in_decimal_space() {
+            let dsl = "* | where status > 400";
+            assert_eq!(
+                eval_where(dsl, r#"{"status": "404"}"#, VARCHAR_STATUS),
+                EvalValue::Bool(true)
+            );
+            assert_eq!(
+                eval_where(dsl, r#"{"status": "200"}"#, VARCHAR_STATUS),
+                EvalValue::Bool(false)
+            );
+            // No reading → UNKNOWN, not false — `NOT` cannot invert it.
+            assert_eq!(
+                eval_where(dsl, r#"{"status": "accepted"}"#, VARCHAR_STATUS),
+                EvalValue::Null
+            );
+            assert_eq!(
+                eval_where(
+                    "* | where not (status > 400)",
+                    r#"{"status": "accepted"}"#,
+                    VARCHAR_STATUS
+                ),
+                EvalValue::Null
+            );
+        }
+
+        #[test]
+        fn varchar_eq_numeric_matches_text_or_reading() {
+            let dsl = "* | where status == 200";
+            for value in [r#""200""#, "200", "200.0", r#""0200""#] {
+                assert_eq!(
+                    eval_where(dsl, &format!(r#"{{"status": {value}}}"#), VARCHAR_STATUS),
+                    EvalValue::Bool(true),
+                    "{value}"
+                );
+            }
+            assert_eq!(
+                eval_where(dsl, r#"{"status": "accepted"}"#, VARCHAR_STATUS),
+                EvalValue::Bool(false)
+            );
+        }
+
+        /// Strict null policy: `!=` over an absent/null field is UNKNOWN
+        /// (plain SQL null propagation), NOT the search stage's widening.
+        #[test]
+        fn ne_over_absent_field_is_unknown() {
+            for event in ["{}", r#"{"status": null}"#] {
+                assert_eq!(
+                    eval_where("* | where status != 200", event, VARCHAR_STATUS),
+                    EvalValue::Null,
+                    "{event}"
+                );
+            }
+            // Present, unreadable value still answers TRUE (text differs).
+            assert_eq!(
+                eval_where(
+                    "* | where status != 200",
+                    r#"{"status": "accepted"}"#,
+                    VARCHAR_STATUS
+                ),
+                EvalValue::Bool(true)
+            );
+        }
+
+        /// A conform-nulled value under a typed pin is a stored NULL:
+        /// UNKNOWN for every operator, `!=` included (Strict, unlike the
+        /// search lane's `OR col IS NULL`).
+        #[test]
+        fn typed_pin_unreadable_value_is_unknown_even_for_ne() {
+            assert_eq!(
+                eval_where("* | where dur != 1", r#"{"dur": "1.5"}"#, BIGINT_DUR),
+                EvalValue::Null
+            );
+            assert_eq!(
+                eval_where("* | where dur > 1", r#"{"dur": "1.5"}"#, BIGINT_DUR),
+                EvalValue::Null
+            );
+            // A readable spelling still compares in the pin's domain.
+            assert_eq!(
+                eval_where("* | where dur > 1", r#"{"dur": "0404"}"#, BIGINT_DUR),
+                EvalValue::Bool(true)
+            );
+        }
+
+        #[test]
+        fn reversed_operands_bind_the_field_rule() {
+            assert_eq!(
+                eval_where(
+                    "* | where 400 < status",
+                    r#"{"status": "404"}"#,
+                    VARCHAR_STATUS
+                ),
+                EvalValue::Bool(true)
+            );
+            assert_eq!(
+                eval_where(
+                    "* | where 400 < status",
+                    r#"{"status": "200"}"#,
+                    VARCHAR_STATUS
+                ),
+                EvalValue::Bool(false)
+            );
+        }
+
+        /// Quote provenance is discarded: `status > "400"` IS `status > 400`.
+        #[test]
+        fn quoted_numeric_literal_binds_content() {
+            assert_eq!(
+                eval_where(
+                    "* | where status > \"400\"",
+                    r#"{"status": "404"}"#,
+                    VARCHAR_STATUS
+                ),
+                EvalValue::Bool(true)
+            );
+        }
+
+        /// Pattern ops against a typed pin match the canonical text form.
+        #[test]
+        fn matches_over_typed_pin_targets_canonical_text() {
+            assert_eq!(
+                eval_where(
+                    "* | where dur matches \"^4\"",
+                    r#"{"dur": 404}"#,
+                    BIGINT_DUR
+                ),
+                EvalValue::Bool(true)
+            );
+            assert_eq!(
+                eval_where(
+                    "* | where dur matches \"^4\"",
+                    r#"{"dur": 200}"#,
+                    BIGINT_DUR
+                ),
+                EvalValue::Bool(false)
+            );
+            // The stored value is the conformed one: "0404" reads 404.
+            assert_eq!(
+                eval_where(
+                    "* | where dur matches \"^4\"",
+                    r#"{"dur": "0404"}"#,
+                    BIGINT_DUR
+                ),
+                EvalValue::Bool(true)
+            );
+            // No reading → NULL target → UNKNOWN.
+            assert_eq!(
+                eval_where(
+                    "* | where dur matches \"^4\"",
+                    r#"{"dur": "4.5"}"#,
+                    BIGINT_DUR
+                ),
+                EvalValue::Null
+            );
+        }
+
+        /// A pinned comparison binds the row's key the way `DuckDB` binds
+        /// a column reference — either case direction, because a pipeline
+        /// stage can MAKE a mixed-case key (`rename status as St`) that a
+        /// later stage names differently (`where st>400`).
+        #[test]
+        fn pinned_lookup_binds_the_rows_key_case_insensitively() {
+            for event in [r#"{"status": "404"}"#, r#"{"Status": "404"}"#] {
+                for dsl in ["* | where status > 400", "* | where StAtUs > 400"] {
+                    assert_eq!(
+                        eval_where(dsl, event, VARCHAR_STATUS),
+                        EvalValue::Bool(true),
+                        "{dsl} over {event}"
+                    );
+                }
+            }
+            // An exact key wins over a case-variant sibling...
+            assert_eq!(
+                eval_where(
+                    "* | where status > 400",
+                    r#"{"Status": "500", "status": "200"}"#,
+                    VARCHAR_STATUS
+                ),
+                EvalValue::Bool(false)
+            );
+            // ...and binding, not non-nullness, picks the key: an exact
+            // key holding null is that field's own NULL.
+            assert_eq!(
+                eval_where(
+                    "* | where status > 400",
+                    r#"{"Status": "500", "status": null}"#,
+                    VARCHAR_STATUS
+                ),
+                EvalValue::Null
+            );
+        }
+
+        /// The PIN-BLIND read binds the same way, so a reference does not
+        /// change meaning with the pin: `lower(Status)` and a bare
+        /// `let b = Status` reach the row's `status` exactly as the pinned
+        /// arm beside them does.
+        #[test]
+        fn unpinned_lookup_binds_the_rows_key_case_insensitively() {
+            assert_eq!(
+                eval_where(
+                    "* | where lower(Status) == \"ok\"",
+                    r#"{"status": "OK"}"#,
+                    &[]
+                ),
+                EvalValue::Bool(true)
+            );
+            // An exact key still wins over a case-variant sibling.
+            assert_eq!(
+                eval_where(
+                    "* | where status == \"exact\"",
+                    r#"{"Status": "variant", "status": "exact"}"#,
+                    &[]
+                ),
+                EvalValue::Bool(true)
+            );
+        }
+
+        /// A VARCHAR pin makes even a numeric wire value pattern-matchable
+        /// as its stored text (pin-blind eval answered NULL for non-Str).
+        #[test]
+        fn matches_over_varchar_pin_reads_the_stored_text() {
+            assert_eq!(
+                eval_where(
+                    "* | where status matches \"^2\"",
+                    r#"{"status": 200}"#,
+                    VARCHAR_STATUS
+                ),
+                EvalValue::Bool(true)
+            );
+        }
+
+        #[test]
+        fn in_list_routes_each_element_through_eq() {
+            let dsl = "* | where status in (200, \"accepted\")";
+            for value in [r#""200""#, "200", "200.0", r#""accepted""#] {
+                assert_eq!(
+                    eval_where(dsl, &format!(r#"{{"status": {value}}}"#), VARCHAR_STATUS),
+                    EvalValue::Bool(true),
+                    "{value}"
+                );
+            }
+            assert_eq!(
+                eval_where(dsl, r#"{"status": "404"}"#, VARCHAR_STATUS),
+                EvalValue::Bool(false)
+            );
+            assert_eq!(eval_where(dsl, "{}", VARCHAR_STATUS), EvalValue::Null);
+        }
+
+        /// Unpinned fields and the pin-blind door stay literal-driven: a
+        /// string value ordered against an int literal has no numeric
+        /// reading there (pre-existing behavior, unchanged by pins).
+        #[test]
+        fn unpinned_field_falls_through_to_literal_driven_eval() {
+            assert_eq!(
+                eval_where(
+                    "* | where other > 400",
+                    r#"{"other": "404"}"#,
+                    VARCHAR_STATUS
+                ),
+                EvalValue::Null
+            );
+            // The documented pin-blind door: eval_expr never consults
+            // pins, so the same comparison the pinned walk answers TRUE
+            // stays literal-driven here.
+            let query = parser::parse("* | where status > 400").expect("parses");
+            let cond = match &query.pipeline[0].node {
+                crate::ast::PipeStage::Where(w) => w.condition.clone(),
+                _ => unreachable!(),
+            };
+            let event: Map<String, Value> = serde_json::from_str(r#"{"status": "404"}"#).unwrap();
+            assert_eq!(eval_expr(&cond, &event), EvalValue::Null);
+        }
+    }
+
     fn lit_int(n: i64) -> Spanned<Expr> {
         span(Expr::Literal(LiteralValue::Int(n)))
     }
 
     fn lit_float(n: f64) -> Spanned<Expr> {
-        span(Expr::Literal(LiteralValue::Float(n)))
+        span(Expr::Literal(LiteralValue::Float(n.into())))
     }
 
     fn lit_str(s: &str) -> Spanned<Expr> {

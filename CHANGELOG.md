@@ -7,6 +7,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Changed — behavior
+- **`| where` and `| let` comparisons follow the field catalog's pins
+  (ADR-0011 slice A′, #66).** Bare field-vs-literal comparisons in the
+  pipeline stages now consult the same pin snapshot and the same rule
+  table the search stage adopted in slice A — in batch SQL, live tail
+  (SSE), and the post-`extract kv` batch tail alike. Concretely: over a
+  VARCHAR-pinned field, `| where status > 400` stops raising a
+  Conversion error and starts filtering in `DECIMAL(38,6)`;
+  `| where status == 200` gains the numeric arm and now matches a stored
+  `"200.0"`; `| where status in (…)` routes each element through the
+  equality rule; `matches`/`like`/`ilike` against typed pins match the
+  stored value's canonical text (on TIMESTAMP pins, live-tail ordered
+  comparisons become the instant comparison batch always performed,
+  instead of lexical text). Which pin applies follows the pipeline:
+  `rename` remaps it, a computed `let` removes it (a bare alias copies
+  it), aggregations keep group-by keys only, `extract kv` passes the
+  scope through. Quote provenance is discarded (`where status == "400"`
+  is `where status == 400`). The pipeline `!=` keeps plain SQL null
+  propagation — no `OR field IS NULL` widening — so a repin never
+  changes missing-field semantics. Field-vs-field, function-wrapped and
+  arithmetic comparisons, unpinned fields, and embedded `--data` mode
+  are byte-for-byte unchanged. The post-`extract kv` tail now evaluates
+  over the stored **UTC** instant with the display-zone shift applied
+  *last* (the all-SQL path's order — previously the tail compared
+  display-shifted text, skewing every timestamp comparison by the
+  client's offset), and the final shift follows the tail's own lineage:
+  a timestamp column `rename`d or copied by a bare-alias `let` inside
+  the tail still renders in the display zone, while a *computed* value
+  (`let t = coalesce(_time, x)`, aggregate outputs) is the tail's own
+  and renders UTC. The envelope seed pins
+  `host`/`service`/`env`/`message`/`severity_text`/`_raw` VARCHAR, so
+  this is live on day one of every install. Unblocks the repin engine
+  (#53).
+- **Sibling references inside one `| let` resolve column-first,
+  alias-second (ADR-0011 slice A′, #66).** The in-memory stage — live
+  tail (SSE) and the post-`extract kv` batch tail — now mirrors what
+  DuckDB does with the single projection the batch lane emits
+  (`COLUMNS(c -> c NOT IN (targets)), (expr) AS tgt, …`): a target
+  naming a column the row already carries stays invisible to its
+  siblings, so `let a = 1, b = a` and `let a = a + 1, b = a` give `b`
+  the **original** `a` where the previous sequential evaluation handed
+  it the just-computed one; a target the row does *not* carry — the
+  ordinary case, since `let` usually names something new — is the
+  lateral column alias a later sibling reads, so
+  `let ms = 1000, total = ms * 2` answers `2000` in every lane, as it
+  always did in SQL. Which column a name binds is DuckDB's own
+  case-insensitive rule (`let A = 1, b = A` shadows an `a`), and a
+  pipeline field *read* now binds the same way whether or not the field
+  is pinned, so a reference does not change meaning with the pin. Pins
+  never follow the alias — an alias-bound sibling is unpinned in both
+  lanes. One residual: a column the *corpus* carries but *this row*
+  leaves absent (a sparse custom field) is a NULL column read in batch,
+  while the live lane, seeing no key, binds the alias.
 - **Comparisons follow the field catalog's type pins (ADR-0011 slice A, #63).**
   Search-stage field filters — batch queries, exports, *and* live tail (SSE) —
   now consult the field's pinned type instead of guessing from the query

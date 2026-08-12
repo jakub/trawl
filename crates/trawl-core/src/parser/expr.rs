@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn test_literal_float() {
         let result = parse_expr("3.25");
-        assert_eq!(result.node, Expr::Literal(LiteralValue::Float(3.25)));
+        assert_eq!(result.node, Expr::Literal(LiteralValue::Float(3.25.into())));
     }
 
     #[test]

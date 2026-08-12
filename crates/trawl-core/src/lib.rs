@@ -32,6 +32,15 @@ pub mod eval;
 /// In-memory event filter compiled from the search stage.
 pub mod filter;
 
+/// The shared in-memory pin-aware comparison core (ADR-0011 slice A′):
+/// one evaluator behind both the search-stage matcher and the pipeline
+/// expression evaluator.
+mod pin_match;
+
+/// The compile-time pin scope walk: which catalog pin applies at each
+/// pipeline stage, shared by the SQL emitter and the stream compiler.
+pub mod pin_scope;
+
 /// The declared event envelope: field names, reserved keys, wire aliases.
 pub mod schema;
 

@@ -642,12 +642,71 @@ impl fmt::Display for UnaryOp {
     }
 }
 
+/// A float literal: the parsed value together with the SOURCE TEXT it was
+/// written as.
+///
+/// The text is not decoration. A pipeline comparison against a VARCHAR pin
+/// binds the literal's TEXT into `DECIMAL(38,6)` — ADR-0011 ruling #6: the
+/// literal never round-trips through `f64`, because `f64` is lossy the
+/// moment a literal needs more than 53 bits. `9007199254740993.0` parses as
+/// `9007199254740992`, so rendering the parsed double back would compare
+/// against the ADJACENT identifier, and the same query written
+/// `"9007199254740993.0"` — a string literal, carried verbatim — would
+/// answer differently, contradicting the documented quote-insensitivity of
+/// pipeline comparisons. Keeping the token means the pipeline binds exactly
+/// what the search stage binds for the same text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloatLiteral {
+    value: f64,
+    text: String,
+}
+
+impl FloatLiteral {
+    /// A float literal read from source: the parsed value and its token.
+    pub fn new(value: f64, text: impl Into<String>) -> Self {
+        Self {
+            value,
+            text: text.into(),
+        }
+    }
+
+    /// The parsed double — what arithmetic and native binding use.
+    #[must_use]
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+
+    /// The source token — what pin-aware comparison binds.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl From<f64> for FloatLiteral {
+    /// A literal with no token behind it (a programmatically built AST).
+    /// Rust renders the shortest round-tripping decimal, so the text reads
+    /// back as exactly this double — the best a value with no source can do.
+    fn from(value: f64) -> Self {
+        Self {
+            text: value.to_string(),
+            value,
+        }
+    }
+}
+
+impl fmt::Display for FloatLiteral {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 /// Literal values in expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiteralValue {
     String(String),
     Int(i64),
-    Float(f64),
+    Float(FloatLiteral),
     Bool(bool),
     Null,
 }
