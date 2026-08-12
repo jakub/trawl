@@ -48,17 +48,19 @@ pub(crate) fn swap_envs(data_dir: &Path, shadow: &Path, aside: &Path) -> Result<
             let put_aside = free_aside_slot(aside, &env)?;
             std::fs::rename(&live, &put_aside).map_err(|e| {
                 format!(
-                    "failed to set aside {} -> {}: {e}",
+                    "failed to set aside {} -> {}: {e}{}",
                     live.display(),
-                    put_aside.display()
+                    put_aside.display(),
+                    cross_device_hint(&e)
                 )
             })?;
         }
         std::fs::rename(&next, &live).map_err(|e| {
             format!(
-                "failed to publish {} -> {}: {e}",
+                "failed to publish {} -> {}: {e}{}",
                 next.display(),
-                live.display()
+                live.display(),
+                cross_device_hint(&e)
             )
         })?;
     }
@@ -78,6 +80,30 @@ pub(crate) fn swap_envs(data_dir: &Path, shadow: &Path, aside: &Path) -> Result<
         );
     }
     Ok(())
+}
+
+/// The one failure this text must explain rather than merely report: a
+/// data root that is itself a mount point puts the staging siblings on the
+/// parent filesystem, so no rename can cross.
+/// [`check_staging_filesystem`](crate::repin::marker::check_staging_filesystem)
+/// refuses a job that would meet this, but a marker written before the
+/// data root was remounted (or by an older build) still replays here at
+/// every boot, where the bare `Invalid cross-device link` says nothing
+/// about why the node will not start or what to do about it. Nothing has
+/// moved when this fires — every rename fails alike — so the corpus stands
+/// at its pre-repin generation.
+fn cross_device_hint(e: &std::io::Error) -> &'static str {
+    if e.kind() == std::io::ErrorKind::CrossesDevices {
+        " — the repin staging root is on a DIFFERENT filesystem than the \
+         data root (the data root is itself a mount point), so no rename \
+         in this swap can complete and the corpus stands at its pre-repin \
+         generation. Mount the volume one level up so the data root is a \
+         directory INSIDE it (the packaged layout: volume at \
+         /var/lib/trawl, data at /var/lib/trawl/data), then restart to let \
+         the marker replay finish the swap"
+    } else {
+        ""
+    }
 }
 
 /// The slot this env's outgoing generation is parked in: `aside/{env}`

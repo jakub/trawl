@@ -17,10 +17,19 @@
 //! into dot-directories (probed by execution in
 //! `trawl-engine/tests/duckdb_probe.rs`), so an in-root shadow would be
 //! unioned into every fallback-glob query as duplicate rows. A sibling is
-//! invisible to every data-root glob and walk by construction, sits on
-//! the same filesystem (hardlinks and renames are guaranteed), and moves
+//! invisible to every data-root glob and walk by construction and moves
 //! nothing that must not move — `wal/`, `scheduled/`, `EPOCH` and
 //! `CATALOG` never leave the data root.
+//!
+//! Being a sibling puts the staging on the PARENT's filesystem, which is
+//! the data root's own for the shipped packaging (the volume is mounted
+//! at `/var/lib/trawl`, data at `/var/lib/trawl/data`) but not when an
+//! operator mounts a volume AT the data dir (`[data] path = "/mnt/logs"`)
+//! — and then no hardlink and no rename can cross. That is not a
+//! survivable discovery mid-cutover (the swap is forward-only past the
+//! marker, so an `EXDEV` there costs the process and every subsequent
+//! boot replays the same `EXDEV`), so [`check_staging_filesystem`] proves
+//! it BEFORE a job is allowed to build anything.
 
 use std::path::{Path, PathBuf};
 
@@ -88,6 +97,53 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 #[must_use]
 pub fn marker_path(data_dir: &Path) -> PathBuf {
     data_dir.join(REPIN_MARKER)
+}
+
+/// Prove the staging siblings will land on the data root's OWN filesystem
+/// — i.e. that the data root is not itself a mount point.
+///
+/// The whole staging design is renames and hardlinks between the data root
+/// and its siblings, neither of which crosses a filesystem. Discovering
+/// that mid-job is only ever bad: a hardlink `EXDEV` fails the build
+/// (clean, but late), and a corpus where nothing needed hardlinking builds
+/// fine and then meets the SAME `EXDEV` in the forward-only swap, where
+/// the only safe answer is to exit the process — after which every boot
+/// replays the marker into the identical failure and refuses to start.
+/// One `stat` pair up front turns all of that into a refusal that changes
+/// nothing.
+pub fn check_staging_filesystem(data_dir: &Path) -> Result<(), String> {
+    let parent = data_dir.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    if device_of(data_dir)? == device_of(parent)? {
+        return Ok(());
+    }
+    Err(format!(
+        "the data root {} is a mount point, so the repin staging roots \
+         ({}, {}) would sit on the parent filesystem — the hardlinks and \
+         the atomic per-env swap a repin is built from cannot cross \
+         filesystems (EXDEV). Mount the volume one level up and put the \
+         data root inside it (the packaged layout: volume at \
+         /var/lib/trawl, [data] path = \"/var/lib/trawl/data\")",
+        data_dir.display(),
+        shadow_root(data_dir).display(),
+        aside_root(data_dir).display()
+    ))
+}
+
+/// The filesystem a path lives on. Non-unix has no device identity to
+/// compare, so the check is a no-op there (trawld ships for Linux).
+fn device_of(path: &Path) -> Result<u64, String> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        Ok(std::os::unix::fs::MetadataExt::dev(&meta))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        Ok(0)
+    }
 }
 
 /// Read the marker, if present. A present-but-unreadable marker is an
@@ -181,5 +237,39 @@ mod tests {
             Path::new("/var/lib/trawl/data.repin-aside")
         );
         assert!(!shadow_root(data).starts_with(data));
+    }
+
+    /// The shipped shape — a data root that is an ordinary directory
+    /// inside its volume — passes the pre-flight.
+    #[test]
+    fn a_data_root_inside_its_volume_passes_the_staging_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        check_staging_filesystem(&data).expect("siblings share the parent's filesystem");
+    }
+
+    /// A data root that is itself a mount point is refused BEFORE anything
+    /// is built — the shape `[data] path = "/mnt/logs"` creates, and the
+    /// one the forward-only cutover cannot survive. `/proc` is a real
+    /// mount under `/` on every Linux box, so this is a genuine
+    /// cross-device stat rather than a mocked one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_data_root_on_its_own_mount_is_refused() {
+        let mount = Path::new("/proc");
+        if !mount.exists() || device_of(mount).unwrap() == device_of(Path::new("/")).unwrap() {
+            return; // no /proc to lean on; nothing to prove here
+        }
+        let err = check_staging_filesystem(mount).expect_err("a mount point must be refused");
+        assert!(err.contains("/proc.repin-next"), "{err}");
+        assert!(err.contains("EXDEV"), "{err}");
+    }
+
+    /// A relative data root has an empty `parent()`; the check must read
+    /// that as the working directory rather than stat `""` and fail.
+    #[test]
+    fn a_relative_single_component_data_root_checks_against_the_cwd() {
+        check_staging_filesystem(Path::new(".")).expect("the cwd shares its own filesystem");
     }
 }

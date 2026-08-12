@@ -137,7 +137,7 @@ Retention is exactly those two files — there is no multi-generation rotation o
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `path` | string | *(required)* | Parquet data directory |
+| `path` | string | *(required)* | Parquet data directory. Point it at a directory *inside* your storage volume, not at the mount point itself: a repin stages its shadow and set-aside generations as siblings (`data.repin-next/`, `data.repin-aside/`), and hardlinks and renames cannot cross a filesystem boundary. Both packaged layouts already do this (volume at `/var/lib/trawl`, data at `/var/lib/trawl/data`). A repin requested on a data root that *is* a mount point is refused before it builds anything, naming this |
 
 ### `[auth]`
 

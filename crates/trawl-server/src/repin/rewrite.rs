@@ -133,8 +133,9 @@ pub(crate) struct ProcessTally {
 /// Process ONE source file into the shadow root: an affected layout
 /// parquet is rewritten through [`ConformPolicy::Repin`]; everything else
 /// — unaffected parquet, foreign parquet, non-parquet evidence — is
-/// hardlinked verbatim (same filesystem by construction: the shadow is a
-/// sibling of the data root).
+/// hardlinked verbatim (the shadow is a sibling of the data root, and
+/// `marker::check_staging_filesystem` proved before the job started that
+/// the sibling shares its filesystem, so the link cannot be `EXDEV`).
 ///
 /// Idempotent per file: a pre-existing shadow entry (an earlier catch-up
 /// pass's output for a since-replaced source) is removed first.

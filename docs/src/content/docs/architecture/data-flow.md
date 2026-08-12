@@ -92,7 +92,11 @@ rewrite writes. A **symlink** under an env directory refuses the job
 (dry run included): trawl never writes one, the shadow cannot carry it,
 and skipping it would leave the swapped-aside original as the only copy
 for the job's own cleanup sweep to delete — materialize it or move it
-out of `data/{env}/` and retry.
+out of `data/{env}/` and retry. A data root that is itself a **mount
+point** refuses the job for the same class of reason (dry run included,
+before anything is built): the siblings would land on the parent
+filesystem, where neither the hardlinks nor the swap's renames can reach
+them — put the data root inside the volume, as both packaged layouts do.
 
 An additive catch-up loop folds in files compaction writes meanwhile (the
 file-relocating daily rollup is paused for the whole job, so the diff is

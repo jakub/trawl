@@ -227,6 +227,20 @@ impl RepinEngine {
         dry_run: bool,
         force: bool,
     ) -> Result<StartOutcome, ServerError> {
+        // Layout pre-flight, ahead of the minutes-long scan: the staging
+        // siblings must share the data root's filesystem, because both
+        // halves of this engine are renames and hardlinks across that
+        // boundary. It gates the dry run too — "can this repin run here"
+        // is exactly what a dry run is asked, and answering yes to a
+        // layout whose cutover can only exit the process would be a lie.
+        // Post-claim, so the refusal is a terminal job row the status
+        // surface reports rather than a stranded running slot.
+        if let Err(msg) = crate::repin::marker::check_staging_filesystem(&self.data_dir) {
+            self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                .await;
+            return Err(ServerError::BadRequest(msg));
+        }
+
         let (counts, tallies) = match self.run_scan(&field, to).await {
             Ok(measured) => measured,
             Err(e) => {
