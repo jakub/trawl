@@ -228,12 +228,72 @@ on <code dir="auto">NOT f=x</code> to catch events missing a field need rewritin
 <ul>
 <li><strong>Numeric-literal detection is by content, not quoting</strong>: the parser
 discards quote provenance, so <code dir="auto">status&gt;"400"</code> and <code dir="auto">status&gt;400</code> are the
-same query.</li>
-<li><strong>Embedded mode (<code dir="auto">--data</code>) and the pipeline <code dir="auto">| where</code> stage stay
-literal-driven</strong> — there is no catalog behind <code dir="auto">--data</code>, and <code dir="auto">| where</code>
-is a typed expression evaluated after the search stage. <code dir="auto">| where status &gt; 400</code> over a VARCHAR-pinned column can therefore still error
-where the search-stage <code dir="auto">status&gt;400</code> filters cleanly.</li>
+same query — in the search stage and in <code dir="auto">| where</code> alike (<code dir="auto">where status == "400"</code> binds exactly as <code dir="auto">where status == 400</code>).</li>
+<li><strong>Embedded mode (<code dir="auto">--data</code>) stays literal-driven</strong> — there is no
+catalog behind <code dir="auto">--data</code>, so every comparison keeps its pre-catalog
+behavior there.</li>
 </ul>
+<div class="sl-heading-wrapper level-h4"><h4 id="pin-aware--where-and--let-adr-0011-slice-a">Pin-aware <code dir="auto">| where</code> and <code dir="auto">| let</code> (ADR-0011 slice A′)</h4><a class="sl-anchor-link" href="#pin-aware--where-and--let-adr-0011-slice-a"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Pin-aware | where and | let (ADR-0011 slice A′)”</span></a></div>
+<p>A <strong>bare field-vs-literal comparison</strong> inside <code dir="auto">| where</code> or <code dir="auto">| let</code>
+consults the same catalog pin the search stage does, and adopts exactly
+the same rule table: on a VARCHAR pin <code dir="auto">where status &gt; 400</code> compares in
+<code dir="auto">DECIMAL(38,6)</code> (a value with no reading is unknown, never an error),
+<code dir="auto">where status == 200</code> matches the stored text <em>or</em> its numeric reading,
+<code dir="auto">where status in (200, "accepted")</code> routes each element through the
+equality rule; pattern operators (<code dir="auto">matches</code>, <code dir="auto">like</code>, <code dir="auto">ilike</code>) against a
+typed pin target the same canonical text form globs do. Both operand
+orders bind (<code dir="auto">400 &lt; status</code> is <code dir="auto">status &gt; 400</code>); for pattern operators
+only the <em>left</em> operand is a subject — the right operand is the pattern.
+Live tail (SSE) and the batch tail behind <code dir="auto">extract kv</code> evaluate the same
+rules, so a pipeline means one thing in every lane.</p>
+<p><strong>Excluded shapes</strong> stay literal-driven, structurally: field-vs-field
+(<code dir="auto">where a == b</code>), function-wrapped fields (<code dir="auto">where lower(status) == "a"</code>),
+arithmetic on the field (<code dir="auto">where status * 2 &gt; 400</code>), <code dir="auto">== null</code>, and a
+pattern with the field on the right (<code dir="auto">where "x" matches f</code>). Unpinned
+fields are unchanged everywhere.</p>
+<p><strong>Which pin applies follows the pipeline</strong>, not a flat name lookup:</p>
+<ul>
+<li><code dir="auto">rename status as st | where st &gt; 400</code> is pin-aware under the new name
+(and <code dir="auto">status</code> no longer resolves the pin).</li>
+<li><code dir="auto">let status = &lt;expr&gt; | where status &gt; 400</code> is literal-driven — a
+computed value has no pin. A <strong>bare alias</strong> copies the pin:
+<code dir="auto">let s2 = status | where s2 &gt; 400</code> is pin-aware. Within one <code dir="auto">let</code>, a
+reference to a sibling target resolves the way the SQL does — an
+existing <em>column</em> of that name wins (so <code dir="auto">let a = 1, b = a</code> gives <code dir="auto">b</code>
+the original <code dir="auto">a</code>, not <code dir="auto">1</code>), and only a name the row doesn’t carry reads
+the sibling’s freshly computed value (<code dir="auto">let ms = 1000, total = ms * 2</code>
+gives <code dir="auto">total = 2000</code>). <em>Pins</em> stay strictly pre-stage either way, so
+<code dir="auto">let a = status, b = a</code> gives <code dir="auto">b</code> no pin.</li>
+<li>Aggregations keep their group-by keys and nothing else:
+<code dir="auto">stats count() by status | where status == 200</code> stays pin-aware, while
+aggregate outputs (<code dir="auto">count</code>, aliases, the <code dir="auto">timechart</code> time bucket) are
+never pinned.</li>
+<li><code dir="auto">extract &lt;regex&gt;</code> unpins its capture-group names; <code dir="auto">extract kv</code> passes
+the scope through — with one caveat: a kv key that <em>shadows</em> a pinned
+field name is read under that pin. Confine kv extraction to fields
+that don’t collide with pinned names if that matters.</li>
+<li><code dir="auto">from saved</code> reads another query’s output: no pins apply.</li>
+</ul>
+<p><strong>Timestamps in the <code dir="auto">extract kv</code> tail</strong> are compared as stored instants
+and shifted to your display timezone <em>last</em>, like every other lane. The
+shift follows the tail’s own lineage: <code dir="auto">rename _time as t</code> and a bare
+alias <code dir="auto">let t2 = _time</code> still render in your zone, while a <em>computed</em>
+value (<code dir="auto">let t = coalesce(_time, x)</code>, aggregate outputs) is a value the
+tail derived and renders as UTC text.</p>
+<p><strong>One NULL-policy difference from the search stage, kept on purpose</strong>:
+the pipeline <code dir="auto">!=</code> does <em>not</em> carry the search stage’s <code dir="auto">OR field IS NULL</code>
+widening. <code dir="auto">| where f != x</code> over an event without <code dir="auto">f</code> is unknown and
+filtered — exactly what the pin-blind <code dir="auto">| where</code> always answered — so a
+repin never changes missing-field semantics. Use the search-stage <code dir="auto">f!=x</code>
+when you want the missing-field net.</p>
+<aside aria-label="Changed in the ADR-0011 slice A′ release" class="starlight-aside starlight-aside--caution"><p class="starlight-aside__title" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" class="starlight-aside__icon"><path d="M12 16a1 1 0 1 0 0 2 1 1 0 0 0 0-2Zm10.67 1.47-8.05-14a3 3 0 0 0-5.24 0l-8 14A3 3 0 0 0 3.94 22h16.12a3 3 0 0 0 2.61-4.53Zm-1.73 2a1 1 0 0 1-.88.51H3.94a1 1 0 0 1-.88-.51 1 1 0 0 1 0-1l8-14a1 1 0 0 1 1.78 0l8.05 14a1 1 0 0 1 .05 1.02v-.02ZM12 8a1 1 0 0 0-1 1v4a1 1 0 0 0 2 0V9a1 1 0 0 0-1-1Z"/></svg>Changed in the ADR-0011 slice A′ release</p><div class="starlight-aside__content"><p><code dir="auto">| where</code> and <code dir="auto">| let</code> comparisons on pinned fields change answers:
+<code dir="auto">| where status &gt; 400</code> over a VARCHAR pin stops raising a Conversion
+error and starts filtering; <code dir="auto">== 200</code> gains the numeric arm (it now
+matches a stored <code dir="auto">"200.0"</code>); on TIMESTAMP pins live-tail ordered
+comparisons become the instant comparison batch always performed instead
+of lexical text. The envelope seed pins <code dir="auto">host</code>/<code dir="auto">service</code>/<code dir="auto">env</code>/<code dir="auto">message</code>/
+<code dir="auto">severity_text</code>/<code dir="auto">_raw</code> as VARCHAR on every install, so this is live on
+day one.</p></div></aside>
 <div class="sl-heading-wrapper level-h3"><h3 id="severity-the-level-alias">Severity: the <code dir="auto">level</code> alias</h3><a class="sl-anchor-link" href="#severity-the-level-alias"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Severity: the level alias”</span></a></div>
 <p><code dir="auto">level</code> is a <strong>query alias for the numeric <code dir="auto">severity</code> column</strong> (OTel
 SeverityNumber 1-24). Name tokens are matched case-insensitively and
@@ -680,4 +740,4 @@ never consulted:</p>
 </div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53"># Pivot status codes by host</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">last=1h | pivot count() on status by host</span></div></div><div class="ec-line"><div class="code">
 </div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53"># Conditional field with null handling</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">* | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10</span></div></div><div class="ec-line"><div class="code">
 </div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53"># Distinct values per group</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">* | stats values(severity_text), first(message) by service | head 10</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="# Errors in the last hour by servicelevel=error last=1h | stats count() by service | sort -count# Slow requests by endpointstatus=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10# 4xx/5xx rate by hoststatus>=400 last=2h | stats count() by host, status | where count > 10# Extract IPs and count&quot;connection from&quot; | rex &quot;(?P<ip>\d+\.\d+\.\d+\.\d+)&quot; from message | stats count() by ip | sort -count# Time series of error ratelevel=error OR level=fatal | timechart span=5m count() by service# Dedup flapping alertsservice=monitoring | dedup host, alert_name# Pivot status codes by hostlast=1h | pivot count() on status by host# Conditional field with null handling* | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10# Distinct values per group* | stats values(severity_text), first(message) by service | head 10"><div></div></button></div></figure></div>
-</div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/dsl.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a><p>Last updated: <time datetime="2026-08-12T03:01:29.000Z">Aug 12, 2026</time></p></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/getting-started/vector-integration/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Vector Integration</span></span></a><a href="/reference/cli/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">CLI &amp; TUI</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
+</div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/dsl.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a><p>Last updated: <time datetime="2026-08-12T15:51:13.000Z">Aug 12, 2026</time></p></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/getting-started/vector-integration/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Vector Integration</span></span></a><a href="/reference/cli/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">CLI &amp; TUI</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
