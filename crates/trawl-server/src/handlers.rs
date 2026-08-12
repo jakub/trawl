@@ -1267,23 +1267,14 @@ pub async fn field_values(
     // Cache miss — sample from parquet.
     let start = std::time::Instant::now();
 
-    // Build glob: service-scoped if param present, else fallback.
-    let glob = if let Some(ref svc) = params.service {
-        let base = state.query.pool.fallback_glob();
-        let base_prefix = base.find('*').map_or(base.as_ref(), |pos| &base[..pos]);
-        format!("{base_prefix}**/{svc}.parquet")
-    } else {
-        state.query.pool.fallback_glob().to_string()
-    };
-    let field_clone = field.clone();
-
-    let values = tokio::task::spawn_blocking(move || {
-        let executor = trawl_engine::executor::Executor::new()?;
-        executor.sample_field_values(&glob, &field_clone, limit)
-    })
-    .await
-    .map_err(|e| ServerError::Internal(format!("task panicked: {e}")))?
-    .map_err(ServerError::from)?;
+    // Through the pool: the glob is expanded inside the permit-holding task,
+    // so this lane is excluded by the repin cutover like every other
+    // parquet reader (ADR-0011 slice B).
+    let values = state
+        .query
+        .pool
+        .sample_field_values(&field, params.service.as_deref(), limit)
+        .await?;
 
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 

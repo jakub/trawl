@@ -701,7 +701,7 @@ impl ExecutorPool {
     /// (ADR-0011 slice B).
     ///
     /// Every lane that can read parquet funnels through this semaphore
-    /// (queries, `from saved`, exports, ping), and each lane computes its
+    /// (queries, `from saved`, exports, value sampling, ping), and each lane computes its
     /// source and snapshots its comparison pins INSIDE the permit-holding
     /// task — so holding all permits means no query can straddle the
     /// per-env swap or the pin flip. SSE streams hold no permit, read no
@@ -805,6 +805,60 @@ impl ExecutorPool {
         })
         .await
         .map_err(|e| ServerError::Internal(format!("ping task panicked: {e}")))?;
+
+        self.return_executor(executor);
+        result
+    }
+
+    /// Sample distinct values of one field for autocomplete.
+    ///
+    /// A parquet-reading lane like any other, so it funnels through the
+    /// same semaphore [`exclusive`](Self::exclusive) drains — and, like the
+    /// query lanes, expands its glob INSIDE the permit-holding task, so it
+    /// cannot list paths before the repin cutover's per-env swap and read
+    /// them after (ADR-0011 slice B).
+    ///
+    /// `service`, when present, scopes the glob to one service's files; the
+    /// caller is responsible for validating the name.
+    pub async fn sample_field_values(
+        &self,
+        field: &str,
+        service: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, ServerError> {
+        let semaphore = Arc::clone(&self.semaphore);
+        let Ok(permit) = semaphore.acquire_owned().await else {
+            return Err(ServerError::Internal("executor pool shut down".into()));
+        };
+
+        let executor = self.take_executor();
+        let fallback_glob = Arc::clone(&self.fallback_glob);
+        let field = field.to_owned();
+        let service = service.map(ToOwned::to_owned);
+
+        let (executor, result) = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let glob = match service {
+                Some(svc) => {
+                    let base = fallback_glob.as_ref();
+                    let base_prefix = base.find('*').map_or(base, |pos| &base[..pos]);
+                    format!("{base_prefix}**/{svc}.parquet")
+                }
+                None => fallback_glob.to_string(),
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                executor
+                    .sample_field_values(&glob, &field, limit)
+                    .map_err(ServerError::from)
+            }));
+            let result = match result {
+                Ok(r) => r,
+                Err(_) => Err(ServerError::Internal("field values sample panicked".into())),
+            };
+            (executor, result)
+        })
+        .await
+        .map_err(|e| ServerError::Internal(format!("field values task panicked: {e}")))?;
 
         self.return_executor(executor);
         result
@@ -1103,6 +1157,31 @@ mod tests {
         let outcome = queued.await.expect("queued query joins");
         // (The DSL result itself is irrelevant — the point is it RAN.)
         let _ = outcome.result;
+    }
+
+    /// Value sampling reads parquet, so it is a permit-taking lane like any
+    /// other — otherwise it could expand its glob before the cutover's
+    /// per-env swap and read after it, sampling a half-swapped corpus.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exclusive_blocks_field_value_sampling() {
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
+        let guard = pool
+            .exclusive(Duration::from_secs(1))
+            .await
+            .expect("an idle pool is immediately exclusive");
+
+        let p2 = pool.clone();
+        let queued = tokio::spawn(async move { p2.sample_field_values("service", None, 10).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !queued.is_finished(),
+            "value sampling must not read parquet while the cutover holds the pool"
+        );
+
+        drop(guard);
+        // (The sample itself fails against a nonexistent corpus — the point
+        // is that it only RAN once exclusivity was released.)
+        let _ = queued.await.expect("queued sample joins");
     }
 
     /// A held query permit starves `exclusive()` past its budget: the

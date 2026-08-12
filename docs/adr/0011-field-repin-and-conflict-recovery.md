@@ -440,8 +440,8 @@ primitives across the final increment, the swap and the pin flip: a
 corpus gate whose read side wraps every compaction batch's
 pin-snapshot → conform → publish phase, and exclusivity over every
 executor-pool permit (every parquet-reading lane — query, from-saved,
-export — computes its source and snapshots its comparison pins inside
-the permit-holding task). The drain is bounded: a wedged query aborts
+export, value sampling — computes its source and snapshots its
+comparison pins inside the permit-holding task). The drain is bounded: a wedged query aborts
 the job to the terminal `blocked` outcome rather than starving the
 cutover. Past the cutover marker the engine is forward-only — a swap or
 flip failure terminates the process crash-consistent (the marker replay
