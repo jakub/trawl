@@ -1535,6 +1535,101 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
     }
 }
 
+// -- repin handlers (ADR-0011 slice B) ----------------------------------------
+
+/// Wire shape of one repin job row.
+fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse {
+    let clamp = |v: i64| u64::try_from(v).unwrap_or(0);
+    trawl_api::RepinJobResponse {
+        id: job.id,
+        field: job.field,
+        from_type: job.from_type,
+        to_type: job.to_type,
+        dry_run: job.dry_run,
+        force: job.force,
+        status: job.status.as_str().to_owned(),
+        requested_by: job.requested_by,
+        started_at: iso8601(job.started_at),
+        finished_at: job.finished_at.map(iso8601),
+        error: job.error,
+        files_total: clamp(job.files_total),
+        rows_carrying: clamp(job.rows_carrying),
+        projected_nulls: clamp(job.projected_nulls),
+        resurrectable: clamp(job.resurrectable),
+        affected_bytes: clamp(job.affected_bytes),
+        files_done: clamp(job.files_done),
+        rows_rewritten: clamp(job.rows_rewritten),
+        rows_nulled: clamp(job.rows_nulled),
+        rows_resurrected: clamp(job.rows_resurrected),
+    }
+}
+
+/// `POST /api/v1/schema/repin` — trigger a repin (ADR-0011 slice B).
+/// `SchemaWrite`-gated: the first data-mutating schema action.
+///
+/// The HTTP status carries the verdict: 200 = dry-run report, 202 =
+/// rewrite started (poll `/schema/repin/status`), 409 = the scan projected
+/// nulled values and no force flag was passed — the body is the plan the
+/// refusal is based on (a second concurrent repin also 409s, but with the
+/// error envelope). Validation refusals (unpinned field, envelope field,
+/// unknown target type, same-type without force) are 400s; a query-only
+/// node answers 503 — it owns nothing under the data root.
+pub async fn schema_repin(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Json(req): Json<trawl_api::RepinRequest>,
+) -> Result<axum::response::Response, ServerError> {
+    if !verified.has_permission(Permission::SchemaWrite) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+    let Some(engine) = state.repin.as_ref() else {
+        return Err(ServerError::ServiceUnavailable(
+            "repin requires an ingest-enabled node (this node does not own \
+             the data root)"
+                .into(),
+        ));
+    };
+
+    let outcome = engine
+        .start(
+            &req.field,
+            &req.to,
+            req.dry_run,
+            req.force,
+            Some(&verified.name),
+        )
+        .await?;
+    let (status, job) = match outcome {
+        crate::repin::StartOutcome::DryRun(job) => (StatusCode::OK, job),
+        crate::repin::StartOutcome::Started(job) => (StatusCode::ACCEPTED, job),
+        crate::repin::StartOutcome::Refused(job) => (StatusCode::CONFLICT, job),
+    };
+    Ok((
+        status,
+        Json(trawl_api::RepinResponse {
+            job: repin_job_to_wire(job),
+        }),
+    )
+        .into_response())
+}
+
+/// `GET /api/v1/schema/repin/status` — the running job if any, else the
+/// newest job of any status. `SchemaRead`-gated on purpose (ADR-0011
+/// slice C: read-only surfaces show state without offering the trigger),
+/// and served on query-only nodes too — the job rows live in postgres.
+pub async fn schema_repin_status(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<Json<trawl_api::RepinStatusResponse>, ServerError> {
+    if !verified.has_permission(Permission::SchemaRead) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+    let job = state.storage.repin.latest().await?;
+    Ok(Json(trawl_api::RepinStatusResponse {
+        job: job.map(repin_job_to_wire),
+    }))
+}
+
 // -- schedule handlers -------------------------------------------------------
 
 /// Remove parquet files for deleted report runs (best-effort, logs warnings on failure).

@@ -21,6 +21,8 @@ use sqlx::PgPool;
 const BASE_MIGRATION: &str =
     include_str!("../migrations/20260515000001_create_api_key_keystore.sql");
 const ROLES_MIGRATION: &str = include_str!("../migrations/20260726000001_roles_as_data.sql");
+const SCHEMA_WRITE_MIGRATION: &str =
+    include_str!("../migrations/20260812000001_trawl_schema_write.sql");
 
 /// The legacy trawl role → permission tables (policy.rs), minus the dead
 /// `key_manage` the migration intentionally drops.
@@ -173,6 +175,10 @@ async fn ac1_conversion_preserves_every_legacy_grant(pool: PgPool) {
         .execute(&pool)
         .await
         .expect("roles-as-data migration");
+    sqlx::raw_sql(SCHEMA_WRITE_MIGRATION)
+        .execute(&pool)
+        .await
+        .expect("schema_write registry migration");
 
     // Every trawl key resolves exactly the old compile-time set, minus
     // key_manage, and links to the converted `trawl-<role>` role.
@@ -244,7 +250,9 @@ async fn ac1_conversion_preserves_every_legacy_grant(pool: PgPool) {
     .unwrap();
     assert!(!legacy_exists, "api_key_role_assignment must be dropped");
 
-    // trawl's 9 live permission strings are registered; key_manage is not.
+    // trawl's live permission strings are registered (the roles-as-data
+    // conversion's 9 plus schema_write from the ADR-0011 slice-B
+    // migration); key_manage is not.
     let registry: BTreeSet<String> = sqlx::query_scalar::<_, String>(
         "SELECT permission FROM app_permissions WHERE app = 'trawl'",
     )
@@ -265,6 +273,7 @@ async fn ac1_conversion_preserves_every_legacy_grant(pool: PgPool) {
             "query_cancel",
             "server_manage",
             "ingest",
+            "schema_write",
         ])
     );
 }

@@ -78,8 +78,9 @@ pub use trawl_api::{
     ExportFormat, ExportRequest, FieldValuesResponse, GlobalRunSummary, HealthResponse,
     HealthStatus, HistoryEntryResponse, HistoryResponse, IngestEventError, IngestResponse,
     ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, PaginationMeta,
-    QueriesResponse, QueryRequest, QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary,
-    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse,
-    ServiceColumnStats, ServiceSchema, ServiceSchemaResponse, SetScheduleRequest, StatsResponse,
-    UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    QueriesResponse, QueryRequest, QueryResponse, QueryStatus, RepinJobResponse, RepinRequest,
+    RepinResponse, RepinStatusResponse, ReportRunResponse, ReportRunSummary, RunsStatsResponse,
+    SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse, ServiceColumnStats,
+    ServiceSchema, ServiceSchemaResponse, SetScheduleRequest, StatsResponse, UpdateSavedRequest,
+    ValidationResponse, WhoAmIResponse,
 };

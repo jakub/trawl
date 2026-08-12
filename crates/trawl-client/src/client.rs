@@ -15,14 +15,26 @@ use crate::types::{
     CancelResponse, CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse,
     DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, FieldValuesResponse,
     HealthResponse, HistoryResponse, IngestResponse, ListAllRunsResponse, ListReportRunsResponse,
-    ListSavedResponse, QueriesResponse, QueryResponse, ReportRunResponse, ReportRunSummary,
-    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaResponse, ServiceSchemaResponse,
-    StatsResponse, ValidationResponse, WhoAmIResponse,
+    ListSavedResponse, QueriesResponse, QueryResponse, RepinStatusResponse, ReportRunResponse,
+    ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaResponse,
+    ServiceSchemaResponse, StatsResponse, ValidationResponse, WhoAmIResponse,
 };
 use crate::types::{
     CreateSavedRequestRef, ErrorResponse, ExportRequestRef, SetScheduleRequestRef, StreamEvent,
     UpdateSavedRequestRef, ValidateRequest,
 };
+
+/// Outcome of `POST /api/v1/schema/repin` — the HTTP status decoded.
+#[derive(Debug, Clone)]
+pub enum RepinStart {
+    /// 200: a dry-run report (the job is terminal `succeeded`).
+    Report(trawl_api::RepinJobResponse),
+    /// 202: the rewrite is running; poll `schema_repin_status`.
+    Started(trawl_api::RepinJobResponse),
+    /// 409 with a job body: the scan projected nulled values and no force
+    /// flag was passed — the job is the plan the refusal is based on.
+    Refused(trawl_api::RepinJobResponse),
+}
 
 /// HTTP client for the trawl daemon API.
 #[derive(Clone)]
@@ -448,6 +460,78 @@ impl HttpClient {
         if let Some(l) = limit {
             req = req.query(&[("limit", l.to_string())]);
         }
+        self.send_authenticated(req).await
+    }
+
+    /// Trigger a repin (`POST /api/v1/schema/repin`, ADR-0011 slice B).
+    ///
+    /// The HTTP status carries the verdict, so this returns a three-way
+    /// outcome instead of flattening 409-with-plan into an opaque error:
+    /// 200 = dry-run report, 202 = rewrite started, 409 with a job body =
+    /// lossy without force (the plan rides back). Every other failure —
+    /// including the "already running" 409, whose body is the error
+    /// envelope — surfaces as [`ClientError::Server`].
+    pub async fn schema_repin(
+        &self,
+        field: &str,
+        to: &str,
+        dry_run: bool,
+        force: bool,
+    ) -> Result<RepinStart, ClientError> {
+        let url = self.endpoint("/api/v1/schema/repin");
+        let body = trawl_api::RepinRequest {
+            field: field.to_owned(),
+            to: to.to_owned(),
+            dry_run,
+            force,
+        };
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .header("Authorization", self.auth_header_value())
+            .send()
+            .await
+            .map_err(sanitize_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if status == 409 {
+            // Two 409 shapes: a refused-needs-force PLAN (RepinResponse
+            // body) and the already-running error envelope.
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| ClientError::Parse(e.to_string()))?;
+            if let Ok(refused) = serde_json::from_slice::<trawl_api::RepinResponse>(&bytes) {
+                return Ok(RepinStart::Refused(refused.job));
+            }
+            let error = serde_json::from_slice::<ErrorResponse>(&bytes).map_or_else(
+                |_| {
+                    trawl_api::ErrorEnvelope::simple(
+                        trawl_api::ErrorCode::InternalError,
+                        "unknown error",
+                    )
+                },
+                |e| e.error,
+            );
+            return Err(ClientError::Server { status, error });
+        }
+        let resp = check_status(resp).await?;
+        let outcome: trawl_api::RepinResponse = resp
+            .json()
+            .await
+            .map_err(|e| ClientError::Parse(e.to_string()))?;
+        Ok(match status {
+            202 => RepinStart::Started(outcome.job),
+            _ => RepinStart::Report(outcome.job),
+        })
+    }
+
+    /// Fetch the repin status surface
+    /// (`GET /api/v1/schema/repin/status`).
+    pub async fn schema_repin_status(&self) -> Result<RepinStatusResponse, ClientError> {
+        let url = self.endpoint("/api/v1/schema/repin/status");
+        let req = self.client.get(&url);
         self.send_authenticated(req).await
     }
 

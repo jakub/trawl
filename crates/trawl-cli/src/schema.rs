@@ -505,3 +505,247 @@ mod tests {
         assert!(rows.iter().all(|r| !r[1].as_str().unwrap().is_empty()));
     }
 }
+
+// -- repin (ADR-0011 slice B) -------------------------------------------------
+
+/// The `trawl schema repin` flag bundle.
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // four independent CLI switches
+pub struct RepinFlags {
+    /// Scan and report only.
+    pub dry_run: bool,
+    /// Accept a lossy projection / run a resurrection-only pass.
+    pub force: bool,
+    /// Skip the interactive confirmation.
+    pub yes: bool,
+    /// Poll the job to completion.
+    pub wait: bool,
+}
+
+/// One repin job → generic key/value (columns, rows) for the driver
+/// formatter — the job is a single record, so it renders as one row.
+pub fn repin_job_to_rows(job: &trawl_client::RepinJobResponse) -> (Vec<String>, Vec<Vec<Json>>) {
+    let columns = [
+        "id",
+        "field",
+        "from",
+        "to",
+        "status",
+        "files_total",
+        "files_done",
+        "rows_carrying",
+        "projected_nulls",
+        "resurrectable",
+        "rows_rewritten",
+        "rows_nulled",
+        "rows_resurrected",
+        "error",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let rows = vec![vec![
+        Json::from(job.id),
+        Json::from(job.field.clone()),
+        Json::from(job.from_type.clone()),
+        Json::from(job.to_type.clone()),
+        Json::from(job.status.clone()),
+        Json::from(job.files_total),
+        Json::from(job.files_done),
+        Json::from(job.rows_carrying),
+        Json::from(job.projected_nulls),
+        Json::from(job.resurrectable),
+        Json::from(job.rows_rewritten),
+        Json::from(job.rows_nulled),
+        Json::from(job.rows_resurrected),
+        job.error.clone().map_or(Json::Null, Json::from),
+    ]];
+    (columns, rows)
+}
+
+/// `trawl schema repin <field> --to <type>`.
+///
+/// An executing repin rewrites the archive, so it confirms interactively —
+/// and off a TTY it REFUSES without `--yes` rather than assuming (a piped
+/// or scripted invocation must state its intent). Dry runs never prompt.
+pub async fn run_repin(
+    out: &mut impl Write,
+    conn: ConnectionParams,
+    field: &str,
+    to: &str,
+    flags: RepinFlags,
+    format: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    let format = resolve_format(format)?;
+    if !flags.dry_run && !flags.yes {
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            eprint!(
+                "repin {field:?} to {to}: this rewrites the standing corpus \
+                 (dry-run first with --dry-run). Proceed? [y/N] "
+            );
+            io::stderr().flush().ok();
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                return Err(CliError::Usage("repin aborted".into()));
+            }
+        } else {
+            return Err(CliError::Usage(
+                "repin rewrites the standing corpus; non-interactive \
+                 invocations must pass --yes (or use --dry-run)"
+                    .into(),
+            ));
+        }
+    }
+
+    let client = make_client(&conn)?;
+    let outcome = client
+        .schema_repin(field, to, flags.dry_run, flags.force)
+        .await?;
+    let (verdict, job) = match outcome {
+        trawl_client::RepinStart::Report(job) => ("dry run", job),
+        trawl_client::RepinStart::Started(job) => ("started", job),
+        trawl_client::RepinStart::Refused(job) => ("refused: needs --force", job),
+    };
+
+    let refused = job.status == "refused_needs_force";
+    let mut job = job;
+    if flags.wait && !refused && job.status == "running" {
+        job = wait_for_terminal(&client, job).await?;
+    }
+
+    if format == OutputFormat::Table {
+        writeln!(out, "repin {}: {verdict}", job.field)?;
+    }
+    let (columns, rows) = repin_job_to_rows(&job);
+    render_driver_results(&columns, &rows, format, out)?;
+    if refused {
+        return Err(CliError::Usage(format!(
+            "repin would null {} stored value(s); re-run with --force to \
+             accept the loss (originals remain findable in _raw)",
+            job.projected_nulls
+        )));
+    }
+    Ok(())
+}
+
+/// Poll the status surface until the job leaves `running`.
+async fn wait_for_terminal(
+    client: &trawl_client::HttpClient,
+    job: trawl_client::RepinJobResponse,
+) -> Result<trawl_client::RepinJobResponse, CliError> {
+    let id = job.id;
+    let mut latest = job;
+    while latest.status == "running" {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let status = client.schema_repin_status().await?;
+        match status.job {
+            Some(j) if j.id == id => latest = j,
+            // A different (or no) job means ours got reconciled away by a
+            // restart; report what we last saw.
+            _ => break,
+        }
+    }
+    Ok(latest)
+}
+
+/// `trawl schema repin-status`.
+pub async fn run_repin_status(
+    out: &mut impl Write,
+    conn: ConnectionParams,
+    format: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    let format = resolve_format(format)?;
+    let client = make_client(&conn)?;
+    let status = client.schema_repin_status().await?;
+    match status.job {
+        Some(job) => {
+            let (columns, rows) = repin_job_to_rows(&job);
+            render_driver_results(&columns, &rows, format, out)?;
+        }
+        None => writeln!(out, "no repin job has ever run")?,
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod repin_tests {
+    use super::*;
+
+    fn sample_job() -> trawl_client::RepinJobResponse {
+        trawl_client::RepinJobResponse {
+            id: 3,
+            field: "status".into(),
+            from_type: "BIGINT".into(),
+            to_type: "VARCHAR".into(),
+            dry_run: true,
+            force: false,
+            status: "succeeded".into(),
+            requested_by: Some("ops".into()),
+            started_at: "2026-08-12T10:00:00Z".into(),
+            finished_at: Some("2026-08-12T10:00:05Z".into()),
+            error: None,
+            files_total: 4,
+            rows_carrying: 1000,
+            projected_nulls: 0,
+            resurrectable: 25,
+            affected_bytes: 1 << 20,
+            files_done: 4,
+            rows_rewritten: 1200,
+            rows_nulled: 0,
+            rows_resurrected: 25,
+        }
+    }
+
+    /// The job renders through the shared driver formatter in every
+    /// format the schema family honours.
+    #[test]
+    fn repin_job_renders_in_table_json_and_csv() {
+        let (columns, rows) = repin_job_to_rows(&sample_job());
+        for format in [OutputFormat::Table, OutputFormat::Json, OutputFormat::Csv] {
+            let mut out = Vec::new();
+            render_driver_results(&columns, &rows, format, &mut out).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("VARCHAR"), "{format:?}: {text}");
+            assert!(text.contains("succeeded"), "{format:?}: {text}");
+        }
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        let parsed: Json =
+            serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["resurrectable"], 25);
+        assert_eq!(parsed["projected_nulls"], 0);
+    }
+
+    /// An executing repin off a TTY refuses without `--yes` BEFORE any
+    /// network access — the connection params here are deliberately
+    /// unusable, so reaching the client would fail differently.
+    #[tokio::test]
+    async fn non_tty_execute_without_yes_refuses() {
+        let conn = ConnectionParams {
+            url: "https://127.0.0.1:1".into(),
+            token: "unused".into(),
+            insecure: true,
+        };
+        let mut out = Vec::new();
+        let err = run_repin(
+            &mut out,
+            conn,
+            "status",
+            "VARCHAR",
+            RepinFlags {
+                dry_run: false,
+                force: false,
+                yes: false,
+                wait: false,
+            },
+            Some(OutputFormat::Json),
+        )
+        .await
+        .expect_err("must refuse without --yes off a TTY");
+        assert!(
+            matches!(err, CliError::Usage(ref msg) if msg.contains("--yes")),
+            "got {err:?}"
+        );
+        assert!(out.is_empty(), "nothing rendered before the refusal");
+    }
+}

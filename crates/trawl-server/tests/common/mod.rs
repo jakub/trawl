@@ -90,6 +90,18 @@ pub async fn seed_trawl_roles(store: &KeyStore) {
         .create_role("trawl-ingest", None, &trawl_perms(&["ingest"]))
         .await
         .expect("seed trawl-ingest");
+    // Beyond the four frozen conversion bundles: the ADR-0011 slice-B
+    // schema-admin shape — schema_write WITHOUT server_manage, which is
+    // the whole point of the separate permission. No pre-existing role
+    // carries schema_write (the migration registers, never grants).
+    store
+        .create_role(
+            "trawl-schema-admin",
+            None,
+            &trawl_perms(&["query", "schema_read", "schema_write"]),
+        )
+        .await
+        .expect("seed trawl-schema-admin");
     store
         .create_role(
             "coastwatch-viewer",
@@ -492,6 +504,7 @@ pub struct TestServer {
     pub admin_token: String,
     pub reader_token: String,
     pub ingest_token: String,
+    pub schema_admin_token: String,
     pub coastwatch_only_token: String,
     /// Pool on the per-test FLEET database (mint/revoke keys mid-test).
     pub fleet_pool: PgPool,
@@ -628,6 +641,15 @@ pub async fn setup_in_dir_with_data(
     let app_db_url = create_app_database(&pool).await;
 
     let (analyst_token, admin_token, reader_token, ingest_token) = mint_role_keys(&store).await;
+    let schema_admin = store
+        .create_key(
+            "schema-admin-key",
+            PrincipalKind::Service,
+            &roles(&["trawl-schema-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
     // Holds a role, but one with zero trawl permissions — the "grantless"
     // shape under roles-as-data.
     let coastwatch_only = store
@@ -714,6 +736,7 @@ pub async fn setup_in_dir_with_data(
         admin_token,
         reader_token,
         ingest_token,
+        schema_admin_token: schema_admin.plaintext_token.to_string(),
         coastwatch_only_token: coastwatch_only.plaintext_token.to_string(),
         fleet_pool: pool,
         fleet_db_url,

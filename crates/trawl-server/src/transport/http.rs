@@ -67,6 +67,8 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         // Catalog read routes (#51). The field DETAIL takes `?name=` rather
         // than a path segment: a catalog key may contain `/`.
         .route("/schema/fields", get(handlers::catalog_fields))
+        .route("/schema/repin", post(handlers::schema_repin))
+        .route("/schema/repin/status", get(handlers::schema_repin_status))
         .route("/schema/field", get(handlers::catalog_field))
         .route("/schema/conflicts", get(handlers::catalog_conflicts))
         .route("/schema/values/{field}", get(handlers::field_values))
