@@ -113,6 +113,12 @@ fn retention_tick(
     // bytes the job is deliberately double-holding. The job's own
     // free-space pre-flight is what keeps this suppression affordable.
     if let Some(what) = repin_in_flight(data_dir) {
+        // Alertable, because "suppressed" is not always "a job is
+        // running": staging whose sweep keeps failing holds this at 1
+        // across boots with no job to explain it, and the archive grows
+        // the whole time. An info line per tick is not something an
+        // operator can page on; a gauge held high is.
+        metrics::gauge!(crate::metrics::RETENTION_SUPPRESSED).set(1.0);
         tracing::info!(
             event_type = "retention_repin_suppressed",
             evidence = what,
@@ -122,6 +128,7 @@ fn retention_tick(
         );
         return Ok(());
     }
+    metrics::gauge!(crate::metrics::RETENTION_SUPPRESSED).set(0.0);
 
     let today = chrono::Utc::now().date_naive();
     let today_str = today.format("%Y-%m-%d").to_string();
@@ -371,6 +378,7 @@ fn dir_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::RETENTION_SUPPRESSED;
 
     fn make_config(max_age_days: u64, min_free_disk_bytes: u64) -> RetentionConfig {
         RetentionConfig {
@@ -661,6 +669,46 @@ mod tests {
                 "{staging}: no sweep may run while a repin is in flight"
             );
         }
+    }
+
+    /// Suppression is alertable, not just loggable. `repin_running` is 0
+    /// for staging no job owns — a boot replay whose sweep keeps failing
+    /// — which is precisely the case that suppresses retention forever,
+    /// so the gauge has to key on the staging itself and clear on the
+    /// tick that sweeps again.
+    #[test]
+    fn suppression_raises_and_clears_the_alertable_gauge() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config = make_config(90, 0);
+
+        metrics::with_local_recorder(&recorder, || {
+            // No job owns this aside — no marker, nothing running.
+            std::fs::create_dir_all(tmp.path().join("data.repin-aside")).unwrap();
+            retention_tick(&data_dir, &config, |_| Ok(u64::MAX)).unwrap();
+        });
+        assert!(
+            handle
+                .render()
+                .contains(&format!("{RETENTION_SUPPRESSED} 1")),
+            "orphaned staging must hold the gauge high: {}",
+            handle.render()
+        );
+
+        metrics::with_local_recorder(&recorder, || {
+            std::fs::remove_dir_all(tmp.path().join("data.repin-aside")).unwrap();
+            retention_tick(&data_dir, &config, |_| Ok(u64::MAX)).unwrap();
+        });
+        assert!(
+            handle
+                .render()
+                .contains(&format!("{RETENTION_SUPPRESSED} 0")),
+            "the tick that sweeps again must clear it: {}",
+            handle.render()
+        );
     }
 
     /// And both resume once the job's staging is gone.

@@ -46,6 +46,7 @@ pub const CATALOG_REPIN_FILES_DONE: &str = "trawl_catalog_repin_files_done";
 pub const CATALOG_REPIN_ROWS_NULLED_TOTAL: &str = "trawl_catalog_repin_rows_nulled_total";
 pub const CATALOG_REPIN_ROWS_RESURRECTED_TOTAL: &str = "trawl_catalog_repin_rows_resurrected_total";
 pub const CATALOG_REPIN_DURATION_SECONDS: &str = "trawl_catalog_repin_duration_seconds";
+pub const RETENTION_SUPPRESSED: &str = "trawl_retention_suppressed";
 pub const AUTH_FAILURES_TOTAL: &str = "trawl_auth_failures_total";
 pub const TELEMETRY_WAL_WRITE_FAILURES_TOTAL: &str = "trawl_telemetry_wal_write_failures_total";
 pub const TELEMETRY_EVENTS_DROPPED_TOTAL: &str = "trawl_telemetry_events_dropped_total";
@@ -169,6 +170,14 @@ pub fn describe_metrics() {
     describe_histogram!(
         CATALOG_REPIN_DURATION_SECONDS,
         "End-to-end repin job duration (build, catch-up, cutover, sweep)"
+    );
+    describe_gauge!(
+        RETENTION_SUPPRESSED,
+        "1 while retention sweeps (age AND disk pressure) stand down for \
+         repin staging on the data root, 0 when they run. Unlike \
+         trawl_catalog_repin_running this stays 1 for staging no job owns \
+         — a boot replay whose sweep keeps failing — so alert on it held \
+         high across ticks: the archive grows unbounded meanwhile"
     );
     describe_counter!(
         AUTH_FAILURES_TOTAL,

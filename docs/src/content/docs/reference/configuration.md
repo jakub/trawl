@@ -200,7 +200,12 @@ A staging root that survives its sweep — a permission or I/O error —
 deliberately keeps the marker, since the marker is what licenses trawl to
 delete that root: the cleanup is retried at the next boot
 (`repin_recovery_incomplete` meanwhile), and retention stays suppressed
-until the root is actually gone.
+until the root is actually gone. Alert on `trawl_retention_suppressed` —
+it is 1 for every tick either sweep stands down and 0 once they run
+again, so it distinguishes a repin in progress (minutes, hours) from
+staging nothing owns, which holds it at 1 indefinitely while the archive
+grows. `trawl_catalog_repin_running` cannot: it is 0 in exactly the
+stranded case.
 
 Disk-pressure deletion is suppressed while a pre-cutover `data.pre-schema-v2/` set-aside directory exists (it sits outside `data/`, so deleting partitions could never reclaim it); each tick under pressure logs `retention_disk_pressure_suppressed` instead. Remove the set-aside to reclaim the space and re-enable the policy. Age-based retention is unaffected.
 
