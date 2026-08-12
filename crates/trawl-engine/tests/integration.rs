@@ -1733,3 +1733,89 @@ fn extract_kv_tail_without_pins_stays_literal_driven() {
         .unwrap();
     assert_eq!(result.row_count(), 0, "embedded mode keeps today's answer");
 }
+
+/// A source holding one row at `_time = 2026-01-01 05:30:00` UTC, plus
+/// the TIMESTAMP pin the envelope seed gives `_time` on every install.
+fn setup_pinned_time() -> (Executor, String, FieldTypes, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("timed.parquet");
+    {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT TIMESTAMP '2026-01-01 05:30:00' AS _time, \
+             'plain text line' AS message) TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+    }
+    let mut ft = FieldTypes::new();
+    ft.insert("_time", trawl_core::schema::CanonicalType::Timestamp);
+    let exec = Executor::new().expect("executor should initialize");
+    (exec, format!("{}", path.display()), ft, dir)
+}
+
+/// The tail's pin-aware TIMESTAMP comparison reads the STORED instant, not
+/// the caller's display shift: `utc_offset_secs` is a rendering knob, so
+/// the same query must answer the same rows in every display zone — and
+/// exactly what the split-free query answers.
+#[test]
+fn extract_kv_tail_timestamp_compare_ignores_the_display_offset() {
+    let (exec, src, ft, _dir) = setup_pinned_time();
+    let dsl = "* | extract kv | where _time > \"2026-01-01T05:00:00Z\"";
+    for offset in [0, -18_000, 19_800] {
+        let result = exec.run_query(dsl, &src, &ft, 1000, offset).unwrap();
+        assert_eq!(
+            result.row_count(),
+            1,
+            "05:30Z is after 05:00Z whatever zone the client displays in (offset {offset})"
+        );
+    }
+    // The threshold that genuinely excludes the row excludes it everywhere.
+    let after = "* | extract kv | where _time > \"2026-01-01T06:00:00Z\"";
+    for offset in [0, -18_000, 19_800] {
+        assert_eq!(
+            exec.run_query(after, &src, &ft, 1000, offset)
+                .unwrap()
+                .row_count(),
+            0,
+            "offset {offset}"
+        );
+    }
+    // And it agrees with the same predicate without the kv split.
+    assert_eq!(
+        exec.run_query(
+            "* | where _time > \"2026-01-01T05:00:00Z\"",
+            &src,
+            &ft,
+            1000,
+            -18_000,
+        )
+        .unwrap()
+        .row_count(),
+        1,
+    );
+}
+
+/// Running the tail over UTC does not cost the caller its display zone:
+/// the surviving TIMESTAMP columns are shifted back afterwards, so the
+/// rendered cell is the same one the split-free query prints.
+#[test]
+fn extract_kv_tail_still_renders_timestamps_in_the_display_zone() {
+    let (exec, src, ft, _dir) = setup_pinned_time();
+    let with_kv = exec
+        .run_query("* | extract kv | head 5", &src, &ft, 1000, -18_000)
+        .unwrap();
+    let without_kv = exec
+        .run_query("* | head 5", &src, &ft, 1000, -18_000)
+        .unwrap();
+    let cell = |result: &QueryResult| {
+        let idx = result
+            .columns
+            .iter()
+            .position(|c| c.name == "_time")
+            .expect("_time column");
+        result.rows[0][idx].clone()
+    };
+    assert_eq!(cell(&with_kv), Value::String("2026-01-01 00:30:00".into()));
+    assert_eq!(cell(&with_kv), cell(&without_kv));
+}
