@@ -238,6 +238,38 @@ pub(crate) fn sweep_pre_swap_staging(data_dir: &Path) -> bool {
     shadow_swept && aside_swept
 }
 
+/// Sweep both staging roots for a job that has ALREADY cut over — the
+/// outgoing generation in the aside and whatever the swap left of the
+/// shadow — then drop the marker if both are gone.
+///
+/// Returns nothing, and that is the contract: past the point of no return
+/// the corpus IS the new generation and `finish_cutover` has flipped the
+/// pin, so nothing here may be reported as a failure of the job. A
+/// staging root or a marker that will not delete is leftover disk — the
+/// marker deliberately stands so the next boot replays `phase=cleanup`
+/// and retries the sweep, which is also the only license to delete the
+/// aside ([`sweep_pre_swap_staging`]). Surfacing either as an error would
+/// overwrite the `succeeded` row with `failed` and log "corpus
+/// untouched" over a completed destructive rewrite.
+pub(crate) fn finish_post_swap_staging(data_dir: &Path) {
+    let aside_swept = sweep_dir(&crate::repin::marker::aside_root(data_dir), "aside");
+    let shadow_swept = sweep_dir(
+        &crate::repin::marker::shadow_root(data_dir),
+        "shadow remnant",
+    );
+    if aside_swept
+        && shadow_swept
+        && let Err(e) = crate::repin::marker::remove_marker(data_dir)
+    {
+        tracing::warn!(
+            event_type = "repin_marker_error",
+            error = %e,
+            "post-cutover marker removal failed; the repin itself is \
+             complete and the next boot's replay retries the cleanup"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +313,38 @@ mod tests {
         assert!(
             sweep_pre_swap_staging(&data),
             "with the permissions repaired the retry finishes"
+        );
+    }
+
+    /// The post-cutover tail cannot report a failure, because there is no
+    /// failure left to report: the swap has published the new generation
+    /// and the pin is flipped. A marker that will not delete (here: a
+    /// directory in its place, so `remove_file` fails as root too) leaves
+    /// the marker standing for the boot replay and hands nothing back —
+    /// the job stays `succeeded`.
+    #[test]
+    fn an_undeletable_marker_cannot_fail_the_finished_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let shadow = crate::repin::marker::shadow_root(&data);
+        let aside = crate::repin::marker::aside_root(&data);
+        write(&data.join("prod/2026-01-01/10/svc.parquet"), b"repinned");
+        write(&aside.join("prod/2026-01-01/10/svc.parquet"), b"outgoing");
+        let marker = crate::repin::marker::marker_path(&data);
+        std::fs::create_dir_all(&marker).unwrap();
+
+        // Infallible by type: the only thing this returns is `()`.
+        finish_post_swap_staging(&data);
+
+        assert!(!aside.exists(), "the outgoing generation is still swept");
+        assert!(!shadow.exists());
+        assert!(
+            marker.is_dir(),
+            "the undeletable marker stands so the boot replay retries the cleanup"
+        );
+        assert!(
+            data.join("prod/2026-01-01/10/svc.parquet").exists(),
+            "the cut-over corpus is untouched by the sweep"
         );
     }
 

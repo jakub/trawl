@@ -35,7 +35,9 @@ use crate::catalog::FieldCatalog;
 use crate::catalog::conform::open_bounded_connection;
 use crate::error::ServerError;
 use crate::pool::ExecutorPool;
-use crate::repin::cutover::{prepare_shadow_root, swap_envs, sweep_dir, sweep_pre_swap_staging};
+use crate::repin::cutover::{
+    finish_post_swap_staging, prepare_shadow_root, swap_envs, sweep_pre_swap_staging,
+};
 use crate::repin::gate::RepinCoordinator;
 use crate::repin::marker::{
     RepinMarker, RepinPhase, aside_root, remove_marker, shadow_root, write_marker,
@@ -623,14 +625,14 @@ impl RepinEngine {
         // Evidence + metrics for what the rewrite actually did.
         self.record_outcome(job_id, field, from, to, &state).await;
 
-        // Sweep: disk-only from here. A failed sweep of EITHER staging root
-        // keeps the marker so the boot replay retries it — a leftover root
-        // suppresses retention until it is gone.
-        let aside_swept = sweep_dir(&aside_root(&self.data_dir), "aside");
-        let shadow_swept = sweep_dir(&shadow, "shadow remnant");
-        if aside_swept && shadow_swept {
-            remove_marker(&self.data_dir).map_err(JobAbort::Failed)?;
-        }
+        // Sweep: disk-only from here, and infallible by type. A failed
+        // sweep of EITHER staging root keeps the marker so the boot replay
+        // retries it — a leftover root suppresses retention until it is
+        // gone — but nothing past the point of no return may be reported
+        // as a failure of the JOB: the corpus is the new generation and
+        // the pin is flipped, so an undeletable marker is leftover disk,
+        // not a repin that "left the corpus untouched".
+        finish_post_swap_staging(&self.data_dir);
         Ok(())
     }
 
