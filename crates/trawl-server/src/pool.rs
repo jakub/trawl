@@ -107,6 +107,11 @@ pub struct ExecutorPool {
     idle: Arc<Mutex<Vec<Executor>>>,
     /// Hot buffer for fresh events not yet compacted to parquet.
     hot_buffer: Option<Arc<HotBuffer>>,
+    /// Field catalog whose full pin snapshot types every query's
+    /// search-stage comparisons (ADR-0011 slice A). Defaults to an empty
+    /// catalog; the server wires the shared cache via
+    /// [`Self::with_field_catalog`].
+    field_catalog: Arc<crate::catalog::FieldCatalog>,
 }
 
 impl std::fmt::Debug for ExecutorPool {
@@ -135,6 +140,7 @@ fn run_query_blocking(
     dsl: &str,
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
+    pins: &trawl_core::schema::FieldTypes,
     max_result_rows: usize,
     utc_offset_secs: i32,
     capture_debug: bool,
@@ -170,6 +176,7 @@ fn run_query_blocking(
             dsl,
             source,
             hot_buffer,
+            pins,
             fallback_glob,
             pool_wait_ms,
         ))
@@ -189,13 +196,14 @@ fn run_query_blocking(
                     source,
                     hot_path,
                     &hot.field_types,
+                    pins,
                     max_result_rows,
                     utc_offset_secs,
                 )
                 .map_err(ServerError::from)
         } else {
             executor
-                .run_query(dsl, source, max_result_rows, utc_offset_secs)
+                .run_query(dsl, source, pins, max_result_rows, utc_offset_secs)
                 .map_err(ServerError::from)
         }
     }));
@@ -224,6 +232,7 @@ fn capture_pool_debug(
     dsl: &str,
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
+    pins: &trawl_core::schema::FieldTypes,
     fallback_glob: &str,
     pool_wait_ms: u64,
 ) -> PoolDebugInfo {
@@ -256,7 +265,8 @@ fn capture_pool_debug(
                 .time_filter
                 .as_ref()
                 .map(|tf| tf.node.duration.to_seconds());
-            let (sql, params) = match trawl_core::emitter::emit(&ast, source) {
+            // Pin-aware, so the debug-log SQL preview matches what ran.
+            let (sql, params) = match trawl_core::emitter::emit_with_pins(&ast, source, pins) {
                 Ok(emitted) => (
                     emitted.sql,
                     emitted.params.iter().map(ToString::to_string).collect(),
@@ -331,7 +341,17 @@ impl ExecutorPool {
             active_interrupts: Arc::new(Mutex::new(HashMap::new())),
             idle: Arc::new(Mutex::new(executors)),
             hot_buffer,
+            field_catalog: Arc::new(crate::catalog::FieldCatalog::new()),
         }
+    }
+
+    /// Attach the shared field-catalog pin cache (ADR-0011 slice A).
+    /// Builder-style, mirroring `HotBuffer::with_field_catalog`, so the
+    /// test call sites that need no catalog stay on `new`.
+    #[must_use]
+    pub fn with_field_catalog(mut self, catalog: Arc<crate::catalog::FieldCatalog>) -> Self {
+        self.field_catalog = catalog;
+        self
     }
 
     /// Take an executor from the pool.
@@ -423,6 +443,7 @@ impl ExecutorPool {
         let fallback_glob = Arc::clone(&self.fallback_glob);
         let max_result_rows = self.max_result_rows;
         let hot_buffer = self.hot_buffer.clone();
+        let field_catalog = Arc::clone(&self.field_catalog);
 
         // Channel for the blocking task to send back its interrupt handle
         // before starting the actual query.
@@ -456,11 +477,15 @@ impl ExecutorPool {
                 "computed query source"
             );
 
+            // One catalog snapshot per query: every retry inside the
+            // executor sees the same comparison pins (ADR-0011 slice A).
+            let pins = field_catalog.all();
             run_query_blocking(
                 executor,
                 &dsl,
                 &source,
                 hot_buffer.as_ref(),
+                &pins,
                 max_result_rows,
                 utc_offset_secs,
                 capture_debug,
@@ -578,6 +603,7 @@ impl ExecutorPool {
         let source = source.to_owned();
         let fallback_glob = Arc::clone(&self.fallback_glob);
         let max_result_rows = self.max_result_rows;
+        let field_catalog = Arc::clone(&self.field_catalog);
 
         let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
 
@@ -600,11 +626,13 @@ impl ExecutorPool {
             );
 
             // No hot buffer — saved query results are self-contained.
+            let pins = field_catalog.all();
             run_query_blocking(
                 executor,
                 &dsl,
                 &source,
                 None,
+                &pins,
                 max_result_rows,
                 utc_offset_secs,
                 capture_debug,
@@ -770,6 +798,7 @@ impl ExecutorPool {
         let base_dir = Arc::clone(&self.base_dir);
         let fallback_glob = Arc::clone(&self.fallback_glob);
         let hot_buffer = self.hot_buffer.clone();
+        let field_catalog = Arc::clone(&self.field_catalog);
 
         let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
 
@@ -789,6 +818,7 @@ impl ExecutorPool {
                 .and_then(|hb| hb.snapshot())
                 .filter(|s| s.path().to_str().is_some());
 
+            let pins = field_catalog.all();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if let Some(ref hot) = hot_snapshot {
                     let hot_path = hot.path().to_str().unwrap_or_default();
@@ -797,11 +827,12 @@ impl ExecutorPool {
                         &source,
                         hot_path,
                         &hot.field_types,
+                        &pins,
                         &tmp_path,
                         max_rows,
                     )
                 } else {
-                    executor.export_parquet(&dsl, &source, &tmp_path, max_rows)
+                    executor.export_parquet(&dsl, &source, &pins, &tmp_path, max_rows)
                 }
                 .map_err(ServerError::from)
             }));

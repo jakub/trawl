@@ -10,13 +10,25 @@
 //!
 //! Key invariant: `filter.matches(event)` must agree with running the
 //! emitted SQL against `DuckDB` for every `(event, search_stage)` pair.
+//!
+//! Evaluation is therefore three-valued, like the SQL it mirrors: every
+//! matcher answers [`Truth`] (`Some(true)`/`Some(false)`/`None` for
+//! UNKNOWN), UNKNOWN propagates through NOT/AND/OR by SQL's rules, and
+//! only a final `Some(true)` is a match. Collapsing UNKNOWN to `false`
+//! at the leaf would survive a top-level filter but invert under `NOT`:
+//! `NOT status>=400` over a VARCHAR-pinned `status="accepted"` is a live
+//! match while `NOT (TRY_CAST(status AS DECIMAL(38,6)) >= …)` stays NULL
+//! and is filtered out — a false-positive live alert.
 
 use aho_corasick::AhoCorasick;
 use regex::Regex;
 use serde_json::Value;
 
 use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken};
-use crate::emitter::EmitError;
+use crate::compare::{self, CompareForm, PatternForm};
+use crate::emitter::{EmitError, SqlValue};
+use crate::schema::CanonicalType;
+use crate::schema::FieldTypes;
 
 /// A compiled filter that can match JSON events in memory.
 ///
@@ -59,7 +71,7 @@ enum TokenMatcher {
 /// In-memory mirror of the SQL `level` → severity band predicates
 /// (`emitter::severity`). SSE and SQL must agree on every event.
 enum SeverityMatcher {
-    /// `level=tok` — severity within the band; NULL/absent → no match.
+    /// `level=tok` — severity within the band; NULL/absent → UNKNOWN.
     Band { lo: u8, hi: u8 },
     /// `level=a,b` — severity within any listed band.
     Bands { bands: Vec<(u8, u8)> },
@@ -71,23 +83,22 @@ enum SeverityMatcher {
 }
 
 impl SeverityMatcher {
-    fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
+    /// A NULL/absent `severity` makes the band predicates UNKNOWN, exactly
+    /// as `severity BETWEEN lo AND hi` does in SQL. `NotBand` is the one
+    /// total form — its emitted shape carries `OR "severity" IS NULL`.
+    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
         let sev = event.get("severity").and_then(extract_i64);
         match self {
-            Self::Band { lo, hi } => {
-                sev.is_some_and(|n| n >= i64::from(*lo) && n <= i64::from(*hi))
-            }
-            Self::Bands { bands } => sev.is_some_and(|n| {
+            Self::Band { lo, hi } => sev.map(|n| n >= i64::from(*lo) && n <= i64::from(*hi)),
+            Self::Bands { bands } => sev.map(|n| {
                 bands
                     .iter()
                     .any(|(lo, hi)| n >= i64::from(*lo) && n <= i64::from(*hi))
             }),
             Self::NotBand { lo, hi } => {
-                sev.is_none_or(|n| n < i64::from(*lo) || n > i64::from(*hi))
+                Some(sev.is_none_or(|n| n < i64::from(*lo) || n > i64::from(*hi)))
             }
-            Self::Ordered { op, number } => {
-                sev.is_some_and(|n| apply_ord(n.cmp(&i64::from(*number)), *op))
-            }
+            Self::Ordered { op, number } => sev.map(|n| apply_ord(n.cmp(&i64::from(*number)), *op)),
         }
     }
 }
@@ -137,11 +148,11 @@ struct FieldMatcher {
 enum FieldPredicate {
     Compare { op: CompareOp, value: CoercedValue },
     InList { values: Vec<CoercedValue> },
-    Glob { regex: Regex },
-    Regex { regex: Regex },
+    Glob { regex: Regex, form: PatternForm },
+    Regex { regex: Regex, form: PatternForm },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CompareOp {
     Eq,
     Ne,
@@ -153,12 +164,64 @@ enum CompareOp {
 
 /// A filter value coerced to the most specific numeric type.
 ///
-/// Mirrors the coercion in `emitter::fields::coerce_filter_value()`.
+/// Mirrors the coercion in `emitter::fields::coerce_filter_value()`, plus
+/// the pinned form that binds differently ([`CoercedValue::NumericOnText`]).
 #[derive(Clone, Debug)]
 enum CoercedValue {
     Int(i64),
     Float(f64),
     Str(String),
+    /// The VARCHAR-pinned ordered-numeric form: the literal's reading in
+    /// the one comparison space ([`crate::conform::decimal_reading`]),
+    /// scaled by 10^6 and exact — so a stored value with no reading is
+    /// NULL (UNKNOWN, not FALSE), and so is a LITERAL with none, which is
+    /// what `None` here means. Kept apart from [`CoercedValue::Float`] so
+    /// the unpinned literal-driven path stays byte-identical.
+    NumericOnText(Option<i128>),
+    /// The VARCHAR-pinned equality form for a numeric literal: the SQL
+    /// side is `(col = ? OR COALESCE(dec(col) = dec(?), FALSE))` (and its
+    /// complement for `!=`), because a number's STORED text is
+    /// `read_json`'s inference rendered — `"200.0"` for a wire `200` that
+    /// shared a batch with a fractional value — while this matcher only
+    /// ever sees the wire JSON. The numeric reading is the half the two
+    /// sides can agree on; see [`crate::compare`].
+    TextOrNumeric {
+        text: String,
+        number: Option<i128>,
+    },
+    /// The TYPED-pin form: the column the SQL compares is the CONFORMED
+    /// one, so this matcher reads the wire value's own conformed value
+    /// first and compares that, in the pin's domain.
+    ///
+    /// Without it every value the round-trip guard nulls out answered
+    /// differently on the two sides — a wire `1.5` under a BIGINT pin is
+    /// NULL in both batch lanes, so `duration>1` is UNKNOWN there and was
+    /// TRUE here.
+    Conformed {
+        pin: CanonicalType,
+        literal: PinLiteral,
+    },
+}
+
+/// A literal read into a TYPED pin's own domain, once per compiled filter.
+///
+/// The emitter binds the literal exactly as the unpinned path does and
+/// leaves the cast to `DuckDB`, which resolves it against the pinned
+/// COLUMN's type — a string literal against a BOOLEAN column takes the
+/// cast's wide vocabulary (`flag=TRUE` matches), and against a TIMESTAMP
+/// column the wall-clock parse (`compare::literal_timestamp`). All probed.
+#[derive(Clone, Copy, Debug)]
+enum PinLiteral {
+    Int(i64),
+    Double(f64),
+    Bool(bool),
+    Time(compare::Instant),
+    /// `DuckDB` cannot compare the two at all — a word against a numeric
+    /// column, a number against a TIMESTAMP one — and raises a conversion
+    /// or binder ERROR, which returns no rows at all. UNKNOWN is the
+    /// closest total answer: it matches nothing, and `NOT` cannot invert
+    /// it into a match the failed query never had.
+    Unreadable,
 }
 
 struct TextMatcher {
@@ -176,6 +239,13 @@ struct TextMatcher {
 impl CompiledFilter {
     /// Compile a filter from a parsed search stage.
     ///
+    /// `pins` is the field catalog's full pin snapshot (ADR-0011 slice A):
+    /// comparisons against pinned fields follow the same rule table the
+    /// SQL emitter's `emit_with_pins` applies — batch/live parity is part
+    /// of the contract. Pass an empty set where no catalog exists
+    /// (embedded mode, plain unit tests); every comparison then stays
+    /// literal-driven, exactly as before.
+    ///
     /// Regex and glob patterns are compiled eagerly. Invalid patterns
     /// are silently skipped (they would also fail at SQL execution time).
     ///
@@ -186,7 +256,7 @@ impl CompiledFilter {
     /// or regex). Such a filter has no in-memory meaning: compiling it to
     /// a match-nothing predicate would turn a typo into a silently empty
     /// live stream while the same query errors on `/api/v1/query`.
-    pub fn compile(search: &SearchStage) -> Result<Self, EmitError> {
+    pub fn compile(search: &SearchStage, pins: &FieldTypes) -> Result<Self, EmitError> {
         let time_filter = search.time_filter.as_ref().map(|tf| TimeMatcher {
             duration_secs: tf.node.duration.to_seconds(),
         });
@@ -203,7 +273,7 @@ impl CompiledFilter {
                 .map(|dt| dt.with_timezone(&chrono::Utc))
         });
 
-        let groups = compile_groups(&search.groups)?;
+        let groups = compile_groups(&search.groups, pins)?;
 
         Ok(Self {
             groups,
@@ -263,29 +333,32 @@ impl CompiledFilter {
             return true;
         }
 
-        // OR of AND: any group where all matchers pass.
-        self.groups
-            .iter()
-            .any(|group| group.iter().all(|m| m.matches(event)))
+        // OR of AND, in SQL's three-valued logic: only TRUE is a match —
+        // a WHERE clause evaluating to UNKNOWN filters the row out.
+        eval_groups(&self.groups, event) == Some(true)
     }
 }
 
 /// Compile OR-of-AND groups, dropping tokens with no in-memory matcher.
 fn compile_groups(
     groups: &[Vec<crate::ast::Spanned<SearchToken>>],
+    pins: &FieldTypes,
 ) -> Result<Vec<Vec<TokenMatcher>>, EmitError> {
     groups
         .iter()
         .map(|group| {
             group
                 .iter()
-                .filter_map(|token| compile_token(&token.node).transpose())
+                .filter_map(|token| compile_token(&token.node, pins).transpose())
                 .collect()
         })
         .collect()
 }
 
-fn compile_token(token: &SearchToken) -> Result<Option<TokenMatcher>, EmitError> {
+fn compile_token(
+    token: &SearchToken,
+    pins: &FieldTypes,
+) -> Result<Option<TokenMatcher>, EmitError> {
     Ok(match token {
         SearchToken::FieldFilter(ff) => {
             // `level` is the severity band alias — mirror the SQL emitter.
@@ -294,31 +367,56 @@ fn compile_token(token: &SearchToken) -> Result<Option<TokenMatcher>, EmitError>
                     ff.op, &ff.value,
                 )?)));
             }
+            // The catalog pin typing this comparison (ADR-0011 slice A);
+            // the lookup folds through `catalog_key`, same as the emitter.
+            let pin = pins.pin_for(&ff.field);
+            // Glob/regex match ONE canonical text per pin, resolved by the
+            // shared rule table: plain stringification mirrors the SQL
+            // side's bare column only where there is no pin to conform to
+            // (unpinned, VARCHAR), and every typed pin renders the value's
+            // own cast reading — RFC 3339 microseconds for TIMESTAMP,
+            // `DuckDB`'s DOUBLE text for DOUBLE, the conformed integer for
+            // BIGINT, lowercase `true`/`false` for BOOLEAN — so a pattern
+            // cannot mean one thing live and another in batch. All four
+            // are corroborated by execution probes in
+            // trawl-engine/tests/duckdb_probe.rs, not assumed.
+            let form = compare::pattern_form(pin);
             let predicate = match (&ff.op, &ff.value) {
                 (FilterOp::Glob, FilterValue::Literal(pattern)) => {
                     let Ok(regex) = Regex::new(&glob_to_regex(pattern)) else {
                         return Ok(None);
                     };
-                    FieldPredicate::Glob { regex }
+                    FieldPredicate::Glob { regex, form }
                 }
                 (FilterOp::Regex, FilterValue::Literal(pattern)) => {
                     let Ok(regex) = Regex::new(pattern) else {
                         return Ok(None);
                     };
-                    FieldPredicate::Regex { regex }
+                    FieldPredicate::Regex { regex, form }
                 }
                 (_, FilterValue::List(values)) => FieldPredicate::InList {
-                    values: values.iter().map(|v| coerce_value(v)).collect(),
+                    values: values
+                        .iter()
+                        .map(|v| coerce_form(compare::compare_form(pin, FilterOp::Eq, v)))
+                        .collect(),
                 },
                 (op, FilterValue::Literal(v)) => FieldPredicate::Compare {
                     op: compile_op(*op),
-                    value: coerce_value(v),
+                    value: coerce_form(compare::compare_form(pin, *op, v)),
                 },
             };
             Some(TokenMatcher::Field(FieldMatcher {
-                // `timestamp`/`@timestamp` alias the physical `_time` key,
-                // matching the SQL emitter's quote_field mapping.
-                field: crate::schema::resolve_field_alias(&ff.field).to_owned(),
+                // The event key is the SAME `catalog_key` the pin lookup
+                // used: `timestamp`/`@timestamp` alias the physical `_time`
+                // key (matching the SQL emitter's quote_field mapping), and
+                // the ASCII fold mirrors DuckDB binding `"Status"` to the
+                // real `status` column. Ingest folds every incoming field
+                // name, so an exact lookup on the folded spelling is the
+                // one that finds the value — without the fold a mixed-case
+                // reference would read every event as a NULL column, which
+                // `!=` reports as a match (`OR col IS NULL`): live tail
+                // would stream everything while `/query` returned nothing.
+                field: crate::schema::catalog_key(&ff.field),
                 predicate,
             }))
         }
@@ -357,13 +455,13 @@ fn compile_token(token: &SearchToken) -> Result<Option<TokenMatcher>, EmitError>
             }))
         }
         SearchToken::Not(inner) => {
-            let Some(inner_matcher) = compile_token(&inner.node)? else {
+            let Some(inner_matcher) = compile_token(&inner.node, pins)? else {
                 return Ok(None);
             };
             Some(TokenMatcher::Not(Box::new(inner_matcher)))
         }
         SearchToken::Group(groups) => {
-            let compiled_groups = compile_groups(groups)?;
+            let compiled_groups = compile_groups(groups, pins)?;
             Some(TokenMatcher::OrGroup(compiled_groups))
         }
     })
@@ -387,52 +485,180 @@ fn compile_op(op: FilterOp) -> CompareOp {
     }
 }
 
-/// Coerce a string filter value to the most specific type.
+/// Map a resolved [`CompareForm`] onto the matcher's coercion vocabulary.
 ///
-/// Matches `emitter::fields::coerce_filter_value()` exactly.
-fn coerce_value(s: &str) -> CoercedValue {
-    if let Ok(i) = s.parse::<i64>() {
-        return CoercedValue::Int(i);
+/// One rule table, two consumers (ADR-0011 slice A): [`crate::compare`]
+/// decides how the literal binds, this translates the decision into the
+/// evaluator's terms:
+///
+/// - `Native` — today's literal-driven coercion, verbatim.
+/// - `Text` — string comparison against the event value's text form,
+///   mirroring the SQL side's `col = '200'` on the VARCHAR column.
+/// - `NumericOnText` — comparison over the value's text form in the one
+///   comparison space, read through [`compare::decimal_micros`] so the
+///   domain is `DuckDB`'s cast domain; a value outside it mirrors
+///   `TRY_CAST(col AS DECIMAL(38,6))` degrading to NULL: UNKNOWN, so `NOT`
+///   leaves it unmatched.
+/// - `TextOrNumeric` — the equality-class form under a VARCHAR pin: the
+///   value's text form OR its DECIMAL reading, mirroring the SQL side's
+///   `COALESCE`d two-armed predicate.
+///
+/// The literal's own reading is taken HERE, once per compiled filter,
+/// from the same text the SQL binds — the batch side casts that string
+/// with the identical expression, so a literal the space cannot read
+/// (`nan`, `1e40`) is `None` on both sides rather than a special case on
+/// either.
+fn coerce_form(form: CompareForm) -> CoercedValue {
+    match form {
+        CompareForm::Native(SqlValue::Int(i)) => CoercedValue::Int(i),
+        CompareForm::Native(SqlValue::Float(f)) => CoercedValue::Float(f),
+        CompareForm::NumericOnText(literal) => {
+            CoercedValue::NumericOnText(compare::decimal_micros(&literal))
+        }
+        CompareForm::TextOrNumeric(literal) => CoercedValue::TextOrNumeric {
+            number: compare::decimal_micros(&literal),
+            text: literal,
+        },
+        CompareForm::Native(SqlValue::String(s)) | CompareForm::Text(s) => CoercedValue::Str(s),
+        // coerce_filter_value never yields Bool; keep the match total.
+        CompareForm::Native(SqlValue::Bool(b)) => CoercedValue::Str(b.to_string()),
+        CompareForm::Conformed { pin, literal } => CoercedValue::Conformed {
+            pin,
+            literal: pin_literal(pin, &literal),
+        },
     }
-    if let Ok(f) = s.parse::<f64>() {
-        return CoercedValue::Float(f);
+}
+
+/// Read a bound literal the way `DuckDB` reads it against a column of the
+/// pinned type — the other half of [`CoercedValue::Conformed`].
+fn pin_literal(pin: CanonicalType, literal: &SqlValue) -> PinLiteral {
+    match (pin, literal) {
+        // Numeric columns take numeric literals directly, and DuckDB
+        // promotes BIGINT to DOUBLE to meet a fractional one (so an id
+        // above 2^53 collapses onto its neighbour — in both engines
+        // alike, which is why the comparison stays here rather than in
+        // the exact DECIMAL space the VARCHAR rungs use).
+        // A BOOLEAN column meeting a number casts ITSELF to the number,
+        // so the three numeric pins take a numeric literal alike.
+        (
+            CanonicalType::BigInt | CanonicalType::Double | CanonicalType::Boolean,
+            SqlValue::Int(i),
+        ) => PinLiteral::Int(*i),
+        (
+            CanonicalType::BigInt | CanonicalType::Double | CanonicalType::Boolean,
+            SqlValue::Float(f),
+        ) => PinLiteral::Double(*f),
+        // A BOOLEAN column casts a string literal through the WIDE
+        // vocabulary: `TRUE`, `yes` and `1` all match a stored `true`,
+        // where the same texts STORED conform to NULL.
+        (CanonicalType::Boolean, SqlValue::String(s)) => {
+            compare::try_cast_boolean(s).map_or(PinLiteral::Unreadable, PinLiteral::Bool)
+        }
+        (CanonicalType::Boolean, SqlValue::Bool(b)) => PinLiteral::Bool(*b),
+        // A TIMESTAMP column casts a string literal WALL-CLOCK, so an
+        // offset spelled in the literal is ignored where the same offset
+        // in a STORED value shifts the instant.
+        (CanonicalType::Timestamp, SqlValue::String(s)) => {
+            compare::literal_timestamp(s).map_or(PinLiteral::Unreadable, PinLiteral::Time)
+        }
+        // Everything else is a comparison DuckDB refuses outright: a word
+        // against a numeric column, a number against a TIMESTAMP one.
+        (CanonicalType::Varchar, _) => {
+            debug_assert!(false, "the VARCHAR pin takes the text rules, not a conform");
+            PinLiteral::Unreadable
+        }
+        _ => PinLiteral::Unreadable,
     }
-    CoercedValue::Str(s.to_string())
 }
 
 // ---------------------------------------------------------------------------
 // Matching
 // ---------------------------------------------------------------------------
 
+/// One SQL truth value: `Some(true)`, `Some(false)`, or `None` = UNKNOWN.
+type Truth = Option<bool>;
+
+/// SQL `AND` over a sequence: FALSE if any FALSE, else UNKNOWN if any
+/// UNKNOWN, else TRUE. Short-circuits on the first FALSE, like `all()`.
+fn and_all(items: impl IntoIterator<Item = Truth>) -> Truth {
+    let mut unknown = false;
+    for item in items {
+        match item {
+            Some(false) => return Some(false),
+            None => unknown = true,
+            Some(true) => {}
+        }
+    }
+    if unknown { None } else { Some(true) }
+}
+
+/// SQL `OR` over a sequence: TRUE if any TRUE, else UNKNOWN if any
+/// UNKNOWN, else FALSE. Short-circuits on the first TRUE, like `any()`.
+fn or_any(items: impl IntoIterator<Item = Truth>) -> Truth {
+    let mut unknown = false;
+    for item in items {
+        match item {
+            Some(true) => return Some(true),
+            None => unknown = true,
+            Some(false) => {}
+        }
+    }
+    if unknown { None } else { Some(false) }
+}
+
+/// SQL `OR` of `AND` groups — the search stage's own shape.
+fn eval_groups(groups: &[Vec<TokenMatcher>], event: &serde_json::Map<String, Value>) -> Truth {
+    or_any(
+        groups
+            .iter()
+            .map(|group| and_all(group.iter().map(|m| m.eval(event)))),
+    )
+}
+
 impl TokenMatcher {
-    fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
+    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
         match self {
-            Self::Field(fm) => fm.matches(event),
-            Self::Severity(sm) => sm.matches(event),
-            Self::Text(tm) => tm.matches(event),
-            Self::Not(inner) => !inner.matches(event),
-            Self::OrGroup(groups) => groups
-                .iter()
-                .any(|group| group.iter().all(|m| m.matches(event))),
+            Self::Field(fm) => fm.eval(event),
+            Self::Severity(sm) => sm.eval(event),
+            Self::Text(tm) => tm.eval(event),
+            // `NOT UNKNOWN` is UNKNOWN, never a match — the SQL `NOT (...)`
+            // this mirrors stays NULL and the row is filtered out.
+            Self::Not(inner) => inner.eval(event).map(|b| !b),
+            Self::OrGroup(groups) => eval_groups(groups, event),
         }
     }
 }
 
 impl FieldMatcher {
-    fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
-        let Some(event_val) = event.get(&self.field) else {
-            // Missing field → no match (mirrors SQL NULL semantics).
-            return false;
+    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
+        let event_val = event.get(&self.field).filter(|v| !v.is_null());
+        let Some(event_val) = event_val else {
+            // SQL three-valued logic: a missing field is a NULL column and
+            // a JSON null is a NULL value, so every comparison is UNKNOWN
+            // — except `!=`, whose emitted form carries `OR col IS NULL`
+            // and is therefore TRUE. Decided here, before coercion, so
+            // every coercion class agrees with the SQL on nulls
+            // (stringifying null to "" made ordered comparisons diverge).
+            return match &self.predicate {
+                FieldPredicate::Compare {
+                    op: CompareOp::Ne, ..
+                } => Some(true),
+                _ => None,
+            };
         };
 
         match &self.predicate {
             FieldPredicate::Compare { op, value } => compare_values(event_val, *op, value),
-            FieldPredicate::InList { values } => values
-                .iter()
-                .any(|v| compare_values(event_val, CompareOp::Eq, v)),
-            FieldPredicate::Glob { regex } | FieldPredicate::Regex { regex } => {
-                let s = json_to_string(event_val);
-                regex.is_match(&s)
+            FieldPredicate::InList { values } => or_any(
+                values
+                    .iter()
+                    .map(|v| compare_values(event_val, CompareOp::Eq, v)),
+            ),
+            FieldPredicate::Glob { regex, form } | FieldPredicate::Regex { regex, form } => {
+                // No canonical text (a TIMESTAMP pin over a value with no
+                // timestamp reading) is a NULL column in batch, and
+                // `strftime(NULL, …) GLOB p` is NULL: UNKNOWN, not FALSE.
+                pattern_text(event_val, *form).map(|s| regex.is_match(&s))
             }
         }
     }
@@ -453,7 +679,12 @@ impl TextMatcher {
     /// so a term matches another field's value *and* a field name — and the
     /// negated form excludes on the same basis (see
     /// [`crate::emitter`]'s `push_text_search` and the DSL reference).
-    fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
+    /// A missing/non-string column is NULL, so the positive form is UNKNOWN
+    /// (not FALSE) when neither column matches and one is NULL — `NOT term`
+    /// must then leave the event unmatched, as `NOT (NULL OR NULL)` does.
+    /// The negated form's `COALESCE(... , TRUE)` makes its `_raw` side
+    /// total, so only a NULL `message` can make it UNKNOWN.
+    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
         let msg = match event.get("message") {
             Some(Value::String(s)) => Some(self.searcher.is_match(s)),
             _ => None,
@@ -463,44 +694,96 @@ impl TextMatcher {
             _ => None,
         };
         if self.negated {
-            msg == Some(false) && raw != Some(true)
+            and_all([msg.map(|m| !m), Some(raw != Some(true))])
         } else {
-            msg == Some(true) || raw == Some(true)
+            or_any([msg, raw])
         }
     }
 }
 
-/// Compare a JSON event value against a coerced filter value.
+/// Compare a non-null JSON event value against a coerced filter value.
 ///
 /// Implements type promotion matching `DuckDB`'s implicit casting:
 /// - Int filter: try to extract event value as i64 (number or string parse)
 /// - Float filter: try to extract event value as f64
 /// - String filter: compare as strings (convert event value to string if needed)
-fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -> bool {
+/// - `NumericOnText` filter: the DECIMAL(38,6) reading of the value's
+///   text form — a text outside `DuckDB`'s cast domain is NULL, so the
+///   comparison is UNKNOWN
+/// - `TextOrNumeric` filter: the value's text form OR that same DECIMAL
+///   reading, both `COALESCE`d exactly as the SQL is
+fn compare_values(event_val: &Value, op: CompareOp, filter_val: &CoercedValue) -> Truth {
     match filter_val {
         CoercedValue::Int(fv) => {
             if let Some(ev) = extract_i64(event_val) {
-                apply_ord(ev.cmp(fv), op)
+                Some(apply_ord(ev.cmp(fv), op))
             } else if let Some(ev) = extract_f64(event_val) {
                 // Promote filter value to f64 for mixed comparison.
                 #[allow(clippy::cast_precision_loss)]
-                apply_f64(ev, *fv as f64, op)
+                Some(apply_f64(ev, *fv as f64, op))
             } else {
                 // String filter value that happened to parse as int —
                 // fall back to string comparison.
-                false
+                Some(false)
             }
         }
         CoercedValue::Float(fv) => {
             if let Some(ev) = extract_f64(event_val) {
-                apply_f64(ev, *fv, op)
+                Some(apply_f64(ev, *fv, op))
             } else {
-                false
+                Some(false)
             }
         }
+        // The TRY_CAST rung: the column is VARCHAR under the pin, so the
+        // batch side casts the value's TEXT form — and DuckDB's cast
+        // domain is wider than Rust's number parser (whitespace, `_`
+        // separators, `0404`), which `compare::decimal_micros` mirrors, or
+        // the stream silently drops rows the batch query returns. A text
+        // outside the domain is NULL, so UNKNOWN — the one place a
+        // non-null event value can still be UNKNOWN — and a LITERAL
+        // outside it (`fv` is `None`) makes every row UNKNOWN, exactly as
+        // the SQL's NULL right-hand side does.
+        CoercedValue::NumericOnText(fv) => (*fv).and_then(|literal| {
+            compare::decimal_micros(&json_to_string(event_val))
+                .map(|ev| apply_ord(ev.cmp(&literal), op))
+        }),
         CoercedValue::Str(fv) => {
             let ev = json_to_string(event_val);
-            apply_ord(ev.as_str().cmp(fv.as_str()), op)
+            Some(apply_ord(ev.as_str().cmp(fv.as_str()), op))
+        }
+        // The typed-pin rung: the SQL compares the CONFORMED column, so
+        // read the wire value's conformed value and compare THAT. A value
+        // with no reading is the NULL the guard wrote — and the emitted
+        // `!=` carries `OR col IS NULL`, so it answers exactly as an
+        // absent key does.
+        CoercedValue::Conformed { pin, literal } => match conformed_reading(event_val, *pin) {
+            Some(reading) => compare_conformed(reading, op, *literal),
+            None => (op == CompareOp::Ne).then_some(true),
+        },
+        // The two-armed equality rung. The wire text is only the stored
+        // text when `read_json` did not widen the column, so the numeric
+        // reading carries the cases where it did (`200` stored `"200.0"`).
+        // Both arms are total here, mirroring the SQL's COALESCEs: a value
+        // with no numeric reading falls back to the text answer alone
+        // rather than poisoning the predicate with UNKNOWN.
+        CoercedValue::TextOrNumeric { text, number } => {
+            let ev = json_to_string(event_val);
+            let text_eq = ev.as_str() == text.as_str();
+            // UNKNOWN when EITHER side has no reading, which is what
+            // `dec(col) = dec(?)` answers when either cast is NULL.
+            let number_eq =
+                number.and_then(|literal| compare::decimal_micros(&ev).map(|read| read == literal));
+            match op {
+                CompareOp::Eq => Some(text_eq || number_eq.unwrap_or(false)),
+                CompareOp::Ne => Some(!text_eq && number_eq.is_none_or(|eq| !eq)),
+                // Ordered ops never resolve to this form (`compare_form`
+                // sends them to `NumericOnText`); fall back to the text
+                // comparison rather than inventing an ordering.
+                ordered => {
+                    debug_assert!(false, "TextOrNumeric is an equality-class form");
+                    Some(apply_ord(ev.as_str().cmp(text.as_str()), ordered))
+                }
+            }
         }
     }
 }
@@ -521,6 +804,179 @@ fn extract_f64(v: &Value) -> Option<f64> {
         Value::String(s) => s.parse().ok(),
         _ => None,
     }
+}
+
+/// What a TYPED-pinned column HOLDS for one wire value — the reading
+/// [`crate::conform`] stored, which is what a comparison and a pattern
+/// must both see.
+///
+/// `None` is the NULL the guard wrote: the value is in `_raw`, the column
+/// is empty, and every comparison over it is UNKNOWN.
+#[derive(Clone, Copy, Debug)]
+enum Conformed {
+    Int(i64),
+    Double(f64),
+    Bool(bool),
+    Time(compare::Instant),
+}
+
+impl Conformed {
+    /// The conformed value's own text — `CAST(col AS VARCHAR)` on the SQL
+    /// side for the three scalar pins, `strftime` for TIMESTAMP.
+    fn text(self) -> String {
+        match self {
+            Self::Int(i) => i.to_string(),
+            Self::Double(d) => compare::canonical_double_text(d),
+            Self::Bool(b) => b.to_string(),
+            Self::Time(t) => t.pattern_text(),
+        }
+    }
+}
+
+/// Conform one wire value to a pin, exactly as the batch lanes conform the
+/// column it lands in.
+///
+/// Conformance casts the value's TEXT form under a round-trip guard, so
+/// the readings here are text readings too, and each is total on exactly
+/// the shapes that guard admits:
+///
+/// - DOUBLE: a JSON number is its own double (the conform is the bare cast
+///   — the round trip through text is the identity), and a JSON string
+///   goes through `DuckDB`'s cast domain ([`compare::try_cast_double`], so
+///   `"200"` is the same `200.0` the conform wrote);
+/// - BIGINT: a JSON integer is itself, and every other numeric or string
+///   shape goes through the guarded reading
+///   ([`compare::conformed_bigint`], so `"0404"` reads `404` while
+///   `"1.5"` and a fractional JSON number have no reading at all — the
+///   cast would round them, so the conform stores NULL);
+/// - BOOLEAN: a JSON bool is itself (`to_json` renders it as the very text
+///   the guard demands), and a string must BE `true`/`false`
+///   ([`compare::conformed_boolean`], so `"TRUE"` has no reading);
+/// - TIMESTAMP: only a JSON string has a reading at all — an epoch numeral
+///   is not a timestamp to any cast, probed — and it goes through
+///   [`compare::conformed_timestamp`], which APPLIES a zone offset the way
+///   the conform's `TIMESTAMPTZ` rung does (ADR-0011 ruling #1), so
+///   `"…T09:00:00+05:30"` reads `03:30`, the hour the corpus holds.
+///
+/// A JSON bool under a numeric pin, and a number under the BOOLEAN pin,
+/// have no reading either: `'true'` is not a number to any cast, and the
+/// BOOLEAN cast's vocabulary stops at `1`/`0`, so `'200'` is NULL to it.
+/// (Before the conform went text-first, a numeric under a BOOLEAN pin read
+/// TRUE in a JSON-inferred hot column and NULL everywhere else — the
+/// state-dependence ADR-0011 removed.) An array or object — stringified at
+/// ingest, so never a pinned column's live shape — is likewise NULL.
+fn conformed_reading(v: &Value, pin: CanonicalType) -> Option<Conformed> {
+    match pin {
+        CanonicalType::BigInt => match v {
+            // A JSON integer is exact and needs no guard; every other
+            // number is read through the text the conform would see.
+            Value::Number(n) => n.as_i64().or_else(|| {
+                n.as_f64()
+                    .and_then(|f| compare::conformed_bigint(&compare::canonical_double_text(f)))
+            }),
+            Value::String(s) => compare::conformed_bigint(s),
+            _ => None,
+        }
+        .map(Conformed::Int),
+        CanonicalType::Double => match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => compare::try_cast_double(s),
+            _ => None,
+        }
+        .map(Conformed::Double),
+        CanonicalType::Boolean => match v {
+            Value::Bool(b) => Some(*b),
+            Value::String(s) => compare::conformed_boolean(s),
+            _ => None,
+        }
+        .map(Conformed::Bool),
+        CanonicalType::Timestamp => match v {
+            Value::String(s) => compare::conformed_timestamp(s),
+            _ => None,
+        }
+        .map(Conformed::Time),
+        // The VARCHAR pin has no conform — its comparisons take the text
+        // rules and its patterns match the column directly.
+        CanonicalType::Varchar => None,
+    }
+}
+
+/// Compare a conformed reading against the literal in the pin's own
+/// domain — the promotions `DuckDB` performs between the pinned COLUMN's
+/// type and the bound parameter's, each one probed.
+#[allow(clippy::cast_precision_loss)] // mirrors DuckDB's own BIGINT → DOUBLE promotion
+fn compare_conformed(reading: Conformed, op: CompareOp, literal: PinLiteral) -> Truth {
+    match (reading, literal) {
+        (Conformed::Int(value), PinLiteral::Int(lit)) => Some(apply_ord(value.cmp(&lit), op)),
+        (Conformed::Int(value), PinLiteral::Double(lit)) => Some(apply_f64(value as f64, lit, op)),
+        (Conformed::Double(value), PinLiteral::Int(lit)) => Some(apply_f64(value, lit as f64, op)),
+        (Conformed::Double(value), PinLiteral::Double(lit)) => Some(apply_f64(value, lit, op)),
+        (Conformed::Bool(value), PinLiteral::Bool(lit)) => Some(apply_ord(value.cmp(&lit), op)),
+        // A BOOLEAN column meeting a NUMBER casts itself to the number.
+        (Conformed::Bool(value), PinLiteral::Int(lit)) => {
+            Some(apply_ord(i64::from(value).cmp(&lit), op))
+        }
+        (Conformed::Bool(value), PinLiteral::Double(lit)) => {
+            Some(apply_f64(f64::from(u8::from(value)), lit, op))
+        }
+        (Conformed::Time(value), PinLiteral::Time(lit)) => Some(apply_ord(value.cmp(&lit), op)),
+        (_, PinLiteral::Unreadable) => None,
+        (_, _) => {
+            debug_assert!(false, "pin_literal resolves a literal per pin");
+            None
+        }
+    }
+}
+
+/// The text a glob/regex matches for one event value, under the pin's
+/// pattern form — the in-memory mirror of the SQL side's `pattern_target`.
+///
+/// `None` is a NULL pattern target: every typed pin can produce one, for a
+/// value the conform would also null out, which is exactly what the corpus
+/// already holds.
+///
+/// Each typed reading mirrors what [`crate::conform`] stored, not what the
+/// wire carried — the wire text is only the same string when the value
+/// already reads as its pin, and the divergences are silent (a live tail
+/// firing on events the equivalent batch query drops). Conformance casts
+/// the value's TEXT form under a round-trip guard, so the readings here are
+/// text readings too, and each is total on exactly the shapes that guard
+/// admits:
+///
+/// - DOUBLE: a JSON number is its own double (the conform is the bare cast
+///   — the round trip through text is the identity), and a JSON string
+///   goes through `DuckDB`'s cast domain ([`compare::try_cast_double`], so
+///   `"200"` is the same `200.0` the conform wrote);
+/// - BIGINT: a JSON integer is itself, and every other numeric or string
+///   shape goes through the guarded reading
+///   ([`compare::conformed_bigint`], so `"0404"` globs as `404` while
+///   `"1.5"` and a fractional JSON number have no reading at all — the
+///   cast would round them, so the conform stores NULL);
+/// - BOOLEAN: a JSON bool is itself (`to_json` renders it as the very text
+///   the guard demands), and a string must BE `true`/`false`
+///   ([`compare::conformed_boolean`], so `"TRUE"` has no reading);
+/// - TIMESTAMP: only a JSON string has a reading at all — an epoch numeral
+///   is not a timestamp to any cast — and it goes through
+///   [`compare::canonical_timestamp_text`], which APPLIES a zone offset
+///   the way the conform's `TIMESTAMPTZ` rung does (ADR-0011 ruling #1),
+///   so `"…T09:00:00+05:30"` globs as `03:30`, the hour the corpus holds.
+///
+/// A JSON bool under a numeric pin, and a number under the BOOLEAN pin,
+/// have no reading either: `'true'` is not a number to any cast, and
+/// `CAST(TRY_CAST('200' AS BOOLEAN) AS VARCHAR)` is `'true'`, not `'200'`.
+/// (Before the conform went text-first, a numeric under a BOOLEAN pin read
+/// TRUE in a JSON-inferred hot column and NULL everywhere else — the
+/// state-dependence ADR-0011 removed.) An array or object — stringified at
+/// ingest, so never a pinned column's live shape — is likewise NULL.
+fn pattern_text(v: &Value, form: PatternForm) -> Option<String> {
+    let pin = match form {
+        PatternForm::Native => return Some(json_to_string(v)),
+        PatternForm::BigIntText => CanonicalType::BigInt,
+        PatternForm::DoubleText => CanonicalType::Double,
+        PatternForm::BooleanText => CanonicalType::Boolean,
+        PatternForm::Rfc3339Text => CanonicalType::Timestamp,
+    };
+    conformed_reading(v, pin).map(Conformed::text)
 }
 
 /// Convert a JSON value to its string representation for comparison.
@@ -762,7 +1218,25 @@ mod tests {
     /// Helper: parse DSL, compile filter, test against event.
     fn matches_event(dsl: &str, event_json: &str) -> bool {
         let query = parser::parse(dsl).expect("parse should succeed");
-        let filter = CompiledFilter::compile(&query.search).expect("filter compiles");
+        let filter = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+            .expect("filter compiles");
+        let event: serde_json::Map<String, Value> =
+            serde_json::from_str(event_json).expect("valid JSON object");
+        filter.matches(&event)
+    }
+
+    /// Helper: like `matches_event`, with catalog pins (ADR-0011 slice A).
+    fn matches_event_pinned(
+        dsl: &str,
+        event_json: &str,
+        pins: &[(&str, crate::schema::CanonicalType)],
+    ) -> bool {
+        let mut ft = crate::schema::FieldTypes::new();
+        for (field, ty) in pins {
+            ft.insert(field, *ty);
+        }
+        let query = parser::parse(dsl).expect("parse should succeed");
+        let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
         filter.matches(&event)
@@ -773,7 +1247,8 @@ mod tests {
     /// between event construction and evaluation, which flakes under load.
     fn matches_event_at(dsl: &str, event_json: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
         let query = parser::parse(dsl).expect("parse should succeed");
-        let filter = CompiledFilter::compile(&query.search).expect("filter compiles");
+        let filter = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+            .expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
         filter.matches_at(&event, now)
@@ -939,6 +1414,312 @@ mod tests {
         ));
     }
 
+    // ── pin-aware comparisons (ADR-0011 slice A) ──────────────────────
+
+    use crate::schema::CanonicalType as CT;
+
+    const VARCHAR_STATUS: &[(&str, CT)] = &[("status", CT::Varchar)];
+    const BIGINT_STATUS: &[(&str, CT)] = &[("status", CT::BigInt)];
+
+    #[test]
+    fn pinned_varchar_eq_numeric_compares_as_text_or_reading() {
+        // String-stored "200" matches on the text arm.
+        assert!(matches_event_pinned(
+            "status=200",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+        // A wire NUMBER matches on the numeric arm, which is the arm that
+        // survives `read_json` widening the column: the same event stores
+        // "200" beside integers and "200.0" beside a fractional sibling,
+        // and batch answers TRUE either way (executed in
+        // `tests/filter_parity.rs`).
+        assert!(matches_event_pinned(
+            "status=200",
+            r#"{"status": 200}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(matches_event_pinned(
+            "status=200",
+            r#"{"status": 200.0}"#,
+            VARCHAR_STATUS
+        ));
+        // Other spellings of the same number are the same number to
+        // `TRY_CAST` — as they were before pins existed.
+        assert!(matches_event_pinned(
+            "status=200",
+            r#"{"status": "0200"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status=200",
+            r#"{"status": "accepted"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status=200",
+            r#"{"status": "404"}"#,
+            VARCHAR_STATUS
+        ));
+        // A non-numeric literal keeps the pure text arm.
+        assert!(matches_event_pinned(
+            "status=accepted",
+            r#"{"status": "accepted"}"#,
+            VARCHAR_STATUS
+        ));
+    }
+
+    /// `!=` is the complement of `=` over non-null values, including for
+    /// the values with no numeric reading that motivate a VARCHAR pin:
+    /// `status!=200` must still return `"accepted"`, not drop it into
+    /// UNKNOWN. Mirrors the SQL's `COALESCE(…, TRUE)`.
+    #[test]
+    fn pinned_varchar_ne_numeric_keeps_unreadable_values() {
+        for value in [r#""accepted""#, r#""n/a""#, r#""404""#, "404"] {
+            let event = format!(r#"{{"status": {value}}}"#);
+            assert!(
+                matches_event_pinned("status!=200", &event, VARCHAR_STATUS),
+                "status!=200 must match {value}"
+            );
+        }
+        for value in [r#""200""#, "200", "200.0"] {
+            let event = format!(r#"{{"status": {value}}}"#);
+            assert!(
+                !matches_event_pinned("status!=200", &event, VARCHAR_STATUS),
+                "status!=200 must not match {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_varchar_ne_numeric_includes_json_null() {
+        assert!(matches_event_pinned(
+            "status!=200",
+            r#"{"status": "404"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status!=200",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+        // SQL emits `(status != '200' OR status IS NULL)` — a JSON null
+        // must match here too, or batch and live disagree on every
+        // repaired event.
+        assert!(matches_event_pinned(
+            "status!=200",
+            r#"{"status": null}"#,
+            VARCHAR_STATUS
+        ));
+    }
+
+    /// An absent key IS the null case: in batch, a row whose file never
+    /// carried the field reads the column as NULL, so `!=` includes it
+    /// through `OR col IS NULL`. Absent is the dominant shape on the bus
+    /// (the canonicalizer only fills envelope fields), so a divergence
+    /// here would drop every field-less event from live tail while
+    /// `/query` returned them all. Executed against `DuckDB` in
+    /// `tests/filter_parity.rs` (both pinned matrices carry the field-less
+    /// event).
+    #[test]
+    fn absent_field_matches_ne_like_explicit_null() {
+        for dsl in ["status!=200", "status!=accepted"] {
+            for event in [r#"{"status": null}"#, "{}"] {
+                assert!(
+                    matches_event_pinned(dsl, event, VARCHAR_STATUS),
+                    "{dsl} over {event} must match under a VARCHAR pin"
+                );
+                assert!(
+                    matches_event(dsl, event),
+                    "{dsl} over {event} must match unpinned"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_varchar_in_list_compares_as_text() {
+        assert!(matches_event_pinned(
+            "status=200,301",
+            r#"{"status": "301"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status=200,301",
+            r#"{"status": "404"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status=200,301",
+            r#"{"status": "accepted"}"#,
+            VARCHAR_STATUS
+        ));
+    }
+
+    #[test]
+    fn pinned_varchar_ordered_numeric_matches_numeric_text() {
+        // "404"/"500" are numeric under TRY_CAST(DOUBLE) semantics.
+        assert!(matches_event_pinned(
+            "status>=400",
+            r#"{"status": "404"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(matches_event_pinned(
+            "status>=400",
+            r#"{"status": "500"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status>=400",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+        // Non-numeric values are NULL under TRY_CAST — never a match,
+        // never an error.
+        assert!(!matches_event_pinned(
+            "status>=400",
+            r#"{"status": "accepted"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status>=400",
+            r#"{"status": null}"#,
+            VARCHAR_STATUS
+        ));
+        // DOUBLE domain uniformly: "1.5" sits between 1 and 2.
+        assert!(matches_event_pinned(
+            "dur>1",
+            r#"{"dur": "1.5"}"#,
+            &[("dur", CT::Varchar)]
+        ));
+        assert!(matches_event_pinned(
+            "dur<2",
+            r#"{"dur": "1.5"}"#,
+            &[("dur", CT::Varchar)]
+        ));
+    }
+
+    #[test]
+    fn pinned_varchar_ordered_lexical_stays_lexical() {
+        assert!(matches_event_pinned(
+            "host>alpha",
+            r#"{"host": "beta"}"#,
+            &[("host", CT::Varchar)]
+        ));
+        assert!(!matches_event_pinned(
+            "host>alpha",
+            r#"{"host": "aleph"}"#,
+            &[("host", CT::Varchar)]
+        ));
+    }
+
+    #[test]
+    fn pinned_bigint_glob_and_regex_match_text_form() {
+        assert!(matches_event_pinned(
+            "status=4*",
+            r#"{"status": 404}"#,
+            BIGINT_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "status=4*",
+            r#"{"status": 200}"#,
+            BIGINT_STATUS
+        ));
+        assert!(matches_event_pinned(
+            "status=/40./",
+            r#"{"status": 404}"#,
+            BIGINT_STATUS
+        ));
+    }
+
+    #[test]
+    fn pinned_lookup_is_case_folded() {
+        // Both halves fold, over an event whose key is spelled the way
+        // ingest actually writes it (lowercase). The EVENT lookup: DuckDB
+        // binds `"Status"` to the real `status` column, so a mixed-case
+        // reference must read the value, not an absent key — and `!=` over
+        // an absent key is a MATCH (`OR col IS NULL`), so a fold miss here
+        // streams every event live while `/query` returns none.
+        assert!(matches_event_pinned(
+            "Status=200",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event_pinned(
+            "Status!=200",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+        // The PIN lookup: "accepted" has no numeric reading, so only the
+        // VARCHAR pin's text arm can answer `!=` at all — a fold miss
+        // falls back to the unpinned Int coercion, which answers FALSE.
+        assert!(matches_event_pinned(
+            "Status!=200",
+            r#"{"status": "accepted"}"#,
+            VARCHAR_STATUS
+        ));
+        assert!(!matches_event("status!=200", r#"{"status": "accepted"}"#));
+        // A JSON null still matches `!=` through the folded key.
+        assert!(matches_event_pinned(
+            "Status!=200",
+            r#"{"status": null}"#,
+            VARCHAR_STATUS
+        ));
+    }
+
+    #[test]
+    fn pinned_not_over_unknown_is_never_a_match() {
+        // A TRY_CAST miss is NULL, so `NOT (TRY_CAST(status AS
+        // DECIMAL(38,6)) >= …)` is NULL and the batch query drops the row — the live
+        // stream must not fire on it (executed against DuckDB in
+        // tests/filter_parity.rs::pinned_varchar_matrix_parity).
+        assert!(!matches_event_pinned(
+            "NOT status>=400",
+            r#"{"status": "accepted"}"#,
+            VARCHAR_STATUS
+        ));
+        // Same for a NULL column, across every predicate class.
+        for dsl in [
+            "NOT status>=400",
+            "NOT status=200",
+            "NOT status=200,301",
+            "NOT status=2*",
+            "NOT status=/2.*/",
+            "NOT status>accepted",
+        ] {
+            assert!(
+                !matches_event_pinned(dsl, r#"{"status": null}"#, VARCHAR_STATUS),
+                "{dsl} over a NULL column must stay UNKNOWN"
+            );
+            assert!(
+                !matches_event_pinned(dsl, "{}", VARCHAR_STATUS),
+                "{dsl} over an absent field must stay UNKNOWN"
+            );
+        }
+        // `!=` is the total form (`OR col IS NULL`): TRUE on a null, so
+        // NOT genuinely inverts to no-match.
+        assert!(!matches_event_pinned(
+            "NOT status!=200",
+            r#"{"status": null}"#,
+            VARCHAR_STATUS
+        ));
+        // A real FALSE still inverts — UNKNOWN is not a blanket veto.
+        assert!(matches_event_pinned(
+            "NOT status>=400",
+            r#"{"status": "200"}"#,
+            VARCHAR_STATUS
+        ));
+    }
+
+    #[test]
+    fn unpinned_not_over_null_column_is_not_a_match() {
+        // The same rule without a catalog: `NOT (status = 200)` over a
+        // NULL is NULL in SQL, so no live match either.
+        assert!(!matches_event("NOT status=200", r#"{"status": null}"#));
+        assert!(!matches_event("NOT status=200", r#"{"message": "hi"}"#));
+        assert!(matches_event("NOT status=200", r#"{"status": 404}"#));
+    }
+
     // ── text search ───────────────────────────────────────────────────
 
     #[test]
@@ -1094,10 +1875,13 @@ mod tests {
                     || panic!("{dsl:?} should be an emit error"),
                     |e| e.to_string(),
                 );
-            let compile_error = CompiledFilter::compile(&query.search).err().map_or_else(
-                || panic!("{dsl:?} should not compile to a filter"),
-                |e| e.to_string(),
-            );
+            let compile_error =
+                CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+                    .err()
+                    .map_or_else(
+                        || panic!("{dsl:?} should not compile to a filter"),
+                        |e| e.to_string(),
+                    );
             assert_eq!(compile_error, emit_error, "{dsl:?}");
         }
     }
@@ -1336,7 +2120,8 @@ mod tests {
     #[test]
     fn matches_at_uses_provided_now() {
         let query = parser::parse("last=1h").expect("parse should succeed");
-        let filter = CompiledFilter::compile(&query.search).expect("filter compiles");
+        let filter = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+            .expect("filter compiles");
 
         // Event 30 min ago from "now".
         let now = chrono::Utc::now();

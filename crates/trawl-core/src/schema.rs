@@ -90,6 +90,21 @@ pub fn resolve_field_alias(name: &str) -> &str {
     }
 }
 
+/// The catalog spelling of a DSL field reference: resolve the time aliases,
+/// then ASCII-lowercase (ADR-0011 slice A).
+///
+/// Catalog names are ASCII-folded at every producer's door (ingest, boot
+/// seeding, compaction proposals), and `DuckDB` folds identifiers over
+/// ASCII too — so `Status` in a query names the same column, and the same
+/// pin, as `status`. Without this fold a mixed-case reference would
+/// silently fall back to unpinned while the lowercase spelling is
+/// pin-aware. Non-ASCII stays put, mirroring `DuckDB`'s ASCII-only
+/// identifier folding.
+#[must_use]
+pub fn catalog_key(dsl_name: &str) -> String {
+    resolve_field_alias(dsl_name).to_ascii_lowercase()
+}
+
 // ---------------------------------------------------------------------------
 // Field-catalog type vocabulary (ADR-0009 slice 2)
 // ---------------------------------------------------------------------------
@@ -224,9 +239,18 @@ pub const ENVELOPE_TYPES: &[(&str, CanonicalType)] = &[
 /// An ordered field → canonical-type map, as threaded from the server's
 /// pin cache into the emitter (pins ∩ hot-snapshot keys). Ordered so the
 /// emitted SQL is deterministic.
+///
+/// The map is shared behind an `Arc` and written copy-on-write: a pin set
+/// is built once and then read many times — the emitter carries one per
+/// pass, and a single logical query can re-emit up to three times on the
+/// pruned-retry / hot-only-fallback ladder. With the catalog bounded at
+/// `MAX_PINNED_FIELDS` (10 000 install-wide) a deep copy per clone is a
+/// real per-query cost; `clone` here is a refcount bump instead. Mutation
+/// stays available (`insert` through [`std::sync::Arc::make_mut`]) and
+/// unshared instances — the build-then-share path — never copy at all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FieldTypes {
-    entries: std::collections::BTreeMap<String, CanonicalType>,
+    entries: std::sync::Arc<std::collections::BTreeMap<String, CanonicalType>>,
 }
 
 impl FieldTypes {
@@ -237,8 +261,11 @@ impl FieldTypes {
     }
 
     /// Insert or overwrite a field's type.
+    ///
+    /// Copy-on-write: copies the map only when another clone is still
+    /// holding it, which the build-then-share callers never do.
     pub fn insert(&mut self, field: &str, ty: CanonicalType) {
-        self.entries.insert(field.to_owned(), ty);
+        std::sync::Arc::make_mut(&mut self.entries).insert(field.to_owned(), ty);
     }
 
     /// Iterate `(field, type)` in field-name order.
@@ -250,6 +277,15 @@ impl FieldTypes {
     #[must_use]
     pub fn get(&self, field: &str) -> Option<CanonicalType> {
         self.entries.get(field).copied()
+    }
+
+    /// Look up the pin for a DSL field reference, through [`catalog_key`]
+    /// (alias resolution + ASCII fold). The emitter's and the in-memory
+    /// filter's shared pin lookup — both must agree on which pin a query
+    /// token names (ADR-0011 slice A).
+    #[must_use]
+    pub fn pin_for(&self, dsl_name: &str) -> Option<CanonicalType> {
+        self.get(&catalog_key(dsl_name))
     }
 
     /// Whether the map holds no pins.
@@ -444,6 +480,34 @@ mod tests {
     }
 
     #[test]
+    fn catalog_key_resolves_aliases_then_folds_ascii() {
+        // Alias resolution first: the pinned column is `_time`, whatever
+        // spelling the DSL used.
+        assert_eq!(catalog_key("timestamp"), "_time");
+        assert_eq!(catalog_key("@timestamp"), "_time");
+        // ASCII fold second: catalog names are ingest-folded lowercase, so
+        // `Status` must find the `status` pin instead of silently falling
+        // back to unpinned.
+        assert_eq!(catalog_key("Status"), "status");
+        assert_eq!(catalog_key("DUR"), "dur");
+        // Non-ASCII stays put — DuckDB folds identifiers over ASCII only.
+        assert_eq!(catalog_key("CAFÉ"), "cafÉ");
+        assert_eq!(catalog_key("host"), "host");
+    }
+
+    #[test]
+    fn pin_for_looks_up_through_the_catalog_key() {
+        let mut ft = FieldTypes::new();
+        ft.insert("status", CanonicalType::Varchar);
+        ft.insert("_time", CanonicalType::Timestamp);
+        assert_eq!(ft.pin_for("status"), Some(CanonicalType::Varchar));
+        assert_eq!(ft.pin_for("Status"), Some(CanonicalType::Varchar));
+        assert_eq!(ft.pin_for("timestamp"), Some(CanonicalType::Timestamp));
+        assert_eq!(ft.pin_for("@timestamp"), Some(CanonicalType::Timestamp));
+        assert_eq!(ft.pin_for("unpinned"), None);
+    }
+
+    #[test]
     fn field_types_is_ordered_and_deduplicated() {
         let mut ft = FieldTypes::new();
         ft.insert("zeta", CanonicalType::BigInt);
@@ -459,5 +523,21 @@ mod tests {
         );
         assert!(!ft.is_empty());
         assert!(FieldTypes::new().is_empty());
+    }
+
+    #[test]
+    fn cloning_shares_the_map_and_insert_copies_on_write() {
+        let mut ft = FieldTypes::new();
+        ft.insert("status", CanonicalType::Varchar);
+        let shared = ft.clone();
+        // The emitter clones a pin set per pass (up to three passes per
+        // logical query); that must not deep-copy the catalog.
+        assert!(std::sync::Arc::ptr_eq(&ft.entries, &shared.entries));
+
+        // ... and a write through one handle must not reach the other.
+        ft.insert("duration", CanonicalType::BigInt);
+        assert_eq!(ft.get("duration"), Some(CanonicalType::BigInt));
+        assert_eq!(shared.get("duration"), None);
+        assert_eq!(shared.get("status"), Some(CanonicalType::Varchar));
     }
 }

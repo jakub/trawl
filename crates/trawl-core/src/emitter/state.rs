@@ -64,6 +64,11 @@ pub(crate) struct EmitterState {
     params: Vec<SqlValue>,
     /// How text search binds `_raw` in this pass (see [`RawBinding`]).
     raw_binding: RawBinding,
+    /// The full catalog pin set typing search-stage comparisons (ADR-0011
+    /// slice A). Distinct from the hot-branch conformance pins passed to
+    /// [`Self::with_hot_source`] — empty for pin-blind emission
+    /// (embedded mode, [`super::emit`]).
+    compare_pins: crate::schema::FieldTypes,
 }
 
 /// How the `_raw` column is bound by text search in one emission pass.
@@ -196,20 +201,19 @@ fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
 /// UNTYPED — the emitter has no `DESCRIBE`, so the expression must be valid
 /// whatever type `read_json` inferred for the column.
 ///
-/// Typed pins (`BIGINT`/`DOUBLE`/`TIMESTAMP`/`BOOLEAN`) use `TRY_CAST`:
-/// a nonconforming hot value degrades to NULL instead of throwing the
-/// hot+cold union (ADR-0008). The VARCHAR pin uses
-/// `json_extract_string(to_json(x), '$')`, which yields UNQUOTED strings
-/// over every inference class the snapshot can produce (VARCHAR, JSON from
-/// mixed values, BIGINT) — probed by execution in
-/// `trawl-engine/tests/duckdb_probe.rs`; a plain `CAST(x AS VARCHAR)` on a
-/// JSON-inferred column would keep the quotes.
+/// Text first, then the guarded cast, exactly as compaction conforms the
+/// same event on its way to parquet ([`crate::conform`]): the hot value a
+/// query reads is the one the corpus will durably hold, so a result cannot
+/// flip when the compactor runs. Both halves matter — the text form pins
+/// the cast domain to VARCHAR whatever `read_json` inferred from the rest
+/// of the snapshot, and the guard refuses a cast that would ALTER the value
+/// (`'1.5'` is not 2, `'TRUE'` is not `true`) instead of silently
+/// rewriting it.
+///
+/// A hot value that does not conform degrades to NULL, which is also what
+/// keeps it from throwing the hot+cold union (ADR-0008).
 fn conform_untyped(quoted: &str, pin: crate::schema::CanonicalType) -> String {
-    use crate::schema::CanonicalType;
-    match pin {
-        CanonicalType::Varchar => format!("json_extract_string(to_json({quoted}), '$')"),
-        typed => format!("TRY_CAST({quoted} AS {})", typed.as_duckdb()),
-    }
+    crate::conform::guarded_cast(&crate::conform::untyped_text(quoted), pin)
 }
 
 /// The pins that get their own `REPLACE` entry: everything except the
@@ -243,6 +247,21 @@ fn conformable_pins(
         .collect()
 }
 
+/// The `REPLACE` list conforming a hot-buffer read to the catalog, shared
+/// by every lane that reads the snapshot ([`EmitterState::with_hot_source`]
+/// and [`EmitterState::with_hot_only_source`]) so hot rows carry the same
+/// types whether or not cold data happens to exist.
+fn hot_replace_list(hot_pins: &crate::schema::FieldTypes) -> String {
+    let mut parts = Vec::with_capacity(crate::schema::TIMESTAMP_COLUMNS.len() + hot_pins.len());
+    for col in crate::schema::TIMESTAMP_COLUMNS {
+        parts.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
+    }
+    for (quoted, ty) in conformable_pins(hot_pins) {
+        parts.push(format!("{} AS {quoted}", conform_untyped(&quoted, ty)));
+    }
+    parts.join(", ")
+}
+
 /// Public accessor for the parquet/list source reader expression, so the
 /// engine can `DESCRIBE` the same cold source the emitter reads from.
 pub fn source_reader(source: &str) -> Result<String, super::EmitError> {
@@ -269,9 +288,11 @@ impl EmitterState {
     ///
     /// - both envelope TIMESTAMP columns get their unconditional `TRY_CAST`s
     ///   (ADR-0008 — survives empty `pins`, so catalog-less callers keep the
-    ///   timestamp guarantee), and
+    ///   timestamp guarantee; ingest already canonicalized them to UTC, so
+    ///   they need none of the zone-aware rung's work), and
     /// - every pinned field (excluding the timestamp columns, already
-    ///   handled) gets its [`conform_untyped`] expression, so a hot value
+    ///   handled) gets its [`conform_untyped`] expression — the same
+    ///   text-first guarded cast compaction writes with — so a hot value
     ///   that disagrees with the write-time pin degrades to NULL instead of
     ///   throwing the union.
     ///
@@ -285,25 +306,40 @@ impl EmitterState {
     pub(crate) fn with_hot_source(
         primary: &str,
         hot: &str,
-        pins: &crate::schema::FieldTypes,
+        hot_pins: &crate::schema::FieldTypes,
     ) -> Result<Self, super::EmitError> {
         let primary_reader = build_reader(primary)?;
         let hot_reader = hot_reader(hot)?;
-
-        let mut parts = Vec::with_capacity(crate::schema::TIMESTAMP_COLUMNS.len() + pins.len());
-        for col in crate::schema::TIMESTAMP_COLUMNS {
-            parts.push(format!("TRY_CAST(\"{col}\" AS TIMESTAMP) AS \"{col}\""));
-        }
-        for (quoted, ty) in conformable_pins(pins) {
-            parts.push(format!("{} AS {quoted}", conform_untyped(&quoted, ty)));
-        }
-        let hot_replace = parts.join(", ");
+        let hot_replace = hot_replace_list(hot_pins);
 
         let composite = format!(
             "(SELECT * FROM {primary_reader} UNION ALL BY NAME \
              SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
         );
         Ok(Self::with_source(composite))
+    }
+
+    /// Construct with the hot-buffer ndjson as the SOLE source, carrying the
+    /// same `REPLACE` conformance the union's hot branch gets.
+    ///
+    /// The executor reads hot-only whenever there is provably no cold data to
+    /// hide (a genuine cold start, ADR-0008). That is a change of *sources*,
+    /// never a change of *types*: reading the raw ndjson would hand the query
+    /// whatever `read_json` inferred — a JSON numeric `200` under a VARCHAR
+    /// pin binds as BIGINT and matches `status=200.0` by implicit cast, while
+    /// the conformed hot+cold union and the SSE filter compare the text
+    /// `'200'` and reject it. Sharing one `REPLACE` list with
+    /// [`Self::with_hot_source`] keeps a result from flipping the moment the
+    /// first parquet lands (ADR-0011 slice A).
+    pub(crate) fn with_hot_only_source(
+        hot: &str,
+        hot_pins: &crate::schema::FieldTypes,
+    ) -> Result<Self, super::EmitError> {
+        let hot_reader = hot_reader(hot)?;
+        let hot_replace = hot_replace_list(hot_pins);
+        Ok(Self::with_source(format!(
+            "(SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
+        )))
     }
 
     fn with_source(source: String) -> Self {
@@ -324,7 +360,27 @@ impl EmitterState {
             ctes: Vec::new(),
             params: Vec::new(),
             raw_binding: RawBinding::Available,
+            compare_pins: crate::schema::FieldTypes::new(),
         }
+    }
+
+    /// Attach the comparison pin set (ADR-0011 slice A). Builder-style so
+    /// the `emit*` entry points can funnel through one constructor per
+    /// source shape.
+    ///
+    /// The clone is a refcount bump, not a map copy ([`crate::schema::FieldTypes`]
+    /// shares its entries behind an `Arc`): every emission takes one, the
+    /// raw-free fallback takes a second, and the executor's pruned-retry /
+    /// hot-only ladder can re-emit a third time for one logical query.
+    pub(crate) fn with_compare_pins(mut self, pins: &crate::schema::FieldTypes) -> Self {
+        self.compare_pins = pins.clone();
+        self
+    }
+
+    /// The pin typing a comparison against `dsl_name`, looked up through
+    /// [`crate::schema::catalog_key`] (alias resolution + ASCII fold).
+    pub(crate) fn compare_pin(&self, dsl_name: &str) -> Option<crate::schema::CanonicalType> {
+        self.compare_pins.pin_for(dsl_name)
     }
 
     /// Emit the raw-free variant of this query: text search binds a typed

@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_with_pins(\"host>alpha\", &[(\"host\", CT::Varchar)])"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE "host" > ?
+---
+params:
+  0: 'alpha'

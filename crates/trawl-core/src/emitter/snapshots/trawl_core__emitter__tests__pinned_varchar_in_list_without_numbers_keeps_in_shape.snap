@@ -1,0 +1,11 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_with_pins(\"status=accepted,pending\", &[(\"status\", CT::Varchar)])"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE "status" IN (?, ?)
+---
+params:
+  0: 'accepted'
+  1: 'pending'

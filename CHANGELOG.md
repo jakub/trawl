@@ -6,6 +6,165 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed — behavior
+- **Comparisons follow the field catalog's type pins (ADR-0011 slice A, #63).**
+  Search-stage field filters — batch queries, exports, *and* live tail (SSE) —
+  now consult the field's pinned type instead of guessing from the query
+  literal. Against a VARCHAR-pinned field, `status=200` / `status!=200` /
+  `status=200,301` compare **as text** (matching the stored `"200"`), with a
+  numeric literal additionally matching any spelling of the same number
+  (`"0200"`, `"200.0"`) — the text a number is stored under depends on the
+  batch it arrived in, so the reading is what keeps live tail and `/query`
+  answering alike — and `status>=400` compares **numerically** in
+  `DECIMAL(38,6)`, the same space on the column and on the literal (see the
+  exact-integer entry below) —
+  `"404"` matches, `"accepted"` quietly doesn't, and nothing errors where the
+  pin-blind emission previously threw a Conversion/Binder error. Glob and
+  regex against numeric/boolean pins match the **stored** value's text
+  form (`status=4*` finds 404 in a BIGINT column; previously a hard
+  error) — which is not always how the event spelled it: a wire `"0404"`
+  is stored as the integer 404 (so `status=0*` matches nothing),
+  `"accepted"` under an integer pin is stored as NULL, a **boolean** pin
+  holds only the values DuckDB writes back — the lowercase words `true`
+  and `false`, so `flag=/^true$/` matches those and `flag=TRUE*` matches
+  nothing (a wire `"TRUE"`/`"t"`/`"yes"`/`"1"` does not survive the
+  conform's round-trip guard and is stored as NULL) — and for a **double**
+  pin that text is DuckDB's own
+  double rendering, which always carries a fraction and a signed
+  two-digit exponent (`200.0`, `1e-07`), so `dur=/^200$/` matches nothing
+  on either side while `dur=/^200\.0$/` matches both — and
+  against a **timestamp** pin they match the RFC 3339 UTC-microsecond form
+  of the stored *instant*, offsets applied
+  (`_time=/T09:/`, `_time=/\.123456Z$/`; see the zone-aware entry below) —
+  the same text batch and live, not DuckDB's space-separated rendering.
+  **This is live on day one for every install**: the envelope seed pins
+  `host`/`service`/`env`/`message`/`severity_text`/`_raw` as VARCHAR, so e.g.
+  `host=42` changes from a potential Conversion error to a clean text match
+  immediately — strictly a fix, but saved queries that leaned on implicit
+  casting may match differently. Unpinned fields, embedded mode (`--data`,
+  no catalog) and the pipeline `| where` stage keep today's literal-driven
+  *coercion* — how the literal binds is unchanged there — but the live-tail
+  NULL rules in the next entry change for **every** query, pinned or not.
+  Both are documented in the DSL reference. This lands **before** the repin
+  engine (#53) so a future type repin changes storage, not query meaning —
+  in the search stage. The pipeline `| where` / `| let` stages are still
+  pin-blind, so that promise is not complete until they follow; ADR-0011's
+  amendment sequences that slice ahead of the engine.
+
+- **Live tail (SSE) evaluates the search stage in SQL's three-valued logic
+  — two NULL reversals, on unpinned fields as much as pinned ones
+  (ADR-0011 slice A, #63).** The in-memory matcher behind
+  `GET /api/v1/stream` used to collapse "the event has no such field" to
+  *false* and then let `NOT` negate that into a match. It now answers
+  UNKNOWN, like the NULL column it mirrors, and UNKNOWN propagates through
+  `NOT`/`AND`/`OR` by SQL's rules. Pins are what surfaced this, not what
+  caused it: each direction was already a live/batch divergence against SQL
+  that has emitted `("f" != ? OR "f" IS NULL)` and a bare `NOT (...)` since
+  long before this release, so the fix is live tail agreeing with the batch
+  answer operators were already getting from `/api/v1/query`. Two live-tail
+  behaviors flip, in opposite directions:
+  - `f!=x` now **matches events that carry no `f`** (and events whose `f`
+    is JSON null). Bus events carry the envelope plus whatever their sender
+    sent, so a live tail keyed on `!=` over a sparse custom field can go
+    from a trickle to most of the firehose. Pair it with `f=*` (or filter
+    on a field the events actually carry) to get the old shape back.
+  - `NOT f=x` — and any negated field filter, `NOT level=...` band, or
+    `NOT <bare term>` — **no longer matches events that carry no `f`**,
+    because `NOT (NULL)` is NULL and the batch query has always dropped
+    those rows. **A live alert written as `NOT f=x` to catch events missing
+    `f` stops firing**; use `f!=x`, whose emitted form is the total one.
+
+- **The hot window now matches what compacted storage holds (ADR-0011, #63).**
+  A freshly ingested event was conformed to its pin with a bare `TRY_CAST`
+  while it sat in the hot buffer, and with the catalog's lossless round-trip
+  guard once compaction wrote it to parquet. The two disagree in exactly the
+  cases the guard exists for: `"1.5"` under a BIGINT pin read as `2` for the
+  minutes it was hot and NULL thereafter, `"TRUE"` under a BOOLEAN pin read
+  as `true` and then NULL. So `dur=2` was a hit, then a miss, with nothing in the
+  request to explain the change — and on a busy install the flip landed
+  mid-dashboard-refresh. Both lanes now build the same expression, and both
+  read the column's *text* form rather than whatever type `read_json`
+  inferred for the batch (JSON's cast domain is narrower than VARCHAR's for
+  a fractional string and wider for a number under a BOOLEAN pin, so the
+  inferred-type cast made one event's reading depend on what else shared its
+  snapshot). Expect **fewer** hot matches on values that never conformed:
+  they are now NULL — and therefore *unknown*, not false — from the moment
+  they land, exactly as the corpus has always held them.
+
+  Two things about what is **written** change with it, both permanent:
+  - the pin ladder scores its candidates through that same guard over that
+    same text, so a column of integral doubles beyond 2^53 now pins
+    **BIGINT** where it pinned DOUBLE — `1735689600123456710.7` conforms
+    as `1735689600123456800`, the integer its own DOUBLE rendering names.
+    A pin slot is spent for the life of the install, so this is a durable
+    change of both the column's type and the value stored in it;
+  - a field pinned **VARCHAR** whose batch `read_json` typed DOUBLE (or
+    DECIMAL, or nested) is stored in the `to_json` spelling:
+    `100000000000000000000.0` rather than `1e+20`, `1e-7` rather than
+    `1e-07`. Under that pin the guard is the identity, so the text form
+    *is* the stored value, and a lane that picked its own spelling was a
+    lane with its own corpus — the same flip this entry is about, one
+    level down.
+
+- **The live tail conforms a value before comparing it (ADR-0011, #63).**
+  Under a BIGINT/DOUBLE/BOOLEAN/TIMESTAMP pin, `GET /api/v1/stream`
+  compared the value the *sender* wrote while `/api/v1/query` compared the
+  value the *catalog stored*, so everything the round-trip guard nulls out
+  answered differently on the two paths. A wire `1.5` under a BIGINT pin
+  matched `duration>1` on the stream and was unknown to the query; `"abc"`
+  matched `duration!=2` in batch (the emitted form carries
+  `OR col IS NULL`) and not on the stream; `"TRUE"` under a BOOLEAN pin
+  made `NOT flag=true` fire live while `/api/v1/query` returned nothing.
+  The stream now reads the conformed value, so **a live tail on a pinned
+  field matches exactly what the equivalent query matches** — expect fewer
+  stream hits on values that never conformed, and `!=` to start matching
+  them. Nothing about `/api/v1/query` changes: the emitted SQL is
+  unchanged byte for byte. The same round closed the remaining places the
+  in-memory mirror read a text differently from DuckDB's own casts — the
+  DECIMAL cast forgiving a scan that whitespace cut short (`"- "` reads
+  zero), its exponent path rounding on the leading digit (`5e-8` reads one
+  microstep where `0.00000005` reads zero), and `inf ` reading as infinity
+  where the cast NULLs it — each of which was a live match the query did
+  not have.
+
+- **Custom timestamp fields are conformed zone-aware, in UTC (ADR-0011, #63).**
+  A TIMESTAMP-pinned custom field whose value carried an offset was conformed
+  with `TRY_CAST(text AS TIMESTAMP)`, a **wall-clock** parse that ignores the
+  offset: `2026-01-15T09:00:00+05:30` stored `09:00`, while the same value
+  arriving in a batch DuckDB happened to infer as TIMESTAMP stored `03:30`.
+  Every conform — compaction, the boot conformance pass, the hot branch, and
+  the live-tail pattern text — now parses through `TIMESTAMPTZ`, so an offset
+  is **applied** and a zoneless text reads as UTC; `_time`-style globs on such
+  a field follow (`/T03:30/` where `/T09:00/` used to match). Because that
+  parse consults the session zone, every DuckDB connection that conforms,
+  scores the pin ladder, or reads a hot snapshot now sets `TimeZone='UTC'` —
+  previously the bundled ICU build defaulted to the **host** zone, so a stored
+  instant could depend on `/etc/localtime`. **Data compacted before this
+  release keeps its wall-clock values**; they are not rewritten, and mixed
+  history is possible for a field that received offset-bearing values (the
+  ADR-0011 repin rewrite is the mechanism that would restate them). The
+  envelope's own `_time`/`_ingested` are unaffected — ingest canonicalizes
+  them to RFC 3339 UTC before storage (ADR-0008).
+
+- **VARCHAR-pinned numeric comparison is exact for every 64-bit integer
+  (ADR-0011, #63).** The numeric arm of `=`/`!=`/IN and the ordered rungs
+  compared through DOUBLE, which is blind above 2^53 — and blind identically
+  in both engines, so live/batch parity looked perfect while both answers
+  were wrong. `id=1737000000123456789` returned **three** distinct stored
+  ids, and `id!=9007199254740993` silently suppressed the genuinely different
+  `9007199254740992`; snowflake ids and nanosecond epochs sit in VARCHAR
+  fields in exactly that shape. Both rungs now read the column *and* the
+  literal through the same `DECIMAL(38,6)` cast (the literal binds as its own
+  text, so it never round-trips through `f64`), which is exact for every
+  `i64` and out to 10^32 and is also the space the conform guard compares in.
+  Two deliberate narrowings come with it, and both narrow what *matches*, not
+  what agrees: a stored `"nan"`/`"inf"` no longer sorts above every number
+  (`dur>1` used to return it, and now matches nothing — no reading is
+  *unknown*, never a false match), and stored or queried magnitudes at or
+  above 10^32 likewise have no reading. Fractions quantize at 10^-6, rounded
+  half away from zero, so two VARCHAR-stored values a nanosecond apart now
+  compare equal.
+
 ### Added
 - **fleet-ui grows `Atmosphere`, a WebGL mesh-gradient backdrop (ADR-0012; tracking issue jakub/coastwatch#308).** A decorative, theme-reactive shader layer over a vendored, committed `@paper-design/shaders` 0.0.79 ESM bundle (142 KB against the 500 KB cap, Apache-2.0 attribution stamped into the artifact itself, drift-gated in CI alongside the trawl-web-ui bundles) — mounted under a consumer's login card by one component and one feature flag: the bundle is a compile-time wasm-bindgen snippet, so consumers inherit it through the crate dependency with no build wiring of their own, but *linking* that snippet is also what plants its 142 KB in a dist, so the backdrop sits behind the default-off `atmosphere` cargo feature and only a consumer that mounts it pays the bytes (`features = ["atmosphere"]` on the dep, or `data-cargo-features` on Trunk's `rel="rust"` link). Every tunable lives in `atmosphere::palette`, the single Rust knobs site, with the two `--accent` anchors machine-pinned against `fleet-ui.css`; theme flips re-color the mounted mesh in place (never a remount), `prefers-reduced-motion` freezes it to a static frame, and WebGL-less or context-lost sessions silently keep the `var(--bg)` CSS floor. `.login-shell` no longer declares a background (zero visual delta today — body's floor propagates to the viewport canvas — and the composability the backdrop needs; coastwatch absorbs it on its next `TRAWL_REV` bump). The fleet-ui workbench's `/login` route composes the backdrop live (opting into the feature via `data-cargo-features`), and its trunk build joins CI as the only wasm-target build of this code. trawl-web-ui does not mount it in this slice and does not enable the feature — CI asserts both sides: the workbench dist carries the snippet, the SPA dist does not.
 - **Self-telemetry gets a bounded retry queue and first-class loss metrics (#56).** A failed telemetry WAL flush now *retains* its batch on a FIFO retry queue instead of dropping it, and drains oldest-first once the volume recovers — coalescing consecutive queued batches into WAL writes of at most 4 MiB (one file, one `batch_id`, one published batch) so a long outage recovers in a handful of fsynced writes instead of one per flush tick, while nothing merges until a write has actually succeeded — with the WAL write (and both fsync barriers) moved off the async executor onto Tokio's blocking pool. The durability-before-visibility invariant is unchanged and now exactly-once: a batch reaches the hot buffer and SSE strictly after its WAL write succeeds. Retained memory is capped by the new `[ingest] telemetry_buffer_max_bytes` (default 16 MiB, an estimated charge like `hot_buffer_max_bytes`) — one budget over the active buffer, the retry queue *and* the batch in flight through a write, enforced as events arrive so a wedged write cannot let the active buffer grow unbounded; over budget the *oldest* queued batches are shed first and then the incoming event itself, all with exact accounting, and the previously-silent pre-init bootstrap cap now counts its drops too. New Prometheus series — `trawl_telemetry_wal_write_failures_total`, `trawl_telemetry_{events,bytes}_dropped_total{reason="preinit_cap"|"buffer_cap"}`, and the `trawl_telemetry_buffer_{events,bytes}` depth gauges — stay scrapeable precisely while self-ingestion is unavailable; the searchable `telemetry_dropped` recovery event now carries event counts and per-reason totals. Graceful shutdown attempts a final flush under a 5-second budget so an unhealthy volume cannot hang the daemon.

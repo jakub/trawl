@@ -19,6 +19,7 @@ mod validate;
 use crate::ast::{PipeStage, Query, Spanned};
 use state::EmitterState;
 
+pub(crate) use fields::coerce_filter_value;
 pub use fields::map_field_name;
 pub use functions::is_aggregate_function;
 pub use functions::{DATE_PART_UNITS, DATE_UNITS};
@@ -155,29 +156,92 @@ impl EmitError {
 /// Emit parameterized `DuckDB` SQL from a parsed query.
 ///
 /// `source` is the parquet glob path, e.g. `"/data/**/*.parquet"`.
+///
+/// Deliberately PIN-BLIND: comparisons stay literal-driven (ADR-0011 slice
+/// A's documented embedded-mode behavior). This is the door for embedded
+/// `--data` queries, the fuzz target and the snapshot tests; every
+/// catalog-backed caller goes through [`emit_with_pins`] or
+/// [`emit_with_hot_source`].
 pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
     emit_with_raw_fallback(query, || EmitterState::new(source))
+}
+
+/// Emit SQL with the field catalog's pins typing the search-stage
+/// comparisons (ADR-0011 slice A).
+///
+/// `pins` is the FULL catalog snapshot (not intersected with any hot key
+/// set): a VARCHAR-pinned field compares as text under `=`/`!=`/IN,
+/// numerically in [`crate::conform::DECIMAL_COMPARISON_SPACE`] for
+/// ordered numeric literals (both sides cast, so the literal never
+/// round-trips through `f64`), and typed pins glob/regex through
+/// `CAST(col AS VARCHAR)`. A typed pin's COMPARISONS emit exactly what the
+/// unpinned path emits — the column on disk already is the pinned type —
+/// and travel to the live matcher, which has to conform the wire value
+/// before it can answer the same question ([`crate::filter`]). See
+/// [`crate::compare`] for the rule table. Empty `pins` emits exactly what
+/// [`emit`] emits.
+pub fn emit_with_pins(
+    query: &Query,
+    source: &str,
+    pins: &crate::schema::FieldTypes,
+) -> Result<EmittedQuery, EmitError> {
+    emit_with_raw_fallback(query, || {
+        Ok(EmitterState::new(source)?.with_compare_pins(pins))
+    })
 }
 
 /// Emit SQL that unions the primary parquet source with a hot buffer ndjson file.
 ///
 /// Produces a `UNION ALL BY NAME` composite source so that fresh events
-/// in the hot buffer are visible alongside compacted parquet data. `pins`
-/// is the field catalog's pinned types intersected with the snapshot's
-/// observed keys: each pinned field is conformed on the HOT branch only
-/// (`TRY_CAST` for typed pins, the untyped json path for VARCHAR), so a
-/// hot value disagreeing with the write-time pin degrades to NULL instead
-/// of throwing the union. Empty `pins` (embedded mode, catalog-less
-/// buffer) leaves the union plain apart from the unconditional envelope
-/// timestamp `TRY_CAST`s (ADR-0008).
+/// in the hot buffer are visible alongside compacted parquet data.
+///
+/// Two pin sets, two roles, never conflated (ADR-0011 slice A):
+///
+/// - `hot_pins` — the catalog's pins intersected with the snapshot's
+///   observed keys: each pinned field is conformed on the HOT branch only,
+///   through the same text-first guarded cast compaction writes with
+///   ([`crate::conform`]), so a hot value disagreeing with the write-time
+///   pin degrades to NULL instead of throwing the union — and one that
+///   agrees reads exactly as it will once compacted. An intersected set,
+///   because the `REPLACE` list must never name a column absent from the
+///   snapshot.
+/// - `pins` — the FULL catalog snapshot typing the search-stage
+///   comparisons (see [`emit_with_pins`]). Full, because a cold-only
+///   field's comparison semantics must not depend on ingest timing.
+///
+/// Empty sets (embedded mode, catalog-less buffer) leave the union plain
+/// apart from the unconditional envelope timestamp `TRY_CAST`s (ADR-0008)
+/// and the comparisons literal-driven.
 pub fn emit_with_hot_source(
     query: &Query,
     source: &str,
     hot_source: &str,
+    hot_pins: &crate::schema::FieldTypes,
     pins: &crate::schema::FieldTypes,
 ) -> Result<EmittedQuery, EmitError> {
     emit_with_raw_fallback(query, || {
-        EmitterState::with_hot_source(source, hot_source, pins)
+        Ok(EmitterState::with_hot_source(source, hot_source, hot_pins)?.with_compare_pins(pins))
+    })
+}
+
+/// Emit SQL reading ONLY the hot-buffer ndjson, conformed exactly as the
+/// union's hot branch is (ADR-0011 slice A).
+///
+/// Same two pin sets, same two roles as [`emit_with_hot_source`]:
+/// `hot_pins` (intersected with the snapshot's keys) conforms the hot
+/// columns, `pins` (the full catalog snapshot) types the comparisons. This
+/// is the executor's cold-start lane — reading the raw ndjson through
+/// [`emit_with_pins`] instead would let `read_json`'s inference, not the
+/// catalog, decide a hot column's type, so a query's answer would change
+/// the moment the first parquet file landed.
+pub fn emit_hot_only(
+    query: &Query,
+    hot_source: &str,
+    hot_pins: &crate::schema::FieldTypes,
+    pins: &crate::schema::FieldTypes,
+) -> Result<EmittedQuery, EmitError> {
+    emit_with_raw_fallback(query, || {
+        Ok(EmitterState::with_hot_only_source(hot_source, hot_pins)?.with_compare_pins(pins))
     })
 }
 
@@ -1319,6 +1383,7 @@ mod tests {
             SRC,
             "/tmp/hot_abc123.ndjson",
             &crate::schema::FieldTypes::new(),
+            &crate::schema::FieldTypes::new(),
         )
         .unwrap();
         assert_snapshot!(format_result(&result));
@@ -1332,6 +1397,7 @@ mod tests {
             SRC,
             "/tmp/bad;path.ndjson",
             &crate::schema::FieldTypes::new(),
+            &crate::schema::FieldTypes::new(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
@@ -1343,14 +1409,32 @@ mod tests {
         let mut pins = crate::schema::FieldTypes::new();
         pins.insert("duration", crate::schema::CanonicalType::BigInt);
         pins.insert("note", crate::schema::CanonicalType::Varchar);
-        let sql = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson", &pins)
-            .unwrap()
-            .sql;
-        // Typed pin: TRY_CAST on the hot branch (NULL on mismatch, never a
-        // union throw — ADR-0008).
+        let sql = emit_with_hot_source(
+            &query,
+            SRC,
+            "/tmp/hot_abc123.ndjson",
+            &pins,
+            &crate::schema::FieldTypes::new(),
+        )
+        .unwrap()
+        .sql;
+        // Typed pin: the guarded cast over the column's TEXT form, exactly
+        // what compaction writes (NULL on mismatch, never a union throw —
+        // ADR-0008). The cast never touches the column itself, so the
+        // domain cannot vary with read_json's inference.
+        let duration_text = r#"json_extract_string(to_json("duration"), '$')"#;
+        assert_eq!(
+            sql.matches(&format!(
+                "{} AS \"duration\"",
+                crate::conform::guarded_cast(duration_text, crate::schema::CanonicalType::BigInt)
+            ))
+            .count(),
+            1,
+            "hot branch must conform the BIGINT pin through the shared guard: {sql}"
+        );
         assert!(
-            sql.contains(r#"TRY_CAST("duration" AS BIGINT) AS "duration""#),
-            "hot branch must conform the BIGINT pin: {sql}"
+            !sql.contains(r#"TRY_CAST("duration""#),
+            "no cast may bind the raw hot column: {sql}"
         );
         // VARCHAR pin: the untyped json path, so strings land unquoted
         // whatever the snapshot column inferred as.
@@ -1358,10 +1442,9 @@ mod tests {
             sql.contains(r#"json_extract_string(to_json("note"), '$') AS "note""#),
             "hot branch must conform the VARCHAR pin untyped: {sql}"
         );
-        // The pin casts appear ONCE — on the hot branch only. The cold
-        // branch is plain: parquet is write-time conformant, and a
-        // defensive cold cast would mask a real invariant breach.
-        assert_eq!(sql.matches(r#"TRY_CAST("duration""#).count(), 1);
+        // The conform appears on the hot branch only. The cold branch is
+        // plain: parquet is write-time conformant, and a defensive cold
+        // cast would mask a real invariant breach.
         assert!(
             sql.contains("(SELECT * FROM read_parquet("),
             "cold branch must have no REPLACE: {sql}"
@@ -1376,9 +1459,15 @@ mod tests {
         let mut pins = crate::schema::FieldTypes::new();
         pins.insert("_time", crate::schema::CanonicalType::Timestamp);
         pins.insert("_ingested", crate::schema::CanonicalType::Timestamp);
-        let sql = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson", &pins)
-            .unwrap()
-            .sql;
+        let sql = emit_with_hot_source(
+            &query,
+            SRC,
+            "/tmp/hot_abc123.ndjson",
+            &pins,
+            &crate::schema::FieldTypes::new(),
+        )
+        .unwrap()
+        .sql;
         assert_eq!(sql.matches(r#"AS "_time""#).count(), 1, "{sql}");
         assert_eq!(sql.matches(r#"AS "_ingested""#).count(), 1, "{sql}");
     }
@@ -1392,15 +1481,27 @@ mod tests {
         let mut pins = crate::schema::FieldTypes::new();
         pins.insert("café", crate::schema::CanonicalType::Varchar);
         pins.insert("cafÉ", crate::schema::CanonicalType::BigInt);
-        let sql = emit_with_hot_source(&query, SRC, "/tmp/hot_abc123.ndjson", &pins)
-            .unwrap()
-            .sql;
+        let sql = emit_with_hot_source(
+            &query,
+            SRC,
+            "/tmp/hot_abc123.ndjson",
+            &pins,
+            &crate::schema::FieldTypes::new(),
+        )
+        .unwrap()
+        .sql;
         assert!(
             sql.contains(r#"json_extract_string(to_json("café"), '$') AS "café""#),
             "{sql}"
         );
         assert!(
-            sql.contains(r#"TRY_CAST("cafÉ" AS BIGINT) AS "cafÉ""#),
+            sql.contains(&format!(
+                "{} AS \"cafÉ\"",
+                crate::conform::guarded_cast(
+                    r#"json_extract_string(to_json("cafÉ"), '$')"#,
+                    crate::schema::CanonicalType::BigInt
+                )
+            )),
             "{sql}"
         );
     }
@@ -1415,6 +1516,7 @@ mod tests {
             &query,
             SRC,
             "/tmp/hot_abc123.ndjson",
+            &crate::schema::FieldTypes::new(),
             &crate::schema::FieldTypes::new(),
         )
         .unwrap()
@@ -1435,6 +1537,219 @@ mod tests {
             1,
             "empty pins must add no further REPLACE entries: {sql}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // pin-aware comparisons (ADR-0011 slice A)
+    // -----------------------------------------------------------------------
+
+    fn pins(entries: &[(&str, crate::schema::CanonicalType)]) -> crate::schema::FieldTypes {
+        let mut ft = crate::schema::FieldTypes::new();
+        for (field, ty) in entries {
+            ft.insert(field, *ty);
+        }
+        ft
+    }
+
+    /// Parse a DSL string and emit pin-aware SQL; format for snapshots.
+    fn emit_dsl_with_pins(input: &str, entries: &[(&str, crate::schema::CanonicalType)]) -> String {
+        let query = parser::parse(input).expect("parse should succeed");
+        let result = emit_with_pins(&query, SRC, &pins(entries)).expect("emit should succeed");
+        format_result(&result)
+    }
+
+    use crate::schema::CanonicalType as CT;
+
+    /// A numeric literal binds BOTH the text and its numeric reading: the
+    /// stored text of a number is `read_json`'s inference rendered
+    /// (`"200.0"`), so exact text alone would be a batch miss where the
+    /// live matcher — which only sees the wire `200` — hits.
+    #[test]
+    fn pinned_varchar_eq_numeric_binds_text_and_reading() {
+        assert_snapshot!(emit_dsl_with_pins("status=200", &[("status", CT::Varchar)]));
+    }
+
+    #[test]
+    fn pinned_varchar_ne_numeric_binds_text_and_reading_keeping_null_policy() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "status!=200",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// A list with a numeric element expands to the OR of its per-element
+    /// equalities — an element with two arms has no single bound value.
+    #[test]
+    fn pinned_varchar_in_list_expands_to_or_of_equalities() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "status=200,301,404",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// A list with no numeric element keeps the plain `IN (…)` shape.
+    #[test]
+    fn pinned_varchar_in_list_without_numbers_keeps_in_shape() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "status=accepted,pending",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// Mixed lists mix the shapes, element by element.
+    #[test]
+    fn pinned_varchar_in_list_mixes_text_and_numeric_elements() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "status=200,accepted",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    /// The ordered rung casts BOTH sides into the one comparison space:
+    /// binding the literal as a number would put it back on the `f64`
+    /// path that made every id above 2^53 equal to its neighbours
+    /// (ADR-0011 ruling #6).
+    #[test]
+    fn pinned_varchar_ordered_numeric_compares_in_decimal_space() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "status>=400",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    #[test]
+    fn pinned_varchar_ordered_lexical_unchanged() {
+        assert_snapshot!(emit_dsl_with_pins("host>alpha", &[("host", CT::Varchar)]));
+    }
+
+    #[test]
+    fn pinned_bigint_glob_casts_to_varchar() {
+        assert_snapshot!(emit_dsl_with_pins("status=4*", &[("status", CT::BigInt)]));
+    }
+
+    /// A TIMESTAMP pin renders the canonical RFC 3339 pattern text, not
+    /// `DuckDB`'s space-separated CAST rendering — the live matcher builds
+    /// the same string from the wire value (`compare::
+    /// canonical_timestamp_text`), so an anchored pattern means one thing.
+    #[test]
+    fn pinned_timestamp_regex_renders_rfc3339_text() {
+        assert_snapshot!(emit_dsl_with_pins(
+            r"_time=/2026-01-.*/",
+            &[("_time", CT::Timestamp)]
+        ));
+    }
+
+    /// Pin lookup goes through `catalog_key`: a mixed-case reference names
+    /// the same (ingest-folded, DuckDB-case-insensitive) column and must
+    /// find the same pin — never silently fall back to unpinned. The
+    /// identifier keeps the user's spelling (`DuckDB` folds it), so the
+    /// evidence is the bound parameters: under the VARCHAR pin the same
+    /// literal text binds twice — once for the text arm, once as the
+    /// numeric arm's cast input — where an unpinned emission binds the
+    /// coerced number alone.
+    #[test]
+    fn pinned_lookup_is_case_folded() {
+        let ft = pins(&[("status", CT::Varchar)]);
+        for dsl in ["status=200", "Status=200"] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            let emitted = emit_with_pins(&query, SRC, &ft).expect("emit should succeed");
+            assert_eq!(
+                emitted.params,
+                vec![
+                    SqlValue::String("200".into()),
+                    SqlValue::String("200".into())
+                ],
+                "{dsl} must bind the pinned two-armed equality"
+            );
+        }
+    }
+
+    /// Composite hot source with BOTH pin sets: `hot_pins` conforms the
+    /// hot branch (REPLACE), `pins` types the comparison — two distinct
+    /// roles, never conflated.
+    #[test]
+    fn hot_source_with_comparison_pins() {
+        let query = parser::parse("status=200 duration>5").unwrap();
+        let mut hot_pins = crate::schema::FieldTypes::new();
+        hot_pins.insert("duration", CT::BigInt);
+        let comparison = pins(&[("status", CT::Varchar), ("duration", CT::BigInt)]);
+        let result = emit_with_hot_source(
+            &query,
+            SRC,
+            "/tmp/hot_abc123.ndjson",
+            &hot_pins,
+            &comparison,
+        )
+        .unwrap();
+        assert_snapshot!(format_result(&result));
+    }
+
+    /// Minimality is a tested invariant: outside the changed cells of the
+    /// ADR-0011 slice A table, pinned emission is byte-identical to
+    /// unpinned emission — a repin changes no other query's meaning.
+    #[test]
+    fn pinned_emission_is_byte_identical_outside_the_changed_cells() {
+        use crate::ast::FilterOp;
+
+        let pin_states: [Option<CT>; 6] = [
+            None,
+            Some(CT::Varchar),
+            Some(CT::BigInt),
+            Some(CT::Double),
+            Some(CT::Timestamp),
+            Some(CT::Boolean),
+        ];
+        // (dsl template, op class) — `{}` is replaced by the literal.
+        let cases: [(&str, FilterOp); 9] = [
+            ("f={}", FilterOp::Eq),
+            ("f!={}", FilterOp::Ne),
+            ("f>{}", FilterOp::Gt),
+            ("f>={}", FilterOp::Gte),
+            ("f<{}", FilterOp::Lt),
+            ("f<={}", FilterOp::Lte),
+            ("f={},{}", FilterOp::Eq),     // IN list
+            ("f={}*", FilterOp::Glob),     // glob (auto-detected)
+            ("f=/{}.*/", FilterOp::Regex), // regex
+        ];
+        let literals: [(&str, bool); 4] = [
+            ("200", true),
+            ("1.5", true),
+            ("accepted", false),
+            ("9999999999999999999", true),
+        ];
+
+        for pin in pin_states {
+            for (template, op) in cases {
+                for (lit, numeric) in literals {
+                    let dsl = template.replace("{}", lit);
+                    let Ok(query) = parser::parse(&dsl) else {
+                        continue;
+                    };
+                    let unpinned = emit(&query, SRC).expect("unpinned emit");
+                    let entries: Vec<(&str, CT)> = pin.map(|t| ("f", t)).into_iter().collect();
+                    let pinned = emit_with_pins(&query, SRC, &pins(&entries)).expect("pinned emit");
+
+                    let is_pattern = matches!(op, FilterOp::Glob | FilterOp::Regex);
+                    let changed = match pin {
+                        Some(CT::Varchar) => {
+                            // eq/ne/IN rebind numeric literals as text;
+                            // ordered numeric literals move to TRY_CAST.
+                            !is_pattern && numeric
+                        }
+                        Some(_) => is_pattern,
+                        None => false,
+                    };
+                    let identical = pinned.sql == unpinned.sql && pinned.params == unpinned.params;
+                    assert_eq!(
+                        identical, !changed,
+                        "{dsl:?} under pin {pin:?}: expected changed={changed}\n\
+                         unpinned sql: {}\nparams: {:?}\n\
+                         pinned sql: {}\nparams: {:?}",
+                        unpinned.sql, unpinned.params, pinned.sql, pinned.params
+                    );
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

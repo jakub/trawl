@@ -496,7 +496,11 @@ impl AppState {
                     config.server.max_concurrent_queries,
                     config.server.max_result_rows,
                     hot_buffer.clone(),
-                ),
+                )
+                // Comparison typing (ADR-0011 slice A): the pool snapshots
+                // the full pin set per query. The catalog is constructed
+                // unconditionally above, so query-only nodes are covered.
+                .with_field_catalog(Arc::clone(&field_catalog)),
                 timeout_secs: config.server.timeout_secs,
                 tracker: Arc::new(QueryTracker::with_capacity(config.server.max_query_history)),
                 schema_cache_ttl_secs: config.server.schema_cache_ttl_secs,

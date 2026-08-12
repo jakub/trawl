@@ -1,6 +1,7 @@
 # Field repin and conflict recovery
 
-status: accepted (2026-08-05)
+status: accepted (2026-08-05), amended (2026-08-10) after the slice-A
+implementation review — see Amendment
 
 ADR-0009 made the field catalog the install-wide write-time type authority:
 one pinned type per field name, decided at first typed sight, permanent. That
@@ -46,7 +47,12 @@ first-typed-sight pinning tenable at multi-team scale.
   scope for pin-awareness.
 - Because emission adapts to the pin, a repin changes no query's meaning.
   This property is what makes one-click (and eventually automatic) repin
-  safe, and is why slice A must merge before the engine.
+  safe, and is why slice A must merge before the engine. **[Corrected by
+  the Amendment: slice A adapts the SEARCH STAGE only. The pipeline
+  `| where` and `| let` stages stayed literal-driven and pin-blind, so
+  the invisibility property does not yet hold — a repin to VARCHAR would
+  break a saved `| where status > 400` loudly. Slice A′ closes the gap
+  and takes over as the engine's gate.]**
 
 ### Slice B — the repin engine (issue #53)
 
@@ -148,5 +154,156 @@ first-typed-sight pinning tenable at multi-team scale.
   pin-aware emission makes the numeric idioms (`status>=400`, `status=4*`)
   keep working there — better than either splunk's coerce-everything or a
   rigid numeric pin.
-- Sequencing is A → B → C; each slice is one PR, prepped through the front
-  door in turn.
+- Sequencing is A → A′ → B → C (the Amendment inserts A′, the pipeline
+  half of pin-awareness, as the engine's gate); each slice is one PR,
+  prepped through the front door in turn.
+
+## Amendment (2026-08-10): what slice A shipped, and six adjudicated rulings
+
+The slice-A (#63) implementation review escalated six blockers and all six
+were adjudicated. One principle unifies them: **the live mirror imitates
+what conformance stores, conformance is the lossless guard, everywhere, in
+one deterministic cast domain.** Slice A set out to make a comparison mean
+the pin rather than the literal; five of the six rulings are about the
+readings that comparison is built on being the *same* readings the corpus
+durably holds, and the sixth is about not claiming more than shipped.
+
+Every rule below is verified by execution against the bundled DuckDB and
+pinned in `trawl-engine/tests/duckdb_probe.rs`, per the ADR-0009 probe
+convention. The catalog schema is untouched; no pin changes meaning.
+
+### 1. The timestamp rung is zone-aware, in both lanes and in the mirror
+
+`TRY_CAST(text AS TIMESTAMP)` is a **wall-clock** parse: it ignores a
+trailing offset. So a custom TIMESTAMP-pinned `09:00:00+05:30` stored
+`09:00` through the conform and `03:30` through `read_json`'s own
+inference — the same wire value, two instants, decided by what else shared
+its batch. Every conform now parses through `TIMESTAMPTZ`
+(`TRY_CAST(TRY_CAST(t AS TIMESTAMPTZ) AS TIMESTAMP)`), which applies the
+offset and reads a zoneless text as the session zone. That makes the
+session zone load-bearing, so every connection that conforms, scores the
+pin ladder, or reads a conformed hot branch installs
+`SET TimeZone='UTC'` first: the bundled DuckDB links ICU and otherwise
+defaults `TimeZone` to the *host* zone (probed), which would have made
+stored instants a function of `/etc/localtime`. UTC is not a preference —
+ingest already canonicalizes `_time` to RFC 3339 UTC (ADR-0008).
+
+The TIMESTAMP pin's pattern text (`compare::canonical_timestamp_text`,
+what `_time=2026-01-15*` globs against in live tail) is the mirror of that
+expression and was rewritten to match it: offsets applied, `epoch` and
+`infinity` keywords, a trailing zone *name* from the definitionally-UTC
+set, hour 24 rolling into the next day, and the seconds-less
+`T09:00+00:00` false positive refused.
+
+### 2. The hot branch conforms exactly as compaction does — one builder
+
+Slice A's hot-branch `REPLACE` list applied a bare `TRY_CAST` to a typed
+pin while compaction applied the ADR-0009 round-trip guard. A `"1.5"`
+under a BIGINT pin therefore read `2` while the event was hot and NULL a
+few minutes later — a query whose answer changes with a background timer,
+with nothing in the request to explain it. Both lanes now build their SQL
+from one function (`trawl_core::conform::guarded_cast`); the compaction
+copy (`lossless_cast`) is deleted, and neither lane decides anything for
+itself, down to the spelling of the column's text
+(`json_extract_string(to_json(x), '$')`, in both). Letting compaction
+choose that spelling from its `DESCRIBE` — which it briefly did, since it
+alone knows the physical type — left the flip alive under the **VARCHAR**
+pin, where the guard is the identity and the text form therefore IS the
+stored value: `TRY_CAST(col AS VARCHAR)` spells a DOUBLE `1e20` as
+`1e+20` and `to_json` spells it `100000000000000000000.0`, so
+`note=/^1e/` matched while the event was hot and stopped matching once
+the compactor ran. The guard is the authority everywhere it exists: a
+cast that would ALTER the value writes NULL, counts as a conflict, and
+leaves the original findable in `_raw`.
+
+### 3. One deterministic cast domain: the text form, always VARCHAR
+
+`read_json` types a hot column from the batch's *contents*, and the cast
+domains of those inference classes disagree in both directions:
+`TRY_CAST(JSON '"1.5"' AS BIGINT)` is NULL where `TRY_CAST('1.5' AS
+BIGINT)` rounds to 2, and a JSON *number* under a BOOLEAN pin reads `true`
+where its text does not. Casting the inferred type would make one event's
+stored value a function of what happened to share its batch. Neither lane
+casts the source column any more: both derive the column's canonical TEXT
+and cast that, so the domain is VARCHAR always, and the pin ladder scores
+through the same expression it will later write with.
+
+### 4. A live mirror is proven by execution; the probe matrix is the contract
+
+Rules 1-3 are claims about DuckDB, and the in-memory matcher has to make
+the same claims in Rust. Every mirror pairing is now executed side by side
+against the bundled engine rather than reasoned about — the timestamp work
+alone turned up shapes no reviewer had named (`infinity` renders as a
+word, chrono's `%Y` disagrees with DuckDB outside four digits, `23:59:60`
+parses as a chrono leap second and must not, `+0530` is accepted where
+`+053015` is not). The standing policy, written into the probe module and
+onto the mirrors themselves: **the probe matrix is the contract**. A
+divergence the matrix does not name is a bug in the *mirror* — add the
+input, then fix the mirror against what the engine actually does. Any
+surviving divergence must be a deliberate, ONE-DIRECTIONAL residual (the
+mirror under-reads; it may never fire where a batch query does not) listed
+with its cost written down.
+
+### 5. Slice A's invisibility promise is scoped, and slice A′ gates the engine
+
+Slice A as written claimed a repin "changes no query's meaning". It does
+not, yet: pin-awareness deliberately stops at the search stage, and the
+pipeline `| where` / `| let` stages remain literal-driven typed
+expressions. A repin of `status` to VARCHAR would leave `status>=400`
+answering correctly and `| where status > 400` erroring — the loud
+breakage slice A exists to prevent, in the stage an operator is most
+likely to have saved. The promise is therefore restated as scoped, and a
+new slice takes over as the engine's gate:
+
+- **Slice A′ — pin-aware pipeline comparisons.** `| where`, `| let` and
+  the expression evaluator consult the same pin snapshot and the same rule
+  table (`trawl-core/src/compare.rs`) the search stage does, with the same
+  batch/live parity discipline. Its scope is the semantics slice A already
+  ratified — the DECIMAL comparison space, the guarded readings, the
+  three-valued NULL rules — applied one stage later, not a second rule
+  table.
+- **A′ merges before B.** The invisibility property is what makes a repin
+  safe to offer as a button; until every stage adapts, the engine would be
+  shipping an archive rewrite that breaks saved queries. Nothing else in
+  slice B's design changes.
+
+### 6. One numeric comparison space: `DECIMAL(38,6)`
+
+Slice A's VARCHAR-pinned numeric rungs compared through DOUBLE, which is
+blind above 2^53 — and blind *identically* in both engines, so parity
+testing could never have caught it. `id=1737000000123456789` matched three
+distinct stored ids, and `id!=9007199254740993` suppressed the genuinely
+different `9007199254740992`; snowflake ids and nanosecond epochs sit in
+VARCHAR-pinned fields in exactly that shape. Both rungs — equality/IN and
+ordered — now read the column and the literal through the same
+`DECIMAL(38,6)` cast, which is also the space the BIGINT conform guard
+compares in, so the guard and the comparison rules are one expression. The
+literal binds as its own text and is cast by the identical expression the
+column is, so it never round-trips through `f64`.
+
+Two costs, paid by both engines together — they narrow what *matches*,
+never what *agrees*: fractions quantize at 10^-6 (two values a nanosecond
+apart compare equal), and `nan`, `inf` and magnitudes at or above 10^32
+have no reading at all. No reading is a NULL — UNKNOWN, never a false
+match, and `NOT` cannot invert it. DOUBLE's total ordering used to sort a
+stored `"nan"` above every number, so `dur>1` returned it; it now matches
+nothing. Never `BIGINT`, for the reason it is not a conform rung either:
+`TRY_CAST('1.5' AS BIGINT)` rounds, which would make `dur>1` and `dur>1.5`
+disagree about a stored `"1.5"`.
+
+### Consequences of the amendment
+
+- A value that fails the lossless guard is NULL in the hot window too, so
+  the hit-then-miss flip at compaction is gone. Data compacted before this
+  change may hold wall-clock timestamps for zone-bearing custom values;
+  the slice-B rewrite is the mechanism that would restate them.
+- `trawl_core::conform` is now the single home of the conform expression,
+  the comparison space, and the mandatory session zone. Slice B's
+  ConformPlan rewrite inherits all three by construction — the "TRY_CAST
+  under the lossless round-trip guard" it was designed against is that
+  module's `guarded_cast`, unchanged in intent.
+- Three residuals were named by the review and deliberately left: the
+  `| where`/`| let` pin-blindness above (slice A′), `field!=a,b` reading
+  as a positive IN list, and an invalid glob/regex dropping silently out
+  of a live filter. None of them are new in this slice, and none is a
+  repin hazard.

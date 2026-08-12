@@ -1617,3 +1617,237 @@ mod boot {
         assert_eq!(result.result.row_count(), 4, "full corpus visible");
     }
 }
+
+/// ADR-0011 slice A acceptance: comparisons against a VARCHAR-pinned
+/// field follow the pin over HTTP — with the hot buffer populated AND
+/// drained (the drained case exercises the formerly pin-blind cold-only
+/// `run_query` branch).
+#[sqlx::test(migrations = false)]
+async fn pinned_varchar_comparisons_behave_over_http(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    // Mixed numeric-looking and word statuses (all strings) — the ladder
+    // pins VARCHAR at first compaction.
+    let statuses = ["200", "404", "accepted", "301"];
+    let events: Vec<serde_json::Value> = statuses
+        .iter()
+        .map(|s| {
+            json!({
+                "service": "pin-svc", "env": "prod", "host": "web01",
+                "timestamp": now_ts(), "message": format!("s-{s}"), "status": s,
+            })
+        })
+        .collect();
+    let resp = h.ingest.ingest(&events).await.expect("ingest");
+    assert_eq!(resp.accepted, 4);
+    compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
+    assert_eq!(
+        h.server.state.query.field_catalog.get("status"),
+        Some(trawl_core::schema::CanonicalType::Varchar),
+        "the mixed batch must pin status VARCHAR"
+    );
+
+    let count = |dsl: &str| {
+        let query = &h.query;
+        let dsl = dsl.to_owned();
+        async move {
+            query
+                .query_paginated(&dsl, None, None)
+                .await
+                .unwrap_or_else(|e| panic!("{dsl}: pinned comparison must not error: {e}"))
+                .result
+                .row_count()
+        }
+    };
+
+    // Drained phase: the hot buffer emptied at compaction, so these ride
+    // the cold-only run_query branch.
+    assert_eq!(count("service=pin-svc status=200 last=1h").await, 1);
+    assert_eq!(count("service=pin-svc status=200,301 last=1h").await, 2);
+    assert_eq!(count("service=pin-svc status!=200 last=1h").await, 3);
+    assert_eq!(
+        count("service=pin-svc status>=400 last=1h").await,
+        1,
+        "only '404' is >= 400 — 'accepted' NULLs out instead of erroring"
+    );
+
+    // Populated phase: fresh uncompacted events ride the hot branch of
+    // the union, under the same comparison pins.
+    let more: Vec<serde_json::Value> = ["500", "accepted"]
+        .iter()
+        .map(|s| {
+            json!({
+                "service": "pin-svc", "env": "prod", "host": "web01",
+                "timestamp": now_ts(), "message": format!("hot-{s}"), "status": s,
+            })
+        })
+        .collect();
+    let resp = h.ingest.ingest(&more).await.expect("ingest hot");
+    assert_eq!(resp.accepted, 2);
+
+    assert_eq!(count("service=pin-svc status=200 last=1h").await, 1);
+    assert_eq!(count("service=pin-svc status=200,301 last=1h").await, 2);
+    assert_eq!(count("service=pin-svc status!=200 last=1h").await, 5);
+    assert_eq!(
+        count("service=pin-svc status>=400 last=1h").await,
+        2,
+        "cold '404' plus hot '500'"
+    );
+
+    // Wire NUMBERS under the same VARCHAR pin. `read_json` types the
+    // column from the whole batch, so the fractional sibling widens it to
+    // DOUBLE and `200` is stored as the text "200.0" — durably, once
+    // compaction writes the parquet. The equality rule carries the
+    // value's numeric reading precisely so this row is still `status=200`
+    // on both the hot and the cold side, and on the live tail.
+    let numeric: Vec<serde_json::Value> = [json!(200), json!(200.5)]
+        .iter()
+        .map(|n| {
+            json!({
+                "service": "pin-svc", "env": "prod", "host": "web01",
+                "timestamp": now_ts(), "message": format!("num-{n}"), "status": n,
+            })
+        })
+        .collect();
+    assert_eq!(
+        h.ingest
+            .ingest(&numeric)
+            .await
+            .expect("ingest numeric")
+            .accepted,
+        2
+    );
+    assert_eq!(
+        count("service=pin-svc status=200 last=1h").await,
+        2,
+        "the wire 200 matches alongside the stored '200'"
+    );
+
+    compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
+    assert_eq!(
+        h.server.state.query.field_catalog.get("status"),
+        Some(trawl_core::schema::CanonicalType::Varchar),
+        "the pin is unchanged — numbers conform to text"
+    );
+    assert_eq!(
+        count("service=pin-svc status=200 last=1h").await,
+        2,
+        "and still matches once the widened text is on disk"
+    );
+    assert_eq!(
+        count("service=pin-svc status>=200.5 last=1h").await,
+        4,
+        "'301', '404', '500' and the stored '200.5'"
+    );
+}
+
+/// Read SSE chunks until `needle` shows up (bounded), returning the
+/// accumulated body.
+async fn read_until(resp: &mut reqwest::Response, needle: &str) -> String {
+    let mut buf = String::new();
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let chunk = resp.chunk().await.unwrap().expect("stream ended early");
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            if buf.contains(needle) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("needle {needle:?} never arrived; got: {buf}"));
+    buf
+}
+
+/// ADR-0011 slice A acceptance: live tail receives the pins. A string
+/// "404" event matches `status>=400` on the SSE stream, and the
+/// equality rule is discriminably live — `status!=200` must match
+/// "accepted" (the pin-blind numeric coercion drops it) while still
+/// excluding every spelling of 200.
+#[sqlx::test(migrations = false)]
+async fn sse_stream_applies_varchar_pin(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    // Seed the VARCHAR pin.
+    let seed: Vec<serde_json::Value> = ["200", "404", "accepted"]
+        .iter()
+        .map(|s| {
+            json!({
+                "service": "sse-svc", "env": "prod", "host": "web01",
+                "timestamp": now_ts(), "message": format!("seed-{s}"), "status": s,
+            })
+        })
+        .collect();
+    h.ingest.ingest(&seed).await.expect("ingest seed");
+    compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
+    assert_eq!(
+        h.server.state.query.field_catalog.get("status"),
+        Some(trawl_core::schema::CanonicalType::Varchar)
+    );
+
+    let raw = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+
+    // Ordered-numeric rule live: string "404" matches status>=400.
+    let mut stream = raw
+        .get(format!("{}/api/v1/stream", h.server.url))
+        .query(&[("query", "service=sse-svc status>=400")])
+        .bearer_auth(&h.server.analyst_token)
+        .send()
+        .await
+        .expect("open stream");
+    assert!(stream.status().is_success(), "{stream:?}");
+    let live: Vec<serde_json::Value> = vec![
+        json!({
+            "service": "sse-svc", "env": "prod", "host": "web01",
+            "timestamp": now_ts(), "message": "sse-decoy", "status": "accepted",
+        }),
+        json!({
+            "service": "sse-svc", "env": "prod", "host": "web01",
+            "timestamp": now_ts(), "message": "sse-needle", "status": "404",
+        }),
+    ];
+    h.ingest.ingest(&live).await.expect("ingest live");
+    let buf = read_until(&mut stream, "sse-needle").await;
+    assert!(
+        !buf.contains("sse-decoy"),
+        "'accepted' must NULL out of status>=400, not match: {buf}"
+    );
+    drop(stream);
+
+    // Equality rule live, discriminably: `status!=200` must return
+    // "accepted" — the pin-blind numeric coercion cannot read it and
+    // answers no-match — while both spellings of 200 stay excluded, the
+    // text one through the text arm and "200.00" through the numeric
+    // reading that keeps batch and live agreeing about a widened column.
+    let mut stream = raw
+        .get(format!("{}/api/v1/stream", h.server.url))
+        .query(&[("query", "service=sse-svc status!=200")])
+        .bearer_auth(&h.server.analyst_token)
+        .send()
+        .await
+        .expect("open eq stream");
+    assert!(stream.status().is_success(), "{stream:?}");
+    let live: Vec<serde_json::Value> = vec![
+        json!({
+            "service": "sse-svc", "env": "prod", "host": "web01",
+            "timestamp": now_ts(), "message": "exact-form", "status": "200",
+        }),
+        json!({
+            "service": "sse-svc", "env": "prod", "host": "web01",
+            "timestamp": now_ts(), "message": "decimal-form", "status": "200.00",
+        }),
+        json!({
+            "service": "sse-svc", "env": "prod", "host": "web01",
+            "timestamp": now_ts(), "message": "word-form", "status": "accepted",
+        }),
+    ];
+    h.ingest.ingest(&live).await.expect("ingest eq live");
+    let buf = read_until(&mut stream, "word-form").await;
+    assert!(
+        !buf.contains("exact-form") && !buf.contains("decimal-form"),
+        "no spelling of 200 may match status!=200: {buf}"
+    );
+}

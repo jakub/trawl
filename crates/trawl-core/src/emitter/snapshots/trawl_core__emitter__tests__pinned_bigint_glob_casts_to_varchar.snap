@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_with_pins(\"status=4*\", &[(\"status\", CT::BigInt)])"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE CAST("status" AS VARCHAR) GLOB ?
+---
+params:
+  0: '4*'

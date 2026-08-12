@@ -786,6 +786,10 @@ fn rollup_day_inner(
     ))
     .map_err(|e| format!("SET memory_limit/threads failed: {e}"))?;
 
+    // Every conform in this connection reads the session zone.
+    conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .map_err(|e| format!("SET TimeZone failed: {e}"))?;
+
     // Build the merge input list: all hourly files, plus the existing
     // day-level file (late-arriving data merges into it after a prior
     // rollup). Validate each input and quarantine truncated/corrupt files
@@ -1669,6 +1673,12 @@ fn prepare_service_batch(
     ))
     .map_err(|e| format!("SET memory_limit/threads failed: {e}"))?;
 
+    // The pin ladder and the conform both read the session zone: a
+    // TIMESTAMP candidate is scored, and written, in UTC or not at all
+    // ([`trawl_core::conform::SESSION_TIME_ZONE_SQL`]).
+    conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .map_err(|e| format!("SET TimeZone failed: {e}"))?;
+
     let survivors = read_wal_to_table(&conn, &valid_files, service, quarantined)?;
     if survivors == 0 {
         // Every sniff-passing file turned out malformed and was quarantined
@@ -1843,101 +1853,30 @@ fn run_pin_ladders(
 /// The SQL expression conforming one column to its pin, or `None` when the
 /// observed type already matches (pass-through).
 ///
-/// All cast semantics verified by execution against the bundled `DuckDB`
-/// (`trawl-engine/tests/duckdb_probe.rs`):
-/// - a bare `TRY_CAST` to a numeric type ROUNDS rather than fails —
-///   `1.5 → 2` from JSON, VARCHAR and DOUBLE sources alike — so every
-///   typed cast is wrapped in a round-trip guard ([`lossless_cast`]): a
-///   value that does not survive the cast unchanged becomes NULL (and so
-///   counts into `field_conflicts` via the tally, and scores as a FAILURE
-///   in the pin ladder) instead of being silently altered;
-/// - `JSON → VARCHAR` goes through `json_extract_string(col, '$')` so
-///   strings land UNQUOTED (`n/a`, not `"n/a"`) while numbers/objects
-///   become their text;
-/// - legacy complex types (STRUCT/MAP/LIST from pre-stringification WAL)
-///   go through `to_json()` so the VARCHAR is real JSON text, reachable
-///   with `json_extract_string`.
+/// Literally the emitter's hot-branch expression: the same text form
+/// ([`trawl_core::conform::untyped_text`]) under the same guard
+/// ([`trawl_core::conform::guarded_cast`]), because a value that reads one
+/// way while it is hot and another once it compacts is a query whose answer
+/// changes with a background timer. The `DESCRIBE`d type decides ONLY
+/// whether the column already is its pin — never how it is read, which is
+/// what makes the reading independent of what `read_json` inferred for the
+/// batch (see [`trawl_core::conform`] for the two rules and their
+/// execution evidence).
+///
+/// Choosing the text form per observed type — which compaction could and
+/// the emitter cannot — is exactly what made the lanes disagree: under a
+/// VARCHAR pin the guard is the identity, so the text form IS the stored
+/// value, and `TRY_CAST(col AS VARCHAR)` spells a DOUBLE `1e20` as
+/// `1e+20` where `to_json` spells it `100000000000000000000.0`. Same
+/// value, two corpora, and `note=/^1e/` flipped when the compactor ran.
 pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Option<String> {
     if dtype == pin.as_duckdb() {
         return None;
     }
-    let upper = dtype.trim().to_ascii_uppercase();
-    let is_complex = upper.starts_with("STRUCT")
-        || upper.starts_with("MAP")
-        || upper.starts_with("LIST")
-        || upper.starts_with("UNION")
-        || upper.ends_with("[]");
-    Some(match pin {
-        CanonicalType::Varchar if upper == "JSON" => {
-            format!("json_extract_string({quoted}, '$')")
-        }
-        CanonicalType::Varchar if is_complex => {
-            format!("CAST(to_json({quoted}) AS VARCHAR)")
-        }
-        // Stringification is lossless by construction; no guard needed.
-        CanonicalType::Varchar => format!("TRY_CAST({quoted} AS VARCHAR)"),
-        typed => lossless_cast(quoted, &upper, typed),
-    })
-}
-
-/// A typed cast that succeeds only when the value survives the round trip
-/// unchanged — `CASE WHEN <round-trips> THEN TRY_CAST(...) END` — because
-/// `TRY_CAST` alone ROUNDS instead of failing (`1.5 → 2`, `true → 1`;
-/// probed by execution in `trawl-engine/tests/duckdb_probe.rs`). Without
-/// the guard, a 95%-fractional batch scores ≥90% "success" on the BIGINT
-/// rung and pins BIGINT, silently rounding every value on write forever
-/// with no `field_conflicts` row.
-///
-/// The comparison space is chosen per rung (all probed by execution):
-/// - `BIGINT` compares the cast against the value's canonical text
-///   re-parsed as `DECIMAL(38,6)` — an EXACT integer space across the whole
-///   BIGINT range. A DOUBLE-space comparison was blind above 2^53 (both
-///   sides collapse to the same double, so `1735689600123456710.7`
-///   conformed BIGINT as `...711` with no conflict — the original
-///   silent-rounding failure mode, moved up the number line). DECIMAL
-///   keeps every currently-accepted case (`4.0 = 4`, `"042" = 42`,
-///   `1e3 = 1000`, `2^53 ± 1` exact, `i64::MAX`/`MIN`) and every rejection
-///   (`1.5`, `n/a`, `0x10`, `''`, `u64::MAX` still NULLs the cast), while
-///   correctly refusing >2^53 fractional values. Residual tolerance: a
-///   fraction below `DECIMAL(38,6)`'s half-microstep (`4.0000001`)
-///   quantizes to the integer and is absorbed as representation drift —
-///   rounding is refused above `0.5e-6`, not below;
-/// - `DOUBLE` compares in DOUBLE space, which is deliberately
-///   precision-tolerant: `u64::MAX` must pass the DOUBLE rung despite
-///   DOUBLE's >2^53 precision loss — a strict text comparison would fail
-///   it (`1.8446744073709552e+19 ≠ 18446744073709551615`) and regress the
-///   u64-range-pins-DOUBLE acceptance case; pinning DOUBLE *means*
-///   accepting DOUBLE's precision;
-/// - `TIMESTAMP` compares in TIMESTAMP space, tolerating format drift
-///   (RFC 3339 `T`/`Z` vs `DuckDB`'s space-separated rendering, `DATE` at
-///   midnight) — a text no parser reads still becomes NULL;
-/// - `BOOLEAN` compares strict text, so only real `true`/`false` values
-///   conform — `1` never becomes `true` — which is also what makes the
-///   Boolean ladder rung reachable at all (`TRY_CAST(true AS BIGINT)` is 1,
-///   so under bare counting a boolean batch scored ≥90% BIGINT first).
-///
-/// The canonical text is `json_extract_string(x, '$')` for a JSON column
-/// (unquoted strings) and `CAST(x AS VARCHAR)` for every other source.
-fn lossless_cast(quoted: &str, upper_dtype: &str, pin: CanonicalType) -> String {
-    let canon = if upper_dtype == "JSON" {
-        format!("json_extract_string({quoted}, '$')")
-    } else {
-        format!("CAST({quoted} AS VARCHAR)")
-    };
-    let cast = format!("TRY_CAST({quoted} AS {})", pin.as_duckdb());
-    let ok = match pin {
-        CanonicalType::BigInt => {
-            format!("TRY_CAST({canon} AS DECIMAL(38,6)) = TRY_CAST({cast} AS DECIMAL(38,6))")
-        }
-        CanonicalType::Double => {
-            format!("TRY_CAST({canon} AS DOUBLE) = {cast}")
-        }
-        CanonicalType::Timestamp => format!("TRY_CAST({canon} AS TIMESTAMP) = {cast}"),
-        CanonicalType::Boolean => format!("CAST({cast} AS VARCHAR) = {canon}"),
-        // Handled by the caller's VARCHAR arms; never a guarded cast.
-        CanonicalType::Varchar => unreachable!("VARCHAR conforms are lossless by construction"),
-    };
-    format!("(CASE WHEN {ok} THEN {cast} END)")
+    Some(trawl_core::conform::guarded_cast(
+        &trawl_core::conform::untyped_text(quoted),
+        pin,
+    ))
 }
 
 /// Wrap a TIMESTAMP-pinned envelope column's conform in a never-NULL last
@@ -3262,14 +3201,30 @@ mod tests {
         );
     }
 
-    /// The >2^53 boundary: a DOUBLE-space round-trip is blind up there
-    /// (both sides collapse to one double), so a nanosecond-epoch-magnitude
-    /// fractional batch scored 100% on the BIGINT rung and conformed as
-    /// silently rounded integers. The DECIMAL(38,6) comparison refuses it —
-    /// the batch pins DOUBLE — while a >2^53 INTEGER batch still pins
-    /// BIGINT exactly.
+    /// The >2^53 boundary, where a wire number's FRACTION stops being a
+    /// fraction: above 2^53 the gap between adjacent doubles exceeds 1, so
+    /// `read_json` parses `1735689600123456710.7` into an integer-valued
+    /// double before any conform expression exists to see it. The text
+    /// both lanes then read (`1735689600123456800.0`) is integral, so the
+    /// batch pins BIGINT and stores that integer — and a >2^53 INTEGER
+    /// batch still pins BIGINT bit-exactly (JSON keeps integer tokens
+    /// integral, so nothing rounds it at all).
+    ///
+    /// This is the one outcome the ADR-0009 guard used to answer
+    /// differently, and the difference was an artefact: it compared the
+    /// DOUBLE column's own BIGINT cast (`…768`, the double's exact value)
+    /// against the column's 17-significant-digit rendering (`…800`) and
+    /// refused the pin over the gap between two spellings of ONE double.
+    /// Text-first (ADR-0011) takes both sides from one text, so the
+    /// artefact is gone — and it cost determinism, since a `read_json`
+    /// class that rendered the same double differently answered
+    /// differently. Below 2^53 nothing moves: a real fraction survives
+    /// into the text and is still refused
+    /// ([`Self::pin_ladder_fractional_majority_pins_double_not_bigint`]),
+    /// as is a fractional value that arrives as TEXT at any magnitude
+    /// ([`Self::conform_to_bigint_pin_nulls_beyond_2_pow_53_fractionals`]).
     #[test]
-    fn pin_ladder_beyond_2_pow_53_fractional_pins_double_integer_pins_bigint() {
+    fn pin_ladder_beyond_2_pow_53_integral_doubles_pin_bigint() {
         let tmp = tempfile::tempdir().unwrap();
         let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
         std::fs::create_dir_all(&wal_dir).unwrap();
@@ -3284,10 +3239,19 @@ mod tests {
         let parquet = find_files_by_ext(&data_dir, "parquet");
         let (dtype, nn, total) = column_stats(&parquet[0], "ns_frac");
         assert_eq!(
-            dtype, "DOUBLE",
-            ">2^53 fractional must NOT pin BIGINT (DOUBLE-space was blind here)"
+            dtype, "BIGINT",
+            "the parsed double is integral, so the BIGINT rung round-trips"
         );
         assert_eq!((nn, total), (19, 20));
+        let values = read_strings(
+            &parquet[0],
+            "DISTINCT COALESCE(CAST(ns_frac AS VARCHAR), '<null>')",
+        );
+        assert!(
+            values.contains(&"1735689600123456800".to_owned()),
+            "the stored integer is the double's own rendering, not the wire \
+             text DuckDB never held: {values:?}"
+        );
 
         // Same magnitude, integral: exact in DECIMAL space, pins BIGINT.
         let tmp2 = tempfile::tempdir().unwrap();

@@ -1,0 +1,12 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_with_pins(\"status=200,accepted\", &[(\"status\", CT::Varchar)])"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE (("status" = ? OR COALESCE(TRY_CAST("status" AS DECIMAL(38,6)) = TRY_CAST(? AS DECIMAL(38,6)), FALSE)) OR "status" = ?)
+---
+params:
+  0: '200'
+  1: '200'
+  2: 'accepted'

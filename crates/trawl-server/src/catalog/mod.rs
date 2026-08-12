@@ -78,6 +78,26 @@ impl FieldCatalog {
         self.pins.read().clone()
     }
 
+    /// The FULL pin set as a [`FieldTypes`] — the comparison-typing
+    /// snapshot the query path passes to `emit_with_pins` and
+    /// `CompiledFilter::compile` (ADR-0011 slice A).
+    ///
+    /// Deliberately unfiltered, unlike [`Self::intersect`]: the
+    /// hot-intersected set is empty with no hot buffer and misses
+    /// cold-only fields, so typing comparisons with it would make
+    /// `status>=400` mean different things depending on ingest timing.
+    /// The clone is bounded by `MAX_PINNED_FIELDS` (10k) and typically
+    /// tiny; taken once per query.
+    #[must_use]
+    pub fn all(&self) -> FieldTypes {
+        let pins = self.pins.read();
+        let mut out = FieldTypes::new();
+        for (field, ty) in pins.iter() {
+            out.insert(field, *ty);
+        }
+        out
+    }
+
     /// The pins intersected with a hot snapshot's key set — the
     /// [`FieldTypes`] the emitter conforms the hot side of the union with.
     /// Zero postgres I/O: this is the whole point of the cache.
@@ -136,6 +156,23 @@ mod tests {
         let pins = cache.intersect(["Duration"]);
         assert_eq!(pins.get("Duration"), None);
         assert!(pins.is_empty());
+    }
+
+    #[test]
+    fn all_returns_the_full_unfiltered_snapshot() {
+        // The comparison-typing set (ADR-0011 slice A) must be the FULL
+        // catalog — the hot-intersected set is empty with no hot buffer
+        // and misses cold-only fields, so `status>=400` would change
+        // meaning with ingest timing if `intersect` were reused.
+        let cache = catalog(&[
+            ("duration", CanonicalType::BigInt),
+            ("status", CanonicalType::Varchar),
+        ]);
+        let all = cache.all();
+        assert_eq!(all.get("duration"), Some(CanonicalType::BigInt));
+        assert_eq!(all.get("status"), Some(CanonicalType::Varchar));
+        assert_eq!(all.len(), 2);
+        assert!(FieldCatalog::new().all().is_empty());
     }
 
     #[test]
