@@ -12,9 +12,11 @@ use std::sync::Arc;
 
 use duckdb::Connection;
 use duckdb::types::{TimeUnit, ValueRef};
+use trawl_core::ast::{PipeStage, Spanned};
 use trawl_core::emitter::{self, EmittedQuery, SqlValue};
 use trawl_core::parser;
-use trawl_core::schema::FieldTypes;
+use trawl_core::pin_scope::PinScope;
+use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::error::EngineError;
 use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value};
@@ -119,7 +121,8 @@ impl Executor {
                 &emitted.rust_stages,
                 &emitted.rust_stage_pins,
             )?;
-            shift_timestamp_columns(&mut result, &timestamp_columns, utc_offset_secs);
+            let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
+            shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
         }
         if emitted.needs_column_reorder {
             result.reorder_log_columns();
@@ -239,7 +242,8 @@ impl Executor {
                 &emitted.rust_stages,
                 &emitted.rust_stage_pins,
             )?;
-            shift_timestamp_columns(&mut result, &timestamp_columns, utc_offset_secs);
+            let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
+            shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
         }
         if emitted.needs_column_reorder {
             result.reorder_log_columns();
@@ -1144,26 +1148,47 @@ fn sql_render_offset(emitted: &EmittedQuery, utc_offset_secs: i32) -> i32 {
     }
 }
 
-/// Re-apply the display offset to the TIMESTAMP columns that survived the
-/// Rust tail, matched by name.
+/// Follow the SQL result's TIMESTAMP columns through the Rust tail's own
+/// rename/alias lineage.
 ///
-/// A tail stage that renames or aggregates a timestamp column produces a
-/// column this cannot recognise, which then displays UTC — the honest
-/// reading for a value the tail has already transformed, and never a
-/// wrong instant.
-fn shift_timestamp_columns(
-    result: &mut QueryResult,
-    timestamp_columns: &[String],
-    utc_offset_secs: i32,
-) {
-    if utc_offset_secs == 0 || timestamp_columns.is_empty() {
+/// The tail re-uses the pin-scope walk ([`PinScope::advance`], ADR-0011
+/// slice A′) with a scope holding exactly the tracked columns: a
+/// `rename`d timestamp column carries its tracking to the new name, a
+/// bare-alias `let t2 = _time` copies it, and a computed value or
+/// aggregate output — the tail's own, no longer the stored rendering —
+/// is killed by the walk and stays as the tail rendered it. Both display
+/// lineage and comparison pins follow the SAME stage rules, so they can
+/// never disagree about which column is "still `_time`".
+fn tail_timestamp_scope(timestamp_columns: &[String], stages: &[Spanned<PipeStage>]) -> PinScope {
+    let mut seed = FieldTypes::new();
+    for name in timestamp_columns {
+        seed.insert(name, CanonicalType::Timestamp);
+    }
+    let mut scope = PinScope::root(&seed);
+    for stage in stages {
+        scope.advance(&stage.node);
+    }
+    scope
+}
+
+/// Re-apply the display offset to the TIMESTAMP columns that survived the
+/// Rust tail, resolved through the tail's lineage
+/// ([`tail_timestamp_scope`]).
+///
+/// A column the lineage cannot vouch for — an aggregate output, a
+/// computed `let` — displays UTC: the honest reading for a value the
+/// tail has already transformed, and never a wrong instant. Cells the
+/// tail replaced with non-timestamp text are guarded per-cell by
+/// [`shift_display_timestamp`]'s parse.
+fn shift_timestamp_columns(result: &mut QueryResult, tracked: &PinScope, utc_offset_secs: i32) {
+    if utc_offset_secs == 0 || tracked.is_empty() {
         return;
     }
     let targets: Vec<usize> = result
         .columns
         .iter()
         .enumerate()
-        .filter(|(_, col)| timestamp_columns.contains(&col.name))
+        .filter(|(_, col)| tracked.pin_for(&col.name).is_some())
         .map(|(idx, _)| idx)
         .collect();
     if targets.is_empty() {

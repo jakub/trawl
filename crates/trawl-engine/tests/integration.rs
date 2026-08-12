@@ -1819,3 +1819,90 @@ fn extract_kv_tail_still_renders_timestamps_in_the_display_zone() {
     assert_eq!(cell(&with_kv), Value::String("2026-01-01 00:30:00".into()));
     assert_eq!(cell(&with_kv), cell(&without_kv));
 }
+
+/// The display shift follows the tail's own lineage: a timestamp column
+/// renamed INSIDE the tail still renders in the caller's zone under its
+/// new name — the value is untransformed, only the label moved.
+#[test]
+fn extract_kv_tail_rename_keeps_the_display_zone() {
+    let (exec, src, ft, _dir) = setup_pinned_time();
+    let result = exec
+        .run_query(
+            "* | extract kv | rename _time as t | table t",
+            &src,
+            &ft,
+            1000,
+            -18_000,
+        )
+        .unwrap();
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(result.columns[0].name, "t");
+    assert_eq!(
+        result.rows[0][0],
+        Value::String("2026-01-01 00:30:00".into()),
+        "the renamed column is still the stored instant and shifts with it"
+    );
+}
+
+/// The reviewer's repro: `let t2 = _time` copies the value verbatim, so
+/// both columns must show the SAME rendering in the caller's zone — never
+/// one local and one UTC side by side.
+#[test]
+fn extract_kv_tail_alias_copy_keeps_the_display_zone() {
+    let (exec, src, ft, _dir) = setup_pinned_time();
+    let result = exec
+        .run_query(
+            "* | extract kv | let t2 = _time | table _time, t2",
+            &src,
+            &ft,
+            1000,
+            -18_000,
+        )
+        .unwrap();
+    let cell = |name: &str| {
+        let idx = result
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{name} column"));
+        result.rows[0][idx].clone()
+    };
+    assert_eq!(cell("_time"), Value::String("2026-01-01 00:30:00".into()));
+    assert_eq!(
+        cell("t2"),
+        cell("_time"),
+        "an alias copy is the same instant and must display in the same zone"
+    );
+}
+
+/// A COMPUTED value is the tail's own, not the stored rendering: the
+/// lineage kills it and it stays exactly as the tail produced it (UTC
+/// text here) — the honest reading for a transformed value, never a
+/// re-shifted guess.
+#[test]
+fn extract_kv_tail_computed_value_stays_as_rendered() {
+    let (exec, src, ft, _dir) = setup_pinned_time();
+    let result = exec
+        .run_query(
+            "* | extract kv | let t3 = coalesce(_time, _time) | table _time, t3",
+            &src,
+            &ft,
+            1000,
+            -18_000,
+        )
+        .unwrap();
+    let cell = |name: &str| {
+        let idx = result
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{name} column"));
+        result.rows[0][idx].clone()
+    };
+    assert_eq!(cell("_time"), Value::String("2026-01-01 00:30:00".into()));
+    assert_eq!(
+        cell("t3"),
+        Value::String("2026-01-01 05:30:00".into()),
+        "a derived value keeps the tail's own rendering"
+    );
+}

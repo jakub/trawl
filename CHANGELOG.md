@@ -27,7 +27,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   propagation — no `OR field IS NULL` widening — so a repin never
   changes missing-field semantics. Field-vs-field, function-wrapped and
   arithmetic comparisons, unpinned fields, and embedded `--data` mode
-  are byte-for-byte unchanged. The envelope seed pins
+  are byte-for-byte unchanged. The post-`extract kv` tail now evaluates
+  over the stored **UTC** instant with the display-zone shift applied
+  *last* (the all-SQL path's order — previously the tail compared
+  display-shifted text, skewing every timestamp comparison by the
+  client's offset), and the final shift follows the tail's own lineage:
+  a timestamp column `rename`d or copied by a bare-alias `let` inside
+  the tail still renders in the display zone, while a *computed* value
+  (`let t = coalesce(_time, x)`, aggregate outputs) is the tail's own
+  and renders UTC. The envelope seed pins
   `host`/`service`/`env`/`message`/`severity_text`/`_raw` VARCHAR, so
   this is live on day one of every install. Unblocks the repin engine
   (#53).

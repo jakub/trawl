@@ -241,6 +241,13 @@ fields are unchanged everywhere.
   that don't collide with pinned names if that matters.
 - `from saved` reads another query's output: no pins apply.
 
+**Timestamps in the `extract kv` tail** are compared as stored instants
+and shifted to your display timezone *last*, like every other lane. The
+shift follows the tail's own lineage: `rename _time as t` and a bare
+alias `let t2 = _time` still render in your zone, while a *computed*
+value (`let t = coalesce(_time, x)`, aggregate outputs) is a value the
+tail derived and renders as UTC text.
+
 **One NULL-policy difference from the search stage, kept on purpose**:
 the pipeline `!=` does *not* carry the search stage's `OR field IS NULL`
 widening. `| where f != x` over an event without `f` is unknown and
