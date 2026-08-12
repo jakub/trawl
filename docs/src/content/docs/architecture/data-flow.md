@@ -111,7 +111,9 @@ markers never move), then the pin flip (postgres + the in-process cache)
 transactionally with the job's completion. WAL draining pauses only for
 those seconds and the hot buffer keeps every undrained event queryable —
 no event is ever invisible, and events ingested during the rewrite land
-exactly once.
+exactly once. A compaction batch that starts inside the pause is deferred,
+not dropped: it waits at the corpus gate holding its WAL files and its hot
+batch, and resumes itself the moment the pause lifts.
 
 A crash anywhere is finished by boot: the marker replays through a
 decision table *before* the epoch gate (building → abandon the disposable

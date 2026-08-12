@@ -662,15 +662,23 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     assert!(metrics.contains("trawl_catalog_repin_duration_seconds"));
 }
 
-/// The final pause stops WAL draining — and nothing else an operator can
-/// observe. Inside the held pause (corpus gate + every executor permit)
+/// The final pause DEFERS WAL draining — and does nothing else an operator
+/// can observe. Inside the held pause (corpus gate + every executor permit)
 /// ingest still lands, the hot buffer still holds those events undrained
 /// (a drain follows a compaction batch, and no batch may run), and a query
-/// issued into the pause waits rather than erroring or missing them. Past
-/// the cutover the same events are in the corpus exactly once, including
-/// after the compaction tick that finally drains them: ADR-0008's
-/// invisible-events prohibition across ADR-0011 slice B's one stopped
-/// world.
+/// issued into the pause waits rather than erroring or missing them. A
+/// compaction batch that starts inside the pause is blocked, not starved
+/// and not dropped: it resumes on its own the moment the pause lifts, with
+/// no new tick and no operator action, and drains exactly the events it
+/// held. Past the cutover those events are in the corpus exactly once,
+/// before and after that drain lands: ADR-0008's invisible-events
+/// prohibition across ADR-0011 slice B's one stopped world.
+///
+/// (Draining is deferred rather than continuous because the cutover takes
+/// the corpus gate's write side, which excludes whole compaction batches —
+/// the mechanism correction recorded in ADR-0011's 2026-08-12 amendment:
+/// a mixed-type corpus silently promotes instead of erring, so exclusion
+/// is the entire atomicity budget.)
 #[sqlx::test(migrations = false)]
 async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -753,6 +761,31 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: 
         })
     };
 
+    // A compaction batch that starts INSIDE the pause — trawld's loop
+    // ticking on schedule, not a test-driven tick. It blocks at the corpus
+    // gate and holds its WAL files and hot batch until the pause lifts.
+    let deferred_drain = {
+        let wal_dir = h.wal_dir.clone();
+        let data_dir = h.data_dir.clone();
+        let hot = hot.clone();
+        let ctx = catalog_ctx(&h.server);
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            trawl_server::ingest::compaction::compact_once_coordinated(
+                &wal_dir,
+                &data_dir,
+                Duration::ZERO,
+                false,
+                Some(&hot),
+                500,
+                "2GB",
+                Some(&ctx),
+                Some(&coordinator),
+            )
+            .await
+        })
+    };
+
     // Nothing drains while the pause is held: a drain only follows a
     // compaction batch, and no batch may start under the corpus gate.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -760,6 +793,10 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: 
         hot.event_count(),
         1,
         "no drain may make an undrained event invisible during the pause"
+    );
+    assert!(
+        !deferred_drain.is_finished(),
+        "the batch that started inside the pause waits at the corpus gate"
     );
     assert!(
         coordinator.cutover_hold_active(),
@@ -779,18 +816,29 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: 
         "the paused query sees the event ingested during the pause"
     );
 
-    // Exactly once post-cutover — from the hot buffer first, then from the
-    // repinned corpus once compaction has folded the WAL in and drained.
+    // (That answer is the pre-drain half of exactly-once: the event was
+    // still only in the hot buffer, and the paused query saw it once.)
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
-    assert_eq!(h.count("last=1h | stats count()").await, 3);
-    assert_eq!(h.count("status=418 last=1h | stats count()").await, 1);
 
-    h.compact_tick().await;
+    // The deferred batch resumes itself: no second tick was issued, no
+    // operator acted, and the drain it was holding completes.
+    let errors = tokio::time::timeout(Duration::from_secs(30), deferred_drain)
+        .await
+        .expect("the batch blocked by the pause must complete once it lifts")
+        .expect("compaction task")
+        .expect("compaction tick must succeed");
+    assert_eq!(errors, 0, "no compaction errors expected");
     assert_eq!(
         hot.event_count(),
         0,
-        "the pause only deferred the drain; the tick after it completes"
+        "the pause deferred the drain, it neither dropped nor starved it"
     );
+
+    // Exactly once in the repinned corpus, now that the batch it deferred
+    // has published and drained. (Counted here rather than mid-publish: a
+    // batch in flight may briefly show an event in both its new parquet
+    // and the not-yet-drained hot snapshot — ADR-0008's accepted transient
+    // duplicate, ordinary compaction, nothing repin does.)
     assert_eq!(h.count("last=1h | stats count()").await, 3);
     assert_eq!(h.count("status=418 last=1h | stats count()").await, 1);
 }
