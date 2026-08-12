@@ -240,7 +240,9 @@ impl IntoResponse for ServerError {
                         "app-state store unavailable",
                     ),
                 ),
-                StoreError::DuplicateName { .. } | StoreError::ScheduleExists { .. } => (
+                StoreError::DuplicateName { .. }
+                | StoreError::ScheduleExists { .. }
+                | StoreError::RepinAlreadyRunning => (
                     StatusCode::CONFLICT,
                     ErrorEnvelope::simple(ErrorCode::BadRequest, e.to_string()),
                 ),

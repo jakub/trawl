@@ -1172,6 +1172,17 @@ impl CatalogStore {
         Ok(())
     }
 
+    /// Re-arm the boot conformance pass (ADR-0011 slice B): a repin cutover
+    /// recovered at boot clears this so `ensure_conformance` re-proves the
+    /// corpus against the flipped pin in the same boot — the backstop for
+    /// any file an interrupted repin missed.
+    pub async fn clear_conformed(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE catalog_state SET conformed_at = NULL")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Whether the boot pass has backfilled `field_services` from the
     /// standing corpus for this catalog.
     ///

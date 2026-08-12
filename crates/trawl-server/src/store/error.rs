@@ -78,6 +78,11 @@ pub enum StoreError {
         /// The rejected name.
         name: String,
     },
+
+    /// A repin job is already running (23505 on `repin_jobs_one_running`)
+    /// — one shadow rewrite at a time, install-wide.
+    #[error("a repin job is already running (one at a time, install-wide)")]
+    RepinAlreadyRunning,
 }
 
 /// A named-constraint violation classified from a postgres error.
@@ -93,6 +98,8 @@ pub(crate) enum PgViolation {
     ScheduleTaken,
     /// 23505 on `report_runs_one_running` — a run is already in flight.
     RunAlreadyRunning,
+    /// 23505 on `repin_jobs_one_running` — a repin job is already running.
+    RepinAlreadyRunning,
     /// 23503 — referenced row is gone (treat as not-found).
     ForeignKey,
     /// 23514 — a CHECK constraint rejected the value.
@@ -108,6 +115,7 @@ pub(crate) fn classify_violation(e: &sqlx::Error) -> Option<PgViolation> {
         (Some("23505"), Some("saved_queries_key_name_unique")) => Some(PgViolation::SavedNameTaken),
         (Some("23505"), Some("schedules_saved_query_unique")) => Some(PgViolation::ScheduleTaken),
         (Some("23505"), Some("report_runs_one_running")) => Some(PgViolation::RunAlreadyRunning),
+        (Some("23505"), Some("repin_jobs_one_running")) => Some(PgViolation::RepinAlreadyRunning),
         (Some("23503"), _) => Some(PgViolation::ForeignKey),
         (Some("23514"), _) => Some(PgViolation::Check),
         _ => None,

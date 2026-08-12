@@ -22,6 +22,7 @@
 pub mod catalog;
 pub mod error;
 pub mod history;
+pub mod repin;
 pub mod saved;
 pub mod schedule;
 pub mod status;
@@ -41,6 +42,7 @@ pub use catalog::{
 };
 pub use error::StoreError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
+pub use repin::{RepinJob, RepinJobStatus, RepinStore};
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{
     FinishOutcome, FlipOutcome, ReportRun, RunClaim, Schedule, ScheduleStore, format_interval,
@@ -105,6 +107,9 @@ pub struct StorageState {
     /// Field catalog: type pins, per-service observations, conflicts
     /// (ADR-0009 slice 2).
     pub catalog: CatalogStore,
+    /// Repin jobs (ADR-0011 slice B): the persisted one-at-a-time
+    /// operator-triggered field repin.
+    pub repin: RepinStore,
     /// Guard task owning the dedicated session connection that holds
     /// `pg_advisory_lock`. Lives exactly as long as the state; its `Drop`
     /// aborts the task, dropping the connection and releasing the lock.
@@ -195,6 +200,7 @@ impl StorageState {
             saved: SavedQueryStore::new(pool.clone()),
             schedule: ScheduleStore::new(pool.clone()),
             catalog: CatalogStore::new(pool.clone()),
+            repin: RepinStore::new(pool.clone()),
             pool,
             _lock_guard: Arc::new(LockGuard(guard)),
             lock_lost_rx,
