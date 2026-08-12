@@ -198,6 +198,10 @@ pub struct IngestState {
     /// peers is rejected instead of peer-repaired. Parsed boot-fatally —
     /// a warn-skipped entry would fail open into host repair.
     pub trusted_relays: Arc<[crate::syslog::CidrEntry]>,
+    /// Repin ↔ compaction interlock (ADR-0011 slice B). `Some` exactly when
+    /// ingest is enabled — a query-only node runs no compaction and refuses
+    /// repin requests outright.
+    pub repin_coordinator: Option<Arc<crate::repin::RepinCoordinator>>,
 }
 
 /// Parse `[ingest] trusted_relays` CIDRs, boot-fatally.
@@ -537,6 +541,11 @@ impl AppState {
                 envs: config.ingest.effective_envs().into(),
                 default_env: config.ingest.default_env.as_str().into(),
                 trusted_relays: parse_trusted_relays(&config.ingest.trusted_relays)?,
+                repin_coordinator: if config.ingest.enabled {
+                    Some(Arc::new(crate::repin::RepinCoordinator::new()))
+                } else {
+                    None
+                },
             },
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),

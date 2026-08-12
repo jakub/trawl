@@ -478,6 +478,7 @@ fn spawn_ingest_pipeline(
         state.query.hot_buffer.clone(),
         state.ingest.compaction_stats.clone(),
         Some(catalog),
+        state.ingest.repin_coordinator.clone(),
         shutdown_rx,
     );
 

@@ -19,6 +19,7 @@ use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb
 use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs};
 use crate::hot_buffer::HotBuffer;
+use crate::repin::RepinCoordinator;
 use crate::state::CompactionStats;
 use crate::store::{FieldConflict, PinProposal};
 
@@ -45,6 +46,7 @@ pub fn spawn_compaction(
     hot_buffer: Option<Arc<HotBuffer>>,
     compaction_stats: Option<Arc<CompactionStats>>,
     catalog: Option<CatalogContext>,
+    repin: Option<Arc<RepinCoordinator>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -63,7 +65,7 @@ pub fn spawn_compaction(
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
-                    match compact_once(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref(), chunk_size, &memory_limit, catalog.as_ref()).await {
+                    match compact_once_coordinated(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref(), chunk_size, &memory_limit, catalog.as_ref(), repin.as_ref()).await {
                         Ok(data_loss) => {
                             if let Some(ref stats) = compaction_stats {
                                 stats.total_runs.fetch_add(1, Ordering::Relaxed);
@@ -120,6 +122,40 @@ pub async fn compact_once(
     chunk_size: usize,
     memory_limit: &str,
     catalog: Option<&CatalogContext>,
+) -> Result<u64, String> {
+    compact_once_coordinated(
+        wal_dir,
+        data_dir,
+        min_age,
+        daily_rollup,
+        hot_buffer,
+        chunk_size,
+        memory_limit,
+        catalog,
+        None,
+    )
+    .await
+}
+
+/// [`compact_once`] with the repin interlocks (ADR-0011 slice B) attached:
+/// each service batch's pin-snapshot → conform → publish phase runs under
+/// the coordinator's corpus-gate READ guard (so no batch can straddle a
+/// repin cutover), and the file-RELOCATING daily rollup is suppressed for
+/// as long as the coordinator holds a rollup pause (so the shadow build's
+/// catch-up diff stays additive). WAL→parquet draining itself is never
+/// suppressed — it only waits out the seconds the cutover holds the write
+/// guard.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
+pub async fn compact_once_coordinated(
+    wal_dir: &Path,
+    data_dir: &Path,
+    min_age: Duration,
+    daily_rollup: bool,
+    hot_buffer: Option<&Arc<HotBuffer>>,
+    chunk_size: usize,
+    memory_limit: &str,
+    catalog: Option<&CatalogContext>,
+    repin: Option<&Arc<RepinCoordinator>>,
 ) -> Result<u64, String> {
     // Remove orphaned .parquet.tmp files from interrupted compaction runs.
     for (_env, env_data_dir) in list_env_dirs(data_dir) {
@@ -204,9 +240,17 @@ pub async fn compact_once(
                     .collect();
                 let batch_ids: Vec<&str> = batch_ids.iter().map(String::as_str).collect();
 
+                // The corpus-gate read guard covers the whole batch —
+                // pin snapshot, conform, publish — so the cutover's write
+                // guard means "no batch in flight, none can start".
+                let corpus_guard = match repin {
+                    Some(c) => Some(c.compaction_guard().await),
+                    None => None,
+                };
                 let outcome =
                     compact_service_batch(chunk, &env_data_dir, service, memory_limit, catalog)
                         .await;
+                drop(corpus_guard);
 
                 // Fold the quarantine count UNCONDITIONALLY — quarantining
                 // renames the corrupt file to `.corrupt`, so a retry can't
@@ -262,7 +306,16 @@ pub async fn compact_once(
     // per-service daily files. This dramatically reduces file count for
     // long lookback queries. Rollup is best-effort: a failure for one
     // day/service is counted and retried next tick, not propagated.
-    let rollup_failures = if daily_rollup {
+    let rollup_suppressed = repin.is_some_and(|c| c.rollup_paused());
+    if daily_rollup && rollup_suppressed {
+        tracing::info!(
+            event_type = "rollup_suppressed",
+            "daily rollup suppressed for the duration of the running repin \
+             job (the catch-up diff must stay additive); hourly files \
+             consolidate on the first tick after the job ends"
+        );
+    }
+    let rollup_failures = if daily_rollup && !rollup_suppressed {
         match rollup_once(data_dir, memory_limit).await {
             Ok(n) => n,
             Err(e) => {
@@ -4175,6 +4228,68 @@ mod tests {
         assert!(
             daily.exists(),
             "rollup should run even when WAL dir is empty"
+        );
+    }
+
+    /// The repin job's rollup interlock (ADR-0011 slice B): while the
+    /// coordinator holds a rollup pause, a compaction tick drains WAL but
+    /// never relocates hourly files into dailies — the shadow build's
+    /// catch-up diff must stay additive. Dropping the pause resumes
+    /// consolidation on the next tick.
+    #[tokio::test]
+    async fn rollup_is_suppressed_while_a_repin_pause_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let r1 = format!(
+            r#"{{"_time":"{yesterday}T01:00:00Z","_ingested":"{yesterday}T01:00:00Z","service":"nginx","msg":"a"}}"#
+        );
+        let hourly =
+            write_hourly_parquet(&data_dir.join("prod"), &yesterday, "01", "nginx", &[&r1]);
+
+        let coordinator = Arc::new(RepinCoordinator::new());
+        let pause = coordinator.pause_rollup();
+        compact_once_coordinated(
+            &wal_dir,
+            &data_dir,
+            Duration::from_secs(1),
+            true,
+            None,
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+            Some(&coordinator),
+        )
+        .await
+        .unwrap();
+        let daily = data_dir.join("prod").join(&yesterday).join("nginx.parquet");
+        assert!(
+            !daily.exists() && hourly.exists(),
+            "no file may relocate while the repin pause is held"
+        );
+
+        drop(pause);
+        compact_once_coordinated(
+            &wal_dir,
+            &data_dir,
+            Duration::from_secs(1),
+            true,
+            None,
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+            Some(&coordinator),
+        )
+        .await
+        .unwrap();
+        assert!(
+            daily.exists(),
+            "consolidation resumes on the first tick after the job ends"
         );
     }
 

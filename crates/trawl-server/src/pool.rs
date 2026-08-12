@@ -71,6 +71,13 @@ pub struct PoolDebugInfo {
     pub pool_wait_ms: u64,
 }
 
+/// Exclusive hold over the whole executor pool (see
+/// [`ExecutorPool::exclusive`]). Dropping it releases every permit at once.
+#[derive(Debug)]
+pub struct PoolExclusive {
+    _permits: tokio::sync::OwnedSemaphorePermit,
+}
+
 /// Query result paired with optional debug info.
 #[derive(Debug)]
 pub struct ExecuteOutcome {
@@ -690,6 +697,34 @@ impl ExecutorPool {
         outcome
     }
 
+    /// Acquire EVERY permit — the repin cutover's exclusion primitive
+    /// (ADR-0011 slice B).
+    ///
+    /// Every lane that can read parquet funnels through this semaphore
+    /// (queries, `from saved`, exports, ping), and each lane computes its
+    /// source and snapshots its comparison pins INSIDE the permit-holding
+    /// task — so holding all permits means no query can straddle the
+    /// per-env swap or the pin flip. SSE streams hold no permit, read no
+    /// parquet, and keep their compile-time snapshot until reconnect
+    /// (documented residual: a repin reaches a live stream at its next
+    /// connect).
+    ///
+    /// Bounded: a wedged query holds a permit forever, and an unbounded
+    /// wait here would starve the cutover with the rollup suppressed and
+    /// retention disabled. Past `timeout` this returns
+    /// [`ServerError::Timeout`] and the caller aborts to its `blocked`
+    /// outcome.
+    pub async fn exclusive(&self, timeout: Duration) -> Result<PoolExclusive, ServerError> {
+        let permits = u32::try_from(self.max_concurrent)
+            .map_err(|_| ServerError::Internal("pool size exceeds u32".into()))?;
+        let semaphore = Arc::clone(&self.semaphore);
+        match tokio::time::timeout(timeout, semaphore.acquire_many_owned(permits)).await {
+            Ok(Ok(permits)) => Ok(PoolExclusive { _permits: permits }),
+            Ok(Err(_)) => Err(ServerError::Internal("executor pool shut down".into())),
+            Err(_) => Err(ServerError::Timeout),
+        }
+    }
+
     /// Interrupt all currently executing queries. Called during shutdown
     /// to cancel in-flight `DuckDB` operations before draining connections.
     pub fn cancel_all(&self) {
@@ -1029,6 +1064,80 @@ mod tests {
             idle_before, idle_after,
             "executor should be reclaimed after timeout"
         );
+    }
+
+    /// The cutover's exclusion primitive: `exclusive()` holds EVERY permit,
+    /// so no query can start while the guard lives, and a wedged in-flight
+    /// query bounds out with a timeout instead of starving the cutover
+    /// forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exclusive_drains_queries_and_blocks_new_ones() {
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
+
+        // Nothing in flight: exclusivity is immediate.
+        let guard = pool
+            .exclusive(Duration::from_secs(1))
+            .await
+            .expect("an idle pool is immediately exclusive");
+        assert_eq!(pool.available_permits(), 0, "every permit is held");
+
+        // A query submitted while exclusive must WAIT, not run.
+        let p2 = pool.clone();
+        let queued = tokio::spawn(async move {
+            p2.execute(
+                p2.allocate_query_id(),
+                "service:test",
+                Duration::from_secs(10),
+                false,
+                0,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !queued.is_finished(),
+            "a query must not execute while the cutover holds the pool"
+        );
+
+        drop(guard);
+        let outcome = queued.await.expect("queued query joins");
+        // (The DSL result itself is irrelevant — the point is it RAN.)
+        let _ = outcome.result;
+    }
+
+    /// A held query permit starves `exclusive()` past its budget: the
+    /// bounded timeout must surface as `ServerError::Timeout` (mapped to
+    /// the job's `blocked` outcome), never an indefinite wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exclusive_times_out_bounded_while_a_query_runs() {
+        TEST_QUERY_DELAY_MS.store(300, Ordering::Relaxed);
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
+        let p2 = pool.clone();
+        let running = tokio::spawn(async move {
+            p2.execute(
+                p2.allocate_query_id(),
+                "service:test",
+                Duration::from_secs(10),
+                false,
+                0,
+            )
+            .await
+        });
+        // Let the query take its permit.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let err = pool
+            .exclusive(Duration::from_millis(20))
+            .await
+            .expect_err("a held permit must bound out");
+        assert!(matches!(err, ServerError::Timeout), "got {err:?}");
+
+        TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
+        let _ = running.await;
+        // And once the query drains, exclusivity succeeds.
+        pool.exclusive(Duration::from_secs(2))
+            .await
+            .expect("drained pool becomes exclusive");
     }
 
     #[tokio::test]
