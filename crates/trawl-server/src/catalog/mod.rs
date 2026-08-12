@@ -10,13 +10,10 @@
 //! the process-local view. Boot hydrates it, every `pin_missing` refresh
 //! adds entries — and since ADR-0011 slice B the repin cutover overwrites
 //! exactly one entry through [`FieldCatalog::repin`], the cache's first
-//! non-add-only path. "Add-only" is therefore no longer a cache invariant:
-//! [`FieldCatalog::generation`] counts every mutation that can change an
-//! existing pin's meaning (`repin`, `replace`), so a holder of a stale
-//! snapshot can detect it. The query path deliberately does NOT check the
-//! counter — a query roots ONE snapshot per execution and the cutover's
-//! exclusion primitives guarantee no query straddles a flip — it exists
-//! for assertions and observability.
+//! non-add-only path. "Add-only" is therefore no longer a cache invariant.
+//! Nothing needs to detect a stale snapshot: a query roots ONE snapshot
+//! per execution and the cutover's exclusion primitives guarantee no query
+//! straddles a flip.
 //!
 //! Every name in the catalog is ASCII-lowercase by construction: each
 //! producer folds field names at its own door — HTTP ingest in
@@ -31,7 +28,6 @@ pub mod conform;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 use trawl_core::schema::{CanonicalType, FieldTypes};
@@ -42,10 +38,6 @@ use crate::store::CatalogStore;
 #[derive(Debug, Default)]
 pub struct FieldCatalog {
     pins: RwLock<HashMap<String, CanonicalType>>,
-    /// Bumped by every mutation that can change an existing pin's meaning
-    /// ([`Self::repin`], [`Self::replace`]) — never by the add-only
-    /// [`Self::merge`]. Observability/assertion surface only.
-    generation: AtomicU64,
 }
 
 impl FieldCatalog {
@@ -56,27 +48,17 @@ impl FieldCatalog {
     }
 
     /// Replace the whole cache with an authoritative pin set (boot only —
-    /// hydration is the one place that has read the whole catalog). Bumps
-    /// the generation: a full reload can carry a repin.
+    /// hydration is the one place that has read the whole catalog).
     pub fn replace(&self, pins: impl IntoIterator<Item = (String, CanonicalType)>) {
         *self.pins.write() = pins.into_iter().collect();
-        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Overwrite ONE field's pin — the repin cutover's flip (ADR-0011
     /// slice B), and the cache's first non-add-only path. Runs while the
     /// cutover holds every query permit, so no in-flight query can observe
-    /// half a flip; the generation bump makes the mutation observable to
-    /// anything that held a snapshot across it.
+    /// half a flip.
     pub fn repin(&self, field: &str, ty: CanonicalType) {
         self.pins.write().insert(field.to_owned(), ty);
-        self.generation.fetch_add(1, Ordering::Release);
-    }
-
-    /// The mutation counter behind [`Self::repin`]/[`Self::replace`].
-    #[must_use]
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
     }
 
     /// Fold newly-durable pins into the cache, leaving every other entry
@@ -220,43 +202,20 @@ mod tests {
     }
 
     /// The first non-add-only path (ADR-0011 slice B): a repin overwrites
-    /// exactly one key, leaves every other pin alone, and bumps the
-    /// generation — unlike `merge`, which only ever adds.
+    /// exactly one key and leaves every other pin alone — unlike `merge`,
+    /// which only ever adds.
     #[test]
-    fn repin_overwrites_one_key_and_bumps_the_generation() {
+    fn repin_overwrites_exactly_one_key() {
         let cache = catalog(&[
             ("status", CanonicalType::BigInt),
             ("dur", CanonicalType::Double),
         ]);
-        let before = cache.generation();
 
         cache.repin("status", CanonicalType::Varchar);
 
         assert_eq!(cache.get("status"), Some(CanonicalType::Varchar));
         assert_eq!(cache.get("dur"), Some(CanonicalType::Double));
         assert_eq!(cache.snapshot().len(), 2, "an overwrite, never an add");
-        assert!(
-            cache.generation() > before,
-            "a repin must be observable through the generation counter"
-        );
-    }
-
-    /// `replace` (boot re-hydration) also bumps: it can carry a repin done
-    /// by another path, so a held generation must go stale.
-    #[test]
-    fn replace_bumps_the_generation_and_merge_does_not() {
-        let cache = catalog(&[]);
-        let g0 = cache.generation();
-        cache.replace([("a".to_owned(), CanonicalType::BigInt)]);
-        let g1 = cache.generation();
-        assert!(g1 > g0);
-
-        cache.merge([("b".to_owned(), CanonicalType::BigInt)]);
-        assert_eq!(
-            cache.generation(),
-            g1,
-            "an add-only merge changes no existing pin's meaning"
-        );
     }
 
     #[test]

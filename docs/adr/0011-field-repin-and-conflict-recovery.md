@@ -464,6 +464,14 @@ corpus.
   without force parks terminal `refused_needs_force` with the plan as
   the 409 body. `to == current` plus force is the resurrection-only
   pass — the supported repair for a boot-conformed interrupted repin.
+- The pin cache gained its first non-add-only path
+  (`FieldCatalog::repin`) but NO generation counter: the Consequences
+  section above anticipated one, and exclusion made it dead on arrival.
+  The cutover flips the pin while it holds every executor-pool permit,
+  so no query straddles it and no holder of a snapshot ever needs to
+  detect staleness. A counter no code reads is a maintenance cost with
+  a doc comment promising a consumer that does not exist; it was cut
+  rather than shipped for its own unit tests.
 - Named residuals: an SSE stream keeps its pin snapshot until reconnect
   (a repin reaches live tails at their next connect); catch-up
   increments can null values a forced plan did not predict (counted,
