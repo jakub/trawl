@@ -88,7 +88,11 @@ through the same ConformPlan machinery compaction uses, with the target
 column read as `COALESCE(guarded stored reading, guarded _raw
 re-extraction)` — resurrection of conflict-shelved values, under the same
 lossless guard, and the dry run counts with the very expression the
-rewrite writes.
+rewrite writes. A **symlink** under an env directory refuses the job
+(dry run included): trawl never writes one, the shadow cannot carry it,
+and skipping it would leave the swapped-aside original as the only copy
+for the job's own cleanup sweep to delete — materialize it or move it
+out of `data/{env}/` and retry.
 
 An additive catch-up loop folds in files compaction writes meanwhile (the
 file-relocating daily rollup is paused for the whole job, so the diff is

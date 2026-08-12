@@ -44,6 +44,14 @@ pub(crate) struct FileSig {
 /// make a second name for an inode a live writer is about to rewrite.
 /// Anything left behind is an orphan compaction's own stale-tmp sweep
 /// reclaims.
+///
+/// A SYMLINK anywhere under an env directory aborts the walk. trawl never
+/// writes one, so it is an operator's own layout (a date partition or a
+/// large service file parked on another volume), and the shadow cannot
+/// carry it: the entry is neither a file nor a directory to `lstat`, and
+/// silently skipping it would leave the only surviving copy in
+/// `data.repin-aside/` for the job's own sweep to delete. Refusing is the
+/// loud half of "no silent loss" (ADR-0008).
 pub(crate) fn snapshot_env_files(data_dir: &Path) -> Result<BTreeMap<PathBuf, FileSig>, String> {
     let mut out = BTreeMap::new();
     for (_env, env_dir) in crate::env_dirs::try_list_env_dirs(data_dir)
@@ -64,9 +72,20 @@ fn walk_files(
     for entry in entries {
         let entry = entry.map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
         let path = entry.path();
+        // `DirEntry::metadata` is an `lstat`: it does not follow the link,
+        // so a symlinked entry answers neither `is_dir` nor `is_file` and
+        // would fall through both arms unrecorded.
         let meta = entry
             .metadata()
             .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+        if meta.is_symlink() {
+            return Err(format!(
+                "{} is a symlink: the repin shadow cannot carry symlinked \
+                 entries under the data root — replace it with the real file \
+                 or directory (or move it out of the env directory) and retry",
+                path.display()
+            ));
+        }
         if meta.is_dir() {
             walk_files(&path, data_dir, out)?;
         } else if meta.is_file() {
@@ -354,6 +373,35 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(seen, vec!["nginx.parquet", "nginx.parquet.corrupt"]);
+    }
+
+    /// A symlinked entry is neither `is_file` nor `is_dir` to the walk's
+    /// `lstat`, so skipping it would drop it from the shadow and let the
+    /// cutover's aside-sweep delete the only copy. It must abort instead.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_refuses_symlinked_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let hour = data.join("prod/2026-08-12/10");
+        std::fs::create_dir_all(&hour).unwrap();
+        let elsewhere = tmp.path().join("elsewhere.parquet");
+        std::fs::write(&elsewhere, b"p").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, hour.join("nginx.parquet")).unwrap();
+
+        let err = snapshot_env_files(data).unwrap_err();
+        assert!(err.contains("nginx.parquet"), "{err}");
+        assert!(err.contains("symlink"), "{err}");
+
+        // A symlinked DIRECTORY is refused on the same terms: recursing
+        // through it would hardlink its contents onto the data root's own
+        // filesystem and the cutover would then unlink the link.
+        std::fs::remove_file(hour.join("nginx.parquet")).unwrap();
+        let other_hour = tmp.path().join("other-hour");
+        std::fs::create_dir_all(&other_hour).unwrap();
+        std::os::unix::fs::symlink(&other_hour, hour.join("11")).unwrap();
+        let err = snapshot_env_files(data).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
     }
 
     /// The rewrite must not stage where compaction stages.
