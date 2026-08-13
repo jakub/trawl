@@ -3038,3 +3038,114 @@ fn recursive_glob_descends_into_dot_directories() {
          — staging must live beside the root, not inside it"
     );
 }
+
+/// The misfit-sample capture shape (ADR-0011 slice C1): what compaction
+/// runs, per conflicted column, in the same phase as the conflict tally —
+/// the only moment the value the conform is about to null is still in the
+/// table.
+///
+/// Four claims, all executed rather than reasoned about, because the Rust
+/// that reads the result depends on every one of them:
+///
+/// - `FILTER (WHERE …)` composes with `list(DISTINCT …)`, so the misfit
+///   predicate (a non-NULL source value whose guarded cast reads NULL) can
+///   be expressed once instead of smuggled into a `CASE` whose NULL arm
+///   would then rely on `list`'s own NULL handling;
+/// - `DISTINCT` collapses a repeated misfit, so one sender looping the same
+///   bad value spends one sample slot, not five;
+/// - `array_slice(l, 1, 5)` is 1-based and inclusive, and is a no-op below
+///   the cap — the count bound;
+/// - `to_json(list)::VARCHAR` is a JSON array of strings for every value a
+///   client can send, so the transport out of `DuckDB` is one `VARCHAR`
+///   column parsed by `serde_json`, not a `LIST` binding.
+///
+/// And the shape a caller must handle: a filter matching nothing aggregates
+/// to SQL NULL, and `to_json` of NULL is NULL — never `[]` and never the
+/// JSON literal `null`, so the column binds as `Option<String>`.
+#[test]
+fn misfit_sample_capture_is_distinct_null_free_and_capped() {
+    let conn = conn();
+    // Ten rows: six distinct misfits under a BIGINT pin, one of them
+    // repeated, plus a SQL NULL and two values that convert cleanly.
+    conn.execute_batch(
+        "CREATE TABLE b AS SELECT * FROM (VALUES \
+         ('a'), ('b'), ('c'), ('d'), ('e'), ('f'), ('a'), (NULL), ('1'), ('2')) t(v)",
+    )
+    .unwrap();
+
+    let text = untyped_text("v");
+    let cast = conform("v", CanonicalType::BigInt);
+    let sql = format!(
+        "SELECT to_json(array_slice(list(DISTINCT {text}) \
+         FILTER (WHERE v IS NOT NULL AND {cast} IS NULL), 1, 5))::VARCHAR FROM b"
+    );
+    let rendered: String = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+    let samples: Vec<String> = serde_json::from_str(&rendered).expect("a JSON array of strings");
+    assert_eq!(samples.len(), 5, "array_slice caps the set: {samples:?}");
+    let mut sorted = samples.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        5,
+        "DISTINCT already deduplicated: {samples:?}"
+    );
+    assert!(
+        samples
+            .iter()
+            .all(|s| ["a", "b", "c", "d", "e", "f"].contains(&s.as_str())),
+        "only the nulled values are sampled — never a NULL row, never a \
+         value that converts: {samples:?}"
+    );
+
+    // Below the cap the slice is the identity, and the JSON is still an array.
+    let sql = format!(
+        "SELECT to_json(array_slice(list(DISTINCT {text}) \
+         FILTER (WHERE v IS NOT NULL AND {cast} IS NULL), 1, 5))::VARCHAR \
+         FROM b WHERE v IN ('a', 'b')"
+    );
+    let rendered: String = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+    let mut samples: Vec<String> = serde_json::from_str(&rendered).unwrap();
+    samples.sort();
+    assert_eq!(samples, vec!["a".to_owned(), "b".to_owned()]);
+
+    // No misfit at all: the aggregate is SQL NULL, and so is the rendering.
+    let sql = format!(
+        "SELECT to_json(array_slice(list(DISTINCT {text}) \
+         FILTER (WHERE v IS NOT NULL AND {cast} IS NULL), 1, 5))::VARCHAR \
+         FROM b WHERE v IN ('1', '2')"
+    );
+    let rendered: Option<String> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        rendered, None,
+        "an empty capture is SQL NULL, not an empty array — the caller \
+         binds Option<String> and reads no samples"
+    );
+}
+
+/// A misfit value carries whatever bytes a client sent, so the sample is
+/// truncated before it is aggregated — but `DuckDB`'s `left()` counts
+/// CHARACTERS, not bytes, so it bounds accumulation only, never the wire
+/// size. The byte cap the store promises is therefore applied in Rust, on
+/// a `char` boundary; this probe is why it cannot be pushed into the SQL.
+#[test]
+fn left_truncates_by_character_not_by_byte() {
+    let conn = conn();
+    // Four-byte astral characters: 8 chars, 32 bytes.
+    let value = "\u{1F600}".repeat(8);
+    let mut stmt = conn
+        .prepare("SELECT left(?, 8), length(left(?, 8))")
+        .unwrap();
+    let (kept, chars): (String, i64) = stmt
+        .query_row(duckdb::params![&value, &value], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(chars, 8, "left() counts characters");
+    assert_eq!(
+        kept.len(),
+        32,
+        "…so an 8-'character' truncation is 32 BYTES: a byte cap must be \
+         applied in Rust"
+    );
+}

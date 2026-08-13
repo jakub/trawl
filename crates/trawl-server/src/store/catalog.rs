@@ -61,6 +61,12 @@ pub struct FieldConflict {
     pub expected_type: CanonicalType,
     /// Rows whose value the cast nulled (recoverable from `_raw`).
     pub rows_nulled: u64,
+    /// Up to [`MAX_CONFLICT_SAMPLES`] DISTINCT values the cast nulled, each
+    /// sanitised and cut to [`MAX_CONFLICT_SAMPLE_BYTES`] at capture. A
+    /// SAMPLE, never a manifest: the exhaustive record of what was shelved
+    /// is `_raw`. Empty where the lane has no values in hand (the repin
+    /// rewrite counts its own nulls, ADR-0011 slice B).
+    pub samples: Vec<String>,
 }
 
 /// One `(field, service)` observation reconstructed from a standing parquet
@@ -235,6 +241,9 @@ pub struct ConflictListRow {
     pub expected_type: String,
     /// Rows nulled by the conforming cast.
     pub rows_nulled: i64,
+    /// A bounded sample of the values the cast nulled (see
+    /// [`FieldConflict::samples`]).
+    pub samples: Vec<String>,
     /// When the conflict was recorded.
     pub at: DateTime<Utc>,
 }
@@ -250,6 +259,10 @@ pub struct FieldConflictRow {
     pub expected_type: String,
     /// Rows nulled by the conforming cast.
     pub rows_nulled: i64,
+    /// A bounded sample of the values the cast nulled (see
+    /// [`FieldConflict::samples`]); empty for evidence recorded before
+    /// migration 0008, or by a lane with no values in hand.
+    pub samples: Vec<String>,
     /// When the conflict was recorded.
     pub at: DateTime<Utc>,
 }
@@ -318,6 +331,22 @@ pub const MAX_PINNED_FIELDS: i64 = 10_000;
 /// operator WHICH values a pin is currently costing them, and the newest
 /// evidence is the evidence they act on.
 pub const MAX_CONFLICTS_PER_FIELD: i64 = 100;
+
+/// Distinct misfit values kept per conflict row (ADR-0011 slice C1).
+///
+/// The samples answer "which values is this pin costing me", which five
+/// distinct examples answer as well as five hundred — while five hundred
+/// per row, at the cap above, per field, at the pin cap, is a table whose
+/// size is set by how creatively a sender misformats its values. The
+/// exhaustive record is `_raw`, which already holds every one of them.
+pub const MAX_CONFLICT_SAMPLES: usize = 5;
+
+/// Bytes kept per sample, cut on a `char` boundary at capture.
+///
+/// A misfit value is client text of client-chosen length — a whole embedded
+/// document can arrive under a BIGINT pin. Enough to recognise the shape of
+/// what is arriving, far short of storing the payload a second time.
+pub const MAX_CONFLICT_SAMPLE_BYTES: usize = 256;
 
 /// Rows per statement in [`CatalogStore::backfill_services`]. The backfill's
 /// size is (pinned fields x services), which nothing bounds below five
@@ -744,8 +773,18 @@ impl CatalogStore {
     /// keeps the work proportional to the batch — a field that stops
     /// conflicting keeps the evidence it already has and is never re-read.
     ///
-    /// Both statements run in ONE transaction, so a reader never sees the
-    /// window overfull and a failed trim never leaves the insert behind.
+    /// A THIRD statement upserts the durable per-`(field, service)`
+    /// aggregates (`field_conflict_stats`, migration 0009) the degraded-field
+    /// analyzer judges a pin on. It is here, and not in a caller, because the
+    /// trim above is exactly what makes it necessary: the detail rows a
+    /// span-based verdict would have to measure are the ones the window
+    /// evicts first, so the aggregate has to be written by the same
+    /// transaction that evicts them or it is a different number.
+    ///
+    /// All three statements run in ONE transaction, so a reader never sees
+    /// the window overfull, a failed trim never leaves the insert behind, and
+    /// no episode is ever counted in the aggregates without its evidence row
+    /// (or the reverse).
     pub async fn record_conflicts(&self, conflicts: &[FieldConflict]) -> Result<(), StoreError> {
         if conflicts.is_empty() {
             return Ok(());
@@ -761,19 +800,29 @@ impl CatalogStore {
             .iter()
             .map(|c| i64::try_from(c.rows_nulled).unwrap_or(i64::MAX))
             .collect();
+        // `TEXT[][]` has no sqlx binding (postgres multidimensional arrays
+        // must be rectangular, and these rows are not), so the per-row sample
+        // sets ride as JSON and are unnested back to arrays in the statement.
+        let samples: Vec<String> = conflicts
+            .iter()
+            .map(|c| serde_json::to_string(&c.samples).unwrap_or_else(|_| "[]".to_owned()))
+            .collect();
 
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
             "INSERT INTO field_conflicts
-                 (field, service, observed_type, expected_type, rows_nulled)
-             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[])",
+                 (field, service, observed_type, expected_type, rows_nulled, samples)
+             SELECT f, s, o, e, n, ARRAY(SELECT jsonb_array_elements_text(j::jsonb))
+             FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[],
+                         $6::text[]) AS t(f, s, o, e, n, j)",
         )
         .bind(&fields)
         .bind(&services)
         .bind(&observed)
         .bind(&expected)
         .bind(&nulled)
+        .bind(&samples)
         .execute(&mut *tx)
         .await?;
 
@@ -793,6 +842,41 @@ impl CatalogStore {
         )
         .bind(&fields)
         .bind(self.conflict_cap)
+        .execute(&mut *tx)
+        .await?;
+
+        // The durable aggregates the trim above must not be able to erase.
+        //
+        // The GROUP BY is not an optimisation: postgres refuses to let one
+        // `ON CONFLICT DO UPDATE` touch a row twice, and the boot conformance
+        // pass accumulates conflicts across every file it rewrites, so one
+        // call routinely carries many rows for the same `(field, service)`.
+        // Pre-aggregating in the statement makes a call of N such rows one
+        // upsert of N episodes — the same hazard `backfill_services` avoids
+        // by aggregating in its caller, answered here in SQL because this
+        // caller's rows are the evidence and may not be collapsed.
+        //
+        // `last_at` is `now()`, not `GREATEST(existing, now())`: it is the
+        // transaction's own clock, which cannot run backwards against a row
+        // this same statement is the only writer of. `first_at` is left
+        // untouched on conflict for the mirror-image reason — the row's
+        // existing value is by construction the earliest evidence there is
+        // (migration 0009's backfill included).
+        sqlx::query(
+            "INSERT INTO field_conflict_stats
+                 (field, service, episodes, rows_nulled_total)
+             SELECT f, s, count(*)::bigint, COALESCE(sum(n), 0)::bigint
+             FROM UNNEST($1::text[], $2::text[], $3::bigint[]) AS t(f, s, n)
+             GROUP BY f, s
+             ON CONFLICT (field, service) DO UPDATE
+             SET last_at           = now(),
+                 episodes          = field_conflict_stats.episodes + EXCLUDED.episodes,
+                 rows_nulled_total = field_conflict_stats.rows_nulled_total
+                                     + EXCLUDED.rows_nulled_total",
+        )
+        .bind(&fields)
+        .bind(&services)
+        .bind(&nulled)
         .execute(&mut *tx)
         .await?;
 
@@ -885,7 +969,7 @@ impl CatalogStore {
         field: &str,
     ) -> Result<Vec<FieldConflictRow>, StoreError> {
         let rows = sqlx::query(
-            "SELECT service, observed_type, expected_type, rows_nulled, at
+            "SELECT service, observed_type, expected_type, rows_nulled, samples, at
              FROM field_conflicts WHERE field = $1
              ORDER BY at DESC, id DESC",
         )
@@ -899,6 +983,7 @@ impl CatalogStore {
                     observed_type: row.try_get("observed_type")?,
                     expected_type: row.try_get("expected_type")?,
                     rows_nulled: row.try_get("rows_nulled")?,
+                    samples: row.try_get("samples")?,
                     at: row.try_get("at")?,
                 })
             })
@@ -1092,7 +1177,7 @@ impl CatalogStore {
     ) -> Result<(Vec<ConflictListRow>, bool), StoreError> {
         let limit = limit.max(0);
         let rows = sqlx::query(
-            "SELECT field, service, observed_type, expected_type, rows_nulled, at
+            "SELECT field, service, observed_type, expected_type, rows_nulled, samples, at
              FROM field_conflicts
              WHERE ($1::text IS NULL OR field = $1)
                AND ($2::text IS NULL OR service = $2)
@@ -1118,6 +1203,7 @@ impl CatalogStore {
                     observed_type: row.try_get("observed_type")?,
                     expected_type: row.try_get("expected_type")?,
                     rows_nulled: row.try_get("rows_nulled")?,
+                    samples: row.try_get("samples")?,
                     at: row.try_get("at")?,
                 })
             })

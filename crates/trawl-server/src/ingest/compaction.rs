@@ -21,7 +21,7 @@ use crate::env_dirs::{list_env_dirs, try_list_env_dirs};
 use crate::hot_buffer::HotBuffer;
 use crate::repin::RepinCoordinator;
 use crate::state::CompactionStats;
-use crate::store::{FieldConflict, PinProposal};
+use crate::store::{FieldConflict, MAX_CONFLICT_SAMPLE_BYTES, MAX_CONFLICT_SAMPLES, PinProposal};
 
 /// Default compaction chunk size, used when config is not threaded
 /// through (e.g. in direct `compact_once` calls from tests).
@@ -1920,6 +1920,17 @@ fn propose_pins(
 /// in the middle.
 pub(crate) const AGG_CHUNK_COLS: usize = 256;
 
+/// How many CONFLICTED columns one batch captures misfit samples for
+/// ([`ConformPlan::capture_samples`]).
+///
+/// One chunk's worth, for the reason above — but the bound bites far
+/// earlier here, because a sampling aggregate is not a counting one:
+/// `list(DISTINCT …)` holds every distinct misfit of every sampled column
+/// in memory before the slice throws all but five away, and the values are
+/// client text. A batch conflicting on more columns than this is a corpus
+/// with a modelling problem the first 256 fields already evidence.
+const MAX_SAMPLED_CONFLICT_COLUMNS: usize = AGG_CHUNK_COLS;
+
 /// Run the candidate ladder over the columns' actual values, resolving up to
 /// [`AGG_CHUNK_COLS`] columns per aggregate pass: per column the first
 /// candidate whose `TRY_CAST` success rate over non-null values reaches
@@ -2307,6 +2318,10 @@ impl ConformPlan {
     /// those would append a row per (field, service) to the APPEND-ONLY
     /// `field_conflicts` on every compaction tick, forever, for a sender
     /// that is losing nothing — noise that outgrows the evidence.
+    ///
+    /// Every conflict carries a bounded sample of the values it is about to
+    /// destroy ([`Self::capture_samples`]) — this phase is the only place
+    /// they exist as values rather than as `_raw` text to be re-parsed.
     pub(crate) fn tally_conflicts(
         &self,
         conn: &duckdb::Connection,
@@ -2341,8 +2356,16 @@ impl ConformPlan {
             stats.extend(chunk_stats);
         }
 
+        let lossy: Vec<usize> = stats
+            .iter()
+            .enumerate()
+            .filter(|(_, (non_null, ok))| non_null > ok)
+            .map(|(i, _)| i)
+            .collect();
+        let mut samples = self.capture_samples(conn, source, &lossy)?;
+
         let mut conflicts = Vec::new();
-        for (cast, (non_null, ok)) in self.casts.iter().zip(&stats) {
+        for (i, (cast, (non_null, ok))) in self.casts.iter().zip(&stats).enumerate() {
             let rows_nulled = u64::try_from(non_null - ok).unwrap_or(0);
             if rows_nulled > 0 {
                 conflicts.push(FieldConflict {
@@ -2351,11 +2374,119 @@ impl ConformPlan {
                     observed_type: cast.dtype.clone(),
                     expected_type: cast.pin,
                     rows_nulled,
+                    samples: samples.remove(&i).unwrap_or_default(),
                 });
             }
         }
         Ok(conflicts)
     }
+
+    /// Capture up to [`MAX_CONFLICT_SAMPLES`] DISTINCT misfit values for
+    /// each cast column named by `lossy` (indices into [`Self::casts`]) —
+    /// the values whose guarded cast reads NULL while the stored value does
+    /// not, which is exactly what the conform is about to shelve.
+    ///
+    /// Only the columns that ACTUALLY conflicted are sampled, and never more
+    /// than [`MAX_SAMPLED_CONFLICT_COLUMNS`] of them in one pass:
+    /// `list(DISTINCT …)` accumulates every distinct misfit before the slice
+    /// caps it, so the cost is paid per sampled column, and a healthy install
+    /// pays nothing at all (no conflicts, no query). Which columns win the
+    /// cap is decided by NAME rather than by schema position, so a wide
+    /// conflicting batch samples the same fields whatever order the source
+    /// happens to `DESCRIBE` in.
+    ///
+    /// Values are sanitised and byte-capped in Rust ([`sanitize_sample`]):
+    /// `left()` inside the aggregate counts CHARACTERS (probed in
+    /// `trawl-engine/tests/duckdb_probe.rs`), so it bounds what `DuckDB`
+    /// accumulates, never what the store is promised. Samples are attacker
+    /// text end to end — they are never logged, at any level.
+    fn capture_samples(
+        &self,
+        conn: &duckdb::Connection,
+        source: &str,
+        lossy: &[usize],
+    ) -> Result<HashMap<usize, Vec<String>>, String> {
+        if lossy.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut sampled: Vec<usize> = lossy.to_vec();
+        sampled.sort_by(|a, b| self.casts[*a].name.cmp(&self.casts[*b].name));
+        sampled.truncate(MAX_SAMPLED_CONFLICT_COLUMNS);
+
+        let sql = format!(
+            "SELECT {} FROM {source}",
+            sampled
+                .iter()
+                .map(|i| sample_expr(&self.casts[*i]))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let rendered: Vec<Option<String>> = conn
+            .query_row(&sql, [], |row| {
+                let mut out = Vec::with_capacity(sampled.len());
+                for i in 0..sampled.len() {
+                    out.push(row.get::<_, Option<String>>(i)?);
+                }
+                Ok(out)
+            })
+            .map_err(|e| format!("conform sample query failed: {e}"))?;
+
+        let mut out = HashMap::with_capacity(sampled.len());
+        for (i, json) in sampled.into_iter().zip(rendered) {
+            // A capture over zero matching rows is SQL NULL, not `[]`
+            // (probed) — unreachable here, since every sampled column
+            // nulled at least one row, but a NULL must not be an error.
+            let Some(json) = json else { continue };
+            let values: Vec<String> = serde_json::from_str(&json)
+                .map_err(|e| format!("conform sample decode failed: {e}"))?;
+            out.insert(i, values.iter().map(|v| sanitize_sample(v)).collect());
+        }
+        Ok(out)
+    }
+}
+
+/// The misfit-sample capture for one cast column: at most
+/// [`MAX_CONFLICT_SAMPLES`] distinct values the cast nulls, rendered as one
+/// JSON array of strings.
+///
+/// The predicate is the definition of a shelved value — a stored value the
+/// guarded cast cannot read — written against the SAME `cast.expr` the
+/// tally counts with, so the samples can only ever be values the conflict
+/// row is counting.
+fn sample_expr(cast: &CastEntry) -> String {
+    let quoted = quote_ident(&cast.name);
+    let text = trawl_core::conform::untyped_text(&quoted);
+    let expr = &cast.expr;
+    format!(
+        "to_json(array_slice(list(DISTINCT left({text}, {MAX_CONFLICT_SAMPLE_BYTES})) \
+         FILTER (WHERE {quoted} IS NOT NULL AND ({expr}) IS NULL), \
+         1, {MAX_CONFLICT_SAMPLES}))::VARCHAR"
+    )
+}
+
+/// One captured misfit made safe to store, return and render: control
+/// characters become U+FFFD and the result is cut to
+/// [`MAX_CONFLICT_SAMPLE_BYTES`] on a `char` boundary.
+///
+/// Sanitising at CAPTURE rather than at each read is the point: the value is
+/// whatever bytes a client sent, and it goes on to a postgres row, a JSON
+/// body, an operator's terminal and (slice C2) a browser — one door is
+/// auditable, four are not. Order matters, too: U+FFFD is three bytes where
+/// the control character it replaces is one, so the byte cap is applied
+/// AFTER the substitution or it is not a cap.
+fn sanitize_sample(value: &str) -> String {
+    let mut cleaned: String = value
+        .chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect();
+    if cleaned.len() > MAX_CONFLICT_SAMPLE_BYTES {
+        let mut end = MAX_CONFLICT_SAMPLE_BYTES;
+        while !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        cleaned.truncate(end);
+    }
+    cleaned
 }
 
 /// Blocking phase 3: conform `wal_batch` to the authoritative pins, then
@@ -3296,6 +3427,123 @@ mod tests {
         assert!(
             conflicts.iter().all(|c| c.rows_nulled == 1),
             "each lossy column nulled its one row"
+        );
+    }
+
+    /// The evidence a conflict row carries beyond its counts: which values
+    /// the pin is actually costing. Distinct, capped, and only ever values
+    /// the cast NULLED — a lossless column's convergence is not evidence.
+    #[test]
+    fn conflict_samples_are_the_distinct_nulled_values_capped_at_five() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE wal_batch AS SELECT * FROM (VALUES \
+             ('a', '1'), ('b', '2'), ('c', '3'), ('d', '4'), \
+             ('e', '5'), ('f', '6'), ('a', '7'), (NULL, '8')) t(bad, good)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [
+            ("bad".to_owned(), CanonicalType::BigInt),
+            ("good".to_owned(), CanonicalType::BigInt),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        assert_eq!(conflicts.len(), 1, "only `bad` is lossy: {conflicts:?}");
+        let samples = &conflicts[0].samples;
+        assert_eq!(
+            samples.len(),
+            MAX_CONFLICT_SAMPLES,
+            "six distinct misfits, five slots: {samples:?}"
+        );
+        let mut sorted = samples.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), samples.len(), "distinct: {samples:?}");
+        assert!(
+            samples
+                .iter()
+                .all(|s| ["a", "b", "c", "d", "e", "f"].contains(&s.as_str())),
+            "never a converting value, never the NULL row: {samples:?}"
+        );
+    }
+
+    /// A misfit value is client text of client-chosen length and content, so
+    /// the sample is cut to a byte budget and stripped of control characters
+    /// at capture — before it reaches postgres, a response body or a
+    /// terminal. The substitution runs FIRST (U+FFFD is three bytes where the
+    /// character it replaces is one), and the cut lands on a `char` boundary.
+    #[test]
+    fn conflict_samples_are_control_sanitised_then_byte_capped() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE wal_batch (v VARCHAR)")
+            .unwrap();
+        let astral = "\u{1F600}".repeat(100);
+        let controls = "\u{7}".repeat(300);
+        for value in [&astral, &controls, &"a\u{7}b".to_owned()] {
+            conn.execute("INSERT INTO wal_batch VALUES (?)", [value])
+                .unwrap();
+        }
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [("v".to_owned(), CanonicalType::BigInt)]
+            .into_iter()
+            .collect();
+
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        let samples = &conflicts[0].samples;
+        assert_eq!(samples.len(), 3);
+        for sample in samples {
+            assert!(
+                sample.len() <= MAX_CONFLICT_SAMPLE_BYTES,
+                "{} bytes exceeds the cap",
+                sample.len()
+            );
+            assert!(
+                !sample.chars().any(char::is_control),
+                "control characters survived capture"
+            );
+        }
+        assert!(
+            samples.contains(&"a\u{FFFD}b".to_owned()),
+            "a control character is replaced, not dropped: {samples:?}"
+        );
+        // 400 bytes of 4-byte characters cut to exactly 64 of them; 300
+        // control characters become 900 bytes of 3-byte U+FFFD, whose last
+        // whole character ends at 255 — the boundary walk, not the cap.
+        let mut lengths: Vec<usize> = samples.iter().map(String::len).collect();
+        lengths.sort_unstable();
+        assert_eq!(lengths, vec![5, 255, 256]);
+    }
+
+    /// A batch that conflicts on nothing runs no sample query at all — the
+    /// capture is a second aggregate pass over client-width data, and a
+    /// healthy install must not pay it every tick. Asserted by giving the
+    /// capture a source that does not exist: building any SQL against it
+    /// would fail.
+    #[test]
+    fn a_batch_with_no_conflicts_runs_no_sample_query() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE wal_batch AS SELECT '1' AS v")
+            .unwrap();
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [("v".to_owned(), CanonicalType::BigInt)]
+            .into_iter()
+            .collect();
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
+
+        assert!(
+            plan.tally_conflicts(&conn, "wal_batch", "svc")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            plan.capture_samples(&conn, "no_such_table", &[])
+                .unwrap()
+                .is_empty()
         );
     }
 
