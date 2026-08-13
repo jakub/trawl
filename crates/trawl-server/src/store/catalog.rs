@@ -349,6 +349,26 @@ pub const MAX_CONFLICT_SAMPLES: usize = 5;
 /// what is arriving, far short of storing the payload a second time.
 pub const MAX_CONFLICT_SAMPLE_BYTES: usize = 256;
 
+/// Conflict rows per field the verdict is built from
+/// ([`CatalogStore::conflict_evidence_for`]), newest first.
+///
+/// Sized to what a verdict actually consumes: each row carries up to
+/// [`MAX_CONFLICT_SAMPLES`] distinct samples, so this many rows can fill the
+/// sample budget several times over even when they overlap heavily.
+///
+/// It also bounds the OBSERVED-TYPE evidence the suggested target is derived
+/// from, and that is a deliberate narrowing: the suggestion now describes the
+/// newest episodes rather than the whole retained window. That reads the
+/// right way round — a field whose recent traffic is uniformly one rung
+/// should be repinned to that rung — and the suggestion is a starting point
+/// for a dry run, never an action.
+const VERDICT_EVIDENCE_ROWS: i64 = 5;
+
+// Written as a literal because it binds as a postgres `bigint`, and pinned
+// to the sample budget it is derived from: change one and this fails the
+// build rather than silently under-filling a verdict.
+const _: () = assert!(MAX_CONFLICT_SAMPLES == 5);
+
 /// Rows per statement in [`CatalogStore::backfill_services`]. The backfill's
 /// size is (pinned fields x services), which nothing bounds below five
 /// figures, so it is written in chunks rather than one array-of-everything.
@@ -1034,8 +1054,13 @@ impl CatalogStore {
     /// `(observed_type, samples)` pairs a verdict is built from.
     ///
     /// Read only for the fields that came back DEGRADED — usually none —
-    /// so the cost is `MAX_CONFLICTS_PER_FIELD` rows times a handful of
-    /// fields, never the whole evidence table.
+    /// and bounded PER FIELD by [`VERDICT_EVIDENCE_ROWS`] through a LATERAL
+    /// subquery, not by an outer LIMIT: a page-wide limit would spend the
+    /// whole budget on the first field and leave the rest verdictless.
+    /// Unbounded, one `/schema/fields` request with a large `?limit=` over a
+    /// pathologically conflicted catalog would materialise
+    /// `MAX_CONFLICTS_PER_FIELD` rows — each carrying up to its full sample
+    /// payload — for every degraded field on the page.
     pub async fn conflict_evidence_for(
         &self,
         fields: &[String],
@@ -1044,11 +1069,18 @@ impl CatalogStore {
             return Ok(HashMap::new());
         }
         let rows = sqlx::query(
-            "SELECT field, observed_type, samples FROM field_conflicts
-             WHERE field = ANY($1)
-             ORDER BY at DESC, id DESC",
+            "SELECT f.field AS field, c.observed_type, c.samples
+             FROM UNNEST($1::text[]) AS f(field)
+             CROSS JOIN LATERAL (
+                 SELECT observed_type, samples
+                 FROM field_conflicts fc
+                 WHERE fc.field = f.field
+                 ORDER BY fc.at DESC, fc.id DESC
+                 LIMIT $2
+             ) c",
         )
         .bind(fields)
+        .bind(VERDICT_EVIDENCE_ROWS)
         .fetch_all(&self.pool)
         .await?;
 

@@ -335,6 +335,11 @@ fn render_verdict<W: Write>(
     field: &str,
     v: &trawl_client::DegradedVerdict,
 ) -> Result<(), CliError> {
+    // A field name is a client-chosen JSON key that ingest polices for
+    // length and case ONLY: a name carrying `;` and a shell command, or a
+    // bidi override, is legal — and this line is written to be pasted into
+    // a shell. Neutralise the rendering, then quote for the shell.
+    let field = trawl_core::sanitize::sanitize_display_text(field);
     label(out, human, "\ndegraded pin:")?;
     label(out, human, &format!("  since:          {}", v.since))?;
     label(out, human, &format!("  senders:        {}", v.services))?;
@@ -355,10 +360,31 @@ fn render_verdict<W: Write>(
         out,
         human,
         &format!(
-            "  trawl schema repin {field} --to {} --dry-run",
+            "  trawl schema repin {} --to {} --dry-run",
+            shell_quote(&field),
             v.suggested_to.to_ascii_lowercase()
         ),
     )
+}
+
+/// `arg` as one POSIX shell word.
+///
+/// Bare when the name is already a shell-inert token — which every ordinary
+/// field name is, and the common case must stay copy-pasteable-looking —
+/// otherwise single-quoted, with embedded quotes closed and reopened
+/// (`'\''`), the one escape that works inside single quotes. Single quotes
+/// rather than double because nothing inside them expands: no `$`, no
+/// backtick, no backslash.
+fn shell_quote(arg: &str) -> String {
+    let bare = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if bare {
+        arg.to_owned()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
 }
 
 /// `trawl schema conflicts [--field] [--service] [--last] [--limit]`.
@@ -526,6 +552,39 @@ mod tests {
             text.contains("trawl schema repin duration --to varchar --dry-run"),
             "the remedy is copy-pasteable: {text}"
         );
+    }
+
+    /// A field name is client-chosen text that ingest polices for length and
+    /// case only, and the remedy line is written to be pasted into a shell.
+    /// It is neutralised for the terminal and quoted for the shell.
+    #[test]
+    fn the_remedy_line_quotes_a_hostile_field_name() {
+        let mut buf = Vec::new();
+        render_verdict(&mut buf, true, "x; touch pwned", &sample_verdict()).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("trawl schema repin 'x; touch pwned' --to varchar"),
+            "a command-injecting name is one shell word: {text}"
+        );
+
+        let mut buf = Vec::new();
+        render_verdict(&mut buf, true, "it's\u{202e}bad", &sample_verdict()).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("repin 'it'\\''s\u{fffd}bad' --to varchar"),
+            "an embedded quote closes and reopens; a bidi override never \
+             reaches the terminal: {text}"
+        );
+    }
+
+    #[test]
+    fn shell_quoting_leaves_ordinary_names_bare() {
+        for name in ["duration", "http.status_code", "a-b_c", "9lives"] {
+            assert_eq!(shell_quote(name), name);
+        }
+        assert_eq!(shell_quote(""), "''", "an empty word still needs quotes");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("$(id)"), "'$(id)'");
     }
 
     #[test]

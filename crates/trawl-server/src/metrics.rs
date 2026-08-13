@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use metrics::{describe_counter, describe_gauge, describe_histogram};
+use metrics::{describe_counter, describe_gauge, describe_histogram, gauge};
 
 use crate::hot_buffer::HotBuffer;
 
@@ -37,6 +37,8 @@ pub const CATALOG_ROWS_NULLED_TOTAL: &str = "trawl_catalog_rows_nulled_total";
 pub const CATALOG_CONFORM_REWRITES_TOTAL: &str = "trawl_catalog_conform_rewrites_total";
 pub const CATALOG_CONFORM_SKIPPED_TOTAL: &str = "trawl_catalog_conform_skipped_total";
 pub const CATALOG_PINS_REJECTED_TOTAL: &str = "trawl_catalog_pins_rejected_total";
+pub const CATALOG_SAMPLE_CAPTURE_FAILURES_TOTAL: &str =
+    "trawl_catalog_sample_capture_failures_total";
 pub const CATALOG_PINNED_FIELDS: &str = "trawl_catalog_pinned_fields";
 pub const CATALOG_PIN_CAPACITY: &str = "trawl_catalog_pin_capacity";
 pub const CATALOG_DEGRADED_FIELDS: &str = "trawl_catalog_degraded_fields";
@@ -129,6 +131,13 @@ pub fn describe_metrics() {
         CATALOG_PINS_REJECTED_TOTAL,
         "Fields denied a catalog pin, labelled by reason (name_too_long, \
          cap); their columns are not stored and the values remain in _raw"
+    );
+    describe_counter!(
+        CATALOG_SAMPLE_CAPTURE_FAILURES_TOTAL,
+        "Batches whose misfit-sample capture failed (typically an out-of-memory \
+         on a column with pathological misfit cardinality). The conflict COUNTS \
+         are still recorded and the values remain in _raw — only the sample \
+         evidence is missing"
     );
     describe_gauge!(
         CATALOG_PINNED_FIELDS,
@@ -235,6 +244,15 @@ pub fn describe_metrics() {
          by ALL self-telemetry memory — active buffer, retry queue and the \
          in-flight batch (serialized bytes plus retained event maps)"
     );
+
+    // A described gauge has no SERIES until something sets it, and the
+    // degraded count is set by a postgres read on the schema-refresh tick:
+    // a node that boots with the store unreachable would export nothing at
+    // all, which a dashboard reads exactly like "no degraded fields". Seed
+    // it here — at registration, before the first tick — so absence means
+    // "not scraped" and 0 means "none". The refresh's error path keeps the
+    // previous value for the same reason.
+    gauge!(CATALOG_DEGRADED_FIELDS).set(0.0);
 }
 
 // -- bounded label values ----------------------------------------------------

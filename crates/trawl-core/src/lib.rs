@@ -45,6 +45,10 @@ mod pin_match;
 /// pipeline stage, shared by the SQL emitter and the stream compiler.
 pub mod pin_scope;
 
+/// Client-chosen text made safe to render: control and format characters
+/// that would rewrite or hide a terminal line.
+pub mod sanitize;
+
 /// The declared event envelope: field names, reserved keys, wire aliases.
 pub mod schema;
 

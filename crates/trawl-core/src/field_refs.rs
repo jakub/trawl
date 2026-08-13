@@ -142,7 +142,6 @@ fn collect_stage(stage: &PipeStage, out: &mut BTreeSet<String>) {
         }
         PipeStage::Dedup(s) => insert_all(&s.fields, out),
         PipeStage::Table(s) => insert_all(&s.fields, out),
-        PipeStage::Drop(s) => insert_all(&s.fields, out),
         // Sources only: the target is a name the stage creates.
         PipeStage::Rename(s) => {
             for (from, _) in &s.renames {
@@ -156,7 +155,12 @@ fn collect_stage(stage: &PipeStage, out: &mut BTreeSet<String>) {
                 insert(field, out);
             }
         }
-        PipeStage::Limit(_)
+        // Stages that bind no field at all. `drop` is one of them on
+        // purpose: it names a column to REMOVE, so nothing downstream can
+        // depend on that column's values and naming it must not badge the
+        // query.
+        PipeStage::Drop(_)
+        | PipeStage::Limit(_)
         | PipeStage::Tail(_)
         | PipeStage::Sample(_)
         | PipeStage::FromSaved(_) => {}
@@ -204,7 +208,7 @@ mod tests {
 
     #[test]
     fn every_binding_position_is_collected() {
-        let cases: [(&str, &[&str]); 16] = [
+        let cases: [(&str, &[&str]); 17] = [
             ("service=nginx", &["service"]),
             ("status>=400 host=web01", &["host", "status"]),
             ("NOT status=200", &["status"]),
@@ -231,10 +235,10 @@ mod tests {
                 "* | pivot avg(duration) on status by host",
                 &["duration", "host", "status"],
             ),
-            (
-                "* | sort -count, host | dedup host | drop message",
-                &["count", "host", "message"],
-            ),
+            ("* | sort -count, host | dedup host", &["count", "host"]),
+            // `drop` REMOVES a column: the answer cannot depend on its
+            // values, so naming it there binds nothing.
+            ("* | where duration > 1 | drop message", &["duration"]),
             ("* | rename service as svc", &["service"]),
             ("* | extract kv from raw_body", &["raw_body"]),
             ("* | where x in (1, 2) and not isnull(y)", &["x", "y"]),

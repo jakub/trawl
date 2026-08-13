@@ -1876,6 +1876,45 @@ mod catalog {
         );
     }
 
+    /// The verdict's evidence read is bounded PER FIELD, not per page: one
+    /// degraded field cannot spend the whole budget and leave the rest of
+    /// the page verdictless, and a page of degraded fields cannot pull the
+    /// whole evidence table into one response.
+    #[sqlx::test]
+    async fn conflict_evidence_is_bounded_per_field(pool: PgPool) {
+        let store = catalog(&pool);
+        for field in ["duration", "status"] {
+            for i in 0..40_u64 {
+                store
+                    .record_conflicts(&[FieldConflict {
+                        field: field.to_owned(),
+                        service: "svc-a".to_owned(),
+                        observed_type: "VARCHAR".to_owned(),
+                        expected_type: CanonicalType::BigInt,
+                        rows_nulled: 1,
+                        samples: vec![format!("v{i}")],
+                    }])
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let evidence = store
+            .conflict_evidence_for(&["duration".to_owned(), "status".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 2, "every field asked for gets evidence");
+        for (field, rows) in &evidence {
+            assert!(
+                rows.len() <= 5,
+                "{field}: {} rows exceeds the per-field bound",
+                rows.len()
+            );
+            // Newest first: the last episode written is the first row back.
+            assert_eq!(rows[0].1, vec!["v39".to_owned()], "{field}");
+        }
+    }
+
     /// The aggregates exist because the detail window does not survive a
     /// storm: `field_conflicts` is trimmed to the cap in the same
     /// transaction that appends to it, while `field_conflict_stats` keeps

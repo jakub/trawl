@@ -2377,7 +2377,33 @@ impl ConformPlan {
             .filter(|(_, (non_null, ok))| non_null > ok)
             .map(|(i, _)| i)
             .collect();
-        let mut samples = self.capture_samples(conn, source, &lossy)?;
+        // Best-effort, exactly like the postgres-side evidence writes it
+        // feeds. `list(DISTINCT …)` accumulates every distinct misfit before
+        // the slice caps it and DuckDB does not spill it, so a column with
+        // pathological misfit cardinality can OOM the capture on a batch
+        // whose TALLY (two scalar aggregates) just succeeded. Propagating
+        // that would fail the whole conform: the WAL is retained, the next
+        // tick retries a LARGER batch, and ingestion ratchets itself to a
+        // stop — while the boot lane would skip the file and withhold the
+        // marker forever. Evidence is worth less than the data it describes.
+        let mut samples = match self.capture_samples(conn, source, &lossy) {
+            Ok(samples) => samples,
+            Err(e) => {
+                metrics::counter!(crate::metrics::CATALOG_SAMPLE_CAPTURE_FAILURES_TOTAL)
+                    .increment(1);
+                // The error text can name a column, like every other DuckDB
+                // error this module logs; it can never carry a VALUE — the
+                // capture expression embeds no literals, the misfits are
+                // data.
+                tracing::warn!(
+                    event_type = "catalog_sample_capture_failed",
+                    columns = lossy.len(),
+                    error = %e,
+                    "misfit sample capture failed; conflicts are recorded without samples"
+                );
+                HashMap::new()
+            }
+        };
 
         let mut conflicts = Vec::new();
         for (i, (cast, (non_null, ok))) in self.casts.iter().zip(&stats).enumerate() {
@@ -2492,21 +2518,18 @@ fn sample_expr(cast: &CastEntry) -> String {
     )
 }
 
-/// One captured misfit made safe to store, return and render: control
-/// characters become U+FFFD and the result is cut to
-/// [`MAX_CONFLICT_SAMPLE_BYTES`] on a `char` boundary.
+/// One captured misfit made safe to store, return and render: control and
+/// format characters become U+FFFD ([`trawl_core::sanitize`]) and the result
+/// is cut to [`MAX_CONFLICT_SAMPLE_BYTES`] on a `char` boundary.
 ///
 /// Sanitising at CAPTURE rather than at each read is the point: the value is
 /// whatever bytes a client sent, and it goes on to a postgres row, a JSON
 /// body, an operator's terminal and (slice C2) a browser — one door is
 /// auditable, four are not. Order matters, too: U+FFFD is three bytes where
-/// the control character it replaces is one, so the byte cap is applied
-/// AFTER the substitution or it is not a cap.
+/// most of what it replaces is one, so the byte cap is applied AFTER the
+/// substitution or it is not a cap.
 fn sanitize_sample(value: &str) -> String {
-    let mut cleaned: String = value
-        .chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-        .collect();
+    let mut cleaned = trawl_core::sanitize::sanitize_display_text(value);
     if cleaned.len() > MAX_CONFLICT_SAMPLE_BYTES {
         let mut end = MAX_CONFLICT_SAMPLE_BYTES;
         while !cleaned.is_char_boundary(end) {
@@ -3511,7 +3534,10 @@ mod tests {
             .unwrap();
         let astral = "\u{1F600}".repeat(100);
         let controls = "\u{7}".repeat(300);
-        for value in [&astral, &controls, &"a\u{7}b".to_owned()] {
+        // A bidi override: category Cf, invisible to `char::is_control`,
+        // and the lever that makes a sample rewrite the line after it.
+        let trojan = "ok\u{202e}drop table".to_owned();
+        for value in [&astral, &controls, &"a\u{7}b".to_owned(), &trojan] {
             conn.execute("INSERT INTO wal_batch VALUES (?)", [value])
                 .unwrap();
         }
@@ -3523,7 +3549,11 @@ mod tests {
         let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
         let samples = &conflicts[0].samples;
-        assert_eq!(samples.len(), 3);
+        assert_eq!(samples.len(), 4);
+        assert!(
+            samples.contains(&"ok\u{fffd}drop table".to_owned()),
+            "a format character is neutralised like a control one: {samples:?}"
+        );
         for sample in samples {
             assert!(
                 sample.len() <= MAX_CONFLICT_SAMPLE_BYTES,
@@ -3544,7 +3574,7 @@ mod tests {
         // whole character ends at 255 — the boundary walk, not the cap.
         let mut lengths: Vec<usize> = samples.iter().map(String::len).collect();
         lengths.sort_unstable();
-        assert_eq!(lengths, vec![5, 255, 256]);
+        assert_eq!(lengths, vec![5, 15, 255, 256]);
     }
 
     /// `DISTINCT` runs in `DuckDB` over the RAW values, but what is stored
@@ -3582,6 +3612,47 @@ mod tests {
                 "x".repeat(MAX_CONFLICT_SAMPLE_BYTES),
             ],
             "five raw misfits, three distinct samples"
+        );
+    }
+
+    /// A capture that fails must cost the SAMPLES, never the batch.
+    ///
+    /// The failure is real, not mocked: `list(DISTINCT …)` accumulates every
+    /// distinct misfit and `DuckDB` does not spill it, so a memory limit the
+    /// two scalar tally aggregates fit inside comfortably is one the capture
+    /// exhausts. Propagating it would fail the conform, retain the WAL, and
+    /// have the next tick retry a bigger batch — an ingestion stall that
+    /// ratchets itself tighter.
+    #[test]
+    fn a_failed_sample_capture_still_records_the_conflict() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE wal_batch AS \
+             SELECT 'v' || repeat('x', 200) || i::VARCHAR AS v FROM range(20000) s(i)",
+        )
+        .unwrap();
+        // Applied AFTER the fixture: the limit is for the queries.
+        conn.execute_batch("SET memory_limit='10MB'").unwrap();
+
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [("v".to_owned(), CanonicalType::BigInt)]
+            .into_iter()
+            .collect();
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
+
+        assert!(
+            plan.capture_samples(&conn, "wal_batch", &[0]).is_err(),
+            "fixture must actually exhaust the capture, or this test proves nothing"
+        );
+
+        let conflicts = plan
+            .tally_conflicts(&conn, "wal_batch", "svc")
+            .expect("a capture failure must not fail the conform");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].rows_nulled, 20_000, "the counts are exact");
+        assert!(
+            conflicts[0].samples.is_empty(),
+            "evidence degrades to counts, and the values remain in _raw"
         );
     }
 
