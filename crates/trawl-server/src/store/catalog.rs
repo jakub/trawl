@@ -30,6 +30,7 @@ use sqlx::{PgPool, Row as _};
 use trawl_core::schema::CanonicalType;
 
 use super::error::StoreError;
+use crate::catalog::analyzer::ConflictAggregate;
 
 /// A proposed pin for a field absent from the catalog.
 #[derive(Debug, Clone)]
@@ -961,6 +962,129 @@ impl CatalogStore {
             }
         });
         Ok((rows, next))
+    }
+
+    /// [`Self::conflict_aggregates`], page-keyed shape: `$1` field names.
+    /// See the method docs for why this is its own SQL text.
+    const CONFLICT_AGGREGATES_KEYED_SQL: &'static str = "\
+        SELECT field, min(first_at) AS first_at, max(last_at) AS last_at,
+               count(*)::bigint                      AS services,
+               COALESCE(sum(episodes), 0)::bigint    AS episodes,
+               COALESCE(sum(rows_nulled_total), 0)::bigint AS rows_nulled_total
+        FROM field_conflict_stats
+        WHERE field = ANY($1)
+        GROUP BY field";
+
+    /// [`Self::conflict_aggregates`], whole-catalog shape.
+    const CONFLICT_AGGREGATES_ALL_SQL: &'static str = "\
+        SELECT field, min(first_at) AS first_at, max(last_at) AS last_at,
+               count(*)::bigint                      AS services,
+               COALESCE(sum(episodes), 0)::bigint    AS episodes,
+               COALESCE(sum(rows_nulled_total), 0)::bigint AS rows_nulled_total
+        FROM field_conflict_stats
+        GROUP BY field";
+
+    /// Aggregate the durable conflict evidence per FIELD — the input the
+    /// degraded-field analyzer judges ([`crate::catalog::analyzer`]).
+    ///
+    /// `fields` keys the read to a page of pin names; `None` aggregates the
+    /// whole table, which is what a refresh tick wants and is bounded on
+    /// the returned axis by the pin cap.
+    ///
+    /// Two SQL TEXTS rather than one `($1 IS NULL OR field = ANY($1))`
+    /// shape, for the reason [`Self::list_fields`] documents at length: a
+    /// prepared statement switching to its generic plan cannot push the
+    /// `IS NULL`-guarded `OR` into the primary key, so the page-keyed read
+    /// would degrade into a full aggregate over a table whose SERVICE axis
+    /// is client-chosen and never pruned.
+    pub async fn conflict_aggregates(
+        &self,
+        fields: Option<&[String]>,
+    ) -> Result<Vec<ConflictAggregate>, StoreError> {
+        let rows = match fields {
+            Some([]) => return Ok(Vec::new()),
+            Some(names) => {
+                sqlx::query(Self::CONFLICT_AGGREGATES_KEYED_SQL)
+                    .bind(names)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            None => {
+                sqlx::query(Self::CONFLICT_AGGREGATES_ALL_SQL)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+        rows.iter()
+            .map(|row| {
+                Ok(ConflictAggregate {
+                    field: row.try_get("field")?,
+                    first_at: row.try_get("first_at")?,
+                    last_at: row.try_get("last_at")?,
+                    services: row.try_get("services")?,
+                    episodes: row.try_get("episodes")?,
+                    rows_nulled_total: row.try_get("rows_nulled_total")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::from)
+    }
+
+    /// The retained detail evidence for `fields`, newest first: the
+    /// `(observed_type, samples)` pairs a verdict is built from.
+    ///
+    /// Read only for the fields that came back DEGRADED — usually none —
+    /// so the cost is `MAX_CONFLICTS_PER_FIELD` rows times a handful of
+    /// fields, never the whole evidence table.
+    pub async fn conflict_evidence_for(
+        &self,
+        fields: &[String],
+    ) -> Result<HashMap<String, Vec<(String, Vec<String>)>>, StoreError> {
+        if fields.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query(
+            "SELECT field, observed_type, samples FROM field_conflicts
+             WHERE field = ANY($1)
+             ORDER BY at DESC, id DESC",
+        )
+        .bind(fields)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
+        for row in &rows {
+            let field: String = row.try_get("field")?;
+            out.entry(field)
+                .or_default()
+                .push((row.try_get("observed_type")?, row.try_get("samples")?));
+        }
+        Ok(out)
+    }
+
+    /// Drop every trace of one field's conflict evidence, inside a caller's
+    /// transaction.
+    ///
+    /// Called by the repin cutover ([`crate::store::RepinStore::finish_cutover`]):
+    /// the evidence indicts a pin that no longer exists, and the analyzer's
+    /// gate is span-based — left standing, a repinned field would keep its
+    /// verdict forever, and the badge that told the operator to act would
+    /// survive their acting on it. Ordering is the cutover's, not ours: the
+    /// clear runs before the job records its own outcome, so a forced lossy
+    /// repin's fresh evidence is not swept away with the old.
+    pub async fn clear_conflict_evidence(
+        tx: &mut sqlx::PgConnection,
+        field: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM field_conflict_stats WHERE field = $1")
+            .bind(field)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM field_conflicts WHERE field = $1")
+            .bind(field)
+            .execute(&mut *tx)
+            .await?;
+        Ok(())
     }
 
     /// Read the conflict rows for one field, most recent first.

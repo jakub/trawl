@@ -39,6 +39,7 @@ pub const CATALOG_CONFORM_SKIPPED_TOTAL: &str = "trawl_catalog_conform_skipped_t
 pub const CATALOG_PINS_REJECTED_TOTAL: &str = "trawl_catalog_pins_rejected_total";
 pub const CATALOG_PINNED_FIELDS: &str = "trawl_catalog_pinned_fields";
 pub const CATALOG_PIN_CAPACITY: &str = "trawl_catalog_pin_capacity";
+pub const CATALOG_DEGRADED_FIELDS: &str = "trawl_catalog_degraded_fields";
 pub const CATALOG_REPIN_JOBS_TOTAL: &str = "trawl_catalog_repin_jobs_total";
 pub const CATALOG_REPIN_RUNNING: &str = "trawl_catalog_repin_running";
 pub const CATALOG_REPIN_FILES_TOTAL: &str = "trawl_catalog_repin_files_total";
@@ -140,6 +141,15 @@ pub fn describe_metrics() {
         CATALOG_PIN_CAPACITY,
         "Field-catalog pin ceiling (store::catalog::MAX_PINNED_FIELDS); a \
          field arriving at a full catalog is never stored as a column"
+    );
+    describe_gauge!(
+        CATALOG_DEGRADED_FIELDS,
+        "Pinned fields the analyzer currently calls degraded: their pin has \
+         been shelving values for over a day, in volume. Alert on it RISING \
+         — the remedy is an operator-approved `trawl schema repin`, and \
+         nothing clears the count on its own. Advisory and \
+         sender-influenceable by construction: one misbehaving producer can \
+         raise it, which is why it may never gate anything automatically"
     );
     describe_counter!(
         CATALOG_REPIN_JOBS_TOTAL,

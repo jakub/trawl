@@ -1032,9 +1032,18 @@ pub async fn catalog_fields(
     let (pinned_total, pin_capacity) = state.storage.catalog.pin_stats().await?;
 
     trawl_api::value::sort_by_display_rank(&mut rows, |r| &r.field);
+    let verdicts = degraded_verdicts(
+        &state.storage.catalog,
+        &rows
+            .iter()
+            .map(|r| (r.field.clone(), current_pin(&r.duckdb_type)))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
     let fields = rows
         .into_iter()
         .map(|r| trawl_api::CatalogFieldSummary {
+            verdict: verdicts.get(&r.field).cloned(),
             name: r.field,
             data_type: r.duckdb_type,
             pinned_from: r.pinned_from,
@@ -1054,6 +1063,59 @@ pub async fn catalog_fields(
         pin_capacity: u64::try_from(pin_capacity).unwrap_or(0),
         truncated,
     }))
+}
+
+/// Read a pin's stored `DuckDB` spelling back as a canonical type.
+///
+/// The column is `CHECK`-constrained to the canonical five, so the fallback
+/// is unreachable short of a hand-edited catalog; `VARCHAR` is the honest
+/// answer there — it is the one pin under which nothing further can be
+/// shelved.
+fn current_pin(duckdb_type: &str) -> trawl_core::schema::CanonicalType {
+    trawl_core::schema::CanonicalType::from_duckdb(duckdb_type)
+        .unwrap_or(trawl_core::schema::CanonicalType::Varchar)
+}
+
+/// Verdicts for whichever of `pins` the analyzer finds degraded (ADR-0011
+/// slice C1). Absent from the map = healthy, which is the overwhelmingly
+/// common case and costs one aggregate read.
+///
+/// Two PAGE-KEYED queries, never a join into the listing SQL: the same trap
+/// [`crate::store::CatalogStore::list_fields`] documents for its conflict
+/// evidence applies here — a grouped subquery over the whole
+/// `field_conflict_stats` table has no predicate a planner can push down,
+/// and that table's service axis is client-chosen. The second query runs
+/// only for the fields that came back degraded (usually none).
+async fn degraded_verdicts(
+    store: &crate::store::CatalogStore,
+    pins: &[(String, trawl_core::schema::CanonicalType)],
+) -> Result<std::collections::HashMap<String, trawl_api::DegradedVerdict>, ServerError> {
+    use crate::catalog::analyzer;
+
+    let names: Vec<String> = pins.iter().map(|(f, _)| f.clone()).collect();
+    let aggregates: Vec<analyzer::ConflictAggregate> = store
+        .conflict_aggregates(Some(&names))
+        .await?
+        .into_iter()
+        .filter(analyzer::is_degraded)
+        .collect();
+    if aggregates.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let degraded: Vec<String> = aggregates.iter().map(|a| a.field.clone()).collect();
+    let evidence = store.conflict_evidence_for(&degraded).await?;
+    Ok(aggregates
+        .iter()
+        .map(|agg| {
+            let current = pins
+                .iter()
+                .find(|(f, _)| *f == agg.field)
+                .map_or(trawl_core::schema::CanonicalType::Varchar, |(_, t)| *t);
+            let rows = evidence.get(&agg.field).map_or(&[][..], Vec::as_slice);
+            (agg.field.clone(), analyzer::verdict(agg, current, rows))
+        })
+        .collect())
 }
 
 /// Query parameters for `GET /api/v1/schema/field`.
@@ -1124,6 +1186,12 @@ pub async fn catalog_field(
     // MAX_CONFLICTS_PER_FIELD newest rows per field in the writing
     // transaction, so this read is bounded by construction.
     let conflicts = state.storage.catalog.conflicts_for_field(&name).await?;
+    let verdict = degraded_verdicts(
+        &state.storage.catalog,
+        &[(name.clone(), current_pin(&pin.duckdb_type))],
+    )
+    .await?
+    .remove(&name);
 
     Ok(Json(trawl_api::CatalogFieldResponse {
         name: pin.field,
@@ -1148,9 +1216,11 @@ pub async fn catalog_field(
                 observed_type: c.observed_type,
                 expected_type: c.expected_type,
                 rows_nulled: u64::try_from(c.rows_nulled).unwrap_or(0),
+                samples: c.samples,
                 at: iso8601(c.at),
             })
             .collect(),
+        verdict,
     }))
 }
 
@@ -1206,6 +1276,7 @@ pub async fn catalog_conflicts(
                 observed_type: c.observed_type,
                 expected_type: c.expected_type,
                 rows_nulled: u64::try_from(c.rows_nulled).unwrap_or(0),
+                samples: c.samples,
                 at: iso8601(c.at),
             })
             .collect(),

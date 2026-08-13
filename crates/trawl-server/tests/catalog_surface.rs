@@ -132,6 +132,16 @@ async fn ingest_and_compact(h: &Harness, events: &[serde_json::Value]) {
     compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
 }
 
+/// One field's row out of a `/schema/fields` body.
+fn field_row<'a>(body: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    body["fields"]
+        .as_array()
+        .expect("fields array")
+        .iter()
+        .find(|f| f["name"] == name)
+        .unwrap_or_else(|| panic!("field {name} listed"))
+}
+
 fn event(service: &str, extra: &serde_json::Value) -> serde_json::Value {
     let mut base = json!({
         "service": service, "env": "prod", "host": "web01",
@@ -271,6 +281,113 @@ async fn aged_out_field_windowed_away_unless_all(pool: sqlx::PgPool) {
     assert!(
         names.iter().any(|n| n == "old_field"),
         "?all=true lifts the window: {names:?}"
+    );
+}
+
+/// A conflicting field that has not been conflicting for LONG carries no
+/// verdict at all — not a null one, no key: an install where a shipper had
+/// one bad afternoon must read exactly as it did before the analyzer
+/// shipped.
+#[sqlx::test(migrations = false)]
+async fn a_freshly_conflicting_field_carries_no_verdict(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
+    for _ in 0..4 {
+        ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "N/A"}))]).await;
+    }
+
+    let (status, body) = h.get(&h.server.analyst_token, "/schema/fields").await;
+    assert_eq!(status, 200);
+    let row = field_row(&body, "duration");
+    assert!(
+        row.get("verdict").is_none(),
+        "volume without span is not degraded: {row}"
+    );
+    assert!(row["conflict_count"].as_u64().unwrap() >= 4, "{row}");
+
+    let (_, body) = h
+        .get(&h.server.analyst_token, "/schema/field?name=duration")
+        .await;
+    assert!(body.get("verdict").is_none(), "{body}");
+}
+
+/// Acceptance: a pin that has been shelving values for over a day carries
+/// the verdict on both read routes, and the evidence rows carry the misfit
+/// samples the CLI and SPA render.
+#[sqlx::test(migrations = false)]
+async fn a_degraded_field_carries_the_verdict_and_its_samples(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
+    for value in ["N/A", "pending", "N/A"] {
+        ingest_and_compact(&h, &[event("svc-b", &json!({"duration": value}))]).await;
+    }
+
+    // The evidence is real; only its AGE is simulated. `first_at` is the one
+    // thing a test cannot wait 24 hours for.
+    let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
+        .await
+        .expect("connect app db");
+    sqlx::query(
+        "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+         WHERE field = 'duration'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("backdate the evidence");
+
+    let (status, fields) = h.get(&h.server.analyst_token, "/schema/fields").await;
+    assert_eq!(status, 200);
+    let verdict = field_row(&fields, "duration")["verdict"].clone();
+    assert_eq!(verdict["services"], 1, "one sender is enough: {verdict}");
+    assert_eq!(verdict["episodes"], 3, "{verdict}");
+    assert_eq!(verdict["rows_shelved"], 3, "{verdict}");
+    assert_eq!(
+        verdict["suggested_to"], "VARCHAR",
+        "strings under a BIGINT pin suggest text: {verdict}"
+    );
+    assert!(
+        verdict["since"].as_str().unwrap().ends_with('Z'),
+        "{verdict}"
+    );
+    let samples: Vec<&str> = verdict["samples"]
+        .as_array()
+        .expect("samples")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(samples.contains(&"N/A"), "samples: {samples:?}");
+    assert!(samples.contains(&"pending"), "samples: {samples:?}");
+
+    // The case file carries the same verdict plus per-row evidence.
+    let (status, body) = h
+        .get(&h.server.analyst_token, "/schema/field?name=duration")
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["verdict"]["suggested_to"], "VARCHAR", "{body}");
+    let row = body["conflicts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| !c["samples"].as_array().unwrap().is_empty())
+        .expect("the evidence rows carry their samples");
+    assert!(
+        ["N/A", "pending"].contains(&row["samples"][0].as_str().unwrap()),
+        "{row}"
+    );
+
+    // A field with no conflict evidence at all is never badged.
+    assert!(
+        field_row(&fields, "message").get("verdict").is_none(),
+        "an unconflicted envelope field carries no verdict key"
+    );
+
+    // Same routes, unchanged gate: a key without schema_read is still 403.
+    let (status, _) = h
+        .get(&h.server.coastwatch_only_token, "/schema/fields")
+        .await;
+    assert_eq!(
+        status, 403,
+        "the verdict rides the existing SchemaRead gate"
     );
 }
 

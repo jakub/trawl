@@ -2648,6 +2648,70 @@ mod repin_store {
         assert_eq!(again.finished_at, job.finished_at, "redo must not restamp");
     }
 
+    /// The cutover clears the field's conflict evidence in the same
+    /// transaction as the flip: it indicts a pin that no longer exists, and
+    /// the analyzer's gate is span-based, so leaving it would badge the
+    /// field as degraded forever — the remedy would not clear the sign.
+    /// Another field's evidence is untouched.
+    #[sqlx::test]
+    async fn finish_cutover_clears_the_repinned_field_evidence(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        let conflict = |field: &str| trawl_server::store::FieldConflict {
+            field: field.to_owned(),
+            service: "svc-a".to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: 4,
+            samples: vec!["n/a".to_owned()],
+        };
+        catalog
+            .record_conflicts(&[conflict("severity"), conflict("message")])
+            .await
+            .unwrap();
+
+        let id = s
+            .claim(
+                "severity",
+                CanonicalType::BigInt,
+                CanonicalType::Varchar,
+                false,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+            .await
+            .unwrap();
+
+        assert!(
+            catalog
+                .conflicts_for_field("severity")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the repinned field's detail evidence is gone"
+        );
+        assert!(
+            catalog
+                .conflict_aggregates(Some(&["severity".to_owned()]))
+                .await
+                .unwrap()
+                .is_empty(),
+            "and so are its durable aggregates"
+        );
+        assert_eq!(
+            catalog
+                .conflict_aggregates(Some(&["message".to_owned()]))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "another field's evidence survives"
+        );
+    }
+
     /// Boot reconciliation: an orphaned `running` row (killed process, no
     /// marker) fails; the marker's own job — mid-recovery — is kept.
     #[sqlx::test]

@@ -353,6 +353,7 @@ mod tests {
                 last_seen: Some("2026-08-02T10:00:00Z".into()),
                 conflict_count: 1,
                 rows_nulled: 3,
+                verdict: None,
             }],
             pinned_total: 11,
             pin_capacity: 10_000,
@@ -368,6 +369,7 @@ mod tests {
                 observed_type: "VARCHAR".into(),
                 expected_type: "BIGINT".into(),
                 rows_nulled: 3,
+                samples: vec!["n/a".into()],
                 at: "2026-08-02T11:00:00Z".into(),
             }],
             truncated: true,
@@ -440,6 +442,7 @@ mod tests {
             }],
             services_cursor: None,
             conflicts: sample_conflicts().conflicts,
+            verdict: None,
         };
         let (cols, rows) = field_services_to_rows(&resp);
         assert_eq!(cols, vec!["service", "first_seen", "last_seen", "rows"]);

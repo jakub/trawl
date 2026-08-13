@@ -24,6 +24,7 @@
 //! `DuckDB` identifier therefore has exactly one catalog spelling, and
 //! lookups are plain exact-name.
 
+pub mod analyzer;
 pub mod conform;
 
 use std::collections::HashMap;
