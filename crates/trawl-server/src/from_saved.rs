@@ -22,6 +22,15 @@ pub(crate) struct ResolvedFromSaved {
     /// The DSL string with the `from saved` stage stripped, suitable for
     /// re-parse + execution against the resolved source.
     pub remaining_dsl: String,
+    /// The saved query's OWN DSL — the text whose run produced the parquet
+    /// this query reads.
+    ///
+    /// Carried for the incomplete-results notice (ADR-0011 slice C1): the
+    /// stored results were computed from fields the saved query bound, so a
+    /// degraded pin among them is exactly as much a completeness caveat as
+    /// one in the stages the caller typed. Nothing stamps report runs at
+    /// write time, so the walk happens here, over both texts.
+    pub saved_dsl: String,
 }
 
 /// Resolve a `FromSavedStage` to a parquet source and remaining DSL.
@@ -68,6 +77,7 @@ pub(crate) async fn resolve(
     Ok(ResolvedFromSaved {
         source,
         remaining_dsl,
+        saved_dsl: saved.query,
     })
 }
 
@@ -499,6 +509,7 @@ mod pg_tests {
         let ResolvedFromSaved {
             source,
             remaining_dsl,
+            ..
         } = resolve(
             &stage_latest("rollup"),
             dsl,
@@ -527,6 +538,43 @@ mod pg_tests {
         .await
         .unwrap();
         assert_eq!(remaining_dsl, "*");
+    }
+
+    /// The saved query's OWN text rides out of the resolve, because the
+    /// incomplete-results notice is stamped over both halves of what the
+    /// caller reads: the stages they typed AND the query whose recorded run
+    /// produced the rows underneath them. Nothing stamps a report run at
+    /// write time, so this is the only place those fields are still known.
+    #[sqlx::test]
+    async fn resolve_carries_the_saved_querys_own_dsl(pool: PgPool) {
+        let (saved_id, sched_store, saved_store) = seed(&pool, 1, "rollup").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        run(
+            &sched_store,
+            sid,
+            saved_id,
+            RunStatus::Success,
+            Some("p/run_1.parquet"),
+        )
+        .await;
+
+        let dsl = "| from saved rollup | stats count() by host";
+        let span_end = dsl.find(" | stats").unwrap();
+        let resolved = resolve(
+            &stage_latest("rollup"),
+            dsl,
+            span_end,
+            &saved_store,
+            &sched_store,
+            1,
+            "/data",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved.saved_dsl, "level=error",
+            "the saved query's own fields are walkable by the notice"
+        );
     }
 
     fn stage_latest(name: &str) -> FromSavedStage {

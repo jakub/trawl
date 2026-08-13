@@ -352,9 +352,17 @@ pub const MAX_CONFLICT_SAMPLE_BYTES: usize = 256;
 /// Conflict rows per field the verdict is built from
 /// ([`CatalogStore::conflict_evidence_for`]), newest first.
 ///
-/// Sized to what a verdict actually consumes: each row carries up to
-/// [`MAX_CONFLICT_SAMPLES`] distinct samples, so this many rows can fill the
-/// sample budget several times over even when they overlap heavily.
+/// Sized to what a verdict consumes: each row carries up to
+/// [`MAX_CONFLICT_SAMPLES`] distinct samples, so the newest five rows
+/// normally hold several times the sample budget.
+///
+/// Not guaranteed to, though — a row whose capture failed carries none
+/// (evidence is best-effort, `ConformPlan::tally_conflicts`), so five
+/// sample-less rows can leave a verdict with an empty `samples` list while
+/// older retained rows still hold values. That degrades gracefully: the
+/// verdict itself is computed from the durable aggregates and stays
+/// correct, the CLI simply omits the sample block, and the cause is counted
+/// on `trawl_catalog_sample_capture_failures_total`.
 ///
 /// It also bounds the OBSERVED-TYPE evidence the suggested target is derived
 /// from, and that is a deliberate narrowing: the suggestion now describes the

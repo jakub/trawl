@@ -337,9 +337,9 @@ fn render_verdict<W: Write>(
 ) -> Result<(), CliError> {
     // A field name is a client-chosen JSON key that ingest polices for
     // length and case ONLY: a name carrying `;` and a shell command, or a
-    // bidi override, is legal — and this line is written to be pasted into
-    // a shell. Neutralise the rendering, then quote for the shell.
-    let field = trawl_core::sanitize::sanitize_display_text(field);
+    // bidi override, is legal — and the last line here is written to be
+    // pasted into a shell. Every rendering of the name is neutralised.
+    let shown = trawl_core::sanitize::sanitize_display_text(field);
     label(out, human, "\ndegraded pin:")?;
     label(out, human, &format!("  since:          {}", v.since))?;
     label(out, human, &format!("  senders:        {}", v.services))?;
@@ -356,15 +356,33 @@ fn render_verdict<W: Write>(
         }
     }
     label(out, human, &format!("  suggested:      {}", v.suggested_to))?;
-    label(
-        out,
-        human,
-        &format!(
-            "  trawl schema repin {} --to {} --dry-run",
-            shell_quote(&field),
-            v.suggested_to.to_ascii_lowercase()
-        ),
-    )
+
+    // The remedy line is printed ONLY when the name survives that
+    // neutralisation unchanged. A sanitised spelling is a DIFFERENT string:
+    // pasted, it would repin some other field — or nothing, or (with enough
+    // bad luck) a real field whose name genuinely contains U+FFFD. A
+    // command whose argument is not the key it names must not be offered at
+    // all, however well quoted.
+    if shown == field {
+        label(
+            out,
+            human,
+            &format!(
+                "  trawl schema repin {} --to {} --dry-run",
+                shell_quote(&shown),
+                v.suggested_to.to_ascii_lowercase()
+            ),
+        )
+    } else {
+        label(
+            out,
+            human,
+            "  this field's name contains characters that cannot be printed \
+             safely, so no repin command is shown — take the exact name from \
+             `trawl schema field <name> -f json` (or GET /api/v1/schema/field) \
+             before running `trawl schema repin`",
+        )
+    }
 }
 
 /// `arg` as one POSIX shell word.
@@ -556,24 +574,51 @@ mod tests {
 
     /// A field name is client-chosen text that ingest polices for length and
     /// case only, and the remedy line is written to be pasted into a shell.
-    /// It is neutralised for the terminal and quoted for the shell.
+    /// A name that survives sanitisation unchanged is quoted and printed.
     #[test]
     fn the_remedy_line_quotes_a_hostile_field_name() {
         let mut buf = Vec::new();
         render_verdict(&mut buf, true, "x; touch pwned", &sample_verdict()).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(
-            text.contains("trawl schema repin 'x; touch pwned' --to varchar"),
+            text.contains("trawl schema repin 'x; touch pwned' --to varchar --dry-run"),
             "a command-injecting name is one shell word: {text}"
         );
 
         let mut buf = Vec::new();
-        render_verdict(&mut buf, true, "it's\u{202e}bad", &sample_verdict()).unwrap();
+        render_verdict(&mut buf, true, "it's ok", &sample_verdict()).unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(
-            text.contains("repin 'it'\\''s\u{fffd}bad' --to varchar"),
-            "an embedded quote closes and reopens; a bidi override never \
-             reaches the terminal: {text}"
+            text.contains("repin 'it'\\''s ok' --to varchar"),
+            "an embedded quote closes and reopens: {text}"
+        );
+    }
+
+    /// A name the sanitiser CHANGES cannot be named by a command: the
+    /// printed spelling is a different string, and repinning the wrong
+    /// field rewrites the wrong corpus. The verdict facts still render.
+    #[test]
+    fn a_name_that_cannot_be_printed_gets_no_command() {
+        let mut buf = Vec::new();
+        render_verdict(&mut buf, true, "bad\u{202e}name", &sample_verdict()).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+
+        assert!(text.contains("rows shelved:   240 (lifetime)"), "{text}");
+        assert!(
+            !text.contains("trawl schema repin bad"),
+            "no command may name the sanitised spelling: {text}"
+        );
+        assert!(
+            !text.contains("--dry-run"),
+            "no runnable command at all: {text}"
+        );
+        assert!(
+            text.contains("cannot be printed safely"),
+            "the operator is told why, and where to get the real name: {text}"
+        );
+        assert!(
+            !text.contains('\u{202e}'),
+            "and the override still never reaches the terminal: {text}"
         );
     }
 

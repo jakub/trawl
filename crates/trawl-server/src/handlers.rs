@@ -116,11 +116,15 @@ pub async fn query(
     // and execute with the pre-computed source instead of normal glob scan.
     let (outcome, degraded_fields) =
         if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query).await? {
-            // The notice speaks for the DSL that actually RAN: `from saved`
-            // executes the remainder over a resolved source, and the saved
-            // query's own fields were already answered when its run was
-            // recorded.
-            let degraded = degraded_fields_for(&state, &resolved.remaining_dsl);
+            // Both halves of what the caller is actually reading: the
+            // stages they typed, and the saved query whose recorded run
+            // produced the rows those stages run over. Nothing stamps a
+            // report run at write time, so a degraded pin the saved query
+            // bound would otherwise go unmentioned.
+            let degraded = degraded_fields_for(
+                &state,
+                [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()],
+            );
             (
                 state
                     .query
@@ -137,7 +141,7 @@ pub async fn query(
                 degraded,
             )
         } else {
-            let degraded = degraded_fields_for(&state, &req.query);
+            let degraded = degraded_fields_for(&state, [req.query.as_str()]);
             (
                 state
                     .query
@@ -1081,6 +1085,9 @@ pub async fn catalog_fields(
 /// The degraded fields `dsl` BINDS, sorted — the incomplete-results notice
 /// (ADR-0011 slice C1 ruling 4).
 ///
+/// `texts` is every DSL the answer depends on: the query as typed, plus —
+/// for `from saved` — the saved query whose run produced the stored rows.
+///
 /// Reads the in-process set the schema-refresh tick maintains: the query
 /// path never touches postgres, and it may not start now. The empty check
 /// comes first so a healthy install — every install, almost always — pays a
@@ -1089,15 +1096,19 @@ pub async fn catalog_fields(
 /// Fields BOUND, not fields returned: a `where` on a degraded field that
 /// projects it away is exactly the incomplete case
 /// ([`trawl_core::field_refs`]).
-fn degraded_fields_for(state: &AppState, dsl: &str) -> Vec<String> {
+fn degraded_fields_for<'a>(
+    state: &AppState,
+    texts: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
     let degraded = std::sync::Arc::clone(&state.query.degraded_fields.lock());
     if degraded.is_empty() {
         return Vec::new();
     }
-    trawl_core::field_refs::referenced_fields_in(dsl)
-        .into_iter()
-        .filter(|f| degraded.contains(f))
-        .collect()
+    let mut named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for dsl in texts {
+        named.extend(trawl_core::field_refs::referenced_fields_in(dsl));
+    }
+    named.into_iter().filter(|f| degraded.contains(f)).collect()
 }
 
 /// Read a pin's stored `DuckDB` spelling back as a canonical type.

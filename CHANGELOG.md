@@ -34,7 +34,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   successful repin clears the field's evidence in the cutover
   transaction, so the badge goes out when the remedy is applied. The
   verdict is advisory and sender-influenceable by construction: nothing
-  repins without `schema_write` and a human.
+  repins without `schema_write` and a human. Note that `schema_read` now
+  exposes fragments of event VALUES — the captured samples — where it
+  previously carried names, types and counts only.
 - **Operator-triggered field repin (ADR-0011 slice B, #53).** A
   wrongly-pinned catalog field can be retyped to any candidate-ladder
   type with one command: `trawl schema repin <field> --to <type>` /

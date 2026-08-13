@@ -4,11 +4,18 @@
 
 //! Client-chosen text made safe to render (ADR-0011 slice C1).
 //!
-//! Two things trawl shows an operator are strings a sender picked: the
-//! conflict SAMPLES compaction captures, and the FIELD NAMES they are
-//! attributed to. Both reach a terminal, a JSON body and (slice C2) a
-//! browser, and both are policed at ingest for length and case only — the
-//! bytes in between are whatever arrived.
+//! Two renderings carry text a sender picked. The conflict SAMPLES
+//! compaction captures are the obvious one — arbitrary event values,
+//! sanitised once at capture so every consumer downstream is safe by
+//! construction. The other is the CATALOG-SOURCED field name the CLI's case
+//! file prints (`schema field`'s `resp.name`, which is a client-chosen JSON
+//! key that ingest polices for length and case only). Both reach a terminal,
+//! a JSON body and (slice C2) a browser.
+//!
+//! Field names taken from a QUERY need none of this: the parser accepts
+//! `[A-Za-z_][A-Za-z0-9_]*` with `.` and `@`, so the query notice's footer
+//! cannot name anything hostile — it echoes what the user typed, through a
+//! grammar that admits no control or format character.
 //!
 //! [`char::is_control`] is not enough for that. It covers category Cc
 //! alone, while the characters that actually rewrite a rendering are format

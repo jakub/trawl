@@ -49,6 +49,15 @@ pub enum Permission {
     /// Execute search queries, view history, list running queries.
     Query,
     /// Read schema and field catalog.
+    ///
+    /// Since ADR-0011 slice C1 this grants more than names, types and
+    /// counts: `/schema/field` and `/schema/conflicts` carry the misfit
+    /// SAMPLES compaction captured — up to five values per conflict row, 256
+    /// bytes each, of raw client-supplied event data — and a degraded
+    /// field's verdict repeats a bounded set of them. Reading event VALUES
+    /// used to require [`Self::Query`]. A role built as query-less
+    /// schema-admin is therefore a deliberate choice about who may see
+    /// fragments of event content, not only its shape.
     SchemaRead,
     /// Validate DSL syntax without executing.
     Validate,
