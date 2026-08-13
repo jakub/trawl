@@ -132,6 +132,22 @@ recency window, so the two differ on purpose. Every shelved value remains
 in `_raw`. The verdict is advisory — nothing repins without `--yes` and
 `schema_write`.
 
+**Retiring a badge after fixing the sender.** The gate has no recency term:
+evidence is never aged out, so a field stays badged after its shipper is
+corrected. That is on purpose — the shelved rows are still missing from the
+corpus. Clearing both is one command, the same-type pass:
+
+```bash
+trawl schema repin duration --to bigint --force --dry-run   # `bigint` = the current pin
+trawl schema repin duration --to bigint --force --yes
+```
+
+A repin whose target equals the current pin is the **resurrection-only**
+pass: it re-extracts the shelved values from `_raw` under the pin they
+already have, and — because a successful repin clears the field's conflict
+evidence in the same transaction as the flip — the badge goes out with the
+damage it was reporting. Repinning to a *different* type does both as well.
+
 `field` pages its service observations — the service axis is client-chosen
 and never pruned, so the server caps a page at 1000 rows (default 100).
 When more remain, a cursor is printed to stderr; pass it to `--after` for

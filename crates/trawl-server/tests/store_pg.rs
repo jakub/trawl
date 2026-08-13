@@ -1966,6 +1966,51 @@ mod catalog {
         assert!(span, "the span is the evidence, and it only widens");
     }
 
+    /// `first_at` only ever moves EARLIER — the property the whole degraded
+    /// gate rests on.
+    ///
+    /// The gate is `last_at - first_at >= 24h`. If a later episode restamped
+    /// `first_at`, the span would reset on every conflict and no field could
+    /// ever be called degraded: the feature would be inert, silently, with
+    /// every other test still green.
+    #[sqlx::test]
+    async fn recording_an_episode_never_moves_first_at_forward(pool: PgPool) {
+        let store = catalog(&pool);
+        let episode = || FieldConflict {
+            field: "duration".to_owned(),
+            service: "svc-a".to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: 1,
+            samples: Vec::new(),
+        };
+        store.record_conflicts(&[episode()]).await.unwrap();
+        sqlx::query(
+            "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+             WHERE field = $1",
+        )
+        .bind("duration")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        store.record_conflicts(&[episode()]).await.unwrap();
+
+        let (span_hours, episodes): (f64, i64) = sqlx::query_as(
+            "SELECT (extract(epoch FROM (last_at - first_at)) / 3600.0)::float8, episodes
+             FROM field_conflict_stats WHERE field = $1",
+        )
+        .bind("duration")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(episodes, 2, "the later episode was recorded");
+        assert!(
+            span_hours >= 47.9,
+            "the span must still be the backdated distance, not reset: {span_hours}h"
+        );
+    }
+
     /// The boot conformance pass accumulates conflicts across every file it
     /// rewrites, so ONE call routinely carries many rows for the same
     /// `(field, service)`. Postgres refuses to let one `ON CONFLICT DO

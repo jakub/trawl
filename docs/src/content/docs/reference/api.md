@@ -180,7 +180,10 @@ on it means `trawl schema repin`, which needs `schema_write` and a human.
 `row_count`, `first_seen`, `last_seen` and the `?since_secs=` window all
 describe that one service's observations, so a field another service is
 still sending does not keep showing up under a service that stopped. The
-same holds for `?service=` on `/api/v1/schema` above.
+same holds for `?service=` on `/api/v1/schema` above. The `verdict` is the
+exception, deliberately: a pin is global, so its verdict is always
+install-wide — under `?service=` the observation numbers describe that
+service while the verdict beside them describes the field.
 
 ```
 GET /api/v1/schema/field?name=duration

@@ -877,6 +877,13 @@ impl CatalogStore {
         // by aggregating in its caller, answered here in SQL because this
         // caller's rows are the evidence and may not be collapsed.
         //
+        // At-least-once, not exactly-once: the bookkeeping caller retries a
+        // transaction whose COMMIT ACK was lost, and this upsert would then
+        // add the same episodes and rows a second time. Accepted rather than
+        // carried on an idempotency key — the consequence is bounded to a
+        // slightly early or spurious badge on a field that IS conflicting,
+        // and the remedy it points at (a dry run) is free and reversible.
+        //
         // `last_at` is `now()`, not `GREATEST(existing, now())`: it is the
         // transaction's own clock, which cannot run backwards against a row
         // this same statement is the only writer of. `first_at` is left
@@ -996,6 +1003,15 @@ impl CatalogStore {
         GROUP BY field";
 
     /// [`Self::conflict_aggregates`], whole-catalog shape.
+    ///
+    /// Unkeyed and periodic (every schema-refresh tick, on every node), so
+    /// its SCAN axis is `field_conflict_stats` entire — which grows with the
+    /// distinct SERVICE names that have ever conflicted, an axis nothing
+    /// bounds. Measured at ~200ms over 1M rows, and accepted rather than
+    /// indexed or incrementalised: reaching that size means a sender
+    /// inventing service names AND conflicting under each one, which already
+    /// costs it a parquet file per hour per name, and the axis this RETURNS
+    /// is one row per field — pin-capped.
     const CONFLICT_AGGREGATES_ALL_SQL: &'static str = "\
         SELECT field, min(first_at) AS first_at, max(last_at) AS last_at,
                count(*)::bigint                      AS services,

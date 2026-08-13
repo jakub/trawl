@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Degraded-pin analyzer, evidence and query notice (ADR-0011 slice C1,
   #69).** trawl now concludes that a pin is doing sustained damage and
   says so everywhere the field is read. Conflict evidence gained the
-  values it is about it lose — up to five distinct misfit samples per
+  values it is about to lose — up to five distinct misfit samples per
   conflict row, byte-capped and control-sanitised, captured by
   compaction at null-time — plus durable per-`(field, service)`
   aggregates (first/last conflict, episodes, lifetime rows nulled)

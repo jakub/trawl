@@ -20,6 +20,15 @@
 -- therefore aggregates per FIELD in SQL — bounded by the pin cap — and never
 -- returns per-service rows unpaged.
 --
+-- The analyzer reads this table two ways: keyed to a page of field names
+-- (the schema routes) and UNKEYED once per schema-refresh tick, which
+-- aggregates the whole table. That periodic scan's axis grows with the
+-- distinct SERVICE names that have ever conflicted and nothing bounds it —
+-- measured at ~200ms over 1M rows, and accepted: reaching that size takes a
+-- sender inventing service names AND conflicting under each one, which
+-- already costs it a parquet file per hour per name, while the axis the read
+-- RETURNS is one row per field and therefore pin-capped.
+--
 -- Every constraint is NAMED, per the 0001 convention.
 CREATE TABLE field_conflict_stats (
     field             TEXT        NOT NULL,

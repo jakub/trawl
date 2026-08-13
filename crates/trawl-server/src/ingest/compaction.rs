@@ -3628,11 +3628,22 @@ mod tests {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE wal_batch AS \
-             SELECT 'v' || repeat('x', 200) || i::VARCHAR AS v FROM range(20000) s(i)",
+             SELECT 'v' || repeat('x', 200) || i::VARCHAR AS v FROM range(200000) s(i)",
         )
         .unwrap();
-        // Applied AFTER the fixture: the limit is for the queries.
-        conn.execute_batch("SET memory_limit='10MB'").unwrap();
+        // Applied AFTER the fixture: the settings are for the queries under
+        // test. The margin is deliberately an order of magnitude wide — the
+        // tally's two scalar aggregates need single-digit MB whatever the
+        // row count, while the capture must hold ~40MB of distinct values —
+        // so the outcome does not turn on how loaded the machine is. One
+        // thread for the same reason.
+        conn.execute_batch("SET threads=1").unwrap();
+        // No spilling: an over-limit query must FAIL, which is the
+        // production shape (a compactor that silently offloads 40MB of
+        // sample candidates to disk is its own problem) and keeps the test
+        // off DuckDB's temp-file path.
+        conn.execute_batch("SET temp_directory=''").unwrap();
+        conn.execute_batch("SET memory_limit='64MB'").unwrap();
 
         let schema = describe_source(&conn, "wal_batch").unwrap();
         let pins: HashMap<String, CanonicalType> = [("v".to_owned(), CanonicalType::BigInt)]
@@ -3649,38 +3660,119 @@ mod tests {
             .tally_conflicts(&conn, "wal_batch", "svc")
             .expect("a capture failure must not fail the conform");
         assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].rows_nulled, 20_000, "the counts are exact");
+        assert_eq!(conflicts[0].rows_nulled, 200_000, "the counts are exact");
         assert!(
             conflicts[0].samples.is_empty(),
             "evidence degrades to counts, and the values remain in _raw"
         );
     }
 
-    /// A batch that conflicts on nothing runs no sample query at all — the
+    /// A batch that conflicts on nothing runs no sample query at ALL — the
     /// capture is a second aggregate pass over client-width data, and a
-    /// healthy install must not pay it every tick. Asserted by giving the
-    /// capture a source that does not exist: building any SQL against it
-    /// would fail.
+    /// healthy install must not pay it every tick.
+    ///
+    /// Observed rather than assumed, through the one signal a swallowed
+    /// capture leaves: both fixtures are wide enough that a capture over
+    /// them exhausts the connection's memory limit, so a capture that ran
+    /// would bump the failure counter. The conflicting fixture proves the
+    /// probe has teeth; the clean one proves the capture never ran.
+    /// (Widening the sampled set from "the columns that conflicted" to
+    /// "every cast column" fails the second assertion.)
     #[test]
     fn a_batch_with_no_conflicts_runs_no_sample_query() {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE wal_batch AS SELECT '1' AS v")
+        // Distinct 200-byte values: enough that `list(DISTINCT …)` cannot
+        // fit inside the limit, while the two scalar tally aggregates fit
+        // inside it with an order of magnitude to spare (so the outcome
+        // does not turn on machine load). Settings are applied AFTER the
+        // fixture: they are for the queries under test, not their setup.
+        let capture_ran = |projection: &str, pin: CanonicalType| {
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE wal_batch AS SELECT {projection} AS v FROM range(200000) s(i)"
+            ))
             .unwrap();
+            conn.execute_batch("SET threads=1").unwrap();
+            conn.execute_batch("SET temp_directory=''").unwrap();
+            conn.execute_batch("SET memory_limit='64MB'").unwrap();
+
+            let schema = describe_source(&conn, "wal_batch").unwrap();
+            let pins: HashMap<String, CanonicalType> =
+                [("v".to_owned(), pin)].into_iter().collect();
+            let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
+            assert_eq!(plan.cast_count(), 1, "the column must be a cast column");
+
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let conflicts = metrics::with_local_recorder(&recorder, || {
+                plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap()
+            });
+            let ran = recorder
+                .handle()
+                .render()
+                .contains(crate::metrics::CATALOG_SAMPLE_CAPTURE_FAILURES_TOTAL);
+            (conflicts, ran)
+        };
+
+        // Unreadable under a BIGINT pin: every row conflicts, so the capture
+        // runs — and fails on this fixture, which is what makes the probe
+        // meaningful.
+        let (conflicts, ran) = capture_ran(
+            "'v' || repeat('x', 200) || i::VARCHAR",
+            CanonicalType::BigInt,
+        );
+        assert_eq!(conflicts.len(), 1);
+        assert!(ran, "the fixture must be wide enough to exhaust a capture");
+
+        // Same width, but a JSON source under a VARCHAR pin converts whole:
+        // a cast column that nulls nothing is not evidence, and must not be
+        // sampled.
+        let (conflicts, ran) = capture_ran(
+            "to_json('v' || repeat('x', 200) || i::VARCHAR)",
+            CanonicalType::Varchar,
+        );
+        assert!(
+            conflicts.is_empty(),
+            "the conform is lossless: {conflicts:?}"
+        );
+        assert!(!ran, "a clean batch must not run the capture at all");
+    }
+
+    /// At the sampled-column cap the evidence degrades, never the tally: a
+    /// batch conflicting on more columns than one capture pass may cover
+    /// still records every conflict, and only the columns past the cap lose
+    /// their samples. Which columns those are is decided by NAME, so a wide
+    /// batch samples the same fields whatever order it describes in.
+    #[test]
+    fn the_sampled_column_cap_drops_samples_not_conflicts() {
+        let cols = MAX_SAMPLED_CONFLICT_COLUMNS + 1;
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let projection = (0..cols)
+            .map(|i| format!("'nope' AS f{i:03}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!("CREATE TABLE wal_batch AS SELECT {projection}"))
+            .unwrap();
+
         let schema = describe_source(&conn, "wal_batch").unwrap();
-        let pins: HashMap<String, CanonicalType> = [("v".to_owned(), CanonicalType::BigInt)]
-            .into_iter()
+        let pins: HashMap<String, CanonicalType> = (0..cols)
+            .map(|i| (format!("f{i:03}"), CanonicalType::BigInt))
             .collect();
         let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
 
-        assert!(
-            plan.tally_conflicts(&conn, "wal_batch", "svc")
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            plan.capture_samples(&conn, "no_such_table", &[])
-                .unwrap()
-                .is_empty()
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        assert_eq!(conflicts.len(), cols, "every conflict is still counted");
+        assert!(conflicts.iter().all(|c| c.rows_nulled == 1));
+
+        let sampled = conflicts.iter().filter(|c| !c.samples.is_empty()).count();
+        assert_eq!(sampled, MAX_SAMPLED_CONFLICT_COLUMNS);
+        let unsampled: Vec<&str> = conflicts
+            .iter()
+            .filter(|c| c.samples.is_empty())
+            .map(|c| c.field.as_str())
+            .collect();
+        assert_eq!(
+            unsampled,
+            vec![format!("f{:03}", cols - 1)],
+            "the last column BY NAME is the one that loses its samples"
         );
     }
 
