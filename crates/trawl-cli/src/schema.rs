@@ -357,13 +357,21 @@ fn render_verdict<W: Write>(
     }
     label(out, human, &format!("  suggested:      {}", v.suggested_to))?;
 
-    // The remedy line is printed ONLY when the name survives that
-    // neutralisation unchanged. A sanitised spelling is a DIFFERENT string:
-    // pasted, it would repin some other field — or nothing, or (with enough
-    // bad luck) a real field whose name genuinely contains U+FFFD. A
-    // command whose argument is not the key it names must not be offered at
-    // all, however well quoted.
-    if shown == field {
+    // The remedy line is printed ONLY for a name a command line can carry
+    // as itself. Two ways it cannot, both reachable because ingest polices
+    // field names for length and case and nothing else:
+    //
+    // - it does not survive the neutralisation above, so the sanitised
+    //   spelling is a DIFFERENT string — pasted, it would repin some other
+    //   field, or nothing, or (with enough bad luck) a real field whose name
+    //   genuinely contains U+FFFD;
+    // - it starts with `-`, so the argument parser reads it as a flag
+    //   however it is quoted (executed: `unexpected argument '-x' found`).
+    //
+    // A `--` terminator would answer the second, but its interaction with
+    // the flags that follow is untested, and an offered command that does
+    // not work is worse than none.
+    if shown == field && !field.starts_with('-') {
         label(
             out,
             human,
@@ -377,10 +385,11 @@ fn render_verdict<W: Write>(
         label(
             out,
             human,
-            "  this field's name contains characters that cannot be printed \
-             safely, so no repin command is shown — take the exact name from \
-             `trawl schema field <name> -f json` (or GET /api/v1/schema/field) \
-             before running `trawl schema repin`",
+            "  this field's name cannot be safely embedded in a command line \
+             (it does not survive display sanitisation, or it begins with `-` \
+             and would be read as a flag), so no repin command is shown — take \
+             the exact name from `trawl schema field <name> -f json` (or GET \
+             /api/v1/schema/field) before running `trawl schema repin`",
         )
     }
 }
@@ -613,13 +622,36 @@ mod tests {
             "no runnable command at all: {text}"
         );
         assert!(
-            text.contains("cannot be printed safely"),
+            text.contains("cannot be safely embedded in a command line"),
             "the operator is told why, and where to get the real name: {text}"
         );
         assert!(
             !text.contains('\u{202e}'),
             "and the override still never reaches the terminal: {text}"
         );
+    }
+
+    /// A DASH-leading name is printable and shell-quotable but still cannot
+    /// be a command argument: the parser reads `'-x'` as a flag, quotes and
+    /// all (`unexpected argument '-x' found`). It takes the same note
+    /// branch, rather than an offered command that does not run.
+    #[test]
+    fn a_flag_shaped_field_name_gets_no_command() {
+        for name in ["-x", "--to"] {
+            let mut buf = Vec::new();
+            render_verdict(&mut buf, true, name, &sample_verdict()).unwrap();
+            let text = String::from_utf8(buf).unwrap();
+
+            assert!(text.contains("episodes:       7"), "{name}: {text}");
+            assert!(
+                !text.contains("--dry-run"),
+                "{name}: a command clap would reject must not be offered: {text}"
+            );
+            assert!(
+                text.contains("cannot be safely embedded in a command line"),
+                "{name}: {text}"
+            );
+        }
     }
 
     #[test]
