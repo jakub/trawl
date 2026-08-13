@@ -531,3 +531,87 @@ corpus.
 
 **The manual `UPDATE field_types` surgery escape hatch is retired: the
 supported path is `trawl schema repin` / `POST /api/v1/schema/repin`.**
+
+## Amendment (2026-08-12): slice C prepped — six rulings, shipped as C1 + C2
+
+The slice C prep resolved the design forks its Decisions bullet left as
+prose. It ships as two PRs: **C1** — evidence capture, the analyzer, the
+wire surface and the query notice (API/CLI complete on its own); **C2** —
+the SPA operator surface, a pure caller of C1's contract.
+
+### 1. The analyzer is a read-time function plus one cache, not a daemon
+
+The verdict is computed inside the catalog read model (a pure function
+over durable evidence, thresholds as named code constants, unit-tested),
+plus ONE in-process degraded-fields set refreshed on the existing
+schema-refresh tick — needed because the query path never touches
+postgres and the notice (ruling 4) is stamped there. No verdict table,
+no new background task, no staleness or reconcile states: a decision
+*record* becomes necessary only when auto-repin exists to consume it,
+and that slice can add its own persistence.
+
+### 2. Evidence gains samples and durable aggregates, in the one writer
+
+`field_conflicts` rows gain a small bounded set of misfit sample values
+(distinct, count- and byte-capped), captured by compaction at null-time —
+the only place the misfit value is ever in hand; anything later means
+re-scanning `_raw`. A new per-`(field, service)` aggregate table
+(`first_at`, `last_at`, `episodes`, `rows_nulled_total` — the
+`field_services` shape and windowing discipline) gives the analyzer its
+"sustained" signal durably: the 100-row recency cap on `field_conflicts`
+remains an evidence-detail window, and a burst can no longer evict the
+history the verdict is judged on. Both are written in the same
+`record_conflicts` transaction — the one-builder doctrine, extended to
+evidence.
+
+### 3. The multi-sender gate is dropped — deliberately looser than the
+Decisions prose
+
+The slice C bullet said "from more than one sender". Ruled out at prep:
+this is a single-node product, and a homelab/SMB install commonly has
+exactly one legitimate producer per field — the bar would make the badge
+unreachable precisely where it is most useful (one nginx sending
+`status="accepted"` for a week IS the case). Degraded is therefore:
+evidence span ≥ 24h AND a volume floor (shelved rows OR distinct
+episodes) — sender count is displayed evidence, never a gate. Residual,
+recorded: the badge is sender-influenceable advisory signal; the control
+against a hostile sender steering an operator toward archive rewrites
+remains the human-approval doctrine plus `schema_write` — and any future
+auto-repin must re-raise its own evidence bar (the opt-in bullet above
+already demands "sustained evidence" on its own terms).
+
+### 4. The incomplete-results notice is a wire fact, stamped server-side
+
+`QueryResponse` gains the degraded-fields list: fields REFERENCED by the
+query (filters and pipeline expressions included — a `where` on a
+degraded field that projects it away is exactly the incomplete case)
+intersected with the in-process degraded set. Wire-level, so every
+consumer — SPA, CLI, TUI — gets the notice, per the API-is-the-feature
+doctrine. Staleness is bounded by one refresh tick, which is fine for a
+condition measured in days. The SSE stream keeps its compile-time
+snapshot semantics and carries no notice — a named residual beside its
+existing keep-pins-until-reconnect one.
+
+### 5. The verdict is structured facts, never stored prose
+
+On the wire: since-when, sender count, episodes, shelved-row count,
+sample values, suggested target type. The UI renders the plain words.
+The suggested target comes from the misfit evidence — observed types
+uniformly one ladder rung suggest that rung; mixed or stringy misfits
+suggest VARCHAR, the enum-shaped field's honest home per this ADR's
+framing decision.
+
+### 6. The operator surface is the schema page's existing anatomy (C2)
+
+One schema page, no new top-level views: service rows carry a
+degraded-field count (honest — evidence is per-`(field, service)`, so
+every degraded field is reachable through at least one badged service);
+the service drawer's fields tab badges degraded fields; clicking one
+drills the drawer into the field case file (back arrow, URL-synced
+`?field=`), which works standalone as the deep-link target the query
+notice points at, and states plainly that a repin rewrites the whole
+corpus, not the service it was reached through. Job progress polls the
+status route only while the drawer is open and a job runs (the CLI's
+`--wait` already blessed polling); completion is a toast receipt. The
+install-wide "every degraded field" listing stays on the CLI/API
+(`trawl schema fields`) rather than growing a SPA table.
