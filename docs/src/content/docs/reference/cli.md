@@ -41,7 +41,18 @@ trawl query -f csv "..."        # RFC 4180 with formula injection protection
 trawl query -f parquet -o out.parquet "..."  # Snappy-compressed parquet file
 ```
 
-**Table** output includes a row count footer and box-drawing borders.
+**Table** output includes a row count footer and box-drawing borders. When
+the query bound a field whose catalog pin is degraded (see below), one more
+footer line follows:
+
+```
+note: results may be incomplete — degraded field(s): duration (see: trawl schema field duration)
+```
+
+The notice is table-only: json/csv carry the same fact as a
+`degraded_fields` list on the wire, where a prose line would corrupt the
+stream. With `--output <file>` it goes to stderr, so the file stays clean.
+Embedded `--data` mode has no catalog and never prints it.
 
 **JSON** output emits one JSON object per row, ndjson-style. Ideal for piping to `jq`:
 
@@ -92,6 +103,50 @@ trawl schema conflicts --field duration --service envoy
 catalog fill (`N/M pins used`) to stderr; `--limit` raises the listing
 caps (fields default 500, conflicts default 100/max 1000). `--last`
 accepts DSL-style windows (`s`, `m`, `h`, `d`, `w`).
+
+### Degraded pins
+
+`fields` carries a `degraded` column, and its stderr summary counts them:
+a pin is degraded when it has been shelving values for **over a day** and
+in volume (100 rows or 3 distinct episodes). `schema field <name>` then
+renders the case file — when the damage started, how many senders and
+episodes, the lifetime rows shelved, a sample of the values that were
+nulled, and the repin command to run:
+
+```
+degraded pin:
+  since:          2026-08-01T10:00:00.000000Z
+  senders:        2
+  episodes:       41
+  rows shelved:   1290 (lifetime)
+  sample values:
+    - n/a
+    - pending
+  suggested:      VARCHAR
+  trawl schema repin duration --to varchar --dry-run
+```
+
+`rows shelved` is the lifetime total; the `rows_nulled` column in the
+conflict table below it sums only the evidence still inside the per-field
+recency window, so the two differ on purpose. Every shelved value remains
+in `_raw`. The verdict is advisory — nothing repins without `--yes` and
+`schema_write`.
+
+**Retiring a badge after fixing the sender.** The gate has no recency term:
+evidence is never aged out, so a field stays badged after its shipper is
+corrected. That is on purpose — the shelved rows are still missing from the
+corpus. Clearing both is one command, the same-type pass:
+
+```bash
+trawl schema repin duration --to bigint --force --dry-run   # `bigint` = the current pin
+trawl schema repin duration --to bigint --force --yes
+```
+
+A repin whose target equals the current pin is the **resurrection-only**
+pass: it re-extracts the shelved values from `_raw` under the pin they
+already have, and — because a successful repin clears the field's conflict
+evidence in the same transaction as the flip — the badge goes out with the
+damage it was reporting. Repinning to a *different* type does both as well.
 
 `field` pages its service observations — the service axis is client-chosen
 and never pruned, so the server caps a page at 1000 rows (default 100).

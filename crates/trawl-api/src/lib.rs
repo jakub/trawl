@@ -328,6 +328,16 @@ pub struct QueryResponse {
     pub truncated: bool,
     /// Pagination metadata.
     pub pagination: PaginationMeta,
+    /// Fields the query BOUND whose catalog pin the analyzer currently calls
+    /// degraded (ADR-0011 slice C1) — the results may be missing values that
+    /// pin shelved. Includes fields the query filtered on and projected away;
+    /// absent from the wire when empty, which is the healthy case.
+    ///
+    /// Bounded by one schema-refresh tick of staleness, and carried by
+    /// `/api/v1/query` only: the SSE stream keeps its compile-time snapshot
+    /// semantics, and embedded `--data` mode has no catalog to consult.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_fields: Vec<String>,
 }
 
 /// Pagination metadata for query responses.
@@ -749,8 +759,46 @@ pub struct CatalogFieldSummary {
     pub last_seen: Option<String>,
     /// Conflict evidence rows currently retained.
     pub conflict_count: u64,
-    /// Total rows nulled across the retained evidence.
+    /// Total rows nulled across the retained evidence — the TRIMMED
+    /// window's sum, not a lifetime total (see [`DegradedVerdict`]).
     pub rows_nulled: u64,
+    /// The analyzer's verdict, present only when the pin is degraded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<DegradedVerdict>,
+}
+
+/// The analyzer's verdict on a degraded field (ADR-0011 slice C1): the pin
+/// has been shelving values for long enough, and in enough volume, that an
+/// operator should decide whether to repin it.
+///
+/// Structured FACTS only — the consumer writes the words. A stored sentence
+/// would fix the phrasing of every current and future surface (CLI table,
+/// SPA drawer, an eventual auto-repin's decision record) at the moment the
+/// evidence was recorded.
+///
+/// The verdict is advisory and sender-influenceable by construction: a
+/// single misbehaving producer can raise it (there is deliberately no
+/// multi-sender gate — a homelab commonly has exactly one producer per
+/// field). What it can never do is act: repinning stays behind
+/// `schema_write` and a human.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DegradedVerdict {
+    /// Earliest conflict evidence for the field (ISO 8601 UTC).
+    pub since: String,
+    /// Distinct services in the evidence. DISPLAYED, never a gate.
+    pub services: u64,
+    /// Distinct conflict episodes across every service.
+    pub episodes: u64,
+    /// Lifetime rows the pin has nulled — durable, and therefore usually
+    /// LARGER than the sibling `rows_nulled` fields, which sum only the
+    /// evidence rows still inside the per-field recency window.
+    pub rows_shelved: u64,
+    /// A bounded sample of the values that were shelved, newest evidence
+    /// first. A sample, never a manifest — every value stays in `_raw`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<String>,
+    /// The type the evidence suggests repinning to (a `DuckDB` spelling).
+    pub suggested_to: String,
 }
 
 /// Response from `GET /api/v1/schema/field?name=` — one field's pin,
@@ -778,6 +826,9 @@ pub struct CatalogFieldResponse {
     /// Retained conflict evidence, most recent first. Bounded by the
     /// catalog's per-field evidence cap, so it needs no cursor.
     pub conflicts: Vec<CatalogConflictRow>,
+    /// The analyzer's verdict, present only when the pin is degraded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<DegradedVerdict>,
 }
 
 /// One service's observation of a field.
@@ -816,6 +867,11 @@ pub struct CatalogConflictRow {
     pub expected_type: String,
     /// Rows whose value the cast nulled (recoverable from `_raw`).
     pub rows_nulled: u64,
+    /// A bounded sample of the values this cast nulled. Empty for evidence
+    /// recorded before the capture shipped, and for the repin rewrite,
+    /// which counts its nulls without materialising them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub samples: Vec<String>,
     /// When the conflict was recorded (ISO 8601 UTC).
     pub at: String,
 }
@@ -1165,6 +1221,7 @@ mod tests {
                 last_seen: Some("2026-08-02T10:00:00Z".into()),
                 conflict_count: 1,
                 rows_nulled: 1,
+                verdict: None,
             }],
             pinned_total: 12,
             pin_capacity: 10_000,
@@ -1205,8 +1262,17 @@ mod tests {
                 observed_type: "VARCHAR".into(),
                 expected_type: "BIGINT".into(),
                 rows_nulled: 1,
+                samples: vec!["n/a".into()],
                 at: "2026-08-02T11:00:00Z".into(),
             }],
+            verdict: Some(DegradedVerdict {
+                since: "2026-08-01T10:00:00Z".into(),
+                services: 1,
+                episodes: 4,
+                rows_shelved: 120,
+                samples: vec!["n/a".into(), "pending".into()],
+                suggested_to: "VARCHAR".into(),
+            }),
         };
         let rt = roundtrip(&resp);
         assert_eq!(rt.name, "duration");
@@ -1219,6 +1285,45 @@ mod tests {
         assert_eq!(rt.services[0].service, "nginx");
         assert_eq!(rt.conflicts.len(), 1);
         assert_eq!(rt.conflicts[0].expected_type, "BIGINT");
+        assert_eq!(rt.conflicts[0].samples, vec!["n/a".to_owned()]);
+        let verdict = rt.verdict.expect("the verdict survives the wire");
+        assert_eq!(verdict.rows_shelved, 120);
+        assert_eq!(verdict.suggested_to, "VARCHAR");
+    }
+
+    /// A healthy field carries no `verdict` KEY and no `samples` key at all
+    /// — the bytes an existing client sees are unchanged, and "absent" is
+    /// the only encoding of "not degraded".
+    #[test]
+    fn a_healthy_field_serialises_without_the_new_keys() {
+        let resp = CatalogFieldsResponse {
+            fields: vec![CatalogFieldSummary {
+                name: "duration".into(),
+                data_type: "BIGINT".into(),
+                pinned_from: None,
+                pinned_at: "2026-08-01T10:00:00Z".into(),
+                service_count: 1,
+                row_count: 5,
+                first_seen: None,
+                last_seen: None,
+                conflict_count: 0,
+                rows_nulled: 0,
+                verdict: None,
+            }],
+            pinned_total: 1,
+            pin_capacity: 10_000,
+            truncated: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("verdict"), "{json}");
+
+        // And an old body without the key still deserialises.
+        let old = r#"{"fields":[{"name":"duration","type":"BIGINT",
+            "pinned_at":"2026-08-01T10:00:00Z","service_count":1,"row_count":5,
+            "conflict_count":0,"rows_nulled":0}],
+            "pinned_total":1,"pin_capacity":10000,"truncated":false}"#;
+        let parsed: CatalogFieldsResponse = serde_json::from_str(old).unwrap();
+        assert!(parsed.fields[0].verdict.is_none());
     }
 
     #[test]
@@ -1230,6 +1335,7 @@ mod tests {
                 observed_type: "VARCHAR".into(),
                 expected_type: "BIGINT".into(),
                 rows_nulled: 3,
+                samples: Vec::new(),
                 at: "2026-08-02T11:00:00Z".into(),
             }],
             truncated: true,

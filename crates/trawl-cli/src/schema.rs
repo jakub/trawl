@@ -75,6 +75,7 @@ pub fn fields_to_rows(resp: &CatalogFieldsResponse) -> (Vec<String>, Vec<Vec<Jso
         "last_seen",
         "conflicts",
         "rows_nulled",
+        "degraded",
     ]
     .map(str::to_owned)
     .to_vec();
@@ -92,6 +93,7 @@ pub fn fields_to_rows(resp: &CatalogFieldsResponse) -> (Vec<String>, Vec<Vec<Jso
                 f.last_seen.clone().map_or(Json::Null, Json::from),
                 Json::from(f.conflict_count),
                 Json::from(f.rows_nulled),
+                Json::from(f.verdict.is_some()),
             ]
         })
         .collect();
@@ -254,10 +256,16 @@ pub async fn run_fields<W: Write>(
 
     let (columns, rows) = fields_to_rows(&resp);
     render(out, &columns, &rows, format)?;
+    let degraded = resp.fields.iter().filter(|f| f.verdict.is_some()).count();
     eprintln!(
-        "{}/{} pins used{}",
+        "{}/{} pins used{}{}",
         resp.pinned_total,
         resp.pin_capacity,
+        if degraded > 0 {
+            format!(", {degraded} degraded (see: trawl schema field <name>)")
+        } else {
+            String::new()
+        },
         if resp.truncated {
             " (listing truncated — raise --limit)"
         } else {
@@ -294,6 +302,10 @@ pub async fn run_field<W: Write>(
     )?;
     label(out, human, &format!("pinned at:   {}", resp.pinned_at))?;
 
+    if let Some(v) = &resp.verdict {
+        render_verdict(out, human, &resp.name, v)?;
+    }
+
     label(out, human, "\nservices:")?;
     let (columns, rows) = field_services_to_rows(&resp);
     render(out, &columns, &rows, format)?;
@@ -307,6 +319,99 @@ pub async fn run_field<W: Write>(
         render(out, &columns, &rows, format)?;
     }
     Ok(())
+}
+
+/// The case file for a degraded pin: the analyzer's facts, the values the
+/// pin is shelving, and the one command that fixes it.
+///
+/// Facts only, phrased here rather than stored (ADR-0011 slice C ruling 5).
+/// "rows shelved" is the LIFETIME total from the durable aggregates, which
+/// is a different number from the `rows_nulled` column in the conflict table
+/// below it — that one sums only the evidence rows still inside the
+/// per-field recency window — so the two are labelled apart on purpose.
+fn render_verdict<W: Write>(
+    out: &mut W,
+    human: bool,
+    field: &str,
+    v: &trawl_client::DegradedVerdict,
+) -> Result<(), CliError> {
+    // A field name is a client-chosen JSON key that ingest polices for
+    // length and case ONLY: a name carrying `;` and a shell command, or a
+    // bidi override, is legal — and the last line here is written to be
+    // pasted into a shell. Every rendering of the name is neutralised.
+    let shown = trawl_core::sanitize::sanitize_display_text(field);
+    label(out, human, "\ndegraded pin:")?;
+    label(out, human, &format!("  since:          {}", v.since))?;
+    label(out, human, &format!("  senders:        {}", v.services))?;
+    label(out, human, &format!("  episodes:       {}", v.episodes))?;
+    label(
+        out,
+        human,
+        &format!("  rows shelved:   {} (lifetime)", v.rows_shelved),
+    )?;
+    if !v.samples.is_empty() {
+        label(out, human, "  sample values:")?;
+        for sample in &v.samples {
+            label(out, human, &format!("    - {sample}"))?;
+        }
+    }
+    label(out, human, &format!("  suggested:      {}", v.suggested_to))?;
+
+    // The remedy line is printed ONLY for a name a command line can carry
+    // as itself. Two ways it cannot, both reachable because ingest polices
+    // field names for length and case and nothing else:
+    //
+    // - it does not survive the neutralisation above, so the sanitised
+    //   spelling is a DIFFERENT string — pasted, it would repin some other
+    //   field, or nothing, or (with enough bad luck) a real field whose name
+    //   genuinely contains U+FFFD;
+    // - it starts with `-`, so the argument parser reads it as a flag
+    //   however it is quoted (executed: `unexpected argument '-x' found`).
+    //
+    // A `--` terminator would answer the second, but its interaction with
+    // the flags that follow is untested, and an offered command that does
+    // not work is worse than none.
+    if shown == field && !field.starts_with('-') {
+        label(
+            out,
+            human,
+            &format!(
+                "  trawl schema repin {} --to {} --dry-run",
+                shell_quote(&shown),
+                v.suggested_to.to_ascii_lowercase()
+            ),
+        )
+    } else {
+        label(
+            out,
+            human,
+            "  this field's name cannot be safely embedded in a command line \
+             (it does not survive display sanitisation, or it begins with `-` \
+             and would be read as a flag), so no repin command is shown — take \
+             the exact name from `trawl schema field <name> -f json` (or GET \
+             /api/v1/schema/field) before running `trawl schema repin`",
+        )
+    }
+}
+
+/// `arg` as one POSIX shell word.
+///
+/// Bare when the name is already a shell-inert token — which every ordinary
+/// field name is, and the common case must stay copy-pasteable-looking —
+/// otherwise single-quoted, with embedded quotes closed and reopened
+/// (`'\''`), the one escape that works inside single quotes. Single quotes
+/// rather than double because nothing inside them expands: no `$`, no
+/// backtick, no backslash.
+fn shell_quote(arg: &str) -> String {
+    let bare = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if bare {
+        arg.to_owned()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
 }
 
 /// `trawl schema conflicts [--field] [--service] [--last] [--limit]`.
@@ -353,10 +458,22 @@ mod tests {
                 last_seen: Some("2026-08-02T10:00:00Z".into()),
                 conflict_count: 1,
                 rows_nulled: 3,
+                verdict: None,
             }],
             pinned_total: 11,
             pin_capacity: 10_000,
             truncated: false,
+        }
+    }
+
+    fn sample_verdict() -> trawl_client::DegradedVerdict {
+        trawl_client::DegradedVerdict {
+            since: "2026-08-01T10:00:00Z".into(),
+            services: 2,
+            episodes: 7,
+            rows_shelved: 240,
+            samples: vec!["n/a".into(), "pending".into()],
+            suggested_to: "VARCHAR".into(),
         }
     }
 
@@ -368,6 +485,7 @@ mod tests {
                 observed_type: "VARCHAR".into(),
                 expected_type: "BIGINT".into(),
                 rows_nulled: 3,
+                samples: vec!["n/a".into()],
                 at: "2026-08-02T11:00:00Z".into(),
             }],
             truncated: true,
@@ -425,6 +543,127 @@ mod tests {
         assert_eq!(rows[0][5], Json::from(3u64));
     }
 
+    /// The degraded column is the listing's badge, and the summary counts
+    /// what it badged.
+    #[test]
+    fn fields_to_rows_carries_the_degraded_flag() {
+        let mut resp = sample_fields();
+        let (cols, rows) = fields_to_rows(&resp);
+        assert_eq!(cols.last().unwrap(), "degraded");
+        assert_eq!(rows[0].last().unwrap(), &Json::from(false));
+
+        resp.fields[0].verdict = Some(sample_verdict());
+        let (_, rows) = fields_to_rows(&resp);
+        assert_eq!(rows[0].last().unwrap(), &Json::from(true));
+    }
+
+    /// The case file states the facts, shows the values, and ends with the
+    /// exact command that fixes it — with the lifetime total labelled apart
+    /// from the windowed `rows_nulled` in the conflict table below it.
+    #[test]
+    fn the_case_file_renders_facts_samples_and_the_remedy() {
+        let mut buf = Vec::new();
+        render_verdict(&mut buf, true, "duration", &sample_verdict()).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("degraded pin:"), "{text}");
+        assert!(
+            text.contains("since:          2026-08-01T10:00:00Z"),
+            "{text}"
+        );
+        assert!(text.contains("senders:        2"), "{text}");
+        assert!(text.contains("episodes:       7"), "{text}");
+        assert!(text.contains("rows shelved:   240 (lifetime)"), "{text}");
+        assert!(text.contains("    - n/a"), "{text}");
+        assert!(text.contains("suggested:      VARCHAR"), "{text}");
+        assert!(
+            text.contains("trawl schema repin duration --to varchar --dry-run"),
+            "the remedy is copy-pasteable: {text}"
+        );
+    }
+
+    /// A field name is client-chosen text that ingest polices for length and
+    /// case only, and the remedy line is written to be pasted into a shell.
+    /// A name that survives sanitisation unchanged is quoted and printed.
+    #[test]
+    fn the_remedy_line_quotes_a_hostile_field_name() {
+        let mut buf = Vec::new();
+        render_verdict(&mut buf, true, "x; touch pwned", &sample_verdict()).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("trawl schema repin 'x; touch pwned' --to varchar --dry-run"),
+            "a command-injecting name is one shell word: {text}"
+        );
+
+        let mut buf = Vec::new();
+        render_verdict(&mut buf, true, "it's ok", &sample_verdict()).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("repin 'it'\\''s ok' --to varchar"),
+            "an embedded quote closes and reopens: {text}"
+        );
+    }
+
+    /// A name the sanitiser CHANGES cannot be named by a command: the
+    /// printed spelling is a different string, and repinning the wrong
+    /// field rewrites the wrong corpus. The verdict facts still render.
+    #[test]
+    fn a_name_that_cannot_be_printed_gets_no_command() {
+        let mut buf = Vec::new();
+        render_verdict(&mut buf, true, "bad\u{202e}name", &sample_verdict()).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+
+        assert!(text.contains("rows shelved:   240 (lifetime)"), "{text}");
+        assert!(
+            !text.contains("trawl schema repin bad"),
+            "no command may name the sanitised spelling: {text}"
+        );
+        assert!(
+            !text.contains("--dry-run"),
+            "no runnable command at all: {text}"
+        );
+        assert!(
+            text.contains("cannot be safely embedded in a command line"),
+            "the operator is told why, and where to get the real name: {text}"
+        );
+        assert!(
+            !text.contains('\u{202e}'),
+            "and the override still never reaches the terminal: {text}"
+        );
+    }
+
+    /// A DASH-leading name is printable and shell-quotable but still cannot
+    /// be a command argument: the parser reads `'-x'` as a flag, quotes and
+    /// all (`unexpected argument '-x' found`). It takes the same note
+    /// branch, rather than an offered command that does not run.
+    #[test]
+    fn a_flag_shaped_field_name_gets_no_command() {
+        for name in ["-x", "--to"] {
+            let mut buf = Vec::new();
+            render_verdict(&mut buf, true, name, &sample_verdict()).unwrap();
+            let text = String::from_utf8(buf).unwrap();
+
+            assert!(text.contains("episodes:       7"), "{name}: {text}");
+            assert!(
+                !text.contains("--dry-run"),
+                "{name}: a command clap would reject must not be offered: {text}"
+            );
+            assert!(
+                text.contains("cannot be safely embedded in a command line"),
+                "{name}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_quoting_leaves_ordinary_names_bare() {
+        for name in ["duration", "http.status_code", "a-b_c", "9lives"] {
+            assert_eq!(shell_quote(name), name);
+        }
+        assert_eq!(shell_quote(""), "''", "an empty word still needs quotes");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("$(id)"), "'$(id)'");
+    }
+
     #[test]
     fn field_detail_converters_split_services_and_conflicts() {
         let resp = CatalogFieldResponse {
@@ -440,6 +679,7 @@ mod tests {
             }],
             services_cursor: None,
             conflicts: sample_conflicts().conflicts,
+            verdict: None,
         };
         let (cols, rows) = field_services_to_rows(&resp);
         assert_eq!(cols, vec!["service", "first_seen", "last_seen", "rows"]);

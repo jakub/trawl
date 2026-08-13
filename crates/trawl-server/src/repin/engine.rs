@@ -821,6 +821,11 @@ impl RepinEngine {
                 observed_type: from.as_duckdb().to_owned(),
                 expected_type: to,
                 rows_nulled,
+                // The rewrite counts what it nulled per service; it never
+                // materialises the values (a rewrite that carried them back
+                // would be a second full pass over the corpus for evidence
+                // the operator asked for this repin in spite of).
+                samples: Vec::new(),
             })
             .collect();
         if !conflicts.is_empty()

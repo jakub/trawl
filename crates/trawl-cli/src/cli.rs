@@ -81,9 +81,10 @@ pub async fn run_query(
         ));
     }
 
-    let result = if let Some(data) = data {
+    let (result, degraded) = if let Some(data) = data {
         match run_embedded_mode(data, query, timezone) {
-            Ok(r) => r,
+            // Embedded mode has no catalog, so it has no notice to carry.
+            Ok(r) => (r, Vec::new()),
             Err(CliError::Engine(ref engine_err)) => {
                 render_engine_error(query, engine_err);
                 return Err(CliError::Usage("query failed".into()));
@@ -114,6 +115,8 @@ pub async fn run_query(
             OutputFormat::Csv => render_csv(&result, &mut file)?,
             OutputFormat::Parquet => unreachable!("handled above"),
         }
+        // The file is the deliverable; the notice belongs on the terminal.
+        write_degraded_footer(&mut io::stderr(), format, &degraded)?;
     } else {
         let stdout = io::stdout();
         let mut out = stdout.lock();
@@ -123,9 +126,34 @@ pub async fn run_query(
             OutputFormat::Csv => render_csv(&result, &mut out)?,
             OutputFormat::Parquet => unreachable!("handled above"),
         }
+        write_degraded_footer(&mut out, format, &degraded)?;
     }
 
     Ok(())
+}
+
+/// The incomplete-results footer (ADR-0011 slice C1): one line after the
+/// row count when the query bound a field whose pin is shelving values.
+///
+/// Table output only. json/csv/parquet carry `degraded_fields` on the wire
+/// — that IS the notice for a machine — and a prose line in a machine format
+/// is a parse error waiting to happen. One sentence, no advice beyond where
+/// to look: the case file holds the evidence and the remedy.
+fn write_degraded_footer(
+    out: &mut impl Write,
+    format: OutputFormat,
+    fields: &[String],
+) -> io::Result<()> {
+    if format != OutputFormat::Table || fields.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "note: results may be incomplete — degraded field(s): {} \
+         (see: trawl schema field {})",
+        fields.join(", "),
+        fields[0]
+    )
 }
 
 /// Validate a DSL query.
@@ -198,12 +226,12 @@ async fn run_daemon_mode(
     conn: &ConnectionParams,
     query: &str,
     timezone: &str,
-) -> Result<QueryResult, CliError> {
+) -> Result<(QueryResult, Vec<String>), CliError> {
     let client = make_client(conn)?;
     let response = client
         .query_paginated_tz(query, None, None, Some(timezone.to_owned()))
         .await?;
-    Ok(response.result)
+    Ok((response.result, response.degraded_fields))
 }
 
 /// Execute the query locally with an embedded `DuckDB` engine.
@@ -540,6 +568,32 @@ fn csv_escape_json(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The notice is a TABLE-only footer: a machine format carries the
+    /// wire field instead, and a prose line inside ndjson or CSV would
+    /// corrupt it.
+    #[test]
+    fn the_degraded_footer_is_table_only() {
+        let fields = vec!["duration".to_owned(), "status".to_owned()];
+        let render = |format, fields: &[String]| {
+            let mut buf = Vec::new();
+            write_degraded_footer(&mut buf, format, fields).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+
+        let footer = render(OutputFormat::Table, &fields);
+        assert_eq!(
+            footer.trim(),
+            "note: results may be incomplete — degraded field(s): duration, status \
+             (see: trawl schema field duration)"
+        );
+        assert!(render(OutputFormat::Json, &fields).is_empty());
+        assert!(render(OutputFormat::Csv, &fields).is_empty());
+        assert!(
+            render(OutputFormat::Table, &[]).is_empty(),
+            "a healthy query prints nothing at all"
+        );
+    }
 
     #[test]
     fn csv_negative_number_not_prefixed() {

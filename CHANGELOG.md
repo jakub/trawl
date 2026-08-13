@@ -7,6 +7,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Degraded-pin analyzer, evidence and query notice (ADR-0011 slice C1,
+  #69).** trawl now concludes that a pin is doing sustained damage and
+  says so everywhere the field is read. Conflict evidence gained the
+  values it is about to lose — up to five distinct misfit samples per
+  conflict row, byte-capped and control-sanitised, captured by
+  compaction at null-time — plus durable per-`(field, service)`
+  aggregates (first/last conflict, episodes, lifetime rows nulled)
+  written in the same transaction, so the 100-row recency window can no
+  longer evict the history a verdict rests on. A pure read-time
+  **analyzer** calls a pin degraded when its evidence spans ≥24h *and*
+  carries volume (≥100 rows shelved or ≥3 episodes); sender count is
+  displayed evidence, never a gate. `GET /api/v1/schema/fields` and
+  `/schema/field?name=` carry a structured `verdict` (since, senders,
+  episodes, lifetime rows shelved, sample values, suggested target type
+  — uniform misfit rung, else `VARCHAR`) under the existing
+  `schema_read` gate; conflict rows carry their samples;
+  `trawl_catalog_degraded_fields` gauges the count. `POST /api/v1/query`
+  stamps `degraded_fields` — the degraded fields the query **bound**,
+  including ones it filtered on and projected away — refreshed on the
+  existing schema tick (SSE and embedded `--data` carry no notice).
+  `trawl schema fields` marks degraded pins and counts them, `trawl
+  schema field <name>` renders the case file with samples and the exact
+  `trawl schema repin` command, and `trawl query` table output appends
+  one footer line (json/csv carry the wire field untouched). A
+  successful repin clears the field's evidence in the cutover
+  transaction, so the badge goes out when the remedy is applied. The
+  verdict is advisory and sender-influenceable by construction: nothing
+  repins without `schema_write` and a human. Note that `schema_read` now
+  exposes fragments of event VALUES — the captured samples — where it
+  previously carried names, types and counts only.
 - **Operator-triggered field repin (ADR-0011 slice B, #53).** A
   wrongly-pinned catalog field can be retyped to any candidate-ladder
   type with one command: `trawl schema repin <field> --to <type>` /

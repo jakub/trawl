@@ -79,6 +79,22 @@ Content-Type: application/json
 
 Execute a DSL query. Returns results as a JSON array of row objects.
 
+The response may also carry `degraded_fields` — the fields the query
+**bound** (filters, `where`/`let` expressions, group-by and sort keys)
+whose catalog pin the analyzer currently calls degraded, meaning results
+may be missing values that pin shelved. Fields the query filtered on and
+then projected away are included: that is exactly the incomplete case.
+The key is **absent when empty**, which is the ordinary case. Freshness is
+bounded by one schema-refresh tick (`schema_cache_ttl_secs`, default 60s).
+The SSE stream carries no notice, and embedded `--data` mode has no
+catalog to consult.
+
+```json
+{ "columns": [], "rows": [], "truncated": false,
+  "pagination": { "limit": 1000, "offset": 0, "returned": 12 },
+  "degraded_fields": ["duration"] }
+```
+
 ### Validate
 
 ```
@@ -133,11 +149,41 @@ first/last observation, and conflict counts. The response carries
 `pinned_total` / `pin_capacity` (catalog fill) and `truncated` (the
 default limit is 500, clamped to the pin cap).
 
+A field whose pin is doing sustained damage also carries a `verdict`
+object (absent otherwise — there is no null verdict):
+
+```json
+{ "name": "duration", "type": "BIGINT", "conflict_count": 12,
+  "rows_nulled": 34,
+  "verdict": { "since": "2026-08-01T10:00:00.000000Z", "services": 2,
+               "episodes": 41, "rows_shelved": 1290,
+               "samples": ["n/a", "pending"], "suggested_to": "VARCHAR" } }
+```
+
+Degraded means the conflict evidence **spans at least 24 hours** and
+carries volume — 100 rows shelved or 3 distinct episodes. Sender count is
+displayed evidence, never a gate: one producer sending `status="accepted"`
+for a week is exactly the case worth surfacing. The verdict is structured
+facts only; the words are the client's.
+
+Two numbers that look alike and are not: `rows_nulled` sums the conflict
+rows still inside the per-field recency window, while `rows_shelved` is
+the **lifetime** total from durable aggregates the window cannot evict.
+`samples` are a bounded, de-duplicated set of the values the pin nulled —
+a sample, never a manifest; every one of them remains in `_raw`.
+
+The verdict is advisory and sender-influenceable by construction: acting
+on it means `trawl schema repin`, which needs `schema_write` and a human.
+`trawl_catalog_degraded_fields` gauges how many pins currently qualify.
+
 `?service=` scopes the numbers, not just the row set: `service_count`,
 `row_count`, `first_seen`, `last_seen` and the `?since_secs=` window all
 describe that one service's observations, so a field another service is
 still sending does not keep showing up under a service that stopped. The
-same holds for `?service=` on `/api/v1/schema` above.
+same holds for `?service=` on `/api/v1/schema` above. The `verdict` is the
+exception, deliberately: a pin is global, so its verdict is always
+install-wide — under `?service=` the observation numbers describe that
+service while the verdict beside them describes the field.
 
 ```
 GET /api/v1/schema/field?name=duration
@@ -145,7 +191,9 @@ GET /api/v1/schema/field?name=duration&limit=500&after=<services_cursor>
 ```
 
 One field's detail: the pin, one page of per-service observations, and
-retained conflict evidence. The name is a **query parameter** (a catalog
+retained conflict evidence. Carries the same `verdict` object when the
+field is degraded, and each conflict row carries `samples` — the values
+that cast nulled. The name is a **query parameter** (a catalog
 key may contain `/`) and is ASCII-lowercased before lookup, mirroring
 ingest's fold; an unpinned name returns 404.
 
@@ -164,8 +212,9 @@ GET /api/v1/schema/conflicts?field=duration&service=envoy&since_secs=604800
 ```
 
 The schema-health dashboard: recent type conflicts (a batch column whose
-conforming cast nulled rows), most recent first. Filter by `field`,
-`service`, and `since_secs`; `limit` defaults to 100 (max 1000).
+conforming cast nulled rows), most recent first, each with a bounded
+`samples` set of the values it nulled. Filter by `field`, `service`, and
+`since_secs`; `limit` defaults to 100 (max 1000).
 
 ```
 POST /api/v1/schema/repin

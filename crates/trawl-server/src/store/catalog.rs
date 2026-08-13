@@ -30,6 +30,7 @@ use sqlx::{PgPool, Row as _};
 use trawl_core::schema::CanonicalType;
 
 use super::error::StoreError;
+use crate::catalog::analyzer::ConflictAggregate;
 
 /// A proposed pin for a field absent from the catalog.
 #[derive(Debug, Clone)]
@@ -61,6 +62,12 @@ pub struct FieldConflict {
     pub expected_type: CanonicalType,
     /// Rows whose value the cast nulled (recoverable from `_raw`).
     pub rows_nulled: u64,
+    /// Up to [`MAX_CONFLICT_SAMPLES`] DISTINCT values the cast nulled, each
+    /// sanitised and cut to [`MAX_CONFLICT_SAMPLE_BYTES`] at capture. A
+    /// SAMPLE, never a manifest: the exhaustive record of what was shelved
+    /// is `_raw`. Empty where the lane has no values in hand (the repin
+    /// rewrite counts its own nulls, ADR-0011 slice B).
+    pub samples: Vec<String>,
 }
 
 /// One `(field, service)` observation reconstructed from a standing parquet
@@ -235,6 +242,9 @@ pub struct ConflictListRow {
     pub expected_type: String,
     /// Rows nulled by the conforming cast.
     pub rows_nulled: i64,
+    /// A bounded sample of the values the cast nulled (see
+    /// [`FieldConflict::samples`]).
+    pub samples: Vec<String>,
     /// When the conflict was recorded.
     pub at: DateTime<Utc>,
 }
@@ -250,6 +260,10 @@ pub struct FieldConflictRow {
     pub expected_type: String,
     /// Rows nulled by the conforming cast.
     pub rows_nulled: i64,
+    /// A bounded sample of the values the cast nulled (see
+    /// [`FieldConflict::samples`]); empty for evidence recorded before
+    /// migration 0008, or by a lane with no values in hand.
+    pub samples: Vec<String>,
     /// When the conflict was recorded.
     pub at: DateTime<Utc>,
 }
@@ -318,6 +332,50 @@ pub const MAX_PINNED_FIELDS: i64 = 10_000;
 /// operator WHICH values a pin is currently costing them, and the newest
 /// evidence is the evidence they act on.
 pub const MAX_CONFLICTS_PER_FIELD: i64 = 100;
+
+/// Distinct misfit values kept per conflict row (ADR-0011 slice C1).
+///
+/// The samples answer "which values is this pin costing me", which five
+/// distinct examples answer as well as five hundred — while five hundred
+/// per row, at the cap above, per field, at the pin cap, is a table whose
+/// size is set by how creatively a sender misformats its values. The
+/// exhaustive record is `_raw`, which already holds every one of them.
+pub const MAX_CONFLICT_SAMPLES: usize = 5;
+
+/// Bytes kept per sample, cut on a `char` boundary at capture.
+///
+/// A misfit value is client text of client-chosen length — a whole embedded
+/// document can arrive under a BIGINT pin. Enough to recognise the shape of
+/// what is arriving, far short of storing the payload a second time.
+pub const MAX_CONFLICT_SAMPLE_BYTES: usize = 256;
+
+/// Conflict rows per field the verdict is built from
+/// ([`CatalogStore::conflict_evidence_for`]), newest first.
+///
+/// Sized to what a verdict consumes: each row carries up to
+/// [`MAX_CONFLICT_SAMPLES`] distinct samples, so the newest five rows
+/// normally hold several times the sample budget.
+///
+/// Not guaranteed to, though — a row whose capture failed carries none
+/// (evidence is best-effort, `ConformPlan::tally_conflicts`), so five
+/// sample-less rows can leave a verdict with an empty `samples` list while
+/// older retained rows still hold values. That degrades gracefully: the
+/// verdict itself is computed from the durable aggregates and stays
+/// correct, the CLI simply omits the sample block, and the cause is counted
+/// on `trawl_catalog_sample_capture_failures_total`.
+///
+/// It also bounds the OBSERVED-TYPE evidence the suggested target is derived
+/// from, and that is a deliberate narrowing: the suggestion now describes the
+/// newest episodes rather than the whole retained window. That reads the
+/// right way round — a field whose recent traffic is uniformly one rung
+/// should be repinned to that rung — and the suggestion is a starting point
+/// for a dry run, never an action.
+const VERDICT_EVIDENCE_ROWS: i64 = 5;
+
+// Written as a literal because it binds as a postgres `bigint`, and pinned
+// to the sample budget it is derived from: change one and this fails the
+// build rather than silently under-filling a verdict.
+const _: () = assert!(MAX_CONFLICT_SAMPLES == 5);
 
 /// Rows per statement in [`CatalogStore::backfill_services`]. The backfill's
 /// size is (pinned fields x services), which nothing bounds below five
@@ -744,8 +802,18 @@ impl CatalogStore {
     /// keeps the work proportional to the batch — a field that stops
     /// conflicting keeps the evidence it already has and is never re-read.
     ///
-    /// Both statements run in ONE transaction, so a reader never sees the
-    /// window overfull and a failed trim never leaves the insert behind.
+    /// A THIRD statement upserts the durable per-`(field, service)`
+    /// aggregates (`field_conflict_stats`, migration 0009) the degraded-field
+    /// analyzer judges a pin on. It is here, and not in a caller, because the
+    /// trim above is exactly what makes it necessary: the detail rows a
+    /// span-based verdict would have to measure are the ones the window
+    /// evicts first, so the aggregate has to be written by the same
+    /// transaction that evicts them or it is a different number.
+    ///
+    /// All three statements run in ONE transaction, so a reader never sees
+    /// the window overfull, a failed trim never leaves the insert behind, and
+    /// no episode is ever counted in the aggregates without its evidence row
+    /// (or the reverse).
     pub async fn record_conflicts(&self, conflicts: &[FieldConflict]) -> Result<(), StoreError> {
         if conflicts.is_empty() {
             return Ok(());
@@ -761,19 +829,29 @@ impl CatalogStore {
             .iter()
             .map(|c| i64::try_from(c.rows_nulled).unwrap_or(i64::MAX))
             .collect();
+        // `TEXT[][]` has no sqlx binding (postgres multidimensional arrays
+        // must be rectangular, and these rows are not), so the per-row sample
+        // sets ride as JSON and are unnested back to arrays in the statement.
+        let samples: Vec<String> = conflicts
+            .iter()
+            .map(|c| serde_json::to_string(&c.samples).unwrap_or_else(|_| "[]".to_owned()))
+            .collect();
 
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
             "INSERT INTO field_conflicts
-                 (field, service, observed_type, expected_type, rows_nulled)
-             SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[])",
+                 (field, service, observed_type, expected_type, rows_nulled, samples)
+             SELECT f, s, o, e, n, ARRAY(SELECT jsonb_array_elements_text(j::jsonb))
+             FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[],
+                         $6::text[]) AS t(f, s, o, e, n, j)",
         )
         .bind(&fields)
         .bind(&services)
         .bind(&observed)
         .bind(&expected)
         .bind(&nulled)
+        .bind(&samples)
         .execute(&mut *tx)
         .await?;
 
@@ -793,6 +871,48 @@ impl CatalogStore {
         )
         .bind(&fields)
         .bind(self.conflict_cap)
+        .execute(&mut *tx)
+        .await?;
+
+        // The durable aggregates the trim above must not be able to erase.
+        //
+        // The GROUP BY is not an optimisation: postgres refuses to let one
+        // `ON CONFLICT DO UPDATE` touch a row twice, and the boot conformance
+        // pass accumulates conflicts across every file it rewrites, so one
+        // call routinely carries many rows for the same `(field, service)`.
+        // Pre-aggregating in the statement makes a call of N such rows one
+        // upsert of N episodes — the same hazard `backfill_services` avoids
+        // by aggregating in its caller, answered here in SQL because this
+        // caller's rows are the evidence and may not be collapsed.
+        //
+        // At-least-once, not exactly-once: the bookkeeping caller retries a
+        // transaction whose COMMIT ACK was lost, and this upsert would then
+        // add the same episodes and rows a second time. Accepted rather than
+        // carried on an idempotency key — the consequence is bounded to a
+        // slightly early or spurious badge on a field that IS conflicting,
+        // and the remedy it points at (a dry run) is free and reversible.
+        //
+        // `last_at` is `now()`, not `GREATEST(existing, now())`: it is the
+        // transaction's own clock, which cannot run backwards against a row
+        // this same statement is the only writer of. `first_at` is left
+        // untouched on conflict for the mirror-image reason — the row's
+        // existing value is by construction the earliest evidence there is
+        // (migration 0009's backfill included).
+        sqlx::query(
+            "INSERT INTO field_conflict_stats
+                 (field, service, episodes, rows_nulled_total)
+             SELECT f, s, count(*)::bigint, COALESCE(sum(n), 0)::bigint
+             FROM UNNEST($1::text[], $2::text[], $3::bigint[]) AS t(f, s, n)
+             GROUP BY f, s
+             ON CONFLICT (field, service) DO UPDATE
+             SET last_at           = now(),
+                 episodes          = field_conflict_stats.episodes + EXCLUDED.episodes,
+                 rows_nulled_total = field_conflict_stats.rows_nulled_total
+                                     + EXCLUDED.rows_nulled_total",
+        )
+        .bind(&fields)
+        .bind(&services)
+        .bind(&nulled)
         .execute(&mut *tx)
         .await?;
 
@@ -879,13 +999,157 @@ impl CatalogStore {
         Ok((rows, next))
     }
 
+    /// [`Self::conflict_aggregates`], page-keyed shape: `$1` field names.
+    /// See the method docs for why this is its own SQL text.
+    const CONFLICT_AGGREGATES_KEYED_SQL: &'static str = "\
+        SELECT field, min(first_at) AS first_at, max(last_at) AS last_at,
+               count(*)::bigint                      AS services,
+               COALESCE(sum(episodes), 0)::bigint    AS episodes,
+               COALESCE(sum(rows_nulled_total), 0)::bigint AS rows_nulled_total
+        FROM field_conflict_stats
+        WHERE field = ANY($1)
+        GROUP BY field";
+
+    /// [`Self::conflict_aggregates`], whole-catalog shape.
+    ///
+    /// Unkeyed and periodic (every schema-refresh tick, on every node), so
+    /// its SCAN axis is `field_conflict_stats` entire — which grows with the
+    /// distinct SERVICE names that have ever conflicted, an axis nothing
+    /// bounds. Measured at ~200ms over 1M rows, and accepted rather than
+    /// indexed or incrementalised: reaching that size means a sender
+    /// inventing service names AND conflicting under each one, which already
+    /// costs it a parquet file per hour per name, and the axis this RETURNS
+    /// is one row per field — pin-capped.
+    const CONFLICT_AGGREGATES_ALL_SQL: &'static str = "\
+        SELECT field, min(first_at) AS first_at, max(last_at) AS last_at,
+               count(*)::bigint                      AS services,
+               COALESCE(sum(episodes), 0)::bigint    AS episodes,
+               COALESCE(sum(rows_nulled_total), 0)::bigint AS rows_nulled_total
+        FROM field_conflict_stats
+        GROUP BY field";
+
+    /// Aggregate the durable conflict evidence per FIELD — the input the
+    /// degraded-field analyzer judges ([`crate::catalog::analyzer`]).
+    ///
+    /// `fields` keys the read to a page of pin names; `None` aggregates the
+    /// whole table, which is what a refresh tick wants and is bounded on
+    /// the returned axis by the pin cap.
+    ///
+    /// Two SQL TEXTS rather than one `($1 IS NULL OR field = ANY($1))`
+    /// shape, for the reason [`Self::list_fields`] documents at length: a
+    /// prepared statement switching to its generic plan cannot push the
+    /// `IS NULL`-guarded `OR` into the primary key, so the page-keyed read
+    /// would degrade into a full aggregate over a table whose SERVICE axis
+    /// is client-chosen and never pruned.
+    pub async fn conflict_aggregates(
+        &self,
+        fields: Option<&[String]>,
+    ) -> Result<Vec<ConflictAggregate>, StoreError> {
+        let rows = match fields {
+            Some([]) => return Ok(Vec::new()),
+            Some(names) => {
+                sqlx::query(Self::CONFLICT_AGGREGATES_KEYED_SQL)
+                    .bind(names)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            None => {
+                sqlx::query(Self::CONFLICT_AGGREGATES_ALL_SQL)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+        rows.iter()
+            .map(|row| {
+                Ok(ConflictAggregate {
+                    field: row.try_get("field")?,
+                    first_at: row.try_get("first_at")?,
+                    last_at: row.try_get("last_at")?,
+                    services: row.try_get("services")?,
+                    episodes: row.try_get("episodes")?,
+                    rows_nulled_total: row.try_get("rows_nulled_total")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::from)
+    }
+
+    /// The retained detail evidence for `fields`, newest first: the
+    /// `(observed_type, samples)` pairs a verdict is built from.
+    ///
+    /// Read only for the fields that came back DEGRADED — usually none —
+    /// and bounded PER FIELD by [`VERDICT_EVIDENCE_ROWS`] through a LATERAL
+    /// subquery, not by an outer LIMIT: a page-wide limit would spend the
+    /// whole budget on the first field and leave the rest verdictless.
+    /// Unbounded, one `/schema/fields` request with a large `?limit=` over a
+    /// pathologically conflicted catalog would materialise
+    /// `MAX_CONFLICTS_PER_FIELD` rows — each carrying up to its full sample
+    /// payload — for every degraded field on the page.
+    pub async fn conflict_evidence_for(
+        &self,
+        fields: &[String],
+    ) -> Result<HashMap<String, Vec<(String, Vec<String>)>>, StoreError> {
+        if fields.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query(
+            "SELECT f.field AS field, c.observed_type, c.samples
+             FROM UNNEST($1::text[]) AS f(field)
+             CROSS JOIN LATERAL (
+                 SELECT observed_type, samples
+                 FROM field_conflicts fc
+                 WHERE fc.field = f.field
+                 ORDER BY fc.at DESC, fc.id DESC
+                 LIMIT $2
+             ) c",
+        )
+        .bind(fields)
+        .bind(VERDICT_EVIDENCE_ROWS)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
+        for row in &rows {
+            let field: String = row.try_get("field")?;
+            out.entry(field)
+                .or_default()
+                .push((row.try_get("observed_type")?, row.try_get("samples")?));
+        }
+        Ok(out)
+    }
+
+    /// Drop every trace of one field's conflict evidence, inside a caller's
+    /// transaction.
+    ///
+    /// Called by the repin cutover ([`crate::store::RepinStore::finish_cutover`]):
+    /// the evidence indicts a pin that no longer exists, and the analyzer's
+    /// gate is span-based — left standing, a repinned field would keep its
+    /// verdict forever, and the badge that told the operator to act would
+    /// survive their acting on it. Ordering is the cutover's, not ours: the
+    /// clear runs before the job records its own outcome, so a forced lossy
+    /// repin's fresh evidence is not swept away with the old.
+    pub async fn clear_conflict_evidence(
+        tx: &mut sqlx::PgConnection,
+        field: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM field_conflict_stats WHERE field = $1")
+            .bind(field)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM field_conflicts WHERE field = $1")
+            .bind(field)
+            .execute(&mut *tx)
+            .await?;
+        Ok(())
+    }
+
     /// Read the conflict rows for one field, most recent first.
     pub async fn conflicts_for_field(
         &self,
         field: &str,
     ) -> Result<Vec<FieldConflictRow>, StoreError> {
         let rows = sqlx::query(
-            "SELECT service, observed_type, expected_type, rows_nulled, at
+            "SELECT service, observed_type, expected_type, rows_nulled, samples, at
              FROM field_conflicts WHERE field = $1
              ORDER BY at DESC, id DESC",
         )
@@ -899,6 +1163,7 @@ impl CatalogStore {
                     observed_type: row.try_get("observed_type")?,
                     expected_type: row.try_get("expected_type")?,
                     rows_nulled: row.try_get("rows_nulled")?,
+                    samples: row.try_get("samples")?,
                     at: row.try_get("at")?,
                 })
             })
@@ -1092,7 +1357,7 @@ impl CatalogStore {
     ) -> Result<(Vec<ConflictListRow>, bool), StoreError> {
         let limit = limit.max(0);
         let rows = sqlx::query(
-            "SELECT field, service, observed_type, expected_type, rows_nulled, at
+            "SELECT field, service, observed_type, expected_type, rows_nulled, samples, at
              FROM field_conflicts
              WHERE ($1::text IS NULL OR field = $1)
                AND ($2::text IS NULL OR service = $2)
@@ -1118,6 +1383,7 @@ impl CatalogStore {
                     observed_type: row.try_get("observed_type")?,
                     expected_type: row.try_get("expected_type")?,
                     rows_nulled: row.try_get("rows_nulled")?,
+                    samples: row.try_get("samples")?,
                     at: row.try_get("at")?,
                 })
             })

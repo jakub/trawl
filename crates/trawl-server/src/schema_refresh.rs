@@ -18,6 +18,11 @@
 //! the offending file can be identified, deduplicated across passes (via the
 //! `warned` set) so a persistently-broken file doesn't spam the log every tick.
 //!
+//! The same tick also reloads the degraded-field set the query path stamps
+//! its incomplete-results notice from (ADR-0011 slice C1) — the ONE part of
+//! this job that reads postgres, and the reason the "footer stats need
+//! neither postgres nor `DuckDB`" claim above is about the SCHEMA half only.
+//!
 //! Follows the same pattern as [`crate::monitor::spawn_snapshot_collector`].
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -50,8 +55,8 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
         // same role for columns with no catalog pin.
         let warned: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
         let warned_unpinned: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        // Types come from the in-process pin cache — the refresh is
-        // postgres-free and needs no DuckDB at all (ADR-0009 slice 3).
+        // Types come from the in-process pin cache — the schema half needs
+        // neither postgres nor DuckDB (ADR-0009 slice 3).
         let catalog = Arc::clone(&state.query.field_catalog);
 
         loop {
@@ -93,8 +98,42 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
                     );
                 }
             }
+
+            refresh_degraded_fields(&state).await;
         }
     })
+}
+
+/// Reload the degraded-field set and publish the gauge (ADR-0011 slice C1).
+///
+/// Runs on every node, ingesting or not: the notice is stamped by the query
+/// path, and a query-only node answers queries.
+///
+/// A store error KEEPS the previous set rather than clearing it. The
+/// alternative — an empty set on a postgres blip — silently un-badges every
+/// degraded field on the install for as long as the blip lasts, which is the
+/// one failure mode a notice must not have. The gauge is left standing for
+/// the same reason: it would otherwise read as a fixed catalog.
+#[allow(clippy::cast_precision_loss)] // gauge values are f64; the pin cap is exact
+pub async fn refresh_degraded_fields(state: &AppState) {
+    match state.storage.catalog.conflict_aggregates(None).await {
+        Ok(aggregates) => {
+            let degraded: BTreeSet<String> = aggregates
+                .iter()
+                .filter(|a| crate::catalog::analyzer::is_degraded(a))
+                .map(|a| a.field.clone())
+                .collect();
+            metrics::gauge!(crate::metrics::CATALOG_DEGRADED_FIELDS).set(degraded.len() as f64);
+            *state.query.degraded_fields.lock() = Arc::new(degraded);
+        }
+        Err(e) => {
+            tracing::warn!(
+                event_type = "degraded_refresh_error",
+                error = %e,
+                "degraded-field refresh failed; keeping the previous set"
+            );
+        }
+    }
 }
 
 /// Collected metadata for a single parquet file.

@@ -222,6 +222,7 @@ mod tests {
                 offset: 0,
                 returned,
             },
+            degraded_fields: Vec::new(),
         }
     }
 

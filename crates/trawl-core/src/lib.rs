@@ -29,6 +29,10 @@ pub mod conform;
 
 pub mod eval;
 
+/// Which catalog keys a query binds — the incomplete-results notice's
+/// input (ADR-0011 slice C1).
+pub mod field_refs;
+
 /// In-memory event filter compiled from the search stage.
 pub mod filter;
 
@@ -40,6 +44,10 @@ mod pin_match;
 /// The compile-time pin scope walk: which catalog pin applies at each
 /// pipeline stage, shared by the SQL emitter and the stream compiler.
 pub mod pin_scope;
+
+/// Client-chosen text made safe to render: control and format characters
+/// that would rewrite or hide a terminal line.
+pub mod sanitize;
 
 /// The declared event envelope: field names, reserved keys, wire aliases.
 pub mod schema;

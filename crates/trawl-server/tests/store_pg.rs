@@ -1806,6 +1806,7 @@ mod catalog {
             observed_type: "VARCHAR".to_owned(),
             expected_type: CanonicalType::BigInt,
             rows_nulled: 3,
+            samples: vec!["n/a".to_owned()],
         };
         store
             .record_conflicts(std::slice::from_ref(&row))
@@ -1819,6 +1820,279 @@ mod catalog {
         assert_eq!(rows[0].observed_type, "VARCHAR");
         assert_eq!(rows[0].expected_type, "BIGINT");
         assert_eq!(rows[0].rows_nulled, 3);
+        assert_eq!(
+            rows[0].samples,
+            vec!["n/a".to_owned()],
+            "the misfit samples ride the row they annotate"
+        );
+    }
+
+    /// The samples are per-row evidence: an arbitrary list of client text
+    /// per conflict, carried whole (empty included) rather than merged.
+    #[sqlx::test]
+    async fn conflict_samples_round_trip_per_row(pool: PgPool) {
+        let store = catalog(&pool);
+        let mk = |service: &str, samples: Vec<String>| FieldConflict {
+            field: "duration".to_owned(),
+            service: service.to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: 1,
+            samples,
+        };
+        // Postgres array literals, JSON and SQL all have opinions about
+        // these characters; the value that arrives is the value that was
+        // captured.
+        let awkward = vec![
+            "n/a".to_owned(),
+            "{\"a\",\"b\"}".to_owned(),
+            "he said \"no\"".to_owned(),
+            "back\\slash".to_owned(),
+            "\u{fffd}\u{1f600}".to_owned(),
+        ];
+        store
+            .record_conflicts(&[mk("svc-a", awkward.clone()), mk("svc-b", Vec::new())])
+            .await
+            .unwrap();
+
+        let rows = store.conflicts_for_field("duration").await.unwrap();
+        let by_service: std::collections::HashMap<&str, &Vec<String>> = rows
+            .iter()
+            .map(|r| (r.service.as_str(), &r.samples))
+            .collect();
+        assert_eq!(by_service["svc-a"], &awkward);
+        assert!(
+            by_service["svc-b"].is_empty(),
+            "a lane with no values in hand records none"
+        );
+
+        let (listed, _) = store
+            .recent_conflicts(Some("duration"), Some("svc-a"), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            listed[0].samples, awkward,
+            "the cross-field listing carries the same evidence"
+        );
+    }
+
+    /// The verdict's evidence read is bounded PER FIELD, not per page: one
+    /// degraded field cannot spend the whole budget and leave the rest of
+    /// the page verdictless, and a page of degraded fields cannot pull the
+    /// whole evidence table into one response.
+    #[sqlx::test]
+    async fn conflict_evidence_is_bounded_per_field(pool: PgPool) {
+        let store = catalog(&pool);
+        for field in ["duration", "status"] {
+            for i in 0..40_u64 {
+                store
+                    .record_conflicts(&[FieldConflict {
+                        field: field.to_owned(),
+                        service: "svc-a".to_owned(),
+                        observed_type: "VARCHAR".to_owned(),
+                        expected_type: CanonicalType::BigInt,
+                        rows_nulled: 1,
+                        samples: vec![format!("v{i}")],
+                    }])
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let evidence = store
+            .conflict_evidence_for(&["duration".to_owned(), "status".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 2, "every field asked for gets evidence");
+        for (field, rows) in &evidence {
+            assert!(
+                rows.len() <= 5,
+                "{field}: {} rows exceeds the per-field bound",
+                rows.len()
+            );
+            // Newest first: the last episode written is the first row back.
+            assert_eq!(rows[0].1, vec!["v39".to_owned()], "{field}");
+        }
+    }
+
+    /// The aggregates exist because the detail window does not survive a
+    /// storm: `field_conflicts` is trimmed to the cap in the same
+    /// transaction that appends to it, while `field_conflict_stats` keeps
+    /// the span, the episode count and the lifetime shelved rows the
+    /// analyzer judges the pin on.
+    #[sqlx::test]
+    async fn conflict_stats_outlive_the_recency_trim(pool: PgPool) {
+        let store = catalog(&pool).with_conflict_cap(10);
+        for i in 0..60_u64 {
+            let service = if i % 2 == 0 { "svc-a" } else { "svc-b" };
+            store
+                .record_conflicts(&[FieldConflict {
+                    field: "duration".to_owned(),
+                    service: service.to_owned(),
+                    observed_type: "VARCHAR".to_owned(),
+                    expected_type: CanonicalType::BigInt,
+                    rows_nulled: 2,
+                    samples: vec!["n/a".to_owned()],
+                }])
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.conflicts_for_field("duration").await.unwrap().len(),
+            10,
+            "the detail window is at the cap"
+        );
+        let stats: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT service, episodes, rows_nulled_total FROM field_conflict_stats
+             WHERE field = $1 ORDER BY service",
+        )
+        .bind("duration")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stats,
+            vec![("svc-a".to_owned(), 30, 60), ("svc-b".to_owned(), 30, 60)],
+            "every episode is counted, per sender, whatever the window kept"
+        );
+        let span: bool = sqlx::query_scalar(
+            "SELECT bool_and(last_at >= first_at) FROM field_conflict_stats WHERE field = $1",
+        )
+        .bind("duration")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(span, "the span is the evidence, and it only widens");
+    }
+
+    /// `first_at` only ever moves EARLIER — the property the whole degraded
+    /// gate rests on.
+    ///
+    /// The gate is `last_at - first_at >= 24h`. If a later episode restamped
+    /// `first_at`, the span would reset on every conflict and no field could
+    /// ever be called degraded: the feature would be inert, silently, with
+    /// every other test still green.
+    #[sqlx::test]
+    async fn recording_an_episode_never_moves_first_at_forward(pool: PgPool) {
+        let store = catalog(&pool);
+        let episode = || FieldConflict {
+            field: "duration".to_owned(),
+            service: "svc-a".to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: 1,
+            samples: Vec::new(),
+        };
+        store.record_conflicts(&[episode()]).await.unwrap();
+        sqlx::query(
+            "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+             WHERE field = $1",
+        )
+        .bind("duration")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        store.record_conflicts(&[episode()]).await.unwrap();
+
+        let (span_hours, episodes): (f64, i64) = sqlx::query_as(
+            "SELECT (extract(epoch FROM (last_at - first_at)) / 3600.0)::float8, episodes
+             FROM field_conflict_stats WHERE field = $1",
+        )
+        .bind("duration")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(episodes, 2, "the later episode was recorded");
+        assert!(
+            span_hours >= 47.9,
+            "the span must still be the backdated distance, not reset: {span_hours}h"
+        );
+    }
+
+    /// The boot conformance pass accumulates conflicts across every file it
+    /// rewrites, so ONE call routinely carries many rows for the same
+    /// `(field, service)`. Postgres refuses to let one `ON CONFLICT DO
+    /// UPDATE` touch a row twice, so the upsert aggregates in the statement.
+    #[sqlx::test]
+    async fn conflict_stats_aggregate_duplicate_pairs_within_one_call(pool: PgPool) {
+        let store = catalog(&pool);
+        let batch: Vec<FieldConflict> = (0..4_u64)
+            .map(|i| FieldConflict {
+                field: "duration".to_owned(),
+                service: "svc-a".to_owned(),
+                observed_type: "VARCHAR".to_owned(),
+                expected_type: CanonicalType::BigInt,
+                rows_nulled: i,
+                samples: Vec::new(),
+            })
+            .collect();
+        store.record_conflicts(&batch).await.unwrap();
+
+        let (episodes, nulled): (i64, i64) = sqlx::query_as(
+            "SELECT episodes, rows_nulled_total FROM field_conflict_stats
+             WHERE field = $1 AND service = $2",
+        )
+        .bind("duration")
+        .bind("svc-a")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (episodes, nulled),
+            (4, 6),
+            "four rows in one call are four episodes, not one and not an error"
+        );
+        assert_eq!(
+            store.conflicts_for_field("duration").await.unwrap().len(),
+            4,
+            "the detail rows are still individual evidence"
+        );
+    }
+
+    /// Evidence rows, the trim and the aggregates are one transaction: a
+    /// failure in the last statement leaves none of the first two behind,
+    /// so no episode is ever counted without the row it came from.
+    #[sqlx::test]
+    async fn conflict_evidence_and_stats_commit_together(pool: PgPool) {
+        let store = catalog(&pool);
+        sqlx::query(
+            "ALTER TABLE field_conflict_stats
+             ADD CONSTRAINT field_conflict_stats_injected_failure
+             CHECK (field <> 'duration')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = store
+            .record_conflicts(&[FieldConflict {
+                field: "duration".to_owned(),
+                service: "svc-a".to_owned(),
+                observed_type: "VARCHAR".to_owned(),
+                expected_type: CanonicalType::BigInt,
+                rows_nulled: 3,
+                samples: vec!["n/a".to_owned()],
+            }])
+            .await;
+        assert!(err.is_err(), "the injected failure must surface");
+
+        assert!(
+            store
+                .conflicts_for_field("duration")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the evidence row rolled back with the aggregate"
+        );
+        let stats: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM field_conflict_stats WHERE field = $1")
+                .bind("duration")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stats, 0, "no partial aggregate row survives");
     }
 
     #[sqlx::test]
@@ -1835,6 +2109,7 @@ mod catalog {
             observed_type: "VARCHAR".to_owned(),
             expected_type: CanonicalType::BigInt,
             rows_nulled: nulled,
+            samples: Vec::new(),
         };
 
         for i in 0..6_u64 {
@@ -1938,6 +2213,7 @@ mod catalog {
                 observed_type: "VARCHAR".to_owned(),
                 expected_type: CanonicalType::BigInt,
                 rows_nulled: 1,
+                samples: Vec::new(),
             }])
             .await
             .unwrap();
@@ -1992,6 +2268,7 @@ mod catalog {
                 observed_type: "VARCHAR".to_owned(),
                 expected_type: CanonicalType::BigInt,
                 rows_nulled: 7,
+                samples: Vec::new(),
             }])
             .await
             .unwrap();
@@ -2043,6 +2320,7 @@ mod catalog {
                 observed_type: "VARCHAR".to_owned(),
                 expected_type: CanonicalType::BigInt,
                 rows_nulled: 4,
+                samples: Vec::new(),
             }])
             .await
             .unwrap();
@@ -2241,6 +2519,7 @@ mod catalog {
             observed_type: "VARCHAR".to_owned(),
             expected_type: CanonicalType::BigInt,
             rows_nulled: nulled,
+            samples: Vec::new(),
         };
         store
             .record_conflicts(&[mk("duration", "svc-a", 1)])
@@ -2451,6 +2730,129 @@ mod repin_store {
         let again = s.get(id).await.unwrap().unwrap();
         assert_eq!(again.status, RepinJobStatus::Succeeded);
         assert_eq!(again.finished_at, job.finished_at, "redo must not restamp");
+    }
+
+    /// The cutover clears the field's conflict evidence in the same
+    /// transaction as the flip: it indicts a pin that no longer exists, and
+    /// the analyzer's gate is span-based, so leaving it would badge the
+    /// field as degraded forever — the remedy would not clear the sign.
+    /// Another field's evidence is untouched.
+    #[sqlx::test]
+    async fn finish_cutover_clears_the_repinned_field_evidence(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        let conflict = |field: &str| trawl_server::store::FieldConflict {
+            field: field.to_owned(),
+            service: "svc-a".to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: 4,
+            samples: vec!["n/a".to_owned()],
+        };
+        catalog
+            .record_conflicts(&[conflict("severity"), conflict("message")])
+            .await
+            .unwrap();
+
+        let id = s
+            .claim(
+                "severity",
+                CanonicalType::BigInt,
+                CanonicalType::Varchar,
+                false,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+            .await
+            .unwrap();
+
+        assert!(
+            catalog
+                .conflicts_for_field("severity")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the repinned field's detail evidence is gone"
+        );
+        assert!(
+            catalog
+                .conflict_aggregates(Some(&["severity".to_owned()]))
+                .await
+                .unwrap()
+                .is_empty(),
+            "and so are its durable aggregates"
+        );
+        assert_eq!(
+            catalog
+                .conflict_aggregates(Some(&["message".to_owned()]))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "another field's evidence survives"
+        );
+    }
+
+    /// A replay of an ALREADY-succeeded cutover must not clear evidence.
+    ///
+    /// A forced lossy repin records its own conflict evidence — describing
+    /// the NEW pin — after the flip commits. Boot recovery replays
+    /// `finish_cutover` whenever the marker outlived the cleanup window, and
+    /// an unconditional clear would delete exactly that evidence, which
+    /// nothing writes again.
+    #[sqlx::test]
+    async fn finish_cutover_replay_keeps_evidence_recorded_after_the_flip(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        let id = s
+            .claim(
+                "severity",
+                CanonicalType::BigInt,
+                CanonicalType::Varchar,
+                false,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+            .await
+            .unwrap();
+
+        // What the forced job's own `record_outcome` writes next.
+        catalog
+            .record_conflicts(&[trawl_server::store::FieldConflict {
+                field: "severity".to_owned(),
+                service: "svc-a".to_owned(),
+                observed_type: "BIGINT".to_owned(),
+                expected_type: CanonicalType::Varchar,
+                rows_nulled: 2,
+                samples: Vec::new(),
+            }])
+            .await
+            .unwrap();
+
+        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            catalog.conflicts_for_field("severity").await.unwrap().len(),
+            1,
+            "the replay must not touch evidence written after the flip"
+        );
+        assert_eq!(
+            catalog
+                .conflict_aggregates(Some(&["severity".to_owned()]))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "nor its aggregates"
+        );
     }
 
     /// Boot reconciliation: an orphaned `running` row (killed process, no

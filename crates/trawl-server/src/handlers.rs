@@ -114,32 +114,48 @@ pub async fn query(
 
     // Check for `| from saved` — if present, resolve to parquet source
     // and execute with the pre-computed source instead of normal glob scan.
-    let outcome =
+    let (outcome, degraded_fields) =
         if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query).await? {
-            state
-                .query
-                .pool
-                .execute_with_source(
-                    query_id,
-                    &resolved.remaining_dsl,
-                    &resolved.source,
-                    timeout,
-                    capture_debug,
-                    utc_offset_secs,
-                )
-                .await
+            // Both halves of what the caller is actually reading: the
+            // stages they typed, and the saved query whose recorded run
+            // produced the rows those stages run over. Nothing stamps a
+            // report run at write time, so a degraded pin the saved query
+            // bound would otherwise go unmentioned.
+            let degraded = degraded_fields_for(
+                &state,
+                [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()],
+            );
+            (
+                state
+                    .query
+                    .pool
+                    .execute_with_source(
+                        query_id,
+                        &resolved.remaining_dsl,
+                        &resolved.source,
+                        timeout,
+                        capture_debug,
+                        utc_offset_secs,
+                    )
+                    .await,
+                degraded,
+            )
         } else {
-            state
-                .query
-                .pool
-                .execute(
-                    query_id,
-                    &req.query,
-                    timeout,
-                    capture_debug,
-                    utc_offset_secs,
-                )
-                .await
+            let degraded = degraded_fields_for(&state, [req.query.as_str()]);
+            (
+                state
+                    .query
+                    .pool
+                    .execute(
+                        query_id,
+                        &req.query,
+                        timeout,
+                        capture_debug,
+                        utc_offset_secs,
+                    )
+                    .await,
+                degraded,
+            )
         };
 
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -217,6 +233,7 @@ pub async fn query(
                     offset,
                     returned,
                 },
+                degraded_fields,
             }))
         }
         Err(ServerError::Timeout) => {
@@ -1032,9 +1049,18 @@ pub async fn catalog_fields(
     let (pinned_total, pin_capacity) = state.storage.catalog.pin_stats().await?;
 
     trawl_api::value::sort_by_display_rank(&mut rows, |r| &r.field);
+    let verdicts = degraded_verdicts(
+        &state.storage.catalog,
+        &rows
+            .iter()
+            .map(|r| (r.field.clone(), current_pin(&r.duckdb_type)))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
     let fields = rows
         .into_iter()
         .map(|r| trawl_api::CatalogFieldSummary {
+            verdict: verdicts.get(&r.field).cloned(),
             name: r.field,
             data_type: r.duckdb_type,
             pinned_from: r.pinned_from,
@@ -1054,6 +1080,88 @@ pub async fn catalog_fields(
         pin_capacity: u64::try_from(pin_capacity).unwrap_or(0),
         truncated,
     }))
+}
+
+/// The degraded fields `dsl` BINDS, sorted — the incomplete-results notice
+/// (ADR-0011 slice C1 ruling 4).
+///
+/// `texts` is every DSL the answer depends on: the query as typed, plus —
+/// for `from saved` — the saved query whose run produced the stored rows.
+///
+/// Reads the in-process set the schema-refresh tick maintains: the query
+/// path never touches postgres, and it may not start now. The empty check
+/// comes first so a healthy install — every install, almost always — pays a
+/// lock acquisition and nothing else, never a parse.
+///
+/// Fields BOUND, not fields returned: a `where` on a degraded field that
+/// projects it away is exactly the incomplete case
+/// ([`trawl_core::field_refs`]).
+fn degraded_fields_for<'a>(
+    state: &AppState,
+    texts: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let degraded = std::sync::Arc::clone(&state.query.degraded_fields.lock());
+    if degraded.is_empty() {
+        return Vec::new();
+    }
+    let mut named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for dsl in texts {
+        named.extend(trawl_core::field_refs::referenced_fields_in(dsl));
+    }
+    named.into_iter().filter(|f| degraded.contains(f)).collect()
+}
+
+/// Read a pin's stored `DuckDB` spelling back as a canonical type.
+///
+/// The column is `CHECK`-constrained to the canonical five, so the fallback
+/// is unreachable short of a hand-edited catalog; `VARCHAR` is the honest
+/// answer there — it is the one pin under which nothing further can be
+/// shelved.
+fn current_pin(duckdb_type: &str) -> trawl_core::schema::CanonicalType {
+    trawl_core::schema::CanonicalType::from_duckdb(duckdb_type)
+        .unwrap_or(trawl_core::schema::CanonicalType::Varchar)
+}
+
+/// Verdicts for whichever of `pins` the analyzer finds degraded (ADR-0011
+/// slice C1). Absent from the map = healthy, which is the overwhelmingly
+/// common case and costs one aggregate read.
+///
+/// Two PAGE-KEYED queries, never a join into the listing SQL: the same trap
+/// [`crate::store::CatalogStore::list_fields`] documents for its conflict
+/// evidence applies here — a grouped subquery over the whole
+/// `field_conflict_stats` table has no predicate a planner can push down,
+/// and that table's service axis is client-chosen. The second query runs
+/// only for the fields that came back degraded (usually none).
+async fn degraded_verdicts(
+    store: &crate::store::CatalogStore,
+    pins: &[(String, trawl_core::schema::CanonicalType)],
+) -> Result<std::collections::HashMap<String, trawl_api::DegradedVerdict>, ServerError> {
+    use crate::catalog::analyzer;
+
+    let names: Vec<String> = pins.iter().map(|(f, _)| f.clone()).collect();
+    let aggregates: Vec<analyzer::ConflictAggregate> = store
+        .conflict_aggregates(Some(&names))
+        .await?
+        .into_iter()
+        .filter(analyzer::is_degraded)
+        .collect();
+    if aggregates.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let degraded: Vec<String> = aggregates.iter().map(|a| a.field.clone()).collect();
+    let evidence = store.conflict_evidence_for(&degraded).await?;
+    Ok(aggregates
+        .iter()
+        .map(|agg| {
+            let current = pins
+                .iter()
+                .find(|(f, _)| *f == agg.field)
+                .map_or(trawl_core::schema::CanonicalType::Varchar, |(_, t)| *t);
+            let rows = evidence.get(&agg.field).map_or(&[][..], Vec::as_slice);
+            (agg.field.clone(), analyzer::verdict(agg, current, rows))
+        })
+        .collect())
 }
 
 /// Query parameters for `GET /api/v1/schema/field`.
@@ -1124,6 +1232,12 @@ pub async fn catalog_field(
     // MAX_CONFLICTS_PER_FIELD newest rows per field in the writing
     // transaction, so this read is bounded by construction.
     let conflicts = state.storage.catalog.conflicts_for_field(&name).await?;
+    let verdict = degraded_verdicts(
+        &state.storage.catalog,
+        &[(name.clone(), current_pin(&pin.duckdb_type))],
+    )
+    .await?
+    .remove(&name);
 
     Ok(Json(trawl_api::CatalogFieldResponse {
         name: pin.field,
@@ -1148,9 +1262,11 @@ pub async fn catalog_field(
                 observed_type: c.observed_type,
                 expected_type: c.expected_type,
                 rows_nulled: u64::try_from(c.rows_nulled).unwrap_or(0),
+                samples: c.samples,
                 at: iso8601(c.at),
             })
             .collect(),
+        verdict,
     }))
 }
 
@@ -1206,6 +1322,7 @@ pub async fn catalog_conflicts(
                 observed_type: c.observed_type,
                 expected_type: c.expected_type,
                 rows_nulled: u64::try_from(c.rows_nulled).unwrap_or(0),
+                samples: c.samples,
                 at: iso8601(c.at),
             })
             .collect(),
