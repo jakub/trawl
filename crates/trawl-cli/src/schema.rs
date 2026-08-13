@@ -75,6 +75,7 @@ pub fn fields_to_rows(resp: &CatalogFieldsResponse) -> (Vec<String>, Vec<Vec<Jso
         "last_seen",
         "conflicts",
         "rows_nulled",
+        "degraded",
     ]
     .map(str::to_owned)
     .to_vec();
@@ -92,6 +93,7 @@ pub fn fields_to_rows(resp: &CatalogFieldsResponse) -> (Vec<String>, Vec<Vec<Jso
                 f.last_seen.clone().map_or(Json::Null, Json::from),
                 Json::from(f.conflict_count),
                 Json::from(f.rows_nulled),
+                Json::from(f.verdict.is_some()),
             ]
         })
         .collect();
@@ -254,10 +256,16 @@ pub async fn run_fields<W: Write>(
 
     let (columns, rows) = fields_to_rows(&resp);
     render(out, &columns, &rows, format)?;
+    let degraded = resp.fields.iter().filter(|f| f.verdict.is_some()).count();
     eprintln!(
-        "{}/{} pins used{}",
+        "{}/{} pins used{}{}",
         resp.pinned_total,
         resp.pin_capacity,
+        if degraded > 0 {
+            format!(", {degraded} degraded (see: trawl schema field <name>)")
+        } else {
+            String::new()
+        },
         if resp.truncated {
             " (listing truncated — raise --limit)"
         } else {
@@ -294,6 +302,10 @@ pub async fn run_field<W: Write>(
     )?;
     label(out, human, &format!("pinned at:   {}", resp.pinned_at))?;
 
+    if let Some(v) = &resp.verdict {
+        render_verdict(out, human, &resp.name, v)?;
+    }
+
     label(out, human, "\nservices:")?;
     let (columns, rows) = field_services_to_rows(&resp);
     render(out, &columns, &rows, format)?;
@@ -307,6 +319,46 @@ pub async fn run_field<W: Write>(
         render(out, &columns, &rows, format)?;
     }
     Ok(())
+}
+
+/// The case file for a degraded pin: the analyzer's facts, the values the
+/// pin is shelving, and the one command that fixes it.
+///
+/// Facts only, phrased here rather than stored (ADR-0011 slice C ruling 5).
+/// "rows shelved" is the LIFETIME total from the durable aggregates, which
+/// is a different number from the `rows_nulled` column in the conflict table
+/// below it — that one sums only the evidence rows still inside the
+/// per-field recency window — so the two are labelled apart on purpose.
+fn render_verdict<W: Write>(
+    out: &mut W,
+    human: bool,
+    field: &str,
+    v: &trawl_client::DegradedVerdict,
+) -> Result<(), CliError> {
+    label(out, human, "\ndegraded pin:")?;
+    label(out, human, &format!("  since:          {}", v.since))?;
+    label(out, human, &format!("  senders:        {}", v.services))?;
+    label(out, human, &format!("  episodes:       {}", v.episodes))?;
+    label(
+        out,
+        human,
+        &format!("  rows shelved:   {} (lifetime)", v.rows_shelved),
+    )?;
+    if !v.samples.is_empty() {
+        label(out, human, "  sample values:")?;
+        for sample in &v.samples {
+            label(out, human, &format!("    - {sample}"))?;
+        }
+    }
+    label(out, human, &format!("  suggested:      {}", v.suggested_to))?;
+    label(
+        out,
+        human,
+        &format!(
+            "  trawl schema repin {field} --to {} --dry-run",
+            v.suggested_to.to_ascii_lowercase()
+        ),
+    )
 }
 
 /// `trawl schema conflicts [--field] [--service] [--last] [--limit]`.
@@ -358,6 +410,17 @@ mod tests {
             pinned_total: 11,
             pin_capacity: 10_000,
             truncated: false,
+        }
+    }
+
+    fn sample_verdict() -> trawl_client::DegradedVerdict {
+        trawl_client::DegradedVerdict {
+            since: "2026-08-01T10:00:00Z".into(),
+            services: 2,
+            episodes: 7,
+            rows_shelved: 240,
+            samples: vec!["n/a".into(), "pending".into()],
+            suggested_to: "VARCHAR".into(),
         }
     }
 
@@ -425,6 +488,44 @@ mod tests {
         assert_eq!(rows[0][1], Json::from("duration"));
         assert_eq!(rows[0][3], Json::from("VARCHAR"));
         assert_eq!(rows[0][5], Json::from(3u64));
+    }
+
+    /// The degraded column is the listing's badge, and the summary counts
+    /// what it badged.
+    #[test]
+    fn fields_to_rows_carries_the_degraded_flag() {
+        let mut resp = sample_fields();
+        let (cols, rows) = fields_to_rows(&resp);
+        assert_eq!(cols.last().unwrap(), "degraded");
+        assert_eq!(rows[0].last().unwrap(), &Json::from(false));
+
+        resp.fields[0].verdict = Some(sample_verdict());
+        let (_, rows) = fields_to_rows(&resp);
+        assert_eq!(rows[0].last().unwrap(), &Json::from(true));
+    }
+
+    /// The case file states the facts, shows the values, and ends with the
+    /// exact command that fixes it — with the lifetime total labelled apart
+    /// from the windowed `rows_nulled` in the conflict table below it.
+    #[test]
+    fn the_case_file_renders_facts_samples_and_the_remedy() {
+        let mut buf = Vec::new();
+        render_verdict(&mut buf, true, "duration", &sample_verdict()).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("degraded pin:"), "{text}");
+        assert!(
+            text.contains("since:          2026-08-01T10:00:00Z"),
+            "{text}"
+        );
+        assert!(text.contains("senders:        2"), "{text}");
+        assert!(text.contains("episodes:       7"), "{text}");
+        assert!(text.contains("rows shelved:   240 (lifetime)"), "{text}");
+        assert!(text.contains("    - n/a"), "{text}");
+        assert!(text.contains("suggested:      VARCHAR"), "{text}");
+        assert!(
+            text.contains("trawl schema repin duration --to varchar --dry-run"),
+            "the remedy is copy-pasteable: {text}"
+        );
     }
 
     #[test]
