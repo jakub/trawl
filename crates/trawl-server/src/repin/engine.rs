@@ -61,6 +61,20 @@ const CUTOVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// (the marker replay completes it at the next boot).
 const FLIP_ATTEMPTS: u32 = 3;
 
+/// Cadence of the detached terminal-write retry after the fast attempts
+/// in [`RepinEngine::finish`] are exhausted (a real store outage).
+const FINISH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The terminal-outcome counter, incremented ONLY once the terminal write
+/// has actually landed — see [`RepinEngine::finish`].
+fn count_outcome(status: RepinJobStatus) {
+    metrics::counter!(
+        crate::metrics::CATALOG_REPIN_JOBS_TOTAL,
+        "outcome" => status.as_str()
+    )
+    .increment(1);
+}
+
 /// Test-only per-file delay in the build pass, so integration tests can
 /// ingest through a deliberately slowed rewrite.
 #[cfg(any(test, feature = "test-support"))]
@@ -355,20 +369,77 @@ impl RepinEngine {
             .ok_or_else(|| ServerError::Internal("repin job row vanished".into()))
     }
 
+    /// Terminalize a claimed job row, riding out postgres trouble.
+    ///
+    /// The `repin_jobs_one_running` slot is unique, so a `running` row
+    /// whose terminal write is lost would 409 every later repin until a
+    /// restart's boot reconciliation — a wedge the daemon must not carry
+    /// while it lives. A blip gets bounded fast retries (the catalog
+    /// bookkeeping cadence); a real outage hands the write to a detached
+    /// slow loop that retries until it lands. While the store is down no
+    /// new claim can succeed either, so the slot is honestly busy rather
+    /// than wedged, and it frees within one tick of the store returning.
+    /// A daemon that dies with the loop still trying falls back to boot
+    /// reconciliation, as before. The outcome counter increments only
+    /// when the write lands: a row still `running` must not be metered
+    /// as a terminal outcome.
     async fn finish(&self, job_id: i64, status: RepinJobStatus, error: Option<&str>) {
-        if let Err(e) = self.store.finish(job_id, status, error).await {
-            tracing::error!(
-                event_type = "repin_store_error",
-                job_id,
-                error = %e,
-                "failed to record repin job outcome"
-            );
+        const FAST_ATTEMPTS: u32 = 3;
+        for attempt in 1..=FAST_ATTEMPTS {
+            match self.store.finish(job_id, status, error).await {
+                Ok(()) => {
+                    count_outcome(status);
+                    return;
+                }
+                Err(e) if attempt < FAST_ATTEMPTS => {
+                    tracing::warn!(
+                        event_type = "repin_store_retry",
+                        job_id,
+                        attempt,
+                        error = %e,
+                        "failed to record repin job outcome; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 << (attempt - 1))).await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        event_type = "repin_store_error",
+                        job_id,
+                        error = %e,
+                        "failed to record repin job outcome; handing the \
+                         terminal write to a background retry so the \
+                         one-running slot cannot stay wedged"
+                    );
+                }
+            }
         }
-        metrics::counter!(
-            crate::metrics::CATALOG_REPIN_JOBS_TOTAL,
-            "outcome" => status.as_str()
-        )
-        .increment(1);
+        let store = self.store.clone();
+        let error = error.map(str::to_owned);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(FINISH_RETRY_INTERVAL).await;
+                match store.finish(job_id, status, error.as_deref()).await {
+                    Ok(()) => {
+                        count_outcome(status);
+                        tracing::info!(
+                            event_type = "repin_store_recovered",
+                            job_id,
+                            "repin job outcome recorded after store recovery; \
+                             the one-running slot is free again"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            event_type = "repin_store_retry",
+                            job_id,
+                            error = %e,
+                            "repin job outcome write still failing; will retry"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// The background half: build, catch up, cut over, sweep.
