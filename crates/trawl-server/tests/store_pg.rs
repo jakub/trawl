@@ -2322,3 +2322,241 @@ mod catalog {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// repin jobs (ADR-0011 slice B, issue #53)
+// ---------------------------------------------------------------------------
+
+mod repin_store {
+    use sqlx::PgPool;
+    use trawl_core::schema::CanonicalType;
+    use trawl_server::store::{CatalogStore, RepinJobStatus, RepinStore, StoreError};
+
+    fn store(pool: &PgPool) -> RepinStore {
+        RepinStore::new(pool.clone())
+    }
+
+    /// One repin at a time, enforced by the partial unique index — the
+    /// second claim maps the named violation, never a raw pg error.
+    #[sqlx::test]
+    async fn second_claim_is_repin_already_running(pool: PgPool) {
+        let s = store(&pool);
+        let id = s
+            .claim(
+                "status",
+                CanonicalType::BigInt,
+                CanonicalType::Varchar,
+                false,
+                false,
+                Some("key-1"),
+            )
+            .await
+            .unwrap();
+        assert!(id > 0);
+
+        let err = s
+            .claim(
+                "dur",
+                CanonicalType::Varchar,
+                CanonicalType::BigInt,
+                false,
+                false,
+                None,
+            )
+            .await
+            .expect_err("a second running job must refuse");
+        assert!(matches!(err, StoreError::RepinAlreadyRunning));
+
+        // A terminal job frees the slot.
+        s.finish(id, RepinJobStatus::Failed, Some("test"))
+            .await
+            .unwrap();
+        s.claim(
+            "dur",
+            CanonicalType::Varchar,
+            CanonicalType::BigInt,
+            false,
+            false,
+            None,
+        )
+        .await
+        .expect("a terminal job frees the one-running slot");
+    }
+
+    /// Two CONCURRENT claims: exactly one wins, the loser sees the domain
+    /// error (the pg-native replacement for a process mutex).
+    #[sqlx::test]
+    async fn concurrent_claims_admit_exactly_one(pool: PgPool) {
+        let s1 = store(&pool);
+        let s2 = store(&pool);
+        let (a, b) = tokio::join!(
+            s1.claim(
+                "status",
+                CanonicalType::BigInt,
+                CanonicalType::Varchar,
+                false,
+                false,
+                None
+            ),
+            s2.claim(
+                "status",
+                CanonicalType::BigInt,
+                CanonicalType::Varchar,
+                false,
+                false,
+                None
+            ),
+        );
+        let wins = [&a, &b].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(wins, 1, "exactly one claim may win: {a:?} / {b:?}");
+        let loser = if a.is_err() { a } else { b };
+        assert!(matches!(loser, Err(StoreError::RepinAlreadyRunning)));
+    }
+
+    /// The cutover flip is ONE transaction: the pin's stored type and the
+    /// job's completion move together, and re-running it (crash recovery's
+    /// idempotent redo) changes nothing.
+    #[sqlx::test]
+    async fn finish_cutover_flips_pin_and_job_transactionally_and_idempotently(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        // `severity` is seeded BIGINT by migration 0002.
+        let id = s
+            .claim(
+                "severity",
+                CanonicalType::BigInt,
+                CanonicalType::Varchar,
+                false,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+            .await
+            .unwrap();
+
+        let pins: std::collections::HashMap<_, _> =
+            catalog.load_pins().await.unwrap().into_iter().collect();
+        assert_eq!(pins.get("severity"), Some(&CanonicalType::Varchar));
+        let job = s.get(id).await.unwrap().expect("job row");
+        assert_eq!(job.status, RepinJobStatus::Succeeded);
+        assert!(job.finished_at.is_some());
+
+        // Idempotent redo (boot recovery replays the flip).
+        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+            .await
+            .unwrap();
+        let again = s.get(id).await.unwrap().unwrap();
+        assert_eq!(again.status, RepinJobStatus::Succeeded);
+        assert_eq!(again.finished_at, job.finished_at, "redo must not restamp");
+    }
+
+    /// Boot reconciliation: an orphaned `running` row (killed process, no
+    /// marker) fails; the marker's own job — mid-recovery — is kept.
+    #[sqlx::test]
+    async fn reconcile_orphans_fails_running_rows_except_the_kept_one(pool: PgPool) {
+        let s = store(&pool);
+        let id = s
+            .claim(
+                "status",
+                CanonicalType::BigInt,
+                CanonicalType::Varchar,
+                false,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(s.reconcile_orphans(Some(id)).await.unwrap(), 0);
+        assert_eq!(
+            s.get(id).await.unwrap().unwrap().status,
+            RepinJobStatus::Running,
+            "the marker's job survives reconciliation"
+        );
+
+        assert_eq!(s.reconcile_orphans(None).await.unwrap(), 1);
+        let job = s.get(id).await.unwrap().unwrap();
+        assert_eq!(job.status, RepinJobStatus::Failed);
+        assert!(job.error.is_some());
+    }
+
+    /// Plan + progress land on the row; `latest` prefers the running job
+    /// and falls back to the newest terminal one.
+    #[sqlx::test]
+    async fn plan_progress_and_latest(pool: PgPool) {
+        let s = store(&pool);
+        assert!(s.latest().await.unwrap().is_none());
+
+        let first = s
+            .claim(
+                "status",
+                CanonicalType::BigInt,
+                CanonicalType::Varchar,
+                true,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        s.record_plan(first, 12, 3400, 25, 19, 1 << 20)
+            .await
+            .unwrap();
+        s.finish(first, RepinJobStatus::Succeeded, None)
+            .await
+            .unwrap();
+
+        let second = s
+            .claim(
+                "status",
+                CanonicalType::BigInt,
+                CanonicalType::Varchar,
+                false,
+                true,
+                Some("key-9"),
+            )
+            .await
+            .unwrap();
+        s.record_progress(second, 5, 1200, 2, 7).await.unwrap();
+
+        let latest = s.latest().await.unwrap().expect("a running job");
+        assert_eq!(latest.id, second);
+        assert_eq!(latest.status, RepinJobStatus::Running);
+        assert!(latest.force);
+        assert!(!latest.dry_run);
+        assert_eq!(latest.requested_by.as_deref(), Some("key-9"));
+        assert_eq!(latest.files_done, 5);
+        assert_eq!(latest.rows_rewritten, 1200);
+        assert_eq!(latest.rows_nulled, 2);
+        assert_eq!(latest.rows_resurrected, 7);
+
+        s.finish(second, RepinJobStatus::Blocked, Some("cutover starved"))
+            .await
+            .unwrap();
+        let latest = s.latest().await.unwrap().expect("newest terminal job");
+        assert_eq!(latest.id, second);
+        assert_eq!(latest.status, RepinJobStatus::Blocked);
+        assert_eq!(latest.error.as_deref(), Some("cutover starved"));
+
+        let dry = s.get(first).await.unwrap().unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(dry.files_total, 12);
+        assert_eq!(dry.rows_carrying, 3400);
+        assert_eq!(dry.projected_nulls, 25);
+        assert_eq!(dry.resurrectable, 19);
+        assert_eq!(dry.affected_bytes, 1 << 20);
+    }
+
+    /// The re-arm switch for boot recovery: a recovered cutover clears
+    /// `conformed_at` so the next conformance pass re-proves the corpus.
+    #[sqlx::test]
+    async fn clear_conformed_rearms_the_boot_pass(pool: PgPool) {
+        let catalog = CatalogStore::new(pool.clone());
+        catalog.mark_conformed().await.unwrap();
+        assert!(catalog.is_conformed().await.unwrap());
+        catalog.clear_conformed().await.unwrap();
+        assert!(!catalog.is_conformed().await.unwrap());
+    }
+}

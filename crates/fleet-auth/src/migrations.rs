@@ -26,10 +26,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migrator_exposes_both_migrations() {
+    fn migrator_exposes_every_migration() {
         // Smoke test that the Migrator builds and the SQL embeds are non-empty.
         let migrations: Vec<_> = MIGRATOR.iter().collect();
-        assert_eq!(migrations.len(), 2);
+        assert_eq!(migrations.len(), 3);
         assert_eq!(migrations[0].version, 20_260_515_000_001);
         assert!(migrations[0].sql.as_str().contains("CREATE TABLE api_keys"));
         assert_eq!(migrations[1].version, 20_260_726_000_001);
@@ -39,6 +39,15 @@ mod tests {
                 .sql
                 .as_str()
                 .contains("DROP TABLE api_key_role_assignment")
+        );
+        // ADR-0011 slice B: schema_write registered, never granted.
+        assert_eq!(migrations[2].version, 20_260_812_000_001);
+        let registry = migrations[2].sql.as_str();
+        assert!(registry.contains("'schema_write'"));
+        assert!(registry.contains("INSERT INTO app_permissions"));
+        assert!(
+            !registry.contains("role_permissions") && !registry.contains("key_roles"),
+            "the registry migration must grant nothing"
         );
     }
 }

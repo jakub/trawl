@@ -2727,3 +2727,314 @@ fn pattern_targets_take_like_and_ilike() {
         "the space-separated CAST rendering is NOT the pattern text"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Slice B (issue #53): the repin rewrite's engine assumptions.
+// ---------------------------------------------------------------------------
+
+/// The repin rewrite's target-column expression
+/// ([`trawl_core::conform::resurrection_expr`]): the stored value's guarded
+/// reading first, and where the column is NULL — a prior conform shelved the
+/// value — the `_raw` re-extraction's guarded reading. Executed per ladder
+/// target over a conflict-shaped corpus.
+#[test]
+fn resurrection_recovers_shelved_values_per_ladder_target() {
+    use trawl_core::conform::resurrection_expr;
+
+    let conn = conn();
+    // A BIGINT-pinned column after a lossy conform: `404` survived, the
+    // rest were nulled and live only in `_raw` (one of them not even JSON —
+    // a client-supplied verbatim `_raw` is honoured, not validated).
+    conn.execute_batch(
+        "CREATE TABLE t (v BIGINT, _raw VARCHAR); \
+         INSERT INTO t VALUES \
+         (404, '{\"status\":404}'), \
+         (NULL, '{\"status\":\"accepted\"}'), \
+         (NULL, '{\"status\":\"200\"}'), \
+         (NULL, 'not json')",
+    )
+    .unwrap();
+
+    // Repin BIGINT -> VARCHAR: the stored value keeps its canonical text,
+    // the shelved values come back as their wire text, non-JSON `_raw`
+    // resurrects nothing.
+    let expr = resurrection_expr("v", "\"_raw\"", "status", CanonicalType::Varchar);
+    let got: Vec<Option<String>> = conn
+        .prepare(&format!("SELECT {expr} FROM t"))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        got,
+        vec![
+            Some("404".to_owned()),
+            Some("accepted".to_owned()),
+            Some("200".to_owned()),
+            None,
+        ]
+    );
+
+    // Repin BIGINT -> DOUBLE: the numeric raw value reads, the enum text
+    // has no reading (NULL, counted as a projected null).
+    let expr = resurrection_expr("v", "\"_raw\"", "status", CanonicalType::Double);
+    let got: Vec<Option<f64>> = conn
+        .prepare(&format!("SELECT {expr} FROM t"))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(got, vec![Some(404.0), None, Some(200.0), None]);
+
+    // The guarded rungs stay guarded through resurrection: a raw `"1.5"`
+    // must NOT round into a BIGINT 2.
+    conn.execute_batch(
+        "CREATE TABLE g (v VARCHAR, _raw VARCHAR); \
+         INSERT INTO g VALUES \
+         (NULL, '{\"dur\":\"1.5\"}'), \
+         (NULL, '{\"dur\":\"0404\"}'), \
+         ('7', '{\"dur\":7}')",
+    )
+    .unwrap();
+    let expr = resurrection_expr("v", "\"_raw\"", "dur", CanonicalType::BigInt);
+    let got: Vec<Option<i64>> = conn
+        .prepare(&format!("SELECT {expr} FROM g"))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        got,
+        vec![None, Some(404), Some(7)],
+        "the round-trip guard holds through the `_raw` arm ('1.5' refused, \
+         '0404' absorbed as representation drift)"
+    );
+}
+
+/// The `_raw` lookup is an EXACT key lookup in JSON Pointer form — never a
+/// `JSONPath` parse — so a client key carrying `.`/`"`/`'`/`[`/`$`/`/`/`~`
+/// resolves as itself. The case-variant fallback (`_raw` written before the
+/// ingest fold, or by a client whose spelling the fold collapsed) recovers a
+/// mixed-case original, and the exact spelling wins when both exist.
+#[test]
+fn raw_extraction_is_exact_key_lookup_and_survives_hostile_keys() {
+    use trawl_core::conform::resurrection_expr;
+
+    let conn = conn();
+    let read = |field: &str, raw: &str| -> Option<String> {
+        let expr = resurrection_expr("v", "r", field, CanonicalType::Varchar);
+        conn.query_row(
+            &format!(
+                "SELECT {expr} FROM (SELECT CAST(NULL AS VARCHAR) AS v, '{}' AS r)",
+                raw.replace('\'', "''")
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    for (field, raw, want) in [
+        ("a.b", r#"{"a.b":"dot","a":{"b":"nested"}}"#, "dot"),
+        (r#"a"b"#, r#"{"a\"b":"quote"}"#, "quote"),
+        ("a'b", r#"{"a'b":"tick"}"#, "tick"),
+        ("a[0]", r#"{"a[0]":"bracket","a":["indexed"]}"#, "bracket"),
+        ("$weird", r#"{"$weird":"dollar"}"#, "dollar"),
+        ("/slash", r#"{"/slash":"slash"}"#, "slash"),
+        ("~tilde", r#"{"~tilde":"tilde"}"#, "tilde"),
+    ] {
+        assert_eq!(
+            read(field, raw).as_deref(),
+            Some(want),
+            "field {field:?} must resolve as an exact key"
+        );
+    }
+
+    // Case-variant fallback: the catalog key is folded, `_raw` holds the
+    // client's original spelling.
+    assert_eq!(
+        read("dur", r#"{"Dur":"9"}"#).as_deref(),
+        Some("9"),
+        "a case-variant original spelling is recovered best-effort"
+    );
+    assert_eq!(
+        read("dur", r#"{"dur":"exact","Dur":"variant"}"#).as_deref(),
+        Some("exact"),
+        "the exact spelling wins over a variant"
+    );
+    // And the fallback is harmless where `_raw` is valid JSON but not an
+    // object at all.
+    assert_eq!(read("dur", "[1,2]"), None);
+    assert_eq!(read("dur", "42"), None);
+}
+
+/// The `json_valid` guard must hold under VECTORIZED execution: a batch
+/// mixing valid and invalid `_raw` rows must answer NULL for the invalid
+/// ones without erroring the whole scan (a `CASE` that eagerly evaluated
+/// its THEN arm over every row would throw on the cast).
+#[test]
+fn raw_guard_is_vector_safe_over_mixed_validity() {
+    use std::fmt::Write as _;
+
+    use trawl_core::conform::resurrection_expr;
+
+    let conn = conn();
+    conn.execute_batch("CREATE TABLE m (v VARCHAR, r VARCHAR)")
+        .unwrap();
+    let mut insert = String::from("INSERT INTO m VALUES ");
+    for i in 0..2048 {
+        if i > 0 {
+            insert.push(',');
+        }
+        if i % 3 == 0 {
+            write!(insert, "(NULL, 'garbage {i}')").unwrap();
+        } else {
+            write!(insert, "(NULL, '{{\"k\":\"{i}\"}}')").unwrap();
+        }
+    }
+    conn.execute_batch(&insert).unwrap();
+
+    let expr = resurrection_expr("v", "r", "k", CanonicalType::Varchar);
+    let (rows, recovered): (i64, i64) = conn
+        .query_row(
+            &format!("SELECT count(*)::BIGINT, count({expr})::BIGINT FROM m"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("mixed-validity batch must not error");
+    assert_eq!(rows, 2048);
+    assert_eq!(
+        recovered,
+        2048 - 683,
+        "every valid-JSON row recovers its value"
+    );
+}
+
+/// What `read_parquet(union_by_name=true)` actually does over each mixed
+/// scalar ladder pair: it PROMOTES silently — it does not error. Executed
+/// over every ordered pair of the five canonical types.
+///
+/// This kills a load-bearing assumption the repin design could otherwise
+/// lean on: a half-swapped corpus (one env repinned, another not) would NOT
+/// fail loudly — it would answer queries with silently promoted values
+/// (`BIGINT ∪ VARCHAR` reads VARCHAR, `BIGINT ∪ BOOLEAN` reads the booleans
+/// as 0/1). The cutover therefore may not rely on union errors for
+/// atomicity: the exclusion primitives (all query permits held across the
+/// swap and the pin flip) are the ONLY thing keeping a mixed-type corpus
+/// unobservable, and this probe is why they are mandatory.
+#[test]
+fn mixed_ladder_pair_unions_promote_rather_than_error() {
+    let all = [
+        CanonicalType::BigInt,
+        CanonicalType::Double,
+        CanonicalType::Boolean,
+        CanonicalType::Timestamp,
+        CanonicalType::Varchar,
+    ];
+    let lit = |t: CanonicalType| match t {
+        CanonicalType::BigInt => "42::BIGINT",
+        CanonicalType::Double => "1.5::DOUBLE",
+        CanonicalType::Boolean => "TRUE",
+        CanonicalType::Timestamp => "TIMESTAMP '2026-01-15 10:00:00'",
+        CanonicalType::Varchar => "'text'",
+    };
+    // The promoted type per unordered pair, probed by execution: VARCHAR
+    // absorbs everything, TIMESTAMP absorbs the remaining scalars, DOUBLE
+    // absorbs BIGINT and BOOLEAN, BIGINT absorbs BOOLEAN.
+    let promoted = |a: CanonicalType, b: CanonicalType| -> &'static str {
+        let has = |t| a == t || b == t;
+        if has(CanonicalType::Varchar) {
+            "VARCHAR"
+        } else if has(CanonicalType::Timestamp) {
+            "TIMESTAMP"
+        } else if has(CanonicalType::Double) {
+            "DOUBLE"
+        } else {
+            "BIGINT"
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let conn = conn();
+    for a in all {
+        for b in all {
+            if a == b {
+                continue;
+            }
+            let d = dir.path().join(format!("{a:?}_{b:?}"));
+            std::fs::create_dir_all(&d).unwrap();
+            conn.execute_batch(&format!(
+                "COPY (SELECT {} AS v) TO '{}/a.parquet' (FORMAT PARQUET); \
+                 COPY (SELECT {} AS v) TO '{}/b.parquet' (FORMAT PARQUET)",
+                lit(a),
+                d.display(),
+                lit(b),
+                d.display()
+            ))
+            .unwrap();
+            let got: String = conn
+                .query_row(
+                    &format!(
+                        "SELECT typeof(v) FROM read_parquet('{}/*.parquet', \
+                         union_by_name=true) LIMIT 1",
+                        d.display()
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|e| panic!("{a:?} ∪ {b:?} must promote, not error: {e}"));
+            assert_eq!(
+                got,
+                promoted(a, b),
+                "{a:?} ∪ {b:?} promotes to the wider scalar"
+            );
+        }
+    }
+}
+
+/// `DuckDB`'s recursive glob descends into dot-directories: a shadow
+/// generation staged INSIDE the data root — however it is named — would be
+/// unioned into every fallback-glob query as duplicate rows. This is why
+/// the repin build stages as a SIBLING of the data root (the epoch
+/// set-aside pattern), which no data-root glob or walk can reach.
+#[test]
+fn recursive_glob_descends_into_dot_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("data/prod/2026-01-01/10");
+    let shadow = dir.path().join("data/.repin-next/prod/2026-01-01/10");
+    let sibling = dir.path().join("data.repin-next/prod/2026-01-01/10");
+    for d in [&live, &shadow, &sibling] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let conn = conn();
+    for p in [
+        live.join("svc.parquet"),
+        shadow.join("svc.parquet"),
+        sibling.join("svc.parquet"),
+    ] {
+        conn.execute_batch(&format!(
+            "COPY (SELECT 1 AS x) TO '{}' (FORMAT PARQUET)",
+            p.display()
+        ))
+        .unwrap();
+    }
+    let count: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*)::BIGINT FROM read_parquet('{}/data/**/*.parquet', \
+                 union_by_name=true)",
+                dir.path().display()
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "the glob reads the in-root dot-dir (2 rows) but never the sibling \
+         — staging must live beside the root, not inside it"
+    );
+}

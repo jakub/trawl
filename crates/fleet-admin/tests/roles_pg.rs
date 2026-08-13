@@ -189,6 +189,75 @@ async fn delete_unheld_role_succeeds(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn schema_write_is_grantable_through_a_role(pool: sqlx::PgPool) {
+    // ADR-0011 slice B (issue #53): the migration REGISTERS
+    // `trawl:schema_write` and grants it to nobody. The operator's whole
+    // path to a schema-admin is therefore one `fleet-admin roles create`
+    // — no deploy, and no `server_manage` riding along.
+    let store = common::migrated_store(pool).await;
+
+    // Registered vocabulary: naming it in a role mutation warns about
+    // nothing (the registry is the warn-only surface exercised above).
+    assert!(
+        store
+            .is_known_permission("trawl", "schema_write")
+            .await
+            .unwrap(),
+        "slice B must register trawl:schema_write in app_permissions"
+    );
+
+    // ...and no converted tier holds it before the operator acts.
+    for role in store.list_roles().await.unwrap() {
+        assert!(
+            !role.permissions.contains(&rp("trawl", "schema_write")),
+            "role {} gained schema_write from a migration: {:?}",
+            role.name,
+            role.permissions
+        );
+    }
+
+    roles::create(
+        &store,
+        &role_name("trawl-schema-admin"),
+        &[rp("trawl", "schema_read"), rp("trawl", "schema_write")],
+        None,
+    )
+    .await
+    .expect("create the schema-admin role");
+
+    let created = store
+        .create_key(
+            "schema-admin",
+            PrincipalKind::Service,
+            &["trawl-schema-admin".to_owned()],
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The grant resolves through the same verify path the server gates on.
+    let verified = store.verify_key(&created.plaintext_token).await.unwrap();
+    assert_eq!(verified.roles(), ["trawl-schema-admin"]);
+    assert!(verified.has_app_permission("trawl", "schema_write"));
+    assert!(verified.has_app_permission("trawl", "schema_read"));
+    assert!(
+        !verified.has_app_permission("trawl", "server_manage"),
+        "a schema-admin must not need server_manage"
+    );
+
+    // And it is revocable the same way it was granted.
+    roles::remove_perm(
+        &store,
+        &role_name("trawl-schema-admin"),
+        &[rp("trawl", "schema_write")],
+    )
+    .await
+    .expect("remove schema_write");
+    let verified = store.verify_key(&created.plaintext_token).await.unwrap();
+    assert!(!verified.has_app_permission("trawl", "schema_write"));
+}
+
+#[sqlx::test(migrations = false)]
 async fn assign_unassign_roundtrip_through_role_commands(pool: sqlx::PgPool) {
     // AC7 round-trip: roles create → keys create --role → assign/unassign
     // visible through the verify path.

@@ -9,8 +9,9 @@
 //! dynamic field's canonical type here BEFORE the first parquet file
 //! carrying it is written, and conforms every batch to the pins — so
 //! `union_by_name` across any set of trawl-written files can never
-//! conflict. Pins are add-only until the repin machinery (#53) — and
-//! because a pin is therefore permanent while its name is a client-chosen
+//! conflict. Pins are add-only on the ingest path (the one mutation is the
+//! operator-triggered repin cutover, `store::repin`, ADR-0011 slice B) —
+//! and because a pin slot is therefore permanent while its name is a client-chosen
 //! JSON key, the catalog is bounded where a sender controls the axis: name
 //! length by [`trawl_core::schema::is_storable_field_name`], pin count by
 //! [`MAX_PINNED_FIELDS`], and per-field conflict evidence by
@@ -255,8 +256,8 @@ pub struct FieldConflictRow {
 
 /// Maximum number of fields the catalog will ever pin.
 ///
-/// Field names are client-chosen JSON keys, and a pin is PERMANENT (pins
-/// are add-only until the repin machinery, #53, and retention never
+/// Field names are client-chosen JSON keys, and a pin SLOT is PERMANENT
+/// (a repin retypes a pin, nothing reclaims one, and retention never
 /// reconciles `field_services`). Without a count bound, a sender that
 /// embeds identifiers in its keys — `user_12345_status`, accidental or
 /// hostile — grows postgres, the in-process [`crate::catalog::FieldCatalog`]
@@ -290,13 +291,13 @@ pub struct FieldConflictRow {
 ///   `catalog_pin_cap_reached` warning only fires once slots are already
 ///   gone.)
 ///
-/// What neither buys is a REMEDY: reclaiming a taken slot means proving no
-/// standing parquet carries the column and rewriting the ones that do, which
-/// is the shadow-generation rewrite of #53; a hand-run
-/// `DELETE FROM field_types` breaks the write-time conformance invariant for
-/// files already on disk and must not be recommended. Until #53, a sustained
-/// sender can still fill the catalog — the ration slows it and the gauges
-/// make it visible while it happens.
+/// What neither buys is a REMEDY: the repin engine (ADR-0011 slice B)
+/// retypes a wrong pin, but reclaiming a taken SLOT means proving no
+/// standing parquet carries the column — deliberately out of scope; a
+/// hand-run `DELETE FROM field_types` breaks the write-time conformance
+/// invariant for files already on disk and must not be recommended. A
+/// sustained sender can still fill the catalog — the ration slows it and
+/// the gauges make it visible while it happens.
 pub const MAX_PINNED_FIELDS: i64 = 10_000;
 
 /// Maximum `field_conflicts` rows kept per field — the newest survive.
@@ -562,7 +563,8 @@ impl CatalogStore {
 
         // The fill level is the signal an operator can act on BEFORE the cap
         // bites; `catalog_pin_cap_reached` below only fires once the slots
-        // are already gone (and gone permanently, until #53).
+        // are already gone — and gone permanently (a repin retypes a slot,
+        // nothing reclaims one).
         let pinned_now: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
             .fetch_one(&self.pool)
             .await?;
@@ -1167,6 +1169,17 @@ impl CatalogStore {
     /// Record boot-conformance completion.
     pub async fn mark_conformed(&self) -> Result<(), StoreError> {
         sqlx::query("UPDATE catalog_state SET conformed_at = now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Re-arm the boot conformance pass (ADR-0011 slice B): a repin cutover
+    /// recovered at boot clears this so `ensure_conformance` re-proves the
+    /// corpus against the flipped pin in the same boot — the backstop for
+    /// any file an interrupted repin missed.
+    pub async fn clear_conformed(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE catalog_state SET conformed_at = NULL")
             .execute(&self.pool)
             .await?;
         Ok(())

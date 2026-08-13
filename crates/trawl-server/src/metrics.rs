@@ -39,6 +39,14 @@ pub const CATALOG_CONFORM_SKIPPED_TOTAL: &str = "trawl_catalog_conform_skipped_t
 pub const CATALOG_PINS_REJECTED_TOTAL: &str = "trawl_catalog_pins_rejected_total";
 pub const CATALOG_PINNED_FIELDS: &str = "trawl_catalog_pinned_fields";
 pub const CATALOG_PIN_CAPACITY: &str = "trawl_catalog_pin_capacity";
+pub const CATALOG_REPIN_JOBS_TOTAL: &str = "trawl_catalog_repin_jobs_total";
+pub const CATALOG_REPIN_RUNNING: &str = "trawl_catalog_repin_running";
+pub const CATALOG_REPIN_FILES_TOTAL: &str = "trawl_catalog_repin_files_total";
+pub const CATALOG_REPIN_FILES_DONE: &str = "trawl_catalog_repin_files_done";
+pub const CATALOG_REPIN_ROWS_NULLED_TOTAL: &str = "trawl_catalog_repin_rows_nulled_total";
+pub const CATALOG_REPIN_ROWS_RESURRECTED_TOTAL: &str = "trawl_catalog_repin_rows_resurrected_total";
+pub const CATALOG_REPIN_DURATION_SECONDS: &str = "trawl_catalog_repin_duration_seconds";
+pub const RETENTION_SUPPRESSED: &str = "trawl_retention_suppressed";
 pub const AUTH_FAILURES_TOTAL: &str = "trawl_auth_failures_total";
 pub const TELEMETRY_WAL_WRITE_FAILURES_TOTAL: &str = "trawl_telemetry_wal_write_failures_total";
 pub const TELEMETRY_EVENTS_DROPPED_TOTAL: &str = "trawl_telemetry_events_dropped_total";
@@ -123,15 +131,53 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         CATALOG_PINNED_FIELDS,
-        "Field-catalog pins in use. A pin is permanent until the repin \
-         rewrite (#53), so this only ever climbs — alert on it against \
-         trawl_catalog_pin_capacity, well before the cap starts denying \
-         pins"
+        "Field-catalog pins in use. A pin slot is permanent (a repin \
+         retypes a pin, nothing reclaims one), so this only ever climbs — \
+         alert on it against trawl_catalog_pin_capacity, well before the \
+         cap starts denying pins"
     );
     describe_gauge!(
         CATALOG_PIN_CAPACITY,
         "Field-catalog pin ceiling (store::catalog::MAX_PINNED_FIELDS); a \
          field arriving at a full catalog is never stored as a column"
+    );
+    describe_counter!(
+        CATALOG_REPIN_JOBS_TOTAL,
+        "Repin jobs finished, labelled by outcome (succeeded, failed, \
+         refused_needs_force, blocked) — dry runs count as succeeded"
+    );
+    describe_gauge!(
+        CATALOG_REPIN_RUNNING,
+        "1 while a repin rewrite is executing (one at a time, install-wide)"
+    );
+    describe_gauge!(
+        CATALOG_REPIN_FILES_TOTAL,
+        "Affected files the running (or last) repin job's scan found"
+    );
+    describe_gauge!(
+        CATALOG_REPIN_FILES_DONE,
+        "Affected files the running repin job has rewritten so far"
+    );
+    describe_counter!(
+        CATALOG_REPIN_ROWS_NULLED_TOTAL,
+        "Stored values repin rewrites could not keep under the new pin \
+         (forced lossy repins; originals remain findable in _raw)"
+    );
+    describe_counter!(
+        CATALOG_REPIN_ROWS_RESURRECTED_TOTAL,
+        "Values repin rewrites recovered from _raw into the structured column"
+    );
+    describe_histogram!(
+        CATALOG_REPIN_DURATION_SECONDS,
+        "End-to-end repin job duration (build, catch-up, cutover, sweep)"
+    );
+    describe_gauge!(
+        RETENTION_SUPPRESSED,
+        "1 while retention sweeps (age AND disk pressure) stand down for \
+         repin staging on the data root, 0 when they run. Unlike \
+         trawl_catalog_repin_running this stays 1 for staging no job owns \
+         — a boot replay whose sweep keeps failing — so alert on it held \
+         high across ticks: the archive grows unbounded meanwhile"
     );
     describe_counter!(
         AUTH_FAILURES_TOTAL,

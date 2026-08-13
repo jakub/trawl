@@ -191,6 +191,76 @@ pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
     }
 }
 
+/// A SQL string literal's body: single quotes doubled.
+fn sql_str(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// The RFC 6901 JSON Pointer naming `field` as a TOP-LEVEL key: `~` → `~0`,
+/// `/` → `~1`, prefixed with `/`.
+///
+/// Pointer form, never `JSONPath`: a field name is a client-chosen JSON key,
+/// and `JSONPath` would parse `.`/`[`/`$` out of it (a leading `$` is a
+/// binder error outright, probed by execution). The pointer escape is total
+/// — every key, hostile or not, resolves as itself.
+#[must_use]
+pub fn raw_json_pointer(field: &str) -> String {
+    format!("/{}", field.replace('~', "~0").replace('/', "~1"))
+}
+
+/// The wire text of `field` inside a `_raw`-shaped column (`raw_quoted`,
+/// already a quoted identifier), or NULL where `_raw` is not valid JSON,
+/// not an object, or does not carry the key.
+///
+/// Two arms under one `json_valid` guard (safe under vectorized execution —
+/// probed over a mixed-validity batch):
+///
+/// 1. the EXACT folded key, in pointer form;
+/// 2. best-effort case-variant recovery: `_raw` written before the ingest
+///    fold (or by a client whose spelling the fold collapsed) carries the
+///    ORIGINAL spelling, so the first `json_keys` entry whose lowercase is
+///    the folded name is re-read through a computed pointer. `lower()` is
+///    Unicode where the ingest fold is ASCII — an over-match there recovers
+///    a value that was never this field's, which is why this arm is
+///    best-effort and second.
+#[must_use]
+pub fn raw_extract(raw_quoted: &str, field: &str) -> String {
+    let exact = sql_str(&raw_json_pointer(field));
+    let folded = sql_str(&field.to_ascii_lowercase());
+    format!(
+        "(CASE WHEN json_valid({raw_quoted}) THEN COALESCE(\
+         json_extract_string({raw_quoted}, '{exact}'), \
+         json_extract_string({raw_quoted}, '/' || \
+         replace(replace(list_filter(json_keys({raw_quoted}), \
+         k -> lower(k) = '{folded}')[1], '~', '~0'), '/', '~1'))) END)"
+    )
+}
+
+/// The repin rewrite's target-column expression (ADR-0011 slice B): the
+/// stored value's guarded reading under the NEW pin, and — where that is
+/// NULL, i.e. the column never carried the value or a prior conform
+/// shelved it — the `_raw` re-extraction's guarded reading.
+///
+/// One expression for the dry-run COUNT and the rewrite WRITE, by the same
+/// doctrine that makes the hot branch and compaction one builder: a plan
+/// that predicts with one expression and rewrites with another is a report
+/// that lies. Both arms go through [`guarded_cast`], so resurrection can
+/// never smuggle in a value the conform would have refused (`"1.5"` does
+/// not round into a BIGINT 2 just because it came back from `_raw`).
+#[must_use]
+pub fn resurrection_expr(
+    quoted: &str,
+    raw_quoted: &str,
+    field: &str,
+    pin: CanonicalType,
+) -> String {
+    format!(
+        "COALESCE({}, {})",
+        guarded_cast(&untyped_text(quoted), pin),
+        guarded_cast(&raw_extract(raw_quoted, field), pin)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +325,43 @@ mod tests {
             untyped_text("\"dur\""),
             "json_extract_string(to_json(\"dur\"), '$')"
         );
+    }
+
+    /// The pointer escape is RFC 6901: `~` first, then `/`, so the escapes
+    /// cannot collide.
+    #[test]
+    fn raw_json_pointer_escapes_rfc_6901() {
+        assert_eq!(raw_json_pointer("status"), "/status");
+        assert_eq!(raw_json_pointer("a/b"), "/a~1b");
+        assert_eq!(raw_json_pointer("a~b"), "/a~0b");
+        assert_eq!(raw_json_pointer("a~1b"), "/a~01b");
+        assert_eq!(raw_json_pointer("$weird"), "/$weird");
+    }
+
+    /// The extraction embeds the field as a SQL literal, so a quote in a
+    /// client-chosen key cannot break out of the string.
+    #[test]
+    fn raw_extract_escapes_sql_quotes() {
+        let sql = raw_extract("r", "a'b");
+        assert!(sql.contains("'/a''b'"), "exact arm must escape: {sql}");
+        assert!(!sql.contains("'/a'b'"), "unescaped literal leaked: {sql}");
+    }
+
+    /// The dry run counts and the rewrite writes with THIS one expression:
+    /// stored reading first, `_raw` reading second, both guarded.
+    #[test]
+    fn resurrection_expr_is_stored_reading_then_guarded_raw_arm() {
+        let sql = resurrection_expr("\"v\"", "\"_raw\"", "dur", CanonicalType::Varchar);
+        assert_eq!(
+            sql,
+            format!(
+                "COALESCE({}, {})",
+                untyped_text("\"v\""),
+                raw_extract("\"_raw\"", "dur")
+            )
+        );
+        // Typed pins guard BOTH arms.
+        let typed = resurrection_expr("\"v\"", "\"_raw\"", "dur", CanonicalType::BigInt);
+        assert_eq!(typed.matches("DECIMAL(38,6)").count(), 4);
     }
 }

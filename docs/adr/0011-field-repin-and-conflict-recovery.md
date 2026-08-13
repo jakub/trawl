@@ -1,7 +1,8 @@
 # Field repin and conflict recovery
 
 status: accepted (2026-08-05), amended (2026-08-10) after the slice-A
-implementation review — see Amendment
+implementation review and (2026-08-12) as slice B shipped — see
+Amendments
 
 ADR-0009 made the field catalog the install-wide write-time type authority:
 one pinned type per field name, decided at first typed sight, permanent. That
@@ -72,11 +73,27 @@ first-typed-sight pinning tenable at multi-team scale.
   affected files/rows, projected nulls, and resurrectable values; a repin
   that would null values requires an explicit force. VARCHAR is simply the
   always-lossless case.
-- **Catch-up, then a narrow pause.** A catch-up loop folds in files written
-  during the build. Only the final increment runs under a pause, and the
+- **Catch-up, then a narrow pause that DEFERS draining.** A catch-up loop
+  folds in files written during the build. Only the final increment runs
+  under a pause, and that pause takes the corpus gate's write side, so it
+  excludes whole compaction batches for its few seconds: WAL→parquet
+  draining is deferred, never dropped and never starved. A batch that
+  starts inside the pause blocks at the gate holding its WAL files and its
+  hot batch and resumes itself the moment the pause lifts, with no new tick
+  and no operator action. Ingest takes neither the gate nor an executor
+  permit, so events keep landing in the WAL and the hot buffer throughout
+  and stay queryable undrained — the invisible-events prohibition of
+  ADR-0008 holds, and an event ingested into the pause is in the corpus
+  exactly once past the cutover.
+  *(Ratified 2026-08-12, replacing this bullet's original mechanism — "the
   pause gates only the file-replacing rollup half of compaction — WAL
-  draining continues throughout, so the hot buffer never evicts unqueryable
-  events (the invisible-events prohibition of ADR-0008 holds).
+  draining continues throughout" — which amendment §2 below disproved by
+  execution: mixed scalar unions silently promote instead of erring, so a
+  batch that kept draining would conform under the OLD pin and publish
+  after the flip. Only the mechanism changed; the ADR-0008 property the
+  original clause protected is unchanged and evidenced by
+  `trawl-server/tests/repin.rs::events_ingested_during_the_final_pause_stay_visible_exactly_once`.
+  Issue #53's matching acceptance criterion carries the same amendment.)*
 - **Atomic, crash-recoverable cutover.** An operation marker is written
   before any visible change; the switch is the epoch.rs discipline — rename
   live root aside, rename shadow onto the canonical path, then flip the pin
@@ -394,3 +411,123 @@ amendment.
 
 **The invisibility property now covers the pipeline: #53 (the repin
 engine) is unblocked.**
+
+## Amendment (2026-08-12): slice B shipped — two mechanism corrections,
+both forced by execution evidence
+
+Issue #53 landed the engine as designed, with two deviations from this
+ADR's literal mechanism text, each recorded here with the evidence that
+forced it:
+
+### 1. Sibling staging and a per-env swap, not a whole-root rename
+
+The ADR said "rename live root aside, rename shadow onto the canonical
+path". Two facts killed that:
+
+- **The WAL lives inside the data root by default**
+  (`wal_dir = {data.base_dir}/wal/`), as do `scheduled/`, `EPOCH` and
+  `CATALOG`. A whole-root swap either strands the live WAL mid-write or
+  forces WAL-writer gating plus a graft of four subtrees between the two
+  renames — strictly more machinery and a wider stopped world.
+- **In-root staging of any spelling is unsafe**: DuckDB's recursive glob
+  descends into dot-directories (probed in
+  `trawl-engine/tests/duckdb_probe.rs`), so a `data/.repin-next/` would
+  be unioned into every fallback-glob query as duplicate rows.
+
+The shadow and aside roots are therefore SIBLINGS of the data root
+(`data.repin-next/`, `data.repin-aside/` — the epoch set-aside pattern:
+same filesystem, so hardlinks and renames are guaranteed, and invisible
+to every data-root glob and walk by construction), and the swap is two
+renames per env directory, idempotent and forward-only, shared verbatim
+by the live cutover and the boot marker replay. Same property — no
+reachable state in which queries observe a mixed-type corpus — different
+mechanism.
+
+### 2. The atomicity budget rests entirely on exclusion — union errors
+protect nothing
+
+The design could have leaned on "a mixed-type corpus errors loudly".
+Probed by execution: every mixed scalar ladder pair under
+`read_parquet(union_by_name=true)` **silently promotes** (`BIGINT ∪
+VARCHAR` reads VARCHAR, `BIGINT ∪ BOOLEAN` reads the booleans as 0/1) —
+it does not error. A query straddling the swap would return wrong
+answers, not a 500. The cutover therefore holds BOTH exclusion
+primitives across the final increment, the swap and the pin flip: a
+corpus gate whose read side wraps every compaction batch's
+pin-snapshot → conform → publish phase, and exclusivity over every
+executor-pool permit (every parquet-reading lane — query, from-saved,
+export, value sampling — computes its source and snapshots its
+comparison pins inside the permit-holding task). The drain is bounded: a wedged query aborts
+the job to the terminal `blocked` outcome rather than starving the
+cutover. Past the cutover marker the engine is forward-only — a swap or
+flip failure terminates the process crash-consistent (the marker replay
+completes it) rather than releasing exclusivity over a half-swapped
+corpus.
+
+### Also recorded
+
+- The narrow pause DEFERS WAL *draining* (a compaction batch cannot start
+  under the corpus gate) but nothing an operator can observe as a missing
+  event: ingest takes neither the gate nor an executor permit, so events
+  keep landing in the WAL and the hot buffer throughout, undrained and
+  therefore still queryable, and they are in the corpus exactly once past
+  the cutover — the ADR-0008 prohibition, evidenced end to end by
+  `trawl-server/tests/repin.rs::events_ingested_during_the_final_pause_stay_visible_exactly_once`.
+  This is the one place the shipped engine reads narrower than issue #53's
+  original acceptance criterion, which said draining *continues* through
+  the pause. That criterion, the issue's matching design paragraph and the
+  Decisions bullet above are all amended to what §2 forces and the test
+  proves — the ratification is recorded, not deferred, so nothing in the
+  decision record still asserts the disproved mechanism. A batch that
+  starts inside the pause is deferred, not starved and not
+  dropped: it blocks at the gate holding its WAL files and its hot batch,
+  resumes on its own the moment the pause lifts (no new tick, no operator
+  action) and drains exactly those events, whose count is 3-total /
+  1-for-`status=418` before and after that drain lands. Continuous
+  draining would mean batches conforming under the OLD pin and publishing
+  after the flip — the mixed corpus §2 exists to exclude.
+  The file-relocating rollup, by contrast, stands down for the WHOLE job
+  — and takes BOTH primitives to do it, because the job claims the pause
+  only after a minutes-long scan a rollup pass may already be running
+  behind. The flag alone would stop a pass that had not STARTED; a pass
+  in flight would keep merging day/service units straight through
+  `swap_envs` and rename a pre-repin daily into the new generation. So
+  every relocating unit (each merge, and the interrupted-rollup
+  recovery) runs under the corpus gate and reads the pause under it: the
+  cutover waits out the one unit in flight, and every later unit stands
+  down mid-pass.
+- The resurrection expression lives in `trawl_core::conform`
+  (`resurrection_expr`: guarded stored reading, then the guarded `_raw`
+  re-extraction — an exact-key RFC 6901 JSON Pointer, never JSONPath,
+  with a best-effort case-variant fallback), and the dry run counts with
+  the same expression the rewrite writes — the one-builder doctrine of
+  the 2026-08-10 amendment, extended to the plan/report pair.
+- Retention stands down ENTIRELY (age and pressure) while the marker or
+  staging exists, not just the pressure sweep; the job pre-flights its
+  double-held bytes against `min_free_disk_bytes` in exchange. The claim
+  is re-read immediately before every directory deletion, not once per
+  tick, so a job admitted mid-tick is not raced by a sweep that started
+  before its marker landed.
+- Dry run, force gate and execution are one code path: every request
+  claims the one-running job row and runs the same scan; a lossy plan
+  without force parks terminal `refused_needs_force` with the plan as
+  the 409 body. `to == current` plus force is the resurrection-only
+  pass — the supported repair for a boot-conformed interrupted repin.
+- The pin cache gained its first non-add-only path
+  (`FieldCatalog::repin`) but NO generation counter: the Consequences
+  section above anticipated one, and exclusion made it dead on arrival.
+  The cutover flips the pin while it holds every executor-pool permit,
+  so no query straddles it and no holder of a snapshot ever needs to
+  detect staleness. A counter no code reads is a maintenance cost with
+  a doc comment promising a consumer that does not exist; it was cut
+  rather than shipped for its own unit tests.
+- Named residuals: an SSE stream keeps its pin snapshot until reconnect
+  (a repin reaches live tails at their next connect); catch-up
+  increments can null values a forced plan did not predict (counted,
+  never aborted — the values remain in `_raw`); a query-only node
+  pointed at a repinned archive keeps stale pins until restart; and a
+  catch-up that cannot converge within its bounded passes fails the job
+  cleanly with the corpus untouched.
+
+**The manual `UPDATE field_types` surgery escape hatch is retired: the
+supported path is `trawl schema repin` / `POST /api/v1/schema/repin`.**

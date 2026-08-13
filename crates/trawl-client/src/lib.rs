@@ -12,7 +12,7 @@ pub mod client;
 pub mod error;
 pub mod types;
 
-pub use client::HttpClient;
+pub use client::{HttpClient, RepinStart};
 pub use error::ClientError;
 pub use types::{
     ActiveQuerySnapshot, CancelResponse, CatalogConflictRow, CatalogConflictsResponse,
@@ -21,7 +21,8 @@ pub use types::{
     ErrorDetail, ErrorEnvelope, ErrorResponse, ErrorSpan, ExportFormat, ExportRequest,
     FieldValuesResponse, HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse,
     IngestEventError, IngestResponse, ListReportRunsResponse, ListSavedResponse, PaginationMeta,
-    QueriesResponse, QueryRequest, QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary,
-    SavedQueryResponse, SchemaColumnResponse, SchemaResponse, StatsResponse, StreamEvent,
-    UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    QueriesResponse, QueryRequest, QueryResponse, QueryStatus, RepinJobResponse, RepinRequest,
+    RepinResponse, RepinStatusResponse, ReportRunResponse, ReportRunSummary, SavedQueryResponse,
+    SchemaColumnResponse, SchemaResponse, StatsResponse, StreamEvent, UpdateSavedRequest,
+    ValidationResponse, WhoAmIResponse,
 };

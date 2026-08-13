@@ -64,6 +64,11 @@ pub enum Permission {
     ServerManage,
     /// Write events via the ingest endpoint.
     Ingest,
+    /// Mutate the field catalog — the repin trigger (ADR-0011 slice B).
+    /// Separate from [`Self::ServerManage`] so a schema-admin role can
+    /// exist without server administration, and read-only surfaces can
+    /// show repin state without offering the trigger.
+    SchemaWrite,
 }
 
 impl Permission {
@@ -80,6 +85,7 @@ impl Permission {
         Self::QueryCancel,
         Self::ServerManage,
         Self::Ingest,
+        Self::SchemaWrite,
     ];
 
     /// Snake-case string representation for wire formats and keystore rows.
@@ -94,6 +100,7 @@ impl Permission {
             Self::QueryCancel => "query_cancel",
             Self::ServerManage => "server_manage",
             Self::Ingest => "ingest",
+            Self::SchemaWrite => "schema_write",
         }
     }
 
@@ -111,6 +118,7 @@ impl Permission {
             "query_cancel" => Some(Self::QueryCancel),
             "server_manage" => Some(Self::ServerManage),
             "ingest" => Some(Self::Ingest),
+            "schema_write" => Some(Self::SchemaWrite),
             _ => None,
         }
     }

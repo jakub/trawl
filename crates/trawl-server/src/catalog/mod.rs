@@ -7,9 +7,13 @@
 //! compaction uses to pin and conform.
 //!
 //! The postgres tables live in [`crate::store::catalog`]; this module is
-//! the process-local view. Pins are add-only until the repin machinery
-//! (#53), so the cache never needs invalidation — boot hydrates it and
-//! every `pin_missing` refresh only ever adds entries.
+//! the process-local view. Boot hydrates it, every `pin_missing` refresh
+//! adds entries — and since ADR-0011 slice B the repin cutover overwrites
+//! exactly one entry through [`FieldCatalog::repin`], the cache's first
+//! non-add-only path. "Add-only" is therefore no longer a cache invariant.
+//! Nothing needs to detect a stale snapshot: a query roots ONE snapshot
+//! per execution and the cutover's exclusion primitives guarantee no query
+//! straddles a flip.
 //!
 //! Every name in the catalog is ASCII-lowercase by construction: each
 //! producer folds field names at its own door — HTTP ingest in
@@ -49,16 +53,26 @@ impl FieldCatalog {
         *self.pins.write() = pins.into_iter().collect();
     }
 
+    /// Overwrite ONE field's pin — the repin cutover's flip (ADR-0011
+    /// slice B), and the cache's first non-add-only path. Runs while the
+    /// cutover holds every query permit, so no in-flight query can observe
+    /// half a flip.
+    pub fn repin(&self, field: &str, ty: CanonicalType) {
+        self.pins.write().insert(field.to_owned(), ty);
+    }
+
     /// Fold newly-durable pins into the cache, leaving every other entry
     /// alone.
     ///
-    /// This — not [`Self::replace`] — is the steady-state update. Pins are
-    /// add-only until the repin machinery (#53), so a delta merge lands the
-    /// same map a full reload would, without re-reading a catalog sized by
-    /// how many distinct field names clients have ever sent (bounded, but
-    /// only by [`crate::store::MAX_PINNED_FIELDS`]). Compaction runs this
-    /// once per batch that actually pinned something; a batch proposing
-    /// nothing touches neither postgres nor this lock.
+    /// This — not [`Self::replace`] — is the steady-state update: on the
+    /// COMPACTION path pins only ever appear (`pin_missing` never rewrites
+    /// one — the one path that does is the repin cutover, which goes
+    /// through [`Self::repin`]), so a delta merge lands the same map a full
+    /// reload would, without re-reading a catalog sized by how many
+    /// distinct field names clients have ever sent (bounded, but only by
+    /// [`crate::store::MAX_PINNED_FIELDS`]). Compaction runs this once per
+    /// batch that actually pinned something; a batch proposing nothing
+    /// touches neither postgres nor this lock.
     pub fn merge(&self, pins: impl IntoIterator<Item = (String, CanonicalType)>) {
         let mut guard = self.pins.write();
         for (field, ty) in pins {
@@ -185,6 +199,23 @@ mod tests {
         assert_eq!(cache.get("duration"), Some(CanonicalType::BigInt));
         assert_eq!(cache.get("status"), Some(CanonicalType::BigInt));
         assert_eq!(cache.snapshot().len(), 2);
+    }
+
+    /// The first non-add-only path (ADR-0011 slice B): a repin overwrites
+    /// exactly one key and leaves every other pin alone — unlike `merge`,
+    /// which only ever adds.
+    #[test]
+    fn repin_overwrites_exactly_one_key() {
+        let cache = catalog(&[
+            ("status", CanonicalType::BigInt),
+            ("dur", CanonicalType::Double),
+        ]);
+
+        cache.repin("status", CanonicalType::Varchar);
+
+        assert_eq!(cache.get("status"), Some(CanonicalType::Varchar));
+        assert_eq!(cache.get("dur"), Some(CanonicalType::Double));
+        assert_eq!(cache.snapshot().len(), 2, "an overwrite, never an add");
     }
 
     #[test]

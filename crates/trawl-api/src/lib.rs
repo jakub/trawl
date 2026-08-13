@@ -820,6 +820,90 @@ pub struct CatalogConflictRow {
     pub at: String,
 }
 
+// -- repin (ADR-0011 slice B) ------------------------------------------------
+
+/// Request body for `POST /api/v1/schema/repin`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepinRequest {
+    /// The field to repin (folded to the catalog's ASCII-lowercase key).
+    pub field: String,
+    /// Target candidate-ladder type (`BIGINT`, `DOUBLE`, `TIMESTAMP`,
+    /// `BOOLEAN`, `VARCHAR`; case-insensitive).
+    pub to: String,
+    /// Scan and report only — no mutation.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Accept a lossy projection (`projected_nulls > 0`), or run a
+    /// resurrection-only pass when `to` equals the current pin.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// One repin job — the dry-run report and the progress/outcome record are
+/// the same shape (they are the same postgres row).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepinJobResponse {
+    /// Job id.
+    pub id: i64,
+    /// The repinned field.
+    pub field: String,
+    /// The pin at claim time.
+    pub from_type: String,
+    /// The target pin.
+    pub to_type: String,
+    /// Whether the job stopped after the scan.
+    pub dry_run: bool,
+    /// Whether a lossy projection was explicitly accepted.
+    pub force: bool,
+    /// `running`, `succeeded`, `failed`, `refused_needs_force`, `blocked`.
+    pub status: String,
+    /// Requesting key's display name.
+    pub requested_by: Option<String>,
+    /// Claim instant (ISO 8601 UTC).
+    pub started_at: String,
+    /// Terminal instant (ISO 8601 UTC).
+    pub finished_at: Option<String>,
+    /// Terminal error text, when any.
+    pub error: Option<String>,
+    /// Scan plan: affected files.
+    pub files_total: u64,
+    /// Scan plan: rows carrying a stored value for the field.
+    pub rows_carrying: u64,
+    /// Scan plan: stored values the new pin cannot keep.
+    pub projected_nulls: u64,
+    /// Scan plan: shelved values `_raw` gives back under the new pin.
+    pub resurrectable: u64,
+    /// Scan plan: bytes across the affected files (held twice until the
+    /// job's final sweep).
+    pub affected_bytes: u64,
+    /// Progress: affected files rewritten so far.
+    pub files_done: u64,
+    /// Outcome: rows written through the rewrite.
+    pub rows_rewritten: u64,
+    /// Outcome: stored values the rewrite nulled.
+    pub rows_nulled: u64,
+    /// Outcome: values resurrected from `_raw`.
+    pub rows_resurrected: u64,
+}
+
+/// Response body for `POST /api/v1/schema/repin`. The HTTP status carries
+/// the verdict: 200 = dry-run report, 202 = rewrite started, 409 = lossy
+/// without force (the job is terminal `refused_needs_force` and this body
+/// IS the plan the refusal is based on).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepinResponse {
+    /// The job row.
+    pub job: RepinJobResponse,
+}
+
+/// Response from `GET /api/v1/schema/repin/status`: the running job if
+/// any, else the newest job of any status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepinStatusResponse {
+    /// The job, or `None` when no repin has ever run.
+    pub job: Option<RepinJobResponse>,
+}
+
 // -- history -----------------------------------------------------------------
 
 /// Response from the history endpoint.

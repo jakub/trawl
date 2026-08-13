@@ -1827,3 +1827,99 @@ async fn list_all_runs_paginated(pool: sqlx::PgPool) {
     assert_eq!(resp.total, 0);
     assert!(resp.runs.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// repin surface (ADR-0011 slice B)
+// ---------------------------------------------------------------------------
+
+/// `SchemaWrite` gates the trigger: even the admin role (frozen conversion
+/// bundle, no `schema_write`) is refused, while the schema-admin role —
+/// which deliberately lacks `server_manage` — may trigger. The status
+/// surface is `SchemaRead` (read-only surfaces show state without
+/// offering the trigger).
+#[sqlx::test(migrations = false)]
+async fn repin_permission_matrix(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
+
+    // Admin: full legacy bundle, but NOT schema_write.
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+    let err = admin
+        .schema_repin("status", "VARCHAR", true, false)
+        .await
+        .expect_err("admin lacks schema_write");
+    match err {
+        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 401),
+        other => panic!("expected auth refusal, got {other:?}"),
+    }
+    // No standing role gained the permission silently.
+    let resp = admin.whoami().await.unwrap();
+    assert!(
+        !resp.permissions.contains(&"schema_write".to_owned()),
+        "existing roles must not gain schema_write: {:?}",
+        resp.permissions
+    );
+
+    // Schema-admin: may trigger (an unpinned field is a 400 — the request
+    // was AUTHORIZED and then refused on the merits, with no side effect).
+    let schema_admin = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
+    let err = schema_admin
+        .schema_repin("never_pinned_field", "VARCHAR", true, false)
+        .await
+        .expect_err("unpinned field refuses on the merits");
+    match err {
+        trawl_client::ClientError::Server { status, error } => {
+            assert_eq!(status, 400);
+            assert!(error.message.contains("not a pinned field"), "{error:?}");
+        }
+        other => panic!("expected a 400, got {other:?}"),
+    }
+    let resp = schema_admin.whoami().await.unwrap();
+    assert_eq!(resp.roles, ["trawl-schema-admin"]);
+    assert!(resp.permissions.contains(&"schema_write".to_owned()));
+    assert!(!resp.permissions.contains(&"server_manage".to_owned()));
+
+    // Status: SchemaRead suffices; the reader can see, not trigger.
+    let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+    let status = reader.schema_repin_status().await.unwrap();
+    assert!(status.job.is_none(), "no repin has run on this server");
+    let err = reader
+        .schema_repin("status", "VARCHAR", true, false)
+        .await
+        .expect_err("reader lacks schema_write");
+    match err {
+        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 401),
+        other => panic!("expected auth refusal, got {other:?}"),
+    }
+
+    // The ingest-only key holds a trawl grant but neither schema permission.
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+    assert!(ingest.schema_repin_status().await.is_err());
+}
+
+/// Envelope fields and unknown target types refuse with 400 before any
+/// job row exists — validation is side-effect-free.
+#[sqlx::test(migrations = false)]
+async fn repin_validation_refusals_are_side_effect_free(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
+    let client = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
+
+    for (field, to) in [
+        ("severity", "VARCHAR"), // envelope field
+        ("_time", "VARCHAR"),    // envelope metadata
+        ("status", "UUID"),      // not a ladder type
+    ] {
+        let err = client
+            .schema_repin(field, to, true, false)
+            .await
+            .expect_err("must refuse");
+        match err {
+            trawl_client::ClientError::Server { status, .. } => {
+                assert_eq!(status, 400, "{field} -> {to}");
+            }
+            other => panic!("expected 400 for {field} -> {to}, got {other:?}"),
+        }
+    }
+    // No job row was ever claimed.
+    let status = client.schema_repin_status().await.unwrap();
+    assert!(status.job.is_none(), "validation refusals claim no job");
+}

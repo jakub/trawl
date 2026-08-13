@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Operator-triggered field repin (ADR-0011 slice B, #53).** A
+  wrongly-pinned catalog field can be retyped to any candidate-ladder
+  type with one command: `trawl schema repin <field> --to <type>` /
+  `POST /api/v1/schema/repin` (new `schema_write` permission — granted
+  to no existing role; `GET /api/v1/schema/repin/status` is
+  `schema_read`). The corpus is rewritten as a shadow generation beside
+  the data root (unaffected and foreign files hardlinked, affected files
+  rebuilt through the conform machinery), **conflict-shelved values are
+  resurrected from `_raw`** under the same lossless guard, and the
+  cutover is atomic, crash-recoverable (a `data/REPIN` marker replays
+  through a boot decision table) and invisible: queries never observe a
+  mixed-type corpus, answers are identical before and after, and events
+  ingested during the rewrite land exactly once. A mandatory-by-shape
+  dry run reports affected files/rows, projected nulls and resurrectable
+  values; a lossy repin refuses without `--force` (409 with the plan)
+  and accounts its losses as conflict evidence when forced — and
+  because ingest keeps running for the whole job, the same gate is
+  re-asked of the finished rewrite, so a started job still ends
+  `refused_needs_force` (corpus untouched) when data that landed after
+  the scan turns out to be unreadable under the new type;
+  `--to <current> --force` runs a resurrection-only pass. One job at a
+  time install-wide (postgres-enforced), progress and outcomes on
+  `trawl_catalog_repin_*` metrics; retention stands down while a job is
+  in flight. This retires the documented stop-trawld-and-do-surgery
+  escape hatch.
+
 ### Changed — behavior
 - **`| where` and `| let` comparisons follow the field catalog's pins
   (ADR-0011 slice A′, #66).** Bare field-vs-literal comparisons in the

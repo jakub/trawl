@@ -137,7 +137,7 @@ Retention is exactly those two files — there is no multi-generation rotation o
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `path` | string | *(required)* | Parquet data directory |
+| `path` | string | *(required)* | Parquet data directory. Point it at a directory *inside* your storage volume, not at the mount point itself: a repin stages its shadow and set-aside generations as siblings (`data.repin-next/`, `data.repin-aside/`), and hardlinks and renames cannot cross a filesystem boundary. Both packaged layouts already do this (volume at `/var/lib/trawl`, data at `/var/lib/trawl/data`). Keep the whole corpus on that one filesystem, too — a volume mounted at an env/date/hour subtree (tiered storage) breaks the same hardlinks, and renaming an env directory that contains a mount point fails with `EBUSY`. A repin requested on a data root that *is* a mount point, or whose env subtree holds one, is refused before it builds anything, naming the offending path |
 
 ### `[auth]`
 
@@ -189,6 +189,23 @@ trawld migrates this database automatically at boot (it is the sole writer) and 
 | `max_age_days` | integer | `90` | Delete data older than N days; `0` disables |
 | `min_free_disk_bytes` | byte size | `"1G"` | Delete oldest data when free disk drops below; `0` disables |
 | `retention_interval_secs` | integer | `3600` | Retention check frequency (default: 1 hour) |
+
+Both sweeps stand down while a repin job's marker or staging roots exist
+(`data/REPIN`, `data.repin-next/`, `data.repin-aside/`): the job
+double-holds its affected bytes until its final sweep and pre-flights
+against `min_free_disk_bytes` before starting, so retention could neither
+relieve the pressure nor safely delete files out from under the shadow
+build. They resume the tick after the job (or its boot replay) finishes.
+A staging root that survives its sweep — a permission or I/O error —
+deliberately keeps the marker, since the marker is what licenses trawl to
+delete that root: the cleanup is retried at the next boot
+(`repin_recovery_incomplete` meanwhile), and retention stays suppressed
+until the root is actually gone. Alert on `trawl_retention_suppressed` —
+it is 1 for every tick either sweep stands down and 0 once they run
+again, so it distinguishes a repin in progress (minutes, hours) from
+staging nothing owns, which holds it at 1 indefinitely while the archive
+grows. `trawl_catalog_repin_running` cannot: it is 0 in exactly the
+stranded case.
 
 Disk-pressure deletion is suppressed while a pre-cutover `data.pre-schema-v2/` set-aside directory exists (it sits outside `data/`, so deleting partitions could never reclaim it); each tick under pressure logs `retention_disk_pressure_suppressed` instead. Remove the set-aside to reclaim the space and re-enable the policy. Age-based retention is unaffected.
 

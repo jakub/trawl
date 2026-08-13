@@ -72,7 +72,56 @@ Ongoing bookkeeping (conflict rows and observations) is written *after* the parq
 
 The catalog is bounded where field names are the client-chosen axis: at most 10,000 fields are ever pinned (a field arriving at a full catalog stays unpinned, so its column is not stored and its values remain in `_raw` — the denial warns as `catalog_pin_cap_reached` and counts on `trawl_catalog_pins_rejected_total`), and `field_conflicts` keeps a rolling window of the 100 newest rows *per field*, trimmed in the same transaction that writes. A sender that keeps disagreeing with a pin therefore costs a fixed amount of postgres, not a growing one; the exhaustive tally lives in the counters, which are never trimmed. `field_services` rows, by contrast, are **ever-observed**: nothing removes one — "which services ever carried this field" is historical fact, not an index over live files — and consumers window on `last_seen`.
 
-A pin slot, unlike those windows, is spent permanently (pins are add-only until the repin rewrite), so *filling* the pin cap is its own hazard: every field pinned after the cap is reached is unstored on the whole install, not just for the sender that filled it. Compaction is therefore rationed — one batch may claim at most **half the free slots**, so no single ingest request can take the catalog and there is always headroom left for the next field a legitimate sender introduces. The fill level is exported as `trawl_catalog_pinned_fields` against `trawl_catalog_pin_capacity`: alert on the ratio, because `catalog_pin_cap_reached` only fires once the slots are already gone. The boot conformance pass is deliberately exempt from the ration — its proposals describe columns already on disk, and denying one of those *deletes* standing data instead of declining to add a column.
+A pin slot, unlike those windows, is spent permanently on the ingest path (only an operator-triggered repin rewrites one), so *filling* the pin cap is its own hazard: every field pinned after the cap is reached is unstored on the whole install, not just for the sender that filled it. Compaction is therefore rationed — one batch may claim at most **half the free slots**, so no single ingest request can take the catalog and there is always headroom left for the next field a legitimate sender introduces. The fill level is exported as `trawl_catalog_pinned_fields` against `trawl_catalog_pin_capacity`: alert on the ratio, because `catalog_pin_cap_reached` only fires once the slots are already gone. The boot conformance pass is deliberately exempt from the ration — its proposals describe columns already on disk, and denying one of those *deletes* standing data instead of declining to add a column.
+
+### Repin: the shadow-generation rewrite
+
+A wrong pin is not permanent: `POST /api/v1/schema/repin` (or `trawl
+schema repin`) retypes one field's whole corpus, ADR-0011 slice B. The
+job — one at a time install-wide, persisted in postgres — builds the new
+generation as a **sibling** of the data root (`data.repin-next/`; a
+sibling because DuckDB's recursive glob descends into dot-directories, so
+an in-root staging dir would leak duplicate rows into fallback-glob
+queries): unaffected and foreign files are hardlinked verbatim, affected
+files (owned layout paths whose footer carries the column) are rewritten
+through the same ConformPlan machinery compaction uses, with the target
+column read as `COALESCE(guarded stored reading, guarded _raw
+re-extraction)` — resurrection of conflict-shelved values, under the same
+lossless guard, and the dry run counts with the very expression the
+rewrite writes. A **symlink** under an env directory refuses the job
+(dry run included): trawl never writes one, the shadow cannot carry it,
+and skipping it would leave the swapped-aside original as the only copy
+for the job's own cleanup sweep to delete — materialize it or move it
+out of `data/{env}/` and retry. A data root that is itself a **mount
+point** refuses the job for the same class of reason (dry run included,
+before anything is built): the siblings would land on the parent
+filesystem, where neither the hardlinks nor the swap's renames can reach
+them — put the data root inside the volume, as both packaged layouts do.
+
+An additive catch-up loop folds in files compaction writes meanwhile (the
+file-relocating daily rollup is paused for the whole job, so the diff is
+pure additions/replacements). The cutover is a few seconds under two
+exclusion primitives — a corpus gate compaction batches take read-side,
+and exclusivity over every query permit — because a half-swapped corpus
+would not error: mixed scalar unions silently *promote* (probed by
+execution), so exclusion is the whole atomicity budget. Inside it: final
+increment, `data/REPIN` marker, two renames per env dir (`data/{env}` →
+`data.repin-aside/{env}`, shadow → live; `wal/`, `scheduled/`, the
+markers never move), then the pin flip (postgres + the in-process cache)
+transactionally with the job's completion. WAL draining pauses only for
+those seconds and the hot buffer keeps every undrained event queryable —
+no event is ever invisible, and events ingested during the rewrite land
+exactly once. A compaction batch that starts inside the pause is deferred,
+not dropped: it waits at the corpus gate holding its WAL files and its hot
+batch, and resumes itself the moment the pause lifts.
+
+A crash anywhere is finished by boot: the marker replays through a
+decision table *before* the epoch gate (building → abandon the disposable
+shadow; cutover → complete the renames forward; cleanup → sweep), the
+postgres half completes the idempotent flip and re-arms the boot
+conformance pass to re-prove the corpus that same boot. Retention stands
+down entirely while the marker or staging exists, and the job pre-flights
+its double-held bytes against `min_free_disk_bytes`.
 
 ### Timestamp repair
 

@@ -37,7 +37,24 @@ The migration converts the former static tiers into these roles:
 | `trawl-ingest` | `ingest` |
 
 Handlers gate on permissions, never role names — reshape the tiers with
-`fleet-admin roles` without a deploy.
+`fleet-admin roles` without a deploy. A valid key that lacks the
+permission a route asks for is refused **401** (the whole per-route gate
+answers alike); **403** is reserved for the grant gate in front of it — a
+key resolving *no* recognized trawl permission at all.
+
+One permission exists outside the converted tiers: `schema_write` gates
+the repin trigger (the first data-mutating schema action) and is
+deliberately granted to **no** role by default — a schema-admin role is
+one `fleet-admin roles create` away:
+
+```bash
+fleet-admin roles create --name trawl-schema-admin \
+  --perm trawl:schema_read --perm trawl:schema_write
+fleet-admin keys assign-role <key-prefix> trawl-schema-admin
+```
+
+No `server_manage` rides along, and no deploy is involved: the migration
+only registers `trawl:schema_write` in the permission vocabulary.
 
 ## Endpoints
 
@@ -149,6 +166,65 @@ GET /api/v1/schema/conflicts?field=duration&service=envoy&since_secs=604800
 The schema-health dashboard: recent type conflicts (a batch column whose
 conforming cast nulled rows), most recent first. Filter by `field`,
 `service`, and `since_secs`; `limit` defaults to 100 (max 1000).
+
+```
+POST /api/v1/schema/repin
+```
+
+Repin a field to a new candidate-ladder type (ADR-0011 slice B): a
+shadow-generation rewrite of every affected file, with resurrection of
+conflict-shelved values from `_raw`, an atomic crash-recoverable cutover,
+and one job at a time install-wide. `schema_write`-gated; a query-only
+node (ingest disabled) answers 503 — it does not own the data root.
+
+```json
+{ "field": "status", "to": "VARCHAR", "dry_run": true, "force": false }
+```
+
+The HTTP status carries the verdict, and the body is the job row in every
+case:
+
+- **200** — a dry-run report: affected files, rows carrying a value,
+  `projected_nulls` (stored values the new type cannot read),
+  `resurrectable` (shelved values `_raw` gives back), affected bytes.
+  Dry runs are persisted jobs too — the row *is* the report.
+- **202** — the rewrite started in the background; poll the status route.
+- **400** — refused on the merits, side-effect-free: an unpinned field, a
+  declared envelope field, an unknown target type, or `to` equal to the
+  current pin without `force` (with `force` that shape runs a
+  **resurrection-only** pass — re-extract shelved values under the same
+  pin).
+- **409** with a job body — the scan projected nulled values and no
+  `force` flag was passed; the job is terminal `refused_needs_force` and
+  the body is the plan the refusal is based on. (A second repin while one
+  runs also 409s, with the ordinary error envelope.)
+
+The request holds open for the whole scan, which is a full-corpus pass —
+minutes on a large archive, past most client and proxy timeouts. A
+disconnect does not cancel anything: the claimed job runs to a terminal
+status on its own and the verdict is readable from the status route, so a
+timed-out repin is polled, never retried blind.
+
+The same gate is asked again of the finished rewrite: ingest keeps running
+for the whole job, so a file written after the scan can carry values the
+new type cannot read. A job that started with 202 therefore still ends
+`refused_needs_force` — corpus untouched, `rows_nulled` carrying what the
+rewrite would have lost — when that happens without `force`.
+
+A forced lossy repin records its losses as `field_conflicts` evidence and
+in `trawl_catalog_repin_rows_nulled_total`; the originals stay findable
+in `_raw`. Queries never observe a mixed-type corpus (the cutover holds
+every query slot for its final seconds), events ingested during the
+rewrite land exactly once, and a crash at any point is finished by the
+next boot's marker replay.
+
+```
+GET /api/v1/schema/repin/status
+```
+
+The running job if any, else the newest job of any status —
+`schema_read`-gated (read-only surfaces show repin state without offering
+the trigger) and served on query-only nodes too.
 
 ```
 GET /api/v1/schema/services

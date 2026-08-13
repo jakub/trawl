@@ -167,6 +167,46 @@ enum SchemaSubcommand {
         #[arg(long, short, value_enum)]
         format: Option<cli::OutputFormat>,
     },
+
+    /// Repin a field to a new type: shadow-rewrite the corpus with
+    /// resurrection of conflict-nulled values from _raw (ADR-0011).
+    Repin {
+        /// Field name (folded to the catalog's ASCII-lowercase spelling).
+        field: String,
+
+        /// Target type: BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, or VARCHAR.
+        #[arg(long)]
+        to: String,
+
+        /// Scan and report only — no mutation.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Accept a lossy projection (values the new type cannot read are
+        /// nulled; originals stay findable in _raw), or run a
+        /// resurrection-only pass when --to equals the current pin.
+        #[arg(long)]
+        force: bool,
+
+        /// Skip the interactive confirmation (required off a TTY).
+        #[arg(long)]
+        yes: bool,
+
+        /// Poll the job to completion instead of returning immediately.
+        #[arg(long)]
+        wait: bool,
+
+        /// Output format (auto-detected if omitted).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+    },
+
+    /// Show the running (or most recent) repin job.
+    RepinStatus {
+        /// Output format (auto-detected if omitted).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -431,6 +471,33 @@ async fn run_schema(
                 format,
             )
             .await
+        }
+        SchemaSubcommand::Repin {
+            field,
+            to,
+            dry_run,
+            force,
+            yes,
+            wait,
+            format,
+        } => {
+            schema::run_repin(
+                &mut out,
+                conn(token)?,
+                &field,
+                &to,
+                schema::RepinFlags {
+                    dry_run,
+                    force,
+                    yes,
+                    wait,
+                },
+                format,
+            )
+            .await
+        }
+        SchemaSubcommand::RepinStatus { format } => {
+            schema::run_repin_status(&mut out, conn(token)?, format).await
         }
     }
 }

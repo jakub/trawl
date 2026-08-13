@@ -19,6 +19,7 @@ use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb
 use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs};
 use crate::hot_buffer::HotBuffer;
+use crate::repin::RepinCoordinator;
 use crate::state::CompactionStats;
 use crate::store::{FieldConflict, PinProposal};
 
@@ -45,6 +46,7 @@ pub fn spawn_compaction(
     hot_buffer: Option<Arc<HotBuffer>>,
     compaction_stats: Option<Arc<CompactionStats>>,
     catalog: Option<CatalogContext>,
+    repin: Option<Arc<RepinCoordinator>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -63,7 +65,7 @@ pub fn spawn_compaction(
         loop {
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
-                    match compact_once(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref(), chunk_size, &memory_limit, catalog.as_ref()).await {
+                    match compact_once_coordinated(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref(), chunk_size, &memory_limit, catalog.as_ref(), repin.as_ref()).await {
                         Ok(data_loss) => {
                             if let Some(ref stats) = compaction_stats {
                                 stats.total_runs.fetch_add(1, Ordering::Relaxed);
@@ -120,6 +122,43 @@ pub async fn compact_once(
     chunk_size: usize,
     memory_limit: &str,
     catalog: Option<&CatalogContext>,
+) -> Result<u64, String> {
+    compact_once_coordinated(
+        wal_dir,
+        data_dir,
+        min_age,
+        daily_rollup,
+        hot_buffer,
+        chunk_size,
+        memory_limit,
+        catalog,
+        None,
+    )
+    .await
+}
+
+/// [`compact_once`] with the repin interlocks (ADR-0011 slice B) attached:
+/// each service batch's pin-snapshot → conform → publish phase runs under
+/// the coordinator's corpus-gate READ guard (so no batch can straddle a
+/// repin cutover), and the file-RELOCATING daily rollup is suppressed for
+/// as long as the coordinator holds a rollup pause (so the shadow build's
+/// catch-up diff stays additive) — suppressed BEFORE it starts by the
+/// pause, and mid-pass by the same corpus gate, which every relocating
+/// unit takes so a pass already running when the job began can neither
+/// straddle the cutover nor continue past it. WAL→parquet draining itself is never
+/// suppressed — it only waits out the seconds the cutover holds the write
+/// guard.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
+pub async fn compact_once_coordinated(
+    wal_dir: &Path,
+    data_dir: &Path,
+    min_age: Duration,
+    daily_rollup: bool,
+    hot_buffer: Option<&Arc<HotBuffer>>,
+    chunk_size: usize,
+    memory_limit: &str,
+    catalog: Option<&CatalogContext>,
+    repin: Option<&Arc<RepinCoordinator>>,
 ) -> Result<u64, String> {
     // Remove orphaned .parquet.tmp files from interrupted compaction runs.
     for (_env, env_data_dir) in list_env_dirs(data_dir) {
@@ -204,9 +243,17 @@ pub async fn compact_once(
                     .collect();
                 let batch_ids: Vec<&str> = batch_ids.iter().map(String::as_str).collect();
 
+                // The corpus-gate read guard covers the whole batch —
+                // pin snapshot, conform, publish — so the cutover's write
+                // guard means "no batch in flight, none can start".
+                let corpus_guard = match repin {
+                    Some(c) => Some(c.compaction_guard().await),
+                    None => None,
+                };
                 let outcome =
                     compact_service_batch(chunk, &env_data_dir, service, memory_limit, catalog)
                         .await;
+                drop(corpus_guard);
 
                 // Fold the quarantine count UNCONDITIONALLY — quarantining
                 // renames the corrupt file to `.corrupt`, so a retry can't
@@ -262,8 +309,17 @@ pub async fn compact_once(
     // per-service daily files. This dramatically reduces file count for
     // long lookback queries. Rollup is best-effort: a failure for one
     // day/service is counted and retried next tick, not propagated.
-    let rollup_failures = if daily_rollup {
-        match rollup_once(data_dir, memory_limit).await {
+    let rollup_suppressed = repin.is_some_and(|c| c.rollup_paused());
+    if daily_rollup && rollup_suppressed {
+        tracing::info!(
+            event_type = "rollup_suppressed",
+            "daily rollup suppressed for the duration of the running repin \
+             job (the catch-up diff must stay additive); hourly files \
+             consolidate on the first tick after the job ends"
+        );
+    }
+    let rollup_failures = if daily_rollup && !rollup_suppressed {
+        match rollup_once(data_dir, memory_limit, repin).await {
             Ok(n) => n,
             Err(e) => {
                 tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
@@ -282,17 +338,64 @@ pub async fn compact_once(
 /// For each date-directory older than today, collects all
 /// `{hour}/{service}.parquet` files, merges them (sorted by timestamp)
 /// into `{date}/{service}.parquet`, then removes the hourly sources.
-async fn rollup_once(data_dir: &Path, memory_limit: &str) -> Result<u64, String> {
+///
+/// Every unit of that relocation runs under the repin corpus gate (see
+/// [`rollup_unit`]), so a pass already running when a repin job starts
+/// stands down instead of moving files across a cutover.
+async fn rollup_once(
+    data_dir: &Path,
+    memory_limit: &str,
+    repin: Option<&Arc<RepinCoordinator>>,
+) -> Result<u64, String> {
     let mut total: u64 = 0;
     for (_env, env_data_dir) in list_env_dirs(data_dir) {
-        total += rollup_env_once(&env_data_dir, memory_limit).await?;
+        if repin.is_some_and(|c| c.rollup_paused()) {
+            break;
+        }
+        total += rollup_env_once(&env_data_dir, memory_limit, repin).await?;
     }
     Ok(total)
 }
 
+/// Whether one file-relocating rollup unit may proceed, and the
+/// corpus-gate read guard that keeps a repin cutover out of it while it
+/// does. Without a coordinator (tests, embedded-style callers) there is no
+/// repin engine to exclude and every unit proceeds ungated.
+enum RollupUnit<'a> {
+    Proceed(Option<tokio::sync::RwLockReadGuard<'a, ()>>),
+    StandDown,
+}
+
+/// Claim the corpus for one relocating unit. See
+/// [`RepinCoordinator::rollup_unit_guard`] for why the pause is read under
+/// the guard rather than before it.
+async fn rollup_unit(repin: Option<&Arc<RepinCoordinator>>) -> RollupUnit<'_> {
+    match repin {
+        None => RollupUnit::Proceed(None),
+        Some(c) => match c.rollup_unit_guard().await {
+            Some(guard) => RollupUnit::Proceed(Some(guard)),
+            None => RollupUnit::StandDown,
+        },
+    }
+}
+
+/// Log the mid-pass stand-down once, on the unit that saw the claim.
+fn log_rollup_stand_down() {
+    tracing::info!(
+        event_type = "rollup_suppressed",
+        "daily rollup stood down mid-pass: a repin job claimed the corpus \
+         while this pass was running; hourly files consolidate on the first \
+         tick after the job ends"
+    );
+}
+
 /// Roll up one env root (`data_dir/{env}`): consolidate each historical
 /// date's hourly files into per-service daily files. Never crosses envs.
-async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, String> {
+async fn rollup_env_once(
+    data_dir: &Path,
+    memory_limit: &str,
+    repin: Option<&Arc<RepinCoordinator>>,
+) -> Result<u64, String> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let mut failures: u64 = 0;
     let mut quarantined_total: u64 = 0;
@@ -324,6 +427,16 @@ async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, Str
         // Recover any interrupted rollups from previous runs before
         // starting new ones. This ensures crash-orphaned hourly files
         // are cleaned up without re-merging already-consolidated data.
+        // Recovery relocates files too (it deletes the hourly sources of a
+        // merge that already completed), so it is a gated unit like the
+        // merges below.
+        let recovery_guard = match rollup_unit(repin).await {
+            RollupUnit::Proceed(guard) => guard,
+            RollupUnit::StandDown => {
+                log_rollup_stand_down();
+                return Ok(failures + quarantined_total);
+            }
+        };
         if let Err(e) = recover_rollup_markers(&path) {
             // A wedged recovery is data-loss-adjacent (an interrupted rollup
             // left orphaned hourlies/tmp that couldn't be cleaned up), so count
@@ -339,6 +452,7 @@ async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, Str
                 "rollup recovery failed"
             );
         }
+        drop(recovery_guard);
 
         // Collect hourly subdirs. If none exist, this day is already consolidated.
         let hour_dirs = collect_hour_dirs(&path);
@@ -353,6 +467,21 @@ async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, Str
         }
 
         for (service, files) in &service_files {
+            // One merge = one gated unit: it reads the day's hourlies,
+            // renames the merged daily into place and deletes the sources,
+            // so a cutover swapping the shadow in between those steps would
+            // republish this file's pre-repin types into the new
+            // generation. Held for the merge, re-taken per service, so the
+            // cutover waits out at most one merge and the rest of the pass
+            // stands down.
+            let unit_guard = match rollup_unit(repin).await {
+                RollupUnit::Proceed(guard) => guard,
+                RollupUnit::StandDown => {
+                    log_rollup_stand_down();
+                    return Ok(failures + quarantined_total);
+                }
+            };
+
             let day_dir = path.clone();
             let svc = service.clone();
             let files = files.clone();
@@ -363,6 +492,7 @@ async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, Str
             })
             .await
             .map_err(|e| format!("rollup task panicked: {e}"))?;
+            drop(unit_guard);
 
             // Quarantined inputs are data-loss whether or not the merge then
             // succeeded — fold the count in unconditionally so it lands on the
@@ -382,6 +512,9 @@ async fn rollup_env_once(data_dir: &Path, memory_limit: &str) -> Result<u64, Str
         }
 
         // Remove empty hour-directories after all services are rolled up.
+        // Deliberately ungated: `remove_dir` fails on a non-empty
+        // directory, so this can never take a parquet file — of either
+        // generation — with it.
         for hour_dir in &hour_dirs {
             if is_dir_empty(hour_dir) {
                 let _ = std::fs::remove_dir(hour_dir);
@@ -1879,6 +2012,56 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
     ))
 }
 
+/// The repin target column's expression, in the ONE place both consumers
+/// read it from: [`ConformPlan::build`] under [`ConformPolicy::Repin`]
+/// (the rewrite) and the repin scan's dry-run counting
+/// (`crate::repin::plan`) — the plan predicts with the same SQL the
+/// rewrite writes, by the same doctrine that makes the hot branch and
+/// compaction one builder.
+pub(crate) fn repin_target_expr(
+    quoted: &str,
+    has_raw: bool,
+    folded: &str,
+    pin: CanonicalType,
+) -> String {
+    if has_raw {
+        trawl_core::conform::resurrection_expr(
+            quoted,
+            &quote_ident(trawl_core::schema::RAW),
+            folded,
+            pin,
+        )
+    } else {
+        trawl_core::conform::guarded_cast(&trawl_core::conform::untyped_text(quoted), pin)
+    }
+}
+
+/// The repin scan/rewrite counting expressions, built over
+/// [`repin_target_expr`] so the dry-run numbers and the rewrite outcome
+/// are the same computation: `(carrying, kept, resurrectable)` —
+/// stored values, stored values the new pin keeps (resurrection arm
+/// included), and shelved (`NULL`-stored) values `_raw` gives back.
+pub(crate) fn repin_count_exprs(
+    quoted: &str,
+    has_raw: bool,
+    folded: &str,
+    pin: CanonicalType,
+) -> (String, String, String) {
+    let target = repin_target_expr(quoted, has_raw, folded, pin);
+    let carrying = format!("count({quoted})");
+    let kept = format!("count(CASE WHEN {quoted} IS NOT NULL THEN {target} END)");
+    let resurrectable = if has_raw {
+        let raw_read = trawl_core::conform::guarded_cast(
+            &trawl_core::conform::raw_extract(&quote_ident(trawl_core::schema::RAW), folded),
+            pin,
+        );
+        format!("count(CASE WHEN {quoted} IS NULL THEN {raw_read} END)")
+    } else {
+        "0".to_owned()
+    };
+    (carrying, kept, resurrectable)
+}
+
 /// Wrap a TIMESTAMP-pinned envelope column's conform in a never-NULL last
 /// arm, so conforming a standing file can never manufacture a NULL partition
 /// key (the boot-pass counterpart of [`repair_expr`]'s third arm, ADR-0008).
@@ -1888,13 +2071,14 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
 /// TIMESTAMP: a `_time` pinned VARCHAR is plain text and needs no partition
 /// guard (and could not take a TIMESTAMP literal anyway).
 fn guard_partition_key(
-    policy: ConformPolicy,
+    policy: &ConformPolicy,
     is_time_col: bool,
     pin: CanonicalType,
     expr: &str,
 ) -> String {
     match policy {
         ConformPolicy::StandingFile { time_fallback }
+        | ConformPolicy::Repin { time_fallback, .. }
             if is_time_col && pin == CanonicalType::Timestamp =>
         {
             format!(
@@ -1909,7 +2093,7 @@ fn guard_partition_key(
 /// Which corpus a [`ConformPlan`] is being built over. The two conform
 /// sites agree on every rule except these, so the difference is named
 /// rather than duplicated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConformPolicy {
     /// A freshly-read WAL batch (compaction). `_time`/`_ingested` pass
     /// through untouched — the ADR-0008 repair ladder already made them
@@ -1937,6 +2121,32 @@ pub(crate) enum ConformPolicy {
     /// partition instant (its `{date}/{HH}` directory), or the conform
     /// instant when the path carries none.
     StandingFile {
+        time_fallback: chrono::DateTime<chrono::Utc>,
+    },
+    /// A repin rewrite over an affected standing file (ADR-0011 slice B):
+    /// [`ConformPolicy::StandingFile`] in every rule but one — the column
+    /// whose FOLDED name is `resurrect_field` routes through
+    /// [`trawl_core::conform::resurrection_expr`] UNCONDITIONALLY, even
+    /// when its physical type already matches the pin (the forced
+    /// resurrection-only pass, `to == current`, exists precisely to
+    /// rewrite a column the ordinary conform would call a noop). The pin
+    /// map handed in is the live one with the target entry flipped to the
+    /// NEW type, so every other column takes the pass-through arm — a
+    /// conformant corpus casts nothing else.
+    ///
+    /// Defensive residual: a file with no `_raw` column (impossible for
+    /// canonicalized events, reachable for a hand-planted file at a valid
+    /// layout path) falls back to the plain guarded conform — no
+    /// resurrection arm, rather than a rewrite-failing reference to a
+    /// missing column.
+    // Constructed by the repin engine (`crate::repin`); until that module
+    // lands in this slice's later milestone the only constructors are
+    // tests, which the lib-only lint pass cannot see.
+    #[allow(dead_code)]
+    Repin {
+        /// The repinned field (catalog key, folded).
+        resurrect_field: String,
+        /// Same role as [`ConformPolicy::StandingFile::time_fallback`].
         time_fallback: chrono::DateTime<chrono::Utc>,
     },
 }
@@ -1985,7 +2195,7 @@ impl ConformPlan {
     pub(crate) fn build(
         schema: &[ColInfo],
         pins: &HashMap<String, CanonicalType>,
-        policy: ConformPolicy,
+        policy: &ConformPolicy,
     ) -> Self {
         let mut plan = Self {
             select_list: Vec::with_capacity(schema.len()),
@@ -1994,17 +2204,44 @@ impl ConformPlan {
             casts: Vec::new(),
             renamed: 0,
         };
+        // The resurrection arm reads `_raw`, so it exists only where the
+        // file carries the column (see [`ConformPolicy::Repin`]).
+        let has_raw = schema
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(trawl_core::schema::RAW));
         for col in schema {
             let quoted = quote_ident(&col.name);
             let folded = col.name.to_ascii_lowercase();
             let is_time_col = trawl_core::schema::TIMESTAMP_COLUMNS.contains(&folded.as_str());
-            if policy == ConformPolicy::WalBatch && is_time_col {
+            if matches!(policy, ConformPolicy::WalBatch) && is_time_col {
                 plan.keep(col, &folded, quoted);
                 continue;
             }
+            let repin_target = matches!(
+                policy,
+                ConformPolicy::Repin { resurrect_field, .. } if *resurrect_field == folded
+            );
             match pins.get(&folded).copied() {
-                None if policy == ConformPolicy::WalBatch => plan.dropped.push(col.name.clone()),
+                None if matches!(policy, ConformPolicy::WalBatch) => {
+                    plan.dropped.push(col.name.clone());
+                }
                 None => plan.keep(col, &folded, quoted),
+                Some(pin) if repin_target => {
+                    // Unconditional — never the `conform_expr` noop check:
+                    // the resurrection-only pass rewrites a column whose
+                    // physical type already IS the pin.
+                    let expr = repin_target_expr(&quoted, has_raw, &folded, pin);
+                    let written = guard_partition_key(policy, is_time_col, pin, &expr);
+                    plan.select_list
+                        .push(format!("{written} AS {}", quote_ident(&folded)));
+                    plan.retained.push(folded.clone());
+                    plan.casts.push(CastEntry {
+                        name: folded,
+                        dtype: col.dtype.clone(),
+                        pin,
+                        expr,
+                    });
+                }
                 Some(pin) => match conform_expr(&quoted, &col.dtype, pin) {
                     None => plan.keep(col, &folded, quoted),
                     Some(expr) => {
@@ -2245,7 +2482,7 @@ fn conform_wal_batch(
     pins: &HashMap<String, CanonicalType>,
     service: &str,
 ) -> Result<(Vec<FieldConflict>, Vec<String>), String> {
-    let plan = ConformPlan::build(schema, pins, ConformPolicy::WalBatch);
+    let plan = ConformPlan::build(schema, pins, &ConformPolicy::WalBatch);
     if plan.select_list.is_empty() {
         return Err("conform produced an empty column list".to_owned());
     }
@@ -3007,7 +3244,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         assert_eq!(plan.cast_count(), 2, "both columns disagree with their pin");
 
         let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
@@ -3043,7 +3280,7 @@ mod tests {
         let pins: HashMap<String, CanonicalType> = (0..cols)
             .map(|i| (format!("f{i}"), CanonicalType::BigInt))
             .collect();
-        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         assert_eq!(plan.cast_count(), cols, "every VARCHAR column casts");
 
         let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
@@ -3294,7 +3531,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
         assert_eq!(conflicts.len(), 1);
         assert_eq!(
@@ -3375,7 +3612,7 @@ mod tests {
         let plan = ConformPlan::build(
             &schema,
             &pins,
-            ConformPolicy::StandingFile {
+            &ConformPolicy::StandingFile {
                 time_fallback: chrono::Utc::now(),
             },
         );
@@ -3391,9 +3628,147 @@ mod tests {
 
         // WalBatch: an unpinned mixed-case column is judged by its FOLDED
         // name — pinned under `dur`, so it is conformed, not dropped.
-        let wal_plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let wal_plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         assert!(wal_plan.dropped.is_empty(), "{:?}", wal_plan.dropped);
         assert_eq!(wal_plan.retained, vec!["dur", "note"]);
+    }
+
+    /// The repin policy (ADR-0011 slice B): the target column routes
+    /// through the resurrection expression — stored guarded reading first,
+    /// then the `_raw` re-extraction — while every already-conformant
+    /// column passes through untouched.
+    #[test]
+    fn repin_policy_routes_the_target_through_resurrection() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE f AS SELECT * FROM (VALUES \
+             (404::BIGINT, 'svc', '{\"status\":404}'), \
+             (NULL::BIGINT, 'svc', '{\"status\":\"accepted\"}')) \
+             t(status, service, _raw)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "f").unwrap();
+        // The one-entry-flipped pin map: status now VARCHAR.
+        let pins: HashMap<String, CanonicalType> = [
+            ("status".to_owned(), CanonicalType::Varchar),
+            ("service".to_owned(), CanonicalType::Varchar),
+            ("_raw".to_owned(), CanonicalType::Varchar),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(
+            &schema,
+            &pins,
+            &ConformPolicy::Repin {
+                resurrect_field: "status".to_owned(),
+                time_fallback: chrono::Utc::now(),
+            },
+        );
+        assert!(!plan.is_noop());
+        assert_eq!(plan.cast_count(), 1, "only the target column is cast");
+        assert!(
+            plan.select_list.iter().any(|s| s == "\"service\""),
+            "conformant columns pass through untouched: {:?}",
+            plan.select_list
+        );
+
+        let rows: Vec<(Option<String>, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT {} FROM f ORDER BY _raw",
+                    plan.select_list.join(", ")
+                ))
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    Some("accepted".to_owned()),
+                    Some("{\"status\":\"accepted\"}".to_owned())
+                ),
+                (Some("404".to_owned()), Some("{\"status\":404}".to_owned())),
+            ],
+            "the stored value keeps its text and the shelved value resurrects"
+        );
+    }
+
+    /// The forced resurrection-only pass (`to == current` + force): the
+    /// column's physical type already IS the pin, which the ordinary
+    /// conform would treat as a noop — the repin target must still be
+    /// rewritten so shelved values come back.
+    #[test]
+    fn repin_policy_fires_even_when_the_dtype_already_matches_the_pin() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE f AS SELECT * FROM (VALUES \
+             (NULL::BIGINT, '{\"dur\":7}')) t(dur, _raw)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "f").unwrap();
+        let pins: HashMap<String, CanonicalType> = [
+            ("dur".to_owned(), CanonicalType::BigInt),
+            ("_raw".to_owned(), CanonicalType::Varchar),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(
+            &schema,
+            &pins,
+            &ConformPolicy::Repin {
+                resurrect_field: "dur".to_owned(),
+                time_fallback: chrono::Utc::now(),
+            },
+        );
+        assert!(!plan.is_noop(), "a resurrection-only pass is a rewrite");
+        assert_eq!(plan.cast_count(), 1);
+        let got: Option<i64> = conn
+            .query_row(
+                &format!("SELECT {} FROM f", plan.select_list[0]),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(got, Some(7), "the shelved value comes back");
+    }
+
+    /// Defensive: an affected file that (against the envelope invariant)
+    /// carries no `_raw` column falls back to the plain guarded conform —
+    /// a resurrection arm referencing a missing column would fail the
+    /// whole rewrite.
+    #[test]
+    fn repin_policy_without_raw_column_falls_back_to_plain_conform() {
+        let schema = vec![ColInfo {
+            name: "status".to_owned(),
+            dtype: "BIGINT".to_owned(),
+        }];
+        let pins: HashMap<String, CanonicalType> = [("status".to_owned(), CanonicalType::Varchar)]
+            .into_iter()
+            .collect();
+        let plan = ConformPlan::build(
+            &schema,
+            &pins,
+            &ConformPolicy::Repin {
+                resurrect_field: "status".to_owned(),
+                time_fallback: chrono::Utc::now(),
+            },
+        );
+        assert_eq!(plan.cast_count(), 1);
+        assert!(
+            !plan.select_list[0].contains("_raw"),
+            "no resurrection arm without a _raw column: {}",
+            plan.select_list[0]
+        );
     }
 
     /// Conform-time lossless guarantee: a batch disagreeing with an
@@ -3418,7 +3793,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let plan = ConformPlan::build(&schema, &pins, ConformPolicy::WalBatch);
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         assert_eq!(plan.cast_count(), 2);
 
         // The tally counts the rounded values as NULLED — they are losses.
@@ -3971,6 +4346,151 @@ mod tests {
         assert!(
             daily.exists(),
             "rollup should run even when WAL dir is empty"
+        );
+    }
+
+    /// The repin job's rollup interlock (ADR-0011 slice B): while the
+    /// coordinator holds a rollup pause, a compaction tick drains WAL but
+    /// never relocates hourly files into dailies — the shadow build's
+    /// catch-up diff must stay additive. Dropping the pause resumes
+    /// consolidation on the next tick.
+    #[tokio::test]
+    async fn rollup_is_suppressed_while_a_repin_pause_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let r1 = format!(
+            r#"{{"_time":"{yesterday}T01:00:00Z","_ingested":"{yesterday}T01:00:00Z","service":"nginx","msg":"a"}}"#
+        );
+        let hourly =
+            write_hourly_parquet(&data_dir.join("prod"), &yesterday, "01", "nginx", &[&r1]);
+
+        let coordinator = Arc::new(RepinCoordinator::new());
+        let pause = coordinator.pause_rollup();
+        compact_once_coordinated(
+            &wal_dir,
+            &data_dir,
+            Duration::from_secs(1),
+            true,
+            None,
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+            Some(&coordinator),
+        )
+        .await
+        .unwrap();
+        let daily = data_dir.join("prod").join(&yesterday).join("nginx.parquet");
+        assert!(
+            !daily.exists() && hourly.exists(),
+            "no file may relocate while the repin pause is held"
+        );
+
+        drop(pause);
+        compact_once_coordinated(
+            &wal_dir,
+            &data_dir,
+            Duration::from_secs(1),
+            true,
+            None,
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+            Some(&coordinator),
+        )
+        .await
+        .unwrap();
+        assert!(
+            daily.exists(),
+            "consolidation resumes on the first tick after the job ends"
+        );
+    }
+
+    /// The other half of that interlock (ADR-0011 slice B): a rollup pass
+    /// that was ALREADY RUNNING when the job started. The pause flag alone
+    /// only stops a pass that has not begun — a pass in flight would keep
+    /// relocating files straight through `swap_envs` and republish
+    /// pre-repin types into the new generation. So every relocating unit
+    /// takes the corpus gate: the cutover waits it out, and the rest of the
+    /// pass stands down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_rollup_pass_is_gated_by_the_cutover_and_stands_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let r1 = format!(
+            r#"{{"_time":"{yesterday}T01:00:00Z","_ingested":"{yesterday}T01:00:00Z","service":"nginx","msg":"a"}}"#
+        );
+        let hourly =
+            write_hourly_parquet(&data_dir.join("prod"), &yesterday, "01", "nginx", &[&r1]);
+        let daily = data_dir.join("prod").join(&yesterday).join("nginx.parquet");
+
+        let coordinator = Arc::new(RepinCoordinator::new());
+
+        // The cutover holds the corpus gate — as it does across the swap.
+        let cutover = coordinator.cutover_guard().await;
+
+        let c = Arc::clone(&coordinator);
+        let (w, d) = (wal_dir.clone(), data_dir.clone());
+        let tick = tokio::spawn(async move {
+            compact_once_coordinated(
+                &w,
+                &d,
+                Duration::from_secs(1),
+                true,
+                None,
+                DEFAULT_CHUNK_SIZE,
+                "2GB",
+                None,
+                Some(&c),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !tick.is_finished() && !daily.exists(),
+            "a relocating rollup unit may not run under the cutover's guard"
+        );
+
+        // The job claims the rollup while that pass sits on the gate, then
+        // the cutover completes.
+        let pause = coordinator.pause_rollup();
+        drop(cutover);
+        tick.await.unwrap().unwrap();
+        assert!(
+            !daily.exists() && hourly.exists(),
+            "the pass in flight must stand down, not relocate a pre-repin \
+             file into the generation the cutover just published"
+        );
+
+        drop(pause);
+        compact_once_coordinated(
+            &wal_dir,
+            &data_dir,
+            Duration::from_secs(1),
+            true,
+            None,
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+            Some(&coordinator),
+        )
+        .await
+        .unwrap();
+        assert!(
+            daily.exists(),
+            "consolidation resumes on the first tick after the job ends"
         );
     }
 
