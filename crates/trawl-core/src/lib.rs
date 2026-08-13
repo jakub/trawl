@@ -29,6 +29,10 @@ pub mod conform;
 
 pub mod eval;
 
+/// Which catalog keys a query binds — the incomplete-results notice's
+/// input (ADR-0011 slice C1).
+pub mod field_refs;
+
 /// In-memory event filter compiled from the search stage.
 pub mod filter;
 

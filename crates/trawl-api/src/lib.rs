@@ -328,6 +328,16 @@ pub struct QueryResponse {
     pub truncated: bool,
     /// Pagination metadata.
     pub pagination: PaginationMeta,
+    /// Fields the query BOUND whose catalog pin the analyzer currently calls
+    /// degraded (ADR-0011 slice C1) — the results may be missing values that
+    /// pin shelved. Includes fields the query filtered on and projected away;
+    /// absent from the wire when empty, which is the healthy case.
+    ///
+    /// Bounded by one schema-refresh tick of staleness, and carried by
+    /// `/api/v1/query` only: the SSE stream keeps its compile-time snapshot
+    /// semantics, and embedded `--data` mode has no catalog to consult.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_fields: Vec<String>,
 }
 
 /// Pagination metadata for query responses.

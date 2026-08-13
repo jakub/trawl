@@ -86,6 +86,41 @@ impl Harness {
         (status, body)
     }
 
+    /// POST an API path with the given token; return (status, parsed body).
+    async fn post(
+        &self,
+        token: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        let resp = self
+            .raw
+            .post(format!("{}/api/v1{path}", self.server.url))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status().as_u16();
+        let body = resp
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    /// Scrape `/metrics` (unauthenticated, outside `/api/v1`).
+    async fn metrics(&self) -> String {
+        self.raw
+            .get(format!("{}/metrics", self.server.url))
+            .send()
+            .await
+            .expect("GET /metrics")
+            .text()
+            .await
+            .expect("metrics body")
+    }
+
     /// Schema column names in response order.
     fn column_names(schema: &serde_json::Value) -> Vec<String> {
         schema["columns"]
@@ -388,6 +423,82 @@ async fn a_degraded_field_carries_the_verdict_and_its_samples(pool: sqlx::PgPool
     assert_eq!(
         status, 403,
         "the verdict rides the existing SchemaRead gate"
+    );
+}
+
+/// Acceptance: a query that BINDS a degraded field is stamped with the
+/// incomplete-results notice — including when it projects the field away —
+/// while a query that binds none carries no key at all, and the gauge
+/// reflects the count after a refresh pass.
+#[sqlx::test(migrations = false)]
+async fn a_query_binding_a_degraded_field_is_stamped(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
+    for value in ["N/A", "pending", "N/A"] {
+        ingest_and_compact(&h, &[event("svc-b", &json!({"duration": value}))]).await;
+    }
+    let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
+        .await
+        .expect("connect app db");
+    sqlx::query(
+        "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+         WHERE field = 'duration'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("backdate the evidence");
+
+    // Before the tick loads it, the query path knows nothing — the notice is
+    // bounded by one refresh interval, deliberately.
+    let (status, body) = h
+        .post(
+            &h.server.analyst_token,
+            "/query",
+            json!({"query": "last=1h | where duration > 1 | table host"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        body.get("degraded_fields").is_none(),
+        "stale-but-clean until the tick runs: {body}"
+    );
+
+    trawl_server::schema_refresh::refresh_degraded_fields(&h.server.state).await;
+
+    // Bound in a filter, projected away by `table` — the incomplete case.
+    let (status, body) = h
+        .post(
+            &h.server.analyst_token,
+            "/query",
+            json!({"query": "last=1h | where duration > 1 | table host"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["degraded_fields"],
+        json!(["duration"]),
+        "a field filtered on and projected away is exactly the notice's case: {body}"
+    );
+
+    // A query binding nothing degraded carries no key.
+    let (_, body) = h
+        .post(
+            &h.server.analyst_token,
+            "/query",
+            json!({"query": "last=1h | stats count() by service"}),
+        )
+        .await;
+    assert!(
+        body.get("degraded_fields").is_none(),
+        "healthy queries are byte-identical to before: {body}"
+    );
+
+    let metrics = h.metrics().await;
+    assert!(
+        metrics
+            .lines()
+            .any(|l| l.trim() == "trawl_catalog_degraded_fields 1"),
+        "the gauge carries the count after a refresh pass: {metrics}"
     );
 }
 

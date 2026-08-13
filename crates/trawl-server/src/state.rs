@@ -4,7 +4,7 @@
 
 //! Shared application state for axum handlers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -102,6 +102,15 @@ pub struct QueryState {
     /// boot from `field_types`, refreshed by compaction after every
     /// `pin_missing` — the query path never touches postgres for pins.
     pub field_catalog: Arc<crate::catalog::FieldCatalog>,
+    /// Fields the analyzer currently calls degraded (ADR-0011 slice C1),
+    /// reloaded on the schema-refresh tick.
+    ///
+    /// The query path stamps `QueryResponse.degraded_fields` from this set
+    /// and may not reach postgres to do it, so the whole set is swapped in
+    /// as one `Arc` — a reader clones the handle under the lock and walks it
+    /// outside. Staleness is bounded by one refresh tick, which is nothing
+    /// against a condition measured in days.
+    pub degraded_fields: Arc<Mutex<Arc<BTreeSet<String>>>>,
     /// Semaphore bounding concurrent SSE streaming connections.
     pub sse_semaphore: Arc<Semaphore>,
     /// Semaphore bounding concurrent admin dashboard-stats streams.
@@ -525,6 +534,7 @@ impl AppState {
                 schema_columns_cache: Arc::new(tokio::sync::Mutex::new([None, None])),
                 field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 field_catalog,
+                degraded_fields: Arc::new(Mutex::new(Arc::new(BTreeSet::new()))),
                 hot_buffer,
                 service_schema_cache: Arc::new(Mutex::new(None)),
                 sse_semaphore: Arc::new(Semaphore::new(config.server.max_sse_connections)),

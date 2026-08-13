@@ -114,32 +114,44 @@ pub async fn query(
 
     // Check for `| from saved` — if present, resolve to parquet source
     // and execute with the pre-computed source instead of normal glob scan.
-    let outcome =
+    let (outcome, degraded_fields) =
         if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query).await? {
-            state
-                .query
-                .pool
-                .execute_with_source(
-                    query_id,
-                    &resolved.remaining_dsl,
-                    &resolved.source,
-                    timeout,
-                    capture_debug,
-                    utc_offset_secs,
-                )
-                .await
+            // The notice speaks for the DSL that actually RAN: `from saved`
+            // executes the remainder over a resolved source, and the saved
+            // query's own fields were already answered when its run was
+            // recorded.
+            let degraded = degraded_fields_for(&state, &resolved.remaining_dsl);
+            (
+                state
+                    .query
+                    .pool
+                    .execute_with_source(
+                        query_id,
+                        &resolved.remaining_dsl,
+                        &resolved.source,
+                        timeout,
+                        capture_debug,
+                        utc_offset_secs,
+                    )
+                    .await,
+                degraded,
+            )
         } else {
-            state
-                .query
-                .pool
-                .execute(
-                    query_id,
-                    &req.query,
-                    timeout,
-                    capture_debug,
-                    utc_offset_secs,
-                )
-                .await
+            let degraded = degraded_fields_for(&state, &req.query);
+            (
+                state
+                    .query
+                    .pool
+                    .execute(
+                        query_id,
+                        &req.query,
+                        timeout,
+                        capture_debug,
+                        utc_offset_secs,
+                    )
+                    .await,
+                degraded,
+            )
         };
 
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -217,6 +229,7 @@ pub async fn query(
                     offset,
                     returned,
                 },
+                degraded_fields,
             }))
         }
         Err(ServerError::Timeout) => {
@@ -1063,6 +1076,28 @@ pub async fn catalog_fields(
         pin_capacity: u64::try_from(pin_capacity).unwrap_or(0),
         truncated,
     }))
+}
+
+/// The degraded fields `dsl` BINDS, sorted — the incomplete-results notice
+/// (ADR-0011 slice C1 ruling 4).
+///
+/// Reads the in-process set the schema-refresh tick maintains: the query
+/// path never touches postgres, and it may not start now. The empty check
+/// comes first so a healthy install — every install, almost always — pays a
+/// lock acquisition and nothing else, never a parse.
+///
+/// Fields BOUND, not fields returned: a `where` on a degraded field that
+/// projects it away is exactly the incomplete case
+/// ([`trawl_core::field_refs`]).
+fn degraded_fields_for(state: &AppState, dsl: &str) -> Vec<String> {
+    let degraded = std::sync::Arc::clone(&state.query.degraded_fields.lock());
+    if degraded.is_empty() {
+        return Vec::new();
+    }
+    trawl_core::field_refs::referenced_fields_in(dsl)
+        .into_iter()
+        .filter(|f| degraded.contains(f))
+        .collect()
 }
 
 /// Read a pin's stored `DuckDB` spelling back as a canonical type.
