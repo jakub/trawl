@@ -1931,6 +1931,21 @@ pub(crate) const AGG_CHUNK_COLS: usize = 256;
 /// with a modelling problem the first 256 fields already evidence.
 const MAX_SAMPLED_CONFLICT_COLUMNS: usize = AGG_CHUNK_COLS;
 
+/// How many distinct raw values the capture pulls per column before Rust
+/// sanitises them ([`sanitize_sample`]) and re-deduplicates.
+///
+/// `DISTINCT` runs in `DuckDB`, on the RAW text, but the values that are
+/// STORED are the sanitised, byte-capped ones — and both transforms can
+/// collapse two distinct misfits into one (`a\x01b` and `a\x02b` both
+/// become `a\u{FFFD}b`; two long values can share their first 256 bytes).
+/// Pulling a small multiple of the budget keeps the slots fillable when
+/// that happens. Residual, accepted: a column whose misfits differ ONLY in
+/// collapsing positions still yields fewer than [`MAX_CONFLICT_SAMPLES`] —
+/// the samples are evidence of shape, and re-querying for more would cost a
+/// second pass over the batch to distinguish values an operator cannot see
+/// apart anyway.
+const SAMPLE_CANDIDATES: usize = MAX_CONFLICT_SAMPLES * 2;
+
 /// Run the candidate ladder over the columns' actual values, resolving up to
 /// [`AGG_CHUNK_COLS`] columns per aggregate pass: per column the first
 /// candidate whose `TRY_CAST` success rate over non-null values reaches
@@ -2439,15 +2454,28 @@ impl ConformPlan {
             let Some(json) = json else { continue };
             let values: Vec<String> = serde_json::from_str(&json)
                 .map_err(|e| format!("conform sample decode failed: {e}"))?;
-            out.insert(i, values.iter().map(|v| sanitize_sample(v)).collect());
+            // Distinct AFTER both transforms, in first-seen order: SQL's
+            // DISTINCT ran over the raw text, and what is promised — and
+            // stored — is distinct SAMPLES.
+            let mut kept: Vec<String> = Vec::with_capacity(MAX_CONFLICT_SAMPLES);
+            for value in values.iter().map(|v| sanitize_sample(v)) {
+                if kept.len() == MAX_CONFLICT_SAMPLES {
+                    break;
+                }
+                if !kept.contains(&value) {
+                    kept.push(value);
+                }
+            }
+            out.insert(i, kept);
         }
         Ok(out)
     }
 }
 
-/// The misfit-sample capture for one cast column: at most
-/// [`MAX_CONFLICT_SAMPLES`] distinct values the cast nulls, rendered as one
-/// JSON array of strings.
+/// The misfit-sample capture for one cast column: up to
+/// [`SAMPLE_CANDIDATES`] distinct values the cast nulls, rendered as one
+/// JSON array of strings, from which the caller keeps at most
+/// [`MAX_CONFLICT_SAMPLES`] once they are sanitised.
 ///
 /// The predicate is the definition of a shelved value — a stored value the
 /// guarded cast cannot read — written against the SAME `cast.expr` the
@@ -2460,7 +2488,7 @@ fn sample_expr(cast: &CastEntry) -> String {
     format!(
         "to_json(array_slice(list(DISTINCT left({text}, {MAX_CONFLICT_SAMPLE_BYTES})) \
          FILTER (WHERE {quoted} IS NOT NULL AND ({expr}) IS NULL), \
-         1, {MAX_CONFLICT_SAMPLES}))::VARCHAR"
+         1, {SAMPLE_CANDIDATES}))::VARCHAR"
     )
 }
 
@@ -3517,6 +3545,44 @@ mod tests {
         let mut lengths: Vec<usize> = samples.iter().map(String::len).collect();
         lengths.sort_unstable();
         assert_eq!(lengths, vec![5, 255, 256]);
+    }
+
+    /// `DISTINCT` runs in `DuckDB` over the RAW values, but what is stored
+    /// is the sanitised, byte-capped form — and two raw misfits can collapse
+    /// into one of those. The stored set is deduplicated after both
+    /// transforms, so "at most five DISTINCT samples" describes the samples
+    /// rather than the values they came from.
+    #[test]
+    fn conflict_samples_are_distinct_after_sanitisation() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE wal_batch (v VARCHAR)")
+            .unwrap();
+        // Two values distinct only in a control character, plus one that is
+        // distinct after the byte cap collapses a shared 256-byte prefix.
+        let long_a = format!("{}A", "x".repeat(MAX_CONFLICT_SAMPLE_BYTES));
+        let long_b = format!("{}B", "x".repeat(MAX_CONFLICT_SAMPLE_BYTES));
+        for value in ["a\u{1}b", "a\u{2}b", &long_a, &long_b, "plain"] {
+            conn.execute("INSERT INTO wal_batch VALUES (?)", [value])
+                .unwrap();
+        }
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [("v".to_owned(), CanonicalType::BigInt)]
+            .into_iter()
+            .collect();
+
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        let mut samples = conflicts[0].samples.clone();
+        samples.sort();
+        assert_eq!(
+            samples,
+            vec![
+                "a\u{fffd}b".to_owned(),
+                "plain".to_owned(),
+                "x".repeat(MAX_CONFLICT_SAMPLE_BYTES),
+            ],
+            "five raw misfits, three distinct samples"
+        );
     }
 
     /// A batch that conflicts on nothing runs no sample query at all — the

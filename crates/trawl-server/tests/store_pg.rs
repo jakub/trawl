@@ -2712,6 +2712,65 @@ mod repin_store {
         );
     }
 
+    /// A replay of an ALREADY-succeeded cutover must not clear evidence.
+    ///
+    /// A forced lossy repin records its own conflict evidence — describing
+    /// the NEW pin — after the flip commits. Boot recovery replays
+    /// `finish_cutover` whenever the marker outlived the cleanup window, and
+    /// an unconditional clear would delete exactly that evidence, which
+    /// nothing writes again.
+    #[sqlx::test]
+    async fn finish_cutover_replay_keeps_evidence_recorded_after_the_flip(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        let id = s
+            .claim(
+                "severity",
+                CanonicalType::BigInt,
+                CanonicalType::Varchar,
+                false,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+            .await
+            .unwrap();
+
+        // What the forced job's own `record_outcome` writes next.
+        catalog
+            .record_conflicts(&[trawl_server::store::FieldConflict {
+                field: "severity".to_owned(),
+                service: "svc-a".to_owned(),
+                observed_type: "BIGINT".to_owned(),
+                expected_type: CanonicalType::Varchar,
+                rows_nulled: 2,
+                samples: Vec::new(),
+            }])
+            .await
+            .unwrap();
+
+        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            catalog.conflicts_for_field("severity").await.unwrap().len(),
+            1,
+            "the replay must not touch evidence written after the flip"
+        );
+        assert_eq!(
+            catalog
+                .conflict_aggregates(Some(&["severity".to_owned()]))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "nor its aggregates"
+        );
+    }
+
     /// Boot reconciliation: an orphaned `running` row (killed process, no
     /// marker) fails; the marker's own job — mid-recovery — is kept.
     #[sqlx::test]

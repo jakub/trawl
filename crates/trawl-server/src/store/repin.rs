@@ -271,9 +271,15 @@ impl RepinStore {
     /// (ADR-0011 slice C1): it indicts a pin that no longer exists, and the
     /// analyzer's gate is span-based, so evidence left behind would badge
     /// the field as degraded forever — the operator's remedy would not clear
-    /// the sign that told them to apply it. The job's OWN outcome is
-    /// recorded afterwards, so a forced lossy repin's fresh evidence
-    /// survives.
+    /// the sign that told them to apply it.
+    ///
+    /// The clear is gated on THIS call being the one that completed the job,
+    /// which is the only part of the flip that is not naturally idempotent.
+    /// A forced lossy repin records its OWN fresh evidence after
+    /// `finish_cutover` returns (`repin::engine`'s `record_outcome`), so a
+    /// boot replay of an already-succeeded job — the cleanup window crashed,
+    /// the marker survived — would otherwise delete evidence describing the
+    /// NEW pin, which nothing would ever write again.
     pub async fn finish_cutover(
         &self,
         id: i64,
@@ -290,15 +296,18 @@ impl RepinStore {
         .bind(to_type.as_duckdb())
         .execute(&mut *tx)
         .await?;
-        super::CatalogStore::clear_conflict_evidence(&mut tx, field).await?;
-        sqlx::query(
+        let completed = sqlx::query(
             "UPDATE repin_jobs
              SET status = 'succeeded', finished_at = COALESCE(finished_at, now())
              WHERE id = $1 AND status = 'running'",
         )
         .bind(id)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if completed > 0 {
+            super::CatalogStore::clear_conflict_evidence(&mut tx, field).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
