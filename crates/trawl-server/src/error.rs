@@ -199,8 +199,8 @@ impl IntoResponse for ServerError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ExecutionError, "query execution failed"),
             ),
-            // The hot+cold read raced a file move while cold data exists —
-            // transient and retryable, never a silent empty 200 (ADR-0008).
+            // The read raced a file move while cold data exists — transient
+            // and retryable, never a silent empty 200 (ADR-0008).
             Self::Engine(EngineError::ColdDataUnread) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(

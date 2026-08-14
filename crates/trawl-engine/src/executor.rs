@@ -114,8 +114,19 @@ impl Executor {
         let resolved = self.resolve_source(source);
         let emitted = resolved.emit_cold(&ast, pins)?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
-        let (mut result, timestamp_columns) =
-            self.execute_emitted_tracked(&emitted, max_rows, sql_offset)?;
+        let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset);
+        // Same gate as the hot lanes, one column over: with no hot buffer to
+        // fall back to, `HotOnly` is unreachable (see [`cold_action`]) — but a
+        // "no files" answer over a source that still reaches files is the
+        // silent cold-data drop either way (ADR-0008).
+        let (mut result, timestamp_columns) = match self.cold_action_for(
+            classify_query_outcome(&outcome),
+            &resolved,
+            HotLane::Absent,
+        ) {
+            ColdAction::ColdDataUnread => return Err(EngineError::ColdDataUnread),
+            ColdAction::ReturnOutcome | ColdAction::HotOnly => outcome?,
+        };
         if !emitted.rust_stages.is_empty() {
             result = crate::post_process::apply_rust_stages(
                 result,
@@ -139,13 +150,12 @@ impl Executor {
     /// Handles cold-start gracefully: when the cold source matches no file at
     /// all, falls back to querying just the hot buffer so events ingested
     /// before the first compaction are visible. A columnless union result is
-    /// not taken as proof of that — it is re-checked against the files on
-    /// disk, because a list source reports "no files" for a single empty
-    /// element too (ADR-0008).
+    /// not taken as proof of that — it is checked against the evidence
+    /// resolution gathered, because a source that still reaches files
+    /// answering "no files" is a race, not an empty window (ADR-0008).
     /// `hot_pins` conforms the hot branch (pins ∩ snapshot keys); `pins`
     /// is the full catalog snapshot typing the comparisons — one
-    /// interpretation per query, carried through every retry below
-    /// (ADR-0011 slice A).
+    /// interpretation per query (ADR-0011 slice A).
     #[allow(clippy::too_many_arguments)]
     pub fn run_query_with_hot(
         &self,
@@ -172,56 +182,32 @@ impl Executor {
         // exist. The read-time coerced retry that used to paper over it is
         // deleted (ADR-0009 slice 2).
 
-        // Classify the outcome, then route on the pure
-        // `cold_action` decision so the outcome policy stays unit-testable.
-        let class = match &outcome {
-            // Columns present → real result (possibly empty rows).
-            Ok((r, _)) if !r.columns.is_empty() => HotColdOutcome::Columns,
-            // No columns: the resolved source matched no file at all. Hot-only
-            // is safe only if a presence check confirms there is no cold data
-            // to hide.
-            Ok(_) => HotColdOutcome::NoColumns,
-            // A binder error remapped to Emit (querying a nonexistent field)
-            // — a user error, safe to keep the empty-result UX.
-            Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
-            // Any other database failure is only provably safe to mask when
-            // no cold files exist.
-            Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
-            // ResultTooLarge, parse, etc. — propagate.
-            Err(_) => HotColdOutcome::Fatal,
-        };
-        let hot_only = match cold_action(class) {
-            ColdAction::ReturnOutcome => false,
-            ColdAction::HotOnly => true,
-            // Evaluated only on this path: hot-only is permitted exactly
-            // when there is no cold data it could hide.
-            ColdAction::HotOnlyIfNoColdFiles => {
-                self.cold_presence(&resolved) == ColdPresence::Absent
+        // Classify the outcome, then route on the pure `cold_action`
+        // decision so the outcome policy stays unit-testable and identical
+        // across the four lanes.
+        let (mut result, timestamp_columns) = match self.cold_action_for(
+            classify_query_outcome(&outcome),
+            &resolved,
+            HotLane::Present,
+        ) {
+            ColdAction::HotOnly => {
+                // Hot-only keeps BOTH halves of the interpretation: the same
+                // comparison pins, and the same hot-column conformance the
+                // union's hot branch applies. Reading the raw ndjson would
+                // let `read_json`'s inference type the columns, so
+                // `status=200.0` over a VARCHAR-pinned field would match a
+                // hot numeric `200` here and stop matching the moment a
+                // parquet file appeared.
+                let hot_emitted = emitter::emit_hot_only(&ast, hot_source, hot_pins, pins)?;
+                match self.execute_emitted_tracked(&hot_emitted, max_rows, sql_offset) {
+                    // Hot-only also hit a binder/emit error (e.g. empty ndjson
+                    // between compaction cycles). Treat as empty, not error.
+                    Err(EngineError::Emit(_)) => (QueryResult::empty(), TimestampColumns::new()),
+                    other => other?,
+                }
             }
-        };
-        let (mut result, timestamp_columns) = if hot_only {
-            // Hot-only keeps BOTH halves of the interpretation: the same
-            // comparison pins, and the same hot-column conformance the
-            // union's hot branch applies. Reading the raw ndjson would let
-            // `read_json`'s inference type the columns, so `status=200.0`
-            // over a VARCHAR-pinned field would match a hot numeric `200`
-            // here and stop matching the moment a parquet file appeared.
-            let hot_emitted = emitter::emit_hot_only(&ast, hot_source, hot_pins, pins)?;
-            match self.execute_emitted_tracked(&hot_emitted, max_rows, sql_offset) {
-                // Hot-only also hit a binder/emit error (e.g. empty ndjson
-                // between compaction cycles). Treat as empty, not error.
-                Err(EngineError::Emit(_)) => (QueryResult::empty(), TimestampColumns::new()),
-                other => other?,
-            }
-        } else if class == HotColdOutcome::NoColumns {
-            // NoColumns reaches this branch only when cold files exist. The
-            // outcome held here is the empty result `execute_emitted`
-            // substituted for a "no files" read error — returning it would be
-            // exactly the silent cold-data drop ADR-0008 forbids, so surface
-            // an explicit, retryable error instead.
-            return Err(EngineError::ColdDataUnread);
-        } else {
-            outcome?
+            ColdAction::ColdDataUnread => return Err(EngineError::ColdDataUnread),
+            ColdAction::ReturnOutcome => outcome?,
         };
         if !emitted.rust_stages.is_empty() {
             result = crate::post_process::apply_rust_stages(
@@ -380,6 +366,24 @@ impl Executor {
         }
     }
 
+    /// Route a classified outcome through [`cold_action`], paying the
+    /// cold-file presence check only where the table's verdict depends on it.
+    fn cold_action_for(
+        &self,
+        outcome: HotColdOutcome,
+        resolved: &ResolvedSource,
+        hot: HotLane,
+    ) -> ColdAction {
+        let cold = if outcome.consults_cold_presence(hot) {
+            self.cold_presence(resolved)
+        } else {
+            // The table answers the same for both values here, so the
+            // argument is inert — and the happy path never globs.
+            ColdPresence::Absent
+        };
+        cold_action(outcome, cold, hot)
+    }
+
     /// Whether `pattern` matches at least one file on disk. Errs on the side
     /// of "matches" when the `glob` call itself fails.
     fn glob_has_match(&self, pattern: &str) -> bool {
@@ -509,7 +513,20 @@ impl Executor {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let resolved = self.resolve_source(source);
         let emitted = resolved.emit_cold(&ast, pins)?;
-        self.export_parquet_from_emitted(&emitted, output_path, max_rows)
+        let outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
+        // The same gate the query lanes run, on the same classification. An
+        // all-missing source keeps surfacing DuckDB's own "no files" error
+        // here — deliberately loud, since there is no empty answer an export
+        // could write — but a source that still reaches files must not fail
+        // that way (ADR-0008).
+        match self.cold_action_for(
+            classify_export_outcome(&outcome),
+            &resolved,
+            HotLane::Absent,
+        ) {
+            ColdAction::ColdDataUnread => Err(EngineError::ColdDataUnread),
+            ColdAction::ReturnOutcome | ColdAction::HotOnly => outcome,
+        }
     }
 
     /// Export with hot buffer union, falling back to hot-only on cold start.
@@ -537,19 +554,20 @@ impl Executor {
         let emitted = resolved.emit_union(&ast, hot_source, hot_pins, pins)?;
         let outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
 
-        match outcome {
-            // No parquet files / binder-shaped failure → hot-only is only
-            // permitted when there is no cold data it could hide.
-            Err(EngineError::Database(_) | EngineError::Emit(_))
-                if self.cold_presence(&resolved) == ColdPresence::Absent =>
-            {
+        match self.cold_action_for(
+            classify_export_outcome(&outcome),
+            &resolved,
+            HotLane::Present,
+        ) {
+            ColdAction::HotOnly => {
                 // Hot-only, conformed like the union's hot branch — an
                 // export must not write JSON-inferred types where the
                 // hot+cold lane would have written the catalog's.
                 let hot_emitted = emitter::emit_hot_only(&ast, hot_source, hot_pins, pins)?;
                 self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows)
             }
-            other => other,
+            ColdAction::ColdDataUnread => Err(EngineError::ColdDataUnread),
+            ColdAction::ReturnOutcome => outcome,
         }
     }
 
@@ -854,21 +872,23 @@ pub fn is_conversion_error(e: &duckdb::Error) -> bool {
     error_class(&e.to_string()) == Some("Conversion")
 }
 
-/// Classification of the hot+cold union outcome that `run_query_with_hot`
-/// branches on.
+/// Classification of a read's outcome, shared by all four entry points.
+///
+/// Produced by [`classify_query_outcome`] and [`classify_export_outcome`]
+/// so no lane holds a private opinion about what a failure means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HotColdOutcome {
-    /// The union produced columns (rows may be empty) — an authoritative
-    /// result; return it as-is.
+    /// The read produced columns (rows may be empty) — an authoritative
+    /// result; return it as-is. An export's `Ok(())` lands here too.
     Columns,
-    /// The union produced no columns at all — `execute_emitted` mapped a "no
-    /// files match the pattern" error to an empty result. Usually the cold
-    /// start, but a list source raises the same error for one non-matching
-    /// element, so this is an observation, not proof: hot-only still needs a
-    /// cold-file presence check.
+    /// The read matched no files: on the query lanes `execute_emitted`
+    /// mapped "no files match the pattern" to an empty result, on the export
+    /// lanes the same error arrives raw. Usually the empty window, but the
+    /// resolved source can also have raced a file move, so this is an
+    /// observation, not proof: it still needs a cold-file presence check.
     NoColumns,
-    /// A binder error remapped to `Emit` (querying a nonexistent field) — a
-    /// user error; hot-only keeps the established empty-result UX.
+    /// A binder error about a missing column (querying a nonexistent field)
+    /// — a user error; the hot lanes keep the established empty-result UX.
     BenignBinder,
     /// Any other database failure — hot-only is only provably safe when a
     /// cold-file presence check says no cold files exist.
@@ -877,32 +897,129 @@ enum HotColdOutcome {
     Fatal,
 }
 
-/// What `run_query_with_hot` should do with a classified outcome.
+/// Whether the lane executing a read has a hot buffer to fall back to.
+///
+/// A property of the ENTRY POINT, not of the data: `run_query` and
+/// `export_parquet` have none, so [`cold_action`] never hands them
+/// [`ColdAction::HotOnly`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColdAction {
-    /// Return the union outcome unchanged (result or error).
-    ReturnOutcome,
-    /// Read hot-only — structurally safe, no cold data can be hidden.
-    HotOnly,
-    /// Read hot-only ONLY if no cold files exist; otherwise return the
-    /// error. A cold-data drop must never be silent, and an arbitrary
-    /// database failure must never masquerade as success (ADR-0008). For
-    /// [`HotColdOutcome::NoColumns`] the held outcome is itself a substituted
-    /// empty *success*, so the caller synthesizes
-    /// [`EngineError::ColdDataUnread`] rather than returning it.
-    HotOnlyIfNoColdFiles,
+enum HotLane {
+    Present,
+    Absent,
 }
 
-/// Decide the next step for a classified hot+cold union outcome.
+/// What a lane should do with a classified outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdAction {
+    /// Return the outcome unchanged (result or error).
+    ReturnOutcome,
+    /// Read hot-only — no cold data can be hidden by doing so.
+    HotOnly,
+    /// The read answered "no files" while cold files exist behind the
+    /// source. On the query lanes the outcome held is a substituted empty
+    /// *success*, so returning it would be exactly the silent cold-data drop
+    /// ADR-0008 forbids; on the export lanes it is a raw IO error that says
+    /// nothing useful. Both surface [`EngineError::ColdDataUnread`] instead:
+    /// explicit, retryable, and never a 200 with rows missing.
+    ColdDataUnread,
+}
+
+/// Decide the next step for a classified outcome — the ONE outcome policy,
+/// consulted by all four entry points (ADR-0008).
 ///
-/// Split out as a pure function so the outcome policy — hot-only fallback
-/// is permitted only when it cannot hide cold data — is unit-testable
-/// without provoking every failure class against a live `DuckDB`.
-fn cold_action(outcome: HotColdOutcome) -> ColdAction {
+/// | outcome          | hot=P, cold=P      | hot=P, cold=A | hot=A, cold=P      | hot=A, cold=A |
+/// |------------------|--------------------|---------------|--------------------|---------------|
+/// | `Columns`        | `Return`           | `Return`      | `Return`           | `Return`      |
+/// | `Fatal`          | `Return`           | `Return`      | `Return`           | `Return`      |
+/// | `BenignBinder`   | `HotOnly`          | `HotOnly`     | `Return`           | `Return`      |
+/// | `NoColumns`      | `ColdDataUnread`   | `HotOnly`     | `ColdDataUnread`   | `Return`      |
+/// | `Recoverable`    | `Return`           | `HotOnly`     | `Return`           | `Return`      |
+///
+/// Two invariants read off it: a hot-only read happens exactly where it
+/// cannot hide cold data, and an empty answer is only ever returned when the
+/// source provably reaches no files. `cold` is [`ColdPresence`], `hot` is
+/// [`HotLane`]; the match is exhaustive with no wildcard arms, so a new
+/// variant of either must state its rule or fail to compile.
+///
+/// Pure, so the policy is unit-testable without provoking every failure
+/// class against a live `DuckDB`.
+fn cold_action(outcome: HotColdOutcome, cold: ColdPresence, hot: HotLane) -> ColdAction {
     match outcome {
+        // An authoritative result and a non-recoverable error are the
+        // source's own answer on every lane.
         HotColdOutcome::Columns | HotColdOutcome::Fatal => ColdAction::ReturnOutcome,
-        HotColdOutcome::BenignBinder => ColdAction::HotOnly,
-        HotColdOutcome::NoColumns | HotColdOutcome::Recoverable => ColdAction::HotOnlyIfNoColdFiles,
+        // A missing-column user error keeps the empty-result UX where there
+        // is a hot buffer to read it from; without one the error is the UX.
+        HotColdOutcome::BenignBinder => match hot {
+            HotLane::Present => ColdAction::HotOnly,
+            HotLane::Absent => ColdAction::ReturnOutcome,
+        },
+        HotColdOutcome::NoColumns => match cold {
+            ColdPresence::Present => ColdAction::ColdDataUnread,
+            ColdPresence::Absent => match hot {
+                HotLane::Present => ColdAction::HotOnly,
+                HotLane::Absent => ColdAction::ReturnOutcome,
+            },
+        },
+        // An unexpected failure may degrade to hot-only only where there is
+        // provably no cold data it would be hiding.
+        HotColdOutcome::Recoverable => match (cold, hot) {
+            (ColdPresence::Absent, HotLane::Present) => ColdAction::HotOnly,
+            (ColdPresence::Absent, HotLane::Absent)
+            | (ColdPresence::Present, HotLane::Present | HotLane::Absent) => {
+                ColdAction::ReturnOutcome
+            }
+        },
+    }
+}
+
+impl HotColdOutcome {
+    /// Whether [`cold_action`]'s verdict for this outcome can actually differ
+    /// between the two [`ColdPresence`] values — i.e. whether the presence
+    /// check is worth paying for.
+    ///
+    /// Derived FROM the table rather than restated beside it, so it can never
+    /// drift out of agreement with it. The happy path (`Columns`) and every
+    /// propagated failure (`Fatal`) answer `false`, which is what keeps a
+    /// successful query from ever globbing.
+    fn consults_cold_presence(self, hot: HotLane) -> bool {
+        cold_action(self, ColdPresence::Present, hot)
+            != cold_action(self, ColdPresence::Absent, hot)
+    }
+}
+
+/// Classify a query lane's outcome.
+fn classify_query_outcome(
+    outcome: &Result<(QueryResult, TimestampColumns), EngineError>,
+) -> HotColdOutcome {
+    match outcome {
+        // Columns present → real result (possibly empty rows).
+        Ok((r, _)) if !r.columns.is_empty() => HotColdOutcome::Columns,
+        // No columns: `execute_emitted` substituted an empty result for a
+        // "no files match the pattern" read error.
+        Ok(_) => HotColdOutcome::NoColumns,
+        // A binder error the query path remapped to Emit.
+        Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
+        Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
+        // ResultTooLarge, parse, IO — propagate.
+        Err(_) => HotColdOutcome::Fatal,
+    }
+}
+
+/// Classify an export lane's outcome.
+///
+/// The export surfaces `DuckDB`'s errors raw where the query path remaps
+/// them, so the same three shapes arrive differently: "no files" and the
+/// binder error are `Database` here, and `Emit` covers the emitter's own
+/// refusals (a `rust_stages` pipeline, a non-UTF-8 path).
+fn classify_export_outcome(outcome: &Result<(), EngineError>) -> HotColdOutcome {
+    match outcome {
+        Ok(()) => HotColdOutcome::Columns,
+        Err(EngineError::Database(e)) if is_no_files_error(e) => HotColdOutcome::NoColumns,
+        Err(EngineError::Database(e)) if is_binder_column_error(e) => HotColdOutcome::BenignBinder,
+        Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
+        Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
+        Err(_) => HotColdOutcome::Fatal,
     }
 }
 
@@ -1346,8 +1463,9 @@ mod tests {
     use duckdb::Connection;
 
     use super::{
-        ColdAction, ColdPresence, EngineError, Executor, FieldTypes, HotColdOutcome, ListEvidence,
-        cold_action, error_class, glob_list_items, is_conversion_error, resolve_list_source,
+        ColdAction, ColdPresence, EngineError, Executor, FieldTypes, HotColdOutcome, HotLane,
+        ListEvidence, cold_action, error_class, glob_list_items, is_conversion_error,
+        resolve_list_source,
     };
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
@@ -1743,39 +1861,129 @@ mod tests {
     }
 
     #[test]
-    fn cold_action_routes_by_outcome_class() {
-        // The outcome policy: hot-only fallback is permitted only when it
-        // cannot hide cold data. Columns and Fatal return the outcome; a
-        // benign missing-column error goes hot-only; a columnless result and
-        // any other failure may go hot-only ONLY if a cold-file presence
-        // check proves there is nothing to hide (ADR-0008: a cold-data drop
-        // is never silent, and an arbitrary database failure never
-        // masquerades as success).
-        assert_eq!(
-            cold_action(HotColdOutcome::Columns),
-            ColdAction::ReturnOutcome,
-            "an authoritative columnful result is returned as-is"
+    fn cold_action_matrix_is_exhaustive() {
+        // The whole outcome policy, cell by cell (ADR-0008). Two invariants
+        // read off it: a hot-only read happens exactly where it cannot hide
+        // cold data, and an empty answer is returned only when the source
+        // provably reaches no files. The `hot=Present` columns are the
+        // behaviour the hot+cold lanes have always had; the `hot=Absent`
+        // ones extend the same gate to `run_query`/`export_parquet`, which
+        // used to have none.
+        use ColdAction::{ColdDataUnread as Unread, HotOnly, ReturnOutcome as Return};
+        use ColdPresence::{Absent as ColdAbsent, Present as ColdPresent};
+        use HotColdOutcome::{BenignBinder, Columns, Fatal, NoColumns, Recoverable};
+        use HotLane::{Absent as NoHot, Present as Hot};
+
+        let matrix = [
+            // (outcome, cold, hot, action, why)
+            (Columns, ColdPresent, Hot, Return, "authoritative result"),
+            (Columns, ColdAbsent, Hot, Return, "authoritative result"),
+            (Columns, ColdPresent, NoHot, Return, "authoritative result"),
+            (Columns, ColdAbsent, NoHot, Return, "authoritative result"),
+            (Fatal, ColdPresent, Hot, Return, "never masked"),
+            (Fatal, ColdAbsent, Hot, Return, "never masked"),
+            (Fatal, ColdPresent, NoHot, Return, "never masked"),
+            (Fatal, ColdAbsent, NoHot, Return, "never masked"),
+            (BenignBinder, ColdPresent, Hot, HotOnly, "empty-result UX"),
+            (BenignBinder, ColdAbsent, Hot, HotOnly, "empty-result UX"),
+            (
+                BenignBinder,
+                ColdPresent,
+                NoHot,
+                Return,
+                "no hot lane to read",
+            ),
+            (
+                BenignBinder,
+                ColdAbsent,
+                NoHot,
+                Return,
+                "no hot lane to read",
+            ),
+            (
+                NoColumns,
+                ColdPresent,
+                Hot,
+                Unread,
+                "cold data would vanish",
+            ),
+            (NoColumns, ColdAbsent, Hot, HotOnly, "genuine cold start"),
+            (
+                NoColumns,
+                ColdPresent,
+                NoHot,
+                Unread,
+                "cold data would vanish",
+            ),
+            (
+                NoColumns,
+                ColdAbsent,
+                NoHot,
+                Return,
+                "genuinely empty window",
+            ),
+            (
+                Recoverable,
+                ColdPresent,
+                Hot,
+                Return,
+                "failure over cold data",
+            ),
+            (Recoverable, ColdAbsent, Hot, HotOnly, "nothing to hide"),
+            (
+                Recoverable,
+                ColdPresent,
+                NoHot,
+                Return,
+                "failure over cold data",
+            ),
+            (
+                Recoverable,
+                ColdAbsent,
+                NoHot,
+                Return,
+                "failure, no hot lane",
+            ),
+        ];
+        for (outcome, cold, hot, expected, why) in matrix {
+            assert_eq!(
+                cold_action(outcome, cold, hot),
+                expected,
+                "{outcome:?} × cold={cold:?} × hot={hot:?} must be {expected:?} ({why})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_happy_path_never_pays_the_presence_check() {
+        // The presence check globs; a successful query must never do that.
+        // `consults_cold_presence` is derived from the table, so this asserts
+        // the table's own shape rather than a second copy of it.
+        for hot in [HotLane::Present, HotLane::Absent] {
+            assert!(
+                !HotColdOutcome::Columns.consults_cold_presence(hot),
+                "a columnful result must not provoke a presence glob"
+            );
+            assert!(
+                !HotColdOutcome::Fatal.consults_cold_presence(hot),
+                "a propagated error must not provoke a presence glob"
+            );
+            assert!(
+                !HotColdOutcome::BenignBinder.consults_cold_presence(hot),
+                "a missing-column user error is decided without the filesystem"
+            );
+            assert!(
+                HotColdOutcome::NoColumns.consults_cold_presence(hot),
+                "a no-files answer is exactly what the presence check settles"
+            );
+        }
+        assert!(
+            HotColdOutcome::Recoverable.consults_cold_presence(HotLane::Present),
+            "a hot lane may degrade an unexpected failure — only presence says whether"
         );
-        assert_eq!(
-            cold_action(HotColdOutcome::Fatal),
-            ColdAction::ReturnOutcome,
-            "a non-recoverable error is propagated, not masked by a hot-only read"
-        );
-        assert_eq!(
-            cold_action(HotColdOutcome::NoColumns),
-            ColdAction::HotOnlyIfNoColdFiles,
-            "a columnless result is only a cold start if no cold files exist — \
-             a list source reports the same error for one empty element"
-        );
-        assert_eq!(
-            cold_action(HotColdOutcome::BenignBinder),
-            ColdAction::HotOnly,
-            "a missing-column user error keeps the empty-result UX"
-        );
-        assert_eq!(
-            cold_action(HotColdOutcome::Recoverable),
-            ColdAction::HotOnlyIfNoColdFiles,
-            "an unexpected failure may go hot-only only when no cold files exist"
+        assert!(
+            !HotColdOutcome::Recoverable.consults_cold_presence(HotLane::Absent),
+            "without a hot lane the failure propagates either way"
         );
     }
 
