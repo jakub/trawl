@@ -93,3 +93,18 @@ outlier.
   which file or value caused it.
 - Rows whose time came from the filename carry ingest time, not event time.
   This is the same accuracy the absent-timestamp path has always had.
+
+## Amendment (2026-08-14): the no-silent-cold-drop gate must ride every lane (#73)
+
+The prune-and-retry and the `ColdDataUnread` outcome gate shipped on the
+hot-union lane only; plain `run_query`/`export_parquet` never got them, and
+the server routes between the lanes on hot-buffer occupancy — so the same
+query silently dropped cold data whenever the buffer was empty, and did so
+permanently on query-only nodes. The corrected doctrine: **list-source
+resolution is a property of the source, not of any lane's retry ladder** —
+a list source is resolved against disk once, before first execution, in one
+helper every entry point shares (query and export, hot and no-hot), and a
+`no files`-substituted empty result over a list source that still has
+matching elements is `ColdDataUnread` in every lane. An all-elements-missing
+list remains a genuine empty window (200), matching the cold-start rule for
+plain globs.
