@@ -10,7 +10,10 @@
 //! - `svc=<name>` — opens the drawer on the named service; clearing
 //!   closes the drawer.
 //! - `stab=overview|fields|tail` — which drawer tab is active
-//!   (default: overview).
+//!   (default: overview). Read through
+//!   [`schema_nav::sanitize_tab`](crate::schema_nav::sanitize_tab): the
+//!   value is re-concatenated into the drill-in URL below, so only a
+//!   spelling from the closed vocabulary is ever carried forward.
 //! - `field=<name>` — opens the field case file (ADR-0011 slice C2),
 //!   which takes precedence over `svc=` and mounts independently of the
 //!   services snapshot, so `/search/schema?field=<name>` is a working
@@ -19,13 +22,17 @@
 //!
 //! Exactly one drawer is mounted at a time: `fleet_ui::Drawer` arbitrates
 //! Escape on the assumption of a single drawer layer, so the page swaps
-//! between the two rather than nesting them.
+//! between the two rather than nesting them. That swap is also why focus
+//! is restored by hand: the originating badge is unmounted while the case
+//! file is up, so the drawer shell's own opener-restore has nothing left
+//! to return to.
 
 use leptos::prelude::*;
 use leptos::web_sys;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_navigate, use_query_map};
 use trawl_api::ServiceSchema;
+use wasm_bindgen::JsCast as _;
 
 use crate::api;
 use crate::components::field_case_drawer::FieldCaseDrawer;
@@ -35,6 +42,7 @@ use crate::components::service_card_fmt::{
 };
 use crate::components::service_drawer::ServiceDrawer;
 use crate::components::sort_th::sort_th;
+use crate::schema_nav::{BackNav, DEFAULT_SCHEMA_TAB, back_nav, sanitize_tab};
 use crate::state::query::{Mode, RangeSpec, navigator};
 use fleet_ui::{
     Badge, Icon, IconView, LoadState, Loaded, Pager, SearchInput, Sparkline, StatusDot, StatusTone,
@@ -44,12 +52,29 @@ use fleet_ui::{
 /// Days of `daily_event_counts` history shown in the activity sparkline.
 const SPARK_DAYS: usize = 30;
 
+/// The page heading's element id — the focus target when the case file
+/// closes outright (nothing is left on screen to return focus to).
+const HEADING_ID: &str = "schema-heading";
+
 /// One URL query-parameter value. A service name's charset is narrow but
 /// a catalog field name is any ASCII-folded client JSON key.
 fn enc(raw: &str) -> String {
     js_sys::encode_uri_component(raw)
         .as_string()
         .unwrap_or_else(|| raw.to_string())
+}
+
+/// Move keyboard focus to `id` on the next frame — after the swap this
+/// call is part of has actually rendered.
+fn focus_on_next_frame(id: &'static str) {
+    request_animation_frame(move || {
+        if let Some(el) = document()
+            .get_element_by_id(id)
+            .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+        {
+            let _ = el.focus();
+        }
+    });
 }
 
 /// Sort key for the services table. Clicking the active header flips
@@ -80,13 +105,11 @@ pub fn SchemaPage() -> impl IntoView {
     // from a hand-edited URL, and an empty name resolves to nothing.
     let svc_selected = Memo::new(move |_| qm.get().get("svc").filter(|s| !s.is_empty()));
     let field_selected = Memo::new(move |_| qm.get().get("field").filter(|s| !s.is_empty()));
-    let tab_param = Memo::new(move |_| {
-        qm.get()
-            .get("stab")
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "overview".to_string())
-    });
-    let tab_sig: Signal<String> = Signal::derive(move || tab_param.get());
+    // Closed vocabulary at READ time: the resolved tab is re-emitted into
+    // the drill-in URL, so a raw `?stab=` could otherwise append a second
+    // `field=` parameter to it (see `schema_nav::sanitize_tab`).
+    let tab_param = Memo::new(move |_| sanitize_tab(qm.get().get("stab").as_deref()));
+    let tab_sig: Signal<String> = Signal::derive(move || tab_param.get().to_string());
 
     // Whether to OFFER the repin trigger on a degraded field's case
     // file. Affordance only — the server gates `POST /schema/repin` on
@@ -109,11 +132,26 @@ pub fn SchemaPage() -> impl IntoView {
     let nav = use_navigate();
     let goto_search = navigator();
 
+    // Which field's history entry THIS page pushed, if any. The case
+    // file's back affordance consults it: popping an entry we did not
+    // push would be someone else's history, and replacing one we DID push
+    // is what grew the stack by a duplicate service entry per drill/back
+    // cycle. Deliberately not cleared by the pop — the entry stays in the
+    // forward stack, so a browser Forward back onto it is still ours.
+    let pushed_field = RwSignal::new(None::<String>);
+    // The field badge to hand focus back to when the service drawer
+    // remounts underneath a closing case file.
+    let focus_field = RwSignal::new(None::<String>);
+
     let push_svc = {
         let nav = nav.clone();
         move |name: Option<&str>, stab: &str| {
             let url = match name {
-                Some(n) => format!("/search/schema?svc={}&stab={stab}", enc(n)),
+                Some(n) => format!(
+                    "/search/schema?svc={}&stab={}",
+                    enc(n),
+                    sanitize_tab(Some(stab))
+                ),
                 None => "/search/schema".to_string(),
             };
             nav(
@@ -126,51 +164,74 @@ pub fn SchemaPage() -> impl IntoView {
         }
     };
 
+    // The `?svc=&stab=` half of a URL — the case file's return context,
+    // carried on the drill-in and restored by a back that has to replace.
+    let return_ctx = move || {
+        svc_selected
+            .get_untracked()
+            .map(|svc| format!("svc={}&stab={}", enc(&svc), tab_param.get_untracked()))
+    };
+
     // Drilling into a field case file PUSHES, so browser-back leaves the
-    // case file for wherever the operator came from; clearing it REPLACES
-    // the case-file entry with its return context (the service drawer's
-    // URL, or the bare page).
+    // case file for wherever the operator came from.
     let push_field = {
         let nav = nav.clone();
-        move |field: Option<&str>| {
-            let ctx = svc_selected
-                .get_untracked()
-                .map(|svc| format!("svc={}&stab={}", enc(&svc), tab_param.get_untracked()));
-            if let Some(f) = field {
-                let mut url = format!("/search/schema?field={}", enc(f));
-                if let Some(ctx) = ctx {
-                    url.push('&');
-                    url.push_str(&ctx);
-                }
-                nav(&url, NavigateOptions::default());
-            } else {
-                let url = ctx.map_or_else(
-                    || "/search/schema".to_string(),
-                    |ctx| format!("/search/schema?{ctx}"),
-                );
-                nav(
-                    &url,
-                    NavigateOptions {
-                        replace: true,
-                        ..Default::default()
-                    },
-                );
+        move |field: &str| {
+            let mut url = format!("/search/schema?field={}", enc(field));
+            if let Some(ctx) = return_ctx() {
+                url.push('&');
+                url.push_str(&ctx);
             }
+            pushed_field.set(Some(field.to_string()));
+            focus_field.set(Some(field.to_string()));
+            nav(&url, NavigateOptions::default());
         }
     };
 
-    let on_open_field: Callback<String> = {
-        let push = push_field.clone();
-        Callback::new(move |field: String| push(Some(&field)))
+    // Leaving the case file by its back arrow. Origin-aware, because the
+    // two cases are different history shapes: an entry we PUSHED is popped
+    // (replacing it would leave the return URL twice over, so one browser
+    // Back per drill/back cycle would go nowhere), while a deep link's
+    // entry is not ours to pop and is replaced with the return context.
+    let back_field = {
+        let nav = nav.clone();
+        move || {
+            let shown = field_selected.get_untracked();
+            let decision = shown.as_deref().map_or(BackNav::Replace, |f| {
+                back_nav(f, pushed_field.get_untracked().as_deref())
+            });
+            if decision == BackNav::Pop
+                && let Some(history) = web_sys::window().and_then(|w| w.history().ok())
+                && history.back().is_ok()
+            {
+                return;
+            }
+            let url = return_ctx().map_or_else(
+                || "/search/schema".to_string(),
+                |ctx| format!("/search/schema?{ctx}"),
+            );
+            nav(
+                &url,
+                NavigateOptions {
+                    replace: true,
+                    ..Default::default()
+                },
+            );
+        }
     };
-    let on_field_back: Callback<()> = {
-        let push = push_field.clone();
-        Callback::new(move |()| push(None))
-    };
+
+    let on_open_field: Callback<String> = Callback::new(move |field: String| push_field(&field));
+    let on_field_back: Callback<()> = Callback::new(move |()| back_field());
 
     let on_open: Callback<String> = {
         let push = push_svc.clone();
-        Callback::new(move |name: String| push(Some(&name), "overview"))
+        Callback::new(move |name: String| {
+            // A drawer opened from the table has no pending return: any
+            // focus request left over from an abandoned drill-in would
+            // otherwise steal focus into this service's fields.
+            focus_field.set(None);
+            push(Some(&name), DEFAULT_SCHEMA_TAB);
+        })
     };
     let on_tail: Callback<String> = {
         let push = push_svc.clone();
@@ -185,7 +246,23 @@ pub fn SchemaPage() -> impl IntoView {
     };
     let on_close: Callback<()> = {
         let push = push_svc.clone();
-        Callback::new(move |()| push(None, "overview"))
+        Callback::new(move |()| {
+            focus_field.set(None);
+            push(None, DEFAULT_SCHEMA_TAB);
+        })
+    };
+    // Closing the CASE FILE outright (its X, the scrim, or Escape with no
+    // service to go back to) clears every param, so nothing the drawer was
+    // opened from is left mounted for the shell's own opener-restore to
+    // find. Focus lands on the page heading rather than the document.
+    let on_field_close: Callback<()> = {
+        let push = push_svc.clone();
+        Callback::new(move |()| {
+            focus_field.set(None);
+            pushed_field.set(None);
+            push(None, DEFAULT_SCHEMA_TAB);
+            focus_on_next_frame(HEADING_ID);
+        })
     };
 
     let on_search: Callback<String> = {
@@ -213,7 +290,9 @@ pub fn SchemaPage() -> impl IntoView {
         <div class="page">
             <div class="page-hd compact">
                 <div>
-                    <h1>"Schema"</h1>
+                    // `tabindex=-1` so the close handler above can put
+                    // focus here — headings are not focusable by default.
+                    <h1 id=HEADING_ID tabindex="-1">"Schema"</h1>
                     <p class="sub">"Click a service to inspect fields, ingest rate, and tail live."</p>
                 </div>
                 <div class="actions">
@@ -403,7 +482,7 @@ pub fn SchemaPage() -> impl IntoView {
                             can_repin=can_repin
                             on_open_field=on_open_field
                             on_back=on_field_back
-                            on_close=on_close
+                            on_close=on_field_close
                         />
                     }.into_any();
                 }
@@ -419,6 +498,7 @@ pub fn SchemaPage() -> impl IntoView {
                     <ServiceDrawer
                         svc=svc
                         tab=tab_sig
+                        focus_field=focus_field
                         on_close=on_close
                         on_tab_change=on_tab_change
                         on_search=on_search
