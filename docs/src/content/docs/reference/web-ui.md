@@ -39,11 +39,17 @@ or an alert.
 
 The case file renders one `GET /api/v1/schema/field?name=` response as plain
 facts: the pin and when and where it was set, the verdict (since when, how
-many services have conflict evidence, episodes, lifetime rows shelved, a
-sample of the values that were nulled, the suggested target type), the
-services carrying the field (paged — the service axis is never pruned), and
-recent conflict rows with their own samples. Every shelved value shown here
-still exists in `_raw`.
+many services have conflict evidence, conflict episodes, lifetime rows
+shelved, a sample of the values that were nulled, the suggested target type),
+the remedy, the services carrying the field (paged — the service axis is
+never pruned), and recent conflict rows with their own samples. Every shelved
+value shown here still exists in `_raw`.
+
+A **conflict episode** is one conforming cast that had to shelve at least one
+value for this field — one compaction batch per sending service, or one file
+for the boot pass that types an existing archive. Three episodes means three
+separate writes put NULL where a value did not survive the pin, not three
+values.
 
 Two things it always says out loud: `rows shelved` is a **lifetime** total
 and deliberately differs from the windowed `rows nulled` beside it, and a

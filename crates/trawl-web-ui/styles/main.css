@@ -1320,7 +1320,7 @@
 .rp-force {
   margin-top: 12px; padding: 10px 12px;
   border: 1px solid var(--red); border-radius: var(--radius-sm);
-  background: color-mix(in oklch, var(--red) 8%, transparent);
+  background: var(--red-wash);
 }
 .rp-force label {
   display: flex; align-items: flex-start; gap: 8px;

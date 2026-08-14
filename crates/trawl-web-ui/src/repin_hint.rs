@@ -77,6 +77,35 @@ pub fn repin_is_terminal(status: &str) -> bool {
     !repin_is_running(status)
 }
 
+/// One hint string split into display segments: `(is_code, text)`, where
+/// a backtick-delimited run is code and the ticks themselves are gone.
+///
+/// The hints above are written to be readable in a TERMINAL, where a
+/// backtick is the only markup there is. A browser must not paint the
+/// ticks, so the view renders each code run as `<span class="mono">` and
+/// the shared string stays CLI-compatible. An unterminated run is plain
+/// text: these are constants, but a rule that reads correctness off that
+/// is a rule that breaks when one is edited.
+#[must_use]
+pub fn hint_segments(hint: &str) -> Vec<(bool, String)> {
+    let mut segments = Vec::new();
+    let mut rest = hint;
+    while let Some(open) = rest.find('`') {
+        let Some(close) = rest[open + 1..].find('`').map(|i| open + 1 + i) else {
+            break;
+        };
+        if open > 0 {
+            segments.push((false, rest[..open].to_string()));
+        }
+        segments.push((true, rest[open + 1..close].to_string()));
+        rest = &rest[close + 1..];
+    }
+    if !rest.is_empty() {
+        segments.push((false, rest.to_string()));
+    }
+    segments
+}
+
 /// `arg` as one POSIX shell word — mirrors the CLI's `shell_quote`.
 ///
 /// Bare when the name is already a shell-inert token (which every
@@ -98,7 +127,42 @@ fn shell_quote(arg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{repin_command_hint, repin_is_running, repin_is_terminal};
+    use super::{
+        REPIN_HINT_REFUSED, hint_segments, repin_command_hint, repin_is_running, repin_is_terminal,
+    };
+
+    #[test]
+    fn hint_segments_lift_the_ticks_out_of_the_text() {
+        // Plain text is one segment and keeps its spelling.
+        assert_eq!(
+            hint_segments("no markup here"),
+            vec![(false, "no markup here".to_string())]
+        );
+        assert_eq!(
+            hint_segments("run `trawl schema repin` first"),
+            vec![
+                (false, "run ".to_string()),
+                (true, "trawl schema repin".to_string()),
+                (false, " first".to_string()),
+            ]
+        );
+        // The shared CLI string keeps its backticks; the browser never
+        // paints one.
+        assert!(REPIN_HINT_REFUSED.contains('`'));
+        let segments = hint_segments(REPIN_HINT_REFUSED);
+        assert!(segments.iter().any(|(code, _)| *code), "no code run found");
+        for (_, text) in &segments {
+            assert!(!text.contains('`'), "a tick survived into {text:?}");
+        }
+        // Round-trips the text itself, ticks aside.
+        let flattened: String = segments.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(flattened, REPIN_HINT_REFUSED.replace('`', ""));
+        // An unterminated run is text, not an open code span.
+        assert_eq!(
+            hint_segments("a `dangling tick"),
+            vec![(false, "a `dangling tick".to_string())]
+        );
+    }
 
     #[test]
     fn ordinary_names_get_a_bare_command() {

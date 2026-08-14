@@ -32,6 +32,26 @@ pub fn format_count(n: u64) -> String {
     }
 }
 
+/// Every digit, thousands-grouped: `"1,204,913"`, `"7"`, `"0"`.
+///
+/// The counterpart to [`format_count`] for a number an operator accepts
+/// RESPONSIBILITY for — the values a repin would null, the rows carrying
+/// the field, what a finished job actually rewrote. "1.2k values become
+/// NULL" is not a fact anyone can act on, and grouping is what makes the
+/// exact digits readable at a glance.
+#[must_use]
+pub fn format_exact(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.char_indices() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Compact bytes: `"1.2 GB"`, `"284 MB"`, `"18 KB"`, `"42 B"`.
 #[must_use]
 pub fn format_bytes(n: u64) -> String {
@@ -287,6 +307,20 @@ mod tests {
         assert_eq!(format_count(12_345), "12k");
         assert_eq!(format_count(1_800_000), "1.8M");
         assert_eq!(format_count(2_500_000_000), "2.5B");
+    }
+
+    #[test]
+    fn format_exact_groups_every_digit() {
+        assert_eq!(format_exact(0), "0");
+        assert_eq!(format_exact(7), "7");
+        assert_eq!(format_exact(999), "999");
+        // The boundary the grouping is for: nothing is rounded away.
+        assert_eq!(format_exact(1_000), "1,000");
+        assert_eq!(format_exact(1_204_913), "1,204,913");
+        assert_eq!(format_exact(u64::MAX), "18,446,744,073,709,551,615");
+        // Never lossy, unlike `format_count`.
+        assert_eq!(format_count(1_204_913), "1.2M");
+        assert_ne!(format_exact(1_204_913), format_count(1_204_913));
     }
 
     #[test]

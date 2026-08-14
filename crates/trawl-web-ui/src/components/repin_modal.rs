@@ -38,7 +38,7 @@ use crate::repin_flow::{
     LostRun, ProbedJob, Recovery, SlotCheck, StatusProbe, Unproven, default_target,
     indeterminate_text, is_pre_claim_failure, recovery_verdict, repin_targets, slot_check,
 };
-use crate::service_card_fmt::format_bytes;
+use crate::service_card_fmt::{format_bytes, format_exact};
 use fleet_ui::{Btn, Icon, Modal, Segmented, SegmentedOption, Variant};
 
 /// The wire status a refusal carries — the one status this dialog has to
@@ -452,7 +452,9 @@ pub fn RepinModal(
                 <p class="rp-note">
                     "Current pin: "<span class="mono">{current_type.clone()}</span>
                     ". The pin it already has is not offered — re-extracting shelved values "
-                    "under the SAME pin is a `--force` resurrection pass, and stays a CLI decision."
+                    "under the "<strong>"same pin"</strong>" is a "
+                    <span class="mono">"--force"</span>
+                    " resurrection pass, and stays a CLI decision."
                 </p>
                 {move || target_locked.get().then(|| view! {
                     <p class="rp-note">
@@ -491,9 +493,13 @@ pub fn RepinModal(
                                     force.set(checked_from_event(&e));
                                 }
                             />
-                            " I accept that "
-                            {job.projected_nulls}
-                            " stored values become NULL"
+                            // The acceptance carries the snapshot caveat
+                            // itself: ingest keeps running, so the count
+                            // being accepted is the last scan's, not a
+                            // reservation.
+                            " I accept that the values the new pin cannot keep — "
+                            {format_exact(job.projected_nulls)}
+                            " at the last scan — become NULL"
                         </label>
                         <p class="rp-note">
                             "A forced repin writes NULL wherever the new pin cannot keep the \
@@ -509,7 +515,7 @@ pub fn RepinModal(
                 }.into_any(),
                 Phase::Busy(msg) => view! {
                     <div class="rp-err" role="alert">
-                        <p>"Another repin is already running — the slot is one at a time, \
+                        <p>"Another repin is already running — only one repin runs at a time, \
                             install-wide."</p>
                         <p class="mono">{sanitize_display_text(&msg)}</p>
                         {move || busy_field.get().map(|f| view! {
@@ -569,14 +575,15 @@ fn checked_from_event(e: &leptos::ev::Event) -> bool {
 /// to "what the refusal is based on" — the numbers themselves are the
 /// same shape, produced by the same expressions the rewrite writes.
 fn plan_block(job: &RepinJobResponse, refused: bool) -> AnyView {
-    // Exact digits, not the compact `format_count` the tables use: this
-    // is a number an operator accepts responsibility for, and "1.2k
-    // values become NULL" is not a fact anyone can act on.
+    // Exact digits, not the compact `format_count` the tables use: these
+    // are numbers an operator accepts responsibility for, and "1.2k
+    // values become NULL" is not a fact anyone can act on. Bytes stay
+    // compact — nobody acts on the last byte.
     let files_total = job.files_total;
-    let files_label = job.files_total;
-    let rows_carrying = job.rows_carrying;
-    let projected_nulls = job.projected_nulls;
-    let resurrectable = job.resurrectable;
+    let files_label = format_exact(job.files_total);
+    let rows_carrying = format_exact(job.rows_carrying);
+    let projected_nulls = format_exact(job.projected_nulls);
+    let resurrectable = format_exact(job.resurrectable);
     let bytes = format_bytes(job.affected_bytes);
     let lossy = job.projected_nulls > 0;
     view! {
@@ -585,9 +592,10 @@ fn plan_block(job: &RepinJobResponse, refused: bool) -> AnyView {
             <div class="rp-kv"><span>"Rows carrying the field"</span><span>{rows_carrying}</span></div>
             <div class="rp-kv"><span>"Values the new pin cannot keep"</span><span>{projected_nulls}</span></div>
             <div class="rp-kv">
-                <span>"Values resurrected from _raw"</span><span>{resurrectable}</span>
+                <span>"Values that would come back from "<span class="mono">"_raw"</span></span>
+                <span>{resurrectable}</span>
             </div>
-            <div class="rp-kv"><span>"Bytes rewritten"</span><span>{bytes}</span></div>
+            <div class="rp-kv"><span>"Bytes to rewrite"</span><span>{bytes}</span></div>
 
             {(files_total == 0).then(|| view! {
                 <p class="rp-note">
@@ -598,9 +606,9 @@ fn plan_block(job: &RepinJobResponse, refused: bool) -> AnyView {
             })}
 
             <p class="rp-note">
-                "A repin rewrites this field across the ENTIRE corpus — every service, every \
-                 environment, every day. Retention stands down for the job's whole life, and \
-                 the affected bytes are held twice until it sweeps."
+                "A repin rewrites this field across the "<strong>"entire corpus"</strong>
+                " — every service, every environment, every day. Retention stands down for the \
+                 job's whole life, and the affected bytes are held twice until it sweeps."
             </p>
             <p class="rp-note">
                 "These numbers are a snapshot of the scan, not a reservation: ingest keeps \

@@ -45,7 +45,8 @@ use crate::components::repin_modal::RepinModal;
 use crate::repin_flow::{
     PollAction, ProbedJob, REPIN_POLL_MS, StatusProbe, claim_toast, poll_decide,
 };
-use crate::repin_hint::{REPIN_HINT_REFUSED, repin_command_hint, repin_is_running};
+use crate::repin_hint::{REPIN_HINT_REFUSED, hint_segments, repin_command_hint, repin_is_running};
+use crate::service_card_fmt::format_exact;
 use fleet_ui::{
     Badge, Btn, Drawer, Icon, IconView, LoadMore, LoadState, Loaded, ToastBus, ToastKind, Tone,
     Variant,
@@ -550,9 +551,10 @@ pub fn FieldCaseDrawer(
                             </p>
                             <p>
                                 "The catalog types a field the first time a batch carries a \
-                                 value for it, so an unpinned name has never been ingested — \
-                                 or is spelled differently. Names are ASCII-lowercased at \
-                                 ingest, and its values, if any, stay findable in "
+                                 value for it, so an unpinned name has never arrived with a \
+                                 typed value — or is spelled differently, or arrived after the \
+                                 pin capacity filled. Names are ASCII-lowercased at ingest, and \
+                                 its values, if any, stay findable in "
                                 <span class="mono">"_raw"</span>
                                 "."
                             </p>
@@ -588,10 +590,11 @@ pub fn FieldCaseDrawer(
                             repin_command_hint(&resp.name, &v.suggested_to),
                         )
                     });
+                    // The deep-link arm has no service to contrast with,
+                    // so it stops at the scope itself.
                     let scope_copy = back_for_copy.clone().map_or_else(
                         || "A repin rewrites this field across the entire corpus \u{2014} every \
-                            service, every environment, every day \u{2014} not just the service \
-                            you reached it from.".to_string(),
+                            service, every environment, every day.".to_string(),
                         |svc| format!(
                             "A repin rewrites this field across the entire corpus \u{2014} every \
                              service, every environment, every day \u{2014} not just {}.",
@@ -621,6 +624,70 @@ pub fn FieldCaseDrawer(
                                 }.into_any(),
                                 |v| verdict_block(&v),
                             )}
+
+                            // Directly under the verdict: the remedy is
+                            // what the verdict is FOR, and a reader who
+                            // has just been told the pin is shelving
+                            // values should not have to scroll past the
+                            // evidence to find out what to do about it.
+                            {remedy.map(|(current, suggested, hint)| view! {
+                                <div class="fc-sec">
+                                    <div class="fc-lb">"Remedy"</div>
+                                    // The trigger and the command line are
+                                    // ALTERNATIVES, never a disabled pair:
+                                    // with `schema_write` the button is the
+                                    // remedy, without it the CLI line is.
+                                    {move || if can_repin.get() {
+                                        let current = current.clone();
+                                        let suggested = suggested.clone();
+                                        view! {
+                                            <div class="sfd-actions">
+                                                <Btn
+                                                    variant=Variant::Primary
+                                                    on_click=Callback::new(move |()| {
+                                                        open_repin.run((
+                                                            current.clone(),
+                                                            suggested.clone(),
+                                                        ));
+                                                    })
+                                                >
+                                                    "Repin this field"
+                                                </Btn>
+                                            </div>
+                                            <p class="fc-note">
+                                                "Opens the plan first \u{2014} the scan runs, and \
+                                                 nothing is rewritten until you confirm it."
+                                            </p>
+                                        }.into_any()
+                                    } else {
+                                        match hint.clone() {
+                                            Some(cmd) => view! {
+                                                <p class="fc-note">
+                                                    "Repinning needs the "
+                                                    <span class="mono">"schema_write"</span>
+                                                    " permission, which this session doesn't \
+                                                     hold. From a shell:"
+                                                </p>
+                                                <pre class="fc-cmd">{cmd}</pre>
+                                            }.into_any(),
+                                            None => view! {
+                                                <p class="fc-note">
+                                                    {hint_segments(REPIN_HINT_REFUSED)
+                                                        .into_iter()
+                                                        .map(|(code, text)| if code {
+                                                            view! {
+                                                                <span class="mono">{text}</span>
+                                                            }.into_any()
+                                                        } else {
+                                                            view! { {text} }.into_any()
+                                                        })
+                                                        .collect::<Vec<_>>()}
+                                                </p>
+                                            }.into_any(),
+                                        }
+                                    }}
+                                </div>
+                            })}
 
                             {(!conflicts.is_empty()).then(|| conflicts_block(&conflicts))}
 
@@ -652,47 +719,11 @@ pub fn FieldCaseDrawer(
                                 />
                             </div>
 
+                            // The footer is the standing scope statement
+                            // and nothing else: it is true of every case
+                            // file, degraded or not.
                             <div class="fc-foot">
                                 <p class="fc-note">{scope_copy}</p>
-                                {remedy.map(|(current, suggested, hint)| view! {
-                                    <div class="fc-lb">"Remedy"</div>
-                                    // The trigger and the command line are
-                                    // ALTERNATIVES, never a disabled pair:
-                                    // with `schema_write` the button is the
-                                    // remedy, without it the CLI line is.
-                                    {move || if can_repin.get() {
-                                        let current = current.clone();
-                                        let suggested = suggested.clone();
-                                        view! {
-                                            <div class="sfd-actions">
-                                                <Btn
-                                                    variant=Variant::Primary
-                                                    on_click=Callback::new(move |()| {
-                                                        open_repin.run((
-                                                            current.clone(),
-                                                            suggested.clone(),
-                                                        ));
-                                                    })
-                                                >
-                                                    "Repin this field"
-                                                </Btn>
-                                            </div>
-                                            <p class="fc-note">
-                                                "Opens the plan first \u{2014} the scan runs, and \
-                                                 nothing is rewritten until you confirm it."
-                                            </p>
-                                        }.into_any()
-                                    } else {
-                                        match hint.clone() {
-                                            Some(cmd) => view! {
-                                                <pre class="fc-cmd">{cmd}</pre>
-                                            }.into_any(),
-                                            None => view! {
-                                                <p class="fc-note">{REPIN_HINT_REFUSED}</p>
-                                            }.into_any(),
-                                        }
-                                    }}
-                                })}
                             </div>
                         </div>
                     }.into_any()
@@ -771,19 +802,25 @@ fn job_outcome_line(job: &RepinJobResponse) -> String {
     let field = sanitize_display_text(&job.field);
     match job.status.as_str() {
         STATUS_SUCCEEDED if job.dry_run => format!(
-            "{field}: dry run finished \u{2014} {} files carry it, {} values could not be kept, \
+            "{field}: dry run finished \u{2014} {} files carry it, {} values cannot be kept, \
              {} would come back from _raw.",
-            job.files_total, job.projected_nulls, job.resurrectable,
+            format_exact(job.files_total),
+            format_exact(job.projected_nulls),
+            format_exact(job.resurrectable),
         ),
         STATUS_SUCCEEDED => format!(
             "{field} is now pinned {} \u{2014} {} rows rewritten, {} nulled, {} resurrected \
              from _raw.",
-            job.to_type, job.rows_rewritten, job.rows_nulled, job.rows_resurrected,
+            job.to_type,
+            format_exact(job.rows_rewritten),
+            format_exact(job.rows_nulled),
+            format_exact(job.rows_resurrected),
         ),
         STATUS_REFUSED => format!(
             "{field}: refused \u{2014} {} stored values cannot be kept as {}, and no force was \
              given. The corpus is untouched.",
-            job.projected_nulls, job.to_type,
+            format_exact(job.projected_nulls),
+            job.to_type,
         ),
         // Including `blocked`, `failed`, and any status a later server
         // adds: the wire word verbatim, plus whatever it said went wrong.
@@ -826,14 +863,19 @@ fn job_block(job: &RepinJobResponse, on_review: Option<Callback<()>>) -> AnyView
     let requested_by = job.requested_by.as_deref().map(sanitize_display_text);
     let started_at = job.started_at.clone();
     // Plain text, re-read on every tick — see the aria-live note above.
-    let progress =
-        running.then(|| format!("{} of {} files rewritten", job.files_done, job.files_total));
+    let progress = running.then(|| {
+        format!(
+            "{} of {} files rewritten",
+            format_exact(job.files_done),
+            format_exact(job.files_total),
+        )
+    });
     let error = job.error.as_deref().map(sanitize_display_text);
     let lagging = job.status == STATUS_SUCCEEDED && !job.dry_run;
     // What the refusal was about. `projected_nulls`, not `rows_nulled`:
     // a refused job wrote nothing, so its outcome counters are zero by
     // construction and the projection is the number it declined over.
-    let projected_nulls = job.projected_nulls;
+    let projected_nulls = format_exact(job.projected_nulls);
     view! {
         <div class="fc-sec fc-job">
             <div class="fc-lb">
@@ -895,7 +937,7 @@ fn verdict_block(v: &DegradedVerdict) -> AnyView {
             <div class="sfd-kv">
                 <span>"Services with conflict evidence"</span><span>{services}</span>
             </div>
-            <div class="sfd-kv"><span>"Episodes"</span><span>{episodes}</span></div>
+            <div class="sfd-kv"><span>"Conflict episodes"</span><span>{episodes}</span></div>
             <div class="sfd-kv">
                 <span>"Rows shelved (lifetime)"</span><span>{rows_shelved}</span>
             </div>
