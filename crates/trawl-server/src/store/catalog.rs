@@ -23,14 +23,14 @@
 //! read surface pages it: [`CatalogStore::field_services`] takes a bounded
 //! limit and a [`ServiceCursor`], never the whole history.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row as _};
 use trawl_core::schema::CanonicalType;
 
 use super::error::StoreError;
-use crate::catalog::analyzer::ConflictAggregate;
+use crate::catalog::analyzer::{ConflictAggregate, is_degraded};
 
 /// A proposed pin for a field absent from the catalog.
 #[derive(Debug, Clone)]
@@ -1060,17 +1060,32 @@ impl CatalogStore {
         &self,
         fields: Option<&[String]>,
     ) -> Result<Vec<ConflictAggregate>, StoreError> {
+        let mut conn = self.pool.acquire().await?;
+        Self::conflict_aggregates_tx(&mut conn, fields).await
+    }
+
+    /// [`Self::conflict_aggregates`] inside a caller's transaction — the
+    /// half of [`Self::degraded_snapshot`] that has to share one postgres
+    /// snapshot with [`Self::conflict_service_pairs_tx`].
+    ///
+    /// Public for the same reason [`Self::clear_conflict_evidence`] is: the
+    /// interleaving these two reads must survive is only expressible by a
+    /// caller that holds the transaction across both.
+    pub async fn conflict_aggregates_tx(
+        tx: &mut sqlx::PgConnection,
+        fields: Option<&[String]>,
+    ) -> Result<Vec<ConflictAggregate>, StoreError> {
         let rows = match fields {
             Some([]) => return Ok(Vec::new()),
             Some(names) => {
                 sqlx::query(Self::CONFLICT_AGGREGATES_KEYED_SQL)
                     .bind(names)
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *tx)
                     .await?
             }
             None => {
                 sqlx::query(Self::CONFLICT_AGGREGATES_ALL_SQL)
-                    .fetch_all(&self.pool)
+                    .fetch_all(&mut *tx)
                     .await?
             }
         };
@@ -1117,13 +1132,24 @@ impl CatalogStore {
         fields: &[String],
         visible_services: &[String],
     ) -> Result<Vec<ConflictServicePair>, StoreError> {
+        let mut conn = self.pool.acquire().await?;
+        Self::conflict_service_pairs_tx(&mut conn, fields, visible_services).await
+    }
+
+    /// [`Self::conflict_service_pairs`] inside a caller's transaction — see
+    /// [`Self::conflict_aggregates_tx`].
+    pub async fn conflict_service_pairs_tx(
+        tx: &mut sqlx::PgConnection,
+        fields: &[String],
+        visible_services: &[String],
+    ) -> Result<Vec<ConflictServicePair>, StoreError> {
         if fields.is_empty() || visible_services.is_empty() {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(Self::CONFLICT_SERVICE_PAIRS_SQL)
             .bind(fields)
             .bind(visible_services)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
         rows.iter()
             .map(|row| {
@@ -1134,6 +1160,74 @@ impl CatalogStore {
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(StoreError::from)
+    }
+
+    /// Begin a read-only `REPEATABLE READ` transaction over the conflict
+    /// evidence.
+    ///
+    /// `READ COMMITTED` — postgres' default, and what two separate pool
+    /// reads get — takes a fresh snapshot per statement, which is exactly
+    /// the tear [`Self::degraded_snapshot`] exists to close.
+    pub async fn begin_evidence_snapshot(
+        &self,
+    ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
+    }
+
+    /// One generation of the degraded-field picture: the fields the
+    /// analyzer indicts, and the `(field, service)` pairs that indicted
+    /// them, read as ONE fact.
+    ///
+    /// The two halves are separate queries, and a repin's evidence clear
+    /// ([`Self::clear_conflict_evidence`]) deletes from the table both of
+    /// them read. Run under two snapshots, a clear landing between them
+    /// publishes a generation with a degraded field and no services
+    /// attributed to it — the query notice standing while every badge
+    /// disappears, for as long as the refresh interval. So when there is
+    /// anything to attribute, both reads share one `REPEATABLE READ`
+    /// snapshot and see the same table.
+    ///
+    /// The healthy install keeps C1's cost exactly: the probe below is the
+    /// one query it has always paid, and a catalog with nothing degraded
+    /// returns from it without opening a transaction at all. Only an
+    /// install that HAS a degraded pin pays the transactional re-read —
+    /// and it is that install whose badges the tear would drop.
+    ///
+    /// `visible_services` bounds the attribution read's service axis (see
+    /// [`Self::conflict_service_pairs`]); an empty list means the schema
+    /// cache has nothing to render yet, and the generation is published
+    /// unattributed — one tick of missing badges at boot, accepted.
+    pub async fn degraded_snapshot(
+        &self,
+        visible_services: &[String],
+    ) -> Result<(BTreeSet<String>, Vec<ConflictServicePair>), StoreError> {
+        if !self
+            .conflict_aggregates(None)
+            .await?
+            .iter()
+            .any(is_degraded)
+        {
+            return Ok((BTreeSet::new(), Vec::new()));
+        }
+
+        let mut tx = self.begin_evidence_snapshot().await?;
+        // Re-read rather than reuse the probe: the probe's rows come from a
+        // snapshot this transaction does not share, so trusting them would
+        // reintroduce the tear one statement earlier.
+        let degraded: BTreeSet<String> = Self::conflict_aggregates_tx(&mut tx, None)
+            .await?
+            .iter()
+            .filter(|agg| is_degraded(agg))
+            .map(|agg| agg.field.clone())
+            .collect();
+        let names: Vec<String> = degraded.iter().cloned().collect();
+        let pairs = Self::conflict_service_pairs_tx(&mut tx, &names, visible_services).await?;
+        tx.commit().await?;
+        Ok((degraded, pairs))
     }
 
     /// The retained detail evidence for `fields`, newest first: the

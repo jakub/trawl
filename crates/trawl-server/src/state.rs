@@ -404,8 +404,9 @@ pub struct CachedServiceSchema {
 ///
 /// Built and swapped as a whole by
 /// [`crate::schema_refresh::refresh_degraded_fields`] and read nowhere else
-/// — both halves come from one pair of postgres reads, so the badge can
-/// never name a field the notice does not, nor the reverse.
+/// — both halves come from one pair of postgres reads inside one
+/// `REPEATABLE READ` transaction, so the badge can never name a field the
+/// notice does not, nor the reverse.
 ///
 /// `by_service` is keyed BY `fields` at construction (a pair naming a field
 /// outside the set is dropped), which is the invariant that makes the two
@@ -429,9 +430,10 @@ impl DegradedSnapshot {
     /// evidence pairs.
     ///
     /// Pairs are grouped by service, sorted and deduplicated; a pair whose
-    /// field is not in `fields` is dropped rather than trusted — the store
-    /// read is keyed on the set, so such a row can only mean the two reads
-    /// straddled a repin's evidence clear.
+    /// field is not in `fields` is dropped rather than trusted. The store
+    /// reads both halves under one `REPEATABLE READ` snapshot and keys the
+    /// pair read on the set, so such a row should be unreachable — the drop
+    /// is the belt to that braces.
     #[must_use]
     pub fn new(
         fields: BTreeSet<String>,

@@ -114,28 +114,43 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
 /// path and the badge by `/schema/services`, and a query-only node serves
 /// both.
 ///
-/// Two reads, one generation. The aggregate read is unconditional and is
-/// the whole cost on a healthy install — the degraded set is empty, so the
-/// second read short-circuits to zero queries and the tick's postgres cost
-/// is exactly the one query C1 shipped. Only when something IS degraded does
-/// the pair read run, keyed on that (pin-capped) set AND on the service
+/// Two reads, one generation, and — when there is anything to attribute —
+/// one postgres SNAPSHOT: [`crate::store::CatalogStore::degraded_snapshot`]
+/// runs both under a single `REPEATABLE READ` transaction, so a repin
+/// clearing a field's evidence between them can no longer publish a
+/// generation whose notice stands while its badges are gone. The healthy
+/// install still pays exactly the one query C1 shipped — the degraded set is
+/// empty, so no second read and no transaction happen at all.
+///
+/// The attribution read is keyed on that (pin-capped) set AND on the service
 /// names the schema cache can currently render, so neither axis can widen it
 /// into a scan of a table whose service axis is client-chosen. A tick whose
-/// service cache has not filled yet (boot) skips the pair read and publishes
-/// an unattributed generation — one tick of missing badges, accepted.
+/// service cache has not filled yet (boot) passes an empty service list and
+/// publishes an unattributed generation — one tick of missing badges,
+/// accepted.
 ///
-/// A store error on EITHER read keeps the ENTIRE previous snapshot rather
-/// than clearing it, and never publishes a half-built one. The alternative
-/// — an empty set on a postgres blip — silently un-badges every degraded
-/// field on the install for as long as the blip lasts, which is the one
-/// failure mode a notice must not have; and a snapshot with fields but no
-/// pairs is strictly worse than stale, since it would un-badge every
-/// service while leaving the notice standing. The gauge is left alone for
-/// the same reason: it would otherwise read as a fixed catalog.
+/// A store error keeps the ENTIRE previous snapshot rather than clearing it,
+/// and never publishes a half-built one. The alternative — an empty set on a
+/// postgres blip — silently un-badges every degraded field on the install for
+/// as long as the blip lasts, which is the one failure mode a notice must not
+/// have; and a snapshot with fields but no pairs is strictly worse than
+/// stale, since it would un-badge every service while leaving the notice
+/// standing. The gauge is left alone for the same reason: it would otherwise
+/// read as a fixed catalog.
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; the pin cap is exact
 pub async fn refresh_degraded_fields(state: &AppState) {
-    let aggregates = match state.storage.catalog.conflict_aggregates(None).await {
-        Ok(aggregates) => aggregates,
+    // Taken before the await: the schema cache is a sync mutex, and it is
+    // the attribution read's service axis.
+    let visible: Vec<String> = state
+        .query
+        .service_schema_cache
+        .lock()
+        .as_ref()
+        .map(|cached| cached.services.iter().map(|s| s.name.clone()).collect())
+        .unwrap_or_default();
+
+    let (degraded, pairs) = match state.storage.catalog.degraded_snapshot(&visible).await {
+        Ok(generation) => generation,
         Err(e) => {
             tracing::warn!(
                 event_type = "degraded_refresh_error",
@@ -143,43 +158,6 @@ pub async fn refresh_degraded_fields(state: &AppState) {
                 "degraded-field refresh failed; keeping the previous snapshot"
             );
             return;
-        }
-    };
-
-    let degraded: BTreeSet<String> = aggregates
-        .iter()
-        .filter(|a| crate::catalog::analyzer::is_degraded(a))
-        .map(|a| a.field.clone())
-        .collect();
-
-    // Attribution: which senders' data actually indicted each pin. Keyed on
-    // both axes, and skipped entirely when either is empty.
-    let pairs = if degraded.is_empty() {
-        Vec::new()
-    } else {
-        let names: Vec<String> = degraded.iter().cloned().collect();
-        let visible: Vec<String> = state
-            .query
-            .service_schema_cache
-            .lock()
-            .as_ref()
-            .map(|cached| cached.services.iter().map(|s| s.name.clone()).collect())
-            .unwrap_or_default();
-        match state
-            .storage
-            .catalog
-            .conflict_service_pairs(&names, &visible)
-            .await
-        {
-            Ok(pairs) => pairs,
-            Err(e) => {
-                tracing::warn!(
-                    event_type = "degraded_refresh_error",
-                    error = %e,
-                    "degraded-field service attribution failed; keeping the previous snapshot"
-                );
-                return;
-            }
         }
     };
 
