@@ -15,6 +15,9 @@ flate2 = { workspace = true }
 # (btn_class, badge_class, …) and sparkline geometry, so the emitted
 # HTML can't drift from the real composition logic.
 fleet-ui = { path = "../crates/fleet-ui" }
+rand = { workspace = true }
+serde_json = { workspace = true }
+trawl-core = { path = "../crates/trawl-core" }
 
 [lints]
 workspace = true

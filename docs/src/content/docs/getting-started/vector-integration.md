@@ -134,6 +134,58 @@ The repo ships ready-made configs under `config/vector/`:
 - `debian/{nginx,apache,postgresql,mysql,redis,docker,fail2ban,unifi-syslog}.toml`
   — per-service drop-ins, safe to deploy everywhere
 
+## Generate adversarial test logs
+
+The repository task runner emits deterministic newline-delimited JSON that is
+valid input for both Vector's JSON file source and trawl's HTTP ingest route:
+
+```bash
+cargo xtask ingest-fuzz --phase mutate --seed 42 --events 1000 > /tmp/trawl-fuzz.ndjson
+curl -fsS \
+  -H "Authorization: Bearer $TRAWL_INGEST_TOKEN" \
+  -H 'Content-Type: application/x-ndjson' \
+  --data-binary @/tmp/trawl-fuzz.ndjson \
+  "$TRAWL_URL/api/v1/ingest"
+```
+
+The generator writes only NDJSON to stdout; its row-count summary goes to
+stderr. `--seed`, `--namespace`, `--env`, and `--events` make it straightforward
+to wrap in a shell loop or CI job. The `mutate` phase emits accepted events
+covering scalar boundaries, nested values, timestamp and severity aliases,
+case-colliding and path-shaped field names, and the server's repair paths. The
+`rejects` phase emits valid JSON objects with invalid envelope fields so a test
+can assert the per-event rejection response.
+
+Schema-pinning runs are deliberately split into phases. Post and compact the
+`pin` file before posting `conflicts`; otherwise both sets may share the first
+DuckDB inference batch and test a different contract:
+
+```bash
+cargo xtask ingest-fuzz --phase pin --seed 42 --namespace ci > /tmp/pin.ndjson
+# POST /tmp/pin.ndjson, then wait for its WAL batch to compact.
+cargo xtask ingest-fuzz --phase conflicts --seed 42 --namespace ci > /tmp/conflicts.ndjson
+# POST /tmp/conflicts.ndjson, compact, then inspect schema/conflict results.
+```
+
+The pin phase installs direct BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, and VARCHAR
+candidates, an all-null deferred candidate, and mixed candidates at exactly
+9/10 and 8/10 successful BIGINT readings. Reusing the seed and namespace is
+load-bearing: they derive the shared field names. Use a disposable trawl data
+root and catalog for these runs; generated fields intentionally spend catalog
+pin slots.
+
+For a Vector file source, decode each line as JSON before connecting it to the
+normal HTTP sink:
+
+```toml
+[sources.trawl_fuzz]
+type = "file"
+include = ["/tmp/trawl-fuzz.ndjson"]
+read_from = "beginning"
+framing.method = "newline_delimited"
+decoding.codec = "json"
+```
+
 ## What the server records
 
 Every server-side substitution is visible: the event's `_repairs` column

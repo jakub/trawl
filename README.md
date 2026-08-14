@@ -139,6 +139,16 @@ data):
 DATABASE_URL=postgres://fleet:fleet@localhost:5433/fleet_test cargo nextest run --workspace
 ```
 
+Deterministic Vector-compatible NDJSON corpora for ingest and schema-pinning
+tests are available through the task runner:
+
+```bash
+cargo xtask ingest-fuzz --phase mutate --seed 42 --events 1000 > /tmp/trawl-fuzz.ndjson
+```
+
+See the [Vector integration guide](docs/src/content/docs/getting-started/vector-integration.md#generate-adversarial-test-logs)
+for the ordered pin/conflict workflow and file-source configuration.
+
 `lefthook install` wires the same suites into pre-push, split across both
 compose clusters so parallel runs don't collide.
 

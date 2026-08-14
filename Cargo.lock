@@ -7383,6 +7383,9 @@ dependencies = [
  "clap",
  "flate2",
  "fleet-ui",
+ "rand 0.8.7",
+ "serde_json",
+ "trawl-core",
 ]
 
 [[package]]

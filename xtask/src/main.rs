@@ -11,10 +11,13 @@
 //!   the gzip/Brotli wire-size budgets (used by cross-build CI).
 //! - `design-cards` — emit static fleet-ui preview cards for
 //!   claude.ai/design (see `design_cards` module).
+//! - `ingest-fuzz` — emit deterministic, Vector-compatible NDJSON corpora
+//!   for the ingest canonicalizer and field-catalog pin/conform boundary.
 //!
 //! Aliased as `cargo xtask` via `.cargo/config.toml`.
 
 mod design_cards;
+mod ingest_fuzz;
 
 use std::fs;
 use std::io::Write;
@@ -24,6 +27,7 @@ use std::process::{Command, ExitCode};
 use brotli::CompressorWriter;
 use clap::{Parser, Subcommand};
 use flate2::{Compression, GzBuilder};
+use ingest_fuzz::Phase;
 
 const GZIP_BUDGET: u64 = 4 * 1024 * 1024;
 const BROTLI_BUDGET: u64 = 5 * 1024 * 1024 / 2;
@@ -61,6 +65,26 @@ enum Cmd {
         #[arg(long, default_value = "target/design-cards")]
         out: PathBuf,
     },
+    /// Emit deterministic NDJSON for ingest and schema-pinning fuzz runs.
+    IngestFuzz {
+        /// Corpus phase. Run `pin`, compact, then run `conflicts` with the
+        /// same seed and namespace to exercise already-pinned fields.
+        #[arg(long, value_enum, default_value_t = Phase::Mutate)]
+        phase: Phase,
+        /// Seed controlling field names, values, and mutation selection.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Lowercase label used to isolate one corpus's field and service names.
+        #[arg(long, default_value = "local")]
+        namespace: String,
+        /// Allowlisted trawl environment written into accepted events.
+        #[arg(long, default_value = "prod")]
+        env: String,
+        /// Number of events in the seeded `mutate` phase. Fixed contract
+        /// phases use the exact row counts required by their boundaries.
+        #[arg(long, default_value_t = 100)]
+        events: usize,
+    },
 }
 
 fn main() -> ExitCode {
@@ -95,6 +119,19 @@ fn main() -> ExitCode {
             };
             design_cards::generate(&css, &out)
         }
+        Cmd::IngestFuzz {
+            phase,
+            seed,
+            namespace,
+            env,
+            events,
+        } => ingest_fuzz::run(&ingest_fuzz::Config {
+            phase,
+            seed,
+            namespace,
+            env,
+            mutation_events: events,
+        }),
     }
 }
 
