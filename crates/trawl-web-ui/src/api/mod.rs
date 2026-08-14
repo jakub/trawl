@@ -52,6 +52,25 @@ pub enum ApiError {
     Decode(String),
 }
 
+impl ApiError {
+    /// The HTTP status this failure carries, when it carries one at all.
+    ///
+    /// `None` is not a status class: a network or decode failure means
+    /// the request's fate is unknown, which is exactly what callers who
+    /// branch on definitiveness (`repin_flow::is_pre_claim_failure`)
+    /// have to tell apart from a server that answered.
+    #[must_use]
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Status(status) | Self::Server { status, .. } => Some(*status),
+            // The one status this enum spells as a word rather than a
+            // number.
+            Self::Unauthorized => Some(401),
+            Self::Network(_) | Self::Decode(_) => None,
+        }
+    }
+}
+
 impl From<gloo_net::Error> for ApiError {
     fn from(e: gloo_net::Error) -> Self {
         Self::Network(e.to_string())

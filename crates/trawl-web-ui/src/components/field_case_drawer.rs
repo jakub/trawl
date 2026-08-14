@@ -64,6 +64,15 @@ const STATUS_SUCCEEDED: &str = "succeeded";
 /// the retry budget still has room.
 const POLL_RETRY_WARNING: &str = "Couldn't read the repin status just now; still trying.";
 
+/// The operator's own re-check answered, and had nothing this page can
+/// follow. Said out loud because a button that appears to do nothing is
+/// indistinguishable from a broken one.
+const STATUS_RECHECK_NONE: &str =
+    "Checked again: the status route has no job this page can follow.";
+
+/// The re-check itself failed, which is not the same as an empty answer.
+const STATUS_RECHECK_FAILED: &str = "Couldn't read the repin status just now.";
+
 /// What the repin modal was opened with.
 #[derive(Clone)]
 struct ModalReq {
@@ -173,10 +182,20 @@ pub fn FieldCaseDrawer(
     // job at mount; cleared the moment the job settles or the
     // install-wide slot moves on.
     let tracked_job_id = RwSignal::new(None::<i64>);
+    // Whether THIS surface started the job it holds — a 202 from its own
+    // modal — as against merely ADOPTING one the status route reported.
+    // Only the operator who is mid-flow gets the force dialog reopened
+    // under them; an adopted refusal is a receipt with a button.
+    let job_initiated = RwSignal::new(false);
     let poll_errors = RwSignal::new(0_u32);
     let poll_in_flight = RwSignal::new(false);
     let poll_warning = RwSignal::new(None::<String>);
     let status_lost = RwSignal::new(false);
+    // A one-shot status read is in flight (mount, or "Check again").
+    let status_probing = RwSignal::new(false);
+    // What the operator's own re-check found, when it found nothing to
+    // follow. Empty for the silent mount read.
+    let recheck_note = RwSignal::new(None::<String>);
     let other_running = RwSignal::new(None::<String>);
     let modal = RwSignal::new(None::<ModalReq>);
 
@@ -236,7 +255,14 @@ pub fn FieldCaseDrawer(
             // dry run changed nothing, so it earns no refetch.
             reload.update(|n| *n += 1);
         }
-        if status == STATUS_REFUSED {
+        // Only for a job this surface STARTED: the operator is mid-flow,
+        // and the refusal is the next rung of the ladder they are on. A
+        // job merely adopted from the install-wide status route belongs
+        // to whoever started it — opening a dialog pre-armed to null
+        // values under a reader who asked for none is not their decision
+        // to be handed. That case renders as a receipt with an explicit
+        // "review" button instead (`job_block`).
+        if status == STATUS_REFUSED && job_initiated.try_get_untracked() == Some(true) {
             // The refusal IS a plan, scanned by the run that just
             // stopped. Re-present it rather than asking for another
             // full-corpus pass.
@@ -263,6 +289,13 @@ pub fn FieldCaseDrawer(
         poll_in_flight.set(true);
         spawn_local(async move {
             let result = api::repin_status().await;
+            // FIRST, before any read: the interval cannot cancel a read
+            // already awaiting, and every branch below reads this
+            // drawer's own signals — which panic once disposed, where a
+            // write is a silent no-op.
+            if !is_alive() {
+                return;
+            }
             poll_in_flight.set(false);
             let (probe, row) = match result {
                 Ok(resp) => match resp.job {
@@ -272,7 +305,7 @@ pub fn FieldCaseDrawer(
                 Err(_) => (StatusProbe::Failed, None),
             };
             let errors = if matches!(probe, StatusProbe::Failed) {
-                poll_errors.get_untracked() + 1
+                poll_errors.try_get_untracked().unwrap_or(0) + 1
             } else {
                 0
             };
@@ -315,36 +348,68 @@ pub fn FieldCaseDrawer(
         });
     });
 
-    // Mount: ONE status read. The route is install-wide, so what comes
-    // back is either this field's job (adopt it — poll if it is still
-    // running, show the receipt if it is not), or another field's (say
-    // so, and do not poll for it), or nothing.
+    // ONE status read. The route is install-wide, so what comes back is
+    // either this field's job (adopt it — poll if it is still running,
+    // show the receipt if it is not), or another field's (say so, and do
+    // not poll for it), or nothing.
+    //
+    // Run at mount, and again from the "Check again" button on the
+    // status-lost alert. `announce` is that button's: an operator who
+    // asked has to be told when the answer was "still nothing", where
+    // the mount read stays silent (the case file is the point; the
+    // receipt is a bonus, and a surface that loaded fine must not be
+    // banner-ed by it).
     let field_for_status = field.clone();
-    spawn_local(async move {
-        let Ok(status) = api::repin_status().await else {
-            // The case file is the point; the receipt is a bonus. A
-            // failed probe stays silent rather than banner-ing a surface
-            // that loaded fine.
+    let probe_status = Callback::new(move |announce: bool| {
+        if status_probing.get_untracked() {
             return;
-        };
-        let Some(found) = status.job else { return };
-        // Catalog keys are ASCII-folded at ingest, but the `?field=`
-        // spelling in the URL is whatever the operator typed.
-        if found.field.eq_ignore_ascii_case(&field_for_status) {
-            let running = repin_is_running(&found.status);
-            let id = found.id;
-            job.set(Some(found));
-            if running {
-                // `try_run`: the drawer may already be gone — closed
-                // inside this read's round trip — and running a disposed
-                // callback panics where a disposed signal write is a
-                // silent no-op.
-                start_poll.try_run(id);
-            }
-        } else if repin_is_running(&found.status) {
-            other_running.set(Some(found.field));
         }
+        status_probing.set(true);
+        recheck_note.set(None);
+        let field = field_for_status.clone();
+        spawn_local(async move {
+            let result = api::repin_status().await;
+            if !is_alive() {
+                return;
+            }
+            status_probing.set(false);
+            let Ok(status) = result else {
+                if announce {
+                    recheck_note.set(Some(STATUS_RECHECK_FAILED.to_string()));
+                }
+                return;
+            };
+            let Some(found) = status.job else {
+                if announce {
+                    recheck_note.set(Some(STATUS_RECHECK_NONE.to_string()));
+                }
+                return;
+            };
+            // Catalog keys are ASCII-folded at ingest, but the `?field=`
+            // spelling in the URL is whatever the operator typed.
+            if found.field.eq_ignore_ascii_case(&field) {
+                let running = repin_is_running(&found.status);
+                let id = found.id;
+                // ADOPTED, not initiated: whatever this job turns out to
+                // be, this surface did not start it.
+                job_initiated.set(false);
+                job.set(Some(found));
+                status_lost.set(false);
+                if running {
+                    // `try_run`: the drawer may already be gone — closed
+                    // inside this read's round trip — and running a
+                    // disposed callback panics where a disposed signal
+                    // write is a silent no-op.
+                    start_poll.try_run(id);
+                }
+            } else if repin_is_running(&found.status) {
+                other_running.set(Some(found.field));
+            } else if announce {
+                recheck_note.set(Some(STATUS_RECHECK_NONE.to_string()));
+            }
+        });
     });
+    probe_status.run(false);
 
     let field_for_modal = field.clone();
     let open_repin = Callback::new(move |(current_type, suggested_to): (String, String)| {
@@ -361,7 +426,11 @@ pub fn FieldCaseDrawer(
     let on_modal_close = Callback::new(move |started: Option<RepinJobResponse>| {
         modal.set(None);
         if let Some(started) = started {
+            // Started from HERE: the operator is mid-ladder, so a
+            // refusal may reopen the dialog on them.
+            job_initiated.set(true);
             status_lost.set(false);
+            recheck_note.set(None);
             if repin_is_running(&started.status) {
                 let id = started.id;
                 job.set(Some(started));
@@ -376,6 +445,20 @@ pub fn FieldCaseDrawer(
                 settle(started);
             }
         }
+    });
+
+    // The adopted-refusal path back into the ladder: the operator asks
+    // for the force dialog rather than being handed it. The refusal's
+    // own job row is the plan, so this costs no second corpus scan.
+    let review_refused = Callback::new(move |()| {
+        let Some(refused) = job.get_untracked() else {
+            return;
+        };
+        modal.set(Some(ModalReq {
+            current_type: refused.from_type.clone(),
+            suggested_to: refused.to_type.clone(),
+            refused: Some(refused),
+        }));
     });
 
     let shown_field = sanitize_display_text(&field);
@@ -398,7 +481,13 @@ pub fn FieldCaseDrawer(
         // Mounted as a SIBLING of the drawer, not inside it: the drawer
         // sits in its own stacking context (z-index 51) and the modal
         // scrim has to cover the whole viewport from the page's.
-        {move || modal.get().map(|req| view! {
+        // The `can_repin` guard is belt and braces: every path that sets
+        // `modal` is already behind it (the Remedy button, and a refusal
+        // for a job this surface started — which needed the permission
+        // to start). A mount-time adoption must never be able to raise
+        // this dialog for a read-only session, so the render site
+        // re-asks rather than trusting that inventory to stay complete.
+        {move || modal.get().filter(|_| can_repin.get()).map(|req| view! {
             <RepinModal
                 field=field_for_modal.clone()
                 current_type=req.current_type
@@ -622,7 +711,16 @@ pub fn FieldCaseDrawer(
                     .filter(|j| !repin_is_running(&j.status))
                     .map(|j| job_outcome_line(&j))}
             </div>
-            {move || job.get().map(|j| job_block(&j))}
+            {move || job.get().map(|j| {
+                // An ADOPTED refusal offers the ladder rather than
+                // opening it: a button the reader can take, and only
+                // when the session may actually repin.
+                let review = (j.status == STATUS_REFUSED
+                    && !job_initiated.get()
+                    && can_repin.get())
+                .then_some(review_refused);
+                job_block(&j, review)
+            })}
             {move || poll_warning.get().map(|msg| view! {
                 <div class="fc-note" role="status">{msg}</div>
             })}
@@ -633,6 +731,16 @@ pub fn FieldCaseDrawer(
                      last state this page saw; "
                     <span class="mono">"trawl schema repin-status"</span>
                     " reads the current one."
+                    {move || recheck_note.get().map(|note| view! { <p>{note}</p> })}
+                    <div class="sfd-actions">
+                        <Btn
+                            variant=Variant::Secondary
+                            disabled=Signal::derive(move || status_probing.get())
+                            on_click=Callback::new(move |()| probe_status.run(true))
+                        >
+                            {move || if status_probing.get() { "Checking\u{2026}" } else { "Check again" }}
+                        </Btn>
+                    </div>
                 </div>
             })}
             {move || other_running.get().map(|other| {
@@ -692,14 +800,25 @@ fn job_outcome_line(job: &RepinJobResponse) -> String {
 /// The job as facts. Progress while it runs, the wire status and the
 /// server's own error text when it stops — never a spinner standing in
 /// for a `blocked` or `failed` job.
-fn job_block(job: &RepinJobResponse) -> AnyView {
+///
+/// `on_review` is present only for an ADOPTED `refused_needs_force` job
+/// a session that may repin is reading: the refusal then renders as a
+/// receipt with a way back into the ladder, instead of the force dialog
+/// opening itself over a reader who started nothing.
+fn job_block(job: &RepinJobResponse, on_review: Option<Callback<()>>) -> AnyView {
     let running = repin_is_running(&job.status);
+    let refused = job.status == STATUS_REFUSED;
     let tone = if running {
         Tone::Info
     } else if job.status == STATUS_SUCCEEDED {
         Tone::Success
-    } else {
+    } else if refused {
+        // A refusal is the server declining to lose data: a warning to
+        // act on, not a failure.
         Tone::Warn
+    } else {
+        // `failed`, `blocked`, and any status a later server adds.
+        Tone::Danger
     };
     let status = sanitize_display_text(&job.status);
     let kind = if job.dry_run { "Dry run" } else { "Repin" };
@@ -711,6 +830,10 @@ fn job_block(job: &RepinJobResponse) -> AnyView {
         running.then(|| format!("{} of {} files rewritten", job.files_done, job.files_total));
     let error = job.error.as_deref().map(sanitize_display_text);
     let lagging = job.status == STATUS_SUCCEEDED && !job.dry_run;
+    // What the refusal was about. `projected_nulls`, not `rows_nulled`:
+    // a refused job wrote nothing, so its outcome counters are zero by
+    // construction and the projection is the number it declined over.
+    let projected_nulls = job.projected_nulls;
     view! {
         <div class="fc-sec fc-job">
             <div class="fc-lb">
@@ -722,8 +845,23 @@ fn job_block(job: &RepinJobResponse) -> AnyView {
                 <div class="sfd-kv"><span>"Requested by"</span><span>{by}</span></div>
             })}
             <div class="sfd-kv"><span>"Started"</span><span>{started_at}</span></div>
+            {refused.then(|| view! {
+                <div class="sfd-kv">
+                    <span>"Values the pin cannot keep"</span><span>{projected_nulls}</span>
+                </div>
+            })}
             {progress.map(|p| view! { <p class="fc-note">{p}</p> })}
             {error.map(|e| view! { <div class="fc-err" role="alert">{e}</div> })}
+            {on_review.map(|review| view! {
+                <div class="sfd-actions">
+                    <Btn variant=Variant::Danger on_click=review>"Review forced repin\u{2026}"</Btn>
+                </div>
+                <p class="fc-note">
+                    "This refusal is a plan the scan has already paid for. Reviewing it \
+                     re-presents those numbers with the force acceptance \u{2014} nothing is \
+                     rewritten until that is checked and confirmed."
+                </p>
+            })}
             {lagging.then(|| view! {
                 <p class="fc-note">
                     "The pin has changed. Degraded badges and query notices elsewhere read a \

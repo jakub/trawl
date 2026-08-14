@@ -46,7 +46,7 @@ use crate::components::service_card_fmt::{
 };
 use crate::components::service_drawer::ServiceDrawer;
 use crate::components::sort_th::sort_th;
-use crate::schema_nav::{BackNav, DEFAULT_SCHEMA_TAB, back_nav, sanitize_tab};
+use crate::schema_nav::{BackNav, DEFAULT_SCHEMA_TAB, back_nav_stack, sanitize_tab};
 use crate::state::query::{Mode, RangeSpec, navigator};
 use fleet_ui::{
     Badge, Icon, IconView, LoadState, Loaded, Pager, SearchInput, Sparkline, StatusDot, StatusTone,
@@ -128,13 +128,16 @@ pub fn SchemaPage() -> impl IntoView {
     let nav = use_navigate();
     let goto_search = navigator();
 
-    // Which field's history entry THIS page pushed, if any. The case
-    // file's back affordance consults it: popping an entry we did not
-    // push would be someone else's history, and replacing one we DID push
-    // is what grew the stack by a duplicate service entry per drill/back
-    // cycle. Deliberately not cleared by the pop — the entry stays in the
-    // forward stack, so a browser Forward back onto it is still ours.
-    let pushed_field = RwSignal::new(None::<String>);
+    // The field history entries THIS page pushed, innermost last. The
+    // case file's back affordance consults the top: popping an entry we
+    // did not push would be someone else's history, and replacing one we
+    // DID push is what grew the stack by a duplicate service entry per
+    // drill/back cycle. A STACK rather than one slot because a case file
+    // links to another case file (the "a repin is running on X" line), so
+    // A → B → A would have the third push overwrite the first — see
+    // `schema_nav::back_nav_stack` for the residual a browser-initiated
+    // Back leaves.
+    let pushed_fields = RwSignal::new(Vec::<String>::new());
     // The field badge to hand focus back to when the service drawer
     // remounts underneath a closing case file.
     let focus_field = RwSignal::new(None::<String>);
@@ -178,7 +181,7 @@ pub fn SchemaPage() -> impl IntoView {
                 url.push('&');
                 url.push_str(&ctx);
             }
-            pushed_field.set(Some(field.to_string()));
+            pushed_fields.update(|stack| stack.push(field.to_string()));
             focus_field.set(Some(field.to_string()));
             nav(&url, NavigateOptions::default());
         }
@@ -193,8 +196,13 @@ pub fn SchemaPage() -> impl IntoView {
         let nav = nav.clone();
         move || {
             let shown = field_selected.get_untracked();
+            // The decision CONSUMES the entry it pops, so the next back
+            // decides against the one below it rather than against a
+            // name three drill-ins old.
             let decision = shown.as_deref().map_or(BackNav::Replace, |f| {
-                back_nav(f, pushed_field.get_untracked().as_deref())
+                let mut decision = BackNav::Replace;
+                pushed_fields.update(|stack| decision = back_nav_stack(f, stack));
+                decision
             });
             if decision == BackNav::Pop
                 && let Some(history) = web_sys::window().and_then(|w| w.history().ok())
@@ -255,7 +263,10 @@ pub fn SchemaPage() -> impl IntoView {
         let push = push_svc.clone();
         Callback::new(move |()| {
             focus_field.set(None);
-            pushed_field.set(None);
+            // Every param is cleared, so nothing on screen stands on one
+            // of those entries any more: what is left of them in the
+            // history is not ours to pop.
+            pushed_fields.set(Vec::new());
             push(None, DEFAULT_SCHEMA_TAB);
             focus_on_next_frame(HEADING_ID);
         })

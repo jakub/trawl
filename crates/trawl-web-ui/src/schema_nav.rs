@@ -82,6 +82,31 @@ pub fn back_nav(shown_field: &str, pushed_field: Option<&str>) -> BackNav {
     }
 }
 
+/// Apply [`back_nav`]'s decision to the page's push STACK, consuming the
+/// entry it pops.
+///
+/// A stack rather than one slot because drill-in is not one level deep:
+/// the case file's "a repin is running on X" line opens ANOTHER case
+/// file, so A → B → A is reachable, and a single slot would have the
+/// third push overwrite the first — leaving one of the two backs to
+/// REPLACE an entry it had actually pushed, which is the duplicate-entry
+/// bug `back_nav` exists to prevent.
+///
+/// Known residual: a user-initiated browser Back or Forward moves the
+/// history cursor without telling this page, which desyncs the stack.
+/// The affected entries then fail the top comparison and take the safe
+/// `Replace` branch — the same class of residual a reload has, and the
+/// same direction (a redundant entry, never someone else's history
+/// popped).
+#[must_use]
+pub fn back_nav_stack(shown_field: &str, stack: &mut Vec<String>) -> BackNav {
+    let decision = back_nav(shown_field, stack.last().map(String::as_str));
+    if decision == BackNav::Pop {
+        stack.pop();
+    }
+    decision
+}
+
 /// Element id of the degraded badge for the field at `index` in the
 /// service's column list — the focus-return target across the
 /// case-file/service-drawer swap.
@@ -152,6 +177,46 @@ mod tests {
         assert_eq!(back_nav("status", Some("duration")), BackNav::Replace);
         // Exact match only.
         assert_eq!(back_nav("Duration", Some("duration")), BackNav::Replace);
+    }
+
+    #[test]
+    fn nested_drill_ins_pop_every_entry_they_pushed() {
+        // A → B → A: reachable because a case file links to the field
+        // whose repin holds the slot, and that field's case file links
+        // back the same way.
+        let mut stack = vec![
+            "duration".to_string(),
+            "status".to_string(),
+            "duration".to_string(),
+        ];
+        assert_eq!(back_nav_stack("duration", &mut stack), BackNav::Pop);
+        assert_eq!(stack, ["duration", "status"]);
+        // The second back stands on B's entry, not on a slot A's push
+        // overwrote.
+        assert_eq!(back_nav_stack("status", &mut stack), BackNav::Pop);
+        assert_eq!(stack, ["duration"]);
+        assert_eq!(back_nav_stack("duration", &mut stack), BackNav::Pop);
+        assert!(stack.is_empty());
+        // Nothing of ours left: the next back replaces rather than
+        // popping someone else's entry.
+        assert_eq!(back_nav_stack("duration", &mut stack), BackNav::Replace);
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn a_desynced_stack_replaces_and_is_left_intact() {
+        // Browser Back moved the cursor without telling the page: the
+        // shown field is no longer the top, so nothing is popped and the
+        // safe branch is taken.
+        let mut stack = vec!["duration".to_string(), "status".to_string()];
+        assert_eq!(back_nav_stack("duration", &mut stack), BackNav::Replace);
+        assert_eq!(stack, ["duration", "status"]);
+        // A deep link landing on a page that already has a stack.
+        assert_eq!(back_nav_stack("host", &mut stack), BackNav::Replace);
+        assert_eq!(stack, ["duration", "status"]);
+        // Exact match only, here as in `back_nav`.
+        assert_eq!(back_nav_stack("Status", &mut stack), BackNav::Replace);
+        assert_eq!(stack.len(), 2);
     }
 
     #[test]

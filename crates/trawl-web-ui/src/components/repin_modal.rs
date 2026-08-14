@@ -36,7 +36,7 @@ use trawl_core::sanitize::sanitize_display_text;
 use crate::api::{self, ApiError, RepinOutcome};
 use crate::repin_flow::{
     LostRun, ProbedJob, Recovery, SlotCheck, StatusProbe, Unproven, default_target,
-    indeterminate_text, recovery_verdict, repin_targets, slot_check,
+    indeterminate_text, is_pre_claim_failure, recovery_verdict, repin_targets, slot_check,
 };
 use crate::service_card_fmt::format_bytes;
 use fleet_ui::{Btn, Icon, Modal, Segmented, SegmentedOption, Variant};
@@ -86,12 +86,43 @@ enum Phase {
     /// The server's own message for a status this modal cannot act on.
     /// The modal STAYS OPEN and keeps the plan it was acting on, if
     /// there was one — a 503 must not cost the operator the scan they
-    /// have already paid for. Only a DRY RUN reaches this: a real run's
-    /// failure is a lost response, never a retryable step.
+    /// have already paid for.
+    ///
+    /// Two things reach this: any dry-run failure (the scan mutates
+    /// nothing, so retrying is free), and a real run refused with a
+    /// DEFINITIVE 4xx. The claim happens before the server answers, so a
+    /// 4xx is decided before it — nothing started, and saying the
+    /// outcome is unknown would be a lie the operator has to chase. A
+    /// 5xx or a lost connection is [`Phase::Indeterminate`] instead.
     Failed {
         message: String,
         plan: Option<Box<RepinJobResponse>>,
     },
+}
+
+/// The dialog's own reactive handles, carried to the out-of-line probes
+/// as ONE value. They are `Copy` handles; a probe that took eight
+/// positional signals is a probe that writes the wrong one.
+#[derive(Clone, Copy)]
+struct Handles {
+    phase: RwSignal<Phase>,
+    probing: RwSignal<bool>,
+    force: RwSignal<bool>,
+    busy_field: RwSignal<Option<String>>,
+    slot_note: RwSignal<Option<String>>,
+    /// False once this dialog is disposed. Every signal above then
+    /// PANICS on `get_untracked` (a write is a silent no-op), and any
+    /// state a dead dialog computes is state nobody can see.
+    alive: StoredValue<bool>,
+}
+
+impl Handles {
+    /// Whether the dialog these handles belong to is still mounted. A
+    /// disposed `StoredValue` reads as `None`, which is the same answer
+    /// as the flag itself.
+    fn is_alive(self) -> bool {
+        self.alive.try_get_value() == Some(true)
+    }
 }
 
 /// The repin dialog. `on_close` carries `Some(job)` ONLY for a real
@@ -150,6 +181,21 @@ pub fn RepinModal(
     // say. Advisory: the busy message stands on its own without it.
     let busy_field = RwSignal::new(None::<String>);
 
+    // Modal-level liveness. Every request below outlives the click that
+    // issued it, and closing the dialog disposes the signals above: a
+    // read of one then PANICS, so each future re-checks this the moment
+    // it comes back from an await.
+    let alive = StoredValue::new(true);
+    on_cleanup(move || alive.set_value(false));
+    let handles = Handles {
+        phase,
+        probing,
+        force,
+        busy_field,
+        slot_note,
+        alive,
+    };
+
     let field_for_calls = field.clone();
     // The one place a repin request is issued. `dry_run`/`force` decide
     // which rung of the ladder; nothing else varies.
@@ -179,7 +225,28 @@ pub fn RepinModal(
         let to = target.get_untracked();
         spawn_local(async move {
             let outcome = api::repin(&field, &to, dry_run, forced).await;
-            if generation.get_untracked() != seq {
+            // 202 FIRST, before any liveness or generation gate: the job
+            // is claimed and running detached server-side, so the one
+            // thing that must survive a dialog closed mid-claim is the
+            // hand-up. `try_run` because the callback may be disposed
+            // too — the case-file drawer that owns it outlives this
+            // modal, and in the case where even that is gone, the
+            // drawer's mount-time status read adopts the running job the
+            // next time the case file is opened.
+            let outcome = match outcome {
+                Ok(RepinOutcome::Started(job)) => {
+                    on_close.try_run(Some(job));
+                    return;
+                }
+                other => other,
+            };
+            // Everything past here paints THIS dialog, so a closed one
+            // has nothing left to say — and reading a disposed signal
+            // panics where writing one is a silent no-op.
+            if !handles.is_alive() {
+                return;
+            }
+            if generation.try_get_untracked() != Some(seq) {
                 // A newer request owns the dialog now.
                 return;
             }
@@ -188,13 +255,8 @@ pub fn RepinModal(
                 // 200 is the scan report and nothing else — the server
                 // only answers it to a dry run.
                 Ok(RepinOutcome::DryRun(job)) => phase.set(Phase::Plan(Box::new(job))),
-                // 202 is the only outcome the case file adopts.
-                // `try_run` because the operator may have closed the
-                // dialog while the claim was in flight — running a
-                // disposed callback panics.
-                Ok(RepinOutcome::Started(job)) => {
-                    on_close.try_run(Some(job));
-                }
+                // Handed to the case file above, before the gates.
+                Ok(RepinOutcome::Started(_)) => {}
                 Ok(RepinOutcome::Refused(job)) => {
                     // Re-arm the acceptance: a refusal must be accepted
                     // for the plan actually shown, never carried over.
@@ -208,10 +270,18 @@ pub fn RepinModal(
                     // the fact on screen and was true when the server
                     // said it, so this probe never moves the dialog on
                     // its own — the operator's "Check again" does.
-                    probe_slot(false, phase, probing, busy_field, slot_note, force);
+                    probe_slot(false, handles);
                 }
                 Err(e) => {
-                    if dry_run {
+                    // A dry run mutates nothing, and a real run answered
+                    // a DEFINITIVE 4xx was decided before the claim: a
+                    // 400's validation, a 403 from a permission that
+                    // expired between the plan and the confirm, a 404
+                    // for a name the catalog does not hold. Both keep
+                    // the plan and say what the server said — calling
+                    // either outcome unknown would send an operator
+                    // hunting a job that does not exist.
+                    if dry_run || is_pre_claim_failure(e.http_status()) {
                         phase.set(Phase::Failed {
                             message: failure_text(&e),
                             plan: carried,
@@ -230,15 +300,7 @@ pub fn RepinModal(
                             force: forced,
                             bound: carried.as_ref().map(|p| p.id),
                         };
-                        probe_recovery(
-                            run,
-                            carried,
-                            failure_text(&e),
-                            phase,
-                            probing,
-                            force,
-                            on_close,
-                        );
+                        probe_recovery(run, carried, failure_text(&e), handles, on_close);
                     }
                 }
             }
@@ -275,8 +337,8 @@ pub fn RepinModal(
             // idempotent; re-running would not be.
             Phase::Indeterminate {
                 lost, plan, run, ..
-            } => probe_recovery(run, plan, lost, phase, probing, force, on_close),
-            Phase::Busy(_) => probe_slot(true, phase, probing, busy_field, slot_note, force),
+            } => probe_recovery(run, plan, lost, handles, on_close),
+            Phase::Busy(_) => probe_slot(true, handles),
             Phase::Planning | Phase::Submitting => {}
         }
     });
@@ -577,32 +639,39 @@ fn probe_recovery(
     run: LostRun,
     plan: Option<Box<RepinJobResponse>>,
     lost: String,
-    phase: RwSignal<Phase>,
-    probing: RwSignal<bool>,
-    force: RwSignal<bool>,
+    handles: Handles,
     on_close: Callback<Option<RepinJobResponse>>,
 ) {
-    probing.set(true);
+    handles.probing.set(true);
     spawn_local(async move {
         let (probe, found) = status_probe().await;
-        probing.set(false);
-        match recovery_verdict(&run, &probe) {
+        let verdict = recovery_verdict(&run, &probe);
+        // Running or terminal, a proven job is the one this modal asked
+        // for: hand it to the case file, which owns progress and
+        // receipts. Before the liveness gate for the same reason a 202
+        // is — the job is real whether or not the dialog survived.
+        let adopt_up = matches!(verdict, Recovery::Adopt)
+            && found
+                .as_ref()
+                .is_some_and(|job| job.status != STATUS_REFUSED);
+        if adopt_up {
+            on_close.try_run(found);
+            return;
+        }
+        if !handles.is_alive() {
+            return;
+        }
+        handles.probing.set(false);
+        match verdict {
             // `Adopt` is only ever returned for a `Job` probe, so the row
-            // is in hand here.
+            // is in hand here — and the non-refused half returned above.
             Recovery::Adopt => {
                 if let Some(job) = found {
-                    if job.status == STATUS_REFUSED {
-                        force.set(false);
-                        phase.set(Phase::NeedsForce(Box::new(job)));
-                    } else {
-                        // Running or terminal, it is the job this modal
-                        // asked for: hand it to the case file, which owns
-                        // progress and receipts.
-                        on_close.try_run(Some(job));
-                    }
+                    handles.force.set(false);
+                    handles.phase.set(Phase::NeedsForce(Box::new(job)));
                 }
             }
-            Recovery::Indeterminate(why) => phase.set(Phase::Indeterminate {
+            Recovery::Indeterminate(why) => handles.phase.set(Phase::Indeterminate {
                 lost,
                 why,
                 plan,
@@ -617,36 +686,34 @@ fn probe_recovery(
 /// [`Phase::NeedsPlan`] once nothing holds the slot; the annotation probe
 /// fired right after a 409 passes `false` and only fills in which field
 /// holds it.
-fn probe_slot(
-    adopt_free: bool,
-    phase: RwSignal<Phase>,
-    probing: RwSignal<bool>,
-    busy_field: RwSignal<Option<String>>,
-    slot_note: RwSignal<Option<String>>,
-    force: RwSignal<bool>,
-) {
-    probing.set(true);
+fn probe_slot(adopt_free: bool, handles: Handles) {
+    handles.probing.set(true);
     spawn_local(async move {
         let (probe, _) = status_probe().await;
-        probing.set(false);
+        // Nothing this read can decide matters to a dialog that is gone,
+        // and it mutates nothing server-side either way.
+        if !handles.is_alive() {
+            return;
+        }
+        handles.probing.set(false);
         match slot_check(&probe) {
             SlotCheck::Held(field) => {
-                slot_note.set(None);
-                busy_field.set(Some(sanitize_display_text(&field)));
+                handles.slot_note.set(None);
+                handles.busy_field.set(Some(sanitize_display_text(&field)));
             }
             SlotCheck::Free => {
                 if adopt_free {
-                    busy_field.set(None);
-                    slot_note.set(None);
-                    force.set(false);
-                    phase.set(Phase::NeedsPlan);
+                    handles.busy_field.set(None);
+                    handles.slot_note.set(None);
+                    handles.force.set(false);
+                    handles.phase.set(Phase::NeedsPlan);
                 }
             }
             // Unknown is not free: the dialog stays where it is and says
             // the read failed.
             SlotCheck::Unknown => {
                 if adopt_free {
-                    slot_note.set(Some(SLOT_CHECK_FAILED.to_string()));
+                    handles.slot_note.set(Some(SLOT_CHECK_FAILED.to_string()));
                 }
             }
         }

@@ -222,6 +222,21 @@ pub fn poll_decide(tracked_id: i64, consecutive_errors: u32, probe: &StatusProbe
     }
 }
 
+/// Whether a failed REAL run's HTTP status PROVES nothing was claimed.
+///
+/// The server claims the one-running `repin_jobs` row BEFORE it answers,
+/// so only a status decided before that claim can be read as "nothing
+/// started". Every 4xx is one: 400 is request validation, 401/403 is
+/// authorization, 404 is a field the catalog does not hold, and the 409s
+/// are decoded elsewhere as a refusal or a held slot. A 5xx can land
+/// AFTER the claim — the rewrite may be running right now — and a
+/// transport or decode failure carries no status at all, so both stay
+/// indeterminate and must never be reported as "provably not running".
+#[must_use]
+pub fn is_pre_claim_failure(status: Option<u16>) -> bool {
+    matches!(status, Some(400..=499))
+}
+
 /// The real run whose RESPONSE was lost, and the one fact that can make
 /// its outcome provable.
 #[derive(Debug, Clone)]
@@ -372,7 +387,8 @@ mod tests {
     use super::{
         ConflictBody, LostRun, MAX_POLL_ERRORS, PollAction, ProbedJob, REPIN_BUSY_FALLBACK,
         Recovery, SlotCheck, StatusProbe, Unproven, claim_toast, classify_conflict, default_target,
-        indeterminate_text, poll_decide, recovery_verdict, repin_targets, slot_check,
+        indeterminate_text, is_pre_claim_failure, poll_decide, recovery_verdict, repin_targets,
+        slot_check,
     };
     use trawl_core::schema::CanonicalType;
 
@@ -638,6 +654,23 @@ mod tests {
         assert_eq!(slot_check(&StatusProbe::NoJob), SlotCheck::Free);
         // A failed read is not a free slot.
         assert_eq!(slot_check(&StatusProbe::Failed), SlotCheck::Unknown);
+    }
+
+    #[test]
+    fn only_a_4xx_proves_a_real_run_was_never_claimed() {
+        // Decided before the claim: validation, authorization, a name
+        // the catalog does not hold.
+        for status in [400_u16, 401, 403, 404, 422, 429, 499] {
+            assert!(is_pre_claim_failure(Some(status)), "{status}");
+        }
+        // A 5xx can be answered AFTER the row was claimed, so the job
+        // may be rewriting the corpus right now.
+        for status in [500_u16, 502, 503, 504] {
+            assert!(!is_pre_claim_failure(Some(status)), "{status}");
+        }
+        // No status at all — a dropped connection or an undecodable
+        // body — proves nothing either way.
+        assert!(!is_pre_claim_failure(None));
     }
 
     #[test]
