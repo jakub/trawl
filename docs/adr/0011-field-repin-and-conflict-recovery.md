@@ -615,3 +615,39 @@ status route only while the drawer is open and a job runs (the CLI's
 `--wait` already blessed polling); completion is a toast receipt. The
 install-wide "every degraded field" listing stays on the CLI/API
 (`trawl schema fields`) rather than growing a SPA table.
+
+## Amendment (2026-08-13): C2 prep rulings — the count rides the wire, four surface decisions
+
+C2 prep against the shipped C1 surfaced one contract gap and settled
+three UI forks:
+
+1. **The per-service degraded count is a wire fact, not a client join.**
+   Ruling 6's honesty claim ("evidence is per-`(field, service)`") is
+   unmeetable from the C1 wire alone — `ServiceSchema` carries no
+   degraded info and `DegradedVerdict.services` is a bare count. A
+   client-side join (badge any service whose column list contains a
+   degraded field name) would badge services that never conflicted.
+   Instead the schema-refresh degraded-set reload — already the tick's
+   one postgres read — also loads each degraded field's conflicting
+   service names from `field_conflict_stats` (bounded by the degraded
+   set), and `/api/v1/schema/services` stamps each service's degraded
+   field list from that in-process cache. Same staleness bound as the
+   query notice, no new request-path postgres reads.
+
+2. **The SPA query notice ships in C2**: a dismissible notice over the
+   search results renders `QueryResponse.degraded_fields`, each field
+   linking to its `?field=` case file — the deep-link target ruling 6
+   defined. Without it the notice would stay CLI-only.
+
+3. **The repin trigger is dry-run-first**: the button always runs
+   `dry_run` and presents the plan (files, rows carrying, projected
+   nulls, resurrectable, bytes) with the whole-corpus warning; confirm
+   executes. A `refused_needs_force` outcome re-presents the plan with
+   an explicit force toggle and lossy copy — the CLI's
+   `--dry-run` → `--yes` → `--force` ladder, mirrored.
+
+4. **A token without `schema_write` gets a read-only case file**: facts,
+   samples and suggested target render under `schema_read`; the repin
+   button is hidden and the footer shows the equivalent
+   `trawl schema repin … --dry-run` command line, matching the CLI
+   rendering. No disabled affordances.
