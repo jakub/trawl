@@ -110,9 +110,23 @@ pub fn Drawer(
                     <div class="sd-ttl">{title()}</div>
                     <div class="sd-actions">
                         {actions.map(|a| a())}
-                        <span class="sd-x" title="Close (Esc)" on:click=move |_| on_close.run(())>
+                        // A native button, not a styled span: the close
+                        // affordance has to be reachable by Tab and
+                        // operable by Enter/Space. `.sd-x` already
+                        // declares the full button reset (background,
+                        // border, cursor, line-height, inline-flex
+                        // centring) and the sheet's global
+                        // `button { font: inherit }` covers the rest, so
+                        // the element swap needs no CSS change.
+                        <button
+                            type="button"
+                            class="sd-x"
+                            aria-label="Close"
+                            title="Close (Esc)"
+                            on:click=move |_| on_close.run(())
+                        >
                             <IconView icon=Icon::Close size=close_size stroke_width=1.5/>
-                        </span>
+                        </button>
                     </div>
                 </div>
 
