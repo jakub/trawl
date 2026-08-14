@@ -1378,7 +1378,7 @@ async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement(pool: PgPool
 mod catalog {
     use super::*;
     use trawl_core::schema::{CanonicalType, ENVELOPE_TYPES};
-    use trawl_server::store::{CatalogStore, FieldConflict, PinProposal};
+    use trawl_server::store::{CatalogStore, ConflictServicePair, FieldConflict, PinProposal};
 
     fn catalog(pool: &PgPool) -> CatalogStore {
         CatalogStore::new(pool.clone())
@@ -1964,6 +1964,104 @@ mod catalog {
         .await
         .unwrap();
         assert!(span, "the span is the evidence, and it only widens");
+    }
+
+    /// The degraded generation's two reads share ONE postgres snapshot.
+    ///
+    /// Both halves read `field_conflict_stats`, and a repin's evidence clear
+    /// deletes from it. As two pool reads (READ COMMITTED, a fresh snapshot
+    /// per statement) a clear landing between them publishes a generation
+    /// with a degraded field and no service attributed to it: the query
+    /// notice stands while every badge vanishes, for a whole refresh
+    /// interval.
+    ///
+    /// The isolation level is only observable by interleaving a COMMITTED
+    /// delete from a second connection, so the test drives the two
+    /// transaction-scoped reads itself — the seam
+    /// `CatalogStore::degraded_snapshot` composes.
+    #[sqlx::test]
+    async fn degraded_snapshot_reads_survive_a_concurrent_evidence_clear(pool: PgPool) {
+        let store = catalog(&pool);
+        let episode = |service: &str| FieldConflict {
+            field: "duration".to_owned(),
+            service: service.to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: 3,
+            samples: vec!["n/a".to_owned()],
+        };
+        for _ in 0..2 {
+            store
+                .record_conflicts(&[episode("svc-a"), episode("svc-b")])
+                .await
+                .unwrap();
+        }
+        // The span half of the degrade gate is the one thing a test cannot
+        // wait 24 hours for.
+        sqlx::query(
+            "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+             WHERE field = 'duration'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let visible = vec!["svc-a".to_owned(), "svc-b".to_owned()];
+
+        // Baseline: the composed read gives both halves of one generation.
+        let (degraded, pairs) = store.degraded_snapshot(&visible).await.unwrap();
+        assert!(degraded.contains("duration"), "the pin is degraded");
+        assert_eq!(
+            pairs,
+            vec![
+                ConflictServicePair {
+                    field: "duration".to_owned(),
+                    service: "svc-a".to_owned(),
+                },
+                ConflictServicePair {
+                    field: "duration".to_owned(),
+                    service: "svc-b".to_owned(),
+                },
+            ],
+            "both senders are attributed"
+        );
+
+        // Now the interleave the transaction exists for.
+        let mut tx = store.begin_evidence_snapshot().await.unwrap();
+        let aggregates = CatalogStore::conflict_aggregates_tx(&mut tx, None)
+            .await
+            .unwrap();
+        assert_eq!(aggregates.len(), 1, "the first half read the evidence");
+
+        let mut other = pool.acquire().await.unwrap();
+        CatalogStore::clear_conflict_evidence(&mut other, "duration")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.conflict_aggregates(None).await.unwrap().len(),
+            0,
+            "the clear really committed — a read outside the transaction sees it gone"
+        );
+
+        let names = vec!["duration".to_owned()];
+        let pairs = CatalogStore::conflict_service_pairs_tx(&mut tx, &names, &visible)
+            .await
+            .unwrap();
+        assert_eq!(
+            pairs.len(),
+            2,
+            "the second half sees the same table the first half did — \
+             a torn generation would have degraded fields and zero pairs"
+        );
+        tx.commit().await.unwrap();
+
+        // And the next generation is empty on BOTH halves: the fix keeps the
+        // reads together, it does not keep evidence alive.
+        let (degraded, pairs) = store.degraded_snapshot(&visible).await.unwrap();
+        assert!(
+            degraded.is_empty(),
+            "the repinned field is no longer badged"
+        );
+        assert!(pairs.is_empty(), "and nothing is attributed to it");
     }
 
     /// `first_at` only ever moves EARLIER — the property the whole degraded

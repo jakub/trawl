@@ -7,6 +7,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **SPA operator surface for degraded pins and repin (ADR-0011 slice C2,
+  #71).** The degraded-pin case file and the repin trigger leave the CLI
+  for the browser, on the schema page's existing anatomy — no new
+  top-level view. `GET /api/v1/schema/services` gains a per-service
+  `degraded_fields` list (absent when empty, so an older server and a
+  healthy install are indistinguishable), loaded beside the degraded set
+  on the schema tick and stamped from that in-process snapshot — a
+  healthy install pays one probe query and opens no transaction, and
+  only an install that HAS a degraded pin pays the additional
+  `REPEATABLE READ` re-read that loads both evidence halves coherently
+  (a clear landing between two snapshots would publish a degraded field
+  with no services attributed to it). It names the fields a service has
+  **actually conflicted on**, which is not a client-computable join:
+  carrying a degraded field's column is not evidence of having degraded
+  it. Service
+  rows and the service drawer's fields tab badge from that list, and a
+  badged field drills into the **field case file** — `?field=` on
+  `/search/schema`, a working deep link with no service context —
+  carrying the pin, the verdict facts, a sample of the values the pin
+  shelved, paged per-service observations, conflict evidence, and the
+  standing statement that a repin rewrites the whole corpus, not the
+  service it was reached through. With `schema_write` the case file
+  offers a **dry-run-first** repin: the plan (files, rows carrying,
+  projected nulls, resurrectable, bytes) before anything is rewritten,
+  an explicit force toggle only after a `refused_needs_force` reply,
+  status polling that runs only while the case file is open and the job
+  is non-terminal, and a completion toast. Without it the same case file
+  renders read-only with the equivalent `trawl schema repin` line and no
+  disabled affordances — the server stays the sole enforcement. Finally,
+  the query notice ships to the browser: `QueryResponse.degraded_fields`
+  renders as one dismissible line above the results naming each field,
+  linked to its case file under `schema_read` and plain text without it,
+  dismissed per (query, field set) so paging the same result keeps it
+  away while a new query brings it back. A notice already returned is a
+  fact about that execution and is never edited away by a later catalog
+  change; the live tail carries none, since SSE has no such stamp. The
+  browser surfaces are documented in the new Web UI reference page.
 - **Degraded-pin analyzer, evidence and query notice (ADR-0011 slice C1,
   #69).** trawl now concludes that a pin is doing sustained damage and
   says so everywhere the field is read. Conflict evidence gained the

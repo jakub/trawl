@@ -502,6 +502,134 @@ async fn a_query_binding_a_degraded_field_is_stamped(pool: sqlx::PgPool) {
     );
 }
 
+/// Acceptance (ADR-0011 slice C2, AC-1): `/api/v1/schema/services` badges a
+/// service with the degraded fields it ACTUALLY conflicted on — and a
+/// service that merely CARRIES the same column, having never disagreed with
+/// its pin, is not badged.
+///
+/// This is the false-positive case the wire field exists to prevent: the
+/// client-side join a SPA could otherwise do (`columns` ∩ degraded set)
+/// would badge both services here, and only one of them has anything to fix.
+#[sqlx::test(migrations = false)]
+async fn schema_services_badges_only_the_service_that_conflicted(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    // svc-a pins duration BIGINT and never disagrees with it again; svc-b
+    // sends strings under that pin, which the conform shelves.
+    ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
+    for value in ["N/A", "pending", "N/A"] {
+        ingest_and_compact(&h, &[event("svc-b", &json!({"duration": value}))]).await;
+    }
+
+    // Only the AGE of the evidence is simulated — the span half of the
+    // degrade gate is the one thing a test cannot wait 24 hours for.
+    let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
+        .await
+        .expect("connect app db");
+    sqlx::query(
+        "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+         WHERE field = 'duration'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("backdate the evidence");
+
+    // The badge is stamped from the schema-refresh tick's caches, so run the
+    // real job: it fills the per-service schema (footer walk) and the
+    // degraded snapshot behind it.
+    let _refresh = trawl_server::schema_refresh::spawn_schema_refresh(h.server.state.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, _) = h.get(&h.server.analyst_token, "/schema/services").await;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "schema refresh never populated the service cache"
+        );
+        if status == 200 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Re-run the degraded half explicitly: the tick's own pass may have run
+    // before the service cache existed, in which case it had no service axis
+    // to key the attribution read on.
+    trawl_server::schema_refresh::refresh_degraded_fields(&h.server.state).await;
+
+    let (status, body) = h.get(&h.server.analyst_token, "/schema/services").await;
+    assert_eq!(status, 200);
+    let services = body["services"].as_array().expect("services array");
+    let svc = |name: &str| {
+        services
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("service {name} listed: {body}"))
+    };
+
+    // Both services carry the column — that is exactly what makes the join
+    // tempting and wrong.
+    for name in ["svc-a", "svc-b"] {
+        assert!(
+            svc(name)["columns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["name"] == "duration"),
+            "{name} carries the duration column"
+        );
+    }
+
+    assert_eq!(
+        svc("svc-b")["degraded_fields"],
+        json!(["duration"]),
+        "the sender whose values the pin shelved is badged: {body}"
+    );
+    assert!(
+        svc("svc-a").get("degraded_fields").is_none(),
+        "a service that never conflicted carries no degraded_fields key at all: {body}"
+    );
+
+    // Same route, unchanged gate.
+    let (status, _) = h
+        .get(&h.server.coastwatch_only_token, "/schema/services")
+        .await;
+    assert_eq!(
+        status, 403,
+        "the badge rides the existing SchemaRead gate, not a new one"
+    );
+
+    // A store error keeps the ENTIRE previous snapshot — both halves or
+    // neither. Clearing on a postgres blip would silently un-badge the
+    // install; publishing a HALF-built one would be worse still, un-badging
+    // every service while leaving the query notice standing.
+    sqlx::query("DROP TABLE field_conflict_stats")
+        .execute(&mut conn)
+        .await
+        .expect("break the evidence read");
+    trawl_server::schema_refresh::refresh_degraded_fields(&h.server.state).await;
+
+    let (status, body) = h.get(&h.server.analyst_token, "/schema/services").await;
+    assert_eq!(status, 200);
+    let services = body["services"].as_array().expect("services array");
+    let svc_b = services.iter().find(|s| s["name"] == "svc-b").unwrap();
+    assert_eq!(
+        svc_b["degraded_fields"],
+        json!(["duration"]),
+        "the badge half survives a failed refresh: {body}"
+    );
+
+    let (_, body) = h
+        .post(
+            &h.server.analyst_token,
+            "/query",
+            json!({"query": "last=1h | where duration > 1 | table host"}),
+        )
+        .await;
+    assert_eq!(
+        body["degraded_fields"],
+        json!(["duration"]),
+        "and so does the notice half — the two are one generation: {body}"
+    );
+}
+
 /// Acceptance: a type conflict surfaces on `/schema/conflicts`, the field
 /// detail lists both services, and the nulled original stays findable via
 /// `_raw` search.

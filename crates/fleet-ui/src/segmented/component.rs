@@ -34,6 +34,10 @@ pub fn Segmented(
                     <button
                         class="seg-opt"
                         class:on=move || active.get() == id
+                        // The visual `on` state is invisible to assistive
+                        // tech; a segmented option is a toggle button, so
+                        // the selection must also ride aria-pressed.
+                        aria-pressed=move || if active.get() == id { "true" } else { "false" }
                         on:click=move |_| on_change.run(id.to_string())
                     >{opt.label}</button>
                 }

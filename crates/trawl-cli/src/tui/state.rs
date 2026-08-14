@@ -2629,6 +2629,7 @@ mod tests {
             total_bytes: 1024,
             total_events: 1000,
             daily_event_counts: vec![],
+            degraded_fields: Vec::new(),
         }
     }
 

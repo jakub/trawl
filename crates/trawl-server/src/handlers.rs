@@ -944,7 +944,8 @@ pub async fn dashboard_stream(
 
 /// `GET /api/v1/schema/services` — rich per-service schema from background refresh.
 ///
-/// Pure cache read. Returns 503 if the background refresh hasn't completed yet.
+/// Pure cache read (two in-process caches, no postgres and no file I/O).
+/// Returns 503 if the background refresh hasn't completed yet.
 pub async fn schema_services(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -956,17 +957,39 @@ pub async fn schema_services(
     let (hot_events, hot_bytes) = hot_buffer_stats(&state);
 
     let cache = state.query.service_schema_cache.lock().clone();
-    match cache {
-        Some(cached) => Ok(Json(trawl_api::ServiceSchemaResponse {
-            services: cached.services,
-            cached: true,
-            hot_buffer_events: hot_events,
-            hot_buffer_bytes: hot_bytes,
-        })),
-        None => Err(ServerError::ServiceUnavailable(
+    let Some(cached) = cache else {
+        return Err(ServerError::ServiceUnavailable(
             "service schema not yet available".into(),
-        )),
+        ));
+    };
+    let mut services = cached.services;
+
+    // Stamp the degraded badge (ADR-0011 slice C2) from the schema-refresh
+    // tick's snapshot — the same generation the query notice reads, so the
+    // two surfaces cannot disagree about a field.
+    //
+    // Intersected with the service's CURRENT columns: `field_conflict_stats`
+    // is ever-observed evidence, so a field whose data has since aged out of
+    // the retained corpus would otherwise keep badging a service that no
+    // longer has anything to repin. Never the inverse join — carrying the
+    // column is not evidence of having conflicted on it.
+    let snapshot = std::sync::Arc::clone(&state.query.degraded_fields.lock());
+    if !snapshot.fields.is_empty() {
+        for svc in &mut services {
+            svc.degraded_fields = snapshot
+                .services_of(&svc.name)
+                .into_iter()
+                .filter(|f| svc.columns.iter().any(|c| c.name == *f))
+                .collect();
+        }
     }
+
+    Ok(Json(trawl_api::ServiceSchemaResponse {
+        services,
+        cached: true,
+        hot_buffer_events: hot_events,
+        hot_buffer_bytes: hot_bytes,
+    }))
 }
 
 /// Format a UTC instant as the wire's ISO 8601 string.
@@ -1100,15 +1123,18 @@ fn degraded_fields_for<'a>(
     state: &AppState,
     texts: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
-    let degraded = std::sync::Arc::clone(&state.query.degraded_fields.lock());
-    if degraded.is_empty() {
+    let snapshot = std::sync::Arc::clone(&state.query.degraded_fields.lock());
+    if snapshot.fields.is_empty() {
         return Vec::new();
     }
     let mut named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for dsl in texts {
         named.extend(trawl_core::field_refs::referenced_fields_in(dsl));
     }
-    named.into_iter().filter(|f| degraded.contains(f)).collect()
+    named
+        .into_iter()
+        .filter(|f| snapshot.fields.contains(f))
+        .collect()
 }
 
 /// Read a pin's stored `DuckDB` spelling back as a canonical type.

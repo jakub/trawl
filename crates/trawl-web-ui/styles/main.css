@@ -541,6 +541,41 @@
 .tabs .action:hover { color: var(--ink); background: var(--panel-2); }
 
 /* ─────────────────────────────────────────────────────────────────
+ *  Incomplete-results notice (ADR-0011 C2) — one warn-toned line
+ *  between the tab strip and the results body. The .deg-live wrapper
+ *  is the persistent aria-live region and carries no box of its own,
+ *  so it collapses to nothing while the notice is absent or dismissed.
+ * ─────────────────────────────────────────────────────────────── */
+.deg-live { flex-shrink: 0; }
+.deg-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 14px;
+  background: var(--yellow-wash);
+  border-bottom: 1px solid var(--line);
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.deg-notice .deg-text { flex: 1; min-width: 0; }
+.deg-notice .mono { font-family: var(--font-mono); color: var(--ink); }
+.deg-notice a.link { font-family: var(--font-mono); font-size: inherit; }
+.deg-x {
+  background: none;
+  border: 0;
+  padding: 0 4px;
+  cursor: pointer;
+  color: var(--ink-3);
+  font-size: var(--fs-ui);
+  line-height: 1.4;
+  border-radius: var(--radius-sm);
+}
+.deg-x:hover { color: var(--ink); background: var(--panel-2); }
+.deg-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ─────────────────────────────────────────────────────────────────
  *  Histogram — 78px strip on Events
  * ─────────────────────────────────────────────────────────────── */
 .histo {
@@ -1155,7 +1190,13 @@
 .sf-row:hover { background: var(--panel-2); }
 .sf-row.open { background: var(--accent-wash); }
 .sf-row .caret { display: inline-block; width: 12px; color: var(--ink-3); margin-right: 4px; }
-.sf-row .c-name { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The name cell must be a shrinkable flex container: `.c-name` is an inline
+ * span, so its ellipsis only engages once the cell itself can shrink below
+ * the grid track (min-width: 0) — otherwise a long field name wraps under
+ * the type chip instead of truncating. */
+.sf-row > div:first-child { display: flex; align-items: center; min-width: 0; }
+.sf-row .caret, .sf-row .deg-btn { flex: none; }
+.sf-row .c-name { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .sf-row .c-card, .sf-row .c-size { color: var(--ink-2); text-align: right; }
 .sf-row .c-sample { color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sf-row .c-cov { display: flex; align-items: center; gap: 6px; }
@@ -1194,6 +1235,105 @@
 .sfd-kv span:first-child { color: var(--ink-3); text-transform: uppercase; font-size: var(--fs-tiny); letter-spacing: .08em; }
 .sfd-kv span:last-child { color: var(--ink); font-family: var(--font-mono); }
 .sfd-actions { display: flex; gap: 6px; margin-top: 12px; flex-wrap: wrap; }
+
+/* Degraded-pin badge button (ADR-0011 C2): a <button> so it is keyboard
+   operable inside the clickable field row, stripped back to the bare
+   <Badge> it wraps. */
+.deg-btn {
+  background: none; border: 0; padding: 0; margin-left: 6px;
+  cursor: pointer; line-height: 1; vertical-align: middle;
+}
+.deg-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-xs); }
+
+/* Field case file (ADR-0011 C2) */
+.fc-back {
+  background: none; border: 0; padding: 2px; margin-right: 2px;
+  cursor: pointer; color: var(--ink-3); display: inline-flex; align-items: center;
+  border-radius: var(--radius-xs);
+}
+.fc-back:hover { color: var(--ink); background: var(--panel-3); }
+.fc-back:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* The icon set carries one chevron (pointing down); the back affordance
+   is that glyph turned to point left. */
+.fc-back svg { transform: rotate(90deg); }
+.fc-case { display: flex; flex-direction: column; gap: 18px; }
+.fc-sec { display: flex; flex-direction: column; }
+.fc-lb, .fc-lb2 {
+  font-family: var(--font-ui); font-size: var(--fs-micro); font-weight: 600;
+  text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
+  margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
+}
+.fc-lb2 { margin-top: 10px; margin-bottom: 4px; }
+.fc-note { font-size: var(--fs-dense); color: var(--ink-2); line-height: 1.5; }
+.fc-note p { margin: 0 0 8px; }
+.fc-err { font-size: var(--fs-dense); color: var(--red); padding: 6px 0; }
+.fc-samples ul, .fc-conflict ul { margin: 0; padding-left: 18px; }
+.fc-samples li, .fc-conflict li {
+  font-size: var(--table-fs); color: var(--ink-2); word-break: break-all;
+}
+.fc-svc, .fc-conflict .hd {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 4px 0; border-bottom: 1px solid var(--line-2);
+  font-size: var(--table-fs);
+}
+.fc-svc .nm, .fc-conflict .nm { color: var(--ink); flex: 1; min-width: 0; }
+.fc-svc .dt, .fc-conflict .dt { color: var(--ink-3); font-size: var(--fs-micro); }
+.fc-svc .ct, .fc-conflict .ct { color: var(--ink-2); font-family: var(--font-mono); }
+.fc-conflict .cast { color: var(--yellow); }
+.fc-conflict details { padding: 4px 0 8px; }
+.fc-conflict summary {
+  font-size: var(--fs-micro); color: var(--ink-3); cursor: pointer;
+}
+.fc-foot { border-top: 1px solid var(--line); padding-top: 12px; }
+.fc-cmd {
+  margin: 0; padding: 8px 10px; background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  font-family: var(--font-mono); font-size: var(--table-fs); color: var(--ink);
+  white-space: pre-wrap; word-break: break-all;
+}
+
+/* Repin job receipt inside the case file (ADR-0011 C2 M3). The
+   aria-live region is always present so a terminal outcome is announced
+   once; it collapses to nothing while a job is still running. */
+.fc-live:empty { display: none; }
+.fc-live {
+  margin-top: 14px; font-size: var(--fs-dense); color: var(--ink-2);
+  line-height: 1.5;
+}
+.fc-job { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.fc-job .fc-note { margin-top: 6px; }
+/* The other-field drill-in: a native button that reads as a link, so it
+   is keyboard operable and the page keeps ownership of routing. */
+.fc-link {
+  background: none; border: 0; padding: 0; cursor: pointer;
+  font-family: var(--font-mono); font-size: inherit; color: var(--accent);
+  text-decoration: underline; text-underline-offset: 2px;
+}
+.fc-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Repin modal (ADR-0011 C2 M3) */
+.rp-note {
+  margin: 8px 0 0; font-size: var(--fs-dense); color: var(--ink-2); line-height: 1.5;
+}
+.rp-plan { margin-top: 4px; }
+.rp-kv {
+  display: flex; justify-content: space-between; gap: 12px;
+  padding: 4px 0; border-bottom: 1px solid var(--line-2);
+  font-size: var(--table-fs);
+}
+.rp-kv span:first-child { color: var(--ink-3); }
+.rp-kv span:last-child { color: var(--ink); font-family: var(--font-mono); }
+.rp-force {
+  margin-top: 12px; padding: 10px 12px;
+  border: 1px solid var(--red); border-radius: var(--radius-sm);
+  background: var(--red-wash);
+}
+.rp-force label {
+  display: flex; align-items: flex-start; gap: 8px;
+  font-size: var(--fs-dense); color: var(--ink); cursor: pointer;
+}
+.rp-err { font-size: var(--fs-dense); color: var(--red); line-height: 1.5; }
+.rp-err p { margin: 0 0 6px; }
 
 /* Live tail tab */
 .sd-tail { display: flex; flex-direction: column; gap: 10px; height: 100%; min-height: 360px; }

@@ -11,12 +11,15 @@
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
 use trawl_api::{
-    CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse, ExportFormat, ExportRequest,
-    HealthResponse, HistoryResponse, ListAllRunsResponse, ListReportRunsResponse,
-    ListSavedResponse, QueryRequest, QueryResponse, ReportRunResponse, ReportRunSummary,
-    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, ServiceSchemaResponse,
-    SetScheduleRequest, UpdateSavedRequest,
+    CatalogFieldResponse, CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse,
+    ErrorResponse, ExportFormat, ExportRequest, HealthResponse, HistoryResponse,
+    ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, QueryRequest, QueryResponse,
+    RepinJobResponse, RepinRequest, RepinResponse, RepinStatusResponse, ReportRunResponse,
+    ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
+    ServiceSchemaResponse, SetScheduleRequest, UpdateSavedRequest,
 };
+
+use crate::repin_flow::{ConflictBody, classify_conflict};
 
 /// Rows per page for the snapshot results table.
 pub const PAGE_SIZE: usize = 50;
@@ -32,8 +35,40 @@ pub enum ApiError {
     #[error("server returned {0}")]
     Status(u16),
 
+    /// A non-2xx whose body carried the server's own error envelope. The
+    /// message is server-written and safe by construction (trawld's
+    /// envelope never quotes DSL or generated SQL), and the repin modal
+    /// renders it verbatim rather than inventing copy for a 400/403/503
+    /// it cannot classify.
+    #[error("{message}")]
+    Server {
+        /// The HTTP status the message came with.
+        status: u16,
+        /// The envelope's human-readable summary.
+        message: String,
+    },
+
     #[error("decode: {0}")]
     Decode(String),
+}
+
+impl ApiError {
+    /// The HTTP status this failure carries, when it carries one at all.
+    ///
+    /// `None` is not a status class: a network or decode failure means
+    /// the request's fate is unknown, which is exactly what callers who
+    /// branch on definitiveness (`repin_flow::is_pre_claim_failure`)
+    /// have to tell apart from a server that answered.
+    #[must_use]
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Status(status) | Self::Server { status, .. } => Some(*status),
+            // The one status this enum spells as a word rather than a
+            // number.
+            Self::Unauthorized => Some(401),
+            Self::Network(_) | Self::Decode(_) => None,
+        }
+    }
 }
 
 impl From<gloo_net::Error> for ApiError {
@@ -171,6 +206,156 @@ pub async fn schema_services() -> Result<ServiceSchemaResponse, ApiError> {
         401 => Err(ApiError::Unauthorized),
         s => Err(ApiError::Status(s)),
     }
+}
+
+/// GET `/api/v1/schema/field?name=` — one field's pin, one PAGE of its
+/// per-service observations (page with the response's `services_cursor`
+/// as `after`), its retained conflict evidence, and the analyzer's
+/// verdict when the pin is degraded.
+///
+/// A field with no pin answers 404, which surfaces here as
+/// [`ApiError::Status(404)`] — the case file maps that to fleet-ui's
+/// neutral `LoadState::Missing`, never to an error banner.
+pub async fn catalog_field(
+    name: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<CatalogFieldResponse, ApiError> {
+    // A catalog key is any ASCII-folded client JSON key — it can carry
+    // `&`, `#`, `%` — and the cursor is opaque server text, so both go
+    // through component encoding rather than into the URL raw.
+    let mut url = format!("/api/v1/schema/field?name={}&limit={limit}", encode(name));
+    if let Some(cursor) = after {
+        url.push_str("&after=");
+        url.push_str(&encode(cursor));
+    }
+    let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<CatalogFieldResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// What `POST /api/v1/schema/repin` answered. The HTTP status carries
+/// the verdict (ADR-0011 slice B), so the call site branches on this
+/// rather than on a single body type.
+#[derive(Debug, Clone)]
+pub enum RepinOutcome {
+    /// 200 — the scan ran and stopped. The job is the plan.
+    DryRun(RepinJobResponse),
+    /// 202 — the rewrite is claimed and running DETACHED. Poll
+    /// [`repin_status`] for the rest of its life.
+    Started(RepinJobResponse),
+    /// 409 whose body decoded as a job — the scan projected values the
+    /// target pin cannot keep and no force was passed. Terminal
+    /// (`refused_needs_force`); the corpus is untouched.
+    Refused(RepinJobResponse),
+    /// 409 whose body decoded as the error envelope — the one-running
+    /// slot is held by another job, install-wide.
+    Busy(String),
+}
+
+/// POST `/api/v1/schema/repin` — plan (`dry_run`) or start a repin.
+///
+/// `SchemaWrite`-gated server-side, which is the ONLY enforcement: this
+/// call is issued exactly as written whatever the SPA believes about the
+/// session's permissions.
+///
+/// The 409 is DOUBLE-SHAPED — a refusal carries the plan, a held slot
+/// carries the error envelope — and the two are told apart by decoding
+/// the body ([`crate::repin_flow::classify_conflict`]), never by
+/// matching on error text.
+pub async fn repin(
+    field: &str,
+    to: &str,
+    dry_run: bool,
+    force: bool,
+) -> Result<RepinOutcome, ApiError> {
+    let body = RepinRequest {
+        // The EXACT name, never the sanitised display copy: the catalog
+        // key is what the server folds and looks up.
+        field: field.to_owned(),
+        to: to.to_owned(),
+        dry_run,
+        force,
+    };
+    let resp = Request::post("/api/v1/schema/repin")
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| ApiError::Decode(e.to_string()))?)?
+        .send()
+        .await?;
+
+    match resp.status() {
+        200 => Ok(RepinOutcome::DryRun(repin_job(&resp).await?)),
+        202 => Ok(RepinOutcome::Started(repin_job(&resp).await?)),
+        409 => {
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| ApiError::Decode(e.to_string()))?;
+            Ok(match classify_conflict(&text) {
+                ConflictBody::Plan(job) => RepinOutcome::Refused(*job),
+                ConflictBody::Busy(msg) => RepinOutcome::Busy(msg),
+            })
+        }
+        // Every other status — including 401/403 — keeps the server's
+        // own message so the modal can show it verbatim. A repin refusal
+        // is an operator-facing sentence ("not a pinned field", "repin
+        // requires an ingest-enabled node"), and replacing it with a
+        // status number would throw away the only actionable part.
+        s => Err(server_error(&resp, s).await),
+    }
+}
+
+/// GET `/api/v1/schema/repin/status` — the running job if any, else the
+/// newest job of any status.
+///
+/// INSTALL-WIDE and unfiltered by design (synthesis R4: no `?id=`): the
+/// caller matches `job.id` against the id it holds and treats anything
+/// else as the slot having moved on.
+pub async fn repin_status() -> Result<RepinStatusResponse, ApiError> {
+    let resp = Request::get("/api/v1/schema/repin/status").send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<RepinStatusResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// The job row out of a `RepinResponse` body.
+async fn repin_job(resp: &gloo_net::http::Response) -> Result<RepinJobResponse, ApiError> {
+    resp.json::<RepinResponse>()
+        .await
+        .map(|r| r.job)
+        .map_err(|e| ApiError::Decode(e.to_string()))
+}
+
+/// A non-2xx as [`ApiError::Server`] when the body carries the error
+/// envelope, else the bare status.
+async fn server_error(resp: &gloo_net::http::Response, status: u16) -> ApiError {
+    let Ok(body) = resp.text().await else {
+        return ApiError::Status(status);
+    };
+    serde_json::from_str::<ErrorResponse>(&body).map_or(ApiError::Status(status), |env| {
+        ApiError::Server {
+            status,
+            message: env.error.message,
+        }
+    })
+}
+
+/// One URL query-parameter value.
+fn encode(raw: &str) -> String {
+    js_sys::encode_uri_component(raw)
+        .as_string()
+        .unwrap_or_else(|| raw.to_string())
 }
 
 /// POST /api/v1/query — execute a DSL query with fixed [`PAGE_SIZE`] paging.

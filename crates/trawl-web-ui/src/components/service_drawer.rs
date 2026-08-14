@@ -33,8 +33,8 @@ use crate::histogram::{Slot, align_buckets, parse_bucket_ms};
 use crate::interop::uplot::{ChartHandle, Opts, create_chart};
 use crate::state::stream_session::{LiveSignals, RingBuffer, StreamLifecycle, start_stream};
 use fleet_ui::{
-    Btn, Drawer, Icon, IconView, LoadState, Loaded, TabItem, ToastBus, ToastKind, Variant,
-    effective_active,
+    Badge, Btn, Drawer, Icon, IconView, LoadState, Loaded, TabItem, ToastBus, ToastKind, Tone,
+    Variant, effective_active,
 };
 
 /// Display cap for the live-tail viewport — keeps the DOM snappy. The
@@ -64,6 +64,14 @@ pub fn ServiceDrawer(
     on_tab_change: Callback<String>,
     on_search: Callback<String>,
     on_use_field: Callback<String>,
+    /// A field whose degraded badge should take focus once this drawer
+    /// has mounted — set by the page when a drill-in unmounted the badge,
+    /// so returning from the case file lands where it left. Cleared by
+    /// the fields pane once it has been honoured.
+    focus_field: RwSignal<Option<String>>,
+    /// Drill into a field's case file (ADR-0011 slice C2). The page owns
+    /// the navigation; the drawer only names the field.
+    on_open_field: Callback<String>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
     let svc_for_card = svc.clone();
@@ -139,7 +147,9 @@ pub fn ServiceDrawer(
                         <FieldsPane
                             svc=svc_for_fields.clone()
                             cardinality=cardinality_sig
+                            focus_field=focus_field
                             on_use_field=on_use_field
+                            on_open_field=on_open_field
                         />
                     }.into_any()
                 } else if eff_tab.get() == "tail" {
@@ -248,12 +258,47 @@ enum SortKey {
 fn FieldsPane(
     svc: ServiceSchema,
     cardinality: Signal<Option<Result<HashMap<String, u64>, String>>>,
+    focus_field: RwSignal<Option<String>>,
     on_use_field: Callback<String>,
+    on_open_field: Callback<String>,
 ) -> impl IntoView {
     let sort = RwSignal::new((SortKey::Cardinality, false)); // desc
     let expanded = RwSignal::new(None::<String>);
     let svc_name = svc.name.clone();
     let columns_owned = svc.columns.clone();
+    let svc_for_degraded = svc.clone();
+
+    // Focus return across the drawer swap (F4). The badge's id is its
+    // position in `columns`, which is the drawer's own order and survives
+    // this table's client-side sorting.
+    //
+    // Re-run on `cardinality`, not once on mount: the row list is rebuilt
+    // when the cardinality fetch lands, which would drop a focus placed
+    // before it. The request is only cleared once that fetch has settled,
+    // so the last attempt is the one that sticks.
+    let columns_for_focus = svc.columns.clone();
+    Effect::new(move |_| {
+        let settled = cardinality.get().is_some();
+        let Some(target) = focus_field.get() else {
+            return;
+        };
+        if settled {
+            focus_field.set(None);
+        }
+        let Some(index) = columns_for_focus.iter().position(|c| c.name == target) else {
+            focus_field.set(None);
+            return;
+        };
+        let id = crate::schema_nav::degraded_badge_id(index);
+        request_animation_frame(move || {
+            if let Some(el) = document()
+                .get_element_by_id(&id)
+                .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                let _ = el.focus();
+            }
+        });
+    });
 
     // Header-click handler: toggle direction if same key, else select
     // with desc as default (matches sort-by-numeric expectation).
@@ -343,12 +388,44 @@ fn FieldsPane(
 
                     let is_open_caret = is_open.clone();
                     let is_open_detail = is_open.clone();
+                    // Membership in the server-stamped list, never a join
+                    // against the install-wide degraded set.
+                    let degraded = super::service_card_fmt::is_degraded_column(
+                        &svc_for_degraded,
+                        &c.name,
+                    );
+                    let fname_for_open = fname.clone();
+                    // Focus-return target across the case-file swap: the
+                    // column's position in the drawer's own list, never
+                    // its client-chosen name.
+                    let badge_id = columns_owned
+                        .iter()
+                        .position(|col| col.name == c.name)
+                        .map(crate::schema_nav::degraded_badge_id);
                     view! {
                         <>
                             <div class=row_class on:click=toggle>
                                 <div>
                                     <span class="caret">{move || if is_open_caret() { "▾" } else { "▸" }}</span>
                                     <span class="c-name">{c.name.clone()}</span>
+                                    {degraded.then(|| view! {
+                                        // Native button so it is keyboard
+                                        // operable; the click is stopped
+                                        // before it reaches the row's
+                                        // expand toggle.
+                                        <button
+                                            type="button"
+                                            class="deg-btn"
+                                            id=badge_id
+                                            title="Degraded pin — open the field case file"
+                                            on:click=move |e: web_sys::MouseEvent| {
+                                                e.stop_propagation();
+                                                on_open_field.run(fname_for_open.clone());
+                                            }
+                                        >
+                                            <Badge tone=Tone::Warn>"degraded"</Badge>
+                                        </button>
+                                    })}
                                 </div>
                                 <div><span class=format!("tp {pill_class}")>{pill_text}</span></div>
                                 <div class="c-cov">

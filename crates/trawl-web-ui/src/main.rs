@@ -8,9 +8,14 @@
 // their tests run under plain `cargo test` on native.
 mod facets;
 mod histogram;
+mod notice_key;
 mod offset;
 mod perms;
 mod query_merge;
+mod repin_flow;
+mod repin_hint;
+mod schema_nav;
+mod service_card_fmt;
 mod tone_vocab;
 
 #[cfg(target_arch = "wasm32")]
