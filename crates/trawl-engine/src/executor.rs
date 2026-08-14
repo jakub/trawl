@@ -1465,7 +1465,7 @@ mod tests {
     use super::{
         ColdAction, ColdPresence, EngineError, Executor, FieldTypes, HotColdOutcome, HotLane,
         ListEvidence, cold_action, error_class, glob_list_items, is_conversion_error,
-        resolve_list_source,
+        is_no_files_error, resolve_list_source,
     };
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
@@ -2254,6 +2254,111 @@ mod tests {
             2,
             "the cold row behind the matching glob element must survive an \
              empty sibling element, alongside the hot row"
+        );
+    }
+
+    #[test]
+    fn partial_list_source_miss_keeps_cold_rows_without_a_hot_buffer() {
+        // The same shape as `partial_list_source_miss_keeps_cold_rows`, one
+        // lane over: `run_query` had NEITHER the prune retry nor the outcome
+        // gate, so `service=X last=Nh` against an idle install answered 200
+        // with zero rows for as long as any hour in range belonged to another
+        // service. Resolution is a source property now, so it does not.
+        let dir = tempfile::tempdir().unwrap();
+        let full_hour = dir.path().join("10");
+        let empty_hour = dir.path().join("11");
+        std::fs::create_dir_all(&full_hour).unwrap();
+        std::fs::create_dir_all(&empty_hour).unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+        write_meta_parquet(&setup, &full_hour.join("svc.parquet"), "'plain'");
+
+        let exec = Executor::new().unwrap();
+        let source = format!(
+            "['{}/*.parquet', '{}/*.parquet']",
+            full_hour.display(),
+            empty_hour.display()
+        );
+        let result = exec
+            .run_query("*", &source, &FieldTypes::new(), usize::MAX, 0)
+            .expect("a partial list-source miss must not fail the query");
+        assert_eq!(
+            result.row_count(),
+            1,
+            "the cold row behind the matching glob element must survive an \
+             empty sibling element, with no hot buffer to rescue it"
+        );
+    }
+
+    #[test]
+    fn export_without_hot_keeps_cold_rows_on_partial_list_miss() {
+        // `export_parquet` surfaced DuckDB's "no files" error raw, so the
+        // same everyday shape was a 500 on the export lane.
+        let dir = tempfile::tempdir().unwrap();
+        let full_hour = dir.path().join("10");
+        let empty_hour = dir.path().join("11");
+        std::fs::create_dir_all(&full_hour).unwrap();
+        std::fs::create_dir_all(&empty_hour).unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+        write_meta_parquet(&setup, &full_hour.join("svc.parquet"), "'plain'");
+        let out = dir.path().join("export.parquet");
+
+        let exec = Executor::new().unwrap();
+        let source = format!(
+            "['{}/*.parquet', '{}/*.parquet']",
+            full_hour.display(),
+            empty_hour.display()
+        );
+        exec.export_parquet("*", &source, &FieldTypes::new(), &out, 1000)
+            .expect("a partial list-source miss must not fail the export");
+
+        let rows: i64 = exec
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    out.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "the surviving cold row must reach the export");
+    }
+
+    #[test]
+    fn empty_window_without_a_hot_buffer_is_an_empty_success() {
+        // The one shape where an empty answer is the truth: the list reaches
+        // no file at all. Widening the gate to `run_query` must not turn a
+        // genuinely empty window into an error — that would make every query
+        // over a quiet time range fail.
+        let dir = tempfile::tempdir().unwrap();
+        let hour = dir.path().join("10");
+        std::fs::create_dir_all(&hour).unwrap();
+
+        let exec = Executor::new().unwrap();
+        let source = format!("['{}/*.parquet']", hour.display());
+        let result = exec
+            .run_query("*", &source, &FieldTypes::new(), usize::MAX, 0)
+            .expect("an empty window must be an empty success, not an error");
+        assert_eq!(result.row_count(), 0, "an empty window has no rows");
+    }
+
+    #[test]
+    fn export_without_hot_stays_loud_for_an_empty_window() {
+        // An export has no empty answer to write, so the raw "no files" error
+        // stands where the query lane returns zero rows. Deliberate, and
+        // pinned so the gate's widening does not quietly convert it.
+        let dir = tempfile::tempdir().unwrap();
+        let hour = dir.path().join("10");
+        std::fs::create_dir_all(&hour).unwrap();
+        let out = dir.path().join("export.parquet");
+
+        let exec = Executor::new().unwrap();
+        let source = format!("['{}/*.parquet']", hour.display());
+        let result = exec.export_parquet("*", &source, &FieldTypes::new(), &out, 1000);
+        assert!(
+            matches!(result, Err(EngineError::Database(ref e)) if is_no_files_error(e)),
+            "an export over an empty window keeps DuckDB's own error; got {result:?}"
         );
     }
 
