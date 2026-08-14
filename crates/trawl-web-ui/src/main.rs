@@ -11,6 +11,7 @@ mod histogram;
 mod offset;
 mod perms;
 mod query_merge;
+mod repin_flow;
 mod repin_hint;
 mod service_card_fmt;
 mod tone_vocab;

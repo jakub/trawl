@@ -88,6 +88,17 @@ pub fn SchemaPage() -> impl IntoView {
     });
     let tab_sig: Signal<String> = Signal::derive(move || tab_param.get());
 
+    // Whether to OFFER the repin trigger on a degraded field's case
+    // file. Affordance only — the server gates `POST /schema/repin` on
+    // `schema_write` and is the sole enforcement — and read-only until
+    // `/me` resolves, so a slow identity fetch never flashes a button
+    // the session may not have.
+    let me = use_context::<RwSignal<Option<api::MeResponse>>>();
+    let can_repin = Signal::derive(move || {
+        me.and_then(|me| me.get())
+            .is_some_and(|me| crate::perms::can_schema_write(&me.permissions))
+    });
+
     let filter = RwSignal::new(String::new());
     let sort = RwSignal::new((SvcSort::Name, false));
 
@@ -389,6 +400,8 @@ pub fn SchemaPage() -> impl IntoView {
                         <FieldCaseDrawer
                             field=field
                             back=svc_selected.get()
+                            can_repin=can_repin
+                            on_open_field=on_open_field
                             on_back=on_field_back
                             on_close=on_close
                         />

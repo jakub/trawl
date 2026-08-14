@@ -32,6 +32,12 @@ fleet-ui = { workspace = true, features = ["atmosphere"] }
 # mirrors is decided by `trawl_core::sanitize` — mirroring THAT too would
 # be a second copy of a security-relevant character set.
 trawl-core = { workspace = true }
+# Unconditional for the same reason again: `repin_flow::classify_conflict`
+# is the pure half of the repin POST — it decides which of the TWO 409
+# bodies arrived by DECODING them — and its table test feeds it real
+# bodies, so serde_json has to build on native too. It is already in the
+# wasm graph; this only widens where it is available.
+serde_json = { workspace = true }
 
 # Wasm-only deps — leptos, web-sys, gloo-net, etc. `cargo check --workspace`
 # on native skips these entirely, but the binary compiles against them when
@@ -46,7 +52,6 @@ gloo-net = "0.7"
 gloo-timers = { version = "0.4", features = ["futures"] }
 js-sys = "0.3"
 serde = { workspace = true }
-serde_json = { workspace = true }
 serde-wasm-bindgen = "0.6"
 thiserror = { workspace = true }
 wasm-bindgen = "0.2"

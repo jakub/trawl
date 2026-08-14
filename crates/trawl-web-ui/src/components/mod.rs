@@ -36,6 +36,7 @@ pub mod lineage_tree;
 pub mod linkage_graph;
 pub mod meta_strip;
 pub mod net_drawer;
+pub mod repin_modal;
 pub mod results_table;
 pub mod save_as_net_modal;
 pub mod service_drawer;
