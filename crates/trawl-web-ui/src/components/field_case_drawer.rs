@@ -42,7 +42,9 @@ use trawl_core::sanitize::sanitize_display_text;
 use crate::api;
 use crate::api::ApiError;
 use crate::components::repin_modal::RepinModal;
-use crate::repin_flow::{PollAction, PollTick, REPIN_POLL_MS, poll_decide};
+use crate::repin_flow::{
+    PollAction, ProbedJob, REPIN_POLL_MS, StatusProbe, claim_toast, poll_decide,
+};
 use crate::repin_hint::{REPIN_HINT_REFUSED, repin_command_hint, repin_is_running};
 use fleet_ui::{
     Badge, Btn, Drawer, Icon, IconView, LoadMore, LoadState, Loaded, ToastBus, ToastKind, Tone,
@@ -171,8 +173,6 @@ pub fn FieldCaseDrawer(
     // job at mount; cleared the moment the job settles or the
     // install-wide slot moves on.
     let tracked_job_id = RwSignal::new(None::<i64>);
-    // One toast per job id, ever.
-    let toasted_job_id = RwSignal::new(None::<i64>);
     let poll_errors = RwSignal::new(0_u32);
     let poll_in_flight = RwSignal::new(false);
     let poll_warning = RwSignal::new(None::<String>);
@@ -186,6 +186,17 @@ pub fn FieldCaseDrawer(
     // so no poll outlives the surface that started it.
     let poller: StoredValue<Option<Interval>, LocalStorage> = StoredValue::new_local(None);
     on_cleanup(move || poller.update_value(|p| *p = None));
+
+    // Cancelling the interval cannot cancel a read already awaiting: a
+    // status response can land after this drawer is gone. Signal writes
+    // are silently dropped once the owner is disposed, but the ToastBus
+    // is NOT this drawer's — it outlives it by design, and a toast from a
+    // dead surface is a notification about a page nobody is looking at.
+    // A disposed `StoredValue` reads as `None`, which is the same answer
+    // as the flag itself.
+    let alive = StoredValue::new(true);
+    on_cleanup(move || alive.set_value(false));
+    let is_alive = move || alive.try_get_value() == Some(true);
     let stop_poll = move || {
         poller.update_value(|p| *p = None);
         poll_in_flight.set(false);
@@ -195,13 +206,21 @@ pub fn FieldCaseDrawer(
     // here, and only once per id — a completion that happened while this
     // drawer was closed is a receipt, never a notification.
     let settle = move |finished: RepinJobResponse| {
+        // The whole settle path, not just the toast: a refetch and a
+        // re-presented refusal are as meaningless as a toast once the
+        // surface they belong to is gone.
+        if !is_alive() {
+            return;
+        }
         let id = finished.id;
         let status = finished.status.clone();
         let dry_run = finished.dry_run;
         let detail = job_outcome_line(&finished);
         job.set(Some(finished.clone()));
-        if toasted_job_id.get_untracked() != Some(id) {
-            toasted_job_id.set(Some(id));
+        // Deduped across drawer INSTANCES (`repin_flow::claim_toast`):
+        // navigating A → B → A builds a third instance, and per-instance
+        // bookkeeping would announce one job twice.
+        if claim_toast(id) {
             match (status.as_str(), dry_run) {
                 (STATUS_SUCCEEDED, true) => {
                     bus.push(ToastKind::Success, "Repin plan ready", Some(detail));
@@ -245,26 +264,20 @@ pub fn FieldCaseDrawer(
         spawn_local(async move {
             let result = api::repin_status().await;
             poll_in_flight.set(false);
-            let (tick, row) = match result {
+            let (probe, row) = match result {
                 Ok(resp) => match resp.job {
-                    Some(j) => (
-                        PollTick::Job {
-                            id: j.id,
-                            status: j.status.clone(),
-                        },
-                        Some(j),
-                    ),
-                    None => (PollTick::NoJob, None),
+                    Some(j) => (StatusProbe::Job(ProbedJob::from(&j)), Some(j)),
+                    None => (StatusProbe::NoJob, None),
                 },
-                Err(_) => (PollTick::Error, None),
+                Err(_) => (StatusProbe::Failed, None),
             };
-            let errors = if matches!(tick, PollTick::Error) {
+            let errors = if matches!(probe, StatusProbe::Failed) {
                 poll_errors.get_untracked() + 1
             } else {
                 0
             };
             poll_errors.set(errors);
-            match poll_decide(tracked, errors, &tick) {
+            match poll_decide(tracked, errors, &probe) {
                 PollAction::Track => {
                     poll_warning.set(None);
                     job.set(row);
@@ -342,17 +355,25 @@ pub fn FieldCaseDrawer(
         }));
     });
     // `Some(job)` only ever arrives from a real 202 (or from the modal's
-    // own recovery probe finding that job), so adopting it here is the
-    // one place polling starts from an operator action.
+    // own recovery probe proving that job is the one it asked for), so
+    // adopting it here is the one place polling starts from an operator
+    // action.
     let on_modal_close = Callback::new(move |started: Option<RepinJobResponse>| {
         modal.set(None);
         if let Some(started) = started {
-            let running = repin_is_running(&started.status);
-            let id = started.id;
-            job.set(Some(started));
             status_lost.set(false);
-            if running {
+            if repin_is_running(&started.status) {
+                let id = started.id;
+                job.set(Some(started));
                 start_poll.run(id);
+            } else {
+                // Already TERMINAL when it was handed up: the recovery
+                // probe found a run that finished inside the round trip
+                // whose response was lost. Nothing will poll it, so this
+                // is the only chance to settle it — without which a
+                // succeeded repin would sit as a receipt beside a case
+                // file still showing the OLD pin, and raise no toast.
+                settle(started);
             }
         }
     });

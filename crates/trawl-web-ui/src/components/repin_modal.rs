@@ -18,6 +18,11 @@
 //!    be checked before the forced run can be started.
 //! 3. **The plan is a snapshot, not a reservation.** Ingest keeps
 //!    running; the real run rescans, and its numbers can differ.
+//! 4. **An indeterminate outcome never offers to run again.** A real run
+//!    whose response was lost may have claimed a job; only a status
+//!    probe that can PROVE which job is ours resolves that, and the
+//!    absence of proof leaves the operator a re-probe, never a second
+//!    rewrite.
 //!
 //! Closing the modal does not cancel anything: past the claim the job
 //! runs DETACHED server-side, so a dismissed dialog abandons the
@@ -29,20 +34,22 @@ use trawl_api::RepinJobResponse;
 use trawl_core::sanitize::sanitize_display_text;
 
 use crate::api::{self, ApiError, RepinOutcome};
-use crate::repin_flow::{default_target, repin_targets};
-use crate::repin_hint::repin_is_running;
+use crate::repin_flow::{
+    LostRun, ProbedJob, Recovery, SlotCheck, StatusProbe, Unproven, default_target,
+    indeterminate_text, recovery_verdict, repin_targets, slot_check,
+};
 use crate::service_card_fmt::format_bytes;
 use fleet_ui::{Btn, Icon, Modal, Segmented, SegmentedOption, Variant};
 
-/// Which step a [`Phase::Failed`] offers to retry — the one that failed,
-/// never a step further down the ladder.
-#[derive(Debug, Clone, Copy)]
-enum RetryStep {
-    /// Re-run the dry run.
-    Plan,
-    /// Re-issue the real run, carrying the force flag it was sent with.
-    Run(bool),
-}
+/// The wire status a refusal carries — the one status this dialog has to
+/// ACT on rather than render. The vocabulary is
+/// `trawl-server/src/store/repin.rs`.
+const STATUS_REFUSED: &str = "refused_needs_force";
+
+/// Shown in the busy block when the slot re-check could not be read. The
+/// slot's state is then UNKNOWN, which is not "free".
+const SLOT_CHECK_FAILED: &str = "Couldn't read the repin status just now, so whether the slot is \
+                                 still held is unknown. Try again.";
 
 #[derive(Debug, Clone)]
 enum Phase {
@@ -59,15 +66,30 @@ enum Phase {
     NeedsForce(Box<RepinJobResponse>),
     /// A real run is in flight.
     Submitting,
-    /// The one-running slot is held elsewhere. No confirm from here.
+    /// The one-running slot is held elsewhere. No confirm from here —
+    /// only a re-read of the slot, which returns to [`Phase::NeedsPlan`]
+    /// once it is free.
     Busy(String),
+    /// A real run's response was lost and the recovery probe could not
+    /// prove what became of it. The rewrite may be running RIGHT NOW, so
+    /// this phase offers exactly one action: probe again.
+    Indeterminate {
+        /// The failure that lost the response.
+        lost: String,
+        /// What the last probe could not establish.
+        why: Unproven,
+        /// The plan the run was started from, kept on screen.
+        plan: Option<Box<RepinJobResponse>>,
+        /// What was asked for, so a re-probe can recognise it.
+        run: LostRun,
+    },
     /// The server's own message for a status this modal cannot act on.
     /// The modal STAYS OPEN and keeps the plan it was acting on, if
     /// there was one — a 503 must not cost the operator the scan they
-    /// have already paid for.
+    /// have already paid for. Only a DRY RUN reaches this: a real run's
+    /// failure is a lost response, never a retryable step.
     Failed {
         message: String,
-        retry: RetryStep,
         plan: Option<Box<RepinJobResponse>>,
     },
 }
@@ -113,6 +135,13 @@ pub fn RepinModal(
         RwSignal::new(refused.map_or(Phase::Planning, |job| Phase::NeedsForce(Box::new(job))));
     let force = RwSignal::new(false);
     let busy = RwSignal::new(false);
+    // A status PROBE is in flight — the recovery read after a lost
+    // response, or the slot re-check. Tracked apart from `busy`: neither
+    // probe mutates anything, but both own the primary action while they
+    // run.
+    let probing = RwSignal::new(false);
+    // Why the last slot re-check told us nothing.
+    let slot_note = RwSignal::new(None::<String>);
     // Every initiating click bumps this; a response whose generation is
     // stale (the operator changed target and re-planned meanwhile) is
     // dropped rather than painted over the current state.
@@ -175,34 +204,40 @@ pub fn RepinModal(
                 Ok(RepinOutcome::Busy(msg)) => {
                     phase.set(Phase::Busy(msg));
                     // Which field holds it, if the status route says.
-                    // Best-effort: a failed probe leaves the message as
-                    // it stands.
-                    spawn_local(async move {
-                        if let Ok(status) = api::repin_status().await
-                            && let Some(job) = status.job
-                            && repin_is_running(&job.status)
-                        {
-                            busy_field.set(Some(sanitize_display_text(&job.field)));
-                        }
-                    });
+                    // Annotation only (`adopt_free: false`): the 409 is
+                    // the fact on screen and was true when the server
+                    // said it, so this probe never moves the dialog on
+                    // its own — the operator's "Check again" does.
+                    probe_slot(false, phase, probing, busy_field, slot_note, force);
                 }
                 Err(e) => {
                     if dry_run {
                         phase.set(Phase::Failed {
                             message: failure_text(&e),
-                            retry: RetryStep::Plan,
                             plan: carried,
                         });
                     } else {
                         // A real run that failed IN TRANSIT may still
                         // have been claimed: the server detaches the job
                         // at the claim, so a dropped response is not a
-                        // job that did not start. Probe once and adopt a
-                        // job that matches this field and target before
-                        // offering a retry that would 409 — or worse,
-                        // start a second rewrite.
-                        recover_from_lost_response(
-                            &field, forced, carried, e, phase, force, on_close,
+                        // job that did not start. Probe once and adopt
+                        // the job — but only one that can be PROVEN to
+                        // be this request's, which is what the plan's own
+                        // row bounds.
+                        let run = LostRun {
+                            field: field.clone(),
+                            to: to.clone(),
+                            force: forced,
+                            bound: carried.as_ref().map(|p| p.id),
+                        };
+                        probe_recovery(
+                            run,
+                            carried,
+                            failure_text(&e),
+                            phase,
+                            probing,
+                            force,
+                            on_close,
                         );
                     }
                 }
@@ -218,39 +253,62 @@ pub fn RepinModal(
 
     let cancel = Callback::new(move |()| on_close.run(None));
 
-    // The primary action depends on the rung: plan, run, forced run —
-    // or nothing at all when the slot is held elsewhere.
-    let primary = Callback::new(move |()| match phase.get_untracked() {
-        Phase::NeedsPlan => submit.run((true, false)),
-        Phase::Plan(_) => submit.run((false, false)),
-        Phase::NeedsForce(_) => {
-            if force.get_untracked() {
-                submit.run((false, true));
-            }
+    // The primary action depends on the rung: plan, run, forced run, or
+    // — where the outcome is not this dialog's to decide — a status read
+    // that can never mutate anything.
+    let primary = Callback::new(move |()| {
+        if probing.get_untracked() {
+            return;
         }
-        Phase::Failed { retry, .. } => match retry {
-            RetryStep::Plan => submit.run((true, false)),
-            RetryStep::Run(forced) => submit.run((false, forced)),
-        },
-        Phase::Planning | Phase::Submitting | Phase::Busy(_) => {}
+        match phase.get_untracked() {
+            // A dry-run failure is retryable BECAUSE it is a dry run:
+            // the scan mutates nothing, so a second one at worst costs
+            // another full-corpus pass.
+            Phase::NeedsPlan | Phase::Failed { .. } => submit.run((true, false)),
+            Phase::Plan(_) => submit.run((false, false)),
+            Phase::NeedsForce(_) => {
+                if force.get_untracked() {
+                    submit.run((false, true));
+                }
+            }
+            // The ONLY action an unproven outcome offers. Re-probing is
+            // idempotent; re-running would not be.
+            Phase::Indeterminate {
+                lost, plan, run, ..
+            } => probe_recovery(run, plan, lost, phase, probing, force, on_close),
+            Phase::Busy(_) => probe_slot(true, phase, probing, busy_field, slot_note, force),
+            Phase::Planning | Phase::Submitting => {}
+        }
     });
 
-    let primary_label = move || match phase.get() {
-        Phase::Planning => "Planning…",
-        Phase::NeedsPlan => "Get plan",
-        Phase::Plan(_) => "Run repin",
-        Phase::NeedsForce(_) => "Run forced repin",
-        Phase::Submitting => "Starting…",
-        Phase::Busy(_) => "Unavailable",
-        Phase::Failed { retry, .. } => match retry {
-            RetryStep::Plan => "Retry plan",
-            RetryStep::Run(_) => "Retry run",
-        },
+    let primary_label = move || {
+        if probing.get() {
+            return "Checking…";
+        }
+        match phase.get() {
+            Phase::Planning => "Planning…",
+            Phase::NeedsPlan => "Get plan",
+            Phase::Plan(_) => "Run repin",
+            Phase::NeedsForce(_) => "Run forced repin",
+            Phase::Submitting => "Starting…",
+            Phase::Busy(_) => "Check again",
+            Phase::Indeterminate { .. } => "Check status",
+            Phase::Failed { .. } => "Retry plan",
+        }
     };
-    let primary_disabled = Signal::derive(move || match phase.get() {
-        Phase::Planning | Phase::Submitting | Phase::Busy(_) => true,
-        Phase::NeedsForce(_) => !force.get(),
-        Phase::NeedsPlan | Phase::Plan(_) | Phase::Failed { .. } => false,
+    let primary_disabled = Signal::derive(move || {
+        if probing.get() {
+            return true;
+        }
+        match phase.get() {
+            Phase::Planning | Phase::Submitting => true,
+            Phase::NeedsForce(_) => !force.get(),
+            Phase::NeedsPlan
+            | Phase::Plan(_)
+            | Phase::Busy(_)
+            | Phase::Indeterminate { .. }
+            | Phase::Failed { .. } => false,
+        }
     });
     let primary_variant = move || match phase.get() {
         Phase::NeedsForce(_) => Variant::Danger,
@@ -261,6 +319,14 @@ pub fn RepinModal(
         .into_iter()
         .map(|c| SegmentedOption::new(c.as_duckdb(), c.as_duckdb()))
         .collect::<Vec<_>>();
+
+    // The target is what every in-flight request was issued FOR, so it
+    // is frozen for as long as one is outstanding — a dry run included,
+    // whose abandoned scan would otherwise keep holding the install-wide
+    // slot the follow-up "Get plan" needs.
+    let target_locked = Signal::derive(move || {
+        busy.get() || probing.get() || matches!(phase.get(), Phase::Indeterminate { .. })
+    });
 
     view! {
         <Modal
@@ -299,12 +365,17 @@ pub fn RepinModal(
                         if id == target.get_untracked() {
                             return;
                         }
-                        // A real run is in flight: its 202 is the only
-                        // thing that can hand the job to the case file,
-                        // so it must not be dropped by a generation bump.
-                        // The scan of a DRY run is safely abandonable —
-                        // it terminalizes server-side either way.
-                        if matches!(phase.get_untracked(), Phase::Submitting) {
+                        // Frozen while anything is outstanding. A real
+                        // run's 202 is the only thing that can hand the
+                        // job to the case file, so it must not be dropped
+                        // by a generation bump; a dry run's scan holds
+                        // the one-running slot until it terminalizes
+                        // server-side, so abandoning it here would leave
+                        // the follow-up plan 409-ing against our OWN
+                        // scan with no way back; and an indeterminate
+                        // run's target is the only record of what may be
+                        // rewriting the corpus right now.
+                        if target_locked.get_untracked() {
                             return;
                         }
                         target.set(id);
@@ -321,6 +392,13 @@ pub fn RepinModal(
                     ". The pin it already has is not offered — re-extracting shelved values "
                     "under the SAME pin is a `--force` resurrection pass, and stays a CLI decision."
                 </p>
+                {move || target_locked.get().then(|| view! {
+                    <p class="rp-note">
+                        "The target is locked while this request is outstanding: it is what the \
+                         request was issued for, and the scan behind it holds the install-wide \
+                         repin slot until the server finishes with it."
+                    </p>
+                })}
             </div>
 
             {move || match phase.get() {
@@ -375,9 +453,33 @@ pub fn RepinModal(
                         {move || busy_field.get().map(|f| view! {
                             <p>"It is repinning "<span class="mono">{f}</span>"."</p>
                         })}
+                        {move || slot_note.get().map(|note| view! { <p>{note}</p> })}
                     </div>
+                    <p class="rp-note">
+                        "Nothing was started. \"Check again\" re-reads the slot; once it is free \
+                         this dialog goes back to asking for a plan."
+                    </p>
                 }.into_any(),
-                Phase::Failed { message, plan, .. } => view! {
+                Phase::Indeterminate { lost, why, plan, .. } => view! {
+                    <div class="rp-err" role="alert">
+                        <p>{sanitize_display_text(&indeterminate_text(&lost, why))}</p>
+                        <p>
+                            "The repin may be running right now: the server claims the job before \
+                             it answers, and then runs it detached. This dialog will not offer to \
+                             start it again — a second run would rewrite the corpus twice."
+                        </p>
+                        <p>
+                            "\"Check status\" reads the slot again; "
+                            <span class="mono">"trawl schema repin-status"</span>
+                            " reads the same thing from a shell. Closing is safe, and the field's \
+                             case file picks up whatever is running."
+                        </p>
+                    </div>
+                    // The scan is still the last thing known about this
+                    // field, and it cost a full-corpus pass.
+                    {plan.map(|plan| plan_block(&plan, true))}
+                }.into_any(),
+                Phase::Failed { message, plan } => view! {
                     <div class="rp-err" role="alert">
                         <p>{sanitize_display_text(&message)}</p>
                     </div>
@@ -453,46 +555,101 @@ fn plan_block(job: &RepinJobResponse, refused: bool) -> AnyView {
     .into_any()
 }
 
-/// A real run whose RESPONSE was lost. Probe the status route once: a
-/// job matching this field and target is OURS — adopt it (or its
-/// refusal) rather than offering a retry that would either 409 against
-/// our own job or start a second rewrite.
-fn recover_from_lost_response(
-    field: &str,
-    forced: bool,
+/// One `/schema/repin/status` read: the decision's reduction of it, and
+/// the row itself for the caller that may adopt it.
+async fn status_probe() -> (StatusProbe, Option<RepinJobResponse>) {
+    match api::repin_status().await {
+        Ok(resp) => match resp.job {
+            Some(job) => (StatusProbe::Job(ProbedJob::from(&job)), Some(job)),
+            None => (StatusProbe::NoJob, None),
+        },
+        // The read said NOTHING. It must never be read as "no job".
+        Err(_) => (StatusProbe::Failed, None),
+    }
+}
+
+/// A real run whose RESPONSE was lost, or a re-probe of one. The status
+/// route gets to say exactly one thing: whether it holds a job that is
+/// PROVABLY this request's ([`recovery_verdict`]). It is adopted if so —
+/// anything else, including a probe that failed outright, leaves the
+/// dialog [`Phase::Indeterminate`], which offers no mutation at all.
+fn probe_recovery(
+    run: LostRun,
     plan: Option<Box<RepinJobResponse>>,
-    err: ApiError,
+    lost: String,
     phase: RwSignal<Phase>,
+    probing: RwSignal<bool>,
     force: RwSignal<bool>,
     on_close: Callback<Option<RepinJobResponse>>,
 ) {
-    let field = field.to_owned();
+    probing.set(true);
     spawn_local(async move {
-        if let Ok(status) = api::repin_status().await
-            && let Some(job) = status.job
-            && !job.dry_run
-            && job.field.eq_ignore_ascii_case(&field)
-        {
-            if job.status == "refused_needs_force" {
-                force.set(false);
-                phase.set(Phase::NeedsForce(Box::new(job)));
-            } else {
-                // Running or terminal, it is the job this modal asked
-                // for: hand it to the case file, which owns progress and
-                // receipts.
-                on_close.try_run(Some(job));
+        let (probe, found) = status_probe().await;
+        probing.set(false);
+        match recovery_verdict(&run, &probe) {
+            // `Adopt` is only ever returned for a `Job` probe, so the row
+            // is in hand here.
+            Recovery::Adopt => {
+                if let Some(job) = found {
+                    if job.status == STATUS_REFUSED {
+                        force.set(false);
+                        phase.set(Phase::NeedsForce(Box::new(job)));
+                    } else {
+                        // Running or terminal, it is the job this modal
+                        // asked for: hand it to the case file, which owns
+                        // progress and receipts.
+                        on_close.try_run(Some(job));
+                    }
+                }
             }
-            return;
+            Recovery::Indeterminate(why) => phase.set(Phase::Indeterminate {
+                lost,
+                why,
+                plan,
+                run,
+            }),
         }
-        phase.set(Phase::Failed {
-            message: format!(
-                "{} — the status route shows no repin for this field, so it most likely never \
-                 started.",
-                failure_text(&err)
-            ),
-            retry: RetryStep::Run(forced),
-            plan,
-        });
+    });
+}
+
+/// Read the install-wide one-running slot. `adopt_free` belongs to the
+/// operator's own re-check, which returns the dialog to
+/// [`Phase::NeedsPlan`] once nothing holds the slot; the annotation probe
+/// fired right after a 409 passes `false` and only fills in which field
+/// holds it.
+fn probe_slot(
+    adopt_free: bool,
+    phase: RwSignal<Phase>,
+    probing: RwSignal<bool>,
+    busy_field: RwSignal<Option<String>>,
+    slot_note: RwSignal<Option<String>>,
+    force: RwSignal<bool>,
+) {
+    probing.set(true);
+    spawn_local(async move {
+        let (probe, _) = status_probe().await;
+        probing.set(false);
+        match slot_check(&probe) {
+            SlotCheck::Held(field) => {
+                slot_note.set(None);
+                busy_field.set(Some(sanitize_display_text(&field)));
+            }
+            SlotCheck::Free => {
+                if adopt_free {
+                    busy_field.set(None);
+                    slot_note.set(None);
+                    force.set(false);
+                    phase.set(Phase::NeedsPlan);
+                }
+            }
+            // Unknown is not free: the dialog stays where it is and says
+            // the read failed.
+            SlotCheck::Unknown => {
+                if adopt_free {
+                    slot_note.set(Some(SLOT_CHECK_FAILED.to_string()));
+                }
+            }
+        }
     });
 }
 
