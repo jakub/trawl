@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use duckdb::Connection;
 use duckdb::types::{TimeUnit, ValueRef};
-use trawl_core::ast::{PipeStage, Spanned};
+use trawl_core::ast::{PipeStage, Query, Spanned};
 use trawl_core::emitter::{self, EmittedQuery, SqlValue};
 use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
@@ -111,7 +111,8 @@ impl Executor {
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit_with_pins(&ast, source, pins)?;
+        let resolved = self.resolve_source(source);
+        let emitted = resolved.emit_cold(&ast, pins)?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
         let (mut result, timestamp_columns) =
             self.execute_emitted_tracked(&emitted, max_rows, sql_offset)?;
@@ -157,9 +158,10 @@ impl Executor {
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, hot_pins, pins)?;
+        let resolved = self.resolve_source(source);
+        let emitted = resolved.emit_union(&ast, hot_source, hot_pins, pins)?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
-        let mut outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset);
+        let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset);
 
         // A hot value disagreeing with a catalog pin is already conformed on
         // the union's hot branch by the emitter (TRY_CAST to NULL), and
@@ -170,31 +172,14 @@ impl Executor {
         // exist. The read-time coerced retry that used to paper over it is
         // deleted (ADR-0009 slice 2).
 
-        // `execute_emitted` maps DuckDB's "no files match the pattern" error
-        // to an empty result. For a LIST source that error also fires when a
-        // SINGLE element matches nothing — even when its siblings hold data —
-        // so an empty result never proves a cold start. The server emits one
-        // glob per hour in range and prunes only on parent-directory
-        // existence, so a sparse-traffic service routinely gets elements
-        // pointing at hour dirs holding no file of its own. Retry over just
-        // the elements that match a file, so the cold rows that do exist are
-        // never silently dropped (ADR-0008).
-        if matches!(&outcome, Ok((r, _)) if r.columns.is_empty())
-            && let Some(pruned) = self.pruned_cold_source(source)
-        {
-            let pruned_emitted =
-                emitter::emit_with_hot_source(&ast, &pruned, hot_source, hot_pins, pins)?;
-            outcome = self.execute_emitted_tracked(&pruned_emitted, max_rows, sql_offset);
-        }
-
-        // Classify the (possibly retried) outcome, then route on the pure
+        // Classify the outcome, then route on the pure
         // `cold_action` decision so the outcome policy stays unit-testable.
         let class = match &outcome {
             // Columns present → real result (possibly empty rows).
             Ok((r, _)) if !r.columns.is_empty() => HotColdOutcome::Columns,
-            // No columns: the source matched no file at all, or the prune
-            // above could not narrow it. Hot-only is safe only if a presence
-            // check confirms there is no cold data to hide.
+            // No columns: the resolved source matched no file at all. Hot-only
+            // is safe only if a presence check confirms there is no cold data
+            // to hide.
             Ok(_) => HotColdOutcome::NoColumns,
             // A binder error remapped to Emit (querying a nonexistent field)
             // — a user error, safe to keep the empty-result UX.
@@ -210,7 +195,9 @@ impl Executor {
             ColdAction::HotOnly => true,
             // Evaluated only on this path: hot-only is permitted exactly
             // when there is no cold data it could hide.
-            ColdAction::HotOnlyIfNoColdFiles => !self.cold_files_present(source),
+            ColdAction::HotOnlyIfNoColdFiles => {
+                self.cold_presence(&resolved) == ColdPresence::Absent
+            }
         };
         let (mut result, timestamp_columns) = if hot_only {
             // Hot-only keeps BOTH halves of the interpretation: the same
@@ -357,50 +344,40 @@ impl Executor {
         Ok((QueryResult { columns, rows }, timestamp_columns))
     }
 
-    /// Whether the cold source has any concrete files behind it.
+    /// Resolve a source argument against the files actually on disk — once,
+    /// before anything is read (ADR-0008).
     ///
-    /// Consulted only on the fallback path of the hot+cold outcome policy: a
-    /// hot-only read after an unexpected failure — or after a columnless
-    /// result — is permitted exactly when there is no cold data it could
-    /// hide. A plain glob is counted via
-    /// `glob(?)`; a list source (`['a', 'b']`) is counted by globbing each
-    /// element — its members are globs over hours that may hold no file yet,
-    /// so membership alone proves nothing. Errs on the side of "present" so
-    /// an unexpected failure surfaces as an error rather than degrading to
-    /// hot-only success.
-    fn cold_files_present(&self, source: &str) -> bool {
-        match glob_list_items(source) {
-            // Unparseable list → assume present (fail closed).
-            Some(items) if items.is_empty() => true,
-            Some(items) => items.iter().any(|item| self.glob_has_match(item)),
-            None => self.glob_has_match(source),
-        }
+    /// The one door onto [`resolve_list_source`], binding its matcher to this
+    /// connection's `glob()`.
+    fn resolve_source(&self, source: &str) -> ResolvedSource {
+        resolve_list_source(source, |pattern| self.glob_has_match(pattern))
     }
 
-    /// Narrow a list source (`['a', 'b']`) to the elements that match at
-    /// least one file on disk.
+    /// Whether the resolved source has any concrete files behind it.
     ///
-    /// `read_parquet` rejects the whole list when ANY element matches nothing,
-    /// so a list carrying both populated and empty hour globs — the normal
-    /// shape for a sparse-traffic service — reads as "no files" and would drop
-    /// the cold rows that do exist. Pruning the empty elements makes the read
-    /// succeed over exactly the same data.
-    ///
-    /// Returns `None` when there is nothing to prune: a plain glob, a list
-    /// this parser doesn't understand, a list where no element matches (the
-    /// genuine cold start), or one where every element already matches.
-    fn pruned_cold_source(&self, source: &str) -> Option<String> {
-        let items = glob_list_items(source)?;
-        let matching: Vec<&str> = items
-            .iter()
-            .copied()
-            .filter(|item| self.glob_has_match(item))
-            .collect();
-        if matching.is_empty() || matching.len() == items.len() {
-            return None;
+    /// Consulted only where the outcome policy's verdict actually depends on
+    /// it: a hot-only read — or an empty success — is permitted exactly when
+    /// there is no cold data it could
+    /// hide. A list source already carries its evidence from resolution, so
+    /// this costs nothing and, crucially, never re-globs: a file that matched
+    /// at resolution and vanished before the read must surface as
+    /// [`EngineError::ColdDataUnread`], not be silently re-resolved away. A
+    /// plain glob was never resolved (there is nothing to narrow), so it is
+    /// globbed lazily, here and only here. [`Executor::glob_has_match`] errs
+    /// on the side of "matches", so an unexpected failure surfaces as an
+    /// error rather than degrading to hot-only success.
+    fn cold_presence(&self, resolved: &ResolvedSource) -> ColdPresence {
+        match resolved.evidence {
+            ListEvidence::NotAList => {
+                if self.glob_has_match(&resolved.sql) {
+                    ColdPresence::Present
+                } else {
+                    ColdPresence::Absent
+                }
+            }
+            ListEvidence::Matching => ColdPresence::Present,
+            ListEvidence::NoneMatching => ColdPresence::Absent,
         }
-        let quoted: Vec<String> = matching.iter().map(|item| format!("'{item}'")).collect();
-        Some(format!("[{}]", quoted.join(", ")))
     }
 
     /// Whether `pattern` matches at least one file on disk. Errs on the side
@@ -530,17 +507,18 @@ impl Executor {
         max_rows: usize,
     ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit_with_pins(&ast, source, pins)?;
+        let resolved = self.resolve_source(source);
+        let emitted = resolved.emit_cold(&ast, pins)?;
         self.export_parquet_from_emitted(&emitted, output_path, max_rows)
     }
 
     /// Export with hot buffer union, falling back to hot-only on cold start.
     ///
-    /// Routes through the same retry and the same outcome gate as
+    /// Routes through the same resolution and the same outcome gate as
     /// [`Self::run_query_with_hot`]: the hot branch is pin-conformed by the
     /// emitter (a nonconformant corpus errors loudly — see the note in
-    /// `run_query_with_hot`), a partial list-source miss is retried over the
-    /// pruned list, and a database failure over an existing cold corpus
+    /// `run_query_with_hot`), a partial list-source miss is narrowed away
+    /// before the read, and a database failure over an existing cold corpus
     /// returns the error instead of silently exporting hot-only data
     /// (ADR-0008).
     #[allow(clippy::too_many_arguments)]
@@ -555,33 +533,15 @@ impl Executor {
         max_rows: usize,
     ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let emitted = emitter::emit_with_hot_source(&ast, source, hot_source, hot_pins, pins)?;
-        let mut outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
-
-        // Same prune retry as `run_query_with_hot`: `read_parquet` rejects a
-        // LIST source wholesale when a SINGLE element matches nothing, even
-        // when its siblings hold data. The server emits one glob per hour in
-        // range and prunes only on parent-directory existence, so a
-        // sparse-traffic service routinely gets elements pointing at hour dirs
-        // holding no file of its own. Unlike the query path — where
-        // `execute_emitted` maps the error to an empty result — the export
-        // surfaces it raw, and the hot-only arm below cannot rescue it (a
-        // matching sibling makes `cold_files_present` true). Retry over just
-        // the elements that match a file so the cold rows that do exist are
-        // exported (ADR-0008).
-        if matches!(&outcome, Err(EngineError::Database(e)) if is_no_files_error(e))
-            && let Some(pruned) = self.pruned_cold_source(source)
-        {
-            let pruned_emitted =
-                emitter::emit_with_hot_source(&ast, &pruned, hot_source, hot_pins, pins)?;
-            outcome = self.export_parquet_from_emitted(&pruned_emitted, output_path, max_rows);
-        }
+        let resolved = self.resolve_source(source);
+        let emitted = resolved.emit_union(&ast, hot_source, hot_pins, pins)?;
+        let outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
 
         match outcome {
             // No parquet files / binder-shaped failure → hot-only is only
             // permitted when there is no cold data it could hide.
             Err(EngineError::Database(_) | EngineError::Emit(_))
-                if !self.cold_files_present(source) =>
+                if self.cold_presence(&resolved) == ColdPresence::Absent =>
             {
                 // Hot-only, conformed like the union's hot branch — an
                 // export must not write JSON-inferred types where the
@@ -946,6 +906,126 @@ fn cold_action(outcome: HotColdOutcome) -> ColdAction {
     }
 }
 
+/// What a source's shape — and, for a list, the filesystem underneath it —
+/// says about the cold files behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListEvidence {
+    /// Not a list: a plain glob, or the `(subquery)` form `from saved`
+    /// builds. Nothing was globbed, so presence is unknown until asked.
+    NotAList,
+    /// A list at least one of whose elements reaches a file — and the
+    /// fail-closed home for a list shape [`glob_list_items`] cannot split,
+    /// which must never be read as "no cold data".
+    Matching,
+    /// A list no element of which reaches a file: the genuine empty window.
+    NoneMatching,
+}
+
+/// Whether the cold side of a read has files behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdPresence {
+    Present,
+    Absent,
+}
+
+/// A source argument resolved against the filesystem — once, before the
+/// read, on every lane (ADR-0008).
+///
+/// `read_parquet` rejects a whole list source when a SINGLE element matches
+/// nothing, and the server emits one glob per hour in range, so a
+/// sparse-traffic service routinely gets elements pointing at hour
+/// directories holding no file of its own. Resolution narrows the list to
+/// the elements that reach a file BEFORE the read, rather than retrying
+/// after one failed — and the evidence it gathers on the way is what the
+/// outcome policy later reads instead of globbing again.
+pub(crate) struct ResolvedSource {
+    /// The source text to emit — the original for a plain glob, an
+    /// all-matching list and an all-missing list; the narrowed list when
+    /// some but not all elements match.
+    sql: String,
+    /// What the resolution learned about the files behind it.
+    evidence: ListEvidence,
+}
+
+impl ResolvedSource {
+    /// Emit the cold-only read over this source.
+    ///
+    /// The crate's ONE call to [`emitter::emit_with_pins`]: every lane that
+    /// reads parquet reads a source that has been resolved.
+    fn emit_cold(
+        &self,
+        query: &Query,
+        pins: &FieldTypes,
+    ) -> Result<EmittedQuery, emitter::EmitError> {
+        emitter::emit_with_pins(query, &self.sql, pins)
+    }
+
+    /// Emit the hot+cold union read over this source.
+    ///
+    /// The crate's ONE call to [`emitter::emit_with_hot_source`], for the
+    /// same reason as [`Self::emit_cold`]. (`emit_hot_only` stays a free
+    /// call — it reads no cold source at all.)
+    fn emit_union(
+        &self,
+        query: &Query,
+        hot_source: &str,
+        hot_pins: &FieldTypes,
+        pins: &FieldTypes,
+    ) -> Result<EmittedQuery, emitter::EmitError> {
+        emitter::emit_with_hot_source(query, &self.sql, hot_source, hot_pins, pins)
+    }
+}
+
+/// Resolve `source` against a file matcher — the ONE owner of list-source
+/// resolution semantics.
+///
+/// The matcher is injected so the semantics are unit-testable without a live
+/// `DuckDB` connection; [`Executor::resolve_source`] binds it to `glob()`.
+///
+/// List elements are retained VERBATIM in their original order, duplicates
+/// included, and never expanded to concrete filenames: the narrowed source
+/// must reach exactly the data the original reached, and a glob expanded at
+/// resolution time would freeze a file list that compaction is still
+/// appending to.
+fn resolve_list_source(source: &str, matches: impl Fn(&str) -> bool) -> ResolvedSource {
+    let Some(items) = glob_list_items(source) else {
+        return ResolvedSource {
+            sql: source.to_owned(),
+            evidence: ListEvidence::NotAList,
+        };
+    };
+    if items.is_empty() {
+        // List-shaped but unparseable: nothing to narrow, and the evidence
+        // must not read as "no cold data" (fail closed).
+        return ResolvedSource {
+            sql: source.to_owned(),
+            evidence: ListEvidence::Matching,
+        };
+    }
+
+    let matching: Vec<&str> = items.iter().copied().filter(|item| matches(item)).collect();
+    if matching.is_empty() {
+        // The genuine empty window: the original stands, and the read's
+        // "no files" answer is the truth.
+        return ResolvedSource {
+            sql: source.to_owned(),
+            evidence: ListEvidence::NoneMatching,
+        };
+    }
+    if matching.len() == items.len() {
+        return ResolvedSource {
+            sql: source.to_owned(),
+            evidence: ListEvidence::Matching,
+        };
+    }
+
+    let quoted: Vec<String> = matching.iter().map(|item| format!("'{item}'")).collect();
+    ResolvedSource {
+        sql: format!("[{}]", quoted.join(", ")),
+        evidence: ListEvidence::Matching,
+    }
+}
+
 /// Split a `DuckDB` list-of-globs source (`['a', 'b']`, as built by the
 /// server's source resolver) into its quoted elements.
 ///
@@ -1266,8 +1346,8 @@ mod tests {
     use duckdb::Connection;
 
     use super::{
-        ColdAction, EngineError, Executor, FieldTypes, HotColdOutcome, cold_action, error_class,
-        glob_list_items, is_conversion_error,
+        ColdAction, ColdPresence, EngineError, Executor, FieldTypes, HotColdOutcome, ListEvidence,
+        cold_action, error_class, glob_list_items, is_conversion_error, resolve_list_source,
     };
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
@@ -1789,27 +1869,135 @@ mod tests {
     }
 
     #[test]
-    fn cold_files_present_globs_list_elements() {
+    fn cold_presence_reads_resolved_list_evidence() {
         // A list source is not "present by construction": the server emits a
         // list of per-hour globs for essentially every time-filtered query,
         // and an hour directory can exist while holding no parquet yet.
+        // Resolution is what settles it, and `cold_presence` reads that
+        // evidence rather than globbing again.
         let dir = tempfile::tempdir().unwrap();
         let empty_hour = dir.path().join("10");
         std::fs::create_dir_all(&empty_hour).unwrap();
         let exec = Executor::new().unwrap();
 
         let absent = format!("['{}/*.parquet']", empty_hour.display());
-        assert!(
-            !exec.cold_files_present(&absent),
+        let resolved = exec.resolve_source(&absent);
+        assert_eq!(
+            resolved.evidence,
+            ListEvidence::NoneMatching,
+            "a list whose globs match no file resolves to no evidence of files"
+        );
+        assert_eq!(
+            exec.cold_presence(&resolved),
+            ColdPresence::Absent,
             "a list whose globs match no file must report no cold files"
         );
 
         let setup = Connection::open_in_memory().unwrap();
         write_meta_parquet(&setup, &empty_hour.join("cold.parquet"), "'plain'");
-        assert!(
-            exec.cold_files_present(&absent),
+        let resolved = exec.resolve_source(&absent);
+        assert_eq!(
+            resolved.evidence,
+            ListEvidence::Matching,
+            "a list whose globs match a file resolves to matching evidence"
+        );
+        assert_eq!(
+            exec.cold_presence(&resolved),
+            ColdPresence::Present,
             "a list whose globs match a file must report cold files present"
         );
+    }
+
+    #[test]
+    fn plain_glob_resolves_lazily_and_is_globbed_on_demand() {
+        // A plain glob has nothing to narrow, so resolution neither globs nor
+        // rewrites it — presence is answered later, and only if the outcome
+        // policy asks.
+        let dir = tempfile::tempdir().unwrap();
+        let exec = Executor::new().unwrap();
+        let glob = format!("{}/*.parquet", dir.path().display());
+
+        let resolved = exec.resolve_source(&glob);
+        assert_eq!(resolved.evidence, ListEvidence::NotAList);
+        assert_eq!(
+            resolved.sql, glob,
+            "a plain glob is passed through verbatim"
+        );
+        assert_eq!(exec.cold_presence(&resolved), ColdPresence::Absent);
+
+        let setup = Connection::open_in_memory().unwrap();
+        write_meta_parquet(&setup, &dir.path().join("cold.parquet"), "'plain'");
+        assert_eq!(
+            exec.cold_presence(&exec.resolve_source(&glob)),
+            ColdPresence::Present
+        );
+    }
+
+    #[test]
+    fn subquery_source_is_never_a_list() {
+        // `from saved` builds a `(SELECT ...)` source. It is not list-shaped,
+        // so resolution passes it through untouched — no globbing, no
+        // rewriting.
+        let source = "(SELECT * FROM read_parquet('/data/**/*.parquet'))";
+        let resolved = resolve_list_source(source, |_| panic!("must not glob a subquery source"));
+        assert_eq!(resolved.evidence, ListEvidence::NotAList);
+        assert_eq!(resolved.sql, source);
+    }
+
+    #[test]
+    fn resolve_list_source_narrows_to_matching_elements() {
+        // The everyday `service=X last=Nh` shape: some hour globs reach the
+        // service's file, some reach an hour directory another service wrote.
+        let source = "['/a/*.parquet', '/b/*.parquet', '/c/*.parquet']";
+        let resolved = resolve_list_source(source, |item| item != "/b/*.parquet");
+        assert_eq!(resolved.evidence, ListEvidence::Matching);
+        assert_eq!(resolved.sql, "['/a/*.parquet', '/c/*.parquet']");
+    }
+
+    #[test]
+    fn resolve_list_source_preserves_order_and_duplicates() {
+        // Elements are kept VERBATIM, in the original order, duplicates
+        // included: the narrowed source must reach exactly what the original
+        // reached, and never a set of concrete filenames.
+        let source = "['/z/*.parquet', '/a/*.parquet', '/z/*.parquet', '/m/*.parquet']";
+        let resolved = resolve_list_source(source, |item| item != "/m/*.parquet");
+        assert_eq!(
+            resolved.sql,
+            "['/z/*.parquet', '/a/*.parquet', '/z/*.parquet']"
+        );
+    }
+
+    #[test]
+    fn resolve_list_source_keeps_the_original_when_nothing_is_narrowed() {
+        // All matching and none matching both leave the source text alone —
+        // only the evidence differs, and only that distinguishes an empty
+        // window from a read that must not answer empty.
+        let source = "['/a/*.parquet', '/b/*.parquet']";
+
+        let all = resolve_list_source(source, |_| true);
+        assert_eq!(all.evidence, ListEvidence::Matching);
+        assert_eq!(all.sql, source);
+
+        let none = resolve_list_source(source, |_| false);
+        assert_eq!(none.evidence, ListEvidence::NoneMatching);
+        assert_eq!(none.sql, source);
+    }
+
+    #[test]
+    fn resolve_list_source_fails_closed_on_an_unparseable_list() {
+        // A list shape the splitter doesn't understand must never read as
+        // "no cold data" — that is exactly the silent drop ADR-0008 forbids.
+        for source in ["['/a/*.parquet", "['/a/*.parquet]", "[]"] {
+            let resolved = resolve_list_source(source, |_| {
+                panic!("an unparseable list must not be globbed")
+            });
+            assert_eq!(
+                resolved.evidence,
+                ListEvidence::Matching,
+                "unparseable list `{source}` must fail closed"
+            );
+            assert_eq!(resolved.sql, source, "and must be emitted verbatim");
+        }
     }
 
     #[test]
