@@ -139,8 +139,9 @@ fn no_match_source(base: &str, file_pattern: &str) -> String {
 }
 
 /// Time-scoped globs for one env root: hour-level for today, day-level
-/// and/or hour-level for historical dates, existence-filtered. Returns
-/// an empty vec when nothing on disk matches the window.
+/// and/or hour-level for historical dates, existence-filtered — by full
+/// path when the service pins the filename, by parent directory for the
+/// wildcard. Returns an empty vec when nothing on disk matches the window.
 fn time_scoped_globs(
     base: &str,
     duration: trawl_core::ast::TrawlDuration,
@@ -199,19 +200,31 @@ fn time_scoped_globs(
         }
     }
 
-    // Filter out globs whose parent directory doesn't exist on disk.
-    // This avoids sending DuckDB a list of entirely nonexistent paths,
-    // which would trigger a "No files found" error before the executor
-    // safety net catches it.
+    // Drop the elements that cannot reach a file. `read_parquet` rejects a
+    // whole list when a SINGLE element matches nothing, so every element
+    // that survives here is one the executor would otherwise have to resolve
+    // away — and for a service-pinned query the parent directory proves
+    // nothing: hour dirs are created by whichever service compacted first,
+    // so a sparse-traffic service's list is mostly siblings' hours.
+    //
+    // A service-pinned `file_pattern` is a literal filename, so it can be
+    // stat'ed directly. The wildcard pattern cannot (a directory listing per
+    // hour would cost more than it saves), so it keeps the parent-dir check.
+    // Pruning is advisory either way — the executor's resolution is the
+    // guarantee — so a metadata error RETAINS the element rather than
+    // dropping data on an unreadable stat.
+    let service_pinned = file_pattern != "*.parquet";
     globs
         .into_iter()
         .filter(|g| {
             // globs are formatted as 'path/to/file_pattern' — strip quotes
-            // and check the parent dir.
-            let path = g.trim_matches('\'');
-            std::path::Path::new(path)
-                .parent()
-                .is_some_and(std::path::Path::exists)
+            // and check the path.
+            let path = std::path::Path::new(g.trim_matches('\''));
+            if service_pinned {
+                path.try_exists().unwrap_or(true)
+            } else {
+                path.parent().is_some_and(std::path::Path::exists)
+            }
         })
         .collect()
 }
@@ -821,6 +834,64 @@ mod tests {
                 "invalid service must not escape the data root, got: {source}"
             );
         }
+    }
+
+    #[test]
+    fn service_scoped_globs_skip_hours_another_service_owns() {
+        // The shape behind #73: two services share the same hour directories,
+        // and only one of them wrote a file in each. A parent-directory check
+        // keeps every hour, so the list names files nginx never wrote —
+        // `read_parquet` then rejects the WHOLE list. Stat the literal
+        // filename instead, so no element names a missing file.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let now = chrono::Utc::now();
+
+        for h_offset in 0..=3 {
+            let dt = now - chrono::Duration::hours(h_offset);
+            let date = dt.format("%Y-%m-%d").to_string();
+            let hour = dt.format("%H").to_string();
+            let hour_dir = tmp.path().join("prod").join(&date).join(&hour);
+            std::fs::create_dir_all(&hour_dir).unwrap();
+            // nginx only compacted into the two OLDEST hours; postgres owns
+            // the rest of the directories.
+            let owner = if h_offset >= 2 { "nginx" } else { "postgres" };
+            std::fs::write(hour_dir.join(format!("{owner}.parquet")), b"data").unwrap();
+        }
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "service=nginx last=1h", &fallback);
+
+        for element in source.trim_matches(['[', ']']).split(", ") {
+            let path = element.trim_matches('\'');
+            assert!(
+                std::path::Path::new(path).exists(),
+                "no list element may name a file nginx never wrote: {path} (from {source})"
+            );
+        }
+        assert!(
+            source.contains("nginx.parquet"),
+            "the hours nginx did write must survive, got: {source}"
+        );
+    }
+
+    #[test]
+    fn wildcard_globs_keep_the_parent_directory_check() {
+        // The wildcard pattern is not a filename, so it cannot be stat'ed —
+        // an existing hour directory keeps its glob whatever it holds.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let now = chrono::Utc::now();
+        let date = now.format("%Y-%m-%d").to_string();
+        let hour = now.format("%H").to_string();
+        std::fs::create_dir_all(tmp.path().join("prod").join(&date).join(&hour)).unwrap();
+
+        let fallback = format!("{base}/**/*.parquet");
+        let source = compute_source(base, "last=1h", &fallback);
+        assert!(
+            source.contains(&format!("{base}/prod/{date}/{hour}/*.parquet")),
+            "an existing hour dir must keep its wildcard glob, got: {source}"
+        );
     }
 
     #[test]
