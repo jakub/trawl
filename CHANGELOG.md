@@ -100,6 +100,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   in flight. This retires the documented stop-trawld-and-do-surgery
   escape hatch.
 
+### Fixed
+- **`service=X last=Nh` no longer answers 200 with zero rows over an idle
+  hot buffer (#73).** A time-filtered query becomes a *list* source — one
+  glob per hour in range — and `read_parquet` rejects the whole list when
+  a SINGLE element matches nothing. Hour directories are created by
+  whichever service compacted into them first, so on any install running
+  more than one service the list named files the queried service never
+  wrote. Two of the four read lanes carried a post-failure retry for
+  that; `run_query` and `export_parquet` carried none, so the moment the
+  hot buffer was empty — an idle minute is enough — the query returned an
+  empty success and the export a 500. List-source resolution is now a
+  property of the source, settled once before the read on every lane, and
+  the planner stats the file rather than its parent directory when the
+  service pins the filename. Two visible consequences: some answers that
+  were silently empty are now a retryable 503 `cold_data_unread` (the
+  read could not reach files the source still points at — retry), and an
+  export that raced a file move returns that 503 instead of a 500. A
+  genuinely empty time window still answers 200 with zero rows, and an
+  export over one still surfaces the underlying error — there is no empty
+  parquet for it to write.
+
 ### Changed — behavior
 - **`| where` and `| let` comparisons follow the field catalog's pins
   (ADR-0011 slice A′, #66).** Bare field-vs-literal comparisons in the

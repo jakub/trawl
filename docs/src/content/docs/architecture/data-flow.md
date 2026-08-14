@@ -216,7 +216,9 @@ A pool of N connections (default: `num_cpus`) sharing one in-memory DuckDB datab
 
 ### Source computation
 
-`compute_source()` narrows the parquet glob by time filter + service filter using filesystem `stat()`. Adds 1-hour padding for compaction lag. Handles both hourly and daily partition layouts. When no parquet files exist, queries fall back to the hot buffer only.
+`compute_source()` narrows the parquet glob by time filter + service filter using filesystem `stat()`. Adds 1-hour padding for compaction lag. Handles both hourly and daily partition layouts. When no parquet files exist, queries fall back to the hot buffer only. A time filter turns the source into a *list* — one glob per hour in range — and when the service pins the filename each element is checked as a full path, not by its parent directory: hour directories are created by whichever service compacted into them first, so the parent proves nothing about the service being queried.
+
+That check is an optimization. The guarantee is one level down: **the executor resolves a list source against the filesystem once, before the read**, narrowing it to the elements that reach a file. `read_parquet` rejects a whole list when a *single* element matches nothing, so an unresolved list is unreadable whenever any hour in range holds no file of its own — the everyday shape for a sparse-traffic service. Resolution happens on every read lane, and the evidence it gathers (did anything match?) is what the outcome policy below consults, rather than globbing a second time after a failure: a file that was there at resolution and gone at read time is a race, and must not be quietly re-resolved away.
 
 ### Hot buffer integration
 
@@ -226,7 +228,9 @@ Field-name casing cannot split a hot column, because it is resolved before anyth
 
 There is no read-time reconciliation beyond that: a type conflict surviving to execution means a corpus the catalog does not govern (foreign parquet dropped in post-boot, a restore against a stale catalog) and returns a loud error instead of a silently degraded result.
 
-A hot-only fallback is permitted only when it cannot hide cold data: on a genuine cold start (the glob matches no parquet files) or a missing-column user error. Any other database failure with cold files present returns an error — a cold-data drop is never a silent HTTP 200 (ADR-0008).
+A hot-only fallback is permitted only when it cannot hide cold data: on a genuine cold start (the source reaches no parquet files) or a missing-column user error. Any other database failure with cold files present returns an error — a cold-data drop is never a silent HTTP 200 (ADR-0008).
+
+**The gate is lane-independent.** All four read lanes — query and parquet export, each with and without a hot buffer — classify their outcome the same way and route it through the same decision table, so a query running with an empty hot buffer answers exactly as one running with a full one. That matters more than it sounds: an empty hot buffer takes the *no-hot* code path, which is the state any install reaches after an idle minute. A read that answers "no files" while its source still reaches files on disk returns a retryable `503 cold_data_unread` on every lane, never an empty success. A source that genuinely reaches nothing is the one shape where an empty answer is the truth: a query returns zero rows, and an export surfaces the underlying error, because there is no empty result for it to write.
 
 ## SSE streaming
 
