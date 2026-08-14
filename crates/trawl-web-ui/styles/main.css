@@ -1190,7 +1190,13 @@
 .sf-row:hover { background: var(--panel-2); }
 .sf-row.open { background: var(--accent-wash); }
 .sf-row .caret { display: inline-block; width: 12px; color: var(--ink-3); margin-right: 4px; }
-.sf-row .c-name { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The name cell must be a shrinkable flex container: `.c-name` is an inline
+ * span, so its ellipsis only engages once the cell itself can shrink below
+ * the grid track (min-width: 0) — otherwise a long field name wraps under
+ * the type chip instead of truncating. */
+.sf-row > div:first-child { display: flex; align-items: center; min-width: 0; }
+.sf-row .caret, .sf-row .deg-btn { flex: none; }
+.sf-row .c-name { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .sf-row .c-card, .sf-row .c-size { color: var(--ink-2); text-align: right; }
 .sf-row .c-sample { color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sf-row .c-cov { display: flex; align-items: center; gap: 6px; }
