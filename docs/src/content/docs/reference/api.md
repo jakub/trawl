@@ -298,8 +298,10 @@ schema-refresh tick's in-process snapshot, so freshness is bounded by one
 tick and no request-path query touches the aggregates.
 
 ```json
-{ "service": "nginx", "columns": [], "file_count": 12,
-  "degraded_fields": ["duration"] }
+{ "services": [
+    { "name": "nginx", "columns": [], "file_count": 12,
+      "degraded_fields": ["duration"] }
+  ] }
 ```
 
 ```

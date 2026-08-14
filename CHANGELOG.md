@@ -13,10 +13,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   top-level view. `GET /api/v1/schema/services` gains a per-service
   `degraded_fields` list (absent when empty, so an older server and a
   healthy install are indistinguishable), loaded beside the degraded set
-  in the schema tick's one postgres read and stamped from that
-  in-process snapshot — it names the fields a service has **actually
-  conflicted on**, which is not a client-computable join: carrying a
-  degraded field's column is not evidence of having degraded it. Service
+  on the schema tick and stamped from that in-process snapshot — a
+  healthy install pays one probe query and opens no transaction, and
+  only an install that HAS a degraded pin pays the additional
+  `REPEATABLE READ` re-read that loads both evidence halves coherently
+  (a clear landing between two snapshots would publish a degraded field
+  with no services attributed to it). It names the fields a service has
+  **actually conflicted on**, which is not a client-computable join:
+  carrying a degraded field's column is not evidence of having degraded
+  it. Service
   rows and the service drawer's fields tab badge from that list, and a
   badged field drills into the **field case file** — `?field=` on
   `/search/schema`, a working deep link with no service context —
