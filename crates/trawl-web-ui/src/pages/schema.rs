@@ -35,6 +35,10 @@ use trawl_api::ServiceSchema;
 use wasm_bindgen::JsCast as _;
 
 use crate::api;
+// One URL query-parameter value. A service name's charset is narrow but
+// a catalog field name is any ASCII-folded client JSON key — shared with
+// the query notice's case-file links so both encode a name identically.
+use crate::components::enc_uri as enc;
 use crate::components::field_case_drawer::FieldCaseDrawer;
 use crate::components::service_card_fmt::{
     avg_cov_permille, degraded_count, format_avg_coverage, format_bytes, format_count, is_healthy,
@@ -55,14 +59,6 @@ const SPARK_DAYS: usize = 30;
 /// The page heading's element id — the focus target when the case file
 /// closes outright (nothing is left on screen to return focus to).
 const HEADING_ID: &str = "schema-heading";
-
-/// One URL query-parameter value. A service name's charset is narrow but
-/// a catalog field name is any ASCII-folded client JSON key.
-fn enc(raw: &str) -> String {
-    js_sys::encode_uri_component(raw)
-        .as_string()
-        .unwrap_or_else(|| raw.to_string())
-}
 
 /// Move keyboard focus to `id` on the next frame — after the swap this
 /// call is part of has actually rendered.

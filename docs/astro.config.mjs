@@ -35,6 +35,7 @@ export default defineConfig({
             { slug: 'reference/dsl' },
             { slug: 'reference/cli' },
             { slug: 'reference/api' },
+            { slug: 'reference/web-ui' },
             { slug: 'reference/configuration' },
             { slug: 'reference/fleet-auth-cutover' },
           ],

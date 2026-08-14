@@ -541,6 +541,41 @@
 .tabs .action:hover { color: var(--ink); background: var(--panel-2); }
 
 /* ─────────────────────────────────────────────────────────────────
+ *  Incomplete-results notice (ADR-0011 C2) — one warn-toned line
+ *  between the tab strip and the results body. The .deg-live wrapper
+ *  is the persistent aria-live region and carries no box of its own,
+ *  so it collapses to nothing while the notice is absent or dismissed.
+ * ─────────────────────────────────────────────────────────────── */
+.deg-live { flex-shrink: 0; }
+.deg-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 7px 14px;
+  background: var(--yellow-wash);
+  border-bottom: 1px solid var(--line);
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.deg-notice .deg-text { flex: 1; min-width: 0; }
+.deg-notice .mono { font-family: var(--font-mono); color: var(--ink); }
+.deg-notice a.link { font-family: var(--font-mono); font-size: inherit; }
+.deg-x {
+  background: none;
+  border: 0;
+  padding: 0 4px;
+  cursor: pointer;
+  color: var(--ink-3);
+  font-size: var(--fs-ui);
+  line-height: 1.4;
+  border-radius: var(--radius-sm);
+}
+.deg-x:hover { color: var(--ink); background: var(--panel-2); }
+.deg-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ─────────────────────────────────────────────────────────────────
  *  Histogram — 78px strip on Events
  * ─────────────────────────────────────────────────────────────── */
 .histo {

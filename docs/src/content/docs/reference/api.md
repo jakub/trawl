@@ -87,7 +87,9 @@ then projected away are included: that is exactly the incomplete case.
 The key is **absent when empty**, which is the ordinary case. Freshness is
 bounded by one schema-refresh tick (`schema_cache_ttl_secs`, default 60s).
 The SSE stream carries no notice, and embedded `--data` mode has no
-catalog to consult.
+catalog to consult. `trawl query -f table` prints it as a footer line and
+the [web UI](/reference/web-ui/#the-incomplete-results-notice) renders it
+as a dismissible notice over the results.
 
 ```json
 { "columns": [], "rows": [], "truncated": false,
@@ -283,6 +285,22 @@ Rich per-service schema (per-column null counts, min/max, sizes, daily
 volumes) from the background footer scan. Types come from the catalog's
 in-process pin cache; a physically-present column with no pin (foreign or
 boot-skipped parquet) reports the sentinel type `UNPINNED`.
+
+Each service also carries `degraded_fields` — the degraded pins **this
+service has actually conflicted on**, from the durable per-`(field,
+service)` conflict aggregates. It is not a client-computable join:
+carrying a degraded field's column is not evidence that this service is
+what degraded it, so a service that only ever sent well-typed values for
+`duration` is not listed under it. The key is **absent when empty** (the
+ordinary case) and a server that predates it is indistinguishable from a
+healthy install. Like the query notice, it is stamped from the
+schema-refresh tick's in-process snapshot, so freshness is bounded by one
+tick and no request-path query touches the aggregates.
+
+```json
+{ "service": "nginx", "columns": [], "file_count": 12,
+  "degraded_fields": ["duration"] }
+```
 
 ```
 GET /api/v1/schema/values/{field}

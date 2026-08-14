@@ -8,6 +8,7 @@
 // their tests run under plain `cargo test` on native.
 mod facets;
 mod histogram;
+mod notice_key;
 mod offset;
 mod perms;
 mod query_merge;

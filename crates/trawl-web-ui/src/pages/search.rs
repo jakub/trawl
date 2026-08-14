@@ -8,6 +8,7 @@
 //! editor wrap (header + `DslEditor` + date range + run button)
 //! → meta strip (filter chips — hidden while empty)
 //! → tabs (Events / Visualization · trailing Save/Export actions)
+//! → degraded-field notice (hidden unless the execution reported one)
 //! → tab body (Events: histogram + results table | Visualization: chart)
 //!
 //! State split:
@@ -21,6 +22,7 @@ use leptos::prelude::*;
 use trawl_api::value::QueryResult;
 
 use crate::components::chart::Chart;
+use crate::components::degraded_notice::DegradedNotice;
 use crate::components::editor_wrap::EditorWrap;
 use crate::components::export_modal::ExportModal;
 use crate::components::facet_sidebar::FacetSidebar;
@@ -311,6 +313,23 @@ pub fn Search() -> impl IntoView {
             .map(|r| r.pagination.returned)
     });
 
+    // The degraded fields THIS execution reported (ADR-0011 slice C2).
+    // Read off the response, never re-derived and never refreshed from
+    // the catalog: it describes the answer already on screen.
+    //
+    // Empty in live mode by construction — the snapshot resource keeps
+    // running behind the live tail, and SSE carries no notice (a named
+    // C1 residual), so a stale snapshot's fields must not be shown over
+    // streamed rows.
+    let degraded_fields = Signal::derive(move || {
+        if mode.get() == Mode::Live {
+            return Vec::new();
+        }
+        rows.get()
+            .and_then(Result::ok)
+            .map_or_else(Vec::new, |r| r.degraded_fields.clone())
+    });
+
     let show_save_modal = RwSignal::new(false);
     let on_save = Callback::new(move |()| show_save_modal.set(true));
     let show_export_modal = RwSignal::new(false);
@@ -365,6 +384,11 @@ pub fn Search() -> impl IntoView {
                         >"Export"</span>
                     }.into_any())
                 />
+                // Above the results BODY, not inside it: a zero-row
+                // answer is exactly when "some values are missing" is
+                // worth reading, and the Visualization tab is drawn from
+                // the same incomplete rows.
+                <DegradedNotice query=effective_q fields=degraded_fields/>
                 {move || match (active_tab.get(), mode.get()) {
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>
