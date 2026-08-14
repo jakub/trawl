@@ -88,6 +88,21 @@ pub struct ServiceObservation {
     pub row_count: i64,
 }
 
+/// One `(field, service)` pair carrying durable conflict evidence — a
+/// `field_conflict_stats` key, stripped of its counters
+/// ([`CatalogStore::conflict_service_pairs`], ADR-0011 slice C2).
+///
+/// The counters are deliberately absent: the degraded VERDICT is per field
+/// (the pin is global), so all this row contributes is attribution — which
+/// sender's data the evidence came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictServicePair {
+    /// Field name (a catalog key).
+    pub field: String,
+    /// Service whose batches contributed the conflict evidence.
+    pub service: String,
+}
+
 /// A `field_services` observation row.
 #[derive(Debug, Clone)]
 pub struct FieldServiceRow {
@@ -1068,6 +1083,53 @@ impl CatalogStore {
                     services: row.try_get("services")?,
                     episodes: row.try_get("episodes")?,
                     rows_nulled_total: row.try_get("rows_nulled_total")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::from)
+    }
+
+    /// [`Self::conflict_service_pairs`]: keyed on BOTH axes, so neither can
+    /// widen the scan into the whole table.
+    const CONFLICT_SERVICE_PAIRS_SQL: &'static str = "\
+        SELECT field, service
+        FROM field_conflict_stats
+        WHERE field = ANY($1) AND service = ANY($2)
+        ORDER BY field, service";
+
+    /// Which services actually conflicted on each of `fields` — the input
+    /// `/api/v1/schema/services` badges a service from (ADR-0011 slice C2).
+    ///
+    /// Keyed on both the (pin-capped, usually EMPTY) degraded set and the
+    /// currently renderable service names, so the result is bounded by
+    /// |degraded| × |services the schema cache can render| and the SERVICE
+    /// axis — client-chosen and never pruned — cannot widen the scan.
+    /// An empty input on EITHER axis short-circuits: a healthy install pays
+    /// no query at all, which is what keeps the refresh tick's postgres cost
+    /// at the one read C1 shipped.
+    ///
+    /// Deliberately NOT a per-service degraded verdict: the analyzer judges
+    /// a pin globally ([`crate::catalog::analyzer::ConflictAggregate`] is
+    /// per field), and these rows only say WHICH senders contributed the
+    /// evidence.
+    pub async fn conflict_service_pairs(
+        &self,
+        fields: &[String],
+        visible_services: &[String],
+    ) -> Result<Vec<ConflictServicePair>, StoreError> {
+        if fields.is_empty() || visible_services.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(Self::CONFLICT_SERVICE_PAIRS_SQL)
+            .bind(fields)
+            .bind(visible_services)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(ConflictServicePair {
+                    field: row.try_get("field")?,
+                    service: row.try_get("service")?,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()

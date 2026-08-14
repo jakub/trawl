@@ -562,6 +562,7 @@ mod tests {
                 total_bytes: 1024,
                 total_events: 100,
                 daily_event_counts: Vec::new(),
+                degraded_fields: Vec::new(),
             },
             trawl_api::ServiceSchema {
                 name: "trawld".into(),
@@ -572,6 +573,7 @@ mod tests {
                 total_bytes: 512,
                 total_events: 50,
                 daily_event_counts: Vec::new(),
+                degraded_fields: Vec::new(),
             },
         ])
     }

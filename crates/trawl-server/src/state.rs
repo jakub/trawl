@@ -4,7 +4,7 @@
 
 //! Shared application state for axum handlers.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -102,15 +102,17 @@ pub struct QueryState {
     /// boot from `field_types`, refreshed by compaction after every
     /// `pin_missing` — the query path never touches postgres for pins.
     pub field_catalog: Arc<crate::catalog::FieldCatalog>,
-    /// Fields the analyzer currently calls degraded (ADR-0011 slice C1),
+    /// What the analyzer currently calls degraded (ADR-0011 slices C1/C2),
     /// reloaded on the schema-refresh tick.
     ///
-    /// The query path stamps `QueryResponse.degraded_fields` from this set
-    /// and may not reach postgres to do it, so the whole set is swapped in
-    /// as one `Arc` — a reader clones the handle under the lock and walks it
-    /// outside. Staleness is bounded by one refresh tick, which is nothing
-    /// against a condition measured in days.
-    pub degraded_fields: Arc<Mutex<Arc<BTreeSet<String>>>>,
+    /// Two request paths stamp from it — `QueryResponse.degraded_fields`
+    /// (the notice) and `ServiceSchema.degraded_fields` (the badge) — and
+    /// neither may reach postgres to do it, so the whole
+    /// [`DegradedSnapshot`] is swapped in as one `Arc`: a reader clones the
+    /// handle under the lock and walks it outside, and the two halves can
+    /// never be read from different generations. Staleness is bounded by one
+    /// refresh tick, which is nothing against a condition measured in days.
+    pub degraded_fields: Arc<Mutex<Arc<DegradedSnapshot>>>,
     /// Semaphore bounding concurrent SSE streaming connections.
     pub sse_semaphore: Arc<Semaphore>,
     /// Semaphore bounding concurrent admin dashboard-stats streams.
@@ -397,6 +399,67 @@ pub struct CachedServiceSchema {
     pub cached_at: Instant,
 }
 
+/// One generation of the degraded-field picture: the fields the analyzer
+/// indicts, plus which senders' data indicted them (ADR-0011 slices C1/C2).
+///
+/// Built and swapped as a whole by
+/// [`crate::schema_refresh::refresh_degraded_fields`] and read nowhere else
+/// — both halves come from one pair of postgres reads, so the badge can
+/// never name a field the notice does not, nor the reverse.
+///
+/// `by_service` is keyed BY `fields` at construction (a pair naming a field
+/// outside the set is dropped), which is the invariant that makes the two
+/// halves one fact rather than two caches that agree by luck.
+#[derive(Debug, Default)]
+pub struct DegradedSnapshot {
+    /// Every degraded field, install-wide — the set the query notice's
+    /// membership test runs against.
+    pub fields: BTreeSet<String>,
+    /// Service → the degraded fields THAT service actually conflicted on.
+    ///
+    /// Private: the only sanctioned read is [`Self::services_of`]. A caller
+    /// holding the map could join it the wrong way round — badging every
+    /// service that merely CARRIES a degraded column — which is precisely
+    /// the false positive this whole snapshot exists to prevent.
+    by_service: BTreeMap<String, Vec<String>>,
+}
+
+impl DegradedSnapshot {
+    /// Build a generation from the degraded set and the `(field, service)`
+    /// evidence pairs.
+    ///
+    /// Pairs are grouped by service, sorted and deduplicated; a pair whose
+    /// field is not in `fields` is dropped rather than trusted — the store
+    /// read is keyed on the set, so such a row can only mean the two reads
+    /// straddled a repin's evidence clear.
+    #[must_use]
+    pub fn new(
+        fields: BTreeSet<String>,
+        pairs: impl IntoIterator<Item = crate::store::ConflictServicePair>,
+    ) -> Self {
+        let mut by_service: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for pair in pairs {
+            if fields.contains(&pair.field) {
+                by_service.entry(pair.service).or_default().push(pair.field);
+            }
+        }
+        for services in by_service.values_mut() {
+            services.sort();
+            services.dedup();
+        }
+        Self { fields, by_service }
+    }
+
+    /// The degraded fields `service` has actually conflicted on, sorted.
+    ///
+    /// Empty for a service that merely carries a degraded field's column
+    /// without ever having disagreed with its pin — the whole point.
+    #[must_use]
+    pub fn services_of(&self, service: &str) -> Vec<String> {
+        self.by_service.get(service).cloned().unwrap_or_default()
+    }
+}
+
 /// Build [`AuthState`]: connect the fleet keystore (eagerly) and wrap it as
 /// a bearer-only [`fleet_auth::BearerState`].
 async fn build_auth_state(config: &Config) -> Result<AuthState, crate::error::ServerError> {
@@ -534,7 +597,7 @@ impl AppState {
                 schema_columns_cache: Arc::new(tokio::sync::Mutex::new([None, None])),
                 field_values_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 field_catalog,
-                degraded_fields: Arc::new(Mutex::new(Arc::new(BTreeSet::new()))),
+                degraded_fields: Arc::new(Mutex::new(Arc::new(DegradedSnapshot::default()))),
                 hot_buffer,
                 service_schema_cache: Arc::new(Mutex::new(None)),
                 sse_semaphore: Arc::new(Semaphore::new(config.server.max_sse_connections)),
@@ -601,5 +664,90 @@ impl AppState {
         };
 
         Ok((state, http))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::ConflictServicePair;
+
+    fn pair(field: &str, service: &str) -> ConflictServicePair {
+        ConflictServicePair {
+            field: field.to_owned(),
+            service: service.to_owned(),
+        }
+    }
+
+    fn fields(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    /// The construction invariant the whole snapshot rests on: `by_service`
+    /// is keyed BY `fields`, so no service can ever be badged for a field
+    /// the notice does not also call degraded. A pair naming a field outside
+    /// the set — what a repin clearing evidence between the two reads
+    /// produces — is dropped, not trusted.
+    #[test]
+    fn by_service_never_names_a_field_outside_the_set() {
+        let snapshot = DegradedSnapshot::new(
+            fields(&["duration"]),
+            vec![
+                pair("duration", "svc-a"),
+                pair("status", "svc-a"),
+                pair("status", "svc-b"),
+            ],
+        );
+
+        for (service, named) in &snapshot.by_service {
+            for field in named {
+                assert!(
+                    snapshot.fields.contains(field),
+                    "{service} badged for {field}, which is not degraded"
+                );
+            }
+        }
+        assert_eq!(snapshot.services_of("svc-a"), vec!["duration".to_owned()]);
+        assert!(
+            snapshot.services_of("svc-b").is_empty(),
+            "a service whose only evidence is for an undegraded field is not badged"
+        );
+    }
+
+    /// Per-service lists are sorted and deduplicated: `field_conflict_stats`
+    /// is keyed on `(field, service)` so duplicates cannot arise today, but
+    /// the badge's ORDER is a rendered wire fact and must not depend on the
+    /// row order postgres happened to return.
+    #[test]
+    fn services_of_is_sorted_and_deduplicated() {
+        let snapshot = DegradedSnapshot::new(
+            fields(&["duration", "status", "bytes"]),
+            vec![
+                pair("status", "svc-a"),
+                pair("bytes", "svc-a"),
+                pair("duration", "svc-a"),
+                pair("status", "svc-a"),
+            ],
+        );
+
+        assert_eq!(
+            snapshot.services_of("svc-a"),
+            vec![
+                "bytes".to_owned(),
+                "duration".to_owned(),
+                "status".to_owned()
+            ]
+        );
+    }
+
+    /// A service with no evidence at all — the overwhelmingly common case,
+    /// including every service on a healthy install — reads as an empty
+    /// list, which the wire then omits entirely.
+    #[test]
+    fn an_unseen_service_has_no_degraded_fields() {
+        let snapshot =
+            DegradedSnapshot::new(fields(&["duration"]), vec![pair("duration", "svc-a")]);
+        assert!(snapshot.services_of("svc-b").is_empty());
+        assert!(DegradedSnapshot::default().services_of("svc-a").is_empty());
     }
 }

@@ -18,10 +18,13 @@
 //! the offending file can be identified, deduplicated across passes (via the
 //! `warned` set) so a persistently-broken file doesn't spam the log every tick.
 //!
-//! The same tick also reloads the degraded-field set the query path stamps
-//! its incomplete-results notice from (ADR-0011 slice C1) — the ONE part of
+//! The same tick also reloads the degraded-field snapshot the query path
+//! stamps its incomplete-results notice from and `/schema/services` stamps
+//! its per-service badge from (ADR-0011 slices C1/C2) — the ONE part of
 //! this job that reads postgres, and the reason the "footer stats need
-//! neither postgres nor `DuckDB`" claim above is about the SCHEMA half only.
+//! neither postgres nor `DuckDB`" claim above is about the SCHEMA half
+//! only. That half is a single query on a healthy install; the attribution
+//! read behind it runs only once something is actually degraded.
 //!
 //! Follows the same pattern as [`crate::monitor::spawn_snapshot_collector`].
 
@@ -37,7 +40,7 @@ use trawl_api::{DailyCount, ServiceColumnStats, ServiceSchema};
 use trawl_engine::parquet_stats::{self, StatsAccumulator};
 
 use crate::catalog::FieldCatalog;
-use crate::state::{AppState, CachedServiceSchema};
+use crate::state::{AppState, CachedServiceSchema, DegradedSnapshot};
 
 /// Spawn the background schema refresh task.
 ///
@@ -104,36 +107,84 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
     })
 }
 
-/// Reload the degraded-field set and publish the gauge (ADR-0011 slice C1).
+/// Reload the degraded-field snapshot and publish the gauge (ADR-0011
+/// slices C1/C2).
 ///
 /// Runs on every node, ingesting or not: the notice is stamped by the query
-/// path, and a query-only node answers queries.
+/// path and the badge by `/schema/services`, and a query-only node serves
+/// both.
 ///
-/// A store error KEEPS the previous set rather than clearing it. The
-/// alternative — an empty set on a postgres blip — silently un-badges every
-/// degraded field on the install for as long as the blip lasts, which is the
-/// one failure mode a notice must not have. The gauge is left standing for
+/// Two reads, one generation. The aggregate read is unconditional and is
+/// the whole cost on a healthy install — the degraded set is empty, so the
+/// second read short-circuits to zero queries and the tick's postgres cost
+/// is exactly the one query C1 shipped. Only when something IS degraded does
+/// the pair read run, keyed on that (pin-capped) set AND on the service
+/// names the schema cache can currently render, so neither axis can widen it
+/// into a scan of a table whose service axis is client-chosen. A tick whose
+/// service cache has not filled yet (boot) skips the pair read and publishes
+/// an unattributed generation — one tick of missing badges, accepted.
+///
+/// A store error on EITHER read keeps the ENTIRE previous snapshot rather
+/// than clearing it, and never publishes a half-built one. The alternative
+/// — an empty set on a postgres blip — silently un-badges every degraded
+/// field on the install for as long as the blip lasts, which is the one
+/// failure mode a notice must not have; and a snapshot with fields but no
+/// pairs is strictly worse than stale, since it would un-badge every
+/// service while leaving the notice standing. The gauge is left alone for
 /// the same reason: it would otherwise read as a fixed catalog.
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; the pin cap is exact
 pub async fn refresh_degraded_fields(state: &AppState) {
-    match state.storage.catalog.conflict_aggregates(None).await {
-        Ok(aggregates) => {
-            let degraded: BTreeSet<String> = aggregates
-                .iter()
-                .filter(|a| crate::catalog::analyzer::is_degraded(a))
-                .map(|a| a.field.clone())
-                .collect();
-            metrics::gauge!(crate::metrics::CATALOG_DEGRADED_FIELDS).set(degraded.len() as f64);
-            *state.query.degraded_fields.lock() = Arc::new(degraded);
-        }
+    let aggregates = match state.storage.catalog.conflict_aggregates(None).await {
+        Ok(aggregates) => aggregates,
         Err(e) => {
             tracing::warn!(
                 event_type = "degraded_refresh_error",
                 error = %e,
-                "degraded-field refresh failed; keeping the previous set"
+                "degraded-field refresh failed; keeping the previous snapshot"
             );
+            return;
         }
-    }
+    };
+
+    let degraded: BTreeSet<String> = aggregates
+        .iter()
+        .filter(|a| crate::catalog::analyzer::is_degraded(a))
+        .map(|a| a.field.clone())
+        .collect();
+
+    // Attribution: which senders' data actually indicted each pin. Keyed on
+    // both axes, and skipped entirely when either is empty.
+    let pairs = if degraded.is_empty() {
+        Vec::new()
+    } else {
+        let names: Vec<String> = degraded.iter().cloned().collect();
+        let visible: Vec<String> = state
+            .query
+            .service_schema_cache
+            .lock()
+            .as_ref()
+            .map(|cached| cached.services.iter().map(|s| s.name.clone()).collect())
+            .unwrap_or_default();
+        match state
+            .storage
+            .catalog
+            .conflict_service_pairs(&names, &visible)
+            .await
+        {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                tracing::warn!(
+                    event_type = "degraded_refresh_error",
+                    error = %e,
+                    "degraded-field service attribution failed; keeping the previous snapshot"
+                );
+                return;
+            }
+        }
+    };
+
+    metrics::gauge!(crate::metrics::CATALOG_DEGRADED_FIELDS).set(degraded.len() as f64);
+    *state.query.degraded_fields.lock() = Arc::new(DegradedSnapshot::new(degraded, pairs));
 }
 
 /// Collected metadata for a single parquet file.
@@ -340,6 +391,10 @@ fn build_service_schema(
         total_bytes,
         total_events,
         daily_event_counts,
+        // Stamped per REQUEST from the degraded snapshot, not cached here:
+        // the two caches have independent refresh points, and a badge frozen
+        // into the schema cache would outlive a repin by up to a full TTL.
+        degraded_fields: Vec::new(),
     }
 }
 

@@ -685,6 +685,14 @@ pub struct ServiceSchema {
     /// Per-day event counts for sparkline rendering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub daily_event_counts: Vec<DailyCount>,
+    /// Fields this service has ACTUALLY conflicted on and which the analyzer
+    /// currently calls degraded (ADR-0011 slice C2). Stamped from the
+    /// schema-refresh tick's in-process snapshot (one-tick staleness, shared
+    /// with the query notice). NOT a client-computable join: carrying a
+    /// degraded field's COLUMN is not evidence that this service is what
+    /// degraded it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_fields: Vec<String>,
 }
 
 /// Per-column statistics extracted from parquet row group metadata.
@@ -1372,6 +1380,9 @@ mod tests {
                     date: "2026-01-01".into(),
                     count: 1,
                 }],
+                // Empty is the healthy install, and the pinned key set below
+                // is what proves it stays OFF the wire there (ADR-0011 C2).
+                degraded_fields: Vec::new(),
             }],
             cached: true,
             hot_buffer_events: Some(1),
@@ -1779,6 +1790,7 @@ mod tests {
                     date: "2026-03-18".into(),
                     count: 12_345,
                 }],
+                degraded_fields: vec!["duration".into()],
             }],
             cached: true,
             hot_buffer_events: Some(42),
@@ -1791,8 +1803,47 @@ mod tests {
         assert_eq!(rt.services[0].columns[0].null_count, 5);
         assert_eq!(rt.services[0].total_events, 500_000);
         assert_eq!(rt.services[0].daily_event_counts.len(), 1);
+        assert_eq!(rt.services[0].degraded_fields, vec!["duration".to_owned()]);
         assert!(rt.cached);
         assert_eq!(rt.hot_buffer_events, Some(42));
+    }
+
+    /// Wire compatibility for the ADR-0011 slice C2 addition: a client or a
+    /// server that predates `degraded_fields` must be indistinguishable from
+    /// a healthy one. Absent on the way in reads as "nothing degraded";
+    /// empty on the way out never reaches the wire at all, so the healthy
+    /// response is byte-identical to the C1 one.
+    #[test]
+    fn service_schema_degraded_fields_defaults_and_omits() {
+        let legacy = serde_json::json!({
+            "name": "nginx",
+            "columns": [],
+            "file_count": 0,
+            "total_bytes": 0,
+            "total_events": 0,
+        });
+        let parsed: ServiceSchema = serde_json::from_value(legacy).unwrap();
+        assert!(
+            parsed.degraded_fields.is_empty(),
+            "a body with no degraded_fields key is a healthy service, not an error"
+        );
+
+        let json = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            json.as_object().unwrap().get("degraded_fields").is_none(),
+            "an empty list is omitted entirely: {json}"
+        );
+
+        let badged = ServiceSchema {
+            degraded_fields: vec!["duration".into(), "status".into()],
+            ..parsed
+        };
+        let rt: ServiceSchema = serde_json::from_value(serde_json::to_value(&badged).unwrap())
+            .expect("badged service round-trips");
+        assert_eq!(
+            rt.degraded_fields,
+            vec!["duration".to_owned(), "status".to_owned()]
+        );
     }
 
     #[test]
