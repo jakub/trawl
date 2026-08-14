@@ -11,6 +11,15 @@
 //!   closes the drawer.
 //! - `stab=overview|fields|tail` — which drawer tab is active
 //!   (default: overview).
+//! - `field=<name>` — opens the field case file (ADR-0011 slice C2),
+//!   which takes precedence over `svc=` and mounts independently of the
+//!   services snapshot, so `/search/schema?field=<name>` is a working
+//!   deep link. `svc=` is carried alongside as the back-arrow's return
+//!   context.
+//!
+//! Exactly one drawer is mounted at a time: `fleet_ui::Drawer` arbitrates
+//! Escape on the assumption of a single drawer layer, so the page swaps
+//! between the two rather than nesting them.
 
 use leptos::prelude::*;
 use leptos::web_sys;
@@ -19,19 +28,29 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 use trawl_api::ServiceSchema;
 
 use crate::api;
+use crate::components::field_case_drawer::FieldCaseDrawer;
 use crate::components::service_card_fmt::{
-    avg_cov_permille, format_avg_coverage, format_bytes, format_count, is_healthy,
+    avg_cov_permille, degraded_count, format_avg_coverage, format_bytes, format_count, is_healthy,
     today_yesterday_utc,
 };
 use crate::components::service_drawer::ServiceDrawer;
 use crate::components::sort_th::sort_th;
 use crate::state::query::{Mode, RangeSpec, navigator};
 use fleet_ui::{
-    Icon, IconView, LoadState, Loaded, Pager, SearchInput, Sparkline, StatusDot, StatusTone,
+    Badge, Icon, IconView, LoadState, Loaded, Pager, SearchInput, Sparkline, StatusDot, StatusTone,
+    Tone,
 };
 
 /// Days of `daily_event_counts` history shown in the activity sparkline.
 const SPARK_DAYS: usize = 30;
+
+/// One URL query-parameter value. A service name's charset is narrow but
+/// a catalog field name is any ASCII-folded client JSON key.
+fn enc(raw: &str) -> String {
+    js_sys::encode_uri_component(raw)
+        .as_string()
+        .unwrap_or_else(|| raw.to_string())
+}
 
 /// Sort key for the services table. Clicking the active header flips
 /// direction; a fresh key starts at its natural direction (name
@@ -57,7 +76,10 @@ impl SvcSort {
 #[allow(clippy::too_many_lines)]
 pub fn SchemaPage() -> impl IntoView {
     let qm = use_query_map();
-    let svc_selected = Memo::new(move |_| qm.get().get("svc"));
+    // An empty param is an absent one: `?svc=` / `?field=` reach here
+    // from a hand-edited URL, and an empty name resolves to nothing.
+    let svc_selected = Memo::new(move |_| qm.get().get("svc").filter(|s| !s.is_empty()));
+    let field_selected = Memo::new(move |_| qm.get().get("field").filter(|s| !s.is_empty()));
     let tab_param = Memo::new(move |_| {
         qm.get()
             .get("stab")
@@ -80,12 +102,7 @@ pub fn SchemaPage() -> impl IntoView {
         let nav = nav.clone();
         move |name: Option<&str>, stab: &str| {
             let url = match name {
-                Some(n) => {
-                    let n_enc = js_sys::encode_uri_component(n)
-                        .as_string()
-                        .unwrap_or_else(|| n.to_string());
-                    format!("/search/schema?svc={n_enc}&stab={stab}")
-                }
+                Some(n) => format!("/search/schema?svc={}&stab={stab}", enc(n)),
                 None => "/search/schema".to_string(),
             };
             nav(
@@ -96,6 +113,48 @@ pub fn SchemaPage() -> impl IntoView {
                 },
             );
         }
+    };
+
+    // Drilling into a field case file PUSHES, so browser-back leaves the
+    // case file for wherever the operator came from; clearing it REPLACES
+    // the case-file entry with its return context (the service drawer's
+    // URL, or the bare page).
+    let push_field = {
+        let nav = nav.clone();
+        move |field: Option<&str>| {
+            let ctx = svc_selected
+                .get_untracked()
+                .map(|svc| format!("svc={}&stab={}", enc(&svc), tab_param.get_untracked()));
+            if let Some(f) = field {
+                let mut url = format!("/search/schema?field={}", enc(f));
+                if let Some(ctx) = ctx {
+                    url.push('&');
+                    url.push_str(&ctx);
+                }
+                nav(&url, NavigateOptions::default());
+            } else {
+                let url = ctx.map_or_else(
+                    || "/search/schema".to_string(),
+                    |ctx| format!("/search/schema?{ctx}"),
+                );
+                nav(
+                    &url,
+                    NavigateOptions {
+                        replace: true,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    };
+
+    let on_open_field: Callback<String> = {
+        let push = push_field.clone();
+        Callback::new(move |field: String| push(Some(&field)))
+    };
+    let on_field_back: Callback<()> = {
+        let push = push_field.clone();
+        Callback::new(move |()| push(None))
     };
 
     let on_open: Callback<String> = {
@@ -246,6 +305,7 @@ pub fn SchemaPage() -> impl IntoView {
                                 let storage_label = format_bytes(svc.total_bytes);
                                 let field_count = svc.columns.len();
                                 let coverage_label = format_avg_coverage(&svc.columns);
+                                let degraded = degraded_count(&svc);
 
                                 let name_for_active = name.clone();
                                 let name_open = name.clone();
@@ -263,6 +323,14 @@ pub fn SchemaPage() -> impl IntoView {
                                         <div class="svc-cell" style="flex:2; min-width:0">
                                             <StatusDot tone=dot_tone/>
                                             <span class="mono name">{name}</span>
+                                            // Count, not colour alone: the badge
+                                            // says how many of this service's
+                                            // fields the catalog calls degraded.
+                                            {(degraded > 0).then(|| view! {
+                                                <Badge tone=Tone::Warn>
+                                                    {format!("{degraded} degraded")}
+                                                </Badge>
+                                            })}
                                         </div>
                                         <div style="flex:0 0 110px">
                                             <Sparkline data=spark_data color=spark_color w=96 h=16/>
@@ -312,9 +380,23 @@ pub fn SchemaPage() -> impl IntoView {
             </div>
 
             {move || {
-                // Drawer mounts only when `?svc=X` is set AND the name
-                // resolves to a service in the current snapshot. If the
-                // user lands on a dead `?svc=foo`, we silently ignore
+                // `?field=` wins, and mounts without consulting the
+                // services resource — that independence is what makes a
+                // bare `/search/schema?field=x` deep link work. A dead
+                // `?svc=` alongside it costs the back arrow, nothing more.
+                if let Some(field) = field_selected.get() {
+                    return view! {
+                        <FieldCaseDrawer
+                            field=field
+                            back=svc_selected.get()
+                            on_back=on_field_back
+                            on_close=on_close
+                        />
+                    }.into_any();
+                }
+                // Service drawer mounts only when `?svc=X` is set AND the
+                // name resolves to a service in the current snapshot. If
+                // the user lands on a dead `?svc=foo`, we silently ignore
                 // it rather than popping an error modal.
                 let Some(selected) = svc_selected.get() else { return ().into_any(); };
                 let Some(Ok(resp)) = services.get() else { return ().into_any(); };
@@ -328,6 +410,7 @@ pub fn SchemaPage() -> impl IntoView {
                         on_tab_change=on_tab_change
                         on_search=on_search
                         on_use_field=on_use_field
+                        on_open_field=on_open_field
                     />
                 }.into_any()
             }}

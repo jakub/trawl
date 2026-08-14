@@ -4,6 +4,15 @@
 
 //! Pure formatting helpers shared by `<ServiceCard/>` and
 //! `<ServiceDrawer/>`. No I/O, no Leptos — just string munging.
+//!
+//! Ungated and top-level for the `tone_vocab` / `facets` reason: inside
+//! the wasm32-gated `components` module its `mod tests` never ran under
+//! `cargo nextest`. `components::service_card_fmt` still resolves — the
+//! module is re-exported there, so every call site keeps its path.
+//! `today_yesterday_utc` is the one wasm32-only member (it reads the
+//! browser clock) and carries its own gate.
+
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 /// Compact human count: `"1.2M"`, `"32k"`, `"480"`.
 #[must_use]
@@ -165,6 +174,27 @@ pub fn today_yesterday_utc() -> (String, String) {
     (today, yesterday)
 }
 
+/// How many of this service's fields the catalog currently calls
+/// degraded (ADR-0011 slice C2).
+///
+/// Reads the server-stamped list and NOTHING else. The count is not
+/// client-derivable: a service is on the list only when
+/// `field_conflict_stats` holds evidence that THIS service conflicted on
+/// the field, so intersecting `columns` with an install-wide degraded set
+/// would badge every service that merely carries the column.
+#[must_use]
+pub fn degraded_count(svc: &trawl_api::ServiceSchema) -> usize {
+    svc.degraded_fields.len()
+}
+
+/// Whether this service's named column carries a degraded pin — the
+/// single membership test behind the fields-tab badge, for the reason in
+/// [`degraded_count`].
+#[must_use]
+pub fn is_degraded_column(svc: &trawl_api::ServiceSchema, field: &str) -> bool {
+    svc.degraded_fields.iter().any(|f| f == field)
+}
+
 /// Non-null percentage as a rounded integer in `0..=100`.
 #[must_use]
 pub fn cov_pct(null: u64, total: u64) -> u32 {
@@ -304,6 +334,43 @@ mod tests {
         assert_eq!(avg_cov_permille(&[col(0, 100), col(50, 100)]), 750);
         // total_count == 0 counts as zero coverage, not a div-by-zero
         assert_eq!(avg_cov_permille(&[col(0, 0), col(0, 100)]), 500);
+    }
+
+    #[test]
+    fn degraded_reads_only_the_server_stamped_list() {
+        let column = |name: &str| trawl_api::ServiceColumnStats {
+            name: name.to_string(),
+            data_type: "VARCHAR".to_string(),
+            null_count: 0,
+            total_count: 10,
+            min_value: None,
+            max_value: None,
+            compressed_bytes: 0,
+        };
+        let svc = |degraded: &[&str]| trawl_api::ServiceSchema {
+            name: "nginx".to_string(),
+            columns: vec![column("duration"), column("status")],
+            earliest_date: None,
+            latest_date: None,
+            file_count: 0,
+            total_bytes: 0,
+            total_events: 0,
+            daily_event_counts: Vec::new(),
+            degraded_fields: degraded.iter().map(|s| (*s).to_string()).collect(),
+        };
+
+        assert_eq!(degraded_count(&svc(&[])), 0);
+        assert_eq!(degraded_count(&svc(&["duration"])), 1);
+        assert_eq!(degraded_count(&svc(&["duration", "status"])), 2);
+
+        assert!(is_degraded_column(&svc(&["duration"]), "duration"));
+        // AC-1's false positive, client side: the service CARRIES the
+        // column, and some other service degraded it — not badged here.
+        assert!(!is_degraded_column(&svc(&[]), "duration"));
+        assert!(!is_degraded_column(&svc(&["duration"]), "status"));
+        // A degraded field the service no longer carries is filtered
+        // server-side; nothing here re-derives membership from columns.
+        assert!(!is_degraded_column(&svc(&["duration"]), "host"));
     }
 
     #[test]

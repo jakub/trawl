@@ -17,14 +17,41 @@
 /// The permission that marks the trawl admin tier.
 const SERVER_MANAGE: &str = "server_manage";
 
+/// The permission the catalog read surfaces are gated on server-side
+/// (`/schema/fields`, `/schema/field`, `/schema/conflicts`,
+/// `/schema/services`, `/schema/repin/status`).
+const SCHEMA_READ: &str = "schema_read";
+
+/// The permission `POST /api/v1/schema/repin` is gated on. The server is
+/// the sole enforcement (ADR-0011 slice B); this predicate only decides
+/// whether the UI offers the affordance.
+const SCHEMA_WRITE: &str = "schema_write";
+
 /// Whether the resolved permission set carries trawl admin capability.
 pub fn is_trawl_admin(permissions: &[String]) -> bool {
     permissions.iter().any(|p| p == SERVER_MANAGE)
 }
 
+/// Whether the session may read the field catalog.
+// Consumed by the query notice's case-file links (ADR-0011 C2 M4): a
+// session without `schema_read` gets the field names as plain text,
+// because the link target would 403.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub fn can_schema_read(permissions: &[String]) -> bool {
+    permissions.iter().any(|p| p == SCHEMA_READ)
+}
+
+/// Whether the session may trigger a repin.
+// Consumed by the case file's repin affordance (ADR-0011 C2 M3); M2 is
+// the read-only surface, which offers the CLI line to everyone.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub fn can_schema_write(permissions: &[String]) -> bool {
+    permissions.iter().any(|p| p == SCHEMA_WRITE)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_trawl_admin;
+    use super::{can_schema_read, can_schema_write, is_trawl_admin};
 
     #[test]
     fn admin_requires_server_manage() {
@@ -35,5 +62,27 @@ mod tests {
         ]));
         assert!(!is_trawl_admin(&["query_read".to_string()]));
         assert!(!is_trawl_admin(&[]));
+    }
+
+    #[test]
+    fn schema_read_is_its_own_permission() {
+        assert!(can_schema_read(&["schema_read".to_string()]));
+        assert!(can_schema_read(&[
+            "query_read".to_string(),
+            "schema_read".to_string()
+        ]));
+        // Neither admin nor write implies read: permissions are a flat
+        // set the server resolves, with no hierarchy (ADR-0006).
+        assert!(!can_schema_read(&["server_manage".to_string()]));
+        assert!(!can_schema_read(&["schema_write".to_string()]));
+        assert!(!can_schema_read(&[]));
+    }
+
+    #[test]
+    fn schema_write_is_its_own_permission() {
+        assert!(can_schema_write(&["schema_write".to_string()]));
+        assert!(!can_schema_write(&["schema_read".to_string()]));
+        assert!(!can_schema_write(&["server_manage".to_string()]));
+        assert!(!can_schema_write(&[]));
     }
 }

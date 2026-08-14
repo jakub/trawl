@@ -11,11 +11,11 @@
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
 use trawl_api::{
-    CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse, ExportFormat, ExportRequest,
-    HealthResponse, HistoryResponse, ListAllRunsResponse, ListReportRunsResponse,
-    ListSavedResponse, QueryRequest, QueryResponse, ReportRunResponse, ReportRunSummary,
-    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, ServiceSchemaResponse,
-    SetScheduleRequest, UpdateSavedRequest,
+    CatalogFieldResponse, CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse,
+    ExportFormat, ExportRequest, HealthResponse, HistoryResponse, ListAllRunsResponse,
+    ListReportRunsResponse, ListSavedResponse, QueryRequest, QueryResponse, ReportRunResponse,
+    ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
+    ServiceSchemaResponse, SetScheduleRequest, UpdateSavedRequest,
 };
 
 /// Rows per page for the snapshot results table.
@@ -171,6 +171,45 @@ pub async fn schema_services() -> Result<ServiceSchemaResponse, ApiError> {
         401 => Err(ApiError::Unauthorized),
         s => Err(ApiError::Status(s)),
     }
+}
+
+/// GET `/api/v1/schema/field?name=` — one field's pin, one PAGE of its
+/// per-service observations (page with the response's `services_cursor`
+/// as `after`), its retained conflict evidence, and the analyzer's
+/// verdict when the pin is degraded.
+///
+/// A field with no pin answers 404, which surfaces here as
+/// [`ApiError::Status(404)`] — the case file maps that to fleet-ui's
+/// neutral `LoadState::Missing`, never to an error banner.
+pub async fn catalog_field(
+    name: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<CatalogFieldResponse, ApiError> {
+    // A catalog key is any ASCII-folded client JSON key — it can carry
+    // `&`, `#`, `%` — and the cursor is opaque server text, so both go
+    // through component encoding rather than into the URL raw.
+    let mut url = format!("/api/v1/schema/field?name={}&limit={limit}", encode(name));
+    if let Some(cursor) = after {
+        url.push_str("&after=");
+        url.push_str(&encode(cursor));
+    }
+    let resp = Request::get(&url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<CatalogFieldResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// One URL query-parameter value.
+fn encode(raw: &str) -> String {
+    js_sys::encode_uri_component(raw)
+        .as_string()
+        .unwrap_or_else(|| raw.to_string())
 }
 
 /// POST /api/v1/query — execute a DSL query with fixed [`PAGE_SIZE`] paging.
