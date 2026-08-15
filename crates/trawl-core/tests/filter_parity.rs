@@ -692,6 +692,95 @@ fn absent_status_event() -> Map<String, Value> {
     m
 }
 
+/// The ADR-0013 deterministic matrix: a SEVERITY-pinned `status` over
+/// stored ladder numbers × the whole token vocabulary × every operator
+/// class, with the EXPECTED answer stated so a matching pair of wrong
+/// lanes cannot pass.
+///
+/// `status` rather than `_severity` on purpose: the harness's one pinned
+/// column is what makes the stored value spellable, and the rule table
+/// binds by the PIN, never by the name.
+#[test]
+fn pinned_severity_matrix_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .unwrap();
+    let ft = pinned(&[("status", CanonicalType::Severity)]);
+
+    // (dsl, stored severity number, expected match)
+    let cases: &[(&str, i64, bool)] = &[
+        // A band token is the whole band, on both ends.
+        ("status=error", 17, true),
+        ("status=error", 20, true),
+        ("status=error", 16, false),
+        ("status=error", 21, false),
+        // The aliases the ADR-0009 token table carries.
+        ("status=err", 18, true),
+        ("status=WARN", 13, true),
+        ("status=warning", 16, true),
+        // An OTel exact short name is ONE number.
+        ("status=error2", 18, true),
+        ("status=error2", 17, false),
+        ("status=warn4", 16, true),
+        // An integer literal is that number.
+        ("status=17", 17, true),
+        ("status=17", 18, false),
+        // Ordered comparisons take the token's own number.
+        ("status>=warn", 13, true),
+        ("status>=warn", 12, false),
+        ("status>error", 18, true),
+        ("status<info", 8, true),
+        ("status<=fatal", 21, true),
+        // `!=` is the band's complement.
+        ("status!=error", 9, true),
+        ("status!=error", 17, false),
+        // An IN list ORs the bands.
+        ("status=warn,error", 14, true),
+        ("status=warn,error", 21, false),
+        // Glob and regex match the CANONICAL token text, so a band's
+        // prefix glob is exactly its four rungs.
+        ("status=warn*", 13, true),
+        ("status=warn*", 16, true),
+        ("status=warn*", 17, false),
+        ("status=/^error2$/", 18, true),
+        ("status=/^error2$/", 17, false),
+    ];
+
+    for (dsl, stored, expected) in cases {
+        let event = status_event(&Value::from(*stored));
+        let got = assert_pinned_parity_over_column(
+            &conn,
+            dsl,
+            &event,
+            &ft,
+            &format!("CAST({stored} AS BIGINT)"),
+        );
+        assert_eq!(got, *expected, "{dsl} over stored {stored}");
+    }
+
+    // An out-of-ladder stored value conforms to NULL, so every comparison
+    // over it is UNKNOWN — and `!=` widens in the search stage alone.
+    for (dsl, expected) in [
+        ("status=error", false),
+        ("status>=warn", false),
+        ("status!=error", true),
+    ] {
+        let event = status_event(&Value::from(99));
+        let got = assert_pinned_parity_over_column(&conn, dsl, &event, &ft, "CAST(NULL AS BIGINT)");
+        assert_eq!(got, expected, "{dsl} over an out-of-ladder value");
+    }
+
+    // An unknown token is an ERROR in BOTH lanes, with the same sentence.
+    let query = parser::parse("status=spicy").expect("dsl parses");
+    let filter_err = CompiledFilter::compile(&query.search, &ft).expect_err("filter refuses");
+    let emit_err = emitter::emit_with_pins(&query, "/x/*.parquet", &ft).expect_err("emit refuses");
+    assert_eq!(filter_err.to_string(), emit_err.to_string());
+    assert!(
+        filter_err.to_string().contains("unknown severity value"),
+        "{filter_err}"
+    );
+}
+
 /// The slice-A deterministic matrix: a VARCHAR-pinned `status` over
 /// string-stored values (the physical column `read_json` infers is
 /// VARCHAR, matching the pin) × every operator class × numeric and
@@ -2101,12 +2190,13 @@ fn assert_let_parity_hot_only(
 
 /// The pins a generated case draws from — the whole `CanonicalType`
 /// vocabulary, because a repin can land on any of them.
-const GENERATIVE_PINS: [CanonicalType; 5] = [
+const GENERATIVE_PINS: [CanonicalType; 6] = [
     CanonicalType::BigInt,
     CanonicalType::Boolean,
     CanonicalType::Double,
     CanonicalType::Timestamp,
     CanonicalType::Varchar,
+    CanonicalType::Severity,
 ];
 
 /// Wire values a generated event can carry under `pin`: shapes the

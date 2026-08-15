@@ -326,6 +326,10 @@ pub fn eval_expr_with_pins(
 /// `Unary{Neg, Literal}`. The two doors must adopt the same shapes or the
 /// batch and live lanes answer one query differently
 /// (`emitter::expr::bare_literal`).
+pub(crate) fn bare_literal_of(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
+    bare_literal(expr)
+}
+
 fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
     match expr {
         Expr::Literal(lit) => Some(Cow::Borrowed(lit)),
@@ -465,7 +469,15 @@ fn try_pinned_comparison(
         _ => return None,
     };
     let pin = pins.pin_for(name)?;
-    let form = crate::compare::compare_form_bound(Some(pin), filter_op, &literal)?;
+    // A literal the rule table refuses (an unknown severity token) cannot
+    // reach here: the compiler in front of BOTH eval lanes —
+    // `stream::compile_stream_plan`, which every SSE stage and every
+    // `rust_stages` batch tail is compiled through — resolves the same
+    // form and rejects it. Falling through to the generic path is the
+    // honest defensive answer, not a second semantics.
+    let form = crate::compare::compare_form_bound(Some(pin), filter_op, &literal)
+        .ok()
+        .flatten()?;
     // Native(String) is the VARCHAR pin's lexical rule — the stored text
     // compares as text, whatever JSON shape the wire value took (the SQL
     // side's generic emission compares the VARCHAR column against a
@@ -512,6 +524,8 @@ fn try_pinned_in_list(
         .map(|item| {
             let element = bare_literal(&item.node)?;
             crate::compare::compare_form_bound(Some(pin), FilterOp::Eq, &element)
+                .ok()
+                .flatten()
         })
         .collect::<Option<_>>()?;
     let Some(value) = pinned_event_value(event, name) else {

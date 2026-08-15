@@ -67,6 +67,12 @@ pub enum StreamPlanError {
     /// A `level` reference the SQL emitter rejects: an unknown severity
     /// token, or `level` named anywhere other than a comparison.
     InvalidLevel(String),
+    /// A pinned comparison the shared rule table refuses — an unknown
+    /// severity value against a `SEVERITY`-pinned field (ADR-0013). The
+    /// SQL emitter errors on exactly this shape, so the stream must too:
+    /// eval has no error channel and would open a live-looking stream
+    /// that can never match.
+    InvalidComparison(String),
 }
 
 impl fmt::Display for StreamPlanError {
@@ -79,6 +85,7 @@ impl fmt::Display for StreamPlanError {
             Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),
             Self::InvalidFormat(msg) => write!(f, "invalid date/time format: {msg}"),
             Self::InvalidLevel(msg) => write!(f, "invalid level comparison: {msg}"),
+            Self::InvalidComparison(msg) => write!(f, "invalid comparison: {msg}"),
         }
     }
 }
@@ -375,7 +382,7 @@ fn compile_limit(s: &LimitStage) -> CompiledStage {
 }
 
 fn compile_where(s: &WhereStage, scope: &PinScope) -> Result<CompiledStage, StreamPlanError> {
-    validate_expr(&s.condition)?;
+    validate_expr(&s.condition, scope)?;
     Ok(CompiledStage::Where {
         condition: s.condition.clone(),
         pins: scope.clone(),
@@ -384,7 +391,7 @@ fn compile_where(s: &WhereStage, scope: &PinScope) -> Result<CompiledStage, Stre
 
 fn compile_let(s: &LetStage, scope: &PinScope) -> Result<CompiledStage, StreamPlanError> {
     for (_, expr) in &s.assignments {
-        validate_expr(expr)?;
+        validate_expr(expr, scope)?;
     }
     Ok(CompiledStage::Let {
         assignments: s.assignments.clone(),
@@ -400,7 +407,10 @@ fn compile_let(s: &LetStage, scope: &PinScope) -> Result<CompiledStage, StreamPl
 /// unknown severity token in `where level == "..."` is rejected at
 /// `compile_stream_plan` time rather than silently evaluating to `Null` (or, in
 /// batch, erroring) in live tail.
-fn validate_expr(expr: &Spanned<crate::ast::Expr>) -> Result<(), StreamPlanError> {
+fn validate_expr(
+    expr: &Spanned<crate::ast::Expr>,
+    scope: &PinScope,
+) -> Result<(), StreamPlanError> {
     match &expr.node {
         Expr::FunctionCall { name, args } => {
             let unit_positions = unit_literal_positions(name);
@@ -427,7 +437,7 @@ fn validate_expr(expr: &Spanned<crate::ast::Expr>) -> Result<(), StreamPlanError
             }
             // Recurse into all args.
             for arg in args {
-                validate_expr(arg)?;
+                validate_expr(arg, scope)?;
             }
         }
         Expr::Binary { lhs, op, rhs } => {
@@ -438,17 +448,82 @@ fn validate_expr(expr: &Spanned<crate::ast::Expr>) -> Result<(), StreamPlanError
                 level_predicate(filter_op, token)
                     .map_err(|e| StreamPlanError::InvalidLevel(e.to_string()))?;
             }
-            validate_expr(lhs)?;
-            validate_expr(rhs)?;
+            // The pinned rule table refuses an unknown severity value, and
+            // it must refuse it HERE — the SQL emitter 400s on the same
+            // shape, and eval (the only other consumer of this scope) has
+            // no error channel at all.
+            validate_pinned_comparison(lhs, *op, rhs, scope)?;
+            validate_expr(lhs, scope)?;
+            validate_expr(rhs, scope)?;
         }
-        Expr::Unary { operand, .. } => validate_expr(operand)?,
+        Expr::Unary { operand, .. } => validate_expr(operand, scope)?,
         Expr::InList { expr: target, list } => {
-            validate_expr(target)?;
+            validate_pinned_in_list(target, list, scope)?;
+            validate_expr(target, scope)?;
             for item in list {
-                validate_expr(item)?;
+                validate_expr(item, scope)?;
             }
         }
         Expr::Literal(_) | Expr::FieldRef(_) => {}
+    }
+    Ok(())
+}
+
+/// Resolve a bare field-vs-literal comparison through the shared pin rule
+/// table, for its ERROR alone — the compiled form is re-resolved per
+/// event by `crate::eval`, which reads the same scope.
+fn validate_pinned_comparison(
+    lhs: &Spanned<crate::ast::Expr>,
+    op: crate::ast::BinaryOp,
+    rhs: &Spanned<crate::ast::Expr>,
+    scope: &PinScope,
+) -> Result<(), StreamPlanError> {
+    use crate::ast::BinaryOp;
+    let filter_op = match op {
+        BinaryOp::Eq => crate::ast::FilterOp::Eq,
+        BinaryOp::Ne => crate::ast::FilterOp::Ne,
+        BinaryOp::Gt => crate::ast::FilterOp::Gt,
+        BinaryOp::Gte => crate::ast::FilterOp::Gte,
+        BinaryOp::Lt => crate::ast::FilterOp::Lt,
+        BinaryOp::Lte => crate::ast::FilterOp::Lte,
+        _ => return Ok(()),
+    };
+    let resolved = match (&lhs.node, &rhs.node) {
+        (Expr::FieldRef(name), other) | (other, Expr::FieldRef(name)) => {
+            crate::eval::bare_literal_of(other).map(|lit| (name, lit))
+        }
+        _ => None,
+    };
+    let Some((name, literal)) = resolved else {
+        return Ok(());
+    };
+    let Some(pin) = scope.pin_for(name) else {
+        return Ok(());
+    };
+    crate::compare::compare_form_bound(Some(pin), filter_op, &literal)
+        .map(|_| ())
+        .map_err(|e| StreamPlanError::InvalidComparison(e.to_string()))
+}
+
+/// The IN-list half of [`validate_pinned_comparison`]: every element
+/// binds through the equality rule, so every element can refuse.
+fn validate_pinned_in_list(
+    target: &Spanned<crate::ast::Expr>,
+    list: &[Spanned<crate::ast::Expr>],
+    scope: &PinScope,
+) -> Result<(), StreamPlanError> {
+    let Expr::FieldRef(name) = &target.node else {
+        return Ok(());
+    };
+    let Some(pin) = scope.pin_for(name) else {
+        return Ok(());
+    };
+    for item in list {
+        let Some(literal) = crate::eval::bare_literal_of(&item.node) else {
+            continue;
+        };
+        crate::compare::compare_form_bound(Some(pin), crate::ast::FilterOp::Eq, &literal)
+            .map_err(|e| StreamPlanError::InvalidComparison(e.to_string()))?;
     }
     Ok(())
 }
@@ -1781,6 +1856,52 @@ mod tests {
             "expected InvalidLevel, got {err:?}"
         );
         assert!(err.to_string().contains("unknown severity token"));
+    }
+
+    /// The SEVERITY pin's closed vocabulary is enforced at COMPILE time
+    /// in the stream lane too (ADR-0013): eval has no error channel, so
+    /// an unknown token would otherwise open a live-looking stream that
+    /// can never match while `/api/v1/query` 400s on the same text.
+    #[test]
+    fn rejects_unknown_severity_values_under_a_severity_pin() {
+        let mut ft = crate::schema::FieldTypes::new();
+        ft.insert("_severity", crate::schema::CanonicalType::Severity);
+        let scope = PinScope::root(&ft);
+
+        for dsl in [
+            r#"* | where _severity == "spicy""#,
+            r#"* | where "spicy" == _severity"#,
+            r#"* | where _severity >= "gold""#,
+            r#"* | where _severity in ("error", "spicy")"#,
+            r#"* | let hot = _severity == "spicy""#,
+        ] {
+            let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
+            let err = compile_stream_plan(&pipeline, &scope).unwrap_err();
+            assert!(
+                matches!(err, StreamPlanError::InvalidComparison(_)),
+                "{dsl}: expected InvalidComparison, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("unknown severity value"),
+                "{dsl}: {err}"
+            );
+        }
+
+        // The vocabulary itself compiles, and an UNPINNED `severity` is
+        // ordinary sender data with no vocabulary at all.
+        for dsl in [
+            r#"* | where _severity == "error""#,
+            r#"* | where _severity >= "warn""#,
+            "* | where _severity == 17",
+            r#"* | where _severity == "error2""#,
+            r#"* | where severity == "spicy""#,
+        ] {
+            let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
+            assert!(
+                compile_stream_plan(&pipeline, &scope).is_ok(),
+                "{dsl} must compile"
+            );
+        }
     }
 
     /// Every `level` shape the SQL emitter rejects is refused here too.

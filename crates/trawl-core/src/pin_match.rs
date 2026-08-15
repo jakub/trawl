@@ -112,6 +112,13 @@ pub(crate) enum CoercedValue {
         pin: CanonicalType,
         literal: PinLiteral,
     },
+    /// The SEVERITY pin's band form (ADR-0013): the stored number inside
+    /// (or, for `!=`, outside) an inclusive band — the live mirror of
+    /// `col BETWEEN lo AND hi`.
+    SeverityBand {
+        lo: u8,
+        hi: u8,
+    },
 }
 
 /// A literal read into a TYPED pin's own domain, once per compiled filter.
@@ -175,6 +182,14 @@ pub(crate) fn coerce_form(form: CompareForm) -> CoercedValue {
         CompareForm::Conformed { pin, literal } => CoercedValue::Conformed {
             pin,
             literal: pin_literal(pin, &literal),
+        },
+        CompareForm::SeverityBand { lo, hi } => CoercedValue::SeverityBand { lo, hi },
+        // The exact form is the SEVERITY column read as the BIGINT it is,
+        // against one integer — the same conform-then-compare rung every
+        // typed pin takes.
+        CompareForm::SeverityExact(n) => CoercedValue::Conformed {
+            pin: CanonicalType::Severity,
+            literal: PinLiteral::Int(n),
         },
     }
 }
@@ -323,6 +338,21 @@ pub(crate) fn compare_values(
                 NullReadPolicy::Unknown => None,
             },
         },
+        // The SEVERITY band rung: `col BETWEEN lo AND hi` over the
+        // conformed reading. A value the ladder guard nulled answers as a
+        // stored NULL does — the caller's lane decides `!=`.
+        CoercedValue::SeverityBand { lo, hi } => {
+            match conformed_reading(event_val, CanonicalType::Severity) {
+                Some(Conformed::Severity(n)) => {
+                    let inside = n >= *lo && n <= *hi;
+                    Some(if op == CompareOp::Ne { !inside } else { inside })
+                }
+                _ => match null_read {
+                    NullReadPolicy::NeMatches => (op == CompareOp::Ne).then_some(true),
+                    NullReadPolicy::Unknown => None,
+                },
+            }
+        }
         // The two-armed equality rung. The wire text is only the stored
         // text when `read_json` did not widen the column, so the numeric
         // reading carries the cases where it did (`200` stored `"200.0"`).

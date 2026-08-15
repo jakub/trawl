@@ -328,12 +328,12 @@ fn compile_token(
                 (_, FilterValue::List(values)) => FieldPredicate::InList {
                     values: values
                         .iter()
-                        .map(|v| coerce_form(compare::compare_form(pin, FilterOp::Eq, v)))
-                        .collect(),
+                        .map(|v| Ok(coerce_form(compare::compare_form(pin, FilterOp::Eq, v)?)))
+                        .collect::<Result<_, EmitError>>()?,
                 },
                 (op, FilterValue::Literal(v)) => FieldPredicate::Compare {
                     op: compile_op(*op),
-                    value: coerce_form(compare::compare_form(pin, *op, v)),
+                    value: coerce_form(compare::compare_form(pin, *op, v)?),
                 },
             };
             Some(TokenMatcher::Field(FieldMatcher {

@@ -204,7 +204,7 @@ fn emit_field_filter(
                 state.push_where(format!("regexp_matches({target}, {placeholder})"));
             }
             _ => {
-                let form = compare::compare_form(pin, ff.op, v);
+                let form = compare::compare_form(pin, ff.op, v)?;
                 let clause = comparison_sql(&field, ff.op, form, NullPolicy::NeMatchesNull, state);
                 state.push_where(clause);
             }
@@ -213,7 +213,7 @@ fn emit_field_filter(
             let forms: Vec<CompareForm> = vs
                 .iter()
                 .map(|v| compare::compare_form(pin, FilterOp::Eq, v))
-                .collect();
+                .collect::<Result<_, _>>()?;
             let clause = in_list_sql(&field, forms, state);
             state.push_where(clause);
         }

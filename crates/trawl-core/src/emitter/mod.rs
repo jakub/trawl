@@ -134,6 +134,18 @@ impl fmt::Display for EmitError {
 
 impl std::error::Error for EmitError {}
 
+/// A literal the pin rule table refuses (`crate::compare::CompareError`)
+/// is an unsupported operation to every emitter caller — one conversion,
+/// so the search stage, the pipeline emitter, the live filter and the
+/// stream compiler all report the same sentence.
+impl From<crate::compare::CompareError> for EmitError {
+    fn from(err: crate::compare::CompareError) -> Self {
+        Self::UnsupportedOperation {
+            message: err.to_string(),
+        }
+    }
+}
+
 impl EmitError {
     /// Produce a user-facing hint string, if applicable.
     pub fn hint(&self) -> Option<String> {
@@ -1573,12 +1585,102 @@ mod tests {
         format_result(&result)
     }
 
+    /// Parse and emit pin-aware SQL, expecting an `EmitError`.
+    fn emit_dsl_err_with_pins(
+        input: &str,
+        entries: &[(&str, crate::schema::CanonicalType)],
+    ) -> String {
+        let query = parser::parse(input).expect("parse should succeed");
+        emit_with_pins(&query, SRC, &pins(entries))
+            .expect_err("emit should fail")
+            .to_string()
+    }
+
+    /// The declared `_severity` pin, as the catalog seed installs it.
+    const SEVERITY_PIN: [(&str, crate::schema::CanonicalType); 1] = [("_severity", CT::Severity)];
+
     use crate::schema::CanonicalType as CT;
 
     /// A numeric literal binds BOTH the text and its numeric reading: the
     /// stored text of a number is `read_json`'s inference rendered
     /// (`"200.0"`), so exact text alone would be a batch miss where the
     /// live matcher — which only sees the wire `200` — hits.
+    // --- the SEVERITY pin (ADR-0013): tokens ride the rule table ---
+
+    #[test]
+    fn pinned_severity_eq_band_token() {
+        assert_snapshot!(emit_dsl_with_pins("_severity=error", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_eq_exact_otel_name() {
+        assert_snapshot!(emit_dsl_with_pins("_severity=error2", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_gte_token_is_the_exact_number() {
+        assert_snapshot!(emit_dsl_with_pins("_severity>=warn", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_ne_band_widens_with_null_in_the_search_stage() {
+        assert_snapshot!(emit_dsl_with_pins("_severity!=info", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_in_list_expands_to_or_of_bands() {
+        assert_snapshot!(emit_dsl_with_pins("_severity=warn,error", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_glob_matches_the_canonical_token_text() {
+        assert_snapshot!(emit_dsl_with_pins("_severity=warn*", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_regex_matches_the_canonical_token_text() {
+        assert_snapshot!(emit_dsl_with_pins("_severity=/^err/", &SEVERITY_PIN));
+    }
+
+    /// The pipeline lane binds the same rule with the STRICT null policy:
+    /// `!=` keeps plain SQL null propagation (ADR-0011 slice A′).
+    #[test]
+    fn pinned_severity_where_eq_band() {
+        assert_snapshot!(emit_dsl_with_pins(
+            r#"* | where _severity == "error""#,
+            &SEVERITY_PIN
+        ));
+    }
+
+    #[test]
+    fn pinned_severity_where_ne_band_stays_strict() {
+        assert_snapshot!(emit_dsl_with_pins(
+            r#"* | where _severity != "error""#,
+            &SEVERITY_PIN
+        ));
+    }
+
+    #[test]
+    fn pinned_severity_where_gte_token() {
+        assert_snapshot!(emit_dsl_with_pins(
+            r#"* | where _severity >= "warn""#,
+            &SEVERITY_PIN
+        ));
+    }
+
+    #[test]
+    fn error_severity_unknown_token() {
+        assert_snapshot!(emit_dsl_err_with_pins("_severity=spicy", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn error_severity_unknown_token_in_where() {
+        assert_snapshot!(emit_dsl_err_with_pins(
+            r#"* | where _severity == "spicy""#,
+            &SEVERITY_PIN
+        ));
+    }
+
     #[test]
     fn pinned_varchar_eq_numeric_binds_text_and_reading() {
         assert_snapshot!(emit_dsl_with_pins("status=200", &[("status", CT::Varchar)]));
