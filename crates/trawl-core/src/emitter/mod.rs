@@ -708,6 +708,30 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // backtick-quoted names (ADR-0013 ruling 7)
+    // -----------------------------------------------------------------------
+
+    /// A backticked name reaches the SQL as the verbatim identifier it
+    /// spells — the quotes are lexing, and `quote_field` is still the
+    /// only thing between the name and the query.
+    #[test]
+    fn backticked_table_fields_quote_verbatim() {
+        assert_snapshot!(emit_dsl("* | table `request id`, `http-status`"));
+    }
+
+    #[test]
+    fn backticked_group_key_quotes_verbatim() {
+        assert_snapshot!(emit_dsl("* | stats count() by `where`"));
+    }
+
+    /// `last=` is still the time filter; the backticked spelling is the
+    /// field, and both survive in one query.
+    #[test]
+    fn backticked_keyword_field_filter_beside_the_time_filter() {
+        assert_snapshot!(emit_dsl("`last`=5 last=2h"));
+    }
+
+    // -----------------------------------------------------------------------
     // multi-stage pipelines (CTE flushing)
     // -----------------------------------------------------------------------
 

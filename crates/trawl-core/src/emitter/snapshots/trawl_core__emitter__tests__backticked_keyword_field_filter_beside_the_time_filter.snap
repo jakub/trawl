@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl(\"`last`=5 last=2h\")"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE TRY_CAST("_time" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours' AND "last" = ?
+---
+params:
+  0: 5

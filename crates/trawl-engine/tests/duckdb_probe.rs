@@ -3258,3 +3258,47 @@ fn severity_conform_yields_the_physical_bigint() {
     // never at read time, so a stray word conforms to NULL.
     assert_eq!(rows, vec![Some(17), None]);
 }
+
+/// Backticks are LEXING: the name a query spells with them is the
+/// identifier in the SQL and the column name `DuckDB` hands back
+/// (ADR-0013 ruling 7). Executed rather than assumed — the whole point
+/// of the escape is that a name reachable in the DSL is reachable end to
+/// end, so `DESCRIBE` is where that claim is settled.
+#[test]
+fn backticked_names_describe_as_the_names_the_dsl_spells() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.parquet");
+    let conn = conn();
+    conn.execute_batch(&format!(
+        "COPY (SELECT 'a' AS \"request id\", 500 AS \"http-status\", 'nginx' AS \"where\") \
+         TO '{}' (FORMAT PARQUET)",
+        file.display()
+    ))
+    .unwrap();
+    let source = file.display().to_string();
+
+    let describe = |sql: &str| -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("DESCRIBE {sql}")).unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+
+    for (dsl, expected) in [
+        (
+            "* | table `request id`, `http-status`",
+            vec!["request id", "http-status"],
+        ),
+        ("* | stats count() by `where`", vec!["where", "count"]),
+        (
+            "* | rename `http-status` as `status code`",
+            vec!["request id", "where", "status code"],
+        ),
+    ] {
+        let query = trawl_core::parser::parse(dsl).unwrap();
+        let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+        assert!(emitted.params.is_empty(), "{dsl} binds no parameters");
+        assert_eq!(describe(&emitted.sql), expected, "{dsl}: {}", emitted.sql);
+    }
+}
