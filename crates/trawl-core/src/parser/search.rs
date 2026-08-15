@@ -135,12 +135,26 @@ fn text_search<'src>()
             })
         });
 
+    // A LEADING backtick never falls through to text search: the term
+    // opened a quoted field name, so a failure there is a loud parse
+    // error rather than a silent search for the literal backtick
+    // (ADR-0013 ruling 7). Mid-word backticks stay ordinary text.
     let positive = any()
         .filter(|c: &char| {
-            !c.is_ascii_whitespace() && *c != '|' && *c != '"' && *c != ')' && *c != '('
+            !c.is_ascii_whitespace()
+                && *c != '|'
+                && *c != '"'
+                && *c != ')'
+                && *c != '('
+                && *c != '`'
         })
-        .repeated()
-        .at_least(1)
+        .then(
+            any()
+                .filter(|c: &char| {
+                    !c.is_ascii_whitespace() && *c != '|' && *c != '"' && *c != ')' && *c != '('
+                })
+                .repeated(),
+        )
         .to_slice()
         .map(|s: &str| {
             SearchToken::TextSearch(TextSearch {
@@ -183,7 +197,13 @@ fn search_token<'src>()
                 // This prevents "NOT |" or "NOT" at end from being parsed as negation.
                 any()
                     .filter(|c: &char| {
-                        c.is_alphanumeric() || *c == '_' || *c == '"' || *c == '-' || *c == '('
+                        c.is_alphanumeric()
+                            || *c == '_'
+                            || *c == '"'
+                            || *c == '-'
+                            || *c == '('
+                            // a backtick opens a quoted field name
+                            || *c == '`'
                     })
                     .rewind()
                     .padded(),
@@ -531,6 +551,90 @@ mod tests {
         // Time filter hoisted, 2 tokens remain in group.
         assert_eq!(result.groups[0].len(), 2);
         assert!(result.time_filter.is_some());
+    }
+
+    // ── backtick escape (ADR-0013 ruling 7) ────────────────────────────
+
+    /// `last=` stays an unconditional keyword and `` `last` ``=5 is the
+    /// field — in the SAME query, so BOTH `field_filter` sites (the
+    /// `.rewind()` lookahead and the committed parse) take the backtick
+    /// production rather than backtracking into text search.
+    #[test]
+    fn backticked_keyword_is_a_field_filter_beside_the_time_filter() {
+        let result = search_stage()
+            .parse("`last`=5 last=2h")
+            .into_result()
+            .unwrap();
+        let tf = result
+            .time_filter
+            .expect("last=2h is still the time filter");
+        assert_eq!(tf.node.duration.quantity, 2);
+        assert_eq!(tf.node.duration.unit, TimeUnit::Hours);
+        assert_eq!(result.groups[0].len(), 1);
+        assert_eq!(
+            result.groups[0][0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "last".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("5".to_string()),
+            })
+        );
+    }
+
+    /// The other two members of the closed keyword set behave the same.
+    #[test]
+    fn backticked_earliest_and_latest_are_field_filters() {
+        let result = search_stage()
+            .parse(r#"`earliest`=x `latest`=y earliest="2026-01-01T00:00:00Z""#)
+            .into_result()
+            .unwrap();
+        assert!(result.earliest.is_some());
+        assert_eq!(result.groups[0].len(), 2);
+        assert_eq!(
+            result.groups[0][0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "earliest".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("x".to_string()),
+            })
+        );
+    }
+
+    /// `NOT` must see a backtick as a token start, else it degrades to a
+    /// bare text search for the word "NOT".
+    #[test]
+    fn not_negates_a_backticked_field_filter() {
+        let result = search_stage()
+            .parse("NOT `http-status`=500")
+            .into_result()
+            .unwrap();
+        assert_eq!(result.groups[0].len(), 1);
+        match &result.groups[0][0].node {
+            SearchToken::Not(inner) => assert_eq!(
+                inner.node,
+                SearchToken::FieldFilter(FieldFilter {
+                    field: "http-status".to_string(),
+                    op: FilterOp::Eq,
+                    value: FilterValue::Literal("500".to_string()),
+                })
+            ),
+            other => panic!("expected Not, got {other:?}"),
+        }
+    }
+
+    /// A backtick INSIDE a bare word is still ordinary text search — the
+    /// loud refusal is for a LEADING backtick that fails the quoted
+    /// production (see `parser::tests`).
+    #[test]
+    fn mid_word_backtick_is_still_text_search() {
+        let result = search_stage().parse("er`ror").into_result().unwrap();
+        assert_eq!(
+            result.groups[0][0].node,
+            SearchToken::TextSearch(TextSearch {
+                term: "er`ror".to_string(),
+                negated: false,
+            })
+        );
     }
 
     #[test]

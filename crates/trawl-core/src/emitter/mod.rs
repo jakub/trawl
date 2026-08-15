@@ -1851,6 +1851,37 @@ mod tests {
         ));
     }
 
+    /// Backticks are lexing, not policy: the ASCII fold still applies, so
+    /// `` `Status` `` IS `status` and binds the same catalog pin
+    /// (ADR-0013 ruling 7). The SQL identifier stays the verbatim text —
+    /// `DuckDB` identifiers are case-insensitive, so it reads the same
+    /// column.
+    #[test]
+    fn backticked_name_folds_to_the_same_pin() {
+        let entries = &[("status", CT::Varchar)];
+        let quoted = parser::parse("`Status`=200").expect("parse should succeed");
+        let bare = parser::parse("status=200").expect("parse should succeed");
+
+        let quoted_sql = emit_with_pins(&quoted, SRC, &pins(entries)).expect("pinned emit");
+        let bare_sql = emit_with_pins(&bare, SRC, &pins(entries)).expect("pinned emit");
+        let unpinned = emit(&quoted, SRC).expect("unpinned emit");
+
+        assert!(
+            quoted_sql.sql.contains(r#""Status""#),
+            "the identifier is verbatim: {}",
+            quoted_sql.sql
+        );
+        assert_eq!(
+            quoted_sql.sql.replace(r#""Status""#, r#""status""#),
+            bare_sql.sql,
+            "the folded name binds the VARCHAR pin's rule, spelling aside"
+        );
+        assert_ne!(
+            quoted_sql.sql, unpinned.sql,
+            "a pin-blind emission is a different rule — the pin really bound"
+        );
+    }
+
     /// The scope walk: a computed `let` kills the pin, so the following
     /// `where` is literal-driven (byte-identical to unpinned emission).
     #[test]

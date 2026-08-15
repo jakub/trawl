@@ -160,10 +160,55 @@ pub(crate) fn system_field<'src>()
         .labelled("system field")
 }
 
-/// Parse a field name — either a regular identifier or an `@`-prefixed system field.
-pub(crate) fn field_name<'src>()
+/// Parse a name in a position that is NOT a field: a function name, a
+/// stage name, a saved-query name. These take no backticks (ADR-0013
+/// ruling 7) — `` `lower`(x) `` must not be a call — so this is the
+/// unquoted production, `field_name()` minus the backtick arm.
+pub(crate) fn plain_name<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     system_field().or(ident())
+}
+
+/// Parse a backtick-quoted name: `` `request id` ``.
+///
+/// Backticks change how a name is LEXED, never what a name may be
+/// (ADR-0013 ruling 7). Content is any character except a backtick; a
+/// doubled backtick escapes one. Empty and control-char names are parse
+/// errors — the only two refusals, because this is lexing, not policy:
+/// the ASCII fold ([`crate::schema::catalog_key`]) and the sealed `_`
+/// namespace ([`crate::schema::is_reserved_name`]) apply to the result
+/// exactly as they do to a bare name. A dot inside the quotes is a
+/// literal character, not a nested-name segment.
+pub(crate) fn quoted_name<'src>()
+-> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
+    choice((just("``").to('`'), none_of('`')))
+        .repeated()
+        .collect::<String>()
+        .delimited_by(just('`'), just('`'))
+        .try_map(|name: String, span| {
+            if name.is_empty() {
+                return Err(Rich::custom(span, "empty field name: `` names no column"));
+            }
+            if let Some(bad) = name.chars().find(|c| c.is_control()) {
+                return Err(Rich::custom(
+                    span,
+                    format!(
+                        "field name contains a control character (U+{:04X}); \
+                         control characters are not part of any column name",
+                        bad as u32
+                    ),
+                ));
+            }
+            Ok(name)
+        })
+        .labelled("backtick-quoted field name")
+}
+
+/// Parse a field name — a backtick-quoted name, an `@`-prefixed system
+/// field, or a regular identifier.
+pub(crate) fn field_name<'src>()
+-> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
+    choice((quoted_name(), system_field(), ident()))
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +457,74 @@ mod tests {
         assert_eq!(
             system_field().parse("@source").into_result().unwrap(),
             "@source"
+        );
+    }
+
+    // ── backtick-quoted names (ADR-0013 ruling 7) ──────────────────────
+
+    /// Backticks change how a name is LEXED, never what a name may be:
+    /// the content is any character except a backtick, and the parse
+    /// yields the bare name with the quotes gone.
+    #[test]
+    fn backtick_name_lexes_any_content() {
+        assert_eq!(
+            field_name().parse("`request id`").into_result().unwrap(),
+            "request id"
+        );
+        assert_eq!(
+            field_name().parse("`http-status`").into_result().unwrap(),
+            "http-status"
+        );
+        assert_eq!(
+            field_name().parse("`where`").into_result().unwrap(),
+            "where"
+        );
+        assert_eq!(field_name().parse("`last`").into_result().unwrap(), "last");
+    }
+
+    /// A doubled backtick escapes one.
+    #[test]
+    fn backtick_name_doubled_backtick_escapes() {
+        assert_eq!(field_name().parse("`a``b`").into_result().unwrap(), "a`b");
+        // `` `` `` — open, one escaped backtick, close.
+        assert_eq!(field_name().parse("````").into_result().unwrap(), "`");
+    }
+
+    /// A dot inside backticks is literal, not a nested-name segment —
+    /// a leading dot is unreachable for the bare production.
+    #[test]
+    fn backtick_name_dot_is_literal() {
+        assert_eq!(
+            field_name().parse("`.leading`").into_result().unwrap(),
+            ".leading"
+        );
+        assert_eq!(
+            field_name().parse("`host.name`").into_result().unwrap(),
+            "host.name"
+        );
+    }
+
+    /// Empty and control-char names are parse errors (ruling 7) — an
+    /// empty column name is unnameable and a control char would rewrite
+    /// the terminal line that renders it.
+    #[test]
+    fn backtick_name_empty_and_control_chars_rejected() {
+        assert!(field_name().parse("``").into_result().is_err());
+        assert!(field_name().parse("`a\nb`").into_result().is_err());
+        assert!(field_name().parse("`a\tb`").into_result().is_err());
+        assert!(field_name().parse("`a\u{7f}b`").into_result().is_err());
+        assert!(field_name().parse("`\u{1b}[2J`").into_result().is_err());
+    }
+
+    /// Function names, stage names and saved-query names are NOT fields,
+    /// so they take the unquoted production and no backticks.
+    #[test]
+    fn plain_name_takes_no_backticks() {
+        assert!(plain_name().parse("`lower`").into_result().is_err());
+        assert_eq!(plain_name().parse("lower").into_result().unwrap(), "lower");
+        assert_eq!(
+            plain_name().parse("@timestamp").into_result().unwrap(),
+            "@timestamp"
         );
     }
 

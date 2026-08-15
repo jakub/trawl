@@ -103,15 +103,21 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 /// strings. Comment content is replaced with spaces so that error spans
 /// remain accurate.
 ///
+/// Backtick-quoted field names are tracked beside double-quoted strings,
+/// so `` `a#b` `` is a name and not a comment (ADR-0013 ruling 7).
+///
 /// Known limitation: `#` inside regex literals (`/pattern#here/`) will be
 /// treated as a comment start. Use `//` comments on lines containing regex
-/// literals, or move the regex to a different line.
+/// literals, or move the regex to a different line. A stray unbalanced
+/// backtick in a bare value has the same shape of consequence — it can
+/// protect a later `#` from being stripped — and the same remedy.
 fn strip_comments(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = bytes.to_vec();
     let len = bytes.len();
     let mut i = 0;
     let mut in_string = false;
+    let mut in_backtick = false;
 
     while i < len {
         if in_string {
@@ -124,8 +130,18 @@ fn strip_comments(input: &str) -> String {
             } else {
                 i += 1;
             }
+        } else if in_backtick {
+            // A doubled backtick escapes one; toggling twice lands back
+            // inside the name, so no special case is needed here.
+            if bytes[i] == b'`' {
+                in_backtick = false;
+            }
+            i += 1;
         } else if bytes[i] == b'"' {
             in_string = true;
+            i += 1;
+        } else if bytes[i] == b'`' {
+            in_backtick = true;
             i += 1;
         } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
             // // comment — blank to end of line
@@ -678,5 +694,45 @@ mod tests {
         let input = "abc # comment\ndef // another\nghi";
         let stripped = strip_comments(input);
         assert_eq!(stripped.len(), input.len());
+    }
+
+    // ── backtick escape (ADR-0013 ruling 7) ─────────────────────────────
+
+    /// Comment stripping tracks backticks beside double quotes, so a `#`
+    /// or `//` INSIDE a quoted name is part of the name — length still
+    /// preserved, since error spans point into the original input.
+    #[test]
+    fn strip_comments_leaves_backticked_names_alone() {
+        for input in ["| table `a#b`", "| table `a//b`, host"] {
+            let stripped = strip_comments(input);
+            assert_eq!(stripped, input, "backtick content must survive");
+            assert_eq!(stripped.len(), input.len());
+        }
+        // …and the name reaches the AST intact.
+        let query = parse("| table `a#b`").expect("parses");
+        match &query.pipeline[0].node {
+            PipeStage::Table(t) => assert_eq!(t.fields, vec!["a#b".to_string()]),
+            other => panic!("expected Table, got {other:?}"),
+        }
+        // A comment AFTER a closed backtick is still a comment.
+        let query = parse("`a b`=x # trailing").expect("parses");
+        assert_eq!(query.search.groups[0].len(), 1);
+        match &query.search.groups[0][0].node {
+            SearchToken::FieldFilter(ff) => assert_eq!(ff.field, "a b"),
+            other => panic!("expected FieldFilter, got {other:?}"),
+        }
+    }
+
+    /// A LEADING backtick that fails the quoted production is a loud
+    /// parse error, never a quiet slide into text search: unterminated,
+    /// empty, or a control character inside.
+    #[test]
+    fn leading_backtick_that_is_not_a_name_is_a_parse_error() {
+        for input in ["`unterminated", "``", "`a\nb`", "`foo` bar"] {
+            assert!(
+                parse(input).is_err(),
+                "{input:?} must be a loud parse error, not text search"
+            );
+        }
     }
 }

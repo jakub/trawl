@@ -1861,6 +1861,12 @@ mod tests {
             "* | rename service as _svc",
             r#"* | extract "(?P<_foo>.)" from message"#,
             r#"* | extract "(?P<_severity>\d+)" from message"#,
+            // Quoting changes the LEXING, never the policy (ADR-0013
+            // ruling 7): a backticked write target is refused exactly as
+            // the bare spelling is.
+            "* | let `_foo` = 1",
+            "* | rename service as `_svc`",
+            "* | stats count() as `_total`",
         ] {
             let Ok(query) = crate::parser::parse(dsl) else {
                 continue; // refused at the parser door
