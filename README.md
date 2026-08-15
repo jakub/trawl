@@ -39,7 +39,7 @@ you want external access.
 
 ```bash
 # errors in the last hour by service
-trawl query "level=error last=1h | stats count() by service | sort -count"
+trawl query "_severity>=error last=1h | stats count() by service | sort -count"
 
 # slow requests with field extraction
 trawl query "status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | head 10"

@@ -27,7 +27,7 @@ The TUI provides:
 Execute a query and print results to stdout.
 
 ```bash
-trawl query "level=error last=1h | stats count() by service"
+trawl query "_severity>=error last=1h | stats count() by service"
 ```
 
 ### Output formats
@@ -70,7 +70,7 @@ Query local parquet files directly, without a server:
 
 ```bash
 trawl query --data 'data/**/*.parquet' "* | stats count() by service"
-trawl query --data '/path/to/*.parquet' "level=error | head 10"
+trawl query --data '/path/to/*.parquet' "_severity>=error | head 10"
 ```
 
 Embedded mode uses a single ephemeral DuckDB connection with no hot buffer, no auth, and no row limit.
@@ -80,7 +80,7 @@ Embedded mode uses a single ephemeral DuckDB connection with no hot buffer, no a
 Check query syntax without executing:
 
 ```bash
-trawl validate "level=error | stats count() by host"
+trawl validate "_severity>=error | stats count() by host"
 trawl validate -p dev "..."     # validate against dev server
 ```
 

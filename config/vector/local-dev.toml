@@ -12,7 +12,7 @@
 #
 # query with trawl:
 #   cargo run -p trawl-cli -- --data "./data/logs/**/*.ndjson" "*"
-#   cargo run -p trawl-cli -- --data "./data/logs/**/*.ndjson" "level=error last=5m"
+#   cargo run -p trawl-cli -- --data "./data/logs/**/*.ndjson" "_severity=error last=5m"
 #   cargo run -p trawl-cli -- --data "./data/logs/**/*.ndjson" "service:flog | stats count() by host"
 
 # ============================================================================
@@ -156,11 +156,13 @@ del(.stream)
 del(.source_type)
 '''
 
-# -- envelope: materialize the ADR-0009 schema ------------------------------
+# -- envelope: materialize the declared schema ------------------------------
 # this config writes ndjson consumed DIRECTLY by embedded-mode queries
 # (no trawld ingest canonicalizer in the path), so the declared envelope
-# is materialized here: _time/_ingested/_raw/env plus numeric severity
-# derived from severity_text using the OTel token table.
+# is materialized here: _time/_ingested/_raw/env plus the derived
+# `_severity` slot, read off `severity_text` through the OTel token table.
+# The source field stays exactly where it is (ADR-0013: derivation
+# observes, it never consumes).
 
 [transforms.envelope]
 type = "remap"
@@ -172,26 +174,26 @@ inputs = [
 ]
 source = '''
 .env = "prod"
-if !exists(._time) && exists(.timestamp) { ._time = del(.timestamp) }
+if !exists(._time) && exists(.timestamp) { ._time = .timestamp }
 if !exists(._time) { ._time = now() }
 ._ingested = now()
 if !exists(._raw) { ._raw = encode_json(.) }
 
 st = downcase(to_string(.severity_text) ?? "")
 if st == "error" || st == "err" || st == "e" {
-  .severity = 17
+  ._severity = 17
 } else if st == "warn" || st == "warning" || st == "w" {
-  .severity = 13
+  ._severity = 13
 } else if st == "notice" {
-  .severity = 10
+  ._severity = 10
 } else if st == "info" || st == "i" {
-  .severity = 9
+  ._severity = 9
 } else if st == "debug" || st == "d" {
-  .severity = 5
+  ._severity = 5
 } else if st == "trace" || st == "t" {
-  .severity = 1
+  ._severity = 1
 } else if st == "fatal" || st == "critical" || st == "crit" || st == "f" {
-  .severity = 21
+  ._severity = 21
 }
 '''
 

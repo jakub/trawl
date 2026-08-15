@@ -123,7 +123,7 @@ trawl query "last=1h"
 trawl query "service=myapp"
 
 # aggregate errors by service
-trawl query "level=error last=1h | stats count() by service"
+trawl query "_severity>=error last=1h | stats count() by service"
 
 # pipe to jq for ad-hoc processing
 trawl query "last=1h | stats count() by service" | jq '.service'

@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn no_time_filter_over_empty_root_matches_nothing() {
         // No env directory on disk → nothing to read.
-        let source = compute_source("/data", "level=error", "/data/**/*.parquet");
+        let source = compute_source("/data", "_severity=error", "/data/**/*.parquet");
         assert_eq!(source, "/data/.no-such-env/*.parquet");
     }
 
@@ -641,7 +641,7 @@ mod tests {
         assert!(source.contains("nginx.parquet"), "got: {source}");
 
         // neither — every env, wildcard pattern.
-        let source = compute_source(base, "level=error", &fallback);
+        let source = compute_source(base, "_severity=error", &fallback);
         assert!(source.contains("/prod/"), "got: {source}");
         assert!(source.contains("/lab/"), "got: {source}");
     }
@@ -696,7 +696,7 @@ mod tests {
         std::fs::write(&run, b"report run").unwrap();
 
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "level=error", &fallback);
+        let source = compute_source(base, "_severity=error", &fallback);
 
         assert_eq!(source, format!("{base}/.no-such-env/*.parquet"));
         assert!(
@@ -728,7 +728,7 @@ mod tests {
         }
 
         let fallback = format!("{base}/**/*.parquet");
-        let source = compute_source(base, "level=error", &fallback);
+        let source = compute_source(base, "_severity=error", &fallback);
 
         assert_eq!(source, format!("{base}/.no-such-env/*.parquet"));
         assert!(

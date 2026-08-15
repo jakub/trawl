@@ -187,11 +187,11 @@ async fn saved_create_and_list(pool: PgPool) {
     let key_id = 1;
 
     let created = store
-        .create(key_id, "nginx_errors", "service=nginx level=error")
+        .create(key_id, "nginx_errors", "service=nginx _severity=error")
         .await
         .unwrap();
     assert_eq!(created.name, "nginx_errors");
-    assert_eq!(created.query, "service=nginx level=error");
+    assert_eq!(created.query, "service=nginx _severity=error");
 
     let list = store.list(key_id).await.unwrap();
     assert_eq!(list.len(), 1);
@@ -321,11 +321,14 @@ async fn saved_get_by_name(pool: PgPool) {
     let store = saved(&pool);
     assert!(store.get_by_name(1, "missing").await.unwrap().is_none());
 
-    store.create(1, "my_query", "level=error").await.unwrap();
+    store
+        .create(1, "my_query", "_severity=error")
+        .await
+        .unwrap();
 
     let found = store.get_by_name(1, "my_query").await.unwrap().unwrap();
     assert_eq!(found.name, "my_query");
-    assert_eq!(found.query, "level=error");
+    assert_eq!(found.query, "_severity=error");
 
     // Other user can't see it.
     assert!(store.get_by_name(2, "my_query").await.unwrap().is_none());
@@ -387,7 +390,7 @@ async fn saved_list_with_details_bulk_join(pool: PgPool) {
 
 async fn seed_saved(pool: &PgPool, key_id: i64, name: &str) -> i64 {
     saved(pool)
-        .create(key_id, name, "level=error")
+        .create(key_id, name, "_severity=error")
         .await
         .unwrap()
         .id
@@ -549,10 +552,13 @@ async fn schedule_user_isolation(pool: PgPool) {
 async fn cascade_on_saved_query_delete(pool: PgPool) {
     let saved_store = saved(&pool);
     let store = schedules(&pool);
-    let sq = saved_store.create(1, "test", "level=error").await.unwrap();
+    let sq = saved_store
+        .create(1, "test", "_severity=error")
+        .await
+        .unwrap();
     let schedule = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
 
-    let run_id = seed_run(&store, schedule.id, sq.id, "level=error").await;
+    let run_id = seed_run(&store, schedule.id, sq.id, "_severity=error").await;
     assert_eq!(
         store
             .finish_run(
@@ -616,7 +622,7 @@ async fn start_and_finish_run(pool: PgPool) {
     let sq_id = seed_saved(&pool, 1, "test").await;
     let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
 
-    let run_id = seed_run(&store, schedule.id, sq_id, "level=error").await;
+    let run_id = seed_run(&store, schedule.id, sq_id, "_severity=error").await;
 
     let run = store.get_run(run_id, 1).await.unwrap().unwrap();
     assert_eq!(run.status, RunStatus::Running);

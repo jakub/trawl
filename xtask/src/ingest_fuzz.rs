@@ -25,7 +25,16 @@ pub enum Phase {
     /// pins installed by `pin`. Compact the pin phase before sending these.
     Conflicts,
     /// Seeded accepted events covering scalar boundaries, nested values,
-    /// hostile-but-storable names, aliases, casing, and repair paths.
+    /// hostile-but-storable names, casing, repair paths, and the whole
+    /// ADR-0013 derivation surface: severity source PRECEDENCE, the
+    /// numeric dialect domain, the time sources (read AND stored), and
+    /// every branch of the sealed `_`-prefix strip — including the empty
+    /// remainder, the bare-name collision, and a forged `_severity`.
+    ///
+    /// The invariant this phase exists to break: every accepted field
+    /// stays queryable under SOME name. Nothing is consumed, and the one
+    /// strip rule either renames or (with no remainder) drops into
+    /// `_raw`.
     #[default]
     Mutate,
     /// Valid JSON objects that trawl should reject at envelope validation.
@@ -138,7 +147,9 @@ fn base_event(config: &Config, names: &Names, phase: &str, seq: usize) -> Map<St
     event.insert("env".into(), json!(config.env));
     event.insert("service".into(), json!(names.service(phase)));
     event.insert("host".into(), json!("fuzz-host"));
-    event.insert("severity_text".into(), json!("info"));
+    // A severity SOURCE, stored verbatim: derivation reads it and leaves
+    // it exactly where it is (ADR-0013 §2).
+    event.insert("severity".into(), json!("info"));
     event.insert(
         "message".into(),
         json!(format!("trawl ingest fuzz {phase} row {seq}")),
@@ -298,16 +309,44 @@ fn mutation_events(config: &Config, names: &Names) -> Vec<Value> {
                     json!({"outer": {"inner": seq}, "list": [null, true, seq]}),
                 );
             }
+            // Source PRECEDENCE: `severity` → `severity_text` → `level`,
+            // first mappable wins, and every one of them lands as its own
+            // column whatever the derivation decides.
             if seq % 7 == 0 {
-                event.remove("severity_text");
+                event.remove("severity");
                 event.insert("level".into(), json!(severity_value(seq)));
             }
+            if seq % 3 == 0 {
+                event.insert("severity_text".into(), json!(severity_value(seq + 1)));
+            }
+            // The sealed `_` prefix at the ingest door (ADR-0013 §5):
+            // server-stamped slots, the internal provenance key, a
+            // journald-shaped name, an empty remainder, and the
+            // bare-name collision — every branch of the ONE strip rule.
             if seq % 11 == 0 {
                 event.insert("_ingested".into(), json!("client-forged"));
                 event.insert("_repairs".into(), json!("client-forged"));
+                event.insert("_trawl_wal_file".into(), json!("client-forged"));
+            }
+            if seq % 4 == 0 {
+                event.insert("_HOSTNAME".into(), json!("journald-box"));
+                event.insert("__name__".into(), json!("prometheus-series"));
+            }
+            if seq % 9 == 0 {
+                event.insert("___".into(), json!("no bare remainder"));
+                event.insert(names.field("collide"), json!("bare wins"));
+                event.insert(format!("_{}", names.field("collide")), json!("loser"));
+            }
+            // A forged verdict: derivation-only, so it strips to bare
+            // `severity` and is then READ like any other source.
+            if seq % 6 == 0 {
+                event.insert("_severity".into(), json!(severity_value(seq)));
             }
             if seq % 13 == 0 {
                 event.insert("timestamp".into(), timestamp_value(seq));
+            }
+            if seq % 8 == 0 {
+                event.insert("@timestamp".into(), timestamp_value(seq + 2));
             }
             if seq % 17 == 0 {
                 event.insert(
@@ -360,13 +399,20 @@ fn mutation_values() -> Vec<Value> {
     ]
 }
 
+/// Severity source values across the whole derivation domain: a token, an
+/// alias, an `OTel` exact short name, an in-ladder numeric (which reads as
+/// `OTel`, never syslog-inverted), out-of-ladder numerics, an unmappable
+/// word, and nothing at all.
 fn severity_value(seq: usize) -> Value {
-    match seq % 6 {
+    match seq % 9 {
         0 => json!("ERROR"),
         1 => json!(7),
         2 => json!("0"),
         3 => json!("SPICY"),
         4 => json!(25),
+        5 => json!("error2"),
+        6 => json!("17"),
+        7 => json!(1.5),
         _ => Value::Null,
     }
 }

@@ -20,7 +20,7 @@ use crate::ast::{
 ///
 /// Output uses one pipe stage per line with `| ` prefix:
 /// ```text
-/// service=nginx level=error last=2h
+/// service=nginx _severity=error last=2h
 /// | stats count() by host
 /// | where count > 10
 /// ```
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn multiple_field_filters() {
-        insta::assert_snapshot!(fmt("service=nginx   level=error   status>=400"), @"service=nginx level=error status>=400");
+        insta::assert_snapshot!(fmt("service=nginx   _severity=error   status>=400"), @"service=nginx _severity=error status>=400");
     }
 
     #[test]
@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn time_filter_at_end() {
-        insta::assert_snapshot!(fmt("service=nginx last=2h level=error"), @"service=nginx level=error last=2h");
+        insta::assert_snapshot!(fmt("service=nginx last=2h _severity=error"), @"service=nginx _severity=error last=2h");
     }
 
     #[test]
@@ -601,9 +601,9 @@ mod tests {
     #[test]
     fn full_pipeline() {
         insta::assert_snapshot!(
-            fmt("service=nginx   level=error   last=2h  |stats count() by host|where count>10|sort -count|head 20"),
+            fmt("service=nginx   _severity=error   last=2h  |stats count() by host|where count>10|sort -count|head 20"),
             @r"
-        service=nginx level=error last=2h
+        service=nginx _severity=error last=2h
         | stats count() by host
         | where count > 10
         | sort -count
@@ -925,7 +925,7 @@ mod tests {
 
     #[test]
     fn idempotent() {
-        let input = "service=nginx   level=error last=2h  |stats count() by host|where count>10|sort -count|head 20";
+        let input = "service=nginx   _severity=error last=2h  |stats count() by host|where count>10|sort -count|head 20";
         let first = fmt(input);
         let second = fmt(&first);
         assert_eq!(first, second, "formatter is not idempotent");

@@ -48,13 +48,13 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 
 ```bash
 # errors in the last hour, grouped by service
-trawl query "level=error last=1h | stats count() by service | sort -count"
+trawl query "_severity>=error last=1h | stats count() by service | sort -count"
 
 # slow requests by endpoint
 trawl query "status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10"
 
 # live tail with filtering
-trawl query "service=nginx level=error" --stream
+trawl query "service=nginx _severity>=error" --stream
 
 # query local parquet files directly (no server needed)
 trawl query --data 'data/**/*.parquet' "* | stats count() by service"

@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn test_multiple_tokens() {
         let result = search_stage()
-            .parse("service=nginx level=error last=2h")
+            .parse("service=nginx _severity=error last=2h")
             .into_result()
             .unwrap();
         // Time filter hoisted, 2 tokens remain in group.
@@ -549,9 +549,9 @@ mod tests {
 
     #[test]
     fn test_not_negates_field_filter() {
-        // "NOT level=error" → single NOT(FieldFilter) token.
+        // "NOT _severity=error" → single NOT(FieldFilter) token.
         let result = search_stage()
-            .parse("NOT level=error")
+            .parse("NOT _severity=error")
             .into_result()
             .unwrap();
         assert_eq!(result.groups[0].len(), 1);
@@ -560,7 +560,7 @@ mod tests {
                 assert_eq!(
                     inner.node,
                     SearchToken::FieldFilter(FieldFilter {
-                        field: "level".to_string(),
+                        field: "_severity".to_string(),
                         op: FilterOp::Eq,
                         value: FilterValue::Literal("error".to_string()),
                     })
@@ -572,9 +572,9 @@ mod tests {
 
     #[test]
     fn test_not_parenthesized_group() {
-        // "NOT (service=nginx OR service=apache) level=error"
+        // "NOT (service=nginx OR service=apache) _severity=error"
         let result = search_stage()
-            .parse("NOT (service=nginx OR service=apache) level=error")
+            .parse("NOT (service=nginx OR service=apache) _severity=error")
             .into_result()
             .unwrap();
         assert_eq!(result.groups[0].len(), 2);
@@ -648,7 +648,7 @@ mod tests {
     fn test_or_implicit_and_binds_tighter() {
         // "a b OR c d" → [[a, b], [c, d]]
         let result = search_stage()
-            .parse("service=nginx level=error OR service=postgres level=warn")
+            .parse("service=nginx _severity=error OR service=postgres _severity=warn")
             .into_result()
             .unwrap();
         assert_eq!(result.groups.len(), 2);

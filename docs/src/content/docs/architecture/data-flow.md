@@ -24,7 +24,7 @@ Each ingest batch produces one WAL file per service, under the batch's env direc
 
 ### Envelope canonicalization
 
-Every accepted event is rewritten into the declared envelope — `_time`, `_ingested`, `_raw`, `_repairs`, `env`, `service`, `host`, `severity`, `severity_text`, `message` (ADR-0009). The canonicalizer captures `_raw` first (the client's string `_raw` verbatim when supplied, else the canonical pre-repair serialization), strips server-owned fields, consumes the `_time`/`timestamp`/`@timestamp` wire aliases, stamps `_ingested`, resolves `env` against the allowlist, fills `host` from the peer where that is honest, and derives the OTel `severity` number. The governing rule: **repair when the server has an honest answer, reject when it would guess.** Repairs are a closed code set recorded per-event in `_repairs` and counted by `trawl_ingest_repairs_total{code, service}`; rejections are per-event and carry a typed reason, so valid siblings in the same batch still land.
+Every accepted event is rewritten into the declared nine-field envelope — `_time`, `_ingested`, `_raw`, `_repairs`, `_severity` (trawl-owned) plus `env`, `service`, `host`, `message` (sender-asserted) — per ADR-0009 as reshaped by ADR-0013. The canonicalizer captures `_raw` first (the client's string `_raw` verbatim when supplied, else the canonical pre-repair serialization), strips the reserved `_` prefix off every non-proposable key so its value lands under the bare remainder, stamps `_ingested`, resolves `env` against the allowlist, fills `host` from the peer where that is honest, and DERIVES `_time` and `_severity` from ordered source lists it only ever READS. Derivation never consumes: `timestamp`, `@timestamp`, `severity`, `severity_text` and `level` all stay as ordinary columns under the names their sender chose. The governing rule: **repair when the server has an honest answer, reject when it would guess** — and a derivation into the `_` namespace is an annotation, not a repair, so it confesses nothing. Repairs are a closed code set recorded per-event in `_repairs` and counted by `trawl_ingest_repairs_total{code, service}`; rejections are per-event and carry a typed reason, so valid siblings in the same batch still land.
 
 #### Timestamps
 
@@ -167,7 +167,7 @@ data/
       ...
 ```
 
-The envelope columns (`_time`, `_ingested`, `_raw`, `_repairs`, `env`, `service`, `host`, `severity`, `severity_text`, `message`) are declared and enforced at ingest; user fields beyond them stay dynamic in *name* — any field can appear at any time — but each name's *type* is pinned by the field catalog at first typed sight, so `union_by_name=true` reconciles heterogeneous column sets without ever facing a type conflict. `_time`/`_ingested` are converted to native `TIMESTAMP` during compaction (via the repair `COALESCE` above, never a hard CAST) for predicate pushdown.
+The envelope columns (`_time`, `_ingested`, `_raw`, `_repairs`, `_severity`, `env`, `service`, `host`, `message`) are declared and enforced at ingest; user fields beyond them stay dynamic in *name* — any field can appear at any time — but each name's *type* is pinned by the field catalog at first typed sight, so `union_by_name=true` reconciles heterogeneous column sets without ever facing a type conflict. `_time`/`_ingested` are converted to native `TIMESTAMP` during compaction (via the repair `COALESCE` above, never a hard CAST) for predicate pushdown.
 
 ### The epoch cutover
 

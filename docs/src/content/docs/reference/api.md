@@ -73,7 +73,7 @@ POST /api/v1/query
 Content-Type: application/json
 
 {
-  "query": "level=error last=1h | stats count() by service"
+  "query": "_severity>=error last=1h | stats count() by service"
 }
 ```
 
@@ -91,10 +91,20 @@ catalog to consult. `trawl query -f table` prints it as a footer line and
 the [web UI](/reference/web-ui/#the-incomplete-results-notice) renders it
 as a dismissible notice over the results.
 
+It may also carry `notices` — non-blocking advisories about the query's
+SHAPE, prose sentences for a human. There is exactly one today: a bare
+`level` compared against a recognized severity token filters the
+sender's own field rather than the severity ladder (ADR-0013), so the
+notice points at `_severity`. The query executed with plain semantics
+either way. Like `degraded_fields`, the key is **absent when empty**.
+`trawl query -f table` prints each as a footer line and the web UI
+renders them over the results.
+
 ```json
 { "columns": [], "rows": [], "truncated": false,
   "pagination": { "limit": 1000, "offset": 0, "returned": 12 },
-  "degraded_fields": ["duration"] }
+  "degraded_fields": ["duration"],
+  "notices": ["'level' is an ordinary field: this filtered the sender's own value, not severity. For the severity ladder use `_severity` (e.g. `_severity>=error`)."] }
 ```
 
 ### Validate
@@ -104,7 +114,7 @@ POST /api/v1/validate
 Content-Type: application/json
 
 {
-  "query": "level=error | stats count() by host"
+  "query": "_severity>=error | stats count() by host"
 }
 ```
 

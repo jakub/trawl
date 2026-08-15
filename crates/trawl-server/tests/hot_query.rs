@@ -24,8 +24,7 @@ fn make_event(service: &str, message: &str) -> Map<String, Value> {
     m.insert("_time".into(), json!("2026-02-15T12:00:00Z"));
     m.insert("_ingested".into(), json!("2026-02-15T12:00:01Z"));
     m.insert("service".into(), json!(service));
-    m.insert("severity".into(), json!(9));
-    m.insert("severity_text".into(), json!("info"));
+    m.insert(trawl_core::schema::SEVERITY.into(), json!(9));
     m.insert("message".into(), json!(message));
     m
 }
@@ -751,6 +750,153 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
     );
 
     // Cold lane (post-compaction): same answers off parquet.
+    trawl_server::ingest::compaction::compact_once(
+        &wal_dir,
+        &data_dir,
+        Duration::ZERO,
+        false,
+        Some(&hot_buffer),
+        500,
+        "2GB",
+        None,
+    )
+    .await
+    .expect("compaction should succeed");
+    assert_eq!(hot_buffer.event_count(), 0);
+    for (dsl, expected) in cases {
+        assert_eq!(run(dsl).await, expected, "cold: {dsl}");
+    }
+}
+
+/// The SEVERITY pin answers identically hot and cold, and in the stream
+/// lane, over the whole token vocabulary (ADR-0013 §6).
+///
+/// The vocabulary is the point: a band token, an `OTel` exact short name,
+/// an integer, an ordered comparison, an IN list and a glob over the
+/// canonical text all bind through ONE rule table, so a divergence here
+/// is a missed lane rather than a missed case.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one linear end-to-end narrative
+async fn severity_pin_agrees_hot_cold_and_stream() {
+    use trawl_core::filter::CompiledFilter;
+    use trawl_server::catalog::FieldCatalog;
+
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let wal_dir = tmp.path().join("wal");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // The declared seed pins `_severity` SEVERITY on day one; here it is
+    // seeded straight into the in-process cache the pool and the stream
+    // both read.
+    let catalog = Arc::new(FieldCatalog::new());
+    catalog.merge([(
+        trawl_core::schema::SEVERITY.to_string(),
+        trawl_core::schema::CanonicalType::Severity,
+    )]);
+
+    let hot_buffer = Arc::new(
+        HotBuffer::new(HotBufferConfig {
+            max_events: 10_000,
+            max_bytes: 10_000_000,
+        })
+        .with_field_catalog(Arc::clone(&catalog)),
+    );
+    let pool = ExecutorPool::new(
+        data_dir.to_str().unwrap().to_owned(),
+        1,
+        1000,
+        Some(Arc::clone(&hot_buffer)),
+    )
+    .with_field_catalog(Arc::clone(&catalog));
+
+    // One row per band edge, plus the game-server row that derives none.
+    let events: Vec<Map<String, Value>> = [
+        (Some(17), "error-lo"),
+        (Some(20), "error-hi"),
+        (Some(18), "error2"),
+        (Some(13), "warn"),
+        (Some(9), "info"),
+        (None, "gold"),
+    ]
+    .into_iter()
+    .map(|(sev, msg)| {
+        let mut m = make_event("nginx", msg);
+        match sev {
+            Some(n) => m.insert(trawl_core::schema::SEVERITY.into(), json!(n)),
+            None => m.remove(trawl_core::schema::SEVERITY),
+        };
+        m.insert("level".into(), json!(msg));
+        m
+    })
+    .collect();
+
+    let wal_writer = WalWriter::new(wal_dir.clone());
+    wal_writer.ensure_dir().unwrap();
+    let ndjson = events_to_ndjson(&events);
+    let wal_path = wal_writer.write("prod", "nginx", &ndjson).unwrap();
+    hot_buffer.insert(Arc::new(IngestBatch {
+        batch_id: format!("prod/{}", wal_path.file_stem().unwrap().to_str().unwrap()).into(),
+        service: "nginx".into(),
+        byte_size: ndjson.len(),
+        events: events.clone(),
+    }));
+
+    let run = |dsl: &'static str| {
+        let pool = &pool;
+        async move {
+            pool.execute(
+                pool.allocate_query_id(),
+                dsl,
+                Duration::from_secs(10),
+                false,
+                0,
+            )
+            .await
+            .result
+            .unwrap_or_else(|e| panic!("{dsl:?} must succeed: {e}"))
+            .rows
+            .len()
+        }
+    };
+
+    // (dsl, expected rows)
+    let cases: [(&'static str, usize); 8] = [
+        ("_severity=error", 3),
+        ("_severity=error2", 1),
+        ("_severity=17", 1),
+        ("_severity>=warn", 4),
+        ("_severity=warn,error", 4),
+        ("_severity=warn*", 1),
+        // `!=` widens with NULL in the search stage, so the row with no
+        // derived severity matches.
+        ("_severity!=error", 3),
+        // `level` is the sender's own field now.
+        ("level=gold", 1),
+    ];
+
+    for (dsl, expected) in cases {
+        assert_eq!(run(dsl).await, expected, "hot: {dsl}");
+    }
+
+    // The live lane, over the same single snapshot the handler feeds it.
+    let stream_matches = |dsl: &str| -> usize {
+        let ast = trawl_core::parser::parse(dsl).expect("parses");
+        let pins = catalog.all();
+        let filter = CompiledFilter::compile(&ast.search, &pins).expect("filter compiles");
+        let now = chrono::Utc::now();
+        events
+            .iter()
+            .filter(|event| filter.matches_at(event, now))
+            .count()
+    };
+    for (dsl, expected) in cases {
+        assert_eq!(stream_matches(dsl), expected, "stream: {dsl}");
+    }
+
+    // Cold lane: same answers off parquet, after conformance wrote the
+    // column as the physical BIGINT the pin names.
     trawl_server::ingest::compaction::compact_once(
         &wal_dir,
         &data_dir,

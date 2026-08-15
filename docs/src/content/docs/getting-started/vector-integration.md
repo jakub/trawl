@@ -17,39 +17,51 @@ about the event.
 | Field | Type | Who sets it | Notes |
 |---|---|---|---|
 | `_time` | TIMESTAMP | you (or trawl repairs) | event time; missing/unparseable values are replaced with the arrival time and flagged `time.from_ingest` |
-| `_ingested` | TIMESTAMP | trawl | arrival time; client values are stripped (`meta.stripped`) |
+| `_ingested` | TIMESTAMP | trawl | arrival time; a client value takes the reserved-prefix strip and lands as a plain `ingested` column (`field.reserved_prefix`) |
 | `_raw` | VARCHAR | you or trawl | most original form available: send a string `_raw` to preserve your pre-parse line, else trawl stores the pre-repair serialization of what arrived. Bare-word search reads this column, so under the serialization a bare term matches any field's value **and** any field name — see [Text search](/reference/dsl/#text-search) |
 | `_repairs` | VARCHAR | trawl | comma-separated repair codes; NULL for untouched events |
 | `env` | VARCHAR | you (or `default_env`) | path dimension; must be in the server's `ingest.envs` allowlist or the event **rejects** |
 | `service` | VARCHAR | you — **required** | shard key and filename; missing or non-string values **reject**. Charset `[A-Za-z0-9._-]`, no spaces, no leading dot, ≤128 bytes |
 | `host` | VARCHAR | you (or peer IP) | filled from the sender address when absent (`host.from_peer`) — **rejected instead** when the peer is a configured trusted relay |
-| `severity` | INTEGER | derived | OTel SeverityNumber 1-24, derived server-side |
-| `severity_text` | VARCHAR | you | your original severity spelling, kept verbatim |
+| `_severity` | SEVERITY | trawl | derived OTel SeverityNumber 1-24; **derivation-only** — a client-sent `_severity` strips to a plain `severity` column, which the derivation then reads |
 | `message` | VARCHAR | you, by convention | the important part of the line |
 
-### Accepted wire aliases
+Everything else you send is **your** vocabulary, stored verbatim under
+the name you sent it. The whole `_` prefix is trawl's, though: a
+non-proposable `_x` has its leading underscores stripped and lands under
+the bare remainder (`_HOSTNAME` → `hostname`, `__name__` → `name__`,
+`field.reserved_prefix`), so a journald or prometheus passthrough keeps
+every field queryable instead of losing it.
 
-trawl consumes these keys at ingest — they feed the envelope and are never
-stored as columns:
+### Derivation sources: read, never consumed
 
-- **`timestamp`** or **`@timestamp`** → the `_time` input (precedence:
-  `_time`, then `timestamp`, then `@timestamp`). Accepted grammar: RFC
-  3339, ISO 8601 basic offsets (`+0530`, `+02`), offset-less date-times
-  (read as UTC), `T` or space separator, `YYYY-MM-DD` or `YYYY/MM/DD`,
-  optional seconds/fraction, or a bare date (midnight UTC).
-- **`level`** → the severity-derivation input (the DSL's `level` alias
-  would shadow a stored column anyway; the original is always in `_raw`).
+trawl READS these keys to fill its own slots and **stores every one of
+them verbatim** as your own column:
 
-So an existing remap that sets `.timestamp` and `.level` keeps working
-unchanged — the shipped configs emit `._time` and `.severity_text`
+- **`_time`** ← `_time`, then `timestamp`, then `@timestamp`; first
+  PRESENT wins. Accepted grammar: RFC 3339, ISO 8601 basic offsets
+  (`+0530`, `+02`), offset-less date-times (read as UTC), `T` or space
+  separator, `YYYY-MM-DD` or `YYYY/MM/DD`, optional seconds/fraction, or
+  a bare date (midnight UTC). Only `_time` itself is consumed — it is
+  the proposal slot — so `timestamp` and `@timestamp` stay queryable
+  beside the canonical instant.
+- **`_severity`** ← `severity`, then `severity_text`, then `level`;
+  first MAPPABLE wins. All three stay as ordinary columns whatever the
+  derivation decides, so `{"service":"game","level":"gold"}` keeps a
+  fully queryable `level="gold"` and simply gets no `_severity`.
+
+So an existing remap that sets `.timestamp` and `.level` keeps working —
+and now keeps its fields too. The shipped configs emit `._time`
 natively, which is preferred.
 
 ### Severity tokens
 
 `severity`, `severity_text` and `level` values are matched
-case-insensitively against this table; anything else leaves `severity`
-NULL with the `severity.unmapped` repair code (never a rejection) and is
-preserved as `severity_text`:
+case-insensitively against this table (plus OTel's exact short names —
+`trace2`, `warn3`, `error2`, …). Anything unmappable simply leaves
+`_severity` absent — no rejection, and **no repair code**, because
+nothing you sent was touched. The ops signal is the
+`trawl_severity_unmapped_total{service}` counter:
 
 | tokens | number |
 |---|---|
@@ -63,15 +75,12 @@ preserved as `severity_text`:
 | `alert` | 23 |
 | `emerg`, `panic` | 24 |
 
-Syslog numerics 0-7 are accepted and **inverted** onto the OTel ladder
-(syslog counts down from Emergency 0): 7→5, 6→9, 5→10, 4→13, 3→17, 2→21,
-1→23, 0→24. A client-supplied integer `severity` in 1-24 always wins;
-then a string `severity` (`{"severity":"ERROR"}`, the GCP/Stackdriver
-shape); then `severity_text`; then `level`. An **integer** `severity` is
-only ever read on the OTel ladder — never syslog-inverted, because `0` is
-OTel's UNSPECIFIED as readily as it is syslog's Emergency — so an
-out-of-ladder integer maps to nothing and is kept as `severity_text`
-rather than guessed at.
+A **numeric** source — JSON number or numeric string — is read
+**strictly as OTel 1-24**, never syslog-inverted: `3` is `trace`, and
+`0` or `25` map to nothing. The two ranges overlap, so no value-shape
+rule could tell the dialects apart; syslog inversion happens only in
+trawl's own syslog listener, where the transport proves the dialect.
+A collector forwarding syslog over HTTP should remap at the collector.
 
 ### env
 
@@ -113,11 +122,11 @@ verify_certificate = false  # if using self-signed certs
 type = "remap"
 inputs = ["your_source"]
 source = '''
-._time = .timestamp            # or leave `timestamp` — it is consumed as an alias
+._time = .timestamp            # or leave `timestamp` — it is read as a source
 .env = "${TRAWL_ENV:-prod}"    # must be in the server's ingest.envs
 .service = "myapp"             # required — events without it are rejected
 .host = get_hostname!()
-.severity_text = "info"        # trawl derives numeric severity
+.severity = "info"             # trawl derives `_severity` and keeps this
 # ._raw = .message             # optionally preserve your pre-parse line
 del(.source_type)
 '''
