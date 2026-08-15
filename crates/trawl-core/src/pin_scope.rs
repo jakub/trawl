@@ -207,17 +207,12 @@ impl PinScope {
         self.pins.restrict_to(&keep);
     }
 
-    /// Kill the output column of every aggregation: the alias when one is
-    /// given, else the default `func_arg`/`func` name the emitter derives.
+    /// Kill the output column of every aggregation, named through the
+    /// ONE derivation every lane reads
+    /// ([`crate::projection::agg_output_name`]).
     fn remove_agg_outputs(&mut self, aggregations: &[AggExpr]) {
         for agg in aggregations {
-            let name =
-                agg.alias
-                    .clone()
-                    .unwrap_or_else(|| match agg.args.first().map(|a| &a.node) {
-                        Some(Expr::FieldRef(arg)) => format!("{}_{arg}", agg.function),
-                        _ => agg.function.clone(),
-                    });
+            let name = crate::projection::agg_output_name(agg);
             self.pins.remove(&catalog_key(&name));
         }
     }

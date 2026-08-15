@@ -95,10 +95,9 @@ fn process_stats(
         let sql_func = translate_function(&agg.function, &arg_strings)?;
 
         // determine alias
-        let first_arg_name = extract_field_name(agg.args.first());
         let alias = match &agg.alias {
             Some(a) => quote_field(a),
-            None => default_agg_alias(&agg.function, first_arg_name.as_deref()),
+            None => default_agg_alias(agg),
         };
 
         select_items.push(format!("{sql_func} AS {alias}"));
@@ -148,23 +147,6 @@ fn process_table(table_stage: &crate::ast::TableStage, ctx: &mut EmitterState) {
     ctx.select = table_stage.fields.iter().map(|f| quote_field(f)).collect();
     ctx.has_projection = true;
     ctx.had_explicit_columns = true;
-}
-
-/// Try to extract a field name from the first arg of an aggregation.
-///
-/// Recurses through wrapping expressions (function calls, binary ops, unary ops)
-/// to find the innermost field reference. This lets `avg(tonumber(rssi) * -1)`
-/// alias to `avg_rssi` instead of just `avg`.
-fn extract_field_name(arg: Option<&crate::ast::Spanned<crate::ast::Expr>>) -> Option<String> {
-    use crate::ast::Expr;
-    let expr = &arg?.node;
-    match expr {
-        Expr::FieldRef(name) => Some(name.clone()),
-        Expr::FunctionCall { args, .. } => extract_field_name(args.first()),
-        Expr::Binary { lhs, .. } => extract_field_name(Some(lhs)),
-        Expr::Unary { operand, .. } => extract_field_name(Some(operand)),
-        _ => None,
-    }
 }
 
 /// Desugar `top N field` → stats `count()` by field | sort -count | limit N.
@@ -373,10 +355,9 @@ fn process_timechart(
 
         let sql_func = translate_function(&agg.function, &arg_strings)?;
 
-        let first_arg_name = extract_field_name(agg.args.first());
         let alias = match &agg.alias {
             Some(a) => quote_field(a),
-            None => default_agg_alias(&agg.function, first_arg_name.as_deref()),
+            None => default_agg_alias(agg),
         };
 
         select_items.push(format!("{sql_func} AS {alias}"));
@@ -517,16 +498,12 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
             .map(|a| emit_expr(a, ctx))
             .collect::<Result<_, _>>()?;
         let sql_func = translate_function(&agg.function, &arg_strings)?;
-        let first_arg_name = agg.args.first().and_then(|a| {
-            if let crate::ast::Expr::FieldRef(name) = &a.node {
-                Some(name.as_str())
-            } else {
-                None
-            }
-        });
         let alias = match &agg.alias {
             Some(a) => quote_field(a),
-            None => default_agg_alias(&agg.function, first_arg_name),
+            // `eventstats` demands an explicit `as` (ADR-0013 ruling 8,
+            // checked in `projection::check_projection`); this arm is
+            // defensive for a hand-built AST that skipped validation.
+            None => default_agg_alias(agg),
         };
         items.push(format!("{sql_func} OVER ({partition}) AS {alias}"));
     }

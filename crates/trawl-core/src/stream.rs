@@ -1061,10 +1061,10 @@ fn compile_agg_expr(agg: &AggExpr) -> CompiledAcc {
         }
     });
 
-    let alias = agg.alias.clone().unwrap_or_else(|| match &field {
-        Some(f) => format!("{}_{f}", agg.function),
-        None => agg.function.clone(),
-    });
+    // The ONE output-name derivation, shared with the SQL emitter and
+    // the pin-scope walk (ADR-0013 ruling 8): a computed argument names
+    // its innermost field here exactly as it does in batch.
+    let alias = crate::projection::agg_output_name(agg);
 
     let percentile = match agg.function.as_str() {
         "p50" => Some(0.5),
