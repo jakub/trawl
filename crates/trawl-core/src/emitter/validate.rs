@@ -56,9 +56,18 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
     Ok(())
 }
 
-/// Validate a function call: name must be known, arity must match.
+/// Validate a function call: name must be known, arity must match, and
+/// its alias — the fourth pipeline write position, beside `let`/`rename`
+/// targets and `extract` capture groups — may not MINT a reserved name
+/// (ADR-0013 §5).
 fn validate_function(agg: &AggExpr) -> Result<(), EmitError> {
-    validate_function_arity(agg.function.as_str(), agg.args.len())
+    validate_function_arity(agg.function.as_str(), agg.args.len())?;
+    if let Some(alias) = &agg.alias
+        && crate::schema::is_reserved_name(alias)
+    {
+        return Err(reserved_name_error("aggregation alias", alias));
+    }
+    Ok(())
 }
 
 /// Validate extract stage: regex must compile and have named groups.
@@ -105,5 +114,63 @@ pub(crate) fn reserved_name_error(what: &str, name: &str) -> EmitError {
              starting with '_' are trawl's contract slots and only trawl \
              writes them (ADR-0013); choose a name without the underscore"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{PivotStage, StatsStage, TimechartStage};
+
+    fn agg(alias: &str) -> AggExpr {
+        AggExpr {
+            function: "count".to_string(),
+            args: vec![],
+            alias: Some(alias.to_string()),
+        }
+    }
+
+    fn stage(node: PipeStage) -> Spanned<PipeStage> {
+        Spanned::new(node, 0..0)
+    }
+
+    /// The aggregate alias is a pipeline WRITE position, so the emitter
+    /// door seals it exactly as the parser door does (ADR-0013 §5) — a
+    /// hand-built AST cannot mint a reserved column either.
+    #[test]
+    fn aggregation_alias_cannot_mint_a_reserved_name() {
+        let stages = [
+            stage(PipeStage::Stats(StatsStage {
+                aggregations: vec![agg("_severity")],
+                group_by: vec!["service".to_string()],
+            })),
+            stage(PipeStage::Timechart(TimechartStage {
+                span: None,
+                aggregations: vec![agg("_time")],
+                group_by: vec![],
+            })),
+            stage(PipeStage::Pivot(PivotStage {
+                aggregation: agg("_raw"),
+                on_field: "status".to_string(),
+                by: vec![],
+            })),
+        ];
+        for s in stages {
+            let err = validate_pipeline(std::slice::from_ref(&s))
+                .expect_err("reserved alias must be refused");
+            assert!(
+                err.to_string().contains("reserved namespace"),
+                "{err} ({s:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_aggregation_alias_is_accepted() {
+        let s = stage(PipeStage::Stats(StatsStage {
+            aggregations: vec![agg("total")],
+            group_by: vec![],
+        }));
+        validate_pipeline(std::slice::from_ref(&s)).expect("plain alias must validate");
     }
 }
