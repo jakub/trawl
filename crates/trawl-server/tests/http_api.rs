@@ -33,6 +33,54 @@ async fn query_returns_results(pool: sqlx::PgPool) {
     assert_eq!(result.result.row_count(), 3);
 }
 
+/// The shape advisory (ADR-0013 §7): non-blocking, fires on exactly the
+/// confusing shape, and a healthy response is byte-identical to one from
+/// a build that predates the field.
+#[sqlx::test(migrations = false)]
+async fn level_shape_advisory_rides_the_notice_channel(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    // A sender that really carries `level`, so the queries below bind a
+    // real column and the advisory is the only thing under test.
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+    ingest
+        .ingest(&[serde_json::json!({
+            "service": "adv-svc", "host": "h", "level": "error", "message": "boom"
+        })])
+        .await
+        .unwrap();
+
+    for dsl in ["level=error", r#"* | where level == "warn""#] {
+        let result = client.query_paginated(dsl, None, None).await.unwrap();
+        assert_eq!(result.notices.len(), 1, "{dsl}");
+        assert!(
+            result.notices[0].contains("_severity"),
+            "{dsl}: {:?}",
+            result.notices
+        );
+    }
+
+    // Not on a genuine sender field, and not on the right spelling.
+    for dsl in ["level=gold", "_severity=error", "*"] {
+        let result = client.query_paginated(dsl, None, None).await.unwrap();
+        assert!(result.notices.is_empty(), "{dsl}: {:?}", result.notices);
+    }
+
+    // Healthy bodies carry no `notices` key at all.
+    let resp = raw_client()
+        .post(format!("{}/api/v1/query", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .json(&serde_json::json!({ "query": "*" }))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.as_object().unwrap().get("notices").is_none(),
+        "a healthy response must be byte-identical: {body}"
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn query_with_filter(pool: sqlx::PgPool) {
     let server = setup(pool).await;

@@ -81,10 +81,10 @@ pub async fn run_query(
         ));
     }
 
-    let (result, degraded) = if let Some(data) = data {
+    let (result, degraded, notices) = if let Some(data) = data {
         match run_embedded_mode(data, query, timezone) {
             // Embedded mode has no catalog, so it has no notice to carry.
-            Ok(r) => (r, Vec::new()),
+            Ok(r) => (r, Vec::new(), Vec::new()),
             Err(CliError::Engine(ref engine_err)) => {
                 render_engine_error(query, engine_err);
                 return Err(CliError::Usage("query failed".into()));
@@ -115,8 +115,9 @@ pub async fn run_query(
             OutputFormat::Csv => render_csv(&result, &mut file)?,
             OutputFormat::Parquet => unreachable!("handled above"),
         }
-        // The file is the deliverable; the notice belongs on the terminal.
+        // The file is the deliverable; the notices belong on the terminal.
         write_degraded_footer(&mut io::stderr(), format, &degraded)?;
+        write_shape_notices(&mut io::stderr(), format, &notices)?;
     } else {
         let stdout = io::stdout();
         let mut out = stdout.lock();
@@ -127,8 +128,30 @@ pub async fn run_query(
             OutputFormat::Parquet => unreachable!("handled above"),
         }
         write_degraded_footer(&mut out, format, &degraded)?;
+        write_shape_notices(&mut out, format, &notices)?;
     }
 
+    Ok(())
+}
+
+/// The shape-advisory footer (ADR-0013 §7): one line per notice, after
+/// the row count and beside the degraded-field note.
+///
+/// Table output only, for exactly the reason the degraded footer is:
+/// json/csv carry `notices` on the wire, which IS the notice for a
+/// machine, and a prose line inside them is a parse error waiting to
+/// happen.
+fn write_shape_notices(
+    out: &mut impl Write,
+    format: OutputFormat,
+    notices: &[String],
+) -> io::Result<()> {
+    if format != OutputFormat::Table {
+        return Ok(());
+    }
+    for notice in notices {
+        writeln!(out, "note: {notice}")?;
+    }
     Ok(())
 }
 
@@ -226,12 +249,12 @@ async fn run_daemon_mode(
     conn: &ConnectionParams,
     query: &str,
     timezone: &str,
-) -> Result<(QueryResult, Vec<String>), CliError> {
+) -> Result<(QueryResult, Vec<String>, Vec<String>), CliError> {
     let client = make_client(conn)?;
     let response = client
         .query_paginated_tz(query, None, None, Some(timezone.to_owned()))
         .await?;
-    Ok((response.result, response.degraded_fields))
+    Ok((response.result, response.degraded_fields, response.notices))
 }
 
 /// Execute the query locally with an embedded `DuckDB` engine.
@@ -593,6 +616,25 @@ mod tests {
             render(OutputFormat::Table, &[]).is_empty(),
             "a healthy query prints nothing at all"
         );
+    }
+
+    /// The shape advisory (ADR-0013 §7) rides the same footer discipline:
+    /// a table line for a human, the wire field for a machine.
+    #[test]
+    fn the_shape_advisory_footer_is_table_only() {
+        let notices = vec![trawl_core::advisory::LEVEL_ADVISORY.to_owned()];
+        let render = |format, notices: &[String]| {
+            let mut buf = Vec::new();
+            write_shape_notices(&mut buf, format, notices).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+
+        let footer = render(OutputFormat::Table, &notices);
+        assert!(footer.starts_with("note: "), "{footer}");
+        assert!(footer.contains("_severity>=error"), "{footer}");
+        assert!(render(OutputFormat::Json, &notices).is_empty());
+        assert!(render(OutputFormat::Csv, &notices).is_empty());
+        assert!(render(OutputFormat::Table, &[]).is_empty());
     }
 
     #[test]

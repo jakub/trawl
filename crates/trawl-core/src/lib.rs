@@ -8,6 +8,9 @@
 //! and no database coupling — it transforms DSL query strings into SQL
 //! strings with parameters. Everything here should be testable in isolation.
 
+/// The shape-triggered `level=` severity advisory (ADR-0013 §7).
+pub mod advisory;
+
 /// AST types representing parsed trawl DSL queries.
 pub mod ast;
 

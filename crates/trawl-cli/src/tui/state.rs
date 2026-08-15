@@ -1711,6 +1711,7 @@ impl LiveBuffer {
             // A live buffer rendered as a response carries no notice: the
             // SSE lane is deliberately outside the stamp (ADR-0011 slice C1).
             degraded_fields: Vec::new(),
+            notices: Vec::new(),
         }
     }
 

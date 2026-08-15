@@ -338,6 +338,18 @@ pub struct QueryResponse {
     /// semantics, and embedded `--data` mode has no catalog to consult.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded_fields: Vec<String>,
+    /// Non-blocking advisories about the query's SHAPE (ADR-0013 §7) —
+    /// prose sentences for a human, beside `degraded_fields`.
+    ///
+    /// Today there is exactly one: a bare `level` compared against a
+    /// recognized severity token, which after the alias deletion filters
+    /// the sender's own field rather than the severity ladder. The query
+    /// executed with pure semantics; this only says so.
+    ///
+    /// Absent from the wire when empty, so a healthy response is
+    /// byte-identical to one from a build that predates the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
 }
 
 /// Pagination metadata for query responses.

@@ -234,6 +234,7 @@ pub async fn query(
                     returned,
                 },
                 degraded_fields,
+                notices: shape_notices(&req.query),
             }))
         }
         Err(ServerError::Timeout) => {
@@ -1119,6 +1120,21 @@ pub async fn catalog_fields(
 /// Fields BOUND, not fields returned: a `where` on a degraded field that
 /// projects it away is exactly the incomplete case
 /// ([`trawl_core::field_refs`]).
+/// Non-blocking advisories about the query's SHAPE (ADR-0013 §7).
+///
+/// Parsed here rather than threaded out of the executor: the walk is
+/// cheap, pin-blind and total, and a query that failed to parse never
+/// reaches this point. A parse failure is impossible by then, so an
+/// unparseable string simply yields nothing rather than inventing a
+/// second error channel.
+fn shape_notices(dsl: &str) -> Vec<String> {
+    trawl_core::parser::parse(dsl)
+        .ok()
+        .filter(trawl_core::advisory::advises_severity)
+        .map(|_| vec![trawl_core::advisory::LEVEL_ADVISORY.to_owned()])
+        .unwrap_or_default()
+}
+
 fn degraded_fields_for<'a>(
     state: &AppState,
     texts: impl IntoIterator<Item = &'a str>,
