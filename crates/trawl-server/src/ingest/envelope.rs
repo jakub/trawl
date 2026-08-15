@@ -657,14 +657,19 @@ fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
 ///    aliases, stringification), so one code path sees one spelling.
 ///    Recorded as `field.name_case_folded` / `field.name_case_collision`
 ///    only when it changed something.
-/// 1. `service` validation (reject path — nothing else runs).
-/// 2. `_raw` capture — FIRST, before reserved-key stripping and every
-///    repair, so the server's own fills never appear inside "what arrived"
-///    (the serialization fallback uses the PRE-fold object, so dropped and
+/// 1. `_raw` capture — before reserved-key stripping and every repair, so
+///    the server's own fills never appear inside "what arrived" (the
+///    serialization fallback uses the PRE-fold object, so dropped and
 ///    folded spellings stay findable).
-/// 3. Reserved-prefix strip ([`strip_reserved_prefixes`],
-///    `field.reserved_prefix` / `field.reserved_prefix_collision`),
-///    over-long field-name drop (`field.name_too_long`).
+/// 2. Reserved-prefix strip ([`strip_reserved_prefixes`],
+///    `field.reserved_prefix` / `field.reserved_prefix_collision`).
+/// 3. `service` validation (reject path), `env` and `host` resolution —
+///    AFTER the strip, because a stripped `_service`/`_env`/`_host` lands
+///    on exactly the bare slot these read, the same way a stripped
+///    `_severity` lands where derivation reads it (ADR-0013 §5). Resolving
+///    first would let step 6 overwrite the stripped value and then confess
+///    `env.defaulted`/`host.from_peer` about a sender that DID assert one.
+///    Over-long field-name drop (`field.name_too_long`) follows.
 /// 4. `_time` derived from the first PRESENT source
 ///    (`_time`/`timestamp`/`@timestamp`), ADR-0008 grammar,
 ///    `time.from_ingest`/`time.out_of_range`. Only `_time` is consumed.
@@ -682,10 +687,31 @@ pub fn canonicalize(
     let fold = fold_field_names(obj);
     let folded_obj = fold.obj;
 
-    let service = validate_service(&folded_obj)?;
-    // Env and host decide rejection before any mutation happens.
-    let (env, env_defaulted) = resolve_env(&folded_obj, ctx)?;
-    let host_missing = matches!(folded_obj.get("host"), None | Some(Value::Null));
+    // 1. Capture `_raw` before anything is stripped or repaired: a
+    // client-supplied string `_raw` (a collector preserving its pre-parse
+    // line, under any spelling of the name) is kept verbatim; otherwise
+    // the canonical pre-repair serialization of the parsed object — the
+    // PRE-fold original, so folded-away spellings stay findable — is the
+    // most original form available (wire-exact bytes do not exist —
+    // events arrive inside JSON arrays and the WAL re-serializes anyway).
+    let raw_string = match folded_obj.get("_raw") {
+        Some(Value::String(s)) => s.clone(),
+        _ => serde_json::to_string(obj).unwrap_or_default(),
+    };
+    let (raw_string, truncated) = truncate_chars(raw_string, MAX_RAW_CHARS);
+
+    let mut out = folded_obj;
+
+    // 2. The `_` namespace is trawl's: strip the prefix, keep the data.
+    let strip = strip_reserved_prefixes(&mut out);
+
+    // 3. Identity, read from the POST-strip event: a `_host`/`_env`/
+    // `_service` has landed on its bare slot by now, so it is ordinary
+    // sender-asserted data and the fills below cannot overwrite it (nor
+    // claim in `_repairs` that the sender asserted nothing).
+    let service = validate_service(&out)?;
+    let (env, env_defaulted) = resolve_env(&out, ctx)?;
+    let host_missing = matches!(out.get("host"), None | Some(Value::Null));
     if host_missing && ctx.peer_is_trusted_relay {
         return Err((
             format!(
@@ -710,24 +736,6 @@ pub fn canonicalize(
     if fold.collided {
         push_repair(&mut repairs, RepairCode::FieldNameCaseCollision);
     }
-
-    // 2. Capture `_raw` before anything is stripped or repaired: a
-    // client-supplied string `_raw` (a collector preserving its pre-parse
-    // line, under any spelling of the name) is kept verbatim; otherwise
-    // the canonical pre-repair serialization of the parsed object — the
-    // PRE-fold original, so folded-away spellings stay findable — is the
-    // most original form available (wire-exact bytes do not exist —
-    // events arrive inside JSON arrays and the WAL re-serializes anyway).
-    let raw_string = match folded_obj.get("_raw") {
-        Some(Value::String(s)) => s.clone(),
-        _ => serde_json::to_string(obj).unwrap_or_default(),
-    };
-    let (raw_string, truncated) = truncate_chars(raw_string, MAX_RAW_CHARS);
-
-    let mut out = folded_obj;
-
-    // 3. The `_` namespace is trawl's: strip the prefix, keep the data.
-    let strip = strip_reserved_prefixes(&mut out);
     if strip.stripped {
         push_repair(&mut repairs, RepairCode::ReservedPrefix);
     }
@@ -1356,6 +1364,49 @@ mod tests {
         assert_eq!(c.obj["_ingested"], ARRIVAL);
         assert_eq!(c.obj["ingested"], "1999-01-01T00:00:00Z");
         assert_eq!(c.obj["repairs"], "forged");
+        assert!(codes(&c).contains(&"field.reserved_prefix"));
+    }
+
+    /// The strip runs BEFORE identity resolution, so a stripped
+    /// `_host`/`_env`/`_service` is sender-asserted data the server's own
+    /// fills can neither overwrite nor misreport in `_repairs`.
+    #[test]
+    fn a_stripped_identity_name_is_sender_asserted_not_overwritten() {
+        let c = canon(r#"{"service":"s","_host":"real-origin","message":"m"}"#);
+        assert_eq!(
+            c.obj["host"], "real-origin",
+            "the peer must not stamp over it"
+        );
+        assert!(
+            !codes(&c).contains(&"host.from_peer"),
+            "the sender asserted a host: {:?}",
+            c.repairs
+        );
+        assert!(codes(&c).contains(&"field.reserved_prefix"));
+
+        let c = canon(r#"{"service":"s","host":"h","_env":"lab","message":"m"}"#);
+        assert_eq!(c.obj["env"], "lab");
+        assert_eq!(c.env, "lab", "the partition follows the stripped value");
+        assert!(
+            !codes(&c).contains(&"env.defaulted"),
+            "the sender asserted an env: {:?}",
+            c.repairs
+        );
+
+        // Case-folded first, so the prefixed spelling makes no difference.
+        let c = canon(r#"{"service":"s","_HOST":"real-origin","message":"m"}"#);
+        assert_eq!(c.obj["host"], "real-origin");
+        assert!(!codes(&c).contains(&"host.from_peer"));
+
+        // And the stripped value is validated like any other: an env
+        // outside the allowlist rejects rather than silently defaulting.
+        let (_, reason) = reject(r#"{"service":"s","host":"h","_env":"nope"}"#);
+        assert!(matches!(reason, RejectReason::EnvNotAllowed), "{reason:?}");
+
+        // `_service` is the same rule — it lands bare and IS the service.
+        let c = canon(r#"{"_service":"other","message":"m"}"#);
+        assert_eq!(c.service, "other");
+        assert_eq!(c.obj["service"], "other");
         assert!(codes(&c).contains(&"field.reserved_prefix"));
     }
 
