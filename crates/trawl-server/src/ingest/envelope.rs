@@ -17,7 +17,6 @@ use std::fmt;
 
 use serde_json::{Map, Value, json};
 
-use crate::ingest::compaction;
 use crate::ingest::pipeline;
 
 /// What the server changed about an accepted event — a closed enum, same
@@ -33,13 +32,19 @@ pub enum RepairCode {
     TimeFromIngest,
     /// `_time` was implausible (>10y past / >1d future); kept, but flagged.
     TimeOutOfRange,
-    /// severity text did not match the ladder.
-    SeverityUnmapped,
     /// a value exceeded the length cap (`_raw`).
     FieldTruncated,
-    /// client sent a server-owned field (`_ingested`, `_repairs`, or a
-    /// non-string `_raw`); value dropped and replaced.
-    MetaStripped,
+    /// a field NAME arrived in trawl's `_` namespace and is not a slot the
+    /// sender may propose (ADR-0013 §5). The leading underscore RUN was
+    /// stripped and the value stored under the bare remainder
+    /// (`_HOSTNAME` → `hostname`, `__name__` → `name__`); a name with no
+    /// remainder at all (`_`, `___`) was dropped. Nothing is lost either
+    /// way — `_raw` carries the original name and value.
+    ReservedPrefix,
+    /// stripping a reserved prefix produced a name the SAME event already
+    /// carries bare, so the prefixed loser was dropped (the case-collision
+    /// precedent). Its value stays findable in `_raw`.
+    ReservedPrefixCollision,
     /// a field's NAME exceeded [`trawl_core::schema::MAX_FIELD_NAME_BYTES`];
     /// the field was dropped (its value stays findable in `_raw`).
     FieldNameTooLong,
@@ -64,9 +69,9 @@ impl RepairCode {
             Self::EnvDefaulted => "env.defaulted",
             Self::TimeFromIngest => "time.from_ingest",
             Self::TimeOutOfRange => "time.out_of_range",
-            Self::SeverityUnmapped => "severity.unmapped",
             Self::FieldTruncated => "field.truncated",
-            Self::MetaStripped => "meta.stripped",
+            Self::ReservedPrefix => "field.reserved_prefix",
+            Self::ReservedPrefixCollision => "field.reserved_prefix_collision",
             Self::FieldNameTooLong => "field.name_too_long",
             Self::FieldNameCaseFolded => "field.name_case_folded",
             Self::FieldNameCaseCollision => "field.name_case_collision",
@@ -180,6 +185,13 @@ pub struct Canonical {
     /// Repair codes applied, in application order (also joined into the
     /// object's `_repairs`).
     pub repairs: Vec<RepairCode>,
+    /// The event carried a severity SOURCE that mapped to nothing on the
+    /// `OTel` ladder, so `_severity` was omitted (ADR-0013 §2).
+    ///
+    /// NOT a repair: derivation into the `_` namespace is an annotation,
+    /// and nothing sender-visible was touched — the source column is
+    /// stored verbatim. The ops signal is a metrics counter instead.
+    pub severity_unmapped: bool,
 }
 
 /// Maximum preserved length of `_raw` (chars). Generous — `_raw` is the
@@ -396,109 +408,65 @@ fn resolve_env(
     }
 }
 
-/// Map a client severity-ish value (`severity_text` / level) to an exact
-/// `SeverityNumber`: name tokens case-insensitively, syslog numerals 0-7
-/// (string or number) inverted onto the `OTel` ladder.
-fn severity_from_value(v: &Value) -> Option<u8> {
+/// The wire keys `_time` derives from, in precedence order (ADR-0013 §2).
+///
+/// Server policy, module-local: slice 2 makes it configurable. Only
+/// `_time` itself is CONSUMED (it is the proposal slot, and it is
+/// canonicalized); `timestamp` and `@timestamp` are read and left where
+/// they are, as ordinary sender columns.
+const TIME_SOURCES: [&str; 3] = [trawl_core::schema::TIME, "timestamp", "@timestamp"];
+
+/// The wire keys `_severity` derives from, in precedence order. All three
+/// are ordinary sender fields, READ and never removed.
+const SEVERITY_SOURCES: [&str; 3] = ["severity", "severity_text", "level"];
+
+/// Map one severity source value onto the `OTel` ladder, or nothing.
+///
+/// A WORD maps through the ADR-0009 token table (`error` → 17) or the
+/// `OTel` exact short names (`error2` → 18). A NUMERIC — JSON number or
+/// numeric string — maps STRICTLY as `OTel` 1-24 (ADR-0013 §4): `3` is
+/// trace here, never syslog's err. The ranges overlap, so no value-shape
+/// rule can tell the dialects apart; syslog inversion happens only where
+/// transport provenance proves the dialect, in the syslog listener, which
+/// writes `_severity` itself.
+fn severity_reading(v: &Value) -> Option<u8> {
+    let from_number = |n: i64| {
+        trawl_core::severity::is_valid_number(n)
+            .then(|| u8::try_from(n).ok())
+            .flatten()
+    };
     match v {
         Value::String(s) => {
             let s = s.trim();
-            if let Ok(n) = s.parse::<u8>() {
-                trawl_core::severity::from_syslog(n)
-            } else {
-                trawl_core::severity::number_for_token(s)
+            if let Ok(n) = s.parse::<i64>() {
+                return from_number(n);
             }
+            trawl_core::severity::number_for_token(s)
+                .or_else(|| trawl_core::severity::number_for_exact(s))
         }
-        Value::Number(n) => n
-            .as_u64()
-            .and_then(|n| u8::try_from(n).ok())
-            .and_then(trawl_core::severity::from_syslog),
+        Value::Number(n) => n.as_i64().and_then(from_number),
         _ => None,
     }
 }
 
-/// Render a severity-ish value as a stored `severity_text` label: strings
-/// verbatim, numbers as their numeral. Anything else has no honest label
-/// (it still survives inside `_raw`).
-fn severity_label(v: Option<&Value>) -> Option<String> {
-    match v {
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(Value::Number(n)) => Some(n.to_string()),
-        _ => None,
-    }
-}
-
-/// Resolve the severity chain onto `out`, consuming the `severity`,
-/// `severity_text`, and `level` inputs: a client `severity` integer 1-24
-/// wins → else derive from a *string* `severity` → else from
-/// `severity_text` → else from `level` → else NULL. `level` is consumed at
-/// ingest — the DSL alias would shadow it anyway; the original is always
-/// in `_raw`.
+/// Derive `_severity` from the event's own fields — READ-ONLY.
 ///
-/// A numeric `severity` is only ever read on the `OTel` ladder, never
-/// syslog-inverted: `severity: 0` is `OTel`'s UNSPECIFIED as readily as it
-/// is syslog's Emergency, and guessing would stamp FATAL on an OTel-native
-/// client. A string `severity` carries no such ambiguity, so
-/// `{"severity":"ERROR"}` — the shape GCP/Stackdriver structured logging
-/// emits — maps through the same token/syslog table as the other
-/// candidates instead of being dropped.
-///
-/// Stored `severity_text` is the client's verbatim when it is a string,
-/// else the `level` value, else the client `severity` whenever that was
-/// not a ladder integer. No severity-ish input is ever deleted from the
-/// event: an unmappable value leaves `severity` NULL but stays queryable
-/// as `severity_text`.
-///
-/// Omit-when-null: an all-null column in a batch must be absent, not JSON
-/// null, or `DuckDB` infers JSON for the column type (ADR-0009). Returns
-/// whether the event carried severity-ish input that failed to map
-/// (`severity.unmapped`).
-fn resolve_severity(out: &mut Map<String, Value>) -> bool {
-    let client_severity = out.remove("severity");
-    let client_text = out.remove("severity_text");
-    let level = out.remove("level");
-
-    let valid_client_number = client_severity
-        .as_ref()
-        .and_then(Value::as_i64)
-        .filter(|n| trawl_core::severity::is_valid_number(*n));
-
-    // Only a string `severity` joins the derivation chain (see above); an
-    // out-of-ladder integer falls through to the text candidates.
-    let mapped_client_severity = match &client_severity {
-        Some(v @ Value::String(_)) => severity_from_value(v),
-        _ => None,
-    };
-
-    let severity_number = valid_client_number.or_else(|| {
-        mapped_client_severity
-            .or_else(|| client_text.as_ref().and_then(severity_from_value))
-            .or_else(|| level.as_ref().and_then(severity_from_value))
-            .map(i64::from)
-    });
-
-    // A ladder-valid integer is a number, not a label — it already lives
-    // in `severity` and must not also become `severity_text`.
-    let unclaimed_severity = if valid_client_number.is_some() {
-        None
-    } else {
-        client_severity.as_ref()
-    };
-    let stored_text: Option<String> = match &client_text {
-        Some(Value::String(s)) => Some(s.clone()),
-        _ => severity_label(level.as_ref()).or_else(|| severity_label(unclaimed_severity)),
-    };
-
-    let unmapped = severity_number.is_none()
-        && (client_severity.is_some() || client_text.is_some() || level.is_some());
-
-    if let Some(n) = severity_number {
-        out.insert("severity".into(), json!(n));
+/// First MAPPABLE source wins; every source stays exactly where it is, so
+/// `{"service":"game","level":"gold"}` keeps a queryable `level="gold"`
+/// column and simply gets no `_severity` (ADR-0013 §2). Returns whether a
+/// source EXISTED and none mapped, which is the ops counter's input — not
+/// a repair, because nothing sender-visible was touched.
+fn derive_severity(out: &mut Map<String, Value>) -> bool {
+    let mut saw_source = false;
+    for key in SEVERITY_SOURCES {
+        let Some(value) = out.get(key) else { continue };
+        saw_source = true;
+        if let Some(number) = severity_reading(value) {
+            out.insert(trawl_core::schema::SEVERITY.into(), json!(number));
+            return false;
+        }
     }
-    if let Some(t) = stored_text {
-        out.insert("severity_text".into(), json!(t));
-    }
-    unmapped
+    saw_source
 }
 
 /// Stringify top-level object/array values to their JSON text (ADR-0009
@@ -520,24 +488,74 @@ fn stringify_nested_values(out: &mut Map<String, Value>) {
     }
 }
 
-/// Remove the fields a client may never set, returning whether any were
-/// present (the `meta.stripped` repair): honouring them would let a sender
-/// forge its own handling history. `_trawl_wal_file` — compaction's
-/// synthetic provenance column, trawl's key rather than the client's — goes
-/// silently, since a row carrying it wedges `read_json`.
-fn strip_server_owned(out: &mut Map<String, Value>) -> bool {
-    let mut stripped = false;
-    for key in trawl_core::schema::RESERVED_CLIENT_FIELDS {
-        if out.remove(*key).is_some() {
-            stripped = true;
+/// What the reserved-prefix strip did to one event.
+#[derive(Default)]
+struct PrefixStrip {
+    /// At least one `_x` key was stripped or dropped
+    /// (`field.reserved_prefix`).
+    stripped: bool,
+    /// A stripped name collided with a bare name the same event carries,
+    /// so the prefixed loser was dropped
+    /// (`field.reserved_prefix_collision`).
+    collided: bool,
+}
+
+/// Whether a `_`-prefixed key is one the SENDER may propose.
+///
+/// Exactly two slots (ADR-0013 §3): `_time`, always — it is the event
+/// time proposal, canonicalized downstream — and `_raw`, when the value
+/// is a string (a collector's pre-parse line). Everything else in the
+/// namespace is trawl's: server-stamped (`_ingested`, `_repairs`),
+/// derivation-only (`_severity`), internal (`_trawl_wal_file`), or a slot
+/// that does not exist yet.
+fn is_proposable(key: &str, value: &Value) -> bool {
+    key == trawl_core::schema::TIME || (key == trawl_core::schema::RAW && value.is_string())
+}
+
+/// Seal the `_` namespace at the ingest door (ADR-0013 §5): a
+/// non-proposable `_x` has its leading underscore RUN stripped and its
+/// value stored under the bare remainder.
+///
+/// ONE rule replaces four hand-written ones — the reserved-client-fields
+/// list, the non-string-`_raw` special case, the silent `_trawl_wal_file`
+/// removal, and the forged-`_severity` question — and it answers the
+/// journald/prometheus collision (`_HOSTNAME` → `hostname`,
+/// `_SYSTEMD_UNIT` → `systemd_unit`, `__name__` → `name__`) while keeping
+/// #60's core promise: every accepted field stays structurally queryable.
+///
+/// Three sub-cases, all deterministic:
+///
+/// - the bare remainder is EMPTY (`_`, `___`): there is no name to store
+///   under, so the field is dropped — its value is still in `_raw`;
+/// - the bare name already exists in this event: the prefixed loser is
+///   dropped (`field.reserved_prefix_collision`), the same tiebreak the
+///   case-fold uses;
+/// - two prefixed claimants for one bare name: the first in map order
+///   wins (`serde_json::Map` iterates sorted, so that is the
+///   ASCII-lexicographically first spelling), the rest collide out.
+fn strip_reserved_prefixes(out: &mut Map<String, Value>) -> PrefixStrip {
+    let reserved: Vec<String> = out
+        .keys()
+        .filter(|k| trawl_core::schema::is_reserved_name(k))
+        .filter(|k| !is_proposable(k, &out[*k]))
+        .cloned()
+        .collect();
+    let mut strip = PrefixStrip::default();
+    for key in reserved {
+        strip.stripped = true;
+        let value = out.remove(&key).expect("key came from this map");
+        let bare = key.trim_start_matches('_');
+        if bare.is_empty() || out.contains_key(bare) {
+            // No name to store under, or the bare name is already taken:
+            // drop the prefixed value. `_raw` still carries it.
+            if !bare.is_empty() {
+                strip.collided = true;
+            }
+            continue;
         }
+        out.insert(bare.to_owned(), value);
     }
-    if matches!(out.get("_raw"), Some(v) if !v.is_string()) {
-        out.remove("_raw");
-        stripped = true;
-    }
-    out.remove(compaction::WAL_FILE_COL);
-    stripped
+    strip
 }
 
 /// One event's field names after ASCII case-folding ([`fold_field_names`]).
@@ -644,15 +662,17 @@ fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
 ///    repair, so the server's own fills never appear inside "what arrived"
 ///    (the serialization fallback uses the PRE-fold object, so dropped and
 ///    folded spellings stay findable).
-/// 3. Reserved-key strip (`meta.stripped`), `_trawl_wal_file` silent drop,
+/// 3. Reserved-prefix strip ([`strip_reserved_prefixes`],
+///    `field.reserved_prefix` / `field.reserved_prefix_collision`),
 ///    over-long field-name drop (`field.name_too_long`).
-/// 4. `_time` from the wire aliases (`_time`/`timestamp`/`@timestamp`,
-///    consumed), ADR-0008 grammar, `time.from_ingest`/`time.out_of_range`.
+/// 4. `_time` derived from the first PRESENT source
+///    (`_time`/`timestamp`/`@timestamp`), ADR-0008 grammar,
+///    `time.from_ingest`/`time.out_of_range`. Only `_time` is consumed.
 /// 5. `_ingested` stamp.
 /// 6. `env` default-or-reject, `host` peer-fill-or-relay-reject.
-/// 7. Severity chain (`severity` 1-24 → string `severity` → `severity_text`
-///    → `level` → NULL); `level` is consumed, and no severity-ish input is
-///    ever deleted (an unmappable one lands in `severity_text`).
+/// 7. `_severity` derived from the first MAPPABLE source
+///    (`severity`/`severity_text`/`level`), READ-ONLY: every source stays
+///    where it is, and no mappable one means no key and no repair.
 /// 8. `_repairs` assembly (omitted when clean).
 pub fn canonicalize(
     obj: &Map<String, Value>,
@@ -706,9 +726,13 @@ pub fn canonicalize(
 
     let mut out = folded_obj;
 
-    // 3. Server-owned metadata is never client-settable.
-    if strip_server_owned(&mut out) {
-        push_repair(&mut repairs, RepairCode::MetaStripped);
+    // 3. The `_` namespace is trawl's: strip the prefix, keep the data.
+    let strip = strip_reserved_prefixes(&mut out);
+    if strip.stripped {
+        push_repair(&mut repairs, RepairCode::ReservedPrefix);
+    }
+    if strip.collided {
+        push_repair(&mut repairs, RepairCode::ReservedPrefixCollision);
     }
 
     // 3.2. Names too long to be a catalog key never become columns.
@@ -719,13 +743,17 @@ pub fn canonicalize(
     // 3.5. Nested values become JSON text (see [`stringify_nested_values`]).
     stringify_nested_values(&mut out);
 
-    // 4. `_time` from the first present wire alias; all aliases consumed.
-    let time_input = trawl_core::schema::TIME_ALIASES
-        .iter()
-        .find_map(|k| out.get(*k).cloned());
-    for k in trawl_core::schema::TIME_ALIASES {
-        out.remove(*k);
-    }
+    // 4. `_time` from the first PRESENT source (ADR-0013 §2): derivation
+    // observes, it never consumes. Only `_time` itself is removed — it is
+    // the proposal slot, and the canonical value replaces it below;
+    // `timestamp`/`@timestamp` stay as ordinary sender columns.
+    //
+    // First PRESENT, not first PARSEABLE: an unparseable `_time` claims
+    // the derivation and falls to arrival time rather than reaching past
+    // itself to a lower-precedence source, so what `_time` holds is
+    // always explicable from ONE input.
+    let time_input = TIME_SOURCES.iter().find_map(|k| out.get(*k).cloned());
+    out.remove(trawl_core::schema::TIME);
     let canonical_time = match &time_input {
         None => {
             push_repair(&mut repairs, RepairCode::TimeFromIngest);
@@ -762,10 +790,9 @@ pub fn canonicalize(
         push_repair(&mut repairs, RepairCode::HostFromPeer);
     }
 
-    // 7. Severity chain (`level` consumed).
-    if resolve_severity(&mut out) {
-        push_repair(&mut repairs, RepairCode::SeverityUnmapped);
-    }
+    // 7. `_severity` derivation — READ-ONLY: every source stays where it
+    // is, and an event with no mappable one simply has no `_severity`.
+    let severity_unmapped = derive_severity(&mut out);
 
     // 8. `_raw` and `_repairs`.
     if truncated {
@@ -788,6 +815,7 @@ pub fn canonicalize(
         service,
         obj: out,
         repairs,
+        severity_unmapped,
     })
 }
 
@@ -967,13 +995,13 @@ mod tests {
 
     #[test]
     fn non_string_raw_is_still_stripped_before_stringification() {
-        // A client object `_raw` must strip with meta.stripped — the
+        // A client object `_raw` takes the reserved-prefix strip — the
         // stringify pass must not first turn it into an honourable string.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z","_raw":{"forged":true}}"#,
         );
-        assert!(codes(&c).contains(&"meta.stripped"));
+        assert!(codes(&c).contains(&"field.reserved_prefix"));
         let raw = c.obj["_raw"].as_str().unwrap();
         assert!(
             raw.contains("forged"),
@@ -1158,165 +1186,275 @@ mod tests {
         assert!(codes(&c).contains(&"env.defaulted"));
     }
 
-    // --- severity (acceptance criteria: normalization, precedence, unmapped) ---
+    // --- `_severity` derivation: observe, never consume (ADR-0013 §2) ---
 
+    /// The #60 canonical example, verbatim: a game server whose `level`
+    /// means loot tier keeps a queryable `level` column, gets no
+    /// `_severity`, and is repaired in no way at all.
     #[test]
-    fn severity_spellings_normalize_to_thirteen() {
-        for spelling in [
-            r#""WARN""#,
-            r#""warning""#,
-            r#""Warn""#,
-            r#""W""#,
-            r#""4""#,
-            "4",
+    fn a_bare_level_that_is_not_a_severity_survives_untouched() {
+        let c = canon(r#"{"service":"game","level":"gold"}"#);
+        assert_eq!(c.obj["level"], "gold", "the sender's own field, verbatim");
+        assert!(
+            !c.obj.contains_key(trawl_core::schema::SEVERITY),
+            "no mappable source → no `_severity` key at all"
+        );
+        assert!(
+            c.severity_unmapped,
+            "a source existed and mapped to nothing — the ops counter's input"
+        );
+        // `env`/`host`/`_time` are filled, which IS confessed; nothing
+        // about the severity derivation is.
+        assert!(
+            !codes(&c).iter().any(|code| code.starts_with("severity")),
+            "derivation into the `_` namespace is never a repair: {:?}",
+            c.repairs
+        );
+    }
+
+    /// The other worked example: an OTel-native sender's `severity: 3`
+    /// stays verbatim AND derives `_severity = 3` — trace on the `OTel`
+    /// ladder, never syslog's err. Both truths coexist.
+    #[test]
+    fn a_numeric_severity_is_stored_verbatim_and_derived_as_otel() {
+        let c = canon(r#"{"service":"x","severity":3}"#);
+        assert_eq!(c.obj["severity"], 3, "the sender's field is untouched");
+        assert_eq!(
+            c.obj[trawl_core::schema::SEVERITY],
+            3,
+            "OTel 1-24, never the syslog inversion that would say 17"
+        );
+        assert!(!c.severity_unmapped);
+    }
+
+    /// The numeric dialect matrix (ADR-0013 §4 + the #60 acceptance
+    /// list): words map through the token table, numerics map strictly as
+    /// `OTel` 1-24, and everything else has no reading.
+    #[test]
+    fn severity_numeric_dialect_matrix() {
+        for (input, expected) in [
+            ("3", Some(3)),
+            (r#""3""#, Some(3)),
+            (r#""error""#, Some(17)),
+            (r#""ERROR""#, Some(17)),
+            (r#""err""#, Some(17)),
+            (r#""error2""#, Some(18)),
+            ("0", None),
+            ("25", None),
+            ("-1", None),
+            (r#""gold""#, None),
+            ("1.5", None),
+            ("true", None),
         ] {
-            let c = canon(&format!(
-                r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","level":{spelling}}}"#
-            ));
-            assert_eq!(c.obj["severity"], 13, "spelling {spelling} must map to 13");
-            assert!(c.repairs.is_empty(), "mapping is not a repair");
+            let c = canon(&format!(r#"{{"service":"s","severity":{input}}}"#));
+            let got = c
+                .obj
+                .get(trawl_core::schema::SEVERITY)
+                .and_then(Value::as_i64);
+            assert_eq!(got, expected, "severity {input}");
+            assert_eq!(
+                c.severity_unmapped,
+                expected.is_none(),
+                "the counter fires exactly when a source mapped to nothing: {input}"
+            );
+            // Whatever the reading, the SOURCE is never touched.
+            assert!(c.obj.contains_key("severity"), "source kept: {input}");
         }
     }
 
+    /// Source precedence is `severity` → `severity_text` → `level`, first
+    /// MAPPABLE wins — and every source stays where it is.
     #[test]
-    fn severity_text_preserved_verbatim() {
-        let c = canon(
-            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity_text":"WARN"}"#,
-        );
-        assert_eq!(c.obj["severity"], 13);
-        assert_eq!(c.obj["severity_text"], "WARN", "verbatim, not lowercased");
+    fn severity_source_precedence_is_first_mappable() {
+        let cases: &[(&str, Option<i64>)] = &[
+            // severity leads.
+            (
+                r#""severity":17,"severity_text":"info","level":"debug""#,
+                Some(17),
+            ),
+            // an unmappable severity falls through to severity_text…
+            (r#""severity":"gold","severity_text":"error""#, Some(17)),
+            // …and on to level.
+            (
+                r#""severity":"gold","severity_text":"gold","level":"warn""#,
+                Some(13),
+            ),
+            // severity_text leads level.
+            (r#""severity_text":"error","level":"info""#, Some(17)),
+            // nothing mappable anywhere.
+            (r#""severity":"gold","level":"silver""#, None),
+        ];
+        for (fields, expected) in cases {
+            let c = canon(&format!(r#"{{"service":"s",{fields}}}"#));
+            assert_eq!(
+                c.obj
+                    .get(trawl_core::schema::SEVERITY)
+                    .and_then(Value::as_i64),
+                *expected,
+                "{fields}"
+            );
+            for source in ["severity", "severity_text", "level"] {
+                if fields.contains(&format!("\"{source}\":")) {
+                    assert!(c.obj.contains_key(source), "{source} consumed by {fields}");
+                }
+            }
+        }
     }
 
+    /// An incoming `_severity` is derivation-only (ADR-0013 §3): it takes
+    /// the standard prefix strip and lands as bare `severity`, which
+    /// derivation then reads — so an OTel-native shipper still lands
+    /// correctly, with zero special-casing and an unforgeable verdict.
     #[test]
-    fn severity_integer_wins_over_text() {
-        // severity: 17 + severity_text: "info" keeps 17.
-        let c = canon(
-            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":17,"severity_text":"info"}"#,
-        );
-        assert_eq!(c.obj["severity"], 17);
-        assert_eq!(c.obj["severity_text"], "info");
+    fn a_forged_severity_strips_to_the_bare_name_and_is_then_derived() {
+        let c = canon(r#"{"service":"s","_severity":17}"#);
+        assert_eq!(c.obj["severity"], 17, "the forged key lands bare");
+        assert_eq!(c.obj[trawl_core::schema::SEVERITY], 17, "derived from it");
+        assert!(codes(&c).contains(&"field.reserved_prefix"));
+    }
+
+    /// An event with no severity-ish field at all is silent on every
+    /// channel: no key, no repair, no counter.
+    #[test]
+    fn absent_severity_sources_are_silent() {
+        let c = canon(r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z"}"#);
+        assert!(!c.obj.contains_key(trawl_core::schema::SEVERITY));
+        assert!(!c.severity_unmapped);
         assert!(c.repairs.is_empty());
     }
 
+    /// Token spellings and the ASCII fold both reach the derivation.
     #[test]
-    fn severity_text_wins_over_level() {
-        // severity_text: "error" + level: "info" derives 17 from severity_text.
-        let c = canon(
-            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity_text":"error","level":"info"}"#,
-        );
-        assert_eq!(c.obj["severity"], 17);
-        assert_eq!(c.obj["severity_text"], "error");
-    }
-
-    #[test]
-    fn level_is_consumed_never_stored() {
-        let c = canon(
-            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","level":"error"}"#,
-        );
-        assert!(!c.obj.contains_key("level"), "level must be consumed");
-        assert_eq!(c.obj["severity"], 17);
-        assert_eq!(
-            c.obj["severity_text"], "error",
-            "the level value used for derivation lands in severity_text"
-        );
-    }
-
-    #[test]
-    fn unmappable_severity_is_null_plus_code_never_reject() {
-        let c = canon(
-            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","level":"SPICY"}"#,
-        );
-        assert!(
-            !c.obj.contains_key("severity"),
-            "unmappable severity must be OMITTED (NULL), got {:?}",
-            c.obj.get("severity")
-        );
-        assert_eq!(c.obj["severity_text"], "SPICY", "severity_text intact");
-        assert!(codes(&c).contains(&"severity.unmapped"));
-    }
-
-    #[test]
-    fn string_client_severity_maps_like_a_token() {
-        // GCP/Stackdriver structured logging emits `severity: "ERROR"`.
-        for spelling in [r#""ERROR""#, r#""error""#, r#""err""#, r#""3""#] {
-            let c = canon(&format!(
-                r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":{spelling}}}"#
-            ));
-            assert_eq!(c.obj["severity"], 17, "spelling {spelling} must map to 17");
-            assert!(c.repairs.is_empty(), "mapping is not a repair");
-        }
-        let c = canon(
-            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":"ERROR"}"#,
-        );
-        assert_eq!(
-            c.obj["severity_text"], "ERROR",
-            "the client spelling is preserved verbatim"
-        );
-    }
-
-    #[test]
-    fn out_of_ladder_client_severity_falls_through() {
-        let c = canon(
-            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":42}"#,
-        );
-        assert!(!c.obj.contains_key("severity"));
-        assert!(codes(&c).contains(&"severity.unmapped"));
-    }
-
-    #[test]
-    fn unmappable_client_severity_is_never_deleted() {
-        // Neither an out-of-ladder integer nor an unknown token may vanish
-        // from the stored event: the value stays queryable as severity_text.
-        for (input, expected) in [("42", "42"), ("0", "0"), (r#""SPICY""#, "SPICY")] {
-            let c = canon(&format!(
-                r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":{input}}}"#
-            ));
-            assert!(
-                !c.obj.contains_key("severity"),
-                "unmappable severity must be OMITTED (NULL): {input}"
-            );
+    fn severity_token_spellings_normalize() {
+        for spelling in [r#""WARN""#, r#""warning""#, r#""Warn""#, r#""W""#] {
+            let c = canon(&format!(r#"{{"service":"s","level":{spelling}}}"#));
             assert_eq!(
-                c.obj["severity_text"], expected,
-                "severity {input} must survive as severity_text"
+                c.obj[trawl_core::schema::SEVERITY],
+                13,
+                "spelling {spelling} must map to 13"
             );
-            assert!(codes(&c).contains(&"severity.unmapped"), "input {input}");
         }
     }
 
+    // --- the sealed `_` namespace at the ingest door (ADR-0013 §5) ---
+
+    /// One rule, every case the four hand-written ones used to cover.
     #[test]
-    fn ladder_client_severity_is_not_echoed_as_text() {
+    fn reserved_prefixes_strip_to_the_bare_remainder() {
         let c = canon(
-            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":17}"#,
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z",
+                "_HOSTNAME":"box","__name__":"up","_SYSTEMD_UNIT":"sshd.service",
+                "_ingested":"1999-01-01T00:00:00Z","_repairs":"forged",
+                "_trawl_wal_file":"x","keep":"me"}"#,
         );
-        assert_eq!(c.obj["severity"], 17);
+        assert_eq!(c.obj["hostname"], "box", "_HOSTNAME folds then strips");
+        assert_eq!(c.obj["name__"], "up", "only the LEADING run is stripped");
+        assert_eq!(c.obj["systemd_unit"], "sshd.service");
+        assert_eq!(c.obj["trawl_wal_file"], "x", "no silent hand-written drop");
+        assert_eq!(c.obj["keep"], "me");
+        // The server's own slots are stamped, never the client's values.
+        assert_eq!(c.obj["_ingested"], ARRIVAL);
+        assert_eq!(c.obj["ingested"], "1999-01-01T00:00:00Z");
+        assert_eq!(c.obj["repairs"], "forged");
+        assert!(codes(&c).contains(&"field.reserved_prefix"));
+    }
+
+    /// A key with no bare remainder has nowhere to land, so it is
+    /// dropped — its value is still in `_raw`.
+    #[test]
+    fn an_all_underscore_name_is_dropped_not_stored() {
+        let c = canon(r#"{"service":"s","_":"a","___":"b","keep":"me"}"#);
+        assert!(!c.obj.contains_key("_"));
+        assert!(!c.obj.contains_key("___"));
+        assert!(!c.obj.contains_key(""));
+        assert_eq!(c.obj["keep"], "me");
+        assert!(codes(&c).contains(&"field.reserved_prefix"));
+        match &c.obj["_raw"] {
+            Value::String(raw) => assert!(raw.contains("\"___\":\"b\""), "{raw}"),
+            other => panic!("_raw must be a string: {other:?}"),
+        }
+    }
+
+    /// The bare name already present in the SAME event wins; the
+    /// prefixed loser is dropped, deterministically.
+    #[test]
+    fn a_prefixed_name_loses_to_the_bare_one_it_would_shadow() {
+        let c = canon(r#"{"service":"s","_dur":1,"dur":2}"#);
+        assert_eq!(c.obj["dur"], 2, "the bare spelling wins");
+        assert!(!c.obj.contains_key("_dur"));
+        assert!(codes(&c).contains(&"field.reserved_prefix_collision"));
+
+        // Two prefixed claimants for one bare name: map order decides
+        // (serde_json::Map iterates sorted, and `_` < `d`, so `__dur`
+        // is the ASCII-lexicographically first spelling).
+        let c = canon(r#"{"service":"s","_dur":1,"__dur":2}"#);
+        assert_eq!(c.obj["dur"], 2, "the first in map order wins");
+        assert!(codes(&c).contains(&"field.reserved_prefix_collision"));
+    }
+
+    /// `_time` and a string `_raw` are the two slots a sender MAY
+    /// propose, so neither strips.
+    #[test]
+    fn the_two_proposable_slots_are_not_stripped() {
+        let c =
+            canon(r#"{"service":"s","_time":"2025-12-31T23:00:00Z","_raw":"a line","keep":"me"}"#);
+        assert_eq!(c.obj["_time"], "2025-12-31T23:00:00.000000Z");
+        assert_eq!(c.obj["_raw"], "a line");
+        assert!(!c.obj.contains_key("time"));
+        assert!(!c.obj.contains_key("raw"));
         assert!(
-            !c.obj.contains_key("severity_text"),
-            "a ladder numeral is not a label, got {:?}",
-            c.obj.get("severity_text")
+            !codes(&c)
+                .iter()
+                .any(|code| code.starts_with("field.reserved")),
+            "a proposable slot is not a strip: {:?}",
+            c.repairs
         );
     }
 
+    /// A NON-string `_raw` is not a proposal, so it takes the standard
+    /// strip and lands bare — the special case is gone.
     #[test]
-    fn severity_text_wins_over_string_severity_for_the_label() {
-        let c = canon(
-            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","severity":"ERROR","severity_text":"warn"}"#,
-        );
-        assert_eq!(c.obj["severity"], 17, "severity leads the derivation");
+    fn a_non_string_raw_strips_like_any_other_reserved_name() {
+        let c = canon(r#"{"service":"s","_raw":{"a":1},"keep":"me"}"#);
+        match &c.obj["_raw"] {
+            Value::String(raw) => assert!(raw.contains("service"), "server-filled: {raw}"),
+            other => panic!("_raw must be the server's serialization: {other:?}"),
+        }
+        assert_eq!(c.obj["raw"], "{\"a\":1}", "the client value lands bare");
+        assert!(codes(&c).contains(&"field.reserved_prefix"));
+    }
+
+    // --- time derivation: observe, never consume (ADR-0013 §2) ---
+
+    /// `timestamp`/`@timestamp` are read for the derivation AND stored
+    /// verbatim as ordinary columns; only `_time` — the proposal slot —
+    /// is consumed.
+    #[test]
+    fn time_alias_sources_are_stored_verbatim() {
+        let c = canon(r#"{"service":"s","timestamp":"2025-06-01T12:00:00Z"}"#);
+        assert_eq!(c.obj["_time"], "2025-06-01T12:00:00.000000Z");
         assert_eq!(
-            c.obj["severity_text"], "warn",
-            "the dedicated text field still owns the label"
+            c.obj["timestamp"], "2025-06-01T12:00:00Z",
+            "the source is the sender's own column, uncanonicalized"
         );
+
+        let c = canon(r#"{"service":"s","@timestamp":"2025-06-01T12:00:00Z"}"#);
+        assert_eq!(c.obj["_time"], "2025-06-01T12:00:00.000000Z");
+        assert_eq!(c.obj["@timestamp"], "2025-06-01T12:00:00Z");
     }
 
+    /// First PRESENT claims the derivation: an unparseable `_time` falls
+    /// to arrival time rather than reaching past itself to a
+    /// lower-precedence source.
     #[test]
-    fn absent_severity_is_not_a_repair() {
-        let c = canon(r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z"}"#);
-        assert!(!c.obj.contains_key("severity"));
-        assert!(!c.obj.contains_key("severity_text"));
-        assert!(!codes(&c).contains(&"severity.unmapped"));
+    fn an_unparseable_time_proposal_does_not_fall_through_to_a_lower_source() {
+        let c = canon(r#"{"service":"s","_time":"not a time","timestamp":"2025-06-01T12:00:00Z"}"#);
+        assert_eq!(c.obj["_time"], ARRIVAL);
+        assert!(codes(&c).contains(&"time.from_ingest"));
+        assert_eq!(c.obj["timestamp"], "2025-06-01T12:00:00Z", "still stored");
     }
 
-    // --- _raw (acceptance criteria: pre-defaults capture, client honour) ---
+    // --- _raw (acceptance criteria: pre-defaults capture, client honour) ---    // --- _raw (acceptance criteria: pre-defaults capture, client honour) ---
 
     #[test]
     fn raw_captured_before_host_fill() {
@@ -1340,26 +1478,27 @@ mod tests {
     }
 
     #[test]
-    fn non_string_raw_replaced_with_meta_stripped() {
+    fn non_string_raw_replaced_with_the_server_serialization() {
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_raw":{"nested":1}}"#,
         );
         let raw = c.obj["_raw"].as_str().unwrap();
         assert!(raw.starts_with('{'), "server-filled canonical form: {raw}");
-        assert!(codes(&c).contains(&"meta.stripped"));
+        assert!(codes(&c).contains(&"field.reserved_prefix"));
     }
 
     #[test]
-    fn client_ingested_and_repairs_stripped() {
+    fn client_ingested_and_repairs_strip_to_bare_names() {
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_ingested":"1999-01-01T00:00:00Z","_repairs":"forged"}"#,
         );
         assert_eq!(c.obj["_ingested"], ARRIVAL, "server stamp wins");
         assert_eq!(
-            c.obj["_repairs"], "meta.stripped",
+            c.obj["_repairs"], "field.reserved_prefix",
             "forged _repairs replaced by the strip record"
         );
-        assert!(codes(&c).contains(&"meta.stripped"));
+        assert_eq!(c.obj["repairs"], "forged", "the client value lands bare");
+        assert_eq!(c.obj["ingested"], "1999-01-01T00:00:00Z");
     }
 
     #[test]
@@ -1474,7 +1613,8 @@ mod tests {
         );
         assert_eq!(c.obj["_time"], "2025-12-31T23:00:00.000000Z");
         assert_eq!(c.obj["message"], "m");
-        assert_eq!(c.obj["severity"], 17, "folded severity joins the chain");
+        assert_eq!(c.obj["severity"], "error", "the source is stored verbatim");
+        assert_eq!(c.obj[trawl_core::schema::SEVERITY], 17, "and derived from");
         assert_eq!(c.obj["custom_field"], 1);
         for original in ["_Time", "Message", "SEVERITY", "Custom_Field"] {
             assert!(!c.obj.contains_key(original), "{original} must be folded");
@@ -1495,13 +1635,14 @@ mod tests {
     }
 
     #[test]
-    fn case_variant_ingested_folds_then_strips_as_server_owned() {
+    fn case_variant_ingested_folds_then_takes_the_reserved_prefix_strip() {
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z","_Ingested":"1999-01-01T00:00:00Z"}"#,
         );
         assert_eq!(c.obj["_ingested"], ARRIVAL, "server stamp wins");
-        assert!(codes(&c).contains(&"meta.stripped"));
+        assert_eq!(c.obj["ingested"], "1999-01-01T00:00:00Z");
+        assert!(codes(&c).contains(&"field.reserved_prefix"));
         assert!(codes(&c).contains(&"field.name_case_folded"));
     }
 
@@ -1567,20 +1708,17 @@ mod tests {
 
     #[test]
     fn folded_severity_inputs_join_the_derivation_chain() {
-        // Pre-fold these were dropped as reserved variants; now `Severity`
-        // IS `severity` and `LEVEL` IS `level` — same chain, one spelling.
+        // `Severity` IS `severity` and `LEVEL` IS `level` — one spelling
+        // reaches the derivation, and both sources are stored verbatim.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z","Severity":"error","LEVEL":"warn"}"#,
         );
         assert!(!c.obj.contains_key("Severity"));
         assert!(!c.obj.contains_key("LEVEL"));
-        assert!(!c.obj.contains_key("level"), "level is consumed");
-        assert_eq!(c.obj["severity"], 17, "string severity leads");
-        assert_eq!(
-            c.obj["severity_text"], "warn",
-            "the level value still lands as the label"
-        );
+        assert_eq!(c.obj["severity"], "error");
+        assert_eq!(c.obj["level"], "warn", "sources are never consumed");
+        assert_eq!(c.obj[trawl_core::schema::SEVERITY], 17, "severity leads");
         assert!(codes(&c).contains(&"field.name_case_folded"));
     }
 
@@ -1699,8 +1837,9 @@ mod tests {
     }
 
     #[test]
-    fn wire_aliases_consumed_in_precedence_order() {
-        // _time wins over timestamp wins over @timestamp; all consumed.
+    fn time_sources_are_read_in_precedence_order_and_kept() {
+        // _time wins over timestamp wins over @timestamp; only `_time` —
+        // the proposal slot — is consumed (ADR-0013 §2).
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-06-01T10:00:00Z",
@@ -1708,8 +1847,8 @@ mod tests {
                 "@timestamp":"2025-06-01T12:00:00Z"}"#,
         );
         assert_eq!(c.obj["_time"], "2025-06-01T10:00:00.000000Z");
-        assert!(!c.obj.contains_key("timestamp"));
-        assert!(!c.obj.contains_key("@timestamp"));
+        assert_eq!(c.obj["timestamp"], "2025-06-01T11:00:00Z");
+        assert_eq!(c.obj["@timestamp"], "2025-06-01T12:00:00Z");
 
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
@@ -1725,34 +1864,19 @@ mod tests {
         assert_eq!(c.obj["_time"], "2025-06-01T12:00:00.000000Z");
     }
 
-    // --- reserved provenance key ---
-
-    #[test]
-    fn wal_file_key_silently_dropped() {
-        let c = canon(
-            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_trawl_wal_file":"x","keep":"me"}"#,
-        );
-        assert!(!c.obj.contains_key(compaction::WAL_FILE_COL));
-        assert_eq!(c.obj["keep"], "me");
-        assert!(
-            c.repairs.is_empty(),
-            "the provenance key drop is silent, not meta.stripped"
-        );
-    }
-
     // --- multiple repairs aggregate ---
 
     #[test]
     fn multiple_repairs_join_comma_separated() {
         let e = envs(&["prod"]);
         let ctx = ctx_with(&e, false);
-        let c = canonicalize(&event(r#"{"service":"s","level":"SPICY"}"#), &ctx).unwrap();
+        let c = canonicalize(&event(r#"{"service":"s","_HOSTNAME":"box"}"#), &ctx).unwrap();
         let repairs = c.obj["_repairs"].as_str().unwrap();
         for code in [
             "time.from_ingest",
             "env.defaulted",
             "host.from_peer",
-            "severity.unmapped",
+            "field.reserved_prefix",
         ] {
             assert!(repairs.contains(code), "missing {code} in {repairs}");
         }

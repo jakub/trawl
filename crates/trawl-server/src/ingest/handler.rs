@@ -88,6 +88,11 @@ struct ParsedEvents {
     /// Per-`(code, service)` repair counts (ADR-0009): accepted events the
     /// server modified, feeding `trawl_ingest_repairs_total{code,service}`.
     repairs: IndexMap<(&'static str, String), u64>,
+    /// Per-service count of accepted events that carried a severity SOURCE
+    /// mapping to nothing on the `OTel` ladder (ADR-0013 §2). Not a
+    /// repair — nothing sender-visible was touched — so it rides its own
+    /// counter, `trawl_severity_unmapped_total{service}`.
+    severity_unmapped: IndexMap<String, u64>,
 }
 
 impl ParsedEvents {
@@ -97,6 +102,7 @@ impl ParsedEvents {
             errors: Vec::new(),
             reject_counts: RejectCounts::default(),
             repairs: IndexMap::new(),
+            severity_unmapped: IndexMap::new(),
         }
     }
 
@@ -114,6 +120,12 @@ impl ParsedEvents {
                     *self
                         .repairs
                         .entry((code.as_str(), canonical.service.clone()))
+                        .or_default() += 1;
+                }
+                if canonical.severity_unmapped {
+                    *self
+                        .severity_unmapped
+                        .entry(canonical.service.clone())
                         .or_default() += 1;
                 }
                 let key = (canonical.env, canonical.service);
@@ -325,6 +337,17 @@ fn finalize_ingest(
             samples = sample_text,
             "events rejected during ingest"
         );
+    }
+
+    for (service, count) in &parsed.severity_unmapped {
+        // Same label discipline as the repair counter: `service` is a
+        // client-chosen data dimension trawl publishes deliberately, run
+        // through the same bounded label helper.
+        metrics::counter!(
+            crate::metrics::SEVERITY_UNMAPPED_TOTAL,
+            "service" => crate::metrics::repair_service_label(service)
+        )
+        .increment(*count);
     }
 
     if !parsed.repairs.is_empty() {
@@ -640,26 +663,43 @@ mod tests {
 
     #[test]
     fn parse_json_array_derives_severity() {
-        // `level` is consumed at ingest: derived onto the OTel ladder,
-        // original spelling in severity_text.
+        // `level` is OBSERVED, never consumed: the source stays as the
+        // sender's own column and `_severity` is derived beside it.
         let data = br#"[{"service":"nginx","level":"error"},{"service":"nginx","level":"warn"}]"#;
         let parsed = parse(data).unwrap();
         let maps = batch_maps(&parsed, "prod", "nginx");
         assert_eq!(maps.len(), 2);
-        assert!(!maps[0].contains_key("level"));
         assert_eq!(
-            maps[0].get("severity").and_then(serde_json::Value::as_i64),
-            Some(17)
+            maps[0].get("level").and_then(serde_json::Value::as_str),
+            Some("error")
         );
         assert_eq!(
-            maps[1].get("severity").and_then(serde_json::Value::as_i64),
-            Some(13)
-        );
-        assert_eq!(
-            maps[1]
-                .get("severity_text")
-                .and_then(serde_json::Value::as_str),
+            maps[1].get("level").and_then(serde_json::Value::as_str),
             Some("warn")
+        );
+        let sev = |m: &serde_json::Map<String, serde_json::Value>| {
+            m.get(trawl_core::schema::SEVERITY)
+                .and_then(serde_json::Value::as_i64)
+        };
+        assert_eq!(sev(&maps[0]), Some(17));
+        assert_eq!(sev(&maps[1]), Some(13));
+    }
+
+    /// A sender whose severity source maps to nothing is counted, never
+    /// repaired (ADR-0013 §2) — the counter's input, per service.
+    #[test]
+    fn unmappable_severity_sources_are_counted_per_service() {
+        let data = br#"[{"service":"game","level":"gold"},{"service":"game","level":"silver"},{"service":"nginx","level":"error"}]"#;
+        let parsed = parse(data).unwrap();
+        assert_eq!(parsed.severity_unmapped.get("game"), Some(&2));
+        assert_eq!(parsed.severity_unmapped.get("nginx"), None);
+        assert!(
+            !parsed
+                .repairs
+                .keys()
+                .any(|(code, _)| *code == "severity.unmapped"),
+            "the deleted repair code must not come back: {:?}",
+            parsed.repairs
         );
     }
 
@@ -966,9 +1006,10 @@ mod tests {
         let data = br#"{"service":"test","timestamp":"2025-12-31T12:00:00Z","host":"myhost","message":"hello"}"#;
         let parsed = parse(data).unwrap();
         let event = &batch_maps(&parsed, "prod", "test")[0];
-        // The timestamp wire alias is consumed into a canonicalized _time.
+        // The `timestamp` source is READ for `_time` and STORED verbatim
+        // as the sender's own column (ADR-0013 §2).
         assert_eq!(event["_time"], "2025-12-31T12:00:00.000000Z");
-        assert!(!event.contains_key("timestamp"));
+        assert_eq!(event["timestamp"], "2025-12-31T12:00:00Z");
         assert_eq!(event["host"], "myhost");
         assert_eq!(event["message"], "hello");
     }

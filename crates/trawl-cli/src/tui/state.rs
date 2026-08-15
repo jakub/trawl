@@ -415,18 +415,10 @@ pub enum DetailSelection {
     ServiceField { service: String, field: String },
 }
 
-/// Well-known fields that are always in the common set (the ADR-0009
+/// Well-known fields that are always in the common set (the ADR-0013
 /// envelope's leading order; kept in sync with
 /// `trawl_api::value::WELL_KNOWN_LOG_FIELDS` — a test asserts parity).
-const WELL_KNOWN_FIELDS: &[&str] = &[
-    "_time",
-    "env",
-    "service",
-    "host",
-    "severity",
-    "severity_text",
-    "message",
-];
+const WELL_KNOWN_FIELDS: &[&str] = &["_time", "env", "service", "host", "_severity", "message"];
 
 /// Compute common fields from the service list.
 ///
@@ -2679,7 +2671,7 @@ mod tests {
                     ("_time", "TIMESTAMP"),
                     ("host", "VARCHAR"),
                     ("service", "VARCHAR"),
-                    ("severity", "INTEGER"),
+                    ("_severity", "BIGINT"),
                 ],
             ),
             make_service(
@@ -2689,14 +2681,14 @@ mod tests {
                     ("_time", "TIMESTAMP"),
                     ("host", "VARCHAR"),
                     ("service", "VARCHAR"),
-                    ("severity", "INTEGER"),
+                    ("_severity", "BIGINT"),
                 ],
             ),
         ];
         let common = compute_common_fields(&services);
         let names: Vec<&str> = common.iter().map(|f| f.name.as_str()).collect();
         // Well-known fields should come in the defined order.
-        assert_eq!(names, &["_time", "service", "host", "severity", "message"]);
+        assert_eq!(names, &["_time", "service", "host", "_severity", "message"]);
     }
 
     #[test]

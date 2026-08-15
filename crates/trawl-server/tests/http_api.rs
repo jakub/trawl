@@ -565,9 +565,14 @@ async fn ingest_accepts_ndjson(pool: sqlx::PgPool) {
     assert_eq!(resp.accepted, 2);
 }
 
+/// The ADR-0013 worked examples, end to end.
+///
 /// A vector-shaped payload (`timestamp` + `level`) lands as the declared
-/// envelope and is immediately queryable, with `_time`, the derived
-/// severity, and `_raw` populated.
+/// nine-field envelope: `_time` derived AND `timestamp` stored verbatim,
+/// `_severity` derived AND `level` stored verbatim, `_raw` populated —
+/// and the severity vocabulary rides `_severity`, which nothing can
+/// shadow. The game server's `level:"gold"` keeps its column and gets no
+/// `_severity` at all.
 #[sqlx::test(migrations = false)]
 async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
     let server = setup(pool).await;
@@ -580,12 +585,15 @@ async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
             "timestamp": now, "message": "boom"}),
         serde_json::json!({"service": "vec-svc", "host": "web01", "level": "info",
             "timestamp": now, "message": "fine"}),
+        // The #60 canonical example: `level` means loot tier here.
+        serde_json::json!({"service": "vec-svc", "host": "web01", "level": "gold",
+            "timestamp": now, "message": "dropped"}),
     ];
     let resp = ingest.ingest(&records).await.unwrap();
-    assert_eq!(resp.accepted, 2);
+    assert_eq!(resp.accepted, 3);
 
     let result = query
-        .query_paginated("service=vec-svc severity=17 last=1h", None, None)
+        .query_paginated("service=vec-svc _severity=error last=1h", None, None)
         .await
         .unwrap();
     assert_eq!(result.result.row_count(), 1, "only the ERROR-band row");
@@ -599,13 +607,22 @@ async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
     };
     let row = &result.result.rows[0];
     assert_eq!(
-        row[col("severity")],
+        row[col(trawl_core::schema::SEVERITY)],
         trawl_api::value::Value::Integer(17),
         "level:error derives the ERROR-band severity 17"
+    );
+    assert_eq!(
+        row[col("level")],
+        trawl_api::value::Value::String("error".into()),
+        "the source is stored verbatim beside the derived slot"
     );
     assert!(
         matches!(&row[col("_time")], trawl_api::value::Value::String(_)),
         "_time populated"
+    );
+    assert!(
+        matches!(&row[col("timestamp")], trawl_api::value::Value::String(_)),
+        "the time SOURCE is stored verbatim too"
     );
     match &row[col("_raw")] {
         trawl_api::value::Value::String(raw) => {
@@ -614,30 +631,81 @@ async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
         other => panic!("_raw must be a string, got {other:?}"),
     }
 
+    // The game server's row is fully queryable under its own vocabulary
+    // and carries no derived severity at all.
+    let gold = query
+        .query_paginated("service=vec-svc level=gold last=1h", None, None)
+        .await
+        .unwrap();
+    assert_eq!(gold.result.row_count(), 1, "the sender's own field filters");
+    let gold_col = gold
+        .result
+        .columns
+        .iter()
+        .position(|c| c.name == trawl_core::schema::SEVERITY);
+    if let Some(idx) = gold_col {
+        assert_eq!(
+            gold.result.rows[0][idx],
+            trawl_api::value::Value::Null,
+            "an unmappable level derives no severity"
+        );
+    }
+
+    // The exact OTel short name and the band token agree with each other.
+    for (dsl, expected) in [
+        ("service=vec-svc _severity=error2 last=1h", 0),
+        ("service=vec-svc _severity>=warn last=1h", 1),
+        ("service=vec-svc _severity=warn,error last=1h", 1),
+        ("service=vec-svc _severity=info last=1h", 1),
+    ] {
+        let r = query.query_paginated(dsl, None, None).await.unwrap();
+        assert_eq!(r.result.row_count(), expected, "{dsl}");
+    }
+
+    // An unknown severity value is a 4xx naming the vocabulary, never a
+    // filter that quietly matches nothing.
+    let resp = raw_client()
+        .post(format!("{}/api/v1/query", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .json(&serde_json::json!({ "query": "_severity=spicy" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("unknown severity value") && body.contains("1-24"),
+        "the error must name the vocabulary: {body}"
+    );
+
     // …and `level` is ORDINARY sender vocabulary now (ADR-0013 §6): the
     // shapes the alias used to refuse — grouping on it, an IN-list in
     // `where` — are plain field usage in both lanes, batch and live.
-    for query in [
+    for query_text in [
         "service=vec-svc last=1h | stats count() by level",
         r#"service=vec-svc last=1h | where level in ("error", "fatal")"#,
     ] {
         let resp = raw_client()
             .post(format!("{}/api/v1/query", server.url))
             .header("authorization", format!("Bearer {}", server.analyst_token))
-            .json(&serde_json::json!({ "query": query }))
+            .json(&serde_json::json!({ "query": query_text }))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200, "{query} must be ordinary field usage");
+        assert_eq!(
+            resp.status(),
+            200,
+            "{query_text} must be ordinary field usage"
+        );
 
         let sse = raw_client()
             .get(format!("{}/api/v1/stream", server.url))
-            .query(&[("query", query)])
+            .query(&[("query", query_text)])
             .header("authorization", format!("Bearer {}", server.analyst_token))
             .send()
             .await
             .unwrap();
-        assert_eq!(sse.status(), 200, "{query} must stream too");
+        assert_eq!(sse.status(), 200, "{query_text} must stream too");
     }
 }
 
@@ -1874,9 +1942,10 @@ async fn repin_validation_refusals_are_side_effect_free(pool: sqlx::PgPool) {
     let client = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
 
     for (field, to) in [
-        ("severity", "VARCHAR"), // envelope field
-        ("_time", "VARCHAR"),    // envelope metadata
-        ("status", "UUID"),      // not a ladder type
+        ("_severity", "VARCHAR"), // envelope field
+        ("_time", "VARCHAR"),     // envelope metadata
+        ("status", "UUID"),       // not a ladder type
+        ("status", "SEVERITY"),   // semantic pin: no physical spelling
     ] {
         let err = client
             .schema_repin(field, to, true, false)

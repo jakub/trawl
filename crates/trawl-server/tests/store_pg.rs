@@ -1410,6 +1410,49 @@ mod catalog {
             ENVELOPE_TYPES.len(),
             "a fresh catalog holds exactly the declared envelope"
         );
+        // The ADR-0013 reshape, spelled out: `_severity` is pinned
+        // SEVERITY (the semantic type, persisted under its own catalog
+        // spelling) and the pre-cutover names are gone from the seed.
+        assert_eq!(
+            pins.iter().find(|(f, _)| f == "_severity").map(|(_, t)| *t),
+            Some(CanonicalType::Severity)
+        );
+        for gone in ["severity", "severity_text"] {
+            assert!(
+                !pins.iter().any(|(f, _)| f == gone),
+                "{gone} left the envelope (ADR-0013 §1)"
+            );
+        }
+    }
+
+    /// Migration 0010's DELETE is SCOPED to the rows migration 0002
+    /// declared: a SENDER's own `severity` pin is ordinary data and must
+    /// survive the reshape, along with its observations and evidence.
+    #[sqlx::test]
+    async fn the_seed_reshape_leaves_a_senders_own_severity_pin_standing(pool: PgPool) {
+        let store = catalog(&pool);
+        // A sender pins `severity` itself, exactly as any custom field.
+        let pinned = store
+            .pin_missing(&[proposal("severity", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+        assert_eq!(pinned.get("severity"), Some(&CanonicalType::BigInt));
+
+        // Re-running the reshape's own statements must not touch it.
+        sqlx::query(
+            "DELETE FROM field_types WHERE field IN ('severity', 'severity_text') \
+             AND pinned_from = '_declared'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pins = store.load_pins().await.unwrap();
+        assert_eq!(
+            pins.iter().find(|(f, _)| f == "severity").map(|(_, t)| *t),
+            Some(CanonicalType::BigInt),
+            "a sender's pin is not the declared seed"
+        );
     }
 
     #[sqlx::test]
@@ -2797,12 +2840,12 @@ mod repin_store {
     async fn finish_cutover_flips_pin_and_job_transactionally_and_idempotently(pool: PgPool) {
         let s = store(&pool);
         let catalog = CatalogStore::new(pool.clone());
-        // `severity` is seeded BIGINT by migration 0002.
+        // `host` is seeded VARCHAR by migration 0002; the flip retypes it.
         let id = s
             .claim(
-                "severity",
-                CanonicalType::BigInt,
+                "host",
                 CanonicalType::Varchar,
+                CanonicalType::BigInt,
                 false,
                 false,
                 None,
@@ -2810,19 +2853,19 @@ mod repin_store {
             .await
             .unwrap();
 
-        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+        s.finish_cutover(id, "host", CanonicalType::BigInt)
             .await
             .unwrap();
 
         let pins: std::collections::HashMap<_, _> =
             catalog.load_pins().await.unwrap().into_iter().collect();
-        assert_eq!(pins.get("severity"), Some(&CanonicalType::Varchar));
+        assert_eq!(pins.get("host"), Some(&CanonicalType::BigInt));
         let job = s.get(id).await.unwrap().expect("job row");
         assert_eq!(job.status, RepinJobStatus::Succeeded);
         assert!(job.finished_at.is_some());
 
         // Idempotent redo (boot recovery replays the flip).
-        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+        s.finish_cutover(id, "host", CanonicalType::BigInt)
             .await
             .unwrap();
         let again = s.get(id).await.unwrap().unwrap();

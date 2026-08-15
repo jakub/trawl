@@ -2,12 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The declared event envelope (ADR-0009): field names, reserved keys, and
-//! wire aliases.
+//! The declared event envelope (ADR-0009, reshaped by ADR-0013): field
+//! names, the sealed namespace predicate, and the derivation source list.
 //!
-//! Namespace rule: `_` marks metadata about the record's handling; no prefix
-//! means data about the event. `severity` is server-derived but carries no
-//! prefix because it is content.
+//! Namespace rule, one sentence: **underscore-prefixed names are trawl's
+//! contract slots** — trawl guarantees their semantics, the sender may
+//! propose some (`_time`, `_raw`), trawl derives the rest — and **bare
+//! names are sender vocabulary trawl never assigns meaning to**. The
+//! `_` prefix is sealed as a PREDICATE ([`is_reserved_name`]), not an
+//! enumerated list, so the envelope can grow without a corpus already
+//! holding a client's colliding key.
 
 use std::fmt;
 
@@ -25,10 +29,12 @@ pub const ENV: &str = "env";
 pub const SERVICE: &str = "service";
 /// Origin host (VARCHAR, required; column, not a path segment).
 pub const HOST: &str = "host";
-/// `OTel` `SeverityNumber` 1-24 (INTEGER, derived).
-pub const SEVERITY: &str = "severity";
-/// Original severity text, verbatim (VARCHAR, optional).
-pub const SEVERITY_TEXT: &str = "severity_text";
+/// The derived `OTel` `SeverityNumber` 1-24 (SEVERITY over BIGINT).
+///
+/// DERIVATION-ONLY (ADR-0013 §3): it is a verdict, not a proposal, so an
+/// incoming `_severity` takes the standard reserved-prefix strip and
+/// lands as a bare `severity` — which derivation then reads.
+pub const SEVERITY: &str = "_severity";
 /// The important part of the line (VARCHAR, by convention).
 pub const MESSAGE: &str = "message";
 
@@ -37,12 +43,6 @@ pub const MESSAGE: &str = "message";
 /// a second TIMESTAMP column left VARCHAR on the hot side trips the
 /// union-conflict path on every query with a non-empty hot buffer.
 pub const TIMESTAMP_COLUMNS: &[&str] = &[TIME, INGESTED];
-
-/// Server-owned metadata a client may never set. A client-sent value is
-/// dropped and replaced, recorded with the `meta.stripped` repair code —
-/// silently honouring it would let a sender forge its own handling history.
-/// (`_raw` is also server-owned when the client value is not a string.)
-pub const RESERVED_CLIENT_FIELDS: &[&str] = &[INGESTED, REPAIRS];
 
 /// Maximum length (bytes) of a field name trawl will store.
 ///
@@ -63,8 +63,7 @@ pub fn is_storable_field_name(name: &str) -> bool {
 }
 
 /// Leading well-known columns for result reordering, in display order.
-pub const LEADING_LOG_FIELDS: &[&str] =
-    &[TIME, ENV, SERVICE, HOST, SEVERITY, SEVERITY_TEXT, MESSAGE];
+pub const LEADING_LOG_FIELDS: &[&str] = &[TIME, ENV, SERVICE, HOST, SEVERITY, MESSAGE];
 
 /// Trailing columns demoted to the end of result reordering.
 pub const TRAILING_LOG_FIELDS: &[&str] = &[RAW, INGESTED, REPAIRS];
@@ -261,11 +260,10 @@ pub const ENVELOPE_TYPES: &[(&str, CanonicalType)] = &[
     (INGESTED, CanonicalType::Timestamp),
     (RAW, CanonicalType::Varchar),
     (REPAIRS, CanonicalType::Varchar),
+    (SEVERITY, CanonicalType::Severity),
     (ENV, CanonicalType::Varchar),
     (SERVICE, CanonicalType::Varchar),
     (HOST, CanonicalType::Varchar),
-    (SEVERITY, CanonicalType::BigInt),
-    (SEVERITY_TEXT, CanonicalType::Varchar),
     (MESSAGE, CanonicalType::Varchar),
 ];
 
@@ -411,14 +409,6 @@ mod tests {
     }
 
     #[test]
-    fn reserved_fields_are_server_owned() {
-        assert!(RESERVED_CLIENT_FIELDS.contains(&INGESTED));
-        assert!(RESERVED_CLIENT_FIELDS.contains(&REPAIRS));
-        // _raw is conditionally honoured (string values kept), so not listed.
-        assert!(!RESERVED_CLIENT_FIELDS.contains(&RAW));
-    }
-
-    #[test]
     fn leading_and_trailing_disjoint() {
         for f in LEADING_LOG_FIELDS {
             assert!(!TRAILING_LOG_FIELDS.contains(f));
@@ -557,24 +547,30 @@ mod tests {
         );
     }
 
+    /// The envelope is NINE fields (ADR-0013 §1): five trawl-owned
+    /// under the `_` namespace and four sender-asserted bare ones.
+    /// `severity_text` is gone outright, and `severity` left the
+    /// envelope to become ordinary sender data.
     #[test]
-    fn envelope_types_cover_the_declared_ten() {
+    fn envelope_types_cover_the_declared_nine() {
         let fields: Vec<&str> = ENVELOPE_TYPES.iter().map(|(f, _)| *f).collect();
         assert_eq!(
             fields,
             vec![
-                TIME,
-                INGESTED,
-                RAW,
-                REPAIRS,
-                ENV,
-                SERVICE,
-                HOST,
-                SEVERITY,
-                SEVERITY_TEXT,
-                MESSAGE
+                TIME, INGESTED, RAW, REPAIRS, SEVERITY, ENV, SERVICE, HOST, MESSAGE
             ]
         );
+        assert_eq!(SEVERITY, "_severity");
+        assert!(!fields.contains(&"severity"));
+        assert!(!fields.contains(&"severity_text"));
+        // Trawl-owned names are exactly the reserved ones.
+        for f in [TIME, INGESTED, RAW, REPAIRS, SEVERITY] {
+            assert!(is_reserved_name(f), "{f} must be reserved");
+        }
+        for f in [ENV, SERVICE, HOST, MESSAGE] {
+            assert!(!is_reserved_name(f), "{f} is sender-asserted");
+        }
+
         let ty = |name: &str| {
             ENVELOPE_TYPES
                 .iter()
@@ -584,8 +580,8 @@ mod tests {
         };
         assert_eq!(ty(TIME), CanonicalType::Timestamp);
         assert_eq!(ty(INGESTED), CanonicalType::Timestamp);
-        assert_eq!(ty(SEVERITY), CanonicalType::BigInt);
-        for f in [RAW, REPAIRS, ENV, SERVICE, HOST, SEVERITY_TEXT, MESSAGE] {
+        assert_eq!(ty(SEVERITY), CanonicalType::Severity);
+        for f in [RAW, REPAIRS, ENV, SERVICE, HOST, MESSAGE] {
             assert_eq!(ty(f), CanonicalType::Varchar, "{f}");
         }
     }
