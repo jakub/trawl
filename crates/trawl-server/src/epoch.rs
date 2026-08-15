@@ -222,7 +222,7 @@ fn decide(data_root: &Path, wal_dir: &Path, ingest_enabled: bool) -> Result<Outc
                     aside.display()
                 ));
             }
-            set_aside_legacy_root(data_root, &aside, wal_dir)
+            set_aside_root(data_root, &aside, wal_dir, &LEGACY_SET_ASIDE)
         }
         Err(e) => Err(format!(
             "failed to read epoch marker {}: {e}",
@@ -266,7 +266,7 @@ fn epoch_2_branch(
             aside.display()
         ));
     }
-    set_aside_previous_epoch(data_root, aside, wal_dir)
+    set_aside_root(data_root, aside, wal_dir, &EPOCH_2_SET_ASIDE)
 }
 
 /// Move `{aside}/scheduled/` into the current data root.
@@ -476,61 +476,50 @@ fn create_fresh_root(data_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The epoch-2 branch: the same set-aside idiom the ADR-0009 cutover
-/// uses, under the epoch-3 name and with the epoch-2 WAL layout.
+/// What one set-aside branch of the decision table calls its corpus.
 ///
-/// An external WAL dir does not ride the root rename, and every file in
-/// it is a pre-cutover event: set it aside under the same suffix, so the
-/// compactor cannot drain epoch-2 events into an epoch-3 corpus.
-fn set_aside_previous_epoch(
-    data_root: &Path,
-    aside: &Path,
-    wal_dir: &Path,
-) -> Result<Outcome, String> {
-    let parquet_files = count_files_with_ext(data_root, "parquet").saturating_sub(
-        count_files_with_ext(&data_root.join(REPORT_RUNS_DIR), "parquet"),
-    );
-    let wal_files = count_files_with_ext(wal_dir, "ndjson");
-
-    let external_wal_set_aside =
-        set_aside_external_wal_with(data_root, wal_dir, EPOCH_3_SET_ASIDE_SUFFIX)?;
-
-    std::fs::rename(data_root, aside).map_err(|e| {
-        format!(
-            "failed to set aside epoch-2 data root {} → {}: {e} — the \
-             set-aside parent must be writable for the epoch-3 cutover",
-            data_root.display(),
-            aside.display()
-        )
-    })?;
-    create_fresh_root(data_root)?;
-
-    tracing::warn!(
-        event_type = "epoch_cutover",
-        set_aside = %aside.display(),
-        parquet_files,
-        wal_files,
-        external_wal_set_aside,
-        "epoch-2 data root set aside (ADR-0013: the event envelope \
-         reshaped, and legacy data is dropped from queries, not deleted) \
-         — trawl will never remove the set-aside directory; delete it \
-         manually to reclaim disk"
-    );
-
-    Ok(Outcome::LegacySetAside {
-        parquet_files,
-        wal_files,
-        external_wal_set_aside,
-    })
+/// Every epoch bump renames the same way and differs only in these three
+/// strings, so the branches share one body ([`set_aside_root`]) and a new
+/// epoch adds a constant rather than a fourth copy of the rename.
+struct SetAsideKind {
+    /// Suffix for the EXTERNAL WAL dir's own set-aside — one per epoch, so
+    /// one cutover's set-aside cannot clobber another's.
+    wal_suffix: &'static str,
+    /// How the corpus being set aside is named in operator-facing text.
+    label: &'static str,
+    /// Why it is being set aside — the ADR clause in the cutover warning.
+    reason: &'static str,
 }
 
-/// The legacy-rename branch: set the whole root (and an external WAL dir)
+/// A marker-less (epoch-1) root, set aside by the ADR-0009 cutover.
+const LEGACY_SET_ASIDE: SetAsideKind = SetAsideKind {
+    wal_suffix: SET_ASIDE_SUFFIX,
+    label: "pre-schema-v2",
+    reason: "ADR-0009: legacy data is dropped from queries, not deleted",
+};
+
+/// An epoch-2 root, set aside by the ADR-0013 cutover.
+const EPOCH_2_SET_ASIDE: SetAsideKind = SetAsideKind {
+    wal_suffix: EPOCH_3_SET_ASIDE_SUFFIX,
+    label: "epoch-2",
+    reason: "ADR-0013: the event envelope reshaped, and legacy data is \
+             dropped from queries, not deleted",
+};
+
+/// The set-aside branch: set the whole root (and an external WAL dir)
 /// aside, then create the fresh marked root.
-fn set_aside_legacy_root(
+fn set_aside_root(
     data_root: &Path,
     aside: &Path,
     wal_dir: &Path,
+    kind: &SetAsideKind,
 ) -> Result<Outcome, String> {
+    let SetAsideKind {
+        wal_suffix,
+        label,
+        reason,
+    } = *kind;
+
     // Report-run parquet is carried back into the fresh root, so it is not
     // part of what the cutover sets aside — don't claim it in the count.
     let parquet_files = count_files_with_ext(data_root, "parquet").saturating_sub(
@@ -538,16 +527,19 @@ fn set_aside_legacy_root(
     );
     let wal_files = count_files_with_ext(wal_dir, "ndjson");
 
-    // An external WAL dir does not move with the root — set it aside
-    // FIRST, so a crash after this rename still resumes correctly (the
-    // data root is untouched, the branch re-runs, and the WAL set-aside
-    // is a no-op because the source is gone).
-    let external_wal_set_aside = set_aside_external_wal(data_root, wal_dir)?;
+    // An external WAL dir does not move with the root, and every file in
+    // it is a pre-cutover event — set it aside FIRST, so a crash after
+    // this rename still resumes correctly (the data root is untouched,
+    // the branch re-runs, and the WAL set-aside is a no-op because the
+    // source is gone) and the compactor can never drain pre-cutover
+    // events into the fresh corpus.
+    let external_wal_set_aside = set_aside_external_wal_with(data_root, wal_dir, wal_suffix)?;
 
     std::fs::rename(data_root, aside).map_err(|e| {
         format!(
-            "failed to set aside legacy data root {} → {}: {e} — the \
-             set-aside parent must be writable for the schema-v2 cutover",
+            "failed to set aside {label} data root {} → {}: {e} — the \
+             set-aside parent must be writable for the epoch-{CURRENT_EPOCH} \
+             cutover",
             data_root.display(),
             aside.display()
         )
@@ -563,9 +555,8 @@ fn set_aside_legacy_root(
         parquet_files,
         wal_files,
         external_wal_set_aside,
-        "pre-schema-v2 data root set aside (ADR-0009: legacy data is \
-         dropped from queries, not deleted) — trawl will never remove the \
-         set-aside directory; delete it manually to reclaim disk"
+        "{label} data root set aside ({reason}) — trawl will never remove \
+         the set-aside directory; delete it manually to reclaim disk"
     );
 
     Ok(Outcome::LegacySetAside {
