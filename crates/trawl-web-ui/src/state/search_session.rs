@@ -49,5 +49,6 @@ fn empty_response() -> QueryResponse {
         },
         // A placeholder for "no query yet" — no execution, no notice.
         degraded_fields: Vec::new(),
+        notices: Vec::new(),
     }
 }
