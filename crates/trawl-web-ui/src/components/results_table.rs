@@ -17,6 +17,8 @@ use leptos::prelude::*;
 use std::cmp::Ordering;
 use trawl_api::QueryResponse;
 use trawl_api::display::value_to_string;
+
+use crate::severity_cell::{severity_class, severity_display};
 use trawl_api::value::Value;
 
 #[component]
@@ -81,10 +83,13 @@ fn ResultsTableBody(
         .into_any();
     }
 
-    // Severity-keyed row coloring (ADR-0009): the numeric `severity`
-    // column and the verbatim `severity_text` both color by OTel band.
-    let severity_idx = columns.iter().position(|c| c == "severity");
-    let severity_text_idx = columns.iter().position(|c| c == "severity_text");
+    // Severity-keyed cell rendering (ADR-0013 §9): `_severity` ONLY —
+    // the derived slot nothing can shadow. A bare `severity` column is
+    // ordinary sender data now, and the `severity_text` fallback died
+    // with the column.
+    let severity_idx = columns
+        .iter()
+        .position(|c| c == trawl_core::schema::SEVERITY);
     let expanded = RwSignal::new(None::<usize>);
     let sort = RwSignal::new(None::<SortState>);
 
@@ -145,7 +150,6 @@ fn ResultsTableBody(
                                 rows_data.clone(),
                                 cols_for_view.clone(),
                                 severity_idx,
-                                severity_text_idx,
                                 expanded,
                                 on_add_filter,
                                 on_navigate,
@@ -229,7 +233,6 @@ impl SortedIndices {
                         row=row
                         columns=cols
                         severity_idx=severity_idx
-                        severity_text_idx=severity_text_idx
                         expanded=expanded
                         on_add_filter=on_add_filter
                         on_navigate=on_navigate
@@ -248,7 +251,6 @@ fn RowFragment(
     row: Vec<Value>,
     columns: Vec<String>,
     severity_idx: Option<usize>,
-    severity_text_idx: Option<usize>,
     expanded: RwSignal<Option<usize>>,
     on_add_filter: Callback<Filter>,
     on_navigate: Callback<String>,
@@ -259,8 +261,11 @@ fn RowFragment(
         .iter()
         .enumerate()
         .map(|(ci, v)| {
-            if Some(ci) == severity_idx || Some(ci) == severity_text_idx {
-                let s = value_to_string(v);
+            if Some(ci) == severity_idx {
+                // Results DISPLAY the token, never the number (ADR-0013
+                // §6). The wire keeps the number: json/csv/SSE carry it
+                // for arithmetic consumers, and rendering is presentation.
+                let s = severity_display(v);
                 let cls = severity_class(v);
                 view! { <td><span class=cls>{s}</span></td> }.into_any()
             } else {
@@ -454,23 +459,6 @@ fn build_similar_query(row: &[Value], columns: &[String]) -> Option<String> {
 
 fn escape_dq(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// CSS class for a severity value: numeric `severity` (OTel 1-24) or a
-/// `severity_text` token, both resolved to a band via `trawl_core`.
-fn severity_class(v: &Value) -> &'static str {
-    let number = match v {
-        Value::Integer(n) => u8::try_from(*n).ok().filter(|n| (1..=24).contains(n)),
-        Value::String(s) => trawl_core::severity::number_for_token(s),
-        _ => None,
-    };
-    match number.and_then(trawl_core::severity::band_name) {
-        Some("error" | "fatal") => "lvl lvl-error",
-        Some("warn") => "lvl lvl-warn",
-        Some("info") => "lvl lvl-info",
-        Some("debug" | "trace") => "lvl lvl-debug",
-        _ => "lvl",
-    }
 }
 
 fn compare(a: Option<&Value>, b: Option<&Value>) -> Ordering {

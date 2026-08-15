@@ -7,8 +7,8 @@
 //!
 //! Time bucketing leans on `crate::histogram::bucketize`. Timestamps
 //! come from any `_time` / `time` / `timestamp` column when present;
-//! "is error" is `severity >= 17` (the OTel ERROR band) when a
-//! `severity` column is present, with a `severity_text` token fallback.
+//! "is error" is `_severity >= 17` (the OTel ERROR band) when the
+//! derived column is present (ADR-0013 §9).
 //! Anything missing → render the "no histogram on this page" hint.
 //!
 //! Y/X axis labels are rendered alongside the bars (`0` / `max/2` /
@@ -95,8 +95,11 @@ fn build_buckets(resp: &QueryResponse) -> Vec<Bucket> {
             "_time" | "time" | "timestamp" | "@timestamp"
         )
     });
-    let severity_idx = cols.iter().position(|c| c.name == "severity");
-    let severity_text_idx = cols.iter().position(|c| c.name == "severity_text");
+    // `_severity` ONLY (ADR-0013 §9): the derived slot nothing can
+    // shadow, and the `severity_text` fallback died with the column.
+    let severity_idx = cols
+        .iter()
+        .position(|c| c.name == trawl_core::schema::SEVERITY);
     let Some(ti) = time_idx else {
         return Vec::new();
     };
@@ -106,30 +109,13 @@ fn build_buckets(resp: &QueryResponse) -> Vec<Bucket> {
         let Some(t) = row.get(ti).and_then(value_to_seconds) else {
             continue;
         };
-        let is_err = row_is_error(row, severity_idx, severity_text_idx);
+        let is_err = crate::severity_cell::row_is_error(row, severity_idx);
         events.push((t, is_err));
     }
     if events.is_empty() {
         return Vec::new();
     }
     bucketize(&events, N_BUCKETS)
-}
-
-/// Whether a row sits at or above the OTel ERROR band (17): numeric
-/// `severity` first, else a `severity_text` token.
-fn row_is_error(
-    row: &[Value],
-    severity_idx: Option<usize>,
-    severity_text_idx: Option<usize>,
-) -> bool {
-    if let Some(Value::Integer(n)) = severity_idx.and_then(|i| row.get(i)) {
-        return *n >= 17;
-    }
-    severity_text_idx
-        .and_then(|i| row.get(i))
-        .and_then(value_as_str)
-        .and_then(trawl_core::severity::number_for_token)
-        .is_some_and(|n| n >= 17)
 }
 
 #[allow(clippy::cast_precision_loss)] // bucket math tolerates 52-bit precision

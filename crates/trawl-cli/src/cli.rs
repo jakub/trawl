@@ -301,14 +301,44 @@ fn render_table(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     let headers: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     table.set_header(headers);
 
+    // `_severity` DISPLAYS its OTel token (ADR-0013 §6): `17` reads
+    // `error`, the same vocabulary that would filter it. Only the table
+    // renders it — json/csv keep the number, for arithmetic consumers.
+    let severity_idx = result
+        .columns
+        .iter()
+        .position(|c| c.name == trawl_core::schema::SEVERITY);
+
     for row in &result.rows {
-        let cells: Vec<String> = row.iter().map(ToString::to_string).collect();
+        let cells: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                if Some(i) == severity_idx {
+                    severity_cell_text(v)
+                } else {
+                    v.to_string()
+                }
+            })
+            .collect();
         table.add_row(cells);
     }
 
     writeln!(out, "{table}")?;
     writeln!(out, "{} row(s)", result.row_count())?;
     Ok(())
+}
+
+/// A `_severity` cell as the table shows it: the `OTel` short name, or
+/// the raw value where the ladder has no reading for it.
+fn severity_cell_text(v: &Value) -> String {
+    let number = match v {
+        Value::Integer(n) => u8::try_from(*n).ok(),
+        _ => None,
+    };
+    number
+        .and_then(trawl_core::severity::otel_name)
+        .map_or_else(|| v.to_string(), str::to_owned)
 }
 
 fn render_ndjson(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
@@ -635,6 +665,30 @@ mod tests {
         assert!(render(OutputFormat::Json, &notices).is_empty());
         assert!(render(OutputFormat::Csv, &notices).is_empty());
         assert!(render(OutputFormat::Table, &[]).is_empty());
+    }
+
+    /// The table renders the token; json and csv keep the number.
+    #[test]
+    fn the_severity_column_displays_its_token_in_the_table_only() {
+        assert_eq!(severity_cell_text(&Value::Integer(17)), "error");
+        assert_eq!(severity_cell_text(&Value::Integer(18)), "error2");
+        assert_eq!(severity_cell_text(&Value::Integer(99)), "99");
+
+        let result = QueryResult {
+            columns: vec![trawl_engine::value::Column {
+                name: trawl_core::schema::SEVERITY.to_owned(),
+            }],
+            rows: vec![vec![Value::Integer(17)]],
+        };
+        let render = |f: fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>| {
+            let mut buf = Vec::new();
+            f(&result, &mut buf).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        assert!(render(render_table).contains("error"));
+        assert!(!render(render_table).contains(" 17 "));
+        assert!(render(render_ndjson).contains("17"));
+        assert!(render(render_csv).contains("17"));
     }
 
     #[test]

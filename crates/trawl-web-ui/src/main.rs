@@ -16,6 +16,7 @@ mod repin_flow;
 mod repin_hint;
 mod schema_nav;
 mod service_card_fmt;
+mod severity_cell;
 mod tone_vocab;
 
 #[cfg(target_arch = "wasm32")]
