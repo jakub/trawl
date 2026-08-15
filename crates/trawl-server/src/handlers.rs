@@ -114,17 +114,17 @@ pub async fn query(
 
     // Check for `| from saved` — if present, resolve to parquet source
     // and execute with the pre-computed source instead of normal glob scan.
-    let (outcome, degraded_fields) =
+    let (outcome, degraded_fields, notices) =
         if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query).await? {
             // Both halves of what the caller is actually reading: the
             // stages they typed, and the saved query whose recorded run
             // produced the rows those stages run over. Nothing stamps a
-            // report run at write time, so a degraded pin the saved query
-            // bound would otherwise go unmentioned.
-            let degraded = degraded_fields_for(
-                &state,
-                [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()],
-            );
+            // report run at write time, so a degraded pin — or a retired
+            // spelling — the saved query bound would otherwise go
+            // unmentioned.
+            let halves = [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()];
+            let degraded = degraded_fields_for(&state, halves);
+            let notices = shape_notices(halves);
             (
                 state
                     .query
@@ -139,9 +139,11 @@ pub async fn query(
                     )
                     .await,
                 degraded,
+                notices,
             )
         } else {
             let degraded = degraded_fields_for(&state, [req.query.as_str()]);
+            let notices = shape_notices([req.query.as_str()]);
             (
                 state
                     .query
@@ -155,6 +157,7 @@ pub async fn query(
                     )
                     .await,
                 degraded,
+                notices,
             )
         };
 
@@ -234,7 +237,7 @@ pub async fn query(
                     returned,
                 },
                 degraded_fields,
-                notices: shape_notices(&req.query),
+                notices,
             }))
         }
         Err(ServerError::Timeout) => {
@@ -1122,21 +1125,32 @@ pub async fn catalog_fields(
 /// ([`trawl_core::field_refs`]).
 /// Non-blocking advisories about the query's SHAPE (ADR-0013 §7).
 ///
+/// `texts` is every DSL the answer depends on, exactly as
+/// [`degraded_fields_for`] takes it: the query as typed, plus — for
+/// `from saved` — the saved query whose run produced the stored rows. The
+/// pre-cutover saved query is the motivating case for the advisory in the
+/// first place, so dropping its half would leave precisely the query that
+/// needs the notice without one. Deduplicated, since both halves naming a
+/// retired spelling earns one advisory, not two.
+///
 /// Parsed here rather than threaded out of the executor: the walk is
 /// cheap, pin-blind and total, and a query that failed to parse never
 /// reaches this point. A parse failure is impossible by then, so an
 /// unparseable string simply yields nothing rather than inventing a
 /// second error channel.
-fn shape_notices(dsl: &str) -> Vec<String> {
-    trawl_core::parser::parse(dsl)
-        .ok()
-        .map(|query| {
-            trawl_core::advisory::notices(&query)
-                .into_iter()
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+fn shape_notices<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for dsl in texts {
+        let Ok(query) = trawl_core::parser::parse(dsl) else {
+            continue;
+        };
+        for notice in trawl_core::advisory::notices(&query) {
+            if !out.contains(&notice) {
+                out.push(notice);
+            }
+        }
+    }
+    out.into_iter().map(ToOwned::to_owned).collect()
 }
 
 fn degraded_fields_for<'a>(
