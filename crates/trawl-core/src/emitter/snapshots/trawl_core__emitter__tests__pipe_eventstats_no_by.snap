@@ -1,10 +1,10 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(\"* | eventstats count()\")"
+expression: "emit_dsl(\"* | eventstats count() as total\")"
 ---
 WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT *, COUNT(*) OVER () AS "count"
+SELECT *, COUNT(*) OVER () AS "total"
 FROM "_s0"

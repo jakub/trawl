@@ -1293,12 +1293,14 @@ mod tests {
 
     #[test]
     fn pipe_eventstats_basic() {
-        assert_snapshot!(emit_dsl("* | eventstats avg(duration) by service"));
+        assert_snapshot!(emit_dsl(
+            "* | eventstats avg(duration) as avg_duration by service"
+        ));
     }
 
     #[test]
     fn pipe_eventstats_no_by() {
-        assert_snapshot!(emit_dsl("* | eventstats count()"));
+        assert_snapshot!(emit_dsl("* | eventstats count() as total"));
     }
 
     #[test]
@@ -1338,7 +1340,7 @@ mod tests {
 
     #[test]
     fn error_eventstats_dc() {
-        assert_snapshot!(emit_dsl_err("* | eventstats dc(host) by service"));
+        assert_snapshot!(emit_dsl_err("* | eventstats dc(host) as hosts by service"));
     }
 
     #[test]

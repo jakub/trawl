@@ -73,6 +73,12 @@ pub enum StreamPlanError {
     /// parse error (ADR-0013 §5). The SQL lane refuses it in
     /// `emitter::validate_pipeline`, which this lane never runs.
     ReservedName(String),
+    /// A projecting stage that would mint two columns of one name
+    /// (ADR-0013 ruling 8). Same reason as `ReservedName`: the sentence
+    /// comes from the one shared check in `crate::projection`, which the
+    /// SQL lane reaches through `validate_pipeline` and this lane
+    /// reaches itself.
+    ProjectionCollision(String),
 }
 
 impl fmt::Display for StreamPlanError {
@@ -86,6 +92,8 @@ impl fmt::Display for StreamPlanError {
             Self::InvalidFormat(msg) => write!(f, "invalid date/time format: {msg}"),
             Self::InvalidComparison(msg) => write!(f, "invalid comparison: {msg}"),
             Self::ReservedName(msg) => write!(f, "unsupported operation: {msg}"),
+            // Verbatim: the shared check owns the whole sentence.
+            Self::ProjectionCollision(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -109,6 +117,15 @@ pub fn compile_stream_plan(
     pipeline: &[Spanned<PipeStage>],
     pins: &PinScope,
 ) -> Result<StreamPlan, StreamPlanError> {
+    // The shared projection-name check runs FIRST, over every stage —
+    // before the unsupported-stage and multi-aggregation refusals — so a
+    // `pivot`/`eventstats` collision gets the semantic answer even where
+    // the stage itself is not streamable (ADR-0013 ruling 8).
+    for stage in pipeline {
+        crate::projection::check_projection(&stage.node)
+            .map_err(StreamPlanError::ProjectionCollision)?;
+    }
+
     // Find the first aggregation stage index (if any).
     let agg_idx = pipeline.iter().position(|s| is_agg_stage(&s.node));
 

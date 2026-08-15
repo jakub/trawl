@@ -217,7 +217,7 @@ mod tests {
                 &["duration", "host", "service"],
             ),
             (
-                "* | eventstats avg(duration) by host",
+                "* | eventstats avg(duration) as avg_duration by host",
                 &["duration", "host"],
             ),
             ("* | timechart span=5m count() by service", &["service"]),

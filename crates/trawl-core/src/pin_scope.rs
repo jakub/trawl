@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn eventstats_keeps_inputs_and_kills_aggregate_outputs() {
         let scope = walk(
-            "* | eventstats avg(dur) by service",
+            "* | eventstats avg(dur) as avg_dur by service",
             &[
                 ("dur", CT::BigInt),
                 ("service", CT::Varchar),
@@ -478,7 +478,7 @@ mod tests {
         // Non-reducing: every input column survives.
         assert_eq!(scope.pin_for("dur"), Some(CT::BigInt));
         assert_eq!(scope.pin_for("service"), Some(CT::Varchar));
-        // The default output name `avg_dur` is the aggregate now.
+        // The aliased output column is the aggregate now.
         assert_eq!(scope.pin_for("avg_dur"), None);
     }
 
