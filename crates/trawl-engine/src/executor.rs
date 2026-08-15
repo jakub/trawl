@@ -334,9 +334,28 @@ impl Executor {
     /// before anything is read (ADR-0008).
     ///
     /// The one door onto [`resolve_list_source`], binding its matcher to this
-    /// connection's `glob()`.
+    /// connection's files.
+    ///
+    /// The matcher is SPLIT by element shape, for cost: a `glob()` round trip
+    /// through `DuckDB` costs roughly a millisecond, and a service-pinned
+    /// window is ALL literals (`.../{HH}/nginx.parquet`, one element per
+    /// hour), so a 30-day query paid ~700ms just to resolve. A literal element
+    /// — no `*`, `?` or `[` — is therefore answered by a single
+    /// [`std::fs::metadata`] call instead. Patterns still go through `glob()`.
+    ///
+    /// The two halves must agree on what "matches" means, because both feed
+    /// the same no-silent-cold-drop verdict; `fs_matcher_agrees_with_duckdb_glob_on_literals`
+    /// is the drift guard, pinning agreement on the shapes where a filesystem
+    /// answer could plausibly diverge from `read_parquet`'s (directory,
+    /// symlink, broken symlink, missing path).
     fn resolve_source(&self, source: &str) -> ResolvedSource {
-        resolve_list_source(source, |pattern| self.glob_has_match(pattern))
+        resolve_list_source(source, |pattern| {
+            if has_glob_meta(pattern) {
+                self.glob_has_match(pattern)
+            } else {
+                literal_path_is_file(pattern)
+            }
+        })
     }
 
     /// Whether the resolved source has any concrete files behind it.
@@ -1093,6 +1112,31 @@ impl ResolvedSource {
     }
 }
 
+/// Whether a source element carries a `DuckDB` glob metacharacter — the test
+/// that decides whether resolution asks the filesystem or asks `glob()`.
+fn has_glob_meta(element: &str) -> bool {
+    element.contains(['*', '?', '['])
+}
+
+/// Whether a LITERAL path (no glob metacharacters) is a file `read_parquet`
+/// could open — the filesystem twin of [`Executor::glob_has_match`].
+///
+/// `metadata` FOLLOWS symlinks, which is what `glob()` does too: a symlink to
+/// a real file matches, a broken one does not. A directory named like a
+/// parquet file is not a file, and `glob()` on a literal path does not match
+/// one either (probed, not assumed).
+///
+/// A metadata error that is NOT `NotFound` (a permission or IO fault) RETAINS
+/// the element: the element must reach `read_parquet` and fail loudly there,
+/// never be dropped into a silently narrower answer.
+fn literal_path_is_file(path: &str) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_file(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
 /// Resolve `source` against a file matcher — the ONE owner of list-source
 /// resolution semantics.
 ///
@@ -1464,8 +1508,8 @@ mod tests {
 
     use super::{
         ColdAction, ColdPresence, EngineError, Executor, FieldTypes, HotColdOutcome, HotLane,
-        ListEvidence, cold_action, error_class, glob_list_items, is_conversion_error,
-        is_no_files_error, resolve_list_source,
+        ListEvidence, cold_action, error_class, glob_list_items, has_glob_meta,
+        is_conversion_error, is_no_files_error, literal_path_is_file, resolve_list_source,
     };
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
@@ -2074,6 +2118,87 @@ mod tests {
         // Unparseable list shapes yield an empty vec → "assume present".
         assert_eq!(glob_list_items("['/a/*.parquet"), Some(Vec::new()));
         assert_eq!(glob_list_items("['/a/*.parquet]"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn has_glob_meta_splits_the_matcher() {
+        assert!(!has_glob_meta("/data/prod/2024-01-15/10/nginx.parquet"));
+        assert!(has_glob_meta("/data/prod/2024-01-15/10/*.parquet"));
+        assert!(has_glob_meta("/data/prod/2024-01-15/1?/nginx.parquet"));
+        assert!(has_glob_meta("/data/prod/2024-01-15/[01]0/nginx.parquet"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fs_matcher_agrees_with_duckdb_glob_on_literals() {
+        // The drift guard on the literal fast path: "matches" must mean the
+        // same thing whether resolution asked the filesystem or `glob()`,
+        // because both feed the same no-silent-cold-drop verdict. Pinned on
+        // the shapes where the two could plausibly diverge.
+        let dir = tempfile::tempdir().unwrap();
+        let exec = Executor::new().unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+
+        let present = dir.path().join("present.parquet");
+        write_meta_parquet(&setup, &present, "'plain'");
+
+        let missing = dir.path().join("missing.parquet");
+
+        // A DIRECTORY named like a parquet file: not something `read_parquet`
+        // can open as an element.
+        let dir_named_parquet = dir.path().join("dir.parquet");
+        std::fs::create_dir(&dir_named_parquet).unwrap();
+
+        // A symlink to a real file, and a broken one.
+        let good_link = dir.path().join("good-link.parquet");
+        std::os::unix::fs::symlink(&present, &good_link).unwrap();
+        let broken_link = dir.path().join("broken-link.parquet");
+        std::os::unix::fs::symlink(&missing, &broken_link).unwrap();
+
+        let shapes = [
+            (present.clone(), true, "an existing parquet file"),
+            (missing.clone(), false, "a missing path"),
+            (dir_named_parquet, false, "a directory named like a parquet"),
+            (good_link, true, "a symlink to a real file"),
+            (broken_link, false, "a broken symlink"),
+        ];
+
+        for (path, expected, what) in shapes {
+            let path = path.to_str().unwrap();
+            assert_eq!(
+                literal_path_is_file(path),
+                expected,
+                "fs matcher disagrees with the pinned answer for {what}"
+            );
+            assert_eq!(
+                exec.glob_has_match(path),
+                expected,
+                "DuckDB glob() disagrees with the fs matcher for {what}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_path_is_file_retains_on_a_non_notfound_error() {
+        // Fail toward RETAINING the element: an unreadable path must reach
+        // `read_parquet` and error loudly, never vanish from the list. A
+        // component that is a FILE makes the lookup ENOTDIR, not ENOENT.
+        let dir = tempfile::tempdir().unwrap();
+        let setup = Connection::open_in_memory().unwrap();
+        let file = dir.path().join("present.parquet");
+        write_meta_parquet(&setup, &file, "'plain'");
+
+        let through_a_file = file.join("nested.parquet");
+        let err = std::fs::metadata(&through_a_file).expect_err("must not resolve");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "fixture must provoke a non-NotFound error"
+        );
+        assert!(
+            literal_path_is_file(through_a_file.to_str().unwrap()),
+            "a non-NotFound metadata error must retain the element"
+        );
     }
 
     #[test]
