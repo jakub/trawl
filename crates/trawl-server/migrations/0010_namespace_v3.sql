@@ -43,9 +43,24 @@ DELETE FROM field_services
 DELETE FROM field_types
  WHERE field IN ('severity', 'severity_text') AND pinned_from = '_declared';
 
+-- `_severity` is the one name the cutover CLAIMS. Before it, `_` was an
+-- ordinary character and a sender could pin `_severity` VARCHAR or BIGINT
+-- from its own data; leaving that pin standing would type the DERIVED
+-- column by the old sender's shape, and `_severity=error` would answer
+-- against the wrong rule-table arm. The declared pin therefore REPLACES
+-- whatever was there — permanence protects sender-owned names, and `_` is
+-- no longer one. The evidence under the old pin describes a corpus epoch 3
+-- is setting aside and a type that no longer exists, so it goes with it.
+DELETE FROM field_conflicts WHERE field = '_severity';
+DELETE FROM field_conflict_stats WHERE field = '_severity';
+DELETE FROM field_services WHERE field = '_severity';
+
 INSERT INTO field_types (field, duckdb_type, pinned_from)
 VALUES ('_severity', 'SEVERITY', '_declared')
-ON CONFLICT (field) DO NOTHING;
+ON CONFLICT (field) DO UPDATE
+    SET duckdb_type = 'SEVERITY',
+        pinned_from = '_declared',
+        pinned_at   = now();
 
 -- Re-arm the boot conformance pass: the data root is about to be set
 -- aside for epoch 3, and the fresh root has to prove itself conformant
