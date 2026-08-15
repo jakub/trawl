@@ -512,6 +512,11 @@ extract kv                      # from 'message' field
 extract kv from raw             # from a specific field
 ```
 
+A kv key starting with `_` is dropped rather than extracted: the `_`
+namespace is trawl's, and a key parsed out of a log line is sender-controlled
+text, so `_severity=17` in a message body would otherwise forge trawl's own
+verdict slot. The text stays findable in the source field and `_raw`.
+
 ### rename
 
 Rename output columns.

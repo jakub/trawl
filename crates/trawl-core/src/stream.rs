@@ -722,6 +722,15 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
             if let Some(Value::String(text)) = event.get(source_field) {
                 let pairs = extract_key_value_pairs(text, *separator);
                 for (k, v) in pairs {
+                    // The `_` namespace is sealed against LOG CONTENT too
+                    // (ADR-0013 §1): a kv key is sender-controlled text, so
+                    // an inserted `_severity`/`_time` would let a message
+                    // body forge trawl's own verdict slots in both the SSE
+                    // lane and the batch tail. The pair is dropped — the
+                    // text stays findable in the source field and `_raw`.
+                    if crate::schema::is_reserved_name(&k) {
+                        continue;
+                    }
                     event.insert(k, coerce_kv_value(v));
                 }
             }
@@ -2254,6 +2263,26 @@ mod tests {
                 ("status".into(), "200".into()),
             ]
         );
+    }
+
+    #[test]
+    fn kv_cannot_mint_reserved_names() {
+        let mut stage = CompiledStage::ExtractKv {
+            source_field: "message".into(),
+            separator: '=',
+        };
+        let mut ev = event(&json!({
+            "message": "_severity=17 _time=bogus a=1",
+            "_severity": 9,
+        }));
+
+        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        // Log content cannot forge trawl's verdict slots (ADR-0013 §1):
+        // the reserved pairs are dropped, the ordinary one lands, and an
+        // existing `_severity` keeps trawl's own value.
+        assert_eq!(ev.get("a"), Some(&json!(1)));
+        assert_eq!(ev.get("_severity"), Some(&json!(9)));
+        assert!(ev.get("_time").is_none());
     }
 
     // ── multi-stage pipeline ───────────────────────────────────────
