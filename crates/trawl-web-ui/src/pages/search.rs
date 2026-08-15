@@ -8,8 +8,7 @@
 //! editor wrap (header + `DslEditor` + date range + run button)
 //! → meta strip (filter chips — hidden while empty)
 //! → tabs (Events / Visualization · trailing Save/Export actions)
-//! → degraded-field notice + shape advisory (hidden unless the
-//!   execution reported one)
+//! → degraded-field notice (hidden unless the execution reported one)
 //! → tab body (Events: histogram + results table | Visualization: chart)
 //!
 //! State split:
@@ -31,7 +30,6 @@ use crate::components::histogram::Histogram;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
-use crate::components::shape_notice::ShapeNotice;
 use crate::components::status_bar::StatusKind;
 use crate::pages::layout::ShellStatus;
 use crate::state::query::{
@@ -332,18 +330,6 @@ pub fn Search() -> impl IntoView {
             .map_or_else(Vec::new, |r| r.degraded_fields.clone())
     });
 
-    // Shape advisories (ADR-0013 §7) ride the same rule as the degraded
-    // notice: a fact about the answer on screen, and empty in live mode
-    // because SSE carries no notice channel at all.
-    let shape_notices = Signal::derive(move || {
-        if mode.get() == Mode::Live {
-            return Vec::new();
-        }
-        rows.get()
-            .and_then(Result::ok)
-            .map_or_else(Vec::new, |r| r.notices.clone())
-    });
-
     let show_save_modal = RwSignal::new(false);
     let on_save = Callback::new(move |()| show_save_modal.set(true));
     let show_export_modal = RwSignal::new(false);
@@ -403,7 +389,6 @@ pub fn Search() -> impl IntoView {
                 // worth reading, and the Visualization tab is drawn from
                 // the same incomplete rows.
                 <DegradedNotice query=effective_q fields=degraded_fields/>
-                <ShapeNotice notices=shape_notices/>
                 {move || match (active_tab.get(), mode.get()) {
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>

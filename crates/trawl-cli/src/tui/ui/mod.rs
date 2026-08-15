@@ -223,7 +223,6 @@ mod tests {
                 returned,
             },
             degraded_fields: Vec::new(),
-            notices: Vec::new(),
         }
     }
 
