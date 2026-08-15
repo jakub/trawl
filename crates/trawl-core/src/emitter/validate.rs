@@ -89,9 +89,10 @@ fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError>
             // The pipeline may not MINT a reserved name (ADR-0013 §5):
             // ingest strips the `_` prefix off an incoming key, so a
             // capture group that wrote one would be a column the DSL can
-            // create and ingest can never carry. This is the one place
-            // the regex is already compiled, and it is reached by BOTH
-            // lanes through `validate_pipeline`.
+            // create and ingest can never carry. The SSE lane never runs
+            // `validate_pipeline`, so it mirrors this refusal where IT
+            // compiles the regex (`stream::compile_extract`), the same
+            // way the kv arm seals its keys in both lanes.
             for name in re.capture_names().flatten() {
                 if crate::schema::is_reserved_name(name) {
                     return Err(reserved_name_error("extract capture group", name));
@@ -109,11 +110,7 @@ fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError>
 /// rename target or capture group in trawl's `_` namespace.
 pub(crate) fn reserved_name_error(what: &str, name: &str) -> EmitError {
     EmitError::UnsupportedOperation {
-        message: format!(
-            "{what} '{name}' is in trawl's reserved namespace — names \
-             starting with '_' are trawl's contract slots and only trawl \
-             writes them (ADR-0013); choose a name without the underscore"
-        ),
+        message: crate::schema::reserved_name_message(what, name),
     }
 }
 

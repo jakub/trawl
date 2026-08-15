@@ -68,6 +68,11 @@ pub enum StreamPlanError {
     /// eval has no error channel and would open a live-looking stream
     /// that can never match.
     InvalidComparison(String),
+    /// A pipeline write position naming trawl's `_` namespace — an
+    /// `extract` capture group, the one such name that is not already a
+    /// parse error (ADR-0013 §5). The SQL lane refuses it in
+    /// `emitter::validate_pipeline`, which this lane never runs.
+    ReservedName(String),
 }
 
 impl fmt::Display for StreamPlanError {
@@ -80,6 +85,7 @@ impl fmt::Display for StreamPlanError {
             Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),
             Self::InvalidFormat(msg) => write!(f, "invalid date/time format: {msg}"),
             Self::InvalidComparison(msg) => write!(f, "invalid comparison: {msg}"),
+            Self::ReservedName(msg) => write!(f, "unsupported operation: {msg}"),
         }
     }
 }
@@ -506,6 +512,20 @@ fn compile_extract(s: &ExtractStage) -> Result<CompiledStage, StreamPlanError> {
         ExtractMode::Regex(pattern) => {
             let regex = regex::Regex::new(pattern)
                 .map_err(|e| StreamPlanError::InvalidRegex(e.to_string()))?;
+            // The `_` namespace is sealed at BOTH pipeline write positions
+            // (ADR-0013 §5), and this lane is a door of its own: SSE parses
+            // and compiles straight to a stream plan, never through
+            // `emitter::validate_pipeline`. Without this mirror of
+            // `validate_extract`'s check, `extract "(?P<_severity>…)"` would
+            // 400 in batch and stream happily live, letting a message body
+            // overwrite trawl's own derived verdict slot.
+            for name in regex.capture_names().flatten() {
+                if crate::schema::is_reserved_name(name) {
+                    return Err(StreamPlanError::ReservedName(
+                        crate::schema::reserved_name_message("extract capture group", name),
+                    ));
+                }
+            }
             Ok(CompiledStage::ExtractRegex {
                 regex,
                 source_field,
@@ -1828,7 +1848,11 @@ mod tests {
     }
 
     /// The pipeline may not MINT a reserved name — the same predicate
-    /// ingest strips by (ADR-0013 §5).
+    /// ingest strips by (ADR-0013 §5) — and BOTH doors refuse it: the
+    /// SQL lane through `validate_pipeline`, the SSE lane (which never
+    /// runs it) through its own plan compilation. Otherwise a capture
+    /// group named `_severity` would 400 in batch and stream live,
+    /// letting log content overwrite trawl's derived verdict.
     #[test]
     fn rejects_minting_reserved_names() {
         for dsl in [
@@ -1836,12 +1860,18 @@ mod tests {
             "* | eval _severity = 17",
             "* | rename service as _svc",
             r#"* | extract "(?P<_foo>.)" from message"#,
+            r#"* | extract "(?P<_severity>\d+)" from message"#,
         ] {
+            let Ok(query) = crate::parser::parse(dsl) else {
+                continue; // refused at the parser door
+            };
             assert!(
-                crate::parser::parse(dsl)
-                    .map_or(true, |q| crate::emitter::validate_pipeline(&q.pipeline)
-                        .is_err()),
-                "{dsl} must be refused"
+                crate::emitter::validate_pipeline(&query.pipeline).is_err(),
+                "{dsl} must be refused by the SQL lane"
+            );
+            assert!(
+                compile_stream_plan(&query.pipeline, &PinScope::unpinned()).is_err(),
+                "{dsl} must be refused by the stream lane"
             );
         }
     }

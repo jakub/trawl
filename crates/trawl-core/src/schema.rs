@@ -87,6 +87,17 @@ pub fn is_reserved_name(name: &str) -> bool {
     name.starts_with('_')
 }
 
+/// The one refusal text every pipeline write position shares, so the SQL
+/// lane and the streaming lane state the same rule in the same words.
+#[must_use]
+pub fn reserved_name_message(what: &str, name: &str) -> String {
+    format!(
+        "{what} '{name}' is in trawl's reserved namespace — names \
+         starting with '_' are trawl's contract slots and only trawl \
+         writes them (ADR-0013); choose a name without the underscore"
+    )
+}
+
 /// The catalog spelling of a DSL field reference: an ASCII fold, and
 /// nothing else (ADR-0013 §6 — the DSL has zero aliases).
 ///
