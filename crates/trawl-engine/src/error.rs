@@ -25,10 +25,13 @@ pub enum EngineError {
     #[error("result too large: query returned more than {0} rows")]
     ResultTooLarge(usize),
 
-    /// The hot+cold union read matched no files even though cold parquet
-    /// exists on disk — the substituted empty result would silently drop the
-    /// cold data, which ADR-0008 forbids. Transient by nature: the read raced
-    /// retention/compaction moving a file, or the hot snapshot vanished.
+    /// A read matched no files even though its source still reaches files on
+    /// disk — the empty answer would silently drop the cold data, which
+    /// ADR-0008 forbids. Raised by every lane (query and export, with a hot
+    /// buffer and without), because the source is resolved before the read
+    /// on all of them and the gate is the same. Transient by nature: the read
+    /// raced retention/compaction/a repin moving a file, or the hot snapshot
+    /// vanished.
     #[error("query matched no files while cold data exists on disk; retry the query")]
     ColdDataUnread,
 

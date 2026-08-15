@@ -531,6 +531,86 @@ async fn query_works_without_hot_buffer() {
     );
 }
 
+#[tokio::test]
+async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours() {
+    // Issue #73, end to end through the real plumbing (compute_source → pool
+    // → executor): one service's data in one hour partition, sibling hour
+    // directories owned by ANOTHER service, and no hot buffer to paper over
+    // it. The planner used to emit `.../{HH}/nginx.parquet` for every hour
+    // directory that existed — including the five nginx never wrote to — and
+    // DuckDB rejects a list source wholesale when ONE element matches
+    // nothing, so `service=nginx last=6h` answered 200 with zero rows on an
+    // install whose only crime was running two services.
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let wal_dir = tmp.path().join("wal");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let pool = ExecutorPool::new(data_dir.to_str().unwrap().to_owned(), 1, 1000, None);
+
+    // One nginx event, timestamped now so it lands in the current hour
+    // partition and inside a `last=6h` window.
+    let now = chrono::Utc::now();
+    let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let mut event = make_event("nginx", "sibling-hour survivor");
+    event.insert("_time".into(), json!(stamp));
+    event.insert("_ingested".into(), json!(stamp));
+
+    let wal_writer = WalWriter::new(wal_dir.clone());
+    wal_writer.ensure_dir().unwrap();
+    let ndjson = events_to_ndjson(std::slice::from_ref(&event));
+    let _wal = wal_writer.write("prod", "nginx", &ndjson).unwrap();
+
+    trawl_server::ingest::compaction::compact_once(
+        &wal_dir,
+        &data_dir,
+        Duration::ZERO,
+        false,
+        None,
+        500,
+        "2GB",
+        None,
+    )
+    .await
+    .expect("compaction should succeed");
+
+    // The other service owns the preceding hours: their directories exist and
+    // hold a file, but never nginx's.
+    for back in 1..=5_i64 {
+        let dt = now - chrono::Duration::hours(back);
+        let hour_dir = data_dir
+            .join("prod")
+            .join(dt.format("%Y-%m-%d").to_string())
+            .join(dt.format("%H").to_string());
+        std::fs::create_dir_all(&hour_dir).unwrap();
+        // Never read: `service=nginx` pins the filename, so this file only
+        // has to exist for the hour directory to look occupied.
+        std::fs::write(hour_dir.join("postgres.parquet"), b"other service").unwrap();
+    }
+
+    let result = pool
+        .execute(
+            pool.allocate_query_id(),
+            "service=nginx last=6h",
+            Duration::from_secs(10),
+            false,
+            0,
+        )
+        .await;
+
+    let query_result = result
+        .result
+        .expect("a service-scoped query must not fail over sibling-service hours");
+    assert_eq!(
+        query_result.rows.len(),
+        1,
+        "nginx's compacted row must come back even though five hour \
+         directories in range hold no nginx file, got {} rows",
+        query_result.rows.len()
+    );
+}
+
 /// Slice A′ end to end: pinned `| where`/`| let` through the REAL query
 /// plumbing — catalog → pool → emitter — over the hot buffer, then over
 /// parquet after compaction, plus the SSE plan lane over the same events
