@@ -2010,7 +2010,8 @@ fn run_pin_ladders(
 }
 
 /// The SQL expression conforming one column to its pin, or `None` when the
-/// observed type already matches (pass-through).
+/// observed type already matches AND the conform over it is the identity
+/// (pass-through).
 ///
 /// Literally the emitter's hot-branch expression: the same text form
 /// ([`trawl_core::conform::untyped_text`]) under the same guard
@@ -2029,7 +2030,13 @@ fn run_pin_ladders(
 /// `1e+20` where `to_json` spells it `100000000000000000000.0`. Same
 /// value, two corpora, and `note=/^1e/` flipped when the compactor ran.
 pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Option<String> {
-    if dtype == pin.as_duckdb() {
+    // The pass-through is valid only where the conform is the IDENTITY
+    // over values already of the physical type. SEVERITY is the one pin
+    // where it is not: its domain is the 1-24 ladder, not "any BIGINT",
+    // so a numeral outside it must still be nulled out here or the corpus
+    // could hold a value with no token rendering — which is exactly what
+    // the rung exists to prevent (ADR-0013).
+    if dtype == pin.as_duckdb() && pin != CanonicalType::Severity {
         return None;
     }
     Some(trawl_core::conform::guarded_cast(
@@ -2863,6 +2870,37 @@ fn extract_service_from_filename(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pass-through shortcut is a claim about the CONFORM, not about
+    /// the physical type: it holds only where a column already of that
+    /// type needs nothing done to it.
+    ///
+    /// SEVERITY is the exception, and it must be: its domain is the 1-24
+    /// ladder, so a BIGINT column carrying `99` still has to be nulled —
+    /// otherwise the corpus holds a value whose canonical token text is
+    /// NULL, and `_severity=warn*` and the results table disagree about
+    /// what is in the column (ADR-0013).
+    #[test]
+    fn the_conform_pass_through_excludes_the_severity_range_guard() {
+        for pin in [
+            CanonicalType::BigInt,
+            CanonicalType::Double,
+            CanonicalType::Boolean,
+            CanonicalType::Timestamp,
+            CanonicalType::Varchar,
+        ] {
+            assert_eq!(
+                conform_expr("\"c\"", pin.as_duckdb(), pin),
+                None,
+                "{pin:?} already IS its pin"
+            );
+        }
+        let sql = conform_expr("\"c\"", "BIGINT", CanonicalType::Severity)
+            .expect("SEVERITY still guards the ladder range");
+        assert!(sql.contains("BETWEEN 1 AND 24"), "{sql}");
+        // …and a non-matching physical type conforms as any other pin does.
+        assert!(conform_expr("\"c\"", "VARCHAR", CanonicalType::Severity).is_some());
+    }
 
     #[test]
     fn extract_service_simple() {

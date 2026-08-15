@@ -636,9 +636,13 @@ async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
         // The #60 canonical example: `level` means loot tier here.
         serde_json::json!({"service": "vec-svc", "host": "web01", "level": "gold",
             "timestamp": now, "message": "dropped"}),
+        // The elastic spelling, which is now an ordinary column whose
+        // DuckDB identifier needs quoting everywhere it appears.
+        serde_json::json!({"service": "vec-svc", "host": "web01",
+            "@timestamp": now, "message": "elastic"}),
     ];
     let resp = ingest.ingest(&records).await.unwrap();
-    assert_eq!(resp.accepted, 3);
+    assert_eq!(resp.accepted, 4);
 
     let result = query
         .query_paginated("service=vec-svc _severity=error last=1h", None, None)
@@ -698,6 +702,27 @@ async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
             "an unmappable level derives no severity"
         );
     }
+
+    // `@timestamp` is a stored column with a quoting-hostile name: it
+    // filters, projects and sorts as itself, and derives `_time` too.
+    let elastic = query
+        .query_paginated(
+            r"service=vec-svc message=elastic last=1h | table @timestamp, _time | sort @timestamp",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(elastic.result.row_count(), 1);
+    assert_eq!(
+        elastic
+            .result
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["@timestamp", "_time"]
+    );
 
     // The exact OTel short name and the band token agree with each other.
     for (dsl, expected) in [
