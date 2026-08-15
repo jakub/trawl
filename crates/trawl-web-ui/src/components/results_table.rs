@@ -18,7 +18,7 @@ use std::cmp::Ordering;
 use trawl_api::QueryResponse;
 use trawl_api::display::value_to_string;
 
-use crate::severity_cell::{severity_class, severity_display};
+use crate::severity_cell::{severity_class, severity_column, severity_display};
 use trawl_api::value::Value;
 
 #[component]
@@ -87,9 +87,7 @@ fn ResultsTableBody(
     // the derived slot nothing can shadow. A bare `severity` column is
     // ordinary sender data now, and the `severity_text` fallback died
     // with the column.
-    let severity_idx = columns
-        .iter()
-        .position(|c| c == trawl_core::schema::SEVERITY);
+    let severity_idx = severity_column(columns.iter().map(String::as_str));
     let expanded = RwSignal::new(None::<usize>);
     let sort = RwSignal::new(None::<SortState>);
 
@@ -215,7 +213,6 @@ impl SortedIndices {
         rows: Vec<Vec<Value>>,
         columns: Vec<String>,
         severity_idx: Option<usize>,
-        severity_text_idx: Option<usize>,
         expanded: RwSignal<Option<usize>>,
         on_add_filter: Callback<Filter>,
         on_navigate: Callback<String>,

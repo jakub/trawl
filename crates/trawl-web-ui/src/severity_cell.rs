@@ -27,6 +27,20 @@
 
 use trawl_api::value::Value;
 
+/// Which result column presentation reads severity from: `_severity`,
+/// and nothing else (ADR-0013 §9).
+///
+/// Both SPA call sites — the results table's cell rendering and the
+/// histogram's error bars — go through this one lookup, so "reads
+/// `_severity` only" is decided in a natively-tested function rather
+/// than twice in wasm-gated component code.
+#[must_use]
+pub fn severity_column<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<usize> {
+    names
+        .into_iter()
+        .position(|name| name == trawl_core::schema::SEVERITY)
+}
+
 /// The `SeverityNumber` a `_severity` cell holds, if it holds one.
 ///
 /// The column is BIGINT on the wire; a string is tolerated only because
@@ -111,6 +125,24 @@ mod tests {
         assert_eq!(severity_number(&Value::String("error".into())), Some(17));
         assert_eq!(severity_number(&Value::String("error2".into())), Some(18));
         assert_eq!(severity_number(&Value::String("gold".into())), None);
+    }
+
+    /// The COLUMN both SPA surfaces read is `_severity` and nothing
+    /// else: a bare `severity` is ordinary sender data now, and
+    /// `severity_text` is gone — neither may be mistaken for the slot.
+    #[test]
+    fn presentation_binds_the_derived_column_alone() {
+        let cols = ["_time", "severity_text", "severity", "_severity", "message"];
+        assert_eq!(severity_column(cols), Some(3));
+
+        // Same row set WITHOUT the derived slot: no column, so nothing
+        // is colored and no bar is painted red.
+        assert_eq!(
+            severity_column(["_time", "severity_text", "severity", "message"]),
+            None
+        );
+        assert_eq!(severity_column(["_severity"]), Some(0));
+        assert_eq!(severity_column(std::iter::empty()), None);
     }
 
     /// Bucketing reads `_severity` ONLY: a bare `severity` column is

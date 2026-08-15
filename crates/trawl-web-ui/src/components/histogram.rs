@@ -97,9 +97,7 @@ fn build_buckets(resp: &QueryResponse) -> Vec<Bucket> {
     });
     // `_severity` ONLY (ADR-0013 §9): the derived slot nothing can
     // shadow, and the `severity_text` fallback died with the column.
-    let severity_idx = cols
-        .iter()
-        .position(|c| c.name == trawl_core::schema::SEVERITY);
+    let severity_idx = crate::severity_cell::severity_column(cols.iter().map(|c| c.name.as_str()));
     let Some(ti) = time_idx else {
         return Vec::new();
     };
@@ -132,14 +130,6 @@ fn value_to_seconds(v: &Value) -> Option<f64> {
             fleet_ui::time::parse_timestamp(s).map(|dt| dt.timestamp() as f64)
         }
         _ => None,
-    }
-}
-
-fn value_as_str(v: &Value) -> Option<&str> {
-    if let Value::String(s) = v {
-        Some(s.as_str())
-    } else {
-        None
     }
 }
 
