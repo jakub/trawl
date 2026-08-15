@@ -4,22 +4,13 @@
 
 use super::SqlValue;
 
-/// Map system field names to their storage column names.
-///
-/// `timestamp` and `@timestamp` → `_time` (ADR-0009: `_time` is the
-/// physical event-time column; the pre-cutover names remain as aliases so
-/// `sort timestamp` and `| table @timestamp` keep working). Everything
-/// else passes through.
-pub fn map_field_name(name: &str) -> &str {
-    crate::schema::resolve_field_alias(name)
-}
-
 /// Double-quote a field name for safe use in SQL.
 ///
-/// Any embedded double-quotes are escaped by doubling them.
+/// Any embedded double-quotes are escaped by doubling them. The name is
+/// otherwise VERBATIM: the DSL has zero aliases (ADR-0013 §6), so the
+/// name you type is the column in DESCRIBE is the identifier in the SQL.
 pub(crate) fn quote_field(name: &str) -> String {
-    let mapped = map_field_name(name);
-    format!("\"{}\"", mapped.replace('"', "\"\""))
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Coerce a string filter value to the most specific `SqlValue`.
@@ -50,19 +41,14 @@ mod tests {
         assert_eq!(quote_field(r#"field"name"#), r#""field""name""#);
     }
 
+    /// Zero aliases: `timestamp` and `@timestamp` are ordinary sender
+    /// field names and quote as themselves (ADR-0013 §6).
     #[test]
-    fn quote_field_maps_at_timestamp() {
-        assert_eq!(quote_field("@timestamp"), "\"_time\"");
-    }
-
-    #[test]
-    fn quote_field_maps_timestamp_alias() {
-        assert_eq!(quote_field("timestamp"), "\"_time\"");
-    }
-
-    #[test]
-    fn quote_field_time_passthrough() {
+    fn quote_field_is_verbatim() {
+        assert_eq!(quote_field("@timestamp"), "\"@timestamp\"");
+        assert_eq!(quote_field("timestamp"), "\"timestamp\"");
         assert_eq!(quote_field("_time"), "\"_time\"");
+        assert_eq!(quote_field("level"), "\"level\"");
     }
 
     #[test]

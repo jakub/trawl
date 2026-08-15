@@ -11,12 +11,15 @@
 //! through a parent-supplied callback.
 
 use crate::api::{ApiError, PAGE_SIZE};
+use crate::context_query::{build_context_query, escape_dq, find_col};
 use crate::state::query::{Filter, FilterOp};
 use fleet_ui::{Btn, CopyButton, LoadState, Loaded, Pager, ToastBus, ToastKind, Variant};
 use leptos::prelude::*;
 use std::cmp::Ordering;
 use trawl_api::QueryResponse;
 use trawl_api::display::value_to_string;
+
+use crate::severity_cell::{severity_class, severity_column, severity_display};
 use trawl_api::value::Value;
 
 #[component]
@@ -81,10 +84,11 @@ fn ResultsTableBody(
         .into_any();
     }
 
-    // Severity-keyed row coloring (ADR-0009): the numeric `severity`
-    // column and the verbatim `severity_text` both color by OTel band.
-    let severity_idx = columns.iter().position(|c| c == "severity");
-    let severity_text_idx = columns.iter().position(|c| c == "severity_text");
+    // Severity-keyed cell rendering (ADR-0013 §9): `_severity` ONLY —
+    // the derived slot nothing can shadow. A bare `severity` column is
+    // ordinary sender data now, and the `severity_text` fallback died
+    // with the column.
+    let severity_idx = severity_column(columns.iter().map(String::as_str));
     let expanded = RwSignal::new(None::<usize>);
     let sort = RwSignal::new(None::<SortState>);
 
@@ -145,7 +149,6 @@ fn ResultsTableBody(
                                 rows_data.clone(),
                                 cols_for_view.clone(),
                                 severity_idx,
-                                severity_text_idx,
                                 expanded,
                                 on_add_filter,
                                 on_navigate,
@@ -211,7 +214,6 @@ impl SortedIndices {
         rows: Vec<Vec<Value>>,
         columns: Vec<String>,
         severity_idx: Option<usize>,
-        severity_text_idx: Option<usize>,
         expanded: RwSignal<Option<usize>>,
         on_add_filter: Callback<Filter>,
         on_navigate: Callback<String>,
@@ -229,7 +231,6 @@ impl SortedIndices {
                         row=row
                         columns=cols
                         severity_idx=severity_idx
-                        severity_text_idx=severity_text_idx
                         expanded=expanded
                         on_add_filter=on_add_filter
                         on_navigate=on_navigate
@@ -248,7 +249,6 @@ fn RowFragment(
     row: Vec<Value>,
     columns: Vec<String>,
     severity_idx: Option<usize>,
-    severity_text_idx: Option<usize>,
     expanded: RwSignal<Option<usize>>,
     on_add_filter: Callback<Filter>,
     on_navigate: Callback<String>,
@@ -259,8 +259,11 @@ fn RowFragment(
         .iter()
         .enumerate()
         .map(|(ci, v)| {
-            if Some(ci) == severity_idx || Some(ci) == severity_text_idx {
-                let s = value_to_string(v);
+            if Some(ci) == severity_idx {
+                // Results DISPLAY the token, never the number (ADR-0013
+                // §6). The wire keeps the number: json/csv/SSE carry it
+                // for arithmetic consumers, and rendering is presentation.
+                let s = severity_display(v);
                 let cls = severity_class(v);
                 view! { <td><span class=cls>{s}</span></td> }.into_any()
             } else {
@@ -408,38 +411,6 @@ fn raw_or_synthesized(row: &[Value], columns: &[String]) -> String {
         .join(" ")
 }
 
-fn find_col(columns: &[String], names: &[&str]) -> Option<usize> {
-    for name in names {
-        if let Some(i) = columns.iter().position(|c| c == name) {
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// Build a `@timestamp>="<t-30s>" @timestamp<="<t+30s>"` window around
-/// this row's timestamp, narrowed to the same host when available.
-fn build_context_query(row: &[Value], columns: &[String]) -> Option<String> {
-    let ti = find_col(columns, &["_time", "time", "timestamp", "@timestamp"])?;
-    let ts_raw = value_to_string(row.get(ti)?);
-    let ts = fleet_ui::time::parse_timestamp(&ts_raw)?;
-    let from = ts - chrono::Duration::seconds(30);
-    let to = ts + chrono::Duration::seconds(30);
-
-    let host_clause = find_col(columns, &["host", "hostname"])
-        .and_then(|hi| row.get(hi))
-        .map(value_to_string)
-        .filter(|s| !s.is_empty())
-        .map(|h| format!("host=\"{}\" ", escape_dq(&h)))
-        .unwrap_or_default();
-
-    Some(format!(
-        "{host_clause}@timestamp>=\"{}\" @timestamp<=\"{}\"",
-        from.to_rfc3339(),
-        to.to_rfc3339()
-    ))
-}
-
 /// Build a phrase-match query on the first ~60 chars of the row's message.
 fn build_similar_query(row: &[Value], columns: &[String]) -> Option<String> {
     let mi = find_col(columns, &["message", "msg"])?;
@@ -450,27 +421,6 @@ fn build_similar_query(row: &[Value], columns: &[String]) -> Option<String> {
     }
     let take: String = trimmed.chars().take(60).collect();
     Some(format!("\"{}\"", escape_dq(&take)))
-}
-
-fn escape_dq(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// CSS class for a severity value: numeric `severity` (OTel 1-24) or a
-/// `severity_text` token, both resolved to a band via `trawl_core`.
-fn severity_class(v: &Value) -> &'static str {
-    let number = match v {
-        Value::Integer(n) => u8::try_from(*n).ok().filter(|n| (1..=24).contains(n)),
-        Value::String(s) => trawl_core::severity::number_for_token(s),
-        _ => None,
-    };
-    match number.and_then(trawl_core::severity::band_name) {
-        Some("error" | "fatal") => "lvl lvl-error",
-        Some("warn") => "lvl lvl-warn",
-        Some("info") => "lvl lvl-info",
-        Some("debug" | "trace") => "lvl lvl-debug",
-        _ => "lvl",
-    }
 }
 
 fn compare(a: Option<&Value>, b: Option<&Value>) -> Ordering {

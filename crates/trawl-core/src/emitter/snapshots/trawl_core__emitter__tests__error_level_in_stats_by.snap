@@ -1,5 +1,0 @@
----
-source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl_err(\"* | stats count() by level\")"
----
-unsupported operation: 'level' is a filter-only alias for the numeric severity column, not a stored column — it works in comparisons only (level=error, where level >= "warn"); to group, project or sort use severity (the number) or severity_text (the original text)

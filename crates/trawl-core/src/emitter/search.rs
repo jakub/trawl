@@ -8,7 +8,6 @@ use crate::compare::{self, CompareForm};
 use super::SqlValue;
 use super::compare::{NullPolicy, comparison_sql, in_list_sql, pattern_target};
 use super::fields::quote_field;
-use super::severity::{LEVEL_FIELD, level_in_list, level_predicate};
 use super::state::EmitterState;
 
 /// Translate the search stage tokens into WHERE clauses on the emitter state.
@@ -176,16 +175,6 @@ fn emit_field_filter(
     ff: &crate::ast::FieldFilter,
     state: &mut EmitterState,
 ) -> Result<(), super::EmitError> {
-    // `level` is a DSL alias for the numeric severity column:
-    // band predicates, not string comparison (ADR-0009).
-    if ff.field == LEVEL_FIELD {
-        let clause = match &ff.value {
-            FilterValue::Literal(v) => level_predicate(ff.op, v)?,
-            FilterValue::List(vs) => level_in_list(vs)?,
-        };
-        state.push_where(clause);
-        return Ok(());
-    }
     let field = quote_field(&ff.field);
     // The catalog pin typing this comparison (ADR-0011 slice A) — `None`
     // outside the catalog-backed paths, which keeps every branch below
@@ -204,7 +193,7 @@ fn emit_field_filter(
                 state.push_where(format!("regexp_matches({target}, {placeholder})"));
             }
             _ => {
-                let form = compare::compare_form(pin, ff.op, v);
+                let form = compare::compare_form(pin, ff.op, v)?;
                 let clause = comparison_sql(&field, ff.op, form, NullPolicy::NeMatchesNull, state);
                 state.push_where(clause);
             }
@@ -213,7 +202,7 @@ fn emit_field_filter(
             let forms: Vec<CompareForm> = vs
                 .iter()
                 .map(|v| compare::compare_form(pin, FilterOp::Eq, v))
-                .collect();
+                .collect::<Result<_, _>>()?;
             let clause = in_list_sql(&field, forms, state);
             state.push_where(clause);
         }

@@ -1,0 +1,5 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_err_with_pins(\"_severity=spicy\", &SEVERITY_PIN)"
+---
+unsupported operation: unknown severity value 'spicy' — a severity field takes a band token (trace, debug, info, notice, warn, error, fatal, alert, emerg), an exact OTel short name (error2, warn3), or a number on the 1-24 ladder

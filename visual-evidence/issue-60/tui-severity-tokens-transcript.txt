@@ -1,0 +1,20 @@
+---
+source: crates/trawl-cli/src/tui/ui/mod.rs
+expression: terminal.backend().to_string()
+---
+" M-1 Query ✓   M-2 History   M-3 Schema   M-4 Saved                                                 "
+"                                                                                                    "
+"┌ Query Editor ────────────────────────────────────────────────────────────────────────────────────┐"
+"│                                                                                                  │"
+"│                                                                                                  │"
+"│                                                                                                  │"
+"│                                                                                                  │"
+"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+"┌ Results (4 rows, cols 1-5/5) ────────────────────────────────────────────────────────────────────┐"
+"│ _time          │ service  │ _severity │ level    │ message                                       ↑"
+"│ 2026-01-15T10… │ nginx    │ error     │ error    │ bad gateway                                   █"
+"│ 2026-01-15T10… │ nginx    │ error2    │ error    │ upstream time…                                █"
+"│ 2026-01-15T10… │ nginx    │ warn      │ warn     │ slow response                                 ║"
+"│                │          │           │          │                                               ↓"
+"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+" [editor]                                        Shift+Enter: execute | Ctrl+S: save | Ctrl+L: clear"

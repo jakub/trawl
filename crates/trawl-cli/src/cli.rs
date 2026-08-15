@@ -106,30 +106,55 @@ pub async fn run_query(
         ));
     };
 
-    // Write to file or stdout.
+    let stdout = io::stdout();
+    emit_results(
+        &result,
+        format,
+        output,
+        &degraded,
+        &mut stdout.lock(),
+        &mut io::stderr(),
+    )
+}
+
+/// Write the results and their footer to the two streams.
+///
+/// The stream split is the contract: with `-o`, the FILE is the
+/// deliverable and the footer goes to `err` so it can never
+/// contaminate it; without it, results and footer share `out`.
+fn emit_results(
+    result: &QueryResult,
+    format: OutputFormat,
+    output: Option<&Path>,
+    degraded: &[String],
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<(), CliError> {
     if let Some(output_path) = output {
         let mut file = std::fs::File::create(output_path)?;
-        match format {
-            OutputFormat::Table => render_table(&result, &mut file)?,
-            OutputFormat::Json => render_ndjson(&result, &mut file)?,
-            OutputFormat::Csv => render_csv(&result, &mut file)?,
-            OutputFormat::Parquet => unreachable!("handled above"),
-        }
+        render_results(result, format, &mut file)?;
         // The file is the deliverable; the notice belongs on the terminal.
-        write_degraded_footer(&mut io::stderr(), format, &degraded)?;
+        write_degraded_footer(err, format, degraded)?;
     } else {
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        match format {
-            OutputFormat::Table => render_table(&result, &mut out)?,
-            OutputFormat::Json => render_ndjson(&result, &mut out)?,
-            OutputFormat::Csv => render_csv(&result, &mut out)?,
-            OutputFormat::Parquet => unreachable!("handled above"),
-        }
-        write_degraded_footer(&mut out, format, &degraded)?;
+        render_results(result, format, out)?;
+        write_degraded_footer(out, format, degraded)?;
     }
 
     Ok(())
+}
+
+/// Render the result rows in the requested format.
+fn render_results(
+    result: &QueryResult,
+    format: OutputFormat,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    match format {
+        OutputFormat::Table => render_table(result, out),
+        OutputFormat::Json => render_ndjson(result, out),
+        OutputFormat::Csv => render_csv(result, out),
+        OutputFormat::Parquet => unreachable!("handled above"),
+    }
 }
 
 /// The incomplete-results footer (ADR-0011 slice C1): one line after the
@@ -231,7 +256,14 @@ async fn run_daemon_mode(
     let response = client
         .query_paginated_tz(query, None, None, Some(timezone.to_owned()))
         .await?;
-    Ok((response.result, response.degraded_fields))
+    Ok(daemon_outcome(response))
+}
+
+/// Split a daemon response into what the printer needs: the rows and the
+/// degraded-field note (ADR-0011 slice C1), which is carried, never
+/// dropped.
+fn daemon_outcome(response: trawl_client::QueryResponse) -> (QueryResult, Vec<String>) {
+    (response.result, response.degraded_fields)
 }
 
 /// Execute the query locally with an embedded `DuckDB` engine.
@@ -278,14 +310,51 @@ fn render_table(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     let headers: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     table.set_header(headers);
 
+    // `_severity` DISPLAYS its OTel token (ADR-0013 §6): `17` reads
+    // `error`, the same vocabulary that would filter it. Only the table
+    // renders it — json/csv keep the number, for arithmetic consumers.
+    let severity_idx = result
+        .columns
+        .iter()
+        .position(|c| c.name == trawl_core::schema::SEVERITY);
+
     for row in &result.rows {
-        let cells: Vec<String> = row.iter().map(ToString::to_string).collect();
+        let cells: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                if Some(i) == severity_idx {
+                    severity_cell_text(v)
+                } else {
+                    v.to_string()
+                }
+            })
+            .collect();
         table.add_row(cells);
     }
 
     writeln!(out, "{table}")?;
     writeln!(out, "{} row(s)", result.row_count())?;
     Ok(())
+}
+
+/// The `OTel` token a `_severity` cell displays, or `None` where the
+/// ladder has no reading for it and the surface renders the value the
+/// way it renders any other.
+///
+/// The one in-crate door onto `trawl_core::severity::token_text` — the
+/// table renderer here and the TUI results grid share the rule but not
+/// their fallback formatting.
+pub(crate) fn severity_token(v: &Value) -> Option<&'static str> {
+    match v {
+        Value::Integer(n) => trawl_core::severity::token_text(*n),
+        _ => None,
+    }
+}
+
+/// A `_severity` cell as the table shows it.
+fn severity_cell_text(v: &Value) -> String {
+    severity_token(v).map_or_else(|| v.to_string(), str::to_owned)
 }
 
 fn render_ndjson(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
@@ -375,7 +444,7 @@ fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_client::Er
 /// For each detail with a span, shows the query text with the error region
 /// underlined:
 /// ```text
-///   level=error | staats count() by host
+///   _severity=error | staats count() by host
 ///                 ~~~~~~
 ///   error: unknown command 'staats'
 ///   hint: did you mean 'stats'?
@@ -593,6 +662,98 @@ mod tests {
             render(OutputFormat::Table, &[]).is_empty(),
             "a healthy query prints nothing at all"
         );
+    }
+
+    /// A mocked daemon response carrying the note channel beside one
+    /// result row.
+    fn mocked_response() -> trawl_client::QueryResponse {
+        trawl_client::QueryResponse {
+            result: QueryResult {
+                columns: vec![trawl_engine::value::Column {
+                    name: "host".to_owned(),
+                }],
+                rows: vec![vec![Value::String("db1".to_owned())]],
+            },
+            truncated: false,
+            pagination: trawl_client::PaginationMeta {
+                limit: 100,
+                offset: 0,
+                returned: 1,
+            },
+            degraded_fields: vec!["duration".to_owned()],
+        }
+    }
+
+    /// The daemon path carries the note channel off the wire and puts it
+    /// on the right stream: with the results when stdout is the
+    /// deliverable, on stderr when a file is.
+    #[test]
+    fn the_daemon_note_reaches_the_terminal_and_never_the_deliverable() {
+        let (result, degraded) = daemon_outcome(mocked_response());
+        assert_eq!(degraded, ["duration"], "degraded_fields must survive");
+
+        let emit = |format, output: Option<&Path>| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            emit_results(&result, format, output, &degraded, &mut out, &mut err).unwrap();
+            (
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+
+        // Table to stdout: the footer rides the result stream, stderr silent.
+        let (out, err) = emit(OutputFormat::Table, None);
+        assert!(out.contains("db1"), "{out}");
+        assert!(out.contains("note: results may be incomplete"), "{out}");
+        assert!(err.is_empty(), "{err}");
+
+        // Table to a file: the file is the deliverable, the footer is
+        // stderr's, and stdout stays silent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let (out, err) = emit(OutputFormat::Table, Some(&path));
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("note: results may be incomplete"), "{err}");
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(file.contains("db1"), "{file}");
+        assert!(!file.contains("note:"), "{file}");
+
+        // Machine formats stay byte-clean: the wire field is the notice.
+        for format in [OutputFormat::Json, OutputFormat::Csv] {
+            let (out, err) = emit(format, None);
+            assert!(!out.contains("note:"), "{out}");
+            assert!(err.is_empty(), "{err}");
+        }
+        let (json, _) = emit(OutputFormat::Json, None);
+        for line in json.lines() {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+        let (csv, _) = emit(OutputFormat::Csv, None);
+        assert_eq!(csv, "host\ndb1\n");
+    }
+
+    /// The table renders the token; json and csv keep the number.
+    #[test]
+    fn the_severity_column_displays_its_token_in_the_table_only() {
+        assert_eq!(severity_cell_text(&Value::Integer(17)), "error");
+        assert_eq!(severity_cell_text(&Value::Integer(18)), "error2");
+        assert_eq!(severity_cell_text(&Value::Integer(99)), "99");
+
+        let result = QueryResult {
+            columns: vec![trawl_engine::value::Column {
+                name: trawl_core::schema::SEVERITY.to_owned(),
+            }],
+            rows: vec![vec![Value::Integer(17)]],
+        };
+        let render = |f: fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>| {
+            let mut buf = Vec::new();
+            f(&result, &mut buf).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        assert!(render(render_table).contains("error"));
+        assert!(!render(render_table).contains(" 17 "));
+        assert!(render(render_ndjson).contains("17"));
+        assert!(render(render_csv).contains("17"));
     }
 
     #[test]

@@ -187,11 +187,11 @@ async fn saved_create_and_list(pool: PgPool) {
     let key_id = 1;
 
     let created = store
-        .create(key_id, "nginx_errors", "service=nginx level=error")
+        .create(key_id, "nginx_errors", "service=nginx _severity=error")
         .await
         .unwrap();
     assert_eq!(created.name, "nginx_errors");
-    assert_eq!(created.query, "service=nginx level=error");
+    assert_eq!(created.query, "service=nginx _severity=error");
 
     let list = store.list(key_id).await.unwrap();
     assert_eq!(list.len(), 1);
@@ -321,11 +321,14 @@ async fn saved_get_by_name(pool: PgPool) {
     let store = saved(&pool);
     assert!(store.get_by_name(1, "missing").await.unwrap().is_none());
 
-    store.create(1, "my_query", "level=error").await.unwrap();
+    store
+        .create(1, "my_query", "_severity=error")
+        .await
+        .unwrap();
 
     let found = store.get_by_name(1, "my_query").await.unwrap().unwrap();
     assert_eq!(found.name, "my_query");
-    assert_eq!(found.query, "level=error");
+    assert_eq!(found.query, "_severity=error");
 
     // Other user can't see it.
     assert!(store.get_by_name(2, "my_query").await.unwrap().is_none());
@@ -387,7 +390,7 @@ async fn saved_list_with_details_bulk_join(pool: PgPool) {
 
 async fn seed_saved(pool: &PgPool, key_id: i64, name: &str) -> i64 {
     saved(pool)
-        .create(key_id, name, "level=error")
+        .create(key_id, name, "_severity=error")
         .await
         .unwrap()
         .id
@@ -549,10 +552,13 @@ async fn schedule_user_isolation(pool: PgPool) {
 async fn cascade_on_saved_query_delete(pool: PgPool) {
     let saved_store = saved(&pool);
     let store = schedules(&pool);
-    let sq = saved_store.create(1, "test", "level=error").await.unwrap();
+    let sq = saved_store
+        .create(1, "test", "_severity=error")
+        .await
+        .unwrap();
     let schedule = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
 
-    let run_id = seed_run(&store, schedule.id, sq.id, "level=error").await;
+    let run_id = seed_run(&store, schedule.id, sq.id, "_severity=error").await;
     assert_eq!(
         store
             .finish_run(
@@ -616,7 +622,7 @@ async fn start_and_finish_run(pool: PgPool) {
     let sq_id = seed_saved(&pool, 1, "test").await;
     let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
 
-    let run_id = seed_run(&store, schedule.id, sq_id, "level=error").await;
+    let run_id = seed_run(&store, schedule.id, sq_id, "_severity=error").await;
 
     let run = store.get_run(run_id, 1).await.unwrap().unwrap();
     assert_eq!(run.status, RunStatus::Running);
@@ -1409,6 +1415,219 @@ mod catalog {
             pins.len(),
             ENVELOPE_TYPES.len(),
             "a fresh catalog holds exactly the declared envelope"
+        );
+        // The ADR-0013 reshape, spelled out: `_severity` is pinned
+        // SEVERITY (the semantic type, persisted under its own catalog
+        // spelling) and the pre-cutover names are gone from the seed.
+        assert_eq!(
+            pins.iter().find(|(f, _)| f == "_severity").map(|(_, t)| *t),
+            Some(CanonicalType::Severity)
+        );
+        for gone in ["severity", "severity_text"] {
+            assert!(
+                !pins.iter().any(|(f, _)| f == gone),
+                "{gone} left the envelope (ADR-0013 §1)"
+            );
+        }
+    }
+
+    /// Migration 0010's DELETE is SCOPED to the rows migration 0002
+    /// declared: a SENDER's own `severity` pin is ordinary data and must
+    /// survive the reshape, along with its observations and evidence.
+    #[sqlx::test]
+    async fn the_seed_reshape_leaves_a_senders_own_severity_pin_standing(pool: PgPool) {
+        let store = catalog(&pool);
+        // A sender pins `severity` itself, exactly as any custom field.
+        let pinned = store
+            .pin_missing(&[proposal("severity", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+        assert_eq!(pinned.get("severity"), Some(&CanonicalType::BigInt));
+
+        // Re-running the reshape's own statements must not touch it.
+        sqlx::query(
+            "DELETE FROM field_types WHERE field IN ('severity', 'severity_text') \
+             AND pinned_from = '_declared'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pins = store.load_pins().await.unwrap();
+        assert_eq!(
+            pins.iter().find(|(f, _)| f == "severity").map(|(_, t)| *t),
+            Some(CanonicalType::BigInt),
+            "a sender's pin is not the declared seed"
+        );
+    }
+
+    /// Row counts for `field` in (`field_services`, `field_conflicts`,
+    /// `field_conflict_stats`) — the three tables the reshape prunes.
+    async fn evidence_of(pool: &PgPool, field: &str) -> [i64; 3] {
+        let services = sqlx::query_scalar("SELECT count(*) FROM field_services WHERE field = $1")
+            .bind(field)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let conflicts = sqlx::query_scalar("SELECT count(*) FROM field_conflicts WHERE field = $1")
+            .bind(field)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let stats =
+            sqlx::query_scalar("SELECT count(*) FROM field_conflict_stats WHERE field = $1")
+                .bind(field)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        [services, conflicts, stats]
+    }
+
+    /// Migration 0010 applied over a REAL pre-cutover catalog.
+    ///
+    /// The reshape test above starts from the already-migrated schema and
+    /// replays one of 0010's statements by hand, which can only speak for
+    /// forward behaviour. This one builds the state a live install actually
+    /// upgrades FROM — migrations 0001-0009, the declared `severity`/
+    /// `severity_text` seed with observations and conflict evidence, a
+    /// SENDER-owned `_severity` pin from the era when `_` was an ordinary
+    /// character, an unrelated sender field, and a stamped `conformed_at` —
+    /// and then applies 0010 over it. sqlx migrations are immutable once
+    /// merged, so this is the only window in which the conditional DELETEs
+    /// can be proven to scope correctly; a pin slot is spent permanently,
+    /// and the corpus a mis-scoped DELETE unstores is standing data.
+    #[sqlx::test(migrations = false)]
+    async fn applying_0010_over_a_0009_catalog_reshapes_only_the_declared_rows(pool: PgPool) {
+        // The crate's real migration set — the same files
+        // `StorageState::connect` runs, so neither half can drift.
+        static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+        MIGRATIONS
+            .run_to(9, &pool)
+            .await
+            .expect("apply 0001-0009 (the pre-cutover schema)");
+
+        // Pre-cutover sender state: `_severity` was pinnable from ordinary
+        // sender data, and `duration` is the bystander nothing may touch.
+        sqlx::query(
+            "INSERT INTO field_types (field, duckdb_type, pinned_from, pinned_at) VALUES
+                 ('_severity', 'VARCHAR', 'legacy-svc', now() - interval '30 days'),
+                 ('duration',  'BIGINT',  'svc-a',      now() - interval '30 days')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO field_services (field, service, row_count) VALUES
+                 ('severity',      'nginx',      10),
+                 ('severity_text', 'nginx',      10),
+                 ('_severity',     'legacy-svc', 10),
+                 ('duration',      'svc-a',      10)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO field_conflicts
+                 (field, service, observed_type, expected_type, rows_nulled, samples) VALUES
+                 ('severity',      'nginx',      'VARCHAR', 'BIGINT',  3, ARRAY['warn']),
+                 ('severity_text', 'nginx',      'BIGINT',  'VARCHAR', 1, ARRAY['17']),
+                 ('_severity',     'legacy-svc', 'BIGINT',  'VARCHAR', 2, ARRAY['9']),
+                 ('duration',      'svc-a',      'VARCHAR', 'BIGINT',  5, ARRAY['fast'])",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO field_conflict_stats
+                 (field, service, episodes, rows_nulled_total) VALUES
+                 ('severity',      'nginx',      2, 3),
+                 ('severity_text', 'nginx',      1, 1),
+                 ('_severity',     'legacy-svc', 4, 2),
+                 ('duration',      'svc-a',      6, 5)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A node that has already proven its corpus conformant, and already
+        // backfilled its observations.
+        sqlx::query(
+            "UPDATE catalog_state SET conformed_at = now(), services_backfilled_at = now()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        MIGRATIONS
+            .run_to(10, &pool)
+            .await
+            .expect("apply 0010 over the pre-cutover catalog");
+
+        // The pin table: exactly the new declared envelope plus the
+        // bystander. `load_pins` parsing at all proves the widened CHECK
+        // constraint and `CanonicalType::from_catalog` agree on SEVERITY.
+        let pins = catalog(&pool).load_pins().await.unwrap();
+        for (field, ty) in ENVELOPE_TYPES {
+            assert_eq!(
+                pins.iter().find(|(f, _)| f == field).map(|(_, t)| *t),
+                Some(*ty),
+                "declared {field} must stand after the reshape"
+            );
+        }
+        assert_eq!(
+            pins.iter().find(|(f, _)| f == "duration").map(|(_, t)| *t),
+            Some(CanonicalType::BigInt),
+            "an unrelated sender pin is untouched"
+        );
+        assert_eq!(
+            pins.len(),
+            ENVELOPE_TYPES.len() + 1,
+            "the reshape leaves the declared envelope plus the sender's own pin: {pins:?}"
+        );
+        // `_severity` is REPLACED, not merely present: the sender's VARCHAR
+        // pin is gone and the row is the declared seed's.
+        let pinned_from: Option<String> =
+            sqlx::query_scalar("SELECT pinned_from FROM field_types WHERE field = '_severity'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pinned_from.as_deref(), Some("_declared"));
+        let bystander: Option<String> =
+            sqlx::query_scalar("SELECT pinned_from FROM field_types WHERE field = 'duration'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bystander.as_deref(), Some("svc-a"));
+
+        // Evidence follows the pin it describes: the two retired declared
+        // names and the replaced `_severity` lose theirs, the bystander
+        // keeps all three rows.
+        for gone in ["severity", "severity_text", "_severity"] {
+            assert_eq!(
+                evidence_of(&pool, gone).await,
+                [0, 0, 0],
+                "{gone}'s observations and conflict evidence go with its pin"
+            );
+        }
+        assert_eq!(
+            evidence_of(&pool, "duration").await,
+            [1, 1, 1],
+            "an unrelated field's evidence survives the reshape"
+        );
+
+        // Re-armed for epoch 3's fresh data root — and nothing else in
+        // `catalog_state` is disturbed (a set-aside root has no standing
+        // corpus to backfill observations from).
+        let (conformed, backfilled): (
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as("SELECT conformed_at, services_backfilled_at FROM catalog_state")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(conformed.is_none(), "the conformance pass must be re-armed");
+        assert!(
+            backfilled.is_some(),
+            "the observation backfill flag is not the reshape's business"
         );
     }
 
@@ -2797,12 +3016,12 @@ mod repin_store {
     async fn finish_cutover_flips_pin_and_job_transactionally_and_idempotently(pool: PgPool) {
         let s = store(&pool);
         let catalog = CatalogStore::new(pool.clone());
-        // `severity` is seeded BIGINT by migration 0002.
+        // `host` is seeded VARCHAR by migration 0002; the flip retypes it.
         let id = s
             .claim(
-                "severity",
-                CanonicalType::BigInt,
+                "host",
                 CanonicalType::Varchar,
+                CanonicalType::BigInt,
                 false,
                 false,
                 None,
@@ -2810,19 +3029,19 @@ mod repin_store {
             .await
             .unwrap();
 
-        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+        s.finish_cutover(id, "host", CanonicalType::BigInt)
             .await
             .unwrap();
 
         let pins: std::collections::HashMap<_, _> =
             catalog.load_pins().await.unwrap().into_iter().collect();
-        assert_eq!(pins.get("severity"), Some(&CanonicalType::Varchar));
+        assert_eq!(pins.get("host"), Some(&CanonicalType::BigInt));
         let job = s.get(id).await.unwrap().expect("job row");
         assert_eq!(job.status, RepinJobStatus::Succeeded);
         assert!(job.finished_at.is_some());
 
         // Idempotent redo (boot recovery replays the flip).
-        s.finish_cutover(id, "severity", CanonicalType::Varchar)
+        s.finish_cutover(id, "host", CanonicalType::BigInt)
             .await
             .unwrap();
         let again = s.get(id).await.unwrap().unwrap();

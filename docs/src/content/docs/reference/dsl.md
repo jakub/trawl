@@ -176,8 +176,9 @@ filtered out. Two consequences are worth knowing before you write an alert:
 - `NOT f=x` **does not match events that carry no `f`** — `NOT (NULL)` is
   NULL, which is unknown, which is filtered out. If you want "events
   missing `f`, plus events where it isn't `x`", write `f!=x`, not
-  `NOT f=x`. The same holds for `NOT level=...` when an event has no
-  `severity`, and for `NOT <bare term>` when it has no `message`/`_raw`.
+  `NOT f=x`. The same holds for `NOT _severity=...` when an event has no
+  derived severity, and for `NOT <bare term>` when it has no
+  `message`/`_raw`.
 
 :::caution[Changed in the ADR-0011 release]
 Live tail previously treated a missing field as *false* rather than
@@ -262,48 +263,94 @@ error and starts filtering; `== 200` gains the numeric arm (it now
 matches a stored `"200.0"`); on TIMESTAMP pins live-tail ordered
 comparisons become the instant comparison batch always performed instead
 of lexical text. The envelope seed pins `host`/`service`/`env`/`message`/
-`severity_text`/`_raw` as VARCHAR on every install, so this is live on
-day one.
+`_raw` as VARCHAR (and `_severity` as SEVERITY) on every install, so this
+is live on day one.
 :::
 
-### Severity: the `level` alias
+### The two namespaces
 
-`level` is a **query alias for the numeric `severity` column** (OTel
-SeverityNumber 1-24). Name tokens are matched case-insensitively and
-compile to band predicates:
+One sentence, learned once (ADR-0013):
+
+- **Bare names are your data.** `service`, `host`, `status`, `level`,
+  `timestamp` — whatever your senders emit, stored verbatim under the
+  name they sent. trawl never assigns meaning to a bare name.
+- **Underscore names are trawl's.** `_time`, `_ingested`, `_raw`,
+  `_repairs`, `_severity` are contract slots whose semantics trawl
+  guarantees on every corpus. The whole `_` prefix is reserved: an
+  incoming `_x` that is not a slot you may propose has its leading
+  underscores stripped and lands under the bare remainder (`_HOSTNAME` →
+  `hostname`), and the DSL cannot mint one either — `let _foo = 1`,
+  `rename x as _foo` and `extract "(?P<_foo>…)"` are errors.
+
+There are **no aliases**. The name you type is the column in `DESCRIBE`
+is the identifier in the SQL, in every lane.
+
+### Severity: `_severity`
+
+`_severity` is the derived OTel SeverityNumber (1-24), pinned to the
+`SEVERITY` type on every install. Because the pin types the comparison,
+the token vocabulary works identically in the SQL emitter, the live
+filter, the stream compiler and the post-SQL tail:
 
 ```
-level=error                     # severity BETWEEN 17 AND 20 (the ERROR band)
-level!=info                     # NOT BETWEEN 9 AND 12, or severity IS NULL
-level=warn,error                # either band
-level>=warn                     # severity >= 13 (the token's exact number)
-| where level == "error"        # same band predicate, in a pipe stage
+_severity=error                 # BETWEEN 17 AND 20 (the ERROR band)
+_severity!=info                 # NOT BETWEEN 9 AND 12, or _severity IS NULL
+_severity=warn,error            # either band
+_severity>=warn                 # >= 13 (the token's exact number)
+_severity=error2                # exactly 18 (the OTel exact short name)
+_severity=17                    # exactly 17
+_severity=warn*                 # glob over the canonical token text: 13-16
+| where _severity == "error"    # the same rule, in a pipe stage
 ```
 
-- Equality/IN match the whole band containing the token (`notice` falls
-  inside the INFO band).
-- Ordered comparisons use the token's exact number (`warn` = 13,
-  `error` = 17, ...).
-- Valid tokens: `trace`/`t`, `debug`/`d`, `info`/`i`, `notice`,
+- Equality and IN match the whole **band** containing the token
+  (`notice` falls inside the INFO band); ordered comparisons use the
+  token's **exact** number.
+- OTel's exact short names (`trace2`, `warn3`, `error2`, …) name one
+  number, under every operator.
+- Glob and regex match the **canonical token text** — the injective OTel
+  short name of the stored number — which is also what results display:
+  a `_severity` cell reads `error`, not `17`. The wire keeps the number:
+  `-f json`, `-f csv` and SSE carry it for arithmetic consumers.
+- An unrecognized value is a **query error naming the vocabulary**, never
+  a filter that quietly matches nothing.
+- Valid band tokens: `trace`/`t`, `debug`/`d`, `info`/`i`, `notice`,
   `warn`/`warning`/`w`, `error`/`err`/`e`, `fatal`/`critical`/`crit`/`f`,
-  `alert`, `emerg`/`panic`. Anything else (or a glob/regex on `level`) is
-  a query error — match the original spelling with
-  `severity_text="..."` instead.
-- `level` works in search-stage filters and in `where` comparisons
-  against a token literal — both compile to the same band predicate, and
-  live tail (SSE) evaluates them identically to a batch query.
-- Everywhere else — projections, `stats by`, `sort`, `dedup`, `rename`,
-  `let` arithmetic — naming `level` is a query error, because there is no
-  stored `level` column to read or write. Use `severity` (the number) or
-  `severity_text` (the original text) instead. The error is deliberate:
-  emitting `level` verbatim would ask the database for a column that does
-  not exist, and a pre-cutover saved query would come back empty rather
-  than say so.
+  `alert`, `emerg`/`panic`.
+- Embedded `--data` mode has no catalog, so it has no `SEVERITY` pin:
+  compare the ladder number there (`_severity>=17`).
 
-### Time aliases
+`_severity` is **derived, never proposed**: ingest reads `severity` →
+`severity_text` → `level` (first mappable wins) and stores every one of
+them verbatim as your own columns. A word maps through the token table
+or the exact names; a number maps strictly as OTel 1-24, so `3` is
+`trace` — the syslog inversion happens only in the syslog listener,
+where the transport proves the dialect. An event with no mappable source
+simply has no `_severity`.
 
-`timestamp` and `@timestamp` are query aliases for the physical `_time`
-column — all three resolve identically.
+:::caution[`level=error` is not a severity filter]
+`level` is an ordinary field now, so `level=error` compares the sender's
+own value. A game server emitting `{"service":"game","level":"gold"}`
+keeps a fully queryable `level` column — that is the point — but if you
+meant severity, you want `_severity>=error`. And a field no sender writes
+is not an error: it simply matches nothing, so a query written against
+the old alias comes back empty rather than failing. trawl says nothing
+about it — `level` is your vocabulary, not trawl's, and a notice keyed on
+the name would be trawl assigning it a meaning again.
+:::
+
+### `timestamp` and `@timestamp`
+
+Ordinary sender fields. They are **read** as sources for the `_time`
+derivation (`_time` → `timestamp` → `@timestamp`, first present wins)
+and **stored verbatim** under their own names, so both the canonical
+instant and what the sender actually sent stay queryable. Only `_time`
+itself is consumed and canonicalized — it is the proposal slot.
+
+They are no longer aliases for `_time`, so `| sort -timestamp` sorts the
+sender's column and finds nothing where no sender sends one — silently,
+exactly as `level` does. Sort, filter and project `_time` when you mean
+the event's instant.
 
 ### Text search
 
@@ -470,6 +517,11 @@ rex "(?P<code>[A-Z]+)" from raw    # rex is an alias for extract
 extract kv                      # from 'message' field
 extract kv from raw             # from a specific field
 ```
+
+A kv key starting with `_` is dropped rather than extracted: the `_`
+namespace is trawl's, and a key parsed out of a log line is sender-controlled
+text, so `_severity=17` in a message body would otherwise forge trawl's own
+verdict slot. The text stays findable in the source field and `_raw`.
 
 ### rename
 
@@ -654,7 +706,7 @@ Invalid format codes (e.g. `%Q`, or a trailing `%`) are rejected before executio
 
 ```
 # Errors in the last hour by service
-level=error last=1h | stats count() by service | sort -count
+_severity>=error last=1h | stats count() by service | sort -count
 
 # Slow requests by endpoint
 status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10
@@ -666,7 +718,7 @@ status>=400 last=2h | stats count() by host, status | where count > 10
 "connection from" | rex "(?P<ip>\d+\.\d+\.\d+\.\d+)" from message | stats count() by ip | sort -count
 
 # Time series of error rate
-level=error OR level=fatal | timechart span=5m count() by service
+_severity>=error | timechart span=5m count() by service
 
 # Dedup flapping alerts
 service=monitoring | dedup host, alert_name
@@ -678,5 +730,5 @@ last=1h | pivot count() on status by host
 * | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10
 
 # Distinct values per group
-* | stats values(severity_text), first(message) by service | head 10
+* | stats values(_severity), first(message) by service | head 10
 ```

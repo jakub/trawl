@@ -4,7 +4,7 @@
 
 //! DSL parser for trawl.s query language.
 //!
-//! Transforms a query string like `service=nginx level=error last=2h | stats count() by host`
+//! Transforms a query string like `service=nginx _severity=error last=2h | stats count() by host`
 //! into a structured AST representation.
 //!
 //! The parser is built in layers:
@@ -324,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_multi_token_search() {
-        let query = parse("service=nginx level=error last=2h").unwrap();
+        let query = parse("service=nginx _severity=error last=2h").unwrap();
         // Time filter hoisted, 2 tokens remain in group.
         assert_eq!(query.search.groups[0].len(), 2);
         assert!(query.search.time_filter.is_some());

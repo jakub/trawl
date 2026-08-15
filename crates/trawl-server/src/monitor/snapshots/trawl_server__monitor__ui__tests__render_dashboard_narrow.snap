@@ -22,7 +22,7 @@ expression: terminal.backend().to_string()
 "│ active: 2/32         ││ enabled: 3 schedules             │"
 "└──────────────────────┘└──────────────────────────────────┘"
 "┌ RECENT QUERIES ──────────────────────────────────────────┐"
-"│#1247   23ms     142 rows   OK   level=error last=1h | sta│"
+"│#1247   23ms     142 rows   OK   _severity=error last=1h |│"
 "│#1246   87ms     1 rows     OK   * | stats count()        │"
 "└──────────────────────────────────────────────────────────┘"
 " q or ctrl-c to quit                                        "

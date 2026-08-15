@@ -188,7 +188,31 @@ pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
         CanonicalType::Timestamp => {
             format!("TRY_CAST(TRY_CAST({text} AS TIMESTAMPTZ) AS TIMESTAMP)")
         }
+        CanonicalType::Severity => {
+            let bigint = guarded_cast(text, CanonicalType::BigInt);
+            format!("(CASE WHEN {bigint} BETWEEN 1 AND 24 THEN {bigint} END)")
+        }
     }
+}
+
+/// The canonical token TEXT of a `SEVERITY`-pinned column — the SQL half
+/// of `compare::PatternForm::SeverityText`.
+///
+/// A total 24-arm table with an explicit NULL fallthrough, generated from
+/// [`crate::severity::otel_name`] so the SQL and the in-memory mirror
+/// cannot drift; the pairing is executed against the bundled `DuckDB` in
+/// `trawl-engine/tests/duckdb_probe.rs`. Out-of-ladder values cannot
+/// exist in a conformed column ([`guarded_cast`]'s SEVERITY rung nulls
+/// them), so the `ELSE NULL` arm is only ever reached by a NULL input.
+#[must_use]
+pub fn severity_token_text_sql(expr: &str) -> String {
+    let arms: Vec<String> = (1..=24u8)
+        .map(|n| {
+            let name = crate::severity::otel_name(n).expect("1-24 is the ladder");
+            format!("WHEN {n} THEN '{name}'")
+        })
+        .collect();
+    format!("(CASE {expr} {} END)", arms.join(" "))
 }
 
 /// A SQL string literal's body: single quotes doubled.
@@ -306,6 +330,36 @@ mod tests {
             "(CASE WHEN CAST(TRY_CAST(t AS BOOLEAN) AS VARCHAR) = t \
              THEN TRY_CAST(t AS BOOLEAN) END)"
         );
+    }
+
+    /// The SEVERITY rung is the BIGINT rung inside a ladder-range guard:
+    /// a number outside 1-24 is not a `SeverityNumber`, so it conforms to
+    /// NULL (a conflict, the value still in `_raw`) rather than becoming
+    /// a token nothing can render.
+    #[test]
+    fn severity_rung_is_the_guarded_bigint_inside_the_ladder_range() {
+        let sql = guarded_cast("t", CanonicalType::Severity);
+        let bigint = guarded_cast("t", CanonicalType::BigInt);
+        assert_eq!(
+            sql,
+            format!("(CASE WHEN {bigint} BETWEEN 1 AND 24 THEN {bigint} END)")
+        );
+    }
+
+    /// The canonical token text is a total 24-arm table with an explicit
+    /// NULL fallthrough — the SQL half of `PatternForm::SeverityText`.
+    #[test]
+    fn severity_token_text_covers_the_whole_ladder() {
+        let sql = severity_token_text_sql("s");
+        for n in 1..=24u8 {
+            let name = crate::severity::otel_name(n).unwrap();
+            assert!(
+                sql.contains(&format!("WHEN {n} THEN '{name}'")),
+                "missing arm {n} → {name}: {sql}"
+            );
+        }
+        assert!(sql.starts_with("(CASE s WHEN 1 THEN 'trace'"), "{sql}");
+        assert!(sql.ends_with("WHEN 24 THEN 'fatal4' END)"), "{sql}");
     }
 
     /// The timestamp rung is zone-aware: it parses through `TIMESTAMPTZ`,

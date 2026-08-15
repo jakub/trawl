@@ -13,22 +13,19 @@ mod fields;
 mod functions;
 mod pipeline;
 mod search;
-pub(crate) mod severity;
-mod state;
+pub(crate) mod state;
 mod validate;
 
 use crate::ast::{PipeStage, Query, Spanned};
 use state::EmitterState;
 
 pub(crate) use fields::coerce_filter_value;
-pub use fields::map_field_name;
 pub use functions::is_aggregate_function;
 pub use functions::{DATE_PART_UNITS, DATE_UNITS};
 pub(crate) use functions::{
     format_literal_position, unit_literal_positions, validate_format_literal, validate_unit_literal,
 };
 pub use state::{hot_source_reader, source_reader, validate_source_path};
-pub(crate) use validate::validate_level_references;
 pub use validate::validate_pipeline;
 
 use std::fmt;
@@ -133,6 +130,18 @@ impl fmt::Display for EmitError {
 }
 
 impl std::error::Error for EmitError {}
+
+/// A literal the pin rule table refuses (`crate::compare::CompareError`)
+/// is an unsupported operation to every emitter caller — one conversion,
+/// so the search stage, the pipeline emitter, the live filter and the
+/// stream compiler all report the same sentence.
+impl From<crate::compare::CompareError> for EmitError {
+    fn from(err: crate::compare::CompareError) -> Self {
+        Self::UnsupportedOperation {
+            message: err.to_string(),
+        }
+    }
+}
 
 impl EmitError {
     /// Produce a user-facing hint string, if applicable.
@@ -393,7 +402,7 @@ mod tests {
 
     #[test]
     fn search_multiple_filters() {
-        assert_snapshot!(emit_dsl("service=nginx level=error"));
+        assert_snapshot!(emit_dsl("service=nginx _severity=error"));
     }
 
     #[test]
@@ -464,7 +473,7 @@ mod tests {
     #[test]
     fn search_kitchen_sink() {
         assert_snapshot!(emit_dsl(
-            r#"service=nginx level=error last=2h "connection refused" -debug"#
+            r#"service=nginx _severity=error last=2h "connection refused" -debug"#
         ));
     }
 
@@ -481,7 +490,7 @@ mod tests {
     #[test]
     fn search_or_multi_token_groups() {
         assert_snapshot!(emit_dsl(
-            "service=nginx level=error OR service=postgres level=warn"
+            "service=nginx _severity=error OR service=postgres _severity=warn"
         ));
     }
 
@@ -492,90 +501,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // level → severity band alias (ADR-0009)
+    // zero DSL aliases (ADR-0013 §6)
     // -----------------------------------------------------------------------
 
+    /// `level` is ordinary sender vocabulary now — one name, one column,
+    /// in every position that used to reject it. The severity band
+    /// vocabulary lives on `_severity`, which nothing can shadow.
     #[test]
-    fn search_level_eq_band() {
-        assert_snapshot!(emit_dsl("level=error"));
-    }
-
-    #[test]
-    fn search_level_gte_number() {
-        assert_snapshot!(emit_dsl("level>=warn"));
-    }
-
-    #[test]
-    fn search_level_ne_band() {
-        assert_snapshot!(emit_dsl("level!=info"));
-    }
-
-    #[test]
-    fn search_level_in_list() {
-        assert_snapshot!(emit_dsl("level=error,fatal"));
-    }
-
-    #[test]
-    fn search_level_case_insensitive_token() {
-        assert_snapshot!(emit_dsl("level=WARN"));
-    }
-
-    #[test]
-    fn error_level_unknown_token() {
-        assert_snapshot!(emit_dsl_err("level=spicy"));
-    }
-
-    #[test]
-    fn error_level_glob() {
-        assert_snapshot!(emit_dsl_err("level=glob:err*"));
-    }
-
-    #[test]
-    fn where_level_eq_band() {
-        assert_snapshot!(emit_dsl(r#"* | where level == "error""#));
-    }
-
-    #[test]
-    fn where_level_gte_number() {
-        assert_snapshot!(emit_dsl(r#"* | where level >= "warn""#));
-    }
-
-    /// `level` is consumed at ingest, so a non-comparison use names a
-    /// column that does not exist. Emitting it verbatim gets a binder
-    /// error that the hot/cold ladder downgrades to an empty 200 — every
-    /// pre-cutover saved query grouping on `level` would silently return
-    /// nothing. Reject it instead, everywhere a field name can appear.
-    #[test]
-    fn error_level_in_stats_by() {
-        assert_snapshot!(emit_dsl_err("* | stats count() by level"));
-    }
-
-    #[test]
-    fn error_level_in_table() {
-        assert_snapshot!(emit_dsl_err("* | table host, level"));
-    }
-
-    #[test]
-    fn error_level_in_sort() {
-        assert_snapshot!(emit_dsl_err("* | sort -level"));
-    }
-
-    #[test]
-    fn error_level_in_expression() {
-        assert_snapshot!(emit_dsl_err(r#"* | where lower(level) == "error""#));
-    }
-
-    /// A `level` column defined mid-pipeline would shadow the severity
-    /// alias for every later stage, so the write side is rejected too.
-    #[test]
-    fn error_level_as_assignment_target() {
-        assert_snapshot!(emit_dsl_err(r#"* | let level = "error""#));
-    }
-
-    /// Every other field-name position routes through the same check.
-    #[test]
-    fn error_level_in_remaining_positions() {
+    fn level_is_an_ordinary_field_in_every_position() {
         for dsl in [
+            "level=error",
+            "level=gold",
+            "level=error,fatal",
+            "level>=warn",
+            "level=err*",
+            "* | stats count() by level",
+            "* | table host, level",
+            "* | sort -level",
+            r#"* | where lower(level) == "error""#,
+            r#"* | let level = "error""#,
             "* | top 5 level",
             "* | rare 5 level",
             "* | dedup level",
@@ -588,42 +532,56 @@ mod tests {
             "* | extract kv from level",
             r#"* | where level in ("error")"#,
         ] {
-            let err = emit_dsl_err(dsl);
-            assert!(
-                err.contains("filter-only alias"),
-                "{dsl} should be rejected, got: {err}"
-            );
-        }
-    }
-
-    /// The rejection must not swallow the legal comparison forms, in
-    /// either stage.
-    #[test]
-    fn level_comparisons_still_emit() {
-        for dsl in [
-            "level=error",
-            "level>=warn",
-            r#"* | where level == "error""#,
-            r#"* | where level != "info" and service == "nginx""#,
-        ] {
             let query = parser::parse(dsl).expect("parse should succeed");
-            emit(&query, SRC).expect("level comparison should still emit");
+            emit(&query, SRC).unwrap_or_else(|e| panic!("{dsl} must emit, got {e}"));
         }
     }
 
+    /// `level=gold` — the #60 canonical example — filters the sender's
+    /// own column, verbatim.
+    #[test]
+    fn search_level_is_a_plain_field_filter() {
+        assert_snapshot!(emit_dsl("level=gold"));
+    }
+
+    #[test]
+    fn where_level_is_a_plain_comparison() {
+        assert_snapshot!(emit_dsl(r#"* | where level == "error""#));
+    }
+
+    /// The pipeline may not MINT a reserved name (ADR-0013 §5): the same
+    /// predicate ingest strips by.
+    #[test]
+    fn reserved_names_cannot_be_minted_by_the_pipeline() {
+        for dsl in [
+            "* | let _foo = 1",
+            "* | eval _severity = 17",
+            "* | rename service as _svc",
+            "* | stats count() as _severity",
+            "* | eventstats count() as _time",
+            "* | timechart span=5m count() as _raw",
+            "* | pivot count() as _repairs on service",
+        ] {
+            assert!(parser::parse(dsl).is_err(), "{dsl} must be a parse error");
+        }
+        // The capture-group door is the one place the regex is already
+        // compiled, reached by both lanes through `validate_pipeline`.
+        let err = emit_dsl_err(r#"* | extract "(?P<_foo>.)" from message"#);
+        assert!(err.contains("reserved namespace"), "{err}");
+    }
+
     // -----------------------------------------------------------------------
-    // _time alias inversion (ADR-0009)
+    // the physical `_time` column (ADR-0013: no aliases resolve onto it)
     // -----------------------------------------------------------------------
 
-    /// `timestamp`, `@timestamp` and `_time` all resolve to the physical
-    /// `_time` column.
+    /// `timestamp` and `@timestamp` are ORDINARY sender field names —
+    /// each names the column it spells, and only `_time` is `_time`.
     #[test]
-    fn time_aliases_resolve_identically() {
-        let canonical = emit_dsl("* | sort _time");
-        assert_eq!(emit_dsl("* | sort timestamp"), canonical);
-        assert_eq!(emit_dsl("* | sort @timestamp"), canonical);
-        assert!(canonical.contains("\"_time\""));
-        assert!(!canonical.contains("\"timestamp\""));
+    fn time_alias_spellings_name_their_own_columns() {
+        assert!(emit_dsl("* | sort _time").contains("\"_time\""));
+        assert!(emit_dsl("* | sort timestamp").contains("\"timestamp\""));
+        assert!(emit_dsl("* | sort @timestamp").contains("\"@timestamp\""));
+        assert!(!emit_dsl("* | sort timestamp").contains("\"_time\""));
     }
 
     #[test]
@@ -1304,13 +1262,15 @@ mod tests {
     #[test]
     fn search_earliest_latest() {
         assert_snapshot!(emit_dsl(
-            r#"earliest="2026-03-14T03:00:00Z" latest="2026-03-14T03:15:00Z" level=error"#
+            r#"earliest="2026-03-14T03:00:00Z" latest="2026-03-14T03:15:00Z" _severity=error"#
         ));
     }
 
     #[test]
     fn search_earliest_only() {
-        assert_snapshot!(emit_dsl(r#"earliest="2026-03-14T00:00:00Z" level=error"#));
+        assert_snapshot!(emit_dsl(
+            r#"earliest="2026-03-14T00:00:00Z" _severity=error"#
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1367,7 +1327,7 @@ mod tests {
     #[test]
     fn search_not_paren_group() {
         assert_snapshot!(emit_dsl(
-            "NOT (service=nginx OR service=apache) level=error"
+            "NOT (service=nginx OR service=apache) _severity=error"
         ));
     }
 
@@ -1573,12 +1533,102 @@ mod tests {
         format_result(&result)
     }
 
+    /// Parse and emit pin-aware SQL, expecting an `EmitError`.
+    fn emit_dsl_err_with_pins(
+        input: &str,
+        entries: &[(&str, crate::schema::CanonicalType)],
+    ) -> String {
+        let query = parser::parse(input).expect("parse should succeed");
+        emit_with_pins(&query, SRC, &pins(entries))
+            .expect_err("emit should fail")
+            .to_string()
+    }
+
+    /// The declared `_severity` pin, as the catalog seed installs it.
+    const SEVERITY_PIN: [(&str, crate::schema::CanonicalType); 1] = [("_severity", CT::Severity)];
+
     use crate::schema::CanonicalType as CT;
 
     /// A numeric literal binds BOTH the text and its numeric reading: the
     /// stored text of a number is `read_json`'s inference rendered
     /// (`"200.0"`), so exact text alone would be a batch miss where the
     /// live matcher — which only sees the wire `200` — hits.
+    // --- the SEVERITY pin (ADR-0013): tokens ride the rule table ---
+
+    #[test]
+    fn pinned_severity_eq_band_token() {
+        assert_snapshot!(emit_dsl_with_pins("_severity=error", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_eq_exact_otel_name() {
+        assert_snapshot!(emit_dsl_with_pins("_severity=error2", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_gte_token_is_the_exact_number() {
+        assert_snapshot!(emit_dsl_with_pins("_severity>=warn", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_ne_band_widens_with_null_in_the_search_stage() {
+        assert_snapshot!(emit_dsl_with_pins("_severity!=info", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_in_list_expands_to_or_of_bands() {
+        assert_snapshot!(emit_dsl_with_pins("_severity=warn,error", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_glob_matches_the_canonical_token_text() {
+        assert_snapshot!(emit_dsl_with_pins("_severity=warn*", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn pinned_severity_regex_matches_the_canonical_token_text() {
+        assert_snapshot!(emit_dsl_with_pins("_severity=/^err/", &SEVERITY_PIN));
+    }
+
+    /// The pipeline lane binds the same rule with the STRICT null policy:
+    /// `!=` keeps plain SQL null propagation (ADR-0011 slice A′).
+    #[test]
+    fn pinned_severity_where_eq_band() {
+        assert_snapshot!(emit_dsl_with_pins(
+            r#"* | where _severity == "error""#,
+            &SEVERITY_PIN
+        ));
+    }
+
+    #[test]
+    fn pinned_severity_where_ne_band_stays_strict() {
+        assert_snapshot!(emit_dsl_with_pins(
+            r#"* | where _severity != "error""#,
+            &SEVERITY_PIN
+        ));
+    }
+
+    #[test]
+    fn pinned_severity_where_gte_token() {
+        assert_snapshot!(emit_dsl_with_pins(
+            r#"* | where _severity >= "warn""#,
+            &SEVERITY_PIN
+        ));
+    }
+
+    #[test]
+    fn error_severity_unknown_token() {
+        assert_snapshot!(emit_dsl_err_with_pins("_severity=spicy", &SEVERITY_PIN));
+    }
+
+    #[test]
+    fn error_severity_unknown_token_in_where() {
+        assert_snapshot!(emit_dsl_err_with_pins(
+            r#"* | where _severity == "spicy""#,
+            &SEVERITY_PIN
+        ));
+    }
+
     #[test]
     fn pinned_varchar_eq_numeric_binds_text_and_reading() {
         assert_snapshot!(emit_dsl_with_pins("status=200", &[("status", CT::Varchar)]));

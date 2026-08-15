@@ -20,6 +20,13 @@ pub const QUERY_DURATION: &str = "trawl_query_duration_seconds";
 pub const INGEST_EVENTS_TOTAL: &str = "trawl_ingest_events_total";
 pub const INGEST_EVENTS_REJECTED_TOTAL: &str = "trawl_ingest_events_rejected_total";
 pub const INGEST_REPAIRS_TOTAL: &str = "trawl_ingest_repairs_total";
+/// Accepted events whose severity SOURCE mapped to nothing on the `OTel`
+/// ladder, so `_severity` was omitted (ADR-0013 §2). Deliberately a
+/// counter rather than a repair code: derivation into the `_` namespace
+/// touches nothing sender-visible, so there is nothing to confess in
+/// `_repairs` — but a sender whose whole feed lands unmapped is an ops
+/// question, and this is where it shows.
+pub const SEVERITY_UNMAPPED_TOTAL: &str = "trawl_severity_unmapped_total";
 pub const HOT_BUFFER_EVENTS: &str = "trawl_hot_buffer_events";
 pub const HOT_BUFFER_BYTES: &str = "trawl_hot_buffer_bytes";
 pub const ACTIVE_CONNECTIONS: &str = "trawl_active_connections";

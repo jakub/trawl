@@ -88,7 +88,7 @@ pub fn is_degraded(agg: &ConflictAggregate) -> bool {
 ///
 /// `observed_types` are the `DuckDB` types the conflicting BATCHES carried —
 /// per-column inferences, not per-value ones — so they are read through
-/// [`normalize_duckdb_type`], never `CanonicalType::from_duckdb` (which
+/// [`normalize_duckdb_type`], never `CanonicalType::from_catalog` (which
 /// knows only the canonical five and would drop `INTEGER`, `HUGEINT` and
 /// `JSON` on the floor). One rung, unanimously, and different from the
 /// current pin, is a suggestion; anything else — mixed rungs, `JSON` (which
@@ -153,7 +153,7 @@ pub fn verdict(
         episodes: u64::try_from(agg.episodes).unwrap_or(0),
         rows_shelved: u64::try_from(agg.rows_nulled_total).unwrap_or(0),
         samples,
-        suggested_to: suggested_target(current, &observed).as_duckdb().to_owned(),
+        suggested_to: suggested_target(current, &observed).as_catalog().to_owned(),
     }
 }
 

@@ -24,7 +24,7 @@ expression: terminal.backend().to_string()
 "│ active: 2/32                 ││ enabled: 3 schedules                         │"
 "└──────────────────────────────┘└──────────────────────────────────────────────┘"
 "┌ RECENT QUERIES ──────────────────────────────────────────────────────────────┐"
-"│#1247   23ms     142 rows   OK   level=error last=1h | stats count() by servic│"
+"│#1247   23ms     142 rows   OK   _severity=error last=1h | stats count() by se│"
 "│#1246   87ms     1 rows     OK   * | stats count()                            │"
 "│#1245   12ms     - rows     ERR  invalid query syntax                         │"
 "│                                                                              │"

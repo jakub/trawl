@@ -112,6 +112,13 @@ pub(crate) enum CoercedValue {
         pin: CanonicalType,
         literal: PinLiteral,
     },
+    /// The SEVERITY pin's band form (ADR-0013): the stored number inside
+    /// (or, for `!=`, outside) an inclusive band — the live mirror of
+    /// `col BETWEEN lo AND hi`.
+    SeverityBand {
+        lo: u8,
+        hi: u8,
+    },
 }
 
 /// A literal read into a TYPED pin's own domain, once per compiled filter.
@@ -176,6 +183,14 @@ pub(crate) fn coerce_form(form: CompareForm) -> CoercedValue {
             pin,
             literal: pin_literal(pin, &literal),
         },
+        CompareForm::SeverityBand { lo, hi } => CoercedValue::SeverityBand { lo, hi },
+        // The exact form is the SEVERITY column read as the BIGINT it is,
+        // against one integer — the same conform-then-compare rung every
+        // typed pin takes.
+        CompareForm::SeverityExact(n) => CoercedValue::Conformed {
+            pin: CanonicalType::Severity,
+            literal: PinLiteral::Int(n),
+        },
     }
 }
 
@@ -191,11 +206,17 @@ fn pin_literal(pin: CanonicalType, literal: &SqlValue) -> PinLiteral {
         // A BOOLEAN column meeting a number casts ITSELF to the number,
         // so the three numeric pins take a numeric literal alike.
         (
-            CanonicalType::BigInt | CanonicalType::Double | CanonicalType::Boolean,
+            CanonicalType::BigInt
+            | CanonicalType::Double
+            | CanonicalType::Boolean
+            | CanonicalType::Severity,
             SqlValue::Int(i),
         ) => PinLiteral::Int(*i),
         (
-            CanonicalType::BigInt | CanonicalType::Double | CanonicalType::Boolean,
+            CanonicalType::BigInt
+            | CanonicalType::Double
+            | CanonicalType::Boolean
+            | CanonicalType::Severity,
             SqlValue::Float(f),
         ) => PinLiteral::Double(*f),
         // A BOOLEAN column casts a string literal through the WIDE
@@ -317,6 +338,21 @@ pub(crate) fn compare_values(
                 NullReadPolicy::Unknown => None,
             },
         },
+        // The SEVERITY band rung: `col BETWEEN lo AND hi` over the
+        // conformed reading. A value the ladder guard nulled answers as a
+        // stored NULL does — the caller's lane decides `!=`.
+        CoercedValue::SeverityBand { lo, hi } => {
+            match conformed_reading(event_val, CanonicalType::Severity) {
+                Some(Conformed::Severity(n)) => {
+                    let inside = n >= *lo && n <= *hi;
+                    Some(if op == CompareOp::Ne { !inside } else { inside })
+                }
+                _ => match null_read {
+                    NullReadPolicy::NeMatches => (op == CompareOp::Ne).then_some(true),
+                    NullReadPolicy::Unknown => None,
+                },
+            }
+        }
         // The two-armed equality rung. The wire text is only the stored
         // text when `read_json` did not widen the column, so the numeric
         // reading carries the cases where it did (`200` stored `"200.0"`).
@@ -375,17 +411,24 @@ enum Conformed {
     Double(f64),
     Bool(bool),
     Time(compare::Instant),
+    /// A `SeverityNumber` in 1-24 (ADR-0013): stored as a `BIGINT`, but
+    /// rendered as its `OTel` short name.
+    Severity(u8),
 }
 
 impl Conformed {
     /// The conformed value's own text — `CAST(col AS VARCHAR)` on the SQL
-    /// side for the three scalar pins, `strftime` for TIMESTAMP.
+    /// side for the three scalar pins, `strftime` for TIMESTAMP, the
+    /// `OTel` short-name table for SEVERITY.
     fn text(self) -> String {
         match self {
             Self::Int(i) => i.to_string(),
             Self::Double(d) => compare::canonical_double_text(d),
             Self::Bool(b) => b.to_string(),
             Self::Time(t) => t.pattern_text(),
+            Self::Severity(n) => crate::severity::otel_name(n)
+                .expect("a conformed severity is in the ladder")
+                .to_owned(),
         }
     }
 }
@@ -452,6 +495,19 @@ fn conformed_reading(v: &Value, pin: CanonicalType) -> Option<Conformed> {
             _ => None,
         }
         .map(Conformed::Time),
+        // The SEVERITY pin is the BIGINT reading inside the 1-24 ladder
+        // guard — a number outside it conforms to NULL, exactly as the
+        // corpus holds it.
+        CanonicalType::Severity => match v {
+            Value::Number(n) => n
+                .as_i64()
+                .map(|i| i.to_string())
+                .or_else(|| n.as_f64().map(compare::canonical_double_text))
+                .and_then(|t| compare::conformed_severity(&t)),
+            Value::String(s) => compare::conformed_severity(s),
+            _ => None,
+        }
+        .map(Conformed::Severity),
         // The VARCHAR pin has no conform — its comparisons take the text
         // rules and its patterns match the column directly.
         CanonicalType::Varchar => None,
@@ -477,6 +533,14 @@ fn compare_conformed(reading: Conformed, op: CompareOp, literal: PinLiteral) -> 
             Some(apply_f64(f64::from(u8::from(value)), lit, op))
         }
         (Conformed::Time(value), PinLiteral::Time(lit)) => Some(apply_ord(value.cmp(&lit), op)),
+        // A SEVERITY column is a BIGINT to every comparison; only its
+        // TEXT rendering is special.
+        (Conformed::Severity(value), PinLiteral::Int(lit)) => {
+            Some(apply_ord(i64::from(value).cmp(&lit), op))
+        }
+        (Conformed::Severity(value), PinLiteral::Double(lit)) => {
+            Some(apply_f64(f64::from(value), lit, op))
+        }
         (_, PinLiteral::Unreadable) => None,
         (_, _) => {
             debug_assert!(false, "pin_literal resolves a literal per pin");
@@ -507,6 +571,7 @@ pub(crate) fn pattern_text(v: &Value, form: PatternForm) -> Option<String> {
         PatternForm::DoubleText => CanonicalType::Double,
         PatternForm::BooleanText => CanonicalType::Boolean,
         PatternForm::Rfc3339Text => CanonicalType::Timestamp,
+        PatternForm::SeverityText => CanonicalType::Severity,
     };
     conformed_reading(v, pin).map(Conformed::text)
 }

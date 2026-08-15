@@ -66,7 +66,7 @@ mod tests {
                 CompletedQuerySnapshot {
                     id: 1247,
                     user: "admin".into(),
-                    query: "level=error last=1h | stats count() by service".into(),
+                    query: "_severity=error last=1h | stats count() by service".into(),
                     duration_ms: 23,
                     rows: Some(142),
                     error: None,

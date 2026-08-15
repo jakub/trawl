@@ -178,7 +178,7 @@ fn extract_field_order(query: &str) -> Vec<String> {
             return t
                 .fields
                 .iter()
-                .map(|f| trawl_core::emitter::map_field_name(f).to_string())
+                .map(std::string::ToString::to_string)
                 .collect();
         }
     }
@@ -199,5 +199,44 @@ fn apply_tz_to_event(event: &mut serde_json::Map<String, serde_json::Value>, utc
             let converted = trawl_engine::timezone::reformat_rfc3339(ts, utc_offset_secs);
             event.insert((*key).to_owned(), serde_json::Value::String(converted));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_field_order;
+
+    /// Zero-alias contract (ADR-0013): the live column order carries the user's
+    /// own spellings verbatim. A re-added alias mapping would make `table
+    /// timestamp` consume `_time` here while the batch lane stayed green.
+    #[test]
+    fn table_field_names_are_verbatim_and_distinct() {
+        assert_eq!(extract_field_order("* | table _time"), vec!["_time"]);
+        assert_eq!(
+            extract_field_order("* | table timestamp"),
+            vec!["timestamp"]
+        );
+        assert_eq!(
+            extract_field_order("* | table @timestamp"),
+            vec!["@timestamp"]
+        );
+    }
+
+    #[test]
+    fn table_field_order_follows_the_user() {
+        assert_eq!(
+            extract_field_order("* | table timestamp, _time, host"),
+            vec!["timestamp", "_time", "host"]
+        );
+        assert_eq!(
+            extract_field_order("* | table host, _time, timestamp"),
+            vec!["host", "_time", "timestamp"]
+        );
+    }
+
+    #[test]
+    fn no_table_stage_or_unparseable_query_yields_no_order() {
+        assert!(extract_field_order("* | head 5").is_empty());
+        assert!(extract_field_order("| | |").is_empty());
     }
 }

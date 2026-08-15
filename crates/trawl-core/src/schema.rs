@@ -2,12 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The declared event envelope (ADR-0009): field names, reserved keys, and
-//! wire aliases.
+//! The declared event envelope (ADR-0009, reshaped by ADR-0013): field
+//! names, the sealed namespace predicate, and the derivation source list.
 //!
-//! Namespace rule: `_` marks metadata about the record's handling; no prefix
-//! means data about the event. `severity` is server-derived but carries no
-//! prefix because it is content.
+//! Namespace rule, one sentence: **underscore-prefixed names are trawl's
+//! contract slots** — trawl guarantees their semantics, the sender may
+//! propose some (`_time`, `_raw`), trawl derives the rest — and **bare
+//! names are sender vocabulary trawl never assigns meaning to**. The
+//! `_` prefix is sealed as a PREDICATE ([`is_reserved_name`]), not an
+//! enumerated list, so the envelope can grow without a corpus already
+//! holding a client's colliding key.
 
 use std::fmt;
 
@@ -25,10 +29,12 @@ pub const ENV: &str = "env";
 pub const SERVICE: &str = "service";
 /// Origin host (VARCHAR, required; column, not a path segment).
 pub const HOST: &str = "host";
-/// `OTel` `SeverityNumber` 1-24 (INTEGER, derived).
-pub const SEVERITY: &str = "severity";
-/// Original severity text, verbatim (VARCHAR, optional).
-pub const SEVERITY_TEXT: &str = "severity_text";
+/// The derived `OTel` `SeverityNumber` 1-24 (SEVERITY over BIGINT).
+///
+/// DERIVATION-ONLY (ADR-0013 §3): it is a verdict, not a proposal, so an
+/// incoming `_severity` takes the standard reserved-prefix strip and
+/// lands as a bare `severity` — which derivation then reads.
+pub const SEVERITY: &str = "_severity";
 /// The important part of the line (VARCHAR, by convention).
 pub const MESSAGE: &str = "message";
 
@@ -37,12 +43,6 @@ pub const MESSAGE: &str = "message";
 /// a second TIMESTAMP column left VARCHAR on the hot side trips the
 /// union-conflict path on every query with a non-empty hot buffer.
 pub const TIMESTAMP_COLUMNS: &[&str] = &[TIME, INGESTED];
-
-/// Server-owned metadata a client may never set. A client-sent value is
-/// dropped and replaced, recorded with the `meta.stripped` repair code —
-/// silently honouring it would let a sender forge its own handling history.
-/// (`_raw` is also server-owned when the client value is not a string.)
-pub const RESERVED_CLIENT_FIELDS: &[&str] = &[INGESTED, REPAIRS];
 
 /// Maximum length (bytes) of a field name trawl will store.
 ///
@@ -63,35 +63,43 @@ pub fn is_storable_field_name(name: &str) -> bool {
 }
 
 /// Leading well-known columns for result reordering, in display order.
-pub const LEADING_LOG_FIELDS: &[&str] =
-    &[TIME, ENV, SERVICE, HOST, SEVERITY, SEVERITY_TEXT, MESSAGE];
+pub const LEADING_LOG_FIELDS: &[&str] = &[TIME, ENV, SERVICE, HOST, SEVERITY, MESSAGE];
 
 /// Trailing columns demoted to the end of result reordering.
 pub const TRAILING_LOG_FIELDS: &[&str] = &[RAW, INGESTED, REPAIRS];
 
-/// Resolve a wire-format alias for the event-time input at ingest.
-///
-/// Clients may send `timestamp` or `@timestamp` (the DSL aliases them to
-/// `_time` identically); none of the aliases are stored as columns — the
-/// canonical value lands in `_time`.
-pub fn is_time_alias(key: &str) -> bool {
-    matches!(key, "timestamp" | "@timestamp" | "_time")
-}
-
-/// Wire keys consumed as the `_time` input, in precedence order.
+/// Wire keys read as the `_time` derivation's sources, in precedence
+/// order (ADR-0013 §2). Ingest OBSERVES these: the alias sources are
+/// stored verbatim as ordinary columns, and only `_time` itself — the
+/// proposal slot — is consumed and canonicalized.
 pub const TIME_ALIASES: &[&str] = &[TIME, "timestamp", "@timestamp"];
 
-/// The DSL-side alias resolution: `timestamp` and `@timestamp` resolve to
-/// the physical `_time` column.
-pub fn resolve_field_alias(name: &str) -> &str {
-    match name {
-        "timestamp" | "@timestamp" => TIME,
-        other => other,
-    }
+/// Whether a name belongs to trawl's contract namespace (ADR-0013 §1).
+///
+/// The ENTIRE `_` prefix is sealed — a predicate, not an enumerated list
+/// — so the envelope can grow without a corpus already holding a client's
+/// colliding key. Both doors enforce it from here: ingest strips the
+/// prefix off an incoming `_x` and stores the value under the bare
+/// remainder, and the pipeline refuses to MINT one (`let _foo`,
+/// `rename x as _foo`, `extract (?P<_foo>…)`).
+#[must_use]
+pub fn is_reserved_name(name: &str) -> bool {
+    name.starts_with('_')
 }
 
-/// The catalog spelling of a DSL field reference: resolve the time aliases,
-/// then ASCII-lowercase (ADR-0011 slice A).
+/// The one refusal text every pipeline write position shares, so the SQL
+/// lane and the streaming lane state the same rule in the same words.
+#[must_use]
+pub fn reserved_name_message(what: &str, name: &str) -> String {
+    format!(
+        "{what} '{name}' is in trawl's reserved namespace — names \
+         starting with '_' are trawl's contract slots and only trawl \
+         writes them (ADR-0013); choose a name without the underscore"
+    )
+}
+
+/// The catalog spelling of a DSL field reference: an ASCII fold, and
+/// nothing else (ADR-0013 §6 — the DSL has zero aliases).
 ///
 /// Catalog names are ASCII-folded at every producer's door (ingest, boot
 /// seeding, compaction proposals), and `DuckDB` folds identifiers over
@@ -102,7 +110,7 @@ pub fn resolve_field_alias(name: &str) -> &str {
 /// identifier folding.
 #[must_use]
 pub fn catalog_key(dsl_name: &str) -> String {
-    resolve_field_alias(dsl_name).to_ascii_lowercase()
+    dsl_name.to_ascii_lowercase()
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +123,13 @@ pub fn catalog_key(dsl_name: &str) -> String {
 // (JSON snapshot) side of the hot+cold union to the parquet side at emit
 // time, with no read-time reconciliation left to do.
 
-/// The five canonical storage types a field can be pinned to.
+/// The canonical storage types a field can be pinned to.
+///
+/// Five are physical types; [`Self::Severity`] is a SEMANTIC type over the
+/// physical `BIGINT` (ADR-0013): the pin is what gives `_severity` its
+/// token vocabulary in the ADR-0011 comparison rule table, and it is
+/// reachable only from the declared envelope seed — `DESCRIBE` never says
+/// `SEVERITY`, so inference cannot mint it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CanonicalType {
     /// `BOOLEAN` on disk.
@@ -128,25 +142,32 @@ pub enum CanonicalType {
     Timestamp,
     /// `VARCHAR` on disk — the honest fallback for everything else.
     Varchar,
+    /// The `OTel` `SeverityNumber` ladder, `BIGINT` on disk and bounded to
+    /// 1-24 by its conform rung (ADR-0013). Only `_severity` carries it.
+    Severity,
 }
 
 impl CanonicalType {
-    /// The exact `DuckDB` type spelling this canonical type is stored as
-    /// (also the spelling persisted in the catalog's `duckdb_type` column).
+    /// The PHYSICAL `DuckDB` type spelling — what a cast, a `DESCRIBE`
+    /// comparison, a repin rewrite and the hot branch's `REPLACE` all
+    /// name. NOT injective: `SEVERITY` is a `BIGINT` on disk.
     #[must_use]
     pub const fn as_duckdb(self) -> &'static str {
         match self {
             Self::Boolean => "BOOLEAN",
-            Self::BigInt => "BIGINT",
+            Self::BigInt | Self::Severity => "BIGINT",
             Self::Double => "DOUBLE",
             Self::Timestamp => "TIMESTAMP",
             Self::Varchar => "VARCHAR",
         }
     }
 
-    /// Parse the catalog's stored spelling back into the enum. EXACT match
-    /// only — the catalog is written by code, so any other spelling is
-    /// corruption and must surface, not be guessed at.
+    /// Parse a PHYSICAL spelling back into the enum. EXACT match only.
+    ///
+    /// `BIGINT` resolves to [`Self::BigInt`] and nothing resolves to
+    /// [`Self::Severity`] — the semantic pin has no physical spelling of
+    /// its own, which is exactly what keeps `repin --to severity` (slice
+    /// 2) out of the operator surface for now.
     #[must_use]
     pub fn from_duckdb(s: &str) -> Option<Self> {
         match s {
@@ -158,11 +179,33 @@ impl CanonicalType {
             _ => None,
         }
     }
+
+    /// The CATALOG spelling: what postgres stores in `field_types` and
+    /// what every schema wire surface carries. Injective, so a pin can be
+    /// read back exactly as it was written.
+    #[must_use]
+    pub const fn as_catalog(self) -> &'static str {
+        match self {
+            Self::Severity => "SEVERITY",
+            other => other.as_duckdb(),
+        }
+    }
+
+    /// Parse the catalog's stored spelling back into the enum. EXACT match
+    /// only — the catalog is written by code, so any other spelling is
+    /// corruption and must surface, not be guessed at.
+    #[must_use]
+    pub fn from_catalog(s: &str) -> Option<Self> {
+        match s {
+            "SEVERITY" => Some(Self::Severity),
+            other => Self::from_duckdb(other),
+        }
+    }
 }
 
 impl fmt::Display for CanonicalType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_duckdb())
+        f.write_str(self.as_catalog())
     }
 }
 
@@ -228,11 +271,10 @@ pub const ENVELOPE_TYPES: &[(&str, CanonicalType)] = &[
     (INGESTED, CanonicalType::Timestamp),
     (RAW, CanonicalType::Varchar),
     (REPAIRS, CanonicalType::Varchar),
+    (SEVERITY, CanonicalType::Severity),
     (ENV, CanonicalType::Varchar),
     (SERVICE, CanonicalType::Varchar),
     (HOST, CanonicalType::Varchar),
-    (SEVERITY, CanonicalType::BigInt),
-    (SEVERITY_TEXT, CanonicalType::Varchar),
     (MESSAGE, CanonicalType::Varchar),
 ];
 
@@ -326,12 +368,34 @@ impl FieldTypes {
 mod tests {
     use super::*;
 
+    /// The `_` prefix is trawl's namespace, whole — a predicate, not a
+    /// list, so a slot added later cannot collide with standing data.
     #[test]
-    fn aliases_resolve_to_time() {
-        assert_eq!(resolve_field_alias("timestamp"), "_time");
-        assert_eq!(resolve_field_alias("@timestamp"), "_time");
-        assert_eq!(resolve_field_alias("_time"), "_time");
-        assert_eq!(resolve_field_alias("host"), "host");
+    fn the_underscore_prefix_is_sealed_as_a_predicate() {
+        for name in [
+            TIME,
+            INGESTED,
+            RAW,
+            REPAIRS,
+            "_severity",
+            "_anything",
+            "__name__",
+            "_",
+        ] {
+            assert!(is_reserved_name(name), "{name}");
+        }
+        for name in [
+            ENV,
+            SERVICE,
+            HOST,
+            MESSAGE,
+            "level",
+            "timestamp",
+            "severity",
+            "a_b",
+        ] {
+            assert!(!is_reserved_name(name), "{name}");
+        }
     }
 
     #[test]
@@ -351,25 +415,8 @@ mod tests {
     }
 
     #[test]
-    fn time_alias_detection() {
-        assert!(is_time_alias("timestamp"));
-        assert!(is_time_alias("@timestamp"));
-        assert!(is_time_alias("_time"));
-        assert!(!is_time_alias("time"));
-        assert!(!is_time_alias("_ingested"));
-    }
-
-    #[test]
     fn timestamp_columns_cover_time_and_ingested() {
         assert_eq!(TIMESTAMP_COLUMNS, &[TIME, INGESTED]);
-    }
-
-    #[test]
-    fn reserved_fields_are_server_owned() {
-        assert!(RESERVED_CLIENT_FIELDS.contains(&INGESTED));
-        assert!(RESERVED_CLIENT_FIELDS.contains(&REPAIRS));
-        // _raw is conditionally honoured (string values kept), so not listed.
-        assert!(!RESERVED_CLIENT_FIELDS.contains(&RAW));
     }
 
     #[test]
@@ -381,20 +428,64 @@ mod tests {
 
     // --- the field-catalog type vocabulary (ADR-0009 slice 2) ---
 
+    /// The CATALOG spelling is the injective one — it is what postgres
+    /// stores and what the wire carries, so it must round-trip for every
+    /// canonical type, `SEVERITY` included.
     #[test]
-    fn canonical_type_duckdb_spellings_round_trip() {
+    fn canonical_type_catalog_spellings_round_trip() {
         for ty in [
             CanonicalType::Boolean,
             CanonicalType::BigInt,
             CanonicalType::Double,
             CanonicalType::Timestamp,
             CanonicalType::Varchar,
+            CanonicalType::Severity,
         ] {
-            assert_eq!(CanonicalType::from_duckdb(ty.as_duckdb()), Some(ty));
+            assert_eq!(CanonicalType::from_catalog(ty.as_catalog()), Some(ty));
         }
-        assert_eq!(CanonicalType::BigInt.as_duckdb(), "BIGINT");
-        assert_eq!(CanonicalType::from_duckdb("JSON"), None);
-        assert_eq!(CanonicalType::from_duckdb("bigint"), None);
+        assert_eq!(CanonicalType::BigInt.as_catalog(), "BIGINT");
+        assert_eq!(CanonicalType::Severity.as_catalog(), "SEVERITY");
+        assert_eq!(CanonicalType::from_catalog("JSON"), None);
+        assert_eq!(CanonicalType::from_catalog("bigint"), None);
+    }
+
+    /// The PHYSICAL spelling is what casts and DDL use, and it is
+    /// deliberately NOT injective: `SEVERITY` is a BIGINT on disk, so
+    /// `from_duckdb` — the inverse of the physical spelling — cannot
+    /// name it. That is the structural reason `repin --to severity` is a
+    /// slice-2 feature rather than a live foot-gun.
+    #[test]
+    fn severity_is_physically_bigint_and_unreachable_by_physical_parse() {
+        assert_eq!(CanonicalType::Severity.as_duckdb(), "BIGINT");
+        assert_eq!(
+            CanonicalType::from_duckdb("BIGINT"),
+            Some(CanonicalType::BigInt)
+        );
+        assert_eq!(CanonicalType::from_duckdb("SEVERITY"), None);
+    }
+
+    /// `DESCRIBE` never reports SEVERITY, so inference can never pin it —
+    /// only the declared seed can.
+    #[test]
+    fn inference_can_never_pin_severity() {
+        for t in [
+            "BIGINT",
+            "SEVERITY",
+            "severity",
+            "INTEGER",
+            "VARCHAR",
+            "DOUBLE",
+            "BOOLEAN",
+            "TIMESTAMP",
+            "JSON",
+            "HUGEINT",
+        ] {
+            assert_ne!(
+                normalize_duckdb_type(t),
+                TypeResolution::Pin(CanonicalType::Severity),
+                "{t}"
+            );
+        }
     }
 
     #[test]
@@ -467,24 +558,30 @@ mod tests {
         );
     }
 
+    /// The envelope is NINE fields (ADR-0013 §1): five trawl-owned
+    /// under the `_` namespace and four sender-asserted bare ones.
+    /// `severity_text` is gone outright, and `severity` left the
+    /// envelope to become ordinary sender data.
     #[test]
-    fn envelope_types_cover_the_declared_ten() {
+    fn envelope_types_cover_the_declared_nine() {
         let fields: Vec<&str> = ENVELOPE_TYPES.iter().map(|(f, _)| *f).collect();
         assert_eq!(
             fields,
             vec![
-                TIME,
-                INGESTED,
-                RAW,
-                REPAIRS,
-                ENV,
-                SERVICE,
-                HOST,
-                SEVERITY,
-                SEVERITY_TEXT,
-                MESSAGE
+                TIME, INGESTED, RAW, REPAIRS, SEVERITY, ENV, SERVICE, HOST, MESSAGE
             ]
         );
+        assert_eq!(SEVERITY, "_severity");
+        assert!(!fields.contains(&"severity"));
+        assert!(!fields.contains(&"severity_text"));
+        // Trawl-owned names are exactly the reserved ones.
+        for f in [TIME, INGESTED, RAW, REPAIRS, SEVERITY] {
+            assert!(is_reserved_name(f), "{f} must be reserved");
+        }
+        for f in [ENV, SERVICE, HOST, MESSAGE] {
+            assert!(!is_reserved_name(f), "{f} is sender-asserted");
+        }
+
         let ty = |name: &str| {
             ENVELOPE_TYPES
                 .iter()
@@ -494,21 +591,21 @@ mod tests {
         };
         assert_eq!(ty(TIME), CanonicalType::Timestamp);
         assert_eq!(ty(INGESTED), CanonicalType::Timestamp);
-        assert_eq!(ty(SEVERITY), CanonicalType::BigInt);
-        for f in [RAW, REPAIRS, ENV, SERVICE, HOST, SEVERITY_TEXT, MESSAGE] {
+        assert_eq!(ty(SEVERITY), CanonicalType::Severity);
+        for f in [RAW, REPAIRS, ENV, SERVICE, HOST, MESSAGE] {
             assert_eq!(ty(f), CanonicalType::Varchar, "{f}");
         }
     }
 
     #[test]
-    fn catalog_key_resolves_aliases_then_folds_ascii() {
-        // Alias resolution first: the pinned column is `_time`, whatever
-        // spelling the DSL used.
-        assert_eq!(catalog_key("timestamp"), "_time");
-        assert_eq!(catalog_key("@timestamp"), "_time");
-        // ASCII fold second: catalog names are ingest-folded lowercase, so
-        // `Status` must find the `status` pin instead of silently falling
-        // back to unpinned.
+    fn catalog_key_only_folds_ascii() {
+        // ZERO aliases (ADR-0013 §6): `timestamp` is an ordinary sender
+        // field, not another spelling of `_time`.
+        assert_eq!(catalog_key("timestamp"), "timestamp");
+        assert_eq!(catalog_key("@timestamp"), "@timestamp");
+        // Catalog names are ingest-folded lowercase, so `Status` must
+        // find the `status` pin instead of silently falling back to
+        // unpinned.
         assert_eq!(catalog_key("Status"), "status");
         assert_eq!(catalog_key("DUR"), "dur");
         // Non-ASCII stays put — DuckDB folds identifiers over ASCII only.
@@ -523,8 +620,9 @@ mod tests {
         ft.insert("_time", CanonicalType::Timestamp);
         assert_eq!(ft.pin_for("status"), Some(CanonicalType::Varchar));
         assert_eq!(ft.pin_for("Status"), Some(CanonicalType::Varchar));
-        assert_eq!(ft.pin_for("timestamp"), Some(CanonicalType::Timestamp));
-        assert_eq!(ft.pin_for("@timestamp"), Some(CanonicalType::Timestamp));
+        assert_eq!(ft.pin_for("_time"), Some(CanonicalType::Timestamp));
+        assert_eq!(ft.pin_for("_TIME"), Some(CanonicalType::Timestamp));
+        assert_eq!(ft.pin_for("timestamp"), None);
         assert_eq!(ft.pin_for("unpinned"), None);
     }
 

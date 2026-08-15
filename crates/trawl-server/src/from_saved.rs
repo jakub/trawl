@@ -224,7 +224,7 @@ mod pg_tests {
         let saved_store = SavedQueryStore::new(pool.clone());
         let sched_store = ScheduleStore::new(pool.clone());
         let saved = saved_store
-            .create(key_id, name, "level=error")
+            .create(key_id, name, "_severity=error")
             .await
             .unwrap();
         sched_store
@@ -572,7 +572,7 @@ mod pg_tests {
         .await
         .unwrap();
         assert_eq!(
-            resolved.saved_dsl, "level=error",
+            resolved.saved_dsl, "_severity=error",
             "the saved query's own fields are walkable by the notice"
         );
     }

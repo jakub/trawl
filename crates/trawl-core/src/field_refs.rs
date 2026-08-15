@@ -54,19 +54,11 @@ pub fn referenced_fields_in(dsl: &str) -> BTreeSet<String> {
     crate::parser::parse(dsl).map_or_else(|_| BTreeSet::new(), |q| referenced_fields(&q))
 }
 
-/// The catalog key a DSL field reference names.
-///
-/// [`schema::catalog_key`] resolves the time aliases and folds; `level` is
-/// resolved on top of it, because the DSL's severity alias is a band
-/// predicate over the physical `severity` column and the schema module has
-/// no reason to know that.
+/// The catalog key a DSL field reference names — the ASCII fold, and
+/// nothing else. The DSL has zero aliases (ADR-0013 §6), so a reference
+/// names the column it spells.
 fn key(name: &str) -> String {
-    let key = schema::catalog_key(name);
-    if key == "level" {
-        schema::SEVERITY.to_owned()
-    } else {
-        key
-    }
+    schema::catalog_key(name)
 }
 
 fn insert(name: &str, out: &mut BTreeSet<String>) {
@@ -267,11 +259,13 @@ mod tests {
     /// DSL aliases name their physical column: the notice must speak the
     /// catalog's spelling, not the query's.
     #[test]
-    fn aliases_and_case_resolve_to_catalog_keys() {
-        assert_eq!(refs("timestamp>\"2026-01-01\""), vec!["_time"]);
-        assert_eq!(refs("* | sort -@timestamp"), vec!["_time"]);
-        assert_eq!(refs("level=error"), vec!["severity"]);
-        assert_eq!(refs("* | where level == \"error\""), vec!["severity"]);
+    fn names_fold_and_never_alias() {
+        // Zero aliases (ADR-0013 §6): each name is its own catalog key.
+        assert_eq!(refs("timestamp>\"2026-01-01\""), vec!["timestamp"]);
+        assert_eq!(refs("* | sort -@timestamp"), vec!["@timestamp"]);
+        // Zero aliases: `level` binds the sender's own `level` column.
+        assert_eq!(refs("level=error"), vec!["level"]);
+        assert_eq!(refs("* | where level == \"error\""), vec!["level"]);
         assert_eq!(refs("Status=200"), vec!["status"]);
     }
 

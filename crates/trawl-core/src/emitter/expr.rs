@@ -26,16 +26,9 @@ pub(crate) fn emit_expr(
         Expr::Literal(lit) => Ok(emit_literal(lit, state)),
         Expr::FieldRef(name) => Ok(quote_field(name)),
         Expr::Binary { lhs, op, rhs } => {
-            // `level` comparisons route through the severity band helper
-            // (ADR-0009): `where level == "error"` means the ERROR band on
-            // the numeric severity column, exactly like `level=error` in
-            // the search stage.
-            if let Some(clause) = try_level_comparison(lhs, *op, rhs)? {
-                return Ok(clause);
-            }
             // Bare field-vs-literal comparisons consult the pin scope
             // (ADR-0011 slice A′) — same rule table as the search stage.
-            if let Some(clause) = try_pinned_comparison(lhs, *op, rhs, state) {
+            if let Some(clause) = try_pinned_comparison(lhs, *op, rhs, state)? {
                 return Ok(clause);
             }
             let l = emit_expr(lhs, state)?;
@@ -96,7 +89,7 @@ pub(crate) fn emit_expr(
             // A pinned bare-field target with an all-literal list routes
             // each element through the equality rule (ADR-0011 slice A′),
             // mirroring the search stage's IN list.
-            if let Some(clause) = try_pinned_in_list(target, list, state) {
+            if let Some(clause) = try_pinned_in_list(target, list, state)? {
                 return Ok(clause);
             }
             let lhs = emit_expr(target, state)?;
@@ -189,42 +182,55 @@ fn try_pinned_comparison(
     op: BinaryOp,
     rhs: &Spanned<Expr>,
     state: &mut EmitterState,
-) -> Option<String> {
+) -> Result<Option<String>, EmitError> {
     // Pattern operators: field on the LEFT only.
     if matches!(op, BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike) {
         let Expr::FieldRef(name) = &lhs.node else {
-            return None;
+            return Ok(None);
         };
         let Expr::Literal(LiteralValue::String(pattern)) = &rhs.node else {
-            return None;
+            return Ok(None);
         };
-        let pin = state.compare_pin(name)?;
+        let Some(pin) = state.compare_pin(name) else {
+            return Ok(None);
+        };
         if compare::pattern_form(Some(pin)) == PatternForm::Native {
             // The column is already text — generic emission is
             // byte-identical, so keep it on the generic path.
-            return None;
+            return Ok(None);
         }
         let target = pattern_target(&quote_field(name), Some(pin));
         let placeholder = state.push_param(SqlValue::String(pattern.clone()));
-        return Some(match op {
+        return Ok(Some(match op {
             BinaryOp::Matches => format!("regexp_matches({target}, {placeholder})"),
             BinaryOp::Like => format!("({target} LIKE {placeholder})"),
             _ => format!("({target} ILIKE {placeholder})"),
-        });
+        }));
     }
 
-    let filter_op = comparison_filter_op(op)?;
-    let (name, filter_op, literal) = match (&lhs.node, &rhs.node) {
-        (Expr::FieldRef(name), rhs) => (name, filter_op, bare_literal(rhs)?),
-        (lhs, Expr::FieldRef(name)) => (name, flip_filter_op(filter_op), bare_literal(lhs)?),
-        _ => return None,
+    let Some(filter_op) = comparison_filter_op(op) else {
+        return Ok(None);
     };
-    let pin = state.compare_pin(name)?;
-    let form = compare::compare_form_bound(Some(pin), filter_op, &literal)?;
+    let resolved = match (&lhs.node, &rhs.node) {
+        (Expr::FieldRef(name), rhs) => bare_literal(rhs).map(|l| (name, filter_op, l)),
+        (lhs, Expr::FieldRef(name)) => {
+            bare_literal(lhs).map(|l| (name, flip_filter_op(filter_op), l))
+        }
+        _ => None,
+    };
+    let Some((name, filter_op, literal)) = resolved else {
+        return Ok(None);
+    };
+    let Some(pin) = state.compare_pin(name) else {
+        return Ok(None);
+    };
+    let Some(form) = compare::compare_form_bound(Some(pin), filter_op, &literal)? else {
+        return Ok(None);
+    };
     if matches!(form, CompareForm::Native(_)) {
         // The rule table leaves the shape literal-driven (VARCHAR pin,
         // ordered non-numeric literal) — generic emission is the rule.
-        return None;
+        return Ok(None);
     }
     let clause = comparison_sql(
         &quote_field(name),
@@ -235,11 +241,11 @@ fn try_pinned_comparison(
     );
     // Parenthesize for composition under and/or/not, matching the generic
     // emitter's style; the two-armed shapes arrive parenthesized already.
-    if clause.starts_with('(') {
-        Some(clause)
+    Ok(Some(if clause.starts_with('(') {
+        clause
     } else {
-        Some(format!("({clause})"))
-    }
+        format!("({clause})")
+    }))
 }
 
 /// Detect `field in (literal, …)` over a pinned field and emit each
@@ -249,38 +255,29 @@ fn try_pinned_in_list(
     target: &Spanned<Expr>,
     list: &[Spanned<Expr>],
     state: &mut EmitterState,
-) -> Option<String> {
-    let Expr::FieldRef(name) = &target.node else {
-        return None;
-    };
-    let pin = state.compare_pin(name)?;
-    let forms: Vec<CompareForm> = list
-        .iter()
-        .map(|item| {
-            let element = bare_literal(&item.node)?;
-            compare::compare_form_bound(Some(pin), FilterOp::Eq, &element)
-        })
-        .collect::<Option<_>>()?;
-    let clause = in_list_sql(&quote_field(name), forms, state);
-    if clause.starts_with('(') {
-        Some(clause)
-    } else {
-        Some(format!("({clause})"))
-    }
-}
-
-/// Detect `level <cmp> "token"` (either operand order) and emit the
-/// severity band predicate. Returns `Ok(None)` when the expression is not
-/// a level comparison and should take the generic path.
-fn try_level_comparison(
-    lhs: &Spanned<Expr>,
-    op: BinaryOp,
-    rhs: &Spanned<Expr>,
 ) -> Result<Option<String>, EmitError> {
-    match super::severity::as_level_comparison(lhs, op, rhs) {
-        Some((filter_op, token)) => super::severity::level_predicate(filter_op, token).map(Some),
-        None => Ok(None),
+    let Expr::FieldRef(name) = &target.node else {
+        return Ok(None);
+    };
+    let Some(pin) = state.compare_pin(name) else {
+        return Ok(None);
+    };
+    let mut forms: Vec<CompareForm> = Vec::with_capacity(list.len());
+    for item in list {
+        let Some(element) = bare_literal(&item.node) else {
+            return Ok(None);
+        };
+        let Some(form) = compare::compare_form_bound(Some(pin), FilterOp::Eq, &element)? else {
+            return Ok(None);
+        };
+        forms.push(form);
     }
+    let clause = in_list_sql(&quote_field(name), forms, state);
+    Ok(Some(if clause.starts_with('(') {
+        clause
+    } else {
+        format!("({clause})")
+    }))
 }
 
 fn emit_literal(lit: &LiteralValue, state: &mut EmitterState) -> String {

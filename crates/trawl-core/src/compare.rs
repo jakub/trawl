@@ -160,7 +160,45 @@ pub enum CompareForm {
     /// every row — the same answer on both engines, and one `NOT` cannot
     /// invert into a match.
     NumericOnText(String),
+    /// The SEVERITY pin's equality-class form for a BAND token
+    /// (ADR-0013): `_severity=error` is the whole ERROR band, `BETWEEN 17
+    /// AND 20`, and `!=` its complement — the semantics the deleted
+    /// `level=` alias carried, now riding an unforgeable name through the
+    /// pin rule table instead of a name special case.
+    SeverityBand { lo: u8, hi: u8 },
+    /// The SEVERITY pin's exact form: an integer literal, an `OTel` exact
+    /// short name (`error2` → 18), or a band token under an ORDERED
+    /// operator (`_severity>=warn` → `>= 13`).
+    SeverityExact(i64),
 }
+
+/// Why a literal cannot bind under a field's pin.
+///
+/// One variant, deliberately: the SEVERITY pin is the only one with a
+/// closed vocabulary, and every other rule table entry is total over
+/// literals by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompareError {
+    /// A `SEVERITY`-pinned comparison against a literal that names no
+    /// point on the `OTel` ladder.
+    UnknownSeverityToken { token: String },
+}
+
+impl std::fmt::Display for CompareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownSeverityToken { token } => write!(
+                f,
+                "unknown severity value '{token}' — a severity field takes a \
+                 band token ({}), an exact OTel short name (error2, warn3), \
+                 or a number on the 1-24 ladder",
+                crate::severity::CANONICAL_TOKENS.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CompareError {}
 
 /// How one glob/regex pattern binds its column.
 ///
@@ -218,6 +256,13 @@ pub enum PatternForm {
     /// DOUBLE), [`canonical_double_text`] over the value's DOUBLE reading
     /// on the live side.
     DoubleText,
+    /// The SEVERITY pin's canonical text: the `OTel` short name of the
+    /// stored number (`17` → `error`, `18` → `error2`) —
+    /// `crate::conform::severity_token_text_sql` on the SQL side,
+    /// [`crate::severity::otel_name`] over the value's
+    /// [`conformed_severity`] reading on the live side. Injective, so
+    /// `_severity=warn*` matches exactly the WARN band (13-16).
+    SeverityText,
 }
 
 /// The `DuckDB` `strftime` format producing a TIMESTAMP pin's canonical
@@ -712,8 +757,16 @@ fn fraction_micros(digits: &[u8]) -> u32 {
 /// `op` [`FilterOp::Glob`]/[`FilterOp::Regex`] never reach here (patterns
 /// resolve through [`pattern_form`]); they fall through to the native
 /// branch defensively.
-#[must_use]
-pub fn compare_form(pin: Option<CanonicalType>, op: FilterOp, literal: &str) -> CompareForm {
+///
+/// # Errors
+///
+/// [`CompareError::UnknownSeverityToken`] when a `SEVERITY`-pinned field
+/// is compared against a literal outside the ladder vocabulary.
+pub fn compare_form(
+    pin: Option<CanonicalType>,
+    op: FilterOp,
+    literal: &str,
+) -> Result<CompareForm, CompareError> {
     form_over(pin, op, literal, || coerce_filter_value(literal))
 }
 
@@ -741,12 +794,15 @@ pub fn compare_form(pin: Option<CanonicalType>, op: FilterOp, literal: &str) -> 
 ///
 /// A non-string literal binds unchanged under a typed pin (`flag == true`
 /// stays `Bool(true)`, byte-identical SQL); only the live mirror conforms.
-#[must_use]
+///
+/// # Errors
+///
+/// [`CompareError::UnknownSeverityToken`], exactly as [`compare_form`].
 pub fn compare_form_bound(
     pin: Option<CanonicalType>,
     op: FilterOp,
     literal: &LiteralValue,
-) -> Option<CompareForm> {
+) -> Result<Option<CompareForm>, CompareError> {
     // (the text every VARCHAR-pin rule reads — the same text the search
     // stage would have carried for this literal — and the value the
     // native/typed branches bind)
@@ -755,9 +811,9 @@ pub fn compare_form_bound(
         LiteralValue::Int(i) => (i.to_string(), SqlValue::Int(*i)),
         LiteralValue::Float(f) => (f.text().to_owned(), SqlValue::Float(f.value())),
         LiteralValue::Bool(b) => (b.to_string(), SqlValue::Bool(*b)),
-        LiteralValue::Null => return None,
+        LiteralValue::Null => return Ok(None),
     };
-    Some(form_over(pin, op, &text, || native))
+    form_over(pin, op, &text, || native).map(Some)
 }
 
 /// The one rule table behind both doors: `text` is the literal's content,
@@ -767,20 +823,22 @@ fn form_over(
     op: FilterOp,
     text: &str,
     native: impl FnOnce() -> SqlValue,
-) -> CompareForm {
+) -> Result<CompareForm, CompareError> {
     match pin {
-        None => return CompareForm::Native(native()),
+        None => return Ok(CompareForm::Native(native())),
+        // The one pin with a closed literal vocabulary (ADR-0013).
+        Some(CanonicalType::Severity) => return severity_form(op, text, native),
         // A typed pin binds the same literal and emits the same SQL; only
         // the live mirror changes, because only it has to conform first.
         Some(typed) if typed != CanonicalType::Varchar => {
-            return CompareForm::Conformed {
+            return Ok(CompareForm::Conformed {
                 pin: typed,
                 literal: native(),
-            };
+            });
         }
         Some(_) => {}
     }
-    match op {
+    Ok(match op {
         FilterOp::Eq | FilterOp::Ne if is_numeric_literal(text) => {
             CompareForm::TextOrNumeric(text.to_owned())
         }
@@ -794,7 +852,54 @@ fn form_over(
         | FilterOp::Lte
         | FilterOp::Glob
         | FilterOp::Regex => CompareForm::Native(native()),
+    })
+}
+
+/// The SEVERITY pin's rung (ADR-0013 §6), resolved in ONE order so every
+/// lane reads the same answer:
+///
+/// 1. an INTEGER binds exactly, unclamped — `_severity>0` is "carries a
+///    severity at all" and `_severity=99` honestly matches nothing (the
+///    conform rung means no stored value is outside 1-24);
+/// 2. a BAND token ([`crate::severity::number_for_token`], the ADR-0009
+///    table with its aliases) is the band under `=`/`!=`/IN and the
+///    token's own number under an ordered operator — `_severity=error`
+///    is `BETWEEN 17 AND 20`, `_severity>=warn` is `>= 13`;
+/// 3. an `OTel` EXACT short name ([`crate::severity::number_for_exact`])
+///    is that exact number, whatever the operator — `error2` is 18. The
+///    band table is consulted first, so the bare base names (`error`,
+///    `warn`) keep their band meaning;
+/// 4. anything else — a word outside the vocabulary, a float, a boolean —
+///    is an error naming the vocabulary, never a filter that quietly
+///    matches nothing.
+///
+/// Glob and regex never reach here (they resolve through
+/// [`pattern_form`]); the defensive arm keeps them literal-driven.
+fn severity_form(
+    op: FilterOp,
+    text: &str,
+    native: impl FnOnce() -> SqlValue,
+) -> Result<CompareForm, CompareError> {
+    if matches!(op, FilterOp::Glob | FilterOp::Regex) {
+        return Ok(CompareForm::Native(native()));
     }
+    if let Ok(n) = text.trim().parse::<i64>() {
+        return Ok(CompareForm::SeverityExact(n));
+    }
+    let equality = matches!(op, FilterOp::Eq | FilterOp::Ne);
+    if let Some(number) = crate::severity::number_for_token(text.trim()) {
+        if equality {
+            let (lo, hi) = crate::severity::band_of(number).expect("table numbers are in-ladder");
+            return Ok(CompareForm::SeverityBand { lo, hi });
+        }
+        return Ok(CompareForm::SeverityExact(i64::from(number)));
+    }
+    if let Some(number) = crate::severity::number_for_exact(text.trim()) {
+        return Ok(CompareForm::SeverityExact(i64::from(number)));
+    }
+    Err(CompareError::UnknownSeverityToken {
+        token: text.to_owned(),
+    })
 }
 
 /// Resolve the binding for a glob/regex pattern under the field's pin.
@@ -811,7 +916,21 @@ pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
         Some(CanonicalType::Double) => PatternForm::DoubleText,
         Some(CanonicalType::BigInt) => PatternForm::BigIntText,
         Some(CanonicalType::Boolean) => PatternForm::BooleanText,
+        Some(CanonicalType::Severity) => PatternForm::SeverityText,
     }
+}
+
+/// The `SeverityNumber` a SEVERITY-pinned column CONFORMS a stored text to
+/// — the live mirror of [`crate::conform::guarded_cast`]'s SEVERITY rung,
+/// which is the guarded BIGINT cast inside a 1-24 ladder guard.
+///
+/// A number outside the ladder is not a severity, so it has no reading at
+/// all: the column holds NULL and the value stays in `_raw`.
+#[must_use]
+pub fn conformed_severity(text: &str) -> Option<u8> {
+    conformed_bigint(text)
+        .filter(|n| crate::severity::is_valid_number(*n))
+        .and_then(|n| u8::try_from(n).ok())
 }
 
 /// The BIGINT a BIGINT-pinned column CONFORMS a stored text to — the live
@@ -1262,6 +1381,21 @@ fn is_numeric_literal(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The two doors, unwrapped: every case in this module binds a
+    /// literal the rule table accepts, so the fallible signature is noise
+    /// here. The refusal path has its own tests below.
+    fn compare_form(pin: Option<CanonicalType>, op: FilterOp, literal: &str) -> CompareForm {
+        super::compare_form(pin, op, literal).expect("literal binds under the pin")
+    }
+
+    fn compare_form_bound(
+        pin: Option<CanonicalType>,
+        op: FilterOp,
+        literal: &LiteralValue,
+    ) -> Option<CompareForm> {
+        super::compare_form_bound(pin, op, literal).expect("literal binds under the pin")
+    }
+
     const ORDERED: [FilterOp; 4] = [FilterOp::Gt, FilterOp::Gte, FilterOp::Lt, FilterOp::Lte];
     const EQ_CLASS: [FilterOp; 2] = [FilterOp::Eq, FilterOp::Ne];
     const TYPED_PINS: [CanonicalType; 4] = [
@@ -1627,6 +1761,132 @@ mod tests {
         }
     }
 
+    // --- the SEVERITY pin (ADR-0013) ---
+
+    /// The equality class takes the BAND, ordered operators take the
+    /// token's own number — the semantics the deleted `level=` alias
+    /// carried, now bound by the pin instead of by a name.
+    #[test]
+    fn severity_band_tokens_bind_bands_for_equality_and_numbers_for_ordering() {
+        let sev = Some(CanonicalType::Severity);
+        for op in EQ_CLASS {
+            assert_eq!(
+                compare_form(sev, op, "error"),
+                CompareForm::SeverityBand { lo: 17, hi: 20 },
+                "{op:?}"
+            );
+        }
+        // Aliases and case-insensitivity ride the ADR-0009 token table.
+        assert_eq!(
+            compare_form(sev, FilterOp::Eq, "ERR"),
+            CompareForm::SeverityBand { lo: 17, hi: 20 }
+        );
+        assert_eq!(
+            compare_form(sev, FilterOp::Eq, "notice"),
+            CompareForm::SeverityBand { lo: 9, hi: 12 }
+        );
+        for op in ORDERED {
+            assert_eq!(
+                compare_form(sev, op, "warn"),
+                CompareForm::SeverityExact(13),
+                "{op:?}"
+            );
+        }
+    }
+
+    /// The `OTel` exact short names name ONE number, under every
+    /// operator — the band table is consulted first, so the bare base
+    /// names keep their band meaning.
+    #[test]
+    fn severity_exact_names_and_integers_bind_exactly() {
+        let sev = Some(CanonicalType::Severity);
+        for op in EQ_CLASS.into_iter().chain(ORDERED) {
+            assert_eq!(
+                compare_form(sev, op, "error2"),
+                CompareForm::SeverityExact(18),
+                "{op:?}"
+            );
+            assert_eq!(
+                compare_form(sev, op, "17"),
+                CompareForm::SeverityExact(17),
+                "{op:?}"
+            );
+        }
+        // Unclamped: `_severity>0` is "carries a severity at all", and an
+        // out-of-ladder equality honestly matches nothing.
+        assert_eq!(
+            compare_form(sev, FilterOp::Gt, "0"),
+            CompareForm::SeverityExact(0)
+        );
+        assert_eq!(
+            compare_form(sev, FilterOp::Eq, "99"),
+            CompareForm::SeverityExact(99)
+        );
+    }
+
+    /// Anything outside the vocabulary is an ERROR naming it — never a
+    /// filter that quietly matches nothing.
+    #[test]
+    fn severity_refuses_literals_outside_the_ladder_vocabulary() {
+        let sev = Some(CanonicalType::Severity);
+        for literal in ["spicy", "gold", "1.5", "true", "error5", ""] {
+            let err =
+                super::compare_form(sev, FilterOp::Eq, literal).expect_err("must refuse {literal}");
+            assert_eq!(
+                err,
+                CompareError::UnknownSeverityToken {
+                    token: literal.to_owned()
+                }
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("error"),
+                "message must name the vocabulary: {msg}"
+            );
+            assert!(msg.contains("1-24"), "message must name the ladder: {msg}");
+        }
+        // The pipeline door refuses the same shapes, including a float
+        // and a boolean the search stage can only spell as text.
+        for literal in [
+            LiteralValue::String("spicy".into()),
+            LiteralValue::Bool(true),
+            LiteralValue::Float(crate::ast::FloatLiteral::new(1.5, "1.5")),
+        ] {
+            assert!(
+                super::compare_form_bound(sev, FilterOp::Eq, &literal).is_err(),
+                "{literal:?} must refuse"
+            );
+        }
+        // `== null` still declines rather than erroring.
+        assert_eq!(
+            super::compare_form_bound(sev, FilterOp::Eq, &LiteralValue::Null),
+            Ok(None)
+        );
+    }
+
+    /// Both doors agree, literal for literal — the property that keeps
+    /// `_severity=error` and `| where _severity == "error"` one rule.
+    #[test]
+    fn severity_doors_agree() {
+        let sev = Some(CanonicalType::Severity);
+        for literal in ["error", "error2", "17", "warn"] {
+            for op in EQ_CLASS.into_iter().chain(ORDERED) {
+                let bound =
+                    super::compare_form_bound(sev, op, &LiteralValue::String(literal.to_owned()))
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(compare_form(sev, op, literal), bound, "{literal} {op:?}");
+            }
+        }
+        // An integer literal binds identically whichever door spelled it.
+        assert_eq!(
+            super::compare_form_bound(sev, FilterOp::Gte, &LiteralValue::Int(13))
+                .unwrap()
+                .unwrap(),
+            compare_form(sev, FilterOp::Gte, "13")
+        );
+    }
+
     /// Every typed pin gets its OWN pattern text — none of them can share
     /// "stringify the wire value", because each conforms values the wire
     /// spells differently (`"0404"` → 404, `"TRUE"` → true, `200` → 200.0,
@@ -1639,6 +1899,7 @@ mod tests {
                 CanonicalType::Double => PatternForm::DoubleText,
                 CanonicalType::BigInt => PatternForm::BigIntText,
                 CanonicalType::Boolean => PatternForm::BooleanText,
+                CanonicalType::Severity => PatternForm::SeverityText,
                 CanonicalType::Varchar => unreachable!("not a typed pin"),
             };
             assert_eq!(pattern_form(Some(pin)), expected, "{pin:?}");

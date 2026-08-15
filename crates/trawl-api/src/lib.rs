@@ -1565,7 +1565,7 @@ mod tests {
     #[test]
     fn query_request_roundtrip() {
         let req = QueryRequest {
-            query: "level=error | stats count()".into(),
+            query: "_severity=error | stats count()".into(),
             limit: Some(100),
             offset: None,
             timezone: None,
@@ -1904,7 +1904,7 @@ mod tests {
             recent_queries: vec![CompletedQuerySnapshot {
                 id: 1,
                 user: "admin".into(),
-                query: "level=error".into(),
+                query: "_severity=error".into(),
                 duration_ms: 23,
                 rows: Some(42),
                 error: None,

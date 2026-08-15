@@ -217,7 +217,9 @@ fn disk_pressure_sweep(
     // date dirs cannot reclaim it, so an unattended loop would destroy
     // every non-today partition and remain under threshold. Refuse to
     // delete anything under pressure while it exists, and say why.
-    let set_aside = crate::epoch::set_aside_path(data_dir);
+    // Either set-aside suppresses the sweep: an install can hold one
+    // from each epoch bump, and trawl deletes neither.
+    let set_asides = crate::epoch::set_aside_paths(data_dir);
 
     loop {
         let available =
@@ -227,7 +229,7 @@ fn disk_pressure_sweep(
             break;
         }
 
-        if set_aside.exists() {
+        if let Some(set_aside) = set_asides.iter().find(|p| p.exists()) {
             tracing::warn!(
                 event_type = "retention_disk_pressure_suppressed",
                 available_bytes = available,
@@ -592,28 +594,51 @@ mod tests {
         assert!(newest.exists(), "newest should survive");
     }
 
+    /// Every suffix `epoch::set_aside_paths` reports suppresses the sweep —
+    /// alone and coexisting. A check narrowed back to one suffix would let
+    /// pressure retention delete live partitions beside the other set-aside.
+    fn set_aside_suffix_cases() -> Vec<Vec<&'static str>> {
+        use crate::epoch::{EPOCH_3_SET_ASIDE_SUFFIX, SET_ASIDE_SUFFIX};
+        vec![
+            vec![SET_ASIDE_SUFFIX],
+            vec![EPOCH_3_SET_ASIDE_SUFFIX],
+            vec![SET_ASIDE_SUFFIX, EPOCH_3_SET_ASIDE_SUFFIX],
+        ]
+    }
+
     #[test]
     fn disk_pressure_suppressed_while_set_aside_exists() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        // The set-aside root is a sibling of `data/` — invisible to the
-        // candidate scan, but it owns the disk the threshold measures.
-        std::fs::create_dir_all(tmp.path().join("data.pre-schema-v2/2025-01-01")).unwrap();
+        for suffixes in set_aside_suffix_cases() {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().join("data");
+            // The set-aside root is a sibling of `data/` — invisible to the
+            // candidate scan, but it owns the disk the threshold measures.
+            for suffix in &suffixes {
+                std::fs::create_dir_all(tmp.path().join(format!("data{suffix}/2025-01-01")))
+                    .unwrap();
+            }
 
-        let oldest = data_dir.join("prod/2026-01-01");
-        let newest = data_dir.join("prod/2026-02-01");
-        for dir in [&oldest, &newest] {
-            std::fs::create_dir_all(dir).unwrap();
-            std::fs::write(dir.join("data.parquet"), b"some data").unwrap();
+            let oldest = data_dir.join("prod/2026-01-01");
+            let newest = data_dir.join("prod/2026-02-01");
+            for dir in [&oldest, &newest] {
+                std::fs::create_dir_all(dir).unwrap();
+                std::fs::write(dir.join("data.parquet"), b"some data").unwrap();
+            }
+
+            // Permanently below threshold: without suppression this loop would
+            // delete every candidate and still report zero remaining dirs.
+            let config = make_config(0, 1_000_000);
+            retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
+
+            assert!(
+                oldest.exists(),
+                "no deletion while the set-aside exists ({suffixes:?})"
+            );
+            assert!(
+                newest.exists(),
+                "no deletion while the set-aside exists ({suffixes:?})"
+            );
         }
-
-        // Permanently below threshold: without suppression this loop would
-        // delete every candidate and still report zero remaining dirs.
-        let config = make_config(0, 1_000_000);
-        retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
-
-        assert!(oldest.exists(), "no deletion while the set-aside exists");
-        assert!(newest.exists(), "no deletion while the set-aside exists");
     }
 
     #[test]
@@ -644,21 +669,28 @@ mod tests {
         let today = chrono::Utc::now().date_naive();
         let old_date = today - chrono::Duration::days(200);
 
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(tmp.path().join("data.pre-schema-v2")).unwrap();
-        let old_dir = data_dir
-            .join("prod")
-            .join(old_date.format("%Y-%m-%d").to_string());
-        std::fs::create_dir_all(&old_dir).unwrap();
-        std::fs::write(old_dir.join("test.parquet"), b"old data").unwrap();
+        for suffixes in set_aside_suffix_cases() {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().join("data");
+            for suffix in &suffixes {
+                std::fs::create_dir_all(tmp.path().join(format!("data{suffix}"))).unwrap();
+            }
+            let old_dir = data_dir
+                .join("prod")
+                .join(old_date.format("%Y-%m-%d").to_string());
+            std::fs::create_dir_all(&old_dir).unwrap();
+            std::fs::write(old_dir.join("test.parquet"), b"old data").unwrap();
 
-        // The set-aside only gates disk-pressure deletion; the operator's
-        // explicit age policy is unaffected.
-        let config = make_config(90, 1_000_000);
-        retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
+            // The set-aside only gates disk-pressure deletion; the operator's
+            // explicit age policy is unaffected.
+            let config = make_config(90, 1_000_000);
+            retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
 
-        assert!(!old_dir.exists(), "age-based retention still applies");
+            assert!(
+                !old_dir.exists(),
+                "age-based retention still applies ({suffixes:?})"
+            );
+        }
     }
 
     /// ADR-0011 slice B: while a repin job exists on this root — marker,

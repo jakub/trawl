@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn render_with_query_text() {
         let mut app = test_app();
-        for ch in "level=error".chars() {
+        for ch in "_severity=error".chars() {
             app.active_tab_mut().editor.insert_char(ch);
         }
         let backend = TestBackend::new(80, 24);
@@ -283,6 +283,53 @@ mod tests {
         app.tab.result = Some(response);
         app.tab.status = TabStatus::Success { duration_ms: 42 };
         let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// The TUI transcript for ADR-0013 §9: a `_severity` column renders
+    /// its `OTel` token (`17` → `error`, `18` → `error2`), injectively, and
+    /// an out-of-ladder value shows itself rather than a guess.
+    #[test]
+    fn render_with_severity_tokens() {
+        let mut app = test_app();
+        let response = make_query_response(
+            vec!["_time", "service", "_severity", "level", "message"],
+            vec![
+                vec![
+                    Value::String("2026-01-15T10:00:00Z".into()),
+                    Value::String("nginx".into()),
+                    Value::Integer(17),
+                    Value::String("error".into()),
+                    Value::String("bad gateway".into()),
+                ],
+                vec![
+                    Value::String("2026-01-15T10:00:01Z".into()),
+                    Value::String("nginx".into()),
+                    Value::Integer(18),
+                    Value::String("error".into()),
+                    Value::String("upstream timeout".into()),
+                ],
+                vec![
+                    Value::String("2026-01-15T10:00:02Z".into()),
+                    Value::String("nginx".into()),
+                    Value::Integer(13),
+                    Value::String("warn".into()),
+                    Value::String("slow response".into()),
+                ],
+                vec![
+                    Value::String("2026-01-15T10:00:03Z".into()),
+                    Value::String("game".into()),
+                    Value::Null,
+                    Value::String("gold".into()),
+                    Value::String("loot dropped".into()),
+                ],
+            ],
+        );
+        app.tab.result = Some(response);
+        app.tab.status = TabStatus::Success { duration_ms: 12 };
+        let backend = TestBackend::new(100, 16);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());

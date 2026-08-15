@@ -38,12 +38,16 @@ trawl-core = { workspace = true }
 # bodies, so serde_json has to build on native too. It is already in the
 # wasm graph; this only widens where it is available.
 serde_json = { workspace = true }
+# Unconditional for the same reason once more: `context_query` builds the
+# Show-context `_time` window, so its ±30s arithmetic and the canonical
+# column name it emits are pinned by native tests. `wasmbind` only kicks
+# in on wasm32 (same shape as fleet-ui's dep).
+chrono = { workspace = true, features = ["wasmbind"] }
 
 # Wasm-only deps — leptos, web-sys, gloo-net, etc. `cargo check --workspace`
 # on native skips these entirely, but the binary compiles against them when
 # `trunk build` sets the wasm32 target.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-chrono = { workspace = true, features = ["wasmbind"] }
 leptos = { version = "0.8", features = ["csr"] }
 leptos_router = { version = "0.8" }
 leptos_meta = "0.8"

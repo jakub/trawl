@@ -47,9 +47,12 @@ fn field_filter_service() {
 }
 
 #[test]
-fn field_filter_level_error() {
+fn field_filter_severity_number() {
     let (exec, glob) = setup();
-    let result = exec.run_query_max("level=error", &glob).unwrap();
+    // Embedded `--data` is pin-blind (ADR-0013 residual): the severity
+    // TOKEN vocabulary needs the catalog's SEVERITY pin, so here the
+    // ladder number is the query.
+    let result = exec.run_query_max("severity=17", &glob).unwrap();
     // nginx 500, nginx 502, sshd "Connection refused"
     assert_eq!(result.row_count(), 3);
 }
@@ -349,11 +352,10 @@ fn timechart_bucket_values_group_by_full_expression() {
 }
 
 #[test]
-fn level_gte_warn_returns_only_warn_and_above() {
-    // `level>=warn` compiles to `severity >= 13`; only WARN-and-above rows
-    // (severity 13 and 17 in the fixture) come back.
+fn severity_gte_warn_returns_only_warn_and_above() {
+    // Only WARN-and-above rows (severity 13 and 17 in the fixture).
     let (exec, glob) = setup();
-    let result = exec.run_query_max("level>=warn", &glob).unwrap();
+    let result = exec.run_query_max("severity>=13", &glob).unwrap();
     assert_eq!(result.row_count(), 7, "4 warn + 3 error rows");
     let sev_idx = result
         .columns
@@ -369,38 +371,10 @@ fn level_gte_warn_returns_only_warn_and_above() {
 }
 
 #[test]
-fn level_eq_error_matches_the_error_band() {
-    // `level=error` compiles to `severity BETWEEN 17 AND 20`.
+fn severity_error_band_matches_three_rows() {
     let (exec, glob) = setup();
-    let result = exec.run_query_max("level=error", &glob).unwrap();
+    let result = exec.run_query_max("severity>=17", &glob).unwrap();
     assert_eq!(result.row_count(), 3, "exactly the three ERROR-band rows");
-}
-
-/// Grouping or projecting on `level` must fail loudly through the whole
-/// executor, not just inside the emitter.
-///
-/// `level` is consumed at ingest, so these used to reach `DuckDB` as a
-/// missing column: the hot/cold ladder classified that binder error as
-/// benign, fell back to hot-only, and the re-emit's second binder error
-/// became an empty result — a pre-cutover saved query returned zero rows
-/// and a 200 instead of saying its column was gone.
-#[test]
-fn level_outside_a_comparison_errors_instead_of_returning_no_rows() {
-    let (exec, glob) = setup();
-    for dsl in [
-        "* | stats count() by level",
-        "* | table level",
-        "* | sort level",
-    ] {
-        let err = exec
-            .run_query_max(dsl, &glob)
-            .expect_err("a `level` column reference must be an error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("filter-only alias"),
-            "{dsl} must explain the severity alias, got: {msg}"
-        );
-    }
 }
 
 #[test]

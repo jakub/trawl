@@ -154,16 +154,48 @@ already share:
 decision with a dry run — the game-server operator who wants `level` to BE
 severity opts in once, with evidence, instead of trawl guessing per event.
 
-### 7. The `level=error` advisory
+### 7. No advisory: `level` is an ordinary field
 
-Pure semantics plus a shape-triggered notice. `level=error` means what it
-says — a verbatim comparison on the sender's field. When the AST shows a
-bare `level` compared against a recognized severity token, the response
-carries a non-blocking advisory in the existing notice channel (beside
-`degraded_fields`; `-f table` gets a footer line) pointing at
-`_severity>=error`. Triggering on query shape rather than catalog state
-closes the mixed-fleet hole where a legitimate `level` pin would silence a
-pin-existence check. Never blocks; fires on exactly the confusing shape.
+Pure semantics, and nothing beside them. `level=error` means what it says —
+a verbatim comparison on the sender's own field — and the response says
+nothing about it.
+
+This section was designed the other way. It specified a shape-triggered
+notice: a bare `level` compared against a recognized severity token earned
+a non-blocking advisory beside `degraded_fields`, pointing at
+`_severity>=error`. Implementation then broadened it, because the narrow
+trigger left the loudest case silent — a retired spelling in a position
+with no literal (`| stats count() by level`, `| table level`,
+`| sort -level`) was a hard emit error before this ADR and is an empty
+success after it, so the advisory was made to fire wherever the name is
+BOUND, and `timestamp`/`@timestamp` were given the same treatment pointing
+at `_time`.
+
+Review ruled the whole mechanism out. Broadening it is what exposed it:
+once the trigger is the NAME in any binding position, the advisory fails
+the only test that matters here — how is `level` different from any other
+absent field? It is not. §1 says trawl assigns no meaning to a bare name,
+and *advisory* meaning is meaning: a notice keyed on `level` is trawl
+asserting it knows what that name is for, which is the exact assertion this
+ADR deletes. §2 compounds it — observe-don't-consume stores `level`
+verbatim, so on every corpus whose senders log a text level, `level=error`
+is a correct query returning correct rows. A shape-triggered notice is
+wrong on those installs and right only where nobody sends the field, which
+across a fleet makes it wrong more often than right — and a notice that is
+usually wrong trains analysts to stop reading notices, including
+`degraded_fields`, which is never wrong.
+
+The saved-query-silence concern the broadening chased is real and is
+already answered elsewhere: trawl carries no production back-compat, this
+is an epoch bump with the old root set aside (§9), and a cutover that
+retires spellings expects saved queries to be rewritten. Buying that with a
+permanent, sender-influenceable heuristic in the query path is the wrong
+trade. The empty result is the honest answer, the same one any other
+unwritten field gives.
+
+`repin <field> --to severity` (§6, slice 2) remains the operator's way to
+make `level` genuinely mean severity — a decision with a dry run and
+evidence, not a guess in a response body.
 
 ### 8. Repairs taxonomy
 
@@ -185,9 +217,9 @@ coloring, histogram bucketing) keys off `_severity` only — the current
 Slice 1 (#60) is the namespace cutover as one coherent semantic change:
 envelope reshape, sealed prefix at both doors, observe-don't-consume
 derivation with fixed default source lists, alias deletion, the SEVERITY pin
-type and token vocabulary, the advisory, presentation cutover, epoch 3, a
-minimal retarget of the syslog listener and telemetry to write
-`_severity`/`_time` under the new envelope, and the ingest-fuzzer redesign.
+type and token vocabulary, presentation cutover, epoch 3, a minimal
+retarget of the syslog listener and telemetry to write `_severity`/`_time`
+under the new envelope, and the ingest-fuzzer redesign.
 Slice 2 (filed at prep, needs its own prep pass) is the producer-profile and
 operator surface: syslog/telemetry through the canonicalizer as source
 profiles with profile-prefixed generated names, `severity_from`/`time_from`

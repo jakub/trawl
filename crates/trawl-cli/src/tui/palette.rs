@@ -484,7 +484,7 @@ mod tests {
             entries: vec![
                 trawl_client::HistoryEntryResponse {
                     id: 1,
-                    query: "level=error".into(),
+                    query: "_severity=error".into(),
                     executed_at: "2026-01-01T00:00:00Z".into(),
                     duration_ms: 42,
                     row_count: 10,
@@ -492,7 +492,7 @@ mod tests {
                 },
                 trawl_client::HistoryEntryResponse {
                     id: 2,
-                    query: "level=error".into(),
+                    query: "_severity=error".into(),
                     executed_at: "2026-01-01T00:01:00Z".into(),
                     duration_ms: 50,
                     row_count: 12,
@@ -516,7 +516,7 @@ mod tests {
             queries: vec![trawl_client::SavedQueryResponse {
                 id: 1,
                 name: "nginx errors".into(),
-                query: "service=nginx level=error | stats count() by host".into(),
+                query: "service=nginx _severity=error | stats count() by host".into(),
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
                 schedule: None,

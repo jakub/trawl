@@ -49,6 +49,8 @@ fn form_name(form: &CompareForm) -> &'static str {
         CompareForm::Text(_) => "Text",
         CompareForm::TextOrNumeric(_) => "TextOrNumeric",
         CompareForm::NumericOnText(_) => "NumericOnText",
+        CompareForm::SeverityBand { .. } => "SeverityBand",
+        CompareForm::SeverityExact(_) => "SeverityExact",
     }
 }
 
@@ -59,6 +61,7 @@ fn pattern_name(form: PatternForm) -> &'static str {
         PatternForm::BooleanText => "BooleanText",
         PatternForm::DoubleText => "DoubleText",
         PatternForm::Rfc3339Text => "Rfc3339Text",
+        PatternForm::SeverityText => "SeverityText",
     }
 }
 
@@ -302,10 +305,27 @@ fn compare_form_coverage_in_both_pipeline_lanes() {
             LiteralValue::Bool(true),
             Value::from(true),
         ),
+        // SEVERITY (ADR-0013): the band form for an equality-class token,
+        // the exact form for an ordered one.
+        (
+            CanonicalType::Severity,
+            "* | where f == \"error\"",
+            trawl_core::ast::FilterOp::Eq,
+            LiteralValue::String("error".into()),
+            Value::from(18),
+        ),
+        (
+            CanonicalType::Severity,
+            "* | where f >= \"warn\"",
+            trawl_core::ast::FilterOp::Gte,
+            LiteralValue::String("warn".into()),
+            Value::from(17),
+        ),
     ];
 
     for (pin, dsl, op, literal, value) in cells {
         let form = compare::compare_form_bound(Some(*pin), *op, literal)
+            .expect("matrix literals bind under their pin")
             .expect("matrix literals are never null");
         seen.insert(form_name(&form));
         let mut ft = FieldTypes::new();
@@ -319,6 +339,8 @@ fn compare_form_coverage_in_both_pipeline_lanes() {
         "Text",
         "TextOrNumeric",
         "NumericOnText",
+        "SeverityBand",
+        "SeverityExact",
     ]
     .into_iter()
     .collect();
@@ -357,6 +379,13 @@ fn pattern_form_coverage_in_both_pipeline_lanes() {
             CanonicalType::Boolean,
             "* | where f like \"tru%\"",
             Value::from(true),
+        ),
+        // SEVERITY renders the OTel short name, so a band's prefix glob
+        // is exactly its four rungs.
+        (
+            CanonicalType::Severity,
+            "* | where f like \"warn%\"",
+            Value::from(15),
         ),
     ];
     for (pin, dsl, value) in cells {
@@ -412,6 +441,7 @@ fn pattern_form_coverage_in_both_pipeline_lanes() {
         "BooleanText",
         "DoubleText",
         "Rfc3339Text",
+        "SeverityText",
     ]
     .into_iter()
     .collect();

@@ -73,7 +73,7 @@ POST /api/v1/query
 Content-Type: application/json
 
 {
-  "query": "level=error last=1h | stats count() by service"
+  "query": "_severity>=error last=1h | stats count() by service"
 }
 ```
 
@@ -104,7 +104,7 @@ POST /api/v1/validate
 Content-Type: application/json
 
 {
-  "query": "level=error | stats count() by host"
+  "query": "_severity>=error | stats count() by host"
 }
 ```
 

@@ -2010,7 +2010,8 @@ fn run_pin_ladders(
 }
 
 /// The SQL expression conforming one column to its pin, or `None` when the
-/// observed type already matches (pass-through).
+/// observed type already matches AND the conform over it is the identity
+/// (pass-through).
 ///
 /// Literally the emitter's hot-branch expression: the same text form
 /// ([`trawl_core::conform::untyped_text`]) under the same guard
@@ -2029,7 +2030,13 @@ fn run_pin_ladders(
 /// `1e+20` where `to_json` spells it `100000000000000000000.0`. Same
 /// value, two corpora, and `note=/^1e/` flipped when the compactor ran.
 pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Option<String> {
-    if dtype == pin.as_duckdb() {
+    // The pass-through is valid only where the conform is the IDENTITY
+    // over values already of the physical type. SEVERITY is the one pin
+    // where it is not: its domain is the 1-24 ladder, not "any BIGINT",
+    // so a numeral outside it must still be nulled out here or the corpus
+    // could hold a value with no token rendering — which is exactly what
+    // the rung exists to prevent (ADR-0013).
+    if dtype == pin.as_duckdb() && pin != CanonicalType::Severity {
         return None;
     }
     Some(trawl_core::conform::guarded_cast(
@@ -2185,6 +2192,15 @@ struct CastEntry {
     dtype: String,
     pin: CanonicalType,
     expr: String,
+    /// The column is ALREADY of its pin's physical type, so the cast can
+    /// only null values outside the pin's DOMAIN — it can never change a
+    /// conforming one. Today that is exactly the SEVERITY ladder guard
+    /// (see [`conform_expr`]); every other pin passes such a column
+    /// through. A plan whose only work is guard-only casts is the identity
+    /// over a file that already satisfies the domain, which is what
+    /// [`ConformPlan::is_guard_only`] lets the rewrite lanes prove before
+    /// paying for a rewrite.
+    guard_only: bool,
 }
 
 /// The per-column select list that conforms a source to the pins, plus the
@@ -2266,6 +2282,9 @@ impl ConformPlan {
                         dtype: col.dtype.clone(),
                         pin,
                         expr,
+                        // A resurrection rewrites the column whatever its
+                        // physical type — never a domain-only guard.
+                        guard_only: false,
                     });
                 }
                 Some(pin) => match conform_expr(&quoted, &col.dtype, pin) {
@@ -2281,6 +2300,7 @@ impl ConformPlan {
                             .push(format!("{written} AS {}", quote_ident(&folded)));
                         plan.retained.push(folded.clone());
                         plan.casts.push(CastEntry {
+                            guard_only: col.dtype == pin.as_duckdb(),
                             name: folded,
                             dtype: col.dtype.clone(),
                             pin,
@@ -2310,6 +2330,24 @@ impl ConformPlan {
     /// drop, or a case-fold rename).
     pub(crate) fn is_noop(&self) -> bool {
         self.casts.is_empty() && self.dropped.is_empty() && self.renamed == 0
+    }
+
+    /// Whether the plan's ONLY work is domain guards over columns already
+    /// of their pin's physical type ([`CastEntry::guard_only`]).
+    ///
+    /// Such a plan rewrites nothing unless the source actually holds a
+    /// value outside the domain, and [`Self::tally_conflicts`] answers
+    /// exactly that question with two aggregates per column. So a caller
+    /// that has tallied and found nothing may skip the rewrite entirely —
+    /// which is the difference between "conform the nonconformant files"
+    /// and "COPY the whole archive": every trawl-written parquet carries
+    /// the SEVERITY-pinned `_severity`, so without this the boot pass
+    /// would rewrite every file in the corpus on every re-arm (ADR-0013).
+    pub(crate) fn is_guard_only(&self) -> bool {
+        !self.casts.is_empty()
+            && self.dropped.is_empty()
+            && self.renamed == 0
+            && self.casts.iter().all(|c| c.guard_only)
     }
 
     /// How many columns the plan casts (a no-cast plan can still drop or
@@ -2683,7 +2721,10 @@ fn conform_wal_batch(
         );
     }
 
-    if !plan.is_noop() {
+    // Same skip the boot pass takes: a guard-only plan that nulled nothing
+    // would copy the batch table to reproduce it byte for byte.
+    let identity = plan.is_noop() || (plan.is_guard_only() && conflicts.is_empty());
+    if !identity {
         conn.execute_batch(&format!(
             "CREATE TABLE wal_conformed AS SELECT {} FROM wal_batch; \
              DROP TABLE wal_batch; \
@@ -2863,6 +2904,37 @@ fn extract_service_from_filename(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pass-through shortcut is a claim about the CONFORM, not about
+    /// the physical type: it holds only where a column already of that
+    /// type needs nothing done to it.
+    ///
+    /// SEVERITY is the exception, and it must be: its domain is the 1-24
+    /// ladder, so a BIGINT column carrying `99` still has to be nulled —
+    /// otherwise the corpus holds a value whose canonical token text is
+    /// NULL, and `_severity=warn*` and the results table disagree about
+    /// what is in the column (ADR-0013).
+    #[test]
+    fn the_conform_pass_through_excludes_the_severity_range_guard() {
+        for pin in [
+            CanonicalType::BigInt,
+            CanonicalType::Double,
+            CanonicalType::Boolean,
+            CanonicalType::Timestamp,
+            CanonicalType::Varchar,
+        ] {
+            assert_eq!(
+                conform_expr("\"c\"", pin.as_duckdb(), pin),
+                None,
+                "{pin:?} already IS its pin"
+            );
+        }
+        let sql = conform_expr("\"c\"", "BIGINT", CanonicalType::Severity)
+            .expect("SEVERITY still guards the ladder range");
+        assert!(sql.contains("BETWEEN 1 AND 24"), "{sql}");
+        // …and a non-matching physical type conforms as any other pin does.
+        assert!(conform_expr("\"c\"", "VARCHAR", CanonicalType::Severity).is_some());
+    }
 
     #[test]
     fn extract_service_simple() {
@@ -3403,6 +3475,68 @@ mod tests {
             i % 60,
             i % 60,
         )
+    }
+
+    /// The SEVERITY ladder guard must not turn every already-conformed file
+    /// into a rewrite: `_severity` is in every parquet trawl writes, so a
+    /// plan whose only cast is that guard is the identity unless the source
+    /// actually holds an out-of-ladder number — and the tally is what proves
+    /// it, per file, before the in-place rewrite is paid for.
+    #[test]
+    fn a_guard_only_plan_over_an_in_range_source_nulls_nothing() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE wal_batch AS \
+             SELECT * FROM (VALUES (9::BIGINT, 'm'), (17::BIGINT, 'm')) t(_severity, message)",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [
+            ("_severity".to_owned(), CanonicalType::Severity),
+            ("message".to_owned(), CanonicalType::Varchar),
+        ]
+        .into_iter()
+        .collect();
+
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
+        assert_eq!(plan.cast_count(), 1, "only the severity guard casts");
+        assert!(plan.is_guard_only(), "the guard is the plan's only work");
+        assert!(
+            plan.tally_conflicts(&conn, "wal_batch", "svc")
+                .unwrap()
+                .is_empty(),
+            "1-24 values are already conformant: nothing to rewrite"
+        );
+
+        // …and an out-of-ladder value is still caught, so the skip is
+        // decided by the data rather than by the pin.
+        conn.execute_batch("INSERT INTO wal_batch VALUES (99, 'm')")
+            .unwrap();
+        let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0].rows_nulled, 1);
+    }
+
+    /// A plan that also renames or drops is never guard-only, whatever its
+    /// casts are: those changes are invisible to the tally.
+    #[test]
+    fn a_rename_alongside_the_guard_is_not_guard_only() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE wal_batch AS \
+             SELECT * FROM (VALUES (9::BIGINT, 'm')) t(_severity, \"Msg\")",
+        )
+        .unwrap();
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [
+            ("_severity".to_owned(), CanonicalType::Severity),
+            ("msg".to_owned(), CanonicalType::Varchar),
+        ]
+        .into_iter()
+        .collect();
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
+        assert!(!plan.is_noop());
+        assert!(!plan.is_guard_only(), "the case-fold rename is real work");
     }
 
     /// Only a cast that NULLED something is conflict evidence.

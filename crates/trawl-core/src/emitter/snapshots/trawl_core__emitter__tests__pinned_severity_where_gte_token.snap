@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_with_pins(r#\"* | where _severity >= \"warn\"\"#, &SEVERITY_PIN)"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE ("_severity" >= ?)
+---
+params:
+  0: 13

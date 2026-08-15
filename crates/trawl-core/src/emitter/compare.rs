@@ -59,6 +59,10 @@ pub(crate) fn pattern_target(field: &str, pin: Option<crate::schema::CanonicalTy
                 compare::TIMESTAMP_PATTERN_SQL_FORMAT
             )
         }
+        // The SEVERITY pin renders the ladder's own short names, so
+        // `_severity=warn*` matches the WARN band and results display
+        // `error` rather than `17` (ADR-0013).
+        PatternForm::SeverityText => conform::severity_token_text_sql(field),
     }
 }
 
@@ -103,6 +107,16 @@ pub(crate) fn comparison_sql(
                 predicate
             }
         }
+        // SEVERITY pin + band token: the whole band, and `!=` its
+        // complement — the same NULL policy split as every other form.
+        CompareForm::SeverityBand { lo, hi } => {
+            let predicate = severity_band(field, op, lo, hi);
+            if op == FilterOp::Ne && policy == NullPolicy::NeMatchesNull {
+                format!("({predicate} OR {field} IS NULL)")
+            } else {
+                predicate
+            }
+        }
         form => {
             let val = comparable_value(form);
             let placeholder = state.push_param(val);
@@ -129,16 +143,22 @@ pub(crate) fn in_list_sql(
     forms: Vec<CompareForm>,
     state: &mut EmitterState,
 ) -> String {
-    if forms
-        .iter()
-        .any(|f| matches!(f, CompareForm::TextOrNumeric(_)))
-    {
+    // The forms with no single bound value: the VARCHAR pin's two-armed
+    // equality, and the SEVERITY pin's band range.
+    let expands = |f: &CompareForm| {
+        matches!(
+            f,
+            CompareForm::TextOrNumeric(_) | CompareForm::SeverityBand { .. }
+        )
+    };
+    if forms.iter().any(expands) {
         let predicates: Vec<String> = forms
             .into_iter()
             .map(|form| match form {
                 CompareForm::TextOrNumeric(literal) => {
                     text_or_numeric(field, FilterOp::Eq, literal, state)
                 }
+                CompareForm::SeverityBand { lo, hi } => severity_band(field, FilterOp::Eq, lo, hi),
                 other => {
                     let placeholder = state.push_param(comparable_value(other));
                     format!("{field} = {placeholder}")
@@ -188,6 +208,17 @@ fn text_or_numeric(field: &str, op: FilterOp, literal: String, state: &mut Emitt
     }
 }
 
+/// The band range predicate for a `SEVERITY`-pinned equality-class
+/// comparison: the band's inclusive bounds, rendered as literals (they
+/// come from a closed table, never from user text).
+fn severity_band(field: &str, op: FilterOp, lo: u8, hi: u8) -> String {
+    if op == FilterOp::Ne {
+        format!("{field} NOT BETWEEN {lo} AND {hi}")
+    } else {
+        format!("{field} BETWEEN {lo} AND {hi}")
+    }
+}
+
 /// Collapse the equality-class forms to the `SqlValue` they bind.
 /// `NumericOnText` and `TextOrNumeric` are handled by their own SQL shapes
 /// before this is called.
@@ -199,7 +230,12 @@ fn comparable_value(form: CompareForm) -> SqlValue {
         // (`crate::filter`), which has to conform the wire value first.
         CompareForm::Native(val) | CompareForm::Conformed { literal: val, .. } => val,
         CompareForm::Text(s) => SqlValue::String(s),
-        CompareForm::NumericOnText(_) | CompareForm::TextOrNumeric(_) => {
+        // A SEVERITY column IS a BIGINT: the exact form binds one integer,
+        // exactly as the unpinned path would.
+        CompareForm::SeverityExact(n) => SqlValue::Int(n),
+        CompareForm::NumericOnText(_)
+        | CompareForm::TextOrNumeric(_)
+        | CompareForm::SeverityBand { .. } => {
             debug_assert!(
                 false,
                 "the pinned numeric forms have their own emission shape"

@@ -340,7 +340,7 @@ fn build_service_schema(
                     unpinned_now.insert(cs.column_name.clone());
                     "UNPINNED".to_owned()
                 },
-                |ty| ty.as_duckdb().to_owned(),
+                |ty| ty.as_catalog().to_owned(),
             );
             ServiceColumnStats {
                 name: cs.column_name.clone(),
@@ -457,6 +457,45 @@ mod tests {
         assert_eq!(status.min_value.as_deref(), Some("200"));
         assert_eq!(status.max_value.as_deref(), Some("404"));
         assert!(status.compressed_bytes > 0);
+    }
+
+    #[test]
+    fn severity_pin_reports_the_catalog_spelling_not_the_physical_one() {
+        // `_severity` is SEVERITY on the wire and BIGINT on disk (ADR-0013):
+        // this endpoint is the one place a non-injective pin is rendered,
+        // so pin the semantic spelling. Reverting to the physical type
+        // would expose `_severity` as BIGINT here.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        write_service_parquet(
+            base,
+            "2026-06-20",
+            "nginx",
+            "SELECT * FROM (VALUES (17::BIGINT), (9::BIGINT)) t(_severity)",
+        );
+
+        let catalog = empty_catalog();
+        catalog.merge([(
+            trawl_core::schema::SEVERITY.to_owned(),
+            trawl_core::schema::CanonicalType::Severity,
+        )]);
+
+        let glob = format!("{}/**/*.parquet", base.display());
+        let warned = Mutex::new(HashSet::new());
+        let warned_unpinned = Mutex::new(HashSet::new());
+        let services = refresh_service_schema(&glob, &warned, &warned_unpinned, &catalog).unwrap();
+
+        let nginx = services.iter().find(|s| s.name == "nginx").unwrap();
+        let severity = nginx
+            .columns
+            .iter()
+            .find(|c| c.name == trawl_core::schema::SEVERITY)
+            .unwrap();
+        assert_eq!(
+            severity.data_type, "SEVERITY",
+            "the semantic catalog spelling is what the endpoint reports"
+        );
+        assert_eq!(severity.total_count, 2, "stats stay filesystem-true");
     }
 
     #[test]

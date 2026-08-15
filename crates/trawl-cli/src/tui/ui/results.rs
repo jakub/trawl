@@ -276,7 +276,14 @@ fn render_table(
                 .map(|&col_idx| {
                     let value = &row_data[col_idx];
                     let width = all_widths[col_idx] as usize;
-                    let text = value_to_string(value);
+                    let text = if result.columns[col_idx].name == trawl_core::schema::SEVERITY {
+                        // `_severity` DISPLAYS its OTel token (ADR-0013
+                        // §6): `17` reads `error`, the same vocabulary
+                        // that would filter it.
+                        severity_cell_text(value)
+                    } else {
+                        value_to_string(value)
+                    };
                     let truncated = truncate_with_ellipsis(&text, width);
                     let cell = Cell::from(truncated);
                     if current_match_cell == Some((abs_row, col_idx)) {
@@ -1457,5 +1464,29 @@ fn format_duration(secs: u64) -> String {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
+    }
+}
+
+/// A `_severity` cell as the TUI shows it: the shared `OTel` token, or —
+/// where the ladder has no reading for it — the cell rendered the way the
+/// grid renders every other.
+fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
+    crate::cli::severity_token(value).map_or_else(|| value_to_string(value), str::to_owned)
+}
+
+#[cfg(test)]
+mod severity_tests {
+    use super::severity_cell_text;
+    use trawl_engine::value::Value;
+
+    /// The TUI shows the token, injectively — `error2` is not `error`.
+    #[test]
+    fn a_severity_cell_shows_its_otel_token() {
+        assert_eq!(severity_cell_text(&Value::Integer(17)), "error");
+        assert_eq!(severity_cell_text(&Value::Integer(18)), "error2");
+        assert_eq!(severity_cell_text(&Value::Integer(13)), "warn");
+        // No reading: the grid's own rendering, never a guess.
+        assert_eq!(severity_cell_text(&Value::Integer(99)), "99");
+        assert_eq!(severity_cell_text(&Value::String("gold".into())), "gold");
     }
 }

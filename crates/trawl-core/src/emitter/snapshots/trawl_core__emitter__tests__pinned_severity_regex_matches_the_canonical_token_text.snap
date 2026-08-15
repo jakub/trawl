@@ -1,0 +1,10 @@
+---
+source: crates/trawl-core/src/emitter/mod.rs
+expression: "emit_dsl_with_pins(\"_severity=/^err/\", &SEVERITY_PIN)"
+---
+SELECT *
+FROM read_parquet('/data/**/*.parquet', union_by_name=true)
+WHERE regexp_matches((CASE "_severity" WHEN 1 THEN 'trace' WHEN 2 THEN 'trace2' WHEN 3 THEN 'trace3' WHEN 4 THEN 'trace4' WHEN 5 THEN 'debug' WHEN 6 THEN 'debug2' WHEN 7 THEN 'debug3' WHEN 8 THEN 'debug4' WHEN 9 THEN 'info' WHEN 10 THEN 'info2' WHEN 11 THEN 'info3' WHEN 12 THEN 'info4' WHEN 13 THEN 'warn' WHEN 14 THEN 'warn2' WHEN 15 THEN 'warn3' WHEN 16 THEN 'warn4' WHEN 17 THEN 'error' WHEN 18 THEN 'error2' WHEN 19 THEN 'error3' WHEN 20 THEN 'error4' WHEN 21 THEN 'fatal' WHEN 22 THEN 'fatal2' WHEN 23 THEN 'fatal3' WHEN 24 THEN 'fatal4' END), ?)
+---
+params:
+  0: '^err'

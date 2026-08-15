@@ -2940,6 +2940,9 @@ fn mixed_ladder_pair_unions_promote_rather_than_error() {
         CanonicalType::Boolean => "TRUE",
         CanonicalType::Timestamp => "TIMESTAMP '2026-01-15 10:00:00'",
         CanonicalType::Varchar => "'text'",
+        // Not in `all`: SEVERITY is physically BIGINT, so it can never be
+        // one half of a MIXED pair.
+        CanonicalType::Severity => unreachable!("physically BIGINT"),
     };
     // The promoted type per unordered pair, probed by execution: VARCHAR
     // absorbs everything, TIMESTAMP absorbs the remaining scalars, DOUBLE
@@ -3148,4 +3151,110 @@ fn left_truncates_by_character_not_by_byte() {
         "…so an 8-'character' truncation is 32 BYTES: a byte cap must be \
          applied in Rust"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The SEVERITY canonical type (ADR-0013)
+// ---------------------------------------------------------------------------
+
+/// The SEVERITY conform rung is the guarded BIGINT cast inside the 1-24
+/// ladder guard, and its LIVE mirror (`compare::conformed_severity`) reads
+/// the same domain — executed, not reasoned. Out-of-ladder numbers
+/// (`0`, `25`, `-3`) conform to NULL in both engines, so a stored value
+/// always has a token rendering.
+#[test]
+fn severity_conform_rung_bounds_the_ladder_on_both_engines() {
+    let conn = conn();
+    let cases: [&str; 14] = [
+        "1",
+        "17",
+        "24",
+        "0",
+        "25",
+        "-3",
+        "  9  ",
+        "017",
+        "17.0",
+        "1.5",
+        "error",
+        "",
+        "nan",
+        "9223372036854775808",
+    ];
+    for text in cases {
+        let escaped = text.replace('\'', "''");
+        let sql = format!(
+            "SELECT {}",
+            guarded_cast(&format!("'{escaped}'"), CanonicalType::Severity)
+        );
+        let sql_reading: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        let live = trawl_core::compare::conformed_severity(text).map(i64::from);
+        assert_eq!(sql_reading, live, "severity conform disagreed on {text:?}");
+    }
+}
+
+/// The canonical token TEXT is one table, rendered by
+/// `conform::severity_token_text_sql` in SQL and `severity::otel_name` in
+/// Rust. Probed over the whole ladder plus both out-of-range shoulders and
+/// NULL, so a glob can never mean one thing live and another in batch.
+#[test]
+fn severity_token_text_matches_the_rust_mirror_over_the_ladder() {
+    let conn = conn();
+    for n in 0..=30i64 {
+        let sql = format!(
+            "SELECT {}",
+            trawl_core::conform::severity_token_text_sql(&format!("CAST({n} AS BIGINT)"))
+        );
+        let rendered: Option<String> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        let expected = u8::try_from(n)
+            .ok()
+            .and_then(trawl_core::severity::otel_name)
+            .map(str::to_owned);
+        assert_eq!(rendered, expected, "token text disagreed at {n}");
+    }
+    let null_sql = format!(
+        "SELECT {}",
+        trawl_core::conform::severity_token_text_sql("CAST(NULL AS BIGINT)")
+    );
+    let rendered: Option<String> = conn.query_row(&null_sql, [], |row| row.get(0)).unwrap();
+    assert_eq!(rendered, None, "a NULL severity has no token text");
+}
+
+/// A SEVERITY-pinned hot column conforms to the same physical BIGINT the
+/// parquet side holds, so the hot+cold union types cleanly — the whole
+/// reason the pin's physical spelling stays `BIGINT`.
+#[test]
+fn severity_conform_yields_the_physical_bigint() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("hot.ndjson");
+    let mut f = std::fs::File::create(&file).unwrap();
+    writeln!(f, r#"{{"_severity":17}}"#).unwrap();
+    writeln!(f, r#"{{"_severity":"warn"}}"#).unwrap();
+    f.sync_all().unwrap();
+
+    let conn = conn();
+    let expr = conform("\"_severity\"", CanonicalType::Severity);
+    let mut stmt = conn
+        .prepare(&format!(
+            "DESCRIBE SELECT {expr} AS s FROM {}",
+            hot_reader(&file)
+        ))
+        .unwrap();
+    let ty: String = stmt.query_row([], |row| row.get(1)).unwrap();
+    assert_eq!(ty, CanonicalType::Severity.as_duckdb());
+
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {expr} AS s FROM {} ORDER BY s NULLS LAST",
+            hot_reader(&file)
+        ))
+        .unwrap();
+    let rows: Vec<Option<i64>> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    // The word `warn` is not a NUMBER: derivation maps tokens at INGEST,
+    // never at read time, so a stray word conforms to NULL.
+    assert_eq!(rows, vec![Some(17), None]);
 }

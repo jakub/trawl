@@ -5,7 +5,7 @@
 //! Convert parsed syslog messages to trawl event maps.
 //!
 //! Produces the declared ADR-0009 envelope (`_time`, `_ingested`,
-//! `_raw`, `env`, `service`, `host`, `severity`, `severity_text`,
+//! `_raw`, `env`, `service`, `host`, `_severity`,
 //! `message`) so that queries work identically regardless of ingestion
 //! path. The syslog listener is an input-mapping ingestor: appnames are
 //! mapped *into* the service charset before validation, syslog numeric
@@ -146,15 +146,17 @@ pub fn syslog_to_event<S: BuildHasher>(
         "host".into(),
         json!(msg.hostname.unwrap_or(&source_ip.to_string())),
     );
-    // Severity: syslog numerics inverted onto the OTel ladder; the
-    // keyword is preserved as severity_text. Absent severity is omitted,
-    // never guessed (omit-when-null, ADR-0009).
-    if let Some(sev) = msg.severity {
-        let (keyword, number) = severity_mapping(sev);
-        if let Some(n) = number {
-            map.insert("severity".into(), json!(n));
-        }
-        map.insert("severity_text".into(), json!(keyword));
+    // Severity: the listener KNOWS its input is syslog, so it is the one
+    // place trawl may invert the numeral onto the OTel ladder (ADR-0013
+    // §4) — and it therefore writes `_severity` itself rather than
+    // proposing a source for the generic derivation, which reads
+    // numerics strictly as OTel. The keyword and the numeral both stay
+    // findable in `_raw`, which is the provenance that proves the
+    // dialect. Absent severity is omitted, never guessed.
+    if let Some(sev) = msg.severity
+        && let (_, Some(n)) = severity_mapping(sev)
+    {
+        map.insert(trawl_core::schema::SEVERITY.into(), json!(n));
     }
     map.insert("message".into(), json!(msg.msg));
 
@@ -223,8 +225,11 @@ mod tests {
         assert_eq!(map["service"], "unifi-gateway");
         assert_eq!(map["env"], "prod");
         assert_eq!(map["host"], "UGW");
-        assert_eq!(map["severity"], 9, "syslog 6 (info) inverts to OTel 9");
-        assert_eq!(map["severity_text"], "info");
+        assert_eq!(
+            map[trawl_core::schema::SEVERITY],
+            9,
+            "syslog 6 (info) inverts to OTel 9"
+        );
         assert!(map["_time"].is_string());
         assert!(map["_ingested"].is_string());
         assert_eq!(map["_raw"], raw, "the pre-parse wire line lands in _raw");
@@ -293,10 +298,13 @@ mod tests {
             "prod",
         );
         assert_eq!(
-            map["severity"], 24,
+            map[trawl_core::schema::SEVERITY],
+            24,
             "syslog 0 (emerg) is OTel 24 (FATAL band)"
         );
-        assert_eq!(map["severity_text"], "emerg");
+        // The keyword and the numeral both stay findable in `_raw`, the
+        // provenance that proves the dialect (ADR-0013 §4).
+        assert!(map["_raw"].as_str().unwrap().contains("<0>"));
 
         let debug_raw = "<7>Mar 12 10:00:00 h app: noisy detail";
         let parsed = parse_syslog(debug_raw);
@@ -309,10 +317,11 @@ mod tests {
             "prod",
         );
         assert_eq!(
-            map["severity"], 5,
+            map[trawl_core::schema::SEVERITY],
+            5,
             "syslog 7 (debug) is OTel 5 (DEBUG band)"
         );
-        assert_eq!(map["severity_text"], "debug");
+        assert!(map["_raw"].as_str().unwrap().contains("<7>"));
     }
 
     /// The full envelope is present on every converted event.

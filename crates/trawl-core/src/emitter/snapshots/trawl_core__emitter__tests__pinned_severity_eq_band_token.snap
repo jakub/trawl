@@ -1,7 +1,7 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(r#\"* | where level >= \"warn\"\"#)"
+expression: "emit_dsl_with_pins(\"_severity=error\", &SEVERITY_PIN)"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE "severity" >= 13
+WHERE "_severity" BETWEEN 17 AND 20

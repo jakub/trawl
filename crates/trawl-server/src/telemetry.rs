@@ -1033,12 +1033,14 @@ where
         record.insert("env".into(), json!(&self.inner.env));
         record.insert("service".into(), json!("trawld"));
         record.insert("host".into(), json!(&self.inner.host));
-        // The server is the producer, so severity maps directly from the
-        // tracing level onto the OTel ladder (ADR-0009).
+        // The server is the producer, so it writes the derived slot
+        // itself (ADR-0013 §9): the tracing level maps onto the OTel
+        // ladder, and the level WORD stays as an ordinary `level` column
+        // — sender vocabulary, verbatim, exactly as any other producer's.
         if let Some(n) = trawl_core::severity::number_for_token(&level) {
-            record.insert("severity".into(), json!(n));
+            record.insert(trawl_core::schema::SEVERITY.into(), json!(n));
         }
-        record.insert("severity_text".into(), json!(&level));
+        record.insert("level".into(), json!(&level));
         record.insert("target".into(), json!(metadata.target()));
         record.insert("event_type".into(), json!(event_type));
         record.insert("message".into(), json!(message));
@@ -1530,8 +1532,15 @@ mod tests {
         assert!(parsed["_ingested"].is_string());
         assert!(parsed["_raw"].is_string());
         assert_eq!(parsed["env"], "prod");
-        assert_eq!(parsed["severity"], 9, "tracing info maps to OTel 9");
-        assert_eq!(parsed["severity_text"], "info");
+        assert_eq!(
+            parsed[trawl_core::schema::SEVERITY],
+            9,
+            "tracing info maps to OTel 9"
+        );
+        assert_eq!(
+            parsed["level"], "info",
+            "the level WORD stays as ordinary sender vocabulary"
+        );
         assert!(parsed["target"].is_string());
     }
 

@@ -7,6 +7,81 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **BREAKING — the namespace cutover: two namespaces, observe-don't-consume derivation, zero DSL aliases (ADR-0013 slice 1, #60).**
+  One contract, one sentence: **bare names are sender vocabulary trawl
+  never assigns meaning to; underscore names are trawl's contract slots.**
+  The envelope shrinks from ten fields to nine — `_time`, `_ingested`,
+  `_raw`, `_repairs`, `_severity` (trawl-owned) plus `service`, `env`,
+  `host`, `message` (sender-asserted). `severity` **leaves the envelope**
+  and becomes ordinary sender data; **`severity_text` is deleted
+  outright** (it existed to preserve text that consumption destroyed, and
+  nothing is consumed now).
+
+  **Derivation observes, it never consumes.** `_time` derives from `_time`
+  → `timestamp` → `@timestamp` (first PRESENT wins; only `_time`, the
+  proposal slot, is consumed and canonicalized) and `_severity` from
+  `severity` → `severity_text` → `level` (first MAPPABLE wins). Every
+  source is stored verbatim under the name its sender chose, so
+  `{"service":"game","level":"gold"}` — the defect that opened #60 — keeps
+  a fully queryable `level` column, gets no `_severity`, and is repaired
+  in no way at all. A numeric severity source is read **strictly as OTel
+  1-24**: `3` is trace, `0` and `25` map to nothing, and the syslog
+  inversion happens only in the syslog listener, where the transport
+  proves the dialect. `severity.unmapped` is **deleted** — a derivation
+  into the `_` namespace touches nothing sender-visible, so there is
+  nothing to confess; the ops signal is the new
+  `trawl_severity_unmapped_total{service}` counter.
+
+  **The `_` prefix is sealed at both doors, from one predicate.** At
+  ingest, a non-proposable `_x` has its leading underscore RUN stripped
+  and its value stored under the bare remainder — `_HOSTNAME` →
+  `hostname`, `__name__` → `name__`, `_SYSTEMD_UNIT` → `systemd_unit` —
+  with the repair code `field.reserved_prefix`; a bare name the same
+  event already carries wins (`field.reserved_prefix_collision`) and a
+  key with no remainder (`_`, `___`) is dropped, its value still in
+  `_raw`. This ONE rule replaces `RESERVED_CLIENT_FIELDS`,
+  **`meta.stripped` (deleted)**, the non-string-`_raw` special case and
+  the silent `_trawl_wal_file` removal, and it answers the
+  journald/prometheus passthrough that used to lose fields. In the DSL,
+  `let _foo = 1`, `rename x as _foo` and `extract "(?P<_foo>…)"` are
+  errors: the pipeline cannot mint a name ingest would refuse.
+
+  **Zero DSL aliases.** `level`, `timestamp` and `@timestamp` are ordinary
+  field references in every position — including the ones that used to be
+  errors (`stats count() by level`, `table level`, `where level in (…)`).
+  `catalog_key` is now an ASCII fold and nothing else, and the name you
+  type is the column in `DESCRIBE` is the identifier in the SQL, in all
+  four lanes. **Severity moves onto `_severity`, which nothing can
+  shadow**, via a new `SEVERITY` canonical type (physically BIGINT,
+  bounded to 1-24 by its conform rung) riding the ADR-0011 pin rule
+  table: `_severity=error` → `BETWEEN 17 AND 20`, `_severity=error2` →
+  exactly 18, `_severity>=warn` → `>= 13`, `_severity=warn*` globs the
+  canonical OTel token text, and an unknown value is a **query error
+  naming the vocabulary** rather than a filter that quietly matches
+  nothing. Results DISPLAY the token (`error`, not `17`) in the CLI
+  table, the TUI and the web UI; `-f json`, `-f csv` and SSE keep the
+  number for arithmetic consumers. Embedded `--data` is pin-blind, so
+  compare the ladder number there.
+
+  **Migration is an epoch bump, not a shim.** `data/EPOCH` goes to 3 and
+  an epoch-2 root is set aside at boot as `data.pre-epoch-3/` (a second
+  name — trawl never deletes a set-aside, so an existing
+  `data.pre-schema-v2/` is left exactly where it is). A query-only node
+  warns and serves an epoch-2 root instead of moving data it does not
+  own. Migration 0010 reshapes only the catalog's `_declared` seed rows,
+  so a sender's own `severity` pin survives, and re-arms the boot
+  conformance pass.
+
+  **Operational note.** A saved query, dashboard panel or alert written
+  `level=error`, `| stats count() by level`, `| sort -timestamp` or
+  `| table timestamp` now reads the sender's own column of that name:
+  over a corpus that has one it answers a different question, and over a
+  corpus that does not it answers with **no rows and no error**. Rewrite
+  them as `_severity>=error` and `_time`. trawl issues no advisory about
+  it: a retired spelling is an ordinary sender field now, indistinguishable
+  from any other name nobody writes, and a notice keyed on it would be
+  trawl assigning meaning to a bare name — the exact thing this cutover
+  deletes (ADR-0013 §7).
 - **SPA operator surface for degraded pins and repin (ADR-0011 slice C2,
   #71).** The degraded-pin case file and the repin trigger leave the CLI
   for the browser, on the schema page's existing anatomy — no new

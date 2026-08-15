@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 
 use crate::ast::{BinaryOp, Expr, FilterOp, FloatLiteral, LiteralValue, Spanned, UnaryOp};
-use crate::emitter::{SqlValue, map_field_name};
+use crate::emitter::SqlValue;
 use crate::pin_match::{self, NullReadPolicy};
 use crate::pin_scope::PinScope;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
@@ -278,13 +278,12 @@ pub fn eval_expr_with_pins(
             // `let b = A` over a row carrying `a` reads that column
             // rather than answering NULL, so a reference does not change
             // meaning with the pin.
-            let mapped = map_field_name(name);
+            let mapped = name.as_str();
             bind_event_key(event, mapped)
                 .and_then(|key| event.get(key))
                 .map_or(EvalValue::Null, EvalValue::from)
         }
-        Expr::Binary { lhs, op, rhs } => eval_level_comparison(lhs, *op, rhs, event)
-            .or_else(|| try_pinned_comparison(lhs, *op, rhs, event, pins))
+        Expr::Binary { lhs, op, rhs } => try_pinned_comparison(lhs, *op, rhs, event, pins)
             .unwrap_or_else(|| {
                 eval_binary(
                     &eval_expr_with_pins(lhs, event, pins),
@@ -326,6 +325,10 @@ pub fn eval_expr_with_pins(
 /// `Unary{Neg, Literal}`. The two doors must adopt the same shapes or the
 /// batch and live lanes answer one query differently
 /// (`emitter::expr::bare_literal`).
+pub(crate) fn bare_literal_of(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
+    bare_literal(expr)
+}
+
 fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
     match expr {
         Expr::Literal(lit) => Some(Cow::Borrowed(lit)),
@@ -382,7 +385,7 @@ pub(crate) fn bind_event_key<'e>(event: &'e Map<String, Value>, name: &str) -> O
 /// null is that field's own NULL (UNKNOWN), never a reason to read a
 /// differently-cased sibling.
 fn pinned_event_value<'e>(event: &'e Map<String, Value>, name: &str) -> Option<&'e Value> {
-    let key = bind_event_key(event, map_field_name(name))?;
+    let key = bind_event_key(event, name)?;
     event.get(key).filter(|v| !v.is_null())
 }
 
@@ -465,7 +468,15 @@ fn try_pinned_comparison(
         _ => return None,
     };
     let pin = pins.pin_for(name)?;
-    let form = crate::compare::compare_form_bound(Some(pin), filter_op, &literal)?;
+    // A literal the rule table refuses (an unknown severity token) cannot
+    // reach here: the compiler in front of BOTH eval lanes —
+    // `stream::compile_stream_plan`, which every SSE stage and every
+    // `rust_stages` batch tail is compiled through — resolves the same
+    // form and rejects it. Falling through to the generic path is the
+    // honest defensive answer, not a second semantics.
+    let form = crate::compare::compare_form_bound(Some(pin), filter_op, &literal)
+        .ok()
+        .flatten()?;
     // Native(String) is the VARCHAR pin's lexical rule — the stored text
     // compares as text, whatever JSON shape the wire value took (the SQL
     // side's generic emission compares the VARCHAR column against a
@@ -512,6 +523,8 @@ fn try_pinned_in_list(
         .map(|item| {
             let element = bare_literal(&item.node)?;
             crate::compare::compare_form_bound(Some(pin), FilterOp::Eq, &element)
+                .ok()
+                .flatten()
         })
         .collect::<Option<_>>()?;
     let Some(value) = pinned_event_value(event, name) else {
@@ -526,65 +539,6 @@ fn try_pinned_in_list(
         )
     }));
     Some(truth_to_eval(truth))
-}
-
-/// Evaluate `level <cmp> "token"` against the numeric `severity` column.
-///
-/// `level` is a DSL alias, not a stored field (ADR-0009): `emit_expr`
-/// rewrites the comparison into a severity band predicate, so streaming
-/// eval must do the same. Reading the (absent) `level` key instead would
-/// evaluate NULL and drop every event the batch path returns.
-///
-/// Returns `None` when this is not a level comparison — the caller then
-/// takes the generic path.
-fn eval_level_comparison(
-    lhs: &Spanned<Expr>,
-    op: BinaryOp,
-    rhs: &Spanned<Expr>,
-    event: &Map<String, Value>,
-) -> Option<EvalValue> {
-    let (filter_op, token) = crate::emitter::severity::as_level_comparison(lhs, op, rhs)?;
-
-    // Unknown tokens are an emit error and a stream-plan error, so nothing
-    // reaches here; NULL (never matches) is the closest an evaluator with
-    // no error channel can get to the batch rejection.
-    let Some(number) = crate::severity::number_for_token(token) else {
-        return Some(EvalValue::Null);
-    };
-    let (lo, hi) = crate::severity::band_of(number).expect("table numbers are in-ladder");
-
-    // A hot event may carry `severity` as a JSON string; DuckDB casts the
-    // column to INTEGER before comparing, so parse rather than fall into a
-    // string comparison.
-    let sev = match event
-        .get(crate::schema::SEVERITY)
-        .map_or(EvalValue::Null, EvalValue::from)
-    {
-        EvalValue::Str(s) => s.parse::<i64>().map_or(EvalValue::Null, EvalValue::Int),
-        other => other,
-    };
-
-    // `severity BETWEEN lo AND hi`, three-valued logic included.
-    let between = |sev: &EvalValue| {
-        eval_and(
-            &eval_binary(sev, BinaryOp::Gte, &EvalValue::Int(i64::from(lo))),
-            &eval_binary(sev, BinaryOp::Lte, &EvalValue::Int(i64::from(hi))),
-        )
-    };
-
-    Some(match filter_op {
-        FilterOp::Eq => between(&sev),
-        // mirrors `severity NOT BETWEEN lo AND hi OR severity IS NULL`
-        FilterOp::Ne => eval_or(
-            &eval_unary(UnaryOp::Not, between(&sev)),
-            &EvalValue::Bool(matches!(sev, EvalValue::Null)),
-        ),
-        FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
-            eval_binary(&sev, op, &EvalValue::Int(i64::from(number)))
-        }
-        // `as_level_comparison` only yields comparison operators
-        FilterOp::Glob | FilterOp::Regex => EvalValue::Null,
-    })
 }
 
 fn eval_literal(lit: &LiteralValue) -> EvalValue {
@@ -1989,8 +1943,12 @@ mod tests {
     }
 
     #[test]
-    fn field_ref_timestamp_mapping() {
+    /// Zero aliases (ADR-0013 §6): `@timestamp` reads the key it spells,
+    /// and `_time` is not that key.
+    fn field_ref_timestamp_is_not_an_alias_for_time() {
         let ev = event(&json!({"_time": "2026-01-01T00:00:00Z"}));
+        assert_eq!(eval_expr(&field("@timestamp"), &ev), EvalValue::Null);
+        let ev = event(&json!({"@timestamp": "2026-01-01T00:00:00Z"}));
         assert_eq!(
             eval_expr(&field("@timestamp"), &ev),
             EvalValue::Str("2026-01-01T00:00:00Z".to_string())
@@ -2188,17 +2146,17 @@ mod tests {
 
     #[test]
     fn where_timestamp_gt_now_for_future_event() {
-        // Event with far-future timestamp: `timestamp > now()` should be true.
+        // Event with far-future timestamp: `_time > now()` should be true.
         let ev = event(&json!({"_time": "2999-12-31 23:59:59"}));
-        let expr = binary(field("timestamp"), BinaryOp::Gt, call("now", vec![]));
+        let expr = binary(field("_time"), BinaryOp::Gt, call("now", vec![]));
         assert_eq!(eval_expr(&expr, &ev), EvalValue::Bool(true));
     }
 
     #[test]
     fn where_timestamp_gt_now_for_past_event() {
-        // Event with past timestamp: `timestamp > now()` should be false.
+        // Event with past timestamp: `_time > now()` should be false.
         let ev = event(&json!({"_time": "2000-01-01 00:00:00"}));
-        let expr = binary(field("timestamp"), BinaryOp::Gt, call("now", vec![]));
+        let expr = binary(field("_time"), BinaryOp::Gt, call("now", vec![]));
         assert_eq!(eval_expr(&expr, &ev), EvalValue::Bool(false));
     }
 

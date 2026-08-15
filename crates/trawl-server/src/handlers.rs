@@ -121,10 +121,8 @@ pub async fn query(
             // produced the rows those stages run over. Nothing stamps a
             // report run at write time, so a degraded pin the saved query
             // bound would otherwise go unmentioned.
-            let degraded = degraded_fields_for(
-                &state,
-                [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()],
-            );
+            let halves = [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()];
+            let degraded = degraded_fields_for(&state, halves);
             (
                 state
                     .query
@@ -1144,7 +1142,7 @@ fn degraded_fields_for<'a>(
 /// answer there — it is the one pin under which nothing further can be
 /// shelved.
 fn current_pin(duckdb_type: &str) -> trawl_core::schema::CanonicalType {
-    trawl_core::schema::CanonicalType::from_duckdb(duckdb_type)
+    trawl_core::schema::CanonicalType::from_catalog(duckdb_type)
         .unwrap_or(trawl_core::schema::CanonicalType::Varchar)
 }
 

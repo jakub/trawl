@@ -176,15 +176,8 @@ impl fmt::Display for Value {
 /// Kept in sync with `trawl_core::schema::LEADING_LOG_FIELDS` (duplicated
 /// because trawl-api does not depend on trawl-core; a trawl-engine test
 /// asserts parity).
-pub const WELL_KNOWN_LOG_FIELDS: &[&str] = &[
-    "_time",
-    "env",
-    "service",
-    "host",
-    "severity",
-    "severity_text",
-    "message",
-];
+pub const WELL_KNOWN_LOG_FIELDS: &[&str] =
+    &["_time", "env", "service", "host", "_severity", "message"];
 
 /// Envelope metadata columns demoted to the end of reordered results.
 ///
@@ -402,7 +395,8 @@ mod tests {
     fn field_display_rank_orders_envelope_custom_trailing() {
         // Envelope fields rank first, in declared order.
         assert_eq!(field_display_rank("_time"), (0, 0));
-        assert_eq!(field_display_rank("message"), (0, 6));
+        assert_eq!(field_display_rank("_severity"), (0, 4));
+        assert_eq!(field_display_rank("message"), (0, 5));
         // Custom fields sit between envelope and trailing metadata; callers
         // break ties by name.
         assert_eq!(field_display_rank("duration").0, 1);

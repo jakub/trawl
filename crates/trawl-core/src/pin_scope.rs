@@ -376,9 +376,13 @@ mod tests {
     }
 
     #[test]
-    fn let_alias_through_time_alias_resolves() {
-        let scope = walk("* | let t = timestamp", ROOT);
+    /// Zero aliases (ADR-0013 §6): a bare alias copies the pin of the
+    /// column it NAMES, and `timestamp` is not `_time`.
+    fn let_alias_copies_the_named_columns_pin() {
+        let scope = walk("* | let t = _time", ROOT);
         assert_eq!(scope.pin_for("t"), Some(CT::Timestamp));
+        let scope = walk("* | let t = timestamp", ROOT);
+        assert_eq!(scope.pin_for("t"), None);
     }
 
     // ── selection ─────────────────────────────────────────────────────
