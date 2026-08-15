@@ -1000,6 +1000,15 @@ fn rewrite_file(
     // Tally the nulled rows before rewriting: the rewrite destroys the
     // pre-cast values this evidence is drawn from.
     let conflicts = plan.tally_conflicts(conn, &source, &file.service)?;
+    // A guard-only plan that nulled nothing is the identity over THIS file:
+    // the columns already are their pins' physical types and every value is
+    // inside the pin's domain. Skipping it is what keeps the pass rewriting
+    // the nonconformant files rather than the whole archive — `_severity` is
+    // in every trawl-written parquet, and this rewrite is in place with no
+    // backing copy (see the fsync comment below).
+    if plan.is_guard_only() && conflicts.is_empty() {
+        return Ok(None);
+    }
 
     let has_time = file
         .schema

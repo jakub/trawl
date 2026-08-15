@@ -1007,6 +1007,43 @@ mod boot {
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
     }
 
+    /// `_severity` is SEVERITY-pinned and in every parquet trawl writes, and
+    /// its conform is a domain guard rather than a pass-through — so without
+    /// a data-decided skip, a re-armed pass (identity mismatch, or the
+    /// `clear_conformed` inside a repin cutover) would rewrite the ENTIRE
+    /// archive in place on every re-arm. An in-ladder corpus must be
+    /// untouched.
+    #[sqlx::test]
+    async fn a_rerun_over_an_in_ladder_severity_corpus_rewrites_nothing(pool: sqlx::PgPool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let file = plant(
+            &data_dir,
+            "prod/2026-08-01/10/svc-a.parquet",
+            "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
+             x::BIGINT AS \"_severity\" FROM (VALUES (9), (17), (24)) t(x)",
+        );
+
+        let store = CatalogStore::new(pool.clone());
+        let cache = FieldCatalog::new();
+        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        let mtime = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
+        let before = mtime(&file);
+
+        std::fs::write(data_dir.join("CATALOG"), "someone-elses-catalog\n").unwrap();
+        let summary = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+            .await
+            .unwrap();
+        assert!(summary.ran, "identity mismatch re-arms the pass");
+        assert_eq!(
+            summary.rewritten, 0,
+            "every _severity is inside 1-24: the guard is the identity"
+        );
+        assert_eq!(mtime(&file), before, "no file touched");
+    }
+
     /// Crash-mid-pass: the marker is published LAST, so a crash after the
     /// rewrites but before the marker leaves a conformant corpus with no
     /// marker. The re-run must be restartable — rewrite nothing (everything
