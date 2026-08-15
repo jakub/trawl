@@ -99,6 +99,50 @@ pub const KNOWN_FUNCTIONS: &[&str] = &[
     "json_array_length",
 ];
 
+/// The grammar's closed keyword set: three words the search stage reads
+/// unconditionally, before any field filter (`last=2h`, `earliest="…"`,
+/// `latest="…"`).
+///
+/// ADR-0013 ruling 7 corrects §6 here — the set is THREE, not one. A
+/// field of one of these names is reachable only through backticks, so
+/// [`quote_dsl_field`] always quotes them.
+pub const GRAMMAR_KEYWORDS: &[&str] = &["last", "earliest", "latest"];
+
+/// Whether `name` lexes as a BARE field name — the unquoted production
+/// (`[A-Za-z_][A-Za-z0-9_]*`, dot-joined, optionally `@`-prefixed).
+///
+/// A pure char walk mirroring `primitives::ident`/`system_field`, pinned
+/// against the real grammar by a drift-guard test.
+#[must_use]
+pub fn is_bare_field_name(name: &str) -> bool {
+    let body = name.strip_prefix('@').unwrap_or(name);
+    !body.is_empty() && body.split('.').all(is_bare_segment)
+}
+
+fn is_bare_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Render a field name as DSL text: bare when the bare production can
+/// spell it and it is not a grammar keyword, else backtick-quoted with
+/// embedded backticks doubled (ADR-0013 ruling 7).
+///
+/// The one renderer every suggestion surface goes through — autocomplete
+/// insertions and the query formatter — so a name trawl offers is a name
+/// trawl can parse back.
+#[must_use]
+pub fn quote_dsl_field(name: &str) -> String {
+    if is_bare_field_name(name) && !GRAMMAR_KEYWORDS.contains(&name) {
+        return name.to_string();
+    }
+    format!("`{}`", name.replace('`', "``"))
+}
+
 /// Compute the Levenshtein edit distance between two strings.
 ///
 /// Uses a standard two-row dynamic programming approach — O(min(a,b)) space.
@@ -167,6 +211,108 @@ pub fn suggest_function(input: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── DSL field-name quoting (ADR-0013 ruling 7) ─────────────────────
+
+    #[test]
+    fn a_bare_lexable_name_renders_bare() {
+        for name in [
+            "host",
+            "host_name",
+            "host.name",
+            "@timestamp",
+            "_time",
+            "a1",
+        ] {
+            assert_eq!(quote_dsl_field(name), name, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_name_the_bare_production_cannot_spell_is_backticked() {
+        assert_eq!(quote_dsl_field("x-request-id"), "`x-request-id`");
+        assert_eq!(quote_dsl_field("request id"), "`request id`");
+        assert_eq!(quote_dsl_field("1st"), "`1st`");
+        assert_eq!(quote_dsl_field("über"), "`über`");
+        assert_eq!(quote_dsl_field("trailing."), "`trailing.`");
+    }
+
+    /// The closed keyword set is THREE (ADR-0013 ruling 7 corrects §6),
+    /// and the rule is uniform: a rendered name is pasteable in every
+    /// position, so these are always quoted even where a bare spelling
+    /// would happen to parse.
+    #[test]
+    fn the_three_grammar_keywords_are_always_quoted() {
+        assert_eq!(GRAMMAR_KEYWORDS, ["last", "earliest", "latest"]);
+        for kw in GRAMMAR_KEYWORDS {
+            assert_eq!(quote_dsl_field(kw), format!("`{kw}`"));
+        }
+    }
+
+    #[test]
+    fn an_embedded_backtick_is_doubled() {
+        assert_eq!(quote_dsl_field("a`b"), "`a``b`");
+    }
+
+    /// The drift guard: `is_bare_field_name` claims to mirror the bare
+    /// production, and `quote_dsl_field` claims its output parses back to
+    /// the same name. Both claims are checked against the REAL parser
+    /// over a hostile corpus — a grammar change that isn't mirrored here
+    /// fails loudly instead of emitting suggestions that don't parse.
+    #[test]
+    fn quoting_agrees_with_the_real_grammar() {
+        for name in [
+            "host",
+            "host.name",
+            "@timestamp",
+            "_time",
+            "x-request-id",
+            "request id",
+            "last",
+            "earliest",
+            "latest",
+            "where",
+            "Dur",
+            "a`b",
+            "a#b",
+            "a//b",
+            "1st",
+            "über",
+            "a.b.c",
+            "trailing.",
+            "with\"quote",
+            "with'quote",
+            "count",
+            "|pipe",
+        ] {
+            let rendered = quote_dsl_field(name);
+            let query = crate::parser::parse(&format!("| table {rendered}"))
+                .unwrap_or_else(|e| panic!("{name:?} rendered as {rendered} must parse: {e:?}"));
+            match &query.pipeline[0].node {
+                crate::ast::PipeStage::Table(t) => assert_eq!(
+                    t.fields,
+                    vec![name.to_string()],
+                    "{name:?} rendered as {rendered} must round-trip"
+                ),
+                other => panic!("expected Table, got {other:?}"),
+            }
+
+            // …and the bare claim is exactly the bare production, keyword
+            // exclusion aside.
+            let bare_parses = crate::parser::parse(&format!("| table {name}"))
+                .ok()
+                .and_then(|q| match &q.pipeline[0].node {
+                    crate::ast::PipeStage::Table(t) => Some(t.fields == vec![name.to_string()]),
+                    _ => None,
+                })
+                .unwrap_or(false);
+            assert_eq!(
+                is_bare_field_name(name),
+                bare_parses,
+                "{name:?}: is_bare_field_name drifted from the grammar"
+            );
+        }
+    }
 
     #[test]
     fn levenshtein_identical() {

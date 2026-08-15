@@ -9,7 +9,7 @@
 //! as a dimmed inline suffix.
 
 use trawl_core::emitter::is_aggregate_function;
-use trawl_core::parser::suggest::{KNOWN_FUNCTIONS, KNOWN_PIPE_STAGES};
+use trawl_core::parser::suggest::{KNOWN_FUNCTIONS, KNOWN_PIPE_STAGES, quote_dsl_field};
 
 // ── Public types ────────────────────────────────────────────────────
 
@@ -339,9 +339,14 @@ fn build_completion(candidate: &Candidate, prefix_len: usize) -> Completion {
                 cursor_offset: None,
             }
         } else {
+            // A field name goes in through the DSL renderer: a name the
+            // bare production cannot spell is inserted backticked
+            // (ADR-0013 ruling 7), so an accepted suggestion always
+            // parses. The ghost text stays the raw name — it labels the
+            // column, and prefix matching runs on bare names.
             Completion {
                 ghost_text: suffix.to_owned(),
-                insert_text: candidate.name.clone(),
+                insert_text: quote_dsl_field(&candidate.name),
                 replace_len: prefix_len,
                 cursor_offset: None,
             }
@@ -725,6 +730,27 @@ mod tests {
         assert_eq!(c.ghost_text, "ame");
         assert_eq!(c.insert_text, "hostname");
         assert_eq!(c.replace_len, 5);
+    }
+
+    /// A field whose name the bare production cannot spell is INSERTED
+    /// backticked (ADR-0013 ruling 7) — a suggestion trawl offers must be
+    /// a query trawl can parse. The ghost text stays the raw name: it is
+    /// the label of the column, not the text at the cursor.
+    #[test]
+    fn complete_field_needing_backticks_inserts_quoted() {
+        let mut schema = fields();
+        schema.push(SchemaField {
+            name: "x-request-id".to_owned(),
+            is_numeric: false,
+        });
+        let c = complete("| table x", 9, &schema).unwrap();
+        assert_eq!(c.insert_text, "`x-request-id`");
+        assert_eq!(c.ghost_text, "-request-id");
+        assert_eq!(c.replace_len, 1);
+        assert!(
+            trawl_core::parser::parse(&format!("| table {}", c.insert_text)).is_ok(),
+            "the inserted text must parse"
+        );
     }
 
     #[test]
