@@ -33,11 +33,11 @@ async fn query_returns_results(pool: sqlx::PgPool) {
     assert_eq!(result.result.row_count(), 3);
 }
 
-/// The shape advisory (ADR-0013 §7): non-blocking, fires on exactly the
-/// confusing shape, and a healthy response is byte-identical to one from
-/// a build that predates the field.
+/// The shape advisory (ADR-0013 §7): non-blocking, fires on every retired
+/// spelling, and a healthy response is byte-identical to one from a build
+/// that predates the field.
 #[sqlx::test(migrations = false)]
-async fn level_shape_advisory_rides_the_notice_channel(pool: sqlx::PgPool) {
+async fn retired_alias_advisories_ride_the_notice_channel(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     // A sender that really carries `level`, so the queries below bind a
@@ -50,7 +50,15 @@ async fn level_shape_advisory_rides_the_notice_channel(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    for dsl in ["level=error", r#"* | where level == "warn""#] {
+    for dsl in [
+        "level=error",
+        r#"* | where level == "warn""#,
+        // No literal to read intent from: a hard emit error before the
+        // cutover, an ordinary column read after it.
+        "* | stats count() by level",
+        "* | table level",
+        "* | sort -level | head 5",
+    ] {
         let result = client.query_paginated(dsl, None, None).await.unwrap();
         assert_eq!(result.notices.len(), 1, "{dsl}");
         assert!(
@@ -60,8 +68,26 @@ async fn level_shape_advisory_rides_the_notice_channel(pool: sqlx::PgPool) {
         );
     }
 
+    // The retired time aliases, over a corpus no sender writes them to:
+    // the answer is an empty success, so the notice is the only thing
+    // standing between a pre-cutover saved query and silence.
+    for dsl in [
+        r#"timestamp>"2026-01-01""#,
+        "* | sort -timestamp | head 5",
+        "* | table timestamp, message",
+    ] {
+        let result = client.query_paginated(dsl, None, None).await.unwrap();
+        assert_eq!(result.result.row_count(), 0, "{dsl}");
+        assert_eq!(result.notices.len(), 1, "{dsl}");
+        assert!(
+            result.notices[0].contains("_time"),
+            "{dsl}: {:?}",
+            result.notices
+        );
+    }
+
     // Not on a genuine sender field, and not on the right spelling.
-    for dsl in ["level=gold", "_severity=error", "*"] {
+    for dsl in ["level=gold", "_severity=error", "* | sort -_time", "*"] {
         let result = client.query_paginated(dsl, None, None).await.unwrap();
         assert!(result.notices.is_empty(), "{dsl}: {:?}", result.notices);
     }

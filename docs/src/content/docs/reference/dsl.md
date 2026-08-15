@@ -332,10 +332,17 @@ simply has no `_severity`.
 `level` is an ordinary field now, so `level=error` compares the sender's
 own value. A game server emitting `{"service":"game","level":"gold"}`
 keeps a fully queryable `level` column — that is the point — but if you
-meant severity, you want `_severity>=error`. Queries with the confusing
-shape (a bare `level` compared against a recognized severity token) come
-back with a non-blocking advisory saying so; the query itself runs with
-plain semantics either way.
+meant severity, you want `_severity>=error`. And a field no sender writes
+is not an error: it simply matches nothing, so a pre-cutover query would
+otherwise come back empty and silent.
+
+Queries naming `level` therefore come back with a non-blocking advisory
+pointing at `_severity` — in every position the name can appear
+(`level=error`, `| stats count() by level`, `| table level`,
+`| sort -level`, `| rename level as lvl`). The one exemption is a
+comparison whose literal proves whose field it is: `level=gold` and
+`level=3` get nothing, and that proof holds for the rest of the query.
+The query itself runs with plain semantics either way.
 :::
 
 ### `timestamp` and `@timestamp`
@@ -345,6 +352,12 @@ derivation (`_time` → `timestamp` → `@timestamp`, first present wins)
 and **stored verbatim** under their own names, so both the canonical
 instant and what the sender actually sent stay queryable. Only `_time`
 itself is consumed and canonicalized — it is the proposal slot.
+
+They are no longer aliases for `_time`, so `| sort -timestamp` sorts the
+sender's column and finds nothing where no sender sends one. Naming
+either spelling anywhere in a query earns the same non-blocking advisory
+`level` does, pointing at `_time`; sort, filter and project `_time` when
+you mean the event's instant.
 
 ### Text search
 

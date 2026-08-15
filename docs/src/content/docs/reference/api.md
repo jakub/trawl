@@ -92,19 +92,23 @@ the [web UI](/reference/web-ui/#the-incomplete-results-notice) renders it
 as a dismissible notice over the results.
 
 It may also carry `notices` — non-blocking advisories about the query's
-SHAPE, prose sentences for a human. There is exactly one today: a bare
-`level` compared against a recognized severity token filters the
-sender's own field rather than the severity ladder (ADR-0013), so the
-notice points at `_severity`. The query executed with plain semantics
-either way. Like `degraded_fields`, the key is **absent when empty**.
-`trawl query -f table` prints each as a footer line and the web UI
-renders them over the results.
+SHAPE, prose sentences for a human. They fire on the spellings ADR-0013
+retired: `level` (which reads the sender's own field, not the severity
+ladder — the notice points at `_severity`) and `timestamp`/`@timestamp`
+(the sender's own fields, not the event instant — the notice points at
+`_time`). Both fire wherever the name is BOUND, not only in a filter,
+because a name no sender writes answers with an empty success rather
+than an error; a `level` comparison against an unrecognized literal
+(`level=gold`) is the one exemption. The query executed with plain
+semantics either way. Like `degraded_fields`, the key is **absent when
+empty**. `trawl query -f table` prints each as a footer line and the web
+UI renders them over the results.
 
 ```json
 { "columns": [], "rows": [], "truncated": false,
   "pagination": { "limit": 1000, "offset": 0, "returned": 12 },
   "degraded_fields": ["duration"],
-  "notices": ["'level' is an ordinary field: this filtered the sender's own value, not severity. For the severity ladder use `_severity` (e.g. `_severity>=error`)."] }
+  "notices": ["'level' is an ordinary field now, not a severity alias: this reads the sender's own value, and matches nothing where no sender writes it. For the severity ladder use `_severity` (e.g. `_severity>=error`)."] }
 ```
 
 ### Validate

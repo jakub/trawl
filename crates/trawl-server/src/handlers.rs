@@ -1130,8 +1130,12 @@ pub async fn catalog_fields(
 fn shape_notices(dsl: &str) -> Vec<String> {
     trawl_core::parser::parse(dsl)
         .ok()
-        .filter(trawl_core::advisory::advises_severity)
-        .map(|_| vec![trawl_core::advisory::LEVEL_ADVISORY.to_owned()])
+        .map(|query| {
+            trawl_core::advisory::notices(&query)
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect()
+        })
         .unwrap_or_default()
 }
 

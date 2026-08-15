@@ -73,13 +73,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   conformance pass.
 
   **Operational note.** A saved query, dashboard panel or alert written
-  `level=error` now filters the sender's own `level` column: over a
-  corpus that has one it answers a different question, and over a corpus
-  that does not it is a query error. Rewrite it as `_severity>=error`.
-  `/api/v1/query` carries a non-blocking `notices` advisory on exactly
-  that shape (a bare `level` against a recognized severity token), and
-  `trawl query -f table` prints it as a footer line; the query runs with
-  plain semantics either way.
+  `level=error`, `| stats count() by level`, `| sort -timestamp` or
+  `| table timestamp` now reads the sender's own column of that name:
+  over a corpus that has one it answers a different question, and over a
+  corpus that does not it answers with **no rows and no error**. Rewrite
+  them as `_severity>=error` and `_time`. `/api/v1/query` carries a
+  non-blocking `notices` advisory wherever a retired spelling is bound —
+  `level` pointing at `_severity`, `timestamp`/`@timestamp` pointing at
+  `_time`, with a `level` comparison against an unrecognized literal
+  (`level=gold`) exempt — and `trawl query -f table` prints each as a
+  footer line; the query runs with plain semantics either way.
 - **SPA operator surface for degraded pins and repin (ADR-0011 slice C2,
   #71).** The degraded-pin case file and the repin trigger leave the CLI
   for the browser, on the schema page's existing anatomy — no new

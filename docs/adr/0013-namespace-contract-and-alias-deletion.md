@@ -165,6 +165,21 @@ carries a non-blocking advisory in the existing notice channel (beside
 closes the mixed-fleet hole where a legitimate `level` pin would silence a
 pin-existence check. Never blocks; fires on exactly the confusing shape.
 
+**Amended in implementation (#60 review).** "The confusing shape" is the
+NAME, not the comparison. A retired spelling in a position with no literal
+— `| stats count() by level`, `| table level`, `| sort -level` — was a hard
+emit error before this ADR and is an empty success after it (a missing
+column reaches the ADR-0008 benign-binder carve-out, so a pre-cutover saved
+query returns zero rows, zero columns and a 200), which is precisely the
+silence the deleted error class existed to prevent. So the advisory fires
+wherever the name is BOUND (the `field_refs` walk), and `timestamp`/
+`@timestamp` earn the same treatment pointing at `_time`. The literal-based
+exemption survives where a literal exists: a `level` comparison against an
+unrecognized value (`level=gold`) proves whose field it is and silences the
+advisory for that query. The cost is one advisory line for the legitimate
+`level` user's aggregate — paid deliberately, since the alternative is the
+empty pre-cutover query saying nothing at all.
+
 ### 8. Repairs taxonomy
 
 `_repairs` records exactly the places trawl touched sender-visible data,
