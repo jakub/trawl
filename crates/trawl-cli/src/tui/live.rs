@@ -178,7 +178,7 @@ fn extract_field_order(query: &str) -> Vec<String> {
             return t
                 .fields
                 .iter()
-                .map(|f| trawl_core::emitter::map_field_name(f).to_string())
+                .map(std::string::ToString::to_string)
                 .collect();
         }
     }

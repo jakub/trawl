@@ -257,34 +257,34 @@ mod tests {
     #[test]
     fn base_only_passes_through() {
         assert_eq!(
-            effective_query("level=error", &[], &RangeSpec::default()),
-            "last=15m level=error"
+            effective_query("_severity=error", &[], &RangeSpec::default()),
+            "last=15m _severity=error"
         );
     }
 
     #[test]
     fn filters_and_range_prepend_to_search_stage() {
         let q = effective_query(
-            "level=error | stats count() by host",
+            "_severity=error | stats count() by host",
             &[inc("host", "web-01"), exc("source", "auth.log")],
             &quick("1h"),
         );
         assert_eq!(
             q,
-            "host=\"web-01\" source!=\"auth.log\" last=1h level=error | stats count() by host"
+            "host=\"web-01\" source!=\"auth.log\" last=1h _severity=error | stats count() by host"
         );
     }
 
     #[test]
     fn existing_last_suppresses_range() {
-        let q = effective_query("last=2h level=error", &[], &quick("15m"));
-        assert_eq!(q, "last=2h level=error");
+        let q = effective_query("last=2h _severity=error", &[], &quick("15m"));
+        assert_eq!(q, "last=2h _severity=error");
     }
 
     #[test]
     fn existing_last_case_insensitive() {
-        let q = effective_query("LAST=2h level=error", &[], &quick("15m"));
-        assert_eq!(q, "LAST=2h level=error");
+        let q = effective_query("LAST=2h _severity=error", &[], &quick("15m"));
+        assert_eq!(q, "LAST=2h _severity=error");
     }
 
     #[test]
@@ -367,8 +367,8 @@ mod tests {
 
     #[test]
     fn split_without_pipe() {
-        let (search, tail) = split_search_stage("level=error");
-        assert_eq!(search, "level=error");
+        let (search, tail) = split_search_stage("_severity=error");
+        assert_eq!(search, "_severity=error");
         assert_eq!(tail, None);
     }
 

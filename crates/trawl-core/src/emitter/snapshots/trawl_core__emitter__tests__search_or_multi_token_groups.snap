@@ -1,11 +1,13 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(\"service=nginx level=error OR service=postgres level=warn\")"
+expression: "emit_dsl(\"service=nginx _severity=error OR service=postgres _severity=warn\")"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE (("service" = ? AND "severity" BETWEEN 17 AND 20) OR ("service" = ? AND "severity" BETWEEN 13 AND 16))
+WHERE (("service" = ? AND "_severity" = ?) OR ("service" = ? AND "_severity" = ?))
 ---
 params:
   0: 'nginx'
-  1: 'postgres'
+  1: 'error'
+  2: 'postgres'
+  3: 'warn'

@@ -1,5 +1,0 @@
----
-source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl_err(\"level=glob:err*\")"
----
-unsupported operation: unknown severity token 'glob:err*' for level= (valid tokens: trace, debug, info, notice, warn, error, fatal, alert, emerg); to match the original text use severity_text instead

@@ -22,10 +22,8 @@ use crate::ast::{
     AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
     LiteralValue, PipeStage, RenameStage, Spanned, TableStage, WhereStage,
 };
-use crate::emitter::severity::{as_level_comparison, level_predicate};
 use crate::emitter::{
-    format_literal_position, map_field_name, unit_literal_positions, validate_format_literal,
-    validate_unit_literal,
+    format_literal_position, unit_literal_positions, validate_format_literal, validate_unit_literal,
 };
 use crate::eval::{bind_event_key, eval_expr_with_pins};
 use crate::pin_scope::PinScope;
@@ -64,9 +62,6 @@ pub enum StreamPlanError {
     InvalidUnit(String),
     /// A `strftime`/`strptime` format string literal contains an invalid code.
     InvalidFormat(String),
-    /// A `level` reference the SQL emitter rejects: an unknown severity
-    /// token, or `level` named anywhere other than a comparison.
-    InvalidLevel(String),
     /// A pinned comparison the shared rule table refuses — an unknown
     /// severity value against a `SEVERITY`-pinned field (ADR-0013). The
     /// SQL emitter errors on exactly this shape, so the stream must too:
@@ -84,7 +79,6 @@ impl fmt::Display for StreamPlanError {
             Self::InvalidRegex(msg) => write!(f, "invalid regex: {msg}"),
             Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),
             Self::InvalidFormat(msg) => write!(f, "invalid date/time format: {msg}"),
-            Self::InvalidLevel(msg) => write!(f, "invalid level comparison: {msg}"),
             Self::InvalidComparison(msg) => write!(f, "invalid comparison: {msg}"),
         }
     }
@@ -109,17 +103,6 @@ pub fn compile_stream_plan(
     pipeline: &[Spanned<PipeStage>],
     pins: &PinScope,
 ) -> Result<StreamPlan, StreamPlanError> {
-    // `level` is a filter-only alias for the numeric `severity` column
-    // (ADR-0009), so every other use of the name — `stats … by level`,
-    // `table level`, `where level in (…)`, `where "error" == level`,
-    // `where isnull(level)` — is a batch-path error. Eval has no error
-    // channel: it would read an absent key, evaluate NULL and open a
-    // live-looking stream that can never match. Reject the same shapes the
-    // emitter does, from the same arbiter, so live tail and batch agree.
-    for spanned in pipeline {
-        reject_level_references(&spanned.node)?;
-    }
-
     // Find the first aggregation stage index (if any).
     let agg_idx = pipeline.iter().position(|s| is_agg_stage(&s.node));
 
@@ -163,11 +146,6 @@ pub fn compile_stream_plan(
         }
         Ok(StreamPlan::PassThrough(stages))
     }
-}
-
-fn reject_level_references(stage: &PipeStage) -> Result<(), StreamPlanError> {
-    crate::emitter::validate_level_references(stage)
-        .map_err(|e| StreamPlanError::InvalidLevel(e.to_string()))
 }
 
 fn is_agg_stage(stage: &PipeStage) -> bool {
@@ -350,7 +328,7 @@ fn compile_table(s: &TableStage) -> CompiledStage {
         fields: s
             .fields
             .iter()
-            .map(|f| map_field_name(f).to_string())
+            .map(std::string::ToString::to_string)
             .collect(),
     }
 }
@@ -360,7 +338,7 @@ fn compile_drop(s: &DropStage) -> CompiledStage {
         fields: s
             .fields
             .iter()
-            .map(|f| map_field_name(f).to_string())
+            .map(std::string::ToString::to_string)
             .collect(),
     }
 }
@@ -370,7 +348,7 @@ fn compile_rename(s: &RenameStage) -> CompiledStage {
         renames: s
             .renames
             .iter()
-            .map(|(from, to)| (map_field_name(from).to_string(), to.clone()))
+            .map(|(from, to)| (from.clone(), to.clone()))
             .collect(),
     }
 }
@@ -441,13 +419,6 @@ fn validate_expr(
             }
         }
         Expr::Binary { lhs, op, rhs } => {
-            // `level` aliases the numeric severity column (ADR-0009); the
-            // emitter rejects unknown tokens, so the stream must too — eval
-            // has no error channel and would just match nothing.
-            if let Some((filter_op, token)) = as_level_comparison(lhs, *op, rhs) {
-                level_predicate(filter_op, token)
-                    .map_err(|e| StreamPlanError::InvalidLevel(e.to_string()))?;
-            }
             // The pinned rule table refuses an unknown severity value, and
             // it must refuse it HERE — the SQL emitter 400s on the same
             // shape, and eval (the only other consumer of this scope) has
@@ -529,11 +500,7 @@ fn validate_pinned_in_list(
 }
 
 fn compile_extract(s: &ExtractStage) -> Result<CompiledStage, StreamPlanError> {
-    let source_field = s
-        .source_field
-        .as_deref()
-        .map_or("message", |f| map_field_name(f))
-        .to_string();
+    let source_field = s.source_field.as_deref().unwrap_or("message").to_string();
 
     match &s.mode {
         ExtractMode::Regex(pattern) => {
@@ -556,7 +523,7 @@ fn compile_dedup(s: &DedupStage) -> CompiledStage {
         fields: s
             .fields
             .iter()
-            .map(|f| map_field_name(f).to_string())
+            .map(std::string::ToString::to_string)
             .collect(),
         seen: HashSet::new(),
         max_entries: 10_000,
@@ -792,7 +759,7 @@ fn dedup_key(fields: &[String], event: &Map<String, Value>) -> Vec<String> {
         fields
             .iter()
             .map(|f| {
-                let mapped = map_field_name(f);
+                let mapped = f.as_str();
                 event.get(mapped).map_or_else(String::new, |v| match v {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
@@ -1059,7 +1026,7 @@ fn new_acc_state(acc: &CompiledAcc) -> AccState {
 fn compile_agg_expr(agg: &AggExpr) -> CompiledAcc {
     let field = agg.args.first().and_then(|a| {
         if let crate::ast::Expr::FieldRef(name) = &a.node {
-            Some(map_field_name(name).to_string())
+            Some(name.clone())
         } else {
             None
         }
@@ -1093,7 +1060,7 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
             let group_by: Vec<_> = s
                 .group_by
                 .iter()
-                .map(|f| map_field_name(f).to_string())
+                .map(std::string::ToString::to_string)
                 .collect();
             Ok(CompiledAggregation::Stats {
                 accumulators,
@@ -1110,7 +1077,7 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
             let group_by: Vec<_> = s
                 .group_by
                 .iter()
-                .map(|f| map_field_name(f).to_string())
+                .map(std::string::ToString::to_string)
                 .collect();
             Ok(CompiledAggregation::Timechart {
                 span_secs,
@@ -1121,14 +1088,14 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
         }
         PipeStage::Top(s) => Ok(CompiledAggregation::Top {
             count: s.count,
-            field: map_field_name(&s.field).to_string(),
-            by: s.by.iter().map(|f| map_field_name(f).to_string()).collect(),
+            field: s.field.clone(),
+            by: s.by.iter().map(std::string::ToString::to_string).collect(),
             counters: HashMap::new(),
         }),
         PipeStage::Rare(s) => Ok(CompiledAggregation::Rare {
             count: s.count,
-            field: map_field_name(&s.field).to_string(),
-            by: s.by.iter().map(|f| map_field_name(f).to_string()).collect(),
+            field: s.field.clone(),
+            by: s.by.iter().map(std::string::ToString::to_string).collect(),
             counters: HashMap::new(),
         }),
         _ => Err(StreamPlanError::UnsupportedStage {
@@ -1602,8 +1569,8 @@ mod tests {
         };
         assert_eq!(
             fields,
-            &["_time", "event_type", "target", "message"],
-            "Table stage must store fields in user-specified order (aliases mapped)"
+            &["timestamp", "event_type", "target", "message"],
+            "Table stage must store fields verbatim, in user-specified order"
         );
     }
 
@@ -1797,8 +1764,9 @@ mod tests {
         assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Filtered);
     }
 
-    /// `where level == "..."` reads the numeric `severity` column, exactly
-    /// like the SQL band predicate — `level` itself is never stored.
+    /// `where level == "..."` is an ORDINARY comparison on the sender's
+    /// own `level` column (ADR-0013 §6): zero aliases, so the stream
+    /// reads the key it was given.
     fn level_where(op: BinaryOp, token: &str) -> Result<CompiledStage, StreamPlanError> {
         compile_where(
             &WhereStage {
@@ -1813,49 +1781,60 @@ mod tests {
     }
 
     #[test]
-    fn where_level_eq_matches_severity_band() {
-        let mut stage = level_where(BinaryOp::Eq, "error").unwrap();
-        let mut in_band = event(&json!({"severity": 17, "severity_text": "error"}));
-        assert_eq!(apply_stage(&mut stage, &mut in_band), StageResult::Pass);
-        let mut out_of_band = event(&json!({"severity": 9, "severity_text": "info"}));
-        assert_eq!(
-            apply_stage(&mut stage, &mut out_of_band),
-            StageResult::Filtered
-        );
-        // absent severity → NULL → no match (SQL: NULL BETWEEN … is NULL)
-        let mut missing = event(&json!({"host": "web-1"}));
-        assert_eq!(apply_stage(&mut stage, &mut missing), StageResult::Filtered);
+    fn where_level_reads_the_senders_own_column() {
+        let mut stage = level_where(BinaryOp::Eq, "gold").unwrap();
+        // The game server's `level` field means what it says.
+        let mut gold = event(&json!({"service": "game", "level": "gold"}));
+        assert_eq!(apply_stage(&mut stage, &mut gold), StageResult::Pass);
+        let mut silver = event(&json!({"service": "game", "level": "silver"}));
+        assert_eq!(apply_stage(&mut stage, &mut silver), StageResult::Filtered);
+        // No `level` key is NULL, not a severity lookup.
+        let mut none = event(&json!({"severity": 17}));
+        assert_eq!(apply_stage(&mut stage, &mut none), StageResult::Filtered);
     }
 
+    /// There is no severity vocabulary on a bare name any more, so
+    /// nothing about `level` is rejected at compile time.
     #[test]
-    fn where_level_ne_includes_null_severity() {
-        let mut stage = level_where(BinaryOp::Ne, "info").unwrap();
-        let mut out_of_band = event(&json!({"severity": 17}));
-        assert_eq!(apply_stage(&mut stage, &mut out_of_band), StageResult::Pass);
-        let mut in_band = event(&json!({"severity": 9}));
-        assert_eq!(apply_stage(&mut stage, &mut in_band), StageResult::Filtered);
-        // mirrors `… OR "severity" IS NULL`
-        let mut missing = event(&json!({"host": "web-1"}));
-        assert_eq!(apply_stage(&mut stage, &mut missing), StageResult::Pass);
+    fn level_is_an_ordinary_field_in_every_position() {
+        for dsl in [
+            r#"* | where level in ("error", "fatal")"#,
+            r#"* | where "error" == level"#,
+            "* | where isnull(level)",
+            "* | where level matches /err.*/",
+            r#"* | where level == "erro""#,
+            "* | table level",
+            "* | dedup level",
+            "* | rename level as lvl",
+            "* | let lvl = level",
+            "* | where timestamp == \"2026-01-01\"",
+            "* | table timestamp, @timestamp",
+        ] {
+            let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
+            assert!(
+                compile_stream_plan(&pipeline, &PinScope::unpinned()).is_ok(),
+                "{dsl} must compile as ordinary field usage"
+            );
+        }
     }
 
+    /// The pipeline may not MINT a reserved name — the same predicate
+    /// ingest strips by (ADR-0013 §5).
     #[test]
-    fn where_level_ordered_uses_exact_number() {
-        let mut stage = level_where(BinaryOp::Gte, "warn").unwrap();
-        let mut warn = event(&json!({"severity": 13}));
-        assert_eq!(apply_stage(&mut stage, &mut warn), StageResult::Pass);
-        let mut info = event(&json!({"severity": 12}));
-        assert_eq!(apply_stage(&mut stage, &mut info), StageResult::Filtered);
-    }
-
-    #[test]
-    fn where_level_unknown_token_rejected_at_compile() {
-        let err = level_where(BinaryOp::Eq, "erro").unwrap_err();
-        assert!(
-            matches!(err, StreamPlanError::InvalidLevel(_)),
-            "expected InvalidLevel, got {err:?}"
-        );
-        assert!(err.to_string().contains("unknown severity token"));
+    fn rejects_minting_reserved_names() {
+        for dsl in [
+            "* | let _foo = 1",
+            "* | eval _severity = 17",
+            "* | rename service as _svc",
+            r#"* | extract "(?P<_foo>.)" from message"#,
+        ] {
+            assert!(
+                crate::parser::parse(dsl)
+                    .map_or(true, |q| crate::emitter::validate_pipeline(&q.pipeline)
+                        .is_err()),
+                "{dsl} must be refused"
+            );
+        }
     }
 
     /// The SEVERITY pin's closed vocabulary is enforced at COMPILE time
@@ -1902,45 +1881,6 @@ mod tests {
                 "{dsl} must compile"
             );
         }
-    }
-
-    /// Every `level` shape the SQL emitter rejects is refused here too.
-    ///
-    /// `level` aliases the numeric `severity` column only inside a
-    /// comparison; anywhere else there is no such key to read, and eval —
-    /// having no error channel — would evaluate NULL and hold open a
-    /// healthy-looking stream that matches nothing, while the very same
-    /// query is a 400 on the batch path.
-    #[test]
-    fn rejects_level_outside_a_comparison() {
-        for dsl in [
-            r#"* | where level in ("error", "fatal")"#,
-            r#"* | where "error" == level"#,
-            "* | where isnull(level)",
-            "* | where level matches /err.*/",
-            "* | stats count() by level",
-            "* | table level",
-            "* | dedup level",
-            "* | rename level as lvl",
-            "* | let lvl = level",
-        ] {
-            let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
-            let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
-            assert!(
-                matches!(err, StreamPlanError::InvalidLevel(_)),
-                "{dsl}: expected InvalidLevel, got {err:?}"
-            );
-            assert!(
-                err.to_string().contains("filter-only alias"),
-                "{dsl}: {err}"
-            );
-        }
-
-        // the comparison itself is untouched
-        let ok = crate::parser::parse(r#"* | where level >= "warn""#)
-            .expect("parses")
-            .pipeline;
-        assert!(compile_stream_plan(&ok, &PinScope::unpinned()).is_ok());
     }
 
     // ── tier 2: let ────────────────────────────────────────────────

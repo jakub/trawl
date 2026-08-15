@@ -57,16 +57,11 @@ impl Rng {
 
 /// Fields referenced in generated search terms.
 /// All are present in every generated event to avoid `DuckDB` binder errors.
-/// (`level` is no longer a physical field — it aliases the numeric
-/// `severity` column via band predicates, generated separately.)
 const FIELDS: &[&str] = &["service", "status", "host", "path", "severity"];
 
 /// String-typed fields (excludes numeric `status`/`severity`).
 /// Used when the filter value is a string to avoid `DuckDB` conversion errors.
 const STRING_FIELDS: &[&str] = &["service", "host", "path"];
-
-/// Severity tokens exercised through the `level` alias.
-const LEVEL_TOKENS: &[&str] = &["trace", "debug", "info", "notice", "warn", "error", "fatal"];
 
 const STRING_VALS: &[&str] = &[
     "nginx", "apache", "postgres", "redis", "error", "warn", "info", "debug", "web-1", "web-2",
@@ -109,32 +104,13 @@ fn random_dsl(rng: &mut Rng) -> String {
 }
 
 fn random_token(rng: &mut Rng) -> String {
-    match rng.range(7) {
+    match rng.range(6) {
         0 => random_field_eq(rng),
         1 => random_field_compare(rng),
         2 => random_field_list(rng),
         3 => random_text_search(rng),
         4 => random_quoted_search(rng),
         5 => random_field_glob(rng),
-        6 => random_level_filter(rng),
-        _ => unreachable!(),
-    }
-}
-
-/// Generate a `level` alias filter: eq / ordered / ne / list of tokens.
-fn random_level_filter(rng: &mut Rng) -> String {
-    let tok = rng.pick(LEVEL_TOKENS);
-    match rng.range(4) {
-        0 => format!("level={tok}"),
-        1 => {
-            let op = rng.pick(&[">", ">=", "<", "<="]);
-            format!("level{op}{tok}")
-        }
-        2 => format!("level!={tok}"),
-        3 => {
-            let tok2 = rng.pick(LEVEL_TOKENS);
-            format!("level={tok},{tok2}")
-        }
         _ => unreachable!(),
     }
 }
@@ -415,31 +391,75 @@ fn envelope_event(severity: Option<i64>, message: &str, raw: Option<&str>) -> Ma
         raw.map_or(Value::Null, |r| Value::String(r.into())),
     );
     m.insert(
-        "severity".into(),
+        "_severity".into(),
         severity.map_or(Value::Null, |n| Value::Number(n.into())),
     );
     m
 }
 
-/// `level` band predicates agree between SQL and the in-memory filter for
-/// every severity number and NULL.
+/// Assert the live filter and the pin-aware SQL agree for one
+/// `_severity` search filter over a stored ladder number, and return the
+/// agreed answer.
+fn assert_severity_parity(conn: &Connection, dsl: &str, stored: Option<i64>) -> bool {
+    let ft = pinned(&[("_severity", CanonicalType::Severity)]);
+    let query = parser::parse(dsl).expect("dsl parses");
+    let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
+
+    let mut event = Map::new();
+    event.insert("message".into(), Value::String("hello".into()));
+    if let Some(n) = stored {
+        event.insert("_severity".into(), Value::from(n));
+    }
+    let filter_result = filter.matches(&event);
+
+    let tmp = tempfile::Builder::new()
+        .suffix(".parquet")
+        .tempfile()
+        .unwrap();
+    let source = tmp.path().to_str().unwrap().to_owned();
+    let stored_sql = stored.map_or_else(
+        || "CAST(NULL AS BIGINT)".to_owned(),
+        |n| format!("CAST({n} AS BIGINT)"),
+    );
+    conn.execute_batch(&format!(
+        "COPY (SELECT {stored_sql} AS \"_severity\", 'hello' AS message) \
+         TO '{source}' (FORMAT PARQUET)"
+    ))
+    .expect("write typed parquet");
+
+    let emitted = emitter::emit_with_pins(&query, &source, &ft).expect("emit succeeds");
+    let sql_result = sql_matches_strict(conn, &emitted);
+    assert_eq!(
+        filter_result, sql_result,
+        "severity parity mismatch\ndsl: {dsl:?}\nstored: {stored:?}\nsql: {}\nparams: {:?}",
+        emitted.sql, emitted.params
+    );
+    filter_result
+}
+
+/// `_severity` band predicates agree between SQL and the in-memory
+/// filter for every severity number and NULL (ADR-0013: the vocabulary
+/// rides the SEVERITY pin, so both lanes bind it from one rule table).
 #[test]
-fn level_band_parity_exhaustive() {
+fn severity_band_parity_exhaustive() {
     let conn = Connection::open_in_memory().unwrap();
     let dsls = [
-        "level=error",
-        "level>=warn",
-        "level>warn",
-        "level<info",
-        "level<=info",
-        "level!=info",
-        "level=error,fatal",
-        "level=trace,notice",
+        "_severity=error",
+        "_severity>=warn",
+        "_severity>warn",
+        "_severity<info",
+        "_severity<=info",
+        "_severity!=info",
+        "_severity=error,fatal",
+        "_severity=trace,notice",
+        "_severity=error2",
+        "_severity=17",
+        "_severity=warn*",
+        "_severity=/^fatal/",
     ];
     for dsl in dsls {
         for sev in (1..=24).map(Some).chain([None]) {
-            let event = envelope_event(sev, "hello", None);
-            assert_parity(&conn, dsl, &event);
+            assert_severity_parity(&conn, dsl, sev);
         }
     }
 }
@@ -479,33 +499,79 @@ fn bare_search_raw_parity() {
     }
 }
 
-/// The pipeline `where level …` stage means the same thing to the SQL
+/// The pipeline `where _severity …` stage means the same thing to the SQL
 /// emitter and to the streaming evaluator, for every severity number and
-/// NULL. `level` is an alias, not a column: the evaluator has to mirror
-/// the band predicate or SSE filters out everything batch returns.
+/// NULL — the same rule table the search stage binds, with the STRICT
+/// null policy (ADR-0011 slice A′).
 #[test]
-fn where_level_band_parity_exhaustive() {
+fn where_severity_band_parity_exhaustive() {
     let conn = Connection::open_in_memory().unwrap();
+    let ft = pinned(&[
+        ("_severity", CanonicalType::Severity),
+        ("status", CanonicalType::BigInt),
+    ]);
     let dsls = [
-        "* | where level == \"error\"",
-        "* | where level != \"info\"",
-        "* | where level >= \"warn\"",
-        "* | where level > \"warn\"",
-        "* | where level < \"info\"",
-        "* | where level <= \"info\"",
-        "* | where level == \"notice\"",
-        "* | where level == \"error\" and status == 500",
-        "* | where not (level == \"error\")",
+        "* | where _severity == \"error\"",
+        "* | where _severity != \"info\"",
+        "* | where _severity >= \"warn\"",
+        "* | where _severity > \"warn\"",
+        "* | where _severity < \"info\"",
+        "* | where _severity <= \"info\"",
+        "* | where _severity == \"notice\"",
+        "* | where _severity == \"error2\"",
+        "* | where _severity == 17",
+        "* | where _severity == \"error\" and status == 500",
+        "* | where not (_severity == \"error\")",
+        "* | where _severity in (\"warn\", \"error\")",
     ];
     for dsl in dsls {
         for sev in (1..=24).map(Some).chain([None]) {
             let mut event = envelope_event(sev, "hello", None);
             event.insert("status".into(), Value::Number(500.into()));
-            // The pin-blind scope: `level` is an alias over the envelope's
-            // own numeric column, so no catalog pin can change its meaning.
-            assert_where_parity(&conn, dsl, &event, &FieldTypes::new());
+            assert_where_parity_over_severity(&conn, dsl, &event, &ft, sev);
         }
     }
+}
+
+/// The `| where` half of [`assert_severity_parity`]: both lanes over a
+/// stored `_severity` BIGINT column, three-valued answer compared
+/// directly so UNKNOWN is observed rather than inferred from "no row".
+fn assert_where_parity_over_severity(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    ft: &FieldTypes,
+    stored: Option<i64>,
+) {
+    let (query, condition) = where_condition(dsl);
+    let scope = trawl_core::pin_scope::PinScope::root(ft);
+    let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
+        &condition, event, &scope,
+    ));
+
+    let tmp = tempfile::Builder::new()
+        .suffix(".parquet")
+        .tempfile()
+        .unwrap();
+    let source = tmp.path().to_str().unwrap().to_owned();
+    let stored_sql = stored.map_or_else(
+        || "CAST(NULL AS BIGINT)".to_owned(),
+        |n| format!("CAST({n} AS BIGINT)"),
+    );
+    conn.execute_batch(&format!(
+        "COPY (SELECT {stored_sql} AS \"_severity\", CAST(500 AS BIGINT) AS status, \
+         'hello' AS message) TO '{source}' (FORMAT PARQUET)"
+    ))
+    .expect("write typed parquet");
+
+    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let sql_result = sql_matches_strict(conn, &emitted);
+    assert_eq!(
+        eval_result == Some(true),
+        sql_result,
+        "where severity parity mismatch\ndsl: {dsl:?}\nstored: {stored:?}\nsql: {}",
+        emitted.sql
+    );
 }
 
 /// `last=` windows evaluate against `_time` identically in SQL and the

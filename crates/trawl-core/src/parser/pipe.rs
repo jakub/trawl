@@ -250,10 +250,33 @@ fn drop_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         .labelled("drop stage")
 }
 
+/// A field name the pipeline WRITES: a `let`/`eval` target or a `rename`
+/// target. Trawl's `_` namespace is sealed at both doors (ADR-0013 §5) —
+/// ingest strips the prefix off an incoming key, so a name the DSL minted
+/// there would be a column ingest can never carry.
+fn assignment_target<'src>()
+-> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
+    field_name().try_map(|name, span| {
+        if crate::schema::is_reserved_name(&name) {
+            return Err(Rich::custom(
+                span,
+                format!(
+                    "'{name}' is in trawl's reserved namespace — names starting \
+                     with '_' are trawl's contract slots and only trawl writes \
+                     them; choose a name without the underscore"
+                ),
+            ));
+        }
+        Ok(name)
+    })
+}
+
 /// Parse a `let` / `eval` assignment: `field = expr`.
 fn let_assignment<'src>()
 -> impl Parser<'src, ParserInput<'src>, (String, Spanned<Expr>), ParserExtra<'src>> + Clone {
-    field_name().then_ignore(just('=').padded()).then(expr())
+    assignment_target()
+        .then_ignore(just('=').padded())
+        .then(expr())
 }
 
 /// Parse a `let` stage: `let field = expr [, field = expr]*`
@@ -457,7 +480,7 @@ fn rename_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parse
 {
     let rename_pair = field_name()
         .then_ignore(keyword("as").padded())
-        .then(field_name());
+        .then(assignment_target());
 
     keyword("rename")
         .padded()

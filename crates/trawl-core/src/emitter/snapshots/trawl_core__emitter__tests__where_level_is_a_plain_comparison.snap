@@ -1,7 +1,10 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(\"level=error\")"
+expression: "emit_dsl(r#\"* | where level == \"error\"\"#)"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE "severity" BETWEEN 17 AND 20
+WHERE ("level" = ?)
+---
+params:
+  0: 'error'

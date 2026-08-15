@@ -1,11 +1,12 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(r#\"earliest=\"2026-03-14T03:00:00Z\" latest=\"2026-03-14T03:15:00Z\" level=error\"#)"
+expression: "emit_dsl(r#\"earliest=\"2026-03-14T03:00:00Z\" latest=\"2026-03-14T03:15:00Z\" _severity=error\"#)"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE TRY_CAST("_time" AS TIMESTAMP) >= CAST(? AS TIMESTAMP) AND TRY_CAST("_time" AS TIMESTAMP) < CAST(? AS TIMESTAMP) AND "severity" BETWEEN 17 AND 20
+WHERE TRY_CAST("_time" AS TIMESTAMP) >= CAST(? AS TIMESTAMP) AND TRY_CAST("_time" AS TIMESTAMP) < CAST(? AS TIMESTAMP) AND "_severity" = ?
 ---
 params:
   0: '2026-03-14T03:00:00Z'
   1: '2026-03-14T03:15:00Z'
+  2: 'error'

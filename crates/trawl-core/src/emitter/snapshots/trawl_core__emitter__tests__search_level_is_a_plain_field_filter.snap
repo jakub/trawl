@@ -1,7 +1,10 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(\"level>=warn\")"
+expression: "emit_dsl(\"level=gold\")"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE "severity" >= 13
+WHERE "level" = ?
+---
+params:
+  0: 'gold'

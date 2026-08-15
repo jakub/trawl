@@ -6,7 +6,7 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT COLUMNS(c -> c NOT IN ('hour')), (DATE_PART(?, "_time")) AS "hour"
+SELECT COLUMNS(c -> c NOT IN ('hour')), (DATE_PART(?, "timestamp")) AS "hour"
 FROM "_s0"
 ---
 params:

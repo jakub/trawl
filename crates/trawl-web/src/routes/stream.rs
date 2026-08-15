@@ -222,7 +222,7 @@ mod tests {
         let sse_body = "event: data\ndata: {\"foo\":\"bar\"}\n\nevent: data\ndata: {\"x\":1}\n\n";
         Mock::given(method("GET"))
             .and(path("/api/v1/stream"))
-            .and(query_param("query", "level=error"))
+            .and(query_param("query", "_severity=error"))
             .and(bearer_token("flt_token"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -234,7 +234,7 @@ mod tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/api/v1/stream?query=level%3Derror")
+            .uri("/api/v1/stream?query=_severity%3Derror")
             .header("cookie", &cookie)
             .body(Body::empty())
             .unwrap();

@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn stage_none_before_pipe() {
-        assert_eq!(find_current_stage("service=nginx level=error"), None);
+        assert_eq!(find_current_stage("service=nginx _severity=error"), None);
     }
 
     // ── is_past_by_keyword ──────────────────────────────────────────

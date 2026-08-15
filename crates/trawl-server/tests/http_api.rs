@@ -256,16 +256,16 @@ async fn query_export_and_stream_telemetry_carry_no_user_content(pool: sqlx::PgP
 
     // -- a FAILING query --------------------------------------------------
     //
-    // The emitter rejects an unknown `level` token by quoting it, so an
+    // The emitter rejects an unknown function by quoting its name, so an
     // error message in default telemetry republishes whatever was typed.
-    let bad_dsl = "level=zz_failure_needle";
+    let bad_dsl = "* | stats zz_failure_needle()";
     let err = client
         .query_paginated(bad_dsl, None, None)
         .await
-        .expect_err("unknown level token is rejected");
+        .expect_err("unknown function is rejected");
     match err {
         trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 400),
-        other => panic!("expected 400 for the bad level token, got: {other:?}"),
+        other => panic!("expected 400 for the bad function name, got: {other:?}"),
     }
 
     // -- an export ---------------------------------------------------------
@@ -565,11 +565,11 @@ async fn ingest_accepts_ndjson(pool: sqlx::PgPool) {
     assert_eq!(resp.accepted, 2);
 }
 
-/// A vector-shaped payload (wire aliases `timestamp` + `level`) lands as
-/// the declared envelope and is immediately queryable through the `level`
-/// DSL band alias, with `_time`, `severity`, and `_raw` populated.
+/// A vector-shaped payload (`timestamp` + `level`) lands as the declared
+/// envelope and is immediately queryable, with `_time`, the derived
+/// severity, and `_raw` populated.
 #[sqlx::test(migrations = false)]
-async fn vector_shaped_ingest_queryable_via_level_alias(pool: sqlx::PgPool) {
+async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
     let query = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
@@ -585,7 +585,7 @@ async fn vector_shaped_ingest_queryable_via_level_alias(pool: sqlx::PgPool) {
     assert_eq!(resp.accepted, 2);
 
     let result = query
-        .query_paginated("service=vec-svc level=error last=1h", None, None)
+        .query_paginated("service=vec-svc severity=17 last=1h", None, None)
         .await
         .unwrap();
     assert_eq!(result.result.row_count(), 1, "only the ERROR-band row");
@@ -601,7 +601,7 @@ async fn vector_shaped_ingest_queryable_via_level_alias(pool: sqlx::PgPool) {
     assert_eq!(
         row[col("severity")],
         trawl_api::value::Value::Integer(17),
-        "level:error derives severity 17"
+        "level:error derives the ERROR-band severity 17"
     );
     assert!(
         matches!(&row[col("_time")], trawl_api::value::Value::String(_)),
@@ -614,61 +614,31 @@ async fn vector_shaped_ingest_queryable_via_level_alias(pool: sqlx::PgPool) {
         other => panic!("_raw must be a string, got {other:?}"),
     }
 
-    // …and the pre-cutover shape of the same query — grouping on `level`
-    // as if it were a column — is a 4xx, not a 200 with zero rows. The
-    // matching data is right there; an empty success would tell a
-    // migrated saved query nothing about why its results vanished.
-    let resp = raw_client()
-        .post(format!("{}/api/v1/query", server.url))
-        .header("authorization", format!("Bearer {}", server.analyst_token))
-        .json(&serde_json::json!({
-            "query": "service=vec-svc last=1h | stats count() by level"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        400,
-        "`stats by level` must be a client error, not an empty success"
-    );
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("filter-only alias"),
-        "the error must name the severity alias: {body}"
-    );
+    // …and `level` is ORDINARY sender vocabulary now (ADR-0013 §6): the
+    // shapes the alias used to refuse — grouping on it, an IN-list in
+    // `where` — are plain field usage in both lanes, batch and live.
+    for query in [
+        "service=vec-svc last=1h | stats count() by level",
+        r#"service=vec-svc last=1h | where level in ("error", "fatal")"#,
+    ] {
+        let resp = raw_client()
+            .post(format!("{}/api/v1/query", server.url))
+            .header("authorization", format!("Bearer {}", server.analyst_token))
+            .json(&serde_json::json!({ "query": query }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{query} must be ordinary field usage");
 
-    // Live tail must refuse exactly what the batch path refuses. `level`
-    // inside an IN-list is not a comparison, so the streaming evaluator
-    // would read an absent key, match nothing, and hold open a
-    // healthy-looking SSE stream — the empty-200 failure in stream form.
-    let in_list = r#"service=vec-svc last=1h | where level in ("error", "fatal")"#;
-    let batch = raw_client()
-        .post(format!("{}/api/v1/query", server.url))
-        .header("authorization", format!("Bearer {}", server.analyst_token))
-        .json(&serde_json::json!({ "query": in_list }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(batch.status(), 400, "`where level in (…)` is a batch error");
-
-    let sse = raw_client()
-        .get(format!("{}/api/v1/stream", server.url))
-        .query(&[("query", in_list)])
-        .header("authorization", format!("Bearer {}", server.analyst_token))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        sse.status(),
-        400,
-        "live tail must refuse the query the batch path rejects, not stream nothing"
-    );
-    let body = sse.text().await.unwrap();
-    assert!(
-        body.contains("filter-only alias"),
-        "the stream error must name the severity alias: {body}"
-    );
+        let sse = raw_client()
+            .get(format!("{}/api/v1/stream", server.url))
+            .query(&[("query", query)])
+            .header("authorization", format!("Bearer {}", server.analyst_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sse.status(), 200, "{query} must stream too");
+    }
 }
 
 /// An event with an unlisted env is rejected per-event with a typed

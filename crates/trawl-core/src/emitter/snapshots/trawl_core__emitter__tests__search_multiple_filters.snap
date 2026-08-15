@@ -1,10 +1,11 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(\"service=nginx level=error\")"
+expression: "emit_dsl(\"service=nginx _severity=error\")"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE "service" = ? AND "severity" BETWEEN 17 AND 20
+WHERE "service" = ? AND "_severity" = ?
 ---
 params:
   0: 'nginx'
+  1: 'error'

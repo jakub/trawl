@@ -5,7 +5,7 @@ expression: terminal.backend().to_string()
 " M-1 Query   M-2 History   M-3 Schema   M-4 Saved                               "
 "                                                                                "
 "┌ Query Editor ────────────────────────────────────────────────────────────────┐"
-"│ level=error                                                                  │"
+"│ _severity=error                                                              │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

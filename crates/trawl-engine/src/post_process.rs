@@ -222,7 +222,7 @@ fn apply_sorts(
         if let PipeStage::Sort(sort) = &stage.node {
             events.sort_by(|a, b| {
                 for field in &sort.fields {
-                    let key = trawl_core::emitter::map_field_name(&field.field);
+                    let key = field.field.as_str();
                     let va = a.get(key);
                     let vb = b.get(key);
                     let cmp = compare_json_values(va, vb);

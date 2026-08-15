@@ -28,8 +28,8 @@ use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken};
 use crate::compare::{self, PatternForm};
 use crate::emitter::EmitError;
 use crate::pin_match::{
-    CoercedValue, CompareOp, NullReadPolicy, Truth, and_all, apply_ord, coerce_form,
-    compare_values, extract_i64, or_any, pattern_text,
+    CoercedValue, CompareOp, NullReadPolicy, Truth, and_all, coerce_form, compare_values, or_any,
+    pattern_text,
 };
 use crate::schema::FieldTypes;
 
@@ -65,82 +65,9 @@ struct TimeMatcher {
 
 enum TokenMatcher {
     Field(FieldMatcher),
-    Severity(SeverityMatcher),
     Text(TextMatcher),
     Not(Box<TokenMatcher>),
     OrGroup(Vec<Vec<TokenMatcher>>),
-}
-
-/// In-memory mirror of the SQL `level` → severity band predicates
-/// (`emitter::severity`). SSE and SQL must agree on every event.
-enum SeverityMatcher {
-    /// `level=tok` — severity within the band; NULL/absent → UNKNOWN.
-    Band { lo: u8, hi: u8 },
-    /// `level=a,b` — severity within any listed band.
-    Bands { bands: Vec<(u8, u8)> },
-    /// `level!=tok` — severity outside the band OR NULL/absent
-    /// (mirrors the SQL `... OR "severity" IS NULL`).
-    NotBand { lo: u8, hi: u8 },
-    /// Ordered comparison against the token's exact number.
-    Ordered { op: CompareOp, number: u8 },
-}
-
-impl SeverityMatcher {
-    /// A NULL/absent `severity` makes the band predicates UNKNOWN, exactly
-    /// as `severity BETWEEN lo AND hi` does in SQL. `NotBand` is the one
-    /// total form — its emitted shape carries `OR "severity" IS NULL`.
-    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
-        let sev = event.get("severity").and_then(extract_i64);
-        match self {
-            Self::Band { lo, hi } => sev.map(|n| n >= i64::from(*lo) && n <= i64::from(*hi)),
-            Self::Bands { bands } => sev.map(|n| {
-                bands
-                    .iter()
-                    .any(|(lo, hi)| n >= i64::from(*lo) && n <= i64::from(*hi))
-            }),
-            Self::NotBand { lo, hi } => {
-                Some(sev.is_none_or(|n| n < i64::from(*lo) || n > i64::from(*hi)))
-            }
-            Self::Ordered { op, number } => sev.map(|n| apply_ord(n.cmp(&i64::from(*number)), *op)),
-        }
-    }
-}
-
-/// Resolve a severity token the SQL emitter has already accepted.
-fn resolve_token(token: &str) -> (u8, (u8, u8)) {
-    let number = crate::severity::number_for_token(token)
-        .expect("emitter accepted the token, so it is in the table");
-    let band = crate::severity::band_of(number).expect("table numbers are in-ladder");
-    (number, band)
-}
-
-/// Compile a `level` field filter into a severity matcher.
-///
-/// Rejection is delegated to the SQL emitter's `level` predicates so the
-/// stream refuses exactly the queries `/api/v1/query` refuses, with the
-/// same message: an unknown token, a glob or a regex on `level` is an
-/// error here too, never a filter that silently matches nothing.
-fn compile_level(op: FilterOp, value: &FilterValue) -> Result<SeverityMatcher, EmitError> {
-    match value {
-        FilterValue::Literal(v) => {
-            crate::emitter::severity::level_predicate(op, v)?;
-            let (number, (lo, hi)) = resolve_token(v);
-            Ok(match op {
-                FilterOp::Eq => SeverityMatcher::Band { lo, hi },
-                FilterOp::Ne => SeverityMatcher::NotBand { lo, hi },
-                _ => SeverityMatcher::Ordered {
-                    op: compile_op(op),
-                    number,
-                },
-            })
-        }
-        FilterValue::List(vs) => {
-            crate::emitter::severity::level_in_list(vs)?;
-            Ok(SeverityMatcher::Bands {
-                bands: vs.iter().map(|v| resolve_token(v).1).collect(),
-            })
-        }
-    }
 }
 
 struct FieldMatcher {
@@ -292,12 +219,6 @@ fn compile_token(
 ) -> Result<Option<TokenMatcher>, EmitError> {
     Ok(match token {
         SearchToken::FieldFilter(ff) => {
-            // `level` is the severity band alias — mirror the SQL emitter.
-            if ff.field == "level" {
-                return Ok(Some(TokenMatcher::Severity(compile_level(
-                    ff.op, &ff.value,
-                )?)));
-            }
             // The catalog pin typing this comparison (ADR-0011 slice A);
             // the lookup folds through `catalog_key`, same as the emitter.
             let pin = pins.pin_for(&ff.field);
@@ -433,7 +354,6 @@ impl TokenMatcher {
     fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
         match self {
             Self::Field(fm) => fm.eval(event),
-            Self::Severity(sm) => sm.eval(event),
             Self::Text(tm) => tm.eval(event),
             // `NOT UNKNOWN` is UNKNOWN, never a match — the SQL `NOT (...)`
             // this mirrors stays NULL and the row is filtered out.
@@ -1325,22 +1245,20 @@ mod tests {
 
     #[test]
     fn or_groups_with_and() {
-        // `service=nginx level=error OR service=apache level=warn`
-        // Group 1: service=nginx AND level=error
-        // Group 2: service=apache AND level=warn
+        let dsl = "service=nginx status=500 OR service=apache status=404";
         assert!(matches_event(
-            "service=nginx level=error OR service=apache level=warn",
-            r#"{"service": "nginx", "severity": 17, "message": "ok"}"#
+            dsl,
+            r#"{"service": "nginx", "status": 500, "message": "ok"}"#
         ));
         // Matches group 2.
         assert!(matches_event(
-            "service=nginx level=error OR service=apache level=warn",
-            r#"{"service": "apache", "severity": 13, "message": "ok"}"#
+            dsl,
+            r#"{"service": "apache", "status": 404, "message": "ok"}"#
         ));
-        // Neither group fully matches (service=nginx but severity=WARN band).
+        // Neither group fully matches.
         assert!(!matches_event(
-            "service=nginx level=error OR service=apache level=warn",
-            r#"{"service": "nginx", "severity": 13, "message": "ok"}"#
+            dsl,
+            r#"{"service": "nginx", "status": 404, "message": "ok"}"#
         ));
     }
 
@@ -1351,13 +1269,13 @@ mod tests {
         assert!(matches_event("", r#"{"service": "nginx"}"#));
     }
 
-    // ── level rejection parity with the SQL emitter ───────────────────
+    // ── the severity vocabulary rides the pin, not the name ───────────
 
+    /// `level` is ordinary sender vocabulary now (ADR-0013 §6): every
+    /// shape that used to be an emit error compiles, and matches the
+    /// sender's own column.
     #[test]
-    fn level_rejections_match_the_sql_emitter() {
-        // A `level` filter the emitter refuses must fail filter compilation
-        // with the same message: the SSE stream rejects the query instead of
-        // going live on a predicate that can never match an event.
+    fn level_is_an_ordinary_field() {
         for dsl in [
             "level=eror",
             "level!=eror",
@@ -1367,28 +1285,41 @@ mod tests {
             "level=/err.*/",
         ] {
             let query = parser::parse(dsl).expect("parse should succeed");
-            let emit_error = crate::emitter::emit(&query, "/data/**/*.parquet")
-                .err()
-                .map_or_else(
-                    || panic!("{dsl:?} should be an emit error"),
-                    |e| e.to_string(),
-                );
-            let compile_error =
-                CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
-                    .err()
-                    .map_or_else(
-                        || panic!("{dsl:?} should not compile to a filter"),
-                        |e| e.to_string(),
-                    );
-            assert_eq!(compile_error, emit_error, "{dsl:?}");
+            crate::emitter::emit(&query, "/data/**/*.parquet").expect("emits");
+            CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
+                .expect("compiles");
         }
+        assert!(matches_event("level=gold", r#"{"level": "gold"}"#));
+        assert!(!matches_event("level=gold", r#"{"severity": 17}"#));
     }
 
+    /// The band vocabulary lives on the SEVERITY pin, where the live
+    /// lane and the SQL agree by construction.
     #[test]
-    fn level_known_token_still_compiles() {
-        assert!(matches_event("level=error", r#"{"severity": 17}"#));
-        assert!(matches_event("level=error,fatal", r#"{"severity": 21}"#));
-        assert!(!matches_event("level=error", r#"{"severity": 9}"#));
+    fn severity_pin_carries_the_band_vocabulary() {
+        let mut ft = crate::schema::FieldTypes::new();
+        ft.insert("_severity", crate::schema::CanonicalType::Severity);
+        let matches = |dsl: &str, json: &str| {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            let filter = CompiledFilter::compile(&query.search, &ft).expect("compiles");
+            let ev: serde_json::Map<String, Value> = serde_json::from_str(json).unwrap();
+            filter.matches(&ev)
+        };
+        assert!(matches("_severity=error", r#"{"_severity": 17}"#));
+        assert!(matches("_severity=error,fatal", r#"{"_severity": 21}"#));
+        assert!(!matches("_severity=error", r#"{"_severity": 9}"#));
+        assert!(matches("_severity=error2", r#"{"_severity": 18}"#));
+        assert!(!matches("_severity=error2", r#"{"_severity": 17}"#));
+
+        // An unknown value refuses in BOTH lanes, with one sentence.
+        let query = parser::parse("_severity=spicy").expect("parse should succeed");
+        let emit_error = crate::emitter::emit_with_pins(&query, "/data/**/*.parquet", &ft)
+            .expect_err("emit refuses")
+            .to_string();
+        let compile_error = CompiledFilter::compile(&query.search, &ft)
+            .expect_err("filter refuses")
+            .to_string();
+        assert_eq!(compile_error, emit_error);
     }
 
     // ── null/missing field ────────────────────────────────────────────

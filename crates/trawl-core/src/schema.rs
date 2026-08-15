@@ -69,29 +69,27 @@ pub const LEADING_LOG_FIELDS: &[&str] =
 /// Trailing columns demoted to the end of result reordering.
 pub const TRAILING_LOG_FIELDS: &[&str] = &[RAW, INGESTED, REPAIRS];
 
-/// Resolve a wire-format alias for the event-time input at ingest.
-///
-/// Clients may send `timestamp` or `@timestamp` (the DSL aliases them to
-/// `_time` identically); none of the aliases are stored as columns — the
-/// canonical value lands in `_time`.
-pub fn is_time_alias(key: &str) -> bool {
-    matches!(key, "timestamp" | "@timestamp" | "_time")
-}
-
-/// Wire keys consumed as the `_time` input, in precedence order.
+/// Wire keys read as the `_time` derivation's sources, in precedence
+/// order (ADR-0013 §2). Ingest OBSERVES these: the alias sources are
+/// stored verbatim as ordinary columns, and only `_time` itself — the
+/// proposal slot — is consumed and canonicalized.
 pub const TIME_ALIASES: &[&str] = &[TIME, "timestamp", "@timestamp"];
 
-/// The DSL-side alias resolution: `timestamp` and `@timestamp` resolve to
-/// the physical `_time` column.
-pub fn resolve_field_alias(name: &str) -> &str {
-    match name {
-        "timestamp" | "@timestamp" => TIME,
-        other => other,
-    }
+/// Whether a name belongs to trawl's contract namespace (ADR-0013 §1).
+///
+/// The ENTIRE `_` prefix is sealed — a predicate, not an enumerated list
+/// — so the envelope can grow without a corpus already holding a client's
+/// colliding key. Both doors enforce it from here: ingest strips the
+/// prefix off an incoming `_x` and stores the value under the bare
+/// remainder, and the pipeline refuses to MINT one (`let _foo`,
+/// `rename x as _foo`, `extract (?P<_foo>…)`).
+#[must_use]
+pub fn is_reserved_name(name: &str) -> bool {
+    name.starts_with('_')
 }
 
-/// The catalog spelling of a DSL field reference: resolve the time aliases,
-/// then ASCII-lowercase (ADR-0011 slice A).
+/// The catalog spelling of a DSL field reference: an ASCII fold, and
+/// nothing else (ADR-0013 §6 — the DSL has zero aliases).
 ///
 /// Catalog names are ASCII-folded at every producer's door (ingest, boot
 /// seeding, compaction proposals), and `DuckDB` folds identifiers over
@@ -102,7 +100,7 @@ pub fn resolve_field_alias(name: &str) -> &str {
 /// identifier folding.
 #[must_use]
 pub fn catalog_key(dsl_name: &str) -> String {
-    resolve_field_alias(dsl_name).to_ascii_lowercase()
+    dsl_name.to_ascii_lowercase()
 }
 
 // ---------------------------------------------------------------------------
@@ -361,12 +359,34 @@ impl FieldTypes {
 mod tests {
     use super::*;
 
+    /// The `_` prefix is trawl's namespace, whole — a predicate, not a
+    /// list, so a slot added later cannot collide with standing data.
     #[test]
-    fn aliases_resolve_to_time() {
-        assert_eq!(resolve_field_alias("timestamp"), "_time");
-        assert_eq!(resolve_field_alias("@timestamp"), "_time");
-        assert_eq!(resolve_field_alias("_time"), "_time");
-        assert_eq!(resolve_field_alias("host"), "host");
+    fn the_underscore_prefix_is_sealed_as_a_predicate() {
+        for name in [
+            TIME,
+            INGESTED,
+            RAW,
+            REPAIRS,
+            "_severity",
+            "_anything",
+            "__name__",
+            "_",
+        ] {
+            assert!(is_reserved_name(name), "{name}");
+        }
+        for name in [
+            ENV,
+            SERVICE,
+            HOST,
+            MESSAGE,
+            "level",
+            "timestamp",
+            "severity",
+            "a_b",
+        ] {
+            assert!(!is_reserved_name(name), "{name}");
+        }
     }
 
     #[test]
@@ -383,15 +403,6 @@ mod tests {
         for (field, _) in ENVELOPE_TYPES {
             assert!(is_storable_field_name(field));
         }
-    }
-
-    #[test]
-    fn time_alias_detection() {
-        assert!(is_time_alias("timestamp"));
-        assert!(is_time_alias("@timestamp"));
-        assert!(is_time_alias("_time"));
-        assert!(!is_time_alias("time"));
-        assert!(!is_time_alias("_ingested"));
     }
 
     #[test]
@@ -580,14 +591,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_key_resolves_aliases_then_folds_ascii() {
-        // Alias resolution first: the pinned column is `_time`, whatever
-        // spelling the DSL used.
-        assert_eq!(catalog_key("timestamp"), "_time");
-        assert_eq!(catalog_key("@timestamp"), "_time");
-        // ASCII fold second: catalog names are ingest-folded lowercase, so
-        // `Status` must find the `status` pin instead of silently falling
-        // back to unpinned.
+    fn catalog_key_only_folds_ascii() {
+        // ZERO aliases (ADR-0013 §6): `timestamp` is an ordinary sender
+        // field, not another spelling of `_time`.
+        assert_eq!(catalog_key("timestamp"), "timestamp");
+        assert_eq!(catalog_key("@timestamp"), "@timestamp");
+        // Catalog names are ingest-folded lowercase, so `Status` must
+        // find the `status` pin instead of silently falling back to
+        // unpinned.
         assert_eq!(catalog_key("Status"), "status");
         assert_eq!(catalog_key("DUR"), "dur");
         // Non-ASCII stays put — DuckDB folds identifiers over ASCII only.
@@ -602,8 +613,9 @@ mod tests {
         ft.insert("_time", CanonicalType::Timestamp);
         assert_eq!(ft.pin_for("status"), Some(CanonicalType::Varchar));
         assert_eq!(ft.pin_for("Status"), Some(CanonicalType::Varchar));
-        assert_eq!(ft.pin_for("timestamp"), Some(CanonicalType::Timestamp));
-        assert_eq!(ft.pin_for("@timestamp"), Some(CanonicalType::Timestamp));
+        assert_eq!(ft.pin_for("_time"), Some(CanonicalType::Timestamp));
+        assert_eq!(ft.pin_for("_TIME"), Some(CanonicalType::Timestamp));
+        assert_eq!(ft.pin_for("timestamp"), None);
         assert_eq!(ft.pin_for("unpinned"), None);
     }
 
