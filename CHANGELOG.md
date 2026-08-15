@@ -111,9 +111,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   that; `run_query` and `export_parquet` carried none, so the moment the
   hot buffer was empty — an idle minute is enough — the query returned an
   empty success and the export a 500. List-source resolution is now a
-  property of the source, settled once before the read on every lane, and
-  the planner stats the file rather than its parent directory when the
-  service pins the filename. Two visible consequences: some answers that
+  property of the source, settled once before the read on every lane —
+  after the hot-buffer snapshot is taken, so the two halves of the union
+  can never disagree about which files exist. Two visible consequences: some answers that
   were silently empty are now a retryable 503 `cold_data_unread` (the
   read could not reach files the source still points at — retry), and an
   export that raced a file move returns that 503 instead of a 500. A

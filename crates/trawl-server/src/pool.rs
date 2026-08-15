@@ -272,7 +272,11 @@ fn capture_pool_debug(
                 .time_filter
                 .as_ref()
                 .map(|tf| tf.node.duration.to_seconds());
-            // Pin-aware, so the debug-log SQL preview matches what ran.
+            // Pin-aware, so the debug-log SQL preview types comparisons the
+            // way the executed query does. It is a PREVIEW, not a transcript:
+            // it renders the PLANNER's source, and the executor may narrow a
+            // list source's elements (dropping ones no file backs) before it
+            // reads — so the logged source can be wider than the one that ran.
             let (sql, params) = match trawl_core::emitter::emit_with_pins(&ast, source, pins) {
                 Ok(emitted) => (
                     emitted.sql,

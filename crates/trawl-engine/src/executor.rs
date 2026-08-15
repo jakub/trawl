@@ -543,6 +543,12 @@ impl Executor {
             &resolved,
             HotLane::Absent,
         ) {
+            // Discarding `outcome`'s error text is safe by construction:
+            // `classify_export_outcome` maps ONLY `is_no_files_error` errors
+            // to `NoColumns` (every other `Database` error classifies
+            // `Recoverable` and propagates verbatim), so the error dropped
+            // here is always the known "no files match" message — which says
+            // strictly less than `ColdDataUnread`.
             ColdAction::ColdDataUnread => Err(EngineError::ColdDataUnread),
             ColdAction::ReturnOutcome | ColdAction::HotOnly => outcome,
         }
@@ -585,6 +591,9 @@ impl Executor {
                 let hot_emitted = emitter::emit_hot_only(&ast, hot_source, hot_pins, pins)?;
                 self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows)
             }
+            // Same invariant as `export_parquet`: only an `is_no_files_error`
+            // reaches `NoColumns`, so the discarded error text is always that
+            // known message and never a distinct diagnosis.
             ColdAction::ColdDataUnread => Err(EngineError::ColdDataUnread),
             ColdAction::ReturnOutcome => outcome,
         }
@@ -906,8 +915,17 @@ enum HotColdOutcome {
     /// resolved source can also have raced a file move, so this is an
     /// observation, not proof: it still needs a cold-file presence check.
     NoColumns,
-    /// A binder error about a missing column (querying a nonexistent field)
-    /// — a user error; the hot lanes keep the established empty-result UX.
+    /// A user error the hot lanes answer with the established empty-result
+    /// UX rather than a failure. What lands here differs by lane: the query
+    /// lanes send only a binder error about a missing column (querying a
+    /// nonexistent field), while the export lanes ALSO send
+    /// [`EngineError::Emit`] refusals (a `rust_stages` pipeline, a non-UTF-8
+    /// output path) — main's behavior, kept deliberately. The consequence on
+    /// export is that a `HotOnly` verdict retries emit-refused queries
+    /// hot-only: a binder-shaped failure can genuinely be rescued by a hot
+    /// snapshot that carries the column, while an emitter refusal fails
+    /// identically on the retry — futile, harmless, and identical to what
+    /// main did.
     BenignBinder,
     /// Any other database failure — hot-only is only provably safe when a
     /// cold-file presence check says no cold files exist.

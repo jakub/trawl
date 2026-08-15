@@ -37,6 +37,11 @@ use trawl_core::schema::FieldTypes;
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::Executor;
 
+/// `DuckDB`'s "no matching files" error text — the substring
+/// `executor::is_no_files_error` tests, mirrored because that predicate is
+/// crate-private.
+const DUCKDB_NO_FILES_MSG: &str = "No files found that match the pattern";
+
 /// Which entry point a shape is being run through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
@@ -242,8 +247,13 @@ fn an_all_missing_list_is_an_empty_window_not_a_failure() {
             // DuckDB's own "no files" error stands — deliberately loud.
             Lane::Export => {
                 let err = outcome.expect_err("an export over an empty window must not succeed");
+                // Not merely "some database error": it must be DuckDB's own
+                // no-files error, the same thing the in-crate twin
+                // `export_without_hot_stays_loud_for_an_empty_window` pins
+                // with `is_no_files_error`. That predicate is crate-private,
+                // so match its one substring here.
                 assert!(
-                    matches!(&err, EngineError::Database(_)),
+                    matches!(&err, EngineError::Database(e) if e.to_string().contains(DUCKDB_NO_FILES_MSG)),
                     "{lane:?}: the raw no-files error must stand, got {err:?}"
                 );
             }
