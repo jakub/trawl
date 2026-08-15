@@ -106,32 +106,59 @@ pub async fn run_query(
         ));
     };
 
-    // Write to file or stdout.
+    let stdout = io::stdout();
+    emit_results(
+        &result,
+        format,
+        output,
+        &degraded,
+        &notices,
+        &mut stdout.lock(),
+        &mut io::stderr(),
+    )
+}
+
+/// Write the results and their footers to the two streams.
+///
+/// The stream split is the contract: with `-o`, the FILE is the
+/// deliverable and both footers go to `err` so they can never
+/// contaminate it; without it, results and footers share `out`.
+fn emit_results(
+    result: &QueryResult,
+    format: OutputFormat,
+    output: Option<&Path>,
+    degraded: &[String],
+    notices: &[String],
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<(), CliError> {
     if let Some(output_path) = output {
         let mut file = std::fs::File::create(output_path)?;
-        match format {
-            OutputFormat::Table => render_table(&result, &mut file)?,
-            OutputFormat::Json => render_ndjson(&result, &mut file)?,
-            OutputFormat::Csv => render_csv(&result, &mut file)?,
-            OutputFormat::Parquet => unreachable!("handled above"),
-        }
+        render_results(result, format, &mut file)?;
         // The file is the deliverable; the notices belong on the terminal.
-        write_degraded_footer(&mut io::stderr(), format, &degraded)?;
-        write_shape_notices(&mut io::stderr(), format, &notices)?;
+        write_degraded_footer(err, format, degraded)?;
+        write_shape_notices(err, format, notices)?;
     } else {
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        match format {
-            OutputFormat::Table => render_table(&result, &mut out)?,
-            OutputFormat::Json => render_ndjson(&result, &mut out)?,
-            OutputFormat::Csv => render_csv(&result, &mut out)?,
-            OutputFormat::Parquet => unreachable!("handled above"),
-        }
-        write_degraded_footer(&mut out, format, &degraded)?;
-        write_shape_notices(&mut out, format, &notices)?;
+        render_results(result, format, out)?;
+        write_degraded_footer(out, format, degraded)?;
+        write_shape_notices(out, format, notices)?;
     }
 
     Ok(())
+}
+
+/// Render the result rows in the requested format.
+fn render_results(
+    result: &QueryResult,
+    format: OutputFormat,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    match format {
+        OutputFormat::Table => render_table(result, out),
+        OutputFormat::Json => render_ndjson(result, out),
+        OutputFormat::Csv => render_csv(result, out),
+        OutputFormat::Parquet => unreachable!("handled above"),
+    }
 }
 
 /// The shape-advisory footer (ADR-0013 §7): one line per notice, after
@@ -254,7 +281,16 @@ async fn run_daemon_mode(
     let response = client
         .query_paginated_tz(query, None, None, Some(timezone.to_owned()))
         .await?;
-    Ok((response.result, response.degraded_fields, response.notices))
+    Ok(daemon_outcome(response))
+}
+
+/// Split a daemon response into what the printer needs: the rows, the
+/// degraded-field note (ADR-0011 slice C1) and the shape advisories
+/// (ADR-0013 §7). Both note channels are carried, never dropped.
+fn daemon_outcome(
+    response: trawl_client::QueryResponse,
+) -> (QueryResult, Vec<String>, Vec<String>) {
+    (response.result, response.degraded_fields, response.notices)
 }
 
 /// Execute the query locally with an embedded `DuckDB` engine.
@@ -672,6 +708,81 @@ mod tests {
         assert!(render(OutputFormat::Json, &notices).is_empty());
         assert!(render(OutputFormat::Csv, &notices).is_empty());
         assert!(render(OutputFormat::Table, &[]).is_empty());
+    }
+
+    /// A mocked daemon response carrying both note channels beside one
+    /// result row.
+    fn mocked_response() -> trawl_client::QueryResponse {
+        trawl_client::QueryResponse {
+            result: QueryResult {
+                columns: vec![trawl_engine::value::Column {
+                    name: "host".to_owned(),
+                }],
+                rows: vec![vec![Value::String("db1".to_owned())]],
+            },
+            truncated: false,
+            pagination: trawl_client::PaginationMeta {
+                limit: 100,
+                offset: 0,
+                returned: 1,
+            },
+            degraded_fields: vec!["duration".to_owned()],
+            notices: vec![trawl_core::advisory::LEVEL_ADVISORY.to_owned()],
+        }
+    }
+
+    /// The daemon path carries BOTH note channels off the wire and puts
+    /// them on the right stream: with the results when stdout is the
+    /// deliverable, on stderr when a file is.
+    #[test]
+    fn daemon_notices_reach_the_terminal_and_never_the_deliverable() {
+        let (result, degraded, notices) = daemon_outcome(mocked_response());
+        assert_eq!(degraded, ["duration"], "degraded_fields must survive");
+        assert_eq!(notices.len(), 1, "notices must survive");
+
+        let emit = |format, output: Option<&Path>| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            emit_results(
+                &result, format, output, &degraded, &notices, &mut out, &mut err,
+            )
+            .unwrap();
+            (
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+
+        // Table to stdout: footers ride the result stream, stderr silent.
+        let (out, err) = emit(OutputFormat::Table, None);
+        assert!(out.contains("db1"), "{out}");
+        assert!(out.contains("note: results may be incomplete"), "{out}");
+        assert!(out.contains("_severity>=error"), "{out}");
+        assert!(err.is_empty(), "{err}");
+
+        // Table to a file: the file is the deliverable, the footers are
+        // stderr's, and stdout stays silent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let (out, err) = emit(OutputFormat::Table, Some(&path));
+        assert!(out.is_empty(), "{out}");
+        assert!(err.contains("note: results may be incomplete"), "{err}");
+        assert!(err.contains("_severity>=error"), "{err}");
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(file.contains("db1"), "{file}");
+        assert!(!file.contains("note:"), "{file}");
+
+        // Machine formats stay byte-clean: the wire fields are the notice.
+        for format in [OutputFormat::Json, OutputFormat::Csv] {
+            let (out, err) = emit(format, None);
+            assert!(!out.contains("note:"), "{out}");
+            assert!(err.is_empty(), "{err}");
+        }
+        let (json, _) = emit(OutputFormat::Json, None);
+        for line in json.lines() {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+        let (csv, _) = emit(OutputFormat::Csv, None);
+        assert_eq!(csv, "host\ndb1\n");
     }
 
     /// The table renders the token; json and csv keep the number.
