@@ -329,16 +329,23 @@ fn render_table(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-/// A `_severity` cell as the table shows it: the `OTel` short name, or
-/// the raw value where the ladder has no reading for it.
-fn severity_cell_text(v: &Value) -> String {
-    let number = match v {
-        Value::Integer(n) => u8::try_from(*n).ok(),
+/// The `OTel` token a `_severity` cell displays, or `None` where the
+/// ladder has no reading for it and the surface renders the value the
+/// way it renders any other.
+///
+/// The one in-crate door onto `trawl_core::severity::token_text` — the
+/// table renderer here and the TUI results grid share the rule but not
+/// their fallback formatting.
+pub(crate) fn severity_token(v: &Value) -> Option<&'static str> {
+    match v {
+        Value::Integer(n) => trawl_core::severity::token_text(*n),
         _ => None,
-    };
-    number
-        .and_then(trawl_core::severity::otel_name)
-        .map_or_else(|| v.to_string(), str::to_owned)
+    }
+}
+
+/// A `_severity` cell as the table shows it.
+fn severity_cell_text(v: &Value) -> String {
+    severity_token(v).map_or_else(|| v.to_string(), str::to_owned)
 }
 
 fn render_ndjson(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {

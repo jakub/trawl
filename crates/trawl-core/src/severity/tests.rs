@@ -51,6 +51,27 @@ fn exact_names_spell_the_band_base_and_suffix() {
     assert_eq!(number_for_exact(""), None);
 }
 
+/// The wire-shaped display rule: a `_severity` cell is BIGINT, so the
+/// narrowing is part of the rule and anything off the ladder — including
+/// a value outside `u8` entirely — has no reading.
+#[test]
+fn token_text_reads_a_wire_severity_cell() {
+    assert_eq!(token_text(17), Some("error"));
+    assert_eq!(token_text(18), Some("error2"));
+    assert_eq!(token_text(13), Some("warn"));
+    assert_eq!(token_text(99), None);
+    assert_eq!(token_text(0), None);
+    assert_eq!(token_text(-1), None);
+    assert_eq!(token_text(i64::MAX), None);
+    for n in 1..=24i64 {
+        assert_eq!(
+            token_text(n),
+            otel_name(u8::try_from(n).unwrap()),
+            "ladder {n}"
+        );
+    }
+}
+
 /// Every token in the issue table maps to its exact number.
 #[test]
 fn token_table_exact_numbers() {

@@ -1467,16 +1467,11 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-/// A `_severity` cell as the TUI shows it: the `OTel` short name, or the
-/// raw value where the ladder has no reading for it.
+/// A `_severity` cell as the TUI shows it: the shared `OTel` token, or —
+/// where the ladder has no reading for it — the cell rendered the way the
+/// grid renders every other.
 fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
-    let number = match value {
-        trawl_engine::value::Value::Integer(n) => u8::try_from(*n).ok(),
-        _ => None,
-    };
-    number
-        .and_then(trawl_core::severity::otel_name)
-        .map_or_else(|| value_to_string(value), str::to_owned)
+    crate::cli::severity_token(value).map_or_else(|| value_to_string(value), str::to_owned)
 }
 
 #[cfg(test)]
@@ -1490,7 +1485,7 @@ mod severity_tests {
         assert_eq!(severity_cell_text(&Value::Integer(17)), "error");
         assert_eq!(severity_cell_text(&Value::Integer(18)), "error2");
         assert_eq!(severity_cell_text(&Value::Integer(13)), "warn");
-        // No reading: the raw value, never a guess.
+        // No reading: the grid's own rendering, never a guess.
         assert_eq!(severity_cell_text(&Value::Integer(99)), "99");
         assert_eq!(severity_cell_text(&Value::String("gold".into())), "gold");
     }

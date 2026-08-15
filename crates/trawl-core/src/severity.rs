@@ -90,6 +90,19 @@ pub fn otel_name(number: u8) -> Option<&'static str> {
     NAMES.get(usize::from(number) - 1).copied()
 }
 
+/// The display text for a `_severity` cell holding `number`, or `None`
+/// where the ladder has no reading for it.
+///
+/// The one owner of the integer-cell display rule every result renderer
+/// applies (ADR-0013 §6): the column is BIGINT on the wire, so the
+/// narrowing to the ladder's `u8` domain belongs beside [`otel_name`]
+/// rather than being re-derived per surface. A caller with no reading
+/// renders the value the way it renders any other — never a guess.
+#[must_use]
+pub fn token_text(number: i64) -> Option<&'static str> {
+    u8::try_from(number).ok().and_then(otel_name)
+}
+
 /// The inverse of [`otel_name`]: a band base with an optional `2`-`4`
 /// suffix, matched case-insensitively.
 ///
