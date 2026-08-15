@@ -44,13 +44,21 @@
 use std::path::{Path, PathBuf};
 
 /// The current storage epoch, written to `data/EPOCH`.
-pub const CURRENT_EPOCH: &str = "2";
+pub const CURRENT_EPOCH: &str = "3";
 
 /// Marker filename inside the data root.
 pub const EPOCH_FILE: &str = "EPOCH";
 
-/// Suffix of the set-aside directory for a pre-cutover root.
+/// Suffix of the set-aside directory for a MARKER-LESS (epoch-1) root.
 pub const SET_ASIDE_SUFFIX: &str = ".pre-schema-v2";
+
+/// Suffix of the set-aside directory for an epoch-2 root (ADR-0013).
+///
+/// A second name, not a reused one: an install that already carries a
+/// `data.pre-schema-v2/` from the ADR-0009 cutover must not have it
+/// clobbered — trawl never deletes a set-aside, so the operator's copy of
+/// epoch-1 stays exactly where they left it while epoch 2 goes beside it.
+pub const EPOCH_3_SET_ASIDE_SUFFIX: &str = ".pre-epoch-3";
 
 /// Report-run results under the data root (`scheduled/{name}/run_{id}.parquet`),
 /// referenced by relative path from postgres `report_runs.result_path`.
@@ -108,7 +116,12 @@ pub fn ensure_current_epoch(
 ) -> Result<Outcome, String> {
     let outcome = decide(data_root, wal_dir, ingest_enabled)?;
     if outcome != Outcome::CutoverDeferred {
-        carry_over_report_runs(&set_aside_path(data_root), data_root)?;
+        // Both set-aside names are consulted: an install can hold one
+        // from each cutover, and the report runs ride across from
+        // whichever one this boot (or a crashed earlier one) created.
+        for aside in set_aside_paths(data_root) {
+            carry_over_report_runs(&aside, data_root)?;
+        }
     }
     Ok(outcome)
 }
@@ -117,6 +130,7 @@ pub fn ensure_current_epoch(
 /// terminal state; only the report-run carry-over is still owed.
 fn decide(data_root: &Path, wal_dir: &Path, ingest_enabled: bool) -> Result<Outcome, String> {
     let aside = set_aside_path(data_root);
+    let epoch_3_aside = sibling_with_suffix(data_root, EPOCH_3_SET_ASIDE_SUFFIX);
     let marker = data_root.join(EPOCH_FILE);
 
     if !data_root.exists() {
@@ -135,16 +149,21 @@ fn decide(data_root: &Path, wal_dir: &Path, ingest_enabled: bool) -> Result<Outc
         Ok(content) => {
             let content = content.trim();
             if content == CURRENT_EPOCH {
-                let aside_present = aside.exists();
-                if aside_present {
-                    tracing::warn!(
-                        event_type = "epoch_aside_present",
-                        path = %aside.display(),
-                        "pre-cutover data set-aside directory still exists — \
-                         trawl never deletes it; remove it to reclaim disk"
-                    );
+                let mut aside_present = false;
+                for path in set_aside_paths(data_root) {
+                    if path.exists() {
+                        aside_present = true;
+                        tracing::warn!(
+                            event_type = "epoch_aside_present",
+                            path = %path.display(),
+                            "pre-cutover data set-aside directory still exists — \
+                             trawl never deletes it; remove it to reclaim disk"
+                        );
+                    }
                 }
                 Ok(Outcome::Current { aside_present })
+            } else if content == "2" {
+                epoch_2_branch(data_root, wal_dir, ingest_enabled, &epoch_3_aside)
             } else {
                 Err(format!(
                     "data root {} carries unrecognized storage epoch {content:?} \
@@ -212,6 +231,44 @@ fn decide(data_root: &Path, wal_dir: &Path, ingest_enabled: bool) -> Result<Outc
     }
 }
 
+/// The epoch 2 → 3 branch of the decision table (ADR-0013 §9).
+///
+/// The envelope reshaped, so an epoch-2 corpus carries `severity` and
+/// `severity_text` columns that mean something else now. No back-compat
+/// ruling is in force: set the root aside and start clean.
+fn epoch_2_branch(
+    data_root: &Path,
+    wal_dir: &Path,
+    ingest_enabled: bool,
+    aside: &Path,
+) -> Result<Outcome, String> {
+    if !ingest_enabled {
+        // A query-only node does not own the root, and an epoch-2 corpus
+        // READS fine under epoch-3 semantics (its severity columns are
+        // ordinary bare columns). Warn and serve, the same shape as the
+        // marker-less branch.
+        tracing::warn!(
+            event_type = "epoch_cutover_deferred",
+            path = %data_root.display(),
+            "data root carries storage epoch 2 but ingest is disabled — \
+             leaving it untouched and serving it; its severity columns \
+             read as ordinary sender fields under epoch {CURRENT_EPOCH}. \
+             Enable ingest to run the cutover"
+        );
+        return Ok(Outcome::CutoverDeferred);
+    }
+    if aside.exists() {
+        return Err(format!(
+            "ambiguous storage state: {} carries epoch 2 AND {} already \
+             exists — refusing to start rather than guess. Move the \
+             existing set-aside elsewhere and restart",
+            data_root.display(),
+            aside.display()
+        ));
+    }
+    set_aside_previous_epoch(data_root, aside, wal_dir)
+}
+
 /// Move `{aside}/scheduled/` into the current data root.
 ///
 /// Report-run results are not epoch-1 event data: they are materialized
@@ -277,6 +334,16 @@ fn carry_over_report_runs(aside: &Path, data_root: &Path) -> Result<(), String> 
 /// filesystem free-space measurements are taken from.
 pub fn set_aside_path(data_root: &Path) -> PathBuf {
     sibling_with_suffix(data_root, SET_ASIDE_SUFFIX)
+}
+
+/// Every set-aside a data root can have, newest cutover first. An install
+/// that has been through both bumps holds one of each, and trawl deletes
+/// neither.
+pub fn set_aside_paths(data_root: &Path) -> [PathBuf; 2] {
+    [
+        sibling_with_suffix(data_root, EPOCH_3_SET_ASIDE_SUFFIX),
+        set_aside_path(data_root),
+    ]
 }
 
 fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -409,6 +476,54 @@ fn create_fresh_root(data_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The epoch-2 branch: the same set-aside idiom the ADR-0009 cutover
+/// uses, under the epoch-3 name and with the epoch-2 WAL layout.
+///
+/// An external WAL dir does not ride the root rename, and every file in
+/// it is a pre-cutover event: set it aside under the same suffix, so the
+/// compactor cannot drain epoch-2 events into an epoch-3 corpus.
+fn set_aside_previous_epoch(
+    data_root: &Path,
+    aside: &Path,
+    wal_dir: &Path,
+) -> Result<Outcome, String> {
+    let parquet_files = count_files_with_ext(data_root, "parquet").saturating_sub(
+        count_files_with_ext(&data_root.join(REPORT_RUNS_DIR), "parquet"),
+    );
+    let wal_files = count_files_with_ext(wal_dir, "ndjson");
+
+    let external_wal_set_aside =
+        set_aside_external_wal_with(data_root, wal_dir, EPOCH_3_SET_ASIDE_SUFFIX)?;
+
+    std::fs::rename(data_root, aside).map_err(|e| {
+        format!(
+            "failed to set aside epoch-2 data root {} → {}: {e} — the \
+             set-aside parent must be writable for the epoch-3 cutover",
+            data_root.display(),
+            aside.display()
+        )
+    })?;
+    create_fresh_root(data_root)?;
+
+    tracing::warn!(
+        event_type = "epoch_cutover",
+        set_aside = %aside.display(),
+        parquet_files,
+        wal_files,
+        external_wal_set_aside,
+        "epoch-2 data root set aside (ADR-0013: the event envelope \
+         reshaped, and legacy data is dropped from queries, not deleted) \
+         — trawl will never remove the set-aside directory; delete it \
+         manually to reclaim disk"
+    );
+
+    Ok(Outcome::LegacySetAside {
+        parquet_files,
+        wal_files,
+        external_wal_set_aside,
+    })
+}
+
 /// The legacy-rename branch: set the whole root (and an external WAL dir)
 /// aside, then create the fresh marked root.
 fn set_aside_legacy_root(
@@ -464,10 +579,20 @@ fn set_aside_legacy_root(
 /// whether anything moved; a WAL dir inside the data root rides the root
 /// rename instead and is left to it.
 fn set_aside_external_wal(data_root: &Path, wal_dir: &Path) -> Result<bool, String> {
+    set_aside_external_wal_with(data_root, wal_dir, SET_ASIDE_SUFFIX)
+}
+
+/// [`set_aside_external_wal`] under a named suffix — each epoch bump uses
+/// its own, so one cutover's set-aside cannot clobber another's.
+fn set_aside_external_wal_with(
+    data_root: &Path,
+    wal_dir: &Path,
+    suffix: &str,
+) -> Result<bool, String> {
     if wal_dir.starts_with(data_root) || !wal_dir.exists() {
         return Ok(false);
     }
-    let wal_aside = sibling_with_suffix(wal_dir, SET_ASIDE_SUFFIX);
+    let wal_aside = sibling_with_suffix(wal_dir, suffix);
     if wal_aside.exists() {
         return Err(format!(
             "ambiguous WAL state: both {} and {} exist — refusing to \
@@ -568,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn epoch_2_root_boots_normally() {
+    fn epoch_3_root_boots_normally() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         let wal = data.join("wal");
@@ -585,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn epoch_2_with_lingering_aside_warns_but_boots() {
+    fn epoch_3_with_lingering_aside_warns_but_boots() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         let wal = data.join("wal");
@@ -599,6 +724,168 @@ mod tests {
                 aside_present: true
             }
         );
+    }
+
+    // --- the epoch 2 → 3 cutover (ADR-0013 §9) ---
+
+    /// Build an epoch-2-shaped root: the marker plus a partitioned
+    /// corpus and WAL under the epoch-2 layout.
+    fn epoch_2_root(tmp: &Path) -> (PathBuf, PathBuf) {
+        let data = tmp.join("data");
+        let hour = data.join("prod").join("2026-01-15").join("10");
+        std::fs::create_dir_all(&hour).unwrap();
+        std::fs::write(hour.join("nginx.parquet"), b"epoch-2 bytes").unwrap();
+        let wal = data.join("wal").join("prod");
+        std::fs::create_dir_all(&wal).unwrap();
+        std::fs::write(wal.join("nginx_1_aa.ndjson"), b"wal bytes").unwrap();
+        std::fs::write(data.join(EPOCH_FILE), "2\n").unwrap();
+        (data.clone(), data.join("wal"))
+    }
+
+    #[test]
+    fn an_epoch_2_root_is_set_aside_under_its_own_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, wal) = epoch_2_root(tmp.path());
+
+        let outcome = ensure_current_epoch(&data, &wal, true).expect("cutover runs");
+        assert_eq!(
+            outcome,
+            Outcome::LegacySetAside {
+                parquet_files: 1,
+                wal_files: 1,
+                external_wal_set_aside: false,
+            }
+        );
+
+        // The fresh root is empty but for its marker…
+        assert_eq!(read_marker(&data), "3");
+        assert!(!data.join("prod").exists(), "no epoch-2 data survives");
+        // …and the epoch-2 root is intact under the NEW suffix, so an
+        // existing `.pre-schema-v2` from the ADR-0009 cutover is safe.
+        let aside = tmp.path().join("data.pre-epoch-3");
+        assert_eq!(
+            std::fs::read(aside.join("prod/2026-01-15/10/nginx.parquet")).unwrap(),
+            b"epoch-2 bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(aside.join(EPOCH_FILE))
+                .unwrap()
+                .trim(),
+            "2"
+        );
+        assert!(!tmp.path().join("data.pre-schema-v2").exists());
+    }
+
+    /// Both set-asides can coexist: trawl deletes neither, and the
+    /// epoch-3 cutover must not clobber the epoch-1 one.
+    #[test]
+    fn an_existing_epoch_1_set_aside_is_left_alone_by_the_epoch_3_cutover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, wal) = epoch_2_root(tmp.path());
+        let old = tmp.path().join("data.pre-schema-v2");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("legacy.parquet"), b"epoch-1 bytes").unwrap();
+
+        ensure_current_epoch(&data, &wal, true).expect("cutover runs");
+        assert_eq!(
+            std::fs::read(old.join("legacy.parquet")).unwrap(),
+            b"epoch-1 bytes",
+            "the ADR-0009 set-aside is untouched"
+        );
+        assert!(tmp.path().join("data.pre-epoch-3").exists());
+    }
+
+    /// A query-only node does not own the root — and an epoch-2 corpus
+    /// READS fine under epoch-3 semantics, so it warns and serves.
+    #[test]
+    fn a_query_only_node_serves_an_epoch_2_root_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, wal) = epoch_2_root(tmp.path());
+
+        let outcome = ensure_current_epoch(&data, &wal, false).expect("must serve");
+        assert_eq!(outcome, Outcome::CutoverDeferred);
+        assert_eq!(read_marker(&data), "2", "the marker is not rewritten");
+        assert!(data.join("prod/2026-01-15/10/nginx.parquet").exists());
+        assert!(!tmp.path().join("data.pre-epoch-3").exists());
+    }
+
+    /// An external WAL dir does not ride the root rename, so the
+    /// epoch-3 cutover sets it aside under its own suffix too.
+    #[test]
+    fn an_external_wal_dir_is_set_aside_by_the_epoch_3_cutover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, _) = epoch_2_root(tmp.path());
+        let wal = tmp.path().join("fast-wal").join("prod");
+        std::fs::create_dir_all(&wal).unwrap();
+        std::fs::write(wal.join("nginx_1_aa.ndjson"), b"wal bytes").unwrap();
+        let wal_root = tmp.path().join("fast-wal");
+
+        let outcome = ensure_current_epoch(&data, &wal_root, true).expect("cutover runs");
+        assert!(
+            matches!(
+                outcome,
+                Outcome::LegacySetAside {
+                    external_wal_set_aside: true,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            !wal_root.exists(),
+            "epoch-2 WAL must not drain into epoch 3"
+        );
+        assert!(
+            tmp.path()
+                .join("fast-wal.pre-epoch-3/prod/nginx_1_aa.ndjson")
+                .exists()
+        );
+    }
+
+    /// A crash between the set-aside rename and the fresh-root rename
+    /// leaves NO `data/`, which the fresh-install branch resumes.
+    #[test]
+    fn a_crash_mid_epoch_3_cutover_resumes_on_the_next_boot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, wal) = epoch_2_root(tmp.path());
+        // Simulate the crash window by hand: the aside exists, data/ does not.
+        std::fs::rename(&data, tmp.path().join("data.pre-epoch-3")).unwrap();
+
+        let outcome = ensure_current_epoch(&data, &wal, true).expect("resumes");
+        assert_eq!(outcome, Outcome::FreshRoot);
+        assert_eq!(read_marker(&data), "3");
+        assert!(tmp.path().join("data.pre-epoch-3").exists());
+    }
+
+    /// Report runs ride across the epoch-3 cutover, exactly as they do
+    /// across the epoch-1 one: their postgres rows name a RELATIVE path.
+    #[test]
+    fn report_runs_ride_across_the_epoch_3_cutover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, wal) = epoch_2_root(tmp.path());
+        let runs = data.join(REPORT_RUNS_DIR).join("nightly");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(runs.join("run_7.parquet"), b"results").unwrap();
+
+        ensure_current_epoch(&data, &wal, true).expect("cutover runs");
+        assert_eq!(
+            std::fs::read(data.join("scheduled/nightly/run_7.parquet")).unwrap(),
+            b"results",
+            "the run rode into the fresh root"
+        );
+    }
+
+    /// An epoch-2 root beside an existing epoch-3 set-aside is
+    /// ambiguous: refuse rather than clobber.
+    #[test]
+    fn an_epoch_2_root_beside_its_own_set_aside_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, wal) = epoch_2_root(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("data.pre-epoch-3")).unwrap();
+
+        let err = ensure_current_epoch(&data, &wal, true).expect_err("must refuse");
+        assert!(err.contains("ambiguous"), "got: {err}");
+        assert!(data.join("prod").exists(), "nothing is touched");
     }
 
     #[test]
@@ -917,7 +1204,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join(EPOCH_FILE), "3\n").unwrap();
+        std::fs::write(data.join(EPOCH_FILE), "4\n").unwrap();
         let wal = data.join("wal");
 
         let err = ensure_current_epoch(&data, &wal, true).expect_err("must refuse");

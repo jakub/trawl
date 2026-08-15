@@ -217,7 +217,9 @@ fn disk_pressure_sweep(
     // date dirs cannot reclaim it, so an unattended loop would destroy
     // every non-today partition and remain under threshold. Refuse to
     // delete anything under pressure while it exists, and say why.
-    let set_aside = crate::epoch::set_aside_path(data_dir);
+    // Either set-aside suppresses the sweep: an install can hold one
+    // from each epoch bump, and trawl deletes neither.
+    let set_asides = crate::epoch::set_aside_paths(data_dir);
 
     loop {
         let available =
@@ -227,7 +229,7 @@ fn disk_pressure_sweep(
             break;
         }
 
-        if set_aside.exists() {
+        if let Some(set_aside) = set_asides.iter().find(|p| p.exists()) {
             tracing::warn!(
                 event_type = "retention_disk_pressure_suppressed",
                 available_bytes = available,
