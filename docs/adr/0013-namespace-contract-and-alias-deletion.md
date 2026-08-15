@@ -261,6 +261,143 @@ the `sev()` query-time ladder function, and `repin --to severity`.
   declared field sources only; content heuristics could someday be per-service
   opt-in, never default.
 
+## Slice 2 prep rulings (2026-08-15, #75)
+
+The slice-2 prep pass (dialectic: blind opus + sol legs, mutual critique,
+human adjudication) hardened the directional rulings above into these
+decisions. Where a ruling amends this ADR's text, the amendment is stated.
+
+1. **Derivation-only is absolute — no producer ever asserts `_severity`,
+   including the syslog listener.** §4's "the syslog listener writes
+   `_severity` itself" is retired: the listener publishes its parse
+   artifacts as ordinary prefixed columns (`syslog_severity` = the raw 0–7
+   numeral, `syslog_timestamp`) and the syslog *profile's* fixed derivation
+   sources read them with `dialect = "syslog"`. Provenance still licenses
+   the inversion — but enforced by where the config lives, not by a
+   privileged writer. The native listener and the syslog-over-HTTP
+   forwarder knob become the same mechanism, so the dialect path is
+   exercised on every syslog install. Both dialectic legs proposed this
+   blind; convergence noted.
+
+2. **Producer profiles are code, not data** — a closed set (`http`,
+   `syslog`, `trawld`), selected only by server call sites, never by
+   anything on the wire. A profile asserts identity up front (`env` from
+   boot-validated config — never `env.defaulted` per event; `service` via
+   the listener's derivation or the fixed `trawld`; `host` per transport)
+   and contributes fixed derivation sources; it bypasses NO universal gate
+   (fold, name-length, sealed prefix, nested stringify, `_raw` cap,
+   `_repairs` assembly). Assertions are not repairs.
+
+3. **Telemetry is an ordinary sender, not ingest machinery — no `trawld_`
+   prefix.** The issue's original `trawld_*` line is overruled (human
+   ruling at grill): when trawld logs about itself it is a *sender*, and
+   bare names are sender vocabulary — its `query_id`/`outcome`/`level` are
+   application vocabulary like any app shipping through vector, colliding
+   with other senders exactly as any two senders may (the conflict/degraded
+   machinery is the answer, as everywhere). Prefixes remain only where the
+   platform invents names while unpacking someone else's message —
+   transport parse artifacts (`syslog_*`, `sd_*`). Telemetry accordingly
+   also stops writing `_severity` directly (ruling 1): bare `level` rides
+   the standard `severity_from` chain. Identity is protected by *assertion
+   precedence*, not namespaces: a payload key colliding with a
+   profile-asserted slot (`service`, `env`, `host`, `message`) loses with a
+   repair code, value findable in `_raw`.
+
+4. **Salvage policy for producers that cannot reject** (syslog, telemetry;
+   HTTP keeps per-event rejection): repair where the server has an honest
+   answer (invalid syslog APP-NAME → profile `default_service` +
+   `service.from_profile`), drop-and-count only what proves a server bug
+   (invalid boot-validated env). A hostname-less frame behind a trusted
+   relay is **kept with `host` omitted** + repair — absent-but-honest beats
+   both the peer-fill lie and the drop (human ruling; the HTTP path's
+   rejection survives there because an HTTP sender can fix and resend).
+   `canonicalize` never calls `tracing` — that is the telemetry loop guard,
+   now a stated invariant; producer failure paths are metrics +
+   rate-limited stderr only.
+
+5. **`severity_from` / `time_from` are global `[ingest]` config** — typed
+   entries `{ field, dialect }` with a bare-string shorthand (`"level"` ≡
+   `{ field = "level", dialect = "otel" }`); dialect ∈ {`otel`, `syslog`}
+   governs NUMERICS only (words always read the one token table); syslog =
+   0–7 inverted, anything else no reading. Per-source, not per-profile —
+   dialect is a property of a field's provenance. Profile-fixed sources
+   prepend the configured list; the `trawld` and `syslog` profiles' fixed
+   sources are not configurable. Validation is boot-fatal: sources must be
+   bare (`is_reserved_name` rejected — `severity_from = ["_severity"]`
+   would silently never match, the sharpest footgun here), `time_from` must
+   contain `_time`, spellings that ASCII-fold differently are errors, no
+   duplicates after folding, bounded length. Empty `severity_from` is legal
+   (derive nothing); empty `time_from` is not. The defaults are a packaging
+   contract (`DEFAULT_LOG_FILTER` precedent). No policy-history machinery:
+   a config change is forward-only, documented as such.
+
+6. **The envelope grows to TEN: `_producer`** (`http` | `syslog` |
+   `trawld`), catalog-seeded VARCHAR, server-stamped, closed vocabulary —
+   provenance becomes queryable data instead of an untraceable config
+   effect ("which events came over syslog", "why is this severity
+   inverted"). This amends §1's nine; the sealed prefix exists exactly so
+   this costs nothing.
+
+7. **Backticks change how a name is lexed, never what a name may be.**
+   Accepted in every field-name position uniformly (a partial rollout
+   recreates "the name you type isn't always reachable"); content is any
+   bytes except backtick, doubled backtick escapes one, empty and
+   control-char names are parse errors; ASCII fold still applies;
+   `is_reserved_name` still refuses write positions — quoting is not an
+   escape from policy. Function names, stage names and saved-query names
+   are not fields and take no backticks. `last=` stays an unconditional
+   keyword; `` `last` ``=… is the field. **Correction to §6:** the closed
+   keyword set is THREE — `last=`, `earliest=`, `latest=` — not one.
+
+8. **Projection-name collisions become one shared pre-emission check**:
+   every projecting aggregation stage (`stats`, `timechart`, `pivot`,
+   `top`/`rare`, `eventstats`) assembles its output-name set (group keys,
+   implicit `_time`, auto aliases, explicit aliases) and errors on any
+   duplicate after folding, naming both producers and demanding `as` —
+   enforced from one function in both lanes (the reserved-name-mint
+   precedent), since the stream lane never runs `validate_pipeline`.
+
+9. **`sev(x)` declares its result as the SEVERITY canonical type** via a
+   function-result-pin table (one entry) consumed by the pin-scope walk and
+   the comparison binder — so `| where sev(level) >= error` binds through
+   the ADR-0011 rule table, equality takes the BAND (a plain-BIGINT `sev()`
+   would compile `== sev("error")` to `== 17` and silently miss
+   `error2`–`error4` — the decisive critique-round argument), and results
+   render tokens. Slice A′'s exclusion of function-wrapped subjects stands
+   on decidability and a declared result pin restores it; the extension is
+   exactly one function. Optional second literal arg `"otel"`|`"syslog"`
+   (same closed vocabulary as the config). No reading → NULL, never an
+   error. One Rust kernel — `severity::reading(value, dialect)` — is THE
+   reader for ingest derivation, `sev()` in all three lanes, and the repin
+   cast; the SQL form is generated from the same tables and probe-pinned.
+
+10. **`repin --to severity`**: the target parses through the CATALOG
+    vocabulary (`from_duckdb` stays incapable of it); the SEVERITY conform
+    rung widens to the full token-aware reading as the pin's LIFETIME
+    meaning (live conform included — otherwise a repin rewrites historical
+    `"error"` correctly and nulls the next live one), mirrored in the
+    compare table's live rung, probe-pinned. A `--dialect otel|syslog`
+    flag, persisted on the job row, governs ONLY the one-time rewrite cast
+    — the pin carries no dialect and live conform stays OTel — because a
+    foreign syslog dump (the target corpus) is otherwise unrepinnable:
+    1–7 are all valid OTel readings, so `--force` would convert them
+    *wrong* rather than inverted. The dry run adds: an ambiguous-1–7 count
+    (refuses without `--force` under `otel`), ≤5 unmapped samples (slice-C1
+    capture rules), and a liveness warning from `field_services.last_seen`
+    — a still-live field is told future rows conform dialect-free and the
+    live stream belongs to `severity_from`. Envelope refusal becomes
+    `is_reserved_name(field)` + the four sender-asserted names, replacing
+    the `ENVELOPE_TYPES` list scan.
+
+11. **Slicing — four issues, dependency-ordered**: (1) severity kernel +
+    `sev()` (trawl-core; first, both chains depend on the reader), (2)
+    producer profiles + derivation config + `_producer` (#75 itself; also
+    fixes three latent defects found at prep: telemetry's uncapped field
+    names can wedge compaction permanently, syslog's `_raw` is untruncated,
+    and the syslog batch key ignores the event's `env`), (3) backticks +
+    the projection collision check (independent), (4) `repin --to
+    severity` (last — never the first consumer of unsettled semantics).
+
 ## Consequences
 
 - The language contract is one sentence an analyst learns once: bare names
