@@ -27,7 +27,12 @@ fn agg_expr<'src>() -> impl Parser<'src, ParserInput<'src>, AggExpr, ParserExtra
         .then_ignore(just('(').padded())
         .then(expr().separated_by(just(',').padded()).collect::<Vec<_>>())
         .then_ignore(just(')').padded())
-        .then(keyword("as").padded().ignore_then(field_name()).or_not())
+        .then(
+            keyword("as")
+                .padded()
+                .ignore_then(assignment_target())
+                .or_not(),
+        )
         .map(|((function, args), alias)| AggExpr {
             function,
             args,
@@ -250,8 +255,10 @@ fn drop_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         .labelled("drop stage")
 }
 
-/// A field name the pipeline WRITES: a `let`/`eval` target or a `rename`
-/// target. Trawl's `_` namespace is sealed at both doors (ADR-0013 §5) —
+/// A field name the pipeline WRITES: a `let`/`eval` target, a `rename`
+/// target, or an explicit aggregate alias (`stats`/`eventstats`/
+/// `timechart`/`pivot` all mint their output column through `as`).
+/// Trawl's `_` namespace is sealed at both doors (ADR-0013 §5) —
 /// ingest strips the prefix off an incoming key, so a name the DSL minted
 /// there would be a column ingest can never carry.
 fn assignment_target<'src>()

@@ -557,6 +557,10 @@ mod tests {
             "* | let _foo = 1",
             "* | eval _severity = 17",
             "* | rename service as _svc",
+            "* | stats count() as _severity",
+            "* | eventstats count() as _time",
+            "* | timechart span=5m count() as _raw",
+            "* | pivot count() as _repairs on service",
         ] {
             assert!(parser::parse(dsl).is_err(), "{dsl} must be a parse error");
         }
