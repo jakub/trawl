@@ -31,7 +31,7 @@
 //! The ladder rungs are [`trawl_core::schema::CanonicalType`] values
 //! rather than mirrored strings — the crate is already an unconditional
 //! dependency, and the `DuckDB` spellings on the wire are exactly what
-//! [`CanonicalType::as_duckdb`] writes.
+//! [`CanonicalType::as_catalog`] writes.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -75,7 +75,7 @@ pub fn repin_targets(current: &str) -> Vec<CanonicalType> {
     let current = current.to_ascii_uppercase();
     REPIN_LADDER
         .into_iter()
-        .filter(|c| c.as_duckdb() != current)
+        .filter(|c| c.as_catalog() != current)
         .collect()
 }
 
@@ -89,7 +89,7 @@ pub fn default_target(current: &str, suggested: &str) -> CanonicalType {
     let suggested = suggested.to_ascii_uppercase();
     offered
         .iter()
-        .find(|c| c.as_duckdb() == suggested)
+        .find(|c| c.as_catalog() == suggested)
         .or_else(|| offered.iter().find(|c| **c == CanonicalType::Varchar))
         .or_else(|| offered.first())
         .copied()

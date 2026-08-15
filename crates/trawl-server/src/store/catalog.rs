@@ -517,7 +517,7 @@ impl CatalogStore {
             .map(|row| {
                 let field: String = row.try_get("field")?;
                 let spelling: String = row.try_get("duckdb_type")?;
-                let ty = CanonicalType::from_duckdb(&spelling).ok_or_else(|| {
+                let ty = CanonicalType::from_catalog(&spelling).ok_or_else(|| {
                     sqlx::Error::Decode(
                         format!("field_types.{field} holds non-canonical type {spelling:?}").into(),
                     )
@@ -596,7 +596,7 @@ impl CatalogStore {
             return Ok(HashMap::new());
         }
         let fields: Vec<&str> = proposals.iter().map(|p| p.field.as_str()).collect();
-        let types: Vec<&str> = proposals.iter().map(|p| p.ty.as_duckdb()).collect();
+        let types: Vec<&str> = proposals.iter().map(|p| p.ty.as_catalog()).collect();
         let sources: Vec<&str> = proposals.iter().map(|p| p.pinned_from.as_str()).collect();
 
         // Only the free slots under the cap are filled, and on the ingest
@@ -652,7 +652,7 @@ impl CatalogStore {
             .map(|row| {
                 let field: String = row.try_get("field")?;
                 let spelling: String = row.try_get("duckdb_type")?;
-                let ty = CanonicalType::from_duckdb(&spelling).ok_or_else(|| {
+                let ty = CanonicalType::from_catalog(&spelling).ok_or_else(|| {
                     sqlx::Error::Decode(
                         format!("field_types.{field} holds non-canonical type {spelling:?}").into(),
                     )
@@ -838,7 +838,7 @@ impl CatalogStore {
         let observed: Vec<&str> = conflicts.iter().map(|c| c.observed_type.as_str()).collect();
         let expected: Vec<&str> = conflicts
             .iter()
-            .map(|c| c.expected_type.as_duckdb())
+            .map(|c| c.expected_type.as_catalog())
             .collect();
         let nulled: Vec<i64> = conflicts
             .iter()

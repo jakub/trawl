@@ -2166,6 +2166,20 @@ fn wire_pool(pin: CanonicalType) -> Vec<Value> {
             Value::from("9007199254740993"),
             Value::Null,
         ],
+        // The SEVERITY pin: the ladder's own numbers, the spellings the
+        // guarded BIGINT cast keeps, and the shapes it nulls (out of
+        // ladder, fractional, a word).
+        CanonicalType::Severity => vec![
+            Value::from(17),
+            Value::from(13),
+            Value::from("17"),
+            Value::from("017"),
+            Value::from(0),
+            Value::from(25),
+            Value::from(1.5),
+            Value::from("error"),
+            Value::Null,
+        ],
     }
 }
 
@@ -2200,6 +2214,9 @@ fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
             "\"accepted\"",
             "\"nan\"",
         ],
+        // The SEVERITY pin takes the ladder's numbers AND its token
+        // vocabulary: band tokens, exact OTel short names, and integers.
+        CanonicalType::Severity => &["17", "13", "0", "\"error\"", "\"warn\"", "\"error2\""],
     }
 }
 

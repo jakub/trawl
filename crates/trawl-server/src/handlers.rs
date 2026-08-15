@@ -1144,7 +1144,7 @@ fn degraded_fields_for<'a>(
 /// answer there — it is the one pin under which nothing further can be
 /// shelved.
 fn current_pin(duckdb_type: &str) -> trawl_core::schema::CanonicalType {
-    trawl_core::schema::CanonicalType::from_duckdb(duckdb_type)
+    trawl_core::schema::CanonicalType::from_catalog(duckdb_type)
         .unwrap_or(trawl_core::schema::CanonicalType::Varchar)
 }
 

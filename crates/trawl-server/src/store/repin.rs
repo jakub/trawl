@@ -172,8 +172,8 @@ impl RepinStore {
              RETURNING id",
         )
         .bind(field)
-        .bind(from_type.as_duckdb())
-        .bind(to_type.as_duckdb())
+        .bind(from_type.as_catalog())
+        .bind(to_type.as_catalog())
         .bind(dry_run)
         .bind(force)
         .bind(requested_by)
@@ -293,7 +293,7 @@ impl RepinStore {
              WHERE field = $1 AND duckdb_type IS DISTINCT FROM $2",
         )
         .bind(field)
-        .bind(to_type.as_duckdb())
+        .bind(to_type.as_catalog())
         .execute(&mut *tx)
         .await?;
         let completed = sqlx::query(

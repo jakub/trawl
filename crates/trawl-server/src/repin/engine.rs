@@ -156,12 +156,7 @@ impl RepinEngine {
         requested_by: Option<&str>,
     ) -> Result<StartOutcome, ServerError> {
         let field = field.to_ascii_lowercase();
-        let to = CanonicalType::from_duckdb(&to.to_ascii_uppercase()).ok_or_else(|| {
-            ServerError::BadRequest(format!(
-                "unknown repin target type {to:?} — the candidate ladder is \
-                 BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, VARCHAR"
-            ))
-        })?;
+        let to = parse_target(to)?;
         if trawl_core::schema::ENVELOPE_TYPES
             .iter()
             .any(|(name, _)| *name == field)
@@ -181,7 +176,7 @@ impl RepinEngine {
                 "{field:?} is already pinned {}; pass force to run a \
                  resurrection-only rewrite that re-extracts shelved values \
                  from _raw under the same pin",
-                to.as_duckdb()
+                to.as_catalog()
             )));
         }
 
@@ -195,8 +190,8 @@ impl RepinEngine {
             event_type = "repin_start",
             job_id,
             field = %field,
-            from = from.as_duckdb(),
-            to = to.as_duckdb(),
+            from = from.as_catalog(),
+            to = to.as_catalog(),
             dry_run,
             force,
             "repin job claimed; scanning the corpus"
@@ -474,7 +469,7 @@ impl RepinEngine {
                     event_type = "repin_complete",
                     job_id,
                     field = %field,
-                    to = to.as_duckdb(),
+                    to = to.as_catalog(),
                     duration_ms = started.elapsed().as_millis(),
                     "repin job complete: the corpus and the pin now agree"
                 );
@@ -548,8 +543,8 @@ impl RepinEngine {
         let marker = RepinMarker {
             job_id,
             field: field.to_owned(),
-            from_type: from.as_duckdb().to_owned(),
-            to_type: to.as_duckdb().to_owned(),
+            from_type: from.as_catalog().to_owned(),
+            to_type: to.as_catalog().to_owned(),
             phase: RepinPhase::Building,
         };
         write_marker(&self.data_dir, &marker).map_err(JobAbort::Failed)?;
@@ -646,7 +641,7 @@ impl RepinEngine {
                  scan cannot be read as {}; the cutover is refused and the \
                  corpus stands at its pre-repin generation. Re-run the dry \
                  run for the current plan, then pass force to accept the loss",
-                to.as_duckdb()
+                to.as_catalog()
             )));
         }
 
@@ -974,4 +969,45 @@ fn run_pass_blocking(
         state.processed.insert(rel, sig);
     }
     Ok(changed)
+}
+
+/// Resolve a requested repin target to a canonical type.
+///
+/// The parse is through `CanonicalType::from_duckdb` — the PHYSICAL
+/// spelling — deliberately: `SEVERITY` has no physical spelling of its
+/// own (ADR-0013), so `--to severity` is refused structurally here rather
+/// than by a hand-maintained deny-list. Making severity an operator
+/// decision is slice 2's job.
+fn parse_target(to: &str) -> Result<CanonicalType, ServerError> {
+    CanonicalType::from_duckdb(&to.to_ascii_uppercase()).ok_or_else(|| {
+        ServerError::BadRequest(format!(
+            "unknown repin target type {to:?} — the candidate ladder is \
+             BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, VARCHAR"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repin_targets_are_the_physical_ladder_and_never_severity() {
+        for (spelling, expected) in [
+            ("bigint", CanonicalType::BigInt),
+            ("VARCHAR", CanonicalType::Varchar),
+            ("TimeStamp", CanonicalType::Timestamp),
+            ("double", CanonicalType::Double),
+            ("boolean", CanonicalType::Boolean),
+        ] {
+            assert_eq!(parse_target(spelling).unwrap(), expected, "{spelling}");
+        }
+        for rejected in ["severity", "SEVERITY", "json", ""] {
+            let err = parse_target(rejected).expect_err("must refuse");
+            assert!(
+                matches!(err, ServerError::BadRequest(ref m) if m.contains("unknown repin target type")),
+                "{rejected}: {err:?}"
+            );
+        }
+    }
 }

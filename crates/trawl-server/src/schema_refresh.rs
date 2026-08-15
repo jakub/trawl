@@ -340,7 +340,7 @@ fn build_service_schema(
                     unpinned_now.insert(cs.column_name.clone());
                     "UNPINNED".to_owned()
                 },
-                |ty| ty.as_duckdb().to_owned(),
+                |ty| ty.as_catalog().to_owned(),
             );
             ServiceColumnStats {
                 name: cs.column_name.clone(),

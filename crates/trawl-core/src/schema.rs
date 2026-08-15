@@ -115,7 +115,13 @@ pub fn catalog_key(dsl_name: &str) -> String {
 // (JSON snapshot) side of the hot+cold union to the parquet side at emit
 // time, with no read-time reconciliation left to do.
 
-/// The five canonical storage types a field can be pinned to.
+/// The canonical storage types a field can be pinned to.
+///
+/// Five are physical types; [`Self::Severity`] is a SEMANTIC type over the
+/// physical `BIGINT` (ADR-0013): the pin is what gives `_severity` its
+/// token vocabulary in the ADR-0011 comparison rule table, and it is
+/// reachable only from the declared envelope seed — `DESCRIBE` never says
+/// `SEVERITY`, so inference cannot mint it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CanonicalType {
     /// `BOOLEAN` on disk.
@@ -128,25 +134,32 @@ pub enum CanonicalType {
     Timestamp,
     /// `VARCHAR` on disk — the honest fallback for everything else.
     Varchar,
+    /// The `OTel` `SeverityNumber` ladder, `BIGINT` on disk and bounded to
+    /// 1-24 by its conform rung (ADR-0013). Only `_severity` carries it.
+    Severity,
 }
 
 impl CanonicalType {
-    /// The exact `DuckDB` type spelling this canonical type is stored as
-    /// (also the spelling persisted in the catalog's `duckdb_type` column).
+    /// The PHYSICAL `DuckDB` type spelling — what a cast, a `DESCRIBE`
+    /// comparison, a repin rewrite and the hot branch's `REPLACE` all
+    /// name. NOT injective: `SEVERITY` is a `BIGINT` on disk.
     #[must_use]
     pub const fn as_duckdb(self) -> &'static str {
         match self {
             Self::Boolean => "BOOLEAN",
-            Self::BigInt => "BIGINT",
+            Self::BigInt | Self::Severity => "BIGINT",
             Self::Double => "DOUBLE",
             Self::Timestamp => "TIMESTAMP",
             Self::Varchar => "VARCHAR",
         }
     }
 
-    /// Parse the catalog's stored spelling back into the enum. EXACT match
-    /// only — the catalog is written by code, so any other spelling is
-    /// corruption and must surface, not be guessed at.
+    /// Parse a PHYSICAL spelling back into the enum. EXACT match only.
+    ///
+    /// `BIGINT` resolves to [`Self::BigInt`] and nothing resolves to
+    /// [`Self::Severity`] — the semantic pin has no physical spelling of
+    /// its own, which is exactly what keeps `repin --to severity` (slice
+    /// 2) out of the operator surface for now.
     #[must_use]
     pub fn from_duckdb(s: &str) -> Option<Self> {
         match s {
@@ -158,11 +171,33 @@ impl CanonicalType {
             _ => None,
         }
     }
+
+    /// The CATALOG spelling: what postgres stores in `field_types` and
+    /// what every schema wire surface carries. Injective, so a pin can be
+    /// read back exactly as it was written.
+    #[must_use]
+    pub const fn as_catalog(self) -> &'static str {
+        match self {
+            Self::Severity => "SEVERITY",
+            other => other.as_duckdb(),
+        }
+    }
+
+    /// Parse the catalog's stored spelling back into the enum. EXACT match
+    /// only — the catalog is written by code, so any other spelling is
+    /// corruption and must surface, not be guessed at.
+    #[must_use]
+    pub fn from_catalog(s: &str) -> Option<Self> {
+        match s {
+            "SEVERITY" => Some(Self::Severity),
+            other => Self::from_duckdb(other),
+        }
+    }
 }
 
 impl fmt::Display for CanonicalType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_duckdb())
+        f.write_str(self.as_catalog())
     }
 }
 
@@ -381,20 +416,64 @@ mod tests {
 
     // --- the field-catalog type vocabulary (ADR-0009 slice 2) ---
 
+    /// The CATALOG spelling is the injective one — it is what postgres
+    /// stores and what the wire carries, so it must round-trip for every
+    /// canonical type, `SEVERITY` included.
     #[test]
-    fn canonical_type_duckdb_spellings_round_trip() {
+    fn canonical_type_catalog_spellings_round_trip() {
         for ty in [
             CanonicalType::Boolean,
             CanonicalType::BigInt,
             CanonicalType::Double,
             CanonicalType::Timestamp,
             CanonicalType::Varchar,
+            CanonicalType::Severity,
         ] {
-            assert_eq!(CanonicalType::from_duckdb(ty.as_duckdb()), Some(ty));
+            assert_eq!(CanonicalType::from_catalog(ty.as_catalog()), Some(ty));
         }
-        assert_eq!(CanonicalType::BigInt.as_duckdb(), "BIGINT");
-        assert_eq!(CanonicalType::from_duckdb("JSON"), None);
-        assert_eq!(CanonicalType::from_duckdb("bigint"), None);
+        assert_eq!(CanonicalType::BigInt.as_catalog(), "BIGINT");
+        assert_eq!(CanonicalType::Severity.as_catalog(), "SEVERITY");
+        assert_eq!(CanonicalType::from_catalog("JSON"), None);
+        assert_eq!(CanonicalType::from_catalog("bigint"), None);
+    }
+
+    /// The PHYSICAL spelling is what casts and DDL use, and it is
+    /// deliberately NOT injective: `SEVERITY` is a BIGINT on disk, so
+    /// `from_duckdb` — the inverse of the physical spelling — cannot
+    /// name it. That is the structural reason `repin --to severity` is a
+    /// slice-2 feature rather than a live foot-gun.
+    #[test]
+    fn severity_is_physically_bigint_and_unreachable_by_physical_parse() {
+        assert_eq!(CanonicalType::Severity.as_duckdb(), "BIGINT");
+        assert_eq!(
+            CanonicalType::from_duckdb("BIGINT"),
+            Some(CanonicalType::BigInt)
+        );
+        assert_eq!(CanonicalType::from_duckdb("SEVERITY"), None);
+    }
+
+    /// `DESCRIBE` never reports SEVERITY, so inference can never pin it —
+    /// only the declared seed can.
+    #[test]
+    fn inference_can_never_pin_severity() {
+        for t in [
+            "BIGINT",
+            "SEVERITY",
+            "severity",
+            "INTEGER",
+            "VARCHAR",
+            "DOUBLE",
+            "BOOLEAN",
+            "TIMESTAMP",
+            "JSON",
+            "HUGEINT",
+        ] {
+            assert_ne!(
+                normalize_duckdb_type(t),
+                TypeResolution::Pin(CanonicalType::Severity),
+                "{t}"
+            );
+        }
     }
 
     #[test]

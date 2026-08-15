@@ -4,6 +4,53 @@
 
 use super::*;
 
+/// The `OTel` short names are INJECTIVE over the whole 1-24 ladder — the
+/// property that lets `_severity` render as text and be filtered by that
+/// same text without two numbers sharing a spelling.
+#[test]
+fn otel_names_are_injective_over_the_ladder() {
+    let mut seen = std::collections::BTreeSet::new();
+    for n in 1..=24u8 {
+        let name = otel_name(n).expect("every ladder number has a name");
+        assert!(seen.insert(name), "{name:?} named twice (n={n})");
+        assert_eq!(number_for_exact(name), Some(n), "{name:?} must invert");
+    }
+    assert_eq!(otel_name(0), None);
+    assert_eq!(otel_name(25), None);
+}
+
+/// The exact names are the band base plus an optional 2-4 suffix.
+#[test]
+fn exact_names_spell_the_band_base_and_suffix() {
+    let cases: &[(u8, &str)] = &[
+        (1, "trace"),
+        (4, "trace4"),
+        (5, "debug"),
+        (9, "info"),
+        (10, "info2"),
+        (13, "warn"),
+        (16, "warn4"),
+        (17, "error"),
+        (18, "error2"),
+        (21, "fatal"),
+        (24, "fatal4"),
+    ];
+    for &(n, name) in cases {
+        assert_eq!(otel_name(n), Some(name), "{n}");
+        assert_eq!(number_for_exact(name), Some(n), "{name}");
+    }
+    // Case-insensitive, like the token table.
+    assert_eq!(number_for_exact("ERROR2"), Some(18));
+    // A suffix outside 2-4, an unknown base, and the aliases the token
+    // table carries are NOT exact names.
+    assert_eq!(number_for_exact("error1"), None);
+    assert_eq!(number_for_exact("error5"), None);
+    assert_eq!(number_for_exact("gold"), None);
+    assert_eq!(number_for_exact("err"), None);
+    assert_eq!(number_for_exact("notice"), None);
+    assert_eq!(number_for_exact(""), None);
+}
+
 /// Every token in the issue table maps to its exact number.
 #[test]
 fn token_table_exact_numbers() {

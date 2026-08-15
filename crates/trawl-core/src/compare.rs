@@ -218,6 +218,13 @@ pub enum PatternForm {
     /// DOUBLE), [`canonical_double_text`] over the value's DOUBLE reading
     /// on the live side.
     DoubleText,
+    /// The SEVERITY pin's canonical text: the `OTel` short name of the
+    /// stored number (`17` → `error`, `18` → `error2`) —
+    /// `crate::conform::severity_token_text_sql` on the SQL side,
+    /// [`crate::severity::otel_name`] over the value's
+    /// [`conformed_severity`] reading on the live side. Injective, so
+    /// `_severity=warn*` matches exactly the WARN band (13-16).
+    SeverityText,
 }
 
 /// The `DuckDB` `strftime` format producing a TIMESTAMP pin's canonical
@@ -811,7 +818,21 @@ pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
         Some(CanonicalType::Double) => PatternForm::DoubleText,
         Some(CanonicalType::BigInt) => PatternForm::BigIntText,
         Some(CanonicalType::Boolean) => PatternForm::BooleanText,
+        Some(CanonicalType::Severity) => PatternForm::SeverityText,
     }
+}
+
+/// The `SeverityNumber` a SEVERITY-pinned column CONFORMS a stored text to
+/// — the live mirror of [`crate::conform::guarded_cast`]'s SEVERITY rung,
+/// which is the guarded BIGINT cast inside a 1-24 ladder guard.
+///
+/// A number outside the ladder is not a severity, so it has no reading at
+/// all: the column holds NULL and the value stays in `_raw`.
+#[must_use]
+pub fn conformed_severity(text: &str) -> Option<u8> {
+    conformed_bigint(text)
+        .filter(|n| crate::severity::is_valid_number(*n))
+        .and_then(|n| u8::try_from(n).ok())
 }
 
 /// The BIGINT a BIGINT-pinned column CONFORMS a stored text to — the live
@@ -1639,6 +1660,7 @@ mod tests {
                 CanonicalType::Double => PatternForm::DoubleText,
                 CanonicalType::BigInt => PatternForm::BigIntText,
                 CanonicalType::Boolean => PatternForm::BooleanText,
+                CanonicalType::Severity => PatternForm::SeverityText,
                 CanonicalType::Varchar => unreachable!("not a typed pin"),
             };
             assert_eq!(pattern_form(Some(pin)), expected, "{pin:?}");

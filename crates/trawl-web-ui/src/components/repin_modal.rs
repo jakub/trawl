@@ -147,16 +147,16 @@ pub fn RepinModal(
     let shown_field = sanitize_display_text(&field);
     let targets = repin_targets(&current_type);
     let initial = refused.as_ref().map_or_else(
-        || default_target(&current_type, &suggested_to).as_duckdb(),
+        || default_target(&current_type, &suggested_to).as_catalog(),
         |job| {
             // The refusal's own target, so the re-presented numbers and
             // the selected rung cannot disagree.
             repin_targets(&current_type)
                 .into_iter()
-                .find(|c| c.as_duckdb() == job.to_type)
+                .find(|c| c.as_catalog() == job.to_type)
                 .map_or_else(
-                    || default_target(&current_type, &suggested_to).as_duckdb(),
-                    |c| c.as_duckdb(),
+                    || default_target(&current_type, &suggested_to).as_catalog(),
+                    |c| c.as_catalog(),
                 )
         },
     );
@@ -379,7 +379,7 @@ pub fn RepinModal(
 
     let strip = targets
         .into_iter()
-        .map(|c| SegmentedOption::new(c.as_duckdb(), c.as_duckdb()))
+        .map(|c| SegmentedOption::new(c.as_catalog(), c.as_catalog()))
         .collect::<Vec<_>>();
 
     // The target is what every in-flight request was issued FOR, so it

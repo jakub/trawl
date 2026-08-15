@@ -59,6 +59,10 @@ pub(crate) fn pattern_target(field: &str, pin: Option<crate::schema::CanonicalTy
                 compare::TIMESTAMP_PATTERN_SQL_FORMAT
             )
         }
+        // The SEVERITY pin renders the ladder's own short names, so
+        // `_severity=warn*` matches the WARN band and results display
+        // `error` rather than `17` (ADR-0013).
+        PatternForm::SeverityText => conform::severity_token_text_sql(field),
     }
 }
 

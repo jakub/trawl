@@ -59,6 +59,7 @@ fn pattern_name(form: PatternForm) -> &'static str {
         PatternForm::BooleanText => "BooleanText",
         PatternForm::DoubleText => "DoubleText",
         PatternForm::Rfc3339Text => "Rfc3339Text",
+        PatternForm::SeverityText => "SeverityText",
     }
 }
 
