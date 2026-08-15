@@ -871,6 +871,49 @@ async fn ingest_repairs_exposed_on_metrics(pool: sqlx::PgPool) {
     assert!(line.trim_end().ends_with('1'), "counter at 1: {line}");
 }
 
+/// An unmappable severity source surfaces as
+/// `trawl_severity_unmapped_total{service}` on /metrics — one increment per
+/// event whose source mapped to nothing, and no series at all for a sender
+/// whose source mapped fine (ADR-0013 §2).
+#[sqlx::test(migrations = false)]
+async fn unmapped_severity_exposed_on_metrics(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+
+    let records = vec![
+        serde_json::json!({"service": "unmapped-svc", "env": "prod", "level": "gold"}),
+        serde_json::json!({"service": "unmapped-svc", "env": "prod", "level": "silver"}),
+        serde_json::json!({"service": "mapped-svc", "env": "prod", "level": "error"}),
+    ];
+    let resp = ingest.ingest(&records).await.unwrap();
+    assert_eq!(resp.accepted, 3, "an unmapped severity is not a rejection");
+
+    let metrics_body = raw_client()
+        .get(format!("{}/metrics", server.url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let line = metrics_body
+        .lines()
+        .find(|l| {
+            l.starts_with("trawl_severity_unmapped_total") && l.contains("service=\"unmapped-svc\"")
+        })
+        .unwrap_or_else(|| {
+            panic!("expected a labelled trawl_severity_unmapped_total line in:\n{metrics_body}")
+        });
+    assert!(line.trim_end().ends_with('2'), "counter at 2: {line}");
+    assert!(
+        !metrics_body
+            .lines()
+            .any(|l| l.starts_with("trawl_severity_unmapped_total")
+                && l.contains("service=\"mapped-svc\"")),
+        "a mappable source publishes no series:\n{metrics_body}"
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn ingest_rejects_missing_auth(pool: sqlx::PgPool) {
     let server = setup(pool).await;

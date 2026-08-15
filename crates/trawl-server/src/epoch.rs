@@ -287,8 +287,29 @@ fn epoch_2_branch(
 /// being already published — completes it.
 fn carry_over_report_runs(aside: &Path, data_root: &Path) -> Result<(), String> {
     let src = aside.join(REPORT_RUNS_DIR);
-    if !src.is_dir() {
-        return Ok(());
+    match std::fs::metadata(&src) {
+        // No report-run subtree in this set-aside: nothing to carry.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // Anything else — a permission wall, an IO fault, a non-directory
+        // planted at the path — is NOT evidence of absence. Folding it into
+        // "nothing to carry" would boot cleanly while every postgres
+        // report_runs row still pointed under the set-aside.
+        Err(e) => {
+            return Err(format!(
+                "failed to inspect report-run results at {}: {e} — refusing \
+                 to start rather than orphan the postgres report_runs rows \
+                 that reference them by relative path",
+                src.display()
+            ));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(format!(
+                "{} is not a directory — refusing to start rather than guess \
+                 what it is holding in place of the report-run results",
+                src.display()
+            ));
+        }
+        Ok(_) => {}
     }
     let dst = data_root.join(REPORT_RUNS_DIR);
     if dst.exists() {
@@ -864,6 +885,19 @@ mod tests {
             b"results",
             "the run rode into the fresh root"
         );
+    }
+
+    /// A non-directory planted where the report runs live is not
+    /// evidence that there are none: refuse rather than boot clean with
+    /// every postgres `report_runs` row stranded under the set-aside.
+    #[test]
+    fn a_non_directory_report_runs_path_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (data, wal) = epoch_2_root(tmp.path());
+        std::fs::write(data.join(REPORT_RUNS_DIR), b"not a directory").unwrap();
+
+        let err = ensure_current_epoch(&data, &wal, true).expect_err("must refuse");
+        assert!(err.contains("not a directory"), "got: {err}");
     }
 
     /// An epoch-2 root beside an existing epoch-3 set-aside is
