@@ -14,7 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `` | stats count() as `total count` by `where` ``. Backticks change how
   a name is **lexed**, never what a name may be — content is any
   character except a backtick (a doubled backtick escapes one), an empty
-  name and control characters are parse errors, the ASCII fold still
+  name is a parse error, as is a control or invisible format character
+  (bidi controls, zero-widths, the soft hyphen — a parsed name is echoed
+  back verbatim in notices and errors), the ASCII fold still
   applies (`` `Dur` `` **is** `dur`), and trawl's `_` namespace is still
   sealed (``let `_foo` = 1`` is the same error as the bare spelling).
   They are accepted in **every** field position, so a name that exists is

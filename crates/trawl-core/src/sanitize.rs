@@ -12,10 +12,13 @@
 //! key that ingest polices for length and case only). Both reach a terminal,
 //! a JSON body and (slice C2) a browser.
 //!
-//! Field names taken from a QUERY need none of this: the parser accepts
-//! `[A-Za-z_][A-Za-z0-9_]*` with `.` and `@`, so the query notice's footer
-//! cannot name anything hostile — it echoes what the user typed, through a
-//! grammar that admits no control or format character.
+//! Field names taken from a QUERY need none of this: the bare production is
+//! `[A-Za-z_][A-Za-z0-9_]*` with `.` and `@`, and the backtick-quoted one
+//! (ADR-0013 ruling 7) admits any character EXCEPT the ones below — its
+//! parser refuses a name carrying an [`is_unsafe_display_char`], so the
+//! query notice's footer and the projection-collision messages cannot name
+//! anything hostile: they echo what the user typed, through a grammar that
+//! admits no control or format character.
 //!
 //! [`char::is_control`] is not enough for that. It covers category Cc
 //! alone, while the characters that actually rewrite a rendering are format

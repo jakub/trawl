@@ -10,6 +10,7 @@
 use chumsky::prelude::*;
 
 use crate::ast::{FilterOp, FloatLiteral, LiteralValue, Spanned, TimeUnit, TrawlDuration};
+use crate::sanitize::is_unsafe_display_char;
 
 /// Shorthand for our parser type — `&str` input, `Rich` errors.
 pub(crate) type ParserInput<'src> = &'src str;
@@ -173,8 +174,11 @@ pub(crate) fn plain_name<'src>()
 ///
 /// Backticks change how a name is LEXED, never what a name may be
 /// (ADR-0013 ruling 7). Content is any character except a backtick; a
-/// doubled backtick escapes one. Empty and control-char names are parse
-/// errors — the only two refusals, because this is lexing, not policy:
+/// doubled backtick escapes one. Empty names and names carrying a
+/// character that cannot be rendered as itself
+/// ([`is_unsafe_display_char`] — controls, bidi and zero-width format
+/// characters, the soft hyphen) are parse errors — the only two
+/// refusals, because this is lexing, not policy:
 /// the ASCII fold ([`crate::schema::catalog_key`]) and the sealed `_`
 /// namespace ([`crate::schema::is_reserved_name`]) apply to the result
 /// exactly as they do to a bare name. A dot inside the quotes is a
@@ -189,12 +193,12 @@ pub(crate) fn quoted_name<'src>()
             if name.is_empty() {
                 return Err(Rich::custom(span, "empty field name: `` names no column"));
             }
-            if let Some(bad) = name.chars().find(|c| c.is_control()) {
+            if let Some(bad) = name.chars().find(|c| is_unsafe_display_char(*c)) {
                 return Err(Rich::custom(
                     span,
                     format!(
-                        "field name contains a control character (U+{:04X}); \
-                         control characters are not part of any column name",
+                        "field name contains a control or invisible format character \
+                         (U+{:04X}); such characters are not part of any column name",
                         bad as u32
                     ),
                 ));

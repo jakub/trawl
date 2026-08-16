@@ -742,10 +742,21 @@ mod tests {
 
     /// A LEADING backtick that fails the quoted production is a loud
     /// parse error, never a quiet slide into text search: unterminated,
-    /// empty, or a control character inside.
+    /// empty, or a character that cannot render as itself inside — a
+    /// control character, but also the bidi and zero-width format
+    /// characters `sanitize` exists to neutralise, since a name that
+    /// parses is echoed verbatim into notices and error messages.
     #[test]
     fn leading_backtick_that_is_not_a_name_is_a_parse_error() {
-        for input in ["`unterminated", "``", "`a\nb`", "`foo` bar"] {
+        for input in [
+            "`unterminated",
+            "``",
+            "`a\nb`",
+            "`foo` bar",
+            "`a\u{202e}b`",
+            "`a\u{200b}b`",
+            "`a\u{00ad}b`",
+        ] {
             assert!(
                 parse(input).is_err(),
                 "{input:?} must be a loud parse error, not text search"

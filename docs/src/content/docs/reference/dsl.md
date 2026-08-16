@@ -302,7 +302,9 @@ Backticks change how a name is **lexed**, never what a name may be:
 
 - content is any character except a backtick, and a doubled backtick
   escapes one (last line above);
-- an empty name and control characters inside one are parse errors;
+- an empty name is a parse error, as is one carrying a character that
+  cannot render as itself — a control character, a bidi or zero-width
+  format character, or the soft hyphen;
 - the ASCII fold still applies: `` `Dur` `` **is** `dur`;
 - trawl's `_` namespace is still sealed: ``let `_foo` = 1`` and
   ``rename x as `_foo` `` are the same errors as the bare spellings.
