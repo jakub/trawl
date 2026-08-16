@@ -704,3 +704,233 @@ fn mixed_case_aliases_resolve_in_both_lanes() {
         &ft
     ));
 }
+
+// ── sev(): the pin-DECLARING subject (ADR-0013 slice 2, ruling 9) ─────
+
+/// `sev(<field>)` is a comparison subject with a FUNCTION-declared pin,
+/// so it binds through the SEVERITY rule table in both lanes — over an
+/// EMPTY catalog, which is the point: the declaration is the function's,
+/// and embedded `--data` over foreign parquet must answer identically.
+#[test]
+fn sev_subject_binds_through_the_severity_rules_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let unpinned = FieldTypes::new();
+
+    // (dsl, event level value, expected answer)
+    let cells: &[(&str, Value, Option<bool>)] = &[
+        // Equality takes the BAND — the whole reason sev() declares
+        // SEVERITY rather than plain BIGINT: `error2` is an error.
+        (
+            r#"* | where sev(level) == "error""#,
+            Value::String("error2".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level) == "error""#,
+            Value::String("warn".into()),
+            Some(false),
+        ),
+        // An ordered operator takes the token's EXACT number (17).
+        (
+            r#"* | where sev(level) >= "error""#,
+            Value::String("error2".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level) >= "error""#,
+            Value::String("warning".into()),
+            Some(false),
+        ),
+        // Both operand orders: `"error" <= sev(level)` IS `>= "error"`.
+        (
+            r#"* | where "error" <= sev(level)"#,
+            Value::String("fatal".into()),
+            Some(true),
+        ),
+        // An exact OTel short name is exactly that number.
+        (
+            r#"* | where sev(level) == "error2""#,
+            Value::String("error2".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level) == "error2""#,
+            Value::String("error".into()),
+            Some(false),
+        ),
+        // Integers bind unclamped.
+        (
+            "* | where sev(level) > 0",
+            Value::String("info".into()),
+            Some(true),
+        ),
+        // A value with no reading is NULL — UNKNOWN, both operators.
+        (
+            r#"* | where sev(level) == "error""#,
+            Value::String("gold".into()),
+            None,
+        ),
+        (
+            r#"* | where sev(level) != "error""#,
+            Value::String("gold".into()),
+            None,
+        ),
+        // …and the pipeline's `!=` stays STRICT (no null widening).
+        (
+            r#"* | where sev(level) != "error""#,
+            Value::String("warn".into()),
+            Some(true),
+        ),
+        // IN routes each element through the equality rule (bands).
+        (
+            r#"* | where sev(level) in ("warn", "fatal")"#,
+            Value::String("fatal2".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level) in ("warn", "fatal")"#,
+            Value::String("error".into()),
+            Some(false),
+        ),
+        // Patterns match the pin's canonical TOKEN text, not the stored
+        // word: a `warning` reads 13 and renders `warn`.
+        (
+            r#"* | where sev(level) matches "^warn$""#,
+            Value::String("warning".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level) matches "^error""#,
+            Value::String("error3".into()),
+            Some(true),
+        ),
+        // A numeric column reads as a ladder position…
+        (
+            r#"* | where sev(level) == "error""#,
+            Value::Number(18.into()),
+            Some(true),
+        ),
+        // …and a JSON shape with no reading is UNKNOWN in both lanes.
+        (
+            r#"* | where sev(level) == "error""#,
+            Value::Bool(true),
+            None,
+        ),
+    ];
+
+    for (dsl, value, expected) in cells {
+        let event = event_with("level", value.clone());
+        assert_eq!(
+            run_cell(&conn, dsl, &event, &unpinned),
+            *expected,
+            "{dsl} over {value:?}"
+        );
+    }
+}
+
+/// The dialect argument travels with the subject: a syslog numeral
+/// inverts in both lanes, and its words are unaffected.
+#[test]
+fn sev_subject_carries_its_dialect_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let unpinned = FieldTypes::new();
+    let cells: &[(&str, Value, Option<bool>)] = &[
+        (
+            r#"* | where sev(level, "syslog") == "error""#,
+            Value::Number(3.into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level, "otel") == "error""#,
+            Value::Number(3.into()),
+            Some(false),
+        ),
+        (
+            r#"* | where sev(level, "syslog") == "error""#,
+            Value::String("error".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level, "syslog") == "error""#,
+            Value::Number(9.into()),
+            None,
+        ),
+    ];
+    for (dsl, value, expected) in cells {
+        let event = event_with("level", value.clone());
+        assert_eq!(
+            run_cell(&conn, dsl, &event, &unpinned),
+            *expected,
+            "{dsl} over {value:?}"
+        );
+    }
+}
+
+/// A `let` target adopts the DECLARED pin, so the comparison downstream
+/// is the same comparison — and the value the two lanes project is the
+/// same number.
+#[test]
+fn sev_let_target_adopts_the_declared_pin_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let unpinned = FieldTypes::new();
+
+    let event = event_with("level", Value::String("error2".into()));
+    run_let_cell(&conn, "* | let s = sev(level)", &event, &unpinned, &["s"]);
+    run_let_cell(
+        &conn,
+        r#"* | let s = sev(level, "syslog")"#,
+        &event_with("level", Value::Number(3.into())),
+        &unpinned,
+        &["s"],
+    );
+
+    // The adopted pin types the downstream comparison: BAND under `==`,
+    // which a plain BIGINT would have missed.
+    assert!(run_pipeline_cell(
+        &conn,
+        r#"* | let s = sev(level) | where s == "error""#,
+        &event,
+        &unpinned
+    ));
+    assert!(run_pipeline_cell(
+        &conn,
+        r#"* | let s = sev(level) | where s >= "error""#,
+        &event,
+        &unpinned
+    ));
+    assert!(!run_pipeline_cell(
+        &conn,
+        r#"* | let s = sev(level) | where s == "warn""#,
+        &event,
+        &unpinned
+    ));
+}
+
+/// An unknown severity token is the SAME refusal in both lanes — the
+/// emitter's 400 and the stream compiler's plan error — because the
+/// subject classifier and the rule table are shared.
+#[test]
+fn sev_subject_refuses_an_unknown_token_in_both_lanes() {
+    let unpinned = FieldTypes::new();
+    for dsl in [
+        r#"* | where sev(level) == "bogus""#,
+        r#"* | where "bogus" == sev(level)"#,
+        r#"* | where sev(level) >= "gold""#,
+        r#"* | where sev(level) in ("error", "spicy")"#,
+        r#"* | let hot = sev(level) == "spicy""#,
+    ] {
+        let query = parser::parse(dsl).expect("parses");
+        let emit_err = emitter::emit_with_pins(&query, "/data/*.parquet", &unpinned)
+            .expect_err("batch must refuse");
+        let stream_err = compile_stream_plan(&query.pipeline, &PinScope::unpinned())
+            .expect_err("live must refuse");
+        assert!(
+            emit_err.to_string().contains("unknown severity value"),
+            "{dsl}: {emit_err}"
+        );
+        assert!(
+            stream_err.to_string().contains("unknown severity value"),
+            "{dsl}: {stream_err}"
+        );
+    }
+}

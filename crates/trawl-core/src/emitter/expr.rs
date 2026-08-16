@@ -194,12 +194,14 @@ fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
     }
 }
 
-/// Detect a bare field-vs-literal comparison whose field resolves to a
-/// catalog pin, and emit it through the shared rule table (ADR-0011 slice
-/// A′). Returns `None` — falling through to generic, literal-driven
-/// emission, structurally — for every other shape: field-vs-field,
-/// function-wrapped fields, arithmetic, `== null`, unpinned fields, and
-/// any form the rule table leaves native.
+/// Detect a pinned-subject-vs-literal comparison and emit it through the
+/// shared rule table (ADR-0011 slice A′, widened by ADR-0013 ruling 9).
+/// The subject is whatever [`PinScope::subject_pin`] recognizes — a bare
+/// pinned field, or a pin-DECLARING call over one (`sev(level)`) — and
+/// every other shape returns `None`, falling through to generic,
+/// literal-driven emission, structurally: field-vs-field, an ordinary
+/// function wrapper, arithmetic, `== null`, unpinned fields, and any form
+/// the rule table leaves native.
 ///
 /// Both operand orders are accepted for the comparison operators
 /// (`400 < status` is `status > 400`); for the pattern operators
@@ -216,15 +218,12 @@ fn try_pinned_comparison(
     rhs: &Spanned<Expr>,
     state: &mut EmitterState,
 ) -> Result<Option<String>, EmitError> {
-    // Pattern operators: field on the LEFT only.
+    // Pattern operators: the subject is the LEFT operand only.
     if matches!(op, BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike) {
-        let Expr::FieldRef(name) = &lhs.node else {
+        let Some((subject, pin)) = state.pin_scope().subject_pin(lhs) else {
             return Ok(None);
         };
         let Expr::Literal(LiteralValue::String(pattern)) = &rhs.node else {
-            return Ok(None);
-        };
-        let Some(pin) = state.compare_pin(name) else {
             return Ok(None);
         };
         if compare::pattern_form(Some(pin)) == PatternForm::Native {
@@ -232,7 +231,9 @@ fn try_pinned_comparison(
             // byte-identical, so keep it on the generic path.
             return Ok(None);
         }
-        let target = pattern_target(&quote_field(name), Some(pin));
+        // The subject's SQL is built BEFORE the pattern's parameter, so
+        // any placeholder inside it keeps its positional order.
+        let target = pattern_target(&subject_sql(&subject, state)?, Some(pin));
         let placeholder = state.push_param(SqlValue::String(pattern.clone()));
         return Ok(Some(match op {
             BinaryOp::Matches => format!("regexp_matches({target}, {placeholder})"),
@@ -244,17 +245,18 @@ fn try_pinned_comparison(
     let Some(filter_op) = comparison_filter_op(op) else {
         return Ok(None);
     };
-    let resolved = match (&lhs.node, &rhs.node) {
-        (Expr::FieldRef(name), rhs) => bare_literal(rhs).map(|l| (name, filter_op, l)),
-        (lhs, Expr::FieldRef(name)) => {
-            bare_literal(lhs).map(|l| (name, flip_filter_op(filter_op), l))
+    let resolved = match (
+        state.pin_scope().subject_pin(lhs),
+        state.pin_scope().subject_pin(rhs),
+    ) {
+        (Some((subject, pin)), _) => bare_literal(&rhs.node).map(|l| (subject, pin, filter_op, l)),
+        // `400 < status` is `status > 400`, subject on the right.
+        (None, Some((subject, pin))) => {
+            bare_literal(&lhs.node).map(|l| (subject, pin, flip_filter_op(filter_op), l))
         }
-        _ => None,
+        (None, None) => None,
     };
-    let Some((name, filter_op, literal)) = resolved else {
-        return Ok(None);
-    };
-    let Some(pin) = state.compare_pin(name) else {
+    let Some((subject, pin, filter_op, literal)) = resolved else {
         return Ok(None);
     };
     let Some(form) = compare::compare_form_bound(Some(pin), filter_op, &literal)? else {
@@ -265,13 +267,9 @@ fn try_pinned_comparison(
         // ordered non-numeric literal) — generic emission is the rule.
         return Ok(None);
     }
-    let clause = comparison_sql(
-        &quote_field(name),
-        filter_op,
-        form,
-        NullPolicy::Strict,
-        state,
-    );
+    // Subject first, again for parameter order.
+    let target = subject_sql(&subject, state)?;
+    let clause = comparison_sql(&target, filter_op, form, NullPolicy::Strict, state);
     // Parenthesize for composition under and/or/not, matching the generic
     // emitter's style; the two-armed shapes arrive parenthesized already.
     Ok(Some(if clause.starts_with('(') {
@@ -289,10 +287,7 @@ fn try_pinned_in_list(
     list: &[Spanned<Expr>],
     state: &mut EmitterState,
 ) -> Result<Option<String>, EmitError> {
-    let Expr::FieldRef(name) = &target.node else {
-        return Ok(None);
-    };
-    let Some(pin) = state.compare_pin(name) else {
+    let Some((subject, pin)) = state.pin_scope().subject_pin(target) else {
         return Ok(None);
     };
     let mut forms: Vec<CompareForm> = Vec::with_capacity(list.len());
@@ -305,12 +300,30 @@ fn try_pinned_in_list(
         };
         forms.push(form);
     }
-    let clause = in_list_sql(&quote_field(name), forms, state);
+    // Subject first: `in_list_sql` pushes one parameter per element.
+    let subject = subject_sql(&subject, state)?;
+    let clause = in_list_sql(&subject, forms, state);
     Ok(Some(if clause.starts_with('(') {
         clause
     } else {
         format!("({clause})")
     }))
+}
+
+/// The SQL a pinned subject compares as: the quoted column, or the
+/// translated call.
+///
+/// A pin-declaring call is emitted by the ordinary function path — it is
+/// the same SQL `| let s = sev(level)` would project — so the comparison
+/// and the projection can never read one value two ways.
+fn subject_sql(
+    subject: &crate::pin_scope::PinnedSubject<'_>,
+    state: &mut EmitterState,
+) -> Result<String, EmitError> {
+    match subject {
+        crate::pin_scope::PinnedSubject::Field(name) => Ok(quote_field(name)),
+        crate::pin_scope::PinnedSubject::Call(call) => emit_expr(call, state),
+    }
 }
 
 /// A literal bound as a parameter that carries its OWN type.

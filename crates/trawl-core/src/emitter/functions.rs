@@ -393,6 +393,32 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
     }
 }
 
+/// The canonical type a function DECLARES its result to be — the one
+/// table that lets a call be a pinned comparison subject (ADR-0013 slice
+/// 2, ruling 9).
+///
+/// ONE entry, and the narrowness is the design. ADR-0011 slice A′ excluded
+/// function-wrapped subjects on DECIDABILITY: nothing tells the binder
+/// what `lower(status)` is, so it stays literal-driven. A DECLARED result
+/// pin restores that decidability for exactly the functions that have one
+/// — `sev()` answers a `SeverityNumber` whatever it is handed — so
+/// `| where sev(level) >= "error"` binds through the same rule table
+/// `_severity` does, equality takes the BAND (a plain-BIGINT `sev()` would
+/// compile `== "error"` to `== 17` and silently miss `error2`-`error4`),
+/// and the result renders as tokens.
+///
+/// The declaration is the FUNCTION's, never the catalog's: it holds under
+/// [`crate::pin_scope::PinScope::unpinned`] too, which is what makes
+/// `sev()` the escape hatch for a corpus trawl did not write (embedded
+/// `--data` over foreign parquet).
+#[must_use]
+pub fn function_result_pin(name: &str) -> Option<crate::schema::CanonicalType> {
+    match name {
+        "sev" => Some(crate::schema::CanonicalType::Severity),
+        _ => None,
+    }
+}
+
 /// Check whether a function name refers to an aggregate function.
 pub fn is_aggregate_function(name: &str) -> bool {
     matches!(

@@ -465,16 +465,14 @@ fn validate_pinned_comparison(
         BinaryOp::Lte => crate::ast::FilterOp::Lte,
         _ => return Ok(()),
     };
-    let resolved = match (&lhs.node, &rhs.node) {
-        (Expr::FieldRef(name), other) | (other, Expr::FieldRef(name)) => {
-            crate::eval::bare_literal_of(other).map(|lit| (name, lit))
-        }
-        _ => None,
+    // The same classifier the emitter and eval consume, so a subject
+    // that binds there binds here — and its refusal is the same sentence.
+    let resolved = match (scope.subject_pin(lhs), scope.subject_pin(rhs)) {
+        (Some((_, pin)), _) => crate::eval::bare_literal_of(&rhs.node).map(|lit| (pin, lit)),
+        (None, Some((_, pin))) => crate::eval::bare_literal_of(&lhs.node).map(|lit| (pin, lit)),
+        (None, None) => None,
     };
-    let Some((name, literal)) = resolved else {
-        return Ok(());
-    };
-    let Some(pin) = scope.pin_for(name) else {
+    let Some((pin, literal)) = resolved else {
         return Ok(());
     };
     crate::compare::compare_form_bound(Some(pin), filter_op, &literal)
@@ -489,10 +487,7 @@ fn validate_pinned_in_list(
     list: &[Spanned<crate::ast::Expr>],
     scope: &PinScope,
 ) -> Result<(), StreamPlanError> {
-    let Expr::FieldRef(name) = &target.node else {
-        return Ok(());
-    };
-    let Some(pin) = scope.pin_for(name) else {
+    let Some((_, pin)) = scope.subject_pin(target) else {
         return Ok(());
     };
     for item in list {

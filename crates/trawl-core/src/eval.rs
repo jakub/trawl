@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use crate::ast::{BinaryOp, Expr, FilterOp, FloatLiteral, LiteralValue, Spanned, UnaryOp};
 use crate::emitter::SqlValue;
 use crate::pin_match::{self, NullReadPolicy};
-use crate::pin_scope::PinScope;
+use crate::pin_scope::{PinScope, PinnedSubject};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use serde_json::{Map, Value};
 
@@ -395,12 +395,46 @@ fn truth_to_eval(truth: Option<bool>) -> EvalValue {
     truth.map_or(EvalValue::Null, EvalValue::Bool)
 }
 
+/// The value a pinned SUBJECT reads for one event — the column's own
+/// value, or the pin-declaring call's result — or `None` for a NULL
+/// subject (an absent field, a JSON null, a call with no reading).
+fn subject_value<'e>(
+    subject: &PinnedSubject<'_>,
+    event: &'e Map<String, Value>,
+    pins: &PinScope,
+) -> Option<std::borrow::Cow<'e, Value>> {
+    match subject {
+        PinnedSubject::Field(name) => {
+            pinned_event_value(event, name).map(std::borrow::Cow::Borrowed)
+        }
+        // Evaluated by the ordinary expression path — the same value
+        // `| let s = sev(level)` would project, so a comparison and a
+        // projection can never read one event two ways.
+        PinnedSubject::Call(call) => match eval_expr_with_pins(call, event, pins) {
+            EvalValue::Int(n) => Some(std::borrow::Cow::Owned(Value::from(n))),
+            EvalValue::Str(s) => Some(std::borrow::Cow::Owned(Value::from(s))),
+            EvalValue::Bool(b) => Some(std::borrow::Cow::Owned(Value::from(b))),
+            EvalValue::Float(f) => {
+                serde_json::Number::from_f64(f).map(|n| std::borrow::Cow::Owned(Value::Number(n)))
+            }
+            // NULL, and the shapes no declared-pin function produces.
+            EvalValue::Null | EvalValue::Timestamp(_) | EvalValue::Array(_) => None,
+        },
+    }
+}
+
 /// The in-memory mirror of the emitter's pinned-comparison arm (ADR-0011
-/// slice A′): detect a bare field-vs-literal comparison whose field
-/// resolves to a pin and answer it through the shared comparison core.
+/// slice A′, widened by ADR-0013 ruling 9): detect a pinned-subject-vs-
+/// literal comparison and answer it through the shared comparison core.
 /// `None` falls through to literal-driven evaluation — same structural
-/// scope as the SQL side (`emitter::expr::try_pinned_comparison`), so the
-/// two lanes adopt and decline exactly the same shapes.
+/// scope as the SQL side (`emitter::expr::try_pinned_comparison`), which
+/// consumes the SAME classifier, so the two lanes adopt and decline
+/// exactly the same shapes.
+///
+/// There is deliberately NO empty-scope fast path in front of the
+/// classifier: a pin-declaring call carries the FUNCTION's pin, and
+/// `sev()` has to bind identically over a corpus with no catalog at all
+/// (embedded `--data`) or the two lanes would split there.
 ///
 /// NULL policy is the pipeline's (strict): an absent field, a JSON null,
 /// or a value the conform would null out is UNKNOWN for every operator —
@@ -412,26 +446,20 @@ fn try_pinned_comparison(
     event: &Map<String, Value>,
     pins: &PinScope,
 ) -> Option<EvalValue> {
-    if pins.is_empty() {
-        return None;
-    }
-    // Pattern operators: the field is a subject on the LEFT only — the
+    // Pattern operators: the subject is the LEFT operand only — the
     // right operand is the pattern.
     if matches!(op, BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike) {
-        let Expr::FieldRef(name) = &lhs.node else {
-            return None;
-        };
+        let (subject, pin) = pins.subject_pin(lhs)?;
         let Expr::Literal(LiteralValue::String(pattern)) = &rhs.node else {
             return None;
         };
-        let pin = pins.pin_for(name)?;
         let form = crate::compare::pattern_form(Some(pin));
-        let Some(value) = pinned_event_value(event, name) else {
+        let Some(value) = subject_value(&subject, event, pins) else {
             return Some(EvalValue::Null);
         };
         // No canonical text (a BIGINT pin over "4.5") is a NULL pattern
         // target in batch — UNKNOWN, not false.
-        let Some(text) = pin_match::pattern_text(value, form) else {
+        let Some(text) = pin_match::pattern_text(&value, form) else {
             return Some(EvalValue::Null);
         };
         let subject = EvalValue::Str(text);
@@ -452,10 +480,10 @@ fn try_pinned_comparison(
         BinaryOp::Lte => FilterOp::Lte,
         _ => return None,
     };
-    let (name, filter_op, literal) = match (&lhs.node, &rhs.node) {
-        (Expr::FieldRef(name), rhs) => (name, filter_op, bare_literal(rhs)?),
+    let (subject, pin, filter_op, literal) = match (pins.subject_pin(lhs), pins.subject_pin(rhs)) {
+        (Some((subject, pin)), _) => (subject, pin, filter_op, bare_literal(&rhs.node)?),
         // `400 < status` is `status > 400`.
-        (lhs, Expr::FieldRef(name)) => {
+        (None, Some((subject, pin))) => {
             let flipped = match filter_op {
                 FilterOp::Gt => FilterOp::Lt,
                 FilterOp::Gte => FilterOp::Lte,
@@ -463,11 +491,10 @@ fn try_pinned_comparison(
                 FilterOp::Lte => FilterOp::Gte,
                 other => other,
             };
-            (name, flipped, bare_literal(lhs)?)
+            (subject, pin, flipped, bare_literal(&lhs.node)?)
         }
-        _ => return None,
+        (None, None) => return None,
     };
-    let pin = pins.pin_for(name)?;
     // A literal the rule table refuses (an unknown severity token) cannot
     // reach here: the compiler in front of BOTH eval lanes —
     // `stream::compile_stream_plan`, which every SSE stage and every
@@ -490,12 +517,12 @@ fn try_pinned_comparison(
     }
     let coerced = pin_match::coerce_form(form);
     let compare_op = pin_match::CompareOp::from_filter(filter_op)?;
-    let Some(value) = pinned_event_value(event, name) else {
+    let Some(value) = subject_value(&subject, event, pins) else {
         // Plain SQL null propagation — strict, no `!=` widening.
         return Some(EvalValue::Null);
     };
     Some(truth_to_eval(pin_match::compare_values(
-        value,
+        &value,
         compare_op,
         &coerced,
         NullReadPolicy::Unknown,
@@ -511,13 +538,7 @@ fn try_pinned_in_list(
     event: &Map<String, Value>,
     pins: &PinScope,
 ) -> Option<EvalValue> {
-    if pins.is_empty() {
-        return None;
-    }
-    let Expr::FieldRef(name) = &target.node else {
-        return None;
-    };
-    let pin = pins.pin_for(name)?;
+    let (subject, pin) = pins.subject_pin(target)?;
     let forms: Vec<crate::compare::CompareForm> = list
         .iter()
         .map(|item| {
@@ -527,12 +548,12 @@ fn try_pinned_in_list(
                 .flatten()
         })
         .collect::<Option<_>>()?;
-    let Some(value) = pinned_event_value(event, name) else {
+    let Some(value) = subject_value(&subject, event, pins) else {
         return Some(EvalValue::Null);
     };
     let truth = pin_match::or_any(forms.into_iter().map(|form| {
         pin_match::compare_values(
-            value,
+            &value,
             pin_match::CompareOp::Eq,
             &pin_match::coerce_form(form),
             NullReadPolicy::Unknown,
