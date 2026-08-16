@@ -23,7 +23,8 @@ use crate::ast::{
     LiteralValue, PipeStage, RenameStage, Spanned, TableStage, WhereStage,
 };
 use crate::emitter::{
-    format_literal_position, unit_literal_positions, validate_format_literal, validate_unit_literal,
+    format_literal_position, unit_literal_positions, validate_format_literal,
+    validate_function_arity, validate_unit_literal,
 };
 use crate::eval::{bind_event_key, eval_expr_with_pins};
 use crate::pin_scope::PinScope;
@@ -62,6 +63,13 @@ pub enum StreamPlanError {
     InvalidUnit(String),
     /// A `strftime`/`strptime` format string literal contains an invalid code.
     InvalidFormat(String),
+    /// A function call the emitter's own tables refuse — an unknown name
+    /// or the wrong argument count. This lane never runs
+    /// `validate_pipeline`, so without the mirror `/stream` accepted
+    /// `let s = sev()` and opened a live-looking stream that can only
+    /// ever evaluate to NULL, while `/api/v1/query` 400s on the same
+    /// text. One predicate, both doors — the reserved-name precedent.
+    InvalidFunction(String),
     /// A pinned comparison the shared rule table refuses — an unknown
     /// severity value against a `SEVERITY`-pinned field (ADR-0013). The
     /// SQL emitter errors on exactly this shape, so the stream must too:
@@ -84,6 +92,8 @@ impl fmt::Display for StreamPlanError {
             Self::InvalidRegex(msg) => write!(f, "invalid regex: {msg}"),
             Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),
             Self::InvalidFormat(msg) => write!(f, "invalid date/time format: {msg}"),
+            // The emitter's own sentence, carried verbatim.
+            Self::InvalidFunction(msg) => write!(f, "{msg}"),
             Self::InvalidComparison(msg) => write!(f, "invalid comparison: {msg}"),
             Self::ReservedName(msg) => write!(f, "unsupported operation: {msg}"),
         }
@@ -397,6 +407,13 @@ fn validate_expr(
 ) -> Result<(), StreamPlanError> {
     match &expr.node {
         Expr::FunctionCall { name, args } => {
+            // Arity and name, from the emitter's single source of truth —
+            // for EVERY function, not just the ones with literal
+            // positions: a wrong-arity call is a 400 in batch, and a
+            // stream that silently nulls instead is the divergence this
+            // lane exists to prevent.
+            validate_function_arity(name, args.len())
+                .map_err(|e| StreamPlanError::InvalidFunction(e.to_string()))?;
             let unit_positions = unit_literal_positions(name);
             for (idx, allowlist) in unit_positions {
                 let arg = args.get(*idx);
@@ -1956,6 +1973,49 @@ mod tests {
                 "{dsl} must compile"
             );
         }
+    }
+
+    /// Arity is the emitter's table in BOTH lanes, word for word: this
+    /// lane never runs `validate_pipeline`, so `/stream` accepted
+    /// `sev()` and `sev(a, b, c)` — opening a live-looking stream that
+    /// can only evaluate to NULL — while `/api/v1/query` 400d on the
+    /// same text.
+    #[test]
+    fn rejects_a_wrong_arity_call_with_the_emitters_own_sentence() {
+        let scope = PinScope::unpinned();
+        for (dsl, sentence) in [
+            ("* | let s = sev()", "sev() requires 1 to 2 arguments"),
+            (
+                r#"* | let s = sev(level, "otel", 1)"#,
+                "sev() requires 1 to 2 arguments",
+            ),
+            (
+                "* | where lower(a, b) == \"x\"",
+                "lower() requires exactly one argument",
+            ),
+            ("* | let s = now(a)", "now() requires exactly 0 argument(s)"),
+        ] {
+            let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
+            let err = compile_stream_plan(&pipeline, &scope)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(sentence), "{dsl}: {err}");
+            // The batch lane's message for the same text, verbatim.
+            let query = crate::parser::parse(dsl).expect("parses");
+            let batch = crate::emitter::emit(&query, "/data/*.parquet")
+                .expect_err("batch must refuse too")
+                .to_string();
+            assert!(batch.contains(sentence), "{dsl}: {batch}");
+        }
+        // An unknown function is refused here too, with the suggestion.
+        let pipeline = crate::parser::parse("* | let s = sevv(level)")
+            .expect("parses")
+            .pipeline;
+        let err = compile_stream_plan(&pipeline, &scope)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sevv"), "{err}");
+        assert!(err.contains("sev"), "the suggestion travels: {err}");
     }
 
     // ── tier 2: let ────────────────────────────────────────────────
