@@ -73,6 +73,11 @@ pub enum StreamPlanError {
     /// parse error (ADR-0013 §5). The SQL lane refuses it in
     /// `emitter::validate_pipeline`, which this lane never runs.
     ReservedName(String),
+    /// A projecting stage that would write one column twice (ADR-0013
+    /// ruling 8). Same reason as `ReservedName`: one shared check
+    /// (`projection::check_projection_names`), two lanes, and this one
+    /// never runs `emitter::validate_pipeline`.
+    ProjectionCollision(String),
 }
 
 impl fmt::Display for StreamPlanError {
@@ -85,7 +90,9 @@ impl fmt::Display for StreamPlanError {
             Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),
             Self::InvalidFormat(msg) => write!(f, "invalid date/time format: {msg}"),
             Self::InvalidComparison(msg) => write!(f, "invalid comparison: {msg}"),
-            Self::ReservedName(msg) => write!(f, "unsupported operation: {msg}"),
+            Self::ReservedName(msg) | Self::ProjectionCollision(msg) => {
+                write!(f, "unsupported operation: {msg}")
+            }
         }
     }
 }
@@ -109,6 +116,16 @@ pub fn compile_stream_plan(
     pipeline: &[Spanned<PipeStage>],
     pins: &PinScope,
 ) -> Result<StreamPlan, StreamPlanError> {
+    // Projection validation runs FIRST — before aggregation discovery and
+    // before the unsupported-stage refusals — so a colliding `pivot` or
+    // `eventstats` reports the collision this lane shares with the SQL one
+    // rather than an "unsupported in streaming mode" that names a
+    // different problem (ADR-0013 ruling 8: one check, one sentence).
+    for stage in pipeline {
+        crate::projection::check_projection_names(&stage.node)
+            .map_err(|e| StreamPlanError::ProjectionCollision(e.to_string()))?;
+    }
+
     // Find the first aggregation stage index (if any).
     let agg_idx = pipeline.iter().position(|s| is_agg_stage(&s.node));
 

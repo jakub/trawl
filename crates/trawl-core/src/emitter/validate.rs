@@ -38,6 +38,11 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
                     validate_function(agg)?;
                 }
             }
+            PipeStage::EventStats(es) => {
+                for agg in &es.aggregations {
+                    validate_function(agg)?;
+                }
+            }
             PipeStage::Pivot(p) => {
                 validate_function(&p.aggregation)?;
             }
@@ -52,6 +57,14 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
             // other stages have no pre-validation needs
             _ => {}
         }
+
+        // Then: would this stage write one column twice? (ADR-0013 ruling
+        // 8; the check itself is shared with the stream lane, which never
+        // runs this function.) It runs AFTER the per-stage validation
+        // above so that an alias in trawl's `_` namespace still reports
+        // the sharper refusal — a name that may not be minted at all is
+        // not usefully described as a duplicate.
+        crate::projection::check_projection_names(&stage.node)?;
     }
     Ok(())
 }

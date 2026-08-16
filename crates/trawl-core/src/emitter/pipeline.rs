@@ -471,7 +471,8 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
         format!("PARTITION BY {}", parts.join(", "))
     };
 
-    let mut items = vec!["*".to_string()];
+    let mut not_in_values = Vec::new();
+    let mut computed = Vec::new();
     for agg in &stage.aggregations {
         // Reject functions not supported as window functions in DuckDB.
         if matches!(
@@ -492,9 +493,25 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
             .map(|a| emit_expr(a, ctx))
             .collect::<Result<_, _>>()?;
         let sql_func = translate_function(&agg.function, &arg_strings)?;
-        let alias = quote_field(&crate::projection::agg_output_name(agg));
-        items.push(format!("{sql_func} OVER ({partition}) AS {alias}"));
+        let name = crate::projection::agg_output_name(agg);
+        // Escape single quotes for the COLUMNS lambda string comparison.
+        let escaped = name.replace('\'', "''");
+        not_in_values.push(format!("'{escaped}'"));
+        computed.push(format!(
+            "{sql_func} OVER ({partition}) AS {}",
+            quote_field(&name)
+        ));
     }
+
+    // The same projection the `let` lane uses (ADR-0011 slice A′): a bare
+    // `*` beside an alias equal to an input column emits that column
+    // TWICE, and a downstream reference then binds to whichever DuckDB
+    // picks. Filtering the overwritten names out makes the documented
+    // let-like overwrite REAL — `COLUMNS(c -> ...)` rather than
+    // `* EXCLUDE (...)` because the name need not exist in the input.
+    let not_in_list = not_in_values.join(", ");
+    let mut items = vec![format!("COLUMNS(c -> c NOT IN ({not_in_list}))")];
+    items.extend(computed);
 
     ctx.select = items;
     ctx.has_projection = true;

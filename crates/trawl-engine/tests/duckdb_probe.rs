@@ -3258,3 +3258,63 @@ fn severity_conform_yields_the_physical_bigint() {
     // never at read time, so a stray word conforms to NULL.
     assert_eq!(rows, vec![Some(17), None]);
 }
+
+/// `eventstats` promises a let-like OVERWRITE (ADR-0013 ruling 8's remedy
+/// sentence), and the emitter keeps that promise with the `let` lane's
+/// `COLUMNS(c -> c NOT IN (…))` projection. Two engine facts hold it up,
+/// neither obvious: the lambda composes with a WINDOW function in the same
+/// SELECT list, and a bare `*` beside the alias really does yield the
+/// column TWICE rather than replacing it — which is what makes a
+/// downstream reference ambiguous.
+#[test]
+fn eventstats_columns_lambda_overwrites_beside_a_window_function() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("hot.ndjson");
+    let mut f = std::fs::File::create(&file).unwrap();
+    writeln!(f, r#"{{"host":"a","service":"nginx","dur":1}}"#).unwrap();
+    writeln!(f, r#"{{"host":"a","service":"nginx","dur":3}}"#).unwrap();
+    f.sync_all().unwrap();
+
+    let conn = conn();
+    let src = hot_reader(&file);
+
+    // The shape the emitter now writes: the overwritten name is filtered
+    // out of the passthrough, so ONE `service` column comes back.
+    let mut stmt = conn
+        .prepare(&format!(
+            "DESCRIBE SELECT COLUMNS(c -> c NOT IN ('service')), \
+             COUNT(*) OVER (PARTITION BY \"host\") AS \"service\" FROM {src}"
+        ))
+        .unwrap();
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        columns.iter().filter(|c| *c == "service").count(),
+        1,
+        "the alias must REPLACE the input column: {columns:?}"
+    );
+    assert!(
+        columns.contains(&"dur".to_string()) && columns.contains(&"host".to_string()),
+        "every other input column still passes through: {columns:?}"
+    );
+
+    // …and the shape it used to write really was ambiguous.
+    let mut stmt = conn
+        .prepare(&format!(
+            "DESCRIBE SELECT *, COUNT(*) OVER (PARTITION BY \"host\") AS \"service\" FROM {src}"
+        ))
+        .unwrap();
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        columns.iter().filter(|c| *c == "service").count(),
+        2,
+        "a bare star emits the name twice: {columns:?}"
+    );
+}

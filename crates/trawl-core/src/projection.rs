@@ -20,7 +20,10 @@
 //! would report collisions the emitter never creates and miss the ones it
 //! does — so the rule has to be shared before it can be checked.
 
-use crate::ast::{AggExpr, Expr, Spanned};
+use std::fmt;
+
+use crate::ast::{AggExpr, Expr, PipeStage, Spanned};
+use crate::schema::catalog_key;
 
 /// The first FIELD REFERENCE reachable from an aggregation's argument.
 ///
@@ -57,10 +60,250 @@ pub fn agg_output_name(agg: &AggExpr) -> String {
     }
 }
 
+/// How a projecting stage came to put a name on its output row. Drives the
+/// remedy sentence — telling an operator to "use `as`" where the grammar
+/// has no `as` to give is worse than no message at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameOrigin {
+    /// A `by` key, or the subject field of `top`/`rare`.
+    GroupKey,
+    /// `timechart`'s implicit `_time` bucket.
+    TimeBucket,
+    /// `top`/`rare`'s implicit `count`.
+    FrequencyCount,
+    /// An aggregation with no `as`, named by [`agg_output_name`].
+    AutoAlias { function: String },
+    /// An aggregation's explicit `as` target.
+    ExplicitAlias { function: String },
+}
+
+impl NameOrigin {
+    /// How this producer reads in the collision message.
+    fn describe(&self, name: &str) -> String {
+        match self {
+            Self::GroupKey => format!("the grouping field `{name}`"),
+            Self::TimeBucket => "the time bucket `_time`".to_string(),
+            Self::FrequencyCount => "the frequency column `count`".to_string(),
+            Self::AutoAlias { function } => {
+                format!("`{function}()`, which names its output `{name}`")
+            }
+            Self::ExplicitAlias { function } => format!("`{function}() as {name}`"),
+        }
+    }
+
+    fn is_auto_alias(&self) -> bool {
+        matches!(self, Self::AutoAlias { .. })
+    }
+
+    fn is_alias(&self) -> bool {
+        matches!(self, Self::AutoAlias { .. } | Self::ExplicitAlias { .. })
+    }
+}
+
+/// One name a stage puts on its output row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducedName {
+    pub name: String,
+    pub origin: NameOrigin,
+}
+
+impl ProducedName {
+    fn new(name: impl Into<String>, origin: NameOrigin) -> Self {
+        Self {
+            name: name.into(),
+            origin,
+        }
+    }
+}
+
+/// Two producers, one column.
+///
+/// Carries both so the message can name them: "produces `count` twice" with
+/// no second half leaves an operator hunting for the other half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameCollision {
+    /// The user's spelling of the stage keyword (`fields` vs `table`).
+    pub stage: &'static str,
+    /// The folded key the two names share.
+    pub folded: String,
+    pub first: ProducedName,
+    pub second: ProducedName,
+}
+
+impl fmt::Display for NameCollision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{}` would produce the column `{}` twice — from {} and from {}",
+            self.stage,
+            self.first.name,
+            self.first.origin.describe(&self.first.name),
+            self.second.origin.describe(&self.second.name),
+        )?;
+        // Two spellings that fold together read as a puzzle otherwise:
+        // `Host` and `host` are one DuckDB identifier.
+        if self.first.name != self.second.name {
+            write!(f, " (the two names fold to one column)")?;
+        }
+        write!(f, "; {}", self.remedy())
+    }
+}
+
+impl std::error::Error for NameCollision {}
+
+impl NameCollision {
+    /// The half an operator acts on. Origin-driven, because `top` has no
+    /// `as` clause to offer and `timechart` always writes `_time`.
+    fn remedy(&self) -> String {
+        let origins = [&self.first.origin, &self.second.origin];
+        if origins.iter().any(|o| o.is_auto_alias()) {
+            if self.stage == "eventstats" {
+                return "give the aggregation an explicit name with `as` — `eventstats` \
+                        overwrites a column of that name the way `let` does, so each \
+                        output needs a name of its own"
+                    .to_string();
+            }
+            return "give the aggregation an explicit name with `as`".to_string();
+        }
+        if origins.iter().any(|o| o.is_alias()) {
+            // One side is already an explicit `as`, so the remedy is that
+            // name — never "drop the duplicate", which would point at a
+            // grouping field the query needs.
+            return "give the aggregation's `as` a name nothing else in the stage produces"
+                .to_string();
+        }
+        if origins.contains(&&NameOrigin::FrequencyCount) {
+            return format!(
+                "`{}` always produces `count`: rename the field with a preceding \
+                 `| rename`, or use `stats`, where the output name is yours",
+                self.stage
+            );
+        }
+        if origins.contains(&&NameOrigin::TimeBucket) {
+            return "`timechart` always produces `_time`: drop it from the `by` list".to_string();
+        }
+        "drop the duplicate".to_string()
+    }
+}
+
+/// Every name `stage` projects, in emission order; empty for a stage that
+/// projects nothing, so a caller may pass any stage.
+///
+/// The set is what the EMITTER writes, which is why it shares
+/// [`agg_output_name`] with it. Two deliberate omissions:
+///
+/// - `pivot`'s value columns come from the ON field's DATA, so no static
+///   check can see them; only the `by` keys are checkable. The aggregation
+///   is NOT a producer either — trawl emits `PIVOT … USING <agg>` with the
+///   alias dropped, so naming it here would report a collision the emitter
+///   never creates.
+/// - `eventstats` passes its input row through, so its group keys are not
+///   stage-produced. An alias equal to an input column is the DOCUMENTED
+///   let-like overwrite, not a collision.
+#[must_use]
+pub fn projected_names(stage: &PipeStage) -> Vec<ProducedName> {
+    fn aggregations(aggs: &[AggExpr], out: &mut Vec<ProducedName>) {
+        for agg in aggs {
+            let function = agg.function.clone();
+            let origin = if agg.alias.is_some() {
+                NameOrigin::ExplicitAlias { function }
+            } else {
+                NameOrigin::AutoAlias { function }
+            };
+            out.push(ProducedName::new(agg_output_name(agg), origin));
+        }
+    }
+    fn group_keys(keys: &[String], out: &mut Vec<ProducedName>) {
+        out.extend(
+            keys.iter()
+                .map(|k| ProducedName::new(k.clone(), NameOrigin::GroupKey)),
+        );
+    }
+
+    let mut out = Vec::new();
+    match stage {
+        PipeStage::Stats(s) => {
+            group_keys(&s.group_by, &mut out);
+            aggregations(&s.aggregations, &mut out);
+        }
+        PipeStage::Timechart(s) => {
+            out.push(ProducedName::new(
+                crate::schema::TIME,
+                NameOrigin::TimeBucket,
+            ));
+            group_keys(&s.group_by, &mut out);
+            aggregations(&s.aggregations, &mut out);
+        }
+        PipeStage::Top(s) => {
+            group_keys(std::slice::from_ref(&s.field), &mut out);
+            group_keys(&s.by, &mut out);
+            out.push(ProducedName::new("count", NameOrigin::FrequencyCount));
+        }
+        PipeStage::Rare(s) => {
+            group_keys(std::slice::from_ref(&s.field), &mut out);
+            group_keys(&s.by, &mut out);
+            out.push(ProducedName::new("count", NameOrigin::FrequencyCount));
+        }
+        PipeStage::Pivot(s) => group_keys(&s.by, &mut out),
+        PipeStage::EventStats(s) => aggregations(&s.aggregations, &mut out),
+        _ => {}
+    }
+    out
+}
+
+/// The stage keyword a collision message names, in the user's own spelling.
+fn stage_keyword(stage: &PipeStage) -> &'static str {
+    match stage {
+        PipeStage::Stats(_) => "stats",
+        PipeStage::Timechart(_) => "timechart",
+        PipeStage::Top(_) => "top",
+        PipeStage::Rare(_) => "rare",
+        PipeStage::Pivot(_) => "pivot",
+        PipeStage::EventStats(_) => "eventstats",
+        _ => "stage",
+    }
+}
+
+/// Refuse a stage that would put two producers on one output column
+/// (ADR-0013 ruling 8).
+///
+/// Called from `emitter::validate_pipeline` AND `stream::compile_stream_plan`
+/// — the reserved-name-mint precedent, since the stream lane never runs the
+/// emitter's validation and a duplicate column is not something SQL reports:
+/// it silently emits two `AS` clauses and a later reference binds to
+/// whichever the engine picks.
+///
+/// Names fold through [`catalog_key`] first, because that is what decides
+/// whether two spellings are one column.
+///
+/// The collision is BOXED because it carries both producers and their
+/// spellings — a 152-byte `Err` on the hot path of every stage validation
+/// (`clippy::result_large_err`), where the error is the rare case.
+///
+/// # Errors
+///
+/// Returns the FIRST pair of produced names equal after folding.
+pub fn check_projection_names(stage: &PipeStage) -> Result<(), Box<NameCollision>> {
+    let produced = projected_names(stage);
+    let mut seen: Vec<(String, ProducedName)> = Vec::with_capacity(produced.len());
+    for name in produced {
+        let folded = catalog_key(&name.name);
+        if let Some((_, first)) = seen.iter().find(|(key, _)| *key == folded) {
+            return Err(Box::new(NameCollision {
+                stage: stage_keyword(stage),
+                folded,
+                first: first.clone(),
+                second: name,
+            }));
+        }
+        seen.push((folded, name));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::PipeStage;
     use crate::parser;
 
     /// The aggregations of the first pipe stage of `dsl`.
@@ -173,6 +416,150 @@ mod tests {
                 scope.advance(&stage.node);
             }
             assert_eq!(scope.pin_for(&want), None, "{dsl}: pin scope");
+        }
+    }
+
+    // ── the collision check (ADR-0013 ruling 8) ──────────────────────────
+
+    fn first_stage(dsl: &str) -> PipeStage {
+        let query = parser::parse(dsl).expect("parse should succeed");
+        query.pipeline[0].node.clone()
+    }
+
+    fn collision(dsl: &str) -> Box<NameCollision> {
+        check_projection_names(&first_stage(dsl))
+            .expect_err(&format!("{dsl} must be refused as a collision"))
+    }
+
+    /// Every projecting stage, every way two producers can land on one
+    /// column. The message names BOTH producers — half a message leaves an
+    /// operator hunting for the other producer.
+    #[test]
+    fn a_duplicate_output_column_is_refused_in_every_projecting_stage() {
+        let cases: &[(&str, &str, &str)] = &[
+            // stats: a group key against an auto alias — ruling 8's example
+            (
+                "* | stats count() by count",
+                "count",
+                "give the aggregation an explicit name with `as`",
+            ),
+            // …two aggregations with no `by` at all still collide
+            (
+                "* | stats count(), count()",
+                "count",
+                "give the aggregation an explicit name with `as`",
+            ),
+            // …duplicate group keys, including case-only variants
+            (
+                "* | stats count() by host, host",
+                "host",
+                "drop the duplicate",
+            ),
+            // …the message names the FIRST spelling, then says they fold
+            (
+                "* | stats count() by Host, host",
+                "Host",
+                "drop the duplicate",
+            ),
+            // …two explicit aliases
+            (
+                "* | stats count() as n, avg(dur) as n",
+                "n",
+                "a name nothing else in the stage produces",
+            ),
+            // timechart always writes `_time`
+            (
+                "* | timechart span=5m count() by _time",
+                "_time",
+                "drop it from the `by` list",
+            ),
+            // top/rare always write `count`, and have no `as` to offer
+            ("* | top 5 count", "count", "use `stats`"),
+            ("* | rare 5 count", "count", "use `stats`"),
+            ("* | top 5 host by host", "host", "drop the duplicate"),
+            // pivot's static half
+            (
+                "* | pivot count() on status by host, host",
+                "host",
+                "drop the duplicate",
+            ),
+            // eventstats: declared outputs only, with the overwrite remedy
+            (
+                "* | eventstats count(), count()",
+                "count",
+                "overwrites a column of that name the way `let` does",
+            ),
+        ];
+
+        for (dsl, column, remedy) in cases {
+            let err = collision(dsl).to_string();
+            assert!(
+                err.contains(&format!("column `{column}`")),
+                "{dsl}: must name the column: {err}"
+            );
+            assert!(
+                err.contains(remedy),
+                "{dsl}: remedy must fit the stage: {err}"
+            );
+            assert!(
+                err.matches(" and from ").count() == 1,
+                "{dsl}: must name both producers: {err}"
+            );
+        }
+    }
+
+    /// The shapes that are NOT collisions — an over-broad check is worse
+    /// than none, since it refuses working queries.
+    #[test]
+    fn distinct_output_columns_are_accepted() {
+        for dsl in [
+            "* | stats count() by host",
+            "* | stats count(), avg(dur)",
+            "* | stats count() as n, count() as m",
+            "* | timechart span=5m count() by service",
+            "* | top 5 host by service",
+            "* | eventstats count()",
+            "* | eventstats avg(dur) by dur",
+            // an eventstats alias equal to an INPUT column is the
+            // documented let-like overwrite, not a duplicate
+            "* | eventstats count() as service",
+            // pivot's value columns are runtime data, so only `by` is checked
+            "* | pivot count() on status by host",
+            "* | pivot count() as host on status by host",
+        ] {
+            check_projection_names(&first_stage(dsl))
+                .unwrap_or_else(|e| panic!("{dsl} must be accepted: {e}"));
+        }
+    }
+
+    /// One check, two lanes, one sentence — the `rejects_minting_reserved_names`
+    /// precedent. The stream lane never runs `validate_pipeline`, so a
+    /// second implementation is exactly how the two would drift apart.
+    #[test]
+    fn collisions_are_refused_in_both_lanes_with_one_message() {
+        use crate::pin_scope::PinScope;
+        use crate::stream::compile_stream_plan;
+
+        for dsl in [
+            "* | stats count() by count",
+            "* | stats count(), count()",
+            "* | stats count() by Host, host",
+            "* | timechart span=5m count() by _time",
+            "* | top 5 count",
+            "* | rare 5 count",
+            // refused as UNSUPPORTED by the stream lane — the collision
+            // check runs first, so both lanes still say the same thing
+            "* | pivot count() on status by host, host",
+            "* | eventstats count(), count()",
+        ] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            let sql = crate::emitter::validate_pipeline(&query.pipeline)
+                .expect_err(&format!("{dsl}: the SQL lane must refuse"))
+                .to_string();
+            let stream = compile_stream_plan(&query.pipeline, &PinScope::unpinned())
+                .expect_err(&format!("{dsl}: the stream lane must refuse"))
+                .to_string();
+            assert_eq!(sql, stream, "{dsl}: both lanes must print one sentence");
         }
     }
 }

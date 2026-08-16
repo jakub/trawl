@@ -143,6 +143,17 @@ impl From<crate::compare::CompareError> for EmitError {
     }
 }
 
+/// A projection-name collision reaches the caller as an unsupported
+/// operation, carrying the shared sentence verbatim — the stream lane
+/// prints the identical text through its own variant.
+impl From<Box<crate::projection::NameCollision>> for EmitError {
+    fn from(err: Box<crate::projection::NameCollision>) -> Self {
+        Self::UnsupportedOperation {
+            message: err.to_string(),
+        }
+    }
+}
+
 impl EmitError {
     /// Produce a user-facing hint string, if applicable.
     pub fn hint(&self) -> Option<String> {
@@ -615,6 +626,31 @@ mod tests {
                 SqlValue::String("200".into())
             ],
             "the pin must be found through the fold"
+        );
+    }
+
+    /// `eventstats` overwrites like `let` (ADR-0013 ruling 8's remedy
+    /// sentence promises it): the alias replaces an input column of the
+    /// same name instead of emitting a SECOND column beside it. A bare `*`
+    /// made that promise false — `SELECT *, … AS "service"` yields two
+    /// `service` columns and a downstream reference binds to whichever
+    /// `DuckDB` picks.
+    #[test]
+    fn eventstats_alias_overwrites_its_input_column() {
+        let sql = emit_dsl("* | eventstats count() as service by host");
+        assert!(
+            sql.contains("COLUMNS(c -> c NOT IN ('service'))"),
+            "the overwritten name must be filtered out of the passthrough: {sql}"
+        );
+        assert!(
+            !sql.contains("SELECT *,"),
+            "a bare star would emit the column twice: {sql}"
+        );
+        // exactly one projection of that name reaches the output
+        assert_eq!(
+            sql.matches(r#"AS "service""#).count(),
+            1,
+            "one column, once: {sql}"
         );
     }
 
