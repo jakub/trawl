@@ -1096,6 +1096,17 @@ fn compile_agg_expr(agg: &AggExpr) -> Result<CompiledAcc, StreamPlanError> {
     let field = match agg.args.first().map(|a| &a.node) {
         Some(crate::ast::Expr::FieldRef(name)) => Some(name.clone()),
         None => None,
+        // `count(<non-null literal>)` IS `count()` — SQL counts one row
+        // per input row either way (probed: `COUNT(1)` = `COUNT(*)`), and
+        // this lane's row counter answers exactly that. `count(null)` is
+        // NOT: SQL counts nothing, and an accumulator that reads no key
+        // cannot express "never increment", so it stays refused with
+        // every other shape.
+        Some(crate::ast::Expr::Literal(lit))
+            if agg.function == "count" && !matches!(lit, crate::ast::LiteralValue::Null) =>
+        {
+            None
+        }
         // An accumulator reads ONE event key; it cannot evaluate a wrapped
         // argument, and since the output-name rule became shared this lane
         // would name that column exactly as the batch lane does

@@ -762,3 +762,60 @@ fn let_case_variant_target_leaves_one_column_in_both_lanes() {
         );
     }
 }
+
+/// `count(<non-null literal>)` is the same aggregate as `count()` in both
+/// lanes — SQL counts one row per input row, and the live accumulator
+/// counts rows — so the live refusal of computed arguments must not
+/// swallow it. Executed against `DuckDB` rather than reasoned about,
+/// because "COUNT(1) counts rows" is an engine fact.
+#[test]
+fn count_over_a_constant_counts_rows_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = FieldTypes::new();
+    let rows = [json!({"a": 1}), json!({"a": 2}), json!({"a": 3})];
+
+    let query = parser::parse("* | stats count(1)").expect("dsl parses");
+
+    // live lane: feed every row through the compiled accumulator.
+    let plan = compile_stream_plan(&query.pipeline, &PinScope::root(&ft)).expect("plan compiles");
+    let StreamPlan::Aggregate {
+        aggregation: mut agg,
+        ..
+    } = plan
+    else {
+        panic!("stats must compile to an aggregate plan");
+    };
+    for row in &rows {
+        agg.feed_event(row.as_object().unwrap());
+    }
+    let (_columns, live_rows) = agg.snapshot();
+    let live_count = live_rows
+        .first()
+        .and_then(|r| r.get("count"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    // batch lane: the same query over the same rows.
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".ndjson")
+        .tempfile()
+        .unwrap();
+    for row in &rows {
+        writeln!(tmp, "{row}").unwrap();
+    }
+    tmp.flush().unwrap();
+    let source = tmp.path().to_str().unwrap().to_owned();
+    let emitted = emitter::emit_with_pins(&query, &source, &ft).expect("emit succeeds");
+    let params = bind_params(&emitted.params);
+    let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+    let batch_count: i64 = conn
+        .query_row(&emitted.sql, param_refs.as_slice(), |row| row.get(0))
+        .expect("count(1) must execute");
+
+    assert_eq!(batch_count, 3, "COUNT(1) counts every row");
+    assert_eq!(
+        live_count,
+        Value::from(batch_count),
+        "count(1) must agree across lanes"
+    );
+}

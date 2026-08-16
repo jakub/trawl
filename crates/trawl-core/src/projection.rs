@@ -400,8 +400,45 @@ mod tests {
             );
         }
 
+        // `count(<non-null literal>)` IS `count()` — the same aggregate
+        // in both lanes — so it is NOT part of the refused class, and it
+        // must still agree with batch. `count(null)` counts nothing in
+        // SQL, which a row counter cannot express, so it stays refused.
+        let query = parser::parse("* | stats count(1)").expect("parse should succeed");
+        let plan = compile_stream_plan(&query.pipeline, &PinScope::unpinned())
+            .expect("count(1) must still stream");
+        match plan {
+            crate::stream::StreamPlan::Aggregate {
+                aggregation: crate::stream::CompiledAggregation::Stats { accumulators, .. },
+                ..
+            } => {
+                assert_eq!(accumulators[0].alias, "count");
+                assert!(
+                    accumulators[0].field.is_none(),
+                    "it counts rows, like count()"
+                );
+            }
+            _ => panic!("expected a stats aggregation plan"),
+        }
+        for refused in [
+            "* | stats count(null)",
+            "* | stats avg(1)",
+            "* | stats sum(1)",
+        ] {
+            let query = parser::parse(refused).expect("parse should succeed");
+            assert!(
+                compile_stream_plan(&query.pipeline, &PinScope::unpinned()).is_err(),
+                "{refused} must stay refused"
+            );
+        }
+
         // the plain shapes still stream
-        for dsl in ["* | stats avg(dur)", "* | stats count() by host"] {
+        for dsl in [
+            "* | stats avg(dur)",
+            "* | stats count() by host",
+            "* | stats p95(dur)",
+            "* | stats count(dur)",
+        ] {
             let query = parser::parse(dsl).expect("parse should succeed");
             compile_stream_plan(&query.pipeline, &PinScope::unpinned())
                 .unwrap_or_else(|e| panic!("{dsl} must still compile: {e}"));
