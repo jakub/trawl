@@ -218,6 +218,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   escape hatch.
 
 ### Fixed
+- **A function call in an aggregation position no longer panics the
+  emitter (#77, landed unclaimed in #80).** `stats split(message, ",", 1)`
+  — any multi-argument scalar call where the pipeline expects an
+  aggregation — hit an unguarded index in `translate_function` and took
+  the whole query down with it (mitigated to a 500 by the panic layer,
+  but a panic all the same). The `sev()` work unified argument emission
+  into one walk shared by every call position, which closed the hole;
+  recorded here because the fix shipped as a side effect of a refactor
+  commit and deserves a paper trail.
 - **`service=X last=Nh` no longer answers 200 with zero rows over an idle
   hot buffer (#73).** A time-filtered query becomes a *list* source — one
   glob per hour in range — and `read_parquet` rejects the whole list when
