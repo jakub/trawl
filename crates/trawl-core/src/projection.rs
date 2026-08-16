@@ -371,6 +371,43 @@ mod tests {
         }
     }
 
+    /// The shared naming rule made the two lanes agree on the column NAME
+    /// for a wrapped argument, which is only an improvement if the live
+    /// lane can actually fill it. It cannot — an accumulator reads one
+    /// event key — so it refuses the shape instead of streaming a column
+    /// that is always empty beside a batch answer that is not.
+    #[test]
+    fn a_wrapped_argument_is_refused_by_the_live_lane_not_silently_empty() {
+        use crate::pin_scope::PinScope;
+        use crate::stream::compile_stream_plan;
+
+        for dsl in [
+            "* | stats avg(lower(dur))",
+            "* | stats sum(a + b) by host",
+            "* | timechart span=5m avg(-x)",
+        ] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            // batch still answers it
+            crate::emitter::emit(&query, "/data/**/*.parquet")
+                .unwrap_or_else(|e| panic!("{dsl} must still emit: {e}"));
+            // …and the stream says why it cannot
+            let err = compile_stream_plan(&query.pipeline, &PinScope::unpinned())
+                .expect_err(&format!("{dsl}: the stream lane must refuse"))
+                .to_string();
+            assert!(
+                err.contains("computed argument"),
+                "{dsl}: the refusal must name the shape: {err}"
+            );
+        }
+
+        // the plain shapes still stream
+        for dsl in ["* | stats avg(dur)", "* | stats count() by host"] {
+            let query = parser::parse(dsl).expect("parse should succeed");
+            compile_stream_plan(&query.pipeline, &PinScope::unpinned())
+                .unwrap_or_else(|e| panic!("{dsl} must still compile: {e}"));
+        }
+    }
+
     /// And every LANE: the column the SQL emitter writes, the alias the
     /// stream lane keys its snapshot rows by, and the name the pin scope
     /// kills are one string. This is the drift guard — it fails on every
@@ -382,13 +419,16 @@ mod tests {
         use crate::schema::{CanonicalType, FieldTypes, catalog_key};
         use crate::stream::{CompiledAggregation, StreamPlan, compile_stream_plan};
 
-        for dsl in [
-            "* | stats count()",
-            "* | stats avg(dur)",
-            "* | stats avg(lower(dur))",
-            "* | stats sum(a + b)",
-            "* | stats avg(-x)",
-            "* | stats count() as t",
+        // `streams` is false for a wrapped argument: the live lane refuses
+        // that shape outright (see the test above), so it has no alias to
+        // compare — the SQL and pin-scope halves still apply to it.
+        for (dsl, streams) in [
+            ("* | stats count()", true),
+            ("* | stats avg(dur)", true),
+            ("* | stats avg(lower(dur))", false),
+            ("* | stats sum(a + b)", false),
+            ("* | stats avg(-x)", false),
+            ("* | stats count() as t", true),
         ] {
             let query = parser::parse(dsl).expect("parse should succeed");
             let want = agg_output_name(&aggs(dsl)[0]);
@@ -401,14 +441,16 @@ mod tests {
                 "{dsl}: SQL must project {want:?}: {sql}"
             );
 
-            let plan = compile_stream_plan(&query.pipeline, &PinScope::unpinned())
-                .expect("plan should compile");
-            match plan {
-                StreamPlan::Aggregate {
-                    aggregation: CompiledAggregation::Stats { accumulators, .. },
-                    ..
-                } => assert_eq!(accumulators[0].alias, want, "{dsl}: stream alias"),
-                _ => panic!("{dsl}: expected a stats aggregation plan"),
+            if streams {
+                let plan = compile_stream_plan(&query.pipeline, &PinScope::unpinned())
+                    .expect("plan should compile");
+                match plan {
+                    StreamPlan::Aggregate {
+                        aggregation: CompiledAggregation::Stats { accumulators, .. },
+                        ..
+                    } => assert_eq!(accumulators[0].alias, want, "{dsl}: stream alias"),
+                    _ => panic!("{dsl}: expected a stats aggregation plan"),
+                }
             }
 
             // The pin scope must kill exactly the column the stage writes:

@@ -1069,18 +1069,29 @@ fn new_acc_state(acc: &CompiledAcc) -> AccState {
     }
 }
 
-fn compile_agg_expr(agg: &AggExpr) -> CompiledAcc {
-    let field = agg.args.first().and_then(|a| {
-        if let crate::ast::Expr::FieldRef(name) = &a.node {
-            Some(name.clone())
-        } else {
-            None
+fn compile_agg_expr(agg: &AggExpr) -> Result<CompiledAcc, StreamPlanError> {
+    let field = match agg.args.first().map(|a| &a.node) {
+        Some(crate::ast::Expr::FieldRef(name)) => Some(name.clone()),
+        None => None,
+        // An accumulator reads ONE event key; it cannot evaluate a wrapped
+        // argument, and since the output-name rule became shared this lane
+        // would name that column exactly as the batch lane does
+        // (`avg_dur`) while never updating it — a stream showing null
+        // where the equivalent query shows a value, with nothing in the
+        // response to say so. Refusing is the same choice the lane makes
+        // for every other shape it cannot evaluate.
+        Some(_) => {
+            return Err(StreamPlanError::UnsupportedStage {
+                stage: format!("{}(...)", agg.function),
+                reason: "an aggregation over a computed argument needs the full dataset; \
+                         aggregate the field itself, or compute it in a preceding `let`"
+                    .to_string(),
+            });
         }
-    });
+    };
 
-    // the OUTPUT name is the shared rule (`projection`), while `field` above
-    // stays the direct first-argument reference: that one is what the
-    // accumulator READS, and this lane cannot evaluate a wrapped argument.
+    // the OUTPUT name is the shared rule (`projection`), so the column this
+    // lane emits is the one the batch lane emits.
     let alias = crate::projection::agg_output_name(agg);
 
     let percentile = match agg.function.as_str() {
@@ -1091,18 +1102,22 @@ fn compile_agg_expr(agg: &AggExpr) -> CompiledAcc {
         _ => None,
     };
 
-    CompiledAcc {
+    Ok(CompiledAcc {
         function: agg.function.clone(),
         field,
         alias,
         percentile,
-    }
+    })
 }
 
 fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamPlanError> {
     match stage {
         PipeStage::Stats(s) => {
-            let accumulators: Vec<_> = s.aggregations.iter().map(compile_agg_expr).collect();
+            let accumulators: Vec<_> = s
+                .aggregations
+                .iter()
+                .map(compile_agg_expr)
+                .collect::<Result<_, _>>()?;
             let group_by: Vec<_> = s
                 .group_by
                 .iter()
@@ -1119,7 +1134,11 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
                 .span
                 .as_ref()
                 .map_or(60, crate::ast::TrawlDuration::to_seconds);
-            let accumulators: Vec<_> = s.aggregations.iter().map(compile_agg_expr).collect();
+            let accumulators: Vec<_> = s
+                .aggregations
+                .iter()
+                .map(compile_agg_expr)
+                .collect::<Result<_, _>>()?;
             let group_by: Vec<_> = s
                 .group_by
                 .iter()
