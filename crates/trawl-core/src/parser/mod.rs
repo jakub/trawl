@@ -99,88 +99,126 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 
 /// Replace `//` and `#` comments with spaces, preserving byte positions.
 ///
-/// Handles `//` (line comment) and `#` (line comment) outside of quoted
-/// strings and backtick-quoted field names. This runs BEFORE the grammar, so
-/// it is the only layer that can protect a name's bytes: without the
-/// backtick state `` | table `a#b` `` and `` | table `http://x` `` are gutted
-/// before the field parser ever sees them. A backtick region has no
-/// backslash escape — the only exit is a tick, and a doubled tick is data.
+/// This runs BEFORE the grammar, so it is the only layer that can protect
+/// a comment marker that is really DATA. It is a four-state mini-lexer,
+/// and each state mirrors one production of the grammar below it:
 ///
-/// This scanner cannot parse, so it engages that state CONSERVATIVELY —
-/// two conditions, both needed, because a tick is also ordinary data inside
-/// a regex or a bare filter value ([`primitives::bare_value`] admits it):
+/// | state | mirrors | ends at |
+/// |---|---|---|
+/// | `Normal` | — | a delimiter below opens a state |
+/// | `String` | [`primitives::quoted_string`] | `"`, with `\` escaping the next byte |
+/// | `Backtick` | [`primitives::backtick_name`] | a lone `` ` `` (a doubled one is data) |
+/// | `Regex` | [`primitives::regex_pattern`] | the FIRST `/` — that production is `none_of("/")`, so it has NO escape and a body may span lines |
 ///
-/// 1. the tick must sit where a field name can syntactically START
-///    ([`can_start_field_name`]), which a tick inside a regex body does not;
-/// 2. the region must CLOSE on the same line. An unterminated tick that
-///    swallowed the rest of the line would leave a real comment unstripped,
-///    and a comment made of bare words parses as extra search terms —
-///    silently answering a different question. Declining to engage there
-///    puts the comment back in the stripper's hands, and the leftover tick
-///    then dies at the grammar (text search and the `NOT` lookahead both
-///    refuse it) rather than quietly meaning something.
+/// Comments are recognised in `Normal` only. Inside a string, a name or a
+/// regex, `#` and `//` are ordinary bytes — which is what makes
+/// `` | table `a#b` ``, `` | table `http://x` `` and `matches /a#b/` mean
+/// what they say.
+///
+/// Two decisions are delegated to [`quoted_name_can_start_after`] and
+/// [`slash_opens_regex`], the ONE classifier this scanner shares with the
+/// editor's completion context. Both are asked about the
+/// comment-NORMALISED prefix — the bytes already written to `out`, never
+/// the raw input — so a comment body can never lend its text to a later
+/// decision (a `matches` inside a comment used to make the next line's
+/// division look like a pattern operator).
+///
+/// The backtick state additionally requires the region to CLOSE on the
+/// same line. An unterminated tick that swallowed the rest of the line
+/// would leave a real comment unstripped, and a comment made of bare
+/// words parses as extra search terms — silently answering a different
+/// question. Declining there puts the line back in the stripper's hands
+/// and the stray tick dies at the grammar instead.
 ///
 /// Residual, stated: a bare value that is itself tick-delimited
-/// (`` service=`a#b` ``) satisfies both conditions and keeps its `#`, since
-/// at this layer it is indistinguishable from a field name after `==`.
-///
-/// Known limitation: `#` inside regex literals (`/pattern#here/`) will be
-/// treated as a comment start. Use `//` comments on lines containing regex
-/// literals, or move the regex to a different line.
+/// (`` service=`a#b` ``) satisfies both conditions and keeps its `#`,
+/// since at this layer it is indistinguishable from a field name after
+/// `==`.
 fn strip_comments(input: &str) -> String {
+    /// Which production the scanner is inside. An enum, not a set of
+    /// flags: the states are mutually exclusive by construction, and a
+    /// new one must state its transitions or fail to compile.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ScanState {
+        Normal,
+        String,
+        Backtick,
+        Regex,
+    }
+
     let bytes = input.as_bytes();
     let mut out = bytes.to_vec();
     let len = bytes.len();
     let mut i = 0;
-    let mut in_string = false;
-    let mut in_backtick = false;
+    let mut state = ScanState::Normal;
 
     while i < len {
-        if in_string {
-            if bytes[i] == b'\\' && i + 1 < len {
-                // skip escaped character inside string
-                i += 2;
-            } else if bytes[i] == b'"' {
-                in_string = false;
-                i += 1;
-            } else {
-                i += 1;
-            }
-        } else if in_backtick {
-            if bytes[i] == b'`' {
-                if i + 1 < len && bytes[i + 1] == b'`' {
-                    // doubled tick — one escaped backtick of name, still inside
+        match state {
+            // `quoted_string`: `\` escapes the next byte, `"` closes.
+            ScanState::String => {
+                if bytes[i] == b'\\' && i + 1 < len {
                     i += 2;
                 } else {
-                    in_backtick = false;
+                    if bytes[i] == b'"' {
+                        state = ScanState::Normal;
+                    }
                     i += 1;
                 }
-            } else {
+            }
+            // `backtick_name`: a doubled tick is one tick of DATA, a lone
+            // tick closes. No backslash escape exists in that production.
+            ScanState::Backtick => {
+                if bytes[i] == b'`' {
+                    if bytes.get(i + 1) == Some(&b'`') {
+                        i += 2;
+                    } else {
+                        state = ScanState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            // `regex_pattern`: `none_of("/")` — every byte is body, there
+            // is no escape, and the FIRST `/` closes.
+            ScanState::Regex => {
+                if bytes[i] == b'/' {
+                    state = ScanState::Normal;
+                }
                 i += 1;
             }
-        } else if bytes[i] == b'"' {
-            in_string = true;
-            i += 1;
-        } else if bytes[i] == b'`'
-            && can_start_field_name(bytes, i)
-            && backtick_closes_on_line(bytes, i)
-        {
-            in_backtick = true;
-            i += 1;
-        } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
-            // // comment — blank to end of line
-            while i < len && bytes[i] != b'\n' {
-                out[i] = b' ';
-                i += 1;
-            }
-        } else if bytes[i] == b'#' {
-            // # comment — blank to end of line
-            while i < len && bytes[i] != b'\n' {
-                out[i] = b' ';
-                i += 1;
-            }
-        } else {
-            i += 1;
+            ScanState::Normal => match bytes[i] {
+                b'"' => {
+                    state = ScanState::String;
+                    i += 1;
+                }
+                b'`' if quoted_name_can_start_after(&out[..i])
+                    && backtick_closes_on_line(bytes, i) =>
+                {
+                    state = ScanState::Backtick;
+                    i += 1;
+                }
+                // `//` is a comment before it is anything else: a regex
+                // body must hold at least one non-`/` byte, so `//` can
+                // never open one.
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    while i < len && bytes[i] != b'\n' {
+                        out[i] = b' ';
+                        i += 1;
+                    }
+                }
+                b'/' if slash_opens_regex(&out[..i]) => {
+                    state = ScanState::Regex;
+                    i += 1;
+                }
+                b'#' => {
+                    while i < len && bytes[i] != b'\n' {
+                        out[i] = b' ';
+                        i += 1;
+                    }
+                }
+                _ => i += 1,
+            },
         }
     }
 
@@ -190,39 +228,28 @@ fn strip_comments(input: &str) -> String {
     String::from_utf8(out).expect("comment stripping only replaces ASCII bytes with spaces")
 }
 
-/// Whether a field name could begin at `i` — judged from the byte before it,
-/// which is all a pre-parse scanner has.
+/// Whether a quoted field name could begin right after `prefix` — the ONE
+/// classifier the comment scanner and the editor's completion context
+/// share, so "is this a name position?" has a single answer.
 ///
-/// The permitted predecessors are the ones the grammar actually puts in
-/// front of a name with no whitespace: the start of input or any
-/// whitespace, an opening paren or comma (argument and field lists), a
-/// pipe, the tail of a comparison operator (`=`, `<`, `>`, `!`) — an
-/// expression may compare against a field, so `` a==`b c` `` is a name —
-/// and the arithmetic operators, which an expression may equally put in
-/// front of one (`` 1+`a b` ``). `-` covers both the arithmetic case and a
-/// descending sort key. Anything else (a letter, a digit) means the tick
-/// is inside a value or a regex, where it is ordinary data.
-///
-/// `/` is admitted only where it DIVIDES. A DSL regex literal appears in
-/// exactly two syntactic places — a search-stage value after `=`, and the
-/// right side of a pattern operator — and neither can follow an OPERAND,
-/// while division always does. So a slash is a divisor when the byte
-/// before it ends an operand (an identifier byte, a closing paren, or a
-/// closing tick) AND the identifier run before it is not a pattern
-/// keyword, which is the one shape that puts a regex directly after
-/// identifier bytes (`a matches/re/`). Every other slash — after `=`,
-/// after whitespace, after `(` — opens a regex as far as this scanner is
-/// concerned, so a tick inside a regex body still shields nothing.
+/// A pre-parse scanner has only the bytes before the position, so the
+/// permitted predecessors are the ones the grammar actually puts in front
+/// of a name with no whitespace: the start of input or any whitespace, an
+/// opening paren or comma (argument and field lists), a pipe, the tail of
+/// a comparison operator (`=`, `<`, `>`, `!`) — an expression may compare
+/// against a field — the arithmetic operators, and a `/` that DIVIDES
+/// rather than opening a regex ([`slash_opens_regex`]).
 ///
 /// Erring narrow is the safe direction: a name this declines is one whose
-/// comment markers stay unprotected, so it dies loudly at the grammar as an
+/// comment markers stay unprotected, so it fails loudly as an
 /// unterminated name. Erring wide would hide a comment.
-fn can_start_field_name(bytes: &[u8], i: usize) -> bool {
-    let Some(prev) = i.checked_sub(1).map(|p| bytes[p]) else {
+#[must_use]
+pub fn quoted_name_can_start_after(prefix: &[u8]) -> bool {
+    let Some(&prev) = prefix.last() else {
         return true;
     };
     if prev == b'/' {
-        return slash_divides(bytes, i - 1);
+        return !slash_opens_regex(&prefix[..prefix.len() - 1]);
     }
     prev.is_ascii_whitespace()
         || matches!(
@@ -231,29 +258,33 @@ fn can_start_field_name(bytes: &[u8], i: usize) -> bool {
         )
 }
 
-/// Whether the `/` at `i` is a division operator rather than the opening
-/// delimiter of a regex literal — see [`can_start_field_name`].
-fn slash_divides(bytes: &[u8], i: usize) -> bool {
-    // Padding does not change what the slash IS, so the classifier reads
-    // the last NON-whitespace byte before it — `host / x` divides exactly
-    // as `host/x` does, and `matches /re/` opens a regex exactly as
-    // `matches/re/` does.
-    let Some(end) = bytes[..i].iter().rposition(|b| !b.is_ascii_whitespace()) else {
-        return false;
+/// Whether the `/` following `prefix` OPENS A REGEX rather than dividing.
+///
+/// A DSL regex literal appears in exactly two syntactic places — a
+/// search-stage value after `=`, and the right side of a pattern operator
+/// — and neither can follow an OPERAND, while division always does. So a
+/// slash divides when the last non-whitespace byte before it ends an
+/// operand (an identifier byte, a closing paren, or a closing tick) AND
+/// the identifier run there is not a pattern keyword, which is the one
+/// shape that puts a regex directly after identifier bytes
+/// (`a matches /re/`). Padding changes nothing on either side.
+///
+/// `prefix` must be comment-NORMALISED: a `matches` inside a comment is
+/// not a pattern operator, and reading raw input made the next line's
+/// division look like one.
+#[must_use]
+pub fn slash_opens_regex(prefix: &[u8]) -> bool {
+    let Some(end) = prefix.iter().rposition(|b| !b.is_ascii_whitespace()) else {
+        return true;
     };
-    // A regex never follows an operand; division always does.
-    if !(bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b')' | b'`')) {
-        return false;
+    if !(prefix[end].is_ascii_alphanumeric() || matches!(prefix[end], b'_' | b')' | b'`')) {
+        return true;
     }
-    // …except after a pattern keyword, the one place a regex DOES follow
-    // identifier bytes. The run is read from the same position, so the
-    // guard holds whether or not the operator was padded.
-    let start = bytes[..=end]
+    let start = prefix[..=end]
         .iter()
         .rposition(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
         .map_or(0, |p| p + 1);
-    let word = &bytes[start..=end];
-    !matches!(word, b"matches" | b"like" | b"ilike")
+    matches!(&prefix[start..=end], b"matches" | b"like" | b"ilike")
 }
 
 /// Whether the backtick region opening at `i` closes before the next newline,
@@ -1089,6 +1120,44 @@ mod tests {
         }
     }
 
+    /// Every regex literal the query carries, from a search-stage filter
+    /// or a pipeline pattern comparison.
+    fn regex_bodies(query: &Query) -> Vec<String> {
+        fn walk_expr(expr: &Expr, out: &mut Vec<String>) {
+            match expr {
+                Expr::Binary { lhs, op, rhs } => {
+                    if *op == crate::ast::BinaryOp::Matches
+                        && let Expr::Literal(LiteralValue::String(pattern)) = &rhs.node
+                    {
+                        out.push(pattern.clone());
+                    }
+                    walk_expr(&lhs.node, out);
+                    walk_expr(&rhs.node, out);
+                }
+                Expr::Unary { operand, .. } => walk_expr(&operand.node, out),
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for group in &query.search.groups {
+            for token in group {
+                if let SearchToken::FieldFilter(f) = &token.node
+                    && f.op == FilterOp::Regex
+                    && let crate::ast::FilterValue::Literal(pattern) = &f.value
+                {
+                    out.push(pattern.clone());
+                }
+            }
+        }
+        for stage in &query.pipeline {
+            if let PipeStage::Where(w) = &stage.node {
+                walk_expr(&w.condition.node, &mut out);
+            }
+        }
+        out
+    }
+
     fn field_positions(query: &Query) -> Vec<String> {
         let mut out = Vec::new();
         for group in &query.search.groups {
@@ -1347,6 +1416,63 @@ mod tests {
         assert!(parse("* | where `a b // x").is_err());
     }
 
+    /// The scanner classifies against the comment-NORMALISED prefix, so a
+    /// comment BODY can never lend its text to a later line's decision.
+    /// Reading raw input made a `matches` inside a comment turn the next
+    /// line's division into a pattern operator, which loudly rejected
+    /// valid DSL.
+    #[test]
+    fn a_comment_body_does_not_poison_a_later_line() {
+        for (dsl, want) in [
+            // `matches` in a comment, division on the next line
+            ("* | let x = host # matches\n/`a#b`", "a#b"),
+            // …an odd tick in a comment leaves no state behind
+            ("* | let x = host # odd ` tick\n/`a#b`", "a#b"),
+            // …and a slash in a comment opens no regex
+            ("* | let x = host # see /re\n/`a#b`", "a#b"),
+        ] {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl:?} must parse: {e:?}"));
+            assert!(
+                field_positions(&query).iter().any(|n| n == want),
+                "{dsl:?}: {:?}",
+                field_positions(&query)
+            );
+        }
+
+        // …and a comment at end of line still ends there, leaving the
+        // next line's regex intact.
+        let query = parse("# c\n* | where a matches /re/").expect("must parse");
+        assert_eq!(regex_bodies(&query), vec!["re".to_string()]);
+    }
+
+    /// Each scanner state ends where its grammar production ends, and
+    /// inside a state the other delimiters are ordinary bytes.
+    #[test]
+    fn each_scanner_state_mirrors_its_production() {
+        // String: `\` escapes, `"` closes — a `#` inside is data.
+        let query = parse(r#""a#b""#).expect("must parse");
+        assert_eq!(query.search.groups[0].len(), 1);
+
+        // Backtick: a doubled tick is data, so the region spans it.
+        let query = parse("* | table `a``#b`").expect("must parse");
+        assert_eq!(field_positions(&query), vec!["a`#b".to_string()]);
+
+        // Regex: `none_of("/")` has NO escape mechanism, so a `\/` cannot
+        // extend a body — the grammar reads `a\` and stops there, which
+        // is not a valid regex, so nothing reaches the AST as one.
+        let query = parse(r"host=/a\/b/").expect("must parse");
+        assert!(
+            regex_bodies(&query).is_empty(),
+            "{:?}",
+            regex_bodies(&query)
+        );
+
+        // …and a regex body may span lines, exactly as `none_of("/")`
+        // accepts a newline, so a `#` on the second line is still body.
+        let query = parse("host=/a\nb#c/").expect("must parse");
+        assert_eq!(regex_bodies(&query), vec!["a\nb#c".to_string()]);
+    }
+
     /// The scanner's engage rule is a heuristic, so the grammar has to be
     /// the backstop: an operator inside a bare VALUE looks exactly like
     /// arithmetic from outside (`host=a+` vs `1+`), so the tick after it
@@ -1437,24 +1563,34 @@ mod tests {
             );
         }
 
-        // …while a slash that OPENS A REGEX still shields nothing, so a
-        // tick inside the body leaves the comment strippable and the
-        // truncated regex dies loudly. Never silently something else.
-        for dsl in [
-            "host=/`a#b`/ # outside",
-            "* | where a matches /`re#x`/ # c",
+        // …while a slash that OPENS A REGEX puts the scanner in its regex
+        // state, where a tick is an ordinary byte and the body reaches the
+        // grammar VERBATIM — comment markers included. The comment after
+        // the closing delimiter is still a comment.
+        for (dsl, want) in [
+            ("host=/`a#b`/ # outside", "`a#b`"),
+            // (a pipeline comment goes on its own line: a blanked one
+            // leaves trailing spaces, which pipe stages reject — a
+            // pre-existing quirk, unrelated to the scanner)
+            ("# c\n* | where a matches /`re#x`/", "`re#x`"),
             // the one shape that puts a regex straight after identifier
             // bytes — the pattern keyword guard, not the operand test
-            "* | where a matches/`re#x`/ # c",
-            // …and the guard still wins when the operator is PADDED,
-            // which is the ordinary spelling
-            "* | where a matches /`re#x`/ # c",
-            "* | where a like /`re#x`/ # c",
-            // a padded search-stage regex value is unchanged too
-            "host = /`re#x`/ # c",
+            ("# c\n* | where a matches/`re#x`/", "`re#x`"),
+            // …and one with no tick at all, the plain form of the delta
+            ("host=/a#b/ # outside", "a#b"),
         ] {
-            assert!(parse(dsl).is_err(), "{dsl} must be a loud parse error");
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl} must parse: {e:?}"));
+            assert!(
+                regex_bodies(&query).iter().any(|body| body == want),
+                "{dsl}: expected the regex {want:?}, got {:?}",
+                regex_bodies(&query)
+            );
         }
+
+        // `like`/`ilike` are in the scanner's keyword guard for safety,
+        // but the GRAMMAR gives them no regex-literal form at all — a
+        // slash there is a parse error either way.
+        assert!(parse("# c\n* | where a like /re/").is_err());
 
         // …and the regex case F1 fixed stays fixed: a tick inside a regex
         // body follows a letter or a `/`, never an operator, so the

@@ -412,7 +412,12 @@ fn open_backtick_prefix(before: &str) -> Option<&str> {
             // prefix garbage — and kill completion for everything typed
             // after it on the line. Same predicate the parser's comment
             // scanner uses, for the same reason.
-            open = if open.is_none() && starts_a_name(bytes, i) {
+            // The ONE classifier `trawl_core` uses for the same question
+            // in the comment scanner — including its slash rule, so a
+            // completion after a DIVISION is not mistaken for one inside
+            // a regex body.
+            open = if open.is_none() && trawl_core::parser::quoted_name_can_start_after(&bytes[..i])
+            {
                 Some(i)
             } else {
                 None
@@ -421,19 +426,6 @@ fn open_backtick_prefix(before: &str) -> Option<&str> {
         i += 1;
     }
     open.map(|start| &before[start..])
-}
-
-/// Whether a field name could begin at `i`, judged from the byte before
-/// it — the editor's mirror of `trawl_core`'s `can_start_field_name`.
-fn starts_a_name(bytes: &[u8], i: usize) -> bool {
-    let Some(prev) = i.checked_sub(1).map(|p| bytes[p]) else {
-        return true;
-    };
-    prev.is_ascii_whitespace()
-        || matches!(
-            prev,
-            b'(' | b',' | b'|' | b'-' | b'=' | b'<' | b'>' | b'!' | b'+' | b'*' | b'%'
-        )
 }
 
 /// Extract the word prefix immediately before the cursor.
@@ -448,26 +440,36 @@ fn extract_prefix(before_cursor: &str) -> &str {
     &before_cursor[start..end]
 }
 
-/// Rough check for whether the cursor is inside a string literal or regex.
+/// Whether the cursor sits inside a string literal or a regex body.
 ///
-/// Counts unescaped `"` and `/` delimiters before the cursor. An odd
-/// count means we're inside one.
+/// A `/` only OPENS a regex where `trawl_core`'s classifier says so — the
+/// same rule the comment scanner uses — so a division no longer reads as
+/// an unterminated regex and suppresses every completion after it.
 fn inside_string_or_regex(before: &str) -> bool {
+    let bytes = before.as_bytes();
     let mut in_double_quote = false;
     let mut in_regex = false;
-    let mut prev_char = '\0';
-
-    for ch in before.chars() {
-        if ch == '"' && prev_char != '\\' {
-            in_double_quote = !in_double_quote;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_double_quote && i + 1 < bytes.len() => {
+                i += 2;
+                continue;
+            }
+            b'"' if !in_regex => in_double_quote = !in_double_quote,
+            b'/' if !in_double_quote => {
+                if in_regex {
+                    // `regex_pattern` is `none_of("/")`: the first slash
+                    // closes, with no escape.
+                    in_regex = false;
+                } else if trawl_core::parser::slash_opens_regex(&bytes[..i]) {
+                    in_regex = true;
+                }
+            }
+            _ => {}
         }
-        // Regex delimiters: `/pattern/` — only toggle when not in a string.
-        if ch == '/' && !in_double_quote && prev_char != '\\' {
-            in_regex = !in_regex;
-        }
-        prev_char = ch;
+        i += 1;
     }
-
     in_double_quote || in_regex
 }
 
@@ -622,6 +624,40 @@ mod tests {
         let spliced = format!("{}{}", &text[..text.len() - c.replace_len], c.insert_text);
         assert_eq!(spliced, "| table `request id`");
         assert!(trawl_core::parser::parse(&spliced).is_ok(), "{spliced}");
+    }
+
+    /// The completion context asks `trawl_core`'s classifier the same
+    /// question the comment scanner does, so it inherits the slash rule:
+    /// a name can start after a DIVISION, and cannot inside a regex body.
+    #[test]
+    fn completion_follows_the_shared_slash_rule() {
+        // A division does not put the cursor "inside a regex", so
+        // completion is not suppressed after it — padded or not.
+        for before in ["* | let x = a/", "* | let x = a / ", "* | let x = (a)/"] {
+            assert!(
+                !inside_string_or_regex(before),
+                "{before:?}: a division is not a regex"
+            );
+        }
+
+        // …while a genuine regex body still suppresses.
+        for before in ["host=/re", "* | where a matches /re", "host=/re/ x=/y"] {
+            assert!(
+                inside_string_or_regex(before),
+                "{before:?}: this IS a regex body"
+            );
+        }
+        // …and a CLOSED regex does not.
+        assert!(!inside_string_or_regex("host=/re/ "));
+
+        // The name-start half of the same rule: a tick right after a
+        // DIVISION opens a quoted-name prefix, while one inside a regex
+        // body does not.
+        assert_eq!(
+            open_backtick_prefix("* | table a/`request i"),
+            Some("`request i")
+        );
+        assert_eq!(open_backtick_prefix("host=/re`quest i"), None);
     }
 
     /// A tick that is DATA — inside a regex or a bare value — must not be
