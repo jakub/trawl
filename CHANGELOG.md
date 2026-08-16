@@ -7,6 +7,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Backtick-quoted field names, and one shared projection-collision check
+  (ADR-0013 rulings 7-8, #78).** Backticks make **any** column nameable —
+  `` `request id`=5 ``, ``| table `http-status` ``, ``| stats avg(`resp ms`)
+  as `mean ms` by `a b` `` — in every field position at once, from one
+  grammar production. The rule is that **backticks change how a name is
+  LEXED, never what a name may be**: content is any character but a
+  backtick, a doubled backtick is one literal backtick of name, the ASCII
+  fold still applies, and quoting is no escape from policy (a backticked
+  `_foo` is refused in a write position exactly as a bare one is). The
+  empty name and one carrying a control or invisible format character are
+  parse errors, as is a malformed backtick anywhere — it never degrades
+  into a text search. Function, stage and saved-query names take no
+  backticks (`` `lower`(x) `` is not a call), and a backtick in a filter
+  VALUE is ordinary text. The three unconditional search keywords stay
+  unconditional: `last=`, `earliest=`, `latest=` — `` `last`=5 `` is the
+  field of that name, and both spellings can appear in one query.
+
+  Every surface that manufactures DSL from a schema name now renders it
+  through one helper (`trawl_core::parser::quote_dsl_name`) — the
+  formatter behind `POST /api/v1/validate`, TUI autocomplete, the schema
+  tree, the command palette, and the SPA's schema, facet-filter and
+  service-drawer actions — so a suggested name that needs backticks
+  arrives as valid DSL. A name the grammar cannot express is declined
+  rather than mangled.
+
+  **Projection-name collisions are refused before the query runs**, from
+  one function in both the batch and live lanes: a stage that would write
+  one output column twice (`| stats count() by count`, `| stats count(),
+  count()`, `| stats count() by Host, host`, `| timechart … by _time`,
+  `| top 5 count`) errors with a sentence naming both producers and a
+  remedy that fits the stage. Previously the emitter wrote two `AS`
+  clauses and a later reference bound to whichever column the engine
+  picked.
 - **BREAKING — the namespace cutover: two namespaces, observe-don't-consume derivation, zero DSL aliases (ADR-0013 slice 1, #60).**
   One contract, one sentence: **bare names are sender vocabulary trawl
   never assigns meaning to; underscore names are trawl's contract slots.**
@@ -174,6 +207,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `trawl_catalog_repin_*` metrics; retention stands down while a job is
   in flight. This retires the documented stop-trawld-and-do-surgery
   escape hatch.
+
+### Changed
+- **`eventstats` aliases now genuinely OVERWRITE (#78).** The stage emitted
+  `SELECT *, … AS "x"`, so an alias equal to an input column produced two
+  columns of that name; it now uses the `let` lane's `COLUMNS(c -> c NOT
+  IN (…))` projection and replaces the column, which is what its
+  documented let-like overwrite always claimed.
+- **Nested-argument aggregations name their output consistently (#78).**
+  The output-name rule had four implementations; `avg(lower(dur))`
+  projected `avg_dur` in the SQL lane but `avg` in the SSE lane, the
+  `eventstats` emitter and the pin-scope walk. All four now share one
+  rule, so the live tail and the batch query agree on the column name.
 
 ### Fixed
 - **`service=X last=Nh` no longer answers 200 with zero rows over an idle

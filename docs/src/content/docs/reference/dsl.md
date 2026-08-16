@@ -267,6 +267,42 @@ of lexical text. The envelope seed pins `host`/`service`/`env`/`message`/
 is live on day one.
 :::
 
+### Quoting a field name
+
+Backticks make **any** column nameable:
+
+```
+`request id`=5                  # a name with a space
+`http-status`>=400              # a name with a hyphen
+| table `a.b`, `2fast`          # a literal dot; a leading digit
+| stats avg(`resp ms`) as `mean ms` by `a b`
+| where `http status` > 400
+```
+
+The rule is one sentence: **backticks change how a name is LEXED, never
+what a name may be.** Content is any character but a backtick, a doubled
+backtick is one literal backtick of name (`` `a``b` `` is the column
+``a`b``), and quoting is not an escape from policy — a backticked `_foo`
+is refused in a write position exactly as a bare one is, and `` `Dur` ``
+folds to `dur` like any other spelling.
+
+Two names are parse **errors**, not silently-something-else: the empty
+name (`` `` ``) and one carrying a control or invisible format character,
+which no terminal can render honestly. A malformed backtick anywhere is an
+error too — it never degrades into a text search.
+
+Backticks are for **field names only**. Function names, stage names and
+saved-query names take none (`` `lower`(x) `` is not a call; use
+`from saved "my report"` for a saved name with spaces), and a backtick in
+a filter *value* is ordinary text: `` service=`nginx` `` compares against
+the literal `` `nginx` ``.
+
+Three spellings are keywords wherever they appear in a search stage, so
+the bare word is never a field there: `last=`, `earliest=` and `latest=`.
+Backtick them to mean the column — `` `last`=5 `` filters the field
+`last`, while `last=2h` is the time filter, and both can appear in one
+query.
+
 ### The two namespaces
 
 One sentence, learned once (ADR-0013):
@@ -402,6 +438,38 @@ a b OR c d                      # implicit AND within groups: (a AND b) OR (c AN
 ```
 
 ## Pipe stages
+
+### Output-name collisions
+
+A stage that aggregates writes a fixed set of output columns: its group-by
+keys, `timechart`'s `_time` bucket, `top`/`rare`'s `count`, and one column
+per aggregation (its `as` name, else `func_arg` / `func`). If two of those
+land on the same column — after the same ASCII fold DuckDB applies, so
+`Host` and `host` are one column — the query is **refused before it runs**,
+in the batch lane and the live one alike, with the same sentence:
+
+```
+| stats count() by count          # the group key and count() both write `count`
+| stats count(), count()          # two aggregations, one auto name
+| stats count() by Host, host     # two spellings, one column
+| timechart span=5m count() by _time
+| top 5 count                     # top always writes `count`
+```
+
+The message names both producers and the remedy fits the stage: give the
+aggregation an explicit `as`, drop the duplicate key, or — for `top` and
+`rare`, which have no `as` — rename the field with a preceding `| rename`,
+or use `stats`, where the output name is yours.
+
+`pivot` is checked on its static half only (the `by` keys); its value
+columns come from the data in the `ON` field and are not knowable until
+the query runs.
+
+`eventstats` overwrites the way `let` does: an alias equal to an existing
+column REPLACES it rather than adding a second column of that name. That
+is why its own outputs must still be distinct from each other —
+`| eventstats count(), count()` asks for one column twice and is refused,
+with `as` as the remedy.
 
 ### stats
 
