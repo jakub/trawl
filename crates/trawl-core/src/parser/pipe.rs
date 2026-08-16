@@ -17,13 +17,16 @@ use crate::ast::{
 };
 use crate::parser::expr::expr;
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, duration, field_name, keyword, raw_quoted_string, spanned, uint,
+    ParserExtra, ParserInput, duration, field_name, keyword, plain_name, raw_quoted_string,
+    spanned, uint,
 };
 
 /// Parse an aggregation expression like `count()`, `avg(duration)`,
 /// or `count() as total`.
 fn agg_expr<'src>() -> impl Parser<'src, ParserInput<'src>, AggExpr, ParserExtra<'src>> + Clone {
-    field_name()
+    // The function head takes the UNQUOTED production — a function name
+    // is not a field name (ADR-0013 §7).
+    plain_name()
         .then_ignore(just('(').padded())
         .then(expr().separated_by(just(',').padded()).collect::<Vec<_>>())
         .then_ignore(just(')').padded())
@@ -568,7 +571,8 @@ fn eventstats_stage<'src>()
 /// selects which run(s) to load: `latest` (default), `all`, or a numeric ID.
 fn from_saved_stage<'src>()
 -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
-    let name = choice((raw_quoted_string(), field_name())).labelled("saved query name");
+    // A saved-query name is not a field either — no backticks.
+    let name = choice((raw_quoted_string(), plain_name())).labelled("saved query name");
 
     let run_selector = keyword("run")
         .ignore_then(just('='))
@@ -1193,6 +1197,92 @@ mod tests {
             }
             other => panic!("expected Rename, got {other:?}"),
         }
+    }
+
+    // ── backtick escape (ADR-0013 ruling 7) ─────────────────────────────
+
+    /// Backticks are accepted in EVERY field-name position — a partial
+    /// rollout recreates "the name you type isn't always reachable".
+    #[test]
+    fn backticks_are_accepted_in_every_field_position() {
+        let cases: &[(&str, &str)] = &[
+            ("| table `request id`, `http-status`", "request id"),
+            ("| fields `request id`", "request id"),
+            ("| stats count() by `where`", "where"),
+            ("| stats avg(`response time`)", "response time"),
+            ("| stats count() as `total count`", "total count"),
+            (
+                "| timechart span=1h count() by `http-status`",
+                "http-status",
+            ),
+            (
+                "| eventstats count() as `n rows` by `http-status`",
+                "n rows",
+            ),
+            ("| pivot count() on `http-status`", "http-status"),
+            ("| sort -`http-status`", "http-status"),
+            ("| drop `request id`", "request id"),
+            ("| dedup `request id`", "request id"),
+            ("| top 5 `http-status` by `request id`", "http-status"),
+            ("| rare 5 `http-status`", "http-status"),
+            ("| rename `request id` as `req id`", "request id"),
+            ("| let `req id` = 1", "req id"),
+            ("| where `http-status` > 400", "http-status"),
+            (r#"| extract "(?P<ip>.)" from `raw body`"#, "raw body"),
+        ];
+        for (dsl, needle) in cases {
+            let stages = pipeline()
+                .parse(dsl)
+                .into_result()
+                .unwrap_or_else(|e| panic!("{dsl} must parse: {e:?}"));
+            let printed = format!("{:?}", stages[0].node);
+            assert!(
+                printed.contains(needle),
+                "{dsl}: expected {needle:?} in the AST, got {printed}"
+            );
+        }
+    }
+
+    /// Quoting is not an escape from policy: `is_reserved_name` still
+    /// refuses every WRITE position (ADR-0013 §5).
+    #[test]
+    fn backticks_do_not_unseal_the_reserved_namespace() {
+        for dsl in [
+            "| let `_foo` = 1",
+            "| eval `_severity` = 17",
+            "| rename x as `_foo`",
+            "| stats count() as `_total`",
+            "| timechart span=1h count() as `_time`",
+        ] {
+            assert!(
+                pipeline().parse(dsl).into_result().is_err(),
+                "{dsl} must be a parse error"
+            );
+        }
+    }
+
+    /// Function names are not fields and take no backticks — the
+    /// aggregate head parses through the UNQUOTED production.
+    #[test]
+    fn aggregate_function_names_take_no_backticks() {
+        assert!(pipeline().parse("| stats `count`()").into_result().is_err());
+        assert!(
+            pipeline()
+                .parse("| stats `avg`(duration)")
+                .into_result()
+                .is_err()
+        );
+    }
+
+    /// Saved-query names are not fields either.
+    #[test]
+    fn saved_query_names_take_no_backticks() {
+        assert!(
+            pipeline()
+                .parse("| from saved `daily errors`")
+                .into_result()
+                .is_err()
+        );
     }
 
     // ── from saved ──────────────────────────────────────────────────────

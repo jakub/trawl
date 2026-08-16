@@ -6,5 +6,5 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT COLUMNS(c -> c NOT IN ('r')), (ROUND("duration")) AS "r"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('r')), (ROUND("duration")) AS "r"
 FROM "_s0"

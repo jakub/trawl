@@ -285,6 +285,57 @@ One sentence, learned once (ADR-0013):
 There are **no aliases**. The name you type is the column in `DESCRIBE`
 is the identifier in the SQL, in every lane.
 
+### Backtick-quoted names
+
+Any field name can be written between backticks, and a backticked name is
+**always** a field reference:
+
+```
+`http-status`=500                # a name the bare form cannot spell
+`last`=5                         # the FIELD last, beside last=2h
+| table `request id`, `x-request-id`
+| stats count() as `total count` by `where`
+| table `a``b`                   # a doubled backtick escapes one: the name a`b
+```
+
+Backticks change how a name is **lexed**, never what a name may be:
+
+- content is any character except a backtick, and a doubled backtick
+  escapes one (last line above);
+- an empty name is a parse error, as is one carrying a character that
+  cannot render as itself — a control character, a bidi or zero-width
+  format character, or the soft hyphen;
+- the ASCII fold still applies: `` `Dur` `` **is** `dur`;
+- trawl's `_` namespace is still sealed: ``let `_foo` = 1`` and
+  ``rename x as `_foo` `` are the same errors as the bare spellings.
+
+They are accepted in every field position — search-stage filters,
+expressions, aggregation arguments and `by` keys, `table`/`fields`,
+`sort`, `drop`, `dedup`, both sides of `rename`, `let` targets and `as`
+aliases — so a name that exists is a name you can reach.
+
+**Not fields, so no backticks:** function names (`` `lower`(x) `` is a
+field reference, never a call), stage names, and saved-query names.
+
+The search stage reads exactly three words before anything else —
+`last=`, `earliest=`, `latest=`. Backticks are how you reach fields with
+those names; everywhere else they are ordinary names already.
+
+Inside an expression (`| where`, `| let`, aggregation arguments) the
+words an expression is made of are read before a field reference is
+tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`,
+`in`, `matches`, `like`, `ilike` are operators. Backticks reach the
+fields — ``| where `true` == 1`` filters on the column named `true`,
+while `| where true == 1` compares the boolean.
+
+A `#` or `//` inside backticks is part of the name, not a comment. The
+comment stripper opens a name only where one could start and only when
+the region would really lex as one, so a backtick inside a value — a
+regex literal or a glob — hides nothing. (A stray backtick that does sit
+at a token start and finds a partner on the same line still has the same
+shape of consequence as a `#` inside a regex literal: it can hide a later
+comment from the stripper.)
+
 ### Severity: `_severity`
 
 `_severity` is the derived OTel SeverityNumber (1-24), pinned to the
@@ -442,7 +493,14 @@ service=nginx                   # exact field match
 last=2h                         # units: s, m, h, d, w
 last=7d
 last=30m
+earliest="2026-03-14T03:00:00Z" # absolute lower bound (quoted)
+latest="2026-03-14T03:15:00Z"   # absolute upper bound (quoted)
 ```
+
+`last=`, `earliest=` and `latest=` are the DSL's whole keyword set: they
+are read before any field filter, wherever they appear, and they apply to
+the query globally. Fields of those three names are reachable with
+backticks (`` `last`=5 ``).
 
 ### OR grouping
 
@@ -609,6 +667,39 @@ Pivot table transformation.
 ```
 pivot count() on status
 pivot avg(duration) on service by host
+```
+
+### Output names must be unique
+
+Every aggregating stage projects a fixed set of columns: its group keys,
+`timechart`'s `_time` bucket, the `count` column `top`/`rare` mint, and
+one column per aggregate — named by its `as` alias, else `count`,
+`avg_duration`, `dc_host`. An un-aliased aggregate over a computed
+argument names its innermost field (`avg(tonumber(rssi) * -1)` →
+`avg_rssi`); the in-memory lanes — live tail, and the batch tail behind
+`extract kv` — refuse that argument outright, because their accumulators
+read a bare field out of the event rather than evaluating an expression.
+Two producers naming one column is refused before the query runs, in
+batch and in a live tail alike, with both producers named:
+
+```
+| stats count() by count        # the group key `count` and the aggregate count()
+| stats count() as n, sum(x) as N   # `n` and `N` are one name (names fold)
+| timechart span=1h count() by _time  # the bucket is always `_time`
+| top 5 count                   # `top` mints its own `count` column
+```
+
+The remedy is usually `as`: `| stats count() as hits by count`. `top` and
+`rare` cannot spell `as`, so write them out —
+`| stats count() as hits by count | sort -hits | head 5`.
+
+`eventstats` adds its column to every row and therefore **requires** an
+explicit `as`: a live tail cannot know a row's schema before the rows
+arrive. An alias naming a column the rows already carry overwrites it,
+the way `let` does.
+
+```
+| eventstats avg(duration) as avg_dur by service
 ```
 
 ## Expressions

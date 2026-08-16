@@ -97,11 +97,73 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     }
 }
 
+/// Whether a backtick preceded by `prev` sits where a quoted field name
+/// could START: the beginning of the input, after whitespace, or after one
+/// of the bytes a name may follow directly — `(` and `,` (argument and
+/// field lists), `|` (a stage boundary), `!` and the comparison bytes (a
+/// filter or expression operator). A backtick anywhere else is inside some
+/// other token, exactly as the search grammar reads a mid-word one as
+/// ordinary text.
+fn opens_quoted_name(prev: Option<u8>) -> bool {
+    match prev {
+        None => true,
+        Some(b) => {
+            b.is_ascii_whitespace() || matches!(b, b'(' | b',' | b'|' | b'!' | b'=' | b'<' | b'>')
+        }
+    }
+}
+
+/// Byte index of the backtick CLOSING a quoted name opened at `open`, or
+/// `None` when the region would not lex as one.
+///
+/// Mirrors [`primitives::quoted_name`]'s two refusals — an empty name and
+/// a character that cannot render as itself
+/// ([`crate::sanitize::is_unsafe_display_char`], which covers the newline
+/// like any other control) — plus the doubled backtick that escapes one.
+fn quoted_name_end(input: &str, open: usize) -> Option<usize> {
+    let rest = &input[open + 1..];
+    let mut chars = rest.char_indices();
+    let mut has_content = false;
+    while let Some((off, c)) = chars.next() {
+        if c == '`' {
+            if rest[off + 1..].starts_with('`') {
+                chars.next();
+                has_content = true;
+                continue;
+            }
+            return has_content.then_some(open + 1 + off);
+        }
+        if crate::sanitize::is_unsafe_display_char(c) {
+            return None;
+        }
+        has_content = true;
+    }
+    None
+}
+
 /// Replace `//` and `#` comments with spaces, preserving byte positions.
 ///
 /// Handles `//` (line comment) and `#` (line comment) outside of quoted
 /// strings. Comment content is replaced with spaces so that error spans
 /// remain accurate.
+///
+/// Backtick-quoted field names are tracked beside double-quoted strings,
+/// so `` `a#b` `` is a name and not a comment (ADR-0013 ruling 7).
+///
+/// A backtick opens a name only where one could actually START — at the
+/// beginning of the input, after whitespace, or after `(`, `,`, `|` or a
+/// filter operator's own bytes — and only when what follows would really
+/// lex as [`primitives::quoted_name`]: non-empty, closed, and free of the
+/// characters that production refuses (controls, a newline included, plus
+/// the bidi and zero-width formats). A stray backtick inside a VALUE — a
+/// regex literal (`` message=/a`b/ ``) or a glob (`` cmd=*`* ``) — fails
+/// both tests even when a later, legitimate backtick exists, so it cannot
+/// run a pseudo-name across the following comment and smuggle its words in
+/// as extra AND-ed search terms.
+///
+/// Residual, since this is a scan and not the grammar: a stray backtick
+/// that DOES sit at a token start and finds a partner on the same line
+/// still shields whatever lies between them.
 ///
 /// Known limitation: `#` inside regex literals (`/pattern#here/`) will be
 /// treated as a comment start. Use `//` comments on lines containing regex
@@ -127,6 +189,22 @@ fn strip_comments(input: &str) -> String {
         } else if bytes[i] == b'"' {
             in_string = true;
             i += 1;
+        } else if bytes[i] == b'`' {
+            // Only a region that would really lex as a name quotes anything;
+            // anything else is an ordinary character. The name scan is
+            // attempted ONLY from a position where a name could open — check
+            // that cheap guard BEFORE the forward scan, never after. A stray
+            // backtick (in a value, a regex, or an adversarial run) has some
+            // non-opening byte before it, so it costs O(1) here instead of a
+            // full forward scan; a scan therefore runs at most once per
+            // genuine token boundary, and the whole pass stays linear. (The
+            // guard-after-scan form re-scanned from every backtick byte, an
+            // O(n^2) blowup a 64 KB backtick run could turn into ~1 s of CPU.)
+            let opens = opens_quoted_name(i.checked_sub(1).map(|p| bytes[p]));
+            match opens.then(|| quoted_name_end(input, i)).flatten() {
+                Some(end) => i = end + 1,
+                None => i += 1,
+            }
         } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
             // // comment — blank to end of line
             while i < len && bytes[i] != b'\n' {
@@ -678,5 +756,110 @@ mod tests {
         let input = "abc # comment\ndef // another\nghi";
         let stripped = strip_comments(input);
         assert_eq!(stripped.len(), input.len());
+    }
+
+    // ── backtick escape (ADR-0013 ruling 7) ─────────────────────────────
+
+    /// Comment stripping tracks backticks beside double quotes, so a `#`
+    /// or `//` INSIDE a quoted name is part of the name — length still
+    /// preserved, since error spans point into the original input.
+    #[test]
+    fn strip_comments_leaves_backticked_names_alone() {
+        for input in ["| table `a#b`", "| table `a//b`, host"] {
+            let stripped = strip_comments(input);
+            assert_eq!(stripped, input, "backtick content must survive");
+            assert_eq!(stripped.len(), input.len());
+        }
+        // …and the name reaches the AST intact.
+        let query = parse("| table `a#b`").expect("parses");
+        match &query.pipeline[0].node {
+            PipeStage::Table(t) => assert_eq!(t.fields, vec!["a#b".to_string()]),
+            other => panic!("expected Table, got {other:?}"),
+        }
+        // A comment AFTER a closed backtick is still a comment.
+        let query = parse("`a b`=x # trailing").expect("parses");
+        assert_eq!(query.search.groups[0].len(), 1);
+        match &query.search.groups[0][0].node {
+            SearchToken::FieldFilter(ff) => assert_eq!(ff.field, "a b"),
+            other => panic!("expected FieldFilter, got {other:?}"),
+        }
+    }
+
+    /// A stray backtick inside a VALUE — a regex literal or a glob — must
+    /// not protect a later comment: the comment would parse as extra
+    /// AND-ed text-search terms and silently narrow the match set. That
+    /// holds whether or not a partner backtick appears later on: the stray
+    /// one is not at a name's start, and the region it would open carries
+    /// characters `quoted_name` refuses.
+    #[test]
+    fn stray_backtick_does_not_shield_later_comments() {
+        let input = "message=/back`tick/ # comment";
+        assert_eq!(strip_comments(input), "message=/back`tick/          ");
+        let query = parse(input).expect("parses");
+        assert_eq!(query.search.groups[0].len(), 1);
+
+        // …and with a legitimate backticked name AFTER the comment, whose
+        // presence used to open a pseudo-name across it.
+        for input in [
+            "message=/a`b/ # secret note\n`req id`=1",
+            "message=/a`b/ // secret note\n`req id`=1",
+            "cmd=*`* # secret note\n`req id`=1",
+        ] {
+            let query = parse(input).unwrap_or_else(|e| panic!("{input:?} parses: {e:?}"));
+            assert_eq!(
+                query.search.groups[0].len(),
+                2,
+                "{input:?}: only the two filters, never the comment's words"
+            );
+        }
+    }
+
+    /// `strip_comments` stays linear on an adversarial backtick run. The
+    /// guard-after-scan form re-scanned to end-of-input from every backtick
+    /// byte, so a 64 KB body of the shapes below burned 0.3–1.1 s of CPU
+    /// (O(n^2)); the fixed pass is well under 5 ms. The bound is generous
+    /// (200 ms) so it flags a return of the quadratic blowup — a ~40× jump
+    /// on this input — without flaking on a loaded machine.
+    #[test]
+    fn strip_comments_is_linear_on_a_backtick_run() {
+        let n = 65_536;
+        for body in [
+            "a``".repeat(n / 3),                // clean O(n^2): doubled ticks after content
+            format!("{} x", "`".repeat(n - 2)), // worst case found: a solid tick run
+            " ``a".repeat(n / 4),               // opens, fails, restarts
+        ] {
+            let start = std::time::Instant::now();
+            let _ = strip_comments(&body);
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_millis(200),
+                "strip_comments took {elapsed:?} on a {}-byte backtick run — quadratic blowup is back",
+                body.len()
+            );
+        }
+    }
+
+    /// A LEADING backtick that fails the quoted production is a loud
+    /// parse error, never a quiet slide into text search: unterminated,
+    /// empty, or a character that cannot render as itself inside — a
+    /// control character, but also the bidi and zero-width format
+    /// characters `sanitize` exists to neutralise, since a name that
+    /// parses is echoed verbatim into notices and error messages.
+    #[test]
+    fn leading_backtick_that_is_not_a_name_is_a_parse_error() {
+        for input in [
+            "`unterminated",
+            "``",
+            "`a\nb`",
+            "`foo` bar",
+            "`a\u{202e}b`",
+            "`a\u{200b}b`",
+            "`a\u{00ad}b`",
+        ] {
+            assert!(
+                parse(input).is_err(),
+                "{input:?} must be a loud parse error, not text search"
+            );
+        }
     }
 }

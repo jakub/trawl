@@ -7,6 +7,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Backtick-quoted identifiers, and one rule for aggregate output names
+  (ADR-0013 slice 2 rulings 7-8, #78).** Any field name can now be written
+  between backticks, and a backticked name is **always** a field
+  reference: `` `http-status`=500 ``, `` | table `request id` ``,
+  `` | stats count() as `total count` by `where` ``. Backticks change how
+  a name is **lexed**, never what a name may be — content is any
+  character except a backtick (a doubled backtick escapes one), an empty
+  name is a parse error, as is a control or invisible format character
+  (bidi controls, zero-widths, the soft hyphen — a parsed name is echoed
+  back verbatim in notices and errors), the ASCII fold still
+  applies (`` `Dur` `` **is** `dur`), and trawl's `_` namespace is still
+  sealed (``let `_foo` = 1`` is the same error as the bare spelling).
+  They are accepted in **every** field position, so a name that exists is
+  a name you can reach. Function names, stage names and saved-query names
+  are not fields and take no backticks: `` `lower`(x) `` is a field
+  reference, never a call.
+
+  The search stage's whole keyword set is **three** words — `last=`,
+  `earliest=`, `latest=` — and backticks are how you reach fields of
+  those names (`` `last`=5 `` beside `last=2h`, in one query). Correcting
+  the docs, which claimed one. Two smaller lexical consequences: a `#` or
+  `//` inside backticks is part of the name rather than a comment, and a
+  LEADING backtick that does not close is now a loud parse error instead
+  of a silent search for the literal text.
+
+- **BREAKING — an aggregating stage that would project two columns of one
+  name is refused (ADR-0013 ruling 8, #78).** `| stats count() by count`,
+  `| stats count() as n, sum(x) as N` (names fold, so those are one
+  column), `| timechart span=1h count() by _time` and `| top 5 count`
+  parsed and ran before, with the answer depending on which producer the
+  engine happened to bind. They are now errors that name **both**
+  producers and the way out — `as` where an aggregate is involved, the
+  `| stats count() as hits by … | sort -hits | head N` rewrite where
+  `top`/`rare` mint their own `count`. One check, both lanes: `/api/v1/query`
+  and the SSE stream state the identical sentence.
+
+  **`eventstats` now requires an explicit `as`** (`| eventstats
+  avg(duration) as avg_dur by service`): it adds a column to every row,
+  and a live tail cannot know a row's schema before the rows arrive. An
+  alias naming a column the rows already carry overwrites it, the way
+  `let` does. And one auto-name moves: a computed aggregate argument
+  names its innermost field in **every** lane now (`avg(tonumber(rssi) *
+  -1)` → `avg_rssi`), where the live tail and `eventstats` used to answer
+  a bare `avg`. Saved queries, dashboards and alerts carrying any of these
+  shapes must be rewritten — no shims, per the project's no-back-compat
+  ruling.
+
 - **The severity reading kernel and `sev()` (ADR-0013 slice 2 rulings
   9-10, #77).** "What is this value's severity" now has exactly ONE
   answer: `trawl_core::severity::reading` is THE reader, and the SQL form

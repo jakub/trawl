@@ -81,6 +81,12 @@ pub enum StreamPlanError {
     /// parse error (ADR-0013 §5). The SQL lane refuses it in
     /// `emitter::validate_pipeline`, which this lane never runs.
     ReservedName(String),
+    /// A projecting stage that would mint two columns of one name
+    /// (ADR-0013 ruling 8). Same reason as `ReservedName`: the sentence
+    /// comes from the one shared check in `crate::projection`, which the
+    /// SQL lane reaches through `validate_pipeline` and this lane
+    /// reaches itself.
+    ProjectionCollision(String),
 }
 
 impl fmt::Display for StreamPlanError {
@@ -92,8 +98,12 @@ impl fmt::Display for StreamPlanError {
             Self::InvalidRegex(msg) => write!(f, "invalid regex: {msg}"),
             Self::InvalidUnit(msg) => write!(f, "invalid date/time unit: {msg}"),
             Self::InvalidFormat(msg) => write!(f, "invalid date/time format: {msg}"),
-            // The emitter's own sentence, carried verbatim.
-            Self::InvalidFunction(msg) => write!(f, "{msg}"),
+            // Verbatim: the emitter (InvalidFunction) and the shared
+            // projection check (ProjectionCollision) own their whole
+            // sentence.
+            Self::InvalidFunction(msg) | Self::ProjectionCollision(msg) => {
+                write!(f, "{msg}")
+            }
             Self::InvalidComparison(msg) => write!(f, "invalid comparison: {msg}"),
             Self::ReservedName(msg) => write!(f, "unsupported operation: {msg}"),
         }
@@ -119,6 +129,15 @@ pub fn compile_stream_plan(
     pipeline: &[Spanned<PipeStage>],
     pins: &PinScope,
 ) -> Result<StreamPlan, StreamPlanError> {
+    // The shared projection-name check runs FIRST, over every stage —
+    // before the unsupported-stage and multi-aggregation refusals — so a
+    // `pivot`/`eventstats` collision gets the semantic answer even where
+    // the stage itself is not streamable (ADR-0013 ruling 8).
+    for stage in pipeline {
+        crate::projection::check_projection(&stage.node)
+            .map_err(StreamPlanError::ProjectionCollision)?;
+    }
+
     // Find the first aggregation stage index (if any).
     let agg_idx = pipeline.iter().position(|s| is_agg_stage(&s.node));
 
@@ -1064,19 +1083,33 @@ fn new_acc_state(acc: &CompiledAcc) -> AccState {
     }
 }
 
-fn compile_agg_expr(agg: &AggExpr) -> CompiledAcc {
-    let field = agg.args.first().and_then(|a| {
-        if let crate::ast::Expr::FieldRef(name) = &a.node {
-            Some(name.clone())
-        } else {
-            None
-        }
-    });
+fn compile_agg_expr(agg: &AggExpr, stage: &str) -> Result<CompiledAcc, StreamPlanError> {
+    // The live accumulators read a BARE field out of the event; they have
+    // no expression evaluator. A computed argument would therefore feed
+    // nothing and answer NULL under a column the SQL lane fills with a
+    // real value — and since ADR-0013 ruling 8 both lanes now agree on the
+    // NAME, that divergence would be invisible. Refuse it instead.
+    let field = match agg.args.first() {
+        None => None,
+        Some(a) => match &a.node {
+            crate::ast::Expr::FieldRef(name) => Some(name.clone()),
+            _ => {
+                return Err(StreamPlanError::UnsupportedStage {
+                    stage: stage.to_string(),
+                    reason: format!(
+                        "{}(…) over a computed argument is not supported in streaming mode; \
+                         aggregate a bare field",
+                        agg.function
+                    ),
+                });
+            }
+        },
+    };
 
-    let alias = agg.alias.clone().unwrap_or_else(|| match &field {
-        Some(f) => format!("{}_{f}", agg.function),
-        None => agg.function.clone(),
-    });
+    // The ONE output-name derivation, shared with the SQL emitter and
+    // the pin-scope walk (ADR-0013 ruling 8): a computed argument names
+    // its innermost field here exactly as it does in batch.
+    let alias = crate::projection::agg_output_name(agg);
 
     let percentile = match agg.function.as_str() {
         "p50" => Some(0.5),
@@ -1086,18 +1119,22 @@ fn compile_agg_expr(agg: &AggExpr) -> CompiledAcc {
         _ => None,
     };
 
-    CompiledAcc {
+    Ok(CompiledAcc {
         function: agg.function.clone(),
         field,
         alias,
         percentile,
-    }
+    })
 }
 
 fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamPlanError> {
     match stage {
         PipeStage::Stats(s) => {
-            let accumulators: Vec<_> = s.aggregations.iter().map(compile_agg_expr).collect();
+            let accumulators = s
+                .aggregations
+                .iter()
+                .map(|a| compile_agg_expr(a, "stats"))
+                .collect::<Result<Vec<_>, _>>()?;
             let group_by: Vec<_> = s
                 .group_by
                 .iter()
@@ -1114,7 +1151,11 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
                 .span
                 .as_ref()
                 .map_or(60, crate::ast::TrawlDuration::to_seconds);
-            let accumulators: Vec<_> = s.aggregations.iter().map(compile_agg_expr).collect();
+            let accumulators = s
+                .aggregations
+                .iter()
+                .map(|a| compile_agg_expr(a, "timechart"))
+                .collect::<Result<Vec<_>, _>>()?;
             let group_by: Vec<_> = s
                 .group_by
                 .iter()
@@ -1873,6 +1914,12 @@ mod tests {
             "* | rename service as _svc",
             r#"* | extract "(?P<_foo>.)" from message"#,
             r#"* | extract "(?P<_severity>\d+)" from message"#,
+            // Quoting changes the LEXING, never the policy (ADR-0013
+            // ruling 7): a backticked write target is refused exactly as
+            // the bare spelling is.
+            "* | let `_foo` = 1",
+            "* | rename service as `_svc`",
+            "* | stats count() as `_total`",
         ] {
             let Ok(query) = crate::parser::parse(dsl) else {
                 continue; // refused at the parser door

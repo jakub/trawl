@@ -13,7 +13,8 @@ use std::ops::Range;
 
 use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, field_name, keyword, literal, quoted_string, regex_pattern, spanned,
+    ParserExtra, ParserInput, field_name, keyword, literal, plain_name, quoted_string,
+    regex_pattern, spanned,
 };
 
 /// Parse an expression with full operator precedence.
@@ -32,9 +33,11 @@ pub(crate) fn expr<'src>()
     recursive(|expr| {
         // --- atoms ---
 
-        // function_call: ident "(" args ")" — must try before bare field_ref
+        // function_call: ident "(" args ")" — must try before bare field_ref.
+        // The head is the UNQUOTED production: a function is not a field,
+        // so `lower`(x) is a field reference, never a call (ADR-0013 §7).
         let func_call = spanned(
-            field_name()
+            plain_name()
                 .then_ignore(just('(').padded())
                 .then(
                     expr.clone()
@@ -266,6 +269,33 @@ mod tests {
 
     fn parse_expr(input: &str) -> Spanned<Expr> {
         expr().parse(input).into_result().unwrap()
+    }
+
+    /// A backticked name is ALWAYS a field reference (ADR-0013 ruling 7):
+    /// function names are not fields, so the call head takes the
+    /// unquoted production and `` `lower`(x) `` does not parse as a call.
+    #[test]
+    fn backticked_name_is_never_a_function_call() {
+        let parsed = expr().parse("`lower`(x)").into_result();
+        match parsed {
+            Err(_) => {} // trailing `(x)` is unconsumed — the loud answer
+            Ok(e) => assert_eq!(
+                e.node,
+                Expr::FieldRef("lower".to_string()),
+                "a backticked head must lex as a field, never a call"
+            ),
+        }
+        // …and the whole-query door refuses it outright.
+        assert!(crate::parser::parse("| let y = `lower`(x)").is_err());
+    }
+
+    /// A backticked field reference reaches expressions verbatim.
+    #[test]
+    fn backticked_field_reference_keeps_its_name() {
+        assert_eq!(
+            parse_expr("`http-status`").node,
+            Expr::FieldRef("http-status".to_string())
+        );
     }
 
     #[test]

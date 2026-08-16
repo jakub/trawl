@@ -15,6 +15,16 @@ use crate::ast::{
     LiteralValue, PipeStage, Query, SampleMode, SavedRunSelector, SearchStage, SearchToken,
     SortDirection, UnaryOp,
 };
+use crate::parser::suggest::quote_dsl_field;
+
+/// Render a field-name list (`table a, b`, `by a, b`) as DSL text.
+fn field_list(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|f| quote_dsl_field(f))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Format a parsed query into canonical DSL form.
 ///
@@ -137,7 +147,7 @@ fn format_search_token(token: &SearchToken, out: &mut String) {
 }
 
 fn format_field_filter(ff: &FieldFilter, out: &mut String) {
-    out.push_str(&ff.field);
+    out.push_str(&quote_dsl_field(&ff.field));
     match ff.op {
         FilterOp::Glob | FilterOp::Regex => {
             // Glob and regex use `=` as the display operator, with the value
@@ -209,12 +219,12 @@ fn format_pipe_stage(stage: &PipeStage, out: &mut String) {
             let _ = write!(out, "tail {}", s.count);
         }
         PipeStage::Table(s) => {
-            let _ = write!(out, "{} {}", s.keyword, s.fields.join(", "));
+            let _ = write!(out, "{} {}", s.keyword, field_list(&s.fields));
         }
         PipeStage::Top(s) => format_top_rare("top", s.count, &s.field, &s.by, out),
         PipeStage::Rare(s) => format_top_rare("rare", s.count, &s.field, &s.by, out),
         PipeStage::Drop(s) => {
-            let _ = write!(out, "drop {}", s.fields.join(", "));
+            let _ = write!(out, "drop {}", field_list(&s.fields));
         }
         PipeStage::Let(s) => format_let(s, out),
         PipeStage::Extract(s) => format_extract(s, out),
@@ -243,14 +253,14 @@ fn format_sort(s: &crate::ast::SortStage, out: &mut String) {
         if sf.direction == SortDirection::Desc {
             out.push('-');
         }
-        out.push_str(&sf.field);
+        out.push_str(&quote_dsl_field(&sf.field));
     }
 }
 
 fn format_top_rare(kw: &str, count: u64, field: &str, by: &[String], out: &mut String) {
-    let _ = write!(out, "{kw} {count} {field}");
+    let _ = write!(out, "{kw} {count} {}", quote_dsl_field(field));
     if !by.is_empty() {
-        let _ = write!(out, " by {}", by.join(", "));
+        let _ = write!(out, " by {}", field_list(by));
     }
 }
 
@@ -261,7 +271,7 @@ fn format_let(s: &crate::ast::LetStage, out: &mut String) {
         if i > 0 {
             out.push_str(", ");
         }
-        let _ = write!(out, "{name} = ");
+        let _ = write!(out, "{} = ", quote_dsl_field(name));
         format_expr(&expr.node, 0, ExprContext::Normal, out);
     }
 }
@@ -269,7 +279,7 @@ fn format_let(s: &crate::ast::LetStage, out: &mut String) {
 fn format_dedup(s: &crate::ast::DedupStage, out: &mut String) {
     out.push_str("dedup");
     if !s.fields.is_empty() {
-        let _ = write!(out, " {}", s.fields.join(", "));
+        let _ = write!(out, " {}", field_list(&s.fields));
     }
 }
 
@@ -281,16 +291,16 @@ fn format_timechart(s: &crate::ast::TimechartStage, out: &mut String) {
     out.push(' ');
     format_agg_list(&s.aggregations, out);
     if !s.group_by.is_empty() {
-        let _ = write!(out, " by {}", s.group_by.join(", "));
+        let _ = write!(out, " by {}", field_list(&s.group_by));
     }
 }
 
 fn format_pivot(s: &crate::ast::PivotStage, out: &mut String) {
     out.push_str("pivot ");
     format_agg_expr(&s.aggregation, out);
-    let _ = write!(out, " on {}", s.on_field);
+    let _ = write!(out, " on {}", quote_dsl_field(&s.on_field));
     if !s.by.is_empty() {
-        let _ = write!(out, " by {}", s.by.join(", "));
+        let _ = write!(out, " by {}", field_list(&s.by));
     }
 }
 
@@ -300,7 +310,7 @@ fn format_rename(s: &crate::ast::RenameStage, out: &mut String) {
         if i > 0 {
             out.push_str(", ");
         }
-        let _ = write!(out, "{old} as {new}");
+        let _ = write!(out, "{} as {}", quote_dsl_field(old), quote_dsl_field(new));
     }
 }
 
@@ -309,7 +319,7 @@ fn format_stats(keyword: &str, aggs: &[AggExpr], group_by: &[String], out: &mut 
     out.push(' ');
     format_agg_list(aggs, out);
     if !group_by.is_empty() {
-        let _ = write!(out, " by {}", group_by.join(", "));
+        let _ = write!(out, " by {}", field_list(group_by));
     }
 }
 
@@ -322,7 +332,12 @@ fn format_agg_list(aggs: &[AggExpr], out: &mut String) {
     }
 }
 
-fn format_agg_expr(agg: &AggExpr, out: &mut String) {
+/// Render one aggregate as DSL text.
+///
+/// `pub(crate)` because [`crate::projection`]'s refusal messages quote an
+/// aggregate back at the user as text to type — one renderer, so a name
+/// trawl offers is a name trawl can parse back (ADR-0013 ruling 7).
+pub(crate) fn format_agg_expr(agg: &AggExpr, out: &mut String) {
     out.push_str(&agg.function);
     out.push('(');
     for (i, arg) in agg.args.iter().enumerate() {
@@ -333,7 +348,7 @@ fn format_agg_expr(agg: &AggExpr, out: &mut String) {
     }
     out.push(')');
     if let Some(ref alias) = agg.alias {
-        let _ = write!(out, " as {alias}");
+        let _ = write!(out, " as {}", quote_dsl_field(alias));
     }
 }
 
@@ -351,7 +366,7 @@ fn format_extract(s: &crate::ast::ExtractStage, out: &mut String) {
         }
     }
     if let Some(ref field) = s.source_field {
-        let _ = write!(out, " from {field}");
+        let _ = write!(out, " from {}", quote_dsl_field(field));
     }
 }
 
@@ -459,7 +474,7 @@ fn format_expr(expr: &Expr, parent_prec: u8, ctx: ExprContext, out: &mut String)
             }
             out.push(')');
         }
-        Expr::FieldRef(name) => out.push_str(name),
+        Expr::FieldRef(name) => out.push_str(&quote_dsl_field(name)),
         Expr::Literal(lit) => format_literal(lit, ctx, out),
         Expr::InList { expr, list } => {
             format_expr(&expr.node, 4, ExprContext::Normal, out);
@@ -956,6 +971,61 @@ mod tests {
             @r"
         *
         | let a = lower(service), b = length(service)
+        "
+        );
+    }
+
+    // ── backtick-requiring names (ADR-0013 ruling 7) ──────────────
+
+    /// Every field name prints through the one DSL renderer, so a
+    /// formatted query parses back to the query it came from — including
+    /// names only backticks can spell.
+    #[test]
+    fn hostile_names_round_trip_through_the_formatter() {
+        for dsl in [
+            "`x-request-id`=500",
+            "`request id`>=400",
+            "* | table `x-request-id`, host",
+            "* | fields `a#b`",
+            "* | drop `request id`",
+            "* | dedup `x-request-id`, host",
+            "* | sort -`x-request-id`",
+            "* | stats count() as `total count` by `x-request-id`",
+            "* | stats avg(`response time`)",
+            "* | timechart span=1h count() as n by `x-request-id`",
+            "* | eventstats count() as `n rows` by `x-request-id`",
+            "* | pivot count() as n on `http-status` by `request id`",
+            "* | rename `request id` as `req id`",
+            "* | let `req id` = 1",
+            "* | where `x-request-id` > 400",
+            "* | top 5 `http-status` by `request id`",
+            "* | rare 5 `http-status`",
+            r#"* | extract "(?P<ip>.)" from `raw body`"#,
+        ] {
+            let original = crate::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+            let printed = format_query(&original);
+            let reparsed = crate::parser::parse(&printed)
+                .unwrap_or_else(|e| panic!("{dsl} printed as {printed:?} must parse: {e:?}"));
+            assert_eq!(
+                format_query(&reparsed),
+                printed,
+                "{dsl} printed as {printed:?} must round-trip"
+            );
+            assert!(printed.contains('`'), "{dsl} printed as {printed:?}");
+        }
+    }
+
+    /// The three grammar keywords are fields only backticks can reach,
+    /// so the formatter always quotes them — a printed query must not
+    /// turn a field filter into a time filter.
+    #[test]
+    fn the_grammar_keywords_print_quoted() {
+        insta::assert_snapshot!(fmt("`last`=5 last=2h"), @"`last`=5 last=2h");
+        insta::assert_snapshot!(
+            fmt("* | table `last`, `earliest`, `latest`"),
+            @r"
+        *
+        | table `last`, `earliest`, `latest`
         "
         );
     }

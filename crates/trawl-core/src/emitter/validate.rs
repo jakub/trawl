@@ -5,7 +5,8 @@
 //! Pre-emission pipeline validation.
 //!
 //! Catches malformed regexes, unknown function names, arity mismatches,
-//! and reserved-namespace capture-group names, before any SQL emission
+//! projection-name collisions and reserved-namespace capture-group names,
+//! before any SQL emission
 //! state is mutated. This gives cleaner error reporting and avoids
 //! partially-built CTEs on failure.
 
@@ -52,6 +53,14 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
             // other stages have no pre-validation needs
             _ => {}
         }
+
+        // Every projecting stage's output-name set, from the one
+        // lane-neutral check the stream compiler runs too (ADR-0013
+        // ruling 8) — after the per-stage checks above, so an unknown
+        // function or a reserved alias keeps its more specific sentence.
+        // Non-projecting stages are a no-op there.
+        crate::projection::check_projection(&stage.node)
+            .map_err(|message| EmitError::InvalidAggregation { message })?;
     }
     Ok(())
 }

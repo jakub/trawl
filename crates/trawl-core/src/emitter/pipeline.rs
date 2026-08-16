@@ -12,6 +12,16 @@ use super::expr::{emit_call_args, emit_expr};
 use super::fields::quote_field;
 use super::functions::{default_agg_alias, translate_function};
 use super::state::{EmitterState, FlushCondition};
+use crate::schema::catalog_key;
+
+/// `DuckDB` SQL that ASCII-folds the `COLUMNS` lambda's column name `c` —
+/// the Rust-side [`catalog_key`] rendered as an expression.
+///
+/// `translate` maps character by character and leaves everything outside
+/// `A-Z` alone, so it reproduces `DuckDB`'s own identifier folding exactly
+/// (`CAFÉ` → `cafÉ`), which `lower()` does not.
+const ASCII_FOLD_SQL: &str =
+    "translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
 
 /// Process a single pipe stage, mutating the emitter state.
 pub(crate) fn process_stage(pipe: &PipeStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
@@ -94,10 +104,9 @@ fn process_stats(
         let sql_func = translate_function(&agg.function, &arg_strings)?;
 
         // determine alias
-        let first_arg_name = extract_field_name(agg.args.first());
         let alias = match &agg.alias {
             Some(a) => quote_field(a),
-            None => default_agg_alias(&agg.function, first_arg_name.as_deref()),
+            None => default_agg_alias(agg),
         };
 
         select_items.push(format!("{sql_func} AS {alias}"));
@@ -147,23 +156,6 @@ fn process_table(table_stage: &crate::ast::TableStage, ctx: &mut EmitterState) {
     ctx.select = table_stage.fields.iter().map(|f| quote_field(f)).collect();
     ctx.has_projection = true;
     ctx.had_explicit_columns = true;
-}
-
-/// Try to extract a field name from the first arg of an aggregation.
-///
-/// Recurses through wrapping expressions (function calls, binary ops, unary ops)
-/// to find the innermost field reference. This lets `avg(tonumber(rssi) * -1)`
-/// alias to `avg_rssi` instead of just `avg`.
-fn extract_field_name(arg: Option<&crate::ast::Spanned<crate::ast::Expr>>) -> Option<String> {
-    use crate::ast::Expr;
-    let expr = &arg?.node;
-    match expr {
-        Expr::FieldRef(name) => Some(name.clone()),
-        Expr::FunctionCall { args, .. } => extract_field_name(args.first()),
-        Expr::Binary { lhs, .. } => extract_field_name(Some(lhs)),
-        Expr::Unary { operand, .. } => extract_field_name(Some(operand)),
-        _ => None,
-    }
 }
 
 /// Desugar `top N field` → stats `count()` by field | sort -count | limit N.
@@ -217,27 +209,48 @@ fn process_drop(drop_stage: &crate::ast::DropStage, ctx: &mut EmitterState) {
     ctx.has_projection = true;
 }
 
+/// The wildcard half of an OVERWRITING projection: every incoming column
+/// except the ones the stage is about to project under its own aliases.
+///
+/// Unlike `* EXCLUDE (...)` the lambda tolerates a name no incoming
+/// column carries — crucial for `let a = expr` where `a` is brand new.
+/// It folds BOTH sides because `DuckDB` binds identifiers
+/// case-insensitively and [`crate::projection::check_projection`] folds
+/// every output name: a raw `c NOT IN ('Host')` would leave an incoming
+/// `host` in place beside the new `Host` and hand back two columns of one
+/// folded name.
+///
+/// The fold is ASCII-ONLY on both sides — [`ASCII_FOLD_SQL`] on the column
+/// name, [`catalog_key`] on the literal — because that is the fold
+/// `DuckDB`'s identifier equality performs. `lower()` folds Unicode too,
+/// so over a corpus carrying `ü` the backtickable target `` `Ü` `` would
+/// have deleted the `ü` column the query never named, while `DuckDB`
+/// itself keeps the two apart.
+fn columns_excluding(names: &[String]) -> String {
+    let list = names
+        .iter()
+        // Escape single quotes for the COLUMNS lambda string comparison.
+        .map(|n| format!("'{}'", catalog_key(n).replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("COLUMNS(c -> {ASCII_FOLD_SQL} NOT IN ({list}))")
+}
+
 fn process_let(let_stage: &crate::ast::LetStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
     // always flush: the computed expression may add ? params to SELECT,
     // which must not interleave with WHERE params from prior stages
     ctx.flush_if(FlushCondition::Always);
 
-    let mut not_in_values = Vec::new();
+    let mut targets = Vec::new();
     let mut computed = Vec::new();
     for (field, expr) in &let_stage.assignments {
         let expr_sql = emit_expr(expr, ctx)?;
         let alias = quote_field(field);
-        // Escape single quotes for the COLUMNS lambda string comparison.
-        let escaped = field.replace('\'', "''");
-        not_in_values.push(format!("'{escaped}'"));
+        targets.push(field.clone());
         computed.push(format!("({expr_sql}) AS {alias}"));
     }
 
-    // Use COLUMNS lambda to filter out columns being overridden. Unlike
-    // `* EXCLUDE (...)`, this tolerates missing columns — crucial for
-    // `let a = expr` when `a` is a new computed field, not an override.
-    let not_in_list = not_in_values.join(", ");
-    let mut items = vec![format!("COLUMNS(c -> c NOT IN ({not_in_list}))")];
+    let mut items = vec![columns_excluding(&targets)];
     items.extend(computed);
     ctx.select = items;
     ctx.has_projection = true;
@@ -371,10 +384,9 @@ fn process_timechart(
 
         let sql_func = translate_function(&agg.function, &arg_strings)?;
 
-        let first_arg_name = extract_field_name(agg.args.first());
         let alias = match &agg.alias {
             Some(a) => quote_field(a),
-            None => default_agg_alias(&agg.function, first_arg_name.as_deref()),
+            None => default_agg_alias(agg),
         };
 
         select_items.push(format!("{sql_func} AS {alias}"));
@@ -489,7 +501,8 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
         format!("PARTITION BY {}", parts.join(", "))
     };
 
-    let mut items = vec!["*".to_string()];
+    let mut targets = Vec::new();
+    let mut computed = Vec::new();
     for agg in &stage.aggregations {
         // Reject functions not supported as window functions in DuckDB.
         if matches!(
@@ -509,19 +522,26 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
         // literal rules (`sev()`'s dialect) apply there too.
         let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
         let sql_func = translate_function(&agg.function, &arg_strings)?;
-        let first_arg_name = agg.args.first().and_then(|a| {
-            if let crate::ast::Expr::FieldRef(name) = &a.node {
-                Some(name.as_str())
-            } else {
-                None
-            }
-        });
-        let alias = match &agg.alias {
-            Some(a) => quote_field(a),
-            None => default_agg_alias(&agg.function, first_arg_name),
-        };
-        items.push(format!("{sql_func} OVER ({partition}) AS {alias}"));
+        // `eventstats` demands an explicit `as` (ADR-0013 ruling 8,
+        // checked in `projection::check_projection`); the alias-less
+        // name is defensive for a hand-built AST that skipped validation.
+        let name = crate::projection::agg_output_name(agg);
+        computed.push(format!(
+            "{sql_func} OVER ({partition}) AS {}",
+            quote_field(&name)
+        ));
+        targets.push(name);
     }
+
+    // An alias naming an incoming column OVERWRITES it (documented,
+    // `let`-like), so the wildcard must not also emit the original —
+    // through the same case-folding lambda `let` uses.
+    let mut items = if targets.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        vec![columns_excluding(&targets)]
+    };
+    items.extend(computed);
 
     ctx.select = items;
     ctx.has_projection = true;

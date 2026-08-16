@@ -32,6 +32,7 @@ use leptos::web_sys;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_navigate, use_query_map};
 use trawl_api::ServiceSchema;
+use trawl_core::parser::suggest::quote_dsl_field;
 use wasm_bindgen::JsCast as _;
 
 use crate::api;
@@ -285,8 +286,11 @@ pub fn SchemaPage() -> impl IntoView {
         Callback::new(move |field: String| {
             // Wildcard match — `field=*` selects every event carrying
             // the field, which is what the user usually wants after
-            // drilling in from a schema view.
-            let q = format!("{field}=*");
+            // drilling in from a schema view. The name goes through the
+            // DSL renderer — an ordinary ingested name the bare
+            // production can't spell needs backticks or the clause
+            // parses as a text search (ADR-0013 ruling 7).
+            let q = format!("{}=*", quote_dsl_field(&field));
             goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
         })
     };

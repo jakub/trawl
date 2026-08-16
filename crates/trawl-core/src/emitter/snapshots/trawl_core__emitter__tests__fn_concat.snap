@@ -6,7 +6,7 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT COLUMNS(c -> c NOT IN ('full')), (CONCAT("host", ?, "service")) AS "full"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('full')), (CONCAT("host", ?, "service")) AS "full"
 FROM "_s0"
 ---
 params:

@@ -1,10 +1,10 @@
 ---
 source: crates/trawl-core/src/emitter/mod.rs
-expression: "emit_dsl(\"* | eventstats avg(duration) by service\")"
+expression: "emit_dsl(\"* | eventstats avg(duration) as avg_duration by service\")"
 ---
 WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT *, AVG("duration") OVER (PARTITION BY "service") AS "avg_duration"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('avg_duration')), AVG("duration") OVER (PARTITION BY "service") AS "avg_duration"
 FROM "_s0"

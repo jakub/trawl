@@ -6,7 +6,7 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 ), _s1 AS (
-  SELECT *, AVG("duration") OVER (PARTITION BY "service") AS "avg_dur"
+  SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('avg_dur')), AVG("duration") OVER (PARTITION BY "service") AS "avg_dur"
   FROM "_s0"
 )
 SELECT *

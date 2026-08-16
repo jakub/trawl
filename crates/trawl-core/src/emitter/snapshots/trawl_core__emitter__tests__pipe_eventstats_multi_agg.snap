@@ -6,5 +6,5 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT *, AVG("duration") OVER (PARTITION BY "service") AS "avg_dur", COUNT(*) OVER (PARTITION BY "service") AS "total"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('avg_dur', 'total')), AVG("duration") OVER (PARTITION BY "service") AS "avg_dur", COUNT(*) OVER (PARTITION BY "service") AS "total"
 FROM "_s0"

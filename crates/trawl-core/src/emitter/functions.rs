@@ -457,14 +457,14 @@ pub fn is_aggregate_function(name: &str) -> bool {
     )
 }
 
-/// Generate a default alias for an aggregation expression.
+/// The quoted SQL identifier an un-aliased aggregation projects.
 ///
-/// `count()` → `"count"`, `avg(duration)` → `"avg_duration"`.
-pub(crate) fn default_agg_alias(func_name: &str, first_arg: Option<&str>) -> String {
-    match first_arg {
-        Some(arg) => quote_field(&format!("{func_name}_{arg}")),
-        None => quote_field(func_name),
-    }
+/// `count()` → `"count"`, `avg(duration)` → `"avg_duration"`. A thin
+/// wrapper over [`crate::projection::agg_output_name`], the ONE
+/// derivation the stream compiler and the pin-scope walk read too — the
+/// collision check counts with the names this writes.
+pub(crate) fn default_agg_alias(agg: &crate::ast::AggExpr) -> String {
+    quote_field(&crate::projection::agg_output_name(agg))
 }
 
 fn require_one_arg(
@@ -1099,22 +1099,40 @@ mod tests {
 
     // ── default_agg_alias ───────────────────────────────────────────────
 
+    fn agg(dsl: &str) -> crate::ast::AggExpr {
+        let query = crate::parser::parse(dsl).expect("dsl parses");
+        match &query.pipeline[0].node {
+            crate::ast::PipeStage::Stats(s) => s.aggregations[0].clone(),
+            other => panic!("expected stats, got {other:?}"),
+        }
+    }
+
     #[test]
     fn alias_count_no_arg() {
-        assert_eq!(default_agg_alias("count", None), "\"count\"");
+        assert_eq!(default_agg_alias(&agg("| stats count()")), "\"count\"");
     }
 
     #[test]
     fn alias_avg_with_field() {
         assert_eq!(
-            default_agg_alias("avg", Some("duration")),
+            default_agg_alias(&agg("| stats avg(duration)")),
             "\"avg_duration\""
         );
     }
 
     #[test]
     fn alias_dc_with_field() {
-        assert_eq!(default_agg_alias("dc", Some("host")), "\"dc_host\"");
+        assert_eq!(default_agg_alias(&agg("| stats dc(host)")), "\"dc_host\"");
+    }
+
+    /// The quoted identifier is the verbatim output name, so a
+    /// backticked alias survives into the SQL untouched.
+    #[test]
+    fn alias_quotes_a_backticked_name_verbatim() {
+        assert_eq!(
+            default_agg_alias(&agg("| stats count() as `total count`")),
+            "\"total count\""
+        );
     }
 
     // ── sev() dialect resolution ────────────────────────────────────────

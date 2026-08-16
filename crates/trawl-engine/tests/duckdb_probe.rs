@@ -3487,3 +3487,128 @@ fn severity_conform_yields_the_physical_bigint() {
     // 10), so a stored `warn` is 13 and not a shelved conflict.
     assert_eq!(rows, vec![Some(13), Some(17)]);
 }
+
+/// Backticks are LEXING: the name a query spells with them is the
+/// identifier in the SQL and the column name `DuckDB` hands back
+/// (ADR-0013 ruling 7). Executed rather than assumed — the whole point
+/// of the escape is that a name reachable in the DSL is reachable end to
+/// end, so `DESCRIBE` is where that claim is settled.
+#[test]
+fn backticked_names_describe_as_the_names_the_dsl_spells() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.parquet");
+    let conn = conn();
+    conn.execute_batch(&format!(
+        "COPY (SELECT 'a' AS \"request id\", 500 AS \"http-status\", 'nginx' AS \"where\") \
+         TO '{}' (FORMAT PARQUET)",
+        file.display()
+    ))
+    .unwrap();
+    let source = file.display().to_string();
+
+    let describe = |sql: &str| -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("DESCRIBE {sql}")).unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+
+    for (dsl, expected) in [
+        (
+            "* | table `request id`, `http-status`",
+            vec!["request id", "http-status"],
+        ),
+        ("* | stats count() by `where`", vec!["where", "count"]),
+        (
+            "* | rename `http-status` as `status code`",
+            vec!["request id", "where", "status code"],
+        ),
+    ] {
+        let query = trawl_core::parser::parse(dsl).unwrap();
+        let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+        assert!(emitted.params.is_empty(), "{dsl} binds no parameters");
+        assert_eq!(describe(&emitted.sql), expected, "{dsl}: {}", emitted.sql);
+    }
+}
+
+/// An `eventstats` alias naming an incoming column OVERWRITES it, the
+/// way `let` does (ADR-0013 ruling 8 documents exactly that, which is
+/// why the collision check admits the shape). Executed, because the
+/// wildcard is `DuckDB`'s to expand: a plain `SELECT *, … AS status`
+/// hands the original column BACK beside the window value, so the alias
+/// names must leave the wildcard before the window expressions land.
+#[test]
+fn eventstats_alias_overwrites_the_incoming_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.parquet");
+    let conn = conn();
+    conn.execute_batch(&format!(
+        "COPY (SELECT 'nginx' AS service, 200 AS status \
+         UNION ALL SELECT 'nginx', 500) TO '{}' (FORMAT PARQUET)",
+        file.display()
+    ))
+    .unwrap();
+    let source = file.display().to_string();
+
+    let query = trawl_core::parser::parse("* | eventstats count() as status by service").unwrap();
+    let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+
+    let columns: Vec<String> = {
+        let mut stmt = conn.prepare(&format!("DESCRIBE {}", emitted.sql)).unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        columns,
+        vec!["service", "status"],
+        "one column per name: {}",
+        emitted.sql
+    );
+
+    let mut stmt = conn.prepare(&emitted.sql).unwrap();
+    let rows: Vec<i64> = stmt
+        .query_map([], |r| r.get("status"))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, vec![2, 2], "the window value replaced the original");
+}
+
+/// The overwrite holds for a CASE-VARIANT alias too, because `DuckDB`
+/// binds identifiers case-insensitively while the `COLUMNS` lambda
+/// compares plain strings: an unfolded `c NOT IN ('Status')` leaves the
+/// incoming `status` in the wildcard and hands back TWO columns of one
+/// folded name — exactly the output schema ruling 8 exists to prevent.
+#[test]
+fn eventstats_case_variant_alias_overwrites_the_incoming_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.parquet");
+    let conn = conn();
+    conn.execute_batch(&format!(
+        "COPY (SELECT 'nginx' AS service, 200 AS status \
+         UNION ALL SELECT 'nginx', 500) TO '{}' (FORMAT PARQUET)",
+        file.display()
+    ))
+    .unwrap();
+    let source = file.display().to_string();
+
+    let query = trawl_core::parser::parse("* | eventstats count() as `Status` by service").unwrap();
+    let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+
+    let columns: Vec<String> = {
+        let mut stmt = conn.prepare(&format!("DESCRIBE {}", emitted.sql)).unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        columns,
+        vec!["service", "Status"],
+        "one column per folded name: {}",
+        emitted.sql
+    );
+}

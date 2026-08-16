@@ -684,12 +684,14 @@ impl EmitterState {
     /// The scan is QUOTE-AWARE, and has to be: a `?` inside a SQL string
     /// literal or a quoted identifier is DATA, not a placeholder. The
     /// emitter now authors both — `sev()`'s digits guard carries the
-    /// regex `'[+-]?[0-9]+'`, and a field name is a client-chosen key —
-    /// so a naive scan spliced the next user literal into the middle of
-    /// the regex (`'[+-]'m1'[0-9]+'`, a parser error) and shifted every
-    /// later parameter by one. Doubled quotes (`''`, `""`) are escapes
-    /// INSIDE their literal, never a close; `DuckDB` has no backslash
-    /// escape in either form, so there is nothing else to track.
+    /// regex `'[+-]?[0-9]+'`, and a field name is a client-chosen key
+    /// that since backticks (ADR-0013 ruling 7) may contain ANY
+    /// character, `?` included — so a naive scan spliced the next user
+    /// literal into the middle of the regex (`'[+-]'m1'[0-9]+'`, a
+    /// parser error) and shifted every later parameter by one. Doubled
+    /// quotes (`''`, `""`) are escapes INSIDE their literal, never a
+    /// close; `DuckDB` has no backslash escape in either form, so there
+    /// is nothing else to track.
     fn inline_params_counted(sql: &str, params: &[SqlValue], start_idx: usize) -> (String, usize) {
         /// Which quoted region the scan is inside.
         #[derive(PartialEq, Eq, Clone, Copy)]

@@ -709,6 +709,30 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // backtick-quoted names (ADR-0013 ruling 7)
+    // -----------------------------------------------------------------------
+
+    /// A backticked name reaches the SQL as the verbatim identifier it
+    /// spells — the quotes are lexing, and `quote_field` is still the
+    /// only thing between the name and the query.
+    #[test]
+    fn backticked_table_fields_quote_verbatim() {
+        assert_snapshot!(emit_dsl("* | table `request id`, `http-status`"));
+    }
+
+    #[test]
+    fn backticked_group_key_quotes_verbatim() {
+        assert_snapshot!(emit_dsl("* | stats count() by `where`"));
+    }
+
+    /// `last=` is still the time filter; the backticked spelling is the
+    /// field, and both survive in one query.
+    #[test]
+    fn backticked_keyword_field_filter_beside_the_time_filter() {
+        assert_snapshot!(emit_dsl("`last`=5 last=2h"));
+    }
+
+    // -----------------------------------------------------------------------
     // multi-stage pipelines (CTE flushing)
     // -----------------------------------------------------------------------
 
@@ -948,6 +972,17 @@ mod tests {
         assert_snapshot!(emit_dsl("* | let message = lower(message)"));
     }
 
+    /// The overwriting wildcard folds ASCII and nothing else, exactly as
+    /// `DuckDB` binds identifiers: a backtickable non-ASCII target must
+    /// not exclude a differently-cased non-ASCII column the query never
+    /// named (`lower()` on both sides used to delete it silently).
+    #[test]
+    fn let_wildcard_folds_ascii_only() {
+        let sql = emit_dsl("* | let `Ü` = 1, `HOST` = 2");
+        assert!(sql.contains("NOT IN ('Ü', 'host')"), "{sql}");
+        assert!(!sql.contains("'ü'"), "{sql}");
+    }
+
     // -----------------------------------------------------------------------
     // extract
     // -----------------------------------------------------------------------
@@ -1081,6 +1116,53 @@ mod tests {
         assert_snapshot!(emit_dsl(
             "* | pivot count() on status by host | where count > 5"
         ));
+    }
+
+    /// `pivot` inlines every `?` because `DuckDB` cannot bind a PIVOT —
+    /// and a backticked name may now contain a `?` of its own (ADR-0013
+    /// ruling 7). Only a placeholder OUTSIDE a quoted region may be
+    /// spliced: splicing into the identifier or the COLUMNS lambda string
+    /// would corrupt the name AND shift every later binding, spilling the
+    /// user's value into the statement with only `'` escaped.
+    #[test]
+    fn pivot_inlining_never_splices_into_a_quoted_region() {
+        let query = parser::parse(r#"* | let `a?b` = "v" | pivot count() on status"#)
+            .expect("parse should succeed");
+        let emitted = emit(&query, SRC).expect("emit should succeed");
+        assert!(
+            emitted.sql.contains(r"NOT IN ('a?b')"),
+            "lambda name corrupted: {}",
+            emitted.sql
+        );
+        assert!(
+            emitted.sql.contains(r#"('v') AS "a?b""#),
+            "value must land at the placeholder, name intact: {}",
+            emitted.sql
+        );
+        assert!(emitted.params.is_empty(), "pivot inlines every param");
+
+        let query = parser::parse("`a?b`=v | pivot count() on status").expect("parse");
+        let emitted = emit(&query, SRC).expect("emit should succeed");
+        assert!(
+            emitted.sql.contains(r#""a?b" = 'v'"#),
+            "filter corrupted: {}",
+            emitted.sql
+        );
+
+        // Not a backtick story: a `?` glob in the source path sits in a
+        // string literal too.
+        let query = parser::parse("service=nginx | pivot count() on status").expect("parse");
+        let globbed = emit(&query, "/data/2026-01-0?/*.parquet").expect("emit should succeed");
+        assert!(
+            globbed.sql.contains("'/data/2026-01-0?/*.parquet'"),
+            "source glob corrupted: {}",
+            globbed.sql
+        );
+        assert!(
+            globbed.sql.contains("= 'nginx'"),
+            "filter value must still inline: {}",
+            globbed.sql
+        );
     }
 
     #[test]
@@ -1294,12 +1376,14 @@ mod tests {
 
     #[test]
     fn pipe_eventstats_basic() {
-        assert_snapshot!(emit_dsl("* | eventstats avg(duration) by service"));
+        assert_snapshot!(emit_dsl(
+            "* | eventstats avg(duration) as avg_duration by service"
+        ));
     }
 
     #[test]
     fn pipe_eventstats_no_by() {
-        assert_snapshot!(emit_dsl("* | eventstats count()"));
+        assert_snapshot!(emit_dsl("* | eventstats count() as total"));
     }
 
     #[test]
@@ -1339,7 +1423,7 @@ mod tests {
 
     #[test]
     fn error_eventstats_dc() {
-        assert_snapshot!(emit_dsl_err("* | eventstats dc(host) by service"));
+        assert_snapshot!(emit_dsl_err("* | eventstats dc(host) as hosts by service"));
     }
 
     #[test]
@@ -1850,6 +1934,37 @@ mod tests {
             "* | rename status as st | where st > 400",
             &[("status", CT::Varchar)]
         ));
+    }
+
+    /// Backticks are lexing, not policy: the ASCII fold still applies, so
+    /// `` `Status` `` IS `status` and binds the same catalog pin
+    /// (ADR-0013 ruling 7). The SQL identifier stays the verbatim text —
+    /// `DuckDB` identifiers are case-insensitive, so it reads the same
+    /// column.
+    #[test]
+    fn backticked_name_folds_to_the_same_pin() {
+        let entries = &[("status", CT::Varchar)];
+        let quoted = parser::parse("`Status`=200").expect("parse should succeed");
+        let bare = parser::parse("status=200").expect("parse should succeed");
+
+        let quoted_sql = emit_with_pins(&quoted, SRC, &pins(entries)).expect("pinned emit");
+        let bare_sql = emit_with_pins(&bare, SRC, &pins(entries)).expect("pinned emit");
+        let unpinned = emit(&quoted, SRC).expect("unpinned emit");
+
+        assert!(
+            quoted_sql.sql.contains(r#""Status""#),
+            "the identifier is verbatim: {}",
+            quoted_sql.sql
+        );
+        assert_eq!(
+            quoted_sql.sql.replace(r#""Status""#, r#""status""#),
+            bare_sql.sql,
+            "the folded name binds the VARCHAR pin's rule, spelling aside"
+        );
+        assert_ne!(
+            quoted_sql.sql, unpinned.sql,
+            "a pin-blind emission is a different rule — the pin really bound"
+        );
     }
 
     /// The scope walk: a computed `let` kills the pin, so the following
