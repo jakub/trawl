@@ -234,20 +234,25 @@ fn can_start_field_name(bytes: &[u8], i: usize) -> bool {
 /// Whether the `/` at `i` is a division operator rather than the opening
 /// delimiter of a regex literal — see [`can_start_field_name`].
 fn slash_divides(bytes: &[u8], i: usize) -> bool {
-    let Some(before) = i.checked_sub(1).map(|p| bytes[p]) else {
+    // Padding does not change what the slash IS, so the classifier reads
+    // the last NON-whitespace byte before it — `host / x` divides exactly
+    // as `host/x` does, and `matches /re/` opens a regex exactly as
+    // `matches/re/` does.
+    let Some(end) = bytes[..i].iter().rposition(|b| !b.is_ascii_whitespace()) else {
         return false;
     };
     // A regex never follows an operand; division always does.
-    if !(before.is_ascii_alphanumeric() || matches!(before, b'_' | b')' | b'`')) {
+    if !(bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b')' | b'`')) {
         return false;
     }
     // …except after a pattern keyword, the one place a regex DOES follow
-    // identifier bytes with no space (`a matches/re/`).
-    let start = bytes[..i]
+    // identifier bytes. The run is read from the same position, so the
+    // guard holds whether or not the operator was padded.
+    let start = bytes[..=end]
         .iter()
         .rposition(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
         .map_or(0, |p| p + 1);
-    let word = &bytes[start..i];
+    let word = &bytes[start..=end];
     !matches!(word, b"matches" | b"like" | b"ilike")
 }
 
@@ -1414,6 +1419,24 @@ mod tests {
             );
         }
 
+        // Division may be PADDED on either side, and the padding does not
+        // change what the slash is: the classifier reads the last
+        // NON-whitespace byte before it.
+        for (dsl, want) in [
+            ("* | let x = host /`a#b`", "a#b"),
+            ("* | let x = host / `a#b`", "a#b"),
+            ("* | let x = 1 /`a#b`", "a#b"),
+            ("* | let x = (a) /`a#b`", "a#b"),
+            ("* | let x = host /`http://x`", "http://x"),
+        ] {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl} must parse: {e:?}"));
+            assert!(
+                field_positions(&query).iter().any(|n| n == want),
+                "{dsl}: {:?}",
+                field_positions(&query)
+            );
+        }
+
         // …while a slash that OPENS A REGEX still shields nothing, so a
         // tick inside the body leaves the comment strippable and the
         // truncated regex dies loudly. Never silently something else.
@@ -1423,6 +1446,12 @@ mod tests {
             // the one shape that puts a regex straight after identifier
             // bytes — the pattern keyword guard, not the operand test
             "* | where a matches/`re#x`/ # c",
+            // …and the guard still wins when the operator is PADDED,
+            // which is the ordinary spelling
+            "* | where a matches /`re#x`/ # c",
+            "* | where a like /`re#x`/ # c",
+            // a padded search-stage regex value is unchanged too
+            "host = /`re#x`/ # c",
         ] {
             assert!(parse(dsl).is_err(), "{dsl} must be a loud parse error");
         }
