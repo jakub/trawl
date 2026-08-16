@@ -249,8 +249,9 @@ fn trimmed_sql(expr: &str) -> String {
 /// an INTEGER-typed conform would make the hot branch disagree with the
 /// parquet side and throw the union.
 ///
-/// `text_expr` appears FOUR times in the result — the token lookup, the
-/// digits guard, and the cast's two halves — which is free for a column
+/// `text_expr` appears FIVE times in the result — the ASCII gate, the
+/// token lookup, the digits guard, and the cast's two halves — which is
+/// free for a column
 /// (`DuckDB` evaluates the common subexpression once) but wrong for an
 /// expression carrying bound `?` parameters, since the emitter pushes one
 /// value per call and not per occurrence. A caller whose subject can

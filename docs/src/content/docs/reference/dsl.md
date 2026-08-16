@@ -358,8 +358,9 @@ applied at **query time**, to any field you name:
   expression — `sev(lower(x))`, `sev(coalesce(a, b))` — still *computes*
   the reading, but the comparison around it falls back to the generic,
   literal-driven path, so `sev(lower(x)) == "error"` compares against the
-  string `"error"` rather than the band. Bind it first, which adopts the
-  pin:
+  string `"error"` rather than the band — a `Conversion Error` in batch,
+  and a filter that never matches in the live tail. Bind it first, which
+  adopts the pin:
 
   ```
   | let s = sev(lower(level)) | where s == "error"
