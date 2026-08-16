@@ -477,7 +477,8 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
         format!("PARTITION BY {}", parts.join(", "))
     };
 
-    let mut items = vec!["*".to_string()];
+    let mut not_in_values = Vec::new();
+    let mut computed = Vec::new();
     for agg in &stage.aggregations {
         // Reject functions not supported as window functions in DuckDB.
         if matches!(
@@ -498,15 +499,32 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
             .map(|a| emit_expr(a, ctx))
             .collect::<Result<_, _>>()?;
         let sql_func = translate_function(&agg.function, &arg_strings)?;
-        let alias = match &agg.alias {
-            Some(a) => quote_field(a),
-            // `eventstats` demands an explicit `as` (ADR-0013 ruling 8,
-            // checked in `projection::check_projection`); this arm is
-            // defensive for a hand-built AST that skipped validation.
-            None => default_agg_alias(agg),
-        };
-        items.push(format!("{sql_func} OVER ({partition}) AS {alias}"));
+        // `eventstats` demands an explicit `as` (ADR-0013 ruling 8,
+        // checked in `projection::check_projection`); the alias-less
+        // name is defensive for a hand-built AST that skipped validation.
+        let name = crate::projection::agg_output_name(agg);
+        // Escape single quotes for the COLUMNS lambda string comparison.
+        let escaped = name.replace('\'', "''");
+        not_in_values.push(format!("'{escaped}'"));
+        computed.push(format!(
+            "{sql_func} OVER ({partition}) AS {}",
+            quote_field(&name)
+        ));
     }
+
+    // An alias naming an incoming column OVERWRITES it (documented,
+    // `let`-like), so the wildcard must not also emit the original. Same
+    // missing-column-tolerant COLUMNS lambda `let` uses: a brand-new
+    // alias names no existing column and the filter simply matches none.
+    let mut items = if not_in_values.is_empty() {
+        vec!["*".to_string()]
+    } else {
+        vec![format!(
+            "COLUMNS(c -> c NOT IN ({}))",
+            not_in_values.join(", ")
+        )]
+    };
+    items.extend(computed);
 
     ctx.select = items;
     ctx.has_projection = true;

@@ -3302,3 +3302,48 @@ fn backticked_names_describe_as_the_names_the_dsl_spells() {
         assert_eq!(describe(&emitted.sql), expected, "{dsl}: {}", emitted.sql);
     }
 }
+
+/// An `eventstats` alias naming an incoming column OVERWRITES it, the
+/// way `let` does (ADR-0013 ruling 8 documents exactly that, which is
+/// why the collision check admits the shape). Executed, because the
+/// wildcard is `DuckDB`'s to expand: a plain `SELECT *, … AS status`
+/// hands the original column BACK beside the window value, so the alias
+/// names must leave the wildcard before the window expressions land.
+#[test]
+fn eventstats_alias_overwrites_the_incoming_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.parquet");
+    let conn = conn();
+    conn.execute_batch(&format!(
+        "COPY (SELECT 'nginx' AS service, 200 AS status \
+         UNION ALL SELECT 'nginx', 500) TO '{}' (FORMAT PARQUET)",
+        file.display()
+    ))
+    .unwrap();
+    let source = file.display().to_string();
+
+    let query = trawl_core::parser::parse("* | eventstats count() as status by service").unwrap();
+    let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+
+    let columns: Vec<String> = {
+        let mut stmt = conn.prepare(&format!("DESCRIBE {}", emitted.sql)).unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        columns,
+        vec!["service", "status"],
+        "one column per name: {}",
+        emitted.sql
+    );
+
+    let mut stmt = conn.prepare(&emitted.sql).unwrap();
+    let rows: Vec<i64> = stmt
+        .query_map([], |r| r.get("status"))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, vec![2, 2], "the window value replaced the original");
+}
