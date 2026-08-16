@@ -17,6 +17,8 @@
 
 use std::fmt::Write;
 
+use trawl_core::parser::suggest::quote_dsl_field;
+
 /// Include/exclude operator for a facet-driven filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterOp {
@@ -139,56 +141,80 @@ pub fn effective_query(base_q: &str, filters: &[Filter], range: &RangeSpec) -> S
     }
 }
 
-/// Split on the first top-level `|` (skipping slashes-delimited regex
-/// literals and quoted strings). Returns `(search_stage, optional_tail)`.
-fn split_search_stage(input: &str) -> (&str, Option<&str>) {
+/// Walk `input`'s bytes, calling `hit` only for bytes that sit OUTSIDE a
+/// delimited span — a double-quoted or single-quoted string, a
+/// `/`-delimited regex literal, or a backtick-quoted field name
+/// (ADR-0013 ruling 7). Returns the index of the first byte `hit`
+/// accepted.
+///
+/// Backticks matter as much as quotes here: a backticked name can spell
+/// any character, so it can carry a `|` or the text `last=` that these
+/// text-level walks would otherwise read as grammar. Backslash escapes
+/// are honoured everywhere except inside backticks, whose only escape is
+/// a doubled backtick (which this walk sees as a close immediately
+/// followed by a re-open, so no inner byte leaks out as bare).
+fn scan_outside_quotes<F>(input: &str, mut hit: F) -> Option<usize>
+where
+    F: FnMut(usize, u8) -> bool,
+{
     let bytes = input.as_bytes();
     let mut i = 0;
-    let mut in_double_quote = false;
-    let mut in_single_quote = false;
-    let mut in_regex = false;
+    let mut delim: Option<u8> = None;
     while i < bytes.len() {
         let b = bytes[i];
-        match b {
-            b'\\' if i + 1 < bytes.len() => i += 2,
-            b'"' if !in_single_quote && !in_regex => {
-                in_double_quote = !in_double_quote;
-                i += 1;
+        match delim {
+            None => match b {
+                b'\\' if i + 1 < bytes.len() => i += 2,
+                b'"' | b'\'' | b'/' | b'`' => {
+                    delim = Some(b);
+                    i += 1;
+                }
+                _ => {
+                    if hit(i, b) {
+                        return Some(i);
+                    }
+                    i += 1;
+                }
+            },
+            Some(d) => {
+                if d != b'`' && b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                } else {
+                    if b == d {
+                        delim = None;
+                    }
+                    i += 1;
+                }
             }
-            b'\'' if !in_double_quote && !in_regex => {
-                in_single_quote = !in_single_quote;
-                i += 1;
-            }
-            b'/' if !in_double_quote && !in_single_quote => {
-                in_regex = !in_regex;
-                i += 1;
-            }
-            b'|' if !in_double_quote && !in_single_quote && !in_regex => {
-                return (&input[..i], Some(&input[i + 1..]));
-            }
-            _ => i += 1,
         }
     }
-    (input, None)
+    None
+}
+
+/// Split on the first top-level `|` (skipping slash-delimited regex
+/// literals, quoted strings and backtick-quoted names). Returns
+/// `(search_stage, optional_tail)`.
+fn split_search_stage(input: &str) -> (&str, Option<&str>) {
+    match scan_outside_quotes(input, |_, b| b == b'|') {
+        Some(i) => (&input[..i], Some(&input[i + 1..])),
+        None => (input, None),
+    }
 }
 
 /// Heuristic: does the search stage already carry a `last=<units>` clause?
 /// Word-boundary check to avoid matching `loglast=` or similar. Case-insensitive.
+///
+/// A backticked `` `last` `` is a FIELD, not the grammar keyword, so the
+/// walk skips quoted spans entirely — otherwise the UI would read the
+/// field as an existing time clause and silently drop the range.
 fn search_has_last_clause(search: &str) -> bool {
     let lower = search.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let needle = b"last=";
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if bytes[i..i + needle.len()] == *needle {
-            let prev_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
-            if prev_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
+    scan_outside_quotes(&lower, |i, _| {
+        bytes[i..].starts_with(needle) && (i == 0 || !is_ident_byte(bytes[i - 1]))
+    })
+    .is_some()
 }
 
 const fn is_ident_byte(b: u8) -> bool {
@@ -200,9 +226,13 @@ fn format_filter(f: &Filter) -> String {
         FilterOp::Include => "=",
         FilterOp::Exclude => "!=",
     };
-    // Quote the value so spaces / special chars don't break the DSL.
+    // Quote the value so spaces / special chars don't break the DSL, and
+    // render the field through the one DSL name renderer — a name the
+    // bare production can't spell (`x-forwarded-for`) or a keyword
+    // (`last`) needs backticks or the clause is not a filter at all
+    // (ADR-0013 ruling 7).
     let quoted = format!("\"{}\"", f.value.replace('\\', "\\\\").replace('"', "\\\""));
-    format!("{}{}{}", f.field, op, quoted)
+    format!("{}{}{}", quote_dsl_field(&f.field), op, quoted)
 }
 
 fn format_absolute_range(from: &str, to: &str) -> String {
@@ -365,6 +395,27 @@ mod tests {
         let (search, tail) = split_search_stage("msg=/foo|bar/ | head 10");
         assert_eq!(search, "msg=/foo|bar/ ");
         assert_eq!(tail, Some(" head 10"));
+    }
+
+    #[test]
+    fn filter_field_is_rendered_through_the_dsl_renderer() {
+        let q = effective_query("*", &[inc("x-forwarded-for", "10.0.0.1")], &quick("15m"));
+        assert_eq!(q, "`x-forwarded-for`=\"10.0.0.1\" last=15m *");
+        let q = effective_query("*", &[exc("last", "5m")], &quick("15m"));
+        assert_eq!(q, "`last`!=\"5m\" last=15m *");
+    }
+
+    #[test]
+    fn split_respects_backticked_pipes() {
+        let (search, tail) = split_search_stage("`a|b`=x | stats count()");
+        assert_eq!(search, "`a|b`=x ");
+        assert_eq!(tail, Some(" stats count()"));
+    }
+
+    #[test]
+    fn backticked_last_field_does_not_suppress_range() {
+        let q = effective_query("`last`=5", &[], &quick("15m"));
+        assert_eq!(q, "last=15m `last`=5");
     }
 
     #[test]
