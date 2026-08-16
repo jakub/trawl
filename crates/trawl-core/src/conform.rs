@@ -302,11 +302,21 @@ fn reading_case(trimmed: &str, dialect: crate::severity::Dialect) -> String {
     };
     // A digits-only guard in front of the cast, because `TRY_CAST` reads a
     // vocabulary the kernel does not: `'1e1'` is 10 and `'0x10'` is 16 to
-    // the cast, and both have no reading in Rust.
+    // the cast, and both have no reading in Rust. Deliberately NOT behind
+    // the ASCII gate below — a sign is not alphanumeric, and `+17` reads.
     let numeric_arm =
         format!("(CASE WHEN regexp_full_match({trimmed}, '[+-]?[0-9]+') THEN {numeric} END)");
+    // The token subject is gated on being ASCII alphanumeric, because
+    // `DuckDB`'s `lower()` is UNICODE and the kernel's fold is ASCII:
+    // `lower('İ')` (U+0130) is `i`, which would read as INFO in SQL and
+    // as nothing in Rust — a batch/live and hot/cold split on a value a
+    // sender chooses. Every token is `[a-z0-9]`, so a string carrying
+    // anything else can never BE one, and gating the subject means
+    // `lower()` only ever folds ASCII. A failed gate yields a NULL
+    // subject, so no `WHEN` matches and the numeric arm decides.
     format!(
-        "(CASE lower({trimmed}) {} ELSE {numeric_arm} END)",
+        "(CASE (CASE WHEN regexp_full_match({trimmed}, '[A-Za-z0-9]+') \
+         THEN lower({trimmed}) END) {} ELSE {numeric_arm} END)",
         arms.join(" ")
     )
 }
@@ -495,7 +505,9 @@ mod tests {
     fn severity_reading_sql_shapes_differ_only_in_where_the_subject_lands() {
         let repeated = severity_reading_sql("SUBJ", crate::severity::Dialect::Otel);
         let once = severity_reading_sql_bind_once("SUBJ", crate::severity::Dialect::Otel);
-        assert_eq!(repeated.matches("SUBJ").count(), 4, "{repeated}");
+        // The ASCII gate, the fold, the digits guard, and the cast's two
+        // halves — free for a column, wrong for a bound parameter.
+        assert_eq!(repeated.matches("SUBJ").count(), 5, "{repeated}");
         assert_eq!(once.matches("SUBJ").count(), 1, "{once}");
         // Same arms, both times.
         for (token, number) in crate::severity::token_entries() {

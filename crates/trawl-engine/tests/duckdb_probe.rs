@@ -3207,6 +3207,20 @@ fn severity_reading_sql_matches_the_rust_kernel_in_both_dialects() {
         "gold",
         "nan",
         "inf",
+        // `DuckDB`'s `lower()` is UNICODE and the kernel's fold is ASCII:
+        // `lower('İ')` is `i`, so an ungated token CASE read `İNFO` as 9
+        // in SQL and as nothing in Rust. Both dotted/dotless Turkish i,
+        // a full-width digit (which `TRY_CAST` also refuses), and a
+        // Kelvin sign that folds to `k`.
+        "İNFO",
+        "info\u{307}",
+        "ı",
+        "İ",
+        "\u{212a}",
+        "ＩＮＦＯ",
+        "１７",
+        "ERROR",
+        "Warning",
     ];
     for dialect in [Dialect::Otel, Dialect::Syslog] {
         for text in cases {
@@ -3236,7 +3250,16 @@ fn severity_reading_sql_matches_the_rust_kernel_in_both_dialects() {
         let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
         assert_eq!(engine, None, "{dialect:?} read a NULL as a severity");
     }
+}
 
+/// The generated arms, the result TYPE, and the bind-once shape's reason
+/// for existing — the half of the reading contract that is not the
+/// input matrix.
+#[test]
+fn severity_reading_sql_generates_its_arms_and_types_as_bigint() {
+    use trawl_core::severity::{self, Dialect};
+
+    let conn = conn();
     // Every token spelling and every exact short name, through the SQL:
     // the arms are generated from the kernel's tables, so a table edit
     // that misses the generator fails here.

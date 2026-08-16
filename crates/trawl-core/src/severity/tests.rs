@@ -231,6 +231,14 @@ fn reading_text_matrix() {
         ("   ", None, None),
         ("gold", None, None),
         ("severe", None, None),
+        // The fold is ASCII: a codepoint `DuckDB`'s Unicode `lower()`
+        // would fold onto a token letter is NOT that token here, and the
+        // SQL mirror gates on ASCII to agree (probed).
+        ("İNFO", None, None),
+        ("ı", None, None),
+        ("\u{212a}", None, None),
+        ("ＩＮＦＯ", None, None),
+        ("１７", None, None),
     ];
     for &(input, otel, syslog) in cases {
         assert_eq!(

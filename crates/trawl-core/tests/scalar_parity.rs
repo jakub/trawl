@@ -297,8 +297,34 @@ fn random_substr(rng: &mut Rng) -> String {
 /// `TRY_CAST` reads and the kernel does not (`1.5`, `1e1`, `0x10`), and
 /// values with no reading at all.
 const SEV_TEXTS: &[&str] = &[
-    "error", "ERR", " error ", "error2", "warn", "0", "1", "7", "8", "17", "24", "25", "0404",
-    "007", "+17", "1.5", "1e1", "0x10", "gold", "",
+    "error",
+    "ERR",
+    " error ",
+    "error2",
+    "warn",
+    "0",
+    "1",
+    "7",
+    "8",
+    "17",
+    "24",
+    "25",
+    "0404",
+    "007",
+    "+17",
+    "1.5",
+    "1e1",
+    "0x10",
+    "gold",
+    "",
+    // Unicode case folding: `DuckDB`'s `lower()` folds these onto token
+    // letters and the kernel's ASCII fold does not, so an ungated token
+    // match read them as severities in batch alone.
+    "\u{130}NFO",
+    "\u{131}",
+    "\u{212a}",
+    "\u{ff29}\u{ff2e}\u{ff26}\u{ff2f}",
+    "\u{ff11}\u{ff17}",
 ];
 
 /// `sev(x[, dialect])` over literals AND over the event's own columns —
