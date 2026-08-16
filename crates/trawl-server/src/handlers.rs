@@ -1151,6 +1151,18 @@ fn degraded_fields_for<'a>(
 /// `PinScope::advance` the emitter used, so the answer cannot drift from
 /// what the SQL actually projected. An unparseable query has no columns
 /// to render anyway — execution below reports the parse error.
+///
+/// COHERENCE ASSUMPTION, stated because it will need revisiting: this
+/// snapshot is taken BEFORE the executor takes its own, so a pin that
+/// changes in between is described by the older one. Benign today, and
+/// only because a `SEVERITY` pin can be neither created nor destroyed at
+/// runtime — `normalize_duckdb_type` can never yield it, and
+/// `repin --to severity` is refused structurally (ADR-0013 §6) — so the
+/// two snapshots cannot disagree about which columns are severities.
+/// When repin admission for `SEVERITY` lands, this has to read the
+/// executor's own snapshot instead of taking a second one. The failure
+/// it would otherwise cause is presentational only (a token rendered as
+/// a number, or the reverse), never a wrong value.
 fn severity_columns_for(state: &AppState, dsl: &str) -> Vec<String> {
     let Ok(query) = trawl_core::parser::parse(dsl) else {
         return Vec::new();

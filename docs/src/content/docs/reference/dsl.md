@@ -354,6 +354,20 @@ applied at **query time**, to any field you name:
   everywhere else in `| where`.
 - The pin travels: `| let s = sev(level)` gives `s` the `SEVERITY` type,
   and `| stats count() by s` keeps it.
+- The subject must be `sev(<field>)` **directly**. A computed inner
+  expression — `sev(lower(x))`, `sev(coalesce(a, b))` — still *computes*
+  the reading, but the comparison around it falls back to the generic,
+  literal-driven path, so `sev(lower(x)) == "error"` compares against the
+  string `"error"` rather than the band. Bind it first, which adopts the
+  pin:
+
+  ```
+  | let s = sev(lower(level)) | where s == "error"
+  ```
+
+  The narrowness is deliberate (ADR-0013 ruling 9): which pin types a
+  comparison has to be decidable from the query text alone, in all three
+  lanes, and a bare field reference is where that stops being a guess.
 - `dialect` governs NUMERICS only — words always read the one token
   table. `sev(x, "syslog")` inverts 0-7 (syslog counts down: `3` is
   `err` → 17), which is the reading for a foreign syslog dump. It must be
