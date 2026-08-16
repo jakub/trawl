@@ -6,5 +6,5 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT COLUMNS(c -> c NOT IN ('message')), (LOWER("message")) AS "message"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('message')), (LOWER("message")) AS "message"
 FROM "_s0"

@@ -197,9 +197,11 @@ impl NameCollision {
 ///   is NOT a producer either — trawl emits `PIVOT … USING <agg>` with the
 ///   alias dropped, so naming it here would report a collision the emitter
 ///   never creates.
-/// - `eventstats` passes its input row through, so its group keys are not
-///   stage-produced. An alias equal to an input column is the DOCUMENTED
-///   let-like overwrite, not a collision.
+/// - `eventstats` passes its input row through, so an alias equal to an
+///   ordinary input column is the DOCUMENTED let-like overwrite, not a
+///   collision. Its GROUP KEYS are a different matter and are produced
+///   names like any other stage's: overwriting the column the stage
+///   partitions BY destroys the grouping the row is grouped by.
 #[must_use]
 pub fn projected_names(stage: &PipeStage) -> Vec<ProducedName> {
     fn aggregations(aggs: &[AggExpr], out: &mut Vec<ProducedName>) {
@@ -245,7 +247,10 @@ pub fn projected_names(stage: &PipeStage) -> Vec<ProducedName> {
             out.push(ProducedName::new("count", NameOrigin::FrequencyCount));
         }
         PipeStage::Pivot(s) => group_keys(&s.by, &mut out),
-        PipeStage::EventStats(s) => aggregations(&s.aggregations, &mut out),
+        PipeStage::EventStats(s) => {
+            group_keys(&s.group_by, &mut out);
+            aggregations(&s.aggregations, &mut out);
+        }
         _ => {}
     }
     out
@@ -483,11 +488,19 @@ mod tests {
                 "host",
                 "drop the duplicate",
             ),
-            // eventstats: declared outputs only, with the overwrite remedy
+            // eventstats: declared outputs AND group keys, with the
+            // overwrite remedy
             (
                 "* | eventstats count(), count()",
                 "count",
                 "overwrites a column of that name the way `let` does",
+            ),
+            // …including a group KEY: overwriting the column the stage
+            // partitions by destroys the grouping it grouped by
+            (
+                "* | eventstats count() as service by service",
+                "service",
+                "a name nothing else in the stage produces",
             ),
         ];
 
@@ -519,7 +532,6 @@ mod tests {
             "* | timechart span=5m count() by service",
             "* | top 5 host by service",
             "* | eventstats count()",
-            "* | eventstats avg(dur) by dur",
             // an eventstats alias equal to an INPUT column is the
             // documented let-like overwrite, not a duplicate
             "* | eventstats count() as service",

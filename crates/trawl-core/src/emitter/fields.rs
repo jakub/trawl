@@ -13,6 +13,42 @@ pub(crate) fn quote_field(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// The ASCII case fold `schema::catalog_key` performs, as SQL over a
+/// column NAME — `translate` maps the 26 ASCII uppercase letters and
+/// leaves every other character alone, which `lower()` does NOT (it folds
+/// non-ASCII too, where `DuckDB`'s own identifier binding does not).
+/// Probe-pinned in `trawl-engine/tests/duckdb_probe.rs`.
+const ASCII_FOLD_SQL: &str =
+    "translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
+
+/// The passthrough projection a stage writes when it OVERWRITES columns:
+/// every input column except the ones it is about to write.
+///
+/// `COLUMNS(c -> …)` rather than `* EXCLUDE (…)` because the excluded name
+/// need not exist in the input — `let a = expr` may be minting `a`. The
+/// comparison folds ASCII case on BOTH sides (the names through
+/// [`crate::schema::catalog_key`], the column through [`ASCII_FOLD_SQL`]),
+/// because `DuckDB` binds identifiers case-insensitively and so does the
+/// pin scope: `as Service` names the column `service`, and a
+/// case-sensitive exclusion would leave the original in the row for a
+/// later reference to bind to instead of the value just computed.
+///
+/// ONE builder for the `let` and `eventstats` lanes — they were ported to
+/// be identical, and a second copy is how they stop being.
+pub(crate) fn columns_except(names: &[String]) -> String {
+    let folded: Vec<String> = names
+        .iter()
+        .map(|n| {
+            // Escape single quotes for the lambda's string comparison.
+            format!("'{}'", crate::schema::catalog_key(n).replace('\'', "''"))
+        })
+        .collect();
+    format!(
+        "COLUMNS(c -> {ASCII_FOLD_SQL} NOT IN ({}))",
+        folded.join(", ")
+    )
+}
+
 /// Coerce a string filter value to the most specific `SqlValue`.
 ///
 /// Tries `i64`, then `f64`, falls back to `String`.

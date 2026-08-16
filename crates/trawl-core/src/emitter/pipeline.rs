@@ -202,22 +202,18 @@ fn process_let(let_stage: &crate::ast::LetStage, ctx: &mut EmitterState) -> Resu
     // which must not interleave with WHERE params from prior stages
     ctx.flush_if(FlushCondition::Always);
 
-    let mut not_in_values = Vec::new();
+    let mut targets = Vec::new();
     let mut computed = Vec::new();
     for (field, expr) in &let_stage.assignments {
         let expr_sql = emit_expr(expr, ctx)?;
         let alias = quote_field(field);
-        // Escape single quotes for the COLUMNS lambda string comparison.
-        let escaped = field.replace('\'', "''");
-        not_in_values.push(format!("'{escaped}'"));
+        targets.push(field.clone());
         computed.push(format!("({expr_sql}) AS {alias}"));
     }
 
-    // Use COLUMNS lambda to filter out columns being overridden. Unlike
-    // `* EXCLUDE (...)`, this tolerates missing columns — crucial for
-    // `let a = expr` when `a` is a new computed field, not an override.
-    let not_in_list = not_in_values.join(", ");
-    let mut items = vec![format!("COLUMNS(c -> c NOT IN ({not_in_list}))")];
+    // The shared overwrite projection: every input column except the ones
+    // this stage writes, compared with ASCII case folded on both sides.
+    let mut items = vec![super::fields::columns_except(&targets)];
     items.extend(computed);
     ctx.select = items;
     ctx.has_projection = true;
@@ -471,7 +467,7 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
         format!("PARTITION BY {}", parts.join(", "))
     };
 
-    let mut not_in_values = Vec::new();
+    let mut targets = Vec::new();
     let mut computed = Vec::new();
     for agg in &stage.aggregations {
         // Reject functions not supported as window functions in DuckDB.
@@ -494,23 +490,19 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
             .collect::<Result<_, _>>()?;
         let sql_func = translate_function(&agg.function, &arg_strings)?;
         let name = crate::projection::agg_output_name(agg);
-        // Escape single quotes for the COLUMNS lambda string comparison.
-        let escaped = name.replace('\'', "''");
-        not_in_values.push(format!("'{escaped}'"));
+        targets.push(name.clone());
         computed.push(format!(
             "{sql_func} OVER ({partition}) AS {}",
             quote_field(&name)
         ));
     }
 
-    // The same projection the `let` lane uses (ADR-0011 slice A′): a bare
-    // `*` beside an alias equal to an input column emits that column
-    // TWICE, and a downstream reference then binds to whichever DuckDB
-    // picks. Filtering the overwritten names out makes the documented
-    // let-like overwrite REAL — `COLUMNS(c -> ...)` rather than
-    // `* EXCLUDE (...)` because the name need not exist in the input.
-    let not_in_list = not_in_values.join(", ");
-    let mut items = vec![format!("COLUMNS(c -> c NOT IN ({not_in_list}))")];
+    // The SAME projection the `let` lane uses (ADR-0011 slice A′), from
+    // the same builder: a bare `*` beside an alias equal to an input
+    // column emits that column TWICE, and a downstream reference then
+    // binds to whichever DuckDB picks. Filtering the overwritten names
+    // out makes the documented let-like overwrite REAL.
+    let mut items = vec![super::fields::columns_except(&targets)];
     items.extend(computed);
 
     ctx.select = items;

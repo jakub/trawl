@@ -639,7 +639,7 @@ mod tests {
     fn eventstats_alias_overwrites_its_input_column() {
         let sql = emit_dsl("* | eventstats count() as service by host");
         assert!(
-            sql.contains("COLUMNS(c -> c NOT IN ('service'))"),
+            sql.contains("COLUMNS(c ->") && sql.contains("NOT IN ('service')"),
             "the overwritten name must be filtered out of the passthrough: {sql}"
         );
         assert!(
@@ -681,6 +681,32 @@ mod tests {
         let sql = emit_dsl(r#"service="a?b" status=200 | pivot count() on service"#);
         assert!(sql.contains("'a?b'"), "{sql}");
         assert!(sql.contains("200"), "the next parameter still lands: {sql}");
+    }
+
+    /// The overwrite has to survive a CASE VARIANT, because `DuckDB` binds
+    /// identifiers case-insensitively and the pin scope folds the same
+    /// way: `as Service` names the column `service`. A case-sensitive
+    /// exclusion left the input column in the passthrough, so the stage
+    /// emitted two columns and `| table Service` read the ORIGINAL value
+    /// instead of the aggregate.
+    #[test]
+    fn columns_exclusion_folds_case_in_both_lanes() {
+        for dsl in [
+            "* | eventstats count() as Service by host",
+            "* | let Service = 1",
+        ] {
+            let sql = emit_dsl(dsl);
+            assert!(
+                sql.contains(
+                    "translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', \
+                              'abcdefghijklmnopqrstuvwxyz') NOT IN ('service')"
+                ) || sql.contains(
+                    "translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') \
+                         NOT IN ('service')"
+                ),
+                "{dsl}: the exclusion must compare folded: {sql}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

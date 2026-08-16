@@ -3366,3 +3366,68 @@ fn pivot_inlining_binds_hostile_field_names() {
         .and_then(|mut s| s.query_row([], |_| Ok(())));
     assert!(err.is_err(), "the smuggled identifier must not resolve");
 }
+
+/// The overwrite projection `let` and `eventstats` share compares column
+/// names with ASCII case folded on both sides, and the SQL half of that
+/// fold has to be the EXACT mirror of `schema::catalog_key`. `lower()` is
+/// not: it folds non-ASCII too, where `DuckDB`'s own identifier binding
+/// does not — so `lower()` would drop a column named `Ä` from the
+/// passthrough for an alias `ä` that never names it. `translate` over the
+/// 26 ASCII letters is the mirror, and all three claims run here.
+#[test]
+fn the_columns_exclusion_fold_mirrors_catalog_key() {
+    fn fold_sql(expr: &str) -> String {
+        format!("translate({expr}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')")
+    }
+    let fold_c = fold_sql("c");
+    let conn = conn();
+    conn.execute_batch(r#"CREATE TABLE t AS SELECT 'x' AS "Service", 'y' AS "Ä";"#)
+        .unwrap();
+
+    // 1. the fold agrees with `catalog_key` on both classes of input
+    for name in ["SerVice", "Ä", "ÄX", "host", "_Time"] {
+        let sql = fold_sql(&format!("'{name}'"));
+        let mut stmt = conn.prepare(&format!("SELECT {sql}")).unwrap();
+        let folded: String = stmt.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(
+            folded,
+            trawl_core::schema::catalog_key(name),
+            "the SQL fold must mirror catalog_key for {name:?}"
+        );
+    }
+
+    // 2. a case-variant alias REPLACES the input column
+    let mut stmt = conn
+        .prepare(&format!(
+            "DESCRIBE SELECT COLUMNS(c -> {fold_c} NOT IN ('service')), 1 AS \"Service\" FROM t"
+        ))
+        .unwrap();
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        columns
+            .iter()
+            .filter(|c| catalog_fold(c) == "service")
+            .count(),
+        1,
+        "one `service` column, once: {columns:?}"
+    );
+
+    // 3. …and `DuckDB` really does bind identifiers ASCII-insensitively
+    // but NOT beyond, which is why the mirror may not use `lower()`.
+    assert!(
+        conn.prepare(r#"SELECT "SERVICE" FROM t"#).is_ok(),
+        "ASCII case is insensitive"
+    );
+    assert!(
+        conn.prepare(r#"SELECT "ä" FROM t"#).is_err(),
+        "non-ASCII case is NOT folded by the binder"
+    );
+}
+
+fn catalog_fold(name: &str) -> String {
+    trawl_core::schema::catalog_key(name)
+}

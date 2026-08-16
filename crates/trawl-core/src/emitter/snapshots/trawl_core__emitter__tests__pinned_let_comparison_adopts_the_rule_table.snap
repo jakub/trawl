@@ -6,7 +6,7 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT COLUMNS(c -> c NOT IN ('is_err')), ((TRY_CAST("status" AS DECIMAL(38,6)) >= TRY_CAST(? AS DECIMAL(38,6)))) AS "is_err"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('is_err')), ((TRY_CAST("status" AS DECIMAL(38,6)) >= TRY_CAST(? AS DECIMAL(38,6)))) AS "is_err"
 FROM "_s0"
 ---
 params:

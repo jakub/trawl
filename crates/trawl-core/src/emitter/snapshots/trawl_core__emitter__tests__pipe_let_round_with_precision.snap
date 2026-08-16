@@ -6,7 +6,7 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT COLUMNS(c -> c NOT IN ('pct')), (ROUND((("count" * ?) / ?), 2)) AS "pct"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('pct')), (ROUND((("count" * ?) / ?), 2)) AS "pct"
 FROM "_s0"
 ---
 params:
