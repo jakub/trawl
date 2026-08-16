@@ -332,7 +332,12 @@ fn format_agg_list(aggs: &[AggExpr], out: &mut String) {
     }
 }
 
-fn format_agg_expr(agg: &AggExpr, out: &mut String) {
+/// Render one aggregate as DSL text.
+///
+/// `pub(crate)` because [`crate::projection`]'s refusal messages quote an
+/// aggregate back at the user as text to type — one renderer, so a name
+/// trawl offers is a name trawl can parse back (ADR-0013 ruling 7).
+pub(crate) fn format_agg_expr(agg: &AggExpr, out: &mut String) {
     out.push_str(&agg.function);
     out.push('(');
     for (i, arg) in agg.args.iter().enumerate() {

@@ -14,6 +14,7 @@
 //! lane's emitter.
 
 use crate::ast::{AggExpr, Expr, PipeStage, Spanned};
+use crate::parser::suggest::quote_dsl_field;
 use crate::schema::catalog_key;
 
 /// The column name an aggregate projects: its explicit `as` alias, else
@@ -83,36 +84,45 @@ impl Output {
 
     /// How the message refers to this column.
     fn label(&self, agg: Option<&AggExpr>) -> String {
-        let name = &self.name;
+        let name = label_name(&self.name);
         match self.producer {
-            Producer::GroupKey => format!("the group key `{name}`"),
+            Producer::GroupKey => format!("the group key {name}"),
             Producer::Aggregate => match agg {
                 Some(a) => format!("the aggregate `{}`", render_agg(a)),
-                None => format!("the aggregate `{name}`"),
+                None => format!("the aggregate {name}"),
             },
-            Producer::TimeBucket => format!("the `timechart` time bucket `{name}`"),
-            Producer::MintedCount => format!("the `{name}` column the stage mints"),
-            Producer::Subject => format!("the counted field `{name}`"),
+            Producer::TimeBucket => format!("the `timechart` time bucket {name}"),
+            Producer::MintedCount => format!("the {name} column the stage mints"),
+            Producer::Subject => format!("the counted field {name}"),
         }
     }
 }
 
 /// Render an aggregate the way the query spells it, for the message:
-/// `count()`, `avg(duration)`, `count() as total`. A computed argument
-/// renders as `…` — the name is what matters, not the arithmetic.
+/// `count()`, `avg(duration)`, `count() as total`.
+///
+/// This goes through the query formatter — the ONE renderer, which quotes
+/// every name through [`quote_dsl_field`] — because the message pastes
+/// the result into a rewrite the user is told to type, and a name trawl
+/// offers must be a name trawl can parse back (ADR-0013 ruling 7).
 fn render_agg(agg: &AggExpr) -> String {
-    let args: Vec<&str> = agg
-        .args
-        .iter()
-        .map(|a| match &a.node {
-            Expr::FieldRef(name) => name.as_str(),
-            _ => "…",
-        })
-        .collect();
-    let call = format!("{}({})", agg.function, args.join(", "));
-    match &agg.alias {
-        Some(alias) => format!("{call} as {alias}"),
-        None => call,
+    let mut out = String::new();
+    crate::format::format_agg_expr(agg, &mut out);
+    out
+}
+
+/// A name inside a message: its DSL spelling, always visually quoted.
+///
+/// [`quote_dsl_field`] backticks only what the bare production cannot
+/// spell, so a plain name is wrapped here to keep the message's quoting
+/// uniform — and a name that IS backticked is left exactly as the user
+/// must type it, never double-wrapped.
+fn label_name(name: &str) -> String {
+    let dsl = quote_dsl_field(name);
+    if dsl.starts_with('`') {
+        dsl
+    } else {
+        format!("`{dsl}`")
     }
 }
 
@@ -217,10 +227,10 @@ fn collision_message(
     second: &Output,
     second_agg: Option<&AggExpr>,
 ) -> String {
-    let name = &first.name;
+    let name = label_name(&first.name);
     let remedy = remedy(keyword, first.producer, second.producer);
     format!(
-        "`{keyword}` would project two columns named `{name}`: {} and {} — {remedy}",
+        "`{keyword}` would project two columns named {name}: {} and {} — {remedy}",
         first.label(first_agg),
         second.label(second_agg),
     )
@@ -350,6 +360,22 @@ mod tests {
         let msg = refusal("* | stats count() as total, sum(x) as Total");
         assert!(msg.contains("count() as total"), "{msg}");
         assert!(msg.contains("sum(x) as Total"), "{msg}");
+    }
+
+    /// A refusal quotes names the way the DSL spells them, so the rewrite
+    /// it tells the user to type parses back (ADR-0013 ruling 7).
+    #[test]
+    fn a_refusal_renders_names_as_dsl_text() {
+        let msg = refusal("* | eventstats avg(`response time`)");
+        assert!(
+            msg.contains("eventstats avg(`response time`) as <name>"),
+            "{msg}"
+        );
+        parser::parse("* | eventstats avg(`response time`) as slow")
+            .expect("the offered rewrite parses");
+
+        let msg = refusal("* | pivot count() on status by `request id`, `Request ID`");
+        assert!(msg.contains("named `request id`"), "{msg}");
     }
 
     /// `pivot`'s value columns come from the DATA, so only its `by` keys
