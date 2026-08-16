@@ -231,7 +231,8 @@ fn trimmed_sql(expr: &str) -> String {
 ///
 /// `text_expr` is the column's TEXT form — [`untyped_text`] for a caller
 /// with no `DESCRIBE`, a string literal for a probe. It is read exactly as
-/// the Rust kernel reads a string: trim the ASCII whitespace set, match
+/// the Rust kernel reads a string: trim the enumerated Unicode
+/// `White_Space` set ([`crate::severity::WHITESPACE`]), match
 /// the band token table, then the `OTel` exact short names, then a STRICT
 /// integer (`[+-]?[0-9]+` and nothing else — `1.5`, `1e1`, `1_2` and
 /// `0x10` are deferred here exactly as `str::parse::<i64>` refuses them
