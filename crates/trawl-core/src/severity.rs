@@ -256,14 +256,28 @@ impl Dialect {
     }
 }
 
-/// The ASCII whitespace [`reading_text`] trims, spelled out.
+/// The whitespace [`reading_text`] trims: the Unicode `White_Space`
+/// property, ENUMERATED.
 ///
-/// Deliberately NOT `str::trim`, which trims every Unicode
-/// `White_Space` code point: the SQL mirror trims a fixed character set
-/// (`DuckDB`'s `trim(s, chars)`), and a U+00A0-padded value read one way
-/// in Rust and another in `DuckDB` would be a live tail disagreeing with
-/// its own batch query.
-const ASCII_WHITESPACE: [char; 6] = [' ', '\t', '\r', '\n', '\u{0b}', '\u{0c}'];
+/// Enumerated rather than `char::is_whitespace` because the SQL mirror
+/// trims an explicit character set (`DuckDB`'s `trim(s, chars)`), and the
+/// two have to be the same set or a padded value reads one way in a live
+/// tail and another in its own batch query. `DuckDB` treats the set as
+/// CHARACTERS, multibyte ones included — probed by execution in
+/// `trawl-engine/tests/duckdb_probe.rs`, which is what lets this be the
+/// full property rather than the ASCII six: ingest accepted a
+/// U+00A0-padded `severity` before the kernel landed, and narrowing it
+/// would have dropped those readings silently, with no repair code and
+/// nothing in the event to explain it.
+///
+/// This is `str::trim`'s set, character for character (Rust's
+/// `char::is_whitespace` IS `White_Space`), so the delegation ingest does
+/// is behaviour-preserving.
+pub const WHITESPACE: [char; 25] = [
+    '\u{9}', '\u{a}', '\u{b}', '\u{c}', '\u{d}', '\u{20}', '\u{85}', '\u{a0}', '\u{1680}',
+    '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}',
+    '\u{2008}', '\u{2009}', '\u{200a}', '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
+];
 
 /// THE severity reader: one JSON value's point on the `OTel` ladder, or
 /// nothing.
@@ -292,7 +306,7 @@ pub fn reading(value: &serde_json::Value, dialect: Dialect) -> Option<u8> {
 
 /// The reader's TEXT half — the rung order every lane shares.
 ///
-/// After trimming [`ASCII_WHITESPACE`]: the band token table
+/// After trimming [`WHITESPACE`]: the band token table
 /// ([`number_for_token`], with its aliases), then the `OTel` exact short
 /// names ([`number_for_exact`], `error2` → 18), then a STRICT integer.
 ///
@@ -305,7 +319,7 @@ pub fn reading(value: &serde_json::Value, dialect: Dialect) -> Option<u8> {
 /// and only `+17` lands on the ladder.
 #[must_use]
 pub fn reading_text(text: &str, dialect: Dialect) -> Option<u8> {
-    let trimmed = text.trim_matches(ASCII_WHITESPACE.as_slice());
+    let trimmed = text.trim_matches(WHITESPACE.as_slice());
     if let Some(number) = number_for_token(trimmed) {
         return Some(number);
     }

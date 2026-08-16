@@ -3221,6 +3221,18 @@ fn severity_reading_sql_matches_the_rust_kernel_in_both_dialects() {
         "１７",
         "ERROR",
         "Warning",
+        // The trim set is the Unicode `White_Space` property on BOTH
+        // engines (`DuckDB` matches a multibyte character set by
+        // character, which is what licenses the wide set): a padded
+        // token was accepted by ingest before the kernel landed, and a
+        // narrowing here would drop those readings silently.
+        "\u{a0}error\u{a0}",
+        "\u{2003}error",
+        "\u{3000}error\u{3000}",
+        "\u{85}error",
+        "\u{202f}\u{2009}error\t",
+        "\u{a0}17\u{a0}",
+        "er\u{a0}ror",
     ];
     for dialect in [Dialect::Otel, Dialect::Syslog] {
         for text in cases {
@@ -3314,6 +3326,63 @@ fn severity_reading_sql_generates_its_arms_and_types_as_bigint() {
         .query_row(&sql, duckdb::params![" Error "], |row| row.get(0))
         .unwrap();
     assert_eq!(reading, Some(17));
+}
+
+/// The trim set is ONE set in two spellings — `severity::WHITESPACE` in
+/// Rust, an RE2 class in the SQL — and this is what makes them one: every
+/// character of the const is trimmed by the SQL reader, and a
+/// look-alike that is NOT `White_Space` (U+200B ZERO WIDTH SPACE, U+180E,
+/// U+FEFF) survives on both sides.
+///
+/// The wide set is deliberate. Ingest trimmed with `str::trim` before the
+/// kernel landed, so a `severity` padded with U+00A0 had a reading; an
+/// ASCII-only trim would have dropped it with no repair code and nothing
+/// in the event to explain the loss.
+#[test]
+fn the_trim_set_is_the_same_on_both_engines() {
+    use trawl_core::severity::{self, Dialect, WHITESPACE};
+
+    let conn = conn();
+    for c in WHITESPACE {
+        let padded = format!("{c}error{c}");
+        let escaped = padded.replace('\'', "''");
+        for build in [
+            trawl_core::conform::severity_reading_sql,
+            trawl_core::conform::severity_reading_sql_bind_once,
+        ] {
+            let sql = format!("SELECT {}", build(&format!("'{escaped}'"), Dialect::Otel));
+            let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(
+                engine,
+                Some(17),
+                "SQL did not trim U+{:04X}\n{sql}",
+                u32::from(c)
+            );
+        }
+        assert_eq!(
+            severity::reading_text(&padded, Dialect::Otel),
+            Some(17),
+            "Rust did not trim U+{:04X}",
+            u32::from(c)
+        );
+    }
+
+    // Not `White_Space`, so it is part of the value on both engines.
+    for c in ['\u{200b}', '\u{180e}', '\u{feff}'] {
+        let padded = format!("{c}error");
+        let sql = format!(
+            "SELECT {}",
+            trawl_core::conform::severity_reading_sql(&format!("'{padded}'"), Dialect::Otel)
+        );
+        let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(engine, None, "SQL trimmed U+{:04X}", u32::from(c));
+        assert_eq!(
+            severity::reading_text(&padded, Dialect::Otel),
+            None,
+            "Rust trimmed U+{:04X}",
+            u32::from(c)
+        );
+    }
 }
 
 /// The SEVERITY conform rung is the reading kernel, and its LIVE mirror

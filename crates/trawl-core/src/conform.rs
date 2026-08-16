@@ -198,14 +198,33 @@ pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
     }
 }
 
-/// The ASCII whitespace set [`severity_reading_sql`] trims, as a `DuckDB`
-/// string built from `chr()`.
+/// The RE2 character class matching [`crate::severity::WHITESPACE`] —
+/// the SQL spelling of the same set.
 ///
-/// Spelled with `chr()` rather than embedded control bytes so no
-/// generated SQL — logged, snapshotted, or read by a human debugging a
-/// compaction — ever carries a raw vertical tab. The set is
-/// `crate::severity`'s `ASCII_WHITESPACE`, character for character.
-const ASCII_WS_SQL: &str = "(' ' || chr(9) || chr(10) || chr(11) || chr(12) || chr(13))";
+/// Unicode `White_Space` is `Zs` (17 space separators) plus eight
+/// explicit characters, which is exactly what this class names. It is a
+/// SECOND spelling of the Rust const, and the equivalence is not
+/// reasoned: `trawl-engine/tests/duckdb_probe.rs` trims every character
+/// of the const through this class and asserts a NON-whitespace
+/// look-alike (U+200B) survives, so a divergence fails the suite.
+///
+/// A class rather than `trim(x, <chars>)` for two measured reasons: a
+/// `chr()` chain of 25 terms costs ~80ms per PREPARE in `DuckDB`'s binder
+/// (the expression names its subject five times), and a literal set of 25
+/// characters would put a raw newline inside generated SQL, which
+/// `EmitterState::finalize` re-indents line by line. The class costs ~6ms
+/// to plan and runs ~4x faster than either (183ms vs ~700ms per million
+/// rows).
+const WHITESPACE_CLASS_SQL: &str = r"[\p{Zs}\x{9}-\x{d}\x{85}\x{2028}\x{2029}]";
+
+/// `expr` with leading and trailing [`crate::severity::WHITESPACE`]
+/// removed — the SQL mirror of `str::trim_matches` over that set.
+fn trimmed_sql(expr: &str) -> String {
+    format!(
+        "regexp_replace(regexp_replace({expr}, '^{WHITESPACE_CLASS_SQL}+', ''), \
+         '{WHITESPACE_CLASS_SQL}+$', '')"
+    )
+}
 
 /// The SQL half of [`crate::severity::reading`]: `text_expr`'s point on
 /// the `OTel` ladder as a BIGINT, or NULL where it has no reading.
@@ -237,7 +256,7 @@ const ASCII_WS_SQL: &str = "(' ' || chr(9) || chr(10) || chr(11) || chr(12) || c
 /// carry parameters takes [`severity_reading_sql_bind_once`] instead.
 #[must_use]
 pub fn severity_reading_sql(text_expr: &str, dialect: crate::severity::Dialect) -> String {
-    let trimmed = format!("trim({text_expr}, {ASCII_WS_SQL})");
+    let trimmed = trimmed_sql(text_expr);
     format!("CAST({} AS BIGINT)", reading_case(&trimmed, dialect))
 }
 
@@ -260,7 +279,8 @@ pub fn severity_reading_sql_bind_once(
     dialect: crate::severity::Dialect,
 ) -> String {
     format!(
-        "CAST(list_transform([trim({text_expr}, {ASCII_WS_SQL})], _sev -> {})[1] AS BIGINT)",
+        "CAST(list_transform([{}], _sev -> {})[1] AS BIGINT)",
+        trimmed_sql(text_expr),
         reading_case("_sev", dialect)
     )
 }

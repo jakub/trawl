@@ -21,7 +21,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   instead of being shelved as a conflict, live and under a future repin
   alike. Numeric readings narrow to a STRICT integer (`[+-]?[0-9]+`), so
   `"4.0"`, `"1e1"` and `"0x10"` — spellings `TRY_CAST` reads and the
-  kernel does not — have no reading in either engine.
+  kernel does not — have no reading in either engine. Everything else the
+  reader does is unchanged from ingest's old derivation, deliberately:
+  the trim is the full Unicode `White_Space` set on BOTH engines (probed
+  character by character), and the token fold stays ASCII on both — the
+  SQL gates its token match on an ASCII-alphanumeric subject, because
+  `DuckDB`'s `lower()` is Unicode and would otherwise read `"İNFO"` as
+  INFO in batch and as nothing live.
 
   **`sev(x[, dialect])`** applies that kernel at query time to any field:
   `| where sev(level) >= "error"`. It DECLARES its result as the

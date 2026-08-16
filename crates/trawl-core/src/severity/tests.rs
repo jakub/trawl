@@ -254,14 +254,43 @@ fn reading_text_matrix() {
     }
 }
 
-/// The trim is the EXPLICIT ASCII set, never `str::trim`: a Unicode space
-/// is part of the value, because `DuckDB`'s `trim(s, chars)` would keep it
-/// too and a divergence here is a live tail disagreeing with its batch.
+/// The trim is the ENUMERATED Unicode `White_Space` set — `str::trim`'s
+/// set, character for character, which is what keeps ingest's delegation
+/// behaviour-preserving — and `DuckDB` trims the same one (probed), so a
+/// padded value cannot read one way live and another in batch.
 #[test]
-fn reading_text_trims_ascii_whitespace_only() {
-    assert_eq!(reading_text("\u{0b}error\u{0c}", Dialect::Otel), Some(17));
-    assert_eq!(reading_text("\u{a0}error", Dialect::Otel), None);
-    assert_eq!(reading_text("error\u{2003}", Dialect::Otel), None);
+fn reading_text_trims_the_unicode_whitespace_set() {
+    for padded in [
+        "\u{0b}error\u{0c}",
+        "\u{a0}error",
+        "error\u{2003}",
+        "\u{3000}error\u{3000}",
+        "\u{85}error",
+        "\u{202f}\u{2009}error\t",
+    ] {
+        assert_eq!(reading_text(padded, Dialect::Otel), Some(17), "{padded:?}");
+        // `str::trim` is the same set, so the two agree everywhere.
+        assert_eq!(
+            reading_text(padded, Dialect::Otel),
+            reading_text(padded.trim(), Dialect::Otel),
+            "{padded:?}"
+        );
+    }
+    // Numerics trim too, and INNER whitespace is part of the value.
+    assert_eq!(reading_text("\u{a0}17\u{a0}", Dialect::Otel), Some(17));
+    assert_eq!(reading_text("er\u{a0}ror", Dialect::Otel), None);
+    // The set is exactly `char::is_whitespace`'s.
+    for c in WHITESPACE {
+        assert!(c.is_whitespace(), "{c:?} is not White_Space");
+    }
+    assert_eq!(
+        WHITESPACE.len(),
+        (0..=0x3000u32)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_whitespace())
+            .count(),
+        "the enumeration must be the WHOLE property"
+    );
 }
 
 /// The JSON shapes: a string reads as text, an INTEGER as a number, and
