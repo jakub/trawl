@@ -891,6 +891,13 @@ fn case_variant_projections_agree_across_lanes() {
                 "| rename a as B",
                 "| let B = a",
                 r#"| extract "(?P<B>[a-z]+)" from message"#,
+                // the pattern matches NEITHER row: batch writes the
+                // column as NULL, so the live lane must too
+                r#"| extract "(?P<B>ZZZ+)" from message"#,
+                // …and an optional group that never participates
+                r#"| extract "m(?P<B>ZZ)?" from message"#,
+                // …and one that matches only the FIRST row
+                r#"| extract "(?P<B>mx)" from message"#,
             ],
             &[
                 "| table B, message",
@@ -909,13 +916,16 @@ fn case_variant_projections_agree_across_lanes() {
     for (projections, readers) in groups {
         for projection in projections {
             for reader in readers {
-                // A projection writing a CONSTANT puts both rows in one dedup
-                // group, and which member survives is lane-specific by design
-                // (live keeps the first arrival, batch the most recent) — a
-                // streaming-vs-batch question, not a binding one. Every other
-                // pairing keeps the dedup key distinct per row, so a key that
-                // failed to bind still collapses the rows and fails here.
-                if reader.starts_with("| dedup") && projection.contains("= 1") {
+                // A projection writing the SAME value for every row (a
+                // literal, or a pattern matching none of them, which writes
+                // NULL) puts both rows in one dedup group, and which member
+                // survives is lane-specific by design — live keeps the first
+                // arrival, batch the most recent. A streaming-vs-batch
+                // question, not a binding one. Every other pairing keeps the
+                // dedup key distinct per row, so a key that failed to bind
+                // still collapses the rows and fails here.
+                let writes_one_value = projection.contains("= 1") || projection.contains("ZZ");
+                if reader.starts_with("| dedup") && writes_one_value {
                     continue;
                 }
                 let dsl = format!("* {projection} {reader}");

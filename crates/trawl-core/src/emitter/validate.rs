@@ -111,6 +111,15 @@ fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError>
                     return Err(reserved_name_error("extract capture group", name));
                 }
             }
+            // …and two captures may not name ONE column, for the reason
+            // `let`/`rename` may not: the projection writes both and
+            // DuckDB dedup-names the loser. Refused at the two places the
+            // regex is compiled — the parser never sees these names.
+            if let Some(message) =
+                crate::schema::duplicate_target_message(re.capture_names().flatten(), "extract")
+            {
+                return Err(EmitError::UnsupportedOperation { message });
+            }
         }
         ExtractMode::KeyValue { .. } => {
             // kv extraction is handled post-SQL by the Rust pipeline

@@ -623,6 +623,42 @@ mod tests {
         }
     }
 
+    /// Two capture groups may not name ONE column, and the regex is the
+    /// one write list the PARSER never sees — so the refusal lives at the
+    /// two places the pattern is compiled, in the same words the
+    /// `let`/`rename` parse refusal uses, and both lanes say it alike.
+    #[test]
+    fn duplicate_capture_names_are_refused_in_both_lanes() {
+        use crate::pin_scope::PinScope;
+        use crate::stream::compile_stream_plan;
+
+        for dsl in [
+            r#"* | extract "(?P<A>.)(?P<a>.)" from message"#,
+            r#"* | extract "(?P<dur>.)(?P<DUR>.)" from message"#,
+        ] {
+            let query = parser::parse(dsl).expect("the parser does not read capture names");
+            let sql = crate::emitter::validate_pipeline(&query.pipeline)
+                .expect_err(&format!("{dsl}: the SQL lane must refuse"))
+                .to_string();
+            let stream = compile_stream_plan(&query.pipeline, &PinScope::unpinned())
+                .expect_err(&format!("{dsl}: the stream lane must refuse"))
+                .to_string();
+            assert_eq!(sql, stream, "{dsl}: both lanes must print one sentence");
+            assert!(
+                sql.contains("which name one column") && sql.contains("extract writes"),
+                "{dsl}: {sql}"
+            );
+        }
+
+        // …and a multi-capture extract naming DISTINCT columns still works
+        // in both lanes.
+        let dsl = r#"* | extract "(?P<ip>.)(?P<port>.)" from message"#;
+        let query = parser::parse(dsl).expect("parses");
+        crate::emitter::validate_pipeline(&query.pipeline).expect("SQL lane accepts");
+        compile_stream_plan(&query.pipeline, &PinScope::unpinned()).expect("stream lane accepts");
+        crate::emitter::emit(&query, "/data/**/*.parquet").expect("emits");
+    }
+
     /// One check, two lanes, one sentence — the `rejects_minting_reserved_names`
     /// precedent. The stream lane never runs `validate_pipeline`, so a
     /// second implementation is exactly how the two would drift apart.

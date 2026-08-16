@@ -544,6 +544,15 @@ fn compile_extract(s: &ExtractStage) -> Result<CompiledStage, StreamPlanError> {
                     ));
                 }
             }
+            // Two captures may not name one column: the SQL lane refuses
+            // this in `emitter::validate_pipeline`, which this lane never
+            // runs — the kv arm's precedent, one predicate, both doors.
+            if let Some(message) =
+                crate::schema::duplicate_target_message(regex.capture_names().flatten(), "extract")
+            {
+                return Err(StreamPlanError::ProjectionCollision(message));
+            }
+
             Ok(CompiledStage::ExtractRegex {
                 regex,
                 source_field,
@@ -737,6 +746,38 @@ fn apply_let(
     }
 }
 
+/// Apply a regex `extract` in place: EVERY capture target is written on
+/// EVERY event.
+///
+/// That is the emitted projection's semantic — it excludes each target and
+/// writes `nullif(regexp_extract(…), '')` — so a row the pattern misses,
+/// or an optional group that did not participate, gets the column with
+/// NULL rather than keeping whatever was there. Executed batch output
+/// settles the representation rather than a guess: the key comes back
+/// PRESENT carrying null, never removed.
+fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Map<String, Value>) {
+    let text = match event_value(event, source_field) {
+        Some(Value::String(text)) => Some(text.clone()),
+        _ => None,
+    };
+    let caps = text.as_deref().and_then(|text| regex.captures(text));
+    let written: Vec<(String, Value)> = regex
+        .capture_names()
+        .flatten()
+        .map(|name| {
+            let value = caps
+                .as_ref()
+                .and_then(|caps| caps.name(name))
+                .map_or(Value::Null, |m| Value::String(m.as_str().to_string()));
+            (name.to_string(), value)
+        })
+        .collect();
+    for (name, value) in written {
+        remove_folded_twins(event, &name);
+        event.insert(name, value);
+    }
+}
+
 /// Apply a compiled stage to an event, mutating it in place.
 ///
 /// Returns whether the event should pass through, be filtered, or
@@ -805,22 +846,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
             regex,
             source_field,
         } => {
-            if let Some(Value::String(text)) = event_value(event, source_field)
-                && let Some(caps) = regex.captures(text)
-            {
-                let names: Vec<_> = regex
-                    .capture_names()
-                    .flatten()
-                    .filter_map(|name| {
-                        caps.name(name)
-                            .map(|m| (name.to_string(), m.as_str().to_string()))
-                    })
-                    .collect();
-                for (name, value) in names {
-                    remove_folded_twins(event, &name);
-                    event.insert(name, Value::String(value));
-                }
-            }
+            apply_extract_regex(regex, source_field, event);
             StageResult::Pass
         }
 
@@ -2197,17 +2223,23 @@ mod tests {
     }
 
     #[test]
-    fn extract_regex_no_match_is_noop() {
+    fn extract_regex_no_match_writes_null() {
+        // The emitted projection excludes the target and writes
+        // `nullif(regexp_extract(…), '')`, so a row the pattern misses
+        // gets the column carrying NULL — executed batch output returns
+        // the key PRESENT with null. This lane used to leave the row
+        // untouched, which kept a pre-existing value the batch query
+        // would have overwritten.
         let mut stage = compile_extract(&ExtractStage {
             mode: ExtractMode::Regex(r"(?P<ip>\d+\.\d+\.\d+\.\d+)".into()),
             source_field: Some("message".into()),
             keyword: "extract",
         })
         .unwrap();
-        let mut ev = event(&json!({"message": "no ip here"}));
-        let orig_len = ev.len();
+        let mut ev = event(&json!({"message": "no ip here", "ip": "keep?"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.len(), orig_len);
+        assert_eq!(ev.get("ip"), Some(&Value::Null));
+        assert!(ev.contains_key("ip"), "the key is present, not removed");
     }
 
     #[test]

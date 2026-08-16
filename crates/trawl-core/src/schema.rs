@@ -98,6 +98,35 @@ pub fn reserved_name_message(what: &str, name: &str) -> String {
     )
 }
 
+/// The refusal text a stage shares when two of its WRITE targets name one
+/// column after the fold, or `None` when they are all distinct.
+///
+/// One message, every door — the `reserved_name_message` arrangement: the
+/// parser refuses a `let`/`rename` list here, and both extract compile
+/// sites refuse a capture-group list, in the same words.
+#[must_use]
+pub fn duplicate_target_message<'a>(
+    targets: impl Iterator<Item = &'a str>,
+    what: &str,
+) -> Option<String> {
+    let mut seen: Vec<(String, &str)> = Vec::new();
+    for name in targets {
+        let folded = catalog_key(name);
+        if let Some((_, first)) = seen.iter().find(|(key, _)| *key == folded) {
+            let both = if *first == name {
+                format!("`{name}` twice")
+            } else {
+                format!("`{first}` and `{name}`, which name one column")
+            };
+            return Some(format!(
+                "{what} writes {both} — give each target a name of its own"
+            ));
+        }
+        seen.push((folded, name));
+    }
+    None
+}
+
 /// The catalog spelling of a DSL field reference: an ASCII fold, and
 /// nothing else (ADR-0013 §6 — the DSL has zero aliases).
 ///
