@@ -190,13 +190,20 @@ fn strip_comments(input: &str) -> String {
             in_string = true;
             i += 1;
         } else if bytes[i] == b'`' {
-            // Only a region that would really lex as a name quotes
-            // anything; anything else is an ordinary character. The scan
-            // stops at the first backtick or refused character, so the
-            // whole pass stays linear.
-            match quoted_name_end(input, i) {
-                Some(end) if opens_quoted_name(i.checked_sub(1).map(|p| bytes[p])) => i = end + 1,
-                _ => i += 1,
+            // Only a region that would really lex as a name quotes anything;
+            // anything else is an ordinary character. The name scan is
+            // attempted ONLY from a position where a name could open — check
+            // that cheap guard BEFORE the forward scan, never after. A stray
+            // backtick (in a value, a regex, or an adversarial run) has some
+            // non-opening byte before it, so it costs O(1) here instead of a
+            // full forward scan; a scan therefore runs at most once per
+            // genuine token boundary, and the whole pass stays linear. (The
+            // guard-after-scan form re-scanned from every backtick byte, an
+            // O(n^2) blowup a 64 KB backtick run could turn into ~1 s of CPU.)
+            let opens = opens_quoted_name(i.checked_sub(1).map(|p| bytes[p]));
+            match opens.then(|| quoted_name_end(input, i)).flatten() {
+                Some(end) => i = end + 1,
+                None => i += 1,
             }
         } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
             // // comment — blank to end of line
@@ -803,6 +810,31 @@ mod tests {
                 query.search.groups[0].len(),
                 2,
                 "{input:?}: only the two filters, never the comment's words"
+            );
+        }
+    }
+
+    /// `strip_comments` stays linear on an adversarial backtick run. The
+    /// guard-after-scan form re-scanned to end-of-input from every backtick
+    /// byte, so a 64 KB body of the shapes below burned 0.3–1.1 s of CPU
+    /// (O(n^2)); the fixed pass is well under 5 ms. The bound is generous
+    /// (200 ms) so it flags a return of the quadratic blowup — a ~40× jump
+    /// on this input — without flaking on a loaded machine.
+    #[test]
+    fn strip_comments_is_linear_on_a_backtick_run() {
+        let n = 65_536;
+        for body in [
+            "a``".repeat(n / 3),                // clean O(n^2): doubled ticks after content
+            format!("{} x", "`".repeat(n - 2)), // worst case found: a solid tick run
+            " ``a".repeat(n / 4),               // opens, fails, restarts
+        ] {
+            let start = std::time::Instant::now();
+            let _ = strip_comments(&body);
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_millis(200),
+                "strip_comments took {elapsed:?} on a {}-byte backtick run — quadratic blowup is back",
+                body.len()
             );
         }
     }
