@@ -154,9 +154,24 @@ fn split_search_stage(input: &str) -> (&str, Option<&str>) {
     let mut in_double_quote = false;
     let mut in_single_quote = false;
     let mut in_regex = false;
+    let mut in_backtick = false;
     while i < bytes.len() {
         let b = bytes[i];
         match b {
+            _ if in_backtick => {
+                // Inside a quoted field NAME every byte is name content —
+                // a `|` there is part of the column, not a stage boundary
+                // (ADR-0013 ruling 7). Only a tick closes, and a doubled
+                // tick is data, exactly as the grammar reads it.
+                if b == b'`' {
+                    if bytes.get(i + 1) == Some(&b'`') {
+                        i += 2;
+                        continue;
+                    }
+                    in_backtick = false;
+                }
+                i += 1;
+            }
             b'\\' if i + 1 < bytes.len() => i += 2,
             b'"' if !in_single_quote && !in_regex => {
                 in_double_quote = !in_double_quote;
@@ -164,6 +179,10 @@ fn split_search_stage(input: &str) -> (&str, Option<&str>) {
             }
             b'\'' if !in_double_quote && !in_regex => {
                 in_single_quote = !in_single_quote;
+                i += 1;
+            }
+            b'`' if !in_double_quote && !in_single_quote && !in_regex => {
+                in_backtick = true;
                 i += 1;
             }
             b'/' if !in_double_quote && !in_single_quote => {
@@ -186,12 +205,28 @@ fn search_has_last_clause(search: &str) -> bool {
     let bytes = lower.as_bytes();
     let needle = b"last=";
     let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if bytes[i..i + needle.len()] == *needle {
-            let prev_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
-            if prev_ok {
-                return true;
+    let mut in_backtick = false;
+    while i < bytes.len() {
+        // A time keyword is only a time keyword outside a quoted field
+        // NAME: `` `last=x`=1 `` filters a column called `last=x`, and
+        // reading it as a time clause would suppress the range the caller
+        // asked for (ADR-0013 ruling 7 keeps the keyword unconditional
+        // only where a name is unquoted).
+        if bytes[i] == b'`' {
+            if in_backtick && bytes.get(i + 1) == Some(&b'`') {
+                i += 2;
+                continue;
             }
+            in_backtick = !in_backtick;
+            i += 1;
+            continue;
+        }
+        if !in_backtick
+            && i + needle.len() <= bytes.len()
+            && bytes[i..i + needle.len()] == *needle
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+        {
+            return true;
         }
         i += 1;
     }
@@ -276,6 +311,34 @@ mod tests {
         // …and the rendered clause parses
         let clause = format_filter(&exc("request id", "7")).expect("a clause");
         assert!(trawl_core::parser::parse(&clause).is_ok());
+    }
+
+    /// The stage splitter and the time-clause detector are scanners of
+    /// their own, and a backtick-quoted NAME may contain any character —
+    /// including the `|` they split on and the `last=` they look for.
+    #[test]
+    fn scanners_see_through_a_backticked_field_name() {
+        // the `|` inside the name is not a stage boundary
+        let (search, tail) = split_search_stage("`a|b`=x | stats count()");
+        assert_eq!(search, "`a|b`=x ");
+        assert_eq!(tail, Some(" stats count()"));
+
+        // …a doubled tick is data, so the region does not close early
+        let (search, tail) = split_search_stage("`a``|b`=x | head 5");
+        assert_eq!(search, "`a``|b`=x ");
+        assert_eq!(tail, Some(" head 5"));
+
+        // …and text inside a name is not a time clause
+        assert!(!search_has_last_clause("`last=x`=1"));
+        assert!(search_has_last_clause("`a b`=1 last=15m"));
+        assert!(search_has_last_clause("last=15m"));
+
+        // the whole merge, end to end: the range still applies and the
+        // pipeline survives
+        let merged = effective_query("`a|b`=x | stats count()", &[], &quick("15m"));
+        assert!(merged.contains("| stats count()"), "{merged}");
+        assert!(merged.contains("last=15m"), "{merged}");
+        assert!(merged.contains("`a|b`=x"), "{merged}");
     }
 
     /// A catalog key is client-chosen, so a name the helper REFUSES must
