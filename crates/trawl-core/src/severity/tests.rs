@@ -189,3 +189,139 @@ fn band_names() {
     assert_eq!(band_name(24), Some("fatal"));
     assert_eq!(band_name(0), None);
 }
+
+// ── the reader (ADR-0013 slice 2, ruling 9) ───────────────────────────
+
+use serde_json::json;
+
+/// The reader's TEXT matrix, both dialects — the same list the SQL mirror
+/// is probed against in `trawl-engine/tests/duckdb_probe.rs`, so a case
+/// added here belongs there too.
+#[test]
+fn reading_text_matrix() {
+    // (input, otel, syslog) — words are dialect-FREE, numerics are not.
+    let cases: &[(&str, Option<u8>, Option<u8>)] = &[
+        ("error", Some(17), Some(17)),
+        ("ERR", Some(17), Some(17)),
+        (" error ", Some(17), Some(17)),
+        ("\t error \r\n", Some(17), Some(17)),
+        ("error2", Some(18), Some(18)),
+        ("warn", Some(13), Some(13)),
+        ("notice", Some(10), Some(10)),
+        // Numerics: OTel passes 1-24 through, syslog inverts 0-7.
+        ("0", None, Some(24)),
+        ("1", Some(1), Some(23)),
+        ("7", Some(7), Some(5)),
+        ("8", Some(8), None),
+        ("24", Some(24), None),
+        ("25", None, None),
+        // Leading zeros are still digits.
+        ("0404", None, None),
+        ("007", Some(7), Some(5)),
+        ("+17", Some(17), None),
+        ("-1", None, None),
+        // Spellings `TRY_CAST` would read and the kernel does not.
+        ("1.5", None, None),
+        ("1e1", None, None),
+        ("1_2", None, None),
+        ("0x10", None, None),
+        ("9223372036854775807", None, None),
+        ("9223372036854775808", None, None),
+        ("", None, None),
+        ("   ", None, None),
+        ("gold", None, None),
+        ("severe", None, None),
+    ];
+    for &(input, otel, syslog) in cases {
+        assert_eq!(
+            reading_text(input, Dialect::Otel),
+            otel,
+            "otel reading of {input:?}"
+        );
+        assert_eq!(
+            reading_text(input, Dialect::Syslog),
+            syslog,
+            "syslog reading of {input:?}"
+        );
+    }
+}
+
+/// The trim is the EXPLICIT ASCII set, never `str::trim`: a Unicode space
+/// is part of the value, because `DuckDB`'s `trim(s, chars)` would keep it
+/// too and a divergence here is a live tail disagreeing with its batch.
+#[test]
+fn reading_text_trims_ascii_whitespace_only() {
+    assert_eq!(reading_text("\u{0b}error\u{0c}", Dialect::Otel), Some(17));
+    assert_eq!(reading_text("\u{a0}error", Dialect::Otel), None);
+    assert_eq!(reading_text("error\u{2003}", Dialect::Otel), None);
+}
+
+/// The JSON shapes: a string reads as text, an INTEGER as a number, and
+/// everything else — including a fractional number, which names no rung —
+/// has no reading.
+#[test]
+fn reading_over_json_shapes() {
+    assert_eq!(reading(&json!("error"), Dialect::Otel), Some(17));
+    assert_eq!(reading(&json!(17), Dialect::Otel), Some(17));
+    assert_eq!(reading(&json!("17"), Dialect::Otel), Some(17));
+    assert_eq!(reading(&json!(3), Dialect::Syslog), Some(17));
+    assert_eq!(reading(&json!("3"), Dialect::Syslog), Some(17));
+    // 17.0 is a JSON float: `as_i64` declines it, so it names no rung.
+    assert_eq!(reading(&json!(17.0), Dialect::Otel), None);
+    assert_eq!(reading(&json!(1.5), Dialect::Otel), None);
+    assert_eq!(reading(&json!(true), Dialect::Otel), None);
+    assert_eq!(reading(&json!(null), Dialect::Otel), None);
+    assert_eq!(reading(&json!([17]), Dialect::Otel), None);
+    assert_eq!(reading(&json!({"n": 17}), Dialect::Otel), None);
+}
+
+/// The numeric half is the ONE place a dialect changes anything.
+#[test]
+fn reading_number_per_dialect() {
+    for n in 1..=24i64 {
+        assert_eq!(reading_number(n, Dialect::Otel), u8::try_from(n).ok());
+    }
+    assert_eq!(reading_number(0, Dialect::Otel), None);
+    assert_eq!(reading_number(25, Dialect::Otel), None);
+    assert_eq!(reading_number(i64::MAX, Dialect::Otel), None);
+    assert_eq!(reading_number(i64::MIN, Dialect::Otel), None);
+    for n in 0..=7i64 {
+        assert_eq!(
+            reading_number(n, Dialect::Syslog),
+            from_syslog(u8::try_from(n).unwrap())
+        );
+    }
+    assert_eq!(reading_number(8, Dialect::Syslog), None);
+    assert_eq!(reading_number(-1, Dialect::Syslog), None);
+    assert_eq!(reading_number(i64::MAX, Dialect::Syslog), None);
+}
+
+/// The dialect vocabulary is closed, ASCII-case-insensitive, and its
+/// tokens round-trip — the same set the DSL's `sev()` second argument and
+/// the ingest config accept.
+#[test]
+fn dialect_tokens_round_trip() {
+    assert_eq!(Dialect::from_token("otel"), Some(Dialect::Otel));
+    assert_eq!(Dialect::from_token("OTEL"), Some(Dialect::Otel));
+    assert_eq!(Dialect::from_token("Syslog"), Some(Dialect::Syslog));
+    assert_eq!(Dialect::from_token("rfc5424"), None);
+    assert_eq!(Dialect::from_token(""), None);
+    assert_eq!(Dialect::from_token(" otel"), None);
+    for token in DIALECT_TOKENS {
+        let dialect = Dialect::from_token(token).expect("vocabulary parses");
+        assert_eq!(dialect.token(), *token);
+    }
+    assert_eq!(Dialect::default(), Dialect::Otel);
+}
+
+/// The table the SQL mirror generates its arms from is the table this
+/// module matches against — exposed read-only, in table order.
+#[test]
+fn token_entries_expose_the_table() {
+    let entries: Vec<(&str, u8)> = token_entries().collect();
+    assert_eq!(entries.len(), 20);
+    assert_eq!(entries[0], ("trace", 1));
+    for (token, number) in entries {
+        assert_eq!(number_for_token(token), Some(number));
+    }
+}
