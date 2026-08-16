@@ -13,6 +13,9 @@
 //! [`crate::schema`] and [`crate::pin_scope`], and not inside any one
 //! lane's emitter.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use crate::ast::{AggExpr, Expr, PipeStage, Spanned};
 use crate::parser::suggest::quote_dsl_field;
 use crate::schema::catalog_key;
@@ -193,12 +196,17 @@ fn check_frequency(keyword: &str, field: &str, by: &[String]) -> Result<(), Stri
 
 /// The one duplicate scan: static outputs first, then one output per
 /// aggregate, in projection order.
+///
+/// Names are folded into a hash map keyed on [`catalog_key`], not scanned
+/// linearly: this runs for EVERY stage of every validated, emitted and
+/// streamed query, and a query is allowed thousands of group keys — a
+/// pairwise scan would be quadratic in request-controlled input.
 fn check_outputs(
     keyword: &str,
     statics: &[Output],
     aggregations: &[AggExpr],
 ) -> Result<(), String> {
-    let mut seen: Vec<(&Output, Option<&AggExpr>)> = Vec::new();
+    let mut seen: HashMap<&str, (&Output, Option<&AggExpr>)> = HashMap::new();
     let agg_outputs: Vec<Output> = aggregations
         .iter()
         .map(|agg| Output::new(&agg_output_name(agg), Producer::Aggregate))
@@ -212,10 +220,15 @@ fn check_outputs(
     );
 
     for (output, agg) in all {
-        if let Some((first, first_agg)) = seen.iter().find(|(prev, _)| prev.key == output.key) {
-            return Err(collision_message(keyword, first, *first_agg, output, agg));
+        match seen.entry(output.key.as_str()) {
+            Entry::Occupied(first) => {
+                let (first, first_agg) = *first.get();
+                return Err(collision_message(keyword, first, first_agg, output, agg));
+            }
+            Entry::Vacant(slot) => {
+                slot.insert((output, agg));
+            }
         }
-        seen.push((output, agg));
     }
     Ok(())
 }
@@ -384,6 +397,19 @@ mod tests {
     fn pivot_checks_by_keys_only() {
         assert!(check_projection(&stage("* | pivot count() on status by status")).is_ok());
         assert!(check_projection(&stage("* | pivot count() on status")).is_ok());
+    }
+
+    /// The check is keyed, not pairwise: a stage with thousands of group
+    /// keys is linear work, and the collision is still found.
+    #[test]
+    fn a_very_wide_stage_is_checked_in_linear_time() {
+        let keys: Vec<String> = (0..8000).map(|i| format!("k{i}")).collect();
+        let wide = format!("* | stats count() as c by {}", keys.join(", "));
+        assert!(check_projection(&stage(&wide)).is_ok());
+
+        let dup = format!("* | stats count() as c by {}, K0", keys.join(", "));
+        let msg = check_projection(&stage(&dup)).expect_err("the duplicate must be refused");
+        assert!(msg.contains("name it once"), "{msg}");
     }
 
     fn stage(dsl: &str) -> PipeStage {
