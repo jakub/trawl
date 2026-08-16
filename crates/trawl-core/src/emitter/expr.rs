@@ -41,81 +41,7 @@ pub(crate) fn emit_expr(
             Ok(emit_unary(*op, &inner))
         }
         Expr::FunctionCall { name, args } => {
-            let lit_positions = literal_int_positions(name);
-            let unit_positions = unit_literal_positions(name);
-            let text_positions = literal_text_positions(name);
-            let json_positions = json_read_positions(name);
-            let fmt_position = format_literal_position(name);
-            if !lit_positions.is_empty() || !unit_positions.is_empty() {
-                // Arity BEFORE vocabulary: a call carrying an argument the
-                // function does not have must say so, rather than
-                // complaining about a literal at a position that is not a
-                // literal position at all. Scoped to the functions with
-                // literal positions because only they inspect an argument
-                // before `translate_function`'s own arity guard runs — and
-                // for those the table's message is the guard's, word for
-                // word.
-                validate_function_arity(name, args.len())?;
-            }
-            let translated_args: Vec<String> = args
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    if lit_positions.contains(&i) {
-                        // DuckDB requires certain args as literal ints, not parameters
-                        match &a.node {
-                            Expr::Literal(LiteralValue::Int(n)) => Ok(n.to_string()),
-                            _ => Err(EmitError::InvalidAggregation {
-                                message: format!(
-                                    "{name}() argument {} must be an integer literal",
-                                    i + 1,
-                                ),
-                            }),
-                        }
-                    } else if let Some((_, allowlist)) =
-                        unit_positions.iter().find(|(pos, _)| *pos == i)
-                    {
-                        // Date/time unit args must be string literals from the allowlist.
-                        let raw = match &a.node {
-                            Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
-                            _ => None,
-                        };
-                        validate_unit_literal(name, i, allowlist, raw)?;
-                        if text_positions.contains(&i) {
-                            // The token CHOOSES the emitted expression
-                            // (`sev()`'s dialect), so it is never a bound
-                            // parameter: `translate_function` has to read
-                            // it. Folded here, once, so both the SQL and
-                            // the eval lane see one spelling.
-                            Ok(raw
-                                .expect("a non-literal was refused above")
-                                .to_ascii_lowercase())
-                        } else {
-                            emit_expr(a, state)
-                        }
-                    } else if json_positions.contains(&i)
-                        && let Some(literal) = bare_literal(&a.node)
-                    {
-                        // Read through `to_json` (`sev()`'s subject): a
-                        // bare parameter has no type for `DuckDB` to
-                        // infer there, so a literal carries the type it
-                        // binds as anyway.
-                        Ok(typed_literal(&literal, state))
-                    } else {
-                        if fmt_position == Some(i) {
-                            // strftime/strptime format arg: reject invalid format
-                            // codes at emit time when it is a string literal, so
-                            // batch and streaming fail identically. A non-literal
-                            // (field ref) can't be checked here and keeps its
-                            // pre-existing runtime behaviour.
-                            if let Expr::Literal(LiteralValue::String(s)) = &a.node {
-                                validate_format_literal(name, s)?;
-                            }
-                        }
-                        emit_expr(a, state)
-                    }
-                })
-                .collect::<Result<_, _>>()?;
+            let translated_args = emit_call_args(name, args, state)?;
             translate_function(name, &translated_args)
         }
         Expr::InList { expr: target, list } => {
@@ -133,6 +59,94 @@ pub(crate) fn emit_expr(
             Ok(format!("({lhs} IN ({}))", items.join(", ")))
         }
     }
+}
+
+/// Translate one call's ARGUMENTS, applying every per-position rule the
+/// function declares — literal ints, closed-vocabulary literals, format
+/// strings, and the literals read through `to_json`.
+///
+/// Shared by the expression arm above and by every AGGREGATION-position
+/// call site (`emitter::pipeline`'s `stats`/`timechart`/`pivot`/
+/// `eventstats`): those emitted their arguments with a bare `emit_expr`,
+/// so `stats sev(level, "syslog")` bound the dialect as a parameter and
+/// then failed on the literal `?` it handed the translation. One
+/// argument walk, every position a call can sit in.
+pub(crate) fn emit_call_args(
+    name: &str,
+    args: &[Spanned<Expr>],
+    state: &mut EmitterState,
+) -> Result<Vec<String>, EmitError> {
+    let lit_positions = literal_int_positions(name);
+    let unit_positions = unit_literal_positions(name);
+    let text_positions = literal_text_positions(name);
+    let json_positions = json_read_positions(name);
+    let fmt_position = format_literal_position(name);
+    if !lit_positions.is_empty() || !unit_positions.is_empty() {
+        // Arity BEFORE vocabulary: a call carrying an argument the
+        // function does not have must say so, rather than
+        // complaining about a literal at a position that is not a
+        // literal position at all. Scoped to the functions with
+        // literal positions because only they inspect an argument
+        // before `translate_function`'s own arity guard runs — and
+        // for those the table's message is the guard's, word for
+        // word.
+        validate_function_arity(name, args.len())?;
+    }
+    let translated_args: Vec<String> = args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if lit_positions.contains(&i) {
+                // DuckDB requires certain args as literal ints, not parameters
+                match &a.node {
+                    Expr::Literal(LiteralValue::Int(n)) => Ok(n.to_string()),
+                    _ => Err(EmitError::InvalidAggregation {
+                        message: format!("{name}() argument {} must be an integer literal", i + 1),
+                    }),
+                }
+            } else if let Some((_, allowlist)) = unit_positions.iter().find(|(pos, _)| *pos == i) {
+                // Date/time unit args must be string literals from the allowlist.
+                let raw = match &a.node {
+                    Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
+                    _ => None,
+                };
+                validate_unit_literal(name, i, allowlist, raw)?;
+                if text_positions.contains(&i) {
+                    // The token CHOOSES the emitted expression
+                    // (`sev()`'s dialect), so it is never a bound
+                    // parameter: `translate_function` has to read
+                    // it. Folded here, once, so both the SQL and
+                    // the eval lane see one spelling.
+                    Ok(raw
+                        .expect("a non-literal was refused above")
+                        .to_ascii_lowercase())
+                } else {
+                    emit_expr(a, state)
+                }
+            } else if json_positions.contains(&i)
+                && let Some(literal) = bare_literal(&a.node)
+            {
+                // Read through `to_json` (`sev()`'s subject): a
+                // bare parameter has no type for `DuckDB` to
+                // infer there, so a literal carries the type it
+                // binds as anyway.
+                Ok(typed_literal(&literal, state))
+            } else {
+                if fmt_position == Some(i) {
+                    // strftime/strptime format arg: reject invalid format
+                    // codes at emit time when it is a string literal, so
+                    // batch and streaming fail identically. A non-literal
+                    // (field ref) can't be checked here and keeps its
+                    // pre-existing runtime behaviour.
+                    if let Expr::Literal(LiteralValue::String(s)) = &a.node {
+                        validate_format_literal(name, s)?;
+                    }
+                }
+                emit_expr(a, state)
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(translated_args)
 }
 
 /// Map a comparison [`BinaryOp`] onto the search stage's [`FilterOp`]
