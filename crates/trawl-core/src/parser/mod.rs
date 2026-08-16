@@ -97,6 +97,50 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     }
 }
 
+/// Whether a backtick preceded by `prev` sits where a quoted field name
+/// could START: the beginning of the input, after whitespace, or after one
+/// of the bytes a name may follow directly — `(` and `,` (argument and
+/// field lists), `|` (a stage boundary), `!` and the comparison bytes (a
+/// filter or expression operator). A backtick anywhere else is inside some
+/// other token, exactly as the search grammar reads a mid-word one as
+/// ordinary text.
+fn opens_quoted_name(prev: Option<u8>) -> bool {
+    match prev {
+        None => true,
+        Some(b) => {
+            b.is_ascii_whitespace() || matches!(b, b'(' | b',' | b'|' | b'!' | b'=' | b'<' | b'>')
+        }
+    }
+}
+
+/// Byte index of the backtick CLOSING a quoted name opened at `open`, or
+/// `None` when the region would not lex as one.
+///
+/// Mirrors [`primitives::quoted_name`]'s two refusals — an empty name and
+/// a character that cannot render as itself
+/// ([`crate::sanitize::is_unsafe_display_char`], which covers the newline
+/// like any other control) — plus the doubled backtick that escapes one.
+fn quoted_name_end(input: &str, open: usize) -> Option<usize> {
+    let rest = &input[open + 1..];
+    let mut chars = rest.char_indices();
+    let mut has_content = false;
+    while let Some((off, c)) = chars.next() {
+        if c == '`' {
+            if rest[off + 1..].starts_with('`') {
+                chars.next();
+                has_content = true;
+                continue;
+            }
+            return has_content.then_some(open + 1 + off);
+        }
+        if crate::sanitize::is_unsafe_display_char(c) {
+            return None;
+        }
+        has_content = true;
+    }
+    None
+}
+
 /// Replace `//` and `#` comments with spaces, preserving byte positions.
 ///
 /// Handles `//` (line comment) and `#` (line comment) outside of quoted
@@ -106,10 +150,20 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 /// Backtick-quoted field names are tracked beside double-quoted strings,
 /// so `` `a#b` `` is a name and not a comment (ADR-0013 ruling 7).
 ///
-/// An UNPAIRED backtick opens nothing: a backtick with no later backtick
-/// in the input is an ordinary character, so a stray one (in a regex
-/// literal, say) cannot swallow every following comment and smuggle its
-/// words in as extra AND-ed search terms.
+/// A backtick opens a name only where one could actually START — at the
+/// beginning of the input, after whitespace, or after `(`, `,`, `|` or a
+/// filter operator's own bytes — and only when what follows would really
+/// lex as [`primitives::quoted_name`]: non-empty, closed, and free of the
+/// characters that production refuses (controls, a newline included, plus
+/// the bidi and zero-width formats). A stray backtick inside a VALUE — a
+/// regex literal (`` message=/a`b/ ``) or a glob (`` cmd=*`* ``) — fails
+/// both tests even when a later, legitimate backtick exists, so it cannot
+/// run a pseudo-name across the following comment and smuggle its words in
+/// as extra AND-ed search terms.
+///
+/// Residual, since this is a scan and not the grammar: a stray backtick
+/// that DOES sit at a token start and finds a partner on the same line
+/// still shields whatever lies between them.
 ///
 /// Known limitation: `#` inside regex literals (`/pattern#here/`) will be
 /// treated as a comment start. Use `//` comments on lines containing regex
@@ -120,7 +174,6 @@ fn strip_comments(input: &str) -> String {
     let len = bytes.len();
     let mut i = 0;
     let mut in_string = false;
-    let mut in_backtick = false;
 
     while i < len {
         if in_string {
@@ -133,22 +186,18 @@ fn strip_comments(input: &str) -> String {
             } else {
                 i += 1;
             }
-        } else if in_backtick {
-            // A doubled backtick escapes one; toggling twice lands back
-            // inside the name, so no special case is needed here.
-            if bytes[i] == b'`' {
-                in_backtick = false;
-            }
-            i += 1;
         } else if bytes[i] == b'"' {
             in_string = true;
             i += 1;
         } else if bytes[i] == b'`' {
-            // Only a backtick that CLOSES quotes anything; an unpaired one
-            // is an ordinary character. The scan below is amortized O(n):
-            // failing it proves no backtick remains, so it never runs again.
-            in_backtick = bytes[i + 1..].contains(&b'`');
-            i += 1;
+            // Only a region that would really lex as a name quotes
+            // anything; anything else is an ordinary character. The scan
+            // stops at the first backtick or refused character, so the
+            // whole pass stays linear.
+            match quoted_name_end(input, i) {
+                Some(end) if opens_quoted_name(i.checked_sub(1).map(|p| bytes[p])) => i = end + 1,
+                _ => i += 1,
+            }
         } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
             // // comment — blank to end of line
             while i < len && bytes[i] != b'\n' {
@@ -729,15 +778,33 @@ mod tests {
         }
     }
 
-    /// An unpaired backtick — a regex literal carrying one, say — must not
-    /// protect every later comment: the comment would parse as extra
-    /// AND-ed text-search terms and silently narrow the match set.
+    /// A stray backtick inside a VALUE — a regex literal or a glob — must
+    /// not protect a later comment: the comment would parse as extra
+    /// AND-ed text-search terms and silently narrow the match set. That
+    /// holds whether or not a partner backtick appears later on: the stray
+    /// one is not at a name's start, and the region it would open carries
+    /// characters `quoted_name` refuses.
     #[test]
-    fn unpaired_backtick_does_not_shield_later_comments() {
+    fn stray_backtick_does_not_shield_later_comments() {
         let input = "message=/back`tick/ # comment";
         assert_eq!(strip_comments(input), "message=/back`tick/          ");
         let query = parse(input).expect("parses");
         assert_eq!(query.search.groups[0].len(), 1);
+
+        // …and with a legitimate backticked name AFTER the comment, whose
+        // presence used to open a pseudo-name across it.
+        for input in [
+            "message=/a`b/ # secret note\n`req id`=1",
+            "message=/a`b/ // secret note\n`req id`=1",
+            "cmd=*`* # secret note\n`req id`=1",
+        ] {
+            let query = parse(input).unwrap_or_else(|e| panic!("{input:?} parses: {e:?}"));
+            assert_eq!(
+                query.search.groups[0].len(),
+                2,
+                "{input:?}: only the two filters, never the comment's words"
+            );
+        }
     }
 
     /// A LEADING backtick that fails the quoted production is a loud

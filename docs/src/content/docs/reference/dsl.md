@@ -328,10 +328,13 @@ tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`,
 fields — ``| where `true` == 1`` filters on the column named `true`,
 while `| where true == 1` compares the boolean.
 
-A `#` or `//` inside backticks is part of the name, not a comment. (An
-unbalanced backtick elsewhere in a query has the same shape of
-consequence as a `#` inside a regex literal: it can hide a later comment
-from the stripper.)
+A `#` or `//` inside backticks is part of the name, not a comment. The
+comment stripper opens a name only where one could start and only when
+the region would really lex as one, so a backtick inside a value — a
+regex literal or a glob — hides nothing. (A stray backtick that does sit
+at a token start and finds a partner on the same line still has the same
+shape of consequence as a `#` inside a regex literal: it can hide a later
+comment from the stripper.)
 
 ### Severity: `_severity`
 
