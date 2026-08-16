@@ -491,6 +491,31 @@ fn pivot_on_service() {
     assert!(result.columns.len() >= 4); // at least nginx, sshd, systemd, kernel
 }
 
+/// The PIVOT lane INLINES every parameter (`DuckDB` cannot parameterize
+/// a PIVOT), and `sev()` is the first emitter-authored SQL carrying a `?`
+/// inside a string literal — its digits guard, `'[+-]?[0-9]+'`. A naive
+/// scan spliced the next user literal into the middle of that regex and
+/// shifted every later parameter by one; this runs the whole shape
+/// end to end, so the SQL has to actually parse and answer.
+#[test]
+fn pivot_over_sev_keeps_the_digits_guard_intact() {
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max(
+            r#"service=nginx | let s = sev(severity_text)                | where message == "GET /missing 404 0.001s not found"                | pivot count() on s"#,
+            &glob,
+        )
+        .expect("pivot over sev() must emit parseable SQL");
+    assert_eq!(result.row_count(), 1);
+    // Exactly ONE nginx row carries that message and it is a `warn`, so
+    // the pivot has exactly one dynamic column: the ladder NUMBER, which
+    // is what the column holds. A parameter spliced into the regex — or
+    // shifted past it — would either fail to parse or let the other
+    // severities through as extra columns.
+    let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["13"], "unexpected pivot columns");
+}
+
 // -- JSON source tests (validates read_json_auto pipeline) --
 
 fn setup_json() -> (Executor, String) {

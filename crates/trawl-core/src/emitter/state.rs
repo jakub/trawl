@@ -680,11 +680,54 @@ impl EmitterState {
     /// Replace `?` placeholders starting from `start_idx` in the params slice.
     /// Returns the inlined SQL and the next param index (for chaining across
     /// multiple SQL fragments).
+    ///
+    /// The scan is QUOTE-AWARE, and has to be: a `?` inside a SQL string
+    /// literal or a quoted identifier is DATA, not a placeholder. The
+    /// emitter now authors both — `sev()`'s digits guard carries the
+    /// regex `'[+-]?[0-9]+'`, and a field name is a client-chosen key —
+    /// so a naive scan spliced the next user literal into the middle of
+    /// the regex (`'[+-]'m1'[0-9]+'`, a parser error) and shifted every
+    /// later parameter by one. Doubled quotes (`''`, `""`) are escapes
+    /// INSIDE their literal, never a close; `DuckDB` has no backslash
+    /// escape in either form, so there is nothing else to track.
     fn inline_params_counted(sql: &str, params: &[SqlValue], start_idx: usize) -> (String, usize) {
+        /// Which quoted region the scan is inside.
+        #[derive(PartialEq, Eq, Clone, Copy)]
+        enum Quoted {
+            No,
+            /// `'…'` — a string literal.
+            String,
+            /// `"…"` — a quoted identifier.
+            Ident,
+        }
+
         let mut result = String::with_capacity(sql.len());
         let mut param_idx = start_idx;
-        for ch in sql.chars() {
-            if ch == '?' && param_idx < params.len() {
+        let mut quoted = Quoted::No;
+        let mut chars = sql.chars().peekable();
+        while let Some(ch) = chars.next() {
+            let delimiter = match ch {
+                '\'' => Some(Quoted::String),
+                '"' => Some(Quoted::Ident),
+                _ => None,
+            };
+            if let Some(kind) = delimiter {
+                if quoted == kind && chars.peek() == Some(&ch) {
+                    // A doubled delimiter is one escaped character.
+                    result.push(ch);
+                    result.push(ch);
+                    chars.next();
+                    continue;
+                }
+                if quoted == Quoted::No {
+                    quoted = kind;
+                } else if quoted == kind {
+                    quoted = Quoted::No;
+                }
+                result.push(ch);
+                continue;
+            }
+            if quoted == Quoted::No && ch == '?' && param_idx < params.len() {
                 match &params[param_idx] {
                     SqlValue::String(s) => {
                         result.push('\'');
@@ -721,5 +764,60 @@ impl EmitterState {
     /// column set (table/fields, stats, top, rare, timechart, pivot).
     pub(crate) fn needs_column_reorder(&self) -> bool {
         !self.had_explicit_columns
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The inlining scan is quote-aware: a `?` inside a string literal or
+    /// a quoted identifier is DATA. `sev()`'s digits guard put the first
+    /// one in emitter-authored SQL, and the naive scan spliced the next
+    /// user literal into the middle of it — a parser error, and every
+    /// later parameter shifted by one.
+    #[test]
+    fn inlining_skips_placeholders_inside_quoted_regions() {
+        let sql =
+            "SELECT regexp_full_match(x, '[+-]?[0-9]+'), \"a?b\" FROM t WHERE m = ? AND n = ?";
+        let (inlined, used) = EmitterState::inline_params_counted(
+            sql,
+            &[SqlValue::String("m1".into()), SqlValue::Int(7)],
+            0,
+        );
+        assert_eq!(
+            inlined,
+            "SELECT regexp_full_match(x, '[+-]?[0-9]+'), \"a?b\" \
+             FROM t WHERE m = 'm1' AND n = 7"
+        );
+        assert_eq!(used, 2, "only the two real placeholders were consumed");
+    }
+
+    /// A doubled quote is an ESCAPE inside its own literal, never a
+    /// close: `'it''s ?'` stays one literal, and the `?` after it is the
+    /// placeholder.
+    #[test]
+    fn inlining_treats_doubled_quotes_as_escapes() {
+        let (inlined, used) = EmitterState::inline_params_counted(
+            "SELECT 'it''s ?', \"q\"\"?\", ? FROM t",
+            &[SqlValue::String("v".into())],
+            0,
+        );
+        assert_eq!(inlined, "SELECT 'it''s ?', \"q\"\"?\", 'v' FROM t");
+        assert_eq!(used, 1);
+    }
+
+    /// Chaining across fragments keeps the index, and a fragment whose
+    /// only `?` is quoted consumes nothing.
+    #[test]
+    fn inlining_chains_the_parameter_index_across_fragments() {
+        let params = [SqlValue::String("a".into()), SqlValue::Bool(true)];
+        let (first, used) = EmitterState::inline_params_counted("WHERE x = ?", &params, 0);
+        assert_eq!(first, "WHERE x = 'a'");
+        let (second, used) = EmitterState::inline_params_counted("AND r LIKE '%?%'", &params, used);
+        assert_eq!(second, "AND r LIKE '%?%'");
+        let (third, used) = EmitterState::inline_params_counted("AND b = ?", &params, used);
+        assert_eq!(third, "AND b = TRUE");
+        assert_eq!(used, 2);
     }
 }
