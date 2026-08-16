@@ -202,7 +202,13 @@ fn format_filter(f: &Filter) -> String {
     };
     // Quote the value so spaces / special chars don't break the DSL.
     let quoted = format!("\"{}\"", f.value.replace('\\', "\\\\").replace('"', "\\\""));
-    format!("{}{}{}", f.field, op, quoted)
+    // The FIELD is quoted by its own rule (`quote_dsl_name`) — a facet
+    // name carrying a space is a valid column and must produce a valid
+    // clause. A name the grammar cannot express falls back to its raw
+    // spelling: the clause is then no worse than it was, and the caller
+    // sees a parse error rather than a silently different query.
+    let field = trawl_core::parser::quote_dsl_name(&f.field).unwrap_or_else(|| f.field.clone());
+    format!("{field}{op}{quoted}")
 }
 
 fn format_absolute_range(from: &str, to: &str) -> String {
@@ -245,6 +251,17 @@ mod tests {
             value: value.into(),
             op: FilterOp::Exclude,
         }
+    }
+
+    /// A facet name carrying a space is a valid column, so the clause it
+    /// synthesises has to be valid DSL — through `trawl_core`'s one
+    /// renderer, never a hand-rolled wrap here.
+    #[test]
+    fn a_facet_field_that_needs_quoting_gets_it() {
+        assert_eq!(format_filter(&inc("request id", "7")), "`request id`=\"7\"");
+        assert_eq!(format_filter(&inc("host", "web-01")), "host=\"web-01\"");
+        // …and the rendered clause parses
+        assert!(trawl_core::parser::parse(&format_filter(&exc("request id", "7"))).is_ok());
     }
 
     #[test]

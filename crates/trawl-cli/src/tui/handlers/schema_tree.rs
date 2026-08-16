@@ -284,7 +284,13 @@ impl App {
                 }
             }
             "common_field" | "service_field" => {
-                self.tab.editor.insert_text(&name);
+                // Through the ONE renderer: a name needing backticks must
+                // land in the editor as valid DSL, and one the grammar
+                // cannot express is not offered at all.
+                let Some(rendered) = trawl_core::parser::quote_dsl_name(&name) else {
+                    return;
+                };
+                self.tab.editor.insert_text(&rendered);
                 self.switch_to_main_tab(MainTab::Query);
                 self.focus = Focus::Editor;
             }

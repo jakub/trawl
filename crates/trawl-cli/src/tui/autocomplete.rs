@@ -98,9 +98,26 @@ pub fn complete(
         return None;
     }
 
+    // Matching is against the name the SCHEMA carries, so an opening tick
+    // the user typed is not part of what they are searching for. A tick
+    // only ever opens a field name, so anywhere else it is not a prefix
+    // at all.
+    let match_prefix = match prefix.strip_prefix('`') {
+        Some(rest) => {
+            if !matches!(context, CompletionContext::FieldName { .. }) {
+                return None;
+            }
+            rest
+        }
+        None => prefix.as_str(),
+    };
+    if match_prefix.is_empty() && prefix.len() > 1 {
+        return None;
+    }
+
     let candidates = candidates_for(&context, schema_fields);
-    let candidate = prefix_match(prefix, &candidates)?;
-    Some(build_completion(&candidate, prefix.len()))
+    let candidate = prefix_match(match_prefix, &candidates)?;
+    build_completion(&candidate, prefix)
 }
 
 // ── Context detection ───────────────────────────────────────────────
@@ -114,8 +131,9 @@ pub fn detect_context(text: &str, cursor_byte: usize) -> CompletionContext {
         return CompletionContext::None;
     }
 
-    // Extract the word prefix at cursor (scan back for word chars).
-    let prefix = extract_prefix(before);
+    // Extract the word prefix at cursor: an open backtick region if the
+    // user started quoting a name, else the word-char scan.
+    let prefix = open_backtick_prefix(before).unwrap_or_else(|| extract_prefix(before));
     if prefix.is_empty() {
         return CompletionContext::None;
     }
@@ -307,45 +325,57 @@ fn prefix_match(prefix: &str, candidates: &[Candidate]) -> Option<Candidate> {
 // ── Completion building ─────────────────────────────────────────────
 
 /// Build the final `Completion` from a matched candidate.
-fn build_completion(candidate: &Candidate, prefix_len: usize) -> Completion {
+///
+/// A field is spliced through `trawl_core::parser::quote_dsl_name` — the
+/// ONE renderer — so a name needing backticks is offered as valid DSL
+/// rather than as text that will not parse. `None` when the grammar
+/// cannot express the name at all: offering a lossy spelling would insert
+/// a name that is not the field.
+fn build_completion(candidate: &Candidate, prefix: &str) -> Option<Completion> {
+    let prefix_len = prefix.len();
     if candidate.is_function {
         let suffix = &candidate.name[prefix_len..];
         if candidate.is_zero_arg {
             // count() / now() → cursor after closing paren.
-            Completion {
+            Some(Completion {
                 ghost_text: format!("{suffix}()"),
                 insert_text: format!("{}()", candidate.name),
                 replace_len: prefix_len,
                 cursor_offset: None, // end
-            }
+            })
         } else {
             // avg( → cursor between parens.
-            Completion {
+            Some(Completion {
                 ghost_text: format!("{suffix}()"),
                 insert_text: format!("{}()", candidate.name),
                 replace_len: prefix_len,
                 cursor_offset: Some(candidate.name.len() + 1), // between ( and )
-            }
+            })
         }
-    } else {
-        // Stage or field — trailing space for stages, bare name for fields.
+    } else if KNOWN_PIPE_STAGES.contains(&candidate.name.as_str()) {
         let suffix = &candidate.name[prefix_len..];
-        let is_stage = KNOWN_PIPE_STAGES.contains(&candidate.name.as_str());
-        if is_stage {
-            Completion {
-                ghost_text: format!("{suffix} "),
-                insert_text: format!("{} ", candidate.name),
-                replace_len: prefix_len,
-                cursor_offset: None,
-            }
-        } else {
-            Completion {
-                ghost_text: suffix.to_owned(),
-                insert_text: candidate.name.clone(),
-                replace_len: prefix_len,
-                cursor_offset: None,
-            }
-        }
+        Some(Completion {
+            ghost_text: format!("{suffix} "),
+            insert_text: format!("{} ", candidate.name),
+            replace_len: prefix_len,
+            cursor_offset: None,
+        })
+    } else {
+        let rendered = trawl_core::parser::quote_dsl_name(&candidate.name)?;
+        // The ghost is the part the user has NOT typed, which only exists
+        // when the rendering continues what they typed. A quoted name
+        // starts with a tick they may not have typed, and matching is
+        // case-insensitive, so both cases fall back to showing the whole
+        // rendering rather than slicing text that isn't there.
+        let ghost = rendered
+            .strip_prefix(prefix)
+            .map_or_else(|| rendered.clone(), ToOwned::to_owned);
+        Some(Completion {
+            ghost_text: ghost,
+            insert_text: rendered,
+            replace_len: prefix_len,
+            cursor_offset: None,
+        })
     }
 }
 
@@ -354,6 +384,31 @@ fn build_completion(candidate: &Candidate, prefix_len: usize) -> Completion {
 /// Whether a function takes zero arguments (cursor goes after `()`).
 fn is_zero_arg_function(name: &str) -> bool {
     matches!(name, "count" | "now")
+}
+
+/// The open backtick region at the end of `before`, the opening tick
+/// included, or `None` when no tick is unmatched.
+///
+/// A quoted field name may contain spaces and every other metacharacter,
+/// so once the user opens a tick the word-boundary scan below stops being
+/// the right boundary: the prefix runs from the tick to the cursor.
+/// Doubled ticks are data and do not close the region, matching
+/// `trawl_core`'s production.
+fn open_backtick_prefix(before: &str) -> Option<&str> {
+    let bytes = before.as_bytes();
+    let mut open: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            if open.is_some() && bytes.get(i + 1) == Some(&b'`') {
+                i += 2;
+                continue;
+            }
+            open = if open.is_some() { None } else { Some(i) };
+        }
+        i += 1;
+    }
+    open.map(|start| &before[start..])
 }
 
 /// Extract the word prefix immediately before the cursor.
@@ -503,7 +558,55 @@ mod tests {
                 name: "status".to_owned(),
                 is_numeric: true,
             },
+            // a real catalog name the bare grammar cannot spell
+            SchemaField {
+                name: "request id".to_owned(),
+                is_numeric: false,
+            },
         ]
+    }
+
+    // ── quoted-name completion (ADR-0013 ruling 7, AC8) ─────────────
+
+    /// A completion is DSL, so a name the bare grammar cannot spell is
+    /// offered backticked — through `trawl_core`'s one renderer, not a
+    /// hand-rolled wrap here.
+    #[test]
+    fn field_completion_quotes_a_name_that_needs_it() {
+        let text = "| table req";
+        let c = complete(text, text.len(), &fields()).expect("a completion");
+        assert_eq!(c.insert_text, "`request id`");
+        assert_eq!(c.replace_len, 3);
+        // the ghost cannot be a suffix of what was typed, so the whole
+        // rendering is shown rather than a slice of text that isn't there
+        assert_eq!(c.ghost_text, "`request id`");
+        // …and the result parses as that one field
+        let spliced = format!("{}{}", &text[..text.len() - c.replace_len], c.insert_text);
+        assert!(trawl_core::parser::parse(&spliced).is_ok(), "{spliced}");
+    }
+
+    /// Once the user opens a tick, the prefix runs from the tick to the
+    /// cursor — spaces included — and accepting replaces the tick too, so
+    /// the result is not double-wrapped.
+    #[test]
+    fn completing_inside_an_open_backtick_does_not_double_wrap() {
+        let text = "| table `request i";
+        let c = complete(text, text.len(), &fields()).expect("a completion");
+        assert_eq!(c.insert_text, "`request id`");
+        assert_eq!(c.replace_len, "`request i".len());
+        let spliced = format!("{}{}", &text[..text.len() - c.replace_len], c.insert_text);
+        assert_eq!(spliced, "| table `request id`");
+        assert!(trawl_core::parser::parse(&spliced).is_ok(), "{spliced}");
+    }
+
+    /// A name that needs no quoting keeps its bare spelling — quoting
+    /// everything would churn every existing suggestion.
+    #[test]
+    fn ordinary_field_completion_stays_bare() {
+        let text = "| table hostn";
+        let c = complete(text, text.len(), &fields()).expect("a completion");
+        assert_eq!(c.insert_text, "hostname");
+        assert_eq!(c.ghost_text, "ame");
     }
 
     // ── extract_prefix ──────────────────────────────────────────────

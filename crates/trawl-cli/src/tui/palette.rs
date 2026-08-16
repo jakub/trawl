@@ -288,12 +288,20 @@ pub fn build_service_column_items(schema: &SchemaBrowser, service_name: &str) ->
     };
     svc.columns
         .iter()
-        .map(|col| PaletteItem {
-            label: col.name.clone(),
-            detail: Some(col.data_type.clone()),
-            category: PaletteCategory::Service,
-            shortcut: None,
-            action: PaletteAction::InsertAtCursor(col.name.clone()),
+        // The action carries DSL, so it is rendered HERE, at construction
+        // — the splice site downstream stays dumb. A name the grammar
+        // cannot express gets no palette entry, since there is nothing
+        // honest to insert.
+        .filter_map(|col| {
+            Some(PaletteItem {
+                label: col.name.clone(),
+                detail: Some(col.data_type.clone()),
+                category: PaletteCategory::Service,
+                shortcut: None,
+                action: PaletteAction::InsertAtCursor(trawl_core::parser::quote_dsl_name(
+                    &col.name,
+                )?),
+            })
         })
         .collect()
 }

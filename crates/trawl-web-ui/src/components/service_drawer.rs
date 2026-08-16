@@ -472,10 +472,12 @@ fn FieldDetail(
     let svc_for_q = svc.clone();
     let field_for_q = field_name.clone();
     let top = LocalResource::new(move || {
+        // The field name is DSL, so it goes through the ONE renderer.
+        let field =
+            trawl_core::parser::quote_dsl_name(&field_for_q).unwrap_or_else(|| field_for_q.clone());
         let q = format!(
-            r#"service="{}" last=7d | top 10 {}"#,
+            r#"service="{}" last=7d | top 10 {field}"#,
             svc_for_q.replace('"', ""),
-            field_for_q
         );
         async move { api::query(&q, 0).await }
     });
@@ -657,7 +659,17 @@ fn cardinality_resource(
             if fields.is_empty() {
                 return Ok(HashMap::new());
             }
-            let dc_exprs: Vec<String> = fields.iter().map(|f| format!("dc({f}) as {f}")).collect();
+            // Two name positions per field — the aggregate argument and
+            // the `as` target — both rendered by the ONE helper. A name it
+            // refuses is dropped rather than breaking the whole stats
+            // stage for every other field.
+            let dc_exprs: Vec<String> = fields
+                .iter()
+                .filter_map(|f| {
+                    let name = trawl_core::parser::quote_dsl_name(f)?;
+                    Some(format!("dc({name}) as {name}"))
+                })
+                .collect();
             let q = format!(
                 r#"service="{}" last=7d | stats {}"#,
                 svc_name.replace('"', ""),

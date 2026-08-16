@@ -40,6 +40,16 @@ enum TokenType {
     Whitespace,
 }
 
+/// The name a field token refers to: delimiters stripped and doubled
+/// ticks collapsed, matching `trawl_core`'s quoted-name production. A
+/// bare token is already its own name.
+fn decode_field_token(token: &str) -> std::string::String {
+    match token.strip_prefix('`') {
+        Some(rest) => rest.strip_suffix('`').unwrap_or(rest).replace("``", "`"),
+        None => token.to_owned(),
+    }
+}
+
 /// Syntax highlighter for DSL queries.
 pub struct Highlighter<'a> {
     /// Known field names from schema (for validation).
@@ -80,7 +90,11 @@ impl<'a> Highlighter<'a> {
                         .fg(colors.logical)
                         .add_modifier(Modifier::BOLD),
                     TokenType::Field => {
-                        if self.fields.contains(&text) {
+                        // The schema carries DECODED names, so a quoted
+                        // token has to be decoded before it can match —
+                        // otherwise every backticked field, known or not,
+                        // renders as unknown. Display keeps the raw text.
+                        if self.fields.contains(&decode_field_token(&text)) {
                             Style::default().fg(colors.field_known)
                         } else {
                             Style::default().fg(colors.field_unknown)
@@ -396,5 +410,18 @@ mod tests {
     fn doubled_backticks_do_not_close_the_name() {
         let tokens = Highlighter::tokenize("`a``b`=1");
         assert_eq!(tokens[0], (TokenType::Field, "`a``b`".to_string()));
+    }
+
+    /// The schema carries DECODED names, so the known/unknown colour has
+    /// to compare decoded — otherwise every quoted field renders unknown,
+    /// which is exactly the wrong signal for a name the user quoted
+    /// BECAUSE it is unusual.
+    #[test]
+    fn a_quoted_known_field_decodes_for_the_lookup() {
+        assert_eq!(decode_field_token("`request id`"), "request id");
+        assert_eq!(decode_field_token("`a``b`"), "a`b");
+        assert_eq!(decode_field_token("host"), "host");
+        // an unterminated token still decodes to something matchable
+        assert_eq!(decode_field_token("`req"), "req");
     }
 }

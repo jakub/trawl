@@ -285,8 +285,14 @@ pub fn SchemaPage() -> impl IntoView {
         Callback::new(move |field: String| {
             // Wildcard match — `field=*` selects every event carrying
             // the field, which is what the user usually wants after
-            // drilling in from a schema view.
-            let q = format!("{field}=*");
+            // drilling in from a schema view. The name goes through the
+            // ONE renderer (`quote_dsl_name`): a catalog name needing
+            // backticks must reach the search box as valid DSL, and one
+            // the grammar cannot express gets no query at all.
+            let Some(rendered) = trawl_core::parser::quote_dsl_name(&field) else {
+                return;
+            };
+            let q = format!("{rendered}=*");
             goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
         })
     };
