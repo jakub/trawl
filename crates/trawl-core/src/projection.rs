@@ -290,10 +290,14 @@ fn stage_keyword(stage: &PipeStage) -> &'static str {
 /// Returns the FIRST pair of produced names equal after folding.
 pub fn check_projection_names(stage: &PipeStage) -> Result<(), Box<NameCollision>> {
     let produced = projected_names(stage);
-    let mut seen: Vec<(String, ProducedName)> = Vec::with_capacity(produced.len());
+    // Keyed on the folded name, retaining the FIRST producer for the
+    // message: a stage's produced set is request-controlled, so the scan
+    // may not be quadratic in it.
+    let mut seen: std::collections::HashMap<String, ProducedName> =
+        std::collections::HashMap::with_capacity(produced.len());
     for name in produced {
         let folded = catalog_key(&name.name);
-        if let Some((_, first)) = seen.iter().find(|(key, _)| *key == folded) {
+        if let Some(first) = seen.get(&folded) {
             return Err(Box::new(NameCollision {
                 stage: stage_keyword(stage),
                 folded,
@@ -301,7 +305,7 @@ pub fn check_projection_names(stage: &PipeStage) -> Result<(), Box<NameCollision
                 second: name,
             }));
         }
-        seen.push((folded, name));
+        seen.insert(folded, name);
     }
     Ok(())
 }

@@ -9,6 +9,7 @@
 mod context_query;
 mod drawer_query;
 mod facets;
+mod filter_codec;
 mod histogram;
 mod notice_key;
 mod offset;

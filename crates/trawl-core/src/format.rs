@@ -180,14 +180,18 @@ fn format_field_filter(ff: &FieldFilter, out: &mut String) {
 }
 
 /// Whether a filter value literal needs quoting in the formatted output.
+///
+/// The set is the exact complement of what
+/// [`crate::parser::primitives::bare_value`] accepts, plus `"` (which
+/// would end the quoted form). Anything that production refuses must come
+/// back quoted or `parse -> format -> parse` breaks on the second parse:
+/// that is how the backtick — which now ENDS a bare value — and the
+/// non-space whitespace bytes were both missing here.
 fn needs_quoting(s: &str) -> bool {
     s.is_empty()
-        || s.contains(' ')
-        || s.contains('|')
-        || s.contains('(')
-        || s.contains(')')
-        || s.contains(',')
         || s.contains('"')
+        || s.chars()
+            .any(|c| c.is_ascii_whitespace() || matches!(c, '|' | '(' | ')' | ',' | '`'))
 }
 
 fn format_filter_value(value: &FilterValue, op: FilterOp, out: &mut String) {
@@ -968,6 +972,36 @@ mod tests {
         assert!(first.contains("`request id`"), "{first}");
         assert!(first.contains("`mean ms`"), "{first}");
         assert_eq!(fmt(&first), first, "formatter is not idempotent");
+    }
+
+    /// A VALUE the bare grammar refuses must come back double-quoted, or
+    /// the second parse of `parse -> format -> parse` fails. The backtick
+    /// is the newest member of that set — it ENDS a bare value — and the
+    /// non-space whitespace bytes were always in it.
+    #[test]
+    fn values_the_bare_grammar_refuses_round_trip_quoted() {
+        for dsl in [
+            r#"host="a`b""#,
+            r#"host="a b""#,
+            "host=\"a\\tb\"",
+            r#"host="a,b""#,
+            r#"host="a|b""#,
+            r#"host="a(b)""#,
+            r#"host="""#,
+        ] {
+            let once = fmt(dsl);
+            let twice = fmt(&once);
+            assert_eq!(once, twice, "{dsl}: not idempotent");
+            let reparsed = crate::parser::parse(&once)
+                .unwrap_or_else(|e| panic!("{dsl} formatted as {once:?}: {e:?}"));
+            assert_eq!(
+                format_query(&reparsed),
+                once,
+                "{dsl}: format -> parse -> format must be stable"
+            );
+        }
+        // …and a value needing none of it stays bare.
+        assert_eq!(fmt("host=web-01"), "host=web-01");
     }
 
     /// Quote provenance is discarded by CONTENT (the ADR-0011 literal

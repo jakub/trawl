@@ -109,10 +109,13 @@ pub fn duplicate_target_message<'a>(
     targets: impl Iterator<Item = &'a str>,
     what: &str,
 ) -> Option<String> {
-    let mut seen: Vec<(String, &str)> = Vec::new();
+    // Keyed on the folded name, retaining the FIRST spelling so the
+    // message can still name both: the target list is request-controlled,
+    // so the scan may not be quadratic in it.
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
     for name in targets {
         let folded = catalog_key(name);
-        if let Some((_, first)) = seen.iter().find(|(key, _)| *key == folded) {
+        if let Some(first) = seen.get(&folded) {
             let both = if *first == name {
                 format!("`{name}` twice")
             } else {
@@ -122,7 +125,7 @@ pub fn duplicate_target_message<'a>(
                 "{what} writes {both} — give each target a name of its own"
             ));
         }
-        seen.push((folded, name));
+        seen.insert(folded, name);
     }
     None
 }

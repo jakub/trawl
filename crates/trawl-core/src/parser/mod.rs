@@ -203,10 +203,16 @@ fn strip_comments(input: &str) -> String {
 /// descending sort key. Anything else (a letter, a digit) means the tick
 /// is inside a value or a regex, where it is ordinary data.
 ///
-/// `/` is deliberately ABSENT: it opens a regex far more often than it
-/// divides, and a regex body is exactly the context this predicate exists
-/// to keep out. A quoted name divided into by a slash pays the
-/// unterminated-name error instead.
+/// `/` is admitted only where it DIVIDES. A DSL regex literal appears in
+/// exactly two syntactic places — a search-stage value after `=`, and the
+/// right side of a pattern operator — and neither can follow an OPERAND,
+/// while division always does. So a slash is a divisor when the byte
+/// before it ends an operand (an identifier byte, a closing paren, or a
+/// closing tick) AND the identifier run before it is not a pattern
+/// keyword, which is the one shape that puts a regex directly after
+/// identifier bytes (`a matches/re/`). Every other slash — after `=`,
+/// after whitespace, after `(` — opens a regex as far as this scanner is
+/// concerned, so a tick inside a regex body still shields nothing.
 ///
 /// Erring narrow is the safe direction: a name this declines is one whose
 /// comment markers stay unprotected, so it dies loudly at the grammar as an
@@ -215,11 +221,34 @@ fn can_start_field_name(bytes: &[u8], i: usize) -> bool {
     let Some(prev) = i.checked_sub(1).map(|p| bytes[p]) else {
         return true;
     };
+    if prev == b'/' {
+        return slash_divides(bytes, i - 1);
+    }
     prev.is_ascii_whitespace()
         || matches!(
             prev,
             b'(' | b',' | b'|' | b'-' | b'=' | b'<' | b'>' | b'!' | b'+' | b'*' | b'%'
         )
+}
+
+/// Whether the `/` at `i` is a division operator rather than the opening
+/// delimiter of a regex literal — see [`can_start_field_name`].
+fn slash_divides(bytes: &[u8], i: usize) -> bool {
+    let Some(before) = i.checked_sub(1).map(|p| bytes[p]) else {
+        return false;
+    };
+    // A regex never follows an operand; division always does.
+    if !(before.is_ascii_alphanumeric() || matches!(before, b'_' | b')' | b'`')) {
+        return false;
+    }
+    // …except after a pattern keyword, the one place a regex DOES follow
+    // identifier bytes with no space (`a matches/re/`).
+    let start = bytes[..i]
+        .iter()
+        .rposition(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+        .map_or(0, |p| p + 1);
+    let word = &bytes[start..i];
+    !matches!(word, b"matches" | b"like" | b"ilike")
 }
 
 /// Whether the backtick region opening at `i` closes before the next newline,
@@ -1368,6 +1397,34 @@ mod tests {
                 "{dsl}: {:?}",
                 field_positions(&query)
             );
+        }
+
+        // Division is an operator like any other, so a quoted name after
+        // it opens too — but only where the slash DIVIDES.
+        for (dsl, want) in [
+            ("* | let x = 1/`a#b`", "a#b"),
+            ("* | let x = (a)/`a#b`", "a#b"),
+            ("* | let x = 1 / `a#b`", "a#b"),
+        ] {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl} must parse: {e:?}"));
+            assert!(
+                field_positions(&query).iter().any(|n| n == want),
+                "{dsl}: {:?}",
+                field_positions(&query)
+            );
+        }
+
+        // …while a slash that OPENS A REGEX still shields nothing, so a
+        // tick inside the body leaves the comment strippable and the
+        // truncated regex dies loudly. Never silently something else.
+        for dsl in [
+            "host=/`a#b`/ # outside",
+            "* | where a matches /`re#x`/ # c",
+            // the one shape that puts a regex straight after identifier
+            // bytes — the pattern keyword guard, not the operand test
+            "* | where a matches/`re#x`/ # c",
+        ] {
+            assert!(parse(dsl).is_err(), "{dsl} must be a loud parse error");
         }
 
         // …and the regex case F1 fixed stays fixed: a tick inside a regex

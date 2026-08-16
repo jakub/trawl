@@ -78,7 +78,14 @@ pub fn build_search_url(
         let _ = write!(url, "&mode={m}");
     }
     if !filters.is_empty() {
-        let enc = encode_filters(filters);
+        // The OUTER layer: one percent-encode of the whole payload, which
+        // the router undoes exactly once before `decode_filters` sees it.
+        // Without it a `&` or a literal `+` in a component would end the
+        // parameter (or decode as a space) before the inner codec ever
+        // ran.
+        let enc = js_sys::encode_uri_component(&encode_filters(filters))
+            .as_string()
+            .unwrap_or_default();
         let _ = write!(url, "&f={enc}");
     }
     if *range != RangeSpec::default() {
@@ -88,70 +95,33 @@ pub fn build_search_url(
     url
 }
 
-/// One component of the filter parameter, percent-encoded.
+/// The `f=` payload, ready to be percent-encoded ONCE into the URL.
 ///
-/// `,` separates filters and `=` separates a field from its value, so both
-/// must survive as escapes; `encode_uri_component` escapes them and every
-/// other structural character, and the `,` replacement is belt-and-braces
-/// for engines that leave it bare.
-fn encode_component(text: &str) -> String {
-    js_sys::encode_uri_component(text)
-        .as_string()
-        .unwrap_or_default()
-        .replace(',', "%2C")
-}
-
-/// The inverse, non-explosively: a malformed escape decodes to itself
-/// rather than dropping the filter, which is how a URL written before
-/// field encoding — where a plain name has nothing to decode — still
-/// reads back unchanged.
-fn decode_component(raw: &str) -> String {
-    js_sys::decode_uri_component(raw)
-        .ok()
-        .and_then(|s| s.as_string())
-        .unwrap_or_else(|| raw.to_string())
-}
-
+/// Structure is escaped by [`crate::filter_codec`] in an alphabet
+/// percent-decoding does not touch, because the router hands this module
+/// back an already-decoded string — see that module for the pipeline.
 fn encode_filters(filters: &[Filter]) -> String {
-    let parts: Vec<String> = filters
-        .iter()
-        .map(|f| {
-            // The FIELD is encoded exactly as the value is. A catalog key
-            // is client-chosen and may contain any byte (ADR-0013 ruling
-            // 7 made every name spellable), so a raw one carrying `&` or
-            // `=` would end the parameter and inject its own — reload or
-            // back/forward would then execute a different state than the
-            // one the facet added.
-            let field = encode_component(&f.field);
-            let val = encode_component(&f.value);
-            format!("{}{}={}", f.op.prefix(), field, val)
-        })
-        .collect();
-    parts.join(",")
+    crate::filter_codec::encode_payload(
+        filters
+            .iter()
+            .map(|f| (f.op.prefix(), f.field.as_str(), f.value.as_str())),
+    )
 }
 
+/// Parse the payload `use_query_map` hands back — ALREADY percent-decoded
+/// by the browser, which is why the codec's escapes are not percent
+/// escapes.
 fn decode_filters(raw: &str) -> Vec<Filter> {
-    if raw.is_empty() {
-        return Vec::new();
-    }
-    raw.split(',')
-        .filter_map(|piece| {
-            let mut chars = piece.chars();
-            let op = match chars.next()? {
-                '+' => FilterOp::Include,
-                '-' => FilterOp::Exclude,
-                _ => return None,
-            };
-            let rest = chars.as_str();
-            // Unambiguous: an encoded field cannot contain a literal `=`,
-            // so the FIRST one is always the separator.
-            let eq = rest.find('=')?;
-            let field = decode_component(&rest[..eq]);
-            let value = decode_component(&rest[eq + 1..]);
-            if field.is_empty() {
-                return None;
-            }
-            Some(Filter { field, value, op })
+    crate::filter_codec::decode_payload(raw)
+        .into_iter()
+        .map(|(op, field, value)| Filter {
+            field,
+            value,
+            op: if op == '-' {
+                FilterOp::Exclude
+            } else {
+                FilterOp::Include
+            },
         })
         .collect()
 }
