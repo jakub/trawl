@@ -213,8 +213,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - **`eventstats` aliases now genuinely OVERWRITE (#78).** The stage emitted
   `SELECT *, … AS "x"`, so an alias equal to an input column produced two
-  columns of that name; it now uses the `let` lane's `COLUMNS(c -> c NOT
-  IN (…))` projection and replaces the column, which is what its
+  columns of that name; it now uses the `let` lane's folded
+  `COLUMNS(c -> translate(c,'A-Z','a-z') NOT IN (…))` projection and
+  replaces the column, which is what its
   documented let-like overwrite always claimed.
 - **Nested-argument aggregations name their output consistently (#78).**
   The output-name rule had four implementations; `avg(lower(dur))`

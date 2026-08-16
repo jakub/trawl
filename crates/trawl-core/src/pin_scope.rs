@@ -112,8 +112,8 @@ impl PinScope {
             PipeStage::Rename(r) => {
                 // Parallel, like `let`: every source resolves against the
                 // PRE-stage scope, because the SQL aliases every source
-                // off the pre-stage row (`* EXCLUDE (sources), src AS
-                // tgt, …`). In a chain (`rename a as b, b as c`) the row
+                // off the pre-stage row (`COLUMNS(c -> fold(c) NOT IN
+                // (sources, targets)), src AS tgt, …`). In a chain (`rename a as b, b as c`) the row
                 // gives `b` the original `a` and `c` the original `b`;
                 // resolving sequentially would instead hand `c` the
                 // original `a`'s pin and leave `b` unpinned.
@@ -296,8 +296,9 @@ mod tests {
 
     #[test]
     fn rename_chain_resolves_against_the_pre_stage_scope() {
-        // SQL: `* EXCLUDE (status, dur), status AS dur, dur AS d2` —
-        // `dur` is the original `status`, `d2` the original `dur`.
+        // SQL: `COLUMNS(c -> fold(c) NOT IN ('status','dur','d2')),
+        // status AS dur, dur AS d2` — `dur` is the original `status`,
+        // `d2` the original `dur`.
         let scope = walk("* | rename status as dur, dur as d2", ROOT);
         assert_eq!(scope.pin_for("dur"), Some(CT::Varchar));
         assert_eq!(scope.pin_for("d2"), Some(CT::BigInt));

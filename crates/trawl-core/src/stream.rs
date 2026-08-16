@@ -604,21 +604,22 @@ fn event_text(event: &Map<String, Value>, name: &str) -> String {
 
 /// Apply a `rename` stage in place, with the SQL's parallel semantics.
 ///
-/// The batch lane emits `* EXCLUDE (sources), src AS tgt, …`, so every
-/// target reads the PRE-stage row: `rename a as b, b as c` gives `b` the
+/// The batch lane emits one projection —
+/// `COLUMNS(c -> fold(c) NOT IN (sources, targets)), src AS tgt, …` — so
+/// every target reads the PRE-stage row: `rename a as b, b as c` gives `b` the
 /// original `a` and `c` the original `b`, never the just-renamed value.
 /// A source this event does not carry makes its target absent (the SQL
 /// column would be NULL) rather than leaving the target's own stale
 /// value behind — the same rule [`PinScope::advance`] applies to pins,
 /// so value and pin can never come from different columns.
 ///
-/// The TARGET is inserted verbatim and does NOT displace a folded twin,
-/// which is what the batch lane does too: `* EXCLUDE (sources)` drops the
-/// SOURCE only, so `rename a as B` over a row carrying `b` leaves both
-/// `b` and `B` in either lane. That differs from `let` (whose projection
-/// excludes by target) — checked against the emitted SQL rather than
-/// assumed, and left alone deliberately: making this lane fold here would
-/// be the divergence, not the fix.
+/// A projection write OWNS its folded name, exactly as `let` and
+/// `eventstats` do: the emitted exclusion covers the TARGETS as well as
+/// the sources, so `rename a as B` over a row that also carries `b`
+/// leaves ONE column in either lane. This lane drops the fold-twin
+/// ([`remove_folded_twins`]) before writing, which is the in-memory half
+/// of that same rule — leave the twin behind and a later `B` reads the
+/// stale column while the batch query reads the renamed one.
 ///
 /// Each source binds to the row's OWN spelling ([`bind_event_key`]), for
 /// the same reason [`PinScope::advance`] resolves its pin through
@@ -1809,8 +1810,9 @@ mod tests {
 
     #[test]
     fn rename_chain_reads_the_pre_stage_event() {
-        // SQL: `* EXCLUDE (a, b), a AS b, b AS c` — `b` takes the
-        // original `a`, `c` the original `b`, never the just-renamed one.
+        // SQL: `COLUMNS(c -> fold(c) NOT IN ('a','b','c')), a AS b, b AS c`
+        // — `b` takes the original `a`, `c` the original `b`, never the
+        // just-renamed one.
         let mut stage = compile_rename(&RenameStage {
             renames: vec![("a".into(), "b".into()), ("b".into(), "c".into())],
         });
