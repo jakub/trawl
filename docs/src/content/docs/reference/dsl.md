@@ -624,9 +624,13 @@ pivot avg(duration) on service by host
 Every aggregating stage projects a fixed set of columns: its group keys,
 `timechart`'s `_time` bucket, the `count` column `top`/`rare` mint, and
 one column per aggregate — named by its `as` alias, else `count`,
-`avg_duration`, `dc_host`. Two producers naming one column is refused
-before the query runs, in batch and in a live tail alike, with both
-producers named:
+`avg_duration`, `dc_host`. An un-aliased aggregate over a computed
+argument names its innermost field (`avg(tonumber(rssi) * -1)` →
+`avg_rssi`); the in-memory lanes — live tail, and the batch tail behind
+`extract kv` — refuse that argument outright, because their accumulators
+read a bare field out of the event rather than evaluating an expression.
+Two producers naming one column is refused before the query runs, in
+batch and in a live tail alike, with both producers named:
 
 ```
 | stats count() by count        # the group key `count` and the aggregate count()
