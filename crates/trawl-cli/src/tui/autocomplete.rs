@@ -389,43 +389,18 @@ fn is_zero_arg_function(name: &str) -> bool {
 }
 
 /// The open backtick region at the end of `before`, the opening tick
-/// included, or `None` when no tick is unmatched.
+/// included, or `None` when no name is open.
 ///
-/// A quoted field name may contain spaces and every other metacharacter,
-/// so once the user opens a tick the word-boundary scan below stops being
-/// the right boundary: the prefix runs from the tick to the cursor.
-/// Doubled ticks are data and do not close the region, matching
-/// `trawl_core`'s production.
+/// Asks `trawl_core`'s scanner walk rather than counting ticks: a
+/// backtick inside a CLOSED regex or a string is data, and the byte-level
+/// scan this replaced read one as an opener — which made the prefix
+/// garbage and killed completion for the rest of the line.
 fn open_backtick_prefix(before: &str) -> Option<&str> {
-    let bytes = before.as_bytes();
-    let mut open: Option<usize> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'`' {
-            if open.is_some() && bytes.get(i + 1) == Some(&b'`') {
-                i += 2;
-                continue;
-            }
-            // Only a tick where a NAME can start opens one. A tick inside
-            // a regex or a bare value is data (`host=/foo`bar/` is a legal
-            // filter), and treating it as an open quote would make the
-            // prefix garbage — and kill completion for everything typed
-            // after it on the line. Same predicate the parser's comment
-            // scanner uses, for the same reason.
-            // The ONE classifier `trawl_core` uses for the same question
-            // in the comment scanner — including its slash rule, so a
-            // completion after a DIVISION is not mistaken for one inside
-            // a regex body.
-            open = if open.is_none() && trawl_core::parser::quoted_name_can_start_after(&bytes[..i])
-            {
-                Some(i)
-            } else {
-                None
-            };
-        }
-        i += 1;
-    }
-    open.map(|start| &before[start..])
+    let start = trawl_core::parser::open_quoted_name_start(
+        before.as_bytes(),
+        trawl_core::parser::Input::Partial,
+    )?;
+    Some(&before[start..])
 }
 
 /// Extract the word prefix immediately before the cursor.
@@ -654,6 +629,21 @@ mod tests {
             Some("`request i")
         );
         assert_eq!(open_backtick_prefix("host=/re`quest i"), None);
+
+        // A backtick inside a CLOSED regex is data, so it opens no
+        // prefix and completion survives the rest of the line — the tick
+        // count this replaced saw an opener here.
+        assert_eq!(open_backtick_prefix("host=/a`b/ | table hos"), None);
+        let text = "host=/a`b/ | table hostn";
+        let c = complete(text, text.len(), &fields()).expect("a completion");
+        assert_eq!(c.insert_text, "hostname");
+
+        // …a genuinely open tick still prefixes, unicode included
+        assert_eq!(
+            open_backtick_prefix("host=/a`b/ | table `request i"),
+            Some("`request i")
+        );
+        assert_eq!(open_backtick_prefix("* | table `日本"), Some("`日本"));
     }
 
     /// A tick that is DATA — inside a regex or a bare value — must not be

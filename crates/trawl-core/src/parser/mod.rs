@@ -181,11 +181,29 @@ pub fn scan_state_at(prefix: &[u8], input: Input) -> ScanState {
     scan(prefix, &mut out, input)
 }
 
+/// Where the OPEN quoted name begins, if the cursor sits inside one.
+///
+/// Derived from the same walk, so a backtick inside a closed regex or a
+/// string is not an opener — the byte-level "is there an odd tick?" scan
+/// this replaced could not tell.
+#[must_use]
+pub fn open_quoted_name_start(prefix: &[u8], input: Input) -> Option<usize> {
+    let mut out = prefix.to_vec();
+    let (state, start) = scan_tracked(prefix, &mut out, input);
+    (state == ScanState::Backtick).then_some(start).flatten()
+}
+
 /// The one walk: blanks comments into `out` and returns the final state.
 fn scan(bytes: &[u8], out: &mut [u8], input: Input) -> ScanState {
+    scan_tracked(bytes, out, input).0
+}
+
+/// [`scan`], also reporting where the current `Backtick` region opened.
+fn scan_tracked(bytes: &[u8], out: &mut [u8], input: Input) -> (ScanState, Option<usize>) {
     let len = bytes.len();
     let mut i = 0;
     let mut state = ScanState::Normal;
+    let mut backtick_start = None;
 
     while i < len {
         match state {
@@ -208,6 +226,7 @@ fn scan(bytes: &[u8], out: &mut [u8], input: Input) -> ScanState {
                         i += 2;
                     } else {
                         state = ScanState::Normal;
+                        backtick_start = None;
                         i += 1;
                     }
                 } else {
@@ -231,6 +250,7 @@ fn scan(bytes: &[u8], out: &mut [u8], input: Input) -> ScanState {
                     && (input == Input::Partial || backtick_closes_on_line(bytes, i)) =>
                 {
                     state = ScanState::Backtick;
+                    backtick_start = Some(i);
                     i += 1;
                 }
                 // `//` is a comment before it is anything else: a regex
@@ -262,7 +282,7 @@ fn scan(bytes: &[u8], out: &mut [u8], input: Input) -> ScanState {
             },
         }
     }
-    state
+    (state, backtick_start)
 }
 
 /// Whether a quoted field name could begin right after `prefix` — the ONE
@@ -298,35 +318,61 @@ pub fn quoted_name_can_start_after(prefix: &[u8]) -> bool {
 /// Whether the `/` following `prefix` OPENS A REGEX rather than being an
 /// ordinary byte (a divisor, or the first character of a bare term).
 ///
-/// Derived from the grammar, not from taste: a regex literal has exactly
-/// TWO positions — a search-stage filter VALUE, which follows a filter
-/// operator (`=`, `!=`, `>`, `>=`, `<`, `<=`), and the right side of
-/// `matches`. Nowhere else. A slash at query start, after whitespace,
-/// after `(` or after `,` begins a bare TEXT-SEARCH term (executed:
-/// `/foo#bar/` binds one `TextSearch`), and a slash after an operand
-/// divides.
+/// Derived from the grammar, and from what it ACTUALLY parses rather than
+/// from the bytes that look suggestive. A regex literal has exactly TWO
+/// positions:
 ///
-/// `like`/`ilike` are deliberately absent: the grammar gives them no
-/// regex-literal form at all.
+/// 1. a search-stage filter VALUE. `field_filter` pads NOTHING — not
+///    between the name and the operator, not between the operator and the
+///    value — so only a complete operator token (`=`, `!=`, `>`, `>=`,
+///    `<`, `<=`; a bare `!` is not one) immediately preceded by a NAME
+///    and immediately followed by the slash is that position. Executed:
+///    `host=/re/` is a filter while `host= /re/`, `host =/re/` and
+///    `host = /re/` are all text searches, and `wow! /foo/` is two terms.
+/// 2. the right side of `matches`, where the expression grammar DOES pad.
 ///
-/// `prefix` must be comment-NORMALISED — a `matches` inside a comment is
+/// Everything else — query start, after whitespace, `(`, `,`, or an
+/// operand — is a bare term or a division.
+///
+/// `prefix` must be comment-NORMALISED: a `matches` inside a comment is
 /// not a pattern operator.
 #[must_use]
 pub fn slash_opens_regex(prefix: &[u8]) -> bool {
-    let Some(end) = prefix.iter().rposition(|b| !b.is_ascii_whitespace()) else {
-        // Query start: a bare term, never a regex.
-        return false;
-    };
-    // The tail of a filter operator — the search-stage value position.
-    if matches!(prefix[end], b'=' | b'<' | b'>' | b'!') {
+    // (1) the value position, proven as a whole `name + op` with no
+    // whitespace anywhere in it.
+    if let Some(op_start) = filter_op_start(prefix)
+        && let Some(&before_op) = prefix[..op_start].last()
+        && (before_op.is_ascii_alphanumeric() || matches!(before_op, b'_' | b'.' | b'@' | b'`'))
+    {
         return true;
     }
-    // …or the one operator whose RHS the grammar parses as a regex.
+
+    // (2) the `matches` RHS.
+    let Some(end) = prefix.iter().rposition(|b| !b.is_ascii_whitespace()) else {
+        return false;
+    };
     let start = prefix[..=end]
         .iter()
         .rposition(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
         .map_or(0, |p| p + 1);
-    &prefix[start..=end] == b"matches"
+    start <= end && &prefix[start..=end] == b"matches"
+}
+
+/// Where a COMPLETE search-stage filter operator ending at `prefix`'s last
+/// byte begins, or `None` when the tail is not one.
+///
+/// Longest first, as [`primitives::filter_op`] itself orders them, and a
+/// bare `!` is deliberately absent: it is not an operator, so `wow!` is a
+/// text term and the slash after it opens nothing.
+fn filter_op_start(prefix: &[u8]) -> Option<usize> {
+    let n = prefix.len();
+    if n >= 2 && matches!(&prefix[n - 2..], b"!=" | b">=" | b"<=") {
+        return Some(n - 2);
+    }
+    if n >= 1 && matches!(prefix[n - 1], b'=' | b'>' | b'<') {
+        return Some(n - 1);
+    }
+    None
 }
 
 /// Whether a regex opening at `i` finds its closing delimiter before the
@@ -1559,6 +1605,63 @@ mod tests {
         assert_eq!(regex_bodies(&query), vec!["foo#bar".to_string()]);
         let query = parse("# c\n* | where a matches /foo#bar/").expect("must parse");
         assert_eq!(regex_bodies(&query), vec!["foo#bar".to_string()]);
+    }
+
+    /// The value position is a whole `name + operator`, not a suggestive
+    /// trailing byte. `field_filter` pads NOTHING, so a padded `=` is a
+    /// text term and a bare `!` is not an operator at all — reading them
+    /// as regex openers silently changed the term the query bound.
+    #[test]
+    fn only_a_complete_filter_operator_opens_a_value_regex() {
+        // a bare `!` is not an operator: the slash begins a bare TERM
+        let query = parse("wow! /foo#bar/").expect("must parse");
+        assert_eq!(
+            terms(&query),
+            vec!["wow!".to_string(), "/foo".to_string()],
+            "a comment after a bare term is still a comment"
+        );
+
+        // …and neither is a PADDED operator (executed: `host = /re/` is
+        // three text terms, not a filter)
+        let query = parse("host = /foo#bar/").expect("must parse");
+        assert_eq!(
+            terms(&query),
+            vec!["host".to_string(), "=".to_string(), "/foo".to_string()]
+        );
+        for dsl in ["host= /foo#bar/", "host =/foo#bar/"] {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+            assert!(
+                terms(&query).iter().any(|t| t == "/foo" || t == "=/foo"),
+                "{dsl}: {:?}",
+                terms(&query)
+            );
+        }
+
+        // …while every REAL filter shape still opens one, including a
+        // two-byte operator and a backticked field name.
+        for (dsl, want) in [
+            ("host=/foo#bar/", "foo#bar"),
+            ("a!=/foo#bar/", "foo#bar"),
+            ("a>=/foo#bar/", "foo#bar"),
+            ("`a b`=/foo#bar/", "foo#bar"),
+        ] {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+            assert_eq!(regex_bodies(&query), vec![want.to_string()], "{dsl}");
+        }
+    }
+
+    /// The bare text terms a query binds, in order.
+    fn terms(query: &Query) -> Vec<String> {
+        query
+            .search
+            .groups
+            .iter()
+            .flatten()
+            .filter_map(|t| match &t.node {
+                SearchToken::TextSearch(ts) => Some(ts.term.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Each scanner state ends where its grammar production ends, and
