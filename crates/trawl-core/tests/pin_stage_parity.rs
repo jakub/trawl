@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::io::Write as _;
 
 use duckdb::Connection;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use trawl_core::ast::{FloatLiteral, LiteralValue, PipeStage};
 use trawl_core::compare::{self, CompareForm, PatternForm};
@@ -703,4 +703,62 @@ fn mixed_case_aliases_resolve_in_both_lanes() {
         &event,
         &ft
     ));
+}
+
+/// The batch `let` projection excludes every input column whose name
+/// ASCII-folds to a target's, so `| let A = 1` over a row carrying `a`
+/// leaves ONE column. The live lane has to leave one too: emitting both
+/// spellings puts a column in the stream the equivalent query never
+/// returns, and a downstream reference binds to whichever it meets first.
+///
+/// This compares the whole column SET, not named outputs — the defect was
+/// an extra column, which a per-name comparison cannot see.
+#[test]
+fn let_case_variant_target_leaves_one_column_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = FieldTypes::new();
+
+    for (dsl, event) in [
+        ("* | let A = 1", json!({"a": 5, "message": "hello"})),
+        ("* | let A = 1, b = A", json!({"a": 5, "message": "hello"})),
+        // …and the ordinary no-collision case still keeps both columns
+        ("* | let n = 1", json!({"a": 5, "message": "hello"})),
+    ] {
+        let event: Map<String, Value> = event.as_object().unwrap().clone();
+        let query = parser::parse(dsl).expect("dsl parses");
+
+        let plan =
+            compile_stream_plan(&query.pipeline, &PinScope::root(&ft)).expect("plan compiles");
+        let StreamPlan::PassThrough(mut stages) = plan else {
+            panic!("{dsl:?} must compile to a per-event plan");
+        };
+        let mut streamed = event.clone();
+        for stage in &mut stages {
+            assert_eq!(apply_stage(stage, &mut streamed), StageResult::Pass);
+        }
+
+        let mut tmp = tempfile::Builder::new()
+            .suffix(".ndjson")
+            .tempfile()
+            .unwrap();
+        writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
+        tmp.flush().unwrap();
+        let source = tmp.path().to_str().unwrap().to_owned();
+        let emitted = emitter::emit_with_pins(&query, &source, &ft).expect("emit succeeds");
+        let row_sql = format!("SELECT to_json(_sub) FROM ({}) AS _sub", emitted.sql);
+        let params = bind_params(&emitted.params);
+        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+        let row_json: String = conn
+            .query_row(&row_sql, param_refs.as_slice(), |row| row.get(0))
+            .unwrap_or_else(|e| panic!("let must not error: {e}\ndsl: {dsl:?}\nsql: {row_sql}"));
+        let batch: Map<String, Value> =
+            serde_json::from_str(&row_json).expect("row is a JSON object");
+
+        let batch_keys: BTreeSet<&String> = batch.keys().collect();
+        let live_keys: BTreeSet<&String> = streamed.keys().collect();
+        assert_eq!(
+            live_keys, batch_keys,
+            "column-set divergence\ndsl: {dsl:?}\nbatch: {batch:?}\nlive: {streamed:?}"
+        );
+    }
 }

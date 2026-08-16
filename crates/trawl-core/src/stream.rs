@@ -27,6 +27,7 @@ use crate::emitter::{
 };
 use crate::eval::{bind_event_key, eval_expr_with_pins};
 use crate::pin_scope::PinScope;
+use crate::schema::catalog_key;
 
 // ── stream plan ────────────────────────────────────────────────────
 
@@ -579,6 +580,14 @@ fn compile_dedup(s: &DedupStage) -> CompiledStage {
 /// value behind — the same rule [`PinScope::advance`] applies to pins,
 /// so value and pin can never come from different columns.
 ///
+/// The TARGET is inserted verbatim and does NOT displace a folded twin,
+/// which is what the batch lane does too: `* EXCLUDE (sources)` drops the
+/// SOURCE only, so `rename a as B` over a row carrying `b` leaves both
+/// `b` and `B` in either lane. That differs from `let` (whose projection
+/// excludes by target) — checked against the emitted SQL rather than
+/// assumed, and left alone deliberately: making this lane fold here would
+/// be the divergence, not the fix.
+///
 /// Each source binds to the row's OWN spelling ([`bind_event_key`]), for
 /// the same reason [`PinScope::advance`] resolves its pin through
 /// [`crate::schema::catalog_key`]: `DuckDB` binds the emitted
@@ -672,6 +681,20 @@ fn apply_let(
         resolved.push((name.as_str(), value));
     }
     for (name, value) in resolved {
+        // The batch lane's projection excludes every INPUT column whose
+        // name ASCII-folds to a target's (`fields::columns_except`), so
+        // `let A = 1` over a row carrying `a` leaves ONE column, spelled
+        // as the target wrote it. Dropping the folded twin here is that
+        // same rule: without it this lane emits both spellings and a
+        // downstream reference binds to whichever it finds first.
+        let twins: Vec<String> = event
+            .keys()
+            .filter(|k| k.as_str() != name && catalog_key(k) == catalog_key(name))
+            .cloned()
+            .collect();
+        for twin in twins {
+            event.remove(&twin);
+        }
         event.insert(name.to_string(), value);
     }
 }
@@ -2065,6 +2088,10 @@ mod tests {
         // so the target shadows it and `b` reads the ORIGINAL 5. An
         // exact-key shadowing test would have made `A` a fresh alias and
         // handed `b` the 1.
+        //
+        // The shadowed column also LEAVES: the batch projection excludes
+        // every input column folding to a target, so one column comes
+        // back, spelled as the target wrote it.
         let assignments = vec![
             ("A".into(), span(Expr::Literal(LiteralValue::Int(1)))),
             ("b".into(), span(Expr::FieldRef("A".into()))),
@@ -2080,7 +2107,10 @@ mod tests {
         let mut ev = event(&json!({"a": 5}));
         apply_stage(&mut stage, &mut ev);
         assert_eq!(ev.get("A").unwrap(), 1);
-        assert_eq!(ev.get("a").unwrap(), 5);
+        assert!(
+            !ev.contains_key("a"),
+            "the folded twin must not survive beside the target: {ev:?}"
+        );
         assert_eq!(ev.get("b").unwrap(), 5);
     }
 
