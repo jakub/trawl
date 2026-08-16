@@ -108,10 +108,19 @@ impl Output {
 /// every name through [`quote_dsl_field`] — because the message pastes
 /// the result into a rewrite the user is told to type, and a name trawl
 /// offers must be a name trawl can parse back (ADR-0013 ruling 7).
+///
+/// Unlike a NAME, an aggregate renders its ARGUMENTS, and a string literal
+/// argument's grammar (`none_of('"')`) admits ESC, BEL, U+202E and every
+/// other [`sanitize::is_unsafe_display_char`]. These messages are 400
+/// bodies rendered in a terminal, the TUI and a browser, and a saved query
+/// or scheduled report means the author and the reader need not be the same
+/// person — so the rendering is sanitised, exactly like a conflict sample.
+///
+/// [`sanitize::is_unsafe_display_char`]: crate::sanitize::is_unsafe_display_char
 fn render_agg(agg: &AggExpr) -> String {
     let mut out = String::new();
     crate::format::format_agg_expr(agg, &mut out);
-    out
+    crate::sanitize::sanitize_display_text(&out)
 }
 
 /// A name inside a message: its DSL spelling, always visually quoted.
@@ -389,6 +398,26 @@ mod tests {
 
         let msg = refusal("* | pivot count() on status by `request id`, `Request ID`");
         assert!(msg.contains("named `request id`"), "{msg}");
+    }
+
+    /// A STRING LITERAL argument is not policed by the name grammar, so
+    /// the rendering that pastes it into a 400 body is sanitised: a
+    /// refusal an operator reads can never carry ESC, BEL or a bidi
+    /// override the query author chose.
+    #[test]
+    fn a_refusal_never_echoes_control_characters() {
+        for dsl in [
+            "* | eventstats max(replace(message, \"\u{1b}]0;pwned\u{7}\", \"\"))",
+            "* | stats count(\"\u{1b}[2Kevil\") as n, sum(x) as N",
+            "* | stats count(\"\u{202e}drowssap\") as n, sum(x) as N",
+        ] {
+            let msg = refusal(dsl);
+            assert!(
+                !msg.chars().any(crate::sanitize::is_unsafe_display_char),
+                "{msg:?}"
+            );
+            assert!(msg.contains(crate::sanitize::REPLACEMENT), "{msg:?}");
+        }
     }
 
     /// `pivot`'s value columns come from the DATA, so only its `by` keys
