@@ -47,6 +47,31 @@ pub fn reformat(input: &str) -> Option<String> {
     Some(format_query(&query))
 }
 
+/// A field name as DSL text, through the ONE quoting rule
+/// ([`crate::parser::quote_dsl_name`]).
+///
+/// This path is reachable from production — the server's `/validate`
+/// returns `formatted`, and the TUI writes it back into the editor — so a
+/// name the grammar needs backticks for must come back quoted or the
+/// round trip hands the caller unparseable DSL.
+///
+/// The fallback echoes the raw name: `parse` cannot produce a name
+/// `quote_dsl_name` refuses, so it is unreachable for any AST that came
+/// from a query, and a hand-built one is not worth panicking inside a
+/// response path for.
+fn name(field: &str) -> String {
+    crate::parser::quote_dsl_name(field).unwrap_or_else(|| field.to_string())
+}
+
+/// [`name`] over a list, comma-separated — the shape every field list uses.
+fn name_list(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|f| name(f))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 // ---------------------------------------------------------------------------
 // Search stage
 // ---------------------------------------------------------------------------
@@ -137,7 +162,7 @@ fn format_search_token(token: &SearchToken, out: &mut String) {
 }
 
 fn format_field_filter(ff: &FieldFilter, out: &mut String) {
-    out.push_str(&ff.field);
+    out.push_str(&name(&ff.field));
     match ff.op {
         FilterOp::Glob | FilterOp::Regex => {
             // Glob and regex use `=` as the display operator, with the value
@@ -209,12 +234,12 @@ fn format_pipe_stage(stage: &PipeStage, out: &mut String) {
             let _ = write!(out, "tail {}", s.count);
         }
         PipeStage::Table(s) => {
-            let _ = write!(out, "{} {}", s.keyword, s.fields.join(", "));
+            let _ = write!(out, "{} {}", s.keyword, name_list(&s.fields));
         }
         PipeStage::Top(s) => format_top_rare("top", s.count, &s.field, &s.by, out),
         PipeStage::Rare(s) => format_top_rare("rare", s.count, &s.field, &s.by, out),
         PipeStage::Drop(s) => {
-            let _ = write!(out, "drop {}", s.fields.join(", "));
+            let _ = write!(out, "drop {}", name_list(&s.fields));
         }
         PipeStage::Let(s) => format_let(s, out),
         PipeStage::Extract(s) => format_extract(s, out),
@@ -243,25 +268,25 @@ fn format_sort(s: &crate::ast::SortStage, out: &mut String) {
         if sf.direction == SortDirection::Desc {
             out.push('-');
         }
-        out.push_str(&sf.field);
+        out.push_str(&name(&sf.field));
     }
 }
 
 fn format_top_rare(kw: &str, count: u64, field: &str, by: &[String], out: &mut String) {
-    let _ = write!(out, "{kw} {count} {field}");
+    let _ = write!(out, "{kw} {count} {}", name(field));
     if !by.is_empty() {
-        let _ = write!(out, " by {}", by.join(", "));
+        let _ = write!(out, " by {}", name_list(by));
     }
 }
 
 fn format_let(s: &crate::ast::LetStage, out: &mut String) {
     out.push_str(s.keyword);
     out.push(' ');
-    for (i, (name, expr)) in s.assignments.iter().enumerate() {
+    for (i, (target, expr)) in s.assignments.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
-        let _ = write!(out, "{name} = ");
+        let _ = write!(out, "{} = ", name(target));
         format_expr(&expr.node, 0, ExprContext::Normal, out);
     }
 }
@@ -269,7 +294,7 @@ fn format_let(s: &crate::ast::LetStage, out: &mut String) {
 fn format_dedup(s: &crate::ast::DedupStage, out: &mut String) {
     out.push_str("dedup");
     if !s.fields.is_empty() {
-        let _ = write!(out, " {}", s.fields.join(", "));
+        let _ = write!(out, " {}", name_list(&s.fields));
     }
 }
 
@@ -281,16 +306,16 @@ fn format_timechart(s: &crate::ast::TimechartStage, out: &mut String) {
     out.push(' ');
     format_agg_list(&s.aggregations, out);
     if !s.group_by.is_empty() {
-        let _ = write!(out, " by {}", s.group_by.join(", "));
+        let _ = write!(out, " by {}", name_list(&s.group_by));
     }
 }
 
 fn format_pivot(s: &crate::ast::PivotStage, out: &mut String) {
     out.push_str("pivot ");
     format_agg_expr(&s.aggregation, out);
-    let _ = write!(out, " on {}", s.on_field);
+    let _ = write!(out, " on {}", name(&s.on_field));
     if !s.by.is_empty() {
-        let _ = write!(out, " by {}", s.by.join(", "));
+        let _ = write!(out, " by {}", name_list(&s.by));
     }
 }
 
@@ -300,7 +325,7 @@ fn format_rename(s: &crate::ast::RenameStage, out: &mut String) {
         if i > 0 {
             out.push_str(", ");
         }
-        let _ = write!(out, "{old} as {new}");
+        let _ = write!(out, "{} as {}", name(old), name(new));
     }
 }
 
@@ -309,7 +334,7 @@ fn format_stats(keyword: &str, aggs: &[AggExpr], group_by: &[String], out: &mut 
     out.push(' ');
     format_agg_list(aggs, out);
     if !group_by.is_empty() {
-        let _ = write!(out, " by {}", group_by.join(", "));
+        let _ = write!(out, " by {}", name_list(group_by));
     }
 }
 
@@ -333,7 +358,7 @@ fn format_agg_expr(agg: &AggExpr, out: &mut String) {
     }
     out.push(')');
     if let Some(ref alias) = agg.alias {
-        let _ = write!(out, " as {alias}");
+        let _ = write!(out, " as {}", name(alias));
     }
 }
 
@@ -351,7 +376,7 @@ fn format_extract(s: &crate::ast::ExtractStage, out: &mut String) {
         }
     }
     if let Some(ref field) = s.source_field {
-        let _ = write!(out, " from {field}");
+        let _ = write!(out, " from {}", name(field));
     }
 }
 
@@ -448,8 +473,8 @@ fn format_expr(expr: &Expr, parent_prec: u8, ctx: ExprContext, out: &mut String)
                 out.push(')');
             }
         }
-        Expr::FunctionCall { name, args } => {
-            out.push_str(name);
+        Expr::FunctionCall { name: func, args } => {
+            out.push_str(func);
             out.push('(');
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
@@ -459,7 +484,7 @@ fn format_expr(expr: &Expr, parent_prec: u8, ctx: ExprContext, out: &mut String)
             }
             out.push(')');
         }
-        Expr::FieldRef(name) => out.push_str(name),
+        Expr::FieldRef(field) => out.push_str(&name(field)),
         Expr::Literal(lit) => format_literal(lit, ctx, out),
         Expr::InList { expr, list } => {
             format_expr(&expr.node, 4, ExprContext::Normal, out);
@@ -929,6 +954,28 @@ mod tests {
         let first = fmt(input);
         let second = fmt(&first);
         assert_eq!(first, second, "formatter is not idempotent");
+    }
+
+    /// The formatter is reachable from production (`/validate` returns
+    /// `formatted`; the TUI writes it back into the editor), so a name that
+    /// NEEDS backticks must come back quoted — otherwise a valid query
+    /// round-trips into an unparseable one.
+    #[test]
+    fn quoted_names_survive_the_round_trip() {
+        let input = "`request id`>=5 | stats avg(`resp ms`) as `mean ms` by `a b` \
+                     | rename `a b` as `c d` | sort -`mean ms` | table `c d`, `a.b`";
+        let first = fmt(input);
+        assert!(first.contains("`request id`"), "{first}");
+        assert!(first.contains("`mean ms`"), "{first}");
+        assert_eq!(fmt(&first), first, "formatter is not idempotent");
+    }
+
+    /// Quote provenance is discarded by CONTENT (the ADR-0011 literal
+    /// precedent), so the round trip is CANONICAL, not verbatim: a name
+    /// that needs no backticks loses them, once, on the first pass.
+    #[test]
+    fn unnecessary_quoting_is_canonicalised_away() {
+        assert_eq!(fmt("* | table `host`"), "*\n| table host");
     }
 
     #[test]

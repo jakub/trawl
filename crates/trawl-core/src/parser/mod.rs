@@ -169,6 +169,76 @@ fn strip_comments(input: &str) -> String {
     String::from_utf8(out).expect("comment stripping only replaces ASCII bytes with spaces")
 }
 
+/// Spellings the grammar reads as something other than a field name, in at
+/// least one field position.
+///
+/// Two groups, both decided by reading the grammar rather than by taste:
+/// the words `parser::expr` binds before it ever tries `field_ref`
+/// (literals and operator keywords), and the clause keywords a stage
+/// consumes before its own field list. The three unconditional search
+/// keywords (`last`, `earliest`, `latest`) are here for the same reason —
+/// ADR-0013 ruling 7 keeps them unconditional, which is exactly what makes
+/// the bare spelling unusable as a name.
+///
+/// Stage names are deliberately absent: a field position never begins a
+/// stage, so `| table stats` names the column `stats`. The round-trip
+/// property test is what proves this set is complete, not the list itself.
+const AMBIGUOUS_BARE_NAMES: &[&str] = &[
+    // literals `parser::primitives::literal` binds first
+    "true", "false", "null", // operator keywords in expression position
+    "and", "or", "not", "in", "matches", "like", "ilike",
+    // clause keywords a stage reads before its field list
+    "as", "by", "on", "from", "sep", "kv", "span", "run", "saved", "all",
+    // the unconditional search keywords (ADR-0013 ruling 7)
+    "last", "earliest", "latest",
+    // the search stage's own OR/NOT markers, tried before any leaf token
+    "OR", "NOT",
+];
+
+/// Whether `name` can be written into the DSL with no backticks and mean
+/// itself in every field position.
+///
+/// Two conditions, and the second is not optional: the name must match the
+/// unquoted grammar ([`primitives::plain_name`] — an identifier with
+/// optional dots, or an `@`-prefixed one), AND it must not be a spelling
+/// the grammar reads as something else first. `true` and `by` are perfectly
+/// good identifiers that never reach `field_ref`.
+#[must_use]
+pub fn is_bare_dsl_name(name: &str) -> bool {
+    if AMBIGUOUS_BARE_NAMES.contains(&name) {
+        return false;
+    }
+    let body = name.strip_prefix('@').unwrap_or(name);
+    !body.is_empty()
+        && body.split('.').all(|segment| {
+            let mut chars = segment.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+/// `name` rendered as DSL text: itself when bare-safe, else backtick-quoted
+/// with embedded backticks doubled.
+///
+/// `None` when the grammar cannot express the name at all — it is empty, or
+/// carries a character [`primitives::backtick_name`] refuses. Callers
+/// decline to offer such a name, the way the repin hint declines a name it
+/// cannot print safely; inventing a lossy spelling would offer a name that
+/// is not the field.
+///
+/// This is the ONE renderer. Every surface that manufactures DSL from a
+/// field name goes through it — hand-rolled backtick wrapping is drift.
+#[must_use]
+pub fn quote_dsl_name(name: &str) -> Option<String> {
+    if name.is_empty() || name.chars().any(crate::sanitize::is_unsafe_display_char) {
+        return None;
+    }
+    if is_bare_dsl_name(name) {
+        return Some(name.to_string());
+    }
+    Some(format!("`{}`", name.replace('`', "``")))
+}
+
 /// Convert a chumsky `Rich` error into our `ParseError` with a human-friendly message.
 fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
     use chumsky::error::RichReason;
@@ -697,6 +767,166 @@ mod tests {
         let input = "abc # comment\ndef // another\nghi";
         let stripped = strip_comments(input);
         assert_eq!(stripped.len(), input.len());
+    }
+
+    // --- the quoting helper, and its drift guards ---
+
+    /// Names chosen to break a naive helper: every grammar keyword and
+    /// literal, the three unconditional search spellings, stage names,
+    /// and the shapes only backticks can express.
+    ///
+    /// The keyword half is written out here rather than read from
+    /// [`AMBIGUOUS_BARE_NAMES`] ON PURPOSE — drawing the corpus from the
+    /// constant under test would make dropping a keyword invisible, since
+    /// the name would leave the corpus with it. This list comes from
+    /// grepping `keyword(...)` and `just("...=")` out of the grammar.
+    fn adversarial_names() -> Vec<&'static str> {
+        vec![
+            // shapes the bare grammar cannot express at all
+            "request id",
+            "http-status",
+            "a`b",
+            "a\"b",
+            "a b`c",
+            "日本語",
+            "2fast",
+            "a-b.c",
+            "",
+            " ",
+            "a=b",
+            "a,b",
+            "a|b",
+            "a#b",
+            "http://x",
+            "(a)",
+            "*",
+            // shapes it can — including the ones the FOLD makes equal
+            "host",
+            "host.name",
+            "@timestamp",
+            "_time",
+            "Dur",
+            "dur",
+            "count",
+            "stats",
+            "where",
+            "table",
+            "sort",
+            "limit",
+            "eventstats",
+            "timechart",
+            // every keyword spelling the grammar matches
+            "true",
+            "false",
+            "null",
+            "and",
+            "or",
+            "not",
+            "OR",
+            "NOT",
+            "in",
+            "matches",
+            "like",
+            "ilike",
+            "as",
+            "by",
+            "on",
+            "from",
+            "sep",
+            "kv",
+            "span",
+            "run",
+            "saved",
+            "all",
+            "last",
+            "earliest",
+            "latest",
+            "head",
+            "tail",
+            "drop",
+            "dedup",
+            "rare",
+            "top",
+            "let",
+            "eval",
+            "rename",
+            "pivot",
+            "sample",
+            "fields",
+        ]
+    }
+
+    /// A field position for each door the helper's output must survive.
+    /// Read positions only: a write position adds the sealed-prefix policy,
+    /// which is not a quoting question.
+    fn read_positions(rendered: &str) -> Vec<String> {
+        vec![
+            format!("{rendered}=1"),
+            format!("* | where {rendered} == 1"),
+            format!("* | stats count() by {rendered}"),
+            format!("* | table {rendered}"),
+            format!("* | sort -{rendered}"),
+            format!("* | top 5 {rendered}"),
+        ]
+    }
+
+    /// The helper is the grammar's inverse: whatever it renders parses back
+    /// to the name it was given, in every field position — that is the
+    /// contract every suggestion surface leans on.
+    #[test]
+    fn quote_dsl_name_round_trips() {
+        for original in adversarial_names() {
+            let Some(rendered) = quote_dsl_name(original) else {
+                // refused names are the ones the grammar cannot express;
+                // a caller declines to offer them rather than inventing one.
+                assert!(
+                    original.is_empty(),
+                    "{original:?} was refused but is expressible"
+                );
+                continue;
+            };
+            for dsl in read_positions(&rendered) {
+                let query = parse(&dsl)
+                    .unwrap_or_else(|e| panic!("{original:?} rendered as {dsl:?}: {e:?}"));
+                assert!(
+                    field_positions(&query).iter().any(|n| n == original),
+                    "{original:?} rendered as {dsl:?} parsed as {:?}",
+                    field_positions(&query)
+                );
+            }
+        }
+    }
+
+    /// The half a forgotten keyword breaks: if the helper calls a name
+    /// bare-safe, the BARE spelling must mean that name in every position.
+    /// `true` and `by` are good identifiers that never reach `field_ref`.
+    #[test]
+    fn is_bare_dsl_name_agrees_with_the_grammar() {
+        for original in adversarial_names() {
+            if !is_bare_dsl_name(original) {
+                continue;
+            }
+            for dsl in read_positions(original) {
+                let query = parse(&dsl)
+                    .unwrap_or_else(|e| panic!("{original:?} claimed bare-safe: {dsl:?}: {e:?}"));
+                assert!(
+                    field_positions(&query).iter().any(|n| n == original),
+                    "{original:?} claimed bare-safe but {dsl:?} parsed as {:?}",
+                    field_positions(&query)
+                );
+            }
+        }
+    }
+
+    /// A name the grammar cannot express has no rendering — the helper
+    /// says so rather than inventing one, matching the repin hint's
+    /// "a name that cannot be printed gets no command" precedent.
+    #[test]
+    fn quote_dsl_name_refuses_the_inexpressible() {
+        assert_eq!(quote_dsl_name(""), None);
+        for hostile in ["a\u{202e}b", "a\u{200b}b", "a\u{1}b", "a\u{00ad}b"] {
+            assert_eq!(quote_dsl_name(hostile), None, "{hostile:?}");
+        }
     }
 
     // --- backtick-quoted field names (ADR-0013 ruling 7) ---
