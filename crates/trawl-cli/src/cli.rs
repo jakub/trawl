@@ -837,6 +837,20 @@ mod tests {
         let plain = String::from_utf8(buf).unwrap();
         assert!(!plain.contains("error2"), "{plain}");
 
+        // A MIXED-CASE alias: the pin scope folds the name and the
+        // result column keeps the spelling the user typed, so the match
+        // folds too — `DuckDB` identifiers are case-insensitive.
+        let mixed = QueryResult {
+            columns: vec![trawl_engine::value::Column {
+                name: "S".to_owned(),
+            }],
+            rows: vec![vec![Value::Integer(18)]],
+        };
+        let mut buf = Vec::new();
+        render_table(&mixed, &declared, &mut buf).unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        assert!(table.contains("error2"), "mixed-case alias: {table}");
+
         // Machine formats carry the number in BOTH columns.
         for f in [
             render_ndjson as fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>,

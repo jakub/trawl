@@ -298,7 +298,21 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
                 // is reachable from callers that never ran the arg walk.
                 Some(token) => {
                     validate_unit_literal(name, 1, crate::severity::DIALECT_TOKENS, Some(token))?;
-                    crate::severity::Dialect::from_token(token).unwrap_or_default()
+                    // Never `unwrap_or_default()`: the validator folds
+                    // with `to_lowercase` (Unicode) and `from_token`
+                    // with `to_ascii_lowercase`, so a token the two ever
+                    // disagreed about would silently degrade syslog to
+                    // OTel — WRONG readings (1-7 are valid in both
+                    // dialects), not absent ones. Refuse instead, with
+                    // the vocabulary.
+                    crate::severity::Dialect::from_token(token).ok_or_else(|| {
+                        EmitError::UnsupportedOperation {
+                            message: format!(
+                                "{name}() dialect {token:?} is not in the allowed set: {}",
+                                crate::severity::DIALECT_TOKENS.join(", ")
+                            ),
+                        }
+                    })?
                 }
                 None => crate::severity::Dialect::Otel,
             };
@@ -1101,5 +1115,29 @@ mod tests {
     #[test]
     fn alias_dc_with_field() {
         assert_eq!(default_agg_alias("dc", Some("host")), "\"dc_host\"");
+    }
+
+    // ── sev() dialect resolution ────────────────────────────────────────
+
+    /// The translation NEVER defaults a dialect it cannot parse. The
+    /// validator folds with `to_lowercase` (Unicode) and `from_token`
+    /// with `to_ascii_lowercase`, so a token they ever disagreed about
+    /// would otherwise degrade syslog to `OTel` silently — and 1-7 are
+    /// valid readings in BOTH dialects, so that is a WRONG number, not a
+    /// missing one.
+    #[test]
+    fn sev_refuses_a_dialect_it_cannot_parse_rather_than_defaulting() {
+        let otel = translate_function("sev", &["\"x\"".to_owned(), "otel".to_owned()]).unwrap();
+        let syslog = translate_function("sev", &["\"x\"".to_owned(), "syslog".to_owned()]).unwrap();
+        assert_ne!(otel, syslog);
+        // Bypassing the arg walk (this is the defensive door): an
+        // unparseable token is an error naming the vocabulary, and the
+        // emitted SQL is never the OTel one.
+        let err = translate_function("sev", &["\"x\"".to_owned(), "bogus".to_owned()])
+            .expect_err("an unknown dialect must be refused");
+        assert!(err.to_string().contains("otel, syslog"), "{err}");
+        // Arity is still checked first.
+        let err = translate_function("sev", &[]).expect_err("arity");
+        assert!(err.to_string().contains("1 to 2 arguments"), "{err}");
     }
 }

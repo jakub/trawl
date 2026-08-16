@@ -133,9 +133,19 @@ pub fn token_text(number: i64) -> Option<&'static str> {
 /// `sev()` outputs and any column that took the slot's pin. A renderer
 /// with no list renders `_severity` and nothing else, which is exactly
 /// the pre-`sev()` behaviour.
+///
+/// The match is ASCII-case-INSENSITIVE, and has to be: `DuckDB`
+/// identifiers are, so `| let S = sev(level)` returns a column spelled
+/// `S` while the pin scope — which folds through
+/// [`crate::schema::catalog_key`] — declares `s`. Exact comparison made
+/// that column render numbers. Folding is the principled match: two
+/// spellings ARE one identifier here.
 #[must_use]
 pub fn renders_as_severity(column: &str, severity_columns: &[String]) -> bool {
-    column == crate::schema::SEVERITY || severity_columns.iter().any(|c| c == column)
+    column.eq_ignore_ascii_case(crate::schema::SEVERITY)
+        || severity_columns
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(column))
 }
 
 /// The inverse of [`otel_name`]: a band base with an optional `2`-`4`

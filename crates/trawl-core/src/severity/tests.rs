@@ -362,3 +362,25 @@ fn token_entries_expose_the_table() {
         assert_eq!(number_for_token(token), Some(number));
     }
 }
+
+/// The render rule folds case, because `DuckDB` identifiers do: a
+/// `let S = sev(x)` returns the column spelled `S` while the pin scope
+/// declares the folded `s`, and an exact match rendered numbers there.
+#[test]
+fn renders_as_severity_folds_ascii_case() {
+    let declared = vec!["s".to_owned(), "myLevel".to_owned()];
+    for column in ["s", "S", "myLevel", "MYLEVEL", "mylevel"] {
+        assert!(
+            renders_as_severity(column, &declared),
+            "{column} must render as severity"
+        );
+    }
+    // The envelope slot, by name, whatever the spelling.
+    assert!(renders_as_severity("_severity", &[]));
+    assert!(renders_as_severity("_SEVERITY", &[]));
+    // Anything else is ordinary data.
+    assert!(!renders_as_severity("severity", &declared));
+    assert!(!renders_as_severity("st", &declared));
+    assert!(!renders_as_severity("s2", &declared));
+    assert!(!renders_as_severity("s", &[]));
+}
