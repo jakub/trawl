@@ -123,8 +123,11 @@ fn field_filter<'src>()
 /// in the leaf choice. Were it accepted, an empty or hostile quoted name
 /// would not error — no alternative would match, and the query would
 /// silently become a substring search for the literal ticks. Cost,
-/// deliberate: a bare word containing a tick must now be double-quoted.
-/// Filter VALUES are untouched and still compare against the literal text.
+/// deliberate: a bare word containing a tick must now be double-quoted —
+/// and the same holds for a bare filter VALUE
+/// ([`crate::parser::primitives::bare_value`]), so no unquoted position
+/// can absorb a tick and the comment markers a mis-engaged scanner
+/// shielded behind it.
 fn text_search<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     let negated = just('-')
@@ -776,12 +779,20 @@ mod tests {
         }
     }
 
-    /// Backticks are metacharacters in NAME position only — a filter
-    /// VALUE carrying one is still ordinary literal text.
+    /// A backtick ENDS a bare value, so a value carrying one must be
+    /// double-quoted. Absorbing it would let a value swallow the comment
+    /// markers a mis-engaged pre-parse scanner shielded behind it.
     #[test]
-    fn test_backticks_in_a_filter_value_are_literal() {
+    fn test_a_bare_filter_value_stops_at_a_backtick() {
         let result = search_stage()
+            .then_ignore(chumsky::prelude::end())
             .parse("service=`nginx`")
+            .into_result();
+        assert!(result.is_err(), "{result:?}");
+
+        // …and the double-quoted form carries the tick verbatim.
+        let result = search_stage()
+            .parse(r#"service="ngi`nx""#)
             .into_result()
             .unwrap();
         assert_eq!(
@@ -789,7 +800,7 @@ mod tests {
             SearchToken::FieldFilter(FieldFilter {
                 field: "service".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("`nginx`".to_string()),
+                value: FilterValue::Literal("ngi`nx".to_string()),
             })
         );
     }

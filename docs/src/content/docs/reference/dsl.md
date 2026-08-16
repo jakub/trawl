@@ -293,9 +293,12 @@ error too — it never degrades into a text search.
 
 Backticks are for **field names only**. Function names, stage names and
 saved-query names take none (`` `lower`(x) `` is not a call; use
-`from saved "my report"` for a saved name with spaces), and a backtick in
-a filter *value* is ordinary text: `` service=`nginx` `` compares against
-the literal `` `nginx` ``.
+`from saved "my report"` for a saved name with spaces). A backtick also
+**ends an unquoted value or bare word**, so a value that contains one is
+written double-quoted — `` host="a+`b" `` — which keeps the tick verbatim.
+(The tick is the one character whose meaning is settled before the grammar
+runs, by the comment stripper; ending unquoted text at it is what keeps a
+stray tick a parse error instead of a silently different query.)
 
 Three spellings are keywords wherever they appear in a search stage, so
 the bare word is never a field there: `last=`, `earliest=` and `latest=`.

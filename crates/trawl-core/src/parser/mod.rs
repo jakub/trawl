@@ -1301,27 +1301,51 @@ mod tests {
     /// stripper's hands, and the stray tick then dies at the grammar.
     #[test]
     fn an_unterminated_backtick_never_swallows_a_comment() {
-        // The tick sits where a name COULD start, but never closes.
-        let query = parse("host=`x # comment").expect("the comment must be stripped");
+        // The tick sits where a name COULD start but never closes, so the
+        // scanner declines and the comment IS stripped — and since a bare
+        // value stops at a tick, what is left is a loud parse error rather
+        // than a value that quietly absorbed the tick.
+        assert!(parse("host=`x # comment").is_err());
+
+        // Where the stray tick is a genuine name position, the truncated
+        // name is a loud parse error — the other permitted outcome.
+        assert!(parse("| table `a b # x").is_err());
+        assert!(parse("* | where `a b // x").is_err());
+    }
+
+    /// The scanner's engage rule is a heuristic, so the grammar has to be
+    /// the backstop: an operator inside a bare VALUE looks exactly like
+    /// arithmetic from outside (`host=a+` vs `1+`), so the tick after it
+    /// engages the backtick state and shields the `#` behind it. A value
+    /// that could absorb that tick would absorb the comment with it,
+    /// silently. Ending a bare value at a tick makes it a parse error.
+    #[test]
+    fn a_value_never_absorbs_a_backtick_shielded_comment() {
+        for dsl in [
+            "host=a+`b#c` # outside",
+            "host=a*`b#c` # outside",
+            "host=a%`b#c` # outside",
+            "host=a-`b#c` # outside",
+        ] {
+            assert!(parse(dsl).is_err(), "{dsl} must be a loud parse error");
+        }
+
+        // A value that genuinely contains a tick is double-quoted, and the
+        // comment beside it is still a comment.
+        let query = parse(r#"host="a+`b" # outside"#).expect("the quoted form parses");
         assert_eq!(
-            query.search.groups[0].len(),
-            1,
-            "no comment word may become a search term: {:?}",
-            query.search.groups
+            query.pipeline.len(),
+            0,
+            "the comment must not reach the parser"
         );
         assert_eq!(
             query.search.groups[0][0].node,
             SearchToken::FieldFilter(FieldFilter {
                 field: "host".to_string(),
                 op: FilterOp::Eq,
-                value: FilterValue::Literal("`x".to_string()),
+                value: FilterValue::Literal("a+`b".to_string()),
             })
         );
-
-        // Where the stray tick is a genuine name position, the truncated
-        // name is a loud parse error — the other permitted outcome.
-        assert!(parse("| table `a b # x").is_err());
-        assert!(parse("* | where `a b // x").is_err());
     }
 
     /// An expression may put an ARITHMETIC operator in front of a name,

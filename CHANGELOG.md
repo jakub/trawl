@@ -19,8 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   empty name and one carrying a control or invisible format character are
   parse errors, as is a malformed backtick anywhere — it never degrades
   into a text search. Function, stage and saved-query names take no
-  backticks (`` `lower`(x) `` is not a call), and a backtick in a filter
-  VALUE is ordinary text. The three unconditional search keywords stay
+  backticks (`` `lower`(x) `` is not a call), and a backtick ENDS an
+  unquoted value or bare word — a value containing one is double-quoted
+  (`` host="a+`b" ``), which keeps unquoted text from absorbing the one
+  character whose meaning is settled before the grammar runs. The three unconditional search keywords stay
   unconditional: `last=`, `earliest=`, `latest=` — `` `last`=5 `` is the
   field of that name, and both spellings can appear in one query.
 
