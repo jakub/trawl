@@ -921,16 +921,16 @@ pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
 }
 
 /// The `SeverityNumber` a SEVERITY-pinned column CONFORMS a stored text to
-/// — the live mirror of [`crate::conform::guarded_cast`]'s SEVERITY rung,
-/// which is the guarded BIGINT cast inside a 1-24 ladder guard.
+/// — the live mirror of [`crate::conform::guarded_cast`]'s SEVERITY rung.
 ///
-/// A number outside the ladder is not a severity, so it has no reading at
-/// all: the column holds NULL and the value stays in `_raw`.
+/// A one-line delegate to the ONE reader (ADR-0013 slice 2, ruling 9):
+/// the rung and this mirror are the same kernel, so `"error"` reads 17 on
+/// both engines and a text off the ladder — or off the vocabulary
+/// entirely — has no reading at all, leaving the column NULL and the
+/// value in `_raw`.
 #[must_use]
 pub fn conformed_severity(text: &str) -> Option<u8> {
-    conformed_bigint(text)
-        .filter(|n| crate::severity::is_valid_number(*n))
-        .and_then(|n| u8::try_from(n).ok())
+    crate::severity::reading_text(text, crate::severity::Dialect::Otel)
 }
 
 /// The BIGINT a BIGINT-pinned column CONFORMS a stored text to — the live

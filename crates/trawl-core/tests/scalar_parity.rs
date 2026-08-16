@@ -125,7 +125,7 @@ const FLOAT_LITS: &[&str] = &[
 /// Generate a scalar DSL expression string (no `now()`, no field refs
 /// that could be absent from the fixed event).
 fn random_scalar_expr(rng: &mut Rng) -> Option<String> {
-    match rng.range(14) {
+    match rng.range(15) {
         0 => Some(random_string_fn(rng)),
         1 => Some(random_numeric_fn(rng)),
         2 => Some(random_conditional(rng)),
@@ -140,6 +140,7 @@ fn random_scalar_expr(rng: &mut Rng) -> Option<String> {
         11 => Some(random_coalesce(rng)),
         12 => Some(random_concat(rng)),
         13 => Some(random_substr(rng)),
+        14 => Some(random_sev(rng)),
         _ => unreachable!(),
     }
 }
@@ -290,6 +291,62 @@ fn random_substr(rng: &mut Rng) -> String {
     }
 }
 
+/// Severity texts spanning the reading kernel's rungs: band tokens with
+/// their case and whitespace variants, an exact `OTel` short name, the
+/// numeric strings both dialects read differently, the spellings
+/// `TRY_CAST` reads and the kernel does not (`1.5`, `1e1`, `0x10`), and
+/// values with no reading at all.
+const SEV_TEXTS: &[&str] = &[
+    "error",
+    "ERR",
+    " error ",
+    "error2",
+    "warn",
+    "0",
+    "1",
+    "7",
+    "8",
+    "17",
+    "24",
+    "25",
+    "0404",
+    "007",
+    "+17",
+    "1.5",
+    "1e1",
+    "0x10",
+    "gold",
+    "",
+    // Unicode case folding: `DuckDB`'s `lower()` folds these onto token
+    // letters and the kernel's ASCII fold does not, so an ungated token
+    // match read them as severities in batch alone.
+    "\u{130}NFO",
+    "\u{131}",
+    "\u{212a}",
+    "\u{ff29}\u{ff2e}\u{ff26}\u{ff2f}",
+    "\u{ff11}\u{ff17}",
+];
+
+/// `sev(x[, dialect])` over literals AND over the event's own columns —
+/// the SQL lane reads the column's TEXT form while eval reads the wire
+/// JSON, so a field arm is the one that proves the two readings agree.
+fn random_sev(rng: &mut Rng) -> String {
+    let arg = match rng.range(5) {
+        0 => format!("\"{}\"", rng.pick(SEV_TEXTS)),
+        1 => rng.pick(&[0_i64, 1, 3, 7, 8, 17, 24, 25, -1]).to_string(),
+        2 => "level".to_string(),
+        3 => "sev_num".to_string(),
+        4 => "status".to_string(),
+        _ => unreachable!(),
+    };
+    match rng.range(3) {
+        0 => format!("sev({arg})"),
+        1 => format!("sev({arg}, \"otel\")"),
+        2 => format!("sev({arg}, \"syslog\")"),
+        _ => unreachable!(),
+    }
+}
+
 fn random_typeof(rng: &mut Rng) -> String {
     // typeof on strings only: DuckDB returns BIGINT for integer literals (it
     // widens all integer literals to BIGINT) while eval returns INTEGER.
@@ -329,6 +386,10 @@ fn fixed_event() -> Map<String, Value> {
     m.insert("level".into(), Value::String("error".into()));
     m.insert("status".into(), Value::Number(200.into()));
     m.insert("host".into(), Value::String("web-1".into()));
+    // A severity-bearing pair, one word and one numeral, so `sev()` reads
+    // a real column in both shapes.
+    m.insert("sev_num".into(), Value::Number(3.into()));
+    m.insert("sev_word".into(), Value::String("warn".into()));
     m
 }
 

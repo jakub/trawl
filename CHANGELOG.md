@@ -53,6 +53,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a bare `avg`. Saved queries, dashboards and alerts carrying any of these
   shapes must be rewritten — no shims, per the project's no-back-compat
   ruling.
+
+- **The severity reading kernel and `sev()` (ADR-0013 slice 2 rulings
+  9-10, #77).** "What is this value's severity" now has exactly ONE
+  answer: `trawl_core::severity::reading` is THE reader, and the SQL form
+  (`conform::severity_reading_sql`) is generated from the same tables and
+  probe-pinned against it case by case, in both dialects, against the
+  bundled `DuckDB`. Ingest's `_severity` derivation and the live mirrors
+  (`compare::conformed_severity`, `pin_match`'s SEVERITY arm) become
+  one-line delegates.
+
+  The **`SEVERITY` conform rung widens to that full token-aware reading**
+  as the pin's lifetime meaning: a stored `"error"` now conforms to 17
+  instead of being shelved as a conflict, live and under a future repin
+  alike. Numeric readings narrow to a STRICT integer (`[+-]?[0-9]+`), so
+  `"4.0"`, `"1e1"` and `"0x10"` — spellings `TRY_CAST` reads and the
+  kernel does not — have no reading in either engine. Everything else the
+  reader does is unchanged from ingest's old derivation, deliberately:
+  the trim is the full Unicode `White_Space` set on BOTH engines (probed
+  character by character), and the token fold stays ASCII on both — the
+  SQL gates its token match on an ASCII-alphanumeric subject, because
+  `DuckDB`'s `lower()` is Unicode and would otherwise read `"İNFO"` as
+  INFO in batch and as nothing live.
+
+  **`sev(x[, dialect])`** applies that kernel at query time to any field:
+  `| where sev(level) >= "error"`. It DECLARES its result as the
+  `SEVERITY` canonical type (a new one-entry function-result-pin table
+  consumed by the pin-scope walk), so the comparison binds through the
+  ADR-0011 rule table — equality takes the BAND, an ordered operator the
+  token's exact number, a pattern the canonical token text — a `let`
+  target adopts the pin and carries it through `stats`, and the result
+  column renders tokens. The optional dialect is a literal `"otel"` or
+  `"syslog"` governing numerics only; an unknown or computed one is a
+  query error naming the vocabulary in the SQL lane and the stream
+  compiler alike. Because the pin is DECLARED rather than looked up,
+  `sev()` binds identically over embedded `--data` with no catalog at
+  all. One classifier (`PinScope::subject_pin`) now roots the emitter,
+  the stream compiler and the in-memory evaluator, so the three adopt and
+  decline identical shapes.
+
+  `QueryResponse` gains `severity_columns` — a response-level advisory
+  beside `degraded_fields`, omitted when empty — naming the result
+  columns that render as tokens; `-f json`/`-f csv`/SSE keep the number,
+  so arithmetic consumers are untouched.
 - **BREAKING — the namespace cutover: two namespaces, observe-don't-consume derivation, zero DSL aliases (ADR-0013 slice 1, #60).**
   One contract, one sentence: **bare names are sender vocabulary trawl
   never assigns meaning to; underscore names are trawl's contract slots.**
@@ -222,6 +265,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   escape hatch.
 
 ### Fixed
+- **A function call in an aggregation position no longer panics the
+  emitter (#77, landed unclaimed in #80).** `stats split(message, ",", 1)`
+  — any multi-argument scalar call where the pipeline expects an
+  aggregation — hit an unguarded index in `translate_function` and took
+  the whole query down with it (mitigated to a 500 by the panic layer,
+  but a panic all the same). The `sev()` work unified argument emission
+  into one walk shared by every call position, which closed the hole;
+  recorded here because the fix shipped as a side effect of a refactor
+  commit and deserves a paper trail.
 - **`service=X last=Nh` no longer answers 200 with zero rows over an idle
   hot buffer (#73).** A time-filtered query becomes a *list* source — one
   glob per hour in range — and `read_parquet` rejects the whole list when

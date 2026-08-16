@@ -41,17 +41,44 @@ pub fn severity_column<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<u
         .position(|name| name == trawl_core::schema::SEVERITY)
 }
 
-/// The `SeverityNumber` a `_severity` cell holds, if it holds one.
+/// Which result columns render as severity TOKENS: `_severity`, plus the
+/// columns the response DECLARED (`sev()` output — ADR-0013 slice 2,
+/// ruling 9).
+///
+/// The membership rule is `trawl_core::severity::renders_as_severity`,
+/// the one every renderer asks; only the index collection is local.
+/// Distinct from [`severity_column`], which stays `_severity`-ONLY
+/// because the histogram's error bucketing is a statement about the
+/// EVENT's severity, not about any column a query happened to compute.
+#[must_use]
+pub fn severity_columns<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    declared: &[String],
+) -> Vec<usize> {
+    names
+        .into_iter()
+        .enumerate()
+        .filter(|(_, name)| trawl_core::severity::renders_as_severity(name, declared))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The `SeverityNumber` a severity cell holds, if it holds one.
 ///
 /// The column is BIGINT on the wire; a string is tolerated only because
 /// a hot-buffer row can carry the JSON shape before conformance renders
-/// it, and it reads through the same ladder vocabulary.
+/// it. Both shapes read through the ONE kernel
+/// (`trawl_core::severity::reading_*`, ADR-0013 slice 2 ruling 9), so a
+/// cell displays exactly the number ingest would have derived and
+/// `sev()` would compute — no surface has its own severity vocabulary.
+/// Every other shape (a float, a bool, an array) names no rung and has
+/// no reading, exactly as the kernel says.
 #[must_use]
 pub fn severity_number(v: &Value) -> Option<u8> {
+    use trawl_core::severity::Dialect;
     match v {
-        Value::Integer(n) => u8::try_from(*n).ok().filter(|n| (1..=24).contains(n)),
-        Value::String(s) => trawl_core::severity::number_for_exact(s)
-            .or_else(|| trawl_core::severity::number_for_token(s)),
+        Value::Integer(n) => trawl_core::severity::reading_number(*n, Dialect::Otel),
+        Value::String(s) => trawl_core::severity::reading_text(s, Dialect::Otel),
         _ => None,
     }
 }
@@ -119,12 +146,62 @@ mod tests {
     }
 
     /// A hot-buffer row can still carry the JSON shape before conformance
-    /// renders it, so a string reads through the same ladder.
+    /// renders it, so a string reads through the same ladder — the ONE
+    /// kernel, so a numeric string and a padded token read here exactly
+    /// as they read at ingest and under `sev()`.
     #[test]
     fn a_string_severity_reads_through_the_same_ladder() {
         assert_eq!(severity_number(&Value::String("error".into())), Some(17));
         assert_eq!(severity_number(&Value::String("error2".into())), Some(18));
+        assert_eq!(severity_number(&Value::String("err".into())), Some(17));
+        assert_eq!(severity_number(&Value::String("17".into())), Some(17));
+        assert_eq!(severity_number(&Value::String(" error ".into())), Some(17));
+        // No reading is no reading: the cell renders its raw value.
         assert_eq!(severity_number(&Value::String("gold".into())), None);
+        assert_eq!(severity_number(&Value::String("1.5".into())), None);
+        assert_eq!(severity_number(&Value::String("25".into())), None);
+        assert_eq!(severity_display(&Value::String("gold".into())), "gold");
+        assert_eq!(severity_display(&Value::String("17".into())), "error");
+    }
+
+    /// The INTEGER shape — what the wire actually carries — is unchanged
+    /// by the delegation: the ladder guard is the kernel's own.
+    #[test]
+    fn an_integer_severity_reads_the_ladder_and_nothing_else() {
+        for n in 1..=24i64 {
+            assert_eq!(
+                severity_number(&Value::Integer(n)),
+                u8::try_from(n).ok(),
+                "ladder {n}"
+            );
+        }
+        assert_eq!(severity_number(&Value::Integer(0)), None);
+        assert_eq!(severity_number(&Value::Integer(25)), None);
+        assert_eq!(severity_number(&Value::Integer(-1)), None);
+        assert_eq!(severity_number(&Value::Integer(i64::MAX)), None);
+        // A shape that names no rung.
+        assert_eq!(severity_number(&Value::Float(17.0)), None);
+        assert_eq!(severity_number(&Value::Boolean(true)), None);
+        assert_eq!(severity_number(&Value::Null), None);
+    }
+
+    /// Cell rendering reads `_severity` AND whatever the response
+    /// declared — a `sev()` output renders its token like any other
+    /// severity column, and an undeclared bare name renders as data.
+    #[test]
+    fn declared_severity_columns_join_the_name_keyed_one() {
+        let cols = ["_time", "severity", "_severity", "s"];
+        assert_eq!(severity_columns(cols, &[]), vec![2]);
+        assert_eq!(
+            severity_columns(cols, &["s".to_owned()]),
+            vec![2, 3],
+            "a declared column joins the name-keyed one"
+        );
+        assert_eq!(
+            severity_columns(["_time", "message"], &["s".to_owned()]),
+            Vec::<usize>::new(),
+            "a declared name the result does not carry matches nothing"
+        );
     }
 
     /// The COLUMN both SPA surfaces read is `_severity` and nothing

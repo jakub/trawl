@@ -12,8 +12,9 @@ use super::SqlValue;
 use super::compare::{NullPolicy, comparison_sql, in_list_sql, pattern_target};
 use super::fields::quote_field;
 use super::functions::{
-    format_literal_position, literal_int_positions, translate_function, unit_literal_positions,
-    validate_format_literal, validate_unit_literal,
+    format_literal_position, json_read_positions, literal_int_positions, literal_text_positions,
+    translate_function, unit_literal_positions, validate_format_literal, validate_function_arity,
+    validate_unit_literal,
 };
 use super::state::EmitterState;
 
@@ -40,49 +41,7 @@ pub(crate) fn emit_expr(
             Ok(emit_unary(*op, &inner))
         }
         Expr::FunctionCall { name, args } => {
-            let lit_positions = literal_int_positions(name);
-            let unit_positions = unit_literal_positions(name);
-            let fmt_position = format_literal_position(name);
-            let translated_args: Vec<String> = args
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    if lit_positions.contains(&i) {
-                        // DuckDB requires certain args as literal ints, not parameters
-                        match &a.node {
-                            Expr::Literal(LiteralValue::Int(n)) => Ok(n.to_string()),
-                            _ => Err(EmitError::InvalidAggregation {
-                                message: format!(
-                                    "{name}() argument {} must be an integer literal",
-                                    i + 1,
-                                ),
-                            }),
-                        }
-                    } else if let Some((_, allowlist)) =
-                        unit_positions.iter().find(|(pos, _)| *pos == i)
-                    {
-                        // Date/time unit args must be string literals from the allowlist.
-                        let raw = match &a.node {
-                            Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
-                            _ => None,
-                        };
-                        validate_unit_literal(name, i, allowlist, raw)?;
-                        emit_expr(a, state)
-                    } else {
-                        if fmt_position == Some(i) {
-                            // strftime/strptime format arg: reject invalid format
-                            // codes at emit time when it is a string literal, so
-                            // batch and streaming fail identically. A non-literal
-                            // (field ref) can't be checked here and keeps its
-                            // pre-existing runtime behaviour.
-                            if let Expr::Literal(LiteralValue::String(s)) = &a.node {
-                                validate_format_literal(name, s)?;
-                            }
-                        }
-                        emit_expr(a, state)
-                    }
-                })
-                .collect::<Result<_, _>>()?;
+            let translated_args = emit_call_args(name, args, state)?;
             translate_function(name, &translated_args)
         }
         Expr::InList { expr: target, list } => {
@@ -100,6 +59,94 @@ pub(crate) fn emit_expr(
             Ok(format!("({lhs} IN ({}))", items.join(", ")))
         }
     }
+}
+
+/// Translate one call's ARGUMENTS, applying every per-position rule the
+/// function declares — literal ints, closed-vocabulary literals, format
+/// strings, and the literals read through `to_json`.
+///
+/// Shared by the expression arm above and by every AGGREGATION-position
+/// call site (`emitter::pipeline`'s `stats`/`timechart`/`pivot`/
+/// `eventstats`): those emitted their arguments with a bare `emit_expr`,
+/// so `stats sev(level, "syslog")` bound the dialect as a parameter and
+/// then failed on the literal `?` it handed the translation. One
+/// argument walk, every position a call can sit in.
+pub(crate) fn emit_call_args(
+    name: &str,
+    args: &[Spanned<Expr>],
+    state: &mut EmitterState,
+) -> Result<Vec<String>, EmitError> {
+    let lit_positions = literal_int_positions(name);
+    let unit_positions = unit_literal_positions(name);
+    let text_positions = literal_text_positions(name);
+    let json_positions = json_read_positions(name);
+    let fmt_position = format_literal_position(name);
+    if !lit_positions.is_empty() || !unit_positions.is_empty() {
+        // Arity BEFORE vocabulary: a call carrying an argument the
+        // function does not have must say so, rather than
+        // complaining about a literal at a position that is not a
+        // literal position at all. Scoped to the functions with
+        // literal positions because only they inspect an argument
+        // before `translate_function`'s own arity guard runs — and
+        // for those the table's message is the guard's, word for
+        // word.
+        validate_function_arity(name, args.len())?;
+    }
+    let translated_args: Vec<String> = args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if lit_positions.contains(&i) {
+                // DuckDB requires certain args as literal ints, not parameters
+                match &a.node {
+                    Expr::Literal(LiteralValue::Int(n)) => Ok(n.to_string()),
+                    _ => Err(EmitError::InvalidAggregation {
+                        message: format!("{name}() argument {} must be an integer literal", i + 1),
+                    }),
+                }
+            } else if let Some((_, allowlist)) = unit_positions.iter().find(|(pos, _)| *pos == i) {
+                // Date/time unit args must be string literals from the allowlist.
+                let raw = match &a.node {
+                    Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
+                    _ => None,
+                };
+                validate_unit_literal(name, i, allowlist, raw)?;
+                if text_positions.contains(&i) {
+                    // The token CHOOSES the emitted expression
+                    // (`sev()`'s dialect), so it is never a bound
+                    // parameter: `translate_function` has to read
+                    // it. Folded here, once, so both the SQL and
+                    // the eval lane see one spelling.
+                    Ok(raw
+                        .expect("a non-literal was refused above")
+                        .to_ascii_lowercase())
+                } else {
+                    emit_expr(a, state)
+                }
+            } else if json_positions.contains(&i)
+                && let Some(literal) = bare_literal(&a.node)
+            {
+                // Read through `to_json` (`sev()`'s subject): a
+                // bare parameter has no type for `DuckDB` to
+                // infer there, so a literal carries the type it
+                // binds as anyway.
+                Ok(typed_literal(&literal, state))
+            } else {
+                if fmt_position == Some(i) {
+                    // strftime/strptime format arg: reject invalid format
+                    // codes at emit time when it is a string literal, so
+                    // batch and streaming fail identically. A non-literal
+                    // (field ref) can't be checked here and keeps its
+                    // pre-existing runtime behaviour.
+                    if let Expr::Literal(LiteralValue::String(s)) = &a.node {
+                        validate_format_literal(name, s)?;
+                    }
+                }
+                emit_expr(a, state)
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(translated_args)
 }
 
 /// Map a comparison [`BinaryOp`] onto the search stage's [`FilterOp`]
@@ -161,12 +208,14 @@ fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
     }
 }
 
-/// Detect a bare field-vs-literal comparison whose field resolves to a
-/// catalog pin, and emit it through the shared rule table (ADR-0011 slice
-/// A′). Returns `None` — falling through to generic, literal-driven
-/// emission, structurally — for every other shape: field-vs-field,
-/// function-wrapped fields, arithmetic, `== null`, unpinned fields, and
-/// any form the rule table leaves native.
+/// Detect a pinned-subject-vs-literal comparison and emit it through the
+/// shared rule table (ADR-0011 slice A′, widened by ADR-0013 ruling 9).
+/// The subject is whatever [`PinScope::subject_pin`] recognizes — a bare
+/// pinned field, or a pin-DECLARING call over one (`sev(level)`) — and
+/// every other shape returns `None`, falling through to generic,
+/// literal-driven emission, structurally: field-vs-field, an ordinary
+/// function wrapper, arithmetic, `== null`, unpinned fields, and any form
+/// the rule table leaves native.
 ///
 /// Both operand orders are accepted for the comparison operators
 /// (`400 < status` is `status > 400`); for the pattern operators
@@ -183,15 +232,12 @@ fn try_pinned_comparison(
     rhs: &Spanned<Expr>,
     state: &mut EmitterState,
 ) -> Result<Option<String>, EmitError> {
-    // Pattern operators: field on the LEFT only.
+    // Pattern operators: the subject is the LEFT operand only.
     if matches!(op, BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike) {
-        let Expr::FieldRef(name) = &lhs.node else {
+        let Some((subject, pin)) = state.pin_scope().subject_pin(lhs) else {
             return Ok(None);
         };
         let Expr::Literal(LiteralValue::String(pattern)) = &rhs.node else {
-            return Ok(None);
-        };
-        let Some(pin) = state.compare_pin(name) else {
             return Ok(None);
         };
         if compare::pattern_form(Some(pin)) == PatternForm::Native {
@@ -199,7 +245,9 @@ fn try_pinned_comparison(
             // byte-identical, so keep it on the generic path.
             return Ok(None);
         }
-        let target = pattern_target(&quote_field(name), Some(pin));
+        // The subject's SQL is built BEFORE the pattern's parameter, so
+        // any placeholder inside it keeps its positional order.
+        let target = pattern_target(&subject_sql(&subject, state)?, Some(pin));
         let placeholder = state.push_param(SqlValue::String(pattern.clone()));
         return Ok(Some(match op {
             BinaryOp::Matches => format!("regexp_matches({target}, {placeholder})"),
@@ -211,17 +259,18 @@ fn try_pinned_comparison(
     let Some(filter_op) = comparison_filter_op(op) else {
         return Ok(None);
     };
-    let resolved = match (&lhs.node, &rhs.node) {
-        (Expr::FieldRef(name), rhs) => bare_literal(rhs).map(|l| (name, filter_op, l)),
-        (lhs, Expr::FieldRef(name)) => {
-            bare_literal(lhs).map(|l| (name, flip_filter_op(filter_op), l))
+    let resolved = match (
+        state.pin_scope().subject_pin(lhs),
+        state.pin_scope().subject_pin(rhs),
+    ) {
+        (Some((subject, pin)), _) => bare_literal(&rhs.node).map(|l| (subject, pin, filter_op, l)),
+        // `400 < status` is `status > 400`, subject on the right.
+        (None, Some((subject, pin))) => {
+            bare_literal(&lhs.node).map(|l| (subject, pin, flip_filter_op(filter_op), l))
         }
-        _ => None,
+        (None, None) => None,
     };
-    let Some((name, filter_op, literal)) = resolved else {
-        return Ok(None);
-    };
-    let Some(pin) = state.compare_pin(name) else {
+    let Some((subject, pin, filter_op, literal)) = resolved else {
         return Ok(None);
     };
     let Some(form) = compare::compare_form_bound(Some(pin), filter_op, &literal)? else {
@@ -232,13 +281,9 @@ fn try_pinned_comparison(
         // ordered non-numeric literal) — generic emission is the rule.
         return Ok(None);
     }
-    let clause = comparison_sql(
-        &quote_field(name),
-        filter_op,
-        form,
-        NullPolicy::Strict,
-        state,
-    );
+    // Subject first, again for parameter order.
+    let target = subject_sql(&subject, state)?;
+    let clause = comparison_sql(&target, filter_op, form, NullPolicy::Strict, state);
     // Parenthesize for composition under and/or/not, matching the generic
     // emitter's style; the two-armed shapes arrive parenthesized already.
     Ok(Some(if clause.starts_with('(') {
@@ -256,10 +301,7 @@ fn try_pinned_in_list(
     list: &[Spanned<Expr>],
     state: &mut EmitterState,
 ) -> Result<Option<String>, EmitError> {
-    let Expr::FieldRef(name) = &target.node else {
-        return Ok(None);
-    };
-    let Some(pin) = state.compare_pin(name) else {
+    let Some((subject, pin)) = state.pin_scope().subject_pin(target) else {
         return Ok(None);
     };
     let mut forms: Vec<CompareForm> = Vec::with_capacity(list.len());
@@ -272,12 +314,48 @@ fn try_pinned_in_list(
         };
         forms.push(form);
     }
-    let clause = in_list_sql(&quote_field(name), forms, state);
+    // Subject first: `in_list_sql` pushes one parameter per element.
+    let subject = subject_sql(&subject, state)?;
+    let clause = in_list_sql(&subject, forms, state);
     Ok(Some(if clause.starts_with('(') {
         clause
     } else {
         format!("({clause})")
     }))
+}
+
+/// The SQL a pinned subject compares as: the quoted column, or the
+/// translated call.
+///
+/// A pin-declaring call is emitted by the ordinary function path — it is
+/// the same SQL `| let s = sev(level)` would project — so the comparison
+/// and the projection can never read one value two ways.
+fn subject_sql(
+    subject: &crate::pin_scope::PinnedSubject<'_>,
+    state: &mut EmitterState,
+) -> Result<String, EmitError> {
+    match subject {
+        crate::pin_scope::PinnedSubject::Field(name) => Ok(quote_field(name)),
+        crate::pin_scope::PinnedSubject::Call(call) => emit_expr(call, state),
+    }
+}
+
+/// A literal bound as a parameter that carries its OWN type.
+///
+/// For the positions read through `to_json`
+/// ([`super::functions::json_read_positions`]) — `DuckDB` infers a
+/// parameter's type from its surroundings, and `to_json(?)` offers none,
+/// so the statement fails to prepare. The cast names exactly the type the
+/// value binds as, so nothing about the reading changes; a NULL takes
+/// VARCHAR, the type every text reading starts from.
+fn typed_literal(lit: &LiteralValue, state: &mut EmitterState) -> String {
+    let ty = match lit {
+        LiteralValue::String(_) | LiteralValue::Null => "VARCHAR",
+        LiteralValue::Int(_) => "BIGINT",
+        LiteralValue::Float(_) => "DOUBLE",
+        LiteralValue::Bool(_) => "BOOLEAN",
+    };
+    format!("CAST({} AS {ty})", emit_literal(lit, state))
 }
 
 fn emit_literal(lit: &LiteralValue, state: &mut EmitterState) -> String {

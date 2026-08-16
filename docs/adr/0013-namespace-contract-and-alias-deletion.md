@@ -359,11 +359,18 @@ decisions. Where a ruling amends this ADR's text, the amendment is stated.
 
 9. **`sev(x)` declares its result as the SEVERITY canonical type** via a
    function-result-pin table (one entry) consumed by the pin-scope walk and
-   the comparison binder — so `| where sev(level) >= error` binds through
+   the comparison binder — so `| where sev(level) >= "error"` binds through
    the ADR-0011 rule table, equality takes the BAND (a plain-BIGINT `sev()`
    would compile `== sev("error")` to `== 17` and silently miss
    `error2`–`error4` — the decisive critique-round argument), and results
-   render tokens. Slice A′'s exclusion of function-wrapped subjects stands
+   render tokens. *Amended at #77 land: the token is QUOTED — a bare
+   `error` is a `FieldRef` in the pipeline today, exactly as for
+   `_severity`, and binding it would make an event field named `error`
+   unreachable with no escape until the backticks slice. Bare-token
+   binding, if ever wanted, belongs to that slice. The subject extension
+   is a pin-declaring call over a BARE field ref, narrowly — a computed
+   `sev(<expr>)` subject falls to the generic path (the `let`-first idiom
+   covers it).* Slice A′'s exclusion of function-wrapped subjects stands
    on decidability and a declared result pin restores it; the extension is
    exactly one function. Optional second literal arg `"otel"`|`"syslog"`
    (same closed vocabulary as the config). No reading → NULL, never an

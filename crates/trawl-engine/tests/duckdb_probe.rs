@@ -3157,11 +3157,240 @@ fn left_truncates_by_character_not_by_byte() {
 // The SEVERITY canonical type (ADR-0013)
 // ---------------------------------------------------------------------------
 
-/// The SEVERITY conform rung is the guarded BIGINT cast inside the 1-24
-/// ladder guard, and its LIVE mirror (`compare::conformed_severity`) reads
-/// the same domain — executed, not reasoned. Out-of-ladder numbers
-/// (`0`, `25`, `-3`) conform to NULL in both engines, so a stored value
-/// always has a token rendering.
+/// The reading matrix (ADR-0013 slice 2, ruling 9): `severity_reading_sql`
+/// answers what `severity::reading` answers, case by case, in BOTH
+/// dialects — the whole basis for one kernel serving ingest, `sev()` and
+/// the conform rung.
+///
+/// The cases the probe exists for are the ones where the two engines have
+/// their OWN opinions: `TRY_CAST` reads `'1e1'` as 10 and `'0x10'` as 16
+/// where `str::parse` reads neither (so the SQL guards with a digits-only
+/// `regexp_full_match` first), `'+17'` is a sign both must accept,
+/// `trim(s, chars)` must trim the same six ASCII characters `trim_matches`
+/// does and no Unicode space, and an integer past `i64` must overflow to
+/// NULL on both sides rather than saturating on one.
+#[test]
+fn severity_reading_sql_matches_the_rust_kernel_in_both_dialects() {
+    use trawl_core::severity::{self, Dialect};
+
+    let conn = conn();
+    let cases: &[&str] = &[
+        "error",
+        "ERR",
+        " error ",
+        "error2",
+        "ERROR2",
+        "warn",
+        "notice",
+        "0",
+        "1",
+        "7",
+        "8",
+        "24",
+        "25",
+        "0404",
+        "007",
+        "+17",
+        "-1",
+        "1.5",
+        "17.0",
+        "1_2",
+        "1e1",
+        "0x10",
+        "9223372036854775807",
+        "9223372036854775808",
+        "99999999999999999999999999",
+        "",
+        "   ",
+        "\t 17 \r\n",
+        "\u{a0}error",
+        "gold",
+        "nan",
+        "inf",
+        // `DuckDB`'s `lower()` is UNICODE and the kernel's fold is ASCII:
+        // `lower('İ')` is `i`, so an ungated token CASE read `İNFO` as 9
+        // in SQL and as nothing in Rust. Both dotted/dotless Turkish i,
+        // a full-width digit (which `TRY_CAST` also refuses), and a
+        // Kelvin sign that folds to `k`.
+        "İNFO",
+        "info\u{307}",
+        "ı",
+        "İ",
+        "\u{212a}",
+        "ＩＮＦＯ",
+        "１７",
+        "ERROR",
+        "Warning",
+        // The trim set is the Unicode `White_Space` property on BOTH
+        // engines (`DuckDB` matches a multibyte character set by
+        // character, which is what licenses the wide set): a padded
+        // token was accepted by ingest before the kernel landed, and a
+        // narrowing here would drop those readings silently.
+        "\u{a0}error\u{a0}",
+        "\u{2003}error",
+        "\u{3000}error\u{3000}",
+        "\u{85}error",
+        "\u{202f}\u{2009}error\t",
+        "\u{a0}17\u{a0}",
+        "er\u{a0}ror",
+    ];
+    for dialect in [Dialect::Otel, Dialect::Syslog] {
+        for text in cases {
+            let escaped = text.replace('\'', "''");
+            let kernel = severity::reading_text(text, dialect).map(i64::from);
+            // BOTH shapes — the repeated one the conform rung emits and
+            // the bind-once one `sev()` emits — answer the kernel. They
+            // share an arm generator, and this is what proves the two
+            // wrappers around it are the same reading.
+            for build in [
+                trawl_core::conform::severity_reading_sql,
+                trawl_core::conform::severity_reading_sql_bind_once,
+            ] {
+                let sql = format!("SELECT {}", build(&format!("'{escaped}'"), dialect));
+                let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+                assert_eq!(
+                    engine, kernel,
+                    "{dialect:?} reading disagreed on {text:?}\n{sql}"
+                );
+            }
+        }
+        // A NULL input has no reading on either side.
+        let sql = format!(
+            "SELECT {}",
+            trawl_core::conform::severity_reading_sql("CAST(NULL AS VARCHAR)", dialect)
+        );
+        let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(engine, None, "{dialect:?} read a NULL as a severity");
+    }
+}
+
+/// The generated arms, the result TYPE, and the bind-once shape's reason
+/// for existing — the half of the reading contract that is not the
+/// input matrix.
+#[test]
+fn severity_reading_sql_generates_its_arms_and_types_as_bigint() {
+    use trawl_core::severity::{self, Dialect};
+
+    let conn = conn();
+    // Every token spelling and every exact short name, through the SQL:
+    // the arms are generated from the kernel's tables, so a table edit
+    // that misses the generator fails here.
+    for (token, number) in severity::token_entries() {
+        for spelling in [token.to_owned(), token.to_uppercase()] {
+            let sql = format!(
+                "SELECT {}",
+                trawl_core::conform::severity_reading_sql(&format!("'{spelling}'"), Dialect::Otel)
+            );
+            let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(engine, Some(i64::from(number)), "token {spelling}");
+        }
+    }
+    for n in 1..=24u8 {
+        let name = severity::otel_name(n).unwrap();
+        let sql = format!(
+            "SELECT {}",
+            trawl_core::conform::severity_reading_sql(&format!("'{name}'"), Dialect::Otel)
+        );
+        let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(engine, Some(i64::from(n)), "exact name {name}");
+    }
+
+    // The reading types as the physical BIGINT a SEVERITY column holds —
+    // an INTEGER-typed conform would disagree with the parquet side and
+    // throw the hot+cold union.
+    for build in [
+        trawl_core::conform::severity_reading_sql,
+        trawl_core::conform::severity_reading_sql_bind_once,
+    ] {
+        let sql = format!("DESCRIBE SELECT {} AS s", build("'error'", Dialect::Otel));
+        let ty: String = conn.query_row(&sql, [], |row| row.get(1)).unwrap();
+        assert_eq!(ty, CanonicalType::Severity.as_duckdb());
+    }
+
+    // The bind-once shape exists so a subject carrying a BOUND PARAMETER
+    // is pushed once and read once: `DuckDB` binds `?` positionally, so
+    // the repeated shape would need four copies of one value — and
+    // `to_json(?)` types nothing, which is why the parameter arrives
+    // pre-cast (`emitter::expr::typed_literal`).
+    let subject = trawl_core::conform::untyped_text("CAST(? AS VARCHAR)");
+    let sql = format!(
+        "SELECT {}",
+        trawl_core::conform::severity_reading_sql_bind_once(&subject, Dialect::Otel)
+    );
+    assert_eq!(
+        sql.matches('?').count(),
+        2,
+        "one param, one regex `?`: {sql}"
+    );
+    let reading: Option<i64> = conn
+        .query_row(&sql, duckdb::params![" Error "], |row| row.get(0))
+        .unwrap();
+    assert_eq!(reading, Some(17));
+}
+
+/// The trim set is ONE set in two spellings — `severity::WHITESPACE` in
+/// Rust, an RE2 class in the SQL — and this is what makes them one: every
+/// character of the const is trimmed by the SQL reader, and a
+/// look-alike that is NOT `White_Space` (U+200B ZERO WIDTH SPACE, U+180E,
+/// U+FEFF) survives on both sides.
+///
+/// The wide set is deliberate. Ingest trimmed with `str::trim` before the
+/// kernel landed, so a `severity` padded with U+00A0 had a reading; an
+/// ASCII-only trim would have dropped it with no repair code and nothing
+/// in the event to explain the loss.
+#[test]
+fn the_trim_set_is_the_same_on_both_engines() {
+    use trawl_core::severity::{self, Dialect, WHITESPACE};
+
+    let conn = conn();
+    for c in WHITESPACE {
+        let padded = format!("{c}error{c}");
+        let escaped = padded.replace('\'', "''");
+        for build in [
+            trawl_core::conform::severity_reading_sql,
+            trawl_core::conform::severity_reading_sql_bind_once,
+        ] {
+            let sql = format!("SELECT {}", build(&format!("'{escaped}'"), Dialect::Otel));
+            let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(
+                engine,
+                Some(17),
+                "SQL did not trim U+{:04X}\n{sql}",
+                u32::from(c)
+            );
+        }
+        assert_eq!(
+            severity::reading_text(&padded, Dialect::Otel),
+            Some(17),
+            "Rust did not trim U+{:04X}",
+            u32::from(c)
+        );
+    }
+
+    // Not `White_Space`, so it is part of the value on both engines.
+    for c in ['\u{200b}', '\u{180e}', '\u{feff}'] {
+        let padded = format!("{c}error");
+        let sql = format!(
+            "SELECT {}",
+            trawl_core::conform::severity_reading_sql(&format!("'{padded}'"), Dialect::Otel)
+        );
+        let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(engine, None, "SQL trimmed U+{:04X}", u32::from(c));
+        assert_eq!(
+            severity::reading_text(&padded, Dialect::Otel),
+            None,
+            "Rust trimmed U+{:04X}",
+            u32::from(c)
+        );
+    }
+}
+
+/// The SEVERITY conform rung is the reading kernel, and its LIVE mirror
+/// (`compare::conformed_severity`) reads the same domain — executed, not
+/// reasoned. Out-of-ladder numbers (`0`, `25`, `-3`) conform to NULL in
+/// both engines, so a stored value always has a token rendering, and a
+/// TOKEN (`error`) conforms to its number on both sides (ADR-0013 ruling
+/// 10: the pin's lifetime meaning is the full reading).
 #[test]
 fn severity_conform_rung_bounds_the_ladder_on_both_engines() {
     let conn = conn();
@@ -3254,9 +3483,9 @@ fn severity_conform_yields_the_physical_bigint() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    // The word `warn` is not a NUMBER: derivation maps tokens at INGEST,
-    // never at read time, so a stray word conforms to NULL.
-    assert_eq!(rows, vec![Some(17), None]);
+    // Both conform: the rung is the token-aware reading (ADR-0013 ruling
+    // 10), so a stored `warn` is 13 and not a shelved conflict.
+    assert_eq!(rows, vec![Some(13), Some(17)]);
 }
 
 /// Backticks are LEXING: the name a query spells with them is the

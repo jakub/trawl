@@ -338,6 +338,20 @@ pub struct QueryResponse {
     /// semantics, and embedded `--data` mode has no catalog to consult.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded_fields: Vec<String>,
+    /// Result columns holding `OTel` `SeverityNumber`s that are NOT the
+    /// envelope's `_severity` — `sev()` output, or a column that took the
+    /// slot's pin (ADR-0013 slice 2, ruling 9).
+    ///
+    /// Response-level and PRESENTATIONAL, exactly like `degraded_fields`
+    /// and for the same reason: a per-`Column` field would have to be
+    /// filled at ~25 construction sites, and this says nothing about the
+    /// VALUES — every format still carries the number. A renderer that
+    /// displays tokens (the CLI table, the TUI, the SPA's results grid)
+    /// reads it; json/csv/SSE ignore it, so an arithmetic consumer is
+    /// untouched. Absent from the wire when empty, which is the ordinary
+    /// case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub severity_columns: Vec<String>,
 }
 
 /// Pagination metadata for query responses.

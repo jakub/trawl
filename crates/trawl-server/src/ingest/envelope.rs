@@ -422,31 +422,20 @@ const SEVERITY_SOURCES: [&str; 3] = ["severity", "severity_text", "level"];
 
 /// Map one severity source value onto the `OTel` ladder, or nothing.
 ///
-/// A WORD maps through the ADR-0009 token table (`error` → 17) or the
-/// `OTel` exact short names (`error2` → 18). A NUMERIC — JSON number or
-/// numeric string — maps STRICTLY as `OTel` 1-24 (ADR-0013 §4): `3` is
-/// trace here, never syslog's err. The ranges overlap, so no value-shape
-/// rule can tell the dialects apart; syslog inversion happens only where
-/// transport provenance proves the dialect, in the syslog listener, which
-/// writes `_severity` itself.
+/// A delegate to the ONE reader (ADR-0013 slice 2, ruling 9): a WORD maps
+/// through the ADR-0009 token table (`error` → 17) or the `OTel` exact
+/// short names (`error2` → 18), and a NUMERIC — JSON number or numeric
+/// string — maps STRICTLY as `OTel` 1-24 (ADR-0013 §4): `3` is trace
+/// here, never syslog's err. The ranges overlap, so no value-shape rule
+/// can tell the dialects apart; syslog inversion happens only where
+/// transport provenance proves the dialect (the syslog listener), and it
+/// asks the same kernel with the other [`trawl_core::severity::Dialect`].
+///
+/// Reading through the kernel is also what keeps ingest and `sev()`
+/// honest: the number a query computes from a raw `level` is the number
+/// derivation would have stored for it.
 fn severity_reading(v: &Value) -> Option<u8> {
-    let from_number = |n: i64| {
-        trawl_core::severity::is_valid_number(n)
-            .then(|| u8::try_from(n).ok())
-            .flatten()
-    };
-    match v {
-        Value::String(s) => {
-            let s = s.trim();
-            if let Ok(n) = s.parse::<i64>() {
-                return from_number(n);
-            }
-            trawl_core::severity::number_for_token(s)
-                .or_else(|| trawl_core::severity::number_for_exact(s))
-        }
-        Value::Number(n) => n.as_i64().and_then(from_number),
-        _ => None,
-    }
+    trawl_core::severity::reading(v, trawl_core::severity::Dialect::Otel)
 }
 
 /// Derive `_severity` from the event's own fields — READ-ONLY.

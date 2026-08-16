@@ -20,11 +20,12 @@ use crate::ast::{PipeStage, Query, Spanned};
 use state::EmitterState;
 
 pub(crate) use fields::coerce_filter_value;
-pub use functions::is_aggregate_function;
 pub use functions::{DATE_PART_UNITS, DATE_UNITS};
 pub(crate) use functions::{
-    format_literal_position, unit_literal_positions, validate_format_literal, validate_unit_literal,
+    format_literal_position, unit_literal_positions, validate_format_literal,
+    validate_function_arity, validate_unit_literal,
 };
+pub use functions::{function_result_pin, is_aggregate_function};
 pub use state::{hot_source_reader, source_reader, validate_source_path};
 pub use validate::validate_pipeline;
 
@@ -2206,5 +2207,104 @@ mod tests {
         let query = parser::parse("*").unwrap();
         let err = emit(&query, "[not-quoted]").unwrap_err();
         assert!(err.to_string().contains("invalid source list element"));
+    }
+
+    // -----------------------------------------------------------------------
+    // sev() — the ladder function (ADR-0013 slice 2, ruling 9)
+    // -----------------------------------------------------------------------
+
+    /// `sev(x)` emits the reading kernel over the argument's TEXT form,
+    /// bound ONCE — the subject may carry parameters, and the emitter
+    /// pushes one value per call, not per occurrence.
+    #[test]
+    fn sev_emits_the_reading_kernel_over_the_arguments_text() {
+        let sql = emit_dsl("* | let s = sev(level)");
+        assert!(
+            sql.contains(&crate::conform::severity_reading_sql_bind_once(
+                &crate::conform::untyped_text("\"level\""),
+                crate::severity::Dialect::Otel
+            )),
+            "{sql}"
+        );
+    }
+
+    /// The dialect argument SELECTS the expression and is never bound as a
+    /// parameter — the emitted SQL differs, and no `?` is spent on it.
+    #[test]
+    fn sev_dialect_argument_selects_the_expression_and_binds_nothing() {
+        let otel = emit_dsl("* | let s = sev(level)");
+        let syslog = emit_dsl(r#"* | let s = sev(level, "syslog")"#);
+        assert_ne!(otel, syslog);
+        assert!(
+            !syslog.contains("params:"),
+            "the dialect bound a param: {syslog}"
+        );
+        assert!(
+            syslog.contains(&crate::conform::severity_reading_sql_bind_once(
+                &crate::conform::untyped_text("\"level\""),
+                crate::severity::Dialect::Syslog
+            )),
+            "{syslog}"
+        );
+        // Case-insensitive, like every other token in the vocabulary.
+        assert_eq!(emit_dsl(r#"* | let s = sev(level, "SYSLOG")"#), syslog);
+        assert_eq!(emit_dsl(r#"* | let s = sev(level, "OTel")"#), otel);
+    }
+
+    /// A literal subject carries its own type: `to_json(?)` gives `DuckDB`
+    /// nothing to infer a parameter's type from.
+    #[test]
+    fn sev_over_a_literal_types_its_parameter() {
+        let sql = emit_dsl(r#"* | let s = sev("error")"#);
+        assert_eq!(
+            sql.matches("CAST(? AS VARCHAR)").count(),
+            1,
+            "one occurrence, one param: {sql}"
+        );
+        assert!(sql.contains("\n  0: "), "one bound param: {sql}");
+        assert!(!sql.contains("\n  1: "), "only one bound param: {sql}");
+        let sql = emit_dsl("* | let s = sev(7)");
+        assert_eq!(sql.matches("CAST(? AS BIGINT)").count(), 1, "{sql}");
+        assert!(sql.contains("\n  0: "), "one bound param: {sql}");
+        assert!(!sql.contains("\n  1: "), "only one bound param: {sql}");
+    }
+
+    /// The dialect vocabulary is closed, and the refusal NAMES it.
+    #[test]
+    fn sev_refuses_an_unknown_dialect() {
+        let err = emit_dsl_err(r#"* | let s = sev(level, "rfc5424")"#);
+        assert!(err.contains("otel, syslog"), "{err}");
+        assert!(err.contains("dialect"), "{err}");
+    }
+
+    /// A computed dialect can never be honoured — the stream lane resolves
+    /// no expressions at compile time — so it is refused in both.
+    #[test]
+    fn sev_refuses_a_non_literal_dialect() {
+        let err = emit_dsl_err("* | let s = sev(level, other)");
+        assert!(
+            err.contains("must be a string literal dialect name"),
+            "{err}"
+        );
+    }
+
+    /// Arity BEFORE vocabulary: a third argument is an arity error, not a
+    /// complaint about the second.
+    #[test]
+    fn sev_reports_arity_before_vocabulary() {
+        let err = emit_dsl_err(r#"* | let s = sev(level, "otel", 1)"#);
+        assert!(err.contains("sev() requires 1 to 2 arguments"), "{err}");
+        let err = emit_dsl_err("* | let s = sev()");
+        assert!(err.contains("sev() requires 1 to 2 arguments"), "{err}");
+    }
+
+    /// `sev` is a SCALAR: it gains no aggregate status, so `stats sev(x)`
+    /// is projected exactly as any other scalar in that position is.
+    #[test]
+    fn sev_is_not_an_aggregate() {
+        assert!(!is_aggregate_function("sev"));
+        let sql = emit_dsl("* | stats sev(level)");
+        assert!(sql.contains("AS \"sev_level\""), "{sql}");
+        assert!(!sql.contains("GROUP BY"), "{sql}");
     }
 }
