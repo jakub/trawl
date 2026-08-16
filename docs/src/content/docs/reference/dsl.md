@@ -328,11 +328,46 @@ or the exact names; a number maps strictly as OTel 1-24, so `3` is
 where the transport proves the dialect. An event with no mappable source
 simply has no `_severity`.
 
+#### Reading any field as a severity: `sev()`
+
+`_severity` is what trawl derived at ingest. `sev(x)` is the same reading
+applied at **query time**, to any field you name:
+
+```
+| where sev(level) >= "error"       # the ORDERED rule: >= 17
+| where sev(level) == "error"       # the EQUALITY rule: the 17-20 band
+| where sev(syslog_severity, "syslog") == "error"
+| let s = sev(level) | stats count() by s
+```
+
+- One kernel. `sev()` reads exactly what ingest's derivation reads: the
+  band tokens with their aliases, OTel's exact short names, then a strict
+  integer. Anything else — `1.5`, `1e1`, `0x10`, `gold`, a boolean — has
+  **no reading**, which is `null`, never an error.
+- `sev()` **declares** its result as `SEVERITY`, so a comparison against
+  it binds through the rules above (band for `==`/`in`, exact number when
+  ordered, canonical token text for `matches`/globs) and its column
+  displays tokens in the CLI table, the TUI and the web UI. Machine
+  formats keep the number, as always.
+- The **literals must be quoted**: `sev(level) >= "error"`. A bare
+  `error` in a pipe stage is a field reference, exactly as it is
+  everywhere else in `| where`.
+- The pin travels: `| let s = sev(level)` gives `s` the `SEVERITY` type,
+  and `| stats count() by s` keeps it.
+- `dialect` governs NUMERICS only — words always read the one token
+  table. `sev(x, "syslog")` inverts 0-7 (syslog counts down: `3` is
+  `err` → 17), which is the reading for a foreign syslog dump. It must be
+  a **literal** from `otel`/`syslog`; anything else is a query error
+  naming the vocabulary, in batch and live alike.
+- It works in embedded `--data` mode, where nothing else is pin-aware:
+  the type is declared by the function, not looked up in a catalog.
+
 :::caution[`level=error` is not a severity filter]
 `level` is an ordinary field now, so `level=error` compares the sender's
 own value. A game server emitting `{"service":"game","level":"gold"}`
 keeps a fully queryable `level` column — that is the point — but if you
-meant severity, you want `_severity>=error`. And a field no sender writes
+meant severity, you want `_severity>=error` — or `sev(level)>="error"`
+to read the sender's own field on the ladder. And a field no sender writes
 is not an error: it simply matches nothing, so a query written against
 the old alias comes back empty rather than failing. trawl says nothing
 about it — `level` is your vocabulary, not trawl's, and a notice keyed on
@@ -651,6 +686,7 @@ Available in `let`/`eval` and `where` expressions.
 | `now()` | Current timestamp (timezone-naive, wall-clock UTC) |
 | `tonumber(x)` | Cast to float (`null` on parse failure — mirrors `TRY_CAST AS DOUBLE`) |
 | `tostring(x)` | Cast to string (`null` for null/array input) |
+| `sev(x[, dialect])` | Read a value's OTel SeverityNumber (`null` when it has no reading). `dialect` is `"otel"` (default) or `"syslog"` — see [Reading any field as a severity](#reading-any-field-as-a-severity-sev) |
 
 ### Nested fields (JSON)
 
