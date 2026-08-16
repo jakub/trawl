@@ -3318,3 +3318,51 @@ fn eventstats_columns_lambda_overwrites_beside_a_window_function() {
         "a bare star emits the name twice: {columns:?}"
     );
 }
+
+/// The PIVOT lane inlines its parameters — `DuckDB`'s `PIVOT` takes no
+/// placeholders — so the substitution is the one place a client-chosen
+/// column NAME meets literal SQL text. Backticks made every name
+/// spellable (ADR-0013 ruling 7), so this executes the two hostile shapes
+/// against the engine: a name carrying the placeholder marker itself, and
+/// one carrying the identifier delimiter. Both must select the row they
+/// name and smuggle nothing.
+#[test]
+fn pivot_inlining_binds_hostile_field_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("hot.ndjson");
+    let mut f = std::fs::File::create(&file).unwrap();
+    writeln!(f, r#"{{"service?":"nginx","a\"b":"keep","status":"200"}}"#).unwrap();
+    writeln!(f, r#"{{"service?":"other","a\"b":"drop","status":"500"}}"#).unwrap();
+    f.sync_all().unwrap();
+
+    let conn = conn();
+    let src = hot_reader(&file);
+
+    // The shape the emitter now writes: the marker inside the identifier
+    // stays part of the NAME, and the parameter lands in the comparison.
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT \"a\"\"b\" FROM {src} WHERE \"service?\" = 'nginx'"
+        ))
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        rows,
+        vec!["keep".to_string()],
+        "both hostile names must bind as identifiers"
+    );
+
+    // …and the pre-fix rendering, where the marker ate the parameter, is
+    // not merely wrong but a DIFFERENT identifier — the engine agrees it
+    // never names the column.
+    let err = conn
+        .prepare(&format!(
+            "SELECT \"a\"\"b\" FROM {src} WHERE \"service'nginx'\" = ?"
+        ))
+        .and_then(|mut s| s.query_row([], |_| Ok(())));
+    assert!(err.is_err(), "the smuggled identifier must not resolve");
+}

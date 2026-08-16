@@ -654,6 +654,35 @@ mod tests {
         );
     }
 
+    /// `pivot` is the one lane that INLINES its parameters (`DuckDB`'s PIVOT
+    /// takes no placeholders), so the substitution has to know where SQL
+    /// data ends. A `?` inside a quoted identifier is part of a column
+    /// NAME — client-chosen, and spellable since backticks landed — and
+    /// consuming a parameter there shifts every value one position left
+    /// and splices a literal into the identifier.
+    #[test]
+    fn pivot_inlining_ignores_markers_inside_names_and_literals() {
+        let sql = emit_dsl("`service?`=nginx | pivot count() on service");
+        assert!(
+            sql.contains(r#""service?" = 'nginx'"#),
+            "the name keeps its `?` and the filter keeps its value: {sql}"
+        );
+        assert!(
+            !sql.contains("service'nginx'"),
+            "the marker inside the identifier must not be substituted: {sql}"
+        );
+
+        // A name carrying a double quote reaches SQL through `quote_field`'s
+        // doubling; the scan must not read that as leaving the identifier.
+        let sql = emit_dsl(r#"`a"b?`=x | pivot count() on service"#);
+        assert!(sql.contains(r#""a""b?" = 'x'"#), "{sql}");
+
+        // …and a literal VALUE carrying a marker is data too.
+        let sql = emit_dsl(r#"service="a?b" status=200 | pivot count() on service"#);
+        assert!(sql.contains("'a?b'"), "{sql}");
+        assert!(sql.contains("200"), "the next parameter still lands: {sql}");
+    }
+
     // -----------------------------------------------------------------------
     // the physical `_time` column (ADR-0013: no aliases resolve onto it)
     // -----------------------------------------------------------------------

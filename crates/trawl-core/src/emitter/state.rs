@@ -680,11 +680,26 @@ impl EmitterState {
     /// Replace `?` placeholders starting from `start_idx` in the params slice.
     /// Returns the inlined SQL and the next param index (for chaining across
     /// multiple SQL fragments).
+    ///
+    /// A `?` inside a quoted IDENTIFIER or a string LITERAL is data, not a
+    /// placeholder, and the scan tracks both. Field names are client-chosen
+    /// and reach SQL verbatim (ADR-0013 ruling 7 made every name spellable),
+    /// so a column called `service?` would otherwise eat the next parameter
+    /// — shifting every value one position left and splicing a literal into
+    /// an identifier. The doubling convention needs no special case: `""`
+    /// and `''` toggle twice and land back where they started.
     fn inline_params_counted(sql: &str, params: &[SqlValue], start_idx: usize) -> (String, usize) {
         let mut result = String::with_capacity(sql.len());
         let mut param_idx = start_idx;
+        let mut in_identifier = false;
+        let mut in_literal = false;
         for ch in sql.chars() {
-            if ch == '?' && param_idx < params.len() {
+            match ch {
+                '"' if !in_literal => in_identifier = !in_identifier,
+                '\'' if !in_identifier => in_literal = !in_literal,
+                _ => {}
+            }
+            if ch == '?' && !in_identifier && !in_literal && param_idx < params.len() {
                 match &params[param_idx] {
                     SqlValue::String(s) => {
                         result.push('\'');
