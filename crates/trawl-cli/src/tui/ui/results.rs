@@ -276,10 +276,15 @@ fn render_table(
                 .map(|&col_idx| {
                     let value = &row_data[col_idx];
                     let width = all_widths[col_idx] as usize;
-                    let text = if result.columns[col_idx].name == trawl_core::schema::SEVERITY {
-                        // `_severity` DISPLAYS its OTel token (ADR-0013
-                        // §6): `17` reads `error`, the same vocabulary
-                        // that would filter it.
+                    let text = if trawl_core::severity::renders_as_severity(
+                        &result.columns[col_idx].name,
+                        &response.severity_columns,
+                    ) {
+                        // A severity column DISPLAYS its OTel token
+                        // (ADR-0013 §6): `17` reads `error`, the same
+                        // vocabulary that would filter it — `_severity`
+                        // by name, plus whatever the response declared
+                        // (a `sev()` output).
                         severity_cell_text(value)
                     } else {
                         value_to_string(value)

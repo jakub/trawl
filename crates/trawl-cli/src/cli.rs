@@ -81,10 +81,13 @@ pub async fn run_query(
         ));
     }
 
-    let (result, degraded) = if let Some(data) = data {
+    let (result, degraded, severity_columns) = if let Some(data) = data {
         match run_embedded_mode(data, query, timezone) {
-            // Embedded mode has no catalog, so it has no notice to carry.
-            Ok(r) => (r, Vec::new()),
+            // Embedded mode has no catalog, so it has no notice to carry
+            // — but `sev()` declares its own pin, so its columns still
+            // render as tokens here (that is the whole point of a
+            // FUNCTION-declared pin: it needs no catalog).
+            Ok(r) => (r, Vec::new(), embedded_severity_columns(query)),
             Err(CliError::Engine(ref engine_err)) => {
                 render_engine_error(query, engine_err);
                 return Err(CliError::Usage("query failed".into()));
@@ -112,8 +115,28 @@ pub async fn run_query(
         format,
         output,
         &degraded,
+        &severity_columns,
         &mut stdout.lock(),
         &mut io::stderr(),
+    )
+}
+
+/// The severity-rendering columns of an EMBEDDED query.
+///
+/// The same walk the server runs, from a pin-blind root: embedded mode
+/// has no catalog, so only a FUNCTION-declared pin can survive it — which
+/// is exactly `sev()`, and exactly why it is declared rather than
+/// derived. An unparseable query renders nothing special; the engine
+/// reports the parse error.
+fn embedded_severity_columns(query: &str) -> Vec<String> {
+    trawl_core::parser::parse(query).map_or_else(
+        |_| Vec::new(),
+        |ast| {
+            trawl_core::pin_scope::severity_output_columns(
+                &ast.pipeline,
+                &trawl_core::pin_scope::PinScope::unpinned(),
+            )
+        },
     )
 }
 
@@ -127,16 +150,17 @@ fn emit_results(
     format: OutputFormat,
     output: Option<&Path>,
     degraded: &[String],
+    severity_columns: &[String],
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> Result<(), CliError> {
     if let Some(output_path) = output {
         let mut file = std::fs::File::create(output_path)?;
-        render_results(result, format, &mut file)?;
+        render_results(result, format, severity_columns, &mut file)?;
         // The file is the deliverable; the notice belongs on the terminal.
         write_degraded_footer(err, format, degraded)?;
     } else {
-        render_results(result, format, out)?;
+        render_results(result, format, severity_columns, out)?;
         write_degraded_footer(out, format, degraded)?;
     }
 
@@ -147,10 +171,11 @@ fn emit_results(
 fn render_results(
     result: &QueryResult,
     format: OutputFormat,
+    severity_columns: &[String],
     out: &mut impl Write,
 ) -> io::Result<()> {
     match format {
-        OutputFormat::Table => render_table(result, out),
+        OutputFormat::Table => render_table(result, severity_columns, out),
         OutputFormat::Json => render_ndjson(result, out),
         OutputFormat::Csv => render_csv(result, out),
         OutputFormat::Parquet => unreachable!("handled above"),
@@ -251,7 +276,7 @@ async fn run_daemon_mode(
     conn: &ConnectionParams,
     query: &str,
     timezone: &str,
-) -> Result<(QueryResult, Vec<String>), CliError> {
+) -> Result<(QueryResult, Vec<String>, Vec<String>), CliError> {
     let client = make_client(conn)?;
     let response = client
         .query_paginated_tz(query, None, None, Some(timezone.to_owned()))
@@ -262,8 +287,14 @@ async fn run_daemon_mode(
 /// Split a daemon response into what the printer needs: the rows and the
 /// degraded-field note (ADR-0011 slice C1), which is carried, never
 /// dropped.
-fn daemon_outcome(response: trawl_client::QueryResponse) -> (QueryResult, Vec<String>) {
-    (response.result, response.degraded_fields)
+fn daemon_outcome(
+    response: trawl_client::QueryResponse,
+) -> (QueryResult, Vec<String>, Vec<String>) {
+    (
+        response.result,
+        response.degraded_fields,
+        response.severity_columns,
+    )
 }
 
 /// Execute the query locally with an embedded `DuckDB` engine.
@@ -295,7 +326,11 @@ fn make_client(conn: &ConnectionParams) -> Result<trawl_client::HttpClient, CliE
 
 // -- output formatters -------------------------------------------------------
 
-fn render_table(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
+fn render_table(
+    result: &QueryResult,
+    severity_columns: &[String],
+    out: &mut impl Write,
+) -> io::Result<()> {
     if result.is_empty() {
         writeln!(out, "no results")?;
         return Ok(());
@@ -310,20 +345,23 @@ fn render_table(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     let headers: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     table.set_header(headers);
 
-    // `_severity` DISPLAYS its OTel token (ADR-0013 §6): `17` reads
-    // `error`, the same vocabulary that would filter it. Only the table
-    // renders it — json/csv keep the number, for arithmetic consumers.
-    let severity_idx = result
+    // A severity column DISPLAYS its OTel token (ADR-0013 §6): `17` reads
+    // `error`, the same vocabulary that would filter it. `_severity` by
+    // name, plus whatever the response declared (a `sev()` output). Only
+    // the table renders it — json/csv keep the number, for arithmetic
+    // consumers.
+    let severity_cells: Vec<bool> = result
         .columns
         .iter()
-        .position(|c| c.name == trawl_core::schema::SEVERITY);
+        .map(|c| trawl_core::severity::renders_as_severity(&c.name, severity_columns))
+        .collect();
 
     for row in &result.rows {
         let cells: Vec<String> = row
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                if Some(i) == severity_idx {
+                if severity_cells.get(i).copied().unwrap_or(false) {
                     severity_cell_text(v)
                 } else {
                     v.to_string()
@@ -681,6 +719,7 @@ mod tests {
                 returned: 1,
             },
             degraded_fields: vec!["duration".to_owned()],
+            severity_columns: Vec::new(),
         }
     }
 
@@ -689,12 +728,16 @@ mod tests {
     /// deliverable, on stderr when a file is.
     #[test]
     fn the_daemon_note_reaches_the_terminal_and_never_the_deliverable() {
-        let (result, degraded) = daemon_outcome(mocked_response());
+        let (result, degraded, severity) = daemon_outcome(mocked_response());
         assert_eq!(degraded, ["duration"], "degraded_fields must survive");
+        assert!(severity.is_empty());
 
         let emit = |format, output: Option<&Path>| {
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            emit_results(&result, format, output, &degraded, &mut out, &mut err).unwrap();
+            emit_results(
+                &result, format, output, &degraded, &severity, &mut out, &mut err,
+            )
+            .unwrap();
             (
                 String::from_utf8(out).unwrap(),
                 String::from_utf8(err).unwrap(),
@@ -750,10 +793,73 @@ mod tests {
             f(&result, &mut buf).unwrap();
             String::from_utf8(buf).unwrap()
         };
-        assert!(render(render_table).contains("error"));
-        assert!(!render(render_table).contains(" 17 "));
+        let table = {
+            let mut buf = Vec::new();
+            render_table(&result, &[], &mut buf).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        assert!(table.contains("error"));
+        assert!(!table.contains(" 17 "));
         assert!(render(render_ndjson).contains("17"));
         assert!(render(render_csv).contains("17"));
+    }
+
+    /// A DECLARED severity column — `sev()`'s output under its own alias
+    /// — renders its token in the table and its NUMBER everywhere a
+    /// machine reads (ADR-0013 slice 2, ruling 9).
+    #[test]
+    fn a_declared_severity_column_displays_its_token_in_the_table_only() {
+        let result = QueryResult {
+            columns: vec![
+                trawl_engine::value::Column {
+                    name: "s".to_owned(),
+                },
+                trawl_engine::value::Column {
+                    name: "n".to_owned(),
+                },
+            ],
+            rows: vec![vec![Value::Integer(18), Value::Integer(18)]],
+        };
+        let declared = vec!["s".to_owned()];
+
+        let mut buf = Vec::new();
+        render_table(&result, &declared, &mut buf).unwrap();
+        let table = String::from_utf8(buf).unwrap();
+        assert!(table.contains("error2"), "{table}");
+        assert!(
+            table.contains("18"),
+            "the undeclared column keeps its number: {table}"
+        );
+
+        // Undeclared: no list, no tokens.
+        let mut buf = Vec::new();
+        render_table(&result, &[], &mut buf).unwrap();
+        let plain = String::from_utf8(buf).unwrap();
+        assert!(!plain.contains("error2"), "{plain}");
+
+        // Machine formats carry the number in BOTH columns.
+        for f in [
+            render_ndjson as fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>,
+            render_csv,
+        ] {
+            let mut buf = Vec::new();
+            f(&result, &mut buf).unwrap();
+            let text = String::from_utf8(buf).unwrap();
+            assert!(!text.contains("error2"), "{text}");
+        }
+    }
+
+    /// The embedded lane names the same columns the server would: the
+    /// pin is the FUNCTION's, so it survives a catalog-less root.
+    #[test]
+    fn the_embedded_lane_declares_sev_columns_without_a_catalog() {
+        assert_eq!(embedded_severity_columns("* | let s = sev(level)"), ["s"]);
+        assert_eq!(
+            embedded_severity_columns("* | let s = sev(level) | stats count() by s"),
+            ["s"]
+        );
+        assert!(embedded_severity_columns("* | let s = lower(level)").is_empty());
+        assert!(embedded_severity_columns("this is ) not a query").is_empty());
     }
 
     #[test]

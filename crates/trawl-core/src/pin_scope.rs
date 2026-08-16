@@ -278,6 +278,23 @@ impl PinScope {
         }
     }
 
+    /// The names this scope pins `SEVERITY`, EXCLUDING the envelope's own
+    /// `_severity` — sorted, so the wire order is stable.
+    ///
+    /// `_severity` is left out because every renderer already keys off
+    /// that NAME (ADR-0013 §6): carrying it here would make two rules for
+    /// one column, and the name-keyed one has to stay for the surfaces
+    /// that never see a pipeline (a raw result, a saved run).
+    fn severity_columns(&self) -> Vec<String> {
+        self.pins
+            .iter()
+            .filter(|&(field, ty)| {
+                ty == CanonicalType::Severity && field != crate::schema::SEVERITY
+            })
+            .map(|(field, _)| field.to_owned())
+            .collect()
+    }
+
     /// Restrict the scope to the named columns (through [`catalog_key`]).
     fn restrict_to_names<'a>(&mut self, names: impl Iterator<Item = &'a str>) {
         let keep: Vec<String> = names.map(catalog_key).collect();
@@ -298,6 +315,29 @@ impl PinScope {
             self.pins.remove(&catalog_key(&name));
         }
     }
+}
+
+/// The result columns a query hands back that hold `SeverityNumber`s and
+/// are NOT the envelope's `_severity` — the rendering channel for
+/// `sev()`'s output (ADR-0013 slice 2, ruling 9).
+///
+/// The SAME walk the emitter and the stream compiler consume, run to the
+/// end of the pipeline: whatever the final scope pins `SEVERITY` is what
+/// the rows carry, so `| let s = sev(level) | stats count() by s` names
+/// `s` and `| let s = sev(level) | stats count()` names nothing. A name
+/// the result set does not actually carry is simply never matched by the
+/// renderers, which look columns up by name.
+///
+/// Advisory and presentational: the number is what the wire carries in
+/// every machine format, and a caller that ignores this list renders the
+/// number, which is never wrong — only less legible.
+#[must_use]
+pub fn severity_output_columns(pipeline: &[Spanned<PipeStage>], root: &PinScope) -> Vec<String> {
+    let mut scope = root.clone();
+    for stage in pipeline {
+        scope.advance(&stage.node);
+    }
+    scope.severity_columns()
 }
 
 #[cfg(test)]
@@ -678,6 +718,32 @@ mod tests {
         assert_eq!(subject("* | where lower(status) == 1"), None);
         assert_eq!(subject("* | where status + 1 == 1"), None);
     }
+
+    /// The render channel: which output columns hold `SeverityNumber`s.
+    #[test]
+    fn severity_output_columns_names_declared_columns_only() {
+        let names = |dsl: &str, root: &[(&str, CT)]| {
+            let query = parser::parse(dsl).expect("dsl parses");
+            severity_output_columns(&query.pipeline, &PinScope::root(&pins(root)))
+        };
+        assert_eq!(names("* | let s = sev(level)", &[]), ["s"]);
+        assert_eq!(
+            names("* | let s = sev(level) | stats count() by s", &[]),
+            ["s"]
+        );
+        // Projected away, or aggregated over: nothing to render.
+        assert!(names("* | let s = sev(level) | table message", &[]).is_empty());
+        assert!(names("* | let s = sev(level) | stats count()", &[]).is_empty());
+        assert!(names("* | let s = lower(level)", &[]).is_empty());
+        // The envelope slot is name-keyed by every renderer already, so it
+        // is deliberately NOT carried here — but a column that TOOK its
+        // pin is.
+        assert!(names("*", SEVERITY_ROOT).is_empty());
+        assert_eq!(names("* | rename _severity as sv", SEVERITY_ROOT), ["sv"]);
+        assert_eq!(names("* | let sv = _severity", SEVERITY_ROOT), ["sv"]);
+    }
+
+    const SEVERITY_ROOT: &[(&str, CT)] = &[("_severity", CT::Severity), ("message", CT::Varchar)];
 
     #[test]
     fn unpinned_scope_stays_empty_and_cheap() {

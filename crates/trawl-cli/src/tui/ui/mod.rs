@@ -223,6 +223,7 @@ mod tests {
                 returned,
             },
             degraded_fields: Vec::new(),
+            severity_columns: Vec::new(),
         }
     }
 

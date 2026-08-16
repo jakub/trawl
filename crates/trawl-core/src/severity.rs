@@ -123,6 +123,21 @@ pub fn token_text(number: i64) -> Option<&'static str> {
     u8::try_from(number).ok().and_then(otel_name)
 }
 
+/// Whether a RESULT COLUMN renders as severity tokens — the one rule
+/// every renderer asks (CLI table, TUI, SPA).
+///
+/// Two sources, deliberately: the envelope's own `_severity`, keyed by
+/// NAME because it is unforgeable and reaches surfaces that never saw a
+/// pipeline; and the response's advisory
+/// `severity_columns` list (ADR-0013 slice 2, ruling 9), which names the
+/// `sev()` outputs and any column that took the slot's pin. A renderer
+/// with no list renders `_severity` and nothing else, which is exactly
+/// the pre-`sev()` behaviour.
+#[must_use]
+pub fn renders_as_severity(column: &str, severity_columns: &[String]) -> bool {
+    column == crate::schema::SEVERITY || severity_columns.iter().any(|c| c == column)
+}
+
 /// The inverse of [`otel_name`]: a band base with an optional `2`-`4`
 /// suffix, matched case-insensitively.
 ///
