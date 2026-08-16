@@ -12,10 +12,14 @@
 //! key that ingest polices for length and case only). Both reach a terminal,
 //! a JSON body and (slice C2) a browser.
 //!
-//! Field names taken from a QUERY need none of this: the parser accepts
-//! `[A-Za-z_][A-Za-z0-9_]*` with `.` and `@`, so the query notice's footer
-//! cannot name anything hostile — it echoes what the user typed, through a
-//! grammar that admits no control or format character.
+//! Field names taken from a QUERY need none of this, and that stays true
+//! now that backticks let a query name ANY column (ADR-0013 ruling 7):
+//! `parser::primitives::backtick_name` refuses every
+//! [`is_unsafe_display_char`] outright, so the query notice's footer still
+//! echoes what the user typed through a grammar that admits no control or
+//! format character. The guarantee moved from "the shape is narrow" to
+//! "this predicate is the door", and
+//! `the_grammar_admits_no_unrenderable_name` pins it.
 //!
 //! [`char::is_control`] is not enough for that. It covers category Cc
 //! alone, while the characters that actually rewrite a rendering are format

@@ -117,12 +117,22 @@ fn field_filter<'src>()
 }
 
 /// Parse a bare text search term, optionally negated with `-`.
+///
+/// A backtick is a METACHARACTER here, not a word byte: it opens a quoted
+/// field name (ADR-0013 ruling 7), and text search is the last alternative
+/// in the leaf choice. Were it accepted, an empty or hostile quoted name
+/// would not error — no alternative would match, and the query would
+/// silently become a substring search for the literal ticks. Cost,
+/// deliberate: a bare word containing a tick must now be double-quoted.
+/// Filter VALUES are untouched and still compare against the literal text.
 fn text_search<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     let negated = just('-')
         .ignore_then(
             any()
-                .filter(|c: &char| !c.is_ascii_whitespace() && *c != '|' && *c != ')' && *c != '(')
+                .filter(|c: &char| {
+                    !c.is_ascii_whitespace() && *c != '|' && *c != ')' && *c != '(' && *c != '`'
+                })
                 .repeated()
                 .at_least(1)
                 .to_slice()
@@ -137,7 +147,12 @@ fn text_search<'src>()
 
     let positive = any()
         .filter(|c: &char| {
-            !c.is_ascii_whitespace() && *c != '|' && *c != '"' && *c != ')' && *c != '('
+            !c.is_ascii_whitespace()
+                && *c != '|'
+                && *c != '"'
+                && *c != ')'
+                && *c != '('
+                && *c != '`'
         })
         .repeated()
         .at_least(1)
@@ -181,9 +196,16 @@ fn search_token<'src>()
             .then(
                 // Peek ahead: next char after whitespace must be a valid token start.
                 // This prevents "NOT |" or "NOT" at end from being parsed as negation.
+                // A backtick is one of those starts — without it,
+                // ``NOT `req id`=1`` would degrade into the text term "NOT".
                 any()
                     .filter(|c: &char| {
-                        c.is_alphanumeric() || *c == '_' || *c == '"' || *c == '-' || *c == '('
+                        c.is_alphanumeric()
+                            || *c == '_'
+                            || *c == '"'
+                            || *c == '-'
+                            || *c == '('
+                            || *c == '`'
                     })
                     .rewind()
                     .padded(),
@@ -707,6 +729,69 @@ mod tests {
         assert_eq!(tf.node.duration.unit, TimeUnit::Hours);
         // Only the service token remains in the group.
         assert_eq!(result.groups[0].len(), 1);
+    }
+
+    /// `field_filter` reads the name TWICE — once in the `.rewind()`
+    /// lookahead, once in the committed parse — and both sites take the
+    /// same production, so a quoted name cannot be admitted by one and
+    /// refused by the other. A half-wired pair would not error here: the
+    /// token would fall through to text search, which is why this asserts
+    /// the `FieldFilter` rather than merely a successful parse.
+    #[test]
+    fn test_backticked_field_filter_reaches_both_sites() {
+        let result = search_stage()
+            .parse("`request id`>=5")
+            .into_result()
+            .unwrap();
+        assert_eq!(result.groups[0].len(), 1);
+        assert_eq!(
+            result.groups[0][0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "request id".to_string(),
+                op: FilterOp::Gte,
+                value: FilterValue::Literal("5".to_string()),
+            })
+        );
+    }
+
+    /// `NOT`'s lookahead decides whether `NOT` negates or is itself a
+    /// search term, so a backtick has to count as a token start.
+    #[test]
+    fn test_not_negates_a_backticked_field_filter() {
+        let result = search_stage()
+            .parse("NOT `request id`=5")
+            .into_result()
+            .unwrap();
+        assert_eq!(result.groups[0].len(), 1);
+        match &result.groups[0][0].node {
+            SearchToken::Not(inner) => assert_eq!(
+                inner.node,
+                SearchToken::FieldFilter(FieldFilter {
+                    field: "request id".to_string(),
+                    op: FilterOp::Eq,
+                    value: FilterValue::Literal("5".to_string()),
+                })
+            ),
+            other => panic!("expected Not, got {other:?}"),
+        }
+    }
+
+    /// Backticks are metacharacters in NAME position only — a filter
+    /// VALUE carrying one is still ordinary literal text.
+    #[test]
+    fn test_backticks_in_a_filter_value_are_literal() {
+        let result = search_stage()
+            .parse("service=`nginx`")
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            result.groups[0][0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "service".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("`nginx`".to_string()),
+            })
+        );
     }
 
     #[test]

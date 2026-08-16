@@ -193,10 +193,66 @@ pub(crate) fn function_name<'src>()
         .labelled("function name")
 }
 
+/// Parse a backtick-quoted field name — the ticks delimit, and a doubled
+/// tick is one literal tick of name.
+///
+/// Content is any character but a backtick, with two refusals that are
+/// errors rather than non-matches — past the opening tick there is no other
+/// reading, so falling through would let the token degrade into a text
+/// search (see [`crate::parser::search`]):
+///
+/// - the empty name, which names no column;
+/// - any [`crate::sanitize::is_unsafe_display_char`]. Not merely
+///   [`char::is_control`]: the characters that rewrite a rendering are the
+///   bidi and zero-width FORMAT characters, and `sanitize`'s module doc
+///   rests on the grammar being unable to express one (ADR-0013 ruling 7
+///   widened here at prep — quoting changes how a name is LEXED, and a name
+///   no terminal can print honestly is not a capability anyone loses).
+pub(crate) fn backtick_name<'src>()
+-> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
+    // greedy and unambiguous: at a lone tick `just("``")` fails, `none_of`
+    // fails, the repetition stops and the closing delimiter matches.
+    choice((just("``").to('`'), none_of("`")))
+        .repeated()
+        .collect::<String>()
+        .delimited_by(just('`'), just('`'))
+        .try_map(|name: String, span| {
+            if name.is_empty() {
+                return Err(Rich::custom(
+                    span,
+                    "empty field name: `` names no column — put the field's \
+                     name between the backticks",
+                ));
+            }
+            if let Some(c) = name
+                .chars()
+                .find(|c| crate::sanitize::is_unsafe_display_char(*c))
+            {
+                return Err(Rich::custom(
+                    span,
+                    format!(
+                        "field name contains control or invisible format \
+                         characters (U+{:04X}) — a name that cannot be \
+                         rendered honestly cannot be quoted either",
+                        c as u32
+                    ),
+                ));
+            }
+            Ok(name)
+        })
+        .labelled("quoted field name")
+}
+
 /// Parse a field name — every position in the grammar that names a column.
+///
+/// The backtick arm is what makes the whole column vocabulary reachable
+/// (ADR-0013 ruling 7): one production, so a name spells the same in every
+/// position by construction. What a name may BE is unchanged — the fold
+/// still happens downstream at [`crate::schema::catalog_key`], and
+/// `is_reserved_name` still refuses write positions.
 pub(crate) fn field_name<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
-    plain_name()
+    choice((backtick_name(), plain_name()))
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +528,63 @@ mod tests {
                 .is_err()
         );
         assert!(function_name().parse("@timestamp").into_result().is_err());
+    }
+
+    #[test]
+    fn test_backtick_name() {
+        assert_eq!(
+            backtick_name().parse("`request id`").into_result().unwrap(),
+            "request id"
+        );
+        // a doubled tick is one literal backtick of name; the greedy escape
+        // leaves the closing delimiter unambiguous.
+        assert_eq!(
+            backtick_name().parse("`a``b`").into_result().unwrap(),
+            "a`b"
+        );
+        // every byte but a backtick is name content — including the ones
+        // that mean something everywhere else in the grammar.
+        for (input, want) in [
+            ("`a b`", "a b"),
+            ("`a.b`", "a.b"),
+            ("`last`", "last"),
+            ("`WHERE`", "WHERE"),
+            ("`a\"b`", "a\"b"),
+            ("`#`", "#"),
+            ("`日本語`", "日本語"),
+        ] {
+            assert_eq!(backtick_name().parse(input).into_result().unwrap(), want);
+        }
+        // the empty name names no column
+        assert!(backtick_name().parse("``").into_result().is_err());
+        // …and an unterminated one is an error, never a shorter name
+        assert!(backtick_name().parse("`abc").into_result().is_err());
+    }
+
+    /// The hostile-character set has ONE owner
+    /// ([`crate::sanitize::is_unsafe_display_char`]) and the quoted-name
+    /// production is its query-side door. `sanitize`'s module doc asserts
+    /// the grammar cannot express such a name; this is what keeps that
+    /// true now that any column is nameable.
+    #[test]
+    fn the_grammar_admits_no_unrenderable_name() {
+        for (name, group) in [
+            ("a\u{1}b", "C0 control"),
+            ("a\u{7f}b", "DEL"),
+            ("a\u{9c}b", "C1 control"),
+            ("a\u{202e}b", "RLO — the Trojan-Source lever"),
+            ("a\u{2066}b", "first strong isolate"),
+            ("a\u{061c}b", "arabic letter mark"),
+            ("a\u{200b}b", "zero-width space"),
+            ("a\u{feff}b", "zero-width no-break space"),
+            ("a\u{00ad}b", "soft hyphen"),
+        ] {
+            let input = format!("`{name}`");
+            assert!(
+                backtick_name().parse(&input).into_result().is_err(),
+                "{group} must not be nameable"
+            );
+        }
     }
 
     #[test]

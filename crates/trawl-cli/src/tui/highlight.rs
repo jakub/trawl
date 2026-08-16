@@ -129,6 +129,30 @@ impl<'a> Highlighter<'a> {
         let mut current = std::string::String::new();
 
         while let Some(ch) = chars.next() {
+            // Backtick-quoted field name: `any content`, `` for one literal
+            // backtick. Must precede the comment and regex arms — inside a
+            // name `//` and `#` are name bytes, exactly as the parser's
+            // strip_comments now treats them.
+            if ch == '`' {
+                if !current.is_empty() {
+                    tokens.push((Self::classify_word(&current), current.clone()));
+                    current.clear();
+                }
+                let mut name = std::string::String::from('`');
+                while let Some(c) = chars.next() {
+                    name.push(c);
+                    if c == '`' {
+                        if chars.peek() == Some(&'`') {
+                            name.push(chars.next().expect("peeked"));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                tokens.push((TokenType::Field, name));
+                continue;
+            }
+
             // Comment: // to end of line
             if ch == '/' && chars.peek() == Some(&'/') {
                 if !current.is_empty() {
@@ -342,5 +366,35 @@ impl<'a> Highlighter<'a> {
                 | "typeof"
                 | "now"
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backtick-quoted field name is ONE token whose content is name
+    /// bytes — the `//` inside it is not a comment, the same call the
+    /// parser's `strip_comments` makes.
+    #[test]
+    fn backticked_field_name_is_one_field_token() {
+        let tokens = Highlighter::tokenize("| table `http://x`");
+        assert!(
+            tokens
+                .iter()
+                .any(|(t, s)| *t == TokenType::Field && s == "`http://x`"),
+            "{tokens:?}"
+        );
+        assert!(
+            !tokens.iter().any(|(t, _)| *t == TokenType::Comment),
+            "{tokens:?}"
+        );
+    }
+
+    /// A doubled tick is data and does not close the name.
+    #[test]
+    fn doubled_backticks_do_not_close_the_name() {
+        let tokens = Highlighter::tokenize("`a``b`=1");
+        assert_eq!(tokens[0], (TokenType::Field, "`a``b`".to_string()));
     }
 }

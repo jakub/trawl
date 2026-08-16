@@ -100,8 +100,11 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 /// Replace `//` and `#` comments with spaces, preserving byte positions.
 ///
 /// Handles `//` (line comment) and `#` (line comment) outside of quoted
-/// strings. Comment content is replaced with spaces so that error spans
-/// remain accurate.
+/// strings and backtick-quoted field names. This runs BEFORE the grammar, so
+/// it is the only layer that can protect a name's bytes: without the
+/// backtick state `` | table `a#b` `` and `` | table `http://x` `` are gutted
+/// before the field parser ever sees them. A backtick region has no
+/// backslash escape — the only exit is a tick, and a doubled tick is data.
 ///
 /// Known limitation: `#` inside regex literals (`/pattern#here/`) will be
 /// treated as a comment start. Use `//` comments on lines containing regex
@@ -112,6 +115,7 @@ fn strip_comments(input: &str) -> String {
     let len = bytes.len();
     let mut i = 0;
     let mut in_string = false;
+    let mut in_backtick = false;
 
     while i < len {
         if in_string {
@@ -124,8 +128,23 @@ fn strip_comments(input: &str) -> String {
             } else {
                 i += 1;
             }
+        } else if in_backtick {
+            if bytes[i] == b'`' {
+                if i + 1 < len && bytes[i + 1] == b'`' {
+                    // doubled tick — one escaped backtick of name, still inside
+                    i += 2;
+                } else {
+                    in_backtick = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
         } else if bytes[i] == b'"' {
             in_string = true;
+            i += 1;
+        } else if bytes[i] == b'`' {
+            in_backtick = true;
             i += 1;
         } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
             // // comment — blank to end of line
@@ -678,5 +697,275 @@ mod tests {
         let input = "abc # comment\ndef // another\nghi";
         let stripped = strip_comments(input);
         assert_eq!(stripped.len(), input.len());
+    }
+
+    // --- backtick-quoted field names (ADR-0013 ruling 7) ---
+
+    /// Every name a query wrote in a FIELD position, in AST order.
+    ///
+    /// The position table below asserts against this rather than against
+    /// "the parse succeeded", because a backtick arm that reached only
+    /// SOME positions would not error: the unreached name degrades into a
+    /// text search and the query still parses. Where the name landed is
+    /// the whole question.
+    fn walk_expr(expr: &Expr, out: &mut Vec<String>) {
+        match expr {
+            Expr::FieldRef(name) => out.push(name.clone()),
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    walk_expr(&a.node, out);
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                walk_expr(&lhs.node, out);
+                walk_expr(&rhs.node, out);
+            }
+            Expr::Unary { operand, .. } => walk_expr(&operand.node, out),
+            Expr::InList { expr, list } => {
+                walk_expr(&expr.node, out);
+                for item in list {
+                    walk_expr(&item.node, out);
+                }
+            }
+            Expr::Literal(_) => {}
+        }
+    }
+
+    fn walk_token(token: &SearchToken, out: &mut Vec<String>) {
+        match token {
+            SearchToken::FieldFilter(f) => out.push(f.field.clone()),
+            SearchToken::Not(inner) => walk_token(&inner.node, out),
+            SearchToken::Group(groups) => {
+                for group in groups {
+                    for t in group {
+                        walk_token(&t.node, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_aggs(aggs: &[AggExpr], out: &mut Vec<String>) {
+        for agg in aggs {
+            for a in &agg.args {
+                walk_expr(&a.node, out);
+            }
+            if let Some(alias) = &agg.alias {
+                out.push(alias.clone());
+            }
+        }
+    }
+
+    fn field_positions(query: &Query) -> Vec<String> {
+        let mut out = Vec::new();
+        for group in &query.search.groups {
+            for token in group {
+                walk_token(&token.node, &mut out);
+            }
+        }
+        for stage in &query.pipeline {
+            match &stage.node {
+                PipeStage::Stats(s) => {
+                    walk_aggs(&s.aggregations, &mut out);
+                    out.extend(s.group_by.iter().cloned());
+                }
+                PipeStage::EventStats(s) => {
+                    walk_aggs(&s.aggregations, &mut out);
+                    out.extend(s.group_by.iter().cloned());
+                }
+                PipeStage::Timechart(s) => {
+                    walk_aggs(&s.aggregations, &mut out);
+                    out.extend(s.group_by.iter().cloned());
+                }
+                PipeStage::Pivot(s) => {
+                    walk_aggs(std::slice::from_ref(&s.aggregation), &mut out);
+                    out.push(s.on_field.clone());
+                    out.extend(s.by.iter().cloned());
+                }
+                PipeStage::Where(s) => walk_expr(&s.condition.node, &mut out),
+                PipeStage::Let(s) => {
+                    for (target, value) in &s.assignments {
+                        out.push(target.clone());
+                        walk_expr(&value.node, &mut out);
+                    }
+                }
+                PipeStage::Sort(s) => out.extend(s.fields.iter().map(|f| f.field.clone())),
+                PipeStage::Table(s) => out.extend(s.fields.iter().cloned()),
+                PipeStage::Drop(s) => out.extend(s.fields.iter().cloned()),
+                PipeStage::Dedup(s) => out.extend(s.fields.iter().cloned()),
+                PipeStage::Top(s) => {
+                    out.push(s.field.clone());
+                    out.extend(s.by.iter().cloned());
+                }
+                PipeStage::Rare(s) => {
+                    out.push(s.field.clone());
+                    out.extend(s.by.iter().cloned());
+                }
+                PipeStage::Rename(s) => {
+                    for (from, to) in &s.renames {
+                        out.push(from.clone());
+                        out.push(to.clone());
+                    }
+                }
+                PipeStage::Extract(s) => out.extend(s.source_field.iter().cloned()),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// One production feeds every field-name position, so a backticked
+    /// name reaches all of them — decoded, verbatim, and as ONE name (a
+    /// dot inside the ticks is a literal, exactly as a bare dotted name is
+    /// one column reference).
+    #[test]
+    fn backticks_are_accepted_in_every_field_position() {
+        let cases: &[(&str, &[&str])] = &[
+            // search stage — the .rewind() lookahead AND the committed parse
+            ("`request id`=5", &["request id"]),
+            ("NOT `request id`=5", &["request id"]),
+            ("(`request id`=5 OR `a b`=6)", &["request id", "a b"]),
+            // expressions: where / let RHS / in-list / function arg
+            ("* | where `http status` > 400", &["http status"]),
+            ("* | where `a b` in (1, 2)", &["a b"]),
+            ("* | where lower(`a b`) == \"x\"", &["a b"]),
+            // aggregation argument, by-key and explicit alias
+            (
+                "* | stats avg(`resp ms`) as `mean ms` by `a b`",
+                &["resp ms", "mean ms", "a b"],
+            ),
+            (
+                "* | eventstats count() as `n rows` by `a b`",
+                &["n rows", "a b"],
+            ),
+            (
+                "* | timechart span=5m count() as `n` by `a b`",
+                &["n", "a b"],
+            ),
+            ("* | pivot count() on `a b` by `c d`", &["a b", "c d"]),
+            // projection and ordering stages
+            (
+                "* | table `request id`, `http-status`",
+                &["request id", "http-status"],
+            ),
+            ("* | fields `request id`", &["request id"]),
+            ("* | sort -`request id`", &["request id"]),
+            ("* | drop `request id`", &["request id"]),
+            ("* | dedup `request id`, `a b`", &["request id", "a b"]),
+            ("* | top 5 `a b` by `c d`", &["a b", "c d"]),
+            ("* | rare 5 `a b` by `c d`", &["a b", "c d"]),
+            // write positions
+            ("* | let `a b` = 1", &["a b"]),
+            ("* | eval `a b` = `c d` + 1", &["a b", "c d"]),
+            ("* | rename `a b` as `c d`", &["a b", "c d"]),
+            // extract source
+            ("* | extract kv from `a b`", &["a b"]),
+            (r#"* | extract "(?P<x>.)" from `a b`"#, &["a b"]),
+            // a dot inside the ticks is data, not a path
+            ("* | table `a.b`", &["a.b"]),
+        ];
+
+        for (dsl, expected) in cases {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl} must parse: {e:?}"));
+            let names = field_positions(&query);
+            for want in *expected {
+                assert!(
+                    names.iter().any(|n| n == want),
+                    "{dsl}: expected the name {want:?} in a field position, got {names:?}"
+                );
+            }
+        }
+    }
+
+    /// A backtick is a metacharacter, so a malformed one is a parse ERROR —
+    /// never a text search that quietly answers a different question.
+    #[test]
+    fn malformed_backticks_never_degrade_into_text_search() {
+        for dsl in [
+            "``=x",                    // empty name
+            "`unterminated=5",         // no closing tick
+            "`a\u{202e}b`=5",          // bidi override in the name
+            "`a\u{0007}b`=5",          // control character in the name
+            "`request id`",            // a quoted name is not a search term
+            "* | table `unterminated", // and not only in the search stage
+        ] {
+            assert!(
+                parse(dsl).is_err(),
+                "{dsl} must be a parse error, got {:?}",
+                parse(dsl).map(|q| field_positions(&q))
+            );
+        }
+    }
+
+    /// AC1: the two spellings coexist. `last=` is an unconditional keyword
+    /// (ADR-0013 ruling 7) and `` `last` `` is the field of that name —
+    /// and both `field_filter` sites see the same production, so the
+    /// lookahead cannot admit a name the committed parse then refuses.
+    #[test]
+    fn backticked_last_is_a_field_beside_the_last_keyword() {
+        let query = parse("`last`=5 last=2h").unwrap();
+        assert_eq!(field_positions(&query), vec!["last".to_string()]);
+        let tf = query
+            .search
+            .time_filter
+            .expect("last=2h is the time filter");
+        assert_eq!(tf.node.duration.quantity, 2);
+        assert_eq!(tf.node.duration.unit, TimeUnit::Hours);
+    }
+
+    /// A doubled tick is one literal backtick of NAME; the pair is data,
+    /// not a delimiter.
+    #[test]
+    fn doubled_backticks_escape_one_backtick() {
+        let query = parse("* | table `a``b`").unwrap();
+        assert_eq!(field_positions(&query), vec!["a`b".to_string()]);
+    }
+
+    /// Quoting is not an escape from policy (ADR-0013 ruling 7): the
+    /// sealed `_` prefix is refused at the same door, through backticks.
+    #[test]
+    fn backticks_do_not_unseal_the_reserved_namespace() {
+        for dsl in [
+            "* | let `_foo` = 1",
+            "* | eval `_severity` = 17",
+            "* | rename service as `_svc`",
+            "* | stats count() as `_severity`",
+        ] {
+            assert!(parse(dsl).is_err(), "{dsl} must be a parse error");
+        }
+    }
+
+    /// A function is not a field, so the escape stops at call position
+    /// (AC5): `` `lower`(x) `` reads as the field `lower` with an
+    /// unconsumed `(x)` after it.
+    #[test]
+    fn backticks_are_refused_where_a_name_is_not_a_field() {
+        for dsl in [
+            "* | where `lower`(x) == 1",
+            "* | stats `count`()",
+            "* | from saved `my report`",
+        ] {
+            assert!(parse(dsl).is_err(), "{dsl} must be a parse error");
+        }
+        // …while the double-quoted saved-query name still works.
+        assert!(parse(r#"* | from saved "my report""#).is_ok());
+    }
+
+    /// `strip_comments` runs before the grammar, so it is the only layer
+    /// that can keep a comment marker inside a name from being blanked.
+    #[test]
+    fn comment_markers_inside_a_backticked_name_survive() {
+        for (dsl, want) in [
+            ("* | table `a#b`", "a#b"),
+            ("* | table `http://x`", "http://x"),
+            ("* | table `a``#b`", "a`#b"),
+        ] {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl} must parse: {e:?}"));
+            assert_eq!(field_positions(&query), vec![want.to_string()], "{dsl}");
+        }
+        // …and a comment outside one is still a comment.
+        let query = parse("# leading\n* | table `a b`").unwrap();
+        assert_eq!(field_positions(&query), vec!["a b".to_string()]);
     }
 }

@@ -561,6 +561,12 @@ mod tests {
             "* | eventstats count() as _time",
             "* | timechart span=5m count() as _raw",
             "* | pivot count() as _repairs on service",
+            // quoting changes how a name is LEXED, never what a name may
+            // be (ADR-0013 ruling 7) — the same door refuses the same
+            // names through backticks.
+            "* | let `_foo` = 1",
+            "* | rename service as `_svc`",
+            "* | stats count() as `_severity`",
         ] {
             assert!(parser::parse(dsl).is_err(), "{dsl} must be a parse error");
         }
@@ -568,6 +574,48 @@ mod tests {
         // compiled, reached by both lanes through `validate_pipeline`.
         let err = emit_dsl_err(r#"* | extract "(?P<_foo>.)" from message"#);
         assert!(err.contains("reserved namespace"), "{err}");
+    }
+
+    /// A quoted name reaches SQL as the identifier it DECODES to: verbatim,
+    /// through the unchanged `quote_field` (which doubles an embedded `"`).
+    /// DSL backticks never reach `DuckDB` — they are lexing, not quoting.
+    #[test]
+    fn backticked_names_emit_as_verbatim_identifiers() {
+        let sql = emit_dsl("* | table `request id`, `http-status`");
+        assert!(sql.contains(r#""request id""#), "{sql}");
+        assert!(sql.contains(r#""http-status""#), "{sql}");
+        assert!(
+            !sql.contains('`'),
+            "no DSL quoting may leak into SQL: {sql}"
+        );
+
+        let sql = emit_dsl(r#"* | table `a"b`, `a``b`"#);
+        assert!(sql.contains(r#""a""b""#), "embedded quote doubles: {sql}");
+        assert!(sql.contains("\"a`b\""), "decoded backtick is data: {sql}");
+    }
+
+    /// The parser stores the spelling and nothing else — the ASCII fold
+    /// still happens downstream at `catalog_key`, so a quoted `Dur` finds
+    /// the pin `dur` exactly as a bare `Dur` does (`pinned_lookup_is_case_folded`
+    /// is the bare half; the evidence is the same two-armed VARCHAR binding).
+    #[test]
+    fn backticked_names_fold_for_pin_lookup_and_keep_their_spelling() {
+        let ft = pins(&[("dur", CT::Varchar)]);
+        let query = parser::parse("`Dur`=200").expect("parse should succeed");
+        let emitted = emit_with_pins(&query, SRC, &ft).expect("emit should succeed");
+        assert!(
+            emitted.sql.contains(r#""Dur""#),
+            "the identifier keeps the user's spelling: {}",
+            emitted.sql
+        );
+        assert_eq!(
+            emitted.params,
+            vec![
+                SqlValue::String("200".into()),
+                SqlValue::String("200".into())
+            ],
+            "the pin must be found through the fold"
+        );
     }
 
     // -----------------------------------------------------------------------
