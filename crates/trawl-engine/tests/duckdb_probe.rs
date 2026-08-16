@@ -3347,3 +3347,39 @@ fn eventstats_alias_overwrites_the_incoming_column() {
         .collect();
     assert_eq!(rows, vec![2, 2], "the window value replaced the original");
 }
+
+/// The overwrite holds for a CASE-VARIANT alias too, because `DuckDB`
+/// binds identifiers case-insensitively while the `COLUMNS` lambda
+/// compares plain strings: an unfolded `c NOT IN ('Status')` leaves the
+/// incoming `status` in the wildcard and hands back TWO columns of one
+/// folded name — exactly the output schema ruling 8 exists to prevent.
+#[test]
+fn eventstats_case_variant_alias_overwrites_the_incoming_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.parquet");
+    let conn = conn();
+    conn.execute_batch(&format!(
+        "COPY (SELECT 'nginx' AS service, 200 AS status \
+         UNION ALL SELECT 'nginx', 500) TO '{}' (FORMAT PARQUET)",
+        file.display()
+    ))
+    .unwrap();
+    let source = file.display().to_string();
+
+    let query = trawl_core::parser::parse("* | eventstats count() as `Status` by service").unwrap();
+    let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+
+    let columns: Vec<String> = {
+        let mut stmt = conn.prepare(&format!("DESCRIBE {}", emitted.sql)).unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        columns,
+        vec!["service", "Status"],
+        "one column per folded name: {}",
+        emitted.sql
+    );
+}
