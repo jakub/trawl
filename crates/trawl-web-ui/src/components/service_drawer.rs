@@ -472,18 +472,18 @@ fn FieldDetail(
     let svc_for_q = svc.clone();
     let field_for_q = field_name.clone();
     let top = LocalResource::new(move || {
-        // The field name is DSL, so it goes through the ONE renderer — and
-        // a name it REFUSES is not spliced raw: a catalog key is
-        // client-chosen, so its raw spelling could carry query logic. An
-        // empty query is the honest answer when the field cannot be named.
-        let q =
-            trawl_core::parser::quote_dsl_name(&field_for_q).map_or_else(String::new, |field| {
-                format!(
-                    r#"service="{}" last=7d | top 10 {field}"#,
-                    svc_for_q.replace('"', ""),
-                )
-            });
-        async move { api::query(&q, 0).await }
+        // The field name is DSL, so it goes through the ONE renderer, and a
+        // name it REFUSES fires NO request: the empty string is a VALID
+        // unfiltered query, so falling through to it would turn expanding
+        // one unnameable field into a full corpus scan. There is nothing
+        // to ask, so nothing is asked and the pane renders as empty.
+        let q = crate::drawer_query::top_values_query(&svc_for_q, &field_for_q);
+        async move {
+            match q {
+                Some(q) => api::query(&q, 0).await,
+                None => Ok(declined_query_response()),
+            }
+        }
     });
 
     let cov_pct = super::service_card_fmt::cov_pct(col.null_count, col.total_count);
@@ -651,6 +651,21 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
 
 // ───────────────────────── Helpers ─────────────────────────
 
+/// The response a pane shows for a field the DSL cannot name: empty, and
+/// reached without asking the server anything.
+fn declined_query_response() -> trawl_api::QueryResponse {
+    trawl_api::QueryResponse {
+        result: trawl_api::value::QueryResult::empty(),
+        truncated: false,
+        pagination: trawl_api::PaginationMeta {
+            limit: 0,
+            offset: 0,
+            returned: 0,
+        },
+        degraded_fields: Vec::new(),
+    }
+}
+
 fn cardinality_resource(
     svc: ServiceSchema,
 ) -> LocalResource<Result<HashMap<String, u64>, api::ApiError>> {
@@ -663,22 +678,9 @@ fn cardinality_resource(
             if fields.is_empty() {
                 return Ok(HashMap::new());
             }
-            // Two name positions per field — the aggregate argument and
-            // the `as` target — both rendered by the ONE helper. A name it
-            // refuses is dropped rather than breaking the whole stats
-            // stage for every other field.
-            let dc_exprs: Vec<String> = fields
-                .iter()
-                .filter_map(|f| {
-                    let name = trawl_core::parser::quote_dsl_name(f)?;
-                    Some(format!("dc({name}) as {name}"))
-                })
-                .collect();
-            let q = format!(
-                r#"service="{}" last=7d | stats {}"#,
-                svc_name.replace('"', ""),
-                dc_exprs.join(", ")
-            );
+            let Some(q) = crate::drawer_query::cardinality_query(&svc_name, &fields) else {
+                return Ok(HashMap::new());
+            };
             let resp = api::query(&q, 0).await?;
             Ok(parse_cardinality(&resp))
         }
