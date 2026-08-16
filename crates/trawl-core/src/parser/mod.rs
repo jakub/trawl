@@ -106,6 +106,24 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 /// before the field parser ever sees them. A backtick region has no
 /// backslash escape — the only exit is a tick, and a doubled tick is data.
 ///
+/// This scanner cannot parse, so it engages that state CONSERVATIVELY —
+/// two conditions, both needed, because a tick is also ordinary data inside
+/// a regex or a bare filter value ([`primitives::bare_value`] admits it):
+///
+/// 1. the tick must sit where a field name can syntactically START
+///    ([`can_start_field_name`]), which a tick inside a regex body does not;
+/// 2. the region must CLOSE on the same line. An unterminated tick that
+///    swallowed the rest of the line would leave a real comment unstripped,
+///    and a comment made of bare words parses as extra search terms —
+///    silently answering a different question. Declining to engage there
+///    puts the comment back in the stripper's hands, and the leftover tick
+///    then dies at the grammar (text search and the `NOT` lookahead both
+///    refuse it) rather than quietly meaning something.
+///
+/// Residual, stated: a bare value that is itself tick-delimited
+/// (`` service=`a#b` ``) satisfies both conditions and keeps its `#`, since
+/// at this layer it is indistinguishable from a field name after `==`.
+///
 /// Known limitation: `#` inside regex literals (`/pattern#here/`) will be
 /// treated as a comment start. Use `//` comments on lines containing regex
 /// literals, or move the regex to a different line.
@@ -143,7 +161,10 @@ fn strip_comments(input: &str) -> String {
         } else if bytes[i] == b'"' {
             in_string = true;
             i += 1;
-        } else if bytes[i] == b'`' {
+        } else if bytes[i] == b'`'
+            && can_start_field_name(bytes, i)
+            && backtick_closes_on_line(bytes, i)
+        {
             in_backtick = true;
             i += 1;
         } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
@@ -167,6 +188,43 @@ fn strip_comments(input: &str) -> String {
     // sequences are untouched (continuation bytes are >= 0x80, never
     // matching `"`, `#`, `/`, `\`, or `\n`). So from_utf8 always succeeds.
     String::from_utf8(out).expect("comment stripping only replaces ASCII bytes with spaces")
+}
+
+/// Whether a field name could begin at `i` — judged from the byte before it,
+/// which is all a pre-parse scanner has.
+///
+/// The permitted predecessors are the ones the grammar actually puts in
+/// front of a name with no whitespace: the start of input or any whitespace,
+/// an opening paren or comma (argument and field lists), a pipe, the `-` of
+/// a descending sort key, and the tail of a comparison operator (`=`, `<`,
+/// `>`, `!`) — an expression may compare against a field, so
+/// `` a==`b c` `` is a name. Anything else (a letter, a digit, a `/`) means
+/// the tick is inside a value or a regex, where it is ordinary data.
+///
+/// Erring narrow is the safe direction: a name this declines is one whose
+/// comment markers stay unprotected, so it dies loudly at the grammar as an
+/// unterminated name. Erring wide would hide a comment.
+fn can_start_field_name(bytes: &[u8], i: usize) -> bool {
+    let Some(prev) = i.checked_sub(1).map(|p| bytes[p]) else {
+        return true;
+    };
+    prev.is_ascii_whitespace()
+        || matches!(prev, b'(' | b',' | b'|' | b'-' | b'=' | b'<' | b'>' | b'!')
+}
+
+/// Whether the backtick region opening at `i` closes before the next newline,
+/// counting a doubled tick as data rather than a delimiter.
+fn backtick_closes_on_line(bytes: &[u8], i: usize) -> bool {
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'`' if bytes.get(j + 1) == Some(&b'`') => j += 2,
+            b'`' => return true,
+            b'\n' => return false,
+            _ => j += 1,
+        }
+    }
+    false
 }
 
 /// Spellings the grammar reads as something other than a field name, in at
@@ -1197,5 +1255,62 @@ mod tests {
         // …and a comment outside one is still a comment.
         let query = parse("# leading\n* | table `a b`").unwrap();
         assert_eq!(field_positions(&query), vec!["a b".to_string()]);
+    }
+
+    /// A tick inside a regex or a bare value is DATA, not the opening of a
+    /// name, so comment stripping there is exactly what it was before
+    /// backticks existed. The scanner decides by position, since it cannot
+    /// parse: a regex body puts a letter in front of the tick.
+    #[test]
+    fn a_backtick_inside_a_value_does_not_shield_a_comment() {
+        let query = parse("host=/foo`bar/ # | bad_stage").expect("the comment must be stripped");
+        assert_eq!(
+            query.pipeline.len(),
+            0,
+            "the comment must not reach the parser"
+        );
+        assert_eq!(
+            query.search.groups[0][0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "host".to_string(),
+                op: FilterOp::Regex,
+                value: FilterValue::Literal("foo`bar".to_string()),
+            })
+        );
+        // …and the same through the formatter, which is what the server's
+        // /validate hands back to a client.
+        assert_eq!(
+            crate::format::reformat("host=/foo`bar/ # | bad_stage").as_deref(),
+            Some("host=/foo`bar/")
+        );
+    }
+
+    /// An unterminated tick must never swallow a comment: a comment made of
+    /// bare words would parse as extra search terms and quietly answer a
+    /// different question. Declining to engage puts the line back in the
+    /// stripper's hands, and the stray tick then dies at the grammar.
+    #[test]
+    fn an_unterminated_backtick_never_swallows_a_comment() {
+        // The tick sits where a name COULD start, but never closes.
+        let query = parse("host=`x # comment").expect("the comment must be stripped");
+        assert_eq!(
+            query.search.groups[0].len(),
+            1,
+            "no comment word may become a search term: {:?}",
+            query.search.groups
+        );
+        assert_eq!(
+            query.search.groups[0][0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "host".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("`x".to_string()),
+            })
+        );
+
+        // Where the stray tick is a genuine name position, the truncated
+        // name is a loud parse error — the other permitted outcome.
+        assert!(parse("| table `a b # x").is_err());
+        assert!(parse("* | where `a b // x").is_err());
     }
 }
