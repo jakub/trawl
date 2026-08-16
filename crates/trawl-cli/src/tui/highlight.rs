@@ -144,9 +144,15 @@ impl<'a> Highlighter<'a> {
 
         while let Some(ch) = chars.next() {
             // Backtick-quoted field name: `any content`, `` for one literal
-            // backtick. Must precede the comment and regex arms — inside a
-            // name `//` and `#` are name bytes, exactly as the parser's
-            // strip_comments now treats them.
+            // backtick. Must precede the comment and regex arms so that
+            // `//` and `#` inside a name are coloured as name bytes.
+            //
+            // Deliberately looser than the parser's comment scanner, which
+            // engages only at a name start AND when the region closes on
+            // the same line: this is display only, so a stray tick costs a
+            // mis-coloured tail, and colouring a half-typed name as a name
+            // is what an editor should do while the user is still typing
+            // it. The PARSER decides what the query means.
             if ch == '`' {
                 if !current.is_empty() {
                     tokens.push((Self::classify_word(&current), current.clone()));

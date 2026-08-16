@@ -111,10 +111,6 @@ pub fn complete(
         }
         None => prefix.as_str(),
     };
-    if match_prefix.is_empty() && prefix.len() > 1 {
-        return None;
-    }
-
     let candidates = candidates_for(&context, schema_fields);
     let candidate = prefix_match(match_prefix, &candidates)?;
     build_completion(&candidate, prefix)
@@ -404,11 +400,34 @@ fn open_backtick_prefix(before: &str) -> Option<&str> {
                 i += 2;
                 continue;
             }
-            open = if open.is_some() { None } else { Some(i) };
+            // Only a tick where a NAME can start opens one. A tick inside
+            // a regex or a bare value is data (`host=/foo`bar/` is a legal
+            // filter), and treating it as an open quote would make the
+            // prefix garbage — and kill completion for everything typed
+            // after it on the line. Same predicate the parser's comment
+            // scanner uses, for the same reason.
+            open = if open.is_none() && starts_a_name(bytes, i) {
+                Some(i)
+            } else {
+                None
+            };
         }
         i += 1;
     }
     open.map(|start| &before[start..])
+}
+
+/// Whether a field name could begin at `i`, judged from the byte before
+/// it — the editor's mirror of `trawl_core`'s `can_start_field_name`.
+fn starts_a_name(bytes: &[u8], i: usize) -> bool {
+    let Some(prev) = i.checked_sub(1).map(|p| bytes[p]) else {
+        return true;
+    };
+    prev.is_ascii_whitespace()
+        || matches!(
+            prev,
+            b'(' | b',' | b'|' | b'-' | b'=' | b'<' | b'>' | b'!' | b'+' | b'*' | b'%'
+        )
 }
 
 /// Extract the word prefix immediately before the cursor.
@@ -597,6 +616,22 @@ mod tests {
         let spliced = format!("{}{}", &text[..text.len() - c.replace_len], c.insert_text);
         assert_eq!(spliced, "| table `request id`");
         assert!(trawl_core::parser::parse(&spliced).is_ok(), "{spliced}");
+    }
+
+    /// A tick that is DATA — inside a regex or a bare value — must not be
+    /// read as an open quote, or the prefix becomes garbage and
+    /// completion dies for everything typed after it on the line.
+    #[test]
+    fn a_backtick_inside_a_value_is_not_a_completion_prefix() {
+        let text = "host=/foo`bar/ | table hos";
+        let c = complete(text, text.len(), &fields()).expect("a completion");
+        assert_eq!(c.insert_text, "host");
+        assert_eq!(c.replace_len, 3);
+
+        // …and a tick that DOES open a name still works after one
+        let text = "host=/foo`bar/ | table `request i";
+        let c = complete(text, text.len(), &fields()).expect("a completion");
+        assert_eq!(c.insert_text, "`request id`");
     }
 
     /// A name that needs no quoting keeps its bare spelling — quoting
