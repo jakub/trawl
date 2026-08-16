@@ -898,6 +898,12 @@ fn case_variant_projections_agree_across_lanes() {
                 r#"| extract "m(?P<B>ZZ)?" from message"#,
                 // …and one that matches only the FIRST row
                 r#"| extract "(?P<B>mx)" from message"#,
+                // a group that PARTICIPATES but captures nothing: the
+                // emitted `nullif(…, '')` makes that NULL too
+                r#"| extract "m(?P<B>z*)" from message"#,
+                // …and a chained extract reading the emptied target,
+                // where a divergence would be carried forward
+                r#"| extract "m(?P<B>z*)" from message | extract "(?P<B>q*)" from message"#,
             ],
             &[
                 "| table B, message",
@@ -924,7 +930,9 @@ fn case_variant_projections_agree_across_lanes() {
                 // question, not a binding one. Every other pairing keeps the
                 // dedup key distinct per row, so a key that failed to bind
                 // still collapses the rows and fails here.
-                let writes_one_value = projection.contains("= 1") || projection.contains("ZZ");
+                let writes_one_value = projection.contains("= 1")
+                    || projection.contains("ZZ")
+                    || projection.contains("z*");
                 if reader.starts_with("| dedup") && writes_one_value {
                     continue;
                 }

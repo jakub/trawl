@@ -755,6 +755,12 @@ fn apply_let(
 /// NULL rather than keeping whatever was there. Executed batch output
 /// settles the representation rather than a guess: the key comes back
 /// PRESENT carrying null, never removed.
+///
+/// `nullif` is the whole expression, so an EMPTY match is NULL too: a
+/// group that participated and captured nothing (`(?P<x>a*)` against
+/// `bbb`) is indistinguishable from one that did not, and a chained
+/// extract reading that column would otherwise carry the divergence
+/// forward.
 fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Map<String, Value>) {
     let text = match event_value(event, source_field) {
         Some(Value::String(text)) => Some(text.clone()),
@@ -768,6 +774,7 @@ fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Map
             let value = caps
                 .as_ref()
                 .and_then(|caps| caps.name(name))
+                .filter(|m| !m.as_str().is_empty())
                 .map_or(Value::Null, |m| Value::String(m.as_str().to_string()));
             (name.to_string(), value)
         })
@@ -866,6 +873,15 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
                     if crate::schema::is_reserved_name(&k) {
                         continue;
                     }
+                    // A kv write owns its folded name like every other
+                    // projection write: a message carrying `Status=500`
+                    // over a row that already has `status` must leave ONE
+                    // key, or a later read binds whichever it meets first
+                    // and the stale original wins. Twin removal also makes
+                    // repeated keys within one message last-wins whatever
+                    // their spelling, matching the exact-key rule the
+                    // insert loop already had.
+                    remove_folded_twins(event, &k);
                     event.insert(k, coerce_kv_value(v));
                 }
             }
@@ -2220,6 +2236,56 @@ mod tests {
         let mut ev = event(&json!({"message": "connection from 192.168.1.100 accepted"}));
         apply_stage(&mut stage, &mut ev);
         assert_eq!(ev.get("ip").unwrap(), "192.168.1.100");
+    }
+
+    #[test]
+    fn extract_kv_write_owns_its_folded_name() {
+        // A kv key differing only in case from a column the row already
+        // carries must REPLACE it, not sit beside it — a later read binds
+        // one of the two and the stale original could win.
+        let mut stage = compile_extract(&ExtractStage {
+            mode: ExtractMode::KeyValue { separator: '=' },
+            source_field: Some("message".into()),
+            keyword: "extract",
+        })
+        .unwrap();
+        let mut ev = event(&json!({"message": "Status=500", "status": 200}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("Status"), Some(&Value::from(500)));
+        assert!(!ev.contains_key("status"), "one key, not two: {ev:?}");
+
+        // Repeated keys folding to one name inside a SINGLE message are
+        // last-wins, matching the exact-key rule the insert loop always
+        // had.
+        let mut ev = event(&json!({"message": "dur=1 DUR=2 Dur=3"}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("Dur"), Some(&Value::from(3)));
+        assert_eq!(
+            ev.keys().filter(|k| k.eq_ignore_ascii_case("dur")).count(),
+            1,
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn extract_regex_empty_participating_capture_is_null() {
+        // The emitted expression is `nullif(regexp_extract(…), '')`, so a
+        // group that PARTICIPATED and captured nothing is NULL in batch —
+        // indistinguishable from one that did not participate.
+        let mut stage = compile_extract(&ExtractStage {
+            mode: ExtractMode::Regex(r"(?P<x>a*)".into()),
+            source_field: Some("message".into()),
+            keyword: "extract",
+        })
+        .unwrap();
+        let mut ev = event(&json!({"message": "bbb"}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("x"), Some(&Value::Null));
+
+        // …and a genuine capture still lands.
+        let mut ev = event(&json!({"message": "aab"}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("x"), Some(&Value::from("aa")));
     }
 
     #[test]

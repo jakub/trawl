@@ -88,15 +88,43 @@ pub fn build_search_url(
     url
 }
 
+/// One component of the filter parameter, percent-encoded.
+///
+/// `,` separates filters and `=` separates a field from its value, so both
+/// must survive as escapes; `encode_uri_component` escapes them and every
+/// other structural character, and the `,` replacement is belt-and-braces
+/// for engines that leave it bare.
+fn encode_component(text: &str) -> String {
+    js_sys::encode_uri_component(text)
+        .as_string()
+        .unwrap_or_default()
+        .replace(',', "%2C")
+}
+
+/// The inverse, non-explosively: a malformed escape decodes to itself
+/// rather than dropping the filter, which is how a URL written before
+/// field encoding — where a plain name has nothing to decode — still
+/// reads back unchanged.
+fn decode_component(raw: &str) -> String {
+    js_sys::decode_uri_component(raw)
+        .ok()
+        .and_then(|s| s.as_string())
+        .unwrap_or_else(|| raw.to_string())
+}
+
 fn encode_filters(filters: &[Filter]) -> String {
     let parts: Vec<String> = filters
         .iter()
         .map(|f| {
-            let val = js_sys::encode_uri_component(&f.value)
-                .as_string()
-                .unwrap_or_default()
-                .replace(',', "%2C");
-            format!("{}{}={}", f.op.prefix(), f.field, val)
+            // The FIELD is encoded exactly as the value is. A catalog key
+            // is client-chosen and may contain any byte (ADR-0013 ruling
+            // 7 made every name spellable), so a raw one carrying `&` or
+            // `=` would end the parameter and inject its own — reload or
+            // back/forward would then execute a different state than the
+            // one the facet added.
+            let field = encode_component(&f.field);
+            let val = encode_component(&f.value);
+            format!("{}{}={}", f.op.prefix(), field, val)
         })
         .collect();
     parts.join(",")
@@ -115,13 +143,11 @@ fn decode_filters(raw: &str) -> Vec<Filter> {
                 _ => return None,
             };
             let rest = chars.as_str();
+            // Unambiguous: an encoded field cannot contain a literal `=`,
+            // so the FIRST one is always the separator.
             let eq = rest.find('=')?;
-            let field = rest[..eq].to_string();
-            let value_raw = &rest[eq + 1..];
-            let value = js_sys::decode_uri_component(value_raw)
-                .ok()
-                .and_then(|s| s.as_string())
-                .unwrap_or_else(|| value_raw.to_string());
+            let field = decode_component(&rest[..eq]);
+            let value = decode_component(&rest[eq + 1..]);
             if field.is_empty() {
                 return None;
             }
