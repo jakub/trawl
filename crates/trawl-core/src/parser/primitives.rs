@@ -160,10 +160,43 @@ pub(crate) fn system_field<'src>()
         .labelled("system field")
 }
 
-/// Parse a field name — either a regular identifier or an `@`-prefixed system field.
-pub(crate) fn field_name<'src>()
+/// Parse an unquoted name — either a regular identifier or an `@`-prefixed
+/// system field.
+///
+/// The name shapes that are NOT fields go through this directly: a saved
+/// query is not a column, so it takes no backtick escape (ADR-0013 ruling 7 —
+/// quoting changes how a FIELD name is lexed, and nothing else).
+pub(crate) fn plain_name<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     system_field().or(ident())
+}
+
+/// Parse a function name: `[A-Za-z_][A-Za-z0-9_]*`, and nothing more.
+///
+/// Split off [`field_name`] because a function is not a field. The backtick
+/// escape exists so every COLUMN is reachable; sharing one production with
+/// call position would make `` `lower`(x) `` a call, i.e. a second spelling
+/// for a function name (ADR-0013 ruling 7: function names take no
+/// backticks). Dots and `@` leave with it — no function has ever had either;
+/// they were reachable only because the two productions were one.
+pub(crate) fn function_name<'src>()
+-> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
+    any()
+        .filter(|c: &char| c.is_ascii_alphabetic() || *c == '_')
+        .then(
+            any()
+                .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_')
+                .repeated(),
+        )
+        .to_slice()
+        .map(String::from)
+        .labelled("function name")
+}
+
+/// Parse a field name — every position in the grammar that names a column.
+pub(crate) fn field_name<'src>()
+-> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
+    plain_name()
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +446,32 @@ mod tests {
             system_field().parse("@source").into_result().unwrap(),
             "@source"
         );
+    }
+
+    /// The function production is deliberately narrower than the field one:
+    /// no dots, no `@`, and (once backticks land) no quoting.
+    #[test]
+    fn test_function_name_is_narrower_than_field_name() {
+        assert_eq!(
+            function_name().parse("lower").into_result().unwrap(),
+            "lower"
+        );
+        assert_eq!(function_name().parse("p95").into_result().unwrap(), "p95");
+        assert_eq!(
+            function_name().parse("_private").into_result().unwrap(),
+            "_private"
+        );
+
+        // a dotted name is a FIELD shape — the function production stops at
+        // the dot, so `end()` refuses the remainder.
+        assert!(
+            function_name()
+                .then_ignore(end())
+                .parse("host.name")
+                .into_result()
+                .is_err()
+        );
+        assert!(function_name().parse("@timestamp").into_result().is_err());
     }
 
     #[test]

@@ -17,13 +17,14 @@ use crate::ast::{
 };
 use crate::parser::expr::expr;
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, duration, field_name, keyword, raw_quoted_string, spanned, uint,
+    ParserExtra, ParserInput, duration, field_name, function_name, keyword, plain_name,
+    raw_quoted_string, spanned, uint,
 };
 
 /// Parse an aggregation expression like `count()`, `avg(duration)`,
 /// or `count() as total`.
 fn agg_expr<'src>() -> impl Parser<'src, ParserInput<'src>, AggExpr, ParserExtra<'src>> + Clone {
-    field_name()
+    function_name()
         .then_ignore(just('(').padded())
         .then(expr().separated_by(just(',').padded()).collect::<Vec<_>>())
         .then_ignore(just(')').padded())
@@ -564,11 +565,14 @@ fn eventstats_stage<'src>()
 
 /// Parse a `from saved` stage: `from saved <name> [run=latest|all|N]`
 ///
-/// Name is a bare identifier or a quoted string. The optional `run=` clause
-/// selects which run(s) to load: `latest` (default), `all`, or a numeric ID.
+/// Name is a bare identifier or a double-quoted string — never backticked: a
+/// saved query is not a column (ADR-0013 ruling 7), and the quoted form
+/// already covers every name a bare identifier cannot spell. The optional
+/// `run=` clause selects which run(s) to load: `latest` (default), `all`, or
+/// a numeric ID.
 fn from_saved_stage<'src>()
 -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
-    let name = choice((raw_quoted_string(), field_name())).labelled("saved query name");
+    let name = choice((raw_quoted_string(), plain_name())).labelled("saved query name");
 
     let run_selector = keyword("run")
         .ignore_then(just('='))

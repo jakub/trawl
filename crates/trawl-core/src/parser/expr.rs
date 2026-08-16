@@ -13,7 +13,8 @@ use std::ops::Range;
 
 use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, field_name, keyword, literal, quoted_string, regex_pattern, spanned,
+    ParserExtra, ParserInput, field_name, function_name, keyword, literal, quoted_string,
+    regex_pattern, spanned,
 };
 
 /// Parse an expression with full operator precedence.
@@ -34,7 +35,7 @@ pub(crate) fn expr<'src>()
 
         // function_call: ident "(" args ")" — must try before bare field_ref
         let func_call = spanned(
-            field_name()
+            function_name()
                 .then_ignore(just('(').padded())
                 .then(
                     expr.clone()
@@ -266,6 +267,25 @@ mod tests {
 
     fn parse_expr(input: &str) -> Spanned<Expr> {
         expr().parse(input).into_result().unwrap()
+    }
+
+    /// A function name is its own production (ADR-0013 ruling 7), so the
+    /// shapes that only ever reached call position by sharing the FIELD
+    /// production no longer parse as a call. `host.name(x)` reads as the
+    /// field `host.name` followed by an unconsumed `(x)`, which is a parse
+    /// error at the enclosing `end()`.
+    #[test]
+    fn field_only_name_shapes_are_not_function_calls() {
+        for input in ["host.name(x)", "@timestamp(x)"] {
+            assert!(
+                expr()
+                    .then_ignore(chumsky::prelude::end())
+                    .parse(input)
+                    .into_result()
+                    .is_err(),
+                "{input} must not parse as a function call"
+            );
+        }
     }
 
     #[test]
