@@ -8,7 +8,7 @@ use crate::ast::{
 
 use super::EmitError;
 use super::SqlValue;
-use super::expr::emit_expr;
+use super::expr::{emit_call_args, emit_expr};
 use super::fields::quote_field;
 use super::functions::{default_agg_alias, translate_function};
 use super::state::{EmitterState, FlushCondition};
@@ -86,11 +86,10 @@ fn process_stats(
 
     // aggregation expressions
     for agg in &agg_stage.aggregations {
-        let arg_strings: Vec<String> = agg
-            .args
-            .iter()
-            .map(|a| emit_expr(a, ctx))
-            .collect::<Result<_, _>>()?;
+        // The SAME argument walk the expression lane uses: an
+        // aggregation position is still a call, and its per-position
+        // literal rules (`sev()`'s dialect) apply there too.
+        let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
 
         let sql_func = translate_function(&agg.function, &arg_strings)?;
 
@@ -365,11 +364,10 @@ fn process_timechart(
     }
 
     for agg in &tc.aggregations {
-        let arg_strings: Vec<String> = agg
-            .args
-            .iter()
-            .map(|a| emit_expr(a, ctx))
-            .collect::<Result<_, _>>()?;
+        // The SAME argument walk the expression lane uses: an
+        // aggregation position is still a call, and its per-position
+        // literal rules (`sev()`'s dialect) apply there too.
+        let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
 
         let sql_func = translate_function(&agg.function, &arg_strings)?;
 
@@ -462,12 +460,7 @@ fn process_pivot(pivot: &crate::ast::PivotStage, ctx: &mut EmitterState) -> Resu
     ctx.has_projection = true;
     ctx.flush_to_cte();
 
-    let arg_strings: Vec<String> = pivot
-        .aggregation
-        .args
-        .iter()
-        .map(|a| emit_expr(a, ctx))
-        .collect::<Result<_, _>>()?;
+    let arg_strings = emit_call_args(&pivot.aggregation.function, &pivot.aggregation.args, ctx)?;
 
     let agg_sql = translate_function(&pivot.aggregation.function, &arg_strings)?;
 
@@ -511,11 +504,10 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
             });
         }
 
-        let arg_strings: Vec<String> = agg
-            .args
-            .iter()
-            .map(|a| emit_expr(a, ctx))
-            .collect::<Result<_, _>>()?;
+        // The SAME argument walk the expression lane uses: an
+        // aggregation position is still a call, and its per-position
+        // literal rules (`sev()`'s dialect) apply there too.
+        let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
         let sql_func = translate_function(&agg.function, &arg_strings)?;
         let first_arg_name = agg.args.first().and_then(|a| {
             if let crate::ast::Expr::FieldRef(name) = &a.node {

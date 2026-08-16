@@ -14,8 +14,28 @@
 //! the SAME walk, so which pin applies at each stage is identical in both
 //! lanes by construction.
 
-use crate::ast::{AggExpr, Expr, PipeStage};
+use crate::ast::{AggExpr, Expr, LiteralValue, PipeStage, Spanned};
 use crate::schema::{CanonicalType, FieldTypes, catalog_key};
+
+/// What a pin-aware comparison is comparing — the ONE classifier all
+/// three lanes bind through (ADR-0011 slice A′, widened by ADR-0013 slice
+/// 2 ruling 9).
+///
+/// Subjects widen; the rule table does not. A subject here is either a
+/// bare pinned field reference or a call that DECLARES its result type
+/// ([`crate::emitter::function_result_pin`]) over a bare field reference —
+/// nothing else, because "which pin types this comparison" has to be
+/// decidable from the AST alone in the emitter, the stream compiler and
+/// the in-memory evaluator alike.
+#[derive(Debug, Clone, Copy)]
+pub enum PinnedSubject<'e> {
+    /// A bare field reference whose name carries a catalog pin.
+    Field(&'e str),
+    /// A pin-declaring call — `sev(level)`, `sev(level, "syslog")`. The
+    /// lanes translate or evaluate the CALL itself; only its PIN comes
+    /// from here.
+    Call(&'e Spanned<Expr>),
+}
 
 /// The set of catalog pins in force at one point in a pipeline.
 ///
@@ -56,6 +76,53 @@ impl PinScope {
     #[must_use]
     pub fn pin_for(&self, dsl_name: &str) -> Option<CanonicalType> {
         self.pins.pin_for(dsl_name)
+    }
+
+    /// Classify an expression as a pinned comparison SUBJECT, with the
+    /// pin that types the comparison — the shared recognition behind the
+    /// SQL emitter, the stream compiler and the in-memory evaluator, so
+    /// the three adopt and decline exactly the same shapes.
+    ///
+    /// Two shapes qualify:
+    ///
+    /// 1. a bare field reference the scope pins;
+    /// 2. a call whose name declares a result pin
+    ///    ([`crate::emitter::function_result_pin`]) over a BARE field
+    ///    reference, with every further argument a string literal (the
+    ///    dialect). Its pin is the FUNCTION's declaration, so it holds
+    ///    even under [`Self::unpinned`] — `sev()` is how a corpus with no
+    ///    catalog gets a severity comparison at all.
+    ///
+    /// Everything else declines, structurally: field-vs-field, arithmetic,
+    /// a call over an arbitrary expression (`sev(lower(level))` still
+    /// EMITS — it simply is not a comparison subject), and a call whose
+    /// dialect argument is computed, which both erroring lanes refuse
+    /// downstream anyway.
+    #[must_use]
+    pub fn subject_pin<'e>(
+        &self,
+        expr: &'e Spanned<Expr>,
+    ) -> Option<(PinnedSubject<'e>, CanonicalType)> {
+        match &expr.node {
+            Expr::FieldRef(name) => self
+                .pin_for(name)
+                .map(|pin| (PinnedSubject::Field(name.as_str()), pin)),
+            Expr::FunctionCall { name, args } => {
+                let pin = crate::emitter::function_result_pin(name)?;
+                let (first, rest) = args.split_first()?;
+                if !matches!(first.node, Expr::FieldRef(_)) {
+                    return None;
+                }
+                if !rest
+                    .iter()
+                    .all(|a| matches!(a.node, Expr::Literal(LiteralValue::String(_))))
+                {
+                    return None;
+                }
+                Some((PinnedSubject::Call(expr), pin))
+            }
+            _ => None,
+        }
     }
 
     /// Advance the scope over one pipe stage: the scope BEFORE the call
@@ -141,6 +208,16 @@ impl PinScope {
                     .map(|(target, expr)| {
                         let pin = match &expr.node {
                             Expr::FieldRef(source) => self.pin_for(source),
+                            // A call that DECLARES its result type hands
+                            // that type to the target (ADR-0013 ruling
+                            // 9): `let s = sev(level) | where s >=
+                            // "error"` is the same comparison as the
+                            // inline one, and `| stats count() by s`
+                            // keeps it. Declared, so it applies to an
+                            // unpinned scope too.
+                            Expr::FunctionCall { name, .. } => {
+                                crate::emitter::function_result_pin(name)
+                            }
                             _ => None,
                         };
                         (catalog_key(target), pin)
@@ -201,6 +278,23 @@ impl PinScope {
         }
     }
 
+    /// The names this scope pins `SEVERITY`, EXCLUDING the envelope's own
+    /// `_severity` — sorted, so the wire order is stable.
+    ///
+    /// `_severity` is left out because every renderer already keys off
+    /// that NAME (ADR-0013 §6): carrying it here would make two rules for
+    /// one column, and the name-keyed one has to stay for the surfaces
+    /// that never see a pipeline (a raw result, a saved run).
+    fn severity_columns(&self) -> Vec<String> {
+        self.pins
+            .iter()
+            .filter(|&(field, ty)| {
+                ty == CanonicalType::Severity && field != crate::schema::SEVERITY
+            })
+            .map(|(field, _)| field.to_owned())
+            .collect()
+    }
+
     /// Restrict the scope to the named columns (through [`catalog_key`]).
     fn restrict_to_names<'a>(&mut self, names: impl Iterator<Item = &'a str>) {
         let keep: Vec<String> = names.map(catalog_key).collect();
@@ -221,6 +315,29 @@ impl PinScope {
             self.pins.remove(&catalog_key(&name));
         }
     }
+}
+
+/// The result columns a query hands back that hold `SeverityNumber`s and
+/// are NOT the envelope's `_severity` — the rendering channel for
+/// `sev()`'s output (ADR-0013 slice 2, ruling 9).
+///
+/// The SAME walk the emitter and the stream compiler consume, run to the
+/// end of the pipeline: whatever the final scope pins `SEVERITY` is what
+/// the rows carry, so `| let s = sev(level) | stats count() by s` names
+/// `s` and `| let s = sev(level) | stats count()` names nothing. A name
+/// the result set does not actually carry is simply never matched by the
+/// renderers, which look columns up by name.
+///
+/// Advisory and presentational: the number is what the wire carries in
+/// every machine format, and a caller that ignores this list renders the
+/// number, which is never wrong — only less legible.
+#[must_use]
+pub fn severity_output_columns(pipeline: &[Spanned<PipeStage>], root: &PinScope) -> Vec<String> {
+    let mut scope = root.clone();
+    for stage in pipeline {
+        scope.advance(&stage.node);
+    }
+    scope.severity_columns()
 }
 
 #[cfg(test)]
@@ -533,6 +650,100 @@ mod tests {
         assert_eq!(scope.pin_for("st"), Some(CT::Varchar));
         assert_eq!(scope.pin_for("status"), None);
     }
+
+    // ── the pin-declaring subject (ADR-0013 slice 2, ruling 9) ───────
+
+    /// A call whose name declares a result pin hands it to the `let`
+    /// target — and it does so under an UNPINNED scope, because the
+    /// declaration is the function's, not the catalog's.
+    #[test]
+    fn let_adopts_a_declared_function_result_pin() {
+        let scope = walk("* | let s = sev(level)", ROOT);
+        assert_eq!(scope.pin_for("s"), Some(CT::Severity));
+        let scope = walk(r#"* | let s = sev(level, "syslog")"#, &[]);
+        assert_eq!(scope.pin_for("s"), Some(CT::Severity));
+        // A function with NO declared result pin still unpins its target.
+        let scope = walk("* | let s = lower(level)", ROOT);
+        assert_eq!(scope.pin_for("s"), None);
+    }
+
+    /// The adopted pin follows the pipeline like any other: a group-by
+    /// key keeps it, an aggregate output does not.
+    #[test]
+    fn a_declared_pin_survives_as_a_group_by_key() {
+        let scope = walk("* | let s = sev(level) | stats count() by s", ROOT);
+        assert_eq!(scope.pin_for("s"), Some(CT::Severity));
+        assert_eq!(scope.pin_for("count"), None);
+        let scope = walk("* | let s = sev(level) | stats max(s) as s", ROOT);
+        assert_eq!(scope.pin_for("s"), None);
+        let scope = walk("* | let s = sev(level) | rename s as sv", ROOT);
+        assert_eq!(scope.pin_for("sv"), Some(CT::Severity));
+        assert_eq!(scope.pin_for("s"), None);
+    }
+
+    /// The classifier admits exactly two shapes, and the declared one
+    /// needs a BARE field reference plus literal trailing arguments —
+    /// everything else stays literal-driven, structurally.
+    #[test]
+    fn subject_pin_admits_a_pinned_field_and_a_declaring_call() {
+        let scope = PinScope::root(&pins(ROOT));
+        let subject = |dsl: &str| {
+            let query = parser::parse(dsl).expect("parses");
+            let PipeStage::Where(w) = &query.pipeline[0].node else {
+                panic!("{dsl} needs a where stage")
+            };
+            let Expr::Binary { lhs, .. } = &w.condition.node else {
+                panic!("{dsl} needs a binary condition")
+            };
+            let expr: &crate::ast::Spanned<Expr> = lhs;
+            scope
+                .subject_pin(expr)
+                .map(|(subject, pin)| (matches!(subject, PinnedSubject::Call(_)), pin))
+        };
+        assert_eq!(subject("* | where status == 1"), Some((false, CT::Varchar)));
+        assert_eq!(subject("* | where unpinned == 1"), None);
+        assert_eq!(
+            subject("* | where sev(level) == 1"),
+            Some((true, CT::Severity))
+        );
+        assert_eq!(
+            subject(r#"* | where sev(level, "syslog") == 1"#),
+            Some((true, CT::Severity))
+        );
+        // A call over an ARBITRARY expression still emits; it is simply
+        // not a subject. Nor is a computed dialect, or a function with no
+        // declared result.
+        assert_eq!(subject("* | where sev(lower(level)) == 1"), None);
+        assert_eq!(subject("* | where sev(level, other) == 1"), None);
+        assert_eq!(subject("* | where lower(status) == 1"), None);
+        assert_eq!(subject("* | where status + 1 == 1"), None);
+    }
+
+    /// The render channel: which output columns hold `SeverityNumber`s.
+    #[test]
+    fn severity_output_columns_names_declared_columns_only() {
+        let names = |dsl: &str, root: &[(&str, CT)]| {
+            let query = parser::parse(dsl).expect("dsl parses");
+            severity_output_columns(&query.pipeline, &PinScope::root(&pins(root)))
+        };
+        assert_eq!(names("* | let s = sev(level)", &[]), ["s"]);
+        assert_eq!(
+            names("* | let s = sev(level) | stats count() by s", &[]),
+            ["s"]
+        );
+        // Projected away, or aggregated over: nothing to render.
+        assert!(names("* | let s = sev(level) | table message", &[]).is_empty());
+        assert!(names("* | let s = sev(level) | stats count()", &[]).is_empty());
+        assert!(names("* | let s = lower(level)", &[]).is_empty());
+        // The envelope slot is name-keyed by every renderer already, so it
+        // is deliberately NOT carried here — but a column that TOOK its
+        // pin is.
+        assert!(names("*", SEVERITY_ROOT).is_empty());
+        assert_eq!(names("* | rename _severity as sv", SEVERITY_ROOT), ["sv"]);
+        assert_eq!(names("* | let sv = _severity", SEVERITY_ROOT), ["sv"]);
+    }
+
+    const SEVERITY_ROOT: &[(&str, CT)] = &[("_severity", CT::Severity), ("message", CT::Varchar)];
 
     #[test]
     fn unpinned_scope_stays_empty_and_cheap() {

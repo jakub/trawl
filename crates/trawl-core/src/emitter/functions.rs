@@ -45,7 +45,8 @@ fn function_arity(name: &str) -> (usize, Option<usize>) {
         "if" | "replace" | "split" | "date_diff" => (3, Some(3)),
         "case" => (2, None),
         "substr" => (2, Some(3)),
-        "round" => (1, Some(2)),
+        // round(x[, precision]) and sev(value[, dialect])
+        "round" | "sev" => (1, Some(2)),
         "now" => (0, Some(0)),
         "contains"
         | "startswith"
@@ -84,15 +85,65 @@ pub const DATE_PART_UNITS: &[&str] = &[
     "year", "quarter", "month", "week", "day", "hour", "minute", "second", "dow", "doy", "epoch",
 ];
 
-/// Arg positions (0-indexed) that must be string literal date/time unit names.
+/// Arg positions (0-indexed) that must be string literals drawn from a
+/// closed vocabulary — date/time unit names, and `sev()`'s dialect.
 ///
 /// Returns `(arg_index, allowlist)` pairs. The `emit_expr` `FunctionCall` arm
-/// calls `validate_unit_literal` for each returned pair.
+/// calls `validate_unit_literal` for each returned pair, and so does
+/// `stream::validate_expr` — which is the whole point of the table: the
+/// SSE lane and the `extract kv` batch tail never run `translate_function`,
+/// so a vocabulary they cannot honour has to be refused from the shared
+/// table or it would 400 in batch and silently null live.
 pub(crate) fn unit_literal_positions(name: &str) -> &'static [(usize, &'static [&'static str])] {
     match name {
         "date_part" => &[(0, DATE_PART_UNITS)],
         "date_trunc" | "date_diff" => &[(0, DATE_UNITS)],
+        "sev" => &[(1, crate::severity::DIALECT_TOKENS)],
         _ => &[],
+    }
+}
+
+/// Arg positions (0-indexed) whose string literal must reach
+/// [`translate_function`] as its own TEXT rather than as a bound `?`
+/// parameter.
+///
+/// `sev()`'s dialect is not an operand — it SELECTS which reading
+/// expression is emitted ([`crate::conform::severity_reading_sql`]), so
+/// the translation has to see the token itself. Same precedent as
+/// [`literal_int_positions`], which inlines `split()`'s index because the
+/// emitted SQL indexes a list with it.
+pub(crate) fn literal_text_positions(name: &str) -> &'static [usize] {
+    match name {
+        "sev" => &[1],
+        _ => &[],
+    }
+}
+
+/// Arg positions (0-indexed) whose value is read through `to_json`
+/// ([`crate::conform::untyped_text`]) rather than used as an operand.
+///
+/// `DuckDB` types a prepared statement's parameters by INFERENCE from
+/// where they sit, and `to_json(?)` gives it nothing to infer from — the
+/// statement fails to prepare. A bare LITERAL at such a position therefore
+/// carries its own type (`CAST(? AS BIGINT)`), which is exactly the type
+/// the parameter binds anyway, so the reading is unchanged. Non-literals
+/// are columns and expressions, which type themselves.
+pub(crate) fn json_read_positions(name: &str) -> &'static [usize] {
+    match name {
+        "sev" => &[0],
+        _ => &[],
+    }
+}
+
+/// What one closed-vocabulary argument is CALLED in its error message.
+///
+/// The mechanism is shared with the date/time units, the noun is not: a
+/// `sev()` second argument is a dialect, and telling an operator their
+/// "unit" is wrong would name a concept the function does not have.
+fn literal_noun(func_name: &str) -> &'static str {
+    match func_name {
+        "sev" => "dialect",
+        _ => "unit",
     }
 }
 
@@ -124,10 +175,11 @@ pub(crate) fn validate_unit_literal(
     allowlist: &[&str],
     unit_literal: Option<&str>,
 ) -> Result<(), EmitError> {
+    let noun = literal_noun(func_name);
     let Some(unit) = unit_literal else {
         return Err(EmitError::UnsupportedOperation {
             message: format!(
-                "{func_name}() argument {} must be a string literal unit name, not an expression",
+                "{func_name}() argument {} must be a string literal {noun} name, not an expression",
                 arg_idx + 1
             ),
         });
@@ -135,7 +187,7 @@ pub(crate) fn validate_unit_literal(
     if !allowlist.is_empty() && !allowlist.contains(&unit.to_lowercase().as_str()) {
         return Err(EmitError::UnsupportedOperation {
             message: format!(
-                "{func_name}() unit {unit:?} is not in the allowed set: {}",
+                "{func_name}() {noun} {unit:?} is not in the allowed set: {}",
                 allowlist.join(", ")
             ),
         });
@@ -229,6 +281,48 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
         "now" => require_n_args(name, args, 0, |_| "now()".to_string()),
         "typeof" => require_one_arg(name, args, |a| format!("TYPEOF({a})")),
         "tonumber" => require_one_arg(name, args, |a| format!("TRY_CAST({a} AS DOUBLE)")),
+        // The ladder function (ADR-0013 slice 2, ruling 9): the ONE
+        // reading kernel, in SQL. Its argument goes through
+        // `untyped_text` because `sev(x)` must read a column of ANY
+        // physical type — a VARCHAR `level`, a BIGINT one, a foreign
+        // parquet's JSON — exactly as the conform rung reads its own.
+        "sev" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EmitError::InvalidAggregation {
+                    message: "sev() requires 1 to 2 arguments".to_string(),
+                });
+            }
+            let dialect = match args.get(1) {
+                // The token arrives verbatim (`literal_text_positions`),
+                // and it is re-validated here because `translate_function`
+                // is reachable from callers that never ran the arg walk.
+                Some(token) => {
+                    validate_unit_literal(name, 1, crate::severity::DIALECT_TOKENS, Some(token))?;
+                    // Never `unwrap_or_default()`: the validator folds
+                    // with `to_lowercase` (Unicode) and `from_token`
+                    // with `to_ascii_lowercase`, so a token the two ever
+                    // disagreed about would silently degrade syslog to
+                    // OTel — WRONG readings (1-7 are valid in both
+                    // dialects), not absent ones. Refuse instead, with
+                    // the vocabulary.
+                    crate::severity::Dialect::from_token(token).ok_or_else(|| {
+                        EmitError::UnsupportedOperation {
+                            message: format!(
+                                "{name}() dialect {token:?} is not in the allowed set: {}",
+                                crate::severity::DIALECT_TOKENS.join(", ")
+                            ),
+                        }
+                    })?
+                }
+                None => crate::severity::Dialect::Otel,
+            };
+            // Bound once: the subject is an arbitrary expression, and a
+            // `?` in it must be pushed once and read once.
+            Ok(crate::conform::severity_reading_sql_bind_once(
+                &crate::conform::untyped_text(&args[0]),
+                dialect,
+            ))
+        }
         "tostring" => require_one_arg(name, args, |a| format!("CAST({a} AS VARCHAR)")),
         // string functions
         "contains" => require_n_args(name, args, 2, |a| format!("CONTAINS({}, {})", a[0], a[1])),
@@ -310,6 +404,32 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
             name: name.to_string(),
             suggestion: suggest::suggest_function(name).map(String::from),
         }),
+    }
+}
+
+/// The canonical type a function DECLARES its result to be — the one
+/// table that lets a call be a pinned comparison subject (ADR-0013 slice
+/// 2, ruling 9).
+///
+/// ONE entry, and the narrowness is the design. ADR-0011 slice A′ excluded
+/// function-wrapped subjects on DECIDABILITY: nothing tells the binder
+/// what `lower(status)` is, so it stays literal-driven. A DECLARED result
+/// pin restores that decidability for exactly the functions that have one
+/// — `sev()` answers a `SeverityNumber` whatever it is handed — so
+/// `| where sev(level) >= "error"` binds through the same rule table
+/// `_severity` does, equality takes the BAND (a plain-BIGINT `sev()` would
+/// compile `== "error"` to `== 17` and silently miss `error2`-`error4`),
+/// and the result renders as tokens.
+///
+/// The declaration is the FUNCTION's, never the catalog's: it holds under
+/// [`crate::pin_scope::PinScope::unpinned`] too, which is what makes
+/// `sev()` the escape hatch for a corpus trawl did not write (embedded
+/// `--data` over foreign parquet).
+#[must_use]
+pub fn function_result_pin(name: &str) -> Option<crate::schema::CanonicalType> {
+    match name {
+        "sev" => Some(crate::schema::CanonicalType::Severity),
+        _ => None,
     }
 }
 
@@ -995,5 +1115,29 @@ mod tests {
     #[test]
     fn alias_dc_with_field() {
         assert_eq!(default_agg_alias("dc", Some("host")), "\"dc_host\"");
+    }
+
+    // ── sev() dialect resolution ────────────────────────────────────────
+
+    /// The translation NEVER defaults a dialect it cannot parse. The
+    /// validator folds with `to_lowercase` (Unicode) and `from_token`
+    /// with `to_ascii_lowercase`, so a token they ever disagreed about
+    /// would otherwise degrade syslog to `OTel` silently — and 1-7 are
+    /// valid readings in BOTH dialects, so that is a WRONG number, not a
+    /// missing one.
+    #[test]
+    fn sev_refuses_a_dialect_it_cannot_parse_rather_than_defaulting() {
+        let otel = translate_function("sev", &["\"x\"".to_owned(), "otel".to_owned()]).unwrap();
+        let syslog = translate_function("sev", &["\"x\"".to_owned(), "syslog".to_owned()]).unwrap();
+        assert_ne!(otel, syslog);
+        // Bypassing the arg walk (this is the defensive door): an
+        // unparseable token is an error naming the vocabulary, and the
+        // emitted SQL is never the OTel one.
+        let err = translate_function("sev", &["\"x\"".to_owned(), "bogus".to_owned()])
+            .expect_err("an unknown dialect must be refused");
+        assert!(err.to_string().contains("otel, syslog"), "{err}");
+        // Arity is still checked first.
+        let err = translate_function("sev", &[]).expect_err("arity");
+        assert!(err.to_string().contains("1 to 2 arguments"), "{err}");
     }
 }

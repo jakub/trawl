@@ -495,19 +495,13 @@ fn conformed_reading(v: &Value, pin: CanonicalType) -> Option<Conformed> {
             _ => None,
         }
         .map(Conformed::Time),
-        // The SEVERITY pin is the BIGINT reading inside the 1-24 ladder
-        // guard — a number outside it conforms to NULL, exactly as the
-        // corpus holds it.
-        CanonicalType::Severity => match v {
-            Value::Number(n) => n
-                .as_i64()
-                .map(|i| i.to_string())
-                .or_else(|| n.as_f64().map(compare::canonical_double_text))
-                .and_then(|t| compare::conformed_severity(&t)),
-            Value::String(s) => compare::conformed_severity(s),
-            _ => None,
+        // The SEVERITY pin reads through the ONE kernel (ADR-0013 slice 2,
+        // ruling 9) — the same function the conform rung's SQL is
+        // generated from, so a wire `"error"` and a wire `17` conform
+        // alike here and in `DuckDB`.
+        CanonicalType::Severity => {
+            crate::severity::reading(v, crate::severity::Dialect::Otel).map(Conformed::Severity)
         }
-        .map(Conformed::Severity),
         // The VARCHAR pin has no conform — its comparisons take the text
         // rules and its patterns match the column directly.
         CanonicalType::Varchar => None,

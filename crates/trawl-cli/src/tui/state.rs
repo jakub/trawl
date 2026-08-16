@@ -1711,6 +1711,10 @@ impl LiveBuffer {
             // A live buffer rendered as a response carries no notice: the
             // SSE lane is deliberately outside the stamp (ADR-0011 slice C1).
             degraded_fields: Vec::new(),
+            // …and outside the severity-rendering channel for the same
+            // reason: the stream carries numbers, and a live tail's
+            // columns are whatever the events happened to bring.
+            severity_columns: Vec::new(),
         }
     }
 

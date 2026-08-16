@@ -114,7 +114,7 @@ pub async fn query(
 
     // Check for `| from saved` — if present, resolve to parquet source
     // and execute with the pre-computed source instead of normal glob scan.
-    let (outcome, degraded_fields) =
+    let (outcome, degraded_fields, severity_columns) =
         if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query).await? {
             // Both halves of what the caller is actually reading: the
             // stages they typed, and the saved query whose recorded run
@@ -123,6 +123,9 @@ pub async fn query(
             // bound would otherwise go unmentioned.
             let halves = [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()];
             let degraded = degraded_fields_for(&state, halves);
+            // The stages the caller typed are what shapes the rows they
+            // get back; the saved half produced the source.
+            let severity = severity_columns_for(&state, &resolved.remaining_dsl);
             (
                 state
                     .query
@@ -137,9 +140,11 @@ pub async fn query(
                     )
                     .await,
                 degraded,
+                severity,
             )
         } else {
             let degraded = degraded_fields_for(&state, [req.query.as_str()]);
+            let severity = severity_columns_for(&state, &req.query);
             (
                 state
                     .query
@@ -153,6 +158,7 @@ pub async fn query(
                     )
                     .await,
                 degraded,
+                severity,
             )
         };
 
@@ -232,6 +238,7 @@ pub async fn query(
                     returned,
                 },
                 degraded_fields,
+                severity_columns,
             }))
         }
         Err(ServerError::Timeout) => {
@@ -1133,6 +1140,38 @@ fn degraded_fields_for<'a>(
         .into_iter()
         .filter(|f| snapshot.fields.contains(f))
         .collect()
+}
+
+/// The result columns this query hands back as `SeverityNumber`s
+/// (ADR-0013 slice 2, ruling 9) — the rendering channel for `sev()`.
+///
+/// Rooted in the SAME pin snapshot the query executed under
+/// (`FieldCatalog::all`), so a column that inherited `_severity`'s pin
+/// through a `rename` is named too, and walked with the SAME
+/// `PinScope::advance` the emitter used, so the answer cannot drift from
+/// what the SQL actually projected. An unparseable query has no columns
+/// to render anyway — execution below reports the parse error.
+///
+/// COHERENCE ASSUMPTION, stated because it will need revisiting: this
+/// snapshot is taken BEFORE the executor takes its own, so a pin that
+/// changes in between is described by the older one. Benign today, and
+/// only because a `SEVERITY` pin can be neither created nor destroyed at
+/// runtime — `normalize_duckdb_type` can never yield it, and
+/// `repin --to severity` is refused structurally (ADR-0013 §6) — so the
+/// two snapshots cannot disagree about which columns are severities.
+/// When repin admission for `SEVERITY` lands, this has to read the
+/// executor's own snapshot instead of taking a second one. The failure
+/// it would otherwise cause is presentational only (a token rendered as
+/// a number, or the reverse), never a wrong value.
+fn severity_columns_for(state: &AppState, dsl: &str) -> Vec<String> {
+    let Ok(query) = trawl_core::parser::parse(dsl) else {
+        return Vec::new();
+    };
+    let pins = state.query.field_catalog.all();
+    trawl_core::pin_scope::severity_output_columns(
+        &query.pipeline,
+        &trawl_core::pin_scope::PinScope::root(&pins),
+    )
 }
 
 /// Read a pin's stored `DuckDB` spelling back as a canonical type.

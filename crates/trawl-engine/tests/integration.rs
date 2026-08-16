@@ -491,6 +491,73 @@ fn pivot_on_service() {
     assert!(result.columns.len() >= 4); // at least nginx, sshd, systemd, kernel
 }
 
+/// The PIVOT lane INLINES every parameter (`DuckDB` cannot parameterize
+/// a PIVOT), and `sev()` is the first emitter-authored SQL carrying a `?`
+/// inside a string literal — its digits guard, `'[+-]?[0-9]+'`. A naive
+/// scan spliced the next user literal into the middle of that regex and
+/// shifted every later parameter by one; this runs the whole shape
+/// end to end, so the SQL has to actually parse and answer.
+#[test]
+fn pivot_over_sev_keeps_the_digits_guard_intact() {
+    let (exec, glob) = setup();
+    let result = exec
+        .run_query_max(
+            r#"service=nginx | let s = sev(severity_text)                | where message == "GET /missing 404 0.001s not found"                | pivot count() on s"#,
+            &glob,
+        )
+        .expect("pivot over sev() must emit parseable SQL");
+    assert_eq!(result.row_count(), 1);
+    // Exactly ONE nginx row carries that message and it is a `warn`, so
+    // the pivot has exactly one dynamic column: the ladder NUMBER, which
+    // is what the column holds. A parameter spliced into the regex — or
+    // shifted past it — would either fail to parse or let the other
+    // severities through as extra columns.
+    let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["13"], "unexpected pivot columns");
+}
+
+/// An AGGREGATION position is still a call: its per-position literal
+/// rules apply there too. `stats sev(level, "syslog")` bound the dialect
+/// as a parameter before, then handed `translate_function` a literal `?`
+/// and errored with `dialect "?" is not in the allowed set`.
+#[test]
+fn sev_in_an_aggregation_position_keeps_its_dialect() {
+    let (exec, glob) = setup();
+    // The fixture's `severity` column carries OTel numbers; read as
+    // SYSLOG, 9 (info) is out of the 0-7 range and 17 has no reading
+    // either — so a syslog reading of this corpus is all NULL, while the
+    // OTel one is the ladder itself. Both must EMIT.
+    let syslog = exec
+        .run_query_max(r#"* | stats max(sev(severity, "syslog")) as m"#, &glob)
+        .expect(r#"stats sev(x, "syslog") must emit"#);
+    assert_eq!(
+        syslog.rows[0][0],
+        Value::Null,
+        "syslog: 9/13/17 read as nothing"
+    );
+
+    let otel = exec
+        .run_query_max("* | stats max(sev(severity)) as m", &glob)
+        .expect("stats sev(x) must emit");
+    assert_eq!(otel.rows[0][0], Value::Integer(17));
+
+    // The bare (non-aggregate) form in the same position still works,
+    // and the inversion is real where the numeral IS syslog-shaped.
+    let inverted = exec
+        .run_query_max(r#"* | let s = 3 | stats max(sev(s, "syslog")) as m"#, &glob)
+        .expect("a syslog numeral must invert");
+    assert_eq!(inverted.rows[0][0], Value::Integer(17), "syslog 3 is err");
+
+    // And the vocabulary is still closed in that position.
+    let err = exec
+        .run_query_max(r#"* | stats max(sev(severity, "rfc5424")) as m"#, &glob)
+        .expect_err("an unknown dialect must be refused");
+    assert!(
+        err.to_string().contains("otel, syslog"),
+        "must name the vocabulary: {err}"
+    );
+}
+
 // -- JSON source tests (validates read_json_auto pipeline) --
 
 fn setup_json() -> (Executor, String) {

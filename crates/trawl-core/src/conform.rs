@@ -188,11 +188,159 @@ pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
         CanonicalType::Timestamp => {
             format!("TRY_CAST(TRY_CAST({text} AS TIMESTAMPTZ) AS TIMESTAMP)")
         }
-        CanonicalType::Severity => {
-            let bigint = guarded_cast(text, CanonicalType::BigInt);
-            format!("(CASE WHEN {bigint} BETWEEN 1 AND 24 THEN {bigint} END)")
+        // The SEVERITY rung IS the kernel (ADR-0013 slice 2, rulings
+        // 9-10): the pin's LIFETIME meaning is the full token-aware
+        // reading, so a stored `"error"` conforms to 17 whether it
+        // arrives live or is swept up by a repin. A numeric-only rung
+        // would rewrite history correctly and null the very next live
+        // row.
+        CanonicalType::Severity => severity_reading_sql(text, crate::severity::Dialect::Otel),
+    }
+}
+
+/// The RE2 character class matching [`crate::severity::WHITESPACE`] —
+/// the SQL spelling of the same set.
+///
+/// Unicode `White_Space` is `Zs` (17 space separators) plus eight
+/// explicit characters, which is exactly what this class names. It is a
+/// SECOND spelling of the Rust const, and the equivalence is not
+/// reasoned: `trawl-engine/tests/duckdb_probe.rs` trims every character
+/// of the const through this class and asserts a NON-whitespace
+/// look-alike (U+200B) survives, so a divergence fails the suite.
+///
+/// A class rather than `trim(x, <chars>)` for two measured reasons: a
+/// `chr()` chain of 25 terms costs ~80ms per PREPARE in `DuckDB`'s binder
+/// (the expression names its subject five times), and a literal set of 25
+/// characters would put a raw newline inside generated SQL, which
+/// `EmitterState::finalize` re-indents line by line. The class costs ~6ms
+/// to plan and runs ~4x faster than either (183ms vs ~700ms per million
+/// rows).
+const WHITESPACE_CLASS_SQL: &str = r"[\p{Zs}\x{9}-\x{d}\x{85}\x{2028}\x{2029}]";
+
+/// `expr` with leading and trailing [`crate::severity::WHITESPACE`]
+/// removed — the SQL mirror of `str::trim_matches` over that set.
+fn trimmed_sql(expr: &str) -> String {
+    format!(
+        "regexp_replace(regexp_replace({expr}, '^{WHITESPACE_CLASS_SQL}+', ''), \
+         '{WHITESPACE_CLASS_SQL}+$', '')"
+    )
+}
+
+/// The SQL half of [`crate::severity::reading`]: `text_expr`'s point on
+/// the `OTel` ladder as a BIGINT, or NULL where it has no reading.
+///
+/// `text_expr` is the column's TEXT form — [`untyped_text`] for a caller
+/// with no `DESCRIBE`, a string literal for a probe. It is read exactly as
+/// the Rust kernel reads a string: trim the enumerated Unicode
+/// `White_Space` set ([`crate::severity::WHITESPACE`]), match
+/// the band token table, then the `OTel` exact short names, then a STRICT
+/// integer (`[+-]?[0-9]+` and nothing else — `1.5`, `1e1`, `1_2` and
+/// `0x10` are deferred here exactly as `str::parse::<i64>` refuses them
+/// there), which the dialect then maps.
+///
+/// Every arm is generated from [`crate::severity`]'s own tables
+/// ([`crate::severity::token_entries`], [`crate::severity::otel_name`],
+/// [`crate::severity::from_syslog`]), and the pairing with the Rust kernel
+/// is executed case by case against the bundled `DuckDB` in
+/// `trawl-engine/tests/duckdb_probe.rs` — never assumed.
+///
+/// The result is CAST to BIGINT because it types a stored column: the
+/// `SEVERITY` pin is physically BIGINT (`CanonicalType::as_duckdb`), and
+/// an INTEGER-typed conform would make the hot branch disagree with the
+/// parquet side and throw the union.
+///
+/// `text_expr` appears FIVE times in the result — the ASCII gate, the
+/// token lookup, the digits guard, and the cast's two halves — which is
+/// free for a column
+/// (`DuckDB` evaluates the common subexpression once) but wrong for an
+/// expression carrying bound `?` parameters, since the emitter pushes one
+/// value per call and not per occurrence. A caller whose subject can
+/// carry parameters takes [`severity_reading_sql_bind_once`] instead.
+#[must_use]
+pub fn severity_reading_sql(text_expr: &str, dialect: crate::severity::Dialect) -> String {
+    let trimmed = trimmed_sql(text_expr);
+    format!("CAST({} AS BIGINT)", reading_case(&trimmed, dialect))
+}
+
+/// [`severity_reading_sql`] with its subject bound ONCE — the form
+/// `sev()` emits.
+///
+/// A one-element `list_transform` is `DuckDB`'s only inline binding
+/// construct, and `sev()` needs one for two reasons: its subject is an
+/// arbitrary expression that may carry `?` parameters (which must be
+/// pushed once and read once), and the emitted call may itself be
+/// embedded in a comparison. It is measurably slower than the repeated
+/// form (~2x over 3M rows, probed), which is why the conform rung — every
+/// row of every compaction — does not pay it.
+///
+/// The two shapes share [`reading_case`], so they cannot answer
+/// differently; the probe suite runs the matrix through BOTH.
+#[must_use]
+pub fn severity_reading_sql_bind_once(
+    text_expr: &str,
+    dialect: crate::severity::Dialect,
+) -> String {
+    format!(
+        "CAST(list_transform([{}], _sev -> {})[1] AS BIGINT)",
+        trimmed_sql(text_expr),
+        reading_case("_sev", dialect)
+    )
+}
+
+/// The reading's `CASE`, over an ALREADY-TRIMMED subject — the one arm
+/// generator behind both shapes above.
+///
+/// Rung order is the kernel's ([`crate::severity::reading_text`]): the
+/// band token table first, then the `OTel` exact short names it does not
+/// already carry (the duplicates — `error` is both — agree by
+/// construction), then the numeric arm.
+fn reading_case(trimmed: &str, dialect: crate::severity::Dialect) -> String {
+    let mut arms: Vec<String> = Vec::with_capacity(44);
+    let mut seen: Vec<&str> = Vec::with_capacity(44);
+    for (token, number) in crate::severity::token_entries() {
+        seen.push(token);
+        arms.push(format!("WHEN '{token}' THEN {number}"));
+    }
+    for number in 1..=24u8 {
+        let name = crate::severity::otel_name(number).expect("1-24 is the ladder");
+        if !seen.contains(&name) {
+            arms.push(format!("WHEN '{name}' THEN {number}"));
         }
     }
+    let cast = format!("TRY_CAST({trimmed} AS BIGINT)");
+    let numeric = match dialect {
+        crate::severity::Dialect::Otel => {
+            format!("(CASE WHEN {cast} BETWEEN 1 AND 24 THEN {cast} END)")
+        }
+        crate::severity::Dialect::Syslog => {
+            let rungs: Vec<String> = (0..=7u8)
+                .map(|n| {
+                    let otel = crate::severity::from_syslog(n).expect("0-7 is the syslog range");
+                    format!("WHEN {n} THEN {otel}")
+                })
+                .collect();
+            format!("(CASE {cast} {} END)", rungs.join(" "))
+        }
+    };
+    // A digits-only guard in front of the cast, because `TRY_CAST` reads a
+    // vocabulary the kernel does not: `'1e1'` is 10 and `'0x10'` is 16 to
+    // the cast, and both have no reading in Rust. Deliberately NOT behind
+    // the ASCII gate below — a sign is not alphanumeric, and `+17` reads.
+    let numeric_arm =
+        format!("(CASE WHEN regexp_full_match({trimmed}, '[+-]?[0-9]+') THEN {numeric} END)");
+    // The token subject is gated on being ASCII alphanumeric, because
+    // `DuckDB`'s `lower()` is UNICODE and the kernel's fold is ASCII:
+    // `lower('İ')` (U+0130) is `i`, which would read as INFO in SQL and
+    // as nothing in Rust — a batch/live and hot/cold split on a value a
+    // sender chooses. Every token is `[a-z0-9]`, so a string carrying
+    // anything else can never BE one, and gating the subject means
+    // `lower()` only ever folds ASCII. A failed gate yields a NULL
+    // subject, so no `WHEN` matches and the numeric arm decides.
+    format!(
+        "(CASE (CASE WHEN regexp_full_match({trimmed}, '[A-Za-z0-9]+') \
+         THEN lower({trimmed}) END) {} ELSE {numeric_arm} END)",
+        arms.join(" ")
+    )
 }
 
 /// The canonical token TEXT of a `SEVERITY`-pinned column — the SQL half
@@ -332,18 +480,85 @@ mod tests {
         );
     }
 
-    /// The SEVERITY rung is the BIGINT rung inside a ladder-range guard:
-    /// a number outside 1-24 is not a `SeverityNumber`, so it conforms to
-    /// NULL (a conflict, the value still in `_raw`) rather than becoming
-    /// a token nothing can render.
+    /// The SEVERITY rung IS the reading kernel (ADR-0013 ruling 10) —
+    /// byte for byte, not merely "equivalent": one expression means a
+    /// stored `"error"` conforms to 17 live and under a repin alike.
     #[test]
-    fn severity_rung_is_the_guarded_bigint_inside_the_ladder_range() {
-        let sql = guarded_cast("t", CanonicalType::Severity);
-        let bigint = guarded_cast("t", CanonicalType::BigInt);
+    fn severity_rung_is_the_reading_kernel() {
         assert_eq!(
-            sql,
-            format!("(CASE WHEN {bigint} BETWEEN 1 AND 24 THEN {bigint} END)")
+            guarded_cast("t", CanonicalType::Severity),
+            severity_reading_sql("t", crate::severity::Dialect::Otel)
         );
+    }
+
+    /// The reader's arms are GENERATED from the kernel's tables — every
+    /// band token and every exact short name, then a digits-only numeric
+    /// arm the dialect maps. The Rust/SQL pairing itself is executed in
+    /// `trawl-engine/tests/duckdb_probe.rs`; this pins the shape.
+    #[test]
+    fn severity_reading_sql_covers_both_name_tables_and_the_numeric_arm() {
+        let sql = severity_reading_sql("t", crate::severity::Dialect::Otel);
+        for (token, number) in crate::severity::token_entries() {
+            assert!(
+                sql.contains(&format!("WHEN '{token}' THEN {number}")),
+                "missing band token {token}: {sql}"
+            );
+        }
+        for n in 1..=24u8 {
+            let name = crate::severity::otel_name(n).unwrap();
+            assert!(
+                sql.contains(&format!("WHEN '{name}' THEN {n}")),
+                "missing exact name {name}: {sql}"
+            );
+        }
+        // Digits only, and the OTel numeric arm is the ladder range.
+        assert!(sql.contains("regexp_full_match"), "{sql}");
+        assert!(sql.contains("BETWEEN 1 AND 24"), "{sql}");
+        // A stored column is BIGINT, whatever the arms' literals type as.
+        assert!(sql.starts_with("CAST("), "{sql}");
+        assert!(sql.ends_with(" AS BIGINT)"), "{sql}");
+    }
+
+    /// The two shapes are one reading: the bind-once form names its
+    /// subject EXACTLY once (a subject carrying `?` is pushed once), the
+    /// repeated form four times (free for a column, and measurably faster
+    /// — the reason the conform rung does not pay the lambda).
+    #[test]
+    fn severity_reading_sql_shapes_differ_only_in_where_the_subject_lands() {
+        let repeated = severity_reading_sql("SUBJ", crate::severity::Dialect::Otel);
+        let once = severity_reading_sql_bind_once("SUBJ", crate::severity::Dialect::Otel);
+        // The ASCII gate, the fold, the digits guard, and the cast's two
+        // halves — free for a column, wrong for a bound parameter.
+        assert_eq!(repeated.matches("SUBJ").count(), 5, "{repeated}");
+        assert_eq!(once.matches("SUBJ").count(), 1, "{once}");
+        // Same arms, both times.
+        for (token, number) in crate::severity::token_entries() {
+            let arm = format!("WHEN '{token}' THEN {number}");
+            assert!(repeated.contains(&arm) && once.contains(&arm), "{arm}");
+        }
+        assert!(once.contains("list_transform"), "{once}");
+        assert!(!repeated.contains("list_transform"), "{repeated}");
+    }
+
+    /// The dialect governs the NUMERIC arm and nothing else: the name
+    /// tables are identical, and syslog's 0-7 inversion is the one
+    /// difference.
+    #[test]
+    fn severity_reading_sql_dialect_changes_only_the_numeric_arm() {
+        let otel = severity_reading_sql("t", crate::severity::Dialect::Otel);
+        let syslog = severity_reading_sql("t", crate::severity::Dialect::Syslog);
+        for (token, number) in crate::severity::token_entries() {
+            assert!(syslog.contains(&format!("WHEN '{token}' THEN {number}")));
+        }
+        assert!(!syslog.contains("BETWEEN 1 AND 24"), "{syslog}");
+        for n in 0..=7u8 {
+            let otel_number = crate::severity::from_syslog(n).unwrap();
+            assert!(
+                syslog.contains(&format!("WHEN {n} THEN {otel_number}")),
+                "missing syslog rung {n}: {syslog}"
+            );
+        }
+        assert_ne!(otel, syslog);
     }
 
     /// The canonical token text is a total 24-arm table with an explicit

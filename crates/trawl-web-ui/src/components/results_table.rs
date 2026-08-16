@@ -19,7 +19,7 @@ use std::cmp::Ordering;
 use trawl_api::QueryResponse;
 use trawl_api::display::value_to_string;
 
-use crate::severity_cell::{severity_class, severity_column, severity_display};
+use crate::severity_cell::{severity_class, severity_columns, severity_display};
 use trawl_api::value::Value;
 
 #[component]
@@ -84,11 +84,13 @@ fn ResultsTableBody(
         .into_any();
     }
 
-    // Severity-keyed cell rendering (ADR-0013 §9): `_severity` ONLY —
-    // the derived slot nothing can shadow. A bare `severity` column is
+    // Severity-keyed cell rendering (ADR-0013 §9): the derived slot
+    // nothing can shadow, plus the columns the response DECLARED
+    // (`sev()` output, ADR-0013 slice 2). A bare `severity` column is
     // ordinary sender data now, and the `severity_text` fallback died
     // with the column.
-    let severity_idx = severity_column(columns.iter().map(String::as_str));
+    let severity_cols =
+        severity_columns(columns.iter().map(String::as_str), &resp.severity_columns);
     let expanded = RwSignal::new(None::<usize>);
     let sort = RwSignal::new(None::<SortState>);
 
@@ -148,7 +150,7 @@ fn ResultsTableBody(
                             (move || sorted_indices.render(
                                 rows_data.clone(),
                                 cols_for_view.clone(),
-                                severity_idx,
+                                severity_cols.clone(),
                                 expanded,
                                 on_add_filter,
                                 on_navigate,
@@ -213,7 +215,7 @@ impl SortedIndices {
         &self,
         rows: Vec<Vec<Value>>,
         columns: Vec<String>,
-        severity_idx: Option<usize>,
+        severity_cols: Vec<usize>,
         expanded: RwSignal<Option<usize>>,
         on_add_filter: Callback<Filter>,
         on_navigate: Callback<String>,
@@ -225,12 +227,13 @@ impl SortedIndices {
             .map(|i| {
                 let row = rows[i].clone();
                 let cols = columns.clone();
+                let sev_cols = severity_cols.clone();
                 view! {
                     <RowFragment
                         idx=i
                         row=row
                         columns=cols
-                        severity_idx=severity_idx
+                        severity_cols=sev_cols
                         expanded=expanded
                         on_add_filter=on_add_filter
                         on_navigate=on_navigate
@@ -248,7 +251,7 @@ fn RowFragment(
     idx: usize,
     row: Vec<Value>,
     columns: Vec<String>,
-    severity_idx: Option<usize>,
+    severity_cols: Vec<usize>,
     expanded: RwSignal<Option<usize>>,
     on_add_filter: Callback<Filter>,
     on_navigate: Callback<String>,
@@ -259,7 +262,7 @@ fn RowFragment(
         .iter()
         .enumerate()
         .map(|(ci, v)| {
-            if Some(ci) == severity_idx {
+            if severity_cols.contains(&ci) {
                 // Results DISPLAY the token, never the number (ADR-0013
                 // §6). The wire keeps the number: json/csv/SSE carry it
                 // for arithmetic consumers, and rendering is presentation.
