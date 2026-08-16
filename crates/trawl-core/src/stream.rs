@@ -637,6 +637,11 @@ fn apply_rename(renames: &[(String, String)], event: &mut Map<String, Value>) {
         event.remove(source.as_str());
     }
     for (to, value) in resolved {
+        // The write OWNS its folded name, exactly as the emitted
+        // projection now excludes it: `rename a as B` over a row that
+        // also carries `b` must leave ONE key, or a later `B` reads the
+        // twin here and the column DuckDB projected there.
+        remove_folded_twins(event, to);
         match value {
             Some(v) => {
                 event.insert(to.to_string(), v);
@@ -645,6 +650,23 @@ fn apply_rename(renames: &[(String, String)], event: &mut Map<String, Value>) {
                 event.remove(to);
             }
         }
+    }
+}
+
+/// Drop every key that ASCII-folds to `name` but is not spelled like it.
+///
+/// The in-memory half of "a projection write owns its folded name": the
+/// SQL lanes exclude the twin through [`crate::emitter::fields`]'s folded
+/// `COLUMNS` lambda, and a row that kept both spellings would answer a
+/// later reference with whichever key it met first.
+fn remove_folded_twins(event: &mut Map<String, Value>, name: &str) {
+    let twins: Vec<String> = event
+        .keys()
+        .filter(|k| k.as_str() != name && catalog_key(k) == catalog_key(name))
+        .cloned()
+        .collect();
+    for twin in twins {
+        event.remove(&twin);
     }
 }
 
@@ -710,14 +732,7 @@ fn apply_let(
         // as the target wrote it. Dropping the folded twin here is that
         // same rule: without it this lane emits both spellings and a
         // downstream reference binds to whichever it finds first.
-        let twins: Vec<String> = event
-            .keys()
-            .filter(|k| k.as_str() != name && catalog_key(k) == catalog_key(name))
-            .cloned()
-            .collect();
-        for twin in twins {
-            event.remove(&twin);
-        }
+        remove_folded_twins(event, name);
         event.insert(name.to_string(), value);
     }
 }
@@ -802,6 +817,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
                     })
                     .collect();
                 for (name, value) in names {
+                    remove_folded_twins(event, &name);
                     event.insert(name, Value::String(value));
                 }
             }

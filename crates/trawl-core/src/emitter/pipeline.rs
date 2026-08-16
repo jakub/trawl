@@ -250,7 +250,12 @@ fn process_extract(
                 });
             }
 
-            let mut select_items = vec!["*".to_string()];
+            // Same rule as `rename`/`let`: a capture OWNS its folded name.
+            // A bare `*` here emitted the column twice whenever the row
+            // already carried one (`extract "(?P<b>…)"` over a row with a
+            // `b`), and DuckDB dedup-suffixed the loser.
+            let owned: Vec<String> = group_names.iter().map(|n| (*n).to_string()).collect();
+            let mut select_items = vec![super::fields::columns_except(&owned)];
             for (i, name) in group_names.iter().enumerate() {
                 let group_idx = i + 1;
                 let alias = quote_field(name);
@@ -397,10 +402,18 @@ fn process_tail(tail: &crate::ast::TailStage, ctx: &mut EmitterState) {
 fn process_rename(rename: &crate::ast::RenameStage, ctx: &mut EmitterState) {
     ctx.flush_if(FlushCondition::IfModified);
 
+    // A projection write OWNS its folded name: the exclusion covers the
+    // TARGETS as well as the sources, so `rename a as B` over a row that
+    // also carries `b` yields ONE column rather than `b` plus a
+    // dedup-suffixed `B_1` — which is what made the two lanes disagree
+    // about which value `B` names. `EXCLUDE` cannot express it (it
+    // refuses a name the input lacks, and a twin is statically
+    // unknowable); the COLUMNS lambda tolerates absence, which is exactly
+    // why `let` and `eventstats` already use it.
     let excluded: Vec<String> = rename
         .renames
         .iter()
-        .map(|(old, _)| quote_field(old))
+        .flat_map(|(old, new)| [old.clone(), new.clone()])
         .collect();
     let aliases: Vec<String> = rename
         .renames
@@ -408,10 +421,7 @@ fn process_rename(rename: &crate::ast::RenameStage, ctx: &mut EmitterState) {
         .map(|(old, new)| format!("{} AS {}", quote_field(old), quote_field(new)))
         .collect();
 
-    ctx.select = vec![
-        format!("* EXCLUDE ({})", excluded.join(", ")),
-        aliases.join(", "),
-    ];
+    ctx.select = vec![super::fields::columns_except(&excluded), aliases.join(", ")];
     ctx.has_projection = true;
 }
 

@@ -849,67 +849,108 @@ fn count_over_a_constant_counts_rows_in_both_lanes() {
 fn case_variant_projections_agree_across_lanes() {
     let conn = Connection::open_in_memory().unwrap();
     let ft = FieldTypes::new();
-    // `_time` is present because `dedup` orders by it, and the rows differ
-    // only in the key column so `dedup` never has to CHOOSE between two
-    // rows of one group — which lane keeps which representative is a
+    // `_time` is present because `dedup` orders by it, and every column a
+    // reader groups or dedups on differs per row, so `dedup` never has to
+    // CHOOSE between two rows of one group — which lane keeps which representative is a
     // streaming-vs-batch question (live keeps the first arrival, batch the
     // most recent) and not this guard's subject. A dedup key that failed
     // to bind still fails here: it would collapse both rows into one.
     let rows = [
-        json!({"a": 5, "b": "x", "message": "m", "_time": "2026-08-15T00:00:00Z"}),
-        json!({"a": 7, "b": "x", "message": "m", "_time": "2026-08-15T00:00:01Z"}),
+        json!({"a": 5, "b": "x", "message": "mx", "_time": "2026-08-15T00:00:00Z"}),
+        json!({"a": 7, "b": "x", "message": "my", "_time": "2026-08-15T00:00:01Z"}),
     ];
 
-    // (projection that writes a mixed-case key, reader naming either spelling)
-    let projections = ["| let A = a", "| let A = 1", "| rename a as A"];
-    let readers = [
-        "| where a > 0",
-        "| where A > 0",
-        "| stats count() by a",
-        "| stats count() by A",
-        "| stats sum(a) as s",
-        "| stats first(a) as f",
-        "| stats dc(a) as d",
-        "| table a",
-        "| table A, message",
-        "| drop a",
-        "| dedup a",
-        "| top 5 a",
+    // Each group pairs projections that write ONE folded name with readers
+    // that name that column in either spelling. The second group PRODUCES
+    // a collision — it writes a name folding onto a DIFFERENT existing
+    // column (`b`) — so the write has to own that name in both lanes;
+    // leave the twin behind and the lanes disagree about which value the
+    // name carries. Readers are grouped rather than crossed because a
+    // reader naming a column the projection renamed AWAY is an error in
+    // batch (correctly) and simply absent live: a different question.
+    let groups: [(&[&str], &[&str]); 2] = [
+        (
+            &["| let A = a", "| let A = 1", "| rename a as A"],
+            &[
+                "| where a > 0",
+                "| where A > 0",
+                "| stats count() by a",
+                "| stats count() by A",
+                "| stats sum(a) as s",
+                "| stats first(a) as f",
+                "| stats dc(a) as d",
+                "| table a",
+                "| table A, message",
+                "| drop a",
+                "| dedup a",
+                "| top 5 a",
+            ],
+        ),
+        (
+            &[
+                "| rename a as B",
+                "| let B = a",
+                r#"| extract "(?P<B>[a-z]+)" from message"#,
+            ],
+            &[
+                "| table B, message",
+                "| table b, message",
+                "| stats count() by B",
+                "| stats count() by b",
+                "| stats first(B) as fb",
+                "| stats dc(b) as db",
+                "| dedup B",
+                "| top 5 b",
+                "| drop b",
+            ],
+        ),
     ];
 
-    for projection in projections {
-        for reader in readers {
-            let dsl = format!("* {projection} {reader}");
-            let query = parser::parse(&dsl).expect("dsl parses");
+    for (projections, readers) in groups {
+        for projection in projections {
+            for reader in readers {
+                // A projection writing a CONSTANT puts both rows in one dedup
+                // group, and which member survives is lane-specific by design
+                // (live keeps the first arrival, batch the most recent) — a
+                // streaming-vs-batch question, not a binding one. Every other
+                // pairing keeps the dedup key distinct per row, so a key that
+                // failed to bind still collapses the rows and fails here.
+                if reader.starts_with("| dedup") && projection.contains("= 1") {
+                    continue;
+                }
+                let dsl = format!("* {projection} {reader}");
+                let query = parser::parse(&dsl).expect("dsl parses");
 
-            let live = live_rows(&query, &rows, &ft, &dsl);
+                let live = live_rows(&query, &rows, &ft, &dsl);
 
-            // batch lane
-            let mut tmp = tempfile::Builder::new()
-                .suffix(".ndjson")
-                .tempfile()
-                .unwrap();
-            for row in &rows {
-                writeln!(tmp, "{row}").unwrap();
+                // batch lane
+                let mut tmp = tempfile::Builder::new()
+                    .suffix(".ndjson")
+                    .tempfile()
+                    .unwrap();
+                for row in &rows {
+                    writeln!(tmp, "{row}").unwrap();
+                }
+                tmp.flush().unwrap();
+                let source = tmp.path().to_str().unwrap().to_owned();
+                let emitted = emitter::emit_with_pins(&query, &source, &ft).expect("emit succeeds");
+                let rows_sql = format!("SELECT to_json(_sub) FROM ({}) AS _sub", emitted.sql);
+                let params = bind_params(&emitted.params);
+                let param_refs: Vec<&dyn duckdb::ToSql> =
+                    params.iter().map(AsRef::as_ref).collect();
+                let mut stmt = conn.prepare(&rows_sql).expect("sql prepares");
+                let batch: Vec<Map<String, Value>> = stmt
+                    .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+                    .unwrap_or_else(|e| panic!("{dsl}: sql must run: {e}\n{rows_sql}"))
+                    .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+                    .collect();
+
+                assert_eq!(
+                    comparable(&live),
+                    comparable(&batch),
+                    "lane divergence\ndsl: {dsl}\nlive: {live:?}\nbatch: {batch:?}"
+                );
             }
-            tmp.flush().unwrap();
-            let source = tmp.path().to_str().unwrap().to_owned();
-            let emitted = emitter::emit_with_pins(&query, &source, &ft).expect("emit succeeds");
-            let rows_sql = format!("SELECT to_json(_sub) FROM ({}) AS _sub", emitted.sql);
-            let params = bind_params(&emitted.params);
-            let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
-            let mut stmt = conn.prepare(&rows_sql).expect("sql prepares");
-            let batch: Vec<Map<String, Value>> = stmt
-                .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
-                .unwrap_or_else(|e| panic!("{dsl}: sql must run: {e}\n{rows_sql}"))
-                .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
-                .collect();
-
-            assert_eq!(
-                comparable(&live),
-                comparable(&batch),
-                "lane divergence\ndsl: {dsl}\nlive: {live:?}\nbatch: {batch:?}"
-            );
         }
     }
 }
