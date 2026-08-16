@@ -122,6 +122,16 @@ pub const EXPRESSION_KEYWORDS: &[&str] = &[
     "true", "false", "null", "and", "or", "not", "in", "matches", "like", "ilike",
 ];
 
+/// The SEARCH stage's group separator, in the two spellings the grammar
+/// reads (`search.rs`: `keyword("OR").or(keyword("or"))`) before it tries
+/// a field filter.
+///
+/// `or` is also an expression keyword; `OR` is reachable as a field name
+/// only through backticks, and rendered bare it would not merely change
+/// meaning — `OR=x` splits the search stage into two groups and leaves
+/// the filter as a text search for `=x`, so the predicate vanishes.
+pub const SEARCH_KEYWORDS: &[&str] = &["OR", "or"];
+
 /// Whether `name` lexes as a BARE field name — the unquoted production
 /// (`[A-Za-z_][A-Za-z0-9_]*`, dot-joined, optionally `@`-prefixed).
 ///
@@ -144,7 +154,8 @@ fn is_bare_segment(segment: &str) -> bool {
 
 /// Render a field name as DSL text: bare when the bare production can
 /// spell it and it is not a keyword of the grammar
-/// ([`GRAMMAR_KEYWORDS`]) or of an expression position
+/// ([`GRAMMAR_KEYWORDS`]), of the search stage's group separator
+/// ([`SEARCH_KEYWORDS`]) or of an expression position
 /// ([`EXPRESSION_KEYWORDS`]), else backtick-quoted with embedded
 /// backticks doubled (ADR-0013 ruling 7).
 ///
@@ -155,6 +166,7 @@ fn is_bare_segment(segment: &str) -> bool {
 pub fn quote_dsl_field(name: &str) -> String {
     if is_bare_field_name(name)
         && !GRAMMAR_KEYWORDS.contains(&name)
+        && !SEARCH_KEYWORDS.contains(&name)
         && !EXPRESSION_KEYWORDS.contains(&name)
     {
         return name.to_string();
@@ -308,6 +320,44 @@ mod tests {
                 bare_is_field,
                 !matches!(*kw, "true" | "false" | "null" | "not"),
                 "{kw:?}: expression-keyword hazard drifted from the grammar"
+            );
+        }
+    }
+
+    /// The search stage reads its group separator in TWO spellings before
+    /// it tries a field filter, so both are quoted. Rendered bare, `OR=x`
+    /// is not a changed predicate but a VANISHED one: an OR separator
+    /// followed by a text search for `=x`.
+    #[test]
+    fn the_or_separator_round_trips_in_the_search_stage() {
+        use crate::ast::SearchToken;
+
+        for kw in SEARCH_KEYWORDS {
+            let rendered = quote_dsl_field(kw);
+            assert_eq!(rendered, format!("`{kw}`"), "{kw} must be quoted");
+
+            let parsed = crate::parser::parse(&format!("{rendered}=x"))
+                .unwrap_or_else(|e| panic!("{rendered}=x must parse: {e:?}"));
+            let groups = &parsed.search.groups;
+            assert_eq!(groups.len(), 1, "{kw:?}: {rendered}=x must be one group");
+            match &groups[0][..] {
+                [term] => match &term.node {
+                    SearchToken::FieldFilter(ff) => assert_eq!(&ff.field, kw),
+                    other => panic!("{kw:?}: expected a field filter, got {other:?}"),
+                },
+                other => panic!("{kw:?}: expected one term, got {other:?}"),
+            }
+
+            // …and bare, the same text is the separator: the filter is
+            // gone entirely, not merely reinterpreted.
+            let bare = crate::parser::parse(&format!("{kw}=x"))
+                .unwrap_or_else(|e| panic!("{kw}=x must parse: {e:?}"));
+            assert!(
+                !bare.search.all_tokens().any(|t| matches!(
+                    &t.node,
+                    SearchToken::FieldFilter(ff) if ff.field == *kw
+                )),
+                "{kw:?}: separator hazard drifted from the grammar"
             );
         }
     }
