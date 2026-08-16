@@ -179,6 +179,21 @@ fn format_field_filter(ff: &FieldFilter, out: &mut String) {
     format_filter_value(&ff.value, ff.op, out);
 }
 
+/// A string rendered for a double-quoted DSL position, escaped as the
+/// exact inverse of [`crate::parser::primitives::quoted_string`]: that
+/// production reads `\\` and `\"` as escapes and takes every other byte
+/// literally, so those two — backslash FIRST — are what emission owes it.
+fn escape_quoted(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The double-quoted DSL rendering of `value`, for tests that need to
+/// WRITE a query carrying an awkward value before formatting it back.
+#[cfg(test)]
+pub(crate) fn quote_for_test(value: &str) -> String {
+    format!("\"{}\"", escape_quoted(value))
+}
+
 /// Whether a filter value literal needs quoting in the formatted output.
 ///
 /// The set is the exact complement of what
@@ -200,8 +215,14 @@ fn format_filter_value(value: &FilterValue, op: FilterOp, out: &mut String) {
             if op == FilterOp::Regex {
                 let _ = write!(out, "/{s}/");
             } else if needs_quoting(s) {
-                // Escape any embedded double quotes.
-                let escaped = s.replace('"', "\\\"");
+                // The exact inverse of `primitives::quoted_string`, which
+                // reads `\\` and `\"` as escapes: the BACKSLASH has to go
+                // first, or an emitted `\n` reparses as a newline and the
+                // value silently changes. (`from saved` below keeps only
+                // the quote escape — `raw_quoted_string` passes every
+                // other backslash through verbatim, so escaping there
+                // would ADD one.)
+                let escaped = escape_quoted(s);
                 let _ = write!(out, "\"{escaped}\"");
             } else {
                 out.push_str(s);
@@ -510,7 +531,7 @@ fn format_literal(lit: &LiteralValue, ctx: ExprContext, out: &mut String) {
             if ctx == ExprContext::MatchesRhs {
                 let _ = write!(out, "/{s}/");
             } else {
-                let _ = write!(out, "\"{s}\"");
+                let _ = write!(out, "\"{}\"", escape_quoted(s));
             }
         }
         LiteralValue::Int(n) => {
@@ -1002,6 +1023,50 @@ mod tests {
         }
         // …and a value needing none of it stays bare.
         assert_eq!(fmt("host=web-01"), "host=web-01");
+    }
+
+    /// Emission is the exact inverse of the value-string grammar, which
+    /// reads `\\` and `\"` as escapes. Escaping the quote but not the
+    /// BACKSLASH made `\n` reparse as a newline — the value silently
+    /// changed on a format round trip.
+    #[test]
+    fn backslashes_survive_the_value_round_trip() {
+        for value in [
+            r"a
+`b", // a literal backslash-n beside a backtick
+            r"a",     // …and on its own
+            "a\"b",    // backslash next to a quote
+            r"trail\", // a trailing backslash
+            "new
+line", // a REAL newline, which the grammar takes literally
+            r"c:\path	o",
+        ] {
+            let dsl = format!("host={}", crate::format::quote_for_test(value));
+            let parsed =
+                crate::parser::parse(&dsl).unwrap_or_else(|e| panic!("{dsl:?} must parse: {e:?}"));
+            let once = format_query(&parsed);
+            let again = crate::parser::parse(&once)
+                .unwrap_or_else(|e| panic!("{once:?} must reparse: {e:?}"));
+            assert_eq!(
+                format_query(&again),
+                once,
+                "{value:?}: the value changed across the round trip"
+            );
+            // …and it is still the SAME value, not merely a stable one
+            assert_eq!(filter_value_of(&again), value, "{value:?}: value drifted");
+        }
+    }
+
+    fn filter_value_of(query: &Query) -> String {
+        match &query.search.groups[0][0].node {
+            SearchToken::FieldFilter(f) => match &f.value {
+                crate::ast::FilterValue::Literal(s) => s.clone(),
+                other @ crate::ast::FilterValue::List(_) => {
+                    panic!("expected a literal, got {other:?}")
+                }
+            },
+            other => panic!("expected a field filter, got {other:?}"),
+        }
     }
 
     /// Quote provenance is discarded by CONTENT (the ADR-0011 literal

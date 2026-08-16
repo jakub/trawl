@@ -328,7 +328,13 @@ fn prefix_match(prefix: &str, candidates: &[Candidate]) -> Option<Candidate> {
 /// cannot express the name at all: offering a lossy spelling would insert
 /// a name that is not the field.
 fn build_completion(candidate: &Candidate, prefix: &str) -> Option<Completion> {
+    // BYTES for slicing the candidate, CHARS for the editor: `replace_len`
+    // and `cursor_offset` are both column counts
+    // (`EditorState::replace_at_cursor` subtracts them from a char index),
+    // so feeding a byte length deletes text to the LEFT of the prefix as
+    // soon as anything on the line is multi-byte.
     let prefix_len = prefix.len();
+    let prefix_cols = prefix.chars().count();
     if candidate.is_function {
         let suffix = &candidate.name[prefix_len..];
         if candidate.is_zero_arg {
@@ -336,7 +342,7 @@ fn build_completion(candidate: &Candidate, prefix: &str) -> Option<Completion> {
             Some(Completion {
                 ghost_text: format!("{suffix}()"),
                 insert_text: format!("{}()", candidate.name),
-                replace_len: prefix_len,
+                replace_len: prefix_cols,
                 cursor_offset: None, // end
             })
         } else {
@@ -344,8 +350,8 @@ fn build_completion(candidate: &Candidate, prefix: &str) -> Option<Completion> {
             Some(Completion {
                 ghost_text: format!("{suffix}()"),
                 insert_text: format!("{}()", candidate.name),
-                replace_len: prefix_len,
-                cursor_offset: Some(candidate.name.len() + 1), // between ( and )
+                replace_len: prefix_cols,
+                cursor_offset: Some(candidate.name.chars().count() + 1), // between ( and )
             })
         }
     } else if KNOWN_PIPE_STAGES.contains(&candidate.name.as_str()) {
@@ -353,7 +359,7 @@ fn build_completion(candidate: &Candidate, prefix: &str) -> Option<Completion> {
         Some(Completion {
             ghost_text: format!("{suffix} "),
             insert_text: format!("{} ", candidate.name),
-            replace_len: prefix_len,
+            replace_len: prefix_cols,
             cursor_offset: None,
         })
     } else {
@@ -369,7 +375,7 @@ fn build_completion(candidate: &Candidate, prefix: &str) -> Option<Completion> {
         Some(Completion {
             ghost_text: ghost,
             insert_text: rendered,
-            replace_len: prefix_len,
+            replace_len: prefix_cols,
             cursor_offset: None,
         })
     }
@@ -632,6 +638,35 @@ mod tests {
         let text = "host=/foo`bar/ | table `request i";
         let c = complete(text, text.len(), &fields()).expect("a completion");
         assert_eq!(c.insert_text, "`request id`");
+    }
+
+    /// `replace_len` is a COLUMN count, so a multi-byte character earlier
+    /// on the line must not shift it: feeding the prefix's byte length
+    /// deleted text to the left of what the user typed.
+    #[test]
+    fn completion_length_is_columns_not_bytes() {
+        let mut schema = fields();
+        schema.push(SchemaField {
+            name: "日本語".to_owned(),
+            is_numeric: false,
+        });
+
+        // the typed prefix is itself multi-byte
+        let text = "* | table `日本";
+        let c = complete(text, text.len(), &schema).expect("a completion");
+        assert_eq!(c.insert_text, "`日本語`");
+        assert_eq!(
+            c.replace_len,
+            "`日本".chars().count(),
+            "the replacement is measured in columns"
+        );
+
+        // …and a multi-byte character BEFORE an ASCII prefix does not
+        // change its length either
+        let text = "* | table `日本語`, hostn";
+        let c = complete(text, text.len(), &schema).expect("a completion");
+        assert_eq!(c.insert_text, "hostname");
+        assert_eq!(c.replace_len, 5);
     }
 
     /// A name that needs no quoting keeps its bare spelling — quoting

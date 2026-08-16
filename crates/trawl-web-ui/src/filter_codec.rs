@@ -25,8 +25,14 @@
 //! decode returns those escapes intact, and only then does this module
 //! split. Two layers, disjoint alphabets, one decode each.
 //!
-//! Old URLs written before this scheme carry no backslashes at all, so
-//! unescaping is the identity and they decode unchanged.
+//! # Versioning
+//!
+//! A legacy value may legitimately contain a literal `\c`, which the new
+//! unescaper would silently turn into a comma on reload. So a payload
+//! this module wrote is MARKED — it starts with `1:`, which no legacy
+//! payload can, since those begin with the `+`/`-` op prefix. Marked
+//! payloads unescape; unmarked ones are read exactly as the old decoder
+//! read them, backslashes and all.
 
 // The only CALLER is the wasm32-gated `state::query`; the codec itself is
 // pure and its tests run natively — the `service_card_fmt` arrangement.
@@ -79,13 +85,18 @@ fn unescape(text: &str) -> String {
     out
 }
 
+/// The marker every payload this module writes carries. A legacy payload
+/// starts with the `+`/`-` op prefix, so it can never begin with this.
+const VERSION: &str = "1:";
+
 /// Render `(op, field, value)` triples as the payload that goes into
 /// `f=`, BEFORE percent-encoding.
 pub fn encode_payload<'a>(parts: impl Iterator<Item = (char, &'a str, &'a str)>) -> String {
-    parts
+    let body = parts
         .map(|(op, field, value)| format!("{op}{}={}", escape(field), escape(value)))
         .collect::<Vec<_>>()
-        .join(",")
+        .join(",");
+    format!("{VERSION}{body}")
 }
 
 /// Parse the payload the ROUTER hands back — already percent-decoded.
@@ -98,7 +109,12 @@ pub fn decode_payload(raw: &str) -> Vec<(char, String, String)> {
     if raw.is_empty() {
         return Vec::new();
     }
-    raw.split(',')
+    // An UNMARKED payload predates this codec: its backslashes are data,
+    // so it is read exactly as the old decoder read it.
+    let (body, escaped) = raw
+        .strip_prefix(VERSION)
+        .map_or((raw, false), |body| (body, true));
+    body.split(',')
         .filter_map(|piece| {
             let mut chars = piece.chars();
             let op = chars.next()?;
@@ -107,11 +123,18 @@ pub fn decode_payload(raw: &str) -> Vec<(char, String, String)> {
             }
             let rest = chars.as_str();
             let eq = rest.find('=')?;
-            let field = unescape(&rest[..eq]);
+            let decode = |part: &str| {
+                if escaped {
+                    unescape(part)
+                } else {
+                    part.to_string()
+                }
+            };
+            let field = decode(&rest[..eq]);
             if field.is_empty() {
                 return None;
             }
-            Some((op, field, unescape(&rest[eq + 1..])))
+            Some((op, field, decode(&rest[eq + 1..])))
         })
         .collect()
 }
@@ -152,7 +175,8 @@ mod tests {
 
             // no structural character survives unescaped in the payload
             let payload = encode_payload([('+', field, "web-01")].into_iter());
-            let structural = payload.matches('=').count() + payload.matches(',').count();
+            let body = payload.strip_prefix("1:").expect("payloads are marked");
+            let structural = body.matches('=').count() + body.matches(',').count();
             assert_eq!(structural, 1, "only the separator is bare: {payload:?}");
         }
     }
@@ -180,8 +204,9 @@ mod tests {
         );
     }
 
-    /// A URL written BEFORE this scheme carries no escapes, so it decodes
-    /// unchanged — and a malformed one is skipped, never explosive.
+    /// A URL written BEFORE this scheme is UNMARKED, so its backslashes
+    /// are data — a legacy value holding a literal `\c` must not come
+    /// back as a comma. A malformed payload is skipped, never explosive.
     #[test]
     fn older_and_malformed_payloads_decode_non_explosively() {
         assert_eq!(
@@ -191,13 +216,28 @@ mod tests {
                 ('-', "source".to_string(), "auth.log".to_string()),
             ]
         );
+        // the escapes THIS codec uses are literal text in a legacy payload
+        assert_eq!(
+            decode_payload("+path=a\\cb,-x=y\\e1"),
+            vec![
+                ('+', "path".to_string(), "a\\cb".to_string()),
+                ('-', "x".to_string(), "y\\e1".to_string()),
+            ]
+        );
+        // …and a MARKED one unescapes them
+        assert_eq!(
+            decode_payload("1:+path=a\\cb"),
+            vec![('+', "path".to_string(), "a,b".to_string())]
+        );
         // an unknown escape keeps both characters rather than vanishing
         assert_eq!(
-            decode_payload("+ho\\zst=v"),
+            decode_payload("1:+ho\\zst=v"),
             vec![('+', "ho\\zst".to_string(), "v".to_string())]
         );
         // pieces with no op, no `=`, or an empty field are skipped
         assert_eq!(decode_payload("host=v"), vec![]);
+        assert_eq!(decode_payload("1:"), vec![]);
+        assert_eq!(decode_payload("1:host=v"), vec![]);
         assert_eq!(decode_payload("+hostv"), vec![]);
         assert_eq!(decode_payload("+=v"), vec![]);
         assert_eq!(decode_payload(""), vec![]);
