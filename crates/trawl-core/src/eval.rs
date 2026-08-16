@@ -999,6 +999,29 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
             _ => EvalValue::Null,
         }),
 
+        // The severity ladder function (ADR-0013 slice 2, ruling 9) — the
+        // in-memory half of the ONE kernel, read straight off the
+        // `EvalValue` rather than through a `serde_json` round trip: a
+        // string reads as text, an integer as a number in the requested
+        // dialect, and every other shape (float, bool, timestamp, array,
+        // NULL) has no reading. An unreadable value is `Null`, NEVER
+        // `None` — `sev()` is a known function whatever it is handed.
+        "sev" => {
+            let dialect = match args.get(1) {
+                Some(EvalValue::Str(token)) => crate::severity::Dialect::from_token(token),
+                // No dialect argument is OTel; a token the compile-time
+                // gate would have refused has no reading at all.
+                None => Some(crate::severity::Dialect::Otel),
+                Some(_) => None,
+            };
+            let reading = dialect.and_then(|dialect| match args.first() {
+                Some(EvalValue::Str(text)) => crate::severity::reading_text(text, dialect),
+                Some(EvalValue::Int(n)) => crate::severity::reading_number(*n, dialect),
+                _ => None,
+            });
+            reading.map_or(EvalValue::Null, |n| EvalValue::Int(i64::from(n)))
+        }
+
         // date/time scalar functions
         "tonumber" => eval_tonumber(args),
         "tostring" => eval_tostring(args),
@@ -3384,6 +3407,96 @@ mod tests {
         assert_eq!(
             eval_expr(&expr, &empty_event()),
             EvalValue::Str("TIMESTAMP".to_string())
+        );
+    }
+
+    // ── sev(): the ladder function (ADR-0013 slice 2, ruling 9) ────
+
+    /// The eval lane reads the SAME kernel the SQL lane's expression is
+    /// generated from, straight off the `EvalValue`.
+    #[test]
+    fn fn_sev_reads_the_ladder() {
+        for (text, expected) in [
+            ("error", EvalValue::Int(17)),
+            ("ERR", EvalValue::Int(17)),
+            (" error ", EvalValue::Int(17)),
+            ("error2", EvalValue::Int(18)),
+            ("17", EvalValue::Int(17)),
+            ("007", EvalValue::Int(7)),
+            ("+17", EvalValue::Int(17)),
+            // No reading is NULL, never an error and never a guess.
+            ("0", EvalValue::Null),
+            ("25", EvalValue::Null),
+            ("-1", EvalValue::Null),
+            ("1.5", EvalValue::Null),
+            ("1e1", EvalValue::Null),
+            ("0x10", EvalValue::Null),
+            ("gold", EvalValue::Null),
+            ("", EvalValue::Null),
+        ] {
+            assert_eq!(
+                eval_expr(&call("sev", vec![lit_str(text)]), &empty_event()),
+                expected,
+                "sev({text:?})"
+            );
+        }
+        assert_eq!(
+            eval_expr(&call("sev", vec![lit_int(17)]), &empty_event()),
+            EvalValue::Int(17)
+        );
+        assert_eq!(
+            eval_expr(&call("sev", vec![lit_int(25)]), &empty_event()),
+            EvalValue::Null
+        );
+        // A shape that names no rung — a float, a boolean, a missing
+        // field — has no reading.
+        assert_eq!(
+            eval_expr(&call("sev", vec![lit_float(17.0)]), &empty_event()),
+            EvalValue::Null
+        );
+        assert_eq!(
+            eval_expr(&call("sev", vec![lit_bool(true)]), &empty_event()),
+            EvalValue::Null
+        );
+        assert_eq!(
+            eval_expr(&call("sev", vec![field("level")]), &empty_event()),
+            EvalValue::Null
+        );
+    }
+
+    /// The dialect governs NUMERICS alone: syslog inverts 0-7, and a word
+    /// reads the same in both.
+    #[test]
+    fn fn_sev_dialect_inverts_numerics_only() {
+        let sev = |arg: Spanned<Expr>, dialect: &str| {
+            eval_expr(&call("sev", vec![arg, lit_str(dialect)]), &empty_event())
+        };
+        assert_eq!(sev(lit_int(3), "syslog"), EvalValue::Int(17));
+        assert_eq!(sev(lit_int(3), "otel"), EvalValue::Int(3));
+        assert_eq!(sev(lit_str("3"), "syslog"), EvalValue::Int(17));
+        assert_eq!(sev(lit_int(0), "syslog"), EvalValue::Int(24));
+        assert_eq!(sev(lit_int(8), "syslog"), EvalValue::Null);
+        assert_eq!(sev(lit_str("error"), "syslog"), EvalValue::Int(17));
+        // Case-insensitive, and an unknown dialect reads nothing (the
+        // stream compiler refuses it before an event ever arrives).
+        assert_eq!(sev(lit_int(3), "SYSLOG"), EvalValue::Int(17));
+        assert_eq!(sev(lit_int(3), "rfc5424"), EvalValue::Null);
+    }
+
+    /// Reading a real event column, in both wire shapes.
+    #[test]
+    fn fn_sev_over_event_columns() {
+        let ev = event(&json!({"level": "warn", "syslog_severity": 3}));
+        assert_eq!(
+            eval_expr(&call("sev", vec![field("level")]), &ev),
+            EvalValue::Int(13)
+        );
+        assert_eq!(
+            eval_expr(
+                &call("sev", vec![field("syslog_severity"), lit_str("syslog")]),
+                &ev
+            ),
+            EvalValue::Int(17)
         );
     }
 

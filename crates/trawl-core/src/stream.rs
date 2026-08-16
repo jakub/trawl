@@ -1922,6 +1922,47 @@ mod tests {
         }
     }
 
+    /// `sev()`'s dialect is a closed vocabulary in the STREAM lane too:
+    /// this lane never runs `validate_pipeline`, and eval has no error
+    /// channel, so a dialect it cannot honour has to be refused where the
+    /// plan is compiled — the same sentence the emitter gives.
+    #[test]
+    fn rejects_an_unknown_or_computed_sev_dialect() {
+        let scope = PinScope::unpinned();
+        for dsl in [
+            r#"* | where sev(level, "rfc5424") >= 17"#,
+            r#"* | let s = sev(level, "bogus")"#,
+        ] {
+            let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
+            let err = compile_stream_plan(&pipeline, &scope).unwrap_err();
+            assert!(
+                err.to_string().contains("otel, syslog"),
+                "{dsl}: {err} must name the vocabulary"
+            );
+        }
+        let pipeline = crate::parser::parse("* | let s = sev(level, other)")
+            .expect("parses")
+            .pipeline;
+        let err = compile_stream_plan(&pipeline, &scope).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be a string literal dialect name"),
+            "{err}"
+        );
+        // The vocabulary itself compiles, in either case and either arity.
+        for dsl in [
+            "* | let s = sev(level)",
+            r#"* | let s = sev(level, "syslog")"#,
+            r#"* | let s = sev(level, "OTEL")"#,
+        ] {
+            let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
+            assert!(
+                compile_stream_plan(&pipeline, &scope).is_ok(),
+                "{dsl} must compile"
+            );
+        }
+    }
+
     // ── tier 2: let ────────────────────────────────────────────────
 
     #[test]

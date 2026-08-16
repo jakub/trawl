@@ -76,6 +76,7 @@ pub const KNOWN_FUNCTIONS: &[&str] = &[
     "typeof",
     "tonumber",
     "tostring",
+    "sev",
     // string
     "contains",
     "startswith",

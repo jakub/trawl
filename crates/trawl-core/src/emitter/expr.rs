@@ -12,8 +12,9 @@ use super::SqlValue;
 use super::compare::{NullPolicy, comparison_sql, in_list_sql, pattern_target};
 use super::fields::quote_field;
 use super::functions::{
-    format_literal_position, literal_int_positions, translate_function, unit_literal_positions,
-    validate_format_literal, validate_unit_literal,
+    format_literal_position, json_read_positions, literal_int_positions, literal_text_positions,
+    translate_function, unit_literal_positions, validate_format_literal, validate_function_arity,
+    validate_unit_literal,
 };
 use super::state::EmitterState;
 
@@ -42,7 +43,20 @@ pub(crate) fn emit_expr(
         Expr::FunctionCall { name, args } => {
             let lit_positions = literal_int_positions(name);
             let unit_positions = unit_literal_positions(name);
+            let text_positions = literal_text_positions(name);
+            let json_positions = json_read_positions(name);
             let fmt_position = format_literal_position(name);
+            if !lit_positions.is_empty() || !unit_positions.is_empty() {
+                // Arity BEFORE vocabulary: a call carrying an argument the
+                // function does not have must say so, rather than
+                // complaining about a literal at a position that is not a
+                // literal position at all. Scoped to the functions with
+                // literal positions because only they inspect an argument
+                // before `translate_function`'s own arity guard runs — and
+                // for those the table's message is the guard's, word for
+                // word.
+                validate_function_arity(name, args.len())?;
+            }
             let translated_args: Vec<String> = args
                 .iter()
                 .enumerate()
@@ -67,7 +81,26 @@ pub(crate) fn emit_expr(
                             _ => None,
                         };
                         validate_unit_literal(name, i, allowlist, raw)?;
-                        emit_expr(a, state)
+                        if text_positions.contains(&i) {
+                            // The token CHOOSES the emitted expression
+                            // (`sev()`'s dialect), so it is never a bound
+                            // parameter: `translate_function` has to read
+                            // it. Folded here, once, so both the SQL and
+                            // the eval lane see one spelling.
+                            Ok(raw
+                                .expect("a non-literal was refused above")
+                                .to_ascii_lowercase())
+                        } else {
+                            emit_expr(a, state)
+                        }
+                    } else if json_positions.contains(&i)
+                        && let Some(literal) = bare_literal(&a.node)
+                    {
+                        // Read through `to_json` (`sev()`'s subject): a
+                        // bare parameter has no type for `DuckDB` to
+                        // infer there, so a literal carries the type it
+                        // binds as anyway.
+                        Ok(typed_literal(&literal, state))
                     } else {
                         if fmt_position == Some(i) {
                             // strftime/strptime format arg: reject invalid format
@@ -278,6 +311,24 @@ fn try_pinned_in_list(
     } else {
         format!("({clause})")
     }))
+}
+
+/// A literal bound as a parameter that carries its OWN type.
+///
+/// For the positions read through `to_json`
+/// ([`super::functions::json_read_positions`]) — `DuckDB` infers a
+/// parameter's type from its surroundings, and `to_json(?)` offers none,
+/// so the statement fails to prepare. The cast names exactly the type the
+/// value binds as, so nothing about the reading changes; a NULL takes
+/// VARCHAR, the type every text reading starts from.
+fn typed_literal(lit: &LiteralValue, state: &mut EmitterState) -> String {
+    let ty = match lit {
+        LiteralValue::String(_) | LiteralValue::Null => "VARCHAR",
+        LiteralValue::Int(_) => "BIGINT",
+        LiteralValue::Float(_) => "DOUBLE",
+        LiteralValue::Bool(_) => "BOOLEAN",
+    };
+    format!("CAST({} AS {ty})", emit_literal(lit, state))
 }
 
 fn emit_literal(lit: &LiteralValue, state: &mut EmitterState) -> String {

@@ -3211,16 +3211,22 @@ fn severity_reading_sql_matches_the_rust_kernel_in_both_dialects() {
     for dialect in [Dialect::Otel, Dialect::Syslog] {
         for text in cases {
             let escaped = text.replace('\'', "''");
-            let sql = format!(
-                "SELECT {}",
-                trawl_core::conform::severity_reading_sql(&format!("'{escaped}'"), dialect)
-            );
-            let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
             let kernel = severity::reading_text(text, dialect).map(i64::from);
-            assert_eq!(
-                engine, kernel,
-                "{dialect:?} reading disagreed on {text:?}\n{sql}"
-            );
+            // BOTH shapes — the repeated one the conform rung emits and
+            // the bind-once one `sev()` emits — answer the kernel. They
+            // share an arm generator, and this is what proves the two
+            // wrappers around it are the same reading.
+            for build in [
+                trawl_core::conform::severity_reading_sql,
+                trawl_core::conform::severity_reading_sql_bind_once,
+            ] {
+                let sql = format!("SELECT {}", build(&format!("'{escaped}'"), dialect));
+                let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+                assert_eq!(
+                    engine, kernel,
+                    "{dialect:?} reading disagreed on {text:?}\n{sql}"
+                );
+            }
         }
         // A NULL input has no reading on either side.
         let sql = format!(
@@ -3257,12 +3263,34 @@ fn severity_reading_sql_matches_the_rust_kernel_in_both_dialects() {
     // The reading types as the physical BIGINT a SEVERITY column holds —
     // an INTEGER-typed conform would disagree with the parquet side and
     // throw the hot+cold union.
+    for build in [
+        trawl_core::conform::severity_reading_sql,
+        trawl_core::conform::severity_reading_sql_bind_once,
+    ] {
+        let sql = format!("DESCRIBE SELECT {} AS s", build("'error'", Dialect::Otel));
+        let ty: String = conn.query_row(&sql, [], |row| row.get(1)).unwrap();
+        assert_eq!(ty, CanonicalType::Severity.as_duckdb());
+    }
+
+    // The bind-once shape exists so a subject carrying a BOUND PARAMETER
+    // is pushed once and read once: `DuckDB` binds `?` positionally, so
+    // the repeated shape would need four copies of one value — and
+    // `to_json(?)` types nothing, which is why the parameter arrives
+    // pre-cast (`emitter::expr::typed_literal`).
+    let subject = trawl_core::conform::untyped_text("CAST(? AS VARCHAR)");
     let sql = format!(
-        "DESCRIBE SELECT {} AS s",
-        trawl_core::conform::severity_reading_sql("'error'", Dialect::Otel)
+        "SELECT {}",
+        trawl_core::conform::severity_reading_sql_bind_once(&subject, Dialect::Otel)
     );
-    let ty: String = conn.query_row(&sql, [], |row| row.get(1)).unwrap();
-    assert_eq!(ty, CanonicalType::Severity.as_duckdb());
+    assert_eq!(
+        sql.matches('?').count(),
+        2,
+        "one param, one regex `?`: {sql}"
+    );
+    let reading: Option<i64> = conn
+        .query_row(&sql, duckdb::params![" Error "], |row| row.get(0))
+        .unwrap();
+    assert_eq!(reading, Some(17));
 }
 
 /// The SEVERITY conform rung is the reading kernel, and its LIVE mirror

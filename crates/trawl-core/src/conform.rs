@@ -228,12 +228,51 @@ const ASCII_WS_SQL: &str = "(' ' || chr(9) || chr(10) || chr(11) || chr(12) || c
 /// `SEVERITY` pin is physically BIGINT (`CanonicalType::as_duckdb`), and
 /// an INTEGER-typed conform would make the hot branch disagree with the
 /// parquet side and throw the union.
+///
+/// `text_expr` appears FOUR times in the result — the token lookup, the
+/// digits guard, and the cast's two halves — which is free for a column
+/// (`DuckDB` evaluates the common subexpression once) but wrong for an
+/// expression carrying bound `?` parameters, since the emitter pushes one
+/// value per call and not per occurrence. A caller whose subject can
+/// carry parameters takes [`severity_reading_sql_bind_once`] instead.
 #[must_use]
 pub fn severity_reading_sql(text_expr: &str, dialect: crate::severity::Dialect) -> String {
     let trimmed = format!("trim({text_expr}, {ASCII_WS_SQL})");
-    // The band tokens first, then the exact short names the table does not
-    // already carry — the kernel's own rung order, and the duplicates
-    // (`error` is both) agree by construction.
+    format!("CAST({} AS BIGINT)", reading_case(&trimmed, dialect))
+}
+
+/// [`severity_reading_sql`] with its subject bound ONCE — the form
+/// `sev()` emits.
+///
+/// A one-element `list_transform` is `DuckDB`'s only inline binding
+/// construct, and `sev()` needs one for two reasons: its subject is an
+/// arbitrary expression that may carry `?` parameters (which must be
+/// pushed once and read once), and the emitted call may itself be
+/// embedded in a comparison. It is measurably slower than the repeated
+/// form (~2x over 3M rows, probed), which is why the conform rung — every
+/// row of every compaction — does not pay it.
+///
+/// The two shapes share [`reading_case`], so they cannot answer
+/// differently; the probe suite runs the matrix through BOTH.
+#[must_use]
+pub fn severity_reading_sql_bind_once(
+    text_expr: &str,
+    dialect: crate::severity::Dialect,
+) -> String {
+    format!(
+        "CAST(list_transform([trim({text_expr}, {ASCII_WS_SQL})], _sev -> {})[1] AS BIGINT)",
+        reading_case("_sev", dialect)
+    )
+}
+
+/// The reading's `CASE`, over an ALREADY-TRIMMED subject — the one arm
+/// generator behind both shapes above.
+///
+/// Rung order is the kernel's ([`crate::severity::reading_text`]): the
+/// band token table first, then the `OTel` exact short names it does not
+/// already carry (the duplicates — `error` is both — agree by
+/// construction), then the numeric arm.
+fn reading_case(trimmed: &str, dialect: crate::severity::Dialect) -> String {
     let mut arms: Vec<String> = Vec::with_capacity(44);
     let mut seen: Vec<&str> = Vec::with_capacity(44);
     for (token, number) in crate::severity::token_entries() {
@@ -267,7 +306,7 @@ pub fn severity_reading_sql(text_expr: &str, dialect: crate::severity::Dialect) 
     let numeric_arm =
         format!("(CASE WHEN regexp_full_match({trimmed}, '[+-]?[0-9]+') THEN {numeric} END)");
     format!(
-        "CAST((CASE lower({trimmed}) {} ELSE {numeric_arm} END) AS BIGINT)",
+        "(CASE lower({trimmed}) {} ELSE {numeric_arm} END)",
         arms.join(" ")
     )
 }
@@ -446,6 +485,25 @@ mod tests {
         // A stored column is BIGINT, whatever the arms' literals type as.
         assert!(sql.starts_with("CAST("), "{sql}");
         assert!(sql.ends_with(" AS BIGINT)"), "{sql}");
+    }
+
+    /// The two shapes are one reading: the bind-once form names its
+    /// subject EXACTLY once (a subject carrying `?` is pushed once), the
+    /// repeated form four times (free for a column, and measurably faster
+    /// — the reason the conform rung does not pay the lambda).
+    #[test]
+    fn severity_reading_sql_shapes_differ_only_in_where_the_subject_lands() {
+        let repeated = severity_reading_sql("SUBJ", crate::severity::Dialect::Otel);
+        let once = severity_reading_sql_bind_once("SUBJ", crate::severity::Dialect::Otel);
+        assert_eq!(repeated.matches("SUBJ").count(), 4, "{repeated}");
+        assert_eq!(once.matches("SUBJ").count(), 1, "{once}");
+        // Same arms, both times.
+        for (token, number) in crate::severity::token_entries() {
+            let arm = format!("WHEN '{token}' THEN {number}");
+            assert!(repeated.contains(&arm) && once.contains(&arm), "{arm}");
+        }
+        assert!(once.contains("list_transform"), "{once}");
+        assert!(!repeated.contains("list_transform"), "{repeated}");
     }
 
     /// The dialect governs the NUMERIC arm and nothing else: the name
