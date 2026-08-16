@@ -680,11 +680,27 @@ impl EmitterState {
     /// Replace `?` placeholders starting from `start_idx` in the params slice.
     /// Returns the inlined SQL and the next param index (for chaining across
     /// multiple SQL fragments).
+    ///
+    /// Only a `?` OUTSIDE a string literal (`'…'`) or a quoted identifier
+    /// (`"…"`) is a placeholder. Inside either, it is DATA the emitter
+    /// already escaped — a field name, which since backticks (ADR-0013
+    /// ruling 7) may contain any character, or a glob in the source path.
+    /// Splicing a value there would corrupt the identifier AND shift every
+    /// later binding, spilling the next parameter into the statement with
+    /// only `'` escaped. Doubled quotes need no special case: `''` closes
+    /// then reopens, leaving the scan in-string exactly where the escaped
+    /// quote's own text lives.
     fn inline_params_counted(sql: &str, params: &[SqlValue], start_idx: usize) -> (String, usize) {
         let mut result = String::with_capacity(sql.len());
         let mut param_idx = start_idx;
+        let mut open_quote: Option<char> = None;
         for ch in sql.chars() {
-            if ch == '?' && param_idx < params.len() {
+            match (open_quote, ch) {
+                (None, '\'' | '"') => open_quote = Some(ch),
+                (Some(open), c) if c == open => open_quote = None,
+                _ => {}
+            }
+            if open_quote.is_none() && ch == '?' && param_idx < params.len() {
                 match &params[param_idx] {
                     SqlValue::String(s) => {
                         result.push('\'');

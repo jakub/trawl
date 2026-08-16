@@ -1106,6 +1106,53 @@ mod tests {
         ));
     }
 
+    /// `pivot` inlines every `?` because `DuckDB` cannot bind a PIVOT —
+    /// and a backticked name may now contain a `?` of its own (ADR-0013
+    /// ruling 7). Only a placeholder OUTSIDE a quoted region may be
+    /// spliced: splicing into the identifier or the COLUMNS lambda string
+    /// would corrupt the name AND shift every later binding, spilling the
+    /// user's value into the statement with only `'` escaped.
+    #[test]
+    fn pivot_inlining_never_splices_into_a_quoted_region() {
+        let query = parser::parse(r#"* | let `a?b` = "v" | pivot count() on status"#)
+            .expect("parse should succeed");
+        let emitted = emit(&query, SRC).expect("emit should succeed");
+        assert!(
+            emitted.sql.contains(r"NOT IN ('a?b')"),
+            "lambda name corrupted: {}",
+            emitted.sql
+        );
+        assert!(
+            emitted.sql.contains(r#"('v') AS "a?b""#),
+            "value must land at the placeholder, name intact: {}",
+            emitted.sql
+        );
+        assert!(emitted.params.is_empty(), "pivot inlines every param");
+
+        let query = parser::parse("`a?b`=v | pivot count() on status").expect("parse");
+        let emitted = emit(&query, SRC).expect("emit should succeed");
+        assert!(
+            emitted.sql.contains(r#""a?b" = 'v'"#),
+            "filter corrupted: {}",
+            emitted.sql
+        );
+
+        // Not a backtick story: a `?` glob in the source path sits in a
+        // string literal too.
+        let query = parser::parse("service=nginx | pivot count() on status").expect("parse");
+        let globbed = emit(&query, "/data/2026-01-0?/*.parquet").expect("emit should succeed");
+        assert!(
+            globbed.sql.contains("'/data/2026-01-0?/*.parquet'"),
+            "source glob corrupted: {}",
+            globbed.sql
+        );
+        assert!(
+            globbed.sql.contains("= 'nginx'"),
+            "filter value must still inline: {}",
+            globbed.sql
+        );
+    }
+
     #[test]
     fn pipe_timechart_by_then_where() {
         assert_snapshot!(emit_dsl(
