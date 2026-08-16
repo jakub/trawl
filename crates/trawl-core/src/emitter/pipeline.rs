@@ -12,6 +12,16 @@ use super::expr::emit_expr;
 use super::fields::quote_field;
 use super::functions::{default_agg_alias, translate_function};
 use super::state::{EmitterState, FlushCondition};
+use crate::schema::catalog_key;
+
+/// `DuckDB` SQL that ASCII-folds the `COLUMNS` lambda's column name `c` —
+/// the Rust-side [`catalog_key`] rendered as an expression.
+///
+/// `translate` maps character by character and leaves everything outside
+/// `A-Z` alone, so it reproduces `DuckDB`'s own identifier folding exactly
+/// (`CAFÉ` → `cafÉ`), which `lower()` does not.
+const ASCII_FOLD_SQL: &str =
+    "translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
 
 /// Process a single pipe stage, mutating the emitter state.
 pub(crate) fn process_stage(pipe: &PipeStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
@@ -200,27 +210,48 @@ fn process_drop(drop_stage: &crate::ast::DropStage, ctx: &mut EmitterState) {
     ctx.has_projection = true;
 }
 
+/// The wildcard half of an OVERWRITING projection: every incoming column
+/// except the ones the stage is about to project under its own aliases.
+///
+/// Unlike `* EXCLUDE (...)` the lambda tolerates a name no incoming
+/// column carries — crucial for `let a = expr` where `a` is brand new.
+/// It folds BOTH sides because `DuckDB` binds identifiers
+/// case-insensitively and [`crate::projection::check_projection`] folds
+/// every output name: a raw `c NOT IN ('Host')` would leave an incoming
+/// `host` in place beside the new `Host` and hand back two columns of one
+/// folded name.
+///
+/// The fold is ASCII-ONLY on both sides — [`ASCII_FOLD_SQL`] on the column
+/// name, [`catalog_key`] on the literal — because that is the fold
+/// `DuckDB`'s identifier equality performs. `lower()` folds Unicode too,
+/// so over a corpus carrying `ü` the backtickable target `` `Ü` `` would
+/// have deleted the `ü` column the query never named, while `DuckDB`
+/// itself keeps the two apart.
+fn columns_excluding(names: &[String]) -> String {
+    let list = names
+        .iter()
+        // Escape single quotes for the COLUMNS lambda string comparison.
+        .map(|n| format!("'{}'", catalog_key(n).replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("COLUMNS(c -> {ASCII_FOLD_SQL} NOT IN ({list}))")
+}
+
 fn process_let(let_stage: &crate::ast::LetStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
     // always flush: the computed expression may add ? params to SELECT,
     // which must not interleave with WHERE params from prior stages
     ctx.flush_if(FlushCondition::Always);
 
-    let mut not_in_values = Vec::new();
+    let mut targets = Vec::new();
     let mut computed = Vec::new();
     for (field, expr) in &let_stage.assignments {
         let expr_sql = emit_expr(expr, ctx)?;
         let alias = quote_field(field);
-        // Escape single quotes for the COLUMNS lambda string comparison.
-        let escaped = field.replace('\'', "''");
-        not_in_values.push(format!("'{escaped}'"));
+        targets.push(field.clone());
         computed.push(format!("({expr_sql}) AS {alias}"));
     }
 
-    // Use COLUMNS lambda to filter out columns being overridden. Unlike
-    // `* EXCLUDE (...)`, this tolerates missing columns — crucial for
-    // `let a = expr` when `a` is a new computed field, not an override.
-    let not_in_list = not_in_values.join(", ");
-    let mut items = vec![format!("COLUMNS(c -> c NOT IN ({not_in_list}))")];
+    let mut items = vec![columns_excluding(&targets)];
     items.extend(computed);
     ctx.select = items;
     ctx.has_projection = true;
@@ -477,7 +508,7 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
         format!("PARTITION BY {}", parts.join(", "))
     };
 
-    let mut not_in_values = Vec::new();
+    let mut targets = Vec::new();
     let mut computed = Vec::new();
     for agg in &stage.aggregations {
         // Reject functions not supported as window functions in DuckDB.
@@ -503,26 +534,20 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
         // checked in `projection::check_projection`); the alias-less
         // name is defensive for a hand-built AST that skipped validation.
         let name = crate::projection::agg_output_name(agg);
-        // Escape single quotes for the COLUMNS lambda string comparison.
-        let escaped = name.replace('\'', "''");
-        not_in_values.push(format!("'{escaped}'"));
         computed.push(format!(
             "{sql_func} OVER ({partition}) AS {}",
             quote_field(&name)
         ));
+        targets.push(name);
     }
 
     // An alias naming an incoming column OVERWRITES it (documented,
-    // `let`-like), so the wildcard must not also emit the original. Same
-    // missing-column-tolerant COLUMNS lambda `let` uses: a brand-new
-    // alias names no existing column and the filter simply matches none.
-    let mut items = if not_in_values.is_empty() {
+    // `let`-like), so the wildcard must not also emit the original —
+    // through the same case-folding lambda `let` uses.
+    let mut items = if targets.is_empty() {
         vec!["*".to_string()]
     } else {
-        vec![format!(
-            "COLUMNS(c -> c NOT IN ({}))",
-            not_in_values.join(", ")
-        )]
+        vec![columns_excluding(&targets)]
     };
     items.extend(computed);
 

@@ -6,10 +6,10 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 ), _s1 AS (
-  SELECT COLUMNS(c -> c NOT IN ('x')), (("duration" * ?)) AS "x"
+  SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('x')), (("duration" * ?)) AS "x"
   FROM "_s0"
 )
-SELECT COLUMNS(c -> c NOT IN ('y')), (("x" + ?)) AS "y"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('y')), (("x" + ?)) AS "y"
 FROM "_s1"
 ---
 params:

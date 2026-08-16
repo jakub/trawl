@@ -6,7 +6,7 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT COLUMNS(c -> c NOT IN ('seg')), (STRING_SPLIT("path", ?)[3]) AS "seg"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('seg')), (STRING_SPLIT("path", ?)[3]) AS "seg"
 FROM "_s0"
 ---
 params:

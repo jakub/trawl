@@ -971,6 +971,17 @@ mod tests {
         assert_snapshot!(emit_dsl("* | let message = lower(message)"));
     }
 
+    /// The overwriting wildcard folds ASCII and nothing else, exactly as
+    /// `DuckDB` binds identifiers: a backtickable non-ASCII target must
+    /// not exclude a differently-cased non-ASCII column the query never
+    /// named (`lower()` on both sides used to delete it silently).
+    #[test]
+    fn let_wildcard_folds_ascii_only() {
+        let sql = emit_dsl("* | let `Ü` = 1, `HOST` = 2");
+        assert!(sql.contains("NOT IN ('Ü', 'host')"), "{sql}");
+        assert!(!sql.contains("'ü'"), "{sql}");
+    }
+
     // -----------------------------------------------------------------------
     // extract
     // -----------------------------------------------------------------------

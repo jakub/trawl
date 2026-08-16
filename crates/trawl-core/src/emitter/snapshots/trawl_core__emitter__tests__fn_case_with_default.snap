@@ -6,7 +6,7 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT COLUMNS(c -> c NOT IN ('sev')), (CASE WHEN ("status" >= ?) THEN ? WHEN ("status" >= ?) THEN ? ELSE ? END) AS "sev"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('sev')), (CASE WHEN ("status" >= ?) THEN ? WHEN ("status" >= ?) THEN ? ELSE ? END) AS "sev"
 FROM "_s0"
 ---
 params:
