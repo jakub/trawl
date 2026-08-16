@@ -319,6 +319,13 @@ The search stage reads exactly three words before anything else —
 `last=`, `earliest=`, `latest=`. Backticks are how you reach fields with
 those names; everywhere else they are ordinary names already.
 
+Inside an expression (`| where`, `| let`, aggregation arguments) the
+words an expression is made of are read before a field reference is
+tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`,
+`in`, `matches`, `like`, `ilike` are operators. Backticks reach the
+fields — ``| where `true` == 1`` filters on the column named `true`,
+while `| where true == 1` compares the boolean.
+
 A `#` or `//` inside backticks is part of the name, not a comment. (An
 unbalanced backtick elsewhere in a query has the same shape of
 consequence as a `#` inside a regex literal: it can hide a later comment

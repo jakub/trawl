@@ -108,6 +108,20 @@ pub const KNOWN_FUNCTIONS: &[&str] = &[
 /// [`quote_dsl_field`] always quotes them.
 pub const GRAMMAR_KEYWORDS: &[&str] = &["last", "earliest", "latest"];
 
+/// The words an EXPRESSION position reads before it tries a field
+/// reference: the literal words (`true`/`false`/`null`) and the operator
+/// words (`and`/`or`/`not`/`in`/`matches`/`like`/`ilike`).
+///
+/// Bare, these do not name a column inside `| where` / `| let`: a field
+/// called `true` renders as the boolean literal — a SILENT change of
+/// meaning — and one called `not` turns the surrounding text into a
+/// parse error. A rendered name must be pasteable in every field
+/// position, so [`quote_dsl_field`] backticks the whole set, exactly as
+/// it does [`GRAMMAR_KEYWORDS`].
+pub const EXPRESSION_KEYWORDS: &[&str] = &[
+    "true", "false", "null", "and", "or", "not", "in", "matches", "like", "ilike",
+];
+
 /// Whether `name` lexes as a BARE field name — the unquoted production
 /// (`[A-Za-z_][A-Za-z0-9_]*`, dot-joined, optionally `@`-prefixed).
 ///
@@ -129,15 +143,20 @@ fn is_bare_segment(segment: &str) -> bool {
 }
 
 /// Render a field name as DSL text: bare when the bare production can
-/// spell it and it is not a grammar keyword, else backtick-quoted with
-/// embedded backticks doubled (ADR-0013 ruling 7).
+/// spell it and it is not a keyword of the grammar
+/// ([`GRAMMAR_KEYWORDS`]) or of an expression position
+/// ([`EXPRESSION_KEYWORDS`]), else backtick-quoted with embedded
+/// backticks doubled (ADR-0013 ruling 7).
 ///
 /// The one renderer every suggestion surface goes through — autocomplete
 /// insertions and the query formatter — so a name trawl offers is a name
 /// trawl can parse back.
 #[must_use]
 pub fn quote_dsl_field(name: &str) -> String {
-    if is_bare_field_name(name) && !GRAMMAR_KEYWORDS.contains(&name) {
+    if is_bare_field_name(name)
+        && !GRAMMAR_KEYWORDS.contains(&name)
+        && !EXPRESSION_KEYWORDS.contains(&name)
+    {
         return name.to_string();
     }
     format!("`{}`", name.replace('`', "``"))
@@ -246,6 +265,50 @@ mod tests {
         assert_eq!(GRAMMAR_KEYWORDS, ["last", "earliest", "latest"]);
         for kw in GRAMMAR_KEYWORDS {
             assert_eq!(quote_dsl_field(kw), format!("`{kw}`"));
+        }
+    }
+
+    /// An expression position reads its keywords BEFORE it tries a field
+    /// reference, so a bare rendering there is either a silent change of
+    /// meaning (`true`, `false`, `null` lex as literals) or a parse error
+    /// (`not`). Every one of them round-trips as a field reference only
+    /// through backticks.
+    #[test]
+    fn expression_keywords_round_trip_in_expression_positions() {
+        use crate::ast::{Expr, PipeStage};
+
+        for kw in EXPRESSION_KEYWORDS {
+            let rendered = quote_dsl_field(kw);
+            assert_eq!(rendered, format!("`{kw}`"), "{kw} must be quoted");
+
+            for query in [
+                format!("| where {rendered} == 1"),
+                format!("| let x = {rendered}"),
+                format!("| where a == 1 and {rendered} == 2"),
+            ] {
+                let parsed = crate::parser::parse(&query)
+                    .unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
+                let names = crate::field_refs::referenced_fields(&parsed);
+                assert!(
+                    names.contains(*kw),
+                    "{query} must bind the field {kw:?}, bound {names:?}"
+                );
+            }
+
+            // …and the same name bare does NOT reach the AST as a field.
+            let bare = crate::parser::parse(&format!("| where {kw} == 1"));
+            let bare_is_field = bare.is_ok_and(|q| match &q.pipeline[0].node {
+                PipeStage::Where(w) => matches!(
+                    &w.condition.node,
+                    Expr::Binary { lhs, .. } if lhs.node == Expr::FieldRef((*kw).to_string())
+                ),
+                _ => false,
+            });
+            assert_eq!(
+                bare_is_field,
+                !matches!(*kw, "true" | "false" | "null" | "not"),
+                "{kw:?}: expression-keyword hazard drifted from the grammar"
+            );
         }
     }
 
