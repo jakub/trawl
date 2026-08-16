@@ -342,10 +342,63 @@ or the exact names; a number maps strictly as OTel 1-24, so <code dir="auto">3</
 <code dir="auto">trace</code> — the syslog inversion happens only in the syslog listener,
 where the transport proves the dialect. An event with no mappable source
 simply has no <code dir="auto">_severity</code>.</p>
+<div class="sl-heading-wrapper level-h4"><h4 id="reading-any-field-as-a-severity-sev">Reading any field as a severity: <code dir="auto">sev()</code></h4><a class="sl-anchor-link" href="#reading-any-field-as-a-severity-sev"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Reading any field as a severity: sev()”</span></a></div>
+<p><code dir="auto">_severity</code> is what trawl derived at ingest. <code dir="auto">sev(x)</code> is the same reading
+applied at <strong>query time</strong>, to any field you name:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">| where sev(level) &gt;= "error"       # the ORDERED rule: &gt;= 17</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">| where sev(level) == "error"       # the EQUALITY rule: the 17-20 band</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">| where sev(syslog_severity, "syslog") == "error"</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">| let s = sev(level) | stats count() by s</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="| where sev(level) >= &quot;error&quot;       # the ORDERED rule: >= 17| where sev(level) == &quot;error&quot;       # the EQUALITY rule: the 17-20 band| where sev(syslog_severity, &quot;syslog&quot;) == &quot;error&quot;| let s = sev(level) | stats count() by s"><div></div></button></div></figure></div>
+<ul>
+<li>
+<p>One kernel. <code dir="auto">sev()</code> reads exactly what ingest’s derivation reads: the
+band tokens with their aliases, OTel’s exact short names, then a strict
+integer. Anything else — <code dir="auto">1.5</code>, <code dir="auto">1e1</code>, <code dir="auto">0x10</code>, <code dir="auto">gold</code>, a boolean — has
+<strong>no reading</strong>, which is <code dir="auto">null</code>, never an error.</p>
+</li>
+<li>
+<p><code dir="auto">sev()</code> <strong>declares</strong> its result as <code dir="auto">SEVERITY</code>, so a comparison against
+it binds through the rules above (band for <code dir="auto">==</code>/<code dir="auto">in</code>, exact number when
+ordered, canonical token text for <code dir="auto">matches</code>/globs) and its column
+displays tokens in the CLI table, the TUI and the web UI. Machine
+formats keep the number, as always.</p>
+</li>
+<li>
+<p>The <strong>literals must be quoted</strong>: <code dir="auto">sev(level) &gt;= "error"</code>. A bare
+<code dir="auto">error</code> in a pipe stage is a field reference, exactly as it is
+everywhere else in <code dir="auto">| where</code>.</p>
+</li>
+<li>
+<p>The pin travels: <code dir="auto">| let s = sev(level)</code> gives <code dir="auto">s</code> the <code dir="auto">SEVERITY</code> type,
+and <code dir="auto">| stats count() by s</code> keeps it.</p>
+</li>
+<li>
+<p>The subject must be <code dir="auto">sev(&lt;field&gt;)</code> <strong>directly</strong>. A computed inner
+expression — <code dir="auto">sev(lower(x))</code>, <code dir="auto">sev(coalesce(a, b))</code> — still <em>computes</em>
+the reading, but the comparison around it falls back to the generic,
+literal-driven path, so <code dir="auto">sev(lower(x)) == "error"</code> compares against the
+string <code dir="auto">"error"</code> rather than the band — a <code dir="auto">Conversion Error</code> in batch,
+and a filter that never matches in the live tail. Bind it first, which
+adopts the pin:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">| let s = sev(lower(level)) | where s == "error"</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="| let s = sev(lower(level)) | where s == &quot;error&quot;"><div></div></button></div></figure></div>
+<p>The narrowness is deliberate (ADR-0013 ruling 9): which pin types a
+comparison has to be decidable from the query text alone, in all three
+lanes, and a bare field reference is where that stops being a guess.</p>
+</li>
+<li>
+<p><code dir="auto">dialect</code> governs NUMERICS only — words always read the one token
+table. <code dir="auto">sev(x, "syslog")</code> inverts 0-7 (syslog counts down: <code dir="auto">3</code> is
+<code dir="auto">err</code> → 17), which is the reading for a foreign syslog dump. It must be
+a <strong>literal</strong> from <code dir="auto">otel</code>/<code dir="auto">syslog</code>; anything else is a query error
+naming the vocabulary, in batch and live alike.</p>
+</li>
+<li>
+<p>It works in embedded <code dir="auto">--data</code> mode, where nothing else is pin-aware:
+the type is declared by the function, not looked up in a catalog.</p>
+</li>
+</ul>
 <aside aria-label="level=error is not a severity filter" class="starlight-aside starlight-aside--caution"><p class="starlight-aside__title" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" class="starlight-aside__icon"><path d="M12 16a1 1 0 1 0 0 2 1 1 0 0 0 0-2Zm10.67 1.47-8.05-14a3 3 0 0 0-5.24 0l-8 14A3 3 0 0 0 3.94 22h16.12a3 3 0 0 0 2.61-4.53Zm-1.73 2a1 1 0 0 1-.88.51H3.94a1 1 0 0 1-.88-.51 1 1 0 0 1 0-1l8-14a1 1 0 0 1 1.78 0l8.05 14a1 1 0 0 1 .05 1.02v-.02ZM12 8a1 1 0 0 0-1 1v4a1 1 0 0 0 2 0V9a1 1 0 0 0-1-1Z"/></svg><code dir="auto">level=error</code> is not a severity filter</p><div class="starlight-aside__content"><p><code dir="auto">level</code> is an ordinary field now, so <code dir="auto">level=error</code> compares the sender’s
 own value. A game server emitting <code dir="auto">{"service":"game","level":"gold"}</code>
 keeps a fully queryable <code dir="auto">level</code> column — that is the point — but if you
-meant severity, you want <code dir="auto">_severity&gt;=error</code>. And a field no sender writes
+meant severity, you want <code dir="auto">_severity&gt;=error</code> — or <code dir="auto">sev(level)&gt;="error"</code>
+to read the sender’s own field on the ladder. And a field no sender writes
 is not an error: it simply matches nothing, so a query written against
 the old alias comes back empty rather than failing. trawl says nothing
 about it — <code dir="auto">level</code> is your vocabulary, not trawl’s, and a notice keyed on
@@ -700,6 +753,10 @@ verdict slot. The text stays findable in the source field and <code dir="auto">_
 <td><code dir="auto">tostring(x)</code></td>
 <td>Cast to string (<code dir="auto">null</code> for null/array input)</td>
 </tr>
+<tr>
+<td><code dir="auto">sev(x[, dialect])</code></td>
+<td>Read a value’s OTel SeverityNumber (<code dir="auto">null</code> when it has no reading). <code dir="auto">dialect</code> is <code dir="auto">"otel"</code> (default) or <code dir="auto">"syslog"</code> — see <a href="#reading-any-field-as-a-severity-sev">Reading any field as a severity</a></td>
+</tr>
 </tbody>
 </table>
 <div class="sl-heading-wrapper level-h3"><h3 id="nested-fields-json">Nested fields (JSON)</h3><a class="sl-anchor-link" href="#nested-fields-json"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Nested fields (JSON)”</span></a></div>
@@ -781,4 +838,4 @@ verdict slot. The text stays findable in the source field and <code dir="auto">_
 </div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53"># Pivot status codes by host</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">last=1h | pivot count() on status by host</span></div></div><div class="ec-line"><div class="code">
 </div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53"># Conditional field with null handling</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">* | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10</span></div></div><div class="ec-line"><div class="code">
 </div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53"># Distinct values per group</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">* | stats values(_severity), first(message) by service | head 10</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="# Errors in the last hour by service_severity>=error last=1h | stats count() by service | sort -count# Slow requests by endpointstatus=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10# 4xx/5xx rate by hoststatus>=400 last=2h | stats count() by host, status | where count > 10# Extract IPs and count&quot;connection from&quot; | rex &quot;(?P<ip>\d+\.\d+\.\d+\.\d+)&quot; from message | stats count() by ip | sort -count# Time series of error rate_severity>=error | timechart span=5m count() by service# Dedup flapping alertsservice=monitoring | dedup host, alert_name# Pivot status codes by hostlast=1h | pivot count() on status by host# Conditional field with null handling* | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10# Distinct values per group* | stats values(_severity), first(message) by service | head 10"><div></div></button></div></figure></div>
-</div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/dsl.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a><p>Last updated: <time datetime="2026-08-15T21:54:24.000Z">Aug 15, 2026</time></p></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/getting-started/vector-integration/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Vector Integration</span></span></a><a href="/reference/cli/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">CLI &amp; TUI</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
+</div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/dsl.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a><p>Last updated: <time datetime="2026-08-16T19:24:05.000Z">Aug 16, 2026</time></p></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/getting-started/vector-integration/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Vector Integration</span></span></a><a href="/reference/cli/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">CLI &amp; TUI</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
