@@ -442,35 +442,15 @@ fn extract_prefix(before_cursor: &str) -> &str {
 
 /// Whether the cursor sits inside a string literal or a regex body.
 ///
-/// A `/` only OPENS a regex where `trawl_core`'s classifier says so — the
-/// same rule the comment scanner uses — so a division no longer reads as
-/// an unterminated regex and suppresses every completion after it.
+/// Asks `trawl_core`'s own scanner walk rather than keeping a copy: the
+/// parser's four states are the truth, so a `"` or a `/` inside a
+/// BACKTICKED NAME is data and suppresses nothing, and a slash only opens
+/// a regex where the grammar has one.
 fn inside_string_or_regex(before: &str) -> bool {
-    let bytes = before.as_bytes();
-    let mut in_double_quote = false;
-    let mut in_regex = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if in_double_quote && i + 1 < bytes.len() => {
-                i += 2;
-                continue;
-            }
-            b'"' if !in_regex => in_double_quote = !in_double_quote,
-            b'/' if !in_double_quote => {
-                if in_regex {
-                    // `regex_pattern` is `none_of("/")`: the first slash
-                    // closes, with no escape.
-                    in_regex = false;
-                } else if trawl_core::parser::slash_opens_regex(&bytes[..i]) {
-                    in_regex = true;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    in_double_quote || in_regex
+    matches!(
+        trawl_core::parser::scan_state_at(before.as_bytes(), trawl_core::parser::Input::Partial),
+        trawl_core::parser::ScanState::String | trawl_core::parser::ScanState::Regex
+    )
 }
 
 /// Find the current pipe stage name by scanning backwards from the cursor.
@@ -649,6 +629,22 @@ mod tests {
         }
         // …and a CLOSED regex does not.
         assert!(!inside_string_or_regex("host=/re/ "));
+
+        // A quote or a slash inside a backticked NAME is data, so neither
+        // opens a state and completion stays alive after one — the copy
+        // this used to keep saw a false string / false regex there.
+        for before in [
+            "* | table `a\"b`, hostn",
+            "* | table `a/b`, hostn",
+            "* | table `a\"b`, `c/d`, hostn",
+        ] {
+            assert!(
+                !inside_string_or_regex(before),
+                "{before:?}: a quoted name is not a string or a regex"
+            );
+        }
+        // …and a genuine unterminated string still suppresses.
+        assert!(inside_string_or_regex("* | table `a`, \"open"));
 
         // The name-start half of the same rule: a tick right after a
         // DIVISION opens a quoted-name prefix, while one inside a regex

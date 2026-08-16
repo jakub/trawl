@@ -135,19 +135,54 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 /// since at this layer it is indistinguishable from a field name after
 /// `==`.
 fn strip_comments(input: &str) -> String {
-    /// Which production the scanner is inside. An enum, not a set of
-    /// flags: the states are mutually exclusive by construction, and a
-    /// new one must state its transitions or fail to compile.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum ScanState {
-        Normal,
-        String,
-        Backtick,
-        Regex,
-    }
-
     let bytes = input.as_bytes();
     let mut out = bytes.to_vec();
+    scan(bytes, &mut out, Input::Complete);
+    // We only replaced ASCII bytes with ASCII spaces — multi-byte UTF-8
+    // sequences are untouched (continuation bytes are >= 0x80, never
+    // matching `"`, `#`, `/`, `\`, or `\n`). So from_utf8 always succeeds.
+    String::from_utf8(out).expect("comment stripping only replaces ASCII bytes with spaces")
+}
+
+/// Which production the scanner is inside. An enum, not a set of flags:
+/// the states are mutually exclusive by construction, and a new one must
+/// state its transitions or fail to compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanState {
+    Normal,
+    String,
+    Backtick,
+    Regex,
+}
+
+/// Whether the text being scanned is finished.
+///
+/// The parser reads a COMPLETE query, so it may only enter a state the
+/// grammar can leave — an unterminated `/` is a bare value, not a regex
+/// (see [`regex_closes_before_eof`]). An editor buffer is unfinished by
+/// definition: a half-typed `host=/re` IS inside a regex from the
+/// cursor's point of view, and demanding the closing delimiter would
+/// offer field completions in the middle of a pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Input {
+    /// A whole query, as the parser sees it.
+    Complete,
+    /// A prefix still being typed, as the editor sees it.
+    Partial,
+}
+
+/// The state the scanner is in after reading `prefix` — the SAME walk
+/// `strip_comments` performs, so a caller asks the question once and gets
+/// the parser's own answer (a `"` or `/` inside a quoted NAME is data,
+/// not a delimiter).
+#[must_use]
+pub fn scan_state_at(prefix: &[u8], input: Input) -> ScanState {
+    let mut out = prefix.to_vec();
+    scan(prefix, &mut out, input)
+}
+
+/// The one walk: blanks comments into `out` and returns the final state.
+fn scan(bytes: &[u8], out: &mut [u8], input: Input) -> ScanState {
     let len = bytes.len();
     let mut i = 0;
     let mut state = ScanState::Normal;
@@ -193,7 +228,7 @@ fn strip_comments(input: &str) -> String {
                     i += 1;
                 }
                 b'`' if quoted_name_can_start_after(&out[..i])
-                    && backtick_closes_on_line(bytes, i) =>
+                    && (input == Input::Partial || backtick_closes_on_line(bytes, i)) =>
                 {
                     state = ScanState::Backtick;
                     i += 1;
@@ -207,7 +242,13 @@ fn strip_comments(input: &str) -> String {
                         i += 1;
                     }
                 }
-                b'/' if slash_opens_regex(&out[..i]) => {
+                // Both conditions, the Backtick arm's discipline: the
+                // grammar must have a regex HERE, and must be able to
+                // close it. Either way out leaves the slash in `Normal`,
+                // where comments strip as they always did.
+                b'/' if slash_opens_regex(&out[..i])
+                    && (input == Input::Partial || regex_closes_before_eof(bytes, i)) =>
+                {
                     state = ScanState::Regex;
                     i += 1;
                 }
@@ -221,11 +262,7 @@ fn strip_comments(input: &str) -> String {
             },
         }
     }
-
-    // We only replaced ASCII bytes with ASCII spaces — multi-byte UTF-8
-    // sequences are untouched (continuation bytes are >= 0x80, never
-    // matching `"`, `#`, `/`, `\`, or `\n`). So from_utf8 always succeeds.
-    String::from_utf8(out).expect("comment stripping only replaces ASCII bytes with spaces")
+    state
 }
 
 /// Whether a quoted field name could begin right after `prefix` — the ONE
@@ -258,33 +295,55 @@ pub fn quoted_name_can_start_after(prefix: &[u8]) -> bool {
         )
 }
 
-/// Whether the `/` following `prefix` OPENS A REGEX rather than dividing.
+/// Whether the `/` following `prefix` OPENS A REGEX rather than being an
+/// ordinary byte (a divisor, or the first character of a bare term).
 ///
-/// A DSL regex literal appears in exactly two syntactic places — a
-/// search-stage value after `=`, and the right side of a pattern operator
-/// — and neither can follow an OPERAND, while division always does. So a
-/// slash divides when the last non-whitespace byte before it ends an
-/// operand (an identifier byte, a closing paren, or a closing tick) AND
-/// the identifier run there is not a pattern keyword, which is the one
-/// shape that puts a regex directly after identifier bytes
-/// (`a matches /re/`). Padding changes nothing on either side.
+/// Derived from the grammar, not from taste: a regex literal has exactly
+/// TWO positions — a search-stage filter VALUE, which follows a filter
+/// operator (`=`, `!=`, `>`, `>=`, `<`, `<=`), and the right side of
+/// `matches`. Nowhere else. A slash at query start, after whitespace,
+/// after `(` or after `,` begins a bare TEXT-SEARCH term (executed:
+/// `/foo#bar/` binds one `TextSearch`), and a slash after an operand
+/// divides.
 ///
-/// `prefix` must be comment-NORMALISED: a `matches` inside a comment is
-/// not a pattern operator, and reading raw input made the next line's
-/// division look like one.
+/// `like`/`ilike` are deliberately absent: the grammar gives them no
+/// regex-literal form at all.
+///
+/// `prefix` must be comment-NORMALISED — a `matches` inside a comment is
+/// not a pattern operator.
 #[must_use]
 pub fn slash_opens_regex(prefix: &[u8]) -> bool {
     let Some(end) = prefix.iter().rposition(|b| !b.is_ascii_whitespace()) else {
-        return true;
+        // Query start: a bare term, never a regex.
+        return false;
     };
-    if !(prefix[end].is_ascii_alphanumeric() || matches!(prefix[end], b'_' | b')' | b'`')) {
+    // The tail of a filter operator — the search-stage value position.
+    if matches!(prefix[end], b'=' | b'<' | b'>' | b'!') {
         return true;
     }
+    // …or the one operator whose RHS the grammar parses as a regex.
     let start = prefix[..=end]
         .iter()
         .rposition(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
         .map_or(0, |p| p + 1);
-    matches!(&prefix[start..=end], b"matches" | b"like" | b"ilike")
+    &prefix[start..=end] == b"matches"
+}
+
+/// Whether a regex opening at `i` finds its closing delimiter before the
+/// end of input.
+///
+/// The twin of [`backtick_closes_on_line`], and the same discipline: a
+/// state is entered only when the grammar can actually leave it. An
+/// unterminated slash is NOT a regex — `regex_pattern` requires the
+/// closing delimiter, so the grammar falls back to a bare value — and
+/// swallowing to EOF as if it were one keeps a real comment unstripped,
+/// whose bare words then bind as extra SEARCH TERMS.
+///
+/// Scans to EOF rather than end of line, because `none_of("/")` accepts a
+/// newline: a regex body may legitimately span lines. The body must hold
+/// at least one byte (`at_least(1)`), so the delimiter cannot be adjacent.
+fn regex_closes_before_eof(bytes: &[u8], i: usize) -> bool {
+    bytes.get(i + 2..).is_some_and(|rest| rest.contains(&b'/'))
 }
 
 /// Whether the backtick region opening at `i` closes before the next newline,
@@ -1443,6 +1502,63 @@ mod tests {
         // next line's regex intact.
         let query = parse("# c\n* | where a matches /re/").expect("must parse");
         assert_eq!(regex_bodies(&query), vec!["re".to_string()]);
+    }
+
+    /// The scanner enters Regex only where the GRAMMAR has one and can
+    /// close it. Entering on a slash the grammar reads as a bare value or
+    /// a text term kept a real comment unstripped, and its bare words
+    /// then bound as extra SEARCH TERMS — a silently different query.
+    #[test]
+    fn an_unproven_regex_position_keeps_stripping_comments() {
+        // (a) no closing delimiter: the grammar falls back to a bare
+        // value, so the comment is a comment.
+        let query = parse("host=/foo # comment").expect("must parse");
+        let tokens = &query.search.groups[0];
+        assert_eq!(
+            tokens.len(),
+            1,
+            "no comment word may bind as a term: {tokens:?}"
+        );
+        assert_eq!(
+            tokens[0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "host".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("/foo".to_string()),
+            })
+        );
+
+        // (b) query start is not a regex position at all — a slash there
+        // begins a bare TERM.
+        let query = parse("/foo#bar/").expect("must parse");
+        assert_eq!(
+            query.search.groups[0][0].node,
+            SearchToken::TextSearch(TextSearch {
+                term: "/foo".to_string(),
+                negated: false,
+            })
+        );
+
+        // …the same holds after whitespace: a bare term, comment
+        // stripped, nothing leaked.
+        let query = parse("a /foo#bar/").expect("must parse");
+        assert_eq!(
+            query.search.groups[0]
+                .iter()
+                .map(|t| format!("{:?}", t.node))
+                .count(),
+            2
+        );
+        // …and inside a group the truncated term breaks the parens
+        // LOUDLY, which is the other permitted outcome.
+        assert!(parse("(a OR /foo#bar/)").is_err());
+
+        // …while the two REAL positions still open one and keep their
+        // body verbatim.
+        let query = parse("host=/foo#bar/ # c").expect("must parse");
+        assert_eq!(regex_bodies(&query), vec!["foo#bar".to_string()]);
+        let query = parse("# c\n* | where a matches /foo#bar/").expect("must parse");
+        assert_eq!(regex_bodies(&query), vec!["foo#bar".to_string()]);
     }
 
     /// Each scanner state ends where its grammar production ends, and
