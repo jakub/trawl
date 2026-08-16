@@ -194,12 +194,19 @@ fn strip_comments(input: &str) -> String {
 /// which is all a pre-parse scanner has.
 ///
 /// The permitted predecessors are the ones the grammar actually puts in
-/// front of a name with no whitespace: the start of input or any whitespace,
-/// an opening paren or comma (argument and field lists), a pipe, the `-` of
-/// a descending sort key, and the tail of a comparison operator (`=`, `<`,
-/// `>`, `!`) — an expression may compare against a field, so
-/// `` a==`b c` `` is a name. Anything else (a letter, a digit, a `/`) means
-/// the tick is inside a value or a regex, where it is ordinary data.
+/// front of a name with no whitespace: the start of input or any
+/// whitespace, an opening paren or comma (argument and field lists), a
+/// pipe, the tail of a comparison operator (`=`, `<`, `>`, `!`) — an
+/// expression may compare against a field, so `` a==`b c` `` is a name —
+/// and the arithmetic operators, which an expression may equally put in
+/// front of one (`` 1+`a b` ``). `-` covers both the arithmetic case and a
+/// descending sort key. Anything else (a letter, a digit) means the tick
+/// is inside a value or a regex, where it is ordinary data.
+///
+/// `/` is deliberately ABSENT: it opens a regex far more often than it
+/// divides, and a regex body is exactly the context this predicate exists
+/// to keep out. A quoted name divided into by a slash pays the
+/// unterminated-name error instead.
 ///
 /// Erring narrow is the safe direction: a name this declines is one whose
 /// comment markers stay unprotected, so it dies loudly at the grammar as an
@@ -209,7 +216,10 @@ fn can_start_field_name(bytes: &[u8], i: usize) -> bool {
         return true;
     };
     prev.is_ascii_whitespace()
-        || matches!(prev, b'(' | b',' | b'|' | b'-' | b'=' | b'<' | b'>' | b'!')
+        || matches!(
+            prev,
+            b'(' | b',' | b'|' | b'-' | b'=' | b'<' | b'>' | b'!' | b'+' | b'*' | b'%'
+        )
 }
 
 /// Whether the backtick region opening at `i` closes before the next newline,
@@ -1312,5 +1322,42 @@ mod tests {
         // name is a loud parse error — the other permitted outcome.
         assert!(parse("| table `a b # x").is_err());
         assert!(parse("* | where `a b // x").is_err());
+    }
+
+    /// An expression may put an ARITHMETIC operator in front of a name,
+    /// so those predecessors open a name too — otherwise `` 1+`a#b` ``
+    /// loses its comment markers and dies as an unterminated name.
+    #[test]
+    fn a_backtick_after_an_operator_opens_a_name() {
+        for (dsl, want) in [
+            ("* | let x = 1+`a#b`", "a#b"),
+            ("* | let x = 2*`http://x`", "http://x"),
+            ("* | let x = `a#b`%2", "a#b"),
+            ("* | let x = 1-`a#b`", "a#b"),
+            ("* | where `a#b`>1", "a#b"),
+            ("* | sort -`a#b`", "a#b"),
+            ("* | stats count() by `a#b`", "a#b"),
+        ] {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl} must parse: {e:?}"));
+            assert!(
+                field_positions(&query).iter().any(|n| n == want),
+                "{dsl}: {:?}",
+                field_positions(&query)
+            );
+        }
+
+        // …and the regex case F1 fixed stays fixed: a tick inside a regex
+        // body follows a letter or a `/`, never an operator, so the
+        // comment on that line is still stripped.
+        let query = parse("host=/a+b`c/ # | bad_stage").expect("the comment must be stripped");
+        assert_eq!(
+            query.pipeline.len(),
+            0,
+            "the comment must not reach the parser"
+        );
+        assert_eq!(query.search.groups[0].len(), 1);
+        // a division inside a regex is the same shape
+        let query = parse("host=/a`b/ # x").expect("the comment must be stripped");
+        assert_eq!(query.search.groups[0].len(), 1);
     }
 }

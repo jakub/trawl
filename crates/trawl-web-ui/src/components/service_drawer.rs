@@ -472,13 +472,17 @@ fn FieldDetail(
     let svc_for_q = svc.clone();
     let field_for_q = field_name.clone();
     let top = LocalResource::new(move || {
-        // The field name is DSL, so it goes through the ONE renderer.
-        let field =
-            trawl_core::parser::quote_dsl_name(&field_for_q).unwrap_or_else(|| field_for_q.clone());
-        let q = format!(
-            r#"service="{}" last=7d | top 10 {field}"#,
-            svc_for_q.replace('"', ""),
-        );
+        // The field name is DSL, so it goes through the ONE renderer — and
+        // a name it REFUSES is not spliced raw: a catalog key is
+        // client-chosen, so its raw spelling could carry query logic. An
+        // empty query is the honest answer when the field cannot be named.
+        let q =
+            trawl_core::parser::quote_dsl_name(&field_for_q).map_or_else(String::new, |field| {
+                format!(
+                    r#"service="{}" last=7d | top 10 {field}"#,
+                    svc_for_q.replace('"', ""),
+                )
+            });
         async move { api::query(&q, 0).await }
     });
 

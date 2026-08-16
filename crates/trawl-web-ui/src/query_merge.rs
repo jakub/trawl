@@ -102,7 +102,14 @@ pub fn effective_query(base_q: &str, filters: &[Filter], range: &RangeSpec) -> S
 
     let mut prefix = String::new();
     for f in filters {
-        let clause = format_filter(f);
+        // A facet whose NAME the grammar cannot express contributes no
+        // clause at all. Splicing the raw name would put a client-chosen
+        // catalog key straight into query text, where a newline and a
+        // bare word become query LOGIC. Declining matches the shape the
+        // schema action already uses.
+        let Some(clause) = format_filter(f) else {
+            continue;
+        };
         if !prefix.is_empty() {
             prefix.push(' ');
         }
@@ -195,20 +202,20 @@ const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
 }
 
-fn format_filter(f: &Filter) -> String {
+/// One facet as a DSL clause, or `None` when the field name has no DSL
+/// rendering at all (empty, or carrying a control or invisible format
+/// character). The caller drops the facet: a name the shared helper
+/// refused must never be spliced raw, since a catalog key is
+/// client-chosen and a newline in one turns the rest into query logic.
+fn format_filter(f: &Filter) -> Option<String> {
     let op = match f.op {
         FilterOp::Include => "=",
         FilterOp::Exclude => "!=",
     };
     // Quote the value so spaces / special chars don't break the DSL.
     let quoted = format!("\"{}\"", f.value.replace('\\', "\\\\").replace('"', "\\\""));
-    // The FIELD is quoted by its own rule (`quote_dsl_name`) — a facet
-    // name carrying a space is a valid column and must produce a valid
-    // clause. A name the grammar cannot express falls back to its raw
-    // spelling: the clause is then no worse than it was, and the caller
-    // sees a parse error rather than a silently different query.
-    let field = trawl_core::parser::quote_dsl_name(&f.field).unwrap_or_else(|| f.field.clone());
-    format!("{field}{op}{quoted}")
+    let field = trawl_core::parser::quote_dsl_name(&f.field)?;
+    Some(format!("{field}{op}{quoted}"))
 }
 
 fn format_absolute_range(from: &str, to: &str) -> String {
@@ -258,10 +265,36 @@ mod tests {
     /// renderer, never a hand-rolled wrap here.
     #[test]
     fn a_facet_field_that_needs_quoting_gets_it() {
-        assert_eq!(format_filter(&inc("request id", "7")), "`request id`=\"7\"");
-        assert_eq!(format_filter(&inc("host", "web-01")), "host=\"web-01\"");
+        assert_eq!(
+            format_filter(&inc("request id", "7")).as_deref(),
+            Some("`request id`=\"7\"")
+        );
+        assert_eq!(
+            format_filter(&inc("host", "web-01")).as_deref(),
+            Some("host=\"web-01\"")
+        );
         // …and the rendered clause parses
-        assert!(trawl_core::parser::parse(&format_filter(&exc("request id", "7"))).is_ok());
+        let clause = format_filter(&exc("request id", "7")).expect("a clause");
+        assert!(trawl_core::parser::parse(&clause).is_ok());
+    }
+
+    /// A catalog key is client-chosen, so a name the helper REFUSES must
+    /// drop out of the query entirely — splicing it raw would let a
+    /// newline and a bare word become query logic.
+    #[test]
+    fn a_facet_field_the_grammar_refuses_contributes_no_clause() {
+        for hostile in ["a\nOR service", "a\u{202e}b", ""] {
+            assert_eq!(format_filter(&inc(hostile, "x")), None, "{hostile:?}");
+        }
+        // …and the merged query keeps the facets it CAN express, without
+        // the one it cannot.
+        let merged = effective_query(
+            "*",
+            &[inc("a\nOR service", "x"), inc("host", "web-01")],
+            &quick("15m"),
+        );
+        assert!(!merged.contains("OR service"), "{merged}");
+        assert!(merged.contains("host=\"web-01\""), "{merged}");
     }
 
     #[test]
