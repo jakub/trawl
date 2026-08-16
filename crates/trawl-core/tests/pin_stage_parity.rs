@@ -819,3 +819,165 @@ fn count_over_a_constant_counts_rows_in_both_lanes() {
         "count(1) must agree across lanes"
     );
 }
+
+/// THE CLASS GUARD for mixed-case projection targets (#78 rounds 1-3).
+///
+/// A projection may WRITE a key the row did not have — `| let A = 1` over
+/// a lowercase-keyed row — and every read after it must then agree with
+/// `DuckDB`, which binds identifiers case-insensitively. Three consecutive
+/// review rounds found instances of exactly one class: the live lane doing
+/// an EXACT-key lookup where the batch lane binds. So this generates the
+/// cross product — a case-variant projection, then a stage that reads
+/// either spelling — and asserts both lanes agree, executing the batch SQL
+/// rather than reasoning about it.
+///
+/// Two comparisons are deliberately loose, and only these two:
+///
+/// - column NAMES fold through `catalog_key`, because a group-by output is
+///   spelled as the ROW's bound key in batch (`A`) and as the query wrote
+///   it live (`a`) — one column under `DuckDB`'s own rule;
+/// - VALUES compare through the live lane's own scalar rendering, because
+///   this lane stringifies every group key (`"5"` where batch returns `5`)
+///   REGARDLESS of case, and its numeric accumulators are `f64` where SQL
+///   returns an integer (`12.0` vs `12`) — pre-existing typing
+///   differences of their own, which would otherwise mask the binding
+///   class this guard exists for. A missing or wrong value still fails:
+///   an unbound read yields the empty string or null, never the number.
+///
+/// Row order is not compared: neither lane promises one for groups.
+#[test]
+fn case_variant_projections_agree_across_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let ft = FieldTypes::new();
+    // `_time` is present because `dedup` orders by it, and the rows differ
+    // only in the key column so `dedup` never has to CHOOSE between two
+    // rows of one group — which lane keeps which representative is a
+    // streaming-vs-batch question (live keeps the first arrival, batch the
+    // most recent) and not this guard's subject. A dedup key that failed
+    // to bind still fails here: it would collapse both rows into one.
+    let rows = [
+        json!({"a": 5, "b": "x", "message": "m", "_time": "2026-08-15T00:00:00Z"}),
+        json!({"a": 7, "b": "x", "message": "m", "_time": "2026-08-15T00:00:01Z"}),
+    ];
+
+    // (projection that writes a mixed-case key, reader naming either spelling)
+    let projections = ["| let A = a", "| let A = 1", "| rename a as A"];
+    let readers = [
+        "| where a > 0",
+        "| where A > 0",
+        "| stats count() by a",
+        "| stats count() by A",
+        "| stats sum(a) as s",
+        "| stats first(a) as f",
+        "| stats dc(a) as d",
+        "| table a",
+        "| table A, message",
+        "| drop a",
+        "| dedup a",
+        "| top 5 a",
+    ];
+
+    for projection in projections {
+        for reader in readers {
+            let dsl = format!("* {projection} {reader}");
+            let query = parser::parse(&dsl).expect("dsl parses");
+
+            let live = live_rows(&query, &rows, &ft, &dsl);
+
+            // batch lane
+            let mut tmp = tempfile::Builder::new()
+                .suffix(".ndjson")
+                .tempfile()
+                .unwrap();
+            for row in &rows {
+                writeln!(tmp, "{row}").unwrap();
+            }
+            tmp.flush().unwrap();
+            let source = tmp.path().to_str().unwrap().to_owned();
+            let emitted = emitter::emit_with_pins(&query, &source, &ft).expect("emit succeeds");
+            let rows_sql = format!("SELECT to_json(_sub) FROM ({}) AS _sub", emitted.sql);
+            let params = bind_params(&emitted.params);
+            let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+            let mut stmt = conn.prepare(&rows_sql).expect("sql prepares");
+            let batch: Vec<Map<String, Value>> = stmt
+                .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+                .unwrap_or_else(|e| panic!("{dsl}: sql must run: {e}\n{rows_sql}"))
+                .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+                .collect();
+
+            assert_eq!(
+                comparable(&live),
+                comparable(&batch),
+                "lane divergence\ndsl: {dsl}\nlive: {live:?}\nbatch: {batch:?}"
+            );
+        }
+    }
+}
+
+/// Run `query`'s pipeline over `rows` in the LIVE lane, whichever plan
+/// shape it compiles to.
+fn live_rows(
+    query: &trawl_core::ast::Query,
+    rows: &[Value],
+    ft: &FieldTypes,
+    dsl: &str,
+) -> Vec<Map<String, Value>> {
+    let plan = compile_stream_plan(&query.pipeline, &PinScope::root(ft))
+        .unwrap_or_else(|e| panic!("{dsl}: plan must compile: {e}"));
+    let feed = |stages: &mut [trawl_core::stream::CompiledStage], ev: &mut Map<String, Value>| {
+        stages
+            .iter_mut()
+            .all(|stage| apply_stage(stage, ev) == StageResult::Pass)
+    };
+    match plan {
+        StreamPlan::PassThrough(mut stages) => rows
+            .iter()
+            .filter_map(|row| {
+                let mut ev: Map<String, Value> = row.as_object().unwrap().clone();
+                feed(&mut stages, &mut ev).then_some(ev)
+            })
+            .collect(),
+        StreamPlan::Aggregate {
+            pre_stages: mut pre,
+            aggregation: mut agg,
+            ..
+        } => {
+            for row in rows {
+                let mut ev: Map<String, Value> = row.as_object().unwrap().clone();
+                if feed(&mut pre, &mut ev) {
+                    agg.feed_event(&ev);
+                }
+            }
+            agg.snapshot().1
+        }
+    }
+}
+
+/// One comparable shape per row: folded column name -> the live lane's own
+/// scalar rendering, as an order-insensitive set.
+///
+/// `_time` is fixture plumbing for `dedup`'s ordering and the two lanes
+/// render an instant differently by design (`DuckDB`'s TIMESTAMP text vs
+/// the wire string) — a separate, documented difference, not this guard's
+/// subject.
+fn comparable(rows: &[Map<String, Value>]) -> BTreeSet<Vec<(String, String)>> {
+    rows.iter()
+        .map(|row| {
+            let mut cells: Vec<(String, String)> = row
+                .iter()
+                .filter(|(k, _)| k.as_str() != "_time")
+                .map(|(k, v)| {
+                    let text = match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    // `12.0` and `12` are one number.
+                    let text = text.parse::<f64>().map_or(text, |n| n.to_string());
+                    (trawl_core::schema::catalog_key(k), text)
+                })
+                .collect();
+            cells.sort();
+            cells
+        })
+        .collect()
+}

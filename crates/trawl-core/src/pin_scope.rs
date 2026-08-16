@@ -312,13 +312,20 @@ mod tests {
     }
 
     #[test]
-    fn rename_collision_on_one_target_takes_the_last_source() {
-        // Two sources onto one target: the later mapping wins, as the
-        // later `AS` does in the emitted projection.
-        let scope = walk("* | rename status as x, dur as x", ROOT);
-        assert_eq!(scope.pin_for("x"), Some(CT::BigInt));
+    fn rename_onto_one_target_is_refused_before_any_scope_walk() {
+        // Two sources onto ONE target is a parse error now: `DuckDB` does
+        // not let the later `AS` win — it emits both and dedup-names the
+        // loser (`x`, `x_1`), which no in-memory lane reproduces. This
+        // test used to assert the last-wins reading; the engine never
+        // agreed with it.
+        assert!(parser::parse("* | rename status as x, dur as x").is_err());
+        assert!(parser::parse("* | rename status as X, dur as x").is_err());
+
+        // Distinct targets still walk normally.
+        let scope = walk("* | rename status as x, dur as y", ROOT);
+        assert_eq!(scope.pin_for("x"), Some(CT::Varchar));
+        assert_eq!(scope.pin_for("y"), Some(CT::BigInt));
         assert_eq!(scope.pin_for("status"), None);
-        assert_eq!(scope.pin_for("dur"), None);
     }
 
     #[test]

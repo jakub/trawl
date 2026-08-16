@@ -570,6 +570,29 @@ fn compile_dedup(s: &DedupStage) -> CompiledStage {
 
 // ── stage application ──────────────────────────────────────────────
 
+/// The value a live field read sees, bound the way `DuckDB` binds a name.
+///
+/// Every read in this lane goes through here. `DuckDB` binds identifiers
+/// case-insensitively, and since a projection may WRITE a mixed-case key
+/// mid-pipeline (`| let A = 1` leaves the row carrying `A`), an exact-key
+/// lookup downstream misses a column the batch query happily returns —
+/// `| let A = 1 | stats count() by a` counted nothing while the SQL lane
+/// answered 1. The doctrine already required this for every pipeline field
+/// read (ADR-0011 slice A′); the aggregation machinery predated rows that
+/// could carry a non-lowercase key at all.
+fn event_value<'e>(event: &'e Map<String, Value>, name: &str) -> Option<&'e Value> {
+    let key = bind_event_key(event, name)?;
+    event.get(key)
+}
+
+/// The value a live field read sees, rendered as the grouping/dedup text.
+fn event_text(event: &Map<String, Value>, name: &str) -> String {
+    event_value(event, name).map_or_else(String::new, |v| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    })
+}
+
 /// Apply a `rename` stage in place, with the SQL's parallel semantics.
 ///
 /// The batch lane emits `* EXCLUDE (sources), src AS tgt, …`, so every
@@ -706,13 +729,23 @@ fn apply_let(
 pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) -> StageResult {
     match stage {
         CompiledStage::Table { fields } => {
-            event.retain(|k, _| fields.contains(k));
+            // `SELECT "a"` binds a column named `A`, so the kept set is
+            // decided by the same fold, not by exact spelling.
+            let keep: Vec<String> = fields
+                .iter()
+                .filter_map(|f| bind_event_key(event, f).map(str::to_owned))
+                .collect();
+            event.retain(|k, _| keep.iter().any(|kept| kept == k));
             StageResult::Pass
         }
 
         CompiledStage::Drop { fields } => {
+            // …and `* EXCLUDE ("a")` excludes an `A` column for the same
+            // reason, so the key REMOVED is the one that bound.
             for f in fields.iter() {
-                event.remove(f);
+                if let Some(key) = bind_event_key(event, f).map(str::to_owned) {
+                    event.remove(&key);
+                }
             }
             StageResult::Pass
         }
@@ -757,7 +790,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
             regex,
             source_field,
         } => {
-            if let Some(Value::String(text)) = event.get(source_field)
+            if let Some(Value::String(text)) = event_value(event, source_field)
                 && let Some(caps) = regex.captures(text)
             {
                 let names: Vec<_> = regex
@@ -779,7 +812,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
             source_field,
             separator,
         } => {
-            if let Some(Value::String(text)) = event.get(source_field) {
+            if let Some(Value::String(text)) = event_value(event, source_field) {
                 let pairs = extract_key_value_pairs(text, *separator);
                 for (k, v) in pairs {
                     // The `_` namespace is sealed against LOG CONTENT too
@@ -825,16 +858,7 @@ fn dedup_key(fields: &[String], event: &Map<String, Value>) -> Vec<String> {
         pairs.sort();
         pairs
     } else {
-        fields
-            .iter()
-            .map(|f| {
-                let mapped = f.as_str();
-                event.get(mapped).map_or_else(String::new, |v| match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-            })
-            .collect()
+        fields.iter().map(|f| event_text(event, f)).collect()
     }
 }
 
@@ -1256,12 +1280,7 @@ impl CompiledAggregation {
                 ..
             } => {
                 let group = make_group_key(by, event);
-                let field_val = event
-                    .get(field.as_str())
-                    .map_or_else(String::new, |v| match v {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    });
+                let field_val = event_text(event, field);
                 let counts = counters.entry(group).or_default();
                 *counts.entry(field_val).or_insert(0) += 1;
             }
@@ -1393,15 +1412,7 @@ fn snapshot_frequency(
 }
 
 fn make_group_key(group_by: &[String], event: &Map<String, Value>) -> GroupKey {
-    group_by
-        .iter()
-        .map(|f| {
-            event.get(f).map_or_else(String::new, |v| match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-        })
-        .collect()
+    group_by.iter().map(|f| event_text(event, f)).collect()
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
@@ -1417,7 +1428,7 @@ fn event_time_bucket(event: &Map<String, Value>, span_secs: u64) -> i64 {
 }
 
 fn extract_f64(event: &Map<String, Value>, field: &str) -> Option<f64> {
-    event.get(field).and_then(|v| match v {
+    event_value(event, field).and_then(|v| match v {
         Value::Number(n) => n.as_f64(),
         _ => None,
     })
@@ -1428,7 +1439,7 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Map<String, Value>)
         AccState::Count(n) => *n += 1,
         AccState::CountField { non_null } => {
             if let Some(field) = &acc.field
-                && event.get(field).is_some_and(|v| !v.is_null())
+                && event_value(event, field).is_some_and(|v| !v.is_null())
             {
                 *non_null += 1;
             }
@@ -1468,14 +1479,14 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Map<String, Value>)
         AccState::First(stored) => {
             if stored.is_none()
                 && let Some(field) = &acc.field
-                && let Some(v) = event.get(field)
+                && let Some(v) = event_value(event, field)
             {
                 *stored = Some(v.clone());
             }
         }
         AccState::Last(stored) => {
             if let Some(field) = &acc.field
-                && let Some(v) = event.get(field)
+                && let Some(v) = event_value(event, field)
             {
                 *stored = Some(v.clone());
             }
@@ -1496,7 +1507,7 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Map<String, Value>)
 fn feed_acc_string_set(acc: &CompiledAcc, set: &mut HashSet<String>, event: &Map<String, Value>) {
     if let Some(field) = &acc.field
         && set.len() < MAX_DISTINCT
-        && let Some(v) = event.get(field)
+        && let Some(v) = event_value(event, field)
         && !v.is_null()
     {
         set.insert(match v {

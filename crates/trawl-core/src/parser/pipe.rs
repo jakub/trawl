@@ -279,6 +279,40 @@ fn assignment_target<'src>()
     })
 }
 
+/// Refuse a stage whose write targets would land on ONE column.
+///
+/// `let A = 1, a = 2` names one column twice: `DuckDB` binds identifiers
+/// case-insensitively, so the batch projection writes both and dedup-names
+/// the loser (`A`, `a_1`) while any in-memory lane keeps whichever it
+/// applied last. Neither is what the query asked for, and the two lanes
+/// disagree about the row.
+///
+/// This is a PARSE error rather than a validation one, following the
+/// reserved-name-mint precedent (ADR-0013 §5): the assignment list is pure
+/// syntax and decidable right here, so every lane inherits the refusal by
+/// construction instead of two evaluators each remembering to ask.
+fn folded_duplicate_target<'a>(
+    targets: impl Iterator<Item = &'a str>,
+    stage: &str,
+) -> Option<String> {
+    let mut seen: Vec<(String, &str)> = Vec::new();
+    for name in targets {
+        let folded = crate::schema::catalog_key(name);
+        if let Some((_, first)) = seen.iter().find(|(key, _)| *key == folded) {
+            let both = if *first == name {
+                format!("`{name}` twice")
+            } else {
+                format!("`{first}` and `{name}`, which name one column")
+            };
+            return Some(format!(
+                "{stage} writes {both} — give each target a name of its own"
+            ));
+        }
+        seen.push((folded, name));
+    }
+    None
+}
+
 /// Parse a `let` / `eval` assignment: `field = expr`.
 fn let_assignment<'src>()
 -> impl Parser<'src, ParserInput<'src>, (String, Spanned<Expr>), ParserExtra<'src>> + Clone {
@@ -287,16 +321,28 @@ fn let_assignment<'src>()
         .then(expr())
 }
 
+/// The assignment list of a `let`/`eval`, with its targets checked to name
+/// distinct columns.
+fn let_assignments<'src>()
+-> impl Parser<'src, ParserInput<'src>, Vec<(String, Spanned<Expr>)>, ParserExtra<'src>> + Clone {
+    let_assignment()
+        .separated_by(just(',').padded())
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .try_map(|assignments: Vec<(String, Spanned<Expr>)>, span| {
+            match folded_duplicate_target(assignments.iter().map(|(name, _)| name.as_str()), "let")
+            {
+                Some(message) => Err(Rich::custom(span, message)),
+                None => Ok(assignments),
+            }
+        })
+}
+
 /// Parse a `let` stage: `let field = expr [, field = expr]*`
 fn let_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     keyword("let")
         .padded()
-        .ignore_then(
-            let_assignment()
-                .separated_by(just(',').padded())
-                .at_least(1)
-                .collect::<Vec<_>>(),
-        )
+        .ignore_then(let_assignments())
         .map(|assignments| {
             PipeStage::Let(LetStage {
                 assignments,
@@ -311,12 +357,7 @@ fn eval_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
 {
     keyword("eval")
         .padded()
-        .ignore_then(
-            let_assignment()
-                .separated_by(just(',').padded())
-                .at_least(1)
-                .collect::<Vec<_>>(),
-        )
+        .ignore_then(let_assignments())
         .map(|assignments| {
             PipeStage::Let(LetStage {
                 assignments,
@@ -496,7 +537,16 @@ fn rename_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parse
             rename_pair
                 .separated_by(just(',').padded())
                 .at_least(1)
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>()
+                .try_map(|renames: Vec<(String, String)>, span| {
+                    match folded_duplicate_target(
+                        renames.iter().map(|(_, to)| to.as_str()),
+                        "rename",
+                    ) {
+                        Some(message) => Err(Rich::custom(span, message)),
+                        None => Ok(renames),
+                    }
+                }),
         )
         .map(|renames| PipeStage::Rename(RenameStage { renames }))
         .labelled("rename stage")
