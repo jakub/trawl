@@ -368,14 +368,22 @@ mod tests {
 
     /// One derivation, every lane: the SQL emitter's `AS` alias, the
     /// stream compiler's accumulator column and the pin-scope walk's
-    /// removal all read `agg_output_name`, so a computed-argument
-    /// aggregate cannot be `avg_rssi` in batch and `avg` live.
+    /// removal all read `agg_output_name`.
+    ///
+    /// The live lane accumulates a BARE field only, so a computed
+    /// argument is REFUSED there rather than projected — agreeing on the
+    /// name while answering NULL would be parity in name only.
     #[test]
     fn every_lane_projects_the_same_column_name() {
-        for (dsl, expected) in [
-            ("* | stats avg(tonumber(rssi) * -1)", "avg_rssi"),
-            ("* | stats count() as total", "total"),
-            ("* | timechart span=1h max(length(message))", "max_message"),
+        for (dsl, expected, streams) in [
+            ("* | stats avg(tonumber(rssi) * -1)", "avg_rssi", false),
+            ("* | stats count() as total", "total", true),
+            ("* | stats avg(duration) as slow", "slow", true),
+            (
+                "* | timechart span=1h max(length(message))",
+                "max_message",
+                false,
+            ),
         ] {
             let query = parser::parse(dsl).expect("dsl parses");
 
@@ -390,16 +398,25 @@ mod tests {
             let plan = crate::stream::compile_stream_plan(
                 &query.pipeline,
                 &crate::pin_scope::PinScope::unpinned(),
-            )
-            .expect("stream plan compiles");
-            let crate::stream::StreamPlan::Aggregate { aggregation, .. } = plan else {
-                panic!("{dsl} must compile to an aggregate plan");
-            };
-            let (columns, _) = aggregation.snapshot();
-            assert!(
-                columns.iter().any(|c| c == expected),
-                "{dsl}: stream lane must project {expected}, got {columns:?}"
             );
+            if streams {
+                let Ok(crate::stream::StreamPlan::Aggregate { aggregation, .. }) = plan else {
+                    panic!("{dsl} must compile to an aggregate plan");
+                };
+                let (columns, _) = aggregation.snapshot();
+                assert!(
+                    columns.iter().any(|c| c == expected),
+                    "{dsl}: stream lane must project {expected}, got {columns:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        plan,
+                        Err(crate::stream::StreamPlanError::UnsupportedStage { .. })
+                    ),
+                    "{dsl}: stream lane cannot evaluate a computed argument, so it must refuse"
+                );
+            }
 
             let mut ft = crate::schema::FieldTypes::new();
             ft.insert(expected, crate::schema::CanonicalType::BigInt);

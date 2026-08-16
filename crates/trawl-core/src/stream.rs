@@ -1069,14 +1069,28 @@ fn new_acc_state(acc: &CompiledAcc) -> AccState {
     }
 }
 
-fn compile_agg_expr(agg: &AggExpr) -> CompiledAcc {
-    let field = agg.args.first().and_then(|a| {
-        if let crate::ast::Expr::FieldRef(name) = &a.node {
-            Some(name.clone())
-        } else {
-            None
-        }
-    });
+fn compile_agg_expr(agg: &AggExpr, stage: &str) -> Result<CompiledAcc, StreamPlanError> {
+    // The live accumulators read a BARE field out of the event; they have
+    // no expression evaluator. A computed argument would therefore feed
+    // nothing and answer NULL under a column the SQL lane fills with a
+    // real value — and since ADR-0013 ruling 8 both lanes now agree on the
+    // NAME, that divergence would be invisible. Refuse it instead.
+    let field = match agg.args.first() {
+        None => None,
+        Some(a) => match &a.node {
+            crate::ast::Expr::FieldRef(name) => Some(name.clone()),
+            _ => {
+                return Err(StreamPlanError::UnsupportedStage {
+                    stage: stage.to_string(),
+                    reason: format!(
+                        "{}(…) over a computed argument is not supported in streaming mode; \
+                         aggregate a bare field",
+                        agg.function
+                    ),
+                });
+            }
+        },
+    };
 
     // The ONE output-name derivation, shared with the SQL emitter and
     // the pin-scope walk (ADR-0013 ruling 8): a computed argument names
@@ -1091,18 +1105,22 @@ fn compile_agg_expr(agg: &AggExpr) -> CompiledAcc {
         _ => None,
     };
 
-    CompiledAcc {
+    Ok(CompiledAcc {
         function: agg.function.clone(),
         field,
         alias,
         percentile,
-    }
+    })
 }
 
 fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamPlanError> {
     match stage {
         PipeStage::Stats(s) => {
-            let accumulators: Vec<_> = s.aggregations.iter().map(compile_agg_expr).collect();
+            let accumulators = s
+                .aggregations
+                .iter()
+                .map(|a| compile_agg_expr(a, "stats"))
+                .collect::<Result<Vec<_>, _>>()?;
             let group_by: Vec<_> = s
                 .group_by
                 .iter()
@@ -1119,7 +1137,11 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
                 .span
                 .as_ref()
                 .map_or(60, crate::ast::TrawlDuration::to_seconds);
-            let accumulators: Vec<_> = s.aggregations.iter().map(compile_agg_expr).collect();
+            let accumulators = s
+                .aggregations
+                .iter()
+                .map(|a| compile_agg_expr(a, "timechart"))
+                .collect::<Result<Vec<_>, _>>()?;
             let group_by: Vec<_> = s
                 .group_by
                 .iter()
