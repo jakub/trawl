@@ -3,7 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use super::EmitError;
-use super::fields::quote_field;
 use crate::parser::suggest;
 
 /// Known function names accepted by the emitter (canonical list in `parser::suggest`).
@@ -335,16 +334,6 @@ pub fn is_aggregate_function(name: &str) -> bool {
             | "median"
             | "stddev"
     )
-}
-
-/// Generate a default alias for an aggregation expression.
-///
-/// `count()` → `"count"`, `avg(duration)` → `"avg_duration"`.
-pub(crate) fn default_agg_alias(func_name: &str, first_arg: Option<&str>) -> String {
-    match first_arg {
-        Some(arg) => quote_field(&format!("{func_name}_{arg}")),
-        None => quote_field(func_name),
-    }
 }
 
 fn require_one_arg(
@@ -975,25 +964,5 @@ mod tests {
         let q = parser::parse(r#"* | let t = strptime(message, "%Q")"#).unwrap();
         let err = emit(&q, "/data/**/*.parquet").unwrap_err();
         assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
-    }
-
-    // ── default_agg_alias ───────────────────────────────────────────────
-
-    #[test]
-    fn alias_count_no_arg() {
-        assert_eq!(default_agg_alias("count", None), "\"count\"");
-    }
-
-    #[test]
-    fn alias_avg_with_field() {
-        assert_eq!(
-            default_agg_alias("avg", Some("duration")),
-            "\"avg_duration\""
-        );
-    }
-
-    #[test]
-    fn alias_dc_with_field() {
-        assert_eq!(default_agg_alias("dc", Some("host")), "\"dc_host\"");
     }
 }

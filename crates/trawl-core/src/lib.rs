@@ -45,6 +45,11 @@ mod pin_match;
 /// pipeline stage, shared by the SQL emitter and the stream compiler.
 pub mod pin_scope;
 
+/// The names a projecting stage puts on its output row: the ONE aggregate
+/// output-name rule, shared by the SQL emitter, the stream lane and the
+/// pin-scope walk.
+pub mod projection;
+
 /// Client-chosen text made safe to render: control and format characters
 /// that would rewrite or hide a terminal line.
 pub mod sanitize;

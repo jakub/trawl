@@ -1061,10 +1061,10 @@ fn compile_agg_expr(agg: &AggExpr) -> CompiledAcc {
         }
     });
 
-    let alias = agg.alias.clone().unwrap_or_else(|| match &field {
-        Some(f) => format!("{}_{f}", agg.function),
-        None => agg.function.clone(),
-    });
+    // the OUTPUT name is the shared rule (`projection`), while `field` above
+    // stays the direct first-argument reference: that one is what the
+    // accumulator READS, and this lane cannot evaluate a wrapped argument.
+    let alias = crate::projection::agg_output_name(agg);
 
     let percentile = match agg.function.as_str() {
         "p50" => Some(0.5),
