@@ -106,11 +106,14 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 /// Backtick-quoted field names are tracked beside double-quoted strings,
 /// so `` `a#b` `` is a name and not a comment (ADR-0013 ruling 7).
 ///
+/// An UNPAIRED backtick opens nothing: a backtick with no later backtick
+/// in the input is an ordinary character, so a stray one (in a regex
+/// literal, say) cannot swallow every following comment and smuggle its
+/// words in as extra AND-ed search terms.
+///
 /// Known limitation: `#` inside regex literals (`/pattern#here/`) will be
 /// treated as a comment start. Use `//` comments on lines containing regex
-/// literals, or move the regex to a different line. A stray unbalanced
-/// backtick in a bare value has the same shape of consequence — it can
-/// protect a later `#` from being stripped — and the same remedy.
+/// literals, or move the regex to a different line.
 fn strip_comments(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = bytes.to_vec();
@@ -141,7 +144,10 @@ fn strip_comments(input: &str) -> String {
             in_string = true;
             i += 1;
         } else if bytes[i] == b'`' {
-            in_backtick = true;
+            // Only a backtick that CLOSES quotes anything; an unpaired one
+            // is an ordinary character. The scan below is amortized O(n):
+            // failing it proves no backtick remains, so it never runs again.
+            in_backtick = bytes[i + 1..].contains(&b'`');
             i += 1;
         } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
             // // comment — blank to end of line
@@ -721,6 +727,17 @@ mod tests {
             SearchToken::FieldFilter(ff) => assert_eq!(ff.field, "a b"),
             other => panic!("expected FieldFilter, got {other:?}"),
         }
+    }
+
+    /// An unpaired backtick — a regex literal carrying one, say — must not
+    /// protect every later comment: the comment would parse as extra
+    /// AND-ed text-search terms and silently narrow the match set.
+    #[test]
+    fn unpaired_backtick_does_not_shield_later_comments() {
+        let input = "message=/back`tick/ # comment";
+        assert_eq!(strip_comments(input), "message=/back`tick/          ");
+        let query = parse(input).expect("parses");
+        assert_eq!(query.search.groups[0].len(), 1);
     }
 
     /// A LEADING backtick that fails the quoted production is a loud
