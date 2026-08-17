@@ -364,8 +364,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   What changes is cost: the subject of a `sev(field)` comparison is over a
   kilobyte of SQL, and a six-band query used to repeat it six times. Probed
   over 1M rows, the six-band case goes from ~29.5 ms to ~5.0 ms (5.9x).
-  Bounds are inlined `i64` from the closed ladder table, so a severity
-  filter binds no parameters at all.
+  Range bounds are inlined `i64` from the closed ladder table, so a
+  band-or-list severity filter binds no parameters at all. A scalar exact
+  comparison (`_severity=17`) is unchanged and still binds its one value
+  as `= ?`.
 
   Recorded because the first attempt shipped the wrong shape: collapsing
   the bands into `IN (17, 18, 19, 20)` makes the SQL 5.7x smaller and the
