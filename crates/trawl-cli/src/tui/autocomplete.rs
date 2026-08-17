@@ -98,9 +98,14 @@ pub fn complete(
         return None;
     }
 
+    let match_prefix = match prefix.strip_prefix('`') {
+        Some(rest) if matches!(context, CompletionContext::FieldName { .. }) => rest,
+        Some(_) => return None,
+        None => prefix.as_str(),
+    };
     let candidates = candidates_for(&context, schema_fields);
-    let candidate = prefix_match(prefix, &candidates)?;
-    Some(build_completion(&candidate, prefix.len()))
+    let candidate = prefix_match(match_prefix, &candidates)?;
+    build_completion(&candidate, prefix)
 }
 
 // ── Context detection ───────────────────────────────────────────────
@@ -109,13 +114,15 @@ pub fn complete(
 pub fn detect_context(text: &str, cursor_byte: usize) -> CompletionContext {
     let before = &text[..cursor_byte.min(text.len())];
 
-    // Check if inside a string literal or regex.
-    if inside_string_or_regex(before) {
+    // Once a name is open, its spaces and punctuation are part of the
+    // completion prefix. Only consult the ordinary string/regex detector
+    // when no quoted name is open.
+    let quoted_prefix = open_backtick_prefix(before);
+    if quoted_prefix.is_none() && inside_string_or_regex(before) {
         return CompletionContext::None;
     }
 
-    // Extract the word prefix at cursor (scan back for word chars).
-    let prefix = extract_prefix(before);
+    let prefix = quoted_prefix.unwrap_or_else(|| extract_prefix(before));
     if prefix.is_empty() {
         return CompletionContext::None;
     }
@@ -307,50 +314,49 @@ fn prefix_match(prefix: &str, candidates: &[Candidate]) -> Option<Candidate> {
 // ── Completion building ─────────────────────────────────────────────
 
 /// Build the final `Completion` from a matched candidate.
-fn build_completion(candidate: &Candidate, prefix_len: usize) -> Completion {
+fn build_completion(candidate: &Candidate, prefix: &str) -> Option<Completion> {
+    // Candidate slicing is in bytes, editor replacement/cursor offsets are
+    // character counts. Mixing them deletes text beside a non-ASCII prefix.
+    let prefix_len = prefix.len();
+    let prefix_cols = prefix.chars().count();
     if candidate.is_function {
         let suffix = &candidate.name[prefix_len..];
         if candidate.is_zero_arg {
             // count() / now() → cursor after closing paren.
-            Completion {
+            Some(Completion {
                 ghost_text: format!("{suffix}()"),
                 insert_text: format!("{}()", candidate.name),
-                replace_len: prefix_len,
+                replace_len: prefix_cols,
                 cursor_offset: None, // end
-            }
+            })
         } else {
             // avg( → cursor between parens.
-            Completion {
+            Some(Completion {
                 ghost_text: format!("{suffix}()"),
                 insert_text: format!("{}()", candidate.name),
-                replace_len: prefix_len,
-                cursor_offset: Some(candidate.name.len() + 1), // between ( and )
-            }
+                replace_len: prefix_cols,
+                cursor_offset: Some(candidate.name.chars().count() + 1), // between ( and )
+            })
         }
-    } else {
-        // Stage or field — trailing space for stages, bare name for fields.
+    } else if KNOWN_PIPE_STAGES.contains(&candidate.name.as_str()) {
         let suffix = &candidate.name[prefix_len..];
-        let is_stage = KNOWN_PIPE_STAGES.contains(&candidate.name.as_str());
-        if is_stage {
-            Completion {
-                ghost_text: format!("{suffix} "),
-                insert_text: format!("{} ", candidate.name),
-                replace_len: prefix_len,
-                cursor_offset: None,
-            }
-        } else {
-            // A field name goes in through the DSL renderer: a name the
-            // bare production cannot spell is inserted backticked
-            // (ADR-0013 ruling 7), so an accepted suggestion always
-            // parses. The ghost text stays the raw name — it labels the
-            // column, and prefix matching runs on bare names.
-            Completion {
-                ghost_text: suffix.to_owned(),
-                insert_text: quote_dsl_field(&candidate.name),
-                replace_len: prefix_len,
-                cursor_offset: None,
-            }
-        }
+        Some(Completion {
+            ghost_text: format!("{suffix} "),
+            insert_text: format!("{} ", candidate.name),
+            replace_len: prefix_cols,
+            cursor_offset: None,
+        })
+    } else {
+        let rendered = quote_dsl_field(&candidate.name)?;
+        let ghost_text = rendered
+            .strip_prefix(prefix)
+            .map_or_else(|| rendered.clone(), ToOwned::to_owned);
+        Some(Completion {
+            ghost_text,
+            insert_text: rendered,
+            replace_len: prefix_cols,
+            cursor_offset: None,
+        })
     }
 }
 
@@ -359,6 +365,52 @@ fn build_completion(candidate: &Candidate, prefix_len: usize) -> Completion {
 /// Whether a function takes zero arguments (cursor goes after `()`).
 fn is_zero_arg_function(name: &str) -> bool {
     matches!(name, "count" | "now")
+}
+
+/// Return the open quoted-name region ending at the cursor, opening tick
+/// included. This is editor state, not the comment pre-scanner: incomplete
+/// names are expected here. String/regex regions are skipped so a data
+/// backtick cannot disable completion for the rest of the line.
+fn open_backtick_prefix(before: &str) -> Option<&str> {
+    let bytes = before.as_bytes();
+    let mut open = None;
+    let mut in_string = false;
+    let mut in_regex = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = i > 0 && bytes[i - 1] == b'\\';
+        match bytes[i] {
+            b'"' if open.is_none() && !in_regex && !escaped => in_string = !in_string,
+            b'/' if open.is_none() && !in_string && !escaped => in_regex = !in_regex,
+            b'`' if !in_string && !in_regex => {
+                if open.is_some() && bytes.get(i + 1) == Some(&b'`') {
+                    i += 2;
+                    continue;
+                }
+                open = if open.is_some() {
+                    None
+                } else if quoted_name_can_start(bytes, i) {
+                    Some(i)
+                } else {
+                    None
+                };
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    open.map(|start| &before[start..])
+}
+
+fn quoted_name_can_start(bytes: &[u8], i: usize) -> bool {
+    let Some(prev) = i.checked_sub(1).map(|p| bytes[p]) else {
+        return true;
+    };
+    prev.is_ascii_whitespace()
+        || matches!(
+            prev,
+            b'(' | b',' | b'|' | b'-' | b'=' | b'<' | b'>' | b'!' | b'+' | b'*' | b'%'
+        )
 }
 
 /// Extract the word prefix immediately before the cursor.
@@ -745,12 +797,61 @@ mod tests {
         });
         let c = complete("| table x", 9, &schema).unwrap();
         assert_eq!(c.insert_text, "`x-request-id`");
-        assert_eq!(c.ghost_text, "-request-id");
+        assert_eq!(c.ghost_text, "`x-request-id`");
         assert_eq!(c.replace_len, 1);
         assert!(
             trawl_core::parser::parse(&format!("| table {}", c.insert_text)).is_ok(),
             "the inserted text must parse"
         );
+    }
+
+    #[test]
+    fn completing_an_open_quoted_name_replaces_its_opening_tick() {
+        let mut schema = fields();
+        schema.push(SchemaField {
+            name: "request id".to_owned(),
+            is_numeric: false,
+        });
+        let text = "| table `request i";
+        let completion = complete(text, text.len(), &schema).expect("a completion");
+        assert_eq!(completion.insert_text, "`request id`");
+        assert_eq!(completion.replace_len, "`request i".chars().count());
+        let kept = text.chars().count() - completion.replace_len;
+        let spliced = format!(
+            "{}{}",
+            text.chars().take(kept).collect::<String>(),
+            completion.insert_text
+        );
+        assert_eq!(spliced, "| table `request id`");
+    }
+
+    #[test]
+    fn completion_lengths_are_characters_not_utf8_bytes() {
+        let mut schema = fields();
+        schema.push(SchemaField {
+            name: "日本語".to_owned(),
+            is_numeric: false,
+        });
+        let text = "| table `日本";
+        let completion = complete(text, text.len(), &schema).expect("a completion");
+        assert_eq!(completion.insert_text, "`日本語`");
+        assert_eq!(completion.replace_len, "`日本".chars().count());
+    }
+
+    #[test]
+    fn unrepresentable_catalog_names_are_not_suggested() {
+        let schema = [SchemaField {
+            name: "a\u{202e}b".to_owned(),
+            is_numeric: false,
+        }];
+        assert!(complete("| table a", 9, &schema).is_none());
+    }
+
+    #[test]
+    fn a_data_backtick_does_not_capture_the_rest_of_the_line() {
+        let text = "host=/foo`bar/ | table hos";
+        let completion = complete(text, text.len(), &fields()).expect("a completion");
+        assert_eq!(completion.insert_text, "host");
     }
 
     #[test]

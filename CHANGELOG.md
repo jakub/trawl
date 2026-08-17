@@ -265,6 +265,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   escape hatch.
 
 ### Fixed
+- **Backtick identifier follow-through after #81.** Catalog names are now
+  declined when the DSL cannot represent them and otherwise flow through the
+  shared renderer in every TUI/SPA query builder; URL facet state carries
+  arbitrary names in a versioned opaque payload. Completing an open quoted
+  name no longer doubles its opening tick, and non-ASCII prefixes use
+  character rather than byte offsets. Query formatting now round-trips
+  backticks, whitespace and backslashes in values. Streaming `count(1)` is
+  restored as the row-count operation while unsupported computed aggregates
+  remain loud errors.
 - **A function call in an aggregation position no longer panics the
   emitter (#77, landed unclaimed in #80).** `stats split(message, ",", 1)`
   — any multi-argument scalar call where the pipeline expects an

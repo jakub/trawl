@@ -32,6 +32,8 @@ fleet-ui = { workspace = true, features = ["atmosphere"] }
 # mirrors is decided by `trawl_core::sanitize` — mirroring THAT too would
 # be a second copy of a security-relevant character set.
 trawl-core = { workspace = true }
+base64ct = { workspace = true, features = ["alloc"] }
+serde = { workspace = true }
 # Unconditional for the same reason again: `repin_flow::classify_conflict`
 # is the pure half of the repin POST — it decides which of the TWO 409
 # bodies arrived by DECODING them — and its table test feeds it real
@@ -55,7 +57,6 @@ console_error_panic_hook = "0.1"
 gloo-net = "0.7"
 gloo-timers = { version = "0.4", features = ["futures"] }
 js-sys = "0.3"
-serde = { workspace = true }
 serde-wasm-bindgen = "0.6"
 thiserror = { workspace = true }
 wasm-bindgen = "0.2"

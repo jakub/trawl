@@ -290,7 +290,10 @@ pub fn SchemaPage() -> impl IntoView {
             // DSL renderer — an ordinary ingested name the bare
             // production can't spell needs backticks or the clause
             // parses as a text search (ADR-0013 ruling 7).
-            let q = format!("{}=*", quote_dsl_field(&field));
+            let Some(field) = quote_dsl_field(&field) else {
+                return;
+            };
+            let q = format!("{field}=*");
             goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
         })
     };

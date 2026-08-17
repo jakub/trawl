@@ -130,7 +130,7 @@ fn render_agg(agg: &AggExpr) -> String {
 /// uniform — and a name that IS backticked is left exactly as the user
 /// must type it, never double-wrapped.
 fn label_name(name: &str) -> String {
-    let dsl = quote_dsl_field(name);
+    let dsl = quote_dsl_field(name).expect("projection names came from a parsed AST");
     if dsl.starts_with('`') {
         dsl
     } else {
@@ -459,6 +459,7 @@ mod tests {
         for (dsl, expected, streams) in [
             ("* | stats avg(tonumber(rssi) * -1)", "avg_rssi", false),
             ("* | stats count() as total", "total", true),
+            ("* | stats count(1)", "count", true),
             ("* | stats avg(duration) as slow", "slow", true),
             (
                 "* | timechart span=1h max(length(message))",
@@ -509,6 +510,25 @@ mod tests {
                 scope.pin_for(expected),
                 None,
                 "{dsl}: the pin scope must scrub the aggregate's own output column"
+            );
+        }
+    }
+
+    #[test]
+    fn only_non_null_literal_count_uses_the_row_counter() {
+        for dsl in [
+            "* | stats count(null)",
+            "* | stats avg(1)",
+            "* | stats sum(1)",
+        ] {
+            let query = parser::parse(dsl).expect("dsl parses");
+            assert!(
+                crate::stream::compile_stream_plan(
+                    &query.pipeline,
+                    &crate::pin_scope::PinScope::unpinned(),
+                )
+                .is_err(),
+                "{dsl} must remain refused"
             );
         }
     }

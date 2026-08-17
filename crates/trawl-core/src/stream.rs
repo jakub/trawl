@@ -1093,6 +1093,13 @@ fn compile_agg_expr(agg: &AggExpr, stage: &str) -> Result<CompiledAcc, StreamPla
         None => None,
         Some(a) => match &a.node {
             crate::ast::Expr::FieldRef(name) => Some(name.clone()),
+            crate::ast::Expr::Literal(lit)
+                if agg.function == "count" && !matches!(lit, crate::ast::LiteralValue::Null) =>
+            {
+                // SQL COUNT(non-null constant) is COUNT(*). The row-count
+                // accumulator represents that exactly; COUNT(NULL) does not.
+                None
+            }
             _ => {
                 return Err(StreamPlanError::UnsupportedStage {
                     stage: stage.to_string(),

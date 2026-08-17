@@ -17,11 +17,18 @@ use crate::ast::{
 };
 use crate::parser::suggest::quote_dsl_field;
 
+/// Field names stored in an AST came through the parser, so the quoted-name
+/// grammar has already proved they are representable. Catalog-backed query
+/// builders use the fallible renderer directly instead.
+fn dsl_field(name: &str) -> String {
+    quote_dsl_field(name).expect("parsed AST field names are DSL-representable")
+}
+
 /// Render a field-name list (`table a, b`, `by a, b`) as DSL text.
 fn field_list(fields: &[String]) -> String {
     fields
         .iter()
-        .map(|f| quote_dsl_field(f))
+        .map(|f| dsl_field(f))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -147,7 +154,7 @@ fn format_search_token(token: &SearchToken, out: &mut String) {
 }
 
 fn format_field_filter(ff: &FieldFilter, out: &mut String) {
-    out.push_str(&quote_dsl_field(&ff.field));
+    out.push_str(&dsl_field(&ff.field));
     match ff.op {
         FilterOp::Glob | FilterOp::Regex => {
             // Glob and regex use `=` as the display operator, with the value
@@ -164,15 +171,21 @@ fn format_field_filter(ff: &FieldFilter, out: &mut String) {
     format_filter_value(&ff.value, ff.op, out);
 }
 
+/// A string rendered for a double-quoted DSL position, escaped as the exact
+/// inverse of `primitives::quoted_string`: backslashes first, then quotes.
+fn escape_quoted(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 /// Whether a filter value literal needs quoting in the formatted output.
+///
+/// This is the complement of `primitives::bare_value`, plus `"` which ends
+/// the quoted form. Keeping the sets aligned makes parse-format-parse stable.
 fn needs_quoting(s: &str) -> bool {
     s.is_empty()
-        || s.contains(' ')
-        || s.contains('|')
-        || s.contains('(')
-        || s.contains(')')
-        || s.contains(',')
         || s.contains('"')
+        || s.chars()
+            .any(|c| c.is_ascii_whitespace() || matches!(c, '|' | '(' | ')' | ',' | '`'))
 }
 
 fn format_filter_value(value: &FilterValue, op: FilterOp, out: &mut String) {
@@ -181,8 +194,7 @@ fn format_filter_value(value: &FilterValue, op: FilterOp, out: &mut String) {
             if op == FilterOp::Regex {
                 let _ = write!(out, "/{s}/");
             } else if needs_quoting(s) {
-                // Escape any embedded double quotes.
-                let escaped = s.replace('"', "\\\"");
+                let escaped = escape_quoted(s);
                 let _ = write!(out, "\"{escaped}\"");
             } else {
                 out.push_str(s);
@@ -253,12 +265,12 @@ fn format_sort(s: &crate::ast::SortStage, out: &mut String) {
         if sf.direction == SortDirection::Desc {
             out.push('-');
         }
-        out.push_str(&quote_dsl_field(&sf.field));
+        out.push_str(&dsl_field(&sf.field));
     }
 }
 
 fn format_top_rare(kw: &str, count: u64, field: &str, by: &[String], out: &mut String) {
-    let _ = write!(out, "{kw} {count} {}", quote_dsl_field(field));
+    let _ = write!(out, "{kw} {count} {}", dsl_field(field));
     if !by.is_empty() {
         let _ = write!(out, " by {}", field_list(by));
     }
@@ -271,7 +283,7 @@ fn format_let(s: &crate::ast::LetStage, out: &mut String) {
         if i > 0 {
             out.push_str(", ");
         }
-        let _ = write!(out, "{} = ", quote_dsl_field(name));
+        let _ = write!(out, "{} = ", dsl_field(name));
         format_expr(&expr.node, 0, ExprContext::Normal, out);
     }
 }
@@ -298,7 +310,7 @@ fn format_timechart(s: &crate::ast::TimechartStage, out: &mut String) {
 fn format_pivot(s: &crate::ast::PivotStage, out: &mut String) {
     out.push_str("pivot ");
     format_agg_expr(&s.aggregation, out);
-    let _ = write!(out, " on {}", quote_dsl_field(&s.on_field));
+    let _ = write!(out, " on {}", dsl_field(&s.on_field));
     if !s.by.is_empty() {
         let _ = write!(out, " by {}", field_list(&s.by));
     }
@@ -310,7 +322,7 @@ fn format_rename(s: &crate::ast::RenameStage, out: &mut String) {
         if i > 0 {
             out.push_str(", ");
         }
-        let _ = write!(out, "{} as {}", quote_dsl_field(old), quote_dsl_field(new));
+        let _ = write!(out, "{} as {}", dsl_field(old), dsl_field(new));
     }
 }
 
@@ -348,7 +360,7 @@ pub(crate) fn format_agg_expr(agg: &AggExpr, out: &mut String) {
     }
     out.push(')');
     if let Some(ref alias) = agg.alias {
-        let _ = write!(out, " as {}", quote_dsl_field(alias));
+        let _ = write!(out, " as {}", dsl_field(alias));
     }
 }
 
@@ -366,7 +378,7 @@ fn format_extract(s: &crate::ast::ExtractStage, out: &mut String) {
         }
     }
     if let Some(ref field) = s.source_field {
-        let _ = write!(out, " from {}", quote_dsl_field(field));
+        let _ = write!(out, " from {}", dsl_field(field));
     }
 }
 
@@ -474,7 +486,7 @@ fn format_expr(expr: &Expr, parent_prec: u8, ctx: ExprContext, out: &mut String)
             }
             out.push(')');
         }
-        Expr::FieldRef(name) => out.push_str(&quote_dsl_field(name)),
+        Expr::FieldRef(name) => out.push_str(&dsl_field(name)),
         Expr::Literal(lit) => format_literal(lit, ctx, out),
         Expr::InList { expr, list } => {
             format_expr(&expr.node, 4, ExprContext::Normal, out);
@@ -496,7 +508,7 @@ fn format_literal(lit: &LiteralValue, ctx: ExprContext, out: &mut String) {
             if ctx == ExprContext::MatchesRhs {
                 let _ = write!(out, "/{s}/");
             } else {
-                let _ = write!(out, "\"{s}\"");
+                let _ = write!(out, "\"{}\"", escape_quoted(s));
             }
         }
         LiteralValue::Int(n) => {
@@ -541,6 +553,38 @@ mod tests {
     #[test]
     fn multiple_field_filters() {
         insta::assert_snapshot!(fmt("service=nginx   _severity=error   status>=400"), @"service=nginx _severity=error status>=400");
+    }
+
+    #[test]
+    fn values_refused_by_the_bare_grammar_round_trip_quoted() {
+        for dsl in [
+            r#"host="a`b""#,
+            r#"host="a b""#,
+            "host=\"a\tb\"",
+            r#"host="a,b""#,
+            r#"host="a|b""#,
+            r#"host="a(b)""#,
+            r#"host="""#,
+        ] {
+            let once = fmt(dsl);
+            let twice = fmt(&once);
+            assert_eq!(once, twice, "{dsl}: formatter must be idempotent");
+        }
+        assert_eq!(fmt("host=web-01"), "host=web-01");
+    }
+
+    #[test]
+    fn backslashes_survive_filter_and_expression_round_trips() {
+        for dsl in [
+            r#"host="a\\nb""#,
+            r#"host="trail\\""#,
+            r#"* | where message == "c:\\tmp\\file""#,
+            r#"* | let x = "a\\\"b""#,
+        ] {
+            let once = fmt(dsl);
+            let twice = fmt(&once);
+            assert_eq!(once, twice, "{dsl}: backslash meaning drifted");
+        }
     }
 
     #[test]

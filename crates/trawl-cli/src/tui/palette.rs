@@ -288,12 +288,16 @@ pub fn build_service_column_items(schema: &SchemaBrowser, service_name: &str) ->
     };
     svc.columns
         .iter()
-        .map(|col| PaletteItem {
-            label: col.name.clone(),
-            detail: Some(col.data_type.clone()),
-            category: PaletteCategory::Service,
-            shortcut: None,
-            action: PaletteAction::InsertAtCursor(col.name.clone()),
+        .filter_map(|col| {
+            Some(PaletteItem {
+                label: col.name.clone(),
+                detail: Some(col.data_type.clone()),
+                category: PaletteCategory::Service,
+                shortcut: None,
+                action: PaletteAction::InsertAtCursor(
+                    trawl_core::parser::suggest::quote_dsl_field(&col.name)?,
+                ),
+            })
         })
         .collect()
 }
@@ -601,6 +605,27 @@ mod tests {
         assert_eq!(items[0].label, "timestamp");
         assert_eq!(items[0].detail.as_deref(), Some("TIMESTAMP"));
         assert!(matches!(items[0].action, PaletteAction::InsertAtCursor(_)));
+    }
+
+    #[test]
+    fn service_drill_actions_are_valid_dsl_or_absent() {
+        let mut schema = test_schema();
+        schema.services[0]
+            .columns
+            .push(test_col("request id", "VARCHAR"));
+        schema.services[0]
+            .columns
+            .push(test_col("a\u{202e}b", "VARCHAR"));
+        let items = build_service_column_items(&schema, "nginx");
+        let request_id = items
+            .iter()
+            .find(|item| item.label == "request id")
+            .expect("representable field is offered");
+        assert!(matches!(
+            &request_id.action,
+            PaletteAction::InsertAtCursor(dsl) if dsl == "`request id`"
+        ));
+        assert!(!items.iter().any(|item| item.label.contains('\u{202e}')));
     }
 
     #[test]
