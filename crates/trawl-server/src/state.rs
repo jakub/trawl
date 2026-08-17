@@ -246,6 +246,9 @@ fn parse_trusted_relays(
                  configured)"
             ))
         })?;
+        if let Some(twin) = crate::syslog::mapped_cover_twin(&entry) {
+            entries.push(twin);
+        }
         entries.push(entry);
     }
     Ok(entries.into())

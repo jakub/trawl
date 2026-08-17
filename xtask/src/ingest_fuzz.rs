@@ -465,6 +465,11 @@ fn syslog_payload_events(config: &Config, names: &Names) -> Vec<Value> {
     (0..config.mutation_events)
         .map(|seq| {
             let mut event = base_event(config, names, "syslog", seq);
+            // The syslog door never publishes a bare `severity` — and on an
+            // HTTP replay it would win the severity_from chain at position 0,
+            // shadowing the `syslog_severity` + dialect knob this corpus
+            // exists to exercise (the forwarder recipe in configuration.md).
+            event.remove("severity");
             // The wire frame, proposed as `_raw`. Every eleventh one is
             // past MAX_RAW_CHARS: a 64 KB datagram is exactly the case
             // the listener never used to cap.
@@ -866,7 +871,10 @@ mod tests {
     #[test]
     fn the_trawld_corpus_collides_with_every_asserted_slot() {
         let events = objects(&render(&profiled(Profile::Trawld)));
-        for slot in ["service", "env", "host", "message"] {
+        // `message` is deliberately absent here: the trawld profile does
+        // not assert it (the payload IS the message), so a payload one is
+        // ordinary data, not a collision.
+        for slot in ["service", "env", "host"] {
             assert!(
                 events.iter().any(|e| e.contains_key(slot)),
                 "the trawld corpus must collide with the asserted {slot}"

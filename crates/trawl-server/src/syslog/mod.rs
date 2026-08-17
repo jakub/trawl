@@ -45,7 +45,32 @@ pub fn spawn_syslog(
     pipeline: Arc<PipelineWriter>,
     syslog_stats: Option<Arc<SyslogStats>>,
     shutdown_rx: watch::Receiver<bool>,
-) -> Vec<JoinHandle<()>> {
+) -> Result<Vec<JoinHandle<()>>, String> {
+    // Canonicalize IP-shaped source_service_map keys so a mapped-form
+    // spelling (`::ffff:10.1.2.3` — the only form that matched on a
+    // dual-stack bind before peer canonicalization) keeps matching the
+    // canonical peer the listeners now hand to derive_service. Two keys
+    // folding to one address with different services is a contradiction
+    // the operator must resolve — boot-fatal, never a silent pick.
+    let mut config = config.clone();
+    let mut folded = std::collections::HashMap::with_capacity(config.source_service_map.len());
+    for (key, service) in &config.source_service_map {
+        let canonical = key
+            .parse::<IpAddr>()
+            .map_or_else(|_| key.clone(), |ip| canonical_peer(ip).to_string());
+        if let Some(prev) = folded.get(&canonical)
+            && prev != service
+        {
+            return Err(format!(
+                "syslog.source_service_map: {key:?} folds to {canonical:?}, which \
+                 is already mapped to service {prev:?} (this entry says {service:?})"
+            ));
+        }
+        folded.insert(canonical, service.clone());
+    }
+    config.source_service_map = folded;
+    let config = &config;
+
     let batcher = SyslogBatcher::new(config, pipeline, syslog_stats.clone());
     let sender = batcher.sender();
 
@@ -107,7 +132,7 @@ pub fn spawn_syslog(
         }));
     }
 
-    handles
+    Ok(handles)
 }
 
 /// Canonicalize a peer address at the transport door: a dual-stack listener
@@ -156,11 +181,28 @@ impl CidrEntry {
     }
 }
 
+/// A v6 entry wider than the mapped /96 block that covers it (`::/0`,
+/// `::ffff:0:0/95`, …) used to admit every mapped v4 peer on a dual-stack
+/// bind. Peers now fold to v4 before matching, so such an entry earns an
+/// explicit v4 twin for its intersection with the mapped range — which,
+/// for any covering prefix < 96, is all of v4.
+pub(crate) fn mapped_cover_twin(entry: &CidrEntry) -> Option<CidrEntry> {
+    let mapped_base: IpAddr = "::ffff:0.0.0.0".parse().expect("literal address");
+    (matches!(entry.addr, IpAddr::V6(_)) && entry.prefix_len < 96 && entry.contains(mapped_base))
+        .then_some(CidrEntry {
+            addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            prefix_len: 0,
+        })
+}
+
 /// Parse CIDR strings into entries. Invalid entries are logged and skipped.
 fn parse_cidrs(cidrs: &[String]) -> Arc<[CidrEntry]> {
     let mut entries = Vec::with_capacity(cidrs.len());
     for cidr in cidrs {
         if let Some(entry) = parse_cidr(cidr) {
+            if let Some(twin) = mapped_cover_twin(&entry) {
+                entries.push(twin);
+            }
             entries.push(entry);
         } else {
             tracing::warn!(
@@ -240,9 +282,19 @@ mod tests {
         assert!(mapped_entry.contains("10.0.0.5".parse().unwrap()));
         let mapped_range = parse_cidr("::ffff:10.0.0.0/104").unwrap();
         assert!(mapped_range.contains("10.1.2.3".parse().unwrap()));
-        // A prefix spanning more than the mapped range stays genuine v6.
+        // A prefix spanning more than the mapped range stays genuine v6 as
+        // a single entry, but the LIST builders add a v4 twin for its
+        // intersection with the mapped block — so a pre-fold config like
+        // `::ffff:0:0/95` (or `::/0`) keeps admitting v4 peers.
         let wide = parse_cidr("::ffff:0:0/95").unwrap();
         assert!(!wide.contains("10.0.0.5".parse::<IpAddr>().unwrap()));
+        let twin = mapped_cover_twin(&wide).expect("covers the mapped block");
+        assert!(twin.contains("10.0.0.5".parse::<IpAddr>().unwrap()));
+        let listed = parse_cidrs(&["::ffff:0:0/95".into()]);
+        assert!(is_allowed(&listed, "10.0.0.5".parse().unwrap()));
+        // A narrow or non-covering v6 entry earns no twin.
+        assert!(mapped_cover_twin(&parse_cidr("2001:db8::/32").unwrap()).is_none());
+        assert!(mapped_cover_twin(&parse_cidr("::ffff:10.0.0.0/104").unwrap()).is_none());
         // Genuine v6 peers pass through untouched.
         let v6: IpAddr = "2001:db8::1".parse().unwrap();
         assert_eq!(canonical_peer(v6), v6);

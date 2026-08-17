@@ -328,7 +328,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(state.ingest.pipeline.as_ref().expect("ingest enabled")),
             state.ingest.syslog_stats.clone(),
             shutdown_rx,
-        );
+        )
+        .map_err(|e| {
+            tracing::error!(event_type = "config_error", error = %e, "syslog config rejected — refusing to start");
+            e
+        })?;
         tracing::info!(
             event_type = "lifecycle",
             udp = config.syslog.udp_enabled,

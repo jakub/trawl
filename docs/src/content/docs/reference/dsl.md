@@ -275,8 +275,11 @@ One sentence, learned once (ADR-0013):
   `timestamp` — whatever your senders emit, stored verbatim under the
   name they sent. trawl never assigns meaning to a bare name.
 - **Underscore names are trawl's.** `_time`, `_ingested`, `_raw`,
-  `_repairs`, `_severity` are contract slots whose semantics trawl
-  guarantees on every corpus. The whole `_` prefix is reserved: an
+  `_repairs`, `_severity`, `_producer` are contract slots whose semantics
+  trawl guarantees on every corpus. `_producer` names the door an event
+  entered through (`http` | `syslog` | `trawld`), server-stamped and
+  unforgeable — `_producer=syslog | stats count()` is provenance as a
+  query. The whole `_` prefix is reserved: an
   incoming `_x` that is not a slot you may propose has its leading
   underscores stripped and lands under the bare remainder (`_HOSTNAME` →
   `hostname`), and the DSL cannot mint one either — `let _foo = 1`,
