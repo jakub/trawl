@@ -905,9 +905,16 @@ pub struct CatalogConflictRow {
 pub struct RepinRequest {
     /// The field to repin (folded to the catalog's ASCII-lowercase key).
     pub field: String,
-    /// Target candidate-ladder type (`BIGINT`, `DOUBLE`, `TIMESTAMP`,
-    /// `BOOLEAN`, `VARCHAR`; case-insensitive).
+    /// Target catalog type (`BIGINT`, `DOUBLE`, `TIMESTAMP`, `BOOLEAN`,
+    /// `VARCHAR`, `SEVERITY`; case-insensitive).
     pub to: String,
+    /// Which dialect the corpus's NUMERALS are read in for a `SEVERITY`
+    /// target: `otel` (default) or `syslog`. The two ladders overlap over
+    /// 1-7 with opposite meanings, so no value-shape rule can tell them
+    /// apart — the operator asserts provenance. A dialect with any other
+    /// target is a 400: it would be silently ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
     /// Scan and report only — no mutation.
     #[serde(default)]
     pub dry_run: bool,
@@ -962,6 +969,59 @@ pub struct RepinJobResponse {
     pub rows_nulled: u64,
     /// Outcome: values resurrected from `_raw`.
     pub rows_resurrected: u64,
+    /// The asserted numeral dialect — present exactly for a `SEVERITY`
+    /// target. Absent on a legacy job and on every other target: a
+    /// backfilled `otel` would report an assertion nobody made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
+    /// Rows whose numeral reads as a DIFFERENT severity in each dialect
+    /// (the 1-7 overlap) — the values only provenance can settle. Counted
+    /// whatever the dialect; what the dialect governs is the force gate.
+    #[serde(default)]
+    pub ambiguous_numerals: u64,
+    /// Up to five distinct sanitised samples of values the new pin cannot
+    /// read at all, `_raw` resurrection included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmapped_samples: Vec<String>,
+    /// Scan-time liveness, when something is still writing the field.
+    /// PRESENCE is the verdict — the consumer writes the words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<RepinLiveness>,
+    /// Whether an EXECUTING request with this job's flags would be refused
+    /// for want of a force flag (issue #79).
+    ///
+    /// A dry run succeeds by design, so without this a plan carrying loss or
+    /// dialect ambiguity read as a clean 200 and the operator learned about
+    /// the refusal only from the request that was supposed to do the work.
+    /// The server computes it from THIS row's numbers through the same
+    /// decision the two live gates ask, so a dry run cannot promise an
+    /// outcome the execution would not reach.
+    ///
+    /// ABSENT until the scan has recorded its plan — a claimed job's counts
+    /// are zeros meaning "not measured yet", and answering `false` there
+    /// would promise a clean run for a job that is about to refuse. Absent
+    /// on legacy rows for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_force: Option<bool>,
+    /// Why force is required, in the words the refusal itself uses. Present
+    /// exactly when `requires_force` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_force_reason: Option<String>,
+}
+
+/// Evidence that a repin's subject is still being WRITTEN (issue #79).
+///
+/// A repin translates HISTORY. A field a live sender still feeds keeps
+/// arriving in the ingest-time reading, so a syslog-dialect rewrite leaves
+/// a discontinuity at the cutover instant — the fix for the live half is
+/// `[ingest] severity_from`, not another repin. Facts only, presence being
+/// the verdict (the `Option<DegradedVerdict>` shape).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepinLiveness {
+    /// Newest observation of the field (ISO 8601 UTC).
+    pub last_seen: String,
+    /// One service behind that observation.
+    pub service: String,
 }
 
 /// Response body for `POST /api/v1/schema/repin`. The HTTP status carries

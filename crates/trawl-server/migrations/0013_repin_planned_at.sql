@@ -1,0 +1,15 @@
+-- When a repin job's SCAN actually recorded its plan (issue #79 review).
+--
+-- The force verdict every job row now carries (`requires_force`) is derived
+-- from the row's counts, and a claimed job's counts are zeros until the scan
+-- finishes — which is minutes on a real archive. Without this column a
+-- status poll in that window reads "no loss, no ambiguity" and reports a
+-- clean `requires_force: false` for a job that will 409 the moment the scan
+-- lands. Zeros cannot distinguish the two states on their own: a zero-file
+-- repin is legal and reports the same numbers honestly.
+--
+-- So the verdict is ABSENT (NULL on the wire) until this column is set, and
+-- a fact only afterwards. Legacy rows written before this migration report
+-- absent too, which is the honest answer for a row whose plan instant was
+-- never recorded.
+ALTER TABLE repin_jobs ADD COLUMN planned_at TIMESTAMPTZ;

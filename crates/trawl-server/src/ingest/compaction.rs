@@ -14,7 +14,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
+use trawl_core::conform::RepinTarget;
 use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb_type};
+use trawl_core::severity::Dialect;
 
 use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs};
@@ -2045,6 +2047,67 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
     ))
 }
 
+/// Everything a repin needs to READ one column: the target the rewrite
+/// writes with, and the two wire-dialect readings whose disagreement is
+/// ambiguity (issue #79).
+///
+/// Built ONCE per job, by the engine, because the engine is the only place
+/// that knows the OLD pin — and the old pin is what decides whether the
+/// STORED column holds wire text at all. A stored `SEVERITY` column holds
+/// canonical `OTel` ladder positions, so its arm is dialect-free in every
+/// variant; a stored VARCHAR holds whatever the sender wrote, so its arm
+/// flips with the assertion exactly as the `_raw` arm does. Deriving that
+/// downstream would mean guessing it from the dialects themselves, which
+/// cannot tell `otel-because-canonical` from `otel-because-asserted`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RepinReading {
+    /// What the rewrite writes and the plan counts with.
+    pub(crate) written: RepinTarget,
+    /// Whether the STORED column's own text is SENDER text (the old pin was
+    /// not `SEVERITY`), and therefore a wire position the dialect reaches.
+    stored_is_wire: bool,
+}
+
+impl RepinReading {
+    /// Build the reading rule from the repin's own facts.
+    pub(crate) fn new(from: CanonicalType, to: CanonicalType, dialect: Dialect) -> Self {
+        let stored_is_wire = from != CanonicalType::Severity;
+        Self {
+            written: RepinTarget {
+                pin: to,
+                stored: if stored_is_wire {
+                    dialect
+                } else {
+                    Dialect::Otel
+                },
+                raw: dialect,
+            },
+            stored_is_wire,
+        }
+    }
+
+    /// The `OTel`-and-syslog readings of the SAME columns, or `None` where
+    /// the two are textually identical — every target but `SEVERITY`, whose
+    /// numeric arm is the one dialect-sensitive rung. `None` is what makes
+    /// the ambiguity count a constant `0` rather than a pair of full
+    /// expressions `DuckDB` would evaluate to prove they agree.
+    fn variants(self) -> Option<(RepinTarget, RepinTarget)> {
+        if self.written.pin != CanonicalType::Severity {
+            return None;
+        }
+        let variant = |dialect: Dialect| RepinTarget {
+            pin: self.written.pin,
+            stored: if self.stored_is_wire {
+                dialect
+            } else {
+                Dialect::Otel
+            },
+            raw: dialect,
+        };
+        Some((variant(Dialect::Otel), variant(Dialect::Syslog)))
+    }
+}
+
 /// The repin target column's expression, in the ONE place both consumers
 /// read it from: [`ConformPlan::build`] under [`ConformPolicy::Repin`]
 /// (the rewrite) and the repin scan's dry-run counting
@@ -2055,44 +2118,86 @@ pub(crate) fn repin_target_expr(
     quoted: &str,
     has_raw: bool,
     folded: &str,
-    pin: CanonicalType,
+    target: RepinTarget,
 ) -> String {
     if has_raw {
         trawl_core::conform::resurrection_expr(
             quoted,
             &quote_ident(trawl_core::schema::RAW),
             folded,
-            pin,
+            target,
         )
     } else {
-        trawl_core::conform::guarded_cast(&trawl_core::conform::untyped_text(quoted), pin)
+        // No `_raw` to resurrect from, so the stored arm is the whole
+        // reading — and it is the STORED arm's dialect that reads it.
+        trawl_core::conform::guarded_cast_in(
+            &trawl_core::conform::untyped_text(quoted),
+            target.pin,
+            target.stored,
+        )
     }
 }
 
 /// The repin scan/rewrite counting expressions, built over
 /// [`repin_target_expr`] so the dry-run numbers and the rewrite outcome
-/// are the same computation: `(carrying, kept, resurrectable)` —
-/// stored values, stored values the new pin keeps (resurrection arm
-/// included), and shelved (`NULL`-stored) values `_raw` gives back.
+/// are the same computation.
+#[derive(Debug, Clone)]
+pub(crate) struct RepinCountExprs {
+    /// Stored values the column carries.
+    pub(crate) carrying: String,
+    /// Stored values the new pin keeps (resurrection arm included).
+    pub(crate) kept: String,
+    /// Shelved (`NULL`-stored) values `_raw` gives back.
+    pub(crate) resurrectable: String,
+    /// Rows whose reading DIFFERS between the two dialects — the values
+    /// only provenance can settle.
+    pub(crate) ambiguous: String,
+}
+
+/// Build the counting expressions for one column under `reading`.
 pub(crate) fn repin_count_exprs(
     quoted: &str,
     has_raw: bool,
     folded: &str,
-    pin: CanonicalType,
-) -> (String, String, String) {
-    let target = repin_target_expr(quoted, has_raw, folded, pin);
+    reading: RepinReading,
+) -> RepinCountExprs {
+    let target = repin_target_expr(quoted, has_raw, folded, reading.written);
     let carrying = format!("count({quoted})");
     let kept = format!("count(CASE WHEN {quoted} IS NOT NULL THEN {target} END)");
     let resurrectable = if has_raw {
-        let raw_read = trawl_core::conform::guarded_cast(
+        let raw_read = trawl_core::conform::guarded_cast_in(
             &trawl_core::conform::raw_extract(&quote_ident(trawl_core::schema::RAW), folded),
-            pin,
+            reading.written.pin,
+            reading.written.raw,
         );
         format!("count(CASE WHEN {quoted} IS NULL THEN {raw_read} END)")
     } else {
         "0".to_owned()
     };
-    (carrying, kept, resurrectable)
+    // Ambiguity is DERIVED from the whole target expression rather than
+    // spelled out over the syslog domain a second time: a row is ambiguous
+    // when both wire dialects have a reading for it and they disagree. Over
+    // the FULL expression this covers the resurrection arm for free (a raw
+    // numeral recovering into a shelved column is just as ambiguous), and it
+    // keeps one-dialect values OUT — those are visible loss the
+    // `projected_nulls` count already reports, not silent mistranslation.
+    let ambiguous = match reading.variants() {
+        None => "0".to_owned(),
+        Some((otel, syslog)) => {
+            let a = repin_target_expr(quoted, has_raw, folded, otel);
+            let b = repin_target_expr(quoted, has_raw, folded, syslog);
+            format!(
+                "count(CASE WHEN {a} IS NOT NULL AND {b} IS NOT NULL \
+                 AND {a} <> {b} THEN 1 END)"
+            )
+        }
+    };
+    RepinCountExprs {
+        carrying,
+        kept,
+        resurrectable,
+        ambiguous,
+    }
 }
 
 /// Wrap a TIMESTAMP-pinned envelope column's conform in a never-NULL last
@@ -2172,15 +2277,17 @@ pub(crate) enum ConformPolicy {
     /// layout path) falls back to the plain guarded conform — no
     /// resurrection arm, rather than a rewrite-failing reference to a
     /// missing column.
-    // Constructed by the repin engine (`crate::repin`); until that module
-    // lands in this slice's later milestone the only constructors are
-    // tests, which the lib-only lint pass cannot see.
-    #[allow(dead_code)]
     Repin {
         /// The repinned field (catalog key, folded).
         resurrect_field: String,
         /// Same role as [`ConformPolicy::StandingFile::time_fallback`].
         time_fallback: chrono::DateTime<chrono::Utc>,
+        /// The per-arm reading rule for the target column (issue #79):
+        /// which dialect each arm reads NUMERALS in. Structurally scoped —
+        /// only the `repin_target` arm of [`ConformPlan::build`] can reach
+        /// it, so ordinary compaction and the boot pass stay on the `OTel`
+        /// reading no matter what a job asserted.
+        target: RepinTarget,
     },
 }
 
@@ -2259,20 +2366,32 @@ impl ConformPlan {
                 plan.keep(col, &folded, quoted);
                 continue;
             }
-            let repin_target = matches!(
-                policy,
-                ConformPolicy::Repin { resurrect_field, .. } if *resurrect_field == folded
-            );
+            // The one arm that may read a job's ASSERTED dialect, and it
+            // carries that reading with it — nothing else in this loop can
+            // reach the target.
+            let repin_target = match policy {
+                ConformPolicy::Repin {
+                    resurrect_field,
+                    target,
+                    ..
+                } if *resurrect_field == folded => Some(*target),
+                _ => None,
+            };
             match pins.get(&folded).copied() {
                 None if matches!(policy, ConformPolicy::WalBatch) => {
                     plan.dropped.push(col.name.clone());
                 }
                 None => plan.keep(col, &folded, quoted),
-                Some(pin) if repin_target => {
+                Some(pin) if repin_target.is_some() => {
                     // Unconditional — never the `conform_expr` noop check:
                     // the resurrection-only pass rewrites a column whose
                     // physical type already IS the pin.
-                    let expr = repin_target_expr(&quoted, has_raw, &folded, pin);
+                    let target = repin_target.expect("matched Some above");
+                    debug_assert_eq!(
+                        pin, target.pin,
+                        "the engine flips the pin map to the job's target"
+                    );
+                    let expr = repin_target_expr(&quoted, has_raw, &folded, target);
                     let written = guard_partition_key(policy, is_time_col, pin, &expr);
                     plan.select_list
                         .push(format!("{written} AS {}", quote_ident(&folded)));
@@ -2512,24 +2631,10 @@ impl ConformPlan {
 
         let mut out = HashMap::with_capacity(sampled.len());
         for (i, json) in sampled.into_iter().zip(rendered) {
-            // A capture over zero matching rows is SQL NULL, not `[]`
-            // (probed) — unreachable here, since every sampled column
-            // nulled at least one row, but a NULL must not be an error.
-            let Some(json) = json else { continue };
-            let values: Vec<String> = serde_json::from_str(&json)
-                .map_err(|e| format!("conform sample decode failed: {e}"))?;
-            // Distinct AFTER both transforms, in first-seen order: SQL's
-            // DISTINCT ran over the raw text, and what is promised — and
-            // stored — is distinct SAMPLES.
-            let mut kept: Vec<String> = Vec::with_capacity(MAX_CONFLICT_SAMPLES);
-            for value in values.iter().map(|v| sanitize_sample(v)) {
-                if kept.len() == MAX_CONFLICT_SAMPLES {
-                    break;
-                }
-                if !kept.contains(&value) {
-                    kept.push(value);
-                }
-            }
+            // Decoded through the shared reader, so the conform's evidence
+            // and the repin's report cap, sanitise and de-duplicate the same
+            // way (a NULL cell — zero matching rows — is not an error).
+            let kept = decode_misfit_samples(json.as_deref())?;
             out.insert(i, kept);
         }
         Ok(out)
@@ -2548,12 +2653,91 @@ impl ConformPlan {
 fn sample_expr(cast: &CastEntry) -> String {
     let quoted = quote_ident(&cast.name);
     let text = trawl_core::conform::untyped_text(&quoted);
-    let expr = &cast.expr;
+    distinct_misfit_samples_sql(&quoted, &text, &cast.expr)
+}
+
+/// The conform's own misfit-sampling aggregate (ADR-0011 slice C1): up to
+/// [`SAMPLE_CANDIDATES`] DISTINCT values the cast nulls, as one JSON array
+/// of strings, from which [`decode_misfit_samples`] keeps at most
+/// [`MAX_CONFLICT_SAMPLES`].
+///
+/// `list(DISTINCT …)` accumulates every distinct misfit before the slice
+/// caps it, which is safe HERE and only here: the source is one WAL batch,
+/// already bounded by the compactor's own batch limits. The repin scan runs
+/// the same question over a whole CORPUS, where the distinct count is
+/// unbounded, so it takes [`bounded_misfit_samples_sql`] instead — a
+/// deliberate second spelling, not a drift.
+///
+/// `left()` counts CHARACTERS (probed), so it bounds what `DuckDB`
+/// accumulates and never what the store is promised — the byte cap is
+/// [`sanitize_sample`]'s, in Rust, after the control-character
+/// substitution. `array_slice` takes twice [`MAX_CONFLICT_SAMPLES`]
+/// candidates because sanitising can COLLAPSE two distinct raw values into
+/// one sample.
+fn distinct_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> String {
     format!(
         "to_json(array_slice(list(DISTINCT left({text}, {MAX_CONFLICT_SAMPLE_BYTES})) \
-         FILTER (WHERE {quoted} IS NOT NULL AND ({expr}) IS NULL), \
+         FILTER (WHERE {quoted} IS NOT NULL AND ({target_expr}) IS NULL), \
          1, {SAMPLE_CANDIDATES}))::VARCHAR"
     )
+}
+
+/// The repin scan's misfit-sampling aggregate: at most
+/// [`MAX_CONFLICT_SAMPLES`] of the values a column CARRIES whose reading
+/// through `target_expr` is NULL, as one JSON array of strings — bounded BY
+/// CONSTRUCTION over a corpus of any size (issue #79).
+///
+/// `approx_top_k` is a fixed-size sketch: its memory is a function of `k`,
+/// never of the distinct cardinality. That is the whole reason it is here
+/// rather than [`distinct_misfit_samples_sql`], whose `list(DISTINCT …)`
+/// holds every distinct misfit before the slice caps it — measured to
+/// exhaust the scan's 2GB memory limit at a few million distinct misfits,
+/// on exactly the corpus a repin exists to repair (a field a sender has
+/// been writing free text into). A report that cannot be produced for the
+/// worst corpus is a report for the cases that did not need it.
+///
+/// What changes with the sketch is WHICH samples: the most FREQUENT
+/// misfits rather than the first distinct ones, approximately ordered. For
+/// an advisory "here is what this pin cannot read" that is at least as
+/// useful, and every value in the list is an exact value the corpus holds
+/// — the approximation is in the ranking, never in the strings.
+///
+/// It rides the SAME statement as the counts (`count_repin_effect`), so
+/// the samples and the numbers describe one read of one file: two
+/// statements could straddle a compaction that replaced the file underneath
+/// them and report evidence from a corpus that never existed.
+pub(crate) fn bounded_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> String {
+    format!(
+        "to_json(approx_top_k(left({text}, {MAX_CONFLICT_SAMPLE_BYTES}), \
+         {MAX_CONFLICT_SAMPLES}) \
+         FILTER (WHERE {quoted} IS NOT NULL AND ({target_expr}) IS NULL))::VARCHAR"
+    )
+}
+
+/// Decode one misfit-sample cell — from EITHER sampling aggregate — into at most
+/// [`MAX_CONFLICT_SAMPLES`] sanitised, distinct samples in first-seen
+/// order.
+///
+/// Distinct AFTER both transforms: SQL's `DISTINCT` ran over the raw text,
+/// and what is promised — and stored — is distinct SAMPLES. A capture over
+/// zero matching rows is SQL NULL rather than `[]` (probed), which is not
+/// an error.
+pub(crate) fn decode_misfit_samples(rendered: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(json) = rendered else {
+        return Ok(Vec::new());
+    };
+    let values: Vec<String> =
+        serde_json::from_str(json).map_err(|e| format!("conform sample decode failed: {e}"))?;
+    let mut kept: Vec<String> = Vec::with_capacity(MAX_CONFLICT_SAMPLES);
+    for value in values.iter().map(|v| sanitize_sample(v)) {
+        if kept.len() == MAX_CONFLICT_SAMPLES {
+            break;
+        }
+        if !kept.contains(&value) {
+            kept.push(value);
+        }
+    }
+    Ok(kept)
 }
 
 /// One captured misfit made safe to store, return and render: control and
@@ -2566,7 +2750,7 @@ fn sample_expr(cast: &CastEntry) -> String {
 /// auditable, four are not. Order matters, too: U+FFFD is three bytes where
 /// most of what it replaces is one, so the byte cap is applied AFTER the
 /// substitution or it is not a cap.
-fn sanitize_sample(value: &str) -> String {
+pub(crate) fn sanitize_sample(value: &str) -> String {
     let mut cleaned = trawl_core::sanitize::sanitize_display_text(value);
     if cleaned.len() > MAX_CONFLICT_SAMPLE_BYTES {
         let mut end = MAX_CONFLICT_SAMPLE_BYTES;
@@ -4276,6 +4460,7 @@ mod tests {
             &ConformPolicy::Repin {
                 resurrect_field: "status".to_owned(),
                 time_fallback: chrono::Utc::now(),
+                target: RepinTarget::otel(CanonicalType::Varchar),
             },
         );
         assert!(!plan.is_noop());
@@ -4339,6 +4524,7 @@ mod tests {
             &ConformPolicy::Repin {
                 resurrect_field: "dur".to_owned(),
                 time_fallback: chrono::Utc::now(),
+                target: RepinTarget::otel(CanonicalType::BigInt),
             },
         );
         assert!(!plan.is_noop(), "a resurrection-only pass is a rewrite");
@@ -4372,6 +4558,7 @@ mod tests {
             &ConformPolicy::Repin {
                 resurrect_field: "status".to_owned(),
                 time_fallback: chrono::Utc::now(),
+                target: RepinTarget::otel(CanonicalType::Varchar),
             },
         );
         assert_eq!(plan.cast_count(), 1);
@@ -4379,6 +4566,244 @@ mod tests {
             !plan.select_list[0].contains("_raw"),
             "no resurrection arm without a _raw column: {}",
             plan.select_list[0]
+        );
+    }
+
+    /// TWO sampling aggregates, one promise (issue #79). The conform's own
+    /// evidence accumulates every distinct misfit and slices — safe over a
+    /// bounded WAL batch — while the repin scan reads a whole corpus and
+    /// takes a fixed-size sketch instead, because the distinct count there
+    /// is a sender's free text and nothing bounds it. What they SHARE is
+    /// what a sample is: the same subject (a value the column carries whose
+    /// reading is NULL), the same character cap, and the same
+    /// sanitise-then-cap-then-dedup decode.
+    #[test]
+    fn both_sampling_aggregates_share_the_subject_and_the_decode() {
+        let quoted = quote_ident("dur");
+        let text = trawl_core::conform::untyped_text(&quoted);
+        let unbounded = distinct_misfit_samples_sql(&quoted, &text, "TARGET");
+        let bounded = bounded_misfit_samples_sql(&quoted, &text, "TARGET");
+
+        // The conform's shape is unchanged (its input is a bounded batch).
+        assert_eq!(
+            unbounded,
+            "to_json(array_slice(list(DISTINCT \
+             left(json_extract_string(to_json(\"dur\"), '$'), 256)) \
+             FILTER (WHERE \"dur\" IS NOT NULL AND (TARGET) IS NULL), 1, 10))::VARCHAR"
+        );
+        let cast = CastEntry {
+            name: "dur".to_owned(),
+            dtype: "VARCHAR".to_owned(),
+            pin: CanonicalType::BigInt,
+            expr: "TARGET".to_owned(),
+            guard_only: false,
+        };
+        assert_eq!(sample_expr(&cast), unbounded);
+
+        // One subject, one cap, in both.
+        for sql in [&unbounded, &bounded] {
+            assert!(
+                sql.contains("FILTER (WHERE \"dur\" IS NOT NULL AND (TARGET) IS NULL)"),
+                "a sample is a carried value the target cannot read: {sql}"
+            );
+            assert!(sql.contains(&format!("left({text}, {MAX_CONFLICT_SAMPLE_BYTES})")));
+            assert!(sql.starts_with("to_json(") && sql.ends_with(")::VARCHAR"));
+        }
+        // The repin's memory is a function of k, never of the corpus: the
+        // sketch is the whole point, and `list(DISTINCT …)` must not appear.
+        assert!(
+            bounded.contains(&format!(
+                "approx_top_k(left({text}, {MAX_CONFLICT_SAMPLE_BYTES}), {MAX_CONFLICT_SAMPLES})"
+            )),
+            "{bounded}"
+        );
+        assert!(!bounded.contains("list(DISTINCT"), "{bounded}");
+    }
+
+    /// The bounded aggregate, EXECUTED against the shape that broke the
+    /// unbounded one: a column whose every value is a distinct misfit. The
+    /// scan must survive and return at most five samples, all of them real
+    /// values from the corpus.
+    #[test]
+    fn the_bounded_sampler_survives_a_high_cardinality_misfit_column() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+            .unwrap();
+        // 200k DISTINCT unreadable values — every row its own misfit.
+        conn.execute_batch(
+            "CREATE TABLE f AS SELECT ('gold-' || i::VARCHAR) AS level FROM range(200000) t(i)",
+        )
+        .unwrap();
+        let quoted = quote_ident("level");
+        let text = trawl_core::conform::untyped_text(&quoted);
+        let target = trawl_core::conform::guarded_cast(&text, CanonicalType::Severity);
+        let sql = format!(
+            "SELECT {} FROM f",
+            bounded_misfit_samples_sql(&quoted, &text, &target)
+        );
+        let rendered: Option<String> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        let samples = decode_misfit_samples(rendered.as_deref()).unwrap();
+        assert!(!samples.is_empty(), "the sketch reports what it saw");
+        assert!(samples.len() <= MAX_CONFLICT_SAMPLES, "{samples:?}");
+        for sample in &samples {
+            assert!(sample.starts_with("gold-"), "{sample} is not a real value");
+        }
+
+        // And a column with nothing to sample answers nothing, not an error.
+        conn.execute_batch("CREATE TABLE clean AS SELECT 'error' AS level")
+            .unwrap();
+        let sql = format!(
+            "SELECT {} FROM clean",
+            bounded_misfit_samples_sql(&quoted, &text, &target)
+        );
+        let rendered: Option<String> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        assert!(
+            decode_misfit_samples(rendered.as_deref())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Decoding caps, sanitises and de-duplicates in that order: `left()`
+    /// bounds what `DuckDB` accumulates in CHARACTERS, the byte cap and the
+    /// control-character substitution happen in Rust, and DISTINCT is
+    /// re-applied AFTER both because sanitising can collapse two raw values
+    /// into one sample.
+    #[test]
+    fn decoding_samples_caps_sanitises_then_dedups() {
+        assert_eq!(decode_misfit_samples(None).unwrap(), Vec::<String>::new());
+        // Two values SQL calls distinct that sanitise to one sample, plus
+        // enough tail to prove the cap.
+        let json = "[\"a\\u0001b\",\"x\\u0001\",\"x\\u0002\",\"gold\",\"1\",\"2\",\"3\",\"4\"]";
+        let kept = decode_misfit_samples(Some(json)).unwrap();
+        assert_eq!(
+            kept,
+            vec!["a\u{fffd}b", "x\u{fffd}", "gold", "1", "2"],
+            "control chars fold to U+FFFD, the collapsing pair is one sample, five kept"
+        );
+        assert_eq!(kept.len(), MAX_CONFLICT_SAMPLES);
+        assert!(decode_misfit_samples(Some("not json")).is_err());
+    }
+
+    /// The counting expressions over a SEVERITY target, EXECUTED (issue
+    /// #79): a sender's `level` column repinned onto the ladder. Tokens map
+    /// dialect-free, `gold` maps nowhere, and the numeral `3` maps under
+    /// BOTH dialects to different rungs — which is the whole ambiguity
+    /// notion, counted whatever the job asserted.
+    #[test]
+    fn repin_counts_over_a_severity_target_separate_loss_from_ambiguity() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE f AS SELECT * FROM (VALUES \
+             ('error', '{\"level\":\"error\"}'), \
+             ('ERROR', '{\"level\":\"ERROR\"}'), \
+             ('error2', '{\"level\":\"error2\"}'), \
+             ('3', '{\"level\":\"3\"}'), \
+             ('gold', '{\"level\":\"gold\"}')) t(level, _raw)",
+        )
+        .unwrap();
+        let count = |dialect| {
+            let reading =
+                RepinReading::new(CanonicalType::Varchar, CanonicalType::Severity, dialect);
+            let exprs = repin_count_exprs("\"level\"", true, "level", reading);
+            let sql = format!(
+                "SELECT {}::BIGINT, {}::BIGINT, {}::BIGINT FROM f",
+                exprs.carrying, exprs.kept, exprs.ambiguous
+            );
+            conn.query_row(&sql, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+        };
+
+        // OTel: `3` reads as trace3, `gold` reads as nothing.
+        assert_eq!(count(Dialect::Otel), (5, 4, 1));
+        // Syslog: `3` reads as err (17) instead — still mapped, still the
+        // one ambiguous row, and `gold` is still the only loss. The COUNT
+        // does not depend on the assertion; only the gate does.
+        assert_eq!(count(Dialect::Syslog), (5, 4, 1));
+
+        // The values themselves, to prove the dialect actually changes what
+        // the rewrite would WRITE.
+        let read = |dialect| {
+            let reading =
+                RepinReading::new(CanonicalType::Varchar, CanonicalType::Severity, dialect);
+            let expr = repin_target_expr("\"level\"", true, "level", reading.written);
+            let mut stmt = conn
+                .prepare(&format!("SELECT {expr} FROM f WHERE level = '3'"))
+                .unwrap();
+            stmt.query_row([], |row| row.get::<_, Option<i64>>(0))
+                .unwrap()
+        };
+        assert_eq!(read(Dialect::Otel), Some(3));
+        assert_eq!(read(Dialect::Syslog), Some(17));
+
+        // A non-SEVERITY target has no dialect-sensitive rung at all, so
+        // the ambiguity count is the constant 0 rather than a pair of
+        // expressions DuckDB evaluates to prove they agree.
+        let reading = RepinReading::new(
+            CanonicalType::Varchar,
+            CanonicalType::BigInt,
+            Dialect::Syslog,
+        );
+        let exprs = repin_count_exprs("\"level\"", true, "level", reading);
+        assert_eq!(exprs.ambiguous, "0");
+    }
+
+    /// A repin whose SOURCE is already `SEVERITY` reads its stored column
+    /// dialect-free: the values are canonical ladder positions, and
+    /// re-reading a stored `3` as syslog would silently corrupt it to 17.
+    /// Only the `_raw` arm — the sender's own wire text — takes the
+    /// assertion (issue #79, ruling 1).
+    #[test]
+    fn a_severity_source_keeps_its_stored_arm_dialect_free() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE f AS SELECT * FROM (VALUES \
+             (3::BIGINT, '{\"sev\":\"3\"}'), \
+             (NULL::BIGINT, '{\"sev\":\"3\"}')) t(sev, _raw)",
+        )
+        .unwrap();
+        let reading = RepinReading::new(
+            CanonicalType::Severity,
+            CanonicalType::Severity,
+            Dialect::Syslog,
+        );
+        let expr = repin_target_expr("\"sev\"", true, "sev", reading.written);
+        let mut stmt = conn.prepare(&format!("SELECT {expr} FROM f")).unwrap();
+        let got: Vec<Option<i64>> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            got,
+            vec![Some(3), Some(17)],
+            "the stored canonical 3 is preserved; only the resurrected wire \
+             `3` reads as syslog err"
+        );
+
+        // And the ambiguity variants keep that arm fixed too, so a stored
+        // canonical value is not reported as ambiguous.
+        let exprs = repin_count_exprs("\"sev\"", true, "sev", reading);
+        let ambiguous: i64 = conn
+            .query_row(
+                &format!("SELECT {}::BIGINT FROM f", exprs.ambiguous),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ambiguous, 1,
+            "only the row resurrecting a wire numeral is ambiguous"
         );
     }
 

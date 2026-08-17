@@ -180,6 +180,58 @@ An executing repin confirms interactively; off a TTY it refuses without
 `_raw`). `--to <current type> --force` runs a resurrection-only pass.
 Both commands honour `-f table|json|csv`.
 
+Every report — dry run, running job, terminal job — carries
+`requires_force`: whether the *identical executing* request would be
+refused. A dry run succeeds by design, so without that column a plan
+carrying loss or dialect ambiguity would read as a clean pass and the
+refusal would arrive with the request that was meant to do the work.
+
+#### Putting a sender's own field on the severity ladder
+
+`--to severity` is the one target that changes what values *mean* rather
+than only how they are stored: the field joins `_severity`'s vocabulary, so
+`level=error` becomes a band match, `level>=warn` compares ladder
+positions, and results render tokens.
+
+```bash
+trawl schema repin level --to severity --dry-run                    # plan first
+trawl schema repin level --to severity --dialect syslog --dry-run   # sender speaks syslog PRI
+trawl schema repin level --to severity --yes --force                # accept the plan
+```
+
+`--dialect` reads **numerals only** (tokens are dialect-free): `otel`
+counts up 1-24, `syslog` counts down 0-7 and is inverted. The two ladders
+overlap over 1-7 with opposite meanings — `3` is `trace3` to OTel and `err`
+to syslog — and no value-shape rule can tell them apart, so trawl refuses
+rather than guesses: a corpus carrying those numerals needs either
+`--dialect syslog` or `--force`. The count of such rows is reported
+whatever you assert (`ambiguous_numerals`); only the refusal depends on it.
+`--dialect` with any other target is an error, not an ignored flag.
+
+The report also names the values the new pin cannot read at all (up to five
+distinct samples) and warns when something is **still writing** the field.
+That warning matters: a repin translates **history**. After the cutover,
+live events keep taking the ingest-time reading, so under `--dialect
+syslog` a historical `3` becomes 17 (`err`) while the next live `3`
+conforms as OTel 3 (`trace3`) — one column, two meanings, split at the
+cutover instant. If the sender really speaks syslog PRI, declare it in
+`[ingest] severity_from` (`dialect = "syslog"`) so live events read the
+same way, then repin the history.
+
+**What it costs.** The severity rung is the most expensive conform in the
+vocabulary: it is a token table, an ASCII gate and a guarded numeric read
+per value, measured at roughly **36 µs per affected row** — about 10× any
+other target — so a 100-million-row field is on the order of one CPU-hour
+of rewriting. Retention stands down for the job's whole life and the
+affected bytes are held twice until it sweeps, so size the window before
+starting: a repin that runs for hours is a repin that suppresses deletion
+for hours. Unaffected files are hardlinked and cost nothing, so the number
+that matters is `rows_carrying` in the dry run, not the corpus total.
+
+`repin --to severity` needs `schema_write` and a human, like every other
+repin. `_severity` itself — and every other declared envelope field — is
+refused: its type is part of the event contract.
+
 Embedded mode works for the field listing only — a plain `DESCRIBE` over
 local parquet, no server or postgres needed:
 

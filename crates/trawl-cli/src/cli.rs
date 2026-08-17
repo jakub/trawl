@@ -21,6 +21,28 @@ pub enum OutputFormat {
     Parquet,
 }
 
+/// Which dialect a `SEVERITY` repin reads the corpus's numerals in
+/// (issue #79) — the same closed vocabulary the DSL's `sev()` and the
+/// `[ingest]` derivation config take.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SeverityDialect {
+    /// `OTel` `SeverityNumber`: 1-24, counting up.
+    Otel,
+    /// Syslog PRI severity: 0-7, counting down.
+    Syslog,
+}
+
+impl SeverityDialect {
+    /// The wire token — the one spelling the server parses.
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Otel => "otel",
+            Self::Syslog => "syslog",
+        }
+    }
+}
+
 /// Resolved connection parameters (after config + env + CLI override merge).
 #[derive(Clone)]
 pub struct ConnectionParams {

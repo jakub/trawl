@@ -52,9 +52,16 @@ pub const REPIN_POLL_MS: u32 = 3_000;
 /// store outage must cost one inline warning, not a toast per tick.
 pub const MAX_POLL_ERRORS: u32 = 3;
 
-/// The candidate ladder a repin target is chosen from, in the engine's
-/// own order (`trawl-server/src/repin/engine.rs` rejects anything else
-/// with exactly this list).
+/// The candidate ladder this SPA offers, in the engine's own order.
+///
+/// The engine admits SIX targets since issue #79 — these five PHYSICAL
+/// rungs plus `SEVERITY`. `SEVERITY` is left out DELIBERATELY, not
+/// forgotten: putting a field on the severity ladder means asserting which
+/// dialect its numerals are in (`otel` counts up, `syslog` counts down and
+/// inverts), and that assertion is an operator decision about a sender's
+/// provenance which no modal should be making on their behalf. It is
+/// reachable through `trawl schema repin --to severity --dialect …` and
+/// `POST /api/v1/schema/repin`.
 pub const REPIN_LADDER: [CanonicalType; 5] = [
     CanonicalType::BigInt,
     CanonicalType::Double,

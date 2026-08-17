@@ -222,7 +222,7 @@ conforming cast nulled rows), most recent first, each with a bounded
 POST /api/v1/schema/repin
 ```
 
-Repin a field to a new candidate-ladder type (ADR-0011 slice B): a
+Repin a field to a new catalog type (ADR-0011 slice B): a
 shadow-generation rewrite of every affected file, with resurrection of
 conflict-shelved values from `_raw`, an atomic crash-recoverable cutover,
 and one job at a time install-wide. `schema_write`-gated; a query-only
@@ -232,23 +232,39 @@ node (ingest disabled) answers 503 — it does not own the data root.
 { "field": "status", "to": "VARCHAR", "dry_run": true, "force": false }
 ```
 
+`to` is a catalog spelling: `BIGINT`, `DOUBLE`, `TIMESTAMP`, `BOOLEAN`,
+`VARCHAR` or `SEVERITY` (case-insensitive). `SEVERITY` puts a sender's own
+field on the OTel ladder, and takes an optional `dialect` — `"otel"`
+(default) or `"syslog"` — which reads NUMERALS only; a `dialect` with any
+other target is a 400 rather than an ignored field.
+
 The HTTP status carries the verdict, and the body is the job row in every
 case:
 
 - **200** — a dry-run report: affected files, rows carrying a value,
   `projected_nulls` (stored values the new type cannot read),
-  `resurrectable` (shelved values `_raw` gives back), affected bytes.
-  Dry runs are persisted jobs too — the row *is* the report.
+  `resurrectable` (shelved values `_raw` gives back), affected bytes,
+  `ambiguous_numerals` (rows whose numeral reads as a different severity
+  in each dialect), up to five `unmapped_samples` of the values the new
+  type cannot read, `liveness` when something is still writing the field,
+  and `requires_force` — whether the identical *executing* request would be
+  refused. Dry runs are persisted jobs too — the row *is* the report, and
+  `requires_force` is what keeps a 200 from reading as a green light.
 - **202** — the rewrite started in the background; poll the status route.
 - **400** — refused on the merits, side-effect-free: an unpinned field, a
   declared envelope field, an unknown target type, or `to` equal to the
   current pin without `force` (with `force` that shape runs a
   **resurrection-only** pass — re-extract shelved values under the same
   pin).
-- **409** with a job body — the scan projected nulled values and no
-  `force` flag was passed; the job is terminal `refused_needs_force` and
-  the body is the plan the refusal is based on. (A second repin while one
-  runs also 409s, with the ordinary error envelope.)
+- **409** with a job body — the scan found something the request did not
+  accept and no `force` flag was passed: values the new type cannot read,
+  or (for a `SEVERITY` target read as `otel`) numerals 1-7, which the OTel
+  ladder and syslog PRI read as different severities. The job is terminal
+  `refused_needs_force`, the body is the plan the refusal is based on, and
+  `requires_force_reason` names which of the two it was. Asserting
+  `dialect: "syslog"` answers the ambiguity; `force` accepts either. (A
+  second repin while one runs also 409s, with the ordinary error
+  envelope.)
 
 The request holds open for the whole scan, which is a full-corpus pass —
 minutes on a large archive, past most client and proxy timeouts. A

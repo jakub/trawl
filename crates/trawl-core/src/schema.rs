@@ -94,6 +94,34 @@ pub fn is_reserved_name(name: &str) -> bool {
     name.starts_with('_')
 }
 
+/// The envelope fields the SENDER asserts (ADR-0013 §1): bare names, but
+/// declared slots all the same — trawl mirrors `env`/`service` into the
+/// storage path, peer-fills `host`, and every result surface leads with
+/// `message`.
+///
+/// Bare because the sender is the authority on those VALUES; declared
+/// because their TYPE is part of the event contract, which is what
+/// [`is_contract_typed`] answers — the one public predicate over this
+/// list, so no caller can grow a second opinion about the envelope by
+/// reading the names directly.
+const SENDER_ASSERTED_ENVELOPE: &[&str] = &[ENV, SERVICE, HOST, MESSAGE];
+
+/// Whether a field's TYPE is trawl's to declare rather than an operator's
+/// to change (issue #79).
+///
+/// The union of the two namespaces the envelope spans: everything under the
+/// sealed `_` prefix ([`is_reserved_name`], which covers every trawl-owned
+/// slot present AND future) plus the four sender-asserted bare names
+/// ([`SENDER_ASSERTED_ENVELOPE`]). A repin retypes ONE field's corpus, and
+/// these are exactly the fields whose type the rest of the system reasons
+/// from — the partition path, the peer fill, the severity ladder — so the
+/// refusal is a predicate over the contract rather than a list of names
+/// somewhere else that has to be kept in step with the envelope.
+#[must_use]
+pub fn is_contract_typed(name: &str) -> bool {
+    is_reserved_name(name) || SENDER_ASSERTED_ENVELOPE.contains(&name)
+}
+
 /// The one refusal text every pipeline write position shares, so the SQL
 /// lane and the streaming lane state the same rule in the same words.
 #[must_use]
@@ -198,8 +226,10 @@ impl CanonicalType {
     ///
     /// `BIGINT` resolves to [`Self::BigInt`] and nothing resolves to
     /// [`Self::Severity`] — the semantic pin has no physical spelling of
-    /// its own, which is exactly what keeps `repin --to severity` (slice
-    /// 2) out of the operator surface for now.
+    /// its own, so INFERENCE can never mint it (`DESCRIBE` reports the
+    /// physical type, and [`normalize_duckdb_type`] goes through this
+    /// door). An OPERATOR can now name it: `repin --to severity` parses
+    /// through [`Self::from_catalog`] (issue #79).
     #[must_use]
     pub fn from_duckdb(s: &str) -> Option<Self> {
         match s {
@@ -226,6 +256,13 @@ impl CanonicalType {
     /// Parse the catalog's stored spelling back into the enum. EXACT match
     /// only — the catalog is written by code, so any other spelling is
     /// corruption and must surface, not be guessed at.
+    ///
+    /// This is also the REPIN admission door (issue #79), which retracts
+    /// migration 0010's header claim that `repin --to severity` "parses
+    /// through the physical door": it parses here now, and `SEVERITY` is a
+    /// target an operator can name. What 0010 was really protecting still
+    /// holds — inference cannot mint the pin, because
+    /// [`normalize_duckdb_type`] goes through [`Self::from_duckdb`].
     #[must_use]
     pub fn from_catalog(s: &str) -> Option<Self> {
         match s {
@@ -431,6 +468,37 @@ mod tests {
         }
     }
 
+    /// The contract-typed predicate must cover the WHOLE declared envelope,
+    /// whichever namespace a slot lives in — it is what refuses a repin of
+    /// a field whose type the event contract fixes, and a slot added to
+    /// `ENVELOPE_TYPES` without a matching name here would become
+    /// repinnable silently.
+    #[test]
+    fn every_envelope_field_is_contract_typed() {
+        for (field, _) in ENVELOPE_TYPES {
+            assert!(is_contract_typed(field), "{field} escaped the predicate");
+        }
+        for name in SENDER_ASSERTED_ENVELOPE {
+            assert!(!is_reserved_name(name), "{name} is bare by design");
+            assert!(
+                ENVELOPE_TYPES.iter().any(|(f, _)| f == name),
+                "{name} must be a declared envelope field"
+            );
+        }
+        // Sender vocabulary is the operator's to repin, including the names
+        // that used to be envelope slots (ADR-0013 §7).
+        for name in [
+            "level",
+            "severity",
+            "timestamp",
+            "status",
+            "duration",
+            "env2",
+        ] {
+            assert!(!is_contract_typed(name), "{name}");
+        }
+    }
+
     #[test]
     fn storable_field_names_are_bounded_in_bytes() {
         assert!(is_storable_field_name("duration"));
@@ -485,8 +553,9 @@ mod tests {
     /// The PHYSICAL spelling is what casts and DDL use, and it is
     /// deliberately NOT injective: `SEVERITY` is a BIGINT on disk, so
     /// `from_duckdb` — the inverse of the physical spelling — cannot
-    /// name it. That is the structural reason `repin --to severity` is a
-    /// slice-2 feature rather than a live foot-gun.
+    /// name it. That is what keeps INFERENCE from minting the pin;
+    /// admission for an operator's `--to severity` goes through
+    /// `from_catalog` instead (issue #79).
     #[test]
     fn severity_is_physically_bigint_and_unreachable_by_physical_parse() {
         assert_eq!(CanonicalType::Severity.as_duckdb(), "BIGINT");

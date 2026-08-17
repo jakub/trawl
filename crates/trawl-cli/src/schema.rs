@@ -752,6 +752,8 @@ mod tests {
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)] // four independent CLI switches
 pub struct RepinFlags {
+    /// The asserted numeral dialect, for a `SEVERITY` target only.
+    pub dialect: Option<crate::cli::SeverityDialect>,
     /// Scan and report only.
     pub dry_run: bool,
     /// Accept a lossy projection / run a resurrection-only pass.
@@ -764,21 +766,43 @@ pub struct RepinFlags {
 
 /// One repin job → generic key/value (columns, rows) for the driver
 /// formatter — the job is a single record, so it renders as one row.
-pub fn repin_job_to_rows(job: &trawl_client::RepinJobResponse) -> (Vec<String>, Vec<Vec<Json>>) {
+///
+/// EVERY fact rides the ROW — dialect, ambiguity, samples, liveness, the
+/// force verdict and its reason — because a scripted caller reading
+/// `-f json` or `-f csv` must not have to parse the prose the case file
+/// writes for a human (issue #79). `requires_force` is NULL, not `false`,
+/// while the scan has yet to record a plan: absent is "not known yet".
+///
+/// The samples are an ARRAY in JSON and a joined string everywhere else:
+/// a spreadsheet's formula-injection rule fires on a cell's FIRST
+/// character, so a joined cell puts the first sample there where
+/// `csv_escape_string`'s `'` prefix can neutralise it — inside a rendered
+/// JSON array it would sit behind a `[` and be invisible to that rule.
+pub fn repin_job_to_rows(
+    job: &trawl_client::RepinJobResponse,
+    format: OutputFormat,
+) -> (Vec<String>, Vec<Vec<Json>>) {
     let columns = [
         "id",
         "field",
         "from",
         "to",
+        "dialect",
         "status",
         "files_total",
         "files_done",
         "rows_carrying",
         "projected_nulls",
         "resurrectable",
+        "ambiguous_numerals",
         "rows_rewritten",
         "rows_nulled",
         "rows_resurrected",
+        "unmapped_samples",
+        "field_last_seen",
+        "field_last_service",
+        "requires_force",
+        "requires_force_reason",
         "error",
     ]
     .map(str::to_owned)
@@ -788,18 +812,144 @@ pub fn repin_job_to_rows(job: &trawl_client::RepinJobResponse) -> (Vec<String>, 
         Json::from(job.field.clone()),
         Json::from(job.from_type.clone()),
         Json::from(job.to_type.clone()),
+        job.dialect.clone().map_or(Json::Null, Json::from),
         Json::from(job.status.clone()),
         Json::from(job.files_total),
         Json::from(job.files_done),
         Json::from(job.rows_carrying),
         Json::from(job.projected_nulls),
         Json::from(job.resurrectable),
+        Json::from(job.ambiguous_numerals),
         Json::from(job.rows_rewritten),
         Json::from(job.rows_nulled),
         Json::from(job.rows_resurrected),
+        if format == OutputFormat::Json {
+            Json::Array(
+                job.unmapped_samples
+                    .iter()
+                    .map(|s| Json::from(s.clone()))
+                    .collect(),
+            )
+        } else if job.unmapped_samples.is_empty() {
+            Json::Null
+        } else {
+            Json::from(job.unmapped_samples.join(", "))
+        },
+        job.liveness
+            .as_ref()
+            .map_or(Json::Null, |l| Json::from(l.last_seen.clone())),
+        job.liveness
+            .as_ref()
+            .map_or(Json::Null, |l| Json::from(l.service.clone())),
+        job.requires_force.map_or(Json::Null, Json::from),
+        job.requires_force_reason
+            .clone()
+            .map_or(Json::Null, Json::from),
         job.error.clone().map_or(Json::Null, Json::from),
     ]];
     (columns, rows)
+}
+
+/// The repin report's case file: the evidence a plan's NUMBERS cannot carry
+/// — what the new pin cannot read, whether the corpus is dialect-ambiguous,
+/// whether anything is still WRITING the field, and why force is required
+/// (issue #79).
+///
+/// Facts from the job row, phrased here (the ADR-0011 slice C ruling: the
+/// server ships facts, the consumer writes the words). Every value is
+/// sender-chosen text and every one of them goes through display
+/// sanitisation — samples are attacker text by definition, and this lands in
+/// a terminal.
+fn render_repin_case_file<W: Write>(
+    out: &mut W,
+    human: bool,
+    job: &trawl_client::RepinJobResponse,
+) -> Result<(), CliError> {
+    if let Some(dialect) = &job.dialect {
+        label(
+            out,
+            human,
+            &format!(
+                "\nnumeral dialect: {} (words are dialect-free; this reads NUMERALS)",
+                trawl_core::sanitize::sanitize_display_text(dialect)
+            ),
+        )?;
+    }
+    if job.ambiguous_numerals > 0 {
+        label(
+            out,
+            human,
+            &format!(
+                "  ambiguous numerals: {} row(s) carry 1-7, which OTel reads as \
+                 trace/debug and syslog PRI reads as err/crit",
+                job.ambiguous_numerals
+            ),
+        )?;
+    }
+    if !job.unmapped_samples.is_empty() {
+        label(out, human, "\nvalues the new pin cannot read:")?;
+        for sample in &job.unmapped_samples {
+            label(
+                out,
+                human,
+                &format!(
+                    "  - {}",
+                    trawl_core::sanitize::sanitize_display_text(sample)
+                ),
+            )?;
+        }
+        label(
+            out,
+            human,
+            "  (originals stay findable in _raw, whatever this repin writes)",
+        )?;
+    }
+
+    // Ruling 8: the operator has to be told that a repin translates HISTORY
+    // only. A live sender keeps arriving in the INGEST-time reading, so a
+    // syslog rewrite leaves a discontinuity at the cutover instant, and the
+    // fix for the live half is config, not another repin.
+    if let Some(live) = &job.liveness {
+        let service = trawl_core::sanitize::sanitize_display_text(&live.service);
+        label(
+            out,
+            human,
+            &format!(
+                "\nwarning: {} is STILL being written (last seen {} by service \
+                 {service}). A repin rewrites HISTORY: after the cutover, live \
+                 events keep taking the INGEST-time reading, so under \
+                 --dialect syslog a historical `3` becomes 17 (err) while the \
+                 next live `3` conforms as OTel 3 (trace3) — one column, two \
+                 meanings, split at the cutover instant. If that sender speaks \
+                 syslog PRI, declare it in [ingest] severity_from (dialect = \
+                 \"syslog\") so live events read the same way, then repin the \
+                 history.",
+                trawl_core::sanitize::sanitize_display_text(&job.field),
+                live.last_seen
+            ),
+        )?;
+    }
+
+    match (job.requires_force, &job.requires_force_reason) {
+        (Some(true), Some(reason)) => label(
+            out,
+            human,
+            &format!(
+                "\nrequires --force: {}",
+                trawl_core::sanitize::sanitize_display_text(reason)
+            ),
+        )?,
+        // The scan has not measured the corpus yet, so there is no verdict
+        // to report — saying "no force needed" here would be a promise the
+        // finished scan may contradict.
+        (None, _) => label(
+            out,
+            human,
+            "\nforce verdict: not known yet (the scan has not recorded its plan)",
+        )?,
+        _ => {}
+    }
+    Ok(())
 }
 
 /// `trawl schema repin <field> --to <type>`.
@@ -816,6 +966,15 @@ pub async fn run_repin(
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
     let format = resolve_format(format)?;
+    // Refused here as well as server-side, because this one is a typo an
+    // operator can fix without spending a job claim: the dialect reads
+    // numerals onto the severity ladder, so no other target has anywhere to
+    // put it.
+    if flags.dialect.is_some() && !to.eq_ignore_ascii_case("severity") {
+        return Err(CliError::Usage(format!(
+            "--dialect applies to --to severity only (got --to {to})"
+        )));
+    }
     if !flags.dry_run && !flags.yes {
         if io::stdin().is_terminal() && io::stdout().is_terminal() {
             eprint!(
@@ -839,7 +998,13 @@ pub async fn run_repin(
 
     let client = make_client(&conn)?;
     let outcome = client
-        .schema_repin(field, to, flags.dry_run, flags.force)
+        .schema_repin(
+            field,
+            to,
+            flags.dialect.map(crate::cli::SeverityDialect::token),
+            flags.dry_run,
+            flags.force,
+        )
         .await?;
     let (verdict, job) = match outcome {
         trawl_client::RepinStart::Report(job) => ("dry run", job),
@@ -859,11 +1024,23 @@ pub async fn run_repin(
     if format == OutputFormat::Table {
         writeln!(out, "repin {}: {verdict}", job.field)?;
     }
-    let (columns, rows) = repin_job_to_rows(&job);
+    let (columns, rows) = repin_job_to_rows(&job, format);
     render_driver_results(&columns, &rows, format, out)?;
+    // The case file goes to stdout for a human and to STDERR for a machine
+    // format (`label`), so a piped `-f json` stays one parseable record while
+    // the operator still reads the evidence.
+    render_repin_case_file(out, format == OutputFormat::Table, &job)?;
     if refused {
         // A pre-scan refusal reports its projection; a cutover refusal
-        // reports what the finished rewrite actually nulled.
+        // reports what the finished rewrite actually nulled. The server's own
+        // reason is the authoritative one when it sent it — the two gates and
+        // the wire all ask one function, and it names ambiguity as well as
+        // loss.
+        if let Some(reason) = job.requires_force_reason {
+            return Err(CliError::Usage(format!(
+                "repin refused: {reason} — re-run with --force to accept it"
+            )));
+        }
         let lost = if job.rows_nulled > 0 {
             job.rows_nulled
         } else {
@@ -908,8 +1085,9 @@ pub async fn run_repin_status(
     let status = client.schema_repin_status().await?;
     match status.job {
         Some(job) => {
-            let (columns, rows) = repin_job_to_rows(&job);
+            let (columns, rows) = repin_job_to_rows(&job, format);
             render_driver_results(&columns, &rows, format, out)?;
+            render_repin_case_file(out, format == OutputFormat::Table, &job)?;
         }
         None => writeln!(out, "no repin job has ever run")?,
     }
@@ -942,6 +1120,12 @@ mod repin_tests {
             rows_rewritten: 1200,
             rows_nulled: 0,
             rows_resurrected: 25,
+            dialect: None,
+            ambiguous_numerals: 0,
+            unmapped_samples: Vec::new(),
+            liveness: None,
+            requires_force: Some(false),
+            requires_force_reason: None,
         }
     }
 
@@ -949,7 +1133,7 @@ mod repin_tests {
     /// format the schema family honours.
     #[test]
     fn repin_job_renders_in_table_json_and_csv() {
-        let (columns, rows) = repin_job_to_rows(&sample_job());
+        let (columns, rows) = repin_job_to_rows(&sample_job(), OutputFormat::Table);
         for format in [OutputFormat::Table, OutputFormat::Json, OutputFormat::Csv] {
             let mut out = Vec::new();
             render_driver_results(&columns, &rows, format, &mut out).unwrap();
@@ -963,6 +1147,197 @@ mod repin_tests {
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["resurrectable"], 25);
         assert_eq!(parsed["projected_nulls"], 0);
+    }
+
+    /// AC9: the operator-facing transcript of a `--dry-run` over the
+    /// acceptance corpus, rendered by the real CLI path.
+    ///
+    /// The numbers are the ones the server produces in
+    /// `trawl-server/tests/repin.rs::repin_to_severity_dry_run_matches_the_executed_rewrite`
+    /// (five rows carrying, one unreadable `gold`, one dialect-ambiguous
+    /// `3`), so this pins what an operator actually READS when the plan says
+    /// the executing request would refuse.
+    #[test]
+    fn the_dry_run_transcript_shows_the_plan_the_evidence_and_the_verdict() {
+        let job = trawl_client::RepinJobResponse {
+            id: 1,
+            field: "level".into(),
+            from_type: "VARCHAR".into(),
+            to_type: "SEVERITY".into(),
+            dry_run: true,
+            force: false,
+            status: "succeeded".into(),
+            requested_by: Some("ops".into()),
+            started_at: "2026-08-17T12:00:00Z".into(),
+            finished_at: Some("2026-08-17T12:00:01Z".into()),
+            error: None,
+            files_total: 1,
+            rows_carrying: 5,
+            projected_nulls: 1,
+            resurrectable: 0,
+            affected_bytes: 4096,
+            files_done: 0,
+            rows_rewritten: 0,
+            rows_nulled: 0,
+            rows_resurrected: 0,
+            dialect: Some("otel".into()),
+            ambiguous_numerals: 1,
+            unmapped_samples: vec!["gold".into()],
+            liveness: Some(trawl_client::RepinLiveness {
+                last_seen: "2026-08-17T11:59:58Z".into(),
+                service: "api".into(),
+            }),
+            requires_force: Some(true),
+            requires_force_reason: Some(
+                "1 stored value(s) cannot be read as SEVERITY and would be nulled \
+                 (the originals stay findable in _raw)"
+                    .into(),
+            ),
+        };
+
+        let mut out = Vec::new();
+        writeln!(out, "repin {}: dry run", job.field).unwrap();
+        let (columns, rows) = repin_job_to_rows(&job, OutputFormat::Table);
+        render_driver_results(&columns, &rows, OutputFormat::Table, &mut out).unwrap();
+        render_repin_case_file(&mut out, true, &job).unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        // Printed so the run can be pasted into a PR body verbatim
+        // (`cargo nextest run --no-capture`).
+        println!("{text}");
+
+        for expected in [
+            "repin level: dry run",
+            "SEVERITY",
+            "otel",
+            "values the new pin cannot read:",
+            "- gold",
+            "STILL being written",
+            "requires --force:",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+    }
+
+    /// The case file is the evidence a plan's NUMBERS cannot carry: the
+    /// asserted dialect, the ambiguous rows, the values the pin cannot read,
+    /// the force verdict — and, for a field something is still WRITING, the
+    /// discontinuity warning (issue #79, ruling 8): a repin translates
+    /// history, while live events keep taking the ingest-time reading.
+    #[test]
+    fn the_repin_case_file_states_the_evidence_and_the_discontinuity() {
+        let mut job = sample_job();
+        job.field = "level".into();
+        job.to_type = "SEVERITY".into();
+        job.dialect = Some("syslog".into());
+        job.ambiguous_numerals = 3;
+        job.unmapped_samples = vec!["gold".into(), "platinum".into()];
+        job.liveness = Some(trawl_client::RepinLiveness {
+            last_seen: "2026-08-17T09:00:00Z".into(),
+            service: "nginx".into(),
+        });
+        job.requires_force = Some(true);
+        job.requires_force_reason = Some("2 stored value(s) cannot be read as SEVERITY".into());
+
+        let mut out = Vec::new();
+        render_repin_case_file(&mut out, true, &job).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("numeral dialect: syslog"), "{text}");
+        assert!(text.contains("ambiguous numerals: 3 row(s)"), "{text}");
+        assert!(
+            text.contains("- gold") && text.contains("- platinum"),
+            "{text}"
+        );
+        assert!(text.contains("_raw"), "{text}");
+        // The discontinuity, in the operator's terms and with the remedy.
+        assert!(text.contains("STILL being written"), "{text}");
+        assert!(text.contains("nginx"), "{text}");
+        assert!(text.contains("historical `3` becomes 17"), "{text}");
+        assert!(text.contains("severity_from"), "{text}");
+        assert!(text.contains("requires --force:"), "{text}");
+
+        // A clean plan says none of it — no dialect line for a non-severity
+        // target, no warning for a field nothing writes.
+        let mut out = Vec::new();
+        render_repin_case_file(&mut out, true, &sample_job()).unwrap();
+        assert!(String::from_utf8(out).unwrap().is_empty());
+    }
+
+    /// The ROW carries every fact, in every machine format: a scripted
+    /// caller must never have to parse the case file's prose (issue #79
+    /// review). CSV joins the samples into ONE cell (", "-separated) so the
+    /// first sample's first character is the cell's first character — where
+    /// the formula-injection prefix actually fires; rendered as a JSON
+    /// array, a hostile sample would hide behind the `[`.  JSON keeps the
+    /// real array.
+    #[test]
+    fn the_repin_row_carries_the_evidence_in_every_machine_format() {
+        let mut job = sample_job();
+        job.dialect = Some("otel".into());
+        job.ambiguous_numerals = 7;
+        job.unmapped_samples = vec!["gold".into(), "=cmd()".into()];
+        job.liveness = Some(trawl_client::RepinLiveness {
+            last_seen: "2026-08-17T09:00:00Z".into(),
+            service: "nginx".into(),
+        });
+        job.requires_force = Some(true);
+        job.requires_force_reason = Some("2 stored value(s) cannot be read".into());
+        let render = |format| {
+            let (columns, rows) = repin_job_to_rows(&job, format);
+            let mut out = Vec::new();
+            render_driver_results(&columns, &rows, format, &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+
+        let parsed: Json =
+            serde_json::from_str(render(OutputFormat::Json).lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["dialect"], "otel");
+        assert_eq!(parsed["ambiguous_numerals"], 7);
+        assert_eq!(parsed["requires_force"], true);
+        assert_eq!(
+            parsed["requires_force_reason"],
+            "2 stored value(s) cannot be read"
+        );
+        assert_eq!(parsed["unmapped_samples"][0], "gold");
+        assert_eq!(parsed["field_last_seen"], "2026-08-17T09:00:00Z");
+        assert_eq!(parsed["field_last_service"], "nginx");
+
+        let csv = render(OutputFormat::Csv);
+        assert!(csv.contains("unmapped_samples"), "{csv}");
+        assert!(csv.contains("gold"), "{csv}");
+        assert!(csv.contains("nginx"), "{csv}");
+        assert!(csv.contains("2 stored value(s) cannot be read"), "{csv}");
+
+        let table = render(OutputFormat::Table);
+        assert!(table.contains("otel") && table.contains("nginx"), "{table}");
+
+        // A sample whose FIRST character is a formula trigger lands at the
+        // start of the joined cell, where the CSV escaping neutralises it.
+        let mut hostile = job.clone();
+        hostile.unmapped_samples = vec!["=cmd()".into(), "gold".into()];
+        let (columns, rows) = repin_job_to_rows(&hostile, OutputFormat::Csv);
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Csv, &mut out).unwrap();
+        let csv = String::from_utf8(out).unwrap();
+        assert!(csv.contains("'=cmd()"), "formula prefix missing: {csv}");
+
+        // A job whose scan has not recorded a plan reports NO verdict —
+        // never `false`, which would read as "safe to execute".
+        let mut running = sample_job();
+        running.status = "running".into();
+        running.requires_force = None;
+        running.requires_force_reason = None;
+        let (columns, rows) = repin_job_to_rows(&running, OutputFormat::Json);
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        let parsed: Json =
+            serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["requires_force"], Json::Null);
+        let mut out = Vec::new();
+        render_repin_case_file(&mut out, true, &running).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("not known yet"), "{text}");
+        assert!(!text.contains("requires --force"), "{text}");
     }
 
     /// An executing repin off a TTY refuses without `--yes` BEFORE any
@@ -982,6 +1357,7 @@ mod repin_tests {
             "status",
             "VARCHAR",
             RepinFlags {
+                dialect: None,
                 dry_run: false,
                 force: false,
                 yes: false,
@@ -996,5 +1372,57 @@ mod repin_tests {
             "got {err:?}"
         );
         assert!(out.is_empty(), "nothing rendered before the refusal");
+    }
+
+    /// `--dialect` is a SEVERITY-only assertion, refused here before any
+    /// network access — the server refuses it too, but this one is a typo
+    /// an operator can fix without spending a job claim. A severity target
+    /// carries it through (the refusal below is the `--yes` gate, i.e. the
+    /// dialect check passed).
+    #[tokio::test]
+    async fn dialect_applies_to_a_severity_target_only() {
+        let conn = ConnectionParams {
+            url: "https://127.0.0.1:1".into(),
+            token: "unused".into(),
+            insecure: true,
+        };
+        let flags = RepinFlags {
+            dialect: Some(crate::cli::SeverityDialect::Syslog),
+            dry_run: true,
+            force: false,
+            yes: false,
+            wait: false,
+        };
+        for to in ["VARCHAR", "bigint"] {
+            let mut out = Vec::new();
+            let err = run_repin(&mut out, conn.clone(), "level", to, flags, None)
+                .await
+                .expect_err("a dialect on a non-severity target must refuse");
+            assert!(
+                matches!(err, CliError::Usage(ref msg) if msg.contains("--to severity only")),
+                "{to}: got {err:?}"
+            );
+            assert!(out.is_empty());
+        }
+        // A severity target gets past the flag check and stops at the
+        // execute-confirmation gate instead.
+        let mut out = Vec::new();
+        let err = run_repin(
+            &mut out,
+            conn,
+            "level",
+            "severity",
+            RepinFlags {
+                dry_run: false,
+                ..flags
+            },
+            Some(OutputFormat::Json),
+        )
+        .await
+        .expect_err("no TTY, no --yes");
+        assert!(
+            matches!(err, CliError::Usage(ref msg) if msg.contains("--yes")),
+            "got {err:?}"
+        );
     }
 }

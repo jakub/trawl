@@ -2739,7 +2739,7 @@ fn pattern_targets_take_like_and_ilike() {
 /// target over a conflict-shaped corpus.
 #[test]
 fn resurrection_recovers_shelved_values_per_ladder_target() {
-    use trawl_core::conform::resurrection_expr;
+    use trawl_core::conform::{RepinTarget, resurrection_expr};
 
     let conn = conn();
     // A BIGINT-pinned column after a lossy conform: `404` survived, the
@@ -2758,7 +2758,12 @@ fn resurrection_recovers_shelved_values_per_ladder_target() {
     // Repin BIGINT -> VARCHAR: the stored value keeps its canonical text,
     // the shelved values come back as their wire text, non-JSON `_raw`
     // resurrects nothing.
-    let expr = resurrection_expr("v", "\"_raw\"", "status", CanonicalType::Varchar);
+    let expr = resurrection_expr(
+        "v",
+        "\"_raw\"",
+        "status",
+        RepinTarget::otel(CanonicalType::Varchar),
+    );
     let got: Vec<Option<String>> = conn
         .prepare(&format!("SELECT {expr} FROM t"))
         .unwrap()
@@ -2778,7 +2783,12 @@ fn resurrection_recovers_shelved_values_per_ladder_target() {
 
     // Repin BIGINT -> DOUBLE: the numeric raw value reads, the enum text
     // has no reading (NULL, counted as a projected null).
-    let expr = resurrection_expr("v", "\"_raw\"", "status", CanonicalType::Double);
+    let expr = resurrection_expr(
+        "v",
+        "\"_raw\"",
+        "status",
+        RepinTarget::otel(CanonicalType::Double),
+    );
     let got: Vec<Option<f64>> = conn
         .prepare(&format!("SELECT {expr} FROM t"))
         .unwrap()
@@ -2798,7 +2808,12 @@ fn resurrection_recovers_shelved_values_per_ladder_target() {
          ('7', '{\"dur\":7}')",
     )
     .unwrap();
-    let expr = resurrection_expr("v", "\"_raw\"", "dur", CanonicalType::BigInt);
+    let expr = resurrection_expr(
+        "v",
+        "\"_raw\"",
+        "dur",
+        RepinTarget::otel(CanonicalType::BigInt),
+    );
     let got: Vec<Option<i64>> = conn
         .prepare(&format!("SELECT {expr} FROM g"))
         .unwrap()
@@ -2821,11 +2836,11 @@ fn resurrection_recovers_shelved_values_per_ladder_target() {
 /// mixed-case original, and the exact spelling wins when both exist.
 #[test]
 fn raw_extraction_is_exact_key_lookup_and_survives_hostile_keys() {
-    use trawl_core::conform::resurrection_expr;
+    use trawl_core::conform::{RepinTarget, resurrection_expr};
 
     let conn = conn();
     let read = |field: &str, raw: &str| -> Option<String> {
-        let expr = resurrection_expr("v", "r", field, CanonicalType::Varchar);
+        let expr = resurrection_expr("v", "r", field, RepinTarget::otel(CanonicalType::Varchar));
         conn.query_row(
             &format!(
                 "SELECT {expr} FROM (SELECT CAST(NULL AS VARCHAR) AS v, '{}' AS r)",
@@ -2879,7 +2894,7 @@ fn raw_extraction_is_exact_key_lookup_and_survives_hostile_keys() {
 fn raw_guard_is_vector_safe_over_mixed_validity() {
     use std::fmt::Write as _;
 
-    use trawl_core::conform::resurrection_expr;
+    use trawl_core::conform::{RepinTarget, resurrection_expr};
 
     let conn = conn();
     conn.execute_batch("CREATE TABLE m (v VARCHAR, r VARCHAR)")
@@ -2897,7 +2912,7 @@ fn raw_guard_is_vector_safe_over_mixed_validity() {
     }
     conn.execute_batch(&insert).unwrap();
 
-    let expr = resurrection_expr("v", "r", "k", CanonicalType::Varchar);
+    let expr = resurrection_expr("v", "r", "k", RepinTarget::otel(CanonicalType::Varchar));
     let (rows, recovered): (i64, i64) = conn
         .query_row(
             &format!("SELECT count(*)::BIGINT, count({expr})::BIGINT FROM m"),
@@ -3157,6 +3172,71 @@ fn left_truncates_by_character_not_by_byte() {
 // The SEVERITY canonical type (ADR-0013)
 // ---------------------------------------------------------------------------
 
+/// The severity reading matrix: the cases where the two engines have
+/// their OWN opinions about a value, shared by every probe that pairs a
+/// reading against the Rust kernel (the conform rung in either dialect,
+/// and the dialect-ambiguity classifier).
+const SEVERITY_READING_CASES: &[&str] = &[
+    "error",
+    "ERR",
+    " error ",
+    "error2",
+    "ERROR2",
+    "warn",
+    "notice",
+    "0",
+    "1",
+    "7",
+    "8",
+    "24",
+    "25",
+    "0404",
+    "007",
+    "+17",
+    "-1",
+    "1.5",
+    "17.0",
+    "1_2",
+    "1e1",
+    "0x10",
+    "9223372036854775807",
+    "9223372036854775808",
+    "99999999999999999999999999",
+    "",
+    "   ",
+    "\t 17 \r\n",
+    "\u{a0}error",
+    "gold",
+    "nan",
+    "inf",
+    // `DuckDB`'s `lower()` is UNICODE and the kernel's fold is ASCII:
+    // `lower('İ')` is `i`, so an ungated token CASE read `İNFO` as 9
+    // in SQL and as nothing in Rust. Both dotted/dotless Turkish i,
+    // a full-width digit (which `TRY_CAST` also refuses), and a
+    // Kelvin sign that folds to `k`.
+    "İNFO",
+    "info\u{307}",
+    "ı",
+    "İ",
+    "\u{212a}",
+    "ＩＮＦＯ",
+    "１７",
+    "ERROR",
+    "Warning",
+    // The trim set is the Unicode `White_Space` property on BOTH
+    // engines (`DuckDB` matches a multibyte character set by
+    // character, which is what licenses the wide set): a padded
+    // token was accepted by ingest before the kernel landed, and a
+    // narrowing here would drop those readings silently.
+    "\u{a0}error\u{a0}",
+    "\u{2003}error",
+    "\u{3000}error\u{3000}",
+    "\u{85}error",
+    "\u{202f}\u{2009}error\t",
+    "\u{a0}17\u{a0}",
+    "er\u{a0}ror",
+];
+
 /// The reading matrix (ADR-0013 slice 2, ruling 9): `severity_reading_sql`
 /// answers what `severity::reading` answers, case by case, in BOTH
 /// dialects — the whole basis for one kernel serving ingest, `sev()` and
@@ -3174,66 +3254,7 @@ fn severity_reading_sql_matches_the_rust_kernel_in_both_dialects() {
     use trawl_core::severity::{self, Dialect};
 
     let conn = conn();
-    let cases: &[&str] = &[
-        "error",
-        "ERR",
-        " error ",
-        "error2",
-        "ERROR2",
-        "warn",
-        "notice",
-        "0",
-        "1",
-        "7",
-        "8",
-        "24",
-        "25",
-        "0404",
-        "007",
-        "+17",
-        "-1",
-        "1.5",
-        "17.0",
-        "1_2",
-        "1e1",
-        "0x10",
-        "9223372036854775807",
-        "9223372036854775808",
-        "99999999999999999999999999",
-        "",
-        "   ",
-        "\t 17 \r\n",
-        "\u{a0}error",
-        "gold",
-        "nan",
-        "inf",
-        // `DuckDB`'s `lower()` is UNICODE and the kernel's fold is ASCII:
-        // `lower('İ')` is `i`, so an ungated token CASE read `İNFO` as 9
-        // in SQL and as nothing in Rust. Both dotted/dotless Turkish i,
-        // a full-width digit (which `TRY_CAST` also refuses), and a
-        // Kelvin sign that folds to `k`.
-        "İNFO",
-        "info\u{307}",
-        "ı",
-        "İ",
-        "\u{212a}",
-        "ＩＮＦＯ",
-        "１７",
-        "ERROR",
-        "Warning",
-        // The trim set is the Unicode `White_Space` property on BOTH
-        // engines (`DuckDB` matches a multibyte character set by
-        // character, which is what licenses the wide set): a padded
-        // token was accepted by ingest before the kernel landed, and a
-        // narrowing here would drop those readings silently.
-        "\u{a0}error\u{a0}",
-        "\u{2003}error",
-        "\u{3000}error\u{3000}",
-        "\u{85}error",
-        "\u{202f}\u{2009}error\t",
-        "\u{a0}17\u{a0}",
-        "er\u{a0}ror",
-    ];
+    let cases: &[&str] = SEVERITY_READING_CASES;
     for dialect in [Dialect::Otel, Dialect::Syslog] {
         for text in cases {
             let escaped = text.replace('\'', "''");
@@ -3420,6 +3441,126 @@ fn severity_conform_rung_bounds_the_ladder_on_both_engines() {
         let live = trawl_core::compare::conformed_severity(text).map(i64::from);
         assert_eq!(sql_reading, live, "severity conform disagreed on {text:?}");
     }
+}
+
+/// The SEVERITY conform rung under an ASSERTED dialect (issue #79): a
+/// repin may declare that a corpus's numerals are syslog PRI, and the rung
+/// it gets must be the kernel's syslog reading — not a second expression
+/// that agrees on the cases somebody thought of.
+///
+/// Executed over the whole reading matrix in both dialects, against the
+/// Rust kernel, because this is the expression an operator's `--dialect`
+/// flag reaches: a drift here rewrites a corpus to numbers no lane will
+/// ever read back.
+#[test]
+fn severity_conform_rung_reads_the_asserted_dialect() {
+    use trawl_core::severity::{self, Dialect};
+
+    let conn = conn();
+    for dialect in [Dialect::Otel, Dialect::Syslog] {
+        for text in SEVERITY_READING_CASES {
+            let escaped = text.replace('\'', "''");
+            let subject = format!("'{escaped}'");
+            // The rung IS the reading, byte for byte — the same identity
+            // the OTel rung has, one dialect over.
+            assert_eq!(
+                trawl_core::conform::guarded_cast_in(&subject, CanonicalType::Severity, dialect),
+                trawl_core::conform::severity_reading_sql(&subject, dialect),
+                "{dialect:?} rung is not the reading for {text:?}"
+            );
+            let sql = format!(
+                "SELECT {}",
+                trawl_core::conform::guarded_cast_in(&subject, CanonicalType::Severity, dialect)
+            );
+            let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(
+                engine,
+                severity::reading_text(text, dialect).map(i64::from),
+                "{dialect:?} conform disagreed on {text:?}\n{sql}"
+            );
+        }
+    }
+
+    // The inversion is the whole point: the same stored numeral conforms
+    // to its OTel rung under one assertion and to the syslog rung under
+    // the other, so the dialect is data-changing and must be asserted.
+    for (numeral, otel, syslog) in [(3i64, 3i64, 17i64), (7, 7, 5), (1, 1, 23)] {
+        for (dialect, want) in [(Dialect::Otel, otel), (Dialect::Syslog, syslog)] {
+            let sql = format!(
+                "SELECT {}",
+                trawl_core::conform::guarded_cast_in(
+                    &format!("'{numeral}'"),
+                    CanonicalType::Severity,
+                    dialect
+                )
+            );
+            let engine: Option<i64> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+            assert_eq!(engine, Some(want), "{numeral} under {dialect:?}");
+        }
+    }
+
+    // Every other pin is dialect-INVARIANT by execution as well as by
+    // spelling, which is what lets one dialect ride a pin-generic plan.
+    for pin in [
+        CanonicalType::BigInt,
+        CanonicalType::Double,
+        CanonicalType::Timestamp,
+        CanonicalType::Boolean,
+        CanonicalType::Varchar,
+    ] {
+        assert_eq!(
+            trawl_core::conform::guarded_cast_in("'3'", pin, Dialect::Otel),
+            trawl_core::conform::guarded_cast_in("'3'", pin, Dialect::Syslog),
+            "{pin:?} read a dialect"
+        );
+    }
+}
+
+/// The dialect-ambiguity classifier is ONE predicate in two engines
+/// (issue #79): `conform::severity_dialect_ambiguous_sql` in SQL,
+/// `severity::dialect_ambiguous` in Rust. The repin's force gate fires on
+/// the SQL half and the operator reads the Rust half's vocabulary, so a
+/// divergence is a refusal (or a silent mistranslation) nobody can explain.
+///
+/// A one-dialect value must answer FALSE rather than NULL: an unreadable
+/// value is visible loss the plan already counts as a projected null, and
+/// only a value both ladders claim differently needs a human's assertion.
+#[test]
+fn dialect_ambiguity_pairs_across_both_engines() {
+    let conn = conn();
+    let ask = |subject: &str| -> Option<bool> {
+        let sql = format!(
+            "SELECT {}",
+            trawl_core::conform::severity_dialect_ambiguous_sql(subject)
+        );
+        conn.query_row(&sql, [], |row| row.get(0)).unwrap()
+    };
+
+    for text in SEVERITY_READING_CASES {
+        let escaped = text.replace('\'', "''");
+        assert_eq!(
+            ask(&format!("'{escaped}'")),
+            Some(trawl_core::severity::dialect_ambiguous(text)),
+            "ambiguity disagreed on {text:?}"
+        );
+    }
+    // The overlap is exactly 1-7 on both engines, shoulders included. The
+    // whole `-30..=30` sweep is pinned Rust-side (`severity::tests`); here
+    // it is every rung of the overlap plus both shoulders, because each
+    // case is a PREPARE of a two-reading expression and the sweep would
+    // cost minutes to say the same thing.
+    for n in [-30i64, -7, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 24, 25, 30] {
+        let text = n.to_string();
+        let engine = ask(&format!("'{text}'"));
+        assert_eq!(engine, Some((1..=7).contains(&n)), "SQL misclassified {n}");
+        assert_eq!(
+            engine,
+            Some(trawl_core::severity::dialect_ambiguous(&text)),
+            "engines disagreed on {n}"
+        );
+    }
+    // A NULL subject is not ambiguous — it is nothing at all.
+    assert_eq!(ask("CAST(NULL AS VARCHAR)"), Some(false));
 }
 
 /// The canonical token TEXT is one table, rendered by

@@ -174,9 +174,17 @@ enum SchemaSubcommand {
         /// Field name (folded to the catalog's ASCII-lowercase spelling).
         field: String,
 
-        /// Target type: BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, or VARCHAR.
+        /// Target type: BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, VARCHAR, or
+        /// SEVERITY.
         #[arg(long)]
         to: String,
+
+        /// For --to severity only: which dialect the corpus's NUMERALS are
+        /// read in (otel counts up 1-24, syslog counts down 0-7). The
+        /// ladders overlap over 1-7 with opposite meanings, so only the
+        /// operator can say which one the sender meant.
+        #[arg(long, value_enum)]
+        dialect: Option<cli::SeverityDialect>,
 
         /// Scan and report only — no mutation.
         #[arg(long)]
@@ -475,6 +483,7 @@ async fn run_schema(
         SchemaSubcommand::Repin {
             field,
             to,
+            dialect,
             dry_run,
             force,
             yes,
@@ -487,6 +496,7 @@ async fn run_schema(
                 &field,
                 &to,
                 schema::RepinFlags {
+                    dialect,
                     dry_run,
                     force,
                     yes,

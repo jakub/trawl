@@ -249,7 +249,7 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values(pool: sqlx:
     // nothing lost (VARCHAR is the always-lossless target).
     let dry = match h
         .schema_admin
-        .schema_repin("status", "varchar", true, false)
+        .schema_repin("status", "varchar", None, true, false)
         .await
         .expect("dry run")
     {
@@ -265,7 +265,7 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values(pool: sqlx:
     // Execute; the dry-run projection is the rewrite's outcome.
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", false, false)
+        .schema_repin("status", "VARCHAR", None, false, false)
         .await
         .expect("execute")
     {
@@ -352,7 +352,7 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it(pool: sqlx::PgPo
     // Lossy without force: 409, plan attached, nothing changed.
     let refused = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", false, false)
+        .schema_repin("dur", "BIGINT", None, false, false)
         .await
         .expect("refusal is a decoded outcome, not a transport error")
     {
@@ -368,7 +368,7 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it(pool: sqlx::PgPo
     // evidence like any lossy conform.
     let started = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", false, true)
+        .schema_repin("dur", "BIGINT", None, false, true)
         .await
         .expect("forced execute")
     {
@@ -431,7 +431,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool
     }
     let dry = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", true, false)
+        .schema_repin("dur", "BIGINT", None, true, false)
         .await
         .expect("dry run")
     {
@@ -445,7 +445,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool
         .store(400, std::sync::atomic::Ordering::Relaxed);
     let started = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", false, false)
+        .schema_repin("dur", "BIGINT", None, false, false)
         .await
         .expect("execute")
     {
@@ -482,7 +482,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool
     // The operator's answer: the same repin, forced, accepts the loss.
     let forced = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", false, true)
+        .schema_repin("dur", "BIGINT", None, false, true)
         .await
         .expect("forced execute")
     {
@@ -520,7 +520,7 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPo
         .clone()
         .expect("an ingest-enabled node owns a repin engine");
     TEST_SCAN_DELAY_MS.store(500, Ordering::Relaxed);
-    let mut start = Box::pin(engine.start("status", "VARCHAR", true, false, Some("op")));
+    let mut start = Box::pin(engine.start("status", "VARCHAR", None, true, false, Some("op")));
     // Let the claim land and the scan begin, then drop the future exactly
     // as hyper drops a handler whose connection went away.
     assert!(
@@ -563,7 +563,7 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPo
     // And the slot is free: the next repin is served, not 409ed.
     match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", true, false)
+        .schema_repin("status", "VARCHAR", None, true, false)
         .await
         .expect("the running slot is free again")
     {
@@ -574,18 +574,32 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPo
 
 /// One repin at a time: a concurrent second request 409s with the error
 /// envelope (not a refusal plan); ingest and queries ride through the
-/// slowed rewrite — events land in the hot buffer immediately and exactly
-/// once in the post-cutover corpus, and a query loop across the whole job
-/// (build, cutover, sweep) never errors. That loop also scrapes `/metrics`
-/// from INSIDE the slowed rewrite: the running gauge is up and the
-/// `files_total`/`files_done` progress pair is readable while the job is still
-/// running, with the outcome counter landing only at the terminal state.
+/// rewrite — events land in the hot buffer immediately and exactly once in
+/// the post-cutover corpus, and a query loop across the rest of the job
+/// (release, catch-up, cutover, sweep) never errors. `/metrics` is scraped
+/// from INSIDE the rewrite: the running gauge is up and the
+/// `files_total`/`files_done` progress pair is readable while the job is
+/// still running, with the outcome counter landing only at the terminal
+/// state.
+///
+/// Synchronised by ORDERING, not by timing (issue #79 review). The mid-job
+/// state this test observes — job row `running`, running gauge up,
+/// `files_done` ≥ 1 — exists only between the end of the first build pass
+/// (progress is published per PASS) and the job's terminal write, and a
+/// polling observer can miss that window or find the job already finished
+/// on its first read; both were reproducible here by removing the per-file
+/// delay, and `retries = 1` is why CI saw it as a flake rather than a
+/// failure. The build now HOLDS at its first published progress until this
+/// test releases it, so every mid-job assertion below is a fact about
+/// order. No sleeps, and no per-file delay at all.
 #[sqlx::test(migrations = false)]
 async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sqlx::PgPool) {
+    use std::sync::atomic::Ordering;
+
     let h = harness(pool).await;
 
-    // Seed a few affected files across services (more files = longer
-    // build under the per-file delay).
+    // Seed a few affected files across services, so the build's first pass
+    // has real per-file progress to publish.
     for svc in ["api", "web", "worker"] {
         h.ingest_and_compact(&[
             event(svc, &json!({"status": 200})),
@@ -595,11 +609,17 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     }
     assert_eq!(h.count("last=1h | stats count()").await, 6);
 
-    trawl_server::repin::engine::TEST_FILE_DELAY_MS
-        .store(250, std::sync::atomic::Ordering::Relaxed);
+    // Arm the hold BEFORE the request: from its first published progress
+    // until this test releases it, the job cannot terminalize, so every
+    // "during the rewrite" step below is during the rewrite by
+    // construction.
+    trawl_server::repin::engine::TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
+    trawl_server::repin::engine::TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
+    trawl_server::repin::engine::TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", false, false)
+        .schema_repin("status", "VARCHAR", None, false, false)
         .await
         .expect("execute")
     {
@@ -611,7 +631,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     // through the error envelope.
     let second = h
         .schema_admin
-        .schema_repin("status", "DOUBLE", false, false)
+        .schema_repin("status", "DOUBLE", None, false, false)
         .await;
     match second {
         Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 409),
@@ -635,60 +655,43 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     // gate, so it can never straddle the cutover).
     h.compact_tick().await;
 
-    // Query in a loop across the whole job: no query may ever error. The
-    // same loop scrapes /metrics while the job row still says Running and
-    // keeps the first body that shows the running gauge up — progress is
-    // observed MID-JOB, not reconstructed from the terminal state.
-    let query_loop = {
-        let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
-        let engine_store = h.server.state.storage.repin.clone();
-        let url = h.server.url.clone();
-        let id = started.id;
-        tokio::spawn(async move {
-            let mut queries = 0u32;
-            let mut mid_job: Option<String> = None;
-            loop {
-                let result = client
-                    .query_paginated("last=1h | stats count()", None, None)
-                    .await;
-                assert!(result.is_ok(), "query errored mid-repin: {result:?}");
-                queries += 1;
-                let job = engine_store.get(id).await.expect("job row").expect("job");
-                if job.status != trawl_server::store::RepinJobStatus::Running {
-                    return (queries, mid_job);
-                }
-                if mid_job.is_none() {
-                    let scrape = scrape_metrics(&url).await;
-                    let running =
-                        gauge_value(&scrape, trawl_server::metrics::CATALOG_REPIN_RUNNING)
-                            .is_some_and(|v| v >= 1.0);
-                    let progressed =
-                        gauge_value(&scrape, trawl_server::metrics::CATALOG_REPIN_FILES_DONE)
-                            .is_some_and(|v| v >= 1.0);
-                    if running && progressed {
-                        mid_job = Some(scrape);
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-    };
-
-    let done = h.wait_terminal(started.id).await;
-    trawl_server::repin::engine::TEST_FILE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
-
-    let (queries, mid_job) = query_loop.await.expect("query loop");
-    assert!(queries > 0, "the loop observed the running job");
-
-    // Exactly once: everything ingested before and during the job.
-    assert_eq!(h.pinned_type("status").await, "VARCHAR");
+    // The one state a mid-job scrape needs, pinned: wait for the hold.
+    for _ in 0..600 {
+        if trawl_server::repin::engine::TEST_PROGRESS_PUBLISHED.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        trawl_server::repin::engine::TEST_PROGRESS_PUBLISHED.load(Ordering::SeqCst),
+        "the build never published progress"
+    );
+    let held = h
+        .server
+        .state
+        .storage
+        .repin
+        .get(started.id)
+        .await
+        .expect("job row")
+        .expect("job");
+    assert_eq!(
+        held.status,
+        trawl_server::store::RepinJobStatus::Running,
+        "the held job is still running, which is what makes the scrape mid-job"
+    );
+    // Queries still answer inside the held build — nothing is excluded yet.
     assert_eq!(h.count("last=1h | stats count()").await, 7);
-    assert_eq!(h.count("status=418 last=1h | stats count()").await, 1);
+    let mid_job = scrape_metrics(&h.server.url).await;
 
-    // Progress was scrapeable MID-JOB: that body was taken while the
-    // rewrite was still running, with real progress already on it.
-    let mid_job = mid_job.expect("a progress scrape landed while the job was running");
+    // Progress is scrapeable MID-JOB: the running gauge is up and real
+    // per-file progress is already on it, by construction rather than by
+    // catching a window.
+    assert_eq!(
+        gauge_value(&mid_job, trawl_server::metrics::CATALOG_REPIN_RUNNING),
+        Some(1.0),
+        "the running gauge must be up while the job is held"
+    );
     let total_files = gauge_value(&mid_job, trawl_server::metrics::CATALOG_REPIN_FILES_TOTAL)
         .expect("mid-job scrape must carry the planned file count");
     let done_files = gauge_value(&mid_job, trawl_server::metrics::CATALOG_REPIN_FILES_DONE)
@@ -697,6 +700,44 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
         (1.0..=total_files).contains(&done_files),
         "mid-job progress {done_files} outside 1..={total_files}"
     );
+    assert!(
+        !mid_job.contains("trawl_catalog_repin_jobs_total{outcome=\"succeeded\"}"),
+        "the outcome counter must land only at the terminal state"
+    );
+
+    // Query across the REST of the job — the release, the catch-up passes,
+    // the cutover's exclusion window and the sweep. No query may error.
+    let query_loop = {
+        let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
+        let engine_store = h.server.state.storage.repin.clone();
+        let id = started.id;
+        tokio::spawn(async move {
+            let mut queries = 0u32;
+            loop {
+                let result = client
+                    .query_paginated("last=1h | stats count()", None, None)
+                    .await;
+                assert!(result.is_ok(), "query errored mid-repin: {result:?}");
+                queries += 1;
+                let job = engine_store.get(id).await.expect("job row").expect("job");
+                if job.status != trawl_server::store::RepinJobStatus::Running {
+                    return queries;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+
+    trawl_server::repin::engine::TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    let queries = query_loop.await.expect("query loop");
+    assert!(queries > 0, "the loop queried across the running job");
+
+    // Exactly once: everything ingested before and during the job.
+    assert_eq!(h.pinned_type("status").await, "VARCHAR");
+    assert_eq!(h.count("last=1h | stats count()").await, 7);
+    assert_eq!(h.count("status=418 last=1h | stats count()").await, 1);
 
     // ...and the outcome landed once the job terminalized.
     let metrics = scrape_metrics(&h.server.url).await;
@@ -763,7 +804,7 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: 
     coordinator.set_cutover_hold_ms(3_000);
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", false, false)
+        .schema_repin("status", "VARCHAR", None, false, false)
         .await
         .expect("execute")
     {
@@ -913,14 +954,15 @@ async fn boot_reconciliation_completes_a_recovered_cutover(pool: sqlx::PgPool) {
         .state
         .storage
         .repin
-        .claim(
-            "status",
-            trawl_core::schema::CanonicalType::BigInt,
-            trawl_core::schema::CanonicalType::Varchar,
-            false,
-            false,
-            None,
-        )
+        .claim(trawl_server::store::RepinClaim {
+            field: "status",
+            from_type: trawl_core::schema::CanonicalType::BigInt,
+            to_type: trawl_core::schema::CanonicalType::Varchar,
+            dialect: None,
+            dry_run: false,
+            force: false,
+            requested_by: None,
+        })
         .await
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
@@ -1041,14 +1083,15 @@ async fn boot_reconciliation_completes_a_recovered_cutover(pool: sqlx::PgPool) {
         .state
         .storage
         .repin
-        .claim(
-            "status",
-            trawl_core::schema::CanonicalType::Varchar,
-            trawl_core::schema::CanonicalType::BigInt,
-            false,
-            false,
-            None,
-        )
+        .claim(trawl_server::store::RepinClaim {
+            field: "status",
+            from_type: trawl_core::schema::CanonicalType::Varchar,
+            to_type: trawl_core::schema::CanonicalType::BigInt,
+            dialect: None,
+            dry_run: false,
+            force: false,
+            requested_by: None,
+        })
         .await
         .unwrap();
     trawl_server::repin::recover::reconcile_store(
@@ -1086,7 +1129,7 @@ async fn resurrection_only_pass_recovers_without_retyping(pool: sqlx::PgPool) {
     // Same type without force is a 400 (nothing to do without intent).
     let err = h
         .schema_admin
-        .schema_repin("status", "BIGINT", false, false)
+        .schema_repin("status", "BIGINT", None, false, false)
         .await
         .expect_err("same-type without force refuses");
     match err {
@@ -1099,7 +1142,7 @@ async fn resurrection_only_pass_recovers_without_retyping(pool: sqlx::PgPool) {
     // zero (it was ALREADY null) — but a recoverable value would return.
     let dry = match h
         .schema_admin
-        .schema_repin("status", "BIGINT", true, true)
+        .schema_repin("status", "BIGINT", None, true, true)
         .await
         .expect("dry run")
     {
@@ -1111,4 +1154,631 @@ async fn resurrection_only_pass_recovers_without_retyping(pool: sqlx::PgPool) {
         "already-shelved values are not new losses"
     );
     assert_eq!(dry.resurrectable, 0, "`accepted` has no BIGINT reading");
+}
+
+/// Boot recovery over a SEVERITY cutover marker (issue #79): the engine
+/// writes the marker with the CATALOG spelling, so recovery has to read it
+/// back that way. The physical parse has no `SEVERITY` spelling at all,
+/// which made this the one replay path that could REFUSE — and it refuses
+/// after the corpus is already half-swapped, where forward is the only safe
+/// direction.
+#[sqlx::test(migrations = false)]
+async fn boot_reconciliation_replays_a_severity_cutover(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    // A sender field an operator repins onto the ladder.
+    h.ingest_and_compact(&[event("api", &json!({"level": "error"}))])
+        .await;
+    assert_eq!(h.pinned_type("level").await, "VARCHAR");
+
+    let job_id = h
+        .server
+        .state
+        .storage
+        .repin
+        .claim(trawl_server::store::RepinClaim {
+            field: "level",
+            from_type: trawl_core::schema::CanonicalType::Varchar,
+            to_type: trawl_core::schema::CanonicalType::Severity,
+            dialect: Some(trawl_core::severity::Dialect::Syslog),
+            dry_run: false,
+            force: true,
+            requested_by: None,
+        })
+        .await
+        .unwrap();
+
+    // A throwaway root crashed mid-cutover: the shadow holds the new
+    // generation, the marker names the SEVERITY target as the engine spells
+    // it (`CanonicalType::as_catalog`).
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let dir = data.join("prod/2026-01-01/10");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("svc.parquet"), b"old generation").unwrap();
+    let shadow = trawl_server::repin::shadow_root(&data);
+    let sdir = shadow.join("prod/2026-01-01/10");
+    std::fs::create_dir_all(&sdir).unwrap();
+    std::fs::write(sdir.join("svc.parquet"), b"new generation").unwrap();
+    trawl_server::repin::marker::write_marker(
+        &data,
+        &trawl_server::repin::RepinMarker {
+            job_id,
+            field: "level".to_owned(),
+            from_type: trawl_core::schema::CanonicalType::Varchar
+                .as_catalog()
+                .to_owned(),
+            to_type: trawl_core::schema::CanonicalType::Severity
+                .as_catalog()
+                .to_owned(),
+            phase: trawl_server::repin::RepinPhase::Cutover,
+        },
+    )
+    .unwrap();
+
+    let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
+        .unwrap()
+        .expect("marker present");
+    trawl_server::repin::recover::reconcile_store(
+        &h.server.state.storage,
+        &h.server.state.query.field_catalog,
+        &data,
+        Some(recovered),
+    )
+    .await
+    .expect("a severity cutover marker must replay, not refuse");
+
+    // Forward: the swap finished, the pin flipped in postgres and in the
+    // in-process cache, and the job completed.
+    assert_eq!(
+        std::fs::read(data.join("prod/2026-01-01/10/svc.parquet")).unwrap(),
+        b"new generation"
+    );
+    assert_eq!(h.pinned_type("level").await, "SEVERITY");
+    assert_eq!(
+        h.server.state.query.field_catalog.get("level"),
+        Some(trawl_core::schema::CanonicalType::Severity),
+        "the cache must hold the SEMANTIC pin, not the BIGINT under it"
+    );
+    let job = h
+        .server
+        .state
+        .storage
+        .repin
+        .get(job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, trawl_server::store::RepinJobStatus::Succeeded);
+    assert_eq!(job.dialect.as_deref(), Some("syslog"));
+    assert!(!trawl_server::repin::marker_path(&data).exists());
+}
+
+/// A dry run must say whether the IDENTICAL executing request would refuse
+/// (issue #79): the plan's numbers alone read as a clean 200, and an
+/// operator would learn about the force gate from the request that was
+/// meant to do the work. Both triggers, on the report and on the status
+/// route — one decision function, three askers.
+#[sqlx::test(migrations = false)]
+async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    // `level` carries a value no ladder rung reads (LOSS), `pri` carries a
+    // numeral both dialects read differently (AMBIGUITY) and nothing else.
+    h.ingest_and_compact(&[
+        event("api", &json!({"level": "error", "pri": "error"})),
+        event("api", &json!({"level": "gold", "pri": "3"})),
+    ])
+    .await;
+    assert_eq!(h.pinned_type("level").await, "VARCHAR");
+    assert_eq!(h.pinned_type("pri").await, "VARCHAR");
+
+    // (1) LOSS: `gold` has no reading at all.
+    let dry = match h
+        .schema_admin
+        .schema_repin("level", "severity", None, true, false)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(dry.status, "succeeded", "a dry run still succeeds");
+    assert_eq!(dry.projected_nulls, 1);
+    assert_eq!(
+        dry.requires_force,
+        Some(true),
+        "a plan that would null a value must say so: {dry:?}"
+    );
+    let reason = dry.requires_force_reason.clone().expect("a reason");
+    assert!(reason.contains("cannot be read as SEVERITY"), "{reason}");
+    assert_eq!(
+        dry.unmapped_samples,
+        vec!["gold".to_owned()],
+        "the report shows WHICH value it cannot read"
+    );
+
+    // The status route is the same row, so it carries the same verdict.
+    let latest = h
+        .schema_admin
+        .schema_repin_status()
+        .await
+        .expect("status")
+        .job
+        .expect("a job has run");
+    assert_eq!(latest.id, dry.id);
+    assert_eq!(latest.requires_force, Some(true));
+    assert_eq!(latest.requires_force_reason, dry.requires_force_reason);
+
+    // (2) AMBIGUITY: nothing is lost, but `3` means err to syslog and
+    // trace3 to OTel — the gate fires on the default OTel reading.
+    let dry = match h
+        .schema_admin
+        .schema_repin("pri", "severity", None, true, false)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(dry.projected_nulls, 0, "every value has an OTel reading");
+    assert_eq!(dry.ambiguous_numerals, 1);
+    assert_eq!(dry.requires_force, Some(true), "{dry:?}");
+    let reason = dry.requires_force_reason.clone().expect("a reason");
+    assert!(reason.contains("numeral 1-7"), "{reason}");
+    assert!(reason.contains("dialect=syslog"), "{reason}");
+
+    // Asserting syslog answers the ambiguity, so the same corpus needs no
+    // force at all — and `--force` clears the OTel one.
+    let dry = match h
+        .schema_admin
+        .schema_repin("pri", "severity", Some("syslog"), true, false)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(dry.dialect.as_deref(), Some("syslog"));
+    assert_eq!(dry.ambiguous_numerals, 1, "the COUNT is dialect-blind");
+    assert_eq!(
+        dry.requires_force,
+        Some(false),
+        "an asserted dialect IS the answer to the ambiguity: {dry:?}"
+    );
+    let forced = match h
+        .schema_admin
+        .schema_repin("pri", "severity", None, true, true)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(
+        forced.requires_force,
+        Some(false),
+        "force clears the gate: {forced:?}"
+    );
+}
+
+/// The force verdict has THREE states, and the missing one is the one that
+/// matters (issue #79 review): a claimed job whose scan has not recorded a
+/// plan yet reports NO verdict. Its counts are zeros meaning "not measured",
+/// and answering `false` there tells an operator polling the status route
+/// that a job about to 409 is clean.
+#[sqlx::test(migrations = false)]
+async fn the_force_verdict_is_absent_until_the_scan_has_a_plan(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    h.ingest_and_compact(&[event("api", &json!({"level": "error", "dur": 12}))])
+        .await;
+    h.ingest_and_compact(&[event("web", &json!({"level": "gold", "dur": 34}))])
+        .await;
+
+    // Slow the scan so the claimed-but-unplanned window is observable.
+    trawl_server::repin::engine::TEST_SCAN_DELAY_MS
+        .store(500, std::sync::atomic::Ordering::Relaxed);
+    let client = h.schema_admin.clone();
+    let dry = tokio::spawn(async move {
+        client
+            .schema_repin("level", "severity", None, true, false)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let running = h
+        .schema_admin
+        .schema_repin_status()
+        .await
+        .expect("status")
+        .job
+        .expect("a job is claimed");
+    assert_eq!(running.status, "running");
+    assert_eq!(
+        running.requires_force, None,
+        "a job with no recorded plan has no verdict to report: {running:?}"
+    );
+    assert_eq!(running.requires_force_reason, None);
+
+    let dry = match dry.await.expect("join").expect("dry run") {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    trawl_server::repin::engine::TEST_SCAN_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    // …and once the plan exists the verdict is a fact, both on the report
+    // and on the status route.
+    assert_eq!(dry.requires_force, Some(true), "{dry:?}");
+    let latest = h
+        .schema_admin
+        .schema_repin_status()
+        .await
+        .expect("status")
+        .job
+        .expect("a job has run");
+    assert_eq!(latest.requires_force, Some(true));
+
+    // The third state: a plan with nothing to accept (a BIGINT field to
+    // VARCHAR, which is lossless by construction).
+    let clean = match h
+        .schema_admin
+        .schema_repin("dur", "varchar", None, true, false)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(
+        clean.requires_force,
+        Some(false),
+        "VARCHAR is the always-lossless target: {clean:?}"
+    );
+    assert_eq!(clean.requires_force_reason, None);
+}
+
+/// The corpus every acceptance criterion is written against: one sender
+/// field carrying the five shapes a severity repin has to answer for — two
+/// case-variant tokens, an exact `OTel` short name, a dialect-ambiguous
+/// numeral, and a value no ladder rung reads.
+fn severity_corpus() -> Vec<serde_json::Value> {
+    ["error", "ERROR", "error2", "3", "gold"]
+        .iter()
+        .map(|level| event("api", &json!({"level": level})))
+        .collect()
+}
+
+/// AC2/AC5: the dry run's numbers ARE the executed rewrite's, and the
+/// report carries the evidence an operator decides on (which value cannot
+/// be read, and whether anything is still writing the field).
+#[sqlx::test(migrations = false)]
+async fn repin_to_severity_dry_run_matches_the_executed_rewrite(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    h.ingest_and_compact(&severity_corpus()).await;
+    assert_eq!(h.pinned_type("level").await, "VARCHAR");
+    assert_eq!(h.count("last=1h | stats count()").await, 5);
+
+    let dry = match h
+        .schema_admin
+        .schema_repin("level", "severity", None, true, false)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(dry.files_total, 1);
+    assert_eq!(dry.rows_carrying, 5, "every row carries a level");
+    assert_eq!(dry.projected_nulls, 1, "only `gold` has no reading");
+    assert_eq!(dry.resurrectable, 0, "nothing was shelved before this");
+    assert_eq!(
+        dry.ambiguous_numerals, 1,
+        "`3` reads differently per dialect"
+    );
+    assert_eq!(
+        dry.dialect.as_deref(),
+        Some("otel"),
+        "the default assertion"
+    );
+    // AC5: the evidence, not just the count.
+    assert_eq!(dry.unmapped_samples, vec!["gold".to_owned()]);
+    let live = dry.liveness.as_ref().expect("the sender just wrote");
+    assert_eq!(live.service, "api");
+    assert_eq!(
+        dry.requires_force,
+        Some(true),
+        "loss AND ambiguity, neither accepted yet"
+    );
+
+    // The same plan, executed with force: the rewrite achieves exactly what
+    // the scan projected.
+    let started = match h
+        .schema_admin
+        .schema_repin("level", "severity", None, false, true)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(done.files_done, dry.files_total);
+    assert_eq!(done.rows_rewritten, dry.rows_carrying);
+    assert_eq!(
+        done.rows_nulled, dry.projected_nulls,
+        "the rewrite nulled exactly what the dry run projected"
+    );
+    assert_eq!(done.rows_resurrected, dry.resurrectable);
+    assert_eq!(
+        done.ambiguous_numerals, dry.ambiguous_numerals,
+        "the shadow saw the same dialect-ambiguous rows the scan projected"
+    );
+    assert_eq!(h.pinned_type("level").await, "SEVERITY");
+
+    // The pin now gives the sender's own field the ladder's vocabulary:
+    // bands for equality, the exact number when ordered, and `gold` is a
+    // NULL the pin cannot hold (its original stays in _raw).
+    assert_eq!(h.count("level=error last=1h | stats count()").await, 3);
+    assert_eq!(h.count("level>=warn last=1h | stats count()").await, 3);
+    assert_eq!(
+        h.count("level=error2 last=1h | stats count()").await,
+        1,
+        "an exact short name is exact, not its band"
+    );
+    assert_eq!(
+        h.count("level=trace3 last=1h | stats count()").await,
+        1,
+        "the numeral 3 conformed as the OTel rung it names"
+    );
+    assert_eq!(h.count("level=* last=1h | stats count()").await, 4);
+    assert_eq!(
+        h.count("\"gold\" last=1h | stats count()").await,
+        1,
+        "the unreadable original is still findable in _raw"
+    );
+}
+
+/// AC3: the syslog assertion INVERTS the numeral, is persisted on the job
+/// row, and reads back off the status route — the one dialect-changing
+/// decision an operator can make about their own corpus.
+#[sqlx::test(migrations = false)]
+async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    h.ingest_and_compact(&severity_corpus()).await;
+
+    // The ambiguity gate does NOT fire under an explicit syslog assertion
+    // (AC4's other half is `a_dry_run_reports_the_force_verdict_it_would_hit`),
+    // but `gold` is still a loss, so this run is forced for that reason.
+    let started = match h
+        .schema_admin
+        .schema_repin("level", "severity", Some("syslog"), false, true)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(
+        done.dialect.as_deref(),
+        Some("syslog"),
+        "the assertion is persisted on the job row"
+    );
+
+    // Syslog counts DOWN: `3` is err (17), not trace3 (3). Words are
+    // dialect-free, so the three tokens read exactly as before.
+    assert_eq!(
+        h.count("level=error last=1h | stats count()").await,
+        4,
+        "error, ERROR, error2 and the inverted `3` are all in the error band"
+    );
+    assert_eq!(h.count("level=trace3 last=1h | stats count()").await, 0);
+    assert_eq!(h.count("level>=warn last=1h | stats count()").await, 4);
+}
+
+/// AC6 + ruling 13: a value a PRIOR conform shelved comes back under the
+/// new pin — including one whose `_raw` key still carries the sender's
+/// original mixed-case spelling, which the case-variant fallback recovers
+/// best-effort (the documented Unicode-`lower()`-vs-ASCII-fold edge).
+#[sqlx::test(migrations = false)]
+async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    // First typed sight pins BIGINT…
+    h.ingest_and_compact(&[event("api", &json!({"lvl": 17}))])
+        .await;
+    assert_eq!(h.pinned_type("lvl").await, "BIGINT");
+    // …and a token batch conflicts: the value is nulled and lives on in
+    // `_raw`, which holds the sender's ORIGINAL key spelling (`Lvl`),
+    // because `_raw` is captured before the name fold.
+    h.ingest_and_compact(&[event("api", &json!({"Lvl": "error"}))])
+        .await;
+    assert_eq!(
+        h.count("lvl=* last=1h | stats count()").await,
+        1,
+        "the token was shelved by the BIGINT pin"
+    );
+
+    let dry = match h
+        .schema_admin
+        .schema_repin("lvl", "severity", None, true, true)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(
+        dry.resurrectable, 1,
+        "the shelved `error` is recoverable from _raw under a case-variant key"
+    );
+    assert_eq!(dry.projected_nulls, 0, "17 is already a ladder position");
+
+    let started = match h
+        .schema_admin
+        .schema_repin("lvl", "severity", None, false, true)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(done.rows_resurrected, 1);
+    assert_eq!(h.pinned_type("lvl").await, "SEVERITY");
+    assert_eq!(
+        h.count("lvl=error last=1h | stats count()").await,
+        2,
+        "the stored 17 and the resurrected `error` are one value now"
+    );
+}
+
+/// AC7: after the repin, the sender's own field IS on the ladder in every
+/// lane — the cold parquet, the hot buffer a live event lands in, the
+/// pipeline's `where`, and the in-memory matcher the live tail uses — and a
+/// newly-ingested `"error"` conforms to 17 with no further operator action.
+#[sqlx::test(migrations = false)]
+async fn post_repin_severity_binds_in_every_lane_including_live_ingest(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    h.ingest_and_compact(&severity_corpus()).await;
+    let started = match h
+        .schema_admin
+        .schema_repin("level", "severity", None, false, true)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+
+    // Cold: the rewritten corpus.
+    assert_eq!(h.count("level>=warn last=1h | stats count()").await, 3);
+
+    // LIVE INGEST, uncompacted: the hot branch conforms through the same
+    // catalog pin, so a brand-new `"error"` is 17 the moment it lands —
+    // nothing about the sender changed.
+    let live = event("api", &json!({"level": "error"}));
+    assert_eq!(
+        h.ingest
+            .ingest(std::slice::from_ref(&live))
+            .await
+            .unwrap()
+            .accepted,
+        1
+    );
+    assert_eq!(
+        h.count("level>=warn last=1h | stats count()").await,
+        4,
+        "the hot row reads on the ladder before compaction"
+    );
+    // The PIPELINE lane binds the same pin (ADR-0011 slice A′).
+    assert_eq!(
+        h.count("last=1h | where level >= \"error\" | stats count()")
+            .await,
+        4
+    );
+
+    // The LIVE-TAIL lane: the same filter the SSE stream compiles, over the
+    // same catalog snapshot the handler hands it.
+    let pins = h.server.state.query.field_catalog.all();
+    let matches = |dsl: &str| -> bool {
+        let ast = trawl_core::parser::parse(dsl).expect("parses");
+        let filter =
+            trawl_core::filter::CompiledFilter::compile(&ast.search, &pins).expect("compiles");
+        let event: serde_json::Map<String, serde_json::Value> =
+            live.as_object().cloned().expect("an object");
+        filter.matches_at(&event, chrono::Utc::now())
+    };
+    assert!(matches("level>=warn"), "the live tail binds the new pin");
+    assert!(matches("level=error"));
+    assert!(!matches("level=trace3"));
+
+    // And once it compacts, the answer does not move.
+    h.compact_tick().await;
+    assert_eq!(h.count("level>=warn last=1h | stats count()").await, 4);
+    assert_eq!(h.count("level=error last=1h | stats count()").await, 4);
+}
+
+/// Ruling 7: EVERY shadow pass — the initial build and the catch-up passes
+/// that fold in files compaction wrote meanwhile — rides the JOB's asserted
+/// dialect, while ordinary compaction stays on the `OTel` reading.
+///
+/// That combination is exactly the discontinuity the CLI warns about, so it
+/// is asserted rather than assumed: a `3` the catch-up rewrote reads as
+/// syslog err, and the next `3` to arrive after the cutover reads as `OTel`
+/// trace3.
+#[sqlx::test(migrations = false)]
+async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel(pool: sqlx::PgPool) {
+    use std::sync::atomic::Ordering;
+
+    let h = harness(pool).await;
+    h.ingest_and_compact(&[event("api", &json!({"level": "error"}))])
+        .await;
+    assert_eq!(h.pinned_type("level").await, "VARCHAR");
+
+    // A BARRIER, not just a delay: pass 0 takes its source snapshot and then
+    // waits, so the file this test writes next provably did NOT exist when
+    // the build enumerated its sources — only a CATCH-UP pass can carry it
+    // into the shadow, which is the claim under test. A delay alone would
+    // let pass 0 see the file, and the assertions below would hold even if
+    // catch-up passes read the wrong dialect.
+    trawl_server::repin::engine::TEST_SNAPSHOT_TAKEN.store(false, Ordering::SeqCst);
+    trawl_server::repin::engine::TEST_RELEASE_BUILD.store(false, Ordering::SeqCst);
+    trawl_server::repin::engine::TEST_BARRIER_FIRST_PASS.store(true, Ordering::SeqCst);
+
+    let started = match h
+        .schema_admin
+        .schema_repin("level", "severity", Some("syslog"), false, true)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+
+    for _ in 0..600 {
+        if trawl_server::repin::engine::TEST_SNAPSHOT_TAKEN.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        trawl_server::repin::engine::TEST_SNAPSHOT_TAKEN.load(Ordering::SeqCst),
+        "the build never reached its first snapshot"
+    );
+    // Written by compaction under the OLD pin, AFTER that snapshot.
+    h.ingest_and_compact(&[event("api", &json!({"level": "3"}))])
+        .await;
+    trawl_server::repin::engine::TEST_RELEASE_BUILD.store(true, Ordering::SeqCst);
+
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    // The mid-build row survived the swap, which only a catch-up pass can
+    // do: the cutover publishes the shadow WHOLESALE, so a file the build
+    // never folded in would be gone.
+    assert_eq!(h.count("last=1h | stats count()").await, 2);
+
+    // And it took the job's syslog reading (err), not OTel's — the pass that
+    // folded it in rode the job's dialect, not the live default.
+    assert_eq!(
+        h.count("level=error last=1h | stats count()").await,
+        2,
+        "the token and the inverted numeral are both in the error band"
+    );
+    assert_eq!(h.count("level=trace3 last=1h | stats count()").await, 0);
+
+    // Ordinary compaction after the cutover conforms at OTel — the
+    // discontinuity the report's liveness warning exists to state.
+    h.ingest_and_compact(&[event("api", &json!({"level": "3"}))])
+        .await;
+    assert_eq!(
+        h.count("level=trace3 last=1h | stats count()").await,
+        1,
+        "a live `3` reads as the OTel rung it names; the repin translated \
+         HISTORY only"
+    );
+    assert_eq!(h.count("level=error last=1h | stats count()").await, 2);
 }

@@ -3100,7 +3100,9 @@ mod catalog {
 mod repin_store {
     use sqlx::PgPool;
     use trawl_core::schema::CanonicalType;
-    use trawl_server::store::{CatalogStore, RepinJobStatus, RepinStore, StoreError};
+    use trawl_server::store::{
+        CatalogStore, RepinClaim, RepinJobStatus, RepinPlan, RepinStore, StoreError,
+    };
 
     fn store(pool: &PgPool) -> RepinStore {
         RepinStore::new(pool.clone())
@@ -3112,27 +3114,29 @@ mod repin_store {
     async fn second_claim_is_repin_already_running(pool: PgPool) {
         let s = store(&pool);
         let id = s
-            .claim(
-                "status",
-                CanonicalType::BigInt,
-                CanonicalType::Varchar,
-                false,
-                false,
-                Some("key-1"),
-            )
+            .claim(RepinClaim {
+                field: "status",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: false,
+                force: false,
+                requested_by: Some("key-1"),
+            })
             .await
             .unwrap();
         assert!(id > 0);
 
         let err = s
-            .claim(
-                "dur",
-                CanonicalType::Varchar,
-                CanonicalType::BigInt,
-                false,
-                false,
-                None,
-            )
+            .claim(RepinClaim {
+                field: "dur",
+                from_type: CanonicalType::Varchar,
+                to_type: CanonicalType::BigInt,
+                dialect: None,
+                dry_run: false,
+                force: false,
+                requested_by: None,
+            })
             .await
             .expect_err("a second running job must refuse");
         assert!(matches!(err, StoreError::RepinAlreadyRunning));
@@ -3141,14 +3145,15 @@ mod repin_store {
         s.finish(id, RepinJobStatus::Failed, Some("test"))
             .await
             .unwrap();
-        s.claim(
-            "dur",
-            CanonicalType::Varchar,
-            CanonicalType::BigInt,
-            false,
-            false,
-            None,
-        )
+        s.claim(RepinClaim {
+            field: "dur",
+            from_type: CanonicalType::Varchar,
+            to_type: CanonicalType::BigInt,
+            dialect: None,
+            dry_run: false,
+            force: false,
+            requested_by: None,
+        })
         .await
         .expect("a terminal job frees the one-running slot");
     }
@@ -3160,22 +3165,24 @@ mod repin_store {
         let s1 = store(&pool);
         let s2 = store(&pool);
         let (a, b) = tokio::join!(
-            s1.claim(
-                "status",
-                CanonicalType::BigInt,
-                CanonicalType::Varchar,
-                false,
-                false,
-                None
-            ),
-            s2.claim(
-                "status",
-                CanonicalType::BigInt,
-                CanonicalType::Varchar,
-                false,
-                false,
-                None
-            ),
+            s1.claim(RepinClaim {
+                field: "status",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: false,
+                force: false,
+                requested_by: None,
+            }),
+            s2.claim(RepinClaim {
+                field: "status",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: false,
+                force: false,
+                requested_by: None,
+            }),
         );
         let wins = [&a, &b].iter().filter(|r| r.is_ok()).count();
         assert_eq!(wins, 1, "exactly one claim may win: {a:?} / {b:?}");
@@ -3192,14 +3199,15 @@ mod repin_store {
         let catalog = CatalogStore::new(pool.clone());
         // `host` is seeded VARCHAR by migration 0002; the flip retypes it.
         let id = s
-            .claim(
-                "host",
-                CanonicalType::Varchar,
-                CanonicalType::BigInt,
-                false,
-                false,
-                None,
-            )
+            .claim(RepinClaim {
+                field: "host",
+                from_type: CanonicalType::Varchar,
+                to_type: CanonicalType::BigInt,
+                dialect: None,
+                dry_run: false,
+                force: false,
+                requested_by: None,
+            })
             .await
             .unwrap();
 
@@ -3246,14 +3254,15 @@ mod repin_store {
             .unwrap();
 
         let id = s
-            .claim(
-                "severity",
-                CanonicalType::BigInt,
-                CanonicalType::Varchar,
-                false,
-                false,
-                None,
-            )
+            .claim(RepinClaim {
+                field: "severity",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: false,
+                force: false,
+                requested_by: None,
+            })
             .await
             .unwrap();
         s.finish_cutover(id, "severity", CanonicalType::Varchar)
@@ -3299,14 +3308,15 @@ mod repin_store {
         let s = store(&pool);
         let catalog = CatalogStore::new(pool.clone());
         let id = s
-            .claim(
-                "severity",
-                CanonicalType::BigInt,
-                CanonicalType::Varchar,
-                false,
-                true,
-                None,
-            )
+            .claim(RepinClaim {
+                field: "severity",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: false,
+                force: true,
+                requested_by: None,
+            })
             .await
             .unwrap();
         s.finish_cutover(id, "severity", CanonicalType::Varchar)
@@ -3352,14 +3362,15 @@ mod repin_store {
     async fn reconcile_orphans_fails_running_rows_except_the_kept_one(pool: PgPool) {
         let s = store(&pool);
         let id = s
-            .claim(
-                "status",
-                CanonicalType::BigInt,
-                CanonicalType::Varchar,
-                false,
-                false,
-                None,
-            )
+            .claim(RepinClaim {
+                field: "status",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: false,
+                force: false,
+                requested_by: None,
+            })
             .await
             .unwrap();
 
@@ -3384,35 +3395,50 @@ mod repin_store {
         assert!(s.latest().await.unwrap().is_none());
 
         let first = s
-            .claim(
-                "status",
-                CanonicalType::BigInt,
-                CanonicalType::Varchar,
-                true,
-                false,
-                None,
-            )
+            .claim(RepinClaim {
+                field: "status",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: true,
+                force: false,
+                requested_by: None,
+            })
             .await
             .unwrap();
-        s.record_plan(first, 12, 3400, 25, 19, 1 << 20)
-            .await
-            .unwrap();
+        s.record_plan(
+            first,
+            RepinPlan {
+                files_total: 12,
+                rows_carrying: 3400,
+                projected_nulls: 25,
+                resurrectable: 19,
+                affected_bytes: 1 << 20,
+                ambiguous_numerals: 4,
+                unmapped_samples: vec!["gold".to_owned(), "platinum".to_owned()],
+                field_last_seen: Some(chrono::Utc::now()),
+                field_last_service: Some("nginx".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
         s.finish(first, RepinJobStatus::Succeeded, None)
             .await
             .unwrap();
 
         let second = s
-            .claim(
-                "status",
-                CanonicalType::BigInt,
-                CanonicalType::Varchar,
-                false,
-                true,
-                Some("key-9"),
-            )
+            .claim(RepinClaim {
+                field: "status",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: false,
+                force: true,
+                requested_by: Some("key-9"),
+            })
             .await
             .unwrap();
-        s.record_progress(second, 5, 1200, 2, 7).await.unwrap();
+        s.record_progress(second, 5, 1200, 2, 7, 3).await.unwrap();
 
         let latest = s.latest().await.unwrap().expect("a running job");
         assert_eq!(latest.id, second);
@@ -3424,6 +3450,10 @@ mod repin_store {
         assert_eq!(latest.rows_rewritten, 1200);
         assert_eq!(latest.rows_nulled, 2);
         assert_eq!(latest.rows_resurrected, 7);
+        assert_eq!(
+            latest.ambiguous_numerals, 3,
+            "the shadow's own ambiguity count supersedes the scan's"
+        );
 
         s.finish(second, RepinJobStatus::Blocked, Some("cutover starved"))
             .await
@@ -3440,6 +3470,75 @@ mod repin_store {
         assert_eq!(dry.projected_nulls, 25);
         assert_eq!(dry.resurrectable, 19);
         assert_eq!(dry.affected_bytes, 1 << 20);
+        assert_eq!(dry.ambiguous_numerals, 4, "the plan's own count stands");
+        assert_eq!(dry.unmapped_samples, vec!["gold", "platinum"]);
+        assert!(dry.field_last_seen.is_some(), "liveness rides the plan");
+        assert_eq!(dry.field_last_service.as_deref(), Some("nginx"));
+        // Nothing asserted a dialect, so the row reports none — never a
+        // backfilled `otel` (issue #79).
+        assert_eq!(dry.dialect, None);
+    }
+
+    /// The SEVERITY target and its dialect (issue #79, migration 0012):
+    /// both type CHECKs admit the catalog spelling — a repin AWAY from a
+    /// severity pin claims a job whose FROM type is SEVERITY — and the
+    /// dialect is stored exactly for a severity target, scope-CHECKed on
+    /// both sides so a row can never carry an assertion nothing read (or
+    /// omit one the rewrite needed).
+    #[sqlx::test]
+    async fn a_severity_repin_stores_its_asserted_dialect(pool: PgPool) {
+        use trawl_core::severity::Dialect;
+
+        let s = store(&pool);
+        let claim = |to, dialect, dry_run| RepinClaim {
+            field: "level",
+            from_type: CanonicalType::Varchar,
+            to_type: to,
+            dialect,
+            dry_run,
+            force: false,
+            requested_by: None,
+        };
+
+        let id = s
+            .claim(claim(CanonicalType::Severity, Some(Dialect::Syslog), true))
+            .await
+            .expect("SEVERITY is a claimable target");
+        let job = s.get(id).await.unwrap().unwrap();
+        assert_eq!(job.to_type, "SEVERITY");
+        assert_eq!(job.dialect.as_deref(), Some("syslog"));
+        s.finish(id, RepinJobStatus::Succeeded, None).await.unwrap();
+
+        // And back OFF the severity pin: 0007's from_type CHECK would have
+        // refused this row.
+        let back = s
+            .claim(RepinClaim {
+                field: "level",
+                from_type: CanonicalType::Severity,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: true,
+                force: false,
+                requested_by: None,
+            })
+            .await
+            .expect("a repin away from SEVERITY is claimable");
+        let job = s.get(back).await.unwrap().unwrap();
+        assert_eq!(job.from_type, "SEVERITY");
+        assert_eq!(job.dialect, None);
+        s.finish(back, RepinJobStatus::Succeeded, None)
+            .await
+            .unwrap();
+
+        // The scope CHECK, both directions: a severity target with no
+        // dialect, and a dialect on any other target, are corruption the
+        // store refuses rather than stores.
+        s.claim(claim(CanonicalType::Severity, None, true))
+            .await
+            .expect_err("a SEVERITY job must carry a dialect");
+        s.claim(claim(CanonicalType::BigInt, Some(Dialect::Otel), true))
+            .await
+            .expect_err("only a SEVERITY job may carry a dialect");
     }
 
     /// The re-arm switch for boot recovery: a recovered cutover clears

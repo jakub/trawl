@@ -52,6 +52,7 @@
 //! side by side against the bundled `DuckDB`, never assumed.
 
 use crate::schema::CanonicalType;
+use crate::severity::Dialect;
 
 /// The session setting every connection that conforms — or that reads a
 /// conformed hot branch — MUST install before running this module's SQL.
@@ -124,9 +125,32 @@ pub fn untyped_text(quoted: &str) -> String {
     format!("json_extract_string(to_json({quoted}), '$')")
 }
 
+/// [`guarded_cast_in`] under the `OTel` dialect — the reading every LIVE
+/// conform lane wants.
+///
+/// The dialect governs the SEVERITY rung alone, and every lane that
+/// conforms as events arrive (compaction, the boot pass, the emitter's hot
+/// branch) reads canonical `OTel` severity: ingest already resolved a
+/// syslog PRI numeral at its own door (the syslog profile's fixed
+/// derivation source, ADR-0013 slice 2), so what reaches a stored column
+/// is a ladder position, not a wire dialect. "Live conform is `OTel`" is
+/// therefore a fact about these CALL SITES, not a property of the builder
+/// — the repin engine (issue #79) is the one caller that asserts
+/// otherwise, and it says so per arm through [`RepinTarget`].
+#[must_use]
+pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
+    guarded_cast_in(text, pin, Dialect::Otel)
+}
+
 /// The conform expression for one pinned column, over its canonical
 /// `text` form — a typed cast that succeeds only when the value survives
-/// the round trip unchanged.
+/// the round trip unchanged — reading NUMERIC severity in `dialect`.
+///
+/// `dialect` reaches exactly one rung: SEVERITY, whose numeric arm is the
+/// only dialect-sensitive reading in the vocabulary
+/// ([`crate::severity::reading_number`]). Every other pin is
+/// dialect-INVARIANT, which is what lets a caller thread one dialect
+/// through a pin-generic plan without asking whether it applies.
 ///
 /// The comparison space is chosen per rung, and every one of them is
 /// executed against the bundled `DuckDB` in
@@ -169,7 +193,7 @@ pub fn untyped_text(quoted: &str) -> String {
 /// - `VARCHAR` is the text itself: stringification is lossless by
 ///   construction, so there is nothing to guard.
 #[must_use]
-pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
+pub fn guarded_cast_in(text: &str, pin: CanonicalType, dialect: Dialect) -> String {
     match pin {
         CanonicalType::Varchar => text.to_owned(),
         CanonicalType::BigInt => {
@@ -194,7 +218,7 @@ pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
         // arrives live or is swept up by a repin. A numeric-only rung
         // would rewrite history correctly and null the very next live
         // row.
-        CanonicalType::Severity => severity_reading_sql(text, crate::severity::Dialect::Otel),
+        CanonicalType::Severity => severity_reading_sql(text, dialect),
     }
 }
 
@@ -408,6 +432,67 @@ pub fn raw_extract(raw_quoted: &str, field: &str) -> String {
     )
 }
 
+/// Whether `text_expr` reads as a DIFFERENT severity in each dialect —
+/// the SQL mirror of [`crate::severity::dialect_ambiguous`], and the
+/// building block the repin's ambiguity count is derived from (issue #79).
+///
+/// `A IS NOT NULL AND B IS NOT NULL AND A <> B` over the two readings, so
+/// a value with only ONE reading is FALSE rather than NULL: an unreadable
+/// or one-dialect value is visible loss the plan already counts, and only
+/// a value both dialects claim differently is a silent mistranslation
+/// waiting on an operator's assertion.
+///
+/// `text_expr` lands in the result many times over (both readings name it
+/// five times each), which is free for a column and wrong for an
+/// expression carrying bound `?` parameters — the same constraint
+/// [`severity_reading_sql`] documents.
+#[must_use]
+pub fn severity_dialect_ambiguous_sql(text_expr: &str) -> String {
+    let otel = severity_reading_sql(text_expr, Dialect::Otel);
+    let syslog = severity_reading_sql(text_expr, Dialect::Syslog);
+    format!("({otel} IS NOT NULL AND {syslog} IS NOT NULL AND {otel} <> {syslog})")
+}
+
+/// The pin a repin rewrites TO, with the dialect each ARM reads its
+/// numerals in (issue #79).
+///
+/// Two arms read text under a repin ([`resurrection_expr`]), and they do
+/// not have the same provenance, so they cannot share one dialect:
+///
+/// - `stored` reads the STORED column. Where the old pin was already
+///   `SEVERITY` that column holds canonical `OTel` ladder positions, and
+///   re-reading a canonical `3` as syslog would corrupt it to 17 — so the
+///   engine fixes this arm at [`Dialect::Otel`] for a `SEVERITY` source
+///   and only otherwise lets the operator's assertion reach it;
+/// - `raw` reads the `_raw` re-extraction, which is always the SENDER's
+///   own wire text and therefore always takes the asserted dialect.
+///
+/// Constructed by the repin engine alone (it is the one caller that knows
+/// the OLD pin); every other caller wants [`Self::otel`], which is the
+/// dialect-free reading the live lanes conform with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepinTarget {
+    /// The new pin.
+    pub pin: CanonicalType,
+    /// Dialect for the STORED column's numerals.
+    pub stored: Dialect,
+    /// Dialect for `_raw`'s numerals.
+    pub raw: Dialect,
+}
+
+impl RepinTarget {
+    /// `pin` read in `OTel` on both arms — every non-repin caller, and the
+    /// default a repin that asserts nothing gets.
+    #[must_use]
+    pub fn otel(pin: CanonicalType) -> Self {
+        Self {
+            pin,
+            stored: Dialect::Otel,
+            raw: Dialect::Otel,
+        }
+    }
+}
+
 /// The repin rewrite's target-column expression (ADR-0011 slice B): the
 /// stored value's guarded reading under the NEW pin, and — where that is
 /// NULL, i.e. the column never carried the value or a prior conform
@@ -416,20 +501,21 @@ pub fn raw_extract(raw_quoted: &str, field: &str) -> String {
 /// One expression for the dry-run COUNT and the rewrite WRITE, by the same
 /// doctrine that makes the hot branch and compaction one builder: a plan
 /// that predicts with one expression and rewrites with another is a report
-/// that lies. Both arms go through [`guarded_cast`], so resurrection can
+/// that lies. Both arms go through [`guarded_cast_in`], so resurrection can
 /// never smuggle in a value the conform would have refused (`"1.5"` does
-/// not round into a BIGINT 2 just because it came back from `_raw`).
+/// not round into a BIGINT 2 just because it came back from `_raw`) — each
+/// under its own arm's dialect ([`RepinTarget`]).
 #[must_use]
 pub fn resurrection_expr(
     quoted: &str,
     raw_quoted: &str,
     field: &str,
-    pin: CanonicalType,
+    target: RepinTarget,
 ) -> String {
     format!(
         "COALESCE({}, {})",
-        guarded_cast(&untyped_text(quoted), pin),
-        guarded_cast(&raw_extract(raw_quoted, field), pin)
+        guarded_cast_in(&untyped_text(quoted), target.pin, target.stored),
+        guarded_cast_in(&raw_extract(raw_quoted, field), target.pin, target.raw)
     )
 }
 
@@ -620,7 +706,12 @@ mod tests {
     /// stored reading first, `_raw` reading second, both guarded.
     #[test]
     fn resurrection_expr_is_stored_reading_then_guarded_raw_arm() {
-        let sql = resurrection_expr("\"v\"", "\"_raw\"", "dur", CanonicalType::Varchar);
+        let sql = resurrection_expr(
+            "\"v\"",
+            "\"_raw\"",
+            "dur",
+            RepinTarget::otel(CanonicalType::Varchar),
+        );
         assert_eq!(
             sql,
             format!(
@@ -630,7 +721,113 @@ mod tests {
             )
         );
         // Typed pins guard BOTH arms.
-        let typed = resurrection_expr("\"v\"", "\"_raw\"", "dur", CanonicalType::BigInt);
+        let typed = resurrection_expr(
+            "\"v\"",
+            "\"_raw\"",
+            "dur",
+            RepinTarget::otel(CanonicalType::BigInt),
+        );
         assert_eq!(typed.matches("DECIMAL(38,6)").count(), 4);
+    }
+
+    /// `guarded_cast` IS `guarded_cast_in` at `OTel`, byte for byte, for
+    /// every pin — the delegation is what makes "live conform is `OTel`" a
+    /// fact about call sites rather than a second expression to keep in
+    /// step (issue #79).
+    #[test]
+    fn guarded_cast_is_the_otel_reading_of_every_pin() {
+        for pin in [
+            CanonicalType::Boolean,
+            CanonicalType::BigInt,
+            CanonicalType::Double,
+            CanonicalType::Timestamp,
+            CanonicalType::Varchar,
+            CanonicalType::Severity,
+        ] {
+            assert_eq!(
+                guarded_cast("t", pin),
+                guarded_cast_in("t", pin, crate::severity::Dialect::Otel),
+                "{pin:?}"
+            );
+        }
+    }
+
+    /// The dialect reaches the SEVERITY rung and nothing else, so a caller
+    /// may thread one dialect through a pin-generic plan without asking
+    /// whether it applies.
+    #[test]
+    fn only_the_severity_rung_reads_a_dialect() {
+        for pin in [
+            CanonicalType::Boolean,
+            CanonicalType::BigInt,
+            CanonicalType::Double,
+            CanonicalType::Timestamp,
+            CanonicalType::Varchar,
+        ] {
+            assert_eq!(
+                guarded_cast_in("t", pin, crate::severity::Dialect::Otel),
+                guarded_cast_in("t", pin, crate::severity::Dialect::Syslog),
+                "{pin:?} is not dialect-invariant"
+            );
+        }
+        assert_ne!(
+            guarded_cast_in("t", CanonicalType::Severity, crate::severity::Dialect::Otel),
+            guarded_cast_in(
+                "t",
+                CanonicalType::Severity,
+                crate::severity::Dialect::Syslog
+            )
+        );
+    }
+
+    /// The repin bundle carries one dialect PER ARM, because the two arms
+    /// read text of different provenance (a stored canonical severity is
+    /// dialect-free; `_raw` is always the sender's wire text).
+    #[test]
+    fn resurrection_arms_take_their_own_dialects() {
+        let target = RepinTarget {
+            pin: CanonicalType::Severity,
+            stored: crate::severity::Dialect::Otel,
+            raw: crate::severity::Dialect::Syslog,
+        };
+        let sql = resurrection_expr("\"v\"", "\"_raw\"", "sev", target);
+        assert_eq!(
+            sql,
+            format!(
+                "COALESCE({}, {})",
+                guarded_cast_in(
+                    &untyped_text("\"v\""),
+                    CanonicalType::Severity,
+                    crate::severity::Dialect::Otel
+                ),
+                guarded_cast_in(
+                    &raw_extract("\"_raw\"", "sev"),
+                    CanonicalType::Severity,
+                    crate::severity::Dialect::Syslog
+                )
+            )
+        );
+        // The stored arm is the OTel reading and the raw arm the syslog
+        // one: the syslog inversion table appears exactly once.
+        assert_eq!(sql.matches("WHEN 7 THEN 5").count(), 1, "{sql}");
+        assert_eq!(sql.matches("BETWEEN 1 AND 24").count(), 1, "{sql}");
+        assert_eq!(
+            RepinTarget::otel(CanonicalType::Severity).raw,
+            crate::severity::Dialect::Otel
+        );
+    }
+
+    /// The ambiguity predicate compares the two readings and demands BOTH
+    /// — a one-dialect value is visible loss the plan counts, not a silent
+    /// mistranslation.
+    #[test]
+    fn dialect_ambiguity_sql_compares_both_readings() {
+        let sql = severity_dialect_ambiguous_sql("t");
+        let otel = severity_reading_sql("t", crate::severity::Dialect::Otel);
+        let syslog = severity_reading_sql("t", crate::severity::Dialect::Syslog);
+        assert_eq!(
+            sql,
+            format!("({otel} IS NOT NULL AND {syslog} IS NOT NULL AND {otel} <> {syslog})")
+        );
     }
 }

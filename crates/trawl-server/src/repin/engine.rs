@@ -34,6 +34,7 @@ use trawl_core::schema::CanonicalType;
 use crate::catalog::FieldCatalog;
 use crate::catalog::conform::open_bounded_connection;
 use crate::error::ServerError;
+use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
 use crate::repin::cutover::{
     finish_post_swap_staging, prepare_shadow_root, swap_envs, sweep_pre_swap_staging,
@@ -84,6 +85,56 @@ pub static TEST_FILE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// tests can walk away from a request while the scan is still running.
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_SCAN_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only BARRIER on the build's first pass, arming a
+/// happened-before ordering a delay alone cannot give: pass 0 takes its
+/// source snapshot, publishes [`TEST_SNAPSHOT_TAKEN`], and then waits for
+/// [`TEST_RELEASE_BUILD`].
+///
+/// A test that ingests while the build merely runs SLOWLY proves nothing
+/// about catch-up: pass 0's own snapshot may already have seen the new
+/// file, and the assertion would hold even if catch-up passes read the
+/// wrong dialect. With the barrier the file provably lands AFTER the
+/// snapshot, so only a catch-up pass can carry it into the shadow.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_BARRIER_FIRST_PASS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the build once pass 0 has snapshotted the source tree.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_SNAPSHOT_TAKEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the test to let the barriered pass proceed.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_RELEASE_BUILD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only HOLD at the first published progress, pinning the one state a
+/// mid-job observer needs: the job row `running`, the running gauge up, and
+/// `files_done` already ≥ 1 — with no exclusion primitive held, so queries
+/// and ingest still work exactly as they do mid-build.
+///
+/// Progress is published per PASS, not per file, so the window where
+/// "running AND `files_done` ≥ 1" holds opens only when pass 0 finishes and
+/// closes when the job terminalizes. A polling observer can miss it
+/// entirely — or find the job already terminal on its first read — which is
+/// timing, not behaviour. Holding the job at that point makes the
+/// observation an ORDERING instead of a race: the state is pinned until the
+/// test that wants to see it says so.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_HOLD_AFTER_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the build once it is HOLDING at published progress.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_PROGRESS_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the test to let the held job continue to catch-up and cutover.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_RELEASE_JOB: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// What `start` decided.
 #[derive(Debug)]
@@ -147,20 +198,24 @@ impl RepinEngine {
     ///
     /// Refusals are side-effect-free on the corpus; every claim leaves a
     /// job row (the dry-run report IS the row).
+    #[allow(clippy::too_many_arguments)] // one flag bundle per request field
     pub async fn start(
         self: &Arc<Self>,
         field: &str,
         to: &str,
+        dialect: Option<&str>,
         dry_run: bool,
         force: bool,
         requested_by: Option<&str>,
     ) -> Result<StartOutcome, ServerError> {
         let field = field.to_ascii_lowercase();
         let to = parse_target(to)?;
-        if trawl_core::schema::ENVELOPE_TYPES
-            .iter()
-            .any(|(name, _)| *name == field)
-        {
+        let dialect = resolve_dialect(to, dialect)?;
+        // A PREDICATE, not the envelope list: the whole `_` prefix is
+        // trawl's (`schema::is_contract_typed`), so a contract slot added
+        // later is refused the day it exists rather than the day somebody
+        // remembers this check.
+        if trawl_core::schema::is_contract_typed(&field) {
             return Err(ServerError::BadRequest(format!(
                 "{field:?} is a declared envelope field — its type is part \
                  of the event contract and cannot be repinned"
@@ -183,7 +238,15 @@ impl RepinEngine {
         // The one-running slot: a second request 409s here.
         let job_id = self
             .store
-            .claim(&field, from, to, dry_run, force, requested_by)
+            .claim(crate::store::RepinClaim {
+                field: &field,
+                from_type: from,
+                to_type: to,
+                dialect,
+                dry_run,
+                force,
+                requested_by,
+            })
             .await?;
 
         tracing::info!(
@@ -192,6 +255,7 @@ impl RepinEngine {
             field = %field,
             from = from.as_catalog(),
             to = to.as_catalog(),
+            dialect = dialect.map(trawl_core::severity::Dialect::token),
             dry_run,
             force,
             "repin job claimed; scanning the corpus"
@@ -208,11 +272,17 @@ impl RepinEngine {
         // running job. Detached, the ladder always terminalizes; a caller
         // that walked away merely loses the response and reads the verdict
         // from `/schema/repin/status`.
+        // The reading rule, built ONCE here because this is the only place
+        // that knows the OLD pin (see `RepinReading`). Everything downstream
+        // — scan, rewrite, both force gates — reads it rather than
+        // re-deriving a dialect from the target.
+        let reading = RepinReading::new(from, to, dialect.unwrap_or_default());
         let engine = Arc::clone(self);
-        let decided =
-            tokio::spawn(
-                async move { engine.decide(job_id, field, from, to, dry_run, force).await },
-            );
+        let decided = tokio::spawn(async move {
+            engine
+                .decide(job_id, field, from, reading, dry_run, force)
+                .await
+        });
         match decided.await {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -234,7 +304,7 @@ impl RepinEngine {
         job_id: i64,
         field: String,
         from: CanonicalType,
-        to: CanonicalType,
+        reading: RepinReading,
         dry_run: bool,
         force: bool,
     ) -> Result<StartOutcome, ServerError> {
@@ -265,22 +335,30 @@ impl RepinEngine {
             }
         }
 
-        let (counts, tallies) = match self.run_scan(&field, to).await {
+        let (counts, tallies, samples) = match self.run_scan(&field, reading).await {
             Ok(measured) => measured,
             Err(e) => {
                 self.finish(job_id, RepinJobStatus::Failed, Some(&e)).await;
                 return Err(ServerError::Internal(format!("repin scan failed: {e}")));
             }
         };
+        let liveness = self.field_liveness(&field).await;
+        let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
         if let Err(e) = self
             .store
             .record_plan(
                 job_id,
-                i64::try_from(counts.files_total).unwrap_or(i64::MAX),
-                i64::try_from(counts.rows_carrying).unwrap_or(i64::MAX),
-                i64::try_from(counts.projected_nulls).unwrap_or(i64::MAX),
-                i64::try_from(counts.resurrectable).unwrap_or(i64::MAX),
-                i64::try_from(counts.affected_bytes).unwrap_or(i64::MAX),
+                crate::store::RepinPlan {
+                    files_total: clamp(counts.files_total),
+                    rows_carrying: clamp(counts.rows_carrying),
+                    projected_nulls: clamp(counts.projected_nulls),
+                    resurrectable: clamp(counts.resurrectable),
+                    affected_bytes: clamp(counts.affected_bytes),
+                    ambiguous_numerals: clamp(counts.ambiguous_numerals),
+                    unmapped_samples: samples,
+                    field_last_seen: liveness.as_ref().map(|(at, _)| *at),
+                    field_last_service: liveness.map(|(_, service)| service),
+                },
             )
             .await
         {
@@ -296,8 +374,18 @@ impl RepinEngine {
             self.finish(job_id, RepinJobStatus::Succeeded, None).await;
             return Ok(StartOutcome::DryRun(self.job(job_id).await?));
         }
-        if counts.projected_nulls > 0 && !force {
-            self.finish(job_id, RepinJobStatus::RefusedNeedsForce, None)
+        // The SCAN gate. Same decision as the finished-shadow gate below,
+        // one function — the plan rides back as the 409 body, and the reason
+        // rides with it: a refusal over ambiguity with zero projected nulls
+        // is otherwise a plan an operator cannot read the verdict off.
+        if let Some(reason) = force_refusal(
+            reading.written.pin,
+            Some(reading.written.raw),
+            counts.projected_nulls,
+            counts.ambiguous_numerals,
+            force,
+        ) {
+            self.finish(job_id, RepinJobStatus::RefusedNeedsForce, Some(&reason))
                 .await;
             return Ok(StartOutcome::Refused(self.job(job_id).await?));
         }
@@ -337,7 +425,7 @@ impl RepinEngine {
         let tallies = Arc::new(tallies);
         tokio::spawn(async move {
             engine
-                .run_job(job_id, field, from, to, force, tallies)
+                .run_job(job_id, field, from, reading, force, tallies)
                 .await;
         });
         Ok(StartOutcome::Started(self.job(job_id).await?))
@@ -346,14 +434,43 @@ impl RepinEngine {
     async fn run_scan(
         &self,
         field: &str,
-        to: CanonicalType,
-    ) -> Result<(ScanCounts, ScanTallies), String> {
+        reading: RepinReading,
+    ) -> Result<(ScanCounts, ScanTallies, Vec<String>), String> {
         let data_dir = self.data_dir.clone();
         let memory_limit = self.memory_limit.clone();
         let field = field.to_owned();
-        tokio::task::spawn_blocking(move || scan(&data_dir, &memory_limit, &field, to))
+        tokio::task::spawn_blocking(move || scan(&data_dir, &memory_limit, &field, reading))
             .await
             .map_err(|e| format!("repin scan task panicked: {e}"))?
+    }
+
+    /// Is anything still WRITING this field? The newest observation inside
+    /// [`crate::repin::LIVENESS_WINDOW`], with one service behind it.
+    ///
+    /// One indexed row (`field_services (field, …)`, ordered `last_seen`
+    /// DESC — the read the schema surface already pages through), so no new
+    /// store method and no scan. Best-effort by design: liveness is
+    /// ADVISORY, and a repin must not fail because an observation table was
+    /// briefly unreadable — a warning that cannot be produced is a missing
+    /// warning, not a missing repin.
+    async fn field_liveness(&self, field: &str) -> Option<(chrono::DateTime<chrono::Utc>, String)> {
+        let (rows, _) = self
+            .catalog_store
+            .field_services(field, None, 1)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(
+                    event_type = "catalog_bookkeeping_error",
+                    field = %field,
+                    error = %e,
+                    "could not read repin subject liveness; the report omits it"
+                );
+            })
+            .ok()?;
+        let newest = rows.into_iter().next()?;
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(crate::repin::LIVENESS_WINDOW).unwrap_or_default();
+        (newest.last_seen >= cutoff).then_some((newest.last_seen, newest.service))
     }
 
     async fn job(&self, job_id: i64) -> Result<RepinJob, ServerError> {
@@ -447,7 +564,7 @@ impl RepinEngine {
         job_id: i64,
         field: String,
         from: CanonicalType,
-        to: CanonicalType,
+        reading: RepinReading,
         force: bool,
         scanned: Arc<ScanTallies>,
     ) {
@@ -455,8 +572,9 @@ impl RepinEngine {
         let _rollup_pause = self.coordinator.pause_rollup();
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(1.0);
 
+        let to = reading.written.pin;
         let outcome = self
-            .run_job_inner(job_id, &field, from, to, force, &scanned)
+            .run_job_inner(job_id, &field, from, reading, force, &scanned)
             .await;
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(0.0);
         metrics::histogram!(crate::metrics::CATALOG_REPIN_DURATION_SECONDS)
@@ -536,10 +654,11 @@ impl RepinEngine {
         job_id: i64,
         field: &str,
         from: CanonicalType,
-        to: CanonicalType,
+        reading: RepinReading,
         force: bool,
         scanned: &Arc<ScanTallies>,
     ) -> Result<(), JobAbort> {
+        let to = reading.written.pin;
         let marker = RepinMarker {
             job_id,
             field: field.to_owned(),
@@ -570,10 +689,26 @@ impl RepinEngine {
         let mut converged = false;
         for pass in 0..MAX_CATCHUP_PASSES {
             let changed = self
-                .run_pass(field, to, &flipped, scanned, &mut state)
+                .run_pass(field, reading, &flipped, scanned, &mut state)
                 .await
                 .map_err(JobAbort::Failed)?;
             self.publish_progress(job_id, &state).await;
+
+            // Test-only: pin the mid-job state for an observer (see
+            // `TEST_HOLD_AFTER_PROGRESS`). Bounded, so a mis-driven test
+            // fails instead of hanging, and armed once — later passes run
+            // at full speed.
+            #[cfg(any(test, feature = "test-support"))]
+            if TEST_HOLD_AFTER_PROGRESS.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                TEST_PROGRESS_PUBLISHED.store(true, std::sync::atomic::Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while !TEST_RELEASE_JOB.load(std::sync::atomic::Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+
             tracing::info!(
                 event_type = "repin_pass",
                 job_id,
@@ -621,7 +756,7 @@ impl RepinEngine {
 
         // Final increment under exclusion: nothing can write or read the
         // corpus now, so this pass is the last word.
-        self.run_pass(field, to, &flipped, scanned, &mut state)
+        self.run_pass(field, reading, &flipped, scanned, &mut state)
             .await
             .map_err(JobAbort::Failed)?;
         self.publish_progress(job_id, &state).await;
@@ -633,15 +768,20 @@ impl RepinEngine {
         // shadow's OWN accounting is the only check the operator's
         // omitted force flag can actually govern — and it is safe to
         // refuse here because nothing visible has moved yet.
-        let (_, _, nulled, _) = state.totals();
-        if nulled > 0 && !force {
+        let totals = state.totals();
+        if let Some(reason) = force_refusal(
+            reading.written.pin,
+            Some(reading.written.raw),
+            totals.nulled,
+            totals.ambiguous,
+            force,
+        ) {
             return Err(JobAbort::RefusedNeedsForce(format!(
-                "the completed rewrite nulled {nulled} stored value(s) the \
-                 pre-build scan did not project — data ingested after the \
-                 scan cannot be read as {}; the cutover is refused and the \
-                 corpus stands at its pre-repin generation. Re-run the dry \
-                 run for the current plan, then pass force to accept the loss",
-                to.as_catalog()
+                "the completed rewrite is not what the pre-build scan \
+                 projected — data ingested after the scan carries values the \
+                 plan never saw: {reason}. The cutover is refused and the \
+                 corpus stands at its pre-repin generation; re-run the dry \
+                 run for the current plan, then pass force to accept it"
             )));
         }
 
@@ -740,7 +880,7 @@ impl RepinEngine {
     async fn run_pass(
         &self,
         field: &str,
-        to: CanonicalType,
+        reading: RepinReading,
         flipped: &Arc<HashMap<String, CanonicalType>>,
         scanned: &Arc<ScanTallies>,
         state: &mut BuildState,
@@ -758,7 +898,7 @@ impl RepinEngine {
                 &shadow,
                 &memory_limit,
                 &field,
-                to,
+                reading,
                 &flipped,
                 &scanned,
                 &mut taken,
@@ -772,22 +912,24 @@ impl RepinEngine {
     }
 
     async fn publish_progress(&self, job_id: i64, state: &BuildState) {
-        let (files_done, rows, nulled, resurrected) = state.totals();
+        let totals = state.totals();
+        let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
         if let Err(e) = self
             .store
             .record_progress(
                 job_id,
-                i64::try_from(files_done).unwrap_or(i64::MAX),
-                i64::try_from(rows).unwrap_or(i64::MAX),
-                i64::try_from(nulled).unwrap_or(i64::MAX),
-                i64::try_from(resurrected).unwrap_or(i64::MAX),
+                clamp(totals.files_done),
+                clamp(totals.rows),
+                clamp(totals.nulled),
+                clamp(totals.resurrected),
+                clamp(totals.ambiguous),
             )
             .await
         {
             tracing::warn!(event_type = "repin_store_error", job_id, error = %e, "progress write failed");
         }
         #[allow(clippy::cast_precision_loss)]
-        metrics::gauge!(crate::metrics::CATALOG_REPIN_FILES_DONE).set(files_done as f64);
+        metrics::gauge!(crate::metrics::CATALOG_REPIN_FILES_DONE).set(totals.files_done as f64);
     }
 
     /// Final tallies: counters, and — for a forced lossy repin — the same
@@ -801,10 +943,10 @@ impl RepinEngine {
         to: CanonicalType,
         state: &BuildState,
     ) {
-        let (_, _, nulled, resurrected) = state.totals();
-        metrics::counter!(crate::metrics::CATALOG_REPIN_ROWS_NULLED_TOTAL).increment(nulled);
+        let totals = state.totals();
+        metrics::counter!(crate::metrics::CATALOG_REPIN_ROWS_NULLED_TOTAL).increment(totals.nulled);
         metrics::counter!(crate::metrics::CATALOG_REPIN_ROWS_RESURRECTED_TOTAL)
-            .increment(resurrected);
+            .increment(totals.resurrected);
         self.publish_progress(job_id, state).await;
 
         let conflicts: Vec<FieldConflict> = state
@@ -813,7 +955,11 @@ impl RepinEngine {
             .map(|(service, rows_nulled)| FieldConflict {
                 field: field.to_owned(),
                 service,
-                observed_type: from.as_duckdb().to_owned(),
+                // The CATALOG spelling: evidence a repin authors must name
+                // the pin the values were stored under, and `as_duckdb` is
+                // not injective — a SEVERITY source would indict itself as
+                // BIGINT, a pin the field never had.
+                observed_type: from.as_catalog().to_owned(),
                 expected_type: to,
                 rows_nulled,
                 // The rewrite counts what it nulled per service; it never
@@ -865,6 +1011,22 @@ enum JobAbort {
     RefusedNeedsForce(String),
 }
 
+/// What the shadow generation holds so far — the numbers the progress
+/// record, the metrics and the cutover's force gate all read.
+#[derive(Debug, Clone, Copy, Default)]
+struct BuildTotals {
+    /// Affected files actually rewritten.
+    files_done: u64,
+    /// Rows written through the rewrite.
+    rows: u64,
+    /// Stored values the new pin could not keep.
+    nulled: u64,
+    /// Values recovered from `_raw`.
+    resurrected: u64,
+    /// Rows the new pin reads differently in each dialect.
+    ambiguous: u64,
+}
+
 /// Everything a pass needs to remember between passes: which source file
 /// versions the shadow already reflects, and what each contributed.
 #[derive(Debug, Default)]
@@ -878,19 +1040,21 @@ impl BuildState {
         self.results.values().filter(|t| t.rewritten).count() as u64
     }
 
-    /// `(files_done, rows, nulled, resurrected)` over the CURRENT shadow
-    /// contents — a caught-up replacement supersedes its earlier tally, so
-    /// totals never double-count a reprocessed file.
-    fn totals(&self) -> (u64, u64, u64, u64) {
-        let mut rows = 0u64;
-        let mut nulled = 0u64;
-        let mut resurrected = 0u64;
+    /// The shadow's tallies over its CURRENT contents — a caught-up
+    /// replacement supersedes its earlier tally, so totals never
+    /// double-count a reprocessed file.
+    fn totals(&self) -> BuildTotals {
+        let mut totals = BuildTotals {
+            files_done: self.files_rewritten(),
+            ..BuildTotals::default()
+        };
         for tally in self.results.values().filter(|t| t.rewritten) {
-            rows = rows.saturating_add(tally.rows);
-            nulled = nulled.saturating_add(tally.nulled);
-            resurrected = resurrected.saturating_add(tally.resurrected);
+            totals.rows = totals.rows.saturating_add(tally.rows);
+            totals.nulled = totals.nulled.saturating_add(tally.nulled);
+            totals.resurrected = totals.resurrected.saturating_add(tally.resurrected);
+            totals.ambiguous = totals.ambiguous.saturating_add(tally.ambiguous);
         }
-        (self.files_rewritten(), rows, nulled, resurrected)
+        totals
     }
 
     fn nulled_by_service(&self) -> HashMap<String, u64> {
@@ -914,12 +1078,26 @@ fn run_pass_blocking(
     shadow: &Path,
     memory_limit: &str,
     field: &str,
-    to: CanonicalType,
+    reading: RepinReading,
     flipped: &HashMap<String, CanonicalType>,
     scanned: &ScanTallies,
     state: &mut BuildState,
 ) -> Result<usize, String> {
     let sources = snapshot_env_files(data_dir)?;
+
+    // Test-only happened-before edge: this snapshot is taken, and nothing
+    // moves until the test has written the file it wants a CATCH-UP pass to
+    // carry. Bounded so a mis-driven test fails rather than hangs.
+    #[cfg(any(test, feature = "test-support"))]
+    if TEST_BARRIER_FIRST_PASS.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        TEST_SNAPSHOT_TAKEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !TEST_RELEASE_BUILD.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     // Retirements: a source file that vanished (nothing should remove one
     // while retention and the rollup are suppressed, but an operator can)
@@ -963,7 +1141,7 @@ fn run_pass_blocking(
             .get(&rel)
             .and_then(|(scanned_sig, effect)| (*scanned_sig == sig).then_some(*effect));
         let tally = process_file(
-            &conn, data_dir, shadow, &rel, field, to, flipped, precounted,
+            &conn, data_dir, shadow, &rel, field, reading, flipped, precounted,
         )?;
         state.results.insert(rel.clone(), tally);
         state.processed.insert(rel, sig);
@@ -973,16 +1151,114 @@ fn run_pass_blocking(
 
 /// Resolve a requested repin target to a canonical type.
 ///
-/// The parse is through `CanonicalType::from_duckdb` — the PHYSICAL
-/// spelling — deliberately: `SEVERITY` has no physical spelling of its
-/// own (ADR-0013), so `--to severity` is refused structurally here rather
-/// than by a hand-maintained deny-list. Making severity an operator
-/// decision is slice 2's job.
+/// The parse is through `CanonicalType::from_catalog` — the CATALOG
+/// spelling, the injective one — so `SEVERITY` is admitted (issue #79).
+/// It is a target an operator can only reach by naming it: inference still
+/// cannot mint it (`DESCRIBE` never says SEVERITY, so
+/// `normalize_duckdb_type` can never yield it), and the seed remains the
+/// only other installer. What used to make the physical door the gate —
+/// "severity is not an operator decision" — is exactly what this slice
+/// reverses.
+/// The force decision, asked by all THREE askers — the pre-build scan
+/// gate, the finished-shadow gate, and the wire (`requires_force` on every
+/// job row a client reads) — so a dry run can never report a verdict the
+/// executing request would not reach. `Some(reason)` means the job needs an
+/// explicit force flag it does not have; the reason is the row's `error`
+/// text, and a caller may wrap it in its own context, which is the only
+/// thing the askers say differently.
+///
+/// Takes the PIN and the asserted dialect rather than a `RepinTarget`,
+/// because the wire asker reads a stored job row: `RepinTarget` is the
+/// engine's to construct (it alone knows the old pin), and re-deriving one
+/// from a row would be exactly the second opinion this function exists to
+/// prevent.
+///
+/// Two reasons, both about a value the operator has not knowingly accepted:
+///
+/// 1. LOSS — values the new pin cannot read at all. Unchanged behaviour;
+/// 2. AMBIGUITY — numerals that read as a different severity in each
+///    dialect (the 1-7 overlap). Only under the `OTel` reading, because
+///    asserting syslog IS the statement about provenance the ambiguity is
+///    waiting for (issue #79, AC4). An explicit `dialect=otel` does NOT
+///    suppress it: the refusal is about the values, not about how the
+///    request was spelled, and force is the one escape.
+///
+/// The COUNT is taken whatever the dialect — the report says what is there
+/// — and only the gate is conditional.
+pub(crate) fn force_refusal(
+    pin: CanonicalType,
+    dialect: Option<trawl_core::severity::Dialect>,
+    nulled: u64,
+    ambiguous: u64,
+    force: bool,
+) -> Option<String> {
+    if force {
+        return None;
+    }
+    if nulled > 0 {
+        return Some(format!(
+            "{nulled} stored value(s) cannot be read as {} and would be \
+             nulled (the originals stay findable in _raw)",
+            pin.as_catalog()
+        ));
+    }
+    let ambiguous_gate = pin == CanonicalType::Severity
+        && dialect != Some(trawl_core::severity::Dialect::Syslog)
+        && ambiguous > 0;
+    if ambiguous_gate {
+        return Some(format!(
+            "{ambiguous} row(s) carry a numeral 1-7, which the OTel ladder \
+             and syslog PRI read as DIFFERENT severities (3 is trace3 to \
+             OTel and err to syslog) — no value-shape rule can tell them \
+             apart, so trawl will not guess. Re-run with dialect=syslog if \
+             the sender speaks syslog PRI, or force to accept the OTel \
+             reading"
+        ));
+    }
+    None
+}
+
+/// Resolve the asserted numeral dialect for a target (issue #79).
+///
+/// A `SEVERITY` target always ends up with one — `otel` when the request
+/// says nothing, because that is what every other lane reads and a repin
+/// that changed the ladder by omission would be the silent mistranslation
+/// this whole feature exists to make deliberate.
+///
+/// Any OTHER target with a dialect is a 400, not an ignored field: the
+/// dialect only reaches the SEVERITY rung, so accepting it elsewhere would
+/// tell an operator their assertion was honoured when nothing read it.
+fn resolve_dialect(
+    to: CanonicalType,
+    dialect: Option<&str>,
+) -> Result<Option<trawl_core::severity::Dialect>, ServerError> {
+    use trawl_core::severity::{DIALECT_TOKENS, Dialect};
+
+    match (to, dialect) {
+        (CanonicalType::Severity, None) => Ok(Some(Dialect::Otel)),
+        (CanonicalType::Severity, Some(token)) => {
+            Dialect::from_token(token).map(Some).ok_or_else(|| {
+                ServerError::BadRequest(format!(
+                    "unknown severity dialect {token:?} — the vocabulary is {}",
+                    DIALECT_TOKENS.join(", ")
+                ))
+            })
+        }
+        (_, None) => Ok(None),
+        (_, Some(token)) => Err(ServerError::BadRequest(format!(
+            "dialect {token:?} is only meaningful for a SEVERITY target — \
+             the dialect reads NUMERALS onto the severity ladder, and {} \
+             has no ladder to read them onto",
+            to.as_catalog()
+        ))),
+    }
+}
+
 fn parse_target(to: &str) -> Result<CanonicalType, ServerError> {
-    CanonicalType::from_duckdb(&to.to_ascii_uppercase()).ok_or_else(|| {
+    CanonicalType::from_catalog(&to.to_ascii_uppercase()).ok_or_else(|| {
         ServerError::BadRequest(format!(
             "unknown repin target type {to:?} — the candidate ladder is \
-             BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, VARCHAR"
+             BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, VARCHAR, SEVERITY"
         ))
     })
 }
@@ -991,22 +1267,173 @@ fn parse_target(to: &str) -> Result<CanonicalType, ServerError> {
 mod tests {
     use super::*;
 
+    /// The target vocabulary is the CATALOG's — the injective spelling —
+    /// so `SEVERITY` is a target an operator can name (issue #79) and
+    /// stays DISTINCT from the `BIGINT` it shares a physical type with:
+    /// the two mean different things to every comparison rule, and a parse
+    /// that collapsed them would repin a field to a pin nobody asked for.
     #[test]
-    fn repin_targets_are_the_physical_ladder_and_never_severity() {
+    fn repin_targets_are_the_catalog_vocabulary_severity_included() {
         for (spelling, expected) in [
             ("bigint", CanonicalType::BigInt),
             ("VARCHAR", CanonicalType::Varchar),
             ("TimeStamp", CanonicalType::Timestamp),
             ("double", CanonicalType::Double),
             ("boolean", CanonicalType::Boolean),
+            ("severity", CanonicalType::Severity),
+            ("SEVERITY", CanonicalType::Severity),
+            ("Severity", CanonicalType::Severity),
         ] {
             assert_eq!(parse_target(spelling).unwrap(), expected, "{spelling}");
         }
-        for rejected in ["severity", "SEVERITY", "json", ""] {
+        assert_ne!(
+            parse_target("severity").unwrap(),
+            parse_target("bigint").unwrap(),
+            "SEVERITY is a semantic pin over BIGINT, not a synonym for it"
+        );
+        // Still a closed vocabulary: `JSON` is an inference artifact, never
+        // a pin, and an empty target is a client bug.
+        for rejected in ["json", "", "sev", "otel", "hugeint"] {
             let err = parse_target(rejected).expect_err("must refuse");
             assert!(
                 matches!(err, ServerError::BadRequest(ref m) if m.contains("unknown repin target type")),
                 "{rejected}: {err:?}"
+            );
+        }
+    }
+
+    /// The force gate is ONE decision asked at two moments (the pre-build
+    /// scan and the finished shadow), so the two can only refuse for the
+    /// same reasons: loss always, ambiguity only under the `OTel` reading —
+    /// asserting syslog IS the provenance statement the ambiguity waits for
+    /// — and `--force` is the single escape from either.
+    #[test]
+    fn the_force_gate_refuses_loss_always_and_ambiguity_under_otel_only() {
+        use trawl_core::severity::Dialect;
+
+        const SEVERITY: CanonicalType = CanonicalType::Severity;
+        const VARCHAR: CanonicalType = CanonicalType::Varchar;
+
+        // Loss: any target, any dialect, cleared only by force.
+        assert!(
+            force_refusal(VARCHAR, None, 3, 0, false)
+                .is_some_and(|m| m.contains("cannot be read as VARCHAR")),
+        );
+        assert_eq!(force_refusal(VARCHAR, None, 3, 0, true), None);
+        assert!(force_refusal(SEVERITY, Some(Dialect::Syslog), 3, 0, false).is_some());
+
+        // Ambiguity: refused under OTel, silent under an explicit syslog
+        // assertion, and cleared by force either way.
+        let refusal = force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, false)
+            .expect("an OTel repin over the 1-7 overlap must refuse");
+        assert!(refusal.contains("2 row(s)"), "{refusal}");
+        assert!(refusal.contains("dialect=syslog"), "{refusal}");
+        assert_eq!(
+            force_refusal(SEVERITY, Some(Dialect::Syslog), 0, 2, false),
+            None,
+            "asserting syslog IS the answer to the ambiguity"
+        );
+        assert_eq!(
+            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, true),
+            None
+        );
+        // A row with no recorded dialect at all (a legacy job, or one whose
+        // scope CHECK predates this slice) reads as the OTel default — the
+        // gate must not go silent because a column is NULL.
+        assert!(force_refusal(SEVERITY, None, 0, 2, false).is_some());
+
+        // Nothing to refuse, and a non-severity target has no ambiguity
+        // notion at all (its count is a constant zero upstream, but the gate
+        // must not fire even if one were handed in).
+        assert_eq!(
+            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 0, false),
+            None
+        );
+        assert_eq!(force_refusal(VARCHAR, None, 0, 5, false), None);
+
+        // Loss is reported FIRST: it is the older and larger hazard, and a
+        // plan carrying both needs one force flag, not a ladder of them.
+        let both = force_refusal(SEVERITY, Some(Dialect::Otel), 1, 1, false).unwrap();
+        assert!(both.contains("cannot be read as SEVERITY"), "{both}");
+    }
+
+    /// The dialect is a SEVERITY-only assertion: a severity target defaults
+    /// to `otel` (what every other lane reads), an unknown token names the
+    /// vocabulary, and a dialect on any other target is refused rather than
+    /// ignored — an ignored assertion is one an operator believes was
+    /// honoured.
+    #[test]
+    fn the_dialect_is_resolved_for_severity_targets_only() {
+        use trawl_core::severity::Dialect;
+
+        assert_eq!(
+            resolve_dialect(CanonicalType::Severity, None).unwrap(),
+            Some(Dialect::Otel),
+            "an omitted dialect is the OTel reading, never an absent one"
+        );
+        for (token, want) in [
+            ("otel", Dialect::Otel),
+            ("SYSLOG", Dialect::Syslog),
+            ("Syslog", Dialect::Syslog),
+        ] {
+            assert_eq!(
+                resolve_dialect(CanonicalType::Severity, Some(token)).unwrap(),
+                Some(want),
+                "{token}"
+            );
+        }
+        let err = resolve_dialect(CanonicalType::Severity, Some("rfc5424")).expect_err("refuse");
+        assert!(
+            matches!(err, ServerError::BadRequest(ref m)
+                if m.contains("unknown severity dialect") && m.contains("syslog")),
+            "{err:?}"
+        );
+
+        for pin in [
+            CanonicalType::Varchar,
+            CanonicalType::BigInt,
+            CanonicalType::Double,
+            CanonicalType::Timestamp,
+            CanonicalType::Boolean,
+        ] {
+            assert_eq!(resolve_dialect(pin, None).unwrap(), None, "{pin:?}");
+            let err = resolve_dialect(pin, Some("syslog")).expect_err("refuse");
+            assert!(
+                matches!(err, ServerError::BadRequest(ref m)
+                    if m.contains("only meaningful for a SEVERITY target")),
+                "{pin:?}: {err:?}"
+            );
+        }
+    }
+
+    /// The FIELD side of admission: `start` gates on
+    /// `schema::is_contract_typed`, so every contract slot — the sealed `_`
+    /// namespace whole, present and future, plus the four sender-asserted
+    /// bare names — is refused before a job is ever claimed, while ordinary
+    /// sender vocabulary (including the names that used to be envelope
+    /// slots) is repinnable.
+    #[test]
+    fn contract_typed_fields_are_not_repin_subjects() {
+        for refused in [
+            trawl_core::schema::SEVERITY,
+            trawl_core::schema::TIME,
+            trawl_core::schema::RAW,
+            trawl_core::schema::ENV,
+            trawl_core::schema::SERVICE,
+            trawl_core::schema::HOST,
+            trawl_core::schema::MESSAGE,
+            "_x",
+            "_not_a_slot_yet",
+        ] {
+            assert!(
+                trawl_core::schema::is_contract_typed(refused),
+                "{refused} must be refused by the admission gate"
+            );
+        }
+        for admitted in ["level", "severity", "timestamp", "status", "duration"] {
+            assert!(
+                !trawl_core::schema::is_contract_typed(admitted),
+                "{admitted} is sender vocabulary and repinnable"
             );
         }
     }

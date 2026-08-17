@@ -15,8 +15,8 @@ use trawl_core::schema::CanonicalType;
 
 use crate::catalog::conform::layout_path;
 use crate::ingest::compaction::{
-    ColInfo, ConformPlan, ConformPolicy, describe_source, is_valid_parquet, quote_ident,
-    repin_count_exprs,
+    ColInfo, ConformPlan, ConformPolicy, RepinReading, bounded_misfit_samples_sql,
+    decode_misfit_samples, describe_source, is_valid_parquet, quote_ident, repin_count_exprs,
 };
 
 /// Identity of one source file, for the additive catch-up diff. A
@@ -125,6 +125,9 @@ pub(crate) struct ProcessTally {
     pub(crate) nulled: u64,
     /// Values recovered from `_raw` into the column.
     pub(crate) resurrected: u64,
+    /// Rows the new pin reads DIFFERENTLY in each dialect — the values only
+    /// the operator's assertion can settle (issue #79).
+    pub(crate) ambiguous: u64,
     /// The service the file belongs to (layout files only) — conflict
     /// evidence for a forced lossy repin is attributed per service.
     pub(crate) service: Option<String>,
@@ -151,7 +154,7 @@ pub(crate) fn process_file(
     shadow: &Path,
     rel: &Path,
     field: &str,
-    to: CanonicalType,
+    reading: RepinReading,
     flipped_pins: &HashMap<String, CanonicalType>,
     precounted: Option<RepinEffect>,
 ) -> Result<ProcessTally, String> {
@@ -186,7 +189,7 @@ pub(crate) fn process_file(
         &schema,
         layout,
         field,
-        to,
+        reading,
         flipped_pins,
         precounted,
     )
@@ -235,7 +238,7 @@ fn rewrite_affected(
     schema: &[ColInfo],
     layout: crate::catalog::conform::LayoutPath,
     field: &str,
-    to: CanonicalType,
+    reading: RepinReading,
     flipped_pins: &HashMap<String, CanonicalType>,
     precounted: Option<RepinEffect>,
 ) -> Result<ProcessTally, String> {
@@ -247,7 +250,7 @@ fn rewrite_affected(
     // are equal by construction, not by approximation.
     let counts = match precounted {
         Some(counts) => counts,
-        None => count_repin_effect(conn, &source, schema, field, to)?,
+        None => count_repin_effect(conn, &source, schema, field, reading)?,
     };
 
     let plan = ConformPlan::build(
@@ -256,6 +259,7 @@ fn rewrite_affected(
         &ConformPolicy::Repin {
             resurrect_field: field.to_owned(),
             time_fallback: layout.instant,
+            target: reading.written,
         },
     );
     let has_time = schema
@@ -282,6 +286,7 @@ fn rewrite_affected(
         rows: counts.rows,
         nulled: counts.nulled,
         resurrected: counts.resurrected,
+        ambiguous: counts.ambiguous,
         service: Some(layout.service),
     })
 }
@@ -300,7 +305,7 @@ fn staging_path(dst: &Path) -> PathBuf {
     dst.with_extension(format!("parquet.repin-{}.tmp", std::process::id()))
 }
 
-/// The three per-file numbers the plan reports and the rewrite achieves,
+/// The per-file numbers the plan reports and the rewrite achieves,
 /// computed with the SAME expressions the rewrite writes
 /// (`repin_count_exprs` — see `ingest::compaction::repin_target_expr`).
 #[derive(Debug, Clone, Copy)]
@@ -313,6 +318,10 @@ pub(crate) struct RepinEffect {
     pub(crate) nulled: u64,
     /// Shelved values (`NULL` stored) recovered from `_raw`.
     pub(crate) resurrected: u64,
+    /// Rows whose reading differs between the two dialects. Counted on
+    /// every scan whatever the job asserted — the count is evidence; what
+    /// the assertion governs is the force GATE.
+    pub(crate) ambiguous: u64,
 }
 
 /// Count what the repin would do to one affected source.
@@ -321,32 +330,110 @@ pub(crate) fn count_repin_effect(
     source: &str,
     schema: &[ColInfo],
     field: &str,
-    to: CanonicalType,
+    reading: RepinReading,
 ) -> Result<RepinEffect, String> {
+    let (effect, _) = measure(conn, source, schema, field, reading, false)?;
+    Ok(effect)
+}
+
+/// Count what the repin would do to one affected source AND sample the
+/// values it cannot read — in ONE statement (issue #79).
+///
+/// One statement because the numbers and the evidence must describe the
+/// same read of the same file: compaction can replace a file between two
+/// statements, and a report whose counts came from one generation and whose
+/// samples came from another describes a corpus that never existed.
+///
+/// Sampling is BEST-EFFORT, exactly as the conform's own evidence capture
+/// is: a sampling failure re-runs the plain count and returns no samples
+/// rather than failing the scan. A repin an operator cannot run because the
+/// optional evidence column errored is a worse outcome than a report
+/// without samples.
+pub(crate) fn count_repin_effect_sampled(
+    conn: &duckdb::Connection,
+    source: &str,
+    schema: &[ColInfo],
+    field: &str,
+    reading: RepinReading,
+) -> Result<(RepinEffect, Vec<String>), String> {
+    match measure(conn, source, schema, field, reading, true) {
+        Ok(measured) => Ok(measured),
+        Err(e) => {
+            tracing::warn!(
+                event_type = "repin_sample_failed",
+                error = %e,
+                "could not sample the values this repin cannot read; \
+                 continuing with counts only"
+            );
+            Ok((
+                count_repin_effect(conn, source, schema, field, reading)?,
+                Vec::new(),
+            ))
+        }
+    }
+}
+
+/// The one per-file measurement: the four counts, and — when `sampled` —
+/// the bounded misfit samples beside them in the same statement.
+fn measure(
+    conn: &duckdb::Connection,
+    source: &str,
+    schema: &[ColInfo],
+    field: &str,
+    reading: RepinReading,
+    sampled: bool,
+) -> Result<(RepinEffect, Vec<String>), String> {
     let stored = schema
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case(field))
         .ok_or_else(|| format!("column {field} absent from an affected file"))?;
+    let quoted = quote_ident(&stored.name);
     let has_raw = schema
         .iter()
         .any(|c| c.name.eq_ignore_ascii_case(trawl_core::schema::RAW));
-    let (carrying, kept, resurrectable) =
-        repin_count_exprs(&quote_ident(&stored.name), has_raw, field, to);
+    let exprs = repin_count_exprs(&quoted, has_raw, field, reading);
+    let samples_column = if sampled {
+        let target =
+            crate::ingest::compaction::repin_target_expr(&quoted, has_raw, field, reading.written);
+        let text = trawl_core::conform::untyped_text(&quoted);
+        format!(", {}", bounded_misfit_samples_sql(&quoted, &text, &target))
+    } else {
+        String::new()
+    };
     let sql = format!(
-        "SELECT count(*)::BIGINT, {carrying}::BIGINT, {kept}::BIGINT, \
-         {resurrectable}::BIGINT FROM {source}"
+        "SELECT count(*)::BIGINT, {}::BIGINT, {}::BIGINT, {}::BIGINT, {}::BIGINT{samples_column} \
+         FROM {source}",
+        exprs.carrying, exprs.kept, exprs.resurrectable, exprs.ambiguous
     );
-    let (rows, carrying, kept, resurrected): (i64, i64, i64, i64) = conn
+    let (rows, carrying, kept, resurrected, ambiguous, misfits): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+    ) = conn
         .query_row(&sql, [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                if sampled { row.get(5)? } else { None },
+            ))
         })
         .map_err(|e| format!("repin count failed: {e}"))?;
-    Ok(RepinEffect {
-        rows: u64::try_from(rows).unwrap_or(0),
-        carrying: u64::try_from(carrying).unwrap_or(0),
-        nulled: u64::try_from(carrying - kept).unwrap_or(0),
-        resurrected: u64::try_from(resurrected).unwrap_or(0),
-    })
+    Ok((
+        RepinEffect {
+            rows: u64::try_from(rows).unwrap_or(0),
+            carrying: u64::try_from(carrying).unwrap_or(0),
+            nulled: u64::try_from(carrying - kept).unwrap_or(0),
+            resurrected: u64::try_from(resurrected).unwrap_or(0),
+            ambiguous: u64::try_from(ambiguous).unwrap_or(0),
+        },
+        decode_misfit_samples(misfits.as_deref())?,
+    ))
 }
 
 #[cfg(test)]

@@ -620,6 +620,12 @@ fn plan_block(job: &RepinJobResponse, refused: bool) -> AnyView {
                      stop at the refusal and ask you to accept the loss explicitly."
                 </p>
             })}
+            // The server's own words for WHY force is required. The numbers
+            // above cannot say it on their own: a plan can be refused for
+            // dialect ambiguity with zero projected nulls.
+            {job.requires_force_reason.clone().map(|reason| view! {
+                <p class="rp-note">{reason}</p>
+            })}
         </div>
     }
     .into_any()

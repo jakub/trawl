@@ -66,15 +66,26 @@ pub enum RepinPhase {
 }
 
 /// The `data/REPIN` document.
+///
+/// Dialect-free BY DESIGN (issue #79): a repin to `SEVERITY` may assert
+/// that the corpus's numerals are syslog PRI, but no replay path ever
+/// re-runs a cast — a `building` marker abandons the shadow (the values
+/// were never written), and a `cutover`/`cleanup` marker only completes
+/// renames over files the job already wrote. The dialect lives on the job
+/// ROW, where the report needs it; putting it here would imply a recovery
+/// that could re-read wire text, which is exactly what forward-only
+/// recovery does not do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepinMarker {
     /// The `repin_jobs` row this marker belongs to.
     pub job_id: i64,
     /// The repinned field (catalog key, folded).
     pub field: String,
-    /// The pin at claim time (`DuckDB` spelling).
+    /// The pin at claim time (CATALOG spelling — `SEVERITY` is not
+    /// `BIGINT`, and boot recovery parses this back).
     pub from_type: String,
-    /// The target pin (`DuckDB` spelling).
+    /// The target pin (CATALOG spelling, as written by
+    /// `CanonicalType::as_catalog`).
     pub to_type: String,
     /// Where the job is.
     pub phase: RepinPhase,

@@ -114,7 +114,7 @@ pub async fn query(
 
     // Check for `| from saved` — if present, resolve to parquet source
     // and execute with the pre-computed source instead of normal glob scan.
-    let (outcome, degraded_fields, severity_columns) =
+    let (outcome, degraded_fields) =
         if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query).await? {
             // Both halves of what the caller is actually reading: the
             // stages they typed, and the saved query whose recorded run
@@ -123,9 +123,6 @@ pub async fn query(
             // bound would otherwise go unmentioned.
             let halves = [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()];
             let degraded = degraded_fields_for(&state, halves);
-            // The stages the caller typed are what shapes the rows they
-            // get back; the saved half produced the source.
-            let severity = severity_columns_for(&state, &resolved.remaining_dsl);
             (
                 state
                     .query
@@ -140,11 +137,9 @@ pub async fn query(
                     )
                     .await,
                 degraded,
-                severity,
             )
         } else {
             let degraded = degraded_fields_for(&state, [req.query.as_str()]);
-            let severity = severity_columns_for(&state, &req.query);
             (
                 state
                     .query
@@ -158,12 +153,21 @@ pub async fn query(
                     )
                     .await,
                 degraded,
-                severity,
             )
         };
 
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let duration_secs = start.elapsed().as_secs_f64();
+
+    // Which result columns render as OTel tokens, decided by the EXECUTING
+    // task under the pins the rows were produced with — not by the catalog
+    // as it stands now, since history I/O and logging sit between execution
+    // and the response and a repin landing in that window must not retype
+    // the answer's presentation. The walk itself is a client-shaped cost (a
+    // regex compiled per `extract` stage), so it runs inside the query's
+    // permit on the blocking pool, never here on a reactor thread (see
+    // `crate::pool::severity_columns_for`).
+    let severity_columns = outcome.severity_columns;
 
     match outcome.result {
         Ok(qr) => {
@@ -1142,38 +1146,6 @@ fn degraded_fields_for<'a>(
         .collect()
 }
 
-/// The result columns this query hands back as `SeverityNumber`s
-/// (ADR-0013 slice 2, ruling 9) — the rendering channel for `sev()`.
-///
-/// Rooted in the SAME pin snapshot the query executed under
-/// (`FieldCatalog::all`), so a column that inherited `_severity`'s pin
-/// through a `rename` is named too, and walked with the SAME
-/// `PinScope::advance` the emitter used, so the answer cannot drift from
-/// what the SQL actually projected. An unparseable query has no columns
-/// to render anyway — execution below reports the parse error.
-///
-/// COHERENCE ASSUMPTION, stated because it will need revisiting: this
-/// snapshot is taken BEFORE the executor takes its own, so a pin that
-/// changes in between is described by the older one. Benign today, and
-/// only because a `SEVERITY` pin can be neither created nor destroyed at
-/// runtime — `normalize_duckdb_type` can never yield it, and
-/// `repin --to severity` is refused structurally (ADR-0013 §6) — so the
-/// two snapshots cannot disagree about which columns are severities.
-/// When repin admission for `SEVERITY` lands, this has to read the
-/// executor's own snapshot instead of taking a second one. The failure
-/// it would otherwise cause is presentational only (a token rendered as
-/// a number, or the reverse), never a wrong value.
-fn severity_columns_for(state: &AppState, dsl: &str) -> Vec<String> {
-    let Ok(query) = trawl_core::parser::parse(dsl) else {
-        return Vec::new();
-    };
-    let pins = state.query.field_catalog.all();
-    trawl_core::pin_scope::severity_output_columns(
-        &query.pipeline,
-        &trawl_core::pin_scope::PinScope::root(&pins),
-    )
-}
-
 /// Read a pin's stored `DuckDB` spelling back as a canonical type.
 ///
 /// The column is `CHECK`-constrained to the canonical five, so the fallback
@@ -1709,9 +1681,50 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
 // -- repin handlers (ADR-0011 slice B) ----------------------------------------
 
 /// Wire shape of one repin job row.
+///
+/// `requires_force` is the THIRD asker of the one force decision the two
+/// live gates ask (`repin::force_refusal`), computed from this row's own
+/// persisted numbers: a dry run terminates `succeeded` by design, so the
+/// verdict has to ride the report or an operator learns about the refusal
+/// from the request that was meant to do the work. Never a second
+/// condition — a re-derived one would be free to drift from the gate.
+///
+/// It is ABSENT until the scan has recorded its plan (`planned_at`): a
+/// claimed job's counts are zeros that mean "not measured yet", and a poll
+/// in that window would otherwise read a confident `false` off a row that
+/// is about to refuse. Absent is not "no" — the consumer says "not known
+/// yet", which is what a running job's evidence actually is.
 fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse {
     let clamp = |v: i64| u64::try_from(v).unwrap_or(0);
+    // The pin the job targets, and the dialect it asserted. An unparseable
+    // spelling is corruption in a CHECK-constrained column; VARCHAR is the
+    // pin under which the ambiguity gate cannot fire, so the row reports
+    // loss only rather than inventing a severity verdict.
+    let to = trawl_core::schema::CanonicalType::from_catalog(&job.to_type)
+        .unwrap_or(trawl_core::schema::CanonicalType::Varchar);
+    let dialect = job
+        .dialect
+        .as_deref()
+        .and_then(trawl_core::severity::Dialect::from_token);
+    // The rewrite's own tally supersedes the plan's projection once it has
+    // written anything — the same rule the CLI's refusal text uses.
+    let nulled = if job.rows_nulled > 0 {
+        clamp(job.rows_nulled)
+    } else {
+        clamp(job.projected_nulls)
+    };
+    let requires_force_reason = job.planned_at.and_then(|_| {
+        crate::repin::force_refusal(
+            to,
+            dialect,
+            nulled,
+            clamp(job.ambiguous_numerals),
+            job.force,
+        )
+    });
     trawl_api::RepinJobResponse {
+        requires_force: job.planned_at.map(|_| requires_force_reason.is_some()),
+        requires_force_reason,
         id: job.id,
         field: job.field,
         from_type: job.from_type,
@@ -1732,6 +1745,19 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
         rows_rewritten: clamp(job.rows_rewritten),
         rows_nulled: clamp(job.rows_nulled),
         rows_resurrected: clamp(job.rows_resurrected),
+        dialect: job.dialect,
+        ambiguous_numerals: clamp(job.ambiguous_numerals),
+        unmapped_samples: job.unmapped_samples,
+        // Presence IS the verdict, so both halves must be present: a row
+        // with an observation instant and no service is a partially-written
+        // job row, not a liveness warning.
+        liveness: job
+            .field_last_seen
+            .zip(job.field_last_service)
+            .map(|(last_seen, service)| trawl_api::RepinLiveness {
+                last_seen: iso8601(last_seen),
+                service,
+            }),
     }
 }
 
@@ -1743,8 +1769,9 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
 /// nulled values and no force flag was passed — the body is the plan the
 /// refusal is based on (a second concurrent repin also 409s, but with the
 /// error envelope). Validation refusals (unpinned field, envelope field,
-/// unknown target type, same-type without force) are 400s; a query-only
-/// node answers 503 — it owns nothing under the data root.
+/// unknown target type, same-type without force, a dialect on a
+/// non-`SEVERITY` target) are 400s; a query-only node answers 503 — it owns
+/// nothing under the data root.
 pub async fn schema_repin(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -1765,6 +1792,7 @@ pub async fn schema_repin(
         .start(
             &req.field,
             &req.to,
+            req.dialect.as_deref(),
             req.dry_run,
             req.force,
             Some(&verified.name),

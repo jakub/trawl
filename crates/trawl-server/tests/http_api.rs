@@ -2070,7 +2070,7 @@ async fn repin_permission_matrix(pool: sqlx::PgPool) {
     // Admin: full legacy bundle, but NOT schema_write.
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
     let err = admin
-        .schema_repin("status", "VARCHAR", true, false)
+        .schema_repin("status", "VARCHAR", None, true, false)
         .await
         .expect_err("admin lacks schema_write");
     match err {
@@ -2089,7 +2089,7 @@ async fn repin_permission_matrix(pool: sqlx::PgPool) {
     // was AUTHORIZED and then refused on the merits, with no side effect).
     let schema_admin = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
     let err = schema_admin
-        .schema_repin("never_pinned_field", "VARCHAR", true, false)
+        .schema_repin("never_pinned_field", "VARCHAR", None, true, false)
         .await
         .expect_err("unpinned field refuses on the merits");
     match err {
@@ -2109,7 +2109,7 @@ async fn repin_permission_matrix(pool: sqlx::PgPool) {
     let status = reader.schema_repin_status().await.unwrap();
     assert!(status.job.is_none(), "no repin has run on this server");
     let err = reader
-        .schema_repin("status", "VARCHAR", true, false)
+        .schema_repin("status", "VARCHAR", None, true, false)
         .await
         .expect_err("reader lacks schema_write");
     match err {
@@ -2122,21 +2122,25 @@ async fn repin_permission_matrix(pool: sqlx::PgPool) {
     assert!(ingest.schema_repin_status().await.is_err());
 }
 
-/// Envelope fields and unknown target types refuse with 400 before any
-/// job row exists — validation is side-effect-free.
+/// Contract-typed fields, unknown target types and unpinned fields refuse
+/// with 400 before any job row exists — validation is side-effect-free.
 #[sqlx::test(migrations = false)]
 async fn repin_validation_refusals_are_side_effect_free(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
 
     for (field, to) in [
-        ("_severity", "VARCHAR"), // envelope field
+        ("_severity", "VARCHAR"), // the derived slot: contract-typed
         ("_time", "VARCHAR"),     // envelope metadata
-        ("status", "UUID"),       // not a ladder type
-        ("status", "SEVERITY"),   // semantic pin: no physical spelling
+        ("service", "BIGINT"),    // sender-asserted, still contract-typed
+        ("status", "UUID"),       // not a catalog type
+        // SEVERITY is an admissible target since #79, so this row is
+        // refused for the OTHER reason a repin can be: nothing has pinned
+        // `status` on this server, so there is nothing to repin.
+        ("status", "SEVERITY"),
     ] {
         let err = client
-            .schema_repin(field, to, true, false)
+            .schema_repin(field, to, None, true, false)
             .await
             .expect_err("must refuse");
         match err {

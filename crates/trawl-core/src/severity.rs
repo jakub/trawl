@@ -342,6 +342,32 @@ pub fn reading_text(text: &str, dialect: Dialect) -> Option<u8> {
         .and_then(|n| reading_number(n, dialect))
 }
 
+/// Whether `text` reads as a DIFFERENT severity in each dialect — the
+/// values a repin to `SEVERITY` can only translate by asserting
+/// provenance (issue #79).
+///
+/// True iff both dialects have a reading and the two disagree, which over
+/// the whole input space is exactly the integers 1-7: `3` is `trace3` to
+/// `OTel` and `err` to syslog, and the two ladders overlap nowhere else
+/// (`0` and 8-24 read in one dialect only, and every TOKEN is dialect-free
+/// by construction). A value with ONE reading is not ambiguous — it is
+/// translated or lost, and the repin's own `projected_nulls` already says
+/// which.
+///
+/// The SQL mirror is [`crate::conform::severity_dialect_ambiguous_sql`],
+/// paired against this function by execution in
+/// `trawl-engine/tests/duckdb_probe.rs`.
+#[must_use]
+pub fn dialect_ambiguous(text: &str) -> bool {
+    match (
+        reading_text(text, Dialect::Otel),
+        reading_text(text, Dialect::Syslog),
+    ) {
+        (Some(otel), Some(syslog)) => otel != syslog,
+        _ => false,
+    }
+}
+
 /// The reader's NUMERIC half — the ONE place a dialect changes anything.
 ///
 /// `OTel` passes 1-24 through unchanged; syslog inverts 0-7 through
