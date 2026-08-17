@@ -3414,6 +3414,7 @@ mod repin_store {
                 projected_nulls: 25,
                 resurrectable: 19,
                 affected_bytes: 1 << 20,
+                ambiguous_numerals: 4,
             },
         )
         .await
@@ -3434,7 +3435,7 @@ mod repin_store {
             })
             .await
             .unwrap();
-        s.record_progress(second, 5, 1200, 2, 7).await.unwrap();
+        s.record_progress(second, 5, 1200, 2, 7, 3).await.unwrap();
 
         let latest = s.latest().await.unwrap().expect("a running job");
         assert_eq!(latest.id, second);
@@ -3446,6 +3447,10 @@ mod repin_store {
         assert_eq!(latest.rows_rewritten, 1200);
         assert_eq!(latest.rows_nulled, 2);
         assert_eq!(latest.rows_resurrected, 7);
+        assert_eq!(
+            latest.ambiguous_numerals, 3,
+            "the shadow's own ambiguity count supersedes the scan's"
+        );
 
         s.finish(second, RepinJobStatus::Blocked, Some("cutover starved"))
             .await
@@ -3462,10 +3467,10 @@ mod repin_store {
         assert_eq!(dry.projected_nulls, 25);
         assert_eq!(dry.resurrectable, 19);
         assert_eq!(dry.affected_bytes, 1 << 20);
+        assert_eq!(dry.ambiguous_numerals, 4, "the plan's own count stands");
         // Nothing asserted a dialect, so the row reports none — never a
         // backfilled `otel` (issue #79).
         assert_eq!(dry.dialect, None);
-        assert_eq!(dry.ambiguous_numerals, 0);
         assert!(dry.unmapped_samples.is_empty());
         assert_eq!(dry.field_last_seen, None);
     }

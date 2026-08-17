@@ -14,7 +14,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::watch;
+use trawl_core::conform::RepinTarget;
 use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb_type};
+use trawl_core::severity::Dialect;
 
 use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs};
@@ -2045,6 +2047,67 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
     ))
 }
 
+/// Everything a repin needs to READ one column: the target the rewrite
+/// writes with, and the two wire-dialect readings whose disagreement is
+/// ambiguity (issue #79).
+///
+/// Built ONCE per job, by the engine, because the engine is the only place
+/// that knows the OLD pin — and the old pin is what decides whether the
+/// STORED column holds wire text at all. A stored `SEVERITY` column holds
+/// canonical `OTel` ladder positions, so its arm is dialect-free in every
+/// variant; a stored VARCHAR holds whatever the sender wrote, so its arm
+/// flips with the assertion exactly as the `_raw` arm does. Deriving that
+/// downstream would mean guessing it from the dialects themselves, which
+/// cannot tell `otel-because-canonical` from `otel-because-asserted`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RepinReading {
+    /// What the rewrite writes and the plan counts with.
+    pub(crate) written: RepinTarget,
+    /// Whether the STORED column's own text is SENDER text (the old pin was
+    /// not `SEVERITY`), and therefore a wire position the dialect reaches.
+    stored_is_wire: bool,
+}
+
+impl RepinReading {
+    /// Build the reading rule from the repin's own facts.
+    pub(crate) fn new(from: CanonicalType, to: CanonicalType, dialect: Dialect) -> Self {
+        let stored_is_wire = from != CanonicalType::Severity;
+        Self {
+            written: RepinTarget {
+                pin: to,
+                stored: if stored_is_wire {
+                    dialect
+                } else {
+                    Dialect::Otel
+                },
+                raw: dialect,
+            },
+            stored_is_wire,
+        }
+    }
+
+    /// The `OTel`-and-syslog readings of the SAME columns, or `None` where
+    /// the two are textually identical — every target but `SEVERITY`, whose
+    /// numeric arm is the one dialect-sensitive rung. `None` is what makes
+    /// the ambiguity count a constant `0` rather than a pair of full
+    /// expressions `DuckDB` would evaluate to prove they agree.
+    fn variants(self) -> Option<(RepinTarget, RepinTarget)> {
+        if self.written.pin != CanonicalType::Severity {
+            return None;
+        }
+        let variant = |dialect: Dialect| RepinTarget {
+            pin: self.written.pin,
+            stored: if self.stored_is_wire {
+                dialect
+            } else {
+                Dialect::Otel
+            },
+            raw: dialect,
+        };
+        Some((variant(Dialect::Otel), variant(Dialect::Syslog)))
+    }
+}
+
 /// The repin target column's expression, in the ONE place both consumers
 /// read it from: [`ConformPlan::build`] under [`ConformPolicy::Repin`]
 /// (the rewrite) and the repin scan's dry-run counting
@@ -2055,44 +2118,86 @@ pub(crate) fn repin_target_expr(
     quoted: &str,
     has_raw: bool,
     folded: &str,
-    pin: CanonicalType,
+    target: RepinTarget,
 ) -> String {
     if has_raw {
         trawl_core::conform::resurrection_expr(
             quoted,
             &quote_ident(trawl_core::schema::RAW),
             folded,
-            trawl_core::conform::RepinTarget::otel(pin),
+            target,
         )
     } else {
-        trawl_core::conform::guarded_cast(&trawl_core::conform::untyped_text(quoted), pin)
+        // No `_raw` to resurrect from, so the stored arm is the whole
+        // reading — and it is the STORED arm's dialect that reads it.
+        trawl_core::conform::guarded_cast_in(
+            &trawl_core::conform::untyped_text(quoted),
+            target.pin,
+            target.stored,
+        )
     }
 }
 
 /// The repin scan/rewrite counting expressions, built over
 /// [`repin_target_expr`] so the dry-run numbers and the rewrite outcome
-/// are the same computation: `(carrying, kept, resurrectable)` —
-/// stored values, stored values the new pin keeps (resurrection arm
-/// included), and shelved (`NULL`-stored) values `_raw` gives back.
+/// are the same computation.
+#[derive(Debug, Clone)]
+pub(crate) struct RepinCountExprs {
+    /// Stored values the column carries.
+    pub(crate) carrying: String,
+    /// Stored values the new pin keeps (resurrection arm included).
+    pub(crate) kept: String,
+    /// Shelved (`NULL`-stored) values `_raw` gives back.
+    pub(crate) resurrectable: String,
+    /// Rows whose reading DIFFERS between the two dialects — the values
+    /// only provenance can settle.
+    pub(crate) ambiguous: String,
+}
+
+/// Build the counting expressions for one column under `reading`.
 pub(crate) fn repin_count_exprs(
     quoted: &str,
     has_raw: bool,
     folded: &str,
-    pin: CanonicalType,
-) -> (String, String, String) {
-    let target = repin_target_expr(quoted, has_raw, folded, pin);
+    reading: RepinReading,
+) -> RepinCountExprs {
+    let target = repin_target_expr(quoted, has_raw, folded, reading.written);
     let carrying = format!("count({quoted})");
     let kept = format!("count(CASE WHEN {quoted} IS NOT NULL THEN {target} END)");
     let resurrectable = if has_raw {
-        let raw_read = trawl_core::conform::guarded_cast(
+        let raw_read = trawl_core::conform::guarded_cast_in(
             &trawl_core::conform::raw_extract(&quote_ident(trawl_core::schema::RAW), folded),
-            pin,
+            reading.written.pin,
+            reading.written.raw,
         );
         format!("count(CASE WHEN {quoted} IS NULL THEN {raw_read} END)")
     } else {
         "0".to_owned()
     };
-    (carrying, kept, resurrectable)
+    // Ambiguity is DERIVED from the whole target expression rather than
+    // spelled out over the syslog domain a second time: a row is ambiguous
+    // when both wire dialects have a reading for it and they disagree. Over
+    // the FULL expression this covers the resurrection arm for free (a raw
+    // numeral recovering into a shelved column is just as ambiguous), and it
+    // keeps one-dialect values OUT — those are visible loss the
+    // `projected_nulls` count already reports, not silent mistranslation.
+    let ambiguous = match reading.variants() {
+        None => "0".to_owned(),
+        Some((otel, syslog)) => {
+            let a = repin_target_expr(quoted, has_raw, folded, otel);
+            let b = repin_target_expr(quoted, has_raw, folded, syslog);
+            format!(
+                "count(CASE WHEN {a} IS NOT NULL AND {b} IS NOT NULL \
+                 AND {a} <> {b} THEN 1 END)"
+            )
+        }
+    };
+    RepinCountExprs {
+        carrying,
+        kept,
+        resurrectable,
+        ambiguous,
+    }
 }
 
 /// Wrap a TIMESTAMP-pinned envelope column's conform in a never-NULL last
@@ -2172,15 +2277,17 @@ pub(crate) enum ConformPolicy {
     /// layout path) falls back to the plain guarded conform — no
     /// resurrection arm, rather than a rewrite-failing reference to a
     /// missing column.
-    // Constructed by the repin engine (`crate::repin`); until that module
-    // lands in this slice's later milestone the only constructors are
-    // tests, which the lib-only lint pass cannot see.
-    #[allow(dead_code)]
     Repin {
         /// The repinned field (catalog key, folded).
         resurrect_field: String,
         /// Same role as [`ConformPolicy::StandingFile::time_fallback`].
         time_fallback: chrono::DateTime<chrono::Utc>,
+        /// The per-arm reading rule for the target column (issue #79):
+        /// which dialect each arm reads NUMERALS in. Structurally scoped —
+        /// only the `repin_target` arm of [`ConformPlan::build`] can reach
+        /// it, so ordinary compaction and the boot pass stay on the `OTel`
+        /// reading no matter what a job asserted.
+        target: RepinTarget,
     },
 }
 
@@ -2259,20 +2366,32 @@ impl ConformPlan {
                 plan.keep(col, &folded, quoted);
                 continue;
             }
-            let repin_target = matches!(
-                policy,
-                ConformPolicy::Repin { resurrect_field, .. } if *resurrect_field == folded
-            );
+            // The one arm that may read a job's ASSERTED dialect, and it
+            // carries that reading with it — nothing else in this loop can
+            // reach the target.
+            let repin_target = match policy {
+                ConformPolicy::Repin {
+                    resurrect_field,
+                    target,
+                    ..
+                } if *resurrect_field == folded => Some(*target),
+                _ => None,
+            };
             match pins.get(&folded).copied() {
                 None if matches!(policy, ConformPolicy::WalBatch) => {
                     plan.dropped.push(col.name.clone());
                 }
                 None => plan.keep(col, &folded, quoted),
-                Some(pin) if repin_target => {
+                Some(pin) if repin_target.is_some() => {
                     // Unconditional — never the `conform_expr` noop check:
                     // the resurrection-only pass rewrites a column whose
                     // physical type already IS the pin.
-                    let expr = repin_target_expr(&quoted, has_raw, &folded, pin);
+                    let target = repin_target.expect("matched Some above");
+                    debug_assert_eq!(
+                        pin, target.pin,
+                        "the engine flips the pin map to the job's target"
+                    );
+                    let expr = repin_target_expr(&quoted, has_raw, &folded, target);
                     let written = guard_partition_key(policy, is_time_col, pin, &expr);
                     plan.select_list
                         .push(format!("{written} AS {}", quote_ident(&folded)));
@@ -4276,6 +4395,7 @@ mod tests {
             &ConformPolicy::Repin {
                 resurrect_field: "status".to_owned(),
                 time_fallback: chrono::Utc::now(),
+                target: RepinTarget::otel(CanonicalType::Varchar),
             },
         );
         assert!(!plan.is_noop());
@@ -4339,6 +4459,7 @@ mod tests {
             &ConformPolicy::Repin {
                 resurrect_field: "dur".to_owned(),
                 time_fallback: chrono::Utc::now(),
+                target: RepinTarget::otel(CanonicalType::BigInt),
             },
         );
         assert!(!plan.is_noop(), "a resurrection-only pass is a rewrite");
@@ -4372,6 +4493,7 @@ mod tests {
             &ConformPolicy::Repin {
                 resurrect_field: "status".to_owned(),
                 time_fallback: chrono::Utc::now(),
+                target: RepinTarget::otel(CanonicalType::Varchar),
             },
         );
         assert_eq!(plan.cast_count(), 1);
@@ -4379,6 +4501,128 @@ mod tests {
             !plan.select_list[0].contains("_raw"),
             "no resurrection arm without a _raw column: {}",
             plan.select_list[0]
+        );
+    }
+
+    /// The counting expressions over a SEVERITY target, EXECUTED (issue
+    /// #79): a sender's `level` column repinned onto the ladder. Tokens map
+    /// dialect-free, `gold` maps nowhere, and the numeral `3` maps under
+    /// BOTH dialects to different rungs — which is the whole ambiguity
+    /// notion, counted whatever the job asserted.
+    #[test]
+    fn repin_counts_over_a_severity_target_separate_loss_from_ambiguity() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE f AS SELECT * FROM (VALUES \
+             ('error', '{\"level\":\"error\"}'), \
+             ('ERROR', '{\"level\":\"ERROR\"}'), \
+             ('error2', '{\"level\":\"error2\"}'), \
+             ('3', '{\"level\":\"3\"}'), \
+             ('gold', '{\"level\":\"gold\"}')) t(level, _raw)",
+        )
+        .unwrap();
+        let count = |dialect| {
+            let reading =
+                RepinReading::new(CanonicalType::Varchar, CanonicalType::Severity, dialect);
+            let exprs = repin_count_exprs("\"level\"", true, "level", reading);
+            let sql = format!(
+                "SELECT {}::BIGINT, {}::BIGINT, {}::BIGINT FROM f",
+                exprs.carrying, exprs.kept, exprs.ambiguous
+            );
+            conn.query_row(&sql, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+        };
+
+        // OTel: `3` reads as trace3, `gold` reads as nothing.
+        assert_eq!(count(Dialect::Otel), (5, 4, 1));
+        // Syslog: `3` reads as err (17) instead — still mapped, still the
+        // one ambiguous row, and `gold` is still the only loss. The COUNT
+        // does not depend on the assertion; only the gate does.
+        assert_eq!(count(Dialect::Syslog), (5, 4, 1));
+
+        // The values themselves, to prove the dialect actually changes what
+        // the rewrite would WRITE.
+        let read = |dialect| {
+            let reading =
+                RepinReading::new(CanonicalType::Varchar, CanonicalType::Severity, dialect);
+            let expr = repin_target_expr("\"level\"", true, "level", reading.written);
+            let mut stmt = conn
+                .prepare(&format!("SELECT {expr} FROM f WHERE level = '3'"))
+                .unwrap();
+            stmt.query_row([], |row| row.get::<_, Option<i64>>(0))
+                .unwrap()
+        };
+        assert_eq!(read(Dialect::Otel), Some(3));
+        assert_eq!(read(Dialect::Syslog), Some(17));
+
+        // A non-SEVERITY target has no dialect-sensitive rung at all, so
+        // the ambiguity count is the constant 0 rather than a pair of
+        // expressions DuckDB evaluates to prove they agree.
+        let reading = RepinReading::new(
+            CanonicalType::Varchar,
+            CanonicalType::BigInt,
+            Dialect::Syslog,
+        );
+        let exprs = repin_count_exprs("\"level\"", true, "level", reading);
+        assert_eq!(exprs.ambiguous, "0");
+    }
+
+    /// A repin whose SOURCE is already `SEVERITY` reads its stored column
+    /// dialect-free: the values are canonical ladder positions, and
+    /// re-reading a stored `3` as syslog would silently corrupt it to 17.
+    /// Only the `_raw` arm — the sender's own wire text — takes the
+    /// assertion (issue #79, ruling 1).
+    #[test]
+    fn a_severity_source_keeps_its_stored_arm_dialect_free() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE f AS SELECT * FROM (VALUES \
+             (3::BIGINT, '{\"sev\":\"3\"}'), \
+             (NULL::BIGINT, '{\"sev\":\"3\"}')) t(sev, _raw)",
+        )
+        .unwrap();
+        let reading = RepinReading::new(
+            CanonicalType::Severity,
+            CanonicalType::Severity,
+            Dialect::Syslog,
+        );
+        let expr = repin_target_expr("\"sev\"", true, "sev", reading.written);
+        let mut stmt = conn.prepare(&format!("SELECT {expr} FROM f")).unwrap();
+        let got: Vec<Option<i64>> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            got,
+            vec![Some(3), Some(17)],
+            "the stored canonical 3 is preserved; only the resurrected wire \
+             `3` reads as syslog err"
+        );
+
+        // And the ambiguity variants keep that arm fixed too, so a stored
+        // canonical value is not reported as ambiguous.
+        let exprs = repin_count_exprs("\"sev\"", true, "sev", reading);
+        let ambiguous: i64 = conn
+            .query_row(
+                &format!("SELECT {}::BIGINT FROM f", exprs.ambiguous),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ambiguous, 1,
+            "only the row resurrecting a wire numeral is ambiguous"
         );
     }
 

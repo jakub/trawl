@@ -34,6 +34,7 @@ use trawl_core::schema::CanonicalType;
 use crate::catalog::FieldCatalog;
 use crate::catalog::conform::open_bounded_connection;
 use crate::error::ServerError;
+use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
 use crate::repin::cutover::{
     finish_post_swap_staging, prepare_shadow_root, swap_envs, sweep_pre_swap_staging,
@@ -221,11 +222,17 @@ impl RepinEngine {
         // running job. Detached, the ladder always terminalizes; a caller
         // that walked away merely loses the response and reads the verdict
         // from `/schema/repin/status`.
+        // The reading rule, built ONCE here because this is the only place
+        // that knows the OLD pin (see `RepinReading`). Everything downstream
+        // — scan, rewrite, both force gates — reads it rather than
+        // re-deriving a dialect from the target.
+        let reading = RepinReading::new(from, to, dialect.unwrap_or_default());
         let engine = Arc::clone(self);
-        let decided =
-            tokio::spawn(
-                async move { engine.decide(job_id, field, from, to, dry_run, force).await },
-            );
+        let decided = tokio::spawn(async move {
+            engine
+                .decide(job_id, field, from, reading, dry_run, force)
+                .await
+        });
         match decided.await {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -247,7 +254,7 @@ impl RepinEngine {
         job_id: i64,
         field: String,
         from: CanonicalType,
-        to: CanonicalType,
+        reading: RepinReading,
         dry_run: bool,
         force: bool,
     ) -> Result<StartOutcome, ServerError> {
@@ -278,7 +285,7 @@ impl RepinEngine {
             }
         }
 
-        let (counts, tallies) = match self.run_scan(&field, to).await {
+        let (counts, tallies) = match self.run_scan(&field, reading).await {
             Ok(measured) => measured,
             Err(e) => {
                 self.finish(job_id, RepinJobStatus::Failed, Some(&e)).await;
@@ -296,6 +303,7 @@ impl RepinEngine {
                     projected_nulls: clamp(counts.projected_nulls),
                     resurrectable: clamp(counts.resurrectable),
                     affected_bytes: clamp(counts.affected_bytes),
+                    ambiguous_numerals: clamp(counts.ambiguous_numerals),
                 },
             )
             .await
@@ -312,8 +320,17 @@ impl RepinEngine {
             self.finish(job_id, RepinJobStatus::Succeeded, None).await;
             return Ok(StartOutcome::DryRun(self.job(job_id).await?));
         }
-        if counts.projected_nulls > 0 && !force {
-            self.finish(job_id, RepinJobStatus::RefusedNeedsForce, None)
+        // The SCAN gate. Same decision as the finished-shadow gate below,
+        // one function — the plan rides back as the 409 body, and the reason
+        // rides with it: a refusal over ambiguity with zero projected nulls
+        // is otherwise a plan an operator cannot read the verdict off.
+        if let Some(reason) = force_refusal(
+            reading.written,
+            counts.projected_nulls,
+            counts.ambiguous_numerals,
+            force,
+        ) {
+            self.finish(job_id, RepinJobStatus::RefusedNeedsForce, Some(&reason))
                 .await;
             return Ok(StartOutcome::Refused(self.job(job_id).await?));
         }
@@ -353,7 +370,7 @@ impl RepinEngine {
         let tallies = Arc::new(tallies);
         tokio::spawn(async move {
             engine
-                .run_job(job_id, field, from, to, force, tallies)
+                .run_job(job_id, field, from, reading, force, tallies)
                 .await;
         });
         Ok(StartOutcome::Started(self.job(job_id).await?))
@@ -362,12 +379,12 @@ impl RepinEngine {
     async fn run_scan(
         &self,
         field: &str,
-        to: CanonicalType,
+        reading: RepinReading,
     ) -> Result<(ScanCounts, ScanTallies), String> {
         let data_dir = self.data_dir.clone();
         let memory_limit = self.memory_limit.clone();
         let field = field.to_owned();
-        tokio::task::spawn_blocking(move || scan(&data_dir, &memory_limit, &field, to))
+        tokio::task::spawn_blocking(move || scan(&data_dir, &memory_limit, &field, reading))
             .await
             .map_err(|e| format!("repin scan task panicked: {e}"))?
     }
@@ -463,7 +480,7 @@ impl RepinEngine {
         job_id: i64,
         field: String,
         from: CanonicalType,
-        to: CanonicalType,
+        reading: RepinReading,
         force: bool,
         scanned: Arc<ScanTallies>,
     ) {
@@ -471,8 +488,9 @@ impl RepinEngine {
         let _rollup_pause = self.coordinator.pause_rollup();
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(1.0);
 
+        let to = reading.written.pin;
         let outcome = self
-            .run_job_inner(job_id, &field, from, to, force, &scanned)
+            .run_job_inner(job_id, &field, from, reading, force, &scanned)
             .await;
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(0.0);
         metrics::histogram!(crate::metrics::CATALOG_REPIN_DURATION_SECONDS)
@@ -552,10 +570,11 @@ impl RepinEngine {
         job_id: i64,
         field: &str,
         from: CanonicalType,
-        to: CanonicalType,
+        reading: RepinReading,
         force: bool,
         scanned: &Arc<ScanTallies>,
     ) -> Result<(), JobAbort> {
+        let to = reading.written.pin;
         let marker = RepinMarker {
             job_id,
             field: field.to_owned(),
@@ -586,7 +605,7 @@ impl RepinEngine {
         let mut converged = false;
         for pass in 0..MAX_CATCHUP_PASSES {
             let changed = self
-                .run_pass(field, to, &flipped, scanned, &mut state)
+                .run_pass(field, reading, &flipped, scanned, &mut state)
                 .await
                 .map_err(JobAbort::Failed)?;
             self.publish_progress(job_id, &state).await;
@@ -637,7 +656,7 @@ impl RepinEngine {
 
         // Final increment under exclusion: nothing can write or read the
         // corpus now, so this pass is the last word.
-        self.run_pass(field, to, &flipped, scanned, &mut state)
+        self.run_pass(field, reading, &flipped, scanned, &mut state)
             .await
             .map_err(JobAbort::Failed)?;
         self.publish_progress(job_id, &state).await;
@@ -649,15 +668,15 @@ impl RepinEngine {
         // shadow's OWN accounting is the only check the operator's
         // omitted force flag can actually govern — and it is safe to
         // refuse here because nothing visible has moved yet.
-        let (_, _, nulled, _) = state.totals();
-        if nulled > 0 && !force {
+        let totals = state.totals();
+        if let Some(reason) = force_refusal(reading.written, totals.nulled, totals.ambiguous, force)
+        {
             return Err(JobAbort::RefusedNeedsForce(format!(
-                "the completed rewrite nulled {nulled} stored value(s) the \
-                 pre-build scan did not project — data ingested after the \
-                 scan cannot be read as {}; the cutover is refused and the \
-                 corpus stands at its pre-repin generation. Re-run the dry \
-                 run for the current plan, then pass force to accept the loss",
-                to.as_catalog()
+                "the completed rewrite is not what the pre-build scan \
+                 projected — data ingested after the scan carries values the \
+                 plan never saw: {reason}. The cutover is refused and the \
+                 corpus stands at its pre-repin generation; re-run the dry \
+                 run for the current plan, then pass force to accept it"
             )));
         }
 
@@ -756,7 +775,7 @@ impl RepinEngine {
     async fn run_pass(
         &self,
         field: &str,
-        to: CanonicalType,
+        reading: RepinReading,
         flipped: &Arc<HashMap<String, CanonicalType>>,
         scanned: &Arc<ScanTallies>,
         state: &mut BuildState,
@@ -774,7 +793,7 @@ impl RepinEngine {
                 &shadow,
                 &memory_limit,
                 &field,
-                to,
+                reading,
                 &flipped,
                 &scanned,
                 &mut taken,
@@ -788,22 +807,24 @@ impl RepinEngine {
     }
 
     async fn publish_progress(&self, job_id: i64, state: &BuildState) {
-        let (files_done, rows, nulled, resurrected) = state.totals();
+        let totals = state.totals();
+        let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
         if let Err(e) = self
             .store
             .record_progress(
                 job_id,
-                i64::try_from(files_done).unwrap_or(i64::MAX),
-                i64::try_from(rows).unwrap_or(i64::MAX),
-                i64::try_from(nulled).unwrap_or(i64::MAX),
-                i64::try_from(resurrected).unwrap_or(i64::MAX),
+                clamp(totals.files_done),
+                clamp(totals.rows),
+                clamp(totals.nulled),
+                clamp(totals.resurrected),
+                clamp(totals.ambiguous),
             )
             .await
         {
             tracing::warn!(event_type = "repin_store_error", job_id, error = %e, "progress write failed");
         }
         #[allow(clippy::cast_precision_loss)]
-        metrics::gauge!(crate::metrics::CATALOG_REPIN_FILES_DONE).set(files_done as f64);
+        metrics::gauge!(crate::metrics::CATALOG_REPIN_FILES_DONE).set(totals.files_done as f64);
     }
 
     /// Final tallies: counters, and — for a forced lossy repin — the same
@@ -817,10 +838,10 @@ impl RepinEngine {
         to: CanonicalType,
         state: &BuildState,
     ) {
-        let (_, _, nulled, resurrected) = state.totals();
-        metrics::counter!(crate::metrics::CATALOG_REPIN_ROWS_NULLED_TOTAL).increment(nulled);
+        let totals = state.totals();
+        metrics::counter!(crate::metrics::CATALOG_REPIN_ROWS_NULLED_TOTAL).increment(totals.nulled);
         metrics::counter!(crate::metrics::CATALOG_REPIN_ROWS_RESURRECTED_TOTAL)
-            .increment(resurrected);
+            .increment(totals.resurrected);
         self.publish_progress(job_id, state).await;
 
         let conflicts: Vec<FieldConflict> = state
@@ -885,6 +906,22 @@ enum JobAbort {
     RefusedNeedsForce(String),
 }
 
+/// What the shadow generation holds so far — the numbers the progress
+/// record, the metrics and the cutover's force gate all read.
+#[derive(Debug, Clone, Copy, Default)]
+struct BuildTotals {
+    /// Affected files actually rewritten.
+    files_done: u64,
+    /// Rows written through the rewrite.
+    rows: u64,
+    /// Stored values the new pin could not keep.
+    nulled: u64,
+    /// Values recovered from `_raw`.
+    resurrected: u64,
+    /// Rows the new pin reads differently in each dialect.
+    ambiguous: u64,
+}
+
 /// Everything a pass needs to remember between passes: which source file
 /// versions the shadow already reflects, and what each contributed.
 #[derive(Debug, Default)]
@@ -898,19 +935,21 @@ impl BuildState {
         self.results.values().filter(|t| t.rewritten).count() as u64
     }
 
-    /// `(files_done, rows, nulled, resurrected)` over the CURRENT shadow
-    /// contents — a caught-up replacement supersedes its earlier tally, so
-    /// totals never double-count a reprocessed file.
-    fn totals(&self) -> (u64, u64, u64, u64) {
-        let mut rows = 0u64;
-        let mut nulled = 0u64;
-        let mut resurrected = 0u64;
+    /// The shadow's tallies over its CURRENT contents — a caught-up
+    /// replacement supersedes its earlier tally, so totals never
+    /// double-count a reprocessed file.
+    fn totals(&self) -> BuildTotals {
+        let mut totals = BuildTotals {
+            files_done: self.files_rewritten(),
+            ..BuildTotals::default()
+        };
         for tally in self.results.values().filter(|t| t.rewritten) {
-            rows = rows.saturating_add(tally.rows);
-            nulled = nulled.saturating_add(tally.nulled);
-            resurrected = resurrected.saturating_add(tally.resurrected);
+            totals.rows = totals.rows.saturating_add(tally.rows);
+            totals.nulled = totals.nulled.saturating_add(tally.nulled);
+            totals.resurrected = totals.resurrected.saturating_add(tally.resurrected);
+            totals.ambiguous = totals.ambiguous.saturating_add(tally.ambiguous);
         }
-        (self.files_rewritten(), rows, nulled, resurrected)
+        totals
     }
 
     fn nulled_by_service(&self) -> HashMap<String, u64> {
@@ -934,7 +973,7 @@ fn run_pass_blocking(
     shadow: &Path,
     memory_limit: &str,
     field: &str,
-    to: CanonicalType,
+    reading: RepinReading,
     flipped: &HashMap<String, CanonicalType>,
     scanned: &ScanTallies,
     state: &mut BuildState,
@@ -983,7 +1022,7 @@ fn run_pass_blocking(
             .get(&rel)
             .and_then(|(scanned_sig, effect)| (*scanned_sig == sig).then_some(*effect));
         let tally = process_file(
-            &conn, data_dir, shadow, &rel, field, to, flipped, precounted,
+            &conn, data_dir, shadow, &rel, field, reading, flipped, precounted,
         )?;
         state.results.insert(rel.clone(), tally);
         state.processed.insert(rel, sig);
@@ -1001,6 +1040,57 @@ fn run_pass_blocking(
 /// only other installer. What used to make the physical door the gate —
 /// "severity is not an operator decision" — is exactly what this slice
 /// reverses.
+/// The force decision, asked at BOTH gates — the pre-build scan's and the
+/// finished shadow's — so the two can only ever refuse for the same
+/// reasons. `Some(reason)` means the job needs an explicit force flag it
+/// does not have; the reason is the row's `error` text (and the caller may
+/// wrap it in its own context, which is the only thing the two gates say
+/// differently).
+///
+/// Two reasons, both about a value the operator has not knowingly accepted:
+///
+/// 1. LOSS — values the new pin cannot read at all. Unchanged behaviour;
+/// 2. AMBIGUITY — numerals that read as a different severity in each
+///    dialect (the 1-7 overlap). Only under the `OTel` reading, because
+///    asserting syslog IS the statement about provenance the ambiguity is
+///    waiting for (issue #79, AC4). An explicit `--dialect otel` does NOT
+///    suppress it: the refusal is about the values, not about how the
+///    request was spelled, and `--force` is the one escape.
+///
+/// The COUNT is taken whatever the dialect — the report says what is there
+/// — and only the gate is conditional.
+fn force_refusal(
+    target: trawl_core::conform::RepinTarget,
+    nulled: u64,
+    ambiguous: u64,
+    force: bool,
+) -> Option<String> {
+    if force {
+        return None;
+    }
+    if nulled > 0 {
+        return Some(format!(
+            "{nulled} stored value(s) cannot be read as {} and would be \
+             nulled (the originals stay findable in _raw)",
+            target.pin.as_catalog()
+        ));
+    }
+    let ambiguous_gate = target.pin == CanonicalType::Severity
+        && target.raw == trawl_core::severity::Dialect::Otel
+        && ambiguous > 0;
+    if ambiguous_gate {
+        return Some(format!(
+            "{ambiguous} row(s) carry a numeral 1-7, which the OTel ladder \
+             and syslog PRI read as DIFFERENT severities (3 is trace3 to \
+             OTel and err to syslog) — no value-shape rule can tell them \
+             apart, so trawl will not guess. Re-run with dialect=syslog if \
+             the sender speaks syslog PRI, or force to accept the OTel \
+             reading"
+        ));
+    }
+    None
+}
+
 /// Resolve the asserted numeral dialect for a target (issue #79).
 ///
 /// A `SEVERITY` target always ends up with one — `otel` when the request
@@ -1083,6 +1173,56 @@ mod tests {
                 "{rejected}: {err:?}"
             );
         }
+    }
+
+    /// The force gate is ONE decision asked at two moments (the pre-build
+    /// scan and the finished shadow), so the two can only refuse for the
+    /// same reasons: loss always, ambiguity only under the `OTel` reading —
+    /// asserting syslog IS the provenance statement the ambiguity waits for
+    /// — and `--force` is the single escape from either.
+    #[test]
+    fn the_force_gate_refuses_loss_always_and_ambiguity_under_otel_only() {
+        use trawl_core::conform::RepinTarget;
+        use trawl_core::severity::Dialect;
+
+        let severity = |dialect| RepinTarget {
+            pin: CanonicalType::Severity,
+            stored: dialect,
+            raw: dialect,
+        };
+
+        // Loss: any target, any dialect, cleared only by force.
+        let varchar = RepinTarget::otel(CanonicalType::Varchar);
+        assert!(
+            force_refusal(varchar, 3, 0, false)
+                .is_some_and(|m| m.contains("cannot be read as VARCHAR")),
+        );
+        assert_eq!(force_refusal(varchar, 3, 0, true), None);
+        assert!(force_refusal(severity(Dialect::Syslog), 3, 0, false).is_some());
+
+        // Ambiguity: refused under OTel, silent under an explicit syslog
+        // assertion, and cleared by force either way.
+        let refusal = force_refusal(severity(Dialect::Otel), 0, 2, false)
+            .expect("an OTel repin over the 1-7 overlap must refuse");
+        assert!(refusal.contains("2 row(s)"), "{refusal}");
+        assert!(refusal.contains("dialect=syslog"), "{refusal}");
+        assert_eq!(
+            force_refusal(severity(Dialect::Syslog), 0, 2, false),
+            None,
+            "asserting syslog IS the answer to the ambiguity"
+        );
+        assert_eq!(force_refusal(severity(Dialect::Otel), 0, 2, true), None);
+
+        // Nothing to refuse, and a non-severity target has no ambiguity
+        // notion at all (its count is a constant zero upstream, but the gate
+        // must not fire even if one were handed in).
+        assert_eq!(force_refusal(severity(Dialect::Otel), 0, 0, false), None);
+        assert_eq!(force_refusal(varchar, 0, 5, false), None);
+
+        // Loss is reported FIRST: it is the older and larger hazard, and a
+        // plan carrying both needs one force flag, not a ladder of them.
+        let both = force_refusal(severity(Dialect::Otel), 1, 1, false).unwrap();
+        assert!(both.contains("cannot be read as SEVERITY"), "{both}");
     }
 
     /// The dialect is a SEVERITY-only assertion: a severity target defaults

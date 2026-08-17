@@ -23,9 +23,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use trawl_core::schema::CanonicalType;
-
 use crate::catalog::conform::{Progress, open_bounded_connection};
+use crate::ingest::compaction::RepinReading;
 use crate::repin::rewrite::{FileSig, RepinEffect, affected_schema, count_repin_effect};
 
 /// The scan's PER-FILE readings, keyed by data-root-relative path and
@@ -53,6 +52,9 @@ pub struct ScanCounts {
     /// Bytes across the affected files — the double-hold peak the
     /// free-space pre-flight budgets for.
     pub affected_bytes: u64,
+    /// Rows whose numeral reads as a DIFFERENT severity in each dialect —
+    /// counted whatever the job asserted (issue #79).
+    pub ambiguous_numerals: u64,
 }
 
 /// Scan the corpus for `field` repinned to `to`.
@@ -68,7 +70,7 @@ pub(crate) fn scan(
     data_dir: &Path,
     memory_limit: &str,
     field: &str,
-    to: CanonicalType,
+    reading: RepinReading,
 ) -> Result<(ScanCounts, ScanTallies), String> {
     let sources = crate::repin::rewrite::snapshot_env_files(data_dir)?;
     let conn = open_bounded_connection(data_dir, memory_limit)?;
@@ -96,12 +98,13 @@ pub(crate) fn scan(
             &format!("read_parquet('{safe}')"),
             &schema,
             field,
-            to,
+            reading,
         )?;
         counts.files_total += 1;
         counts.rows_carrying += effect.carrying;
         counts.projected_nulls += effect.nulled;
         counts.resurrectable += effect.resurrected;
+        counts.ambiguous_numerals += effect.ambiguous;
         counts.affected_bytes += std::fs::metadata(&path).map_or(0, |m| m.len());
         tallies.insert(rel, (sig, effect));
     }

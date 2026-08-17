@@ -167,6 +167,8 @@ pub struct RepinPlanCounts {
     pub resurrectable: i64,
     /// Bytes across the affected files (the double-hold peak).
     pub affected_bytes: i64,
+    /// Rows whose numeral reads as a DIFFERENT severity in each dialect.
+    pub ambiguous_numerals: i64,
 }
 
 fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
@@ -250,7 +252,7 @@ impl RepinStore {
         sqlx::query(
             "UPDATE repin_jobs
              SET files_total = $2, rows_carrying = $3, projected_nulls = $4,
-                 resurrectable = $5, affected_bytes = $6
+                 resurrectable = $5, affected_bytes = $6, ambiguous_numerals = $7
              WHERE id = $1",
         )
         .bind(id)
@@ -259,12 +261,19 @@ impl RepinStore {
         .bind(plan.projected_nulls)
         .bind(plan.resurrectable)
         .bind(plan.affected_bytes)
+        .bind(plan.ambiguous_numerals)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
     /// Stamp rewrite progress/outcome tallies onto the job row.
+    ///
+    /// `ambiguous_numerals` is the ONE column the plan and the outcome
+    /// share: the scan's projection stands until the build has actually
+    /// written files, and then the shadow's own count — everything the
+    /// catch-up passes folded in included — supersedes it. That is what the
+    /// cutover's force gate decides on, so it is what the report must show.
     pub async fn record_progress(
         &self,
         id: i64,
@@ -272,11 +281,12 @@ impl RepinStore {
         rows_rewritten: i64,
         rows_nulled: i64,
         rows_resurrected: i64,
+        ambiguous_numerals: i64,
     ) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE repin_jobs
              SET files_done = $2, rows_rewritten = $3, rows_nulled = $4,
-                 rows_resurrected = $5
+                 rows_resurrected = $5, ambiguous_numerals = $6
              WHERE id = $1",
         )
         .bind(id)
@@ -284,6 +294,7 @@ impl RepinStore {
         .bind(rows_rewritten)
         .bind(rows_nulled)
         .bind(rows_resurrected)
+        .bind(ambiguous_numerals)
         .execute(&self.pool)
         .await?;
         Ok(())
