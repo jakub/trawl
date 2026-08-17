@@ -583,6 +583,17 @@ fn where_severity_band_parity_exhaustive() {
         "* | where _severity in (\"error\", 99, 101, 250)",
         "* | where _severity != 99",
         "* | where not (_severity in (99, 101))",
+        // ADJACENT REPRESENTATIVE EXTENSION, the subtlest collapse case:
+        // the out-of-ladder 0 sits beside the TRACE band, so the render
+        // widens to `BETWEEN 0 AND 4` rather than emitting 0 separately.
+        // That is only sound because no stored severity is ever 0 — and
+        // the NEGATION is where an unsound widening would show, since it
+        // would start excluding a row the exact per-point semantics keep.
+        // Exhaustive over every stored 1-24 and the absent column, both
+        // lanes.
+        "* | where _severity in (0, \"trace\")",
+        "* | where not (_severity in (0, \"trace\"))",
+        "* | where not (_severity in (0, 25))",
     ];
     for dsl in dsls {
         for sev in (1..=24).map(Some).chain([None]) {

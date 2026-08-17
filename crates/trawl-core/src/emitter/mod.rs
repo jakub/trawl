@@ -2361,6 +2361,17 @@ mod tests {
             mixed.contains(&format!("({column} BETWEEN 17 AND 20 OR {column} = 99)")),
             "{mixed}"
         );
+        // A representative ADJACENT to an in-ladder run extends it rather
+        // than emitting separately: 0 never matches a stored severity, so
+        // `BETWEEN 0 AND 4` accepts exactly the TRACE band. The negation
+        // of this shape is the one that would expose an unsound widening,
+        // and it is exhaustively parity-tested in `filter_parity.rs`.
+        let adjacent = emit_dsl_with_pins("_severity=0,trace", &SEVERITY_PIN);
+        assert!(
+            adjacent.contains(&format!("{column} BETWEEN 0 AND 4")),
+            "{adjacent}"
+        );
+        assert_eq!(adjacent.matches(column).count(), 1, "{adjacent}");
         // THE AMPLIFICATION GUARD: a long alternating in/out list renders
         // at most 13 subjects — 12 possible in-ladder runs plus the one
         // representative — however many literals it names.
@@ -2449,6 +2460,13 @@ mod tests {
     /// asserts that end to end: a severity predicate emits no parameters
     /// at all, in the search stage and in both operand orders of the
     /// pipeline, for single-run AND multi-run sets.
+    ///
+    /// The last block ties the guard to the TABLE rather than to the one
+    /// name `sev`: every `KNOWN_FUNCTIONS` entry that declares a SEVERITY
+    /// result is admitted by `subject_pin`, so a future Severity-returning
+    /// function joins this test automatically — and if its argument shape
+    /// makes the probe DSL unemittable, the panic names the obligation
+    /// instead of silently covering nothing.
     #[test]
     fn severity_subjects_never_push_parameters() {
         for dsl in [
@@ -2469,6 +2487,46 @@ mod tests {
         ] {
             let sql = emit_dsl(dsl);
             assert!(!sql.contains("\n  0: "), "{dsl} bound a parameter: {sql}");
+        }
+
+        // Structural: derive the covered functions from the same table the
+        // emitter validates against, not from a hand-written list.
+        let severity_fns: Vec<&str> = crate::parser::suggest::KNOWN_FUNCTIONS
+            .iter()
+            .copied()
+            .filter(|f| {
+                functions::function_result_pin(f) == Some(crate::schema::CanonicalType::Severity)
+            })
+            .collect();
+        assert!(
+            severity_fns.contains(&"sev"),
+            "the SEVERITY-declaring set must not be empty, or this guard covers nothing"
+        );
+        for func in severity_fns {
+            for dsl in [
+                format!(r#"* | where {func}(level) == "error""#),
+                format!(r#"* | where {func}(level) in ("warn", "fatal")"#),
+            ] {
+                let query = parser::parse(&dsl).unwrap_or_else(|e| {
+                    panic!(
+                        "{func} declares a SEVERITY result, so it is a comparison SUBJECT and \
+                         must be covered by this guard — but the probe DSL {dsl:?} does not \
+                         parse ({e:?}). Give the guard a shape that fits {func}'s arguments."
+                    )
+                });
+                let emitted = emit(&query, SRC).unwrap_or_else(|e| {
+                    panic!(
+                        "{func} declares a SEVERITY result but the probe DSL {dsl:?} does not \
+                         emit ({e}). Give the guard a shape that fits {func}'s arguments."
+                    )
+                });
+                assert!(
+                    emitted.params.is_empty(),
+                    "{dsl} bound {} parameter(s): a subject that pushes parameters cannot be \
+                     repeated per range — see severity_ranges_sql's contract",
+                    emitted.params.len()
+                );
+            }
         }
     }
 
