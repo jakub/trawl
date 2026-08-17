@@ -284,6 +284,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   carries a `#` or `//` can be sorted descending and used in expressions —
   the contract `quote_dsl_field` already promised. `/` deliberately stays
   out of that set: it opens a regex far more often than it divides.
+- **Query formatting no longer changes what a filter value means (#78
+  follow-up).** `/api/v1/validate`'s `formatted` field and the TUI/web
+  editors' reformat button render a filter value bare whenever the bare
+  grammar can spell it — but a value position re-lexes more than that.
+  `host="a#b"` and `host="a//b"` came back as a filter for `a`, because
+  comments are stripped before the grammar runs; `host="/foo/"` came back
+  a regex and `host="a*b"` a glob, so an exact match — or a `!=` — turned
+  into a pattern. Those shapes are now quoted, and nothing else is: a
+  value with an inner slash (`/foo/bar/`), a genuine glob (`path=/api/*`)
+  and a genuine regex still render exactly as before.
 - **Backtick identifier follow-through after #81.** Catalog names are now
   declined when the DSL cannot represent them and otherwise flow through the
   shared renderer in every TUI/SPA query builder; URL facet state carries
