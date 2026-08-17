@@ -20,8 +20,15 @@ use crate::parser::suggest::quote_dsl_field;
 /// Field names stored in an AST came through the parser, so the quoted-name
 /// grammar has already proved they are representable. Catalog-backed query
 /// builders use the fallible renderer directly instead.
+///
+/// The fallback echoes the raw name rather than panicking: `parse` cannot
+/// produce a name [`quote_dsl_field`] refuses — its refusal set IS that
+/// production's — so the branch is unreachable for any AST that came from
+/// a query, and a hand-built one is not worth a panic inside a response
+/// path (`/api/v1/validate` returns `formatted`, and both editors write it
+/// back).
 fn dsl_field(name: &str) -> String {
-    quote_dsl_field(name).expect("parsed AST field names are DSL-representable")
+    quote_dsl_field(name).unwrap_or_else(|| name.to_string())
 }
 
 /// Render a field-name list (`table a, b`, `by a, b`) as DSL text.
@@ -653,6 +660,19 @@ mod tests {
             assert_eq!(before, after, "{dsl} formatted as {formatted}");
             assert_eq!(formatted, fmt(&formatted), "{dsl}: not idempotent");
         }
+    }
+
+    /// A hand-built AST can carry a name the grammar would never produce.
+    /// The formatter sits on a response path, so it renders what it was
+    /// given instead of panicking there.
+    #[test]
+    fn an_inexpressible_name_does_not_panic_the_formatter() {
+        let mut query = crate::parser::parse("| table host").expect("parses");
+        match &mut query.pipeline[0].node {
+            PipeStage::Table(t) => t.fields[0] = "a\u{202e}b".to_string(),
+            other => panic!("expected Table, got {other:?}"),
+        }
+        assert_eq!(format_query(&query), "| table a\u{202e}b");
     }
 
     /// …and the rule stays tight: a value whose bare spelling parses back
