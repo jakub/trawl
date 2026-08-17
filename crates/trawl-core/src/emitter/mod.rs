@@ -2254,23 +2254,28 @@ mod tests {
         assert_eq!(emit_dsl(r#"* | let s = sev(level, "OTel")"#), otel);
     }
 
-    /// Issue #82: a severity predicate names its subject ONCE, whatever
-    /// the shape — one band, its complement, a multi-band list, a mixed
-    /// token/integer list, and the `sev()` call in either lane.
+    /// Issue #82: a severity predicate names its subject once PER
+    /// CONTIGUOUS RANGE — which is once outright for every natural query,
+    /// because a band, a run of bands and a band-plus-adjacent-point all
+    /// merge into ONE range.
     ///
-    /// The `sev()` subject is derived from the ONE builder that emits it
+    /// The counting rule is the whole point of the merge: the pre-#82
+    /// rendering wrote the subject once per BAND (six copies for the six
+    /// base bands), and the subject is over a kilobyte of `sev()` SQL.
+    ///
+    /// That `sev()` substring is derived from the ONE builder that emits it
     /// (`conform::severity_reading_sql_bind_once` over
     /// `conform::untyped_text`), never hand-typed: a substring that drifts
     /// from the emitter would pass this test while asserting nothing.
     #[test]
-    fn severity_predicates_render_the_subject_once() {
+    fn severity_predicates_render_the_subject_once_per_range() {
         let column = r#""_severity""#;
         let sev_subject = crate::conform::severity_reading_sql_bind_once(
             &crate::conform::untyped_text(r#""level""#),
             crate::severity::Dialect::Otel,
         );
-        // The bare-column cases: the membership predicate names the column
-        // exactly once.
+        // The bare-column cases, all contiguous: ERROR alone, WARN+ERROR
+        // (13-20), and WARN plus the adjacent point 17 (13-17).
         for dsl in [
             "_severity=error",
             "_severity=warn,error",
@@ -2280,10 +2285,22 @@ mod tests {
             let sql = emit_dsl_with_pins(dsl, &SEVERITY_PIN);
             assert_eq!(sql.matches(column).count(), 1, "{dsl}: {sql}");
         }
-        // The one documented second occurrence: the search stage's `!=`
-        // widening is `(pred OR "_severity" IS NULL)`, so the column
-        // appears twice — once as the membership subject, once inside the
-        // widening the pre-existing NULL policy owns.
+        // A genuinely DISJOINT selection is the documented exception: WARN
+        // (13-16) and FATAL (21-24) share no boundary, so there are two
+        // ranges and therefore two subjects. Nothing can merge them
+        // without changing what matches.
+        let disjoint = emit_dsl_with_pins("_severity=warn,fatal", &SEVERITY_PIN);
+        assert_eq!(disjoint.matches(column).count(), 2, "{disjoint}");
+        assert!(
+            disjoint.contains(&format!(
+                "({column} BETWEEN 13 AND 16 OR {column} BETWEEN 21 AND 24)"
+            )),
+            "{disjoint}"
+        );
+        // The one documented second occurrence for a CONTIGUOUS shape: the
+        // search stage's `!=` widening is `(pred OR "_severity" IS NULL)`,
+        // so the column appears twice — once as the range subject, once
+        // inside the widening the pre-existing NULL policy owns.
         let widened = emit_dsl_with_pins("_severity!=error", &SEVERITY_PIN);
         assert_eq!(widened.matches(column).count(), 2, "{widened}");
         assert_eq!(
@@ -2292,25 +2309,34 @@ mod tests {
             "{widened}"
         );
         assert_eq!(
-            widened.matches(&format!("{column} NOT IN (")).count(),
+            widened
+                .matches(&format!("NOT ({column} BETWEEN 17 AND 20)"))
+                .count(),
             1,
             "{widened}"
         );
+        // A singleton run renders as an equality, not a degenerate range.
+        let singleton = emit_dsl_with_pins("_severity=error2,error2", &SEVERITY_PIN);
+        assert!(singleton.contains(&format!("{column} = 18")), "{singleton}");
         // The expensive subject: a `sev()` call is over a kilobyte of SQL,
-        // and it is written once per predicate however many bands the
-        // comparison names.
+        // and a contiguous comparison writes it once however many bands it
+        // names — `error`+`fatal` is 17-24, one range.
         assert!(
             sev_subject.len() > 500,
             "the subject is the cost: {sev_subject}"
         );
         for dsl in [
             r#"* | where sev(level) in ("error", "fatal")"#,
+            r#"* | where sev(level) in ("trace", "debug", "info", "warn", "error", "fatal")"#,
             r#"* | where sev(level) == "error""#,
             r#"* | where sev(level) != "error""#,
         ] {
             let sql = emit_dsl(dsl);
             assert_eq!(sql.matches(sev_subject.as_str()).count(), 1, "{dsl}: {sql}");
         }
+        // …and twice for the disjoint one, for the same structural reason.
+        let sql = emit_dsl(r#"* | where sev(level) in ("warn", "fatal")"#);
+        assert_eq!(sql.matches(sev_subject.as_str()).count(), 2, "{sql}");
     }
 
     /// Issue #82, AC3: the severity set is INLINED, so a subject that
@@ -2335,7 +2361,11 @@ mod tests {
             &mut state,
         );
         let after = state.push_param(SqlValue::String("after".to_owned()));
-        assert_eq!(clause, format!("{subject} IN (13, 17, 18, 19, 20)"));
+        // 13 is isolated (14-16 are absent), 17-20 is the ERROR run.
+        assert_eq!(
+            clause,
+            format!("({subject} = 13 OR {subject} BETWEEN 17 AND 20)")
+        );
         // Placeholders are positional `?`, so the ORDER of the collected
         // params is the whole assertion: the set bound nothing between
         // them, and `after` is still the second value.

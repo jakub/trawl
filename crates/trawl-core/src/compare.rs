@@ -960,6 +960,43 @@ pub fn severity_points(forms: &[CompareForm]) -> Option<Vec<i64>> {
     Some(points.into_iter().collect())
 }
 
+/// Collapse sorted, deduplicated ladder points into MINIMAL CONTIGUOUS
+/// RANGES — the shape a severity predicate actually renders (issue #82).
+///
+/// Points in, inclusive `(lo, hi)` runs out, in ascending order: a run of
+/// one point is `(p, p)`, and two points are one run exactly when they are
+/// adjacent integers. The whole ERROR band is therefore ONE run, the six
+/// base bands together are ONE run (1-24), and a genuinely disjoint
+/// selection like `warn,fatal` is two.
+///
+/// Ranges rather than the point set itself, because the SET is what the
+/// comparison MEANS while the RANGE is what `DuckDB` executes cheaply: a
+/// probe over 1M rows (`trawl-engine/tests/severity_set_bench.rs`) puts a
+/// repeated-subject `BETWEEN` at ~6 ms against ~392 ms for the equivalent
+/// `IN` over the same points — the engine takes an `IN` list over a
+/// COMPUTED left-hand side off its fast path, and a `sev()` subject is
+/// exactly that. Merging is what makes the two goals one: the natural
+/// queries (a band, a contiguous run of bands) collapse to a SINGLE range,
+/// so the expensive subject is written once AND the predicate stays on the
+/// shape the engine likes.
+///
+/// The input must come from [`severity_points`]; anything else has no
+/// meaning here, and a run's bounds are `i64` for the same reason the
+/// points are — an out-of-ladder literal keeps its own value.
+#[must_use]
+pub fn severity_ranges(points: &[i64]) -> Vec<(i64, i64)> {
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    for &p in points {
+        match ranges.last_mut() {
+            // `checked_add` rather than `hi + 1`: the points are unclamped,
+            // so `i64::MAX` is reachable by a literal and must not wrap.
+            Some((_, hi)) if hi.checked_add(1) == Some(p) => *hi = p,
+            _ => ranges.push((p, p)),
+        }
+    }
+    ranges
+}
+
 /// The `SeverityNumber` a SEVERITY-pinned column CONFORMS a stored text to
 /// — the live mirror of [`crate::conform::guarded_cast`]'s SEVERITY rung.
 ///
@@ -1894,6 +1931,18 @@ mod tests {
                 points.windows(2).all(|w| w[0] < w[1]),
                 "{literal}: {points:?}"
             );
+            // The RANGES the renderer actually emits must accept exactly
+            // the numbers the points do (issue #82): merging is a
+            // rendering choice, never a meaning change.
+            let ranges = severity_ranges(&points);
+            assert!(
+                ranges.iter().all(|(lo, hi)| lo <= hi),
+                "{literal}: {ranges:?}"
+            );
+            assert!(
+                ranges.windows(2).all(|w| w[0].1 + 1 < w[1].0),
+                "runs must be maximal and disjoint — {literal}: {ranges:?}"
+            );
             for n in 1..=24_i64 {
                 let live = match form {
                     CompareForm::SeverityBand { lo, hi } => {
@@ -1903,9 +1952,14 @@ mod tests {
                     ref other => panic!("{literal} bound {other:?}"),
                 };
                 assert_eq!(points.contains(&n), live, "{literal} at {n}");
+                assert_eq!(
+                    ranges.iter().any(|(lo, hi)| *lo <= n && n <= *hi),
+                    live,
+                    "{literal} at {n} through the merged ranges {ranges:?}"
+                );
             }
             // Unclamped: an out-of-ladder integer keeps its own value, so
-            // `_severity=99` renders `IN (99)` and honestly matches nothing.
+            // `_severity=99` renders `= 99` and honestly matches nothing.
             if let CompareForm::SeverityExact(exact) = form {
                 assert_eq!(points, vec![exact]);
             }
@@ -1937,6 +1991,40 @@ mod tests {
                 CompareForm::SeverityBand { lo: 13, hi: 16 },
             ]),
             Some(vec![13, 14, 15, 16, 17, 18, 19, 20])
+        );
+    }
+
+    /// The merge itself: maximal runs, in order, and adjacency is what
+    /// joins them (issue #82).
+    #[test]
+    fn severity_ranges_merges_adjacent_points_into_maximal_runs() {
+        // One band is one run; the six base bands together are ONE run,
+        // which is the case the merge exists for.
+        assert_eq!(severity_ranges(&[17, 18, 19, 20]), vec![(17, 20)]);
+        assert_eq!(
+            severity_ranges(&(1..=24).collect::<Vec<_>>()),
+            vec![(1, 24)]
+        );
+        // A genuinely disjoint selection stays two runs…
+        assert_eq!(
+            severity_ranges(&[13, 14, 15, 16, 21, 22, 23, 24]),
+            vec![(13, 16), (21, 24)]
+        );
+        // …and a point adjacent to a band extends it rather than splitting
+        // (`warn,17` is the contiguous 13-17).
+        assert_eq!(severity_ranges(&[13, 14, 15, 16, 17]), vec![(13, 17)]);
+        // Singletons stay singletons, including out-of-ladder ones.
+        assert_eq!(severity_ranges(&[18]), vec![(18, 18)]);
+        assert_eq!(
+            severity_ranges(&[13, 14, 15, 16, 99]),
+            vec![(13, 16), (99, 99)]
+        );
+        assert_eq!(severity_ranges(&[]), vec![]);
+        // `i64::MAX` is reachable by an unclamped literal: the adjacency
+        // test must not wrap.
+        assert_eq!(
+            severity_ranges(&[i64::MIN, i64::MAX]),
+            vec![(i64::MIN, i64::MIN), (i64::MAX, i64::MAX)]
         );
     }
 
