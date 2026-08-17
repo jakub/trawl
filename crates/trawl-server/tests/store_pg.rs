@@ -1490,15 +1490,29 @@ mod catalog {
         [services, conflicts, stats]
     }
 
-    /// The declared envelope AS OF migration 0010 — today's list minus the
-    /// fields later migrations add. A migration-boundary assertion has to
-    /// name the envelope of its own moment: reading `ENVELOPE_TYPES` there
-    /// would make every future envelope growth retroactively fail a
-    /// migration that predates it.
+    /// The declared envelope AS OF migration 0010, written out.
+    ///
+    /// A migration-boundary assertion has to name the envelope of its own
+    /// moment. Deriving it from today's `ENVELOPE_TYPES` — even minus the
+    /// fields added since — keeps the frozen past coupled to the living
+    /// present: a RETYPED envelope field would silently rewrite what this
+    /// test claims 0010 produced, and every later growth would need
+    /// another subtraction here. sqlx migrations are immutable once
+    /// merged, so this list is too.
+    const ENVELOPE_AT_0010: &[(&str, CanonicalType)] = &[
+        ("_time", CanonicalType::Timestamp),
+        ("_ingested", CanonicalType::Timestamp),
+        ("_raw", CanonicalType::Varchar),
+        ("_repairs", CanonicalType::Varchar),
+        ("_severity", CanonicalType::Severity),
+        ("env", CanonicalType::Varchar),
+        ("service", CanonicalType::Varchar),
+        ("host", CanonicalType::Varchar),
+        ("message", CanonicalType::Varchar),
+    ];
+
     fn envelope_at_0010() -> impl Iterator<Item = &'static (&'static str, CanonicalType)> {
-        ENVELOPE_TYPES
-            .iter()
-            .filter(|(f, _)| *f != trawl_core::schema::PRODUCER)
+        ENVELOPE_AT_0010.iter()
     }
 
     /// Migration 0010 applied over a REAL pre-cutover catalog.

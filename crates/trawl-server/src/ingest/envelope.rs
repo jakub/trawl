@@ -76,7 +76,8 @@ pub enum RepairCode {
     /// by precedence, not by a namespace — telemetry's own fields are
     /// ordinary sender vocabulary — and the displaced value stays
     /// findable in `_raw`. An IDENTICAL value is not a collision and
-    /// earns no code.
+    /// earns no code, and neither is a JSON `null` — an explicit null is
+    /// absence, not a competing claim.
     ProducerAsserted,
     /// the producer had no honest `host` to assert, so the event was kept
     /// with `host` ABSENT (ADR-0013 slice 2, ruling 4). Reached by a
@@ -504,7 +505,8 @@ fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -
 /// The two `None`s mean different things, deliberately:
 /// - `host: None` is an assertion of ABSENCE (the producer knows it has
 ///   no honest hostname), so any payload `host` is displaced and the slot
-///   is left empty for the caller to confess as `host.omitted`;
+///   is left empty for the caller to confess as `host.omitted` — a
+///   payload `host: null` displaces nothing, being absence itself;
 /// - `message: None` is NO assertion at all (the payload IS the message,
 ///   as for telemetry), so whatever the payload carries stands.
 fn apply_assertions(out: &mut Map<String, Value>, asserted: &Asserted<'_>) -> bool {
@@ -519,18 +521,27 @@ fn apply_assertions(out: &mut Map<String, Value>, asserted: &Asserted<'_>) -> bo
 
 /// Claim one asserted slot. `Some` stamps the value, `None` empties the
 /// slot. Returns whether a DIFFERENT payload value was displaced.
+///
+/// A JSON `null` counts as ABSENCE, everywhere the collision is judged:
+/// `{"host": null}` asserts nothing, so it displaces nothing and earns no
+/// `field.producer_asserted`. It is still REMOVED — an optional envelope
+/// field is omitted, never written as JSON null (`DuckDB` infers JSON for
+/// an all-null column, ADR-0009) — and the whole payload stays in `_raw`
+/// either way. The alternative would put a repair code on every sender
+/// whose serializer emits explicit nulls for unset fields, which is most
+/// of them.
 fn claim_slot(out: &mut Map<String, Value>, key: &str, value: Option<&str>) -> bool {
     match value {
         Some(value) => {
             let displaced = match out.get(key) {
-                None => false,
+                None | Some(Value::Null) => false,
                 Some(Value::String(existing)) => existing != value,
                 Some(_) => true,
             };
             out.insert(key.to_owned(), json!(value));
             displaced
         }
-        None => out.remove(key).is_some(),
+        None => matches!(out.remove(key), Some(displaced) if !displaced.is_null()),
     }
 }
 
@@ -565,16 +576,42 @@ struct PrefixStrip {
     collided: bool,
 }
 
+/// Whether this profile lets the PAYLOAD propose `_raw`.
+///
+/// `_raw` is the re-extraction lifeline, and what makes it one differs by
+/// door. A remote sender (HTTP) or a transport frame (syslog) has an
+/// original form trawl never saw — the collector's pre-parse line, the
+/// wire datagram — so a string `_raw` it supplies IS the most original
+/// form available and is honoured verbatim.
+///
+/// Trawld's own telemetry has no such thing: the payload IS the original,
+/// and a tracing field literally named `_raw` is ordinary application
+/// vocabulary that would otherwise SHADOW the lifeline — the pre-repair
+/// serialization is what carries the values assertions and collisions
+/// displace, so letting a field claim the slot would make "a displaced
+/// value stays findable in `_raw`" false on exactly the door whose
+/// identity slots are asserted hardest. Non-proposable therefore means
+/// the standard reserved-prefix strip applies: the payload key lands on
+/// bare `raw`, value intact, and the door writes the serialization.
+const fn raw_is_proposable(kind: producer::ProducerKind) -> bool {
+    match kind {
+        producer::ProducerKind::Http | producer::ProducerKind::Syslog => true,
+        producer::ProducerKind::Trawld => false,
+    }
+}
+
 /// Whether a `_`-prefixed key is one the SENDER may propose.
 ///
-/// Exactly two slots (ADR-0013 §3): `_time`, always — it is the event
+/// At most two slots (ADR-0013 §3): `_time`, always — it is the event
 /// time proposal, canonicalized downstream — and `_raw`, when the value
-/// is a string (a collector's pre-parse line). Everything else in the
-/// namespace is trawl's: server-stamped (`_ingested`, `_repairs`),
-/// derivation-only (`_severity`), internal (`_trawl_wal_file`), or a slot
-/// that does not exist yet.
-fn is_proposable(key: &str, value: &Value) -> bool {
-    key == trawl_core::schema::TIME || (key == trawl_core::schema::RAW && value.is_string())
+/// is a string AND this door admits a proposal at all
+/// ([`raw_is_proposable`]). Everything else in the namespace is trawl's:
+/// server-stamped (`_ingested`, `_repairs`), derivation-only
+/// (`_severity`), internal (`_trawl_wal_file`), or a slot that does not
+/// exist yet.
+fn is_proposable(key: &str, value: &Value, raw_proposable: bool) -> bool {
+    key == trawl_core::schema::TIME
+        || (raw_proposable && key == trawl_core::schema::RAW && value.is_string())
 }
 
 /// Seal the `_` namespace at the ingest door (ADR-0013 §5): a
@@ -598,11 +635,11 @@ fn is_proposable(key: &str, value: &Value) -> bool {
 /// - two prefixed claimants for one bare name: the first in map order
 ///   wins (`serde_json::Map` iterates sorted, so that is the
 ///   ASCII-lexicographically first spelling), the rest collide out.
-fn strip_reserved_prefixes(out: &mut Map<String, Value>) -> PrefixStrip {
+fn strip_reserved_prefixes(out: &mut Map<String, Value>, raw_proposable: bool) -> PrefixStrip {
     let reserved: Vec<String> = out
         .keys()
         .filter(|k| trawl_core::schema::is_reserved_name(k))
-        .filter(|k| !is_proposable(k, &out[*k]))
+        .filter(|k| !is_proposable(k, &out[*k], raw_proposable))
         .cloned()
         .collect();
     let mut strip = PrefixStrip::default();
@@ -804,7 +841,9 @@ fn derive_time(
 /// 1. `_raw` capture — before reserved-key stripping and every repair, so
 ///    the server's own fills never appear inside "what arrived" (the
 ///    serialization fallback uses the PRE-fold object, so dropped and
-///    folded spellings stay findable).
+///    folded spellings stay findable). Whether the payload may PROPOSE
+///    `_raw` is per-profile ([`raw_is_proposable`]): trawld's own door
+///    never lets a field claim the lifeline.
 /// 2. Reserved-prefix strip ([`strip_reserved_prefixes`],
 ///    `field.reserved_prefix` / `field.reserved_prefix_collision`).
 ///    2.5. Producer assertions ([`apply_assertions`],
@@ -840,15 +879,17 @@ pub fn canonicalize(
     let fold = fold_field_names(obj);
     let folded_obj = fold.obj;
 
-    // 1. Capture `_raw` before anything is stripped or repaired: a
-    // client-supplied string `_raw` (a collector preserving its pre-parse
-    // line, under any spelling of the name) is kept verbatim; otherwise
-    // the canonical pre-repair serialization of the parsed object — the
-    // PRE-fold original, so folded-away spellings stay findable — is the
-    // most original form available (wire-exact bytes do not exist —
-    // events arrive inside JSON arrays and the WAL re-serializes anyway).
-    let raw_string = match folded_obj.get("_raw") {
-        Some(Value::String(s)) => s.clone(),
+    // 1. Capture `_raw` before anything is stripped or repaired: on a door
+    // that admits the proposal ([`raw_is_proposable`]) a client-supplied
+    // string `_raw` (a collector preserving its pre-parse line, under any
+    // spelling of the name) is kept verbatim; otherwise the canonical
+    // pre-repair serialization of the parsed object — the PRE-fold
+    // original, so folded-away spellings stay findable — is the most
+    // original form available (wire-exact bytes do not exist — events
+    // arrive inside JSON arrays and the WAL re-serializes anyway).
+    let raw_proposable = raw_is_proposable(ctx.producer.kind());
+    let raw_string = match folded_obj.get(trawl_core::schema::RAW) {
+        Some(Value::String(s)) if raw_proposable => s.clone(),
         _ => serde_json::to_string(obj).unwrap_or_default(),
     };
     let (raw_string, truncated) = truncate_chars(raw_string, MAX_RAW_CHARS);
@@ -856,7 +897,7 @@ pub fn canonicalize(
     let mut out = folded_obj;
 
     // 2. The `_` namespace is trawl's: strip the prefix, keep the data.
-    let strip = strip_reserved_prefixes(&mut out);
+    let strip = strip_reserved_prefixes(&mut out, raw_proposable);
 
     let mut repairs: Vec<RepairCode> = Vec::new();
     let push_repair = |repairs: &mut Vec<RepairCode>, code: RepairCode| {
@@ -2221,6 +2262,77 @@ mod tests {
         );
         assert!(c.repairs.is_empty(), "clean profile event: {:?}", c.repairs);
         assert!(!c.obj.contains_key("_repairs"));
+    }
+
+    #[test]
+    fn trawld_never_lets_a_payload_field_claim_the_raw_lifeline() {
+        // `_raw` proposability is per-profile. HTTP and syslog have an
+        // original form trawl never saw, so a string `_raw` they supply
+        // IS it. Trawld's payload IS the original, so a tracing field
+        // named `_raw` is ordinary vocabulary — and letting it claim the
+        // slot would make "a displaced value stays findable in `_raw`"
+        // false on exactly the door that asserts identity hardest.
+        let a = asserted("prod", "trawld", Some("box"), None, &[]);
+        let c = canon_profile(
+            r#"{"_raw":"a tracing field, not a wire line","service":"nginx","message":"boom"}"#,
+            Producer::Trawld(a),
+        );
+        let raw = c.obj["_raw"].as_str().expect("_raw is a string");
+        assert!(
+            raw.contains("\"service\":\"nginx\""),
+            "_raw must be the pre-repair serialization carrying the displaced value: {raw}"
+        );
+        assert_eq!(
+            c.obj["raw"], "a tracing field, not a wire line",
+            "the payload key takes the ordinary reserved-prefix strip"
+        );
+        assert_eq!(c.obj["service"], "trawld");
+        for code in ["field.reserved_prefix", "field.producer_asserted"] {
+            assert!(codes(&c).contains(&code), "missing {code}: {:?}", codes(&c));
+        }
+
+        // The other two doors keep today's rule: a string `_raw` is the
+        // sender's own pre-parse line (or the listener's frame) verbatim.
+        let a = asserted("prod", "unifi", Some("gw"), None, &[]);
+        let c = canon_profile(r#"{"_raw":"<13>the frame","msg":"x"}"#, Producer::Syslog(a));
+        assert_eq!(c.obj["_raw"], "<13>the frame");
+        assert!(!c.obj.contains_key("raw"));
+        let c = canon(r#"{"service":"s","env":"prod","host":"h","_raw":"the line"}"#);
+        assert_eq!(c.obj["_raw"], "the line");
+    }
+
+    #[test]
+    fn a_payload_null_in_an_asserted_slot_is_absence_not_a_collision() {
+        // An explicit null is what most serializers emit for an unset
+        // field. Reading it as a competing claim would put
+        // `field.producer_asserted` on a huge share of well-formed
+        // events, so null counts as ABSENCE in the collision judgement —
+        // and is still removed, because an optional envelope field is
+        // omitted, never written as JSON null (ADR-0009).
+        let a = asserted("prod", "unifi", None, None, &[]);
+        let c = canon_profile(
+            r#"{"host":null,"msg":"x","_time":"2025-12-31T23:00:00Z"}"#,
+            Producer::Syslog(a),
+        );
+        assert!(
+            !c.obj.contains_key("host"),
+            "host must be OMITTED, not null"
+        );
+        assert_eq!(codes(&c), vec!["host.omitted"]);
+
+        // Same rule on a slot the profile DOES assert.
+        let a = asserted("prod", "unifi", Some("gw"), None, &[]);
+        let c = canon_profile(
+            r#"{"host":null,"service":null,"msg":"x","_time":"2025-12-31T23:00:00Z"}"#,
+            Producer::Syslog(a),
+        );
+        assert_eq!(c.obj["host"], "gw");
+        assert_eq!(c.obj["service"], "unifi");
+        assert!(
+            c.repairs.is_empty(),
+            "a null claims nothing: {:?}",
+            c.repairs
+        );
     }
 
     #[test]

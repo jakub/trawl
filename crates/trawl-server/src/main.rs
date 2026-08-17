@@ -120,6 +120,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     metrics_process::Collector::default().describe();
     trawl_server::metrics::describe_metrics();
+    // Publish the salvage profiles' rejection matrix at zero. The claim
+    // "telemetry is rejection-free by construction" (ADR-0013 slice 2,
+    // ruling 4) is evidenced by an absent INCREMENT on a present series —
+    // an absent series would leave a scrape unable to tell "never
+    // happened" from "never wired up".
+    trawl_server::ingest::producer::init_profile_reject_metrics();
 
     // Spawn upkeep task to prevent histogram bucket memory bloat.
     let prom_handle = metrics_handle.clone();

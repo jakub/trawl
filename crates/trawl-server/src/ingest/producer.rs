@@ -356,9 +356,16 @@ fn echo(name: &str) -> String {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DerivationConfigError {
     #[error(
-        "[ingest] {list} holds {count} entries, more than the {MAX_DERIVATION_SOURCES} allowed"
+        "[ingest] {list} holds {count} entries, more than the {MAX_DERIVATION_SOURCES} allowed; \
+         entry {MAX_DERIVATION_SOURCES} ('{first_over}') is the first past the bound"
     )]
-    TooManySources { list: DerivationList, count: usize },
+    TooManySources {
+        list: DerivationList,
+        count: usize,
+        /// The field name of the first entry past the bound, so the
+        /// message points at a line to delete rather than at a number.
+        first_over: String,
+    },
 
     #[error("[ingest] {list} entry {index} has an empty field name")]
     EmptyField { list: DerivationList, index: usize },
@@ -456,6 +463,7 @@ fn check_list(
         return Err(DerivationConfigError::TooManySources {
             list,
             count: specs.len(),
+            first_over: echo(specs[MAX_DERIVATION_SOURCES].field()),
         });
     }
 
@@ -591,7 +599,8 @@ pub fn count_profile_reject(kind: ProducerKind, reason: RejectReason) {
 ///
 /// An ABSENT increment on a present series is what proves the salvage
 /// profiles are rejection-free; an absent SERIES proves nothing, because
-/// a scrape cannot tell "never happened" from "never wired up".
+/// a scrape cannot tell "never happened" from "never wired up". Called
+/// once at boot, right after the recorder is installed and described.
 pub fn init_profile_reject_metrics() {
     for kind in ProducerKind::ALL {
         if *kind == ProducerKind::Http {
@@ -873,7 +882,15 @@ mod tests {
             (
                 "more entries than the bound",
                 with_severity(bare(&nine)),
-                vec!["severity_from".into(), "9".into(), "8".into()],
+                // Naming the first entry PAST the bound turns "nine is
+                // more than eight" into a line the operator can delete.
+                vec![
+                    "severity_from".into(),
+                    "9".into(),
+                    "8".into(),
+                    "entry 8".into(),
+                    "'i'".into(),
+                ],
             ),
             (
                 "a reserved severity source",
@@ -943,6 +960,46 @@ mod tests {
             fields(d.time_from(ProducerKind::Http)),
             vec!["timestamp", "_time"]
         );
+    }
+
+    // --- the rejection-free invariant's evidence (ruling 4) -------------
+
+    #[test]
+    fn the_reject_matrix_renders_at_zero_before_anything_rejects() {
+        // AC3's evidence shape: the salvage profiles prove they are
+        // rejection-free by an absent INCREMENT on a PRESENT series. A
+        // series that only appears on the first drop cannot distinguish
+        // "never happened" from "never wired up", so boot publishes the
+        // whole closed matrix at zero and this pins that it renders.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, init_profile_reject_metrics);
+        let rendered = handle.render();
+
+        for kind in ProducerKind::ALL {
+            for reason in RejectReason::ALL {
+                let series = format!(
+                    "{}{{profile=\"{}\",reason=\"{}\"}} 0",
+                    crate::metrics::INGEST_PROFILE_REJECT_TOTAL,
+                    kind.as_str(),
+                    reason.as_str()
+                );
+                // The HTTP door counts through INGEST_EVENTS_REJECTED_TOTAL
+                // instead: publishing an http series here would advertise a
+                // path that does not exist.
+                if *kind == ProducerKind::Http {
+                    assert!(
+                        !rendered.contains(&series),
+                        "the http door must not publish a profile-reject series: {rendered}"
+                    );
+                } else {
+                    assert!(
+                        rendered.contains(&series),
+                        "missing zero-initialized series {series}: {rendered}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
