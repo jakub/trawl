@@ -213,6 +213,12 @@ pub struct IngestState {
     /// peers is rejected instead of peer-repaired. Parsed boot-fatally —
     /// a warn-skipped entry would fail open into host repair.
     pub trusted_relays: Arc<[crate::syslog::CidrEntry]>,
+    /// The boot-resolved per-profile `_severity`/`_time` source lists
+    /// (ADR-0013 slice 2, ruling 5). Resolved UNCONDITIONALLY — a
+    /// query-only node still derives for its own telemetry — and
+    /// boot-fatally, on the `trusted_relays` precedent: a list that
+    /// silently never matches is worse than a refusal to start.
+    pub derivation: Arc<crate::ingest::producer::Derivation>,
     /// Repin ↔ compaction interlock (ADR-0011 slice B). `Some` exactly when
     /// ingest is enabled — a query-only node runs no compaction and refuses
     /// repin requests outright.
@@ -627,6 +633,11 @@ impl AppState {
                 envs: config.ingest.effective_envs().into(),
                 default_env: config.ingest.default_env.as_str().into(),
                 trusted_relays: parse_trusted_relays(&config.ingest.trusted_relays)?,
+                derivation: Arc::new(
+                    crate::ingest::producer::Derivation::resolve(&config.ingest).map_err(|e| {
+                        crate::error::ServerError::Internal(format!("{e} — refusing to start"))
+                    })?,
+                ),
                 repin_coordinator: repin_coordinator.clone(),
             },
             start_time: Instant::now(),

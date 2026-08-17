@@ -20,6 +20,7 @@ use indexmap::IndexMap;
 use crate::error::ServerError;
 use crate::ingest::envelope::{self, EnvelopeContext, RejectReason};
 use crate::ingest::pipeline::ServiceBatch;
+use crate::ingest::producer::Producer;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::state::AppState;
 use trawl_api::{IngestEventError, IngestResponse};
@@ -183,16 +184,20 @@ pub async fn ingest(
         .any(|c| c.contains(peer_addr.ip()));
     let envs = Arc::clone(&state.ingest.envs);
     let default_env = Arc::clone(&state.ingest.default_env);
+    let derivation = Arc::clone(&state.ingest.derivation);
 
     let (mut parsed, wal_paths, body_bytes, decompress_ms, parse_ms, wal_ms) =
         tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
             let ctx = EnvelopeContext {
                 arrival: &arrival,
                 arrival_instant,
-                peer_host: &peer_host,
-                peer_is_trusted_relay,
                 envs: envs.as_ref(),
                 default_env: default_env.as_ref(),
+                producer: Producer::Http {
+                    peer_host: &peer_host,
+                    peer_is_trusted_relay,
+                },
+                derivation: derivation.as_ref(),
             };
             let t0 = std::time::Instant::now();
             let raw = if compressed {
@@ -555,15 +560,19 @@ mod tests {
 
     fn parse_with(data: &[u8], envs: &[&str], relay: bool) -> Result<ParsedEvents, ServerError> {
         let envs: Vec<String> = envs.iter().map(|s| (*s).to_string()).collect();
+        let derivation = crate::ingest::producer::Derivation::defaults();
         let ctx = EnvelopeContext {
             arrival: ARRIVAL,
             arrival_instant: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
-            peer_host: "127.0.0.1",
-            peer_is_trusted_relay: relay,
             envs: &envs,
             default_env: &envs[0],
+            producer: Producer::Http {
+                peer_host: "127.0.0.1",
+                peer_is_trusted_relay: relay,
+            },
+            derivation: &derivation,
         };
         parse_events(data, &ctx)
     }

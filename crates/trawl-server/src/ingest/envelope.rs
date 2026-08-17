@@ -10,14 +10,25 @@
 //! would guess.** Every repair is recorded as a [`RepairCode`] in the
 //! event's `_repairs` column and counted per `(code, service)`.
 //!
-//! Three producers feed events through here: the HTTP ingest handler, the
-//! syslog listener, and internal telemetry (`service:trawld`).
+//! Three producers feed events through here as PROFILES (ADR-0013 slice 2,
+//! ruling 2): the HTTP ingest handler, the syslog listener, and internal
+//! telemetry (`service:trawld`). A profile asserts the identity it can
+//! prove and contributes fixed derivation sources
+//! ([`crate::ingest::producer`]); it bypasses no gate here, and the door
+//! is the one place `_repairs` is assembled — producers CONTRIBUTE codes,
+//! they never assemble.
+//!
+//! This module never calls `tracing`. Telemetry's own events pass through
+//! it on their way to the WAL, so a log line emitted from inside would be
+//! an ingestion loop (ruling 4) — pinned by
+//! `tests/canonicalize_no_tracing.rs`.
 
 use std::fmt;
 
 use serde_json::{Map, Value, json};
 
 use crate::ingest::pipeline;
+use crate::ingest::producer::{self, Asserted, Derivation, Producer};
 
 /// What the server changed about an accepted event — a closed enum, same
 /// principle as ADR-0006's "roles are data, permissions are code": codes
@@ -59,6 +70,26 @@ pub enum RepairCode {
     /// spelling wins when present; otherwise the ASCII-lexicographically
     /// first variant does.
     FieldNameCaseCollision,
+    /// a payload key named a slot the PRODUCER asserts (`env`, `service`,
+    /// `host`, `message`) and carried a different value, so the
+    /// assertion won (ADR-0013 slice 2, ruling 2). Identity is protected
+    /// by precedence, not by a namespace — telemetry's own fields are
+    /// ordinary sender vocabulary — and the displaced value stays
+    /// findable in `_raw`. An IDENTICAL value is not a collision and
+    /// earns no code.
+    ProducerAsserted,
+    /// the producer had no honest `host` to assert, so the event was kept
+    /// with `host` ABSENT (ADR-0013 slice 2, ruling 4). Reached by a
+    /// hostname-less syslog frame behind a trusted relay and by a failed
+    /// hostname lookup for trawld: absent-but-honest beats both the
+    /// peer-fill lie and dropping the event. The HTTP door never gets
+    /// here — an HTTP sender can be rejected and resend.
+    HostOmitted,
+    /// the producer could not derive a usable `service` from the frame
+    /// and fell back to its profile's configured default (a syslog
+    /// APP-NAME that fails the service charset). The original stays
+    /// findable in `_raw`.
+    ServiceFromProfile,
 }
 
 impl RepairCode {
@@ -75,6 +106,9 @@ impl RepairCode {
             Self::FieldNameTooLong => "field.name_too_long",
             Self::FieldNameCaseFolded => "field.name_case_folded",
             Self::FieldNameCaseCollision => "field.name_case_collision",
+            Self::ProducerAsserted => "field.producer_asserted",
+            Self::HostOmitted => "host.omitted",
+            Self::ServiceFromProfile => "service.from_profile",
         }
     }
 }
@@ -149,9 +183,10 @@ impl fmt::Display for RejectReason {
     }
 }
 
-/// Per-request context the canonicalizer needs: arrival instant, peer
-/// identity, and the env allowlist. Threaded in deliberately — this is
-/// `validate`'s first config-dependent check, and globals would hide it.
+/// Per-event context the canonicalizer needs: arrival instant, which door
+/// the event came in at, the env allowlist, and the derivation policy.
+/// Threaded in deliberately — this is `validate`'s first config-dependent
+/// check, and globals would hide it.
 #[derive(Debug)]
 pub struct EnvelopeContext<'a> {
     /// RFC 3339 UTC arrival time at microsecond precision — stamped as
@@ -159,15 +194,20 @@ pub struct EnvelopeContext<'a> {
     pub arrival: &'a str,
     /// The same arrival instant, for plausibility windows.
     pub arrival_instant: chrono::DateTime<chrono::Utc>,
-    /// Peer IP as a string (from the TCP connection).
-    pub peer_host: &'a str,
-    /// Whether the peer is inside a configured `trusted_relays` CIDR:
-    /// a missing `host` is then rejected instead of repaired.
-    pub peer_is_trusted_relay: bool,
     /// The effective env allowlist (never empty).
     pub envs: &'a [String],
-    /// Fills a missing `env` (recorded as `env.defaulted`).
+    /// Fills a missing `env` (recorded as `env.defaulted`). Unreachable
+    /// for a profile producer, which asserts a boot-validated env.
     pub default_env: &'a str,
+    /// Which door this event arrived at, with whatever that door asserts
+    /// (ADR-0013 slice 2, ruling 2). The HTTP variant carries the peer
+    /// identity that used to sit on this struct — it is evidence for a
+    /// fill, not an assertion, and only that door has it.
+    pub producer: Producer<'a>,
+    /// The boot-resolved, per-profile `_severity`/`_time` source lists
+    /// (ruling 5). Borrowed, because one resolved policy serves every
+    /// event on every door for the life of the process.
+    pub derivation: &'a Derivation,
 }
 
 /// A canonicalized event: the declared envelope plus the client's own
@@ -408,54 +448,90 @@ fn resolve_env(
     }
 }
 
-/// The wire keys `_time` derives from, in precedence order (ADR-0013 §2).
+/// Derive `_severity` from the event's own fields — READ-ONLY.
 ///
-/// Server policy, module-local: slice 2 makes it configurable. Only
-/// `_time` itself is CONSUMED (it is the proposal slot, and it is
-/// canonicalized); `timestamp` and `@timestamp` are read and left where
-/// they are, as ordinary sender columns.
-const TIME_SOURCES: [&str; 3] = [trawl_core::schema::TIME, "timestamp", "@timestamp"];
-
-/// The wire keys `_severity` derives from, in precedence order. All three
-/// are ordinary sender fields, READ and never removed.
-const SEVERITY_SOURCES: [&str; 3] = ["severity", "severity_text", "level"];
-
-/// Map one severity source value onto the `OTel` ladder, or nothing.
+/// First MAPPABLE source wins, over the source list THIS profile reads
+/// (ADR-0013 slice 2, ruling 5): the configured `[ingest] severity_from`
+/// chain, with the profile's fixed sources prepended. Every source stays
+/// exactly where it is, so `{"service":"game","level":"gold"}` keeps a
+/// queryable `level="gold"` column and simply gets no `_severity`
+/// (ADR-0013 §2). Returns whether a source EXISTED and none mapped, which
+/// is the ops counter's input — not a repair, because nothing
+/// sender-visible was touched.
 ///
-/// A delegate to the ONE reader (ADR-0013 slice 2, ruling 9): a WORD maps
-/// through the ADR-0009 token table (`error` → 17) or the `OTel` exact
-/// short names (`error2` → 18), and a NUMERIC — JSON number or numeric
-/// string — maps STRICTLY as `OTel` 1-24 (ADR-0013 §4): `3` is trace
-/// here, never syslog's err. The ranges overlap, so no value-shape rule
-/// can tell the dialects apart; syslog inversion happens only where
-/// transport provenance proves the dialect (the syslog listener), and it
-/// asks the same kernel with the other [`trawl_core::severity::Dialect`].
+/// Each source carries its own dialect, and the value goes through the
+/// ONE reader (ruling 9): a WORD maps through the ADR-0009 token table
+/// (`error` → 17) or the `OTel` exact short names (`error2` → 18), and a
+/// NUMERIC maps as that source's dialect says — `OTel` 1-24 by default,
+/// so `3` is trace, and syslog's inverted 0-7 only where the source's
+/// provenance was declared. The ranges overlap completely, so no
+/// value-shape rule could tell the dialects apart; the config (and the
+/// syslog profile's fixed source) is where provenance is asserted.
 ///
 /// Reading through the kernel is also what keeps ingest and `sev()`
 /// honest: the number a query computes from a raw `level` is the number
 /// derivation would have stored for it.
-fn severity_reading(v: &Value) -> Option<u8> {
-    trawl_core::severity::reading(v, trawl_core::severity::Dialect::Otel)
-}
-
-/// Derive `_severity` from the event's own fields — READ-ONLY.
-///
-/// First MAPPABLE source wins; every source stays exactly where it is, so
-/// `{"service":"game","level":"gold"}` keeps a queryable `level="gold"`
-/// column and simply gets no `_severity` (ADR-0013 §2). Returns whether a
-/// source EXISTED and none mapped, which is the ops counter's input — not
-/// a repair, because nothing sender-visible was touched.
-fn derive_severity(out: &mut Map<String, Value>) -> bool {
+fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -> bool {
     let mut saw_source = false;
-    for key in SEVERITY_SOURCES {
-        let Some(value) = out.get(key) else { continue };
+    for source in sources {
+        let Some(value) = out.get(&source.field) else {
+            continue;
+        };
         saw_source = true;
-        if let Some(number) = severity_reading(value) {
+        if let Some(number) = trawl_core::severity::reading(value, source.dialect) {
             out.insert(trawl_core::schema::SEVERITY.into(), json!(number));
             return false;
         }
     }
     saw_source
+}
+
+/// Stamp what the PRODUCER asserts over the payload, returning whether any
+/// payload value was displaced (ADR-0013 slice 2, ruling 2).
+///
+/// Runs after the reserved-prefix strip and before the validators, so a
+/// stripped `_service` has already landed on its bare slot and the
+/// assertion overrides that too — and so `validate_service`/`resolve_env`
+/// run on the ASSERTED values, giving the profile doors exactly the
+/// checks the HTTP door gets.
+///
+/// Identity is protected by PRECEDENCE, not by a namespace: telemetry's
+/// `service` field is ordinary sender vocabulary that happens to collide,
+/// and it loses. An IDENTICAL value is not a collision — the sender
+/// agreed with the profile, and confessing a repair for that would put a
+/// code on every well-formed syslog frame.
+///
+/// The two `None`s mean different things, deliberately:
+/// - `host: None` is an assertion of ABSENCE (the producer knows it has
+///   no honest hostname), so any payload `host` is displaced and the slot
+///   is left empty for the caller to confess as `host.omitted`;
+/// - `message: None` is NO assertion at all (the payload IS the message,
+///   as for telemetry), so whatever the payload carries stands.
+fn apply_assertions(out: &mut Map<String, Value>, asserted: &Asserted<'_>) -> bool {
+    let mut displaced = claim_slot(out, trawl_core::schema::ENV, Some(asserted.env));
+    displaced |= claim_slot(out, trawl_core::schema::SERVICE, Some(asserted.service));
+    displaced |= claim_slot(out, trawl_core::schema::HOST, asserted.host);
+    if let Some(message) = asserted.message {
+        displaced |= claim_slot(out, trawl_core::schema::MESSAGE, Some(message));
+    }
+    displaced
+}
+
+/// Claim one asserted slot. `Some` stamps the value, `None` empties the
+/// slot. Returns whether a DIFFERENT payload value was displaced.
+fn claim_slot(out: &mut Map<String, Value>, key: &str, value: Option<&str>) -> bool {
+    match value {
+        Some(value) => {
+            let displaced = match out.get(key) {
+                None => false,
+                Some(Value::String(existing)) => existing != value,
+                Some(_) => true,
+            };
+            out.insert(key.to_owned(), json!(value));
+            displaced
+        }
+        None => out.remove(key).is_some(),
+    }
 }
 
 /// Stringify top-level object/array values to their JSON text (ADR-0009
@@ -638,6 +714,85 @@ fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
     !unstorable.is_empty()
 }
 
+/// Decide what to do about `host`, per door (ADR-0013 slice 2, ruling 3).
+///
+/// Returns whether the event arrived without one and, if so, the peer
+/// address to fill it from.
+///
+/// Only the HTTP door has a peer to fill from or to refuse behind: an
+/// HTTP sender can be rejected and resend, so trawl holds out for an
+/// honest answer rather than stamping a relay's address as the origin. A
+/// profile producer cannot reject to anyone, so its absent host is kept
+/// ABSENT and confessed as `host.omitted` by the caller —
+/// absent-but-honest beats both the peer-fill lie and dropping the event.
+fn decide_host<'a>(
+    out: &Map<String, Value>,
+    producer: &Producer<'a>,
+) -> Result<(bool, Option<&'a str>), (String, RejectReason)> {
+    let host_missing = matches!(out.get(trawl_core::schema::HOST), None | Some(Value::Null));
+    let peer_fill = match producer {
+        Producer::Http {
+            peer_host,
+            peer_is_trusted_relay,
+        } if host_missing => {
+            if *peer_is_trusted_relay {
+                return Err((
+                    format!(
+                        "event has no 'host' and peer {peer_host} is a configured trusted relay \
+                         — filling from the peer would stamp the relay's address as the origin"
+                    ),
+                    RejectReason::HostMissingFromRelay,
+                ));
+            }
+            Some(*peer_host)
+        }
+        _ => None,
+    };
+    Ok((host_missing, peer_fill))
+}
+
+/// Derive `_time` from the first PRESENT source in this profile's
+/// `time_from` list, returning the canonical RFC 3339 UTC-microsecond
+/// text and the repair it earned, if any (ADR-0013 §2, ADR-0008 grammar).
+///
+/// Derivation observes, it never consumes. Only `_time` itself is removed
+/// — it is the proposal slot, and the canonical value replaces it;
+/// `timestamp`/`@timestamp`, and the syslog profile's own
+/// `syslog_timestamp`, stay as ordinary columns.
+///
+/// First PRESENT, not first PARSEABLE: an unparseable value claims the
+/// derivation and falls to arrival time rather than reaching past itself
+/// to a lower-precedence source, so what `_time` holds is always
+/// explicable from ONE input.
+fn derive_time(
+    out: &mut Map<String, Value>,
+    ctx: &EnvelopeContext<'_>,
+) -> (String, Option<RepairCode>) {
+    let time_input = ctx
+        .derivation
+        .time_from(ctx.producer.kind())
+        .iter()
+        .find_map(|source| out.get(&source.field).cloned());
+    out.remove(trawl_core::schema::TIME);
+    match &time_input {
+        None => (ctx.arrival.to_owned(), Some(RepairCode::TimeFromIngest)),
+        Some(v) => match parse_event_time(v) {
+            Some(dt) => {
+                let past = ctx.arrival_instant - chrono::Duration::days(OUT_OF_RANGE_PAST_DAYS);
+                let future = ctx.arrival_instant + chrono::Duration::days(OUT_OF_RANGE_FUTURE_DAYS);
+                // Implausible, but parseable: kept — flagged, never
+                // substituted (the client said what it said).
+                let repair = (dt < past || dt > future).then_some(RepairCode::TimeOutOfRange);
+                (
+                    dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                    repair,
+                )
+            }
+            None => (ctx.arrival.to_owned(), Some(RepairCode::TimeFromIngest)),
+        },
+    }
+}
+
 /// Canonicalize one parsed event object into the declared envelope.
 ///
 /// Field order of operations is load-bearing:
@@ -652,6 +807,12 @@ fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
 ///    folded spellings stay findable).
 /// 2. Reserved-prefix strip ([`strip_reserved_prefixes`],
 ///    `field.reserved_prefix` / `field.reserved_prefix_collision`).
+///    2.5. Producer assertions ([`apply_assertions`],
+///    `field.producer_asserted`) — AFTER the strip, so a stripped
+///    `_service` has already landed on its bare slot and the profile
+///    overrides that too, and BEFORE the validators, so an asserted
+///    `service`/`env` faces exactly the checks an HTTP sender's does.
+///    The HTTP door asserts nothing and skips this.
 /// 3. `service` validation (reject path), `env` and `host` resolution —
 ///    AFTER the strip, because a stripped `_service`/`_env`/`_host` lands
 ///    on exactly the bare slot these read, the same way a stripped
@@ -659,14 +820,17 @@ fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
 ///    first would let step 6 overwrite the stripped value and then confess
 ///    `env.defaulted`/`host.from_peer` about a sender that DID assert one.
 ///    Over-long field-name drop (`field.name_too_long`) follows.
-/// 4. `_time` derived from the first PRESENT source
-///    (`_time`/`timestamp`/`@timestamp`), ADR-0008 grammar,
+/// 4. `_time` derived from the first PRESENT source in THIS profile's
+///    `time_from` list, ADR-0008 grammar,
 ///    `time.from_ingest`/`time.out_of_range`. Only `_time` is consumed.
 /// 5. `_ingested` stamp.
-/// 6. `env` default-or-reject, `host` peer-fill-or-relay-reject.
-/// 7. `_severity` derived from the first MAPPABLE source
-///    (`severity`/`severity_text`/`level`), READ-ONLY: every source stays
-///    where it is, and no mappable one means no key and no repair.
+/// 6. `env` default-or-reject, `host` peer-fill / relay-reject / omit.
+/// 7. `_severity` derived from the first MAPPABLE source in THIS profile's
+///    `severity_from` list, READ-ONLY: every source stays where it is, and
+///    no mappable one means no key and no repair.
+///    7.5. `_producer` stamp — after the strip, so an incoming
+///    `_producer` has already become a bare `producer` and the column is
+///    unforgeable.
 /// 8. `_repairs` assembly (omitted when clean).
 pub fn canonicalize(
     obj: &Map<String, Value>,
@@ -694,31 +858,36 @@ pub fn canonicalize(
     // 2. The `_` namespace is trawl's: strip the prefix, keep the data.
     let strip = strip_reserved_prefixes(&mut out);
 
-    // 3. Identity, read from the POST-strip event: a `_host`/`_env`/
-    // `_service` has landed on its bare slot by now, so it is ordinary
-    // sender-asserted data and the fills below cannot overwrite it (nor
-    // claim in `_repairs` that the sender asserted nothing).
-    let service = validate_service(&out)?;
-    let (env, env_defaulted) = resolve_env(&out, ctx)?;
-    let host_missing = matches!(out.get("host"), None | Some(Value::Null));
-    if host_missing && ctx.peer_is_trusted_relay {
-        return Err((
-            format!(
-                "event has no 'host' and peer {} is a configured trusted relay \
-                 — filling from the peer would stamp the relay's address as \
-                 the origin",
-                ctx.peer_host
-            ),
-            RejectReason::HostMissingFromRelay,
-        ));
-    }
-
     let mut repairs: Vec<RepairCode> = Vec::new();
     let push_repair = |repairs: &mut Vec<RepairCode>, code: RepairCode| {
         if !repairs.contains(&code) {
             repairs.push(code);
         }
     };
+
+    // 2.5. What the PRODUCER asserts wins over what the payload carries.
+    // The codes the producer itself contributed lead `_repairs`: they
+    // describe what happened to the event before it reached this door.
+    if let Some(asserted) = ctx.producer.asserted() {
+        for code in asserted.repairs {
+            push_repair(&mut repairs, *code);
+        }
+        if apply_assertions(&mut out, asserted) {
+            push_repair(&mut repairs, RepairCode::ProducerAsserted);
+        }
+    }
+
+    // 3. Identity, read from the POST-strip, POST-assertion event: a
+    // `_host`/`_env`/`_service` has landed on its bare slot by now, so it
+    // is ordinary sender-asserted data and the fills below cannot
+    // overwrite it (nor claim in `_repairs` that the sender asserted
+    // nothing). A profile's assertion sits in those same slots, so it
+    // faces exactly these validators.
+    let service = validate_service(&out)?;
+    let (env, env_defaulted) = resolve_env(&out, ctx)?;
+
+    let (host_missing, peer_fill) = decide_host(&out, &ctx.producer)?;
+
     if fold.folded {
         push_repair(&mut repairs, RepairCode::FieldNameCaseFolded);
     }
@@ -740,56 +909,43 @@ pub fn canonicalize(
     // 3.5. Nested values become JSON text (see [`stringify_nested_values`]).
     stringify_nested_values(&mut out);
 
-    // 4. `_time` from the first PRESENT source (ADR-0013 §2): derivation
-    // observes, it never consumes. Only `_time` itself is removed — it is
-    // the proposal slot, and the canonical value replaces it below;
-    // `timestamp`/`@timestamp` stay as ordinary sender columns.
-    //
-    // First PRESENT, not first PARSEABLE: an unparseable `_time` claims
-    // the derivation and falls to arrival time rather than reaching past
-    // itself to a lower-precedence source, so what `_time` holds is
-    // always explicable from ONE input.
-    let time_input = TIME_SOURCES.iter().find_map(|k| out.get(*k).cloned());
-    out.remove(trawl_core::schema::TIME);
-    let canonical_time = match &time_input {
-        None => {
-            push_repair(&mut repairs, RepairCode::TimeFromIngest);
-            ctx.arrival.to_owned()
-        }
-        Some(v) => {
-            if let Some(dt) = parse_event_time(v) {
-                let past = ctx.arrival_instant - chrono::Duration::days(OUT_OF_RANGE_PAST_DAYS);
-                let future = ctx.arrival_instant + chrono::Duration::days(OUT_OF_RANGE_FUTURE_DAYS);
-                if dt < past || dt > future {
-                    // Implausible, but parseable: kept — flagged, never
-                    // substituted (the client said what it said).
-                    push_repair(&mut repairs, RepairCode::TimeOutOfRange);
-                }
-                dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
-            } else {
-                push_repair(&mut repairs, RepairCode::TimeFromIngest);
-                ctx.arrival.to_owned()
-            }
-        }
-    };
+    // 4. `_time` from this profile's own source list.
+    let (canonical_time, time_repair) = derive_time(&mut out, ctx);
+    if let Some(code) = time_repair {
+        push_repair(&mut repairs, code);
+    }
     out.insert(trawl_core::schema::TIME.into(), json!(canonical_time));
 
     // 5. Server-stamped arrival time.
     out.insert(trawl_core::schema::INGESTED.into(), json!(ctx.arrival));
 
     // 6. env / host.
-    out.insert("env".into(), json!(env));
+    out.insert(trawl_core::schema::ENV.into(), json!(env));
     if env_defaulted {
         push_repair(&mut repairs, RepairCode::EnvDefaulted);
     }
-    if host_missing {
-        out.insert("host".into(), json!(ctx.peer_host));
+    if let Some(peer_host) = peer_fill {
+        out.insert(trawl_core::schema::HOST.into(), json!(peer_host));
         push_repair(&mut repairs, RepairCode::HostFromPeer);
+    } else if host_missing {
+        // Only a profile producer reaches here: the HTTP door either
+        // filled from the peer or rejected above.
+        push_repair(&mut repairs, RepairCode::HostOmitted);
     }
 
     // 7. `_severity` derivation — READ-ONLY: every source stays where it
     // is, and an event with no mappable one simply has no `_severity`.
-    let severity_unmapped = derive_severity(&mut out);
+    let severity_unmapped =
+        derive_severity(&mut out, ctx.derivation.severity_from(ctx.producer.kind()));
+
+    // 7.5. Provenance becomes data (ADR-0013 slice 2, ruling 6). Stamped
+    // from the profile, never from the payload: an incoming `_producer`
+    // was stripped to a bare `producer` back at step 2, so the column
+    // cannot be forged.
+    out.insert(
+        trawl_core::schema::PRODUCER.into(),
+        json!(ctx.producer.kind().as_str()),
+    );
 
     // 8. `_raw` and `_repairs`.
     if truncated {
@@ -828,14 +984,29 @@ mod tests {
 
     const ARRIVAL: &str = "2026-01-01T00:00:00.000000Z";
 
+    /// The default derivation policy, shared by every test that does not
+    /// configure its own. Leaked so a test can hold `&Derivation` for the
+    /// life of a borrowed context without threading an owner through
+    /// every helper.
+    fn default_derivation() -> &'static Derivation {
+        static DEFAULTS: std::sync::OnceLock<Derivation> = std::sync::OnceLock::new();
+        DEFAULTS.get_or_init(Derivation::defaults)
+    }
+
+    /// The HTTP door with the packaged derivation policy — what the whole
+    /// pre-slice-2 matrix below assumes, so the profile reshape shows up
+    /// as a change to this ONE helper and nothing else.
     fn ctx_with(envs: &[String], relay: bool) -> EnvelopeContext<'_> {
         EnvelopeContext {
             arrival: ARRIVAL,
             arrival_instant: arrival_instant(),
-            peer_host: "10.0.4.55",
-            peer_is_trusted_relay: relay,
             envs,
             default_env: &envs[0],
+            producer: Producer::Http {
+                peer_host: "10.0.4.55",
+                peer_is_trusted_relay: relay,
+            },
+            derivation: default_derivation(),
         }
     }
 
@@ -1921,5 +2092,371 @@ mod tests {
             assert!(repairs.contains(code), "missing {code} in {repairs}");
         }
         assert!(repairs.contains(','));
+    }
+
+    // --- producer profiles (ADR-0013 slice 2, rulings 2/3/4/6) ---
+    //
+    // The matrix above is the HTTP door and is UNCHANGED by the profile
+    // reshape — only `ctx_with` moved. These cover what the profiles add.
+
+    /// A profile context: asserted identity plus the packaged derivation.
+    fn profile_ctx<'a>(
+        envs: &'a [String],
+        producer: Producer<'a>,
+        derivation: &'a Derivation,
+    ) -> EnvelopeContext<'a> {
+        EnvelopeContext {
+            arrival: ARRIVAL,
+            arrival_instant: arrival_instant(),
+            envs,
+            default_env: &envs[0],
+            producer,
+            derivation,
+        }
+    }
+
+    fn asserted<'a>(
+        env: &'a str,
+        service: &'a str,
+        host: Option<&'a str>,
+        message: Option<&'a str>,
+        repairs: &'a [RepairCode],
+    ) -> Asserted<'a> {
+        Asserted {
+            env,
+            service,
+            host,
+            message,
+            repairs,
+        }
+    }
+
+    /// Canonicalize a payload through a non-HTTP door.
+    fn canon_profile(json: &str, producer: Producer<'_>) -> Canonical {
+        let e = envs(&["prod", "lab"]);
+        let d = default_derivation();
+        canonicalize(&event(json), &profile_ctx(&e, producer, d)).expect("event must canonicalize")
+    }
+
+    #[test]
+    fn every_door_stamps_its_own_producer() {
+        // Provenance becomes data (ruling 6). One spelling, and it is the
+        // one `ProducerKind` publishes — a query and a metric label can
+        // never disagree about what to call a door.
+        let http = canon(r#"{"service":"s","env":"prod","host":"h"}"#);
+        assert_eq!(http.obj["_producer"], "http");
+
+        let a = asserted("prod", "unifi", Some("gw"), Some("link down"), &[]);
+        assert_eq!(
+            canon_profile(r#"{"syslog_severity":3}"#, Producer::Syslog(a)).obj["_producer"],
+            "syslog"
+        );
+        let t = asserted("prod", "trawld", Some("box"), None, &[]);
+        assert_eq!(
+            canon_profile(r#"{"message":"started"}"#, Producer::Trawld(t)).obj["_producer"],
+            "trawld"
+        );
+    }
+
+    #[test]
+    fn an_incoming_producer_key_cannot_forge_the_column() {
+        // `_producer` is server-stamped, so a client's copy takes the
+        // standard reserved-prefix strip (ADR-0013 §5) and lands as a
+        // bare `producer` column — queryable, but not the envelope slot.
+        let c = canon(r#"{"service":"s","env":"prod","host":"h","_producer":"syslog"}"#);
+        assert_eq!(
+            c.obj["_producer"], "http",
+            "the door stamps, not the sender"
+        );
+        assert_eq!(
+            c.obj["producer"], "syslog",
+            "the sender's value stays queryable"
+        );
+        assert!(codes(&c).contains(&"field.reserved_prefix"));
+
+        // Same rule on a profile door, and the assertion order holds:
+        // the strip runs BEFORE the stamp, so the two never race.
+        let a = asserted("prod", "unifi", Some("gw"), None, &[]);
+        let c = canon_profile(r#"{"_PRODUCER":"http","msg":"x"}"#, Producer::Syslog(a));
+        assert_eq!(c.obj["_producer"], "syslog");
+        assert_eq!(c.obj["producer"], "http");
+    }
+
+    #[test]
+    fn a_profile_assertion_beats_a_colliding_payload_key() {
+        // Ruling 2/3: telemetry's own `service`/`host` fields are ordinary
+        // sender vocabulary — no `trawld_` prefix — and identity is
+        // protected by PRECEDENCE. The displaced values stay in `_raw`.
+        let a = asserted("prod", "trawld", Some("box"), None, &[]);
+        let c = canon_profile(
+            r#"{"service":"nginx","host":"web01","env":"lab","message":"boom"}"#,
+            Producer::Trawld(a),
+        );
+        assert_eq!(c.service, "trawld");
+        assert_eq!(c.obj["service"], "trawld");
+        assert_eq!(c.obj["host"], "box");
+        assert_eq!(c.env, "prod");
+        assert_eq!(c.obj["env"], "prod");
+        // `message: None` is NO assertion — the payload IS the message.
+        assert_eq!(c.obj["message"], "boom");
+        assert!(codes(&c).contains(&"field.producer_asserted"));
+        let raw = c.obj["_raw"].as_str().unwrap();
+        for displaced in ["nginx", "web01", "lab"] {
+            assert!(
+                raw.contains(displaced),
+                "{displaced} must stay in _raw: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_identical_payload_value_is_not_a_collision() {
+        // A code on every well-formed frame would destroy `_repairs`'s
+        // NULL-dominance, and nothing was displaced: the sender agreed.
+        let a = asserted("prod", "unifi", Some("gw"), Some("link down"), &[]);
+        let c = canon_profile(
+            r#"{"service":"unifi","host":"gw","env":"prod","message":"link down",
+                "_time":"2025-12-31T23:00:00Z"}"#,
+            Producer::Syslog(a),
+        );
+        assert!(c.repairs.is_empty(), "clean profile event: {:?}", c.repairs);
+        assert!(!c.obj.contains_key("_repairs"));
+    }
+
+    #[test]
+    fn a_profile_with_no_honest_host_keeps_the_event_and_omits_it() {
+        // Ruling 4: absent-but-honest beats both the peer-fill lie and
+        // dropping the event — a hostname-less frame behind a trusted
+        // relay still lands.
+        let a = asserted("prod", "unifi", None, None, &[]);
+        let c = canon_profile(
+            r#"{"msg":"x","_time":"2025-12-31T23:00:00Z"}"#,
+            Producer::Syslog(a),
+        );
+        assert!(
+            !c.obj.contains_key("host"),
+            "host must be OMITTED, not null"
+        );
+        assert_eq!(codes(&c), vec!["host.omitted"]);
+        // Nothing peer-fills a profile door: there is no peer on it.
+        assert!(!codes(&c).contains(&"host.from_peer"));
+
+        // And a payload key cannot supply what the profile denied.
+        let a = asserted("prod", "unifi", None, None, &[]);
+        let c = canon_profile(
+            r#"{"host":"whatever","_time":"2025-12-31T23:00:00Z"}"#,
+            Producer::Syslog(a),
+        );
+        assert!(!c.obj.contains_key("host"));
+        assert!(codes(&c).contains(&"host.omitted"));
+        assert!(codes(&c).contains(&"field.producer_asserted"));
+    }
+
+    #[test]
+    fn producer_contributed_codes_lead_the_repairs_list() {
+        // Producers contribute codes; only the door assembles `_repairs`.
+        // The producer's own codes describe what happened BEFORE the door,
+        // so they come first.
+        let a = asserted(
+            "prod",
+            "syslog",
+            Some("gw"),
+            None,
+            &[RepairCode::ServiceFromProfile],
+        );
+        let c = canon_profile(r#"{"msg":"x"}"#, Producer::Syslog(a));
+        assert_eq!(codes(&c), vec!["service.from_profile", "time.from_ingest"]);
+        assert_eq!(
+            c.obj["_repairs"], "service.from_profile,time.from_ingest",
+            "the joined column mirrors the vector"
+        );
+    }
+
+    #[test]
+    fn a_profile_never_defaults_its_env() {
+        // Ruling 2: env comes from boot-validated config, so
+        // `env.defaulted` is structurally unreachable on a profile door —
+        // even when the payload carries no env at all.
+        let a = asserted("lab", "unifi", Some("gw"), None, &[]);
+        let c = canon_profile(
+            r#"{"msg":"x","_time":"2025-12-31T23:00:00Z"}"#,
+            Producer::Syslog(a),
+        );
+        assert_eq!(c.env, "lab");
+        assert!(!codes(&c).contains(&"env.defaulted"));
+    }
+
+    #[test]
+    fn a_profile_faces_every_universal_gate() {
+        // AC2: no profile bypasses the fold, the strip, the name-length
+        // drop, the nested stringify or the `_raw` cap.
+        let long = "k".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1);
+        let payload = format!(
+            r#"{{"_HOSTNAME":"box","Dur":12,"nest":{{"a":1}},"{long}":"x",
+                "big":"{}"}}"#,
+            "z".repeat(MAX_RAW_CHARS + 10)
+        );
+        let a = asserted("prod", "unifi", Some("gw"), None, &[]);
+        let c = canon_profile(&payload, Producer::Syslog(a));
+        assert_eq!(c.obj["hostname"], "box", "the sealed prefix is stripped");
+        assert_eq!(c.obj["dur"], 12, "names are ASCII-folded");
+        assert_eq!(c.obj["nest"], r#"{"a":1}"#, "nested values stringify");
+        assert!(!c.obj.contains_key(&long), "an unstorable name is dropped");
+        assert_eq!(
+            c.obj["_raw"].as_str().unwrap().chars().count(),
+            MAX_RAW_CHARS,
+            "_raw is capped on every door"
+        );
+        for code in [
+            "field.reserved_prefix",
+            "field.name_case_folded",
+            "field.name_too_long",
+            "field.truncated",
+        ] {
+            assert!(codes(&c).contains(&code), "missing {code}: {:?}", codes(&c));
+        }
+    }
+
+    #[test]
+    fn an_invalid_asserted_service_rejects_through_the_doors_own_validator() {
+        // Step 2.5 stamps the assertion into the same slot the validator
+        // reads, so a profile gets exactly the HTTP door's checks. The
+        // caller counts the drop; the door only refuses.
+        let e = envs(&["prod"]);
+        let d = default_derivation();
+        let a = asserted("prod", "../escaped", Some("gw"), None, &[]);
+        let (_, reason) = canonicalize(
+            &event(r#"{"msg":"x"}"#),
+            &profile_ctx(&e, Producer::Syslog(a), d),
+        )
+        .expect_err("an unusable asserted service must refuse");
+        assert_eq!(reason, RejectReason::InvalidChars);
+    }
+
+    // --- per-profile derivation (ADR-0013 slice 2, rulings 1/5) ---
+
+    #[test]
+    fn the_syslog_profile_derives_severity_from_its_own_artifact() {
+        // Ruling 1: the listener writes no `_severity`. It publishes the
+        // raw 0-7 numeral and the profile's FIXED source inverts it —
+        // syslog 3 (err) is OTel 17, not OTel 3 (trace2).
+        let a = asserted("prod", "unifi", Some("gw"), None, &[]);
+        let c = canon_profile(r#"{"syslog_severity":3}"#, Producer::Syslog(a));
+        assert_eq!(c.obj["_severity"], 17);
+        assert_eq!(c.obj["syslog_severity"], 3, "the artifact stays queryable");
+
+        // The very same value on the HTTP door reads as OTel, because
+        // nothing there proves the provenance (ADR-0013 §4).
+        let c = canon(r#"{"service":"s","env":"prod","host":"h","syslog_severity":3}"#);
+        assert!(
+            !c.obj.contains_key("_severity"),
+            "an unconfigured field is not a severity source at all"
+        );
+    }
+
+    #[test]
+    fn the_syslog_profile_reads_its_frame_timestamp_first() {
+        let a = asserted("prod", "unifi", Some("gw"), None, &[]);
+        let c = canon_profile(
+            r#"{"syslog_timestamp":"2025-06-01T10:00:00Z","timestamp":"2025-06-01T11:00:00Z"}"#,
+            Producer::Syslog(a),
+        );
+        assert_eq!(c.obj["_time"], "2025-06-01T10:00:00.000000Z");
+        assert_eq!(
+            c.obj["syslog_timestamp"], "2025-06-01T10:00:00Z",
+            "derivation observes; the artifact stays"
+        );
+
+        // An OMITTED artifact (no frame timestamp, or an unparseable one)
+        // falls through the configured chain honestly — no listener-side
+        // `now()` substitution can hide behind it.
+        let a = asserted("prod", "unifi", Some("gw"), None, &[]);
+        let c = canon_profile(r#"{"msg":"x"}"#, Producer::Syslog(a));
+        assert_eq!(c.obj["_time"], ARRIVAL);
+        assert!(codes(&c).contains(&"time.from_ingest"));
+    }
+
+    #[test]
+    fn a_syslog_over_http_forwarder_inverts_through_the_configured_dialect() {
+        // AC5: the native listener and a collector forwarding syslog over
+        // HTTP reach the SAME mechanism. Configure the artifact as a
+        // syslog-dialect source and the HTTP door inverts it too.
+        let derivation = Derivation::resolve(&trawl_config::IngestConfig {
+            severity_from: vec![
+                trawl_config::DerivationSourceSpec::Typed {
+                    field: "syslog_severity".to_owned(),
+                    dialect: Some("syslog".to_owned()),
+                },
+                trawl_config::DerivationSourceSpec::Bare("level".to_owned()),
+            ],
+            ..trawl_config::IngestConfig::default()
+        })
+        .expect("the forwarder config must resolve");
+        let e = envs(&["prod"]);
+        let ctx = profile_ctx(
+            &e,
+            Producer::Http {
+                peer_host: "10.0.4.55",
+                peer_is_trusted_relay: false,
+            },
+            &derivation,
+        );
+
+        let c = canonicalize(
+            &event(r#"{"service":"rsyslog","env":"prod","host":"relay","syslog_severity":3}"#),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(c.obj["_severity"], 17, "syslog 3 is err, which is OTel 17");
+        assert_eq!(c.obj["_producer"], "http");
+
+        // Precedence is the configured order, and the lower-priority
+        // source is still read when the first does not map.
+        let c = canonicalize(
+            &event(
+                r#"{"service":"rsyslog","env":"prod","host":"relay",
+                       "syslog_severity":"nonsense","level":"warn"}"#,
+            ),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(c.obj["_severity"], 13);
+    }
+
+    #[test]
+    fn an_empty_configured_severity_list_derives_nothing_but_keeps_the_fixed_source() {
+        let derivation = Derivation::resolve(&trawl_config::IngestConfig {
+            severity_from: Vec::new(),
+            ..trawl_config::IngestConfig::default()
+        })
+        .unwrap();
+        let e = envs(&["prod"]);
+
+        let ctx = profile_ctx(
+            &e,
+            Producer::Http {
+                peer_host: "10.0.4.55",
+                peer_is_trusted_relay: false,
+            },
+            &derivation,
+        );
+        let c = canonicalize(
+            &event(r#"{"service":"s","env":"prod","host":"h","level":"error"}"#),
+            &ctx,
+        )
+        .unwrap();
+        assert!(!c.obj.contains_key("_severity"));
+        assert_eq!(c.obj["level"], "error", "the source column is untouched");
+        assert!(
+            !c.severity_unmapped,
+            "no source was CONSULTED, so nothing was unmapped"
+        );
+
+        // The syslog profile's fixed source is trawl's, not the
+        // operator's, and survives an empty configured list.
+        let a = asserted("prod", "unifi", Some("gw"), None, &[]);
+        let ctx = profile_ctx(&e, Producer::Syslog(a), &derivation);
+        let c = canonicalize(&event(r#"{"syslog_severity":4}"#), &ctx).unwrap();
+        assert_eq!(c.obj["_severity"], 13, "syslog 4 is warning, OTel 13");
     }
 }
