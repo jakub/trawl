@@ -2395,14 +2395,17 @@ mod tests {
         );
     }
 
-    /// Issue #82, AC3: the severity set is INLINED, so a subject that
-    /// pushes parameters keeps its positional order.
+    /// Issue #82, AC3: the severity set is INLINED, so it binds nothing
+    /// between a subject's parameters and whatever follows.
     ///
-    /// No DSL shape reaches here with such a subject today — `subject_pin`
-    /// admits only a bare pinned field or `sev(<bare field>[, "dialect"])`,
-    /// and the dialect is inlined text rather than a bound parameter — so
-    /// the regression is taken at the renderer, where a future subject
-    /// (an arithmetic wrapper, a literal `sev()` operand) would arrive.
+    /// The set is a SINGLE run here on purpose (review finding B). A
+    /// multi-run set repeats the subject, so a subject carrying `?`
+    /// placeholders would emit more placeholders than parameters were
+    /// pushed — that shape is out of contract, documented at
+    /// `severity_ranges_sql`, and structurally unreachable (see
+    /// [`severity_subjects_never_push_parameters`]). Asserting positions
+    /// over a repeated subject would document a contract the renderer
+    /// does not hold.
     #[test]
     fn a_severity_set_pushes_no_parameters_and_preserves_positions() {
         let mut state = EmitterState::new("/data/**/*.parquet").expect("source");
@@ -2412,16 +2415,15 @@ mod tests {
             &subject,
             vec![
                 crate::compare::CompareForm::SeverityBand { lo: 17, hi: 20 },
-                crate::compare::CompareForm::SeverityExact(13),
+                crate::compare::CompareForm::SeverityExact(18),
             ],
             &mut state,
         );
         let after = state.push_param(SqlValue::String("after".to_owned()));
-        // 13 is isolated (14-16 are absent), 17-20 is the ERROR run.
-        assert_eq!(
-            clause,
-            format!("({subject} = 13 OR {subject} BETWEEN 17 AND 20)")
-        );
+        // 18 sits inside the ERROR band, so this is ONE run and the
+        // subject is written exactly once.
+        assert_eq!(clause, format!("{subject} BETWEEN 17 AND 20"));
+        assert_eq!(clause.matches(&subject).count(), 1, "{clause}");
         // Placeholders are positional `?`, so the ORDER of the collected
         // params is the whole assertion: the set bound nothing between
         // them, and `after` is still the second value.
@@ -2434,6 +2436,40 @@ mod tests {
                 SqlValue::String("after".to_owned())
             ]
         );
+    }
+
+    /// The real regression guard behind AC3 (review finding B): NO subject
+    /// the pin scope admits can push a bound parameter, so the multi-run
+    /// repetition can never desynchronize placeholders from parameters.
+    ///
+    /// `PinScope::subject_pin` admits exactly two shapes — a bare pinned
+    /// field, and a pin-declaring call over a bare field whose remaining
+    /// arguments are string literals — and `sev()`'s dialect is inlined as
+    /// TEXT (`functions::literal_text_positions`) rather than bound. This
+    /// asserts that end to end: a severity predicate emits no parameters
+    /// at all, in the search stage and in both operand orders of the
+    /// pipeline, for single-run AND multi-run sets.
+    #[test]
+    fn severity_subjects_never_push_parameters() {
+        for dsl in [
+            "_severity=error",
+            "_severity=warn,fatal",
+            "_severity!=error",
+            "_severity=99,101",
+        ] {
+            let sql = emit_dsl_with_pins(dsl, &SEVERITY_PIN);
+            assert!(!sql.contains("\n  0: "), "{dsl} bound a parameter: {sql}");
+        }
+        for dsl in [
+            r#"* | where sev(level) == "error""#,
+            r#"* | where "error" == sev(level)"#,
+            r#"* | where sev(level) in ("warn", "fatal")"#,
+            r#"* | where sev(level, "syslog") in ("warn", "fatal")"#,
+            r#"* | where sev(level) != "error""#,
+        ] {
+            let sql = emit_dsl(dsl);
+            assert!(!sql.contains("\n  0: "), "{dsl} bound a parameter: {sql}");
+        }
     }
 
     /// A literal subject carries its own type: `to_json(?)` gives `DuckDB`
