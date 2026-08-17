@@ -85,6 +85,57 @@ pub struct ExecuteOutcome {
     pub result: Result<QueryResult, ServerError>,
     /// Debug info, populated only when `capture_debug` was true.
     pub debug: Option<PoolDebugInfo>,
+    /// Result columns carrying the `SEVERITY` pin where the pipeline ENDS
+    /// — the presentation metadata the human-facing renderers display as
+    /// `OTel` tokens (ADR-0013 slice 2, ruling 9). Computed by
+    /// [`severity_columns_for`] INSIDE the permit-holding blocking task,
+    /// under the catalog snapshot the run EXECUTED with: the answer carries
+    /// ONE interpretation, and a repin landing between execution and the
+    /// response can neither token-render `BIGINT` rows nor strip tokens
+    /// from rows a `SEVERITY` pin produced. Empty for a failed, timed-out
+    /// or never-started run — there are no rows to present.
+    pub severity_columns: Vec<String>,
+}
+
+/// The result columns that carry the `SEVERITY` pin where the pipeline ENDS
+/// — what the human-facing renderers display as `OTel` tokens (ADR-0013
+/// slice 2, ruling 9).
+///
+/// `pins` is the ROOT scope of the walk, and it must be the snapshot the run
+/// EXECUTED under, never a fresh read: a repin completing between execution
+/// and the response would otherwise token-render rows produced under a
+/// `BIGINT`/`VARCHAR` pin, or strip tokens from rows a `SEVERITY` pin
+/// produced. Since issue #79 that is a live hazard rather than a
+/// hypothetical one — `repin --to severity` exists, so the two snapshots
+/// CAN disagree about which columns are severities.
+///
+/// Presentation only, so an unparseable query (execution reports the parse
+/// error) and an empty catalog both answer "nothing", never an error.
+///
+/// **This runs on the blocking pool, inside the query's permit, and never
+/// on a reactor thread.** The parse is a SECOND one (the executor already
+/// parsed and emitted) and [`trawl_core::pin_scope::PinScope::advance`]
+/// compiles a `Regex` per `extract` stage purely to enumerate capture
+/// names — cost the CLIENT chooses through its DSL, so it belongs where
+/// `max_concurrent` bounds it and the query timeout covers it, beside the
+/// identical walk the emitter already performs there. It is paid only when
+/// a pipeline could have moved a pin off the name it was pinned under:
+/// nothing but a pipe stage can — `sev()` included — and a pipe stage needs
+/// a `|`, so a DSL without one is answered from the root scope directly. A
+/// `|` inside a quoted literal or a regex pays the parse and answers
+/// identically: the shortcut only ever errs toward the walk.
+pub(crate) fn severity_columns_for(
+    pins: &trawl_core::schema::FieldTypes,
+    dsl: &str,
+) -> Vec<String> {
+    let root = trawl_core::pin_scope::PinScope::root(pins);
+    if !dsl.contains('|') {
+        return trawl_core::pin_scope::severity_output_columns(&[], &root);
+    }
+    let Ok(query) = trawl_core::parser::parse(dsl) else {
+        return Vec::new();
+    };
+    trawl_core::pin_scope::severity_output_columns(&query.pipeline, &root)
 }
 
 /// Pool that bounds concurrent `DuckDB` query execution.
@@ -434,6 +485,7 @@ impl ExecutorPool {
             return ExecuteOutcome {
                 result: Err(ServerError::Internal("executor pool shut down".into())),
                 debug: None,
+                severity_columns: Vec::new(),
             };
         };
 
@@ -489,9 +541,11 @@ impl ExecutorPool {
             );
 
             // One catalog snapshot per query: every retry inside the
-            // executor sees the same comparison pins (ADR-0011 slice A).
+            // executor sees the same comparison pins (ADR-0011 slice A),
+            // and the presentation metadata computed beside the rows is
+            // rooted in that same snapshot.
             let pins = field_catalog.all();
-            run_query_blocking(
+            let (executor, result, debug) = run_query_blocking(
                 executor,
                 &dsl,
                 &source,
@@ -502,7 +556,16 @@ impl ExecutorPool {
                 capture_debug,
                 &fallback_glob,
                 pool_wait_ms,
-            )
+            );
+            // Inside the permit, on the blocking pool: the walk compiles a
+            // regex per `extract` stage, so it may not run on a reactor
+            // thread (see `severity_columns_for`).
+            let severity_columns = if result.is_ok() {
+                severity_columns_for(&pins, &dsl)
+            } else {
+                Vec::new()
+            };
+            (executor, result, debug, severity_columns)
         });
 
         // Receive interrupt handle (may fail if the task panics before sending).
@@ -522,13 +585,14 @@ impl ExecutorPool {
             // Query completed within timeout — return executor to pool.
             join_result = &mut task => {
                 match join_result {
-                    Ok((executor, result, debug)) => {
+                    Ok((executor, result, debug, severity_columns)) => {
                         self.return_executor(executor);
-                        ExecuteOutcome { result, debug }
+                        ExecuteOutcome { result, debug, severity_columns }
                     }
                     Err(e) => ExecuteOutcome {
                         result: Err(ServerError::Internal(format!("query task panicked: {e}"))),
                         debug: None,
+                        severity_columns: Vec::new(),
                     },
                 }
             }
@@ -541,7 +605,7 @@ impl ExecutorPool {
                 let idle = Arc::clone(&self.idle);
                 tokio::spawn(async move {
                     match task.await {
-                        Ok((executor, _, _)) => {
+                        Ok((executor, ..)) => {
                             idle.lock().push(executor);
                         }
                         Err(e) => {
@@ -552,6 +616,7 @@ impl ExecutorPool {
                 ExecuteOutcome {
                     result: Err(ServerError::Timeout),
                     debug: None,
+                    severity_columns: Vec::new(),
                 }
             }
         };
@@ -595,6 +660,7 @@ impl ExecutorPool {
             return ExecuteOutcome {
                 result: Err(ServerError::Internal("executor pool shut down".into())),
                 debug: None,
+                severity_columns: Vec::new(),
             };
         };
 
@@ -638,7 +704,7 @@ impl ExecutorPool {
 
             // No hot buffer — saved query results are self-contained.
             let pins = field_catalog.all();
-            run_query_blocking(
+            let (executor, result, debug) = run_query_blocking(
                 executor,
                 &dsl,
                 &source,
@@ -649,7 +715,18 @@ impl ExecutorPool {
                 capture_debug,
                 &fallback_glob,
                 pool_wait_ms,
-            )
+            );
+            // `dsl` here is what FOLLOWS `| from saved`, whose `PinScope`
+            // rule CLEARS the scope — so the presentation walk roots in an
+            // EMPTY catalog: a saved run's stored columns are not typed by
+            // what THIS corpus happens to pin now. The comparison pins above
+            // are a separate question and keep the live snapshot.
+            let severity_columns = if result.is_ok() {
+                severity_columns_for(&trawl_core::schema::FieldTypes::new(), &dsl)
+            } else {
+                Vec::new()
+            };
+            (executor, result, debug, severity_columns)
         });
 
         let interrupt = interrupt_rx.await.ok();
@@ -664,13 +741,14 @@ impl ExecutorPool {
         let outcome = tokio::select! {
             join_result = &mut task => {
                 match join_result {
-                    Ok((executor, result, debug)) => {
+                    Ok((executor, result, debug, severity_columns)) => {
                         self.return_executor(executor);
-                        ExecuteOutcome { result, debug }
+                        ExecuteOutcome { result, debug, severity_columns }
                     }
                     Err(e) => ExecuteOutcome {
                         result: Err(ServerError::Internal(format!("query task panicked: {e}"))),
                         debug: None,
+                        severity_columns: Vec::new(),
                     },
                 }
             }
@@ -681,7 +759,7 @@ impl ExecutorPool {
                 let idle = Arc::clone(&self.idle);
                 tokio::spawn(async move {
                     match task.await {
-                        Ok((executor, _, _)) => {
+                        Ok((executor, ..)) => {
                             idle.lock().push(executor);
                         }
                         Err(e) => {
@@ -692,6 +770,7 @@ impl ExecutorPool {
                 ExecuteOutcome {
                     result: Err(ServerError::Timeout),
                     debug: None,
+                    severity_columns: Vec::new(),
                 }
             }
         };
@@ -995,6 +1074,180 @@ impl ExecutorPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The severity presentation metadata is a property of the snapshot the
+    /// run EXECUTED under, so a repin landing between execution and the
+    /// response cannot retype the rows it already produced: the same DSL
+    /// answers differently for a `SEVERITY` snapshot and a `BIGINT` one, and
+    /// the executing task walks under the snapshot it ran with.
+    #[test]
+    fn severity_columns_come_from_the_snapshot_it_is_given() {
+        use trawl_core::schema::{CanonicalType, FieldTypes};
+
+        let mut executed_under = FieldTypes::new();
+        executed_under.insert("sev", CanonicalType::Severity);
+        assert_eq!(
+            severity_columns_for(&executed_under, "* | table sev"),
+            vec!["sev".to_owned()],
+            "a column pinned SEVERITY in the run's snapshot renders tokens"
+        );
+
+        let mut repinned = FieldTypes::new();
+        repinned.insert("sev", CanonicalType::BigInt);
+        assert!(
+            severity_columns_for(&repinned, "* | table sev").is_empty(),
+            "a later BIGINT pin is not the interpretation those rows carry"
+        );
+    }
+
+    /// The pipe-free shortcut answers exactly what the walk answers: with no
+    /// pipeline the terminal scope IS the root scope, and a `|` that is only
+    /// regex punctuation still takes the walk.
+    ///
+    /// The envelope's own `_severity` is deliberately NOT named — every
+    /// renderer keys that column by name, so the list carries only the
+    /// columns a pipeline moved the pin onto (`PinScope::severity_columns`).
+    #[test]
+    fn severity_columns_shortcut_agrees_with_the_walk() {
+        use trawl_core::schema::{CanonicalType, FieldTypes};
+
+        let mut pins = FieldTypes::new();
+        pins.insert(trawl_core::schema::SEVERITY, CanonicalType::Severity);
+        pins.insert("lvl", CanonicalType::Severity);
+        pins.insert("status", CanonicalType::Varchar);
+
+        assert_eq!(
+            severity_columns_for(&pins, "service=nginx last=1h"),
+            vec!["lvl".to_owned()],
+            "a pipe-free query answers from the root scope without a parse"
+        );
+        assert_eq!(
+            severity_columns_for(&pins, "message=/a|b/ last=1h"),
+            vec!["lvl".to_owned()],
+            "a `|` inside a regex costs the parse and answers the same"
+        );
+        // A pipeline that drops the column drops the stamp with it, and an
+        // unparseable query answers nothing (execution reports the error).
+        assert!(
+            severity_columns_for(&pins, "* | table status").is_empty(),
+            "a projection that leaves the column out names nothing"
+        );
+        assert!(severity_columns_for(&pins, "| | |").is_empty());
+        assert!(severity_columns_for(&FieldTypes::new(), "service=nginx").is_empty());
+    }
+
+    /// AC8, executed: the stamp rides back on `ExecuteOutcome` from the
+    /// run's OWN catalog snapshot, taken inside the permit-holding blocking
+    /// task. Repinning the field between the two runs changes the answer,
+    /// which is the whole coherence property — the response describes the
+    /// pins that produced its rows, not the catalog as it stands when the
+    /// JSON is assembled.
+    #[tokio::test]
+    async fn execute_stamps_severity_columns_from_the_runs_own_snapshot() {
+        use crate::bus::IngestBatch;
+        use crate::hot_buffer::HotBufferConfig;
+        use trawl_core::schema::CanonicalType;
+
+        let catalog = Arc::new(crate::catalog::FieldCatalog::new());
+        catalog.repin("lvl", CanonicalType::Severity);
+
+        // Hot-buffer-only corpus: no parquet under the base dir, so the
+        // query answers from the hot branch and needs no fixture files.
+        let hot = Arc::new(
+            HotBuffer::new(HotBufferConfig {
+                max_events: 100,
+                max_bytes: 1 << 20,
+            })
+            .with_field_catalog(Arc::clone(&catalog)),
+        );
+        let mut event = serde_json::Map::new();
+        event.insert("service".into(), "svc".into());
+        event.insert("lvl".into(), 17.into());
+        hot.insert(Arc::new(IngestBatch {
+            batch_id: "b1".into(),
+            service: "svc".into(),
+            byte_size: 64,
+            events: vec![event],
+        }));
+
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, Some(Arc::clone(&hot)))
+            .with_field_catalog(Arc::clone(&catalog));
+
+        let outcome = pool
+            .execute(
+                pool.allocate_query_id(),
+                "* | table lvl",
+                Duration::from_secs(30),
+                false,
+                0,
+            )
+            .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert_eq!(
+            outcome.severity_columns,
+            vec!["lvl".to_owned()],
+            "the run's own snapshot pins `lvl` SEVERITY, so the answer says so"
+        );
+
+        // The operator repins it away. The next run's snapshot is the new
+        // one, and its rows are BIGINTs the renderers must not tokenize.
+        catalog.repin("lvl", CanonicalType::BigInt);
+        let outcome = pool
+            .execute(
+                pool.allocate_query_id(),
+                "* | table lvl",
+                Duration::from_secs(30),
+                false,
+                0,
+            )
+            .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        assert!(
+            outcome.severity_columns.is_empty(),
+            "a repinned field stops being presented as a severity"
+        );
+    }
+
+    /// A run that produced no rows carries no presentation metadata: an
+    /// error and a timeout both stamp nothing, because there is nothing to
+    /// present and the walk's answer would describe a result the caller
+    /// never gets.
+    #[tokio::test]
+    async fn a_failed_run_stamps_no_severity_columns() {
+        let catalog = Arc::new(crate::catalog::FieldCatalog::new());
+        catalog.repin("lvl", trawl_core::schema::CanonicalType::Severity);
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None)
+            .with_field_catalog(Arc::clone(&catalog));
+
+        // A parse error: reported by execution, so the walk is skipped.
+        let outcome = pool
+            .execute(
+                pool.allocate_query_id(),
+                "| | |",
+                Duration::from_secs(10),
+                false,
+                0,
+            )
+            .await;
+        assert!(outcome.result.is_err(), "{:?}", outcome.result);
+        assert!(outcome.severity_columns.is_empty());
+
+        // A timeout: the outcome is assembled on the async side, where no
+        // snapshot and no walk exist at all.
+        TEST_QUERY_DELAY_MS.store(200, Ordering::Relaxed);
+        let outcome = pool
+            .execute(
+                pool.allocate_query_id(),
+                "* | table lvl",
+                Duration::from_millis(10),
+                false,
+                0,
+            )
+            .await;
+        TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
+        assert!(matches!(outcome.result, Err(ServerError::Timeout)));
+        assert!(outcome.severity_columns.is_empty());
+    }
 
     #[tokio::test]
     async fn pool_rejects_invalid_dsl() {
