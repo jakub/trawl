@@ -2656,25 +2656,25 @@ fn sample_expr(cast: &CastEntry) -> String {
     distinct_misfit_samples_sql(&quoted, &text, &cast.expr)
 }
 
-/// The ONE misfit-sampling aggregate (ADR-0011 slice C1), over any column
-/// and any target expression: up to [`SAMPLE_CANDIDATES`] distinct values
-/// the column CARRIES whose reading through `target_expr` is NULL, as one
-/// JSON array of strings.
+/// The conform's own misfit-sampling aggregate (ADR-0011 slice C1): up to
+/// [`SAMPLE_CANDIDATES`] DISTINCT values the cast nulls, as one JSON array
+/// of strings, from which [`decode_misfit_samples`] keeps at most
+/// [`MAX_CONFLICT_SAMPLES`].
 ///
-/// Two callers, one shape: the conform's own conflict evidence
-/// ([`sample_expr`], the first caller) and the repin scan's unmapped
-/// samples (`crate::repin::plan`), whose target expression is the whole
-/// resurrection reading rather than a single guarded cast. A second
-/// spelling would be a second definition of "a value this pin cannot
-/// read", and the repin's report is judged against the conform's.
+/// `list(DISTINCT …)` accumulates every distinct misfit before the slice
+/// caps it, which is safe HERE and only here: the source is one WAL batch,
+/// already bounded by the compactor's own batch limits. The repin scan runs
+/// the same question over a whole CORPUS, where the distinct count is
+/// unbounded, so it takes [`bounded_misfit_samples_sql`] instead — a
+/// deliberate second spelling, not a drift.
 ///
 /// `left()` counts CHARACTERS (probed), so it bounds what `DuckDB`
 /// accumulates and never what the store is promised — the byte cap is
 /// [`sanitize_sample`]'s, in Rust, after the control-character
-/// substitution. `array_slice` takes twice
-/// [`MAX_CONFLICT_SAMPLES`] candidates because sanitising can COLLAPSE two
-/// distinct raw values into one sample.
-pub(crate) fn distinct_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> String {
+/// substitution. `array_slice` takes twice [`MAX_CONFLICT_SAMPLES`]
+/// candidates because sanitising can COLLAPSE two distinct raw values into
+/// one sample.
+fn distinct_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> String {
     format!(
         "to_json(array_slice(list(DISTINCT left({text}, {MAX_CONFLICT_SAMPLE_BYTES})) \
          FILTER (WHERE {quoted} IS NOT NULL AND ({target_expr}) IS NULL), \
@@ -2682,7 +2682,39 @@ pub(crate) fn distinct_misfit_samples_sql(quoted: &str, text: &str, target_expr:
     )
 }
 
-/// Decode one [`distinct_misfit_samples_sql`] cell into at most
+/// The repin scan's misfit-sampling aggregate: at most
+/// [`MAX_CONFLICT_SAMPLES`] of the values a column CARRIES whose reading
+/// through `target_expr` is NULL, as one JSON array of strings — bounded BY
+/// CONSTRUCTION over a corpus of any size (issue #79).
+///
+/// `approx_top_k` is a fixed-size sketch: its memory is a function of `k`,
+/// never of the distinct cardinality. That is the whole reason it is here
+/// rather than [`distinct_misfit_samples_sql`], whose `list(DISTINCT …)`
+/// holds every distinct misfit before the slice caps it — measured to
+/// exhaust the scan's 2GB memory limit at a few million distinct misfits,
+/// on exactly the corpus a repin exists to repair (a field a sender has
+/// been writing free text into). A report that cannot be produced for the
+/// worst corpus is a report for the cases that did not need it.
+///
+/// What changes with the sketch is WHICH samples: the most FREQUENT
+/// misfits rather than the first distinct ones, approximately ordered. For
+/// an advisory "here is what this pin cannot read" that is at least as
+/// useful, and every value in the list is an exact value the corpus holds
+/// — the approximation is in the ranking, never in the strings.
+///
+/// It rides the SAME statement as the counts (`count_repin_effect`), so
+/// the samples and the numbers describe one read of one file: two
+/// statements could straddle a compaction that replaced the file underneath
+/// them and report evidence from a corpus that never existed.
+pub(crate) fn bounded_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> String {
+    format!(
+        "to_json(approx_top_k(left({text}, {MAX_CONFLICT_SAMPLE_BYTES}), \
+         {MAX_CONFLICT_SAMPLES}) \
+         FILTER (WHERE {quoted} IS NOT NULL AND ({target_expr}) IS NULL))::VARCHAR"
+    )
+}
+
+/// Decode one misfit-sample cell — from EITHER sampling aggregate — into at most
 /// [`MAX_CONFLICT_SAMPLES`] sanitised, distinct samples in first-seen
 /// order.
 ///
@@ -4537,14 +4569,28 @@ mod tests {
         );
     }
 
-    /// The misfit-sampling aggregate is ONE expression with two callers
-    /// (issue #79): the conform's conflict evidence and the repin scan's
-    /// unmapped samples. Pinned byte for byte against the spelling C1
-    /// shipped, so the extraction cannot have quietly changed what a sample
-    /// IS — the cap, the DISTINCT, the FILTER predicate and the candidate
-    /// slice are all part of the promise.
+    /// TWO sampling aggregates, one promise (issue #79). The conform's own
+    /// evidence accumulates every distinct misfit and slices — safe over a
+    /// bounded WAL batch — while the repin scan reads a whole corpus and
+    /// takes a fixed-size sketch instead, because the distinct count there
+    /// is a sender's free text and nothing bounds it. What they SHARE is
+    /// what a sample is: the same subject (a value the column carries whose
+    /// reading is NULL), the same character cap, and the same
+    /// sanitise-then-cap-then-dedup decode.
     #[test]
-    fn the_misfit_sample_aggregate_is_one_expression() {
+    fn both_sampling_aggregates_share_the_subject_and_the_decode() {
+        let quoted = quote_ident("dur");
+        let text = trawl_core::conform::untyped_text(&quoted);
+        let unbounded = distinct_misfit_samples_sql(&quoted, &text, "TARGET");
+        let bounded = bounded_misfit_samples_sql(&quoted, &text, "TARGET");
+
+        // The conform's shape is unchanged (its input is a bounded batch).
+        assert_eq!(
+            unbounded,
+            "to_json(array_slice(list(DISTINCT \
+             left(json_extract_string(to_json(\"dur\"), '$'), 256)) \
+             FILTER (WHERE \"dur\" IS NOT NULL AND (TARGET) IS NULL), 1, 10))::VARCHAR"
+        );
         let cast = CastEntry {
             name: "dur".to_owned(),
             dtype: "VARCHAR".to_owned(),
@@ -4552,18 +4598,69 @@ mod tests {
             expr: "TARGET".to_owned(),
             guard_only: false,
         };
-        let quoted = quote_ident("dur");
-        let text = trawl_core::conform::untyped_text(&quoted);
-        assert_eq!(
-            sample_expr(&cast),
-            "to_json(array_slice(list(DISTINCT \
-             left(json_extract_string(to_json(\"dur\"), '$'), 256)) \
-             FILTER (WHERE \"dur\" IS NOT NULL AND (TARGET) IS NULL), 1, 10))::VARCHAR"
+        assert_eq!(sample_expr(&cast), unbounded);
+
+        // One subject, one cap, in both.
+        for sql in [&unbounded, &bounded] {
+            assert!(
+                sql.contains("FILTER (WHERE \"dur\" IS NOT NULL AND (TARGET) IS NULL)"),
+                "a sample is a carried value the target cannot read: {sql}"
+            );
+            assert!(sql.contains(&format!("left({text}, {MAX_CONFLICT_SAMPLE_BYTES})")));
+            assert!(sql.starts_with("to_json(") && sql.ends_with(")::VARCHAR"));
+        }
+        // The repin's memory is a function of k, never of the corpus: the
+        // sketch is the whole point, and `list(DISTINCT …)` must not appear.
+        assert!(
+            bounded.contains(&format!(
+                "approx_top_k(left({text}, {MAX_CONFLICT_SAMPLE_BYTES}), {MAX_CONFLICT_SAMPLES})"
+            )),
+            "{bounded}"
         );
-        // …and the extracted builder IS that expression, for any target.
-        assert_eq!(
-            sample_expr(&cast),
-            distinct_misfit_samples_sql(&quoted, &text, "TARGET")
+        assert!(!bounded.contains("list(DISTINCT"), "{bounded}");
+    }
+
+    /// The bounded aggregate, EXECUTED against the shape that broke the
+    /// unbounded one: a column whose every value is a distinct misfit. The
+    /// scan must survive and return at most five samples, all of them real
+    /// values from the corpus.
+    #[test]
+    fn the_bounded_sampler_survives_a_high_cardinality_misfit_column() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+            .unwrap();
+        // 200k DISTINCT unreadable values — every row its own misfit.
+        conn.execute_batch(
+            "CREATE TABLE f AS SELECT ('gold-' || i::VARCHAR) AS level FROM range(200000) t(i)",
+        )
+        .unwrap();
+        let quoted = quote_ident("level");
+        let text = trawl_core::conform::untyped_text(&quoted);
+        let target = trawl_core::conform::guarded_cast(&text, CanonicalType::Severity);
+        let sql = format!(
+            "SELECT {} FROM f",
+            bounded_misfit_samples_sql(&quoted, &text, &target)
+        );
+        let rendered: Option<String> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        let samples = decode_misfit_samples(rendered.as_deref()).unwrap();
+        assert!(!samples.is_empty(), "the sketch reports what it saw");
+        assert!(samples.len() <= MAX_CONFLICT_SAMPLES, "{samples:?}");
+        for sample in &samples {
+            assert!(sample.starts_with("gold-"), "{sample} is not a real value");
+        }
+
+        // And a column with nothing to sample answers nothing, not an error.
+        conn.execute_batch("CREATE TABLE clean AS SELECT 'error' AS level")
+            .unwrap();
+        let sql = format!(
+            "SELECT {} FROM clean",
+            bounded_misfit_samples_sql(&quoted, &text, &target)
+        );
+        let rendered: Option<String> = conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        assert!(
+            decode_misfit_samples(rendered.as_deref())
+                .unwrap()
+                .is_empty()
         );
     }
 

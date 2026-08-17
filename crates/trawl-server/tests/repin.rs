@@ -1244,8 +1244,9 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
     };
     assert_eq!(dry.status, "succeeded", "a dry run still succeeds");
     assert_eq!(dry.projected_nulls, 1);
-    assert!(
+    assert_eq!(
         dry.requires_force,
+        Some(true),
         "a plan that would null a value must say so: {dry:?}"
     );
     let reason = dry.requires_force_reason.clone().expect("a reason");
@@ -1265,7 +1266,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
         .job
         .expect("a job has run");
     assert_eq!(latest.id, dry.id);
-    assert!(latest.requires_force);
+    assert_eq!(latest.requires_force, Some(true));
     assert_eq!(latest.requires_force_reason, dry.requires_force_reason);
 
     // (2) AMBIGUITY: nothing is lost, but `3` means err to syslog and
@@ -1281,7 +1282,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
     };
     assert_eq!(dry.projected_nulls, 0, "every value has an OTel reading");
     assert_eq!(dry.ambiguous_numerals, 1);
-    assert!(dry.requires_force, "{dry:?}");
+    assert_eq!(dry.requires_force, Some(true), "{dry:?}");
     let reason = dry.requires_force_reason.clone().expect("a reason");
     assert!(reason.contains("numeral 1-7"), "{reason}");
     assert!(reason.contains("dialect=syslog"), "{reason}");
@@ -1299,8 +1300,9 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
     };
     assert_eq!(dry.dialect.as_deref(), Some("syslog"));
     assert_eq!(dry.ambiguous_numerals, 1, "the COUNT is dialect-blind");
-    assert!(
-        !dry.requires_force,
+    assert_eq!(
+        dry.requires_force,
+        Some(false),
         "an asserted dialect IS the answer to the ambiguity: {dry:?}"
     );
     let forced = match h
@@ -1312,7 +1314,84 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
         RepinStart::Report(job) => job,
         other => panic!("expected a report, got {other:?}"),
     };
-    assert!(!forced.requires_force, "force clears the gate: {forced:?}");
+    assert_eq!(
+        forced.requires_force,
+        Some(false),
+        "force clears the gate: {forced:?}"
+    );
+}
+
+/// The force verdict has THREE states, and the missing one is the one that
+/// matters (issue #79 review): a claimed job whose scan has not recorded a
+/// plan yet reports NO verdict. Its counts are zeros meaning "not measured",
+/// and answering `false` there tells an operator polling the status route
+/// that a job about to 409 is clean.
+#[sqlx::test(migrations = false)]
+async fn the_force_verdict_is_absent_until_the_scan_has_a_plan(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    h.ingest_and_compact(&[event("api", &json!({"level": "error", "dur": 12}))])
+        .await;
+    h.ingest_and_compact(&[event("web", &json!({"level": "gold", "dur": 34}))])
+        .await;
+
+    // Slow the scan so the claimed-but-unplanned window is observable.
+    trawl_server::repin::engine::TEST_SCAN_DELAY_MS
+        .store(500, std::sync::atomic::Ordering::Relaxed);
+    let client = h.schema_admin.clone();
+    let dry = tokio::spawn(async move {
+        client
+            .schema_repin("level", "severity", None, true, false)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let running = h
+        .schema_admin
+        .schema_repin_status()
+        .await
+        .expect("status")
+        .job
+        .expect("a job is claimed");
+    assert_eq!(running.status, "running");
+    assert_eq!(
+        running.requires_force, None,
+        "a job with no recorded plan has no verdict to report: {running:?}"
+    );
+    assert_eq!(running.requires_force_reason, None);
+
+    let dry = match dry.await.expect("join").expect("dry run") {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    trawl_server::repin::engine::TEST_SCAN_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    // …and once the plan exists the verdict is a fact, both on the report
+    // and on the status route.
+    assert_eq!(dry.requires_force, Some(true), "{dry:?}");
+    let latest = h
+        .schema_admin
+        .schema_repin_status()
+        .await
+        .expect("status")
+        .job
+        .expect("a job has run");
+    assert_eq!(latest.requires_force, Some(true));
+
+    // The third state: a plan with nothing to accept (a BIGINT field to
+    // VARCHAR, which is lossless by construction).
+    let clean = match h
+        .schema_admin
+        .schema_repin("dur", "varchar", None, true, false)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(
+        clean.requires_force,
+        Some(false),
+        "VARCHAR is the always-lossless target: {clean:?}"
+    );
+    assert_eq!(clean.requires_force_reason, None);
 }
 
 /// The corpus every acceptance criterion is written against: one sender
@@ -1362,8 +1441,9 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite(pool: sqlx::PgPo
     assert_eq!(dry.unmapped_samples, vec!["gold".to_owned()]);
     let live = dry.liveness.as_ref().expect("the sender just wrote");
     assert_eq!(live.service, "api");
-    assert!(
+    assert_eq!(
         dry.requires_force,
+        Some(true),
         "loss AND ambiguity, neither accepted yet"
     );
 

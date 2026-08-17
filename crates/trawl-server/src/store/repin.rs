@@ -126,6 +126,11 @@ pub struct RepinJob {
     pub field_last_seen: Option<DateTime<Utc>>,
     /// One service behind that observation (audit/display only).
     pub field_last_service: Option<String>,
+    /// When the scan recorded its plan, if it has. Until then the row's
+    /// counts are zeros that mean "not measured yet", not "nothing to
+    /// report" — which is why the force verdict is ABSENT rather than false
+    /// before this is set (issue #79 review).
+    pub planned_at: Option<DateTime<Utc>>,
 }
 
 /// What a repin job is claimed FOR — the row's immutable half.
@@ -213,13 +218,15 @@ fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
         unmapped_samples: row.try_get("unmapped_samples")?,
         field_last_seen: row.try_get("field_last_seen")?,
         field_last_service: row.try_get("field_last_service")?,
+        planned_at: row.try_get("planned_at")?,
     })
 }
 
 const JOB_COLS: &str = "id, field, from_type, to_type, dry_run, force, status, requested_by, \
      started_at, finished_at, error, files_total, rows_carrying, projected_nulls, \
      resurrectable, affected_bytes, files_done, rows_rewritten, rows_nulled, rows_resurrected, \
-     dialect, ambiguous_numerals, unmapped_samples, field_last_seen, field_last_service";
+     dialect, ambiguous_numerals, unmapped_samples, field_last_seen, field_last_service, \
+     planned_at";
 
 /// Postgres-backed repin job store. Cheap to clone (shared pool).
 #[derive(Debug, Clone)]
@@ -264,7 +271,8 @@ impl RepinStore {
             "UPDATE repin_jobs
              SET files_total = $2, rows_carrying = $3, projected_nulls = $4,
                  resurrectable = $5, affected_bytes = $6, ambiguous_numerals = $7,
-                 unmapped_samples = $8, field_last_seen = $9, field_last_service = $10
+                 unmapped_samples = $8, field_last_seen = $9, field_last_service = $10,
+                 planned_at = now()
              WHERE id = $1",
         )
         .bind(id)

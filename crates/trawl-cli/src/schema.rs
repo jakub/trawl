@@ -767,10 +767,21 @@ pub struct RepinFlags {
 /// One repin job → generic key/value (columns, rows) for the driver
 /// formatter — the job is a single record, so it renders as one row.
 ///
-/// `dialect`, `ambiguous_numerals` and `requires_force` ride the ROW rather
-/// than the case file below, because a scripted caller reading `-f json`
-/// needs the verdict without parsing prose (issue #79).
-pub fn repin_job_to_rows(job: &trawl_client::RepinJobResponse) -> (Vec<String>, Vec<Vec<Json>>) {
+/// EVERY fact rides the ROW — dialect, ambiguity, samples, liveness, the
+/// force verdict and its reason — because a scripted caller reading
+/// `-f json` or `-f csv` must not have to parse the prose the case file
+/// writes for a human (issue #79). `requires_force` is NULL, not `false`,
+/// while the scan has yet to record a plan: absent is "not known yet".
+///
+/// The samples are an ARRAY in JSON and a joined string everywhere else:
+/// a spreadsheet's formula-injection rule fires on a cell's FIRST
+/// character, so a joined cell puts the first sample there where
+/// `csv_escape_string`'s `'` prefix can neutralise it — inside a rendered
+/// JSON array it would sit behind a `[` and be invisible to that rule.
+pub fn repin_job_to_rows(
+    job: &trawl_client::RepinJobResponse,
+    format: OutputFormat,
+) -> (Vec<String>, Vec<Vec<Json>>) {
     let columns = [
         "id",
         "field",
@@ -787,7 +798,11 @@ pub fn repin_job_to_rows(job: &trawl_client::RepinJobResponse) -> (Vec<String>, 
         "rows_rewritten",
         "rows_nulled",
         "rows_resurrected",
+        "unmapped_samples",
+        "field_last_seen",
+        "field_last_service",
         "requires_force",
+        "requires_force_reason",
         "error",
     ]
     .map(str::to_owned)
@@ -808,7 +823,28 @@ pub fn repin_job_to_rows(job: &trawl_client::RepinJobResponse) -> (Vec<String>, 
         Json::from(job.rows_rewritten),
         Json::from(job.rows_nulled),
         Json::from(job.rows_resurrected),
-        Json::from(job.requires_force),
+        if format == OutputFormat::Json {
+            Json::Array(
+                job.unmapped_samples
+                    .iter()
+                    .map(|s| Json::from(s.clone()))
+                    .collect(),
+            )
+        } else if job.unmapped_samples.is_empty() {
+            Json::Null
+        } else {
+            Json::from(job.unmapped_samples.join(", "))
+        },
+        job.liveness
+            .as_ref()
+            .map_or(Json::Null, |l| Json::from(l.last_seen.clone())),
+        job.liveness
+            .as_ref()
+            .map_or(Json::Null, |l| Json::from(l.service.clone())),
+        job.requires_force.map_or(Json::Null, Json::from),
+        job.requires_force_reason
+            .clone()
+            .map_or(Json::Null, Json::from),
         job.error.clone().map_or(Json::Null, Json::from),
     ]];
     (columns, rows)
@@ -894,15 +930,24 @@ fn render_repin_case_file<W: Write>(
         )?;
     }
 
-    if let Some(reason) = &job.requires_force_reason {
-        label(
+    match (job.requires_force, &job.requires_force_reason) {
+        (Some(true), Some(reason)) => label(
             out,
             human,
             &format!(
                 "\nrequires --force: {}",
                 trawl_core::sanitize::sanitize_display_text(reason)
             ),
-        )?;
+        )?,
+        // The scan has not measured the corpus yet, so there is no verdict
+        // to report — saying "no force needed" here would be a promise the
+        // finished scan may contradict.
+        (None, _) => label(
+            out,
+            human,
+            "\nforce verdict: not known yet (the scan has not recorded its plan)",
+        )?,
+        _ => {}
     }
     Ok(())
 }
@@ -979,7 +1024,7 @@ pub async fn run_repin(
     if format == OutputFormat::Table {
         writeln!(out, "repin {}: {verdict}", job.field)?;
     }
-    let (columns, rows) = repin_job_to_rows(&job);
+    let (columns, rows) = repin_job_to_rows(&job, format);
     render_driver_results(&columns, &rows, format, out)?;
     // The case file goes to stdout for a human and to STDERR for a machine
     // format (`label`), so a piped `-f json` stays one parseable record while
@@ -1040,7 +1085,7 @@ pub async fn run_repin_status(
     let status = client.schema_repin_status().await?;
     match status.job {
         Some(job) => {
-            let (columns, rows) = repin_job_to_rows(&job);
+            let (columns, rows) = repin_job_to_rows(&job, format);
             render_driver_results(&columns, &rows, format, out)?;
             render_repin_case_file(out, format == OutputFormat::Table, &job)?;
         }
@@ -1079,7 +1124,7 @@ mod repin_tests {
             ambiguous_numerals: 0,
             unmapped_samples: Vec::new(),
             liveness: None,
-            requires_force: false,
+            requires_force: Some(false),
             requires_force_reason: None,
         }
     }
@@ -1088,7 +1133,7 @@ mod repin_tests {
     /// format the schema family honours.
     #[test]
     fn repin_job_renders_in_table_json_and_csv() {
-        let (columns, rows) = repin_job_to_rows(&sample_job());
+        let (columns, rows) = repin_job_to_rows(&sample_job(), OutputFormat::Table);
         for format in [OutputFormat::Table, OutputFormat::Json, OutputFormat::Csv] {
             let mut out = Vec::new();
             render_driver_results(&columns, &rows, format, &mut out).unwrap();
@@ -1142,7 +1187,7 @@ mod repin_tests {
                 last_seen: "2026-08-17T11:59:58Z".into(),
                 service: "api".into(),
             }),
-            requires_force: true,
+            requires_force: Some(true),
             requires_force_reason: Some(
                 "1 stored value(s) cannot be read as SEVERITY and would be nulled \
                  (the originals stay findable in _raw)"
@@ -1152,7 +1197,7 @@ mod repin_tests {
 
         let mut out = Vec::new();
         writeln!(out, "repin {}: dry run", job.field).unwrap();
-        let (columns, rows) = repin_job_to_rows(&job);
+        let (columns, rows) = repin_job_to_rows(&job, OutputFormat::Table);
         render_driver_results(&columns, &rows, OutputFormat::Table, &mut out).unwrap();
         render_repin_case_file(&mut out, true, &job).unwrap();
         let text = String::from_utf8(out).unwrap();
@@ -1191,7 +1236,7 @@ mod repin_tests {
             last_seen: "2026-08-17T09:00:00Z".into(),
             service: "nginx".into(),
         });
-        job.requires_force = true;
+        job.requires_force = Some(true);
         job.requires_force_reason = Some("2 stored value(s) cannot be read as SEVERITY".into());
 
         let mut out = Vec::new();
@@ -1218,22 +1263,80 @@ mod repin_tests {
         assert!(String::from_utf8(out).unwrap().is_empty());
     }
 
-    /// The row carries the machine-readable verdict, so a scripted caller
-    /// never has to parse the prose.
+    /// The ROW carries every fact, in every machine format: a scripted
+    /// caller must never have to parse the case file's prose (issue #79
+    /// review). CSV renders the sample array as escaped JSON text — the
+    /// same treatment every other array-valued cell gets — and the
+    /// formula-injection prefix still applies, because a sample is
+    /// sender-chosen text.
     #[test]
-    fn the_repin_row_carries_the_dialect_ambiguity_and_force_verdict() {
+    fn the_repin_row_carries_the_evidence_in_every_machine_format() {
         let mut job = sample_job();
         job.dialect = Some("otel".into());
         job.ambiguous_numerals = 7;
-        job.requires_force = true;
-        let (columns, rows) = repin_job_to_rows(&job);
+        job.unmapped_samples = vec!["gold".into(), "=cmd()".into()];
+        job.liveness = Some(trawl_client::RepinLiveness {
+            last_seen: "2026-08-17T09:00:00Z".into(),
+            service: "nginx".into(),
+        });
+        job.requires_force = Some(true);
+        job.requires_force_reason = Some("2 stored value(s) cannot be read".into());
+        let render = |format| {
+            let (columns, rows) = repin_job_to_rows(&job, format);
+            let mut out = Vec::new();
+            render_driver_results(&columns, &rows, format, &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+
+        let parsed: Json =
+            serde_json::from_str(render(OutputFormat::Json).lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["dialect"], "otel");
+        assert_eq!(parsed["ambiguous_numerals"], 7);
+        assert_eq!(parsed["requires_force"], true);
+        assert_eq!(
+            parsed["requires_force_reason"],
+            "2 stored value(s) cannot be read"
+        );
+        assert_eq!(parsed["unmapped_samples"][0], "gold");
+        assert_eq!(parsed["field_last_seen"], "2026-08-17T09:00:00Z");
+        assert_eq!(parsed["field_last_service"], "nginx");
+
+        let csv = render(OutputFormat::Csv);
+        assert!(csv.contains("unmapped_samples"), "{csv}");
+        assert!(csv.contains("gold"), "{csv}");
+        assert!(csv.contains("nginx"), "{csv}");
+        assert!(csv.contains("2 stored value(s) cannot be read"), "{csv}");
+
+        let table = render(OutputFormat::Table);
+        assert!(table.contains("otel") && table.contains("nginx"), "{table}");
+
+        // A sample whose FIRST character is a formula trigger lands at the
+        // start of the joined cell, where the CSV escaping neutralises it.
+        let mut hostile = job.clone();
+        hostile.unmapped_samples = vec!["=cmd()".into(), "gold".into()];
+        let (columns, rows) = repin_job_to_rows(&hostile, OutputFormat::Csv);
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Csv, &mut out).unwrap();
+        let csv = String::from_utf8(out).unwrap();
+        assert!(csv.contains("'=cmd()"), "formula prefix missing: {csv}");
+
+        // A job whose scan has not recorded a plan reports NO verdict —
+        // never `false`, which would read as "safe to execute".
+        let mut running = sample_job();
+        running.status = "running".into();
+        running.requires_force = None;
+        running.requires_force_reason = None;
+        let (columns, rows) = repin_job_to_rows(&running, OutputFormat::Json);
         let mut out = Vec::new();
         render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
         let parsed: Json =
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
-        assert_eq!(parsed["dialect"], "otel");
-        assert_eq!(parsed["ambiguous_numerals"], 7);
-        assert_eq!(parsed["requires_force"], true);
+        assert_eq!(parsed["requires_force"], Json::Null);
+        let mut out = Vec::new();
+        render_repin_case_file(&mut out, true, &running).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("not known yet"), "{text}");
+        assert!(!text.contains("requires --force"), "{text}");
     }
 
     /// An executing repin off a TTY refuses without `--yes` BEFORE any

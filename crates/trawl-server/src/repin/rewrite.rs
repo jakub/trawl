@@ -15,8 +15,8 @@ use trawl_core::schema::CanonicalType;
 
 use crate::catalog::conform::layout_path;
 use crate::ingest::compaction::{
-    ColInfo, ConformPlan, ConformPolicy, RepinReading, decode_misfit_samples, describe_source,
-    distinct_misfit_samples_sql, is_valid_parquet, quote_ident, repin_count_exprs,
+    ColInfo, ConformPlan, ConformPolicy, RepinReading, bounded_misfit_samples_sql,
+    decode_misfit_samples, describe_source, is_valid_parquet, quote_ident, repin_count_exprs,
 };
 
 /// Identity of one source file, for the additive catch-up diff. A
@@ -332,53 +332,57 @@ pub(crate) fn count_repin_effect(
     field: &str,
     reading: RepinReading,
 ) -> Result<RepinEffect, String> {
-    let stored = schema
-        .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(field))
-        .ok_or_else(|| format!("column {field} absent from an affected file"))?;
-    let has_raw = schema
-        .iter()
-        .any(|c| c.name.eq_ignore_ascii_case(trawl_core::schema::RAW));
-    let exprs = repin_count_exprs(&quote_ident(&stored.name), has_raw, field, reading);
-    let sql = format!(
-        "SELECT count(*)::BIGINT, {}::BIGINT, {}::BIGINT, {}::BIGINT, {}::BIGINT FROM {source}",
-        exprs.carrying, exprs.kept, exprs.resurrectable, exprs.ambiguous
-    );
-    let (rows, carrying, kept, resurrected, ambiguous): (i64, i64, i64, i64, i64) = conn
-        .query_row(&sql, [], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
-        .map_err(|e| format!("repin count failed: {e}"))?;
-    Ok(RepinEffect {
-        rows: u64::try_from(rows).unwrap_or(0),
-        carrying: u64::try_from(carrying).unwrap_or(0),
-        nulled: u64::try_from(carrying - kept).unwrap_or(0),
-        resurrected: u64::try_from(resurrected).unwrap_or(0),
-        ambiguous: u64::try_from(ambiguous).unwrap_or(0),
-    })
+    let (effect, _) = measure(conn, source, schema, field, reading, false)?;
+    Ok(effect)
 }
 
-/// Sample the values one affected file CARRIES that the new pin cannot read
-/// at all — resurrection arm included, so a value `_raw` gives back is not
-/// reported as unmapped (issue #79).
+/// Count what the repin would do to one affected source AND sample the
+/// values it cannot read — in ONE statement (issue #79).
 ///
-/// The same aggregate the conform's own conflict evidence uses
-/// (`compaction::distinct_misfit_samples_sql`) over the repin's whole target
-/// expression, so "unmapped" here means exactly what "shelved" means there.
-/// Attacker text end to end: sanitised at capture and never logged.
-pub(crate) fn sample_unmapped(
+/// One statement because the numbers and the evidence must describe the
+/// same read of the same file: compaction can replace a file between two
+/// statements, and a report whose counts came from one generation and whose
+/// samples came from another describes a corpus that never existed.
+///
+/// Sampling is BEST-EFFORT, exactly as the conform's own evidence capture
+/// is: a sampling failure re-runs the plain count and returns no samples
+/// rather than failing the scan. A repin an operator cannot run because the
+/// optional evidence column errored is a worse outcome than a report
+/// without samples.
+pub(crate) fn count_repin_effect_sampled(
     conn: &duckdb::Connection,
     source: &str,
     schema: &[ColInfo],
     field: &str,
     reading: RepinReading,
-) -> Result<Vec<String>, String> {
+) -> Result<(RepinEffect, Vec<String>), String> {
+    match measure(conn, source, schema, field, reading, true) {
+        Ok(measured) => Ok(measured),
+        Err(e) => {
+            tracing::warn!(
+                event_type = "repin_sample_failed",
+                error = %e,
+                "could not sample the values this repin cannot read; \
+                 continuing with counts only"
+            );
+            Ok((
+                count_repin_effect(conn, source, schema, field, reading)?,
+                Vec::new(),
+            ))
+        }
+    }
+}
+
+/// The one per-file measurement: the four counts, and — when `sampled` —
+/// the bounded misfit samples beside them in the same statement.
+fn measure(
+    conn: &duckdb::Connection,
+    source: &str,
+    schema: &[ColInfo],
+    field: &str,
+    reading: RepinReading,
+    sampled: bool,
+) -> Result<(RepinEffect, Vec<String>), String> {
     let stored = schema
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case(field))
@@ -387,17 +391,49 @@ pub(crate) fn sample_unmapped(
     let has_raw = schema
         .iter()
         .any(|c| c.name.eq_ignore_ascii_case(trawl_core::schema::RAW));
-    let target =
-        crate::ingest::compaction::repin_target_expr(&quoted, has_raw, field, reading.written);
-    let text = trawl_core::conform::untyped_text(&quoted);
+    let exprs = repin_count_exprs(&quoted, has_raw, field, reading);
+    let samples_column = if sampled {
+        let target =
+            crate::ingest::compaction::repin_target_expr(&quoted, has_raw, field, reading.written);
+        let text = trawl_core::conform::untyped_text(&quoted);
+        format!(", {}", bounded_misfit_samples_sql(&quoted, &text, &target))
+    } else {
+        String::new()
+    };
     let sql = format!(
-        "SELECT {} FROM {source}",
-        distinct_misfit_samples_sql(&quoted, &text, &target)
+        "SELECT count(*)::BIGINT, {}::BIGINT, {}::BIGINT, {}::BIGINT, {}::BIGINT{samples_column} \
+         FROM {source}",
+        exprs.carrying, exprs.kept, exprs.resurrectable, exprs.ambiguous
     );
-    let rendered: Option<String> = conn
-        .query_row(&sql, [], |row| row.get(0))
-        .map_err(|e| format!("repin sample query failed: {e}"))?;
-    decode_misfit_samples(rendered.as_deref())
+    let (rows, carrying, kept, resurrected, ambiguous, misfits): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+    ) = conn
+        .query_row(&sql, [], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                if sampled { row.get(5)? } else { None },
+            ))
+        })
+        .map_err(|e| format!("repin count failed: {e}"))?;
+    Ok((
+        RepinEffect {
+            rows: u64::try_from(rows).unwrap_or(0),
+            carrying: u64::try_from(carrying).unwrap_or(0),
+            nulled: u64::try_from(carrying - kept).unwrap_or(0),
+            resurrected: u64::try_from(resurrected).unwrap_or(0),
+            ambiguous: u64::try_from(ambiguous).unwrap_or(0),
+        },
+        decode_misfit_samples(misfits.as_deref())?,
+    ))
 }
 
 #[cfg(test)]

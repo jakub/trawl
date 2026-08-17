@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use crate::catalog::conform::{Progress, open_bounded_connection};
 use crate::ingest::compaction::RepinReading;
 use crate::repin::rewrite::{
-    FileSig, RepinEffect, affected_schema, count_repin_effect, sample_unmapped,
+    FileSig, RepinEffect, affected_schema, count_repin_effect, count_repin_effect_sampled,
 };
 use crate::store::MAX_CONFLICT_SAMPLES;
 
@@ -70,13 +70,13 @@ pub struct ScanCounts {
 /// cannot open at all fails the scan exactly as it would fail the
 /// rewrite — before anything has been staged.
 ///
-/// The third return is up to [`MAX_CONFLICT_SAMPLES`] distinct SAMPLES of
-/// the values the new pin cannot read (issue #79) — the evidence that turns
-/// "42 rows would be nulled" into a decision an operator can make. Gated on
-/// a file actually having lost something (`effect.nulled > 0`) and
-/// short-circuited once five distinct samples are held: the aggregate walks
-/// the whole file, and a corpus-wide misfit would otherwise pay for it once
-/// per file to learn nothing new.
+/// The third return is up to [`MAX_CONFLICT_SAMPLES`] SAMPLES of the values
+/// the new pin cannot read (issue #79) — the evidence that turns "42 rows
+/// would be nulled" into a decision an operator can make. They ride the
+/// per-file counting statement rather than a second query, so the numbers
+/// and the evidence describe one read of one file, and the sampling stops
+/// being ASKED FOR once five distinct samples are held — a corpus-wide
+/// misfit pays for the sketch on the first files and nothing after.
 pub(crate) fn scan(
     data_dir: &Path,
     memory_limit: &str,
@@ -105,29 +105,13 @@ pub(crate) fn scan(
             continue;
         };
         let safe = path.to_string_lossy().replace('\'', "''");
-        let effect = count_repin_effect(
-            &conn,
-            &format!("read_parquet('{safe}')"),
-            &schema,
-            field,
-            reading,
-        )?;
-        counts.files_total += 1;
-        counts.rows_carrying += effect.carrying;
-        counts.projected_nulls += effect.nulled;
-        counts.resurrectable += effect.resurrected;
-        counts.ambiguous_numerals += effect.ambiguous;
-        counts.affected_bytes += std::fs::metadata(&path).map_or(0, |m| m.len());
-        tallies.insert(rel, (sig, effect));
-
-        if effect.nulled > 0 && samples.len() < MAX_CONFLICT_SAMPLES {
-            for value in sample_unmapped(
-                &conn,
-                &format!("read_parquet('{safe}')"),
-                &schema,
-                field,
-                reading,
-            )? {
+        let source = format!("read_parquet('{safe}')");
+        // Sampling rides the counts until five distinct samples are held;
+        // after that the plain statement is the cheaper one.
+        let effect = if samples.len() < MAX_CONFLICT_SAMPLES {
+            let (effect, found) =
+                count_repin_effect_sampled(&conn, &source, &schema, field, reading)?;
+            for value in found {
                 if samples.len() == MAX_CONFLICT_SAMPLES {
                     break;
                 }
@@ -135,7 +119,17 @@ pub(crate) fn scan(
                     samples.push(value);
                 }
             }
-        }
+            effect
+        } else {
+            count_repin_effect(&conn, &source, &schema, field, reading)?
+        };
+        counts.files_total += 1;
+        counts.rows_carrying += effect.carrying;
+        counts.projected_nulls += effect.nulled;
+        counts.resurrectable += effect.resurrected;
+        counts.ambiguous_numerals += effect.ambiguous;
+        counts.affected_bytes += std::fs::metadata(&path).map_or(0, |m| m.len());
+        tallies.insert(rel, (sig, effect));
     }
     Ok((counts, tallies, samples))
 }

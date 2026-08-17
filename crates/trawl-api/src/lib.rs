@@ -996,8 +996,13 @@ pub struct RepinJobResponse {
     /// The server computes it from THIS row's numbers through the same
     /// decision the two live gates ask, so a dry run cannot promise an
     /// outcome the execution would not reach.
-    #[serde(default)]
-    pub requires_force: bool,
+    ///
+    /// ABSENT until the scan has recorded its plan — a claimed job's counts
+    /// are zeros meaning "not measured yet", and answering `false` there
+    /// would promise a clean run for a job that is about to refuse. Absent
+    /// on legacy rows for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_force: Option<bool>,
     /// Why force is required, in the words the refusal itself uses. Present
     /// exactly when `requires_force` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1688,6 +1688,12 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
 /// verdict has to ride the report or an operator learns about the refusal
 /// from the request that was meant to do the work. Never a second
 /// condition — a re-derived one would be free to drift from the gate.
+///
+/// It is ABSENT until the scan has recorded its plan (`planned_at`): a
+/// claimed job's counts are zeros that mean "not measured yet", and a poll
+/// in that window would otherwise read a confident `false` off a row that
+/// is about to refuse. Absent is not "no" — the consumer says "not known
+/// yet", which is what a running job's evidence actually is.
 fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse {
     let clamp = |v: i64| u64::try_from(v).unwrap_or(0);
     // The pin the job targets, and the dialect it asserted. An unparseable
@@ -1707,15 +1713,17 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
     } else {
         clamp(job.projected_nulls)
     };
-    let requires_force_reason = crate::repin::force_refusal(
-        to,
-        dialect,
-        nulled,
-        clamp(job.ambiguous_numerals),
-        job.force,
-    );
+    let requires_force_reason = job.planned_at.and_then(|_| {
+        crate::repin::force_refusal(
+            to,
+            dialect,
+            nulled,
+            clamp(job.ambiguous_numerals),
+            job.force,
+        )
+    });
     trawl_api::RepinJobResponse {
-        requires_force: requires_force_reason.is_some(),
+        requires_force: job.planned_at.map(|_| requires_force_reason.is_some()),
         requires_force_reason,
         id: job.id,
         field: job.field,
