@@ -9,6 +9,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -731,6 +732,125 @@ async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
             .await
             .unwrap();
         assert_eq!(sse.status(), 200, "{query_text} must stream too");
+    }
+}
+
+/// Provenance is data (ADR-0013 slice 2, ruling 6), end to end.
+///
+/// `_producer` has to survive the whole journey to be worth anything: the
+/// door stamps it, the WAL and hot buffer carry it, the catalog types it,
+/// and the DSL filters on it. Two of the three doors are exercised here
+/// against ONE running server — the HTTP handler through the real
+/// endpoint, and the syslog door through `SyslogDoor::admit` into the
+/// server's own pipeline (there is no in-process harness that speaks
+/// UDP/TCP frames to a live listener, and the frame parser is not what
+/// this test is about). The trawld door's stamp is covered where its
+/// events are built, in `telemetry`'s own tests.
+///
+/// The forgery half matters as much as the stamp: a sender that puts
+/// `_producer` on the wire must find it under the bare `producer`
+/// remainder, with the real column still naming the door.
+#[sqlx::test(migrations = false)]
+async fn producer_is_stamped_stored_and_queryable_per_door(pool: sqlx::PgPool) {
+    use std::collections::HashMap;
+
+    use indexmap::IndexMap;
+    use trawl_server::ingest::pipeline::ServiceBatch;
+    use trawl_server::syslog::convert::SyslogDoor;
+
+    let server = setup(pool).await;
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+    let query = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let records = vec![
+        serde_json::json!({"service": "prov-svc", "host": "web01",
+            "_time": now, "message": "one"}),
+        serde_json::json!({"service": "prov-svc", "host": "web01",
+            "_time": now, "message": "two"}),
+        // A sender claiming to be the syslog door. It is not.
+        serde_json::json!({"service": "prov-svc", "host": "web01",
+            "_time": now, "message": "forged", "_producer": "syslog"}),
+    ];
+    assert_eq!(ingest.ingest(&records).await.unwrap().accepted, 3);
+
+    // The syslog door, with the server's OWN boot-resolved policy, into
+    // the server's own pipeline — the same route `spawn_syslog` takes.
+    let door = SyslogDoor {
+        envs: Arc::clone(&server.state.ingest.envs),
+        default_env: Arc::clone(&server.state.ingest.default_env),
+        trusted_relays: Arc::clone(&server.state.ingest.trusted_relays),
+        derivation: Arc::clone(&server.state.ingest.derivation),
+    };
+    let frame = format!(
+        "<165>1 {} appliance-01 prov-syslog 1234 ID47 - reboot",
+        chrono::Utc::now().to_rfc3339()
+    );
+    let event = door
+        .admit(
+            &frame,
+            "10.0.0.9".parse().unwrap(),
+            &HashMap::new(),
+            "syslog",
+            "udp",
+        )
+        .expect("the syslog profile must admit a well-formed frame");
+    assert_eq!(event.map["_producer"], "syslog", "stamped at the door");
+    let mut batch = ServiceBatch::default();
+    batch.push(event.map);
+    let mut batches = IndexMap::new();
+    batches.insert((event.env, event.service), batch);
+    assert_eq!(
+        server
+            .state
+            .ingest
+            .pipeline
+            .as_ref()
+            .expect("ingest is enabled in the test config")
+            .write(batches),
+        1
+    );
+
+    // The column is queryable, and it partitions the two doors.
+    let count = async |dsl: &str| -> i64 {
+        let result = query.query_paginated(dsl, None, None).await.unwrap();
+        assert_eq!(result.result.row_count(), 1, "{dsl}");
+        match &result.result.rows[0][0] {
+            trawl_api::value::Value::Integer(n) => *n,
+            other => panic!("{dsl}: count must be an integer, got {other:?}"),
+        }
+    };
+    assert_eq!(count("_producer=http last=1h | stats count()").await, 3);
+    assert_eq!(count("_producer=syslog last=1h | stats count()").await, 1);
+
+    // The forgery landed bare, the real stamp is untouched, and the wire
+    // spelling stays findable in `_raw`.
+    let forged = query
+        .query_paginated(
+            "service=prov-svc producer=syslog last=1h | table _producer, producer, _raw",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(forged.result.row_count(), 1, "the stripped column filters");
+    let row = &forged.result.rows[0];
+    assert_eq!(
+        row[0],
+        trawl_api::value::Value::String("http".into()),
+        "_producer names the door, never the payload"
+    );
+    assert_eq!(
+        row[1],
+        trawl_api::value::Value::String("syslog".into()),
+        "the forged claim survives under the bare remainder"
+    );
+    match &row[2] {
+        trawl_api::value::Value::String(raw) => assert!(
+            raw.contains("_producer"),
+            "the wire spelling stays in _raw: {raw}"
+        ),
+        other => panic!("_raw must be a string, got {other:?}"),
     }
 }
 
