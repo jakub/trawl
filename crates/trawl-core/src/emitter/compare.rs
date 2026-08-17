@@ -259,9 +259,24 @@ fn text_or_numeric(field: &str, op: FilterOp, literal: String, state: &mut Emitt
 /// The bounds are INLINED, not bound: they are `i64` by type, produced by
 /// the closed ladder table, so no user text can reach the SQL through
 /// them. That is the same reasoning the band bounds were always inlined
-/// under, and it keeps the parameter list of a severity filter empty —
-/// which is what lets a subject that DOES push parameters keep its
-/// positional order.
+/// under, and it keeps the parameter list of a severity filter empty.
+///
+/// # Contract: the subject must not carry bound placeholders
+///
+/// A multi-run set REPEATS the subject, while the emitter pushes one
+/// parameter per `push_param` call and not per occurrence — so a subject
+/// containing `?` would emit more placeholders than values were bound and
+/// desynchronize every parameter after it.
+///
+/// That shape is unreachable today, structurally rather than by care:
+/// [`crate::pin_scope::PinScope::subject_pin`] admits only a bare pinned
+/// field or a pin-declaring call over a bare field whose remaining
+/// arguments are string literals, and `sev()`'s dialect argument is
+/// inlined as TEXT (`super::functions::literal_text_positions`) instead of
+/// bound. `severity_subjects_never_push_parameters` asserts exactly that,
+/// end to end. **Anyone widening `PinnedSubject` must revisit this**: a
+/// subject that can bind parameters needs the runs to share one evaluation
+/// (a CTE or `list_transform` binding) rather than repeat it.
 fn severity_ranges_sql(subject: &str, op: FilterOp, points: &[i64]) -> String {
     debug_assert!(
         matches!(op, FilterOp::Eq | FilterOp::Ne),

@@ -2339,6 +2339,62 @@ mod tests {
         assert_eq!(sql.matches(sev_subject.as_str()).count(), 2, "{sql}");
     }
 
+    /// Review finding A: out-of-ladder points cannot amplify the render.
+    ///
+    /// A `SEVERITY` subject evaluates to 1-24 or NULL, so every point
+    /// outside that range is unmatchable and they are all interchangeable
+    /// — the renderer keeps exactly ONE. Without the collapse each
+    /// non-adjacent literal would be its own run carrying its own ~1.2 KB
+    /// copy of a `sev()` subject, which the 64 KB query-text cap does not
+    /// bound.
+    #[test]
+    fn out_of_ladder_severity_points_render_one_representative() {
+        let column = r#""_severity""#;
+        // Entirely out of ladder: ONE comparison, the smallest point.
+        let all_out = emit_dsl_with_pins("_severity=99,101,250", &SEVERITY_PIN);
+        assert_eq!(all_out.matches(column).count(), 1, "{all_out}");
+        assert!(all_out.contains(&format!("{column} = 99")), "{all_out}");
+        // Mixed: the in-ladder band stands, plus the one representative.
+        let mixed = emit_dsl_with_pins("_severity=error,99,101,250", &SEVERITY_PIN);
+        assert_eq!(mixed.matches(column).count(), 2, "{mixed}");
+        assert!(
+            mixed.contains(&format!("({column} BETWEEN 17 AND 20 OR {column} = 99)")),
+            "{mixed}"
+        );
+        // THE AMPLIFICATION GUARD: a long alternating in/out list renders
+        // at most 13 subjects — 12 possible in-ladder runs plus the one
+        // representative — however many literals it names.
+        let mut list: Vec<String> = Vec::new();
+        for n in (1..=23).step_by(2) {
+            list.push(n.to_string());
+        }
+        for n in (100..400).step_by(2) {
+            list.push(n.to_string());
+        }
+        let long = format!("_severity={}", list.join(","));
+        let sql = emit_dsl_with_pins(&long, &SEVERITY_PIN);
+        assert!(list.len() > 150, "the input must actually be long");
+        assert!(
+            sql.matches(column).count() <= 13,
+            "{} subjects for {} literals: {sql}",
+            sql.matches(column).count(),
+            list.len()
+        );
+        // The same bound over the EXPENSIVE subject, which is the case the
+        // finding is about.
+        let sev_subject = crate::conform::severity_reading_sql_bind_once(
+            &crate::conform::untyped_text(r#""level""#),
+            crate::severity::Dialect::Otel,
+        );
+        let sql = emit_dsl(&format!("* | where sev(level) in ({})", list.join(", ")));
+        assert!(
+            sql.matches(sev_subject.as_str()).count() <= 13,
+            "{} subjects for {} literals",
+            sql.matches(sev_subject.as_str()).count(),
+            list.len()
+        );
+    }
+
     /// Issue #82, AC3: the severity set is INLINED, so a subject that
     /// pushes parameters keeps its positional order.
     ///

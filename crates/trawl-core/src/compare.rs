@@ -980,14 +980,65 @@ pub fn severity_points(forms: &[CompareForm]) -> Option<Vec<i64>> {
 /// so the expensive subject is written once AND the predicate stays on the
 /// shape the engine likes.
 ///
-/// The input must come from [`severity_points`]; anything else has no
-/// meaning here, and a run's bounds are `i64` for the same reason the
-/// points are — an out-of-ladder literal keeps its own value.
+/// # Out-of-ladder points collapse to ONE representative
+///
+/// Every non-adjacent point is its own run, and every run repeats the
+/// subject — so an unbounded run count is an unbounded SQL amplifier. A
+/// query is capped at 64 KB of TEXT, but `sev(level) in (1, 3, 5, …)`
+/// turns each cheap literal into a fresh ~1.2 KB copy of the subject, so
+/// the cap does not bound the SQL. The in-ladder points cannot amplify
+/// (1-24 admits at most 12 non-adjacent points, hence ≤12 runs), but the
+/// out-of-ladder ones are drawn from all of `i64`.
+///
+/// They are also all interchangeable, which is what makes the collapse
+/// sound. A `SEVERITY`-typed subject evaluates to 1-24 or NULL and
+/// nothing else — the conform rung guards a stored `_severity` or
+/// SEVERITY-pinned column into that range
+/// ([`crate::conform::guarded_cast`]'s ladder `CASE`), and the `sev()`
+/// kernel's declared result has the same domain
+/// ([`crate::severity::reading_text`]). So for any point `p` outside
+/// 1-24, `subject = p` is FALSE for every non-NULL subject and UNKNOWN
+/// for a NULL one — a contribution that depends on nothing but `p` being
+/// unmatchable, and therefore identical for every such `p`. Keeping the
+/// SMALLEST one (deterministic, so snapshots are stable) preserves the
+/// predicate's three-valued answer exactly while bounding the render at
+/// **≤13 runs**.
+///
+/// Dropping them entirely would NOT be equivalent: with no in-ladder
+/// points left there would be no predicate at all, and the NULL subject
+/// must still answer UNKNOWN rather than FALSE. The representative is
+/// what carries that.
+///
+/// This is a RENDERING equivalence only — [`severity_points`] keeps the
+/// exact semantic union, and the drift guard checks membership against
+/// it over the ladder domain.
+///
+/// The input should come from [`severity_points`]; duplicates and unsorted
+/// input are tolerated defensively, and a run's bounds are `i64` for the
+/// same reason the points are — an out-of-ladder literal keeps its own
+/// value.
 #[must_use]
 pub fn severity_ranges(points: &[i64]) -> Vec<(i64, i64)> {
-    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    let mut kept: Vec<i64> = Vec::with_capacity(points.len());
+    let mut representative: Option<i64> = None;
     for &p in points {
+        if crate::severity::is_valid_number(p) {
+            kept.push(p);
+        } else {
+            representative = Some(representative.map_or(p, |r: i64| r.min(p)));
+        }
+    }
+    if let Some(r) = representative {
+        kept.push(r);
+    }
+    kept.sort_unstable();
+
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    for p in kept {
         match ranges.last_mut() {
+            // Already covered — a duplicate, or the representative landing
+            // inside a run it is adjacent to.
+            Some((_, hi)) if p <= *hi => {}
             // `checked_add` rather than `hi + 1`: the points are unclamped,
             // so `i64::MAX` is reachable by a literal and must not wrap.
             Some((_, hi)) if hi.checked_add(1) == Some(p) => *hi = p,
@@ -1943,6 +1994,9 @@ mod tests {
                 ranges.windows(2).all(|w| w[0].1 + 1 < w[1].0),
                 "runs must be maximal and disjoint — {literal}: {ranges:?}"
             );
+            // The amplification bound: ≤12 in-ladder runs plus at most one
+            // out-of-ladder representative (review finding A).
+            assert!(ranges.len() <= 13, "{literal}: {ranges:?}");
             for n in 1..=24_i64 {
                 let live = match form {
                     CompareForm::SeverityBand { lo, hi } => {
@@ -2013,19 +2067,49 @@ mod tests {
         // …and a point adjacent to a band extends it rather than splitting
         // (`warn,17` is the contiguous 13-17).
         assert_eq!(severity_ranges(&[13, 14, 15, 16, 17]), vec![(13, 17)]);
-        // Singletons stay singletons, including out-of-ladder ones.
+        // Singletons stay singletons.
         assert_eq!(severity_ranges(&[18]), vec![(18, 18)]);
         assert_eq!(
             severity_ranges(&[13, 14, 15, 16, 99]),
             vec![(13, 16), (99, 99)]
         );
         assert_eq!(severity_ranges(&[]), vec![]);
-        // `i64::MAX` is reachable by an unclamped literal: the adjacency
-        // test must not wrap.
+    }
+
+    /// Out-of-ladder points are interchangeable, so exactly ONE survives
+    /// the render — the amplification bound (issue #82, review finding A).
+    #[test]
+    fn severity_ranges_collapse_out_of_ladder_points_to_one_representative() {
+        // All out of ladder: one representative, the smallest.
+        assert_eq!(severity_ranges(&[-5, 99, 101]), vec![(-5, -5)]);
+        assert_eq!(severity_ranges(&[25, 26, 4000]), vec![(25, 25)]);
+        // Mixed: the in-ladder runs stand, plus the one representative.
+        assert_eq!(
+            severity_ranges(&[-5, 13, 14, 15, 16, 99, 101]),
+            vec![(-5, -5), (13, 16)]
+        );
+        // A representative ADJACENT to an in-ladder run simply extends it
+        // — 0 never matches a real value, so `BETWEEN 0 AND 4` accepts
+        // exactly what `BETWEEN 1 AND 4` does.
+        assert_eq!(severity_ranges(&[0, 1, 2, 3, 4]), vec![(0, 4)]);
+        // `i64::MAX` is reachable by an unclamped literal: neither the
+        // adjacency test nor the collapse may wrap.
         assert_eq!(
             severity_ranges(&[i64::MIN, i64::MAX]),
-            vec![(i64::MIN, i64::MIN), (i64::MAX, i64::MAX)]
+            vec![(i64::MIN, i64::MIN)]
         );
+        // THE BOUND: the ladder admits at most 12 non-adjacent points, so
+        // no input can render more than 13 runs however long it is.
+        let adversarial: Vec<i64> = (1..=24)
+            .step_by(2)
+            .chain((100..2000).map(|n| n * 2))
+            .collect();
+        assert!(
+            severity_ranges(&adversarial).len() <= 13,
+            "{:?}",
+            severity_ranges(&adversarial)
+        );
+        assert_eq!(severity_ranges(&adversarial).len(), 13);
     }
 
     /// Anything outside the vocabulary is an ERROR naming it — never a

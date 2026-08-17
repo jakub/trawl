@@ -458,6 +458,15 @@ fn severity_band_parity_exhaustive() {
         "_severity=warn,17",
         "_severity=error,err,error2",
         "_severity=warn,99",
+        // Review finding A: out-of-ladder points collapse to ONE
+        // representative in the render, because a SEVERITY subject is
+        // 1-24 or NULL. These cells run over every stored number AND the
+        // NULL — which is exactly where a naive constant-FALSE collapse
+        // would diverge from the live matcher (NULL must stay UNKNOWN).
+        "_severity=99,101,250",
+        "_severity=-5,99",
+        "_severity=error,99,101,250",
+        "_severity!=99,101,250",
         "_severity=error2",
         "_severity=17",
         "_severity=warn*",
@@ -565,6 +574,15 @@ fn where_severity_band_parity_exhaustive() {
         "* | where _severity == \"error\" and status == 500",
         "* | where not (_severity == \"error\")",
         "* | where _severity in (\"warn\", \"error\")",
+        // Review finding A, in the STRICT lane where `!=` really negates:
+        // an all-out-of-ladder set must answer FALSE for every stored
+        // number and UNKNOWN for the absent one, and its negation must be
+        // TRUE / UNKNOWN respectively — which is what keeps the one
+        // representative (rather than dropping the points) necessary.
+        "* | where _severity in (99, 101, 250)",
+        "* | where _severity in (\"error\", 99, 101, 250)",
+        "* | where _severity != 99",
+        "* | where not (_severity in (99, 101))",
     ];
     for dsl in dsls {
         for sev in (1..=24).map(Some).chain([None]) {

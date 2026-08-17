@@ -828,6 +828,86 @@ fn sev_subject_binds_through_the_severity_rules_in_both_lanes() {
     }
 }
 
+/// Review finding A: collapsing the out-of-ladder points to ONE
+/// representative is a RENDERING equivalence, so both lanes must still
+/// agree cell for cell.
+///
+/// A `SEVERITY` subject is 1-24 or NULL, so every point outside the
+/// ladder is unmatchable and interchangeable. The cells that matter are
+/// the NULL-producing ones: dropping the points instead of keeping a
+/// representative would turn UNKNOWN into FALSE and diverge from the live
+/// matcher under `not`.
+#[test]
+fn sev_out_of_ladder_points_agree_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let unpinned = FieldTypes::new();
+
+    // (dsl, event level value, expected answer)
+    let cells: &[(&str, Value, Option<bool>)] = &[
+        // Review finding A: an ALL-out-of-ladder set renders one
+        // representative point. It must still answer FALSE for a real
+        // reading and UNKNOWN for a value with none — dropping the points
+        // instead of keeping a representative would lose the second.
+        (
+            "* | where sev(level) in (99, 101, 250)",
+            Value::String("error".into()),
+            Some(false),
+        ),
+        (
+            "* | where sev(level) in (99, 101, 250)",
+            Value::String("gold".into()),
+            None,
+        ),
+        (
+            "* | where not (sev(level) in (99, 101, 250))",
+            Value::String("error".into()),
+            Some(true),
+        ),
+        (
+            "* | where not (sev(level) in (99, 101, 250))",
+            Value::String("gold".into()),
+            None,
+        ),
+        // Mixed: the in-ladder band still decides, the representative
+        // contributes nothing but its NULL propagation.
+        (
+            r#"* | where sev(level) in ("error", 99, 101, 250)"#,
+            Value::String("error3".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level) in ("error", 99, 101, 250)"#,
+            Value::String("warn".into()),
+            Some(false),
+        ),
+        (
+            r#"* | where sev(level) in ("error", 99, 101, 250)"#,
+            Value::String("gold".into()),
+            None,
+        ),
+        // A scalar out-of-ladder point, both polarities.
+        (
+            "* | where sev(level) != 99",
+            Value::String("error".into()),
+            Some(true),
+        ),
+        (
+            "* | where sev(level) != 99",
+            Value::String("gold".into()),
+            None,
+        ),
+    ];
+
+    for (dsl, value, expected) in cells {
+        let event = event_with("level", value.clone());
+        assert_eq!(
+            run_cell(&conn, dsl, &event, &unpinned),
+            *expected,
+            "{dsl} over {value:?}"
+        );
+    }
+}
+
 /// Issue #82: the SEVERITY set collapse must not change what matches.
 ///
 /// A whole IN list now renders as ONE membership test over the union of
