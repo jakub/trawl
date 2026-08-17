@@ -154,9 +154,12 @@ pub struct RepinClaim<'a> {
     pub requested_by: Option<&'a str>,
 }
 
-/// The scan's plan numbers, stamped onto the job row in one statement.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RepinPlanCounts {
+/// Everything the scan learned, stamped onto the job row in ONE statement:
+/// the counts, the evidence and the liveness fact. One write because they
+/// are one reading of the corpus — a row carrying counts from one scan and
+/// samples from another would be a report of a corpus that never existed.
+#[derive(Debug, Clone, Default)]
+pub struct RepinPlan {
     /// Affected files.
     pub files_total: i64,
     /// Rows carrying a stored value for the field.
@@ -169,6 +172,14 @@ pub struct RepinPlanCounts {
     pub affected_bytes: i64,
     /// Rows whose numeral reads as a DIFFERENT severity in each dialect.
     pub ambiguous_numerals: i64,
+    /// Up to `MAX_CONFLICT_SAMPLES` distinct sanitised samples of the values
+    /// the new pin cannot read.
+    pub unmapped_samples: Vec<String>,
+    /// Newest observation of the field inside `repin::LIVENESS_WINDOW`, or
+    /// `None` when nothing has written it lately.
+    pub field_last_seen: Option<DateTime<Utc>>,
+    /// One service behind that observation.
+    pub field_last_service: Option<String>,
 }
 
 fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
@@ -247,12 +258,13 @@ impl RepinStore {
         })
     }
 
-    /// Stamp the scan plan onto the job row.
-    pub async fn record_plan(&self, id: i64, plan: RepinPlanCounts) -> Result<(), StoreError> {
+    /// Stamp the scan's whole reading onto the job row.
+    pub async fn record_plan(&self, id: i64, plan: RepinPlan) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE repin_jobs
              SET files_total = $2, rows_carrying = $3, projected_nulls = $4,
-                 resurrectable = $5, affected_bytes = $6, ambiguous_numerals = $7
+                 resurrectable = $5, affected_bytes = $6, ambiguous_numerals = $7,
+                 unmapped_samples = $8, field_last_seen = $9, field_last_service = $10
              WHERE id = $1",
         )
         .bind(id)
@@ -262,6 +274,9 @@ impl RepinStore {
         .bind(plan.resurrectable)
         .bind(plan.affected_bytes)
         .bind(plan.ambiguous_numerals)
+        .bind(&plan.unmapped_samples)
+        .bind(plan.field_last_seen)
+        .bind(plan.field_last_service.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())

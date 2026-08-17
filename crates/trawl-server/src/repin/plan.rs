@@ -25,7 +25,10 @@ use std::path::{Path, PathBuf};
 
 use crate::catalog::conform::{Progress, open_bounded_connection};
 use crate::ingest::compaction::RepinReading;
-use crate::repin::rewrite::{FileSig, RepinEffect, affected_schema, count_repin_effect};
+use crate::repin::rewrite::{
+    FileSig, RepinEffect, affected_schema, count_repin_effect, sample_unmapped,
+};
+use crate::store::MAX_CONFLICT_SAMPLES;
 
 /// The scan's PER-FILE readings, keyed by data-root-relative path and
 /// stamped with the signature they were measured at.
@@ -66,17 +69,26 @@ pub struct ScanCounts {
 /// plan is honest rather than optimistic, and a file `read_parquet`
 /// cannot open at all fails the scan exactly as it would fail the
 /// rewrite — before anything has been staged.
+///
+/// The third return is up to [`MAX_CONFLICT_SAMPLES`] distinct SAMPLES of
+/// the values the new pin cannot read (issue #79) — the evidence that turns
+/// "42 rows would be nulled" into a decision an operator can make. Gated on
+/// a file actually having lost something (`effect.nulled > 0`) and
+/// short-circuited once five distinct samples are held: the aggregate walks
+/// the whole file, and a corpus-wide misfit would otherwise pay for it once
+/// per file to learn nothing new.
 pub(crate) fn scan(
     data_dir: &Path,
     memory_limit: &str,
     field: &str,
     reading: RepinReading,
-) -> Result<(ScanCounts, ScanTallies), String> {
+) -> Result<(ScanCounts, ScanTallies, Vec<String>), String> {
     let sources = crate::repin::rewrite::snapshot_env_files(data_dir)?;
     let conn = open_bounded_connection(data_dir, memory_limit)?;
 
     let mut counts = ScanCounts::default();
     let mut tallies = ScanTallies::new();
+    let mut samples: Vec<String> = Vec::new();
     let mut progress = Progress::new("repin-scan", sources.len());
     for (rel, sig) in sources {
         progress.tick();
@@ -107,6 +119,23 @@ pub(crate) fn scan(
         counts.ambiguous_numerals += effect.ambiguous;
         counts.affected_bytes += std::fs::metadata(&path).map_or(0, |m| m.len());
         tallies.insert(rel, (sig, effect));
+
+        if effect.nulled > 0 && samples.len() < MAX_CONFLICT_SAMPLES {
+            for value in sample_unmapped(
+                &conn,
+                &format!("read_parquet('{safe}')"),
+                &schema,
+                field,
+                reading,
+            )? {
+                if samples.len() == MAX_CONFLICT_SAMPLES {
+                    break;
+                }
+                if !samples.contains(&value) {
+                    samples.push(value);
+                }
+            }
+        }
     }
-    Ok((counts, tallies))
+    Ok((counts, tallies, samples))
 }

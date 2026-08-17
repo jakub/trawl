@@ -3101,7 +3101,7 @@ mod repin_store {
     use sqlx::PgPool;
     use trawl_core::schema::CanonicalType;
     use trawl_server::store::{
-        CatalogStore, RepinClaim, RepinJobStatus, RepinPlanCounts, RepinStore, StoreError,
+        CatalogStore, RepinClaim, RepinJobStatus, RepinPlan, RepinStore, StoreError,
     };
 
     fn store(pool: &PgPool) -> RepinStore {
@@ -3408,13 +3408,16 @@ mod repin_store {
             .unwrap();
         s.record_plan(
             first,
-            RepinPlanCounts {
+            RepinPlan {
                 files_total: 12,
                 rows_carrying: 3400,
                 projected_nulls: 25,
                 resurrectable: 19,
                 affected_bytes: 1 << 20,
                 ambiguous_numerals: 4,
+                unmapped_samples: vec!["gold".to_owned(), "platinum".to_owned()],
+                field_last_seen: Some(chrono::Utc::now()),
+                field_last_service: Some("nginx".to_owned()),
             },
         )
         .await
@@ -3468,11 +3471,12 @@ mod repin_store {
         assert_eq!(dry.resurrectable, 19);
         assert_eq!(dry.affected_bytes, 1 << 20);
         assert_eq!(dry.ambiguous_numerals, 4, "the plan's own count stands");
+        assert_eq!(dry.unmapped_samples, vec!["gold", "platinum"]);
+        assert!(dry.field_last_seen.is_some(), "liveness rides the plan");
+        assert_eq!(dry.field_last_service.as_deref(), Some("nginx"));
         // Nothing asserted a dialect, so the row reports none — never a
         // backfilled `otel` (issue #79).
         assert_eq!(dry.dialect, None);
-        assert!(dry.unmapped_samples.is_empty());
-        assert_eq!(dry.field_last_seen, None);
     }
 
     /// The SEVERITY target and its dialect (issue #79, migration 0012):

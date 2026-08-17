@@ -987,6 +987,21 @@ pub struct RepinJobResponse {
     /// PRESENCE is the verdict — the consumer writes the words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liveness: Option<RepinLiveness>,
+    /// Whether an EXECUTING request with this job's flags would be refused
+    /// for want of a force flag (issue #79).
+    ///
+    /// A dry run succeeds by design, so without this a plan carrying loss or
+    /// dialect ambiguity read as a clean 200 and the operator learned about
+    /// the refusal only from the request that was supposed to do the work.
+    /// The server computes it from THIS row's numbers through the same
+    /// decision the two live gates ask, so a dry run cannot promise an
+    /// outcome the execution would not reach.
+    #[serde(default)]
+    pub requires_force: bool,
+    /// Why force is required, in the words the refusal itself uses. Present
+    /// exactly when `requires_force` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_force_reason: Option<String>,
 }
 
 /// Evidence that a repin's subject is still being WRITTEN (issue #79).

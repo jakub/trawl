@@ -285,25 +285,29 @@ impl RepinEngine {
             }
         }
 
-        let (counts, tallies) = match self.run_scan(&field, reading).await {
+        let (counts, tallies, samples) = match self.run_scan(&field, reading).await {
             Ok(measured) => measured,
             Err(e) => {
                 self.finish(job_id, RepinJobStatus::Failed, Some(&e)).await;
                 return Err(ServerError::Internal(format!("repin scan failed: {e}")));
             }
         };
+        let liveness = self.field_liveness(&field).await;
         let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
         if let Err(e) = self
             .store
             .record_plan(
                 job_id,
-                crate::store::RepinPlanCounts {
+                crate::store::RepinPlan {
                     files_total: clamp(counts.files_total),
                     rows_carrying: clamp(counts.rows_carrying),
                     projected_nulls: clamp(counts.projected_nulls),
                     resurrectable: clamp(counts.resurrectable),
                     affected_bytes: clamp(counts.affected_bytes),
                     ambiguous_numerals: clamp(counts.ambiguous_numerals),
+                    unmapped_samples: samples,
+                    field_last_seen: liveness.as_ref().map(|(at, _)| *at),
+                    field_last_service: liveness.map(|(_, service)| service),
                 },
             )
             .await
@@ -325,7 +329,8 @@ impl RepinEngine {
         // rides with it: a refusal over ambiguity with zero projected nulls
         // is otherwise a plan an operator cannot read the verdict off.
         if let Some(reason) = force_refusal(
-            reading.written,
+            reading.written.pin,
+            Some(reading.written.raw),
             counts.projected_nulls,
             counts.ambiguous_numerals,
             force,
@@ -380,13 +385,42 @@ impl RepinEngine {
         &self,
         field: &str,
         reading: RepinReading,
-    ) -> Result<(ScanCounts, ScanTallies), String> {
+    ) -> Result<(ScanCounts, ScanTallies, Vec<String>), String> {
         let data_dir = self.data_dir.clone();
         let memory_limit = self.memory_limit.clone();
         let field = field.to_owned();
         tokio::task::spawn_blocking(move || scan(&data_dir, &memory_limit, &field, reading))
             .await
             .map_err(|e| format!("repin scan task panicked: {e}"))?
+    }
+
+    /// Is anything still WRITING this field? The newest observation inside
+    /// [`crate::repin::LIVENESS_WINDOW`], with one service behind it.
+    ///
+    /// One indexed row (`field_services (field, …)`, ordered `last_seen`
+    /// DESC — the read the schema surface already pages through), so no new
+    /// store method and no scan. Best-effort by design: liveness is
+    /// ADVISORY, and a repin must not fail because an observation table was
+    /// briefly unreadable — a warning that cannot be produced is a missing
+    /// warning, not a missing repin.
+    async fn field_liveness(&self, field: &str) -> Option<(chrono::DateTime<chrono::Utc>, String)> {
+        let (rows, _) = self
+            .catalog_store
+            .field_services(field, None, 1)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(
+                    event_type = "catalog_bookkeeping_error",
+                    field = %field,
+                    error = %e,
+                    "could not read repin subject liveness; the report omits it"
+                );
+            })
+            .ok()?;
+        let newest = rows.into_iter().next()?;
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(crate::repin::LIVENESS_WINDOW).unwrap_or_default();
+        (newest.last_seen >= cutoff).then_some((newest.last_seen, newest.service))
     }
 
     async fn job(&self, job_id: i64) -> Result<RepinJob, ServerError> {
@@ -669,8 +703,13 @@ impl RepinEngine {
         // omitted force flag can actually govern — and it is safe to
         // refuse here because nothing visible has moved yet.
         let totals = state.totals();
-        if let Some(reason) = force_refusal(reading.written, totals.nulled, totals.ambiguous, force)
-        {
+        if let Some(reason) = force_refusal(
+            reading.written.pin,
+            Some(reading.written.raw),
+            totals.nulled,
+            totals.ambiguous,
+            force,
+        ) {
             return Err(JobAbort::RefusedNeedsForce(format!(
                 "the completed rewrite is not what the pre-build scan \
                  projected — data ingested after the scan carries values the \
@@ -1040,12 +1079,19 @@ fn run_pass_blocking(
 /// only other installer. What used to make the physical door the gate —
 /// "severity is not an operator decision" — is exactly what this slice
 /// reverses.
-/// The force decision, asked at BOTH gates — the pre-build scan's and the
-/// finished shadow's — so the two can only ever refuse for the same
-/// reasons. `Some(reason)` means the job needs an explicit force flag it
-/// does not have; the reason is the row's `error` text (and the caller may
-/// wrap it in its own context, which is the only thing the two gates say
-/// differently).
+/// The force decision, asked by all THREE askers — the pre-build scan
+/// gate, the finished-shadow gate, and the wire (`requires_force` on every
+/// job row a client reads) — so a dry run can never report a verdict the
+/// executing request would not reach. `Some(reason)` means the job needs an
+/// explicit force flag it does not have; the reason is the row's `error`
+/// text, and a caller may wrap it in its own context, which is the only
+/// thing the askers say differently.
+///
+/// Takes the PIN and the asserted dialect rather than a `RepinTarget`,
+/// because the wire asker reads a stored job row: `RepinTarget` is the
+/// engine's to construct (it alone knows the old pin), and re-deriving one
+/// from a row would be exactly the second opinion this function exists to
+/// prevent.
 ///
 /// Two reasons, both about a value the operator has not knowingly accepted:
 ///
@@ -1053,14 +1099,15 @@ fn run_pass_blocking(
 /// 2. AMBIGUITY — numerals that read as a different severity in each
 ///    dialect (the 1-7 overlap). Only under the `OTel` reading, because
 ///    asserting syslog IS the statement about provenance the ambiguity is
-///    waiting for (issue #79, AC4). An explicit `--dialect otel` does NOT
+///    waiting for (issue #79, AC4). An explicit `dialect=otel` does NOT
 ///    suppress it: the refusal is about the values, not about how the
-///    request was spelled, and `--force` is the one escape.
+///    request was spelled, and force is the one escape.
 ///
 /// The COUNT is taken whatever the dialect — the report says what is there
 /// — and only the gate is conditional.
-fn force_refusal(
-    target: trawl_core::conform::RepinTarget,
+pub(crate) fn force_refusal(
+    pin: CanonicalType,
+    dialect: Option<trawl_core::severity::Dialect>,
     nulled: u64,
     ambiguous: u64,
     force: bool,
@@ -1072,11 +1119,11 @@ fn force_refusal(
         return Some(format!(
             "{nulled} stored value(s) cannot be read as {} and would be \
              nulled (the originals stay findable in _raw)",
-            target.pin.as_catalog()
+            pin.as_catalog()
         ));
     }
-    let ambiguous_gate = target.pin == CanonicalType::Severity
-        && target.raw == trawl_core::severity::Dialect::Otel
+    let ambiguous_gate = pin == CanonicalType::Severity
+        && dialect != Some(trawl_core::severity::Dialect::Syslog)
         && ambiguous > 0;
     if ambiguous_gate {
         return Some(format!(
@@ -1182,46 +1229,51 @@ mod tests {
     /// — and `--force` is the single escape from either.
     #[test]
     fn the_force_gate_refuses_loss_always_and_ambiguity_under_otel_only() {
-        use trawl_core::conform::RepinTarget;
         use trawl_core::severity::Dialect;
 
-        let severity = |dialect| RepinTarget {
-            pin: CanonicalType::Severity,
-            stored: dialect,
-            raw: dialect,
-        };
+        const SEVERITY: CanonicalType = CanonicalType::Severity;
+        const VARCHAR: CanonicalType = CanonicalType::Varchar;
 
         // Loss: any target, any dialect, cleared only by force.
-        let varchar = RepinTarget::otel(CanonicalType::Varchar);
         assert!(
-            force_refusal(varchar, 3, 0, false)
+            force_refusal(VARCHAR, None, 3, 0, false)
                 .is_some_and(|m| m.contains("cannot be read as VARCHAR")),
         );
-        assert_eq!(force_refusal(varchar, 3, 0, true), None);
-        assert!(force_refusal(severity(Dialect::Syslog), 3, 0, false).is_some());
+        assert_eq!(force_refusal(VARCHAR, None, 3, 0, true), None);
+        assert!(force_refusal(SEVERITY, Some(Dialect::Syslog), 3, 0, false).is_some());
 
         // Ambiguity: refused under OTel, silent under an explicit syslog
         // assertion, and cleared by force either way.
-        let refusal = force_refusal(severity(Dialect::Otel), 0, 2, false)
+        let refusal = force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, false)
             .expect("an OTel repin over the 1-7 overlap must refuse");
         assert!(refusal.contains("2 row(s)"), "{refusal}");
         assert!(refusal.contains("dialect=syslog"), "{refusal}");
         assert_eq!(
-            force_refusal(severity(Dialect::Syslog), 0, 2, false),
+            force_refusal(SEVERITY, Some(Dialect::Syslog), 0, 2, false),
             None,
             "asserting syslog IS the answer to the ambiguity"
         );
-        assert_eq!(force_refusal(severity(Dialect::Otel), 0, 2, true), None);
+        assert_eq!(
+            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, true),
+            None
+        );
+        // A row with no recorded dialect at all (a legacy job, or one whose
+        // scope CHECK predates this slice) reads as the OTel default — the
+        // gate must not go silent because a column is NULL.
+        assert!(force_refusal(SEVERITY, None, 0, 2, false).is_some());
 
         // Nothing to refuse, and a non-severity target has no ambiguity
         // notion at all (its count is a constant zero upstream, but the gate
         // must not fire even if one were handed in).
-        assert_eq!(force_refusal(severity(Dialect::Otel), 0, 0, false), None);
-        assert_eq!(force_refusal(varchar, 0, 5, false), None);
+        assert_eq!(
+            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 0, false),
+            None
+        );
+        assert_eq!(force_refusal(VARCHAR, None, 0, 5, false), None);
 
         // Loss is reported FIRST: it is the older and larger hazard, and a
         // plan carrying both needs one force flag, not a ladder of them.
-        let both = force_refusal(severity(Dialect::Otel), 1, 1, false).unwrap();
+        let both = force_refusal(SEVERITY, Some(Dialect::Otel), 1, 1, false).unwrap();
         assert!(both.contains("cannot be read as SEVERITY"), "{both}");
     }
 

@@ -1681,9 +1681,42 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
 // -- repin handlers (ADR-0011 slice B) ----------------------------------------
 
 /// Wire shape of one repin job row.
+///
+/// `requires_force` is the THIRD asker of the one force decision the two
+/// live gates ask (`repin::force_refusal`), computed from this row's own
+/// persisted numbers: a dry run terminates `succeeded` by design, so the
+/// verdict has to ride the report or an operator learns about the refusal
+/// from the request that was meant to do the work. Never a second
+/// condition — a re-derived one would be free to drift from the gate.
 fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse {
     let clamp = |v: i64| u64::try_from(v).unwrap_or(0);
+    // The pin the job targets, and the dialect it asserted. An unparseable
+    // spelling is corruption in a CHECK-constrained column; VARCHAR is the
+    // pin under which the ambiguity gate cannot fire, so the row reports
+    // loss only rather than inventing a severity verdict.
+    let to = trawl_core::schema::CanonicalType::from_catalog(&job.to_type)
+        .unwrap_or(trawl_core::schema::CanonicalType::Varchar);
+    let dialect = job
+        .dialect
+        .as_deref()
+        .and_then(trawl_core::severity::Dialect::from_token);
+    // The rewrite's own tally supersedes the plan's projection once it has
+    // written anything — the same rule the CLI's refusal text uses.
+    let nulled = if job.rows_nulled > 0 {
+        clamp(job.rows_nulled)
+    } else {
+        clamp(job.projected_nulls)
+    };
+    let requires_force_reason = crate::repin::force_refusal(
+        to,
+        dialect,
+        nulled,
+        clamp(job.ambiguous_numerals),
+        job.force,
+    );
     trawl_api::RepinJobResponse {
+        requires_force: requires_force_reason.is_some(),
+        requires_force_reason,
         id: job.id,
         field: job.field,
         from_type: job.from_type,

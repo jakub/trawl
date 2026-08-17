@@ -101,8 +101,10 @@ pub fn is_reserved_name(name: &str) -> bool {
 ///
 /// Bare because the sender is the authority on those VALUES; declared
 /// because their TYPE is part of the event contract, which is what
-/// [`is_contract_typed`] answers.
-pub const SENDER_ASSERTED_ENVELOPE: &[&str] = &[ENV, SERVICE, HOST, MESSAGE];
+/// [`is_contract_typed`] answers — the one public predicate over this
+/// list, so no caller can grow a second opinion about the envelope by
+/// reading the names directly.
+const SENDER_ASSERTED_ENVELOPE: &[&str] = &[ENV, SERVICE, HOST, MESSAGE];
 
 /// Whether a field's TYPE is trawl's to declare rather than an operator's
 /// to change (issue #79).

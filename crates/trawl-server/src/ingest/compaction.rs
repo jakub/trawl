@@ -2631,24 +2631,10 @@ impl ConformPlan {
 
         let mut out = HashMap::with_capacity(sampled.len());
         for (i, json) in sampled.into_iter().zip(rendered) {
-            // A capture over zero matching rows is SQL NULL, not `[]`
-            // (probed) — unreachable here, since every sampled column
-            // nulled at least one row, but a NULL must not be an error.
-            let Some(json) = json else { continue };
-            let values: Vec<String> = serde_json::from_str(&json)
-                .map_err(|e| format!("conform sample decode failed: {e}"))?;
-            // Distinct AFTER both transforms, in first-seen order: SQL's
-            // DISTINCT ran over the raw text, and what is promised — and
-            // stored — is distinct SAMPLES.
-            let mut kept: Vec<String> = Vec::with_capacity(MAX_CONFLICT_SAMPLES);
-            for value in values.iter().map(|v| sanitize_sample(v)) {
-                if kept.len() == MAX_CONFLICT_SAMPLES {
-                    break;
-                }
-                if !kept.contains(&value) {
-                    kept.push(value);
-                }
-            }
+            // Decoded through the shared reader, so the conform's evidence
+            // and the repin's report cap, sanitise and de-duplicate the same
+            // way (a NULL cell — zero matching rows — is not an error).
+            let kept = decode_misfit_samples(json.as_deref())?;
             out.insert(i, kept);
         }
         Ok(out)
@@ -2667,12 +2653,59 @@ impl ConformPlan {
 fn sample_expr(cast: &CastEntry) -> String {
     let quoted = quote_ident(&cast.name);
     let text = trawl_core::conform::untyped_text(&quoted);
-    let expr = &cast.expr;
+    distinct_misfit_samples_sql(&quoted, &text, &cast.expr)
+}
+
+/// The ONE misfit-sampling aggregate (ADR-0011 slice C1), over any column
+/// and any target expression: up to [`SAMPLE_CANDIDATES`] distinct values
+/// the column CARRIES whose reading through `target_expr` is NULL, as one
+/// JSON array of strings.
+///
+/// Two callers, one shape: the conform's own conflict evidence
+/// ([`sample_expr`], the first caller) and the repin scan's unmapped
+/// samples (`crate::repin::plan`), whose target expression is the whole
+/// resurrection reading rather than a single guarded cast. A second
+/// spelling would be a second definition of "a value this pin cannot
+/// read", and the repin's report is judged against the conform's.
+///
+/// `left()` counts CHARACTERS (probed), so it bounds what `DuckDB`
+/// accumulates and never what the store is promised — the byte cap is
+/// [`sanitize_sample`]'s, in Rust, after the control-character
+/// substitution. `array_slice` takes twice
+/// [`MAX_CONFLICT_SAMPLES`] candidates because sanitising can COLLAPSE two
+/// distinct raw values into one sample.
+pub(crate) fn distinct_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> String {
     format!(
         "to_json(array_slice(list(DISTINCT left({text}, {MAX_CONFLICT_SAMPLE_BYTES})) \
-         FILTER (WHERE {quoted} IS NOT NULL AND ({expr}) IS NULL), \
+         FILTER (WHERE {quoted} IS NOT NULL AND ({target_expr}) IS NULL), \
          1, {SAMPLE_CANDIDATES}))::VARCHAR"
     )
+}
+
+/// Decode one [`distinct_misfit_samples_sql`] cell into at most
+/// [`MAX_CONFLICT_SAMPLES`] sanitised, distinct samples in first-seen
+/// order.
+///
+/// Distinct AFTER both transforms: SQL's `DISTINCT` ran over the raw text,
+/// and what is promised — and stored — is distinct SAMPLES. A capture over
+/// zero matching rows is SQL NULL rather than `[]` (probed), which is not
+/// an error.
+pub(crate) fn decode_misfit_samples(rendered: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(json) = rendered else {
+        return Ok(Vec::new());
+    };
+    let values: Vec<String> =
+        serde_json::from_str(json).map_err(|e| format!("conform sample decode failed: {e}"))?;
+    let mut kept: Vec<String> = Vec::with_capacity(MAX_CONFLICT_SAMPLES);
+    for value in values.iter().map(|v| sanitize_sample(v)) {
+        if kept.len() == MAX_CONFLICT_SAMPLES {
+            break;
+        }
+        if !kept.contains(&value) {
+            kept.push(value);
+        }
+    }
+    Ok(kept)
 }
 
 /// One captured misfit made safe to store, return and render: control and
@@ -2685,7 +2718,7 @@ fn sample_expr(cast: &CastEntry) -> String {
 /// auditable, four are not. Order matters, too: U+FFFD is three bytes where
 /// most of what it replaces is one, so the byte cap is applied AFTER the
 /// substitution or it is not a cap.
-fn sanitize_sample(value: &str) -> String {
+pub(crate) fn sanitize_sample(value: &str) -> String {
     let mut cleaned = trawl_core::sanitize::sanitize_display_text(value);
     if cleaned.len() > MAX_CONFLICT_SAMPLE_BYTES {
         let mut end = MAX_CONFLICT_SAMPLE_BYTES;
@@ -4502,6 +4535,57 @@ mod tests {
             "no resurrection arm without a _raw column: {}",
             plan.select_list[0]
         );
+    }
+
+    /// The misfit-sampling aggregate is ONE expression with two callers
+    /// (issue #79): the conform's conflict evidence and the repin scan's
+    /// unmapped samples. Pinned byte for byte against the spelling C1
+    /// shipped, so the extraction cannot have quietly changed what a sample
+    /// IS — the cap, the DISTINCT, the FILTER predicate and the candidate
+    /// slice are all part of the promise.
+    #[test]
+    fn the_misfit_sample_aggregate_is_one_expression() {
+        let cast = CastEntry {
+            name: "dur".to_owned(),
+            dtype: "VARCHAR".to_owned(),
+            pin: CanonicalType::BigInt,
+            expr: "TARGET".to_owned(),
+            guard_only: false,
+        };
+        let quoted = quote_ident("dur");
+        let text = trawl_core::conform::untyped_text(&quoted);
+        assert_eq!(
+            sample_expr(&cast),
+            "to_json(array_slice(list(DISTINCT \
+             left(json_extract_string(to_json(\"dur\"), '$'), 256)) \
+             FILTER (WHERE \"dur\" IS NOT NULL AND (TARGET) IS NULL), 1, 10))::VARCHAR"
+        );
+        // …and the extracted builder IS that expression, for any target.
+        assert_eq!(
+            sample_expr(&cast),
+            distinct_misfit_samples_sql(&quoted, &text, "TARGET")
+        );
+    }
+
+    /// Decoding caps, sanitises and de-duplicates in that order: `left()`
+    /// bounds what `DuckDB` accumulates in CHARACTERS, the byte cap and the
+    /// control-character substitution happen in Rust, and DISTINCT is
+    /// re-applied AFTER both because sanitising can collapse two raw values
+    /// into one sample.
+    #[test]
+    fn decoding_samples_caps_sanitises_then_dedups() {
+        assert_eq!(decode_misfit_samples(None).unwrap(), Vec::<String>::new());
+        // Two values SQL calls distinct that sanitise to one sample, plus
+        // enough tail to prove the cap.
+        let json = "[\"a\\u0001b\",\"x\\u0001\",\"x\\u0002\",\"gold\",\"1\",\"2\",\"3\",\"4\"]";
+        let kept = decode_misfit_samples(Some(json)).unwrap();
+        assert_eq!(
+            kept,
+            vec!["a\u{fffd}b", "x\u{fffd}", "gold", "1", "2"],
+            "control chars fold to U+FFFD, the collapsing pair is one sample, five kept"
+        );
+        assert_eq!(kept.len(), MAX_CONFLICT_SAMPLES);
+        assert!(decode_misfit_samples(Some("not json")).is_err());
     }
 
     /// The counting expressions over a SEVERITY target, EXECUTED (issue

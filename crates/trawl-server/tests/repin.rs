@@ -1212,3 +1212,105 @@ async fn boot_reconciliation_replays_a_severity_cutover(pool: sqlx::PgPool) {
     assert_eq!(job.dialect.as_deref(), Some("syslog"));
     assert!(!trawl_server::repin::marker_path(&data).exists());
 }
+
+/// A dry run must say whether the IDENTICAL executing request would refuse
+/// (issue #79): the plan's numbers alone read as a clean 200, and an
+/// operator would learn about the force gate from the request that was
+/// meant to do the work. Both triggers, on the report and on the status
+/// route — one decision function, three askers.
+#[sqlx::test(migrations = false)]
+async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    // `level` carries a value no ladder rung reads (LOSS), `pri` carries a
+    // numeral both dialects read differently (AMBIGUITY) and nothing else.
+    h.ingest_and_compact(&[
+        event("api", &json!({"level": "error", "pri": "error"})),
+        event("api", &json!({"level": "gold", "pri": "3"})),
+    ])
+    .await;
+    assert_eq!(h.pinned_type("level").await, "VARCHAR");
+    assert_eq!(h.pinned_type("pri").await, "VARCHAR");
+
+    // (1) LOSS: `gold` has no reading at all.
+    let dry = match h
+        .schema_admin
+        .schema_repin("level", "severity", None, true, false)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(dry.status, "succeeded", "a dry run still succeeds");
+    assert_eq!(dry.projected_nulls, 1);
+    assert!(
+        dry.requires_force,
+        "a plan that would null a value must say so: {dry:?}"
+    );
+    let reason = dry.requires_force_reason.clone().expect("a reason");
+    assert!(reason.contains("cannot be read as SEVERITY"), "{reason}");
+    assert_eq!(
+        dry.unmapped_samples,
+        vec!["gold".to_owned()],
+        "the report shows WHICH value it cannot read"
+    );
+
+    // The status route is the same row, so it carries the same verdict.
+    let latest = h
+        .schema_admin
+        .schema_repin_status()
+        .await
+        .expect("status")
+        .job
+        .expect("a job has run");
+    assert_eq!(latest.id, dry.id);
+    assert!(latest.requires_force);
+    assert_eq!(latest.requires_force_reason, dry.requires_force_reason);
+
+    // (2) AMBIGUITY: nothing is lost, but `3` means err to syslog and
+    // trace3 to OTel — the gate fires on the default OTel reading.
+    let dry = match h
+        .schema_admin
+        .schema_repin("pri", "severity", None, true, false)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(dry.projected_nulls, 0, "every value has an OTel reading");
+    assert_eq!(dry.ambiguous_numerals, 1);
+    assert!(dry.requires_force, "{dry:?}");
+    let reason = dry.requires_force_reason.clone().expect("a reason");
+    assert!(reason.contains("numeral 1-7"), "{reason}");
+    assert!(reason.contains("dialect=syslog"), "{reason}");
+
+    // Asserting syslog answers the ambiguity, so the same corpus needs no
+    // force at all — and `--force` clears the OTel one.
+    let dry = match h
+        .schema_admin
+        .schema_repin("pri", "severity", Some("syslog"), true, false)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(dry.dialect.as_deref(), Some("syslog"));
+    assert_eq!(dry.ambiguous_numerals, 1, "the COUNT is dialect-blind");
+    assert!(
+        !dry.requires_force,
+        "an asserted dialect IS the answer to the ambiguity: {dry:?}"
+    );
+    let forced = match h
+        .schema_admin
+        .schema_repin("pri", "severity", None, true, true)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert!(!forced.requires_force, "force clears the gate: {forced:?}");
+}

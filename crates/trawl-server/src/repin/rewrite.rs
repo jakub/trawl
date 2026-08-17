@@ -15,8 +15,8 @@ use trawl_core::schema::CanonicalType;
 
 use crate::catalog::conform::layout_path;
 use crate::ingest::compaction::{
-    ColInfo, ConformPlan, ConformPolicy, RepinReading, describe_source, is_valid_parquet,
-    quote_ident, repin_count_exprs,
+    ColInfo, ConformPlan, ConformPolicy, RepinReading, decode_misfit_samples, describe_source,
+    distinct_misfit_samples_sql, is_valid_parquet, quote_ident, repin_count_exprs,
 };
 
 /// Identity of one source file, for the additive catch-up diff. A
@@ -362,6 +362,42 @@ pub(crate) fn count_repin_effect(
         resurrected: u64::try_from(resurrected).unwrap_or(0),
         ambiguous: u64::try_from(ambiguous).unwrap_or(0),
     })
+}
+
+/// Sample the values one affected file CARRIES that the new pin cannot read
+/// at all — resurrection arm included, so a value `_raw` gives back is not
+/// reported as unmapped (issue #79).
+///
+/// The same aggregate the conform's own conflict evidence uses
+/// (`compaction::distinct_misfit_samples_sql`) over the repin's whole target
+/// expression, so "unmapped" here means exactly what "shelved" means there.
+/// Attacker text end to end: sanitised at capture and never logged.
+pub(crate) fn sample_unmapped(
+    conn: &duckdb::Connection,
+    source: &str,
+    schema: &[ColInfo],
+    field: &str,
+    reading: RepinReading,
+) -> Result<Vec<String>, String> {
+    let stored = schema
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(field))
+        .ok_or_else(|| format!("column {field} absent from an affected file"))?;
+    let quoted = quote_ident(&stored.name);
+    let has_raw = schema
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case(trawl_core::schema::RAW));
+    let target =
+        crate::ingest::compaction::repin_target_expr(&quoted, has_raw, field, reading.written);
+    let text = trawl_core::conform::untyped_text(&quoted);
+    let sql = format!(
+        "SELECT {} FROM {source}",
+        distinct_misfit_samples_sql(&quoted, &text, &target)
+    );
+    let rendered: Option<String> = conn
+        .query_row(&sql, [], |row| row.get(0))
+        .map_err(|e| format!("repin sample query failed: {e}"))?;
+    decode_misfit_samples(rendered.as_deref())
 }
 
 #[cfg(test)]

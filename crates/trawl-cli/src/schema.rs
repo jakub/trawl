@@ -766,21 +766,28 @@ pub struct RepinFlags {
 
 /// One repin job → generic key/value (columns, rows) for the driver
 /// formatter — the job is a single record, so it renders as one row.
+///
+/// `dialect`, `ambiguous_numerals` and `requires_force` ride the ROW rather
+/// than the case file below, because a scripted caller reading `-f json`
+/// needs the verdict without parsing prose (issue #79).
 pub fn repin_job_to_rows(job: &trawl_client::RepinJobResponse) -> (Vec<String>, Vec<Vec<Json>>) {
     let columns = [
         "id",
         "field",
         "from",
         "to",
+        "dialect",
         "status",
         "files_total",
         "files_done",
         "rows_carrying",
         "projected_nulls",
         "resurrectable",
+        "ambiguous_numerals",
         "rows_rewritten",
         "rows_nulled",
         "rows_resurrected",
+        "requires_force",
         "error",
     ]
     .map(str::to_owned)
@@ -790,18 +797,114 @@ pub fn repin_job_to_rows(job: &trawl_client::RepinJobResponse) -> (Vec<String>, 
         Json::from(job.field.clone()),
         Json::from(job.from_type.clone()),
         Json::from(job.to_type.clone()),
+        job.dialect.clone().map_or(Json::Null, Json::from),
         Json::from(job.status.clone()),
         Json::from(job.files_total),
         Json::from(job.files_done),
         Json::from(job.rows_carrying),
         Json::from(job.projected_nulls),
         Json::from(job.resurrectable),
+        Json::from(job.ambiguous_numerals),
         Json::from(job.rows_rewritten),
         Json::from(job.rows_nulled),
         Json::from(job.rows_resurrected),
+        Json::from(job.requires_force),
         job.error.clone().map_or(Json::Null, Json::from),
     ]];
     (columns, rows)
+}
+
+/// The repin report's case file: the evidence a plan's NUMBERS cannot carry
+/// — what the new pin cannot read, whether the corpus is dialect-ambiguous,
+/// whether anything is still WRITING the field, and why force is required
+/// (issue #79).
+///
+/// Facts from the job row, phrased here (the ADR-0011 slice C ruling: the
+/// server ships facts, the consumer writes the words). Every value is
+/// sender-chosen text and every one of them goes through display
+/// sanitisation — samples are attacker text by definition, and this lands in
+/// a terminal.
+fn render_repin_case_file<W: Write>(
+    out: &mut W,
+    human: bool,
+    job: &trawl_client::RepinJobResponse,
+) -> Result<(), CliError> {
+    if let Some(dialect) = &job.dialect {
+        label(
+            out,
+            human,
+            &format!(
+                "\nnumeral dialect: {} (words are dialect-free; this reads NUMERALS)",
+                trawl_core::sanitize::sanitize_display_text(dialect)
+            ),
+        )?;
+    }
+    if job.ambiguous_numerals > 0 {
+        label(
+            out,
+            human,
+            &format!(
+                "  ambiguous numerals: {} row(s) carry 1-7, which OTel reads as \
+                 trace/debug and syslog PRI reads as err/crit",
+                job.ambiguous_numerals
+            ),
+        )?;
+    }
+    if !job.unmapped_samples.is_empty() {
+        label(out, human, "\nvalues the new pin cannot read:")?;
+        for sample in &job.unmapped_samples {
+            label(
+                out,
+                human,
+                &format!(
+                    "  - {}",
+                    trawl_core::sanitize::sanitize_display_text(sample)
+                ),
+            )?;
+        }
+        label(
+            out,
+            human,
+            "  (originals stay findable in _raw, whatever this repin writes)",
+        )?;
+    }
+
+    // Ruling 8: the operator has to be told that a repin translates HISTORY
+    // only. A live sender keeps arriving in the INGEST-time reading, so a
+    // syslog rewrite leaves a discontinuity at the cutover instant, and the
+    // fix for the live half is config, not another repin.
+    if let Some(live) = &job.liveness {
+        let service = trawl_core::sanitize::sanitize_display_text(&live.service);
+        label(
+            out,
+            human,
+            &format!(
+                "\nwarning: {} is STILL being written (last seen {} by service \
+                 {service}). A repin rewrites HISTORY: after the cutover, live \
+                 events keep taking the INGEST-time reading, so under \
+                 --dialect syslog a historical `3` becomes 17 (err) while the \
+                 next live `3` conforms as OTel 3 (trace3) — one column, two \
+                 meanings, split at the cutover instant. If that sender speaks \
+                 syslog PRI, declare it in [ingest] severity_from (dialect = \
+                 \"syslog\") so live events read the same way, then repin the \
+                 history.",
+                trawl_core::sanitize::sanitize_display_text(&job.field),
+                live.last_seen
+            ),
+        )?;
+    }
+
+    if let Some(reason) = &job.requires_force_reason {
+        label(
+            out,
+            human,
+            &format!(
+                "\nrequires --force: {}",
+                trawl_core::sanitize::sanitize_display_text(reason)
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 /// `trawl schema repin <field> --to <type>`.
@@ -878,9 +981,21 @@ pub async fn run_repin(
     }
     let (columns, rows) = repin_job_to_rows(&job);
     render_driver_results(&columns, &rows, format, out)?;
+    // The case file goes to stdout for a human and to STDERR for a machine
+    // format (`label`), so a piped `-f json` stays one parseable record while
+    // the operator still reads the evidence.
+    render_repin_case_file(out, format == OutputFormat::Table, &job)?;
     if refused {
         // A pre-scan refusal reports its projection; a cutover refusal
-        // reports what the finished rewrite actually nulled.
+        // reports what the finished rewrite actually nulled. The server's own
+        // reason is the authoritative one when it sent it — the two gates and
+        // the wire all ask one function, and it names ambiguity as well as
+        // loss.
+        if let Some(reason) = job.requires_force_reason {
+            return Err(CliError::Usage(format!(
+                "repin refused: {reason} — re-run with --force to accept it"
+            )));
+        }
         let lost = if job.rows_nulled > 0 {
             job.rows_nulled
         } else {
@@ -927,6 +1042,7 @@ pub async fn run_repin_status(
         Some(job) => {
             let (columns, rows) = repin_job_to_rows(&job);
             render_driver_results(&columns, &rows, format, out)?;
+            render_repin_case_file(out, format == OutputFormat::Table, &job)?;
         }
         None => writeln!(out, "no repin job has ever run")?,
     }
@@ -963,6 +1079,8 @@ mod repin_tests {
             ambiguous_numerals: 0,
             unmapped_samples: Vec::new(),
             liveness: None,
+            requires_force: false,
+            requires_force_reason: None,
         }
     }
 
@@ -984,6 +1102,68 @@ mod repin_tests {
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["resurrectable"], 25);
         assert_eq!(parsed["projected_nulls"], 0);
+    }
+
+    /// The case file is the evidence a plan's NUMBERS cannot carry: the
+    /// asserted dialect, the ambiguous rows, the values the pin cannot read,
+    /// the force verdict — and, for a field something is still WRITING, the
+    /// discontinuity warning (issue #79, ruling 8): a repin translates
+    /// history, while live events keep taking the ingest-time reading.
+    #[test]
+    fn the_repin_case_file_states_the_evidence_and_the_discontinuity() {
+        let mut job = sample_job();
+        job.field = "level".into();
+        job.to_type = "SEVERITY".into();
+        job.dialect = Some("syslog".into());
+        job.ambiguous_numerals = 3;
+        job.unmapped_samples = vec!["gold".into(), "platinum".into()];
+        job.liveness = Some(trawl_client::RepinLiveness {
+            last_seen: "2026-08-17T09:00:00Z".into(),
+            service: "nginx".into(),
+        });
+        job.requires_force = true;
+        job.requires_force_reason = Some("2 stored value(s) cannot be read as SEVERITY".into());
+
+        let mut out = Vec::new();
+        render_repin_case_file(&mut out, true, &job).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("numeral dialect: syslog"), "{text}");
+        assert!(text.contains("ambiguous numerals: 3 row(s)"), "{text}");
+        assert!(
+            text.contains("- gold") && text.contains("- platinum"),
+            "{text}"
+        );
+        assert!(text.contains("_raw"), "{text}");
+        // The discontinuity, in the operator's terms and with the remedy.
+        assert!(text.contains("STILL being written"), "{text}");
+        assert!(text.contains("nginx"), "{text}");
+        assert!(text.contains("historical `3` becomes 17"), "{text}");
+        assert!(text.contains("severity_from"), "{text}");
+        assert!(text.contains("requires --force:"), "{text}");
+
+        // A clean plan says none of it — no dialect line for a non-severity
+        // target, no warning for a field nothing writes.
+        let mut out = Vec::new();
+        render_repin_case_file(&mut out, true, &sample_job()).unwrap();
+        assert!(String::from_utf8(out).unwrap().is_empty());
+    }
+
+    /// The row carries the machine-readable verdict, so a scripted caller
+    /// never has to parse the prose.
+    #[test]
+    fn the_repin_row_carries_the_dialect_ambiguity_and_force_verdict() {
+        let mut job = sample_job();
+        job.dialect = Some("otel".into());
+        job.ambiguous_numerals = 7;
+        job.requires_force = true;
+        let (columns, rows) = repin_job_to_rows(&job);
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        let parsed: Json =
+            serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["dialect"], "otel");
+        assert_eq!(parsed["ambiguous_numerals"], 7);
+        assert_eq!(parsed["requires_force"], true);
     }
 
     /// An executing repin off a TTY refuses without `--yes` BEFORE any
