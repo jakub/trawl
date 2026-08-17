@@ -214,9 +214,13 @@ pub struct IngestState {
     /// a warn-skipped entry would fail open into host repair.
     pub trusted_relays: Arc<[crate::syslog::CidrEntry]>,
     /// The boot-resolved per-profile `_severity`/`_time` source lists
-    /// (ADR-0013 slice 2, ruling 5). Resolved UNCONDITIONALLY — a
-    /// query-only node still derives for its own telemetry — and
-    /// boot-fatally, on the `trusted_relays` precedent: a list that
+    /// (ADR-0013 slice 2, ruling 5).
+    ///
+    /// Resolved in `main`, before the tracing subscriber, and handed in:
+    /// the telemetry layer needs the same policy and is built earlier
+    /// still, so resolving it here would mean two resolutions of one
+    /// config — the shape that lets two doors disagree. Boot-fatal
+    /// there, on the `trusted_relays` precedent: a source list that
     /// silently never matches is worse than a refusal to start.
     pub derivation: Arc<crate::ingest::producer::Derivation>,
     /// Repin ↔ compaction interlock (ADR-0011 slice B). `Some` exactly when
@@ -541,6 +545,7 @@ impl AppState {
     pub async fn from_config(
         config: &Config,
         metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+        derivation: Arc<crate::ingest::producer::Derivation>,
     ) -> Result<(Self, HttpConfig), crate::error::ServerError> {
         let auth = build_auth_state(config).await?;
         let storage = build_storage_state(config).await?;
@@ -632,11 +637,7 @@ impl AppState {
                 envs: config.ingest.effective_envs().into(),
                 default_env: config.ingest.default_env.as_str().into(),
                 trusted_relays: parse_trusted_relays(&config.ingest.trusted_relays)?,
-                derivation: Arc::new(
-                    crate::ingest::producer::Derivation::resolve(&config.ingest).map_err(|e| {
-                        crate::error::ServerError::Internal(format!("{e} — refusing to start"))
-                    })?,
-                ),
+                derivation,
                 repin_coordinator: repin_coordinator.clone(),
             },
             start_time: Instant::now(),

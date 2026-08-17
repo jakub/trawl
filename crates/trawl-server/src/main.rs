@@ -88,7 +88,27 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // case warns AFTER the subscriber is up (visible because `trawld=info`
     // is part of the default).
     let log_filter = telemetry::resolve_log_filter(std::env::var("RUST_LOG").ok().as_deref());
-    let telemetry = init_tracing(&config, monitor_active, &log_filter.directives)?;
+
+    // The derivation policy is resolved BEFORE the subscriber, because
+    // the telemetry layer derives through it too (ADR-0013 slice 2,
+    // ruling 5) — trawld's own `level` rides the configured
+    // `severity_from` chain like any sender's. That puts it on the same
+    // pre-tracing boundary as the config load: boot-fatal, and the
+    // diagnostic can only reach stderr. Resolved UNCONDITIONALLY, before
+    // and independently of `ingest.enabled`, for the same reason.
+    let derivation = Arc::new(
+        trawl_server::ingest::producer::Derivation::resolve(&config.ingest).map_err(|e| {
+            eprintln!("[trawld] {e} — refusing to start");
+            e
+        })?,
+    );
+
+    let telemetry = init_tracing(
+        &config,
+        monitor_active,
+        &log_filter.directives,
+        Arc::clone(&derivation),
+    )?;
     if let Some(warning) = &log_filter.warning {
         tracing::warn!(event_type = "config_warning", "{warning}");
     }
@@ -162,7 +182,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     );
     warn_unlisted_env_dirs(&config);
 
-    let (mut state, http_config) = AppState::from_config(&config, metrics_handle).await?;
+    let (mut state, http_config) =
+        AppState::from_config(&config, metrics_handle, derivation).await?;
 
     // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());
@@ -549,7 +570,7 @@ fn warn_unlisted_env_dirs(config: &Config) {
         {
             tracing::warn!(
                 event_type = "env_not_in_allowlist",
-                env = %name,
+                unlisted_env = %name,
                 "on-disk env directory is not in ingest.envs — new ingest \
                  for it rejects, existing data stays queryable and ages out \
                  under retention"
@@ -572,6 +593,7 @@ fn init_tracing(
     config: &Config,
     monitor_active: bool,
     filter_directives: &str,
+    derivation: Arc<trawl_server::ingest::producer::Derivation>,
 ) -> Result<Option<(WalHandle, WalLayer)>, Box<dyn std::error::Error>> {
     // The directives were resolved (and validated when operator-supplied) by
     // `telemetry::resolve_log_filter`; each layer builds its own EnvFilter
@@ -588,7 +610,9 @@ fn init_tracing(
         let handle = WalHandle::new();
         let wal_layer = WalLayer::new_with_buffer_cap(
             handle.clone(),
+            &config.ingest.effective_envs(),
             &config.ingest.default_env,
+            derivation,
             config.ingest.telemetry_buffer_max_bytes,
         );
         let flush_layer = wal_layer.clone(); // same Arc<WalLayerInner>

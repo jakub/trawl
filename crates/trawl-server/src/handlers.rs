@@ -1462,7 +1462,7 @@ pub async fn field_values(
         event_type = "field_values_complete",
         user = %verified.name,
         field = %field,
-        service = params.service.as_deref().unwrap_or("*"),
+        scoped_service = params.service.as_deref().unwrap_or("*"),
         values_count = values.len(),
         duration_ms,
         "field values sampled"

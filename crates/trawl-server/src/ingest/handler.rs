@@ -262,8 +262,8 @@ fn write_wal_batches(
             Err(e) => {
                 tracing::warn!(
                     event_type = "wal_write_failed",
-                    env = %env,
-                    service = %svc,
+                    batch_env = %env,
+                    batch_service = %svc,
                     events_lost = batch.maps.len(),
                     error = %e,
                     "WAL write failed for service group"

@@ -625,6 +625,20 @@ pub async fn setup_in_dir(
     setup_in_dir_with_data(pool, dir, ensure_fixtures(), rate_limit).await
 }
 
+/// The derivation policy, resolved the way `main` resolves it.
+///
+/// Production resolves it before the tracing subscriber (the telemetry
+/// layer needs the same policy) and hands it to `AppState::from_config`;
+/// the harness resolves the same config the same way, boot-fatally.
+fn resolve_derivation(
+    config: &Config,
+) -> std::sync::Arc<trawl_server::ingest::producer::Derivation> {
+    std::sync::Arc::new(
+        trawl_server::ingest::producer::Derivation::resolve(&config.ingest)
+            .expect("the test config's derivation lists must resolve"),
+    )
+}
+
 /// Like [`setup_in_dir`], but with an explicit cold-data glob — for tests
 /// that compact into a per-test data directory instead of the shared
 /// fixtures.
@@ -712,9 +726,10 @@ pub async fn setup_in_dir_with_data(
         },
     };
 
-    let (state, http_config) = AppState::from_config(&config, test_metrics_handle())
-        .await
-        .expect("failed to create app state");
+    let (state, http_config) =
+        AppState::from_config(&config, test_metrics_handle(), resolve_derivation(&config))
+            .await
+            .expect("failed to create app state");
 
     boot_conformance_pass(&state, &config).await;
 

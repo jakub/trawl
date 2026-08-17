@@ -105,6 +105,14 @@
 //! `WalWriter::write`'s own best-effort dir-fsync warning. The invariant
 //! is: **no locks are held across `writer.write`, and flush-path tracing
 //! may only buffer.**
+//!
+//! `on_event` now calls `envelope::canonicalize` (ADR-0013 slice 2), so
+//! the guard extends to the door: `ingest/envelope.rs` and
+//! `ingest/producer.rs` never call `tracing`, which is why a refusal
+//! there is a metric and a silent drop rather than a warning. That is a
+//! stated invariant with its own test —
+//! `tests/canonicalize_no_tracing.rs` reads both modules and asserts the
+//! token is absent outside `#[cfg(test)]`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -351,6 +359,11 @@ pub struct WalLayer {
     inner: Arc<WalLayerInner>,
 }
 
+/// The service every telemetry event is filed under — the `trawld`
+/// profile's fixed assertion, the WAL filename, and the `service` column,
+/// all from one spelling.
+const TELEMETRY_SERVICE: &str = "trawld";
+
 /// One staged flush unit: the serialized ndjson lines and the event maps
 /// they were serialized from. Written to the WAL as ONE file, so the
 /// hot-buffer `batch_id` ↔ WAL-filename-stem contract holds per batch.
@@ -462,8 +475,17 @@ struct DropCounters {
 }
 
 struct WalLayerInner {
-    /// Env stamped onto telemetry events (`default_env`).
+    /// Env the `trawld` profile ASSERTS on every telemetry event
+    /// (`default_env`, boot-validated and always a member of `envs`).
     env: String,
+    /// The effective env allowlist, threaded so the door can run its
+    /// ordinary `env` validation on the assertion like any other.
+    envs: Arc<[String]>,
+    /// The boot-resolved per-profile derivation policy. Telemetry is an
+    /// ordinary sender (ADR-0013 slice 2, ruling 3): its bare `level`
+    /// rides the configured `severity_from` chain, exactly as a
+    /// vector-shipped app's would.
+    derivation: Arc<crate::ingest::producer::Derivation>,
     handle: WalHandle,
     /// Active buffer: events accumulated since the last stage.
     active: Mutex<ActiveBuffer>,
@@ -476,8 +498,12 @@ struct WalLayerInner {
     /// (`[ingest] telemetry_buffer_max_bytes`). Atomic so tests can
     /// tighten it after construction.
     max_buffer_bytes: AtomicUsize,
-    /// Cached hostname, resolved once at layer creation.
-    host: String,
+    /// Cached hostname, resolved once at layer creation. `None` when the
+    /// lookup failed or returned nothing: the profile then asserts
+    /// ABSENCE and the door keeps the event with `host` omitted plus
+    /// `host.omitted` (ruling 4). The old empty-string stamp put a
+    /// meaningless `host=""` on every telemetry row instead.
+    host: Option<String>,
     /// Loss accounting for the recovery event and metrics.
     dropped: DropCounters,
     /// Last time a WAL failure was reported to stderr (rate limit).
@@ -499,28 +525,45 @@ impl std::fmt::Debug for WalLayer {
 }
 
 impl WalLayer {
-    /// Create a new layer backed by the given handle. `env` is the env
-    /// telemetry events are stamped with (`default_env`) — the records
-    /// carry it as a column, matching where the WAL handle files them.
-    /// Uses the default memory budget; production passes the configured
-    /// `[ingest] telemetry_buffer_max_bytes` via
-    /// [`WalLayer::new_with_buffer_cap`].
+    /// A layer for TESTS: one-env allowlist, the packaged derivation
+    /// policy, the default memory budget.
+    ///
+    /// Production goes through [`WalLayer::new_with_buffer_cap`], which
+    /// takes the real allowlist and the boot-resolved policy — a test
+    /// that only cares about buffering, flushing or shedding should not
+    /// have to assemble either.
+    #[cfg(test)]
     pub fn new(handle: WalHandle, env: &str) -> Self {
         Self::new_with_buffer_cap(
             handle,
+            &[env.to_owned()],
             env,
+            Arc::new(crate::ingest::producer::Derivation::defaults()),
             trawl_config::DEFAULT_TELEMETRY_BUFFER_MAX_BYTES,
         )
     }
 
-    /// [`WalLayer::new`] with an explicit shared memory budget over the
-    /// active buffer, retry queue and in-flight batch
+    /// Create a layer backed by the given handle.
+    ///
+    /// `envs`/`env` are the ingest allowlist and `default_env`: the
+    /// `trawld` profile ASSERTS that env on every event, so the door runs
+    /// its ordinary validation on a value boot-validation already proved
+    /// (`env.defaulted` is structurally unreachable here). `derivation`
+    /// is the one resolved source policy every profile shares.
+    /// `max_buffer_bytes` is the shared budget over the active buffer,
+    /// retry queue and in-flight batch
     /// (`[ingest] telemetry_buffer_max_bytes`).
-    pub fn new_with_buffer_cap(handle: WalHandle, env: &str, max_buffer_bytes: usize) -> Self {
+    pub fn new_with_buffer_cap(
+        handle: WalHandle,
+        envs: &[String],
+        env: &str,
+        derivation: Arc<crate::ingest::producer::Derivation>,
+        max_buffer_bytes: usize,
+    ) -> Self {
         let host = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
-            .unwrap_or_default();
+            .filter(|h| !h.is_empty());
         Self {
             inner: Arc::new(WalLayerInner {
                 handle,
@@ -533,6 +576,8 @@ impl WalLayer {
                 max_buffer_bytes: AtomicUsize::new(max_buffer_bytes),
                 host,
                 env: env.to_owned(),
+                envs: envs.into(),
+                derivation,
                 dropped: DropCounters::default(),
                 last_stderr: Mutex::new(None),
                 bus: OnceLock::new(),
@@ -568,7 +613,7 @@ impl WalLayer {
         self.inner.stage();
         let mut coalesce = false;
         while let Some(batch) = self.inner.pop_drain_unit(coalesce) {
-            match writer.write(env, "trawld", &batch.bytes) {
+            match writer.write(env, TELEMETRY_SERVICE, &batch.bytes) {
                 Ok(wal_path) => {
                     coalesce = true;
                     self.inner.publish(env, &wal_path, batch);
@@ -605,7 +650,7 @@ impl WalLayer {
             // batch can still be released from the shared accounting.
             let in_flight = (batch.events.len(), batch_charge(&batch));
             let joined = tokio::task::spawn_blocking(move || {
-                let result = w.write(&batch_env, "trawld", &batch.bytes);
+                let result = w.write(&batch_env, TELEMETRY_SERVICE, &batch.bytes);
                 (result, batch)
             })
             .await;
@@ -635,6 +680,48 @@ impl WalLayer {
 }
 
 impl WalLayerInner {
+    /// The PRE-INIT cap: while the writer is not yet set, the active
+    /// buffer is the only place events can go, so it is bounded on its
+    /// own. Returns whether this event must be dropped.
+    ///
+    /// Reached before any per-event work — the drop is counted with an
+    /// exact event count and an ESTIMATED byte charge from the mean
+    /// buffered line size, because it happens before serialization and
+    /// the telemetry-disabled path (where the writer is never injected)
+    /// must stay cheap.
+    fn shed_at_preinit_cap(&self) -> bool {
+        const PRE_INIT_CAP: usize = 1024 * 1024;
+        if self.handle.get().is_some() {
+            return false;
+        }
+        let estimate = {
+            let active = self.active.lock();
+            if active.bytes.len() < PRE_INIT_CAP {
+                None
+            } else {
+                Some((active.bytes.len() / active.events.len().max(1)) as u64)
+            }
+        };
+        let Some(mean_line_bytes) = estimate else {
+            return false;
+        };
+        self.dropped.preinit_events.fetch_add(1, Ordering::Relaxed);
+        self.dropped
+            .preinit_bytes
+            .fetch_add(mean_line_bytes, Ordering::Relaxed);
+        metrics::counter!(
+            crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
+            "reason" => "preinit_cap"
+        )
+        .increment(1);
+        metrics::counter!(
+            crate::metrics::TELEMETRY_BYTES_DROPPED_TOTAL,
+            "reason" => "preinit_cap"
+        )
+        .increment(mean_line_bytes);
+        true
+    }
+
     /// Swap the active buffer into a pending [`Batch`].
     ///
     /// Staging MOVES charge from the active buffer onto the queue without
@@ -792,7 +879,7 @@ impl WalLayerInner {
             let byte_size = batch.bytes.len();
             let batch = Arc::new(IngestBatch {
                 batch_id,
-                service: "trawld".into(),
+                service: TELEMETRY_SERVICE.into(),
                 events: batch.events,
                 byte_size,
             });
@@ -869,50 +956,51 @@ impl JsonVisitor {
         }
     }
 
-    /// Store one field under its ASCII-folded name — the fold-at-the-door
-    /// rule (ADR-0009). Telemetry writes straight into the WAL and hot
-    /// buffer without routing through `envelope::canonicalize`, and a
-    /// tracing field name is any Rust-side identifier
-    /// (`tracing::info!(myField = 1)` is legal), so an unfolded name here
-    /// would become a column spelling the (folded) catalog pin never
-    /// matches. Trawl's own call sites are `snake_case`; this makes that a
-    /// guarantee instead of a convention.
-    fn insert_folded(&mut self, field: &Field, value: serde_json::Value) {
-        self.fields.insert(field.name().to_ascii_lowercase(), value);
+    /// Store one field under the name the macro spelled.
+    ///
+    /// The ASCII fold used to happen HERE, because telemetry wrote
+    /// straight into the WAL without routing through
+    /// `envelope::canonicalize` and a tracing field name is any Rust-side
+    /// identifier (`tracing::info!(myField = 1)` is legal). Now the door
+    /// folds, like it does for every producer — so two fields differing
+    /// only in case earn `field.name_case_collision` instead of one
+    /// silently overwriting the other in this map.
+    fn insert(&mut self, field: &Field, value: serde_json::Value) {
+        self.fields.insert(field.name().to_owned(), value);
     }
 }
 
 impl Visit for JsonVisitor {
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.insert_folded(field, json!(value));
+        self.insert(field, json!(value));
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.insert_folded(field, json!(value));
+        self.insert(field, json!(value));
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.insert_folded(field, json!(value));
+        self.insert(field, json!(value));
     }
 
     fn record_i128(&mut self, field: &Field, value: i128) {
-        self.insert_folded(field, json!(value));
+        self.insert(field, json!(value));
     }
 
     fn record_u128(&mut self, field: &Field, value: u128) {
-        self.insert_folded(field, json!(value));
+        self.insert(field, json!(value));
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.insert_folded(field, json!(value));
+        self.insert(field, json!(value));
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.insert_folded(field, json!(value));
+        self.insert(field, json!(value));
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.insert_folded(field, json!(format!("{value:?}")));
+        self.insert(field, json!(format!("{value:?}")));
     }
 }
 
@@ -953,43 +1041,10 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        // Pre-init cap: if the writer isn't set yet and the buffer is
-        // already over 1 MiB, drop this event to prevent unbounded growth
-        // (e.g. if telemetry is disabled and the writer is never injected).
-        // The drop is counted: event count exact, bytes estimated from the
-        // mean buffered line size — it happens before serialization and
-        // the telemetry-disabled path must stay cheap.
-        const PRE_INIT_CAP: usize = 1024 * 1024;
-        if self.inner.handle.get().is_none() {
-            let estimate = {
-                let active = self.inner.active.lock();
-                if active.bytes.len() < PRE_INIT_CAP {
-                    None
-                } else {
-                    Some((active.bytes.len() / active.events.len().max(1)) as u64)
-                }
-            };
-            if let Some(mean_line_bytes) = estimate {
-                self.inner
-                    .dropped
-                    .preinit_events
-                    .fetch_add(1, Ordering::Relaxed);
-                self.inner
-                    .dropped
-                    .preinit_bytes
-                    .fetch_add(mean_line_bytes, Ordering::Relaxed);
-                metrics::counter!(
-                    crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
-                    "reason" => "preinit_cap"
-                )
-                .increment(1);
-                metrics::counter!(
-                    crate::metrics::TELEMETRY_BYTES_DROPPED_TOTAL,
-                    "reason" => "preinit_cap"
-                )
-                .increment(mean_line_bytes);
-                return;
-            }
+        // The pre-init cap runs FIRST, before any work this event would
+        // otherwise cost — canonicalization included.
+        if self.inner.shed_at_preinit_cap() {
+            return;
         }
 
         // Collect event-level fields.
@@ -1025,43 +1080,82 @@ where
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| message_to_event_type(&message));
 
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        // ONE instant per event, used twice: as the `_time` PROPOSAL and
+        // as the arrival the door stamps into `_ingested`. Equal by
+        // construction, so `time.from_ingest` never fires and `_repairs`
+        // stays NULL-dominant on `service=trawld` — and `_ingested`'s
+        // custody is the OBSERVATION, not the flush that happens up to a
+        // tick later.
+        let observed_at = chrono::Utc::now();
+        let now = observed_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let level = metadata.level().as_str().to_ascii_lowercase();
-        let mut record = serde_json::Map::with_capacity(12 + span_fields.len());
-        record.insert("_time".into(), json!(&now));
-        record.insert("_ingested".into(), json!(&now));
-        record.insert("env".into(), json!(&self.inner.env));
-        record.insert("service".into(), json!("trawld"));
-        record.insert("host".into(), json!(&self.inner.host));
-        // The server is the producer, so it writes the derived slot
-        // itself (ADR-0013 §9): the tracing level maps onto the OTel
-        // ladder, and the level WORD stays as an ordinary `level` column
-        // — sender vocabulary, verbatim, exactly as any other producer's.
-        if let Some(n) = trawl_core::severity::number_for_token(&level) {
-            record.insert(trawl_core::schema::SEVERITY.into(), json!(n));
-        }
-        record.insert("level".into(), json!(&level));
-        record.insert("target".into(), json!(metadata.target()));
-        record.insert("event_type".into(), json!(event_type));
-        record.insert("message".into(), json!(message));
+
+        // An ORDINARY SENDER PAYLOAD (ADR-0013 slice 2, ruling 3): no
+        // `env`, `service`, `host`, `_ingested`, `_raw` or `_severity`.
+        // The profile asserts identity below, the door stamps the
+        // server-owned slots, and `level` rides the configured
+        // `severity_from` chain like any app's would — trawld observing
+        // trawld is trawld SENDING, not ingest machinery with privileges.
+        let mut payload = serde_json::Map::with_capacity(6 + span_fields.len());
+        payload.insert(trawl_core::schema::TIME.into(), json!(&now));
+        payload.insert("level".into(), json!(&level));
+        payload.insert("target".into(), json!(metadata.target()));
+        payload.insert("event_type".into(), json!(event_type));
+        payload.insert("message".into(), json!(message));
 
         // Merge remaining span + event fields.
         for (k, v) in span_fields {
-            record.entry(k).or_insert(v);
+            payload.entry(k).or_insert(v);
         }
 
-        // `_raw` is required by the envelope: for server-generated events
-        // the canonical serialization of the record IS the most original
-        // form available.
-        let raw = serde_json::Value::Object(record.clone()).to_string();
-        record.insert("_raw".into(), json!(raw));
+        // The one door. Nothing here may call `tracing` — including on
+        // the failure path, which is why a refusal is a metric and a
+        // silent drop (ruling 4). It is also unreachable by construction:
+        // everything the profile asserts is boot-validated, and the
+        // zero-initialized `{profile="trawld"}` reject matrix is the
+        // evidence for that claim.
+        let ctx = crate::ingest::envelope::EnvelopeContext {
+            arrival: &now,
+            arrival_instant: observed_at,
+            envs: &self.inner.envs,
+            default_env: &self.inner.env,
+            producer: crate::ingest::producer::Producer::Trawld(
+                crate::ingest::producer::Asserted {
+                    env: &self.inner.env,
+                    service: TELEMETRY_SERVICE,
+                    host: self.inner.host.as_deref(),
+                    // `message: None` is NO assertion — a trawld event's
+                    // payload IS its message, so whatever the tracing
+                    // macro recorded stands.
+                    message: None,
+                    repairs: &[],
+                },
+            ),
+            derivation: &self.inner.derivation,
+        };
+        let canonical = match crate::ingest::envelope::canonicalize(&payload, &ctx) {
+            Ok(canonical) => canonical,
+            // The MESSAGE is discarded, the REASON is not: the reason is
+            // a closed label set, while the message quotes values and
+            // would have nowhere to go but a log line emitted from
+            // inside the logger.
+            Err((_, reason)) => {
+                crate::ingest::producer::count_profile_reject(
+                    crate::ingest::producer::ProducerKind::Trawld,
+                    reason,
+                );
+                return;
+            }
+        };
+        crate::ingest::producer::count_event_outcome(&canonical);
+        let record = canonical.obj;
 
         // Serialize, then push bytes and map under ONE lock so the two
         // representations of the active buffer can never skew (a stage
         // between the two pushes would publish a map whose bytes never
-        // reached the WAL). serde_json::to_vec on Value cannot fail.
-        let mut line = serde_json::to_vec(&serde_json::Value::Object(record.clone()))
-            .expect("JSON serialization of Value is infallible");
+        // reached the WAL). serde_json::to_vec on a Map cannot fail.
+        let mut line =
+            serde_json::to_vec(&record).expect("JSON serialization of a Map is infallible");
         line.push(b'\n');
 
         // The shared budget is enforced HERE, over the active buffer, the
@@ -1542,13 +1636,392 @@ mod tests {
             "the level WORD stays as ordinary sender vocabulary"
         );
         assert!(parsed["target"].is_string());
+        assert_eq!(
+            parsed["_producer"], "trawld",
+            "provenance is data on this door too (ruling 6)"
+        );
+        assert_eq!(
+            parsed["_time"], parsed["_ingested"],
+            "one instant serves both: the proposal and the arrival"
+        );
+        assert!(
+            parsed.get("_repairs").is_none(),
+            "trawld's own events must stay repair-free: {parsed}"
+        );
     }
 
-    /// Tracing field names are Rust-side identifiers and CAN be mixed case
-    /// (`tracing::info!(myField = 1)` is legal); this path writes straight
-    /// into the WAL/hot buffer without `envelope::canonicalize`, so the
-    /// visitor folds at collection — an unfolded name would become a
-    /// column spelling the folded catalog pin never matches.
+    // --- the trawld profile at the door (ADR-0013 slice 2, M5) ---------
+
+    /// A layer wired exactly as production wires it, plus the WAL it
+    /// writes to. Split from [`records_from`] so a test can hold the
+    /// layer (to flush twice, to inspect the buffer).
+    fn telemetry_layer(
+        derivation: Arc<crate::ingest::producer::Derivation>,
+    ) -> (WalLayer, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+        writer.ensure_dir().unwrap();
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+        let layer = WalLayer::new_with_buffer_cap(
+            handle,
+            &["prod".to_owned()],
+            "prod",
+            derivation,
+            trawl_config::DEFAULT_TELEMETRY_BUFFER_MAX_BYTES,
+        );
+        (layer, tmp)
+    }
+
+    /// Emit through a real subscriber and read back every record the WAL
+    /// received, in order.
+    fn records_from(
+        derivation: Arc<crate::ingest::producer::Derivation>,
+        emit: impl FnOnce(),
+    ) -> Vec<serde_json::Value> {
+        use tracing_subscriber::prelude::*;
+
+        let (layer, tmp) = telemetry_layer(derivation);
+        let layer_ref = layer.clone();
+        {
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let _guard = tracing::subscriber::set_default(subscriber);
+            emit();
+        }
+        layer_ref.flush();
+
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(tmp.path().join("prod")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "ndjson") {
+                continue;
+            }
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                out.push(serde_json::from_str(line).unwrap());
+            }
+        }
+        out
+    }
+
+    /// One record, for the single-event tests.
+    fn record_from(
+        derivation: Arc<crate::ingest::producer::Derivation>,
+        emit: impl FnOnce(),
+    ) -> serde_json::Value {
+        let mut records = records_from(derivation, emit);
+        assert_eq!(records.len(), 1, "expected exactly one record: {records:?}");
+        records.pop().unwrap()
+    }
+
+    fn packaged() -> Arc<crate::ingest::producer::Derivation> {
+        Arc::new(crate::ingest::producer::Derivation::defaults())
+    }
+
+    fn repair_codes(record: &serde_json::Value) -> Vec<&str> {
+        record["_repairs"]
+            .as_str()
+            .map(|s| s.split(',').collect())
+            .unwrap_or_default()
+    }
+
+    /// THE compaction-wedge regression (acceptance criterion 2, defect a).
+    ///
+    /// A tracing field name over `MAX_FIELD_NAME_BYTES` used to reach the
+    /// WAL untouched, because telemetry had no name-length gate at all.
+    /// Compaction pins every dynamic column in postgres BEFORE writing
+    /// the parquet that carries it, and an over-long name overflows the
+    /// btree key behind `field_types.field`: the insert errors, the batch
+    /// is retained, and the same WAL re-fails every tick — permanently,
+    /// for `service=trawld`, which is the service an operator most needs
+    /// during an incident. The door drops the FIELD and keeps the event.
+    #[test]
+    fn an_over_long_tracing_field_name_is_dropped_and_the_event_still_lands() {
+        let record = packaged_record_with_long_name();
+        assert_eq!(record["event_type"], "wedge_probe");
+        assert_eq!(record["message"], "the event must still land");
+        assert_eq!(record["survivor"], 1);
+        assert!(
+            record
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|k| k.len() <= trawl_core::schema::MAX_FIELD_NAME_BYTES),
+            "no name over the catalog bound may become a column: {record}"
+        );
+        assert!(repair_codes(&record).contains(&"field.name_too_long"));
+        assert!(
+            record["_raw"].as_str().unwrap().contains("wedge_wedge_"),
+            "the dropped name and its value stay findable in _raw"
+        );
+    }
+
+    /// Split out only because the 264-byte field name has to be a literal
+    /// token — tracing field names are resolved at compile time.
+    fn packaged_record_with_long_name() -> serde_json::Value {
+        record_from(packaged(), || {
+            tracing::info!(
+                event_type = "wedge_probe",
+                survivor = 1u64,
+                "wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_wedge_" =
+                    42u64,
+                "the event must still land"
+            );
+        })
+    }
+
+    /// Acceptance criterion 4: identity is protected by PRECEDENCE, not
+    /// by a namespace.
+    ///
+    /// Telemetry is an ordinary sender (ruling 3) — no `trawld_` prefix —
+    /// so a span or event field literally named `service`/`host`/`env` is
+    /// application vocabulary that happens to collide with a slot the
+    /// profile asserts. It loses, with a repair code, and the displaced
+    /// value stays findable in `_raw`.
+    #[test]
+    fn a_tracing_field_cannot_impersonate_another_service() {
+        let record = record_from(packaged(), || {
+            let span = tracing::info_span!("proxying", service = "nginx", host = "web01");
+            let _entered = span.enter();
+            tracing::info!(event_type = "upstream_5xx", env = "lab", "boom");
+        });
+        assert_eq!(
+            record["service"], "trawld",
+            "the profile owns the identity slot"
+        );
+        assert_eq!(record["env"], "prod");
+        assert_ne!(record["host"], "web01");
+        assert!(repair_codes(&record).contains(&"field.producer_asserted"));
+        let raw = record["_raw"].as_str().unwrap();
+        for displaced in ["nginx", "web01", "lab"] {
+            assert!(
+                raw.contains(displaced),
+                "{displaced} must stay in _raw: {raw}"
+            );
+        }
+        // The event itself is untouched otherwise.
+        assert_eq!(record["event_type"], "upstream_5xx");
+        assert_eq!(record["message"], "boom");
+    }
+
+    /// The tracing LEVEL rides the ordinary `severity_from` chain — no
+    /// direct `_severity` write survives anywhere (ruling 1).
+    #[test]
+    fn the_tracing_level_derives_severity_through_the_configured_chain() {
+        for (emit, level, expected) in [
+            (0u8, "warn", 13),
+            (1, "error", 17),
+            (2, "debug", 5),
+            (3, "trace", 1),
+        ] {
+            let record = record_from(packaged(), move || match emit {
+                0 => tracing::warn!(event_type = "sev", "x"),
+                1 => tracing::error!(event_type = "sev", "x"),
+                2 => tracing::debug!(event_type = "sev", "x"),
+                _ => tracing::trace!(event_type = "sev", "x"),
+            });
+            assert_eq!(
+                record[trawl_core::schema::SEVERITY],
+                expected,
+                "tracing {level} must derive to OTel {expected}"
+            );
+            assert_eq!(
+                record["level"], level,
+                "the level WORD stays an ordinary column"
+            );
+        }
+    }
+
+    /// `severity_from = []` is legal and means "derive nothing" (ruling
+    /// 5). Telemetry obeys it like every other door — the level column
+    /// stays, `_severity` simply is not there.
+    #[test]
+    fn an_empty_severity_chain_leaves_trawlds_own_events_unscored() {
+        let derivation = Arc::new(
+            crate::ingest::producer::Derivation::resolve(&trawl_config::IngestConfig {
+                severity_from: Vec::new(),
+                ..trawl_config::IngestConfig::default()
+            })
+            .expect("an empty severity list is legal"),
+        );
+        let record = record_from(derivation, || {
+            tracing::warn!(event_type = "unscored", "x");
+        });
+        assert!(
+            record.get(trawl_core::schema::SEVERITY).is_none(),
+            "nothing may write _severity outside derivation: {record}"
+        );
+        assert_eq!(record["level"], "warn", "the source column is untouched");
+    }
+
+    /// A tracing field named `_raw` is ordinary application vocabulary,
+    /// not the lifeline: on THIS door `_raw` is not proposable, so the
+    /// field takes the reserved-prefix strip and the door writes the
+    /// pre-repair serialization. Otherwise a single mis-named field would
+    /// shadow the very thing that carries displaced collision values.
+    #[test]
+    fn a_raw_named_tracing_field_cannot_shadow_the_lifeline() {
+        let record = record_from(packaged(), || {
+            let span = tracing::info_span!("collide", service = "nginx");
+            let _entered = span.enter();
+            tracing::info!(event_type = "raw_probe", _raw = "just a field", "x");
+        });
+        assert_eq!(record["raw"], "just a field", "it lands bare, value intact");
+        let raw = record["_raw"].as_str().unwrap();
+        assert!(
+            raw.contains("\"service\":\"nginx\""),
+            "_raw stays the serialization that carries the displaced value: {raw}"
+        );
+        for code in ["field.reserved_prefix", "field.producer_asserted"] {
+            assert!(repair_codes(&record).contains(&code), "missing {code}");
+        }
+    }
+
+    /// Acceptance criterion 3: telemetry is rejection-free BY
+    /// CONSTRUCTION, and the invariant counter is the evidence.
+    ///
+    /// Two halves. First, a bounded deterministic sweep over payloads a
+    /// tracing visitor could plausibly produce — reserved names, empty
+    /// and over-long names, mixed case, non-UTF-safe-looking text, every
+    /// JSON scalar, and every identity slot the profile asserts — driven
+    /// through the very call `on_event` makes. Second, the closed
+    /// `{profile="trawld"}` reject matrix, published at zero and asserted
+    /// still at zero: an absent increment on a PRESENT series is what
+    /// "never happened" looks like, and an absent series would be
+    /// indistinguishable from "never wired up".
+    #[test]
+    fn the_trawld_profile_never_rejects_and_the_counter_proves_it() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            crate::ingest::producer::init_profile_reject_metrics();
+            sweep_trawld_payloads();
+        });
+
+        let rendered = handle.render();
+        for reason in crate::ingest::envelope::RejectReason::ALL {
+            let series = format!(
+                "{}{{profile=\"trawld\",reason=\"{}\"}} 0",
+                crate::metrics::INGEST_PROFILE_REJECT_TOTAL,
+                reason.as_str()
+            );
+            assert!(
+                rendered.contains(&series),
+                "the trawld profile rejected on {}, or the series is missing: {rendered}",
+                reason.as_str()
+            );
+        }
+    }
+
+    /// The generative half of the test above: 600 bounded, seeded
+    /// payloads through the very call `on_event` makes. A refusal is
+    /// COUNTED rather than panicked, so the caller's counter assertion is
+    /// what fails — the invariant is about the metric, not about a
+    /// backtrace.
+    fn sweep_trawld_payloads() {
+        use crate::ingest::envelope::{EnvelopeContext, canonicalize};
+        use crate::ingest::producer::{
+            Asserted, Derivation, Producer, ProducerKind, count_profile_reject,
+        };
+
+        // Names a tracing field could carry, including every one that is
+        // load-bearing at the door.
+        let names: Vec<String> = [
+            "level",
+            "target",
+            "event_type",
+            "message",
+            "service",
+            "env",
+            "host",
+            "_raw",
+            "_time",
+            "_ingested",
+            "_repairs",
+            "_severity",
+            "_producer",
+            "_",
+            "___",
+            "MiXeD",
+            "myField",
+            "myfield",
+            "café",
+            "sd_x@1_k",
+            "",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain(std::iter::once("k".repeat(300)))
+        .collect();
+        let values = |seed: u64| -> serde_json::Value {
+            match seed % 9 {
+                0 => json!(""),
+                1 => json!("x".repeat(300)),
+                2 => json!("nul\u{0}and\ttab"),
+                3 => json!(-1i64),
+                4 => json!(u64::MAX),
+                5 => json!(1.5f64),
+                6 => json!(true),
+                7 => serde_json::Value::Null,
+                _ => json!({ "nested": [1, 2, 3] }),
+            }
+        };
+
+        let derivation = Derivation::defaults();
+        let envs = vec!["prod".to_owned()];
+        let arrival_instant = chrono::Utc::now();
+        let arrival = arrival_instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+        // A cheap deterministic walk over four-field payloads. Bounded
+        // and seeded — no proptest dependency, no flake, and a failing
+        // case is reproducible from the round index.
+        let mut lcg: u64 = 0x2545_F491_4F6C_DD1D;
+        for round in 0..600u64 {
+            let mut payload = serde_json::Map::new();
+            for _ in 0..4 {
+                lcg = lcg.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let name = &names[(lcg >> 33) as usize % names.len()];
+                payload.insert(name.clone(), values(lcg >> 11));
+            }
+            let ctx = EnvelopeContext {
+                arrival: &arrival,
+                arrival_instant,
+                envs: &envs,
+                default_env: "prod",
+                producer: Producer::Trawld(Asserted {
+                    env: "prod",
+                    service: TELEMETRY_SERVICE,
+                    // Alternate the two host shapes: a resolved hostname
+                    // and a failed lookup.
+                    host: (round % 2 == 0).then_some("box"),
+                    message: None,
+                    repairs: &[],
+                }),
+                derivation: &derivation,
+            };
+            match canonicalize(&payload, &ctx) {
+                Ok(canonical) => {
+                    assert_eq!(canonical.service, TELEMETRY_SERVICE);
+                    assert_eq!(canonical.env, "prod");
+                    assert_eq!(canonical.obj["_producer"], "trawld");
+                    assert!(
+                        canonical
+                            .obj
+                            .keys()
+                            .all(|k| k.len() <= trawl_core::schema::MAX_FIELD_NAME_BYTES),
+                        "round {round}: an unstorable name became a column"
+                    );
+                }
+                Err((_, reason)) => count_profile_reject(ProducerKind::Trawld, reason),
+            }
+        }
+    }
+
+    /// Tracing field names are Rust-side identifiers and CAN be mixed
+    /// case (`tracing::info!(myField = 1)` is legal), so an unfolded name
+    /// would become a column spelling the folded catalog pin never
+    /// matches. The fold used to happen in the visitor because this path
+    /// bypassed `envelope::canonicalize`; it is the DOOR's universal one
+    /// now, and the observable answer is unchanged.
     #[test]
     fn mixed_case_tracing_field_names_are_ascii_folded() {
         use tracing_subscriber::prelude::*;
