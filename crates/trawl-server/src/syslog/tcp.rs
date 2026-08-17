@@ -19,9 +19,8 @@ use crate::config::SyslogConfig;
 use crate::state::SyslogStats;
 
 use super::CidrEntry;
-use super::batch::{SyslogEvent, SyslogSender};
-use super::convert;
-use super::parse;
+use super::batch::SyslogSender;
+use super::convert::SyslogDoor;
 
 /// Maximum size for a single TCP syslog message (64 KB).
 const MAX_MESSAGE_SIZE: usize = 65_536;
@@ -29,7 +28,7 @@ const MAX_MESSAGE_SIZE: usize = 65_536;
 /// Run the TCP syslog listener until shutdown.
 pub async fn run_tcp_listener(
     config: &SyslogConfig,
-    default_env: &str,
+    door: &Arc<SyslogDoor>,
     sender: SyslogSender,
     cidrs: Arc<[CidrEntry]>,
     stats: Option<Arc<SyslogStats>>,
@@ -89,7 +88,7 @@ pub async fn run_tcp_listener(
                 let conn_stats = stats.clone();
                 let conn_config_service_map = config.source_service_map.clone();
                 let conn_default_service = config.default_service.clone();
-                let conn_default_env = default_env.to_owned();
+                let conn_door = Arc::clone(door);
                 let idle_timeout = Duration::from_secs(config.tcp_idle_timeout_secs);
                 let max_events = config.max_events_per_connection;
                 let send_failure_limit = config.consecutive_send_failures_limit;
@@ -99,9 +98,9 @@ pub async fn run_tcp_listener(
                         stream,
                         source_ip,
                         conn_sender,
+                        &conn_door,
                         &conn_config_service_map,
                         &conn_default_service,
-                        &conn_default_env,
                         idle_timeout,
                         max_events,
                         send_failure_limit,
@@ -135,9 +134,9 @@ async fn handle_tcp_connection(
     stream: tokio::net::TcpStream,
     source_ip: std::net::IpAddr,
     sender: SyslogSender,
+    door: &SyslogDoor,
     source_service_map: &std::collections::HashMap<String, String>,
     default_service: &str,
-    default_env: &str,
     idle_timeout: Duration,
     max_events: usize,
     send_failure_limit: usize,
@@ -179,39 +178,32 @@ async fn handle_tcp_connection(
             continue;
         }
 
-        let parsed = parse::parse_syslog(&line);
-        let (service, map) = convert::syslog_to_event(
-            &line,
-            &parsed,
-            source_ip,
-            source_service_map,
-            default_service,
-            default_env,
-        );
-
-        let event = SyslogEvent {
-            service,
-            map,
-            transport: "tcp",
-        };
-
-        if sender.try_send(event).is_err() {
-            metrics::counter!(crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL).increment(1);
-            if let Some(s) = stats {
-                s.dropped.fetch_add(1, Ordering::Relaxed);
+        // The one door: parse, then canonicalize under the syslog
+        // profile. A refusal is counted as a profile reject and the frame
+        // is dropped — a TCP sender has no reply channel to be told on —
+        // but it still SPENDS the connection's event budget, so a client
+        // that somehow provokes refusals cannot hold a permit forever.
+        if let Some(event) =
+            door.admit(&line, source_ip, source_service_map, default_service, "tcp")
+        {
+            if sender.try_send(event).is_err() {
+                metrics::counter!(crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL).increment(1);
+                if let Some(s) = stats {
+                    s.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                consecutive_send_failures += 1;
+                if consecutive_send_failures >= send_failure_limit {
+                    tracing::warn!(
+                        event_type = "syslog_tcp_backpressure_disconnect",
+                        source = %source_ip,
+                        failures = consecutive_send_failures,
+                        "batcher overwhelmed, disconnecting TCP client"
+                    );
+                    break;
+                }
+            } else {
+                consecutive_send_failures = 0;
             }
-            consecutive_send_failures += 1;
-            if consecutive_send_failures >= send_failure_limit {
-                tracing::warn!(
-                    event_type = "syslog_tcp_backpressure_disconnect",
-                    source = %source_ip,
-                    failures = consecutive_send_failures,
-                    "batcher overwhelmed, disconnecting TCP client"
-                );
-                break;
-            }
-        } else {
-            consecutive_send_failures = 0;
         }
 
         event_count += 1;
@@ -398,6 +390,16 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    /// The one door, with the packaged derivation policy and no relays.
+    fn test_door() -> SyslogDoor {
+        SyslogDoor {
+            envs: vec!["prod".to_owned()].into(),
+            default_env: "prod".into(),
+            trusted_relays: Vec::new().into(),
+            derivation: Arc::new(crate::ingest::producer::Derivation::defaults()),
+        }
+    }
+
     /// Helper: bind a TCP listener on a free port, return the address.
     async fn bind_free() -> (TcpListener, std::net::SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -527,9 +529,9 @@ mod tests {
             server,
             "127.0.0.1".parse().unwrap(),
             tx,
+            &test_door(),
             &std::collections::HashMap::new(),
             "syslog",
-            "prod",
             Duration::from_millis(50), // very short timeout for test
             100_000,
             100,
@@ -555,9 +557,9 @@ mod tests {
                 server,
                 "127.0.0.1".parse().unwrap(),
                 tx,
+                &test_door(),
                 &std::collections::HashMap::new(),
                 "syslog",
-                "prod",
                 Duration::from_secs(5),
                 3, // max 3 events
                 100,

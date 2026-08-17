@@ -26,14 +26,22 @@ use crate::ingest::pipeline::PipelineWriter;
 use crate::state::SyslogStats;
 
 use self::batch::SyslogBatcher;
+use self::convert::SyslogDoor;
 
 /// Spawn all syslog listeners and the batcher task.
+///
+/// `door` carries everything the listeners need to reach
+/// `envelope::canonicalize`: the env allowlist and `default_env`, the
+/// `trusted_relays` CIDRs (the peer check that decides whether a
+/// hostname-less frame is peer-filled or kept host-less) and the
+/// boot-resolved derivation policy. None of them were threaded here
+/// before, which is why the listener hand-rolled its own envelope.
 ///
 /// Returns join handles that complete when all listeners and the batcher
 /// have shut down. Send `true` on `shutdown_tx` to initiate graceful shutdown.
 pub fn spawn_syslog(
     config: &SyslogConfig,
-    default_env: Arc<str>,
+    door: Arc<SyslogDoor>,
     pipeline: Arc<PipelineWriter>,
     syslog_stats: Option<Arc<SyslogStats>>,
     shutdown_rx: watch::Receiver<bool>,
@@ -54,7 +62,7 @@ pub fn spawn_syslog(
     // Spawn UDP listener.
     if config.udp_enabled {
         let udp_config = config.clone();
-        let udp_env = Arc::clone(&default_env);
+        let udp_door = Arc::clone(&door);
         let udp_sender = sender.clone();
         let udp_shutdown = shutdown_rx.clone();
         let udp_cidrs = cidrs.clone();
@@ -62,7 +70,7 @@ pub fn spawn_syslog(
         handles.push(tokio::spawn(async move {
             if let Err(e) = udp::run_udp_listener(
                 &udp_config,
-                &udp_env,
+                &udp_door,
                 udp_sender,
                 udp_cidrs,
                 udp_stats,
@@ -78,7 +86,7 @@ pub fn spawn_syslog(
     // Spawn TCP listener.
     if config.tcp_enabled {
         let tcp_config = config.clone();
-        let tcp_env = default_env;
+        let tcp_door = door;
         let tcp_sender = sender;
         let tcp_shutdown = shutdown_rx;
         let tcp_cidrs = cidrs;
@@ -86,7 +94,7 @@ pub fn spawn_syslog(
         handles.push(tokio::spawn(async move {
             if let Err(e) = tcp::run_tcp_listener(
                 &tcp_config,
-                &tcp_env,
+                &tcp_door,
                 tcp_sender,
                 tcp_cidrs,
                 tcp_stats,

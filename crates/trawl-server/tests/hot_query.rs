@@ -374,19 +374,20 @@ async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) 
 // tests/field_catalog.rs and `syslog_mixed_case_sd_param_lands_folded_and_
 // pins_folded` below.
 
-/// The syslog producer does NOT route through `envelope::canonicalize`
-/// (`syslog_to_event` → `PipelineWriter::write`), so its fold lives at
-/// SD-key construction. This proves the whole journey: a mixed-case RFC
-/// 5424 SD param reaches the hot buffer folded, and compaction pins it
-/// under the folded name.
+/// The syslog producer routes through `envelope::canonicalize` now
+/// (ADR-0013 slice 2), so its fold is the DOOR's universal one rather
+/// than a listener-local rule at SD-key construction. This proves the
+/// whole journey is unchanged by that move: a mixed-case RFC 5424 SD
+/// param reaches the hot buffer folded, and compaction pins it under the
+/// folded name.
 #[sqlx::test]
 async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgPool) {
     use indexmap::IndexMap;
     use trawl_server::catalog::{CatalogContext, FieldCatalog};
     use trawl_server::ingest::pipeline::{PipelineWriter, ServiceBatch};
+    use trawl_server::ingest::producer::Derivation;
     use trawl_server::store::CatalogStore;
-    use trawl_server::syslog::convert::syslog_to_event;
-    use trawl_server::syslog::parse::parse_syslog;
+    use trawl_server::syslog::convert::SyslogDoor;
 
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let wal_dir = tmp.path().join("wal");
@@ -403,36 +404,39 @@ async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgP
     );
     let wal_writer = Arc::new(WalWriter::new(wal_dir.clone()));
     wal_writer.ensure_dir().unwrap();
-    let pipeline = PipelineWriter::new(
-        Arc::clone(&wal_writer),
-        Some(Arc::clone(&hot_buffer)),
-        None,
-        "prod".into(),
-    );
+    let pipeline =
+        PipelineWriter::new(Arc::clone(&wal_writer), Some(Arc::clone(&hot_buffer)), None);
 
+    let door = SyslogDoor {
+        envs: vec!["prod".to_owned()].into(),
+        default_env: "prod".into(),
+        trusted_relays: Vec::new().into(),
+        derivation: Arc::new(Derivation::defaults()),
+    };
     let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [exampleSDID@32473 eventID="1011"] boom"#;
-    let parsed = parse_syslog(raw);
-    let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-    let (service, map) = syslog_to_event(
-        raw,
-        &parsed,
-        ip,
-        &std::collections::HashMap::new(),
-        "syslog",
-        "prod",
-    );
-    assert_eq!(map["sd_examplesdid@32473_eventid"], "1011");
+    let event = door
+        .admit(
+            raw,
+            "10.0.0.1".parse().unwrap(),
+            &std::collections::HashMap::new(),
+            "syslog",
+            "udp",
+        )
+        .expect("the syslog profile must admit a well-formed frame");
+    assert_eq!(event.map["sd_examplesdid@32473_eventid"], "1011");
     assert!(
-        map.keys()
+        event
+            .map
+            .keys()
             .all(|k| !k.bytes().any(|b| b.is_ascii_uppercase())),
         "the syslog producer must emit folded keys only: {:?}",
-        map.keys().collect::<Vec<_>>()
+        event.map.keys().collect::<Vec<_>>()
     );
 
     let mut batch = ServiceBatch::default();
-    batch.push(map);
+    batch.push(event.map);
     let mut batches = IndexMap::new();
-    batches.insert(service, batch);
+    batches.insert((event.env, event.service), batch);
     assert_eq!(pipeline.write(batches), 1);
 
     // The hot snapshot carries the folded key and no unfolded spelling.

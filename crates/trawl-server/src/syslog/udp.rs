@@ -4,8 +4,9 @@
 
 //! UDP syslog listener.
 //!
-//! Binds a UDP socket and receives syslog datagrams. Each message is
-//! parsed, converted to a trawl event, and sent to the batcher.
+//! Binds a UDP socket and receives syslog datagrams. Each datagram is
+//! parsed, canonicalized through the ONE door under the `syslog` profile
+//! ([`convert::SyslogDoor::admit`]), and sent to the batcher.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -17,9 +18,8 @@ use crate::config::SyslogConfig;
 use crate::state::SyslogStats;
 
 use super::CidrEntry;
-use super::batch::{SyslogEvent, SyslogSender};
-use super::convert;
-use super::parse;
+use super::batch::SyslogSender;
+use super::convert::SyslogDoor;
 
 /// Maximum UDP datagram size for syslog (64 KB per RFC).
 const UDP_RECV_BUFFER_SIZE: usize = 65_536;
@@ -27,7 +27,7 @@ const UDP_RECV_BUFFER_SIZE: usize = 65_536;
 /// Run the UDP syslog listener until shutdown.
 pub async fn run_udp_listener(
     config: &SyslogConfig,
-    default_env: &str,
+    door: &SyslogDoor,
     sender: SyslogSender,
     cidrs: Arc<[CidrEntry]>,
     stats: Option<Arc<SyslogStats>>,
@@ -82,20 +82,18 @@ pub async fn run_udp_listener(
                     continue;
                 };
 
-                let parsed = parse::parse_syslog(raw);
-                let (service, map) = convert::syslog_to_event(
+                // The one door: parse, then canonicalize under the syslog
+                // profile. A refusal is counted as a profile reject (a
+                // server bug — there is nobody to reject a datagram TO)
+                // and the frame is dropped.
+                let Some(event) = door.admit(
                     raw,
-                    &parsed,
                     source_ip,
                     &config.source_service_map,
                     &config.default_service,
-                    default_env,
-                );
-
-                let event = SyslogEvent {
-                    service,
-                    map,
-                    transport: "udp",
+                    "udp",
+                ) else {
+                    continue;
                 };
 
                 // Non-blocking send — drop if batcher is overwhelmed

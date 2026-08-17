@@ -595,6 +595,34 @@ pub fn count_profile_reject(kind: ProducerKind, reason: RejectReason) {
     .increment(1);
 }
 
+/// Count ONE accepted event's outcome: the repairs the door applied and
+/// whether a severity source went unmapped.
+///
+/// The per-event form of the HTTP door's per-request aggregation. HTTP
+/// keeps aggregating — it holds a whole batch and can spend one counter
+/// call per `(code, service)` instead of per event — while the salvage
+/// producers arrive one frame at a time and have nothing to aggregate
+/// over. Both reach the same two series with the same bounded service
+/// label, so a dashboard cannot tell which door filed a repair except by
+/// `_producer`, which is the point.
+pub fn count_event_outcome(canonical: &crate::ingest::envelope::Canonical) {
+    for code in &canonical.repairs {
+        metrics::counter!(
+            crate::metrics::INGEST_REPAIRS_TOTAL,
+            "code" => code.as_str(),
+            "service" => crate::metrics::repair_service_label(&canonical.service),
+        )
+        .increment(1);
+    }
+    if canonical.severity_unmapped {
+        metrics::counter!(
+            crate::metrics::SEVERITY_UNMAPPED_TOTAL,
+            "service" => crate::metrics::repair_service_label(&canonical.service),
+        )
+        .increment(1);
+    }
+}
+
 /// Publish the whole closed label matrix at zero.
 ///
 /// An ABSENT increment on a present series is what proves the salvage

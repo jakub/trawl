@@ -15,15 +15,22 @@ use serde_json::Map;
 use tokio::sync::{mpsc, watch};
 
 use crate::config::SyslogConfig;
-use crate::ingest::pipeline::{PipelineWriter, ServiceBatch};
+use crate::ingest::pipeline::{BatchKey, PipelineWriter, ServiceBatch};
 use crate::state::SyslogStats;
 
-/// A single syslog event ready for batching.
+/// A single canonicalized syslog event ready for batching.
+///
+/// `env` and `service` are the door's OWN verdict (`Canonical::env` /
+/// `Canonical::service`), not the listener's guess, and together they are
+/// the batch key: two envs must never share a WAL file, a hot-buffer
+/// drain key or a parquet partition (ADR-0009).
 #[derive(Debug)]
 pub struct SyslogEvent {
-    /// Derived service name (already sanitized/mapped).
+    /// The env the door filed this event under.
+    pub env: String,
+    /// The service the door validated.
     pub service: String,
-    /// Full event map with all fields.
+    /// The canonicalized event map — the full declared envelope.
     pub map: Map<String, serde_json::Value>,
     /// Transport that received this event ("udp" or "tcp").
     pub transport: &'static str,
@@ -75,7 +82,7 @@ impl SyslogBatcher {
             tokio::time::interval(std::time::Duration::from_millis(self.batch_interval_ms));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        let mut pending: IndexMap<String, ServiceBatch> = IndexMap::new();
+        let mut pending: IndexMap<BatchKey, ServiceBatch> = IndexMap::new();
         let mut pending_count: usize = 0;
         let mut udp_count: u64 = 0;
         let mut tcp_count: u64 = 0;
@@ -115,7 +122,7 @@ impl SyslogBatcher {
                         tcp_count += 1;
                     }
                     pending
-                        .entry(evt.service)
+                        .entry((evt.env, evt.service))
                         .or_default()
                         .push(evt.map);
                     pending_count += 1;
@@ -146,13 +153,13 @@ impl SyslogBatcher {
     /// the tokio runtime.
     async fn flush(
         &self,
-        pending: &mut IndexMap<String, ServiceBatch>,
+        pending: &mut IndexMap<BatchKey, ServiceBatch>,
         pending_count: &mut usize,
         udp_count: u64,
         tcp_count: u64,
     ) {
         let batches = std::mem::take(pending);
-        let services = batches.len();
+        let groups = batches.len();
         let events = *pending_count;
         *pending_count = 0;
 
@@ -191,7 +198,7 @@ impl SyslogBatcher {
 
         tracing::debug!(
             event_type = "syslog_batch_flushed",
-            services,
+            groups,
             events,
             written,
             "flushed syslog batch to pipeline"
@@ -214,7 +221,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wal = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
         wal.ensure_dir().unwrap();
-        let pipeline = Arc::new(PipelineWriter::new(wal, None, None, "prod".into()));
+        let pipeline = Arc::new(PipelineWriter::new(wal, None, None));
 
         let config = SyslogConfig {
             batch_interval_ms,
@@ -227,10 +234,16 @@ mod tests {
     }
 
     fn make_event(service: &str) -> SyslogEvent {
+        make_event_in("prod", service)
+    }
+
+    fn make_event_in(env: &str, service: &str) -> SyslogEvent {
         let mut map = Map::new();
+        map.insert("env".into(), json!(env));
         map.insert("service".into(), json!(service));
         map.insert("message".into(), json!("test"));
         SyslogEvent {
+            env: env.to_owned(),
             service: service.to_owned(),
             map,
             transport: "udp",
@@ -331,42 +344,97 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn batcher_multi_service_grouping() {
-        let (batcher, tmp) = test_batcher(60_000, 10_000);
+    /// WAL files under one env dir, by service-name prefix.
+    fn wal_files(root: &std::path::Path, env: &str) -> Vec<String> {
+        std::fs::read_dir(root.join(env))
+            .map(|dir| {
+                dir.filter_map(Result::ok)
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Drive the batcher to a flush and return once it has settled.
+    async fn drain(batcher: SyslogBatcher, events: Vec<SyslogEvent>) {
         let sender = batcher.sender();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
         let handle = tokio::spawn(async move {
             batcher.run(shutdown_rx).await;
         });
-
-        // Send events for different services
-        sender.send(make_event("nginx")).await.unwrap();
-        sender.send(make_event("sshd")).await.unwrap();
-        sender.send(make_event("nginx")).await.unwrap();
-
+        for event in events {
+            sender.send(event).await.unwrap();
+        }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
         let _ = shutdown_tx.send(true);
         handle.await.unwrap();
+    }
 
-        // Should have separate WAL files for each service
-        let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "ndjson"))
+    #[tokio::test]
+    async fn batcher_multi_service_grouping() {
+        let (batcher, tmp) = test_batcher(60_000, 10_000);
+        drain(
+            batcher,
+            vec![make_event("nginx"), make_event("sshd"), make_event("nginx")],
+        )
+        .await;
+
+        // One WAL file per service, both under the one env.
+        let files = wal_files(tmp.path(), "prod");
+        assert_eq!(
+            files.iter().filter(|f| f.starts_with("nginx")).count(),
+            1,
+            "should have one WAL file for nginx: {files:?}"
+        );
+        assert_eq!(
+            files.iter().filter(|f| f.starts_with("sshd")).count(),
+            1,
+            "should have one WAL file for sshd: {files:?}"
+        );
+    }
+
+    /// Acceptance criterion 7: the batch key is `(env, service)`.
+    ///
+    /// Before the cutover the syslog batcher keyed on service ALONE and
+    /// the writer stamped its own `default_env` on every file, so two
+    /// envs arriving in one interval under the same service name were
+    /// concatenated into a single WAL file under a single path root — a
+    /// silent misfile that no error and no repair code ever mentioned.
+    /// One service name, two envs, one interval is exactly that case.
+    #[tokio::test]
+    async fn batcher_keys_on_env_and_service_together() {
+        let (batcher, tmp) = test_batcher(60_000, 10_000);
+        drain(
+            batcher,
+            vec![
+                make_event_in("prod", "nginx"),
+                make_event_in("lab", "nginx"),
+                make_event_in("prod", "nginx"),
+            ],
+        )
+        .await;
+
+        for env in ["prod", "lab"] {
+            let files = wal_files(tmp.path(), env);
+            assert_eq!(
+                files.iter().filter(|f| f.starts_with("nginx")).count(),
+                1,
+                "env {env} must get its OWN nginx WAL file: {files:?}"
+            );
+        }
+
+        // And the events did not cross: prod carries two, lab one.
+        let counts: Vec<usize> = ["prod", "lab"]
+            .iter()
+            .map(|env| {
+                let name = &wal_files(tmp.path(), env)[0];
+                std::fs::read_to_string(tmp.path().join(env).join(name))
+                    .unwrap()
+                    .lines()
+                    .count()
+            })
             .collect();
-
-        let nginx_files = files
-            .iter()
-            .filter(|f| f.file_name().to_string_lossy().starts_with("nginx"))
-            .count();
-        let sshd_files = files
-            .iter()
-            .filter(|f| f.file_name().to_string_lossy().starts_with("sshd"))
-            .count();
-        assert_eq!(nginx_files, 1, "should have one WAL file for nginx");
-        assert_eq!(sshd_files, 1, "should have one WAL file for sshd");
+        assert_eq!(counts, vec![2, 1], "events must not cross env boundaries");
     }
 }

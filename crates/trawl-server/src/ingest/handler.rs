@@ -19,7 +19,7 @@ use indexmap::IndexMap;
 
 use crate::error::ServerError;
 use crate::ingest::envelope::{self, EnvelopeContext, RejectReason};
-use crate::ingest::pipeline::ServiceBatch;
+use crate::ingest::pipeline::{BatchKey, ServiceBatch};
 use crate::ingest::producer::Producer;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::state::AppState;
@@ -72,10 +72,6 @@ impl RejectCounts {
         }
     }
 }
-
-/// The batch key: `(env, service)` — two envs must never share a WAL
-/// batch, a hot-buffer drain key, or a parquet partition (ADR-0009).
-type BatchKey = (String, String);
 
 /// Parsed ingest payload, grouped by `(env, service)`.
 #[derive(Debug)]
