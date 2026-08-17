@@ -574,18 +574,32 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPo
 
 /// One repin at a time: a concurrent second request 409s with the error
 /// envelope (not a refusal plan); ingest and queries ride through the
-/// slowed rewrite — events land in the hot buffer immediately and exactly
-/// once in the post-cutover corpus, and a query loop across the whole job
-/// (build, cutover, sweep) never errors. That loop also scrapes `/metrics`
-/// from INSIDE the slowed rewrite: the running gauge is up and the
-/// `files_total`/`files_done` progress pair is readable while the job is still
-/// running, with the outcome counter landing only at the terminal state.
+/// rewrite — events land in the hot buffer immediately and exactly once in
+/// the post-cutover corpus, and a query loop across the rest of the job
+/// (release, catch-up, cutover, sweep) never errors. `/metrics` is scraped
+/// from INSIDE the rewrite: the running gauge is up and the
+/// `files_total`/`files_done` progress pair is readable while the job is
+/// still running, with the outcome counter landing only at the terminal
+/// state.
+///
+/// Synchronised by ORDERING, not by timing (issue #79 review). The mid-job
+/// state this test observes — job row `running`, running gauge up,
+/// `files_done` ≥ 1 — exists only between the end of the first build pass
+/// (progress is published per PASS) and the job's terminal write, and a
+/// polling observer can miss that window or find the job already finished
+/// on its first read; both were reproducible here by removing the per-file
+/// delay, and `retries = 1` is why CI saw it as a flake rather than a
+/// failure. The build now HOLDS at its first published progress until this
+/// test releases it, so every mid-job assertion below is a fact about
+/// order. No sleeps, and no per-file delay at all.
 #[sqlx::test(migrations = false)]
 async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sqlx::PgPool) {
+    use std::sync::atomic::Ordering;
+
     let h = harness(pool).await;
 
-    // Seed a few affected files across services (more files = longer
-    // build under the per-file delay).
+    // Seed a few affected files across services, so the build's first pass
+    // has real per-file progress to publish.
     for svc in ["api", "web", "worker"] {
         h.ingest_and_compact(&[
             event(svc, &json!({"status": 200})),
@@ -595,8 +609,14 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     }
     assert_eq!(h.count("last=1h | stats count()").await, 6);
 
-    trawl_server::repin::engine::TEST_FILE_DELAY_MS
-        .store(250, std::sync::atomic::Ordering::Relaxed);
+    // Arm the hold BEFORE the request: from its first published progress
+    // until this test releases it, the job cannot terminalize, so every
+    // "during the rewrite" step below is during the rewrite by
+    // construction.
+    trawl_server::repin::engine::TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
+    trawl_server::repin::engine::TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
+    trawl_server::repin::engine::TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+
     let started = match h
         .schema_admin
         .schema_repin("status", "VARCHAR", None, false, false)
@@ -635,60 +655,43 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     // gate, so it can never straddle the cutover).
     h.compact_tick().await;
 
-    // Query in a loop across the whole job: no query may ever error. The
-    // same loop scrapes /metrics while the job row still says Running and
-    // keeps the first body that shows the running gauge up — progress is
-    // observed MID-JOB, not reconstructed from the terminal state.
-    let query_loop = {
-        let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
-        let engine_store = h.server.state.storage.repin.clone();
-        let url = h.server.url.clone();
-        let id = started.id;
-        tokio::spawn(async move {
-            let mut queries = 0u32;
-            let mut mid_job: Option<String> = None;
-            loop {
-                let result = client
-                    .query_paginated("last=1h | stats count()", None, None)
-                    .await;
-                assert!(result.is_ok(), "query errored mid-repin: {result:?}");
-                queries += 1;
-                let job = engine_store.get(id).await.expect("job row").expect("job");
-                if job.status != trawl_server::store::RepinJobStatus::Running {
-                    return (queries, mid_job);
-                }
-                if mid_job.is_none() {
-                    let scrape = scrape_metrics(&url).await;
-                    let running =
-                        gauge_value(&scrape, trawl_server::metrics::CATALOG_REPIN_RUNNING)
-                            .is_some_and(|v| v >= 1.0);
-                    let progressed =
-                        gauge_value(&scrape, trawl_server::metrics::CATALOG_REPIN_FILES_DONE)
-                            .is_some_and(|v| v >= 1.0);
-                    if running && progressed {
-                        mid_job = Some(scrape);
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-    };
-
-    let done = h.wait_terminal(started.id).await;
-    trawl_server::repin::engine::TEST_FILE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
-
-    let (queries, mid_job) = query_loop.await.expect("query loop");
-    assert!(queries > 0, "the loop observed the running job");
-
-    // Exactly once: everything ingested before and during the job.
-    assert_eq!(h.pinned_type("status").await, "VARCHAR");
+    // The one state a mid-job scrape needs, pinned: wait for the hold.
+    for _ in 0..600 {
+        if trawl_server::repin::engine::TEST_PROGRESS_PUBLISHED.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        trawl_server::repin::engine::TEST_PROGRESS_PUBLISHED.load(Ordering::SeqCst),
+        "the build never published progress"
+    );
+    let held = h
+        .server
+        .state
+        .storage
+        .repin
+        .get(started.id)
+        .await
+        .expect("job row")
+        .expect("job");
+    assert_eq!(
+        held.status,
+        trawl_server::store::RepinJobStatus::Running,
+        "the held job is still running, which is what makes the scrape mid-job"
+    );
+    // Queries still answer inside the held build — nothing is excluded yet.
     assert_eq!(h.count("last=1h | stats count()").await, 7);
-    assert_eq!(h.count("status=418 last=1h | stats count()").await, 1);
+    let mid_job = scrape_metrics(&h.server.url).await;
 
-    // Progress was scrapeable MID-JOB: that body was taken while the
-    // rewrite was still running, with real progress already on it.
-    let mid_job = mid_job.expect("a progress scrape landed while the job was running");
+    // Progress is scrapeable MID-JOB: the running gauge is up and real
+    // per-file progress is already on it, by construction rather than by
+    // catching a window.
+    assert_eq!(
+        gauge_value(&mid_job, trawl_server::metrics::CATALOG_REPIN_RUNNING),
+        Some(1.0),
+        "the running gauge must be up while the job is held"
+    );
     let total_files = gauge_value(&mid_job, trawl_server::metrics::CATALOG_REPIN_FILES_TOTAL)
         .expect("mid-job scrape must carry the planned file count");
     let done_files = gauge_value(&mid_job, trawl_server::metrics::CATALOG_REPIN_FILES_DONE)
@@ -697,6 +700,44 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
         (1.0..=total_files).contains(&done_files),
         "mid-job progress {done_files} outside 1..={total_files}"
     );
+    assert!(
+        !mid_job.contains("trawl_catalog_repin_jobs_total{outcome=\"succeeded\"}"),
+        "the outcome counter must land only at the terminal state"
+    );
+
+    // Query across the REST of the job — the release, the catch-up passes,
+    // the cutover's exclusion window and the sweep. No query may error.
+    let query_loop = {
+        let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
+        let engine_store = h.server.state.storage.repin.clone();
+        let id = started.id;
+        tokio::spawn(async move {
+            let mut queries = 0u32;
+            loop {
+                let result = client
+                    .query_paginated("last=1h | stats count()", None, None)
+                    .await;
+                assert!(result.is_ok(), "query errored mid-repin: {result:?}");
+                queries += 1;
+                let job = engine_store.get(id).await.expect("job row").expect("job");
+                if job.status != trawl_server::store::RepinJobStatus::Running {
+                    return queries;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    };
+
+    trawl_server::repin::engine::TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    let queries = query_loop.await.expect("query loop");
+    assert!(queries > 0, "the loop queried across the running job");
+
+    // Exactly once: everything ingested before and during the job.
+    assert_eq!(h.pinned_type("status").await, "VARCHAR");
+    assert_eq!(h.count("last=1h | stats count()").await, 7);
+    assert_eq!(h.count("status=418 last=1h | stats count()").await, 1);
 
     // ...and the outcome landed once the job terminalized.
     let metrics = scrape_metrics(&h.server.url).await;

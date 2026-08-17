@@ -110,6 +110,32 @@ pub static TEST_SNAPSHOT_TAKEN: std::sync::atomic::AtomicBool =
 pub static TEST_RELEASE_BUILD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only HOLD at the first published progress, pinning the one state a
+/// mid-job observer needs: the job row `running`, the running gauge up, and
+/// `files_done` already ≥ 1 — with no exclusion primitive held, so queries
+/// and ingest still work exactly as they do mid-build.
+///
+/// Progress is published per PASS, not per file, so the window where
+/// "running AND `files_done` ≥ 1" holds opens only when pass 0 finishes and
+/// closes when the job terminalizes. A polling observer can miss it
+/// entirely — or find the job already terminal on its first read — which is
+/// timing, not behaviour. Holding the job at that point makes the
+/// observation an ORDERING instead of a race: the state is pinned until the
+/// test that wants to see it says so.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_HOLD_AFTER_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the build once it is HOLDING at published progress.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_PROGRESS_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the test to let the held job continue to catch-up and cutover.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_RELEASE_JOB: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// What `start` decided.
 #[derive(Debug)]
 pub enum StartOutcome {
@@ -667,6 +693,22 @@ impl RepinEngine {
                 .await
                 .map_err(JobAbort::Failed)?;
             self.publish_progress(job_id, &state).await;
+
+            // Test-only: pin the mid-job state for an observer (see
+            // `TEST_HOLD_AFTER_PROGRESS`). Bounded, so a mis-driven test
+            // fails instead of hanging, and armed once — later passes run
+            // at full speed.
+            #[cfg(any(test, feature = "test-support"))]
+            if TEST_HOLD_AFTER_PROGRESS.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                TEST_PROGRESS_PUBLISHED.store(true, std::sync::atomic::Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while !TEST_RELEASE_JOB.load(std::sync::atomic::Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+
             tracing::info!(
                 event_type = "repin_pass",
                 job_id,
