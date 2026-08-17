@@ -828,6 +828,111 @@ fn sev_subject_binds_through_the_severity_rules_in_both_lanes() {
     }
 }
 
+/// Issue #82: the SEVERITY set collapse must not change what matches.
+///
+/// A whole IN list now renders as ONE membership test over the union of
+/// its bands' ladder points, so a list naming a band twice, a band beside
+/// a point inside it, or an out-of-ladder integer has to answer exactly
+/// as the per-element disjunction did — in BOTH lanes. Reversed scalar
+/// operands ride along: the subject is still the call, so the band still
+/// applies.
+#[test]
+fn sev_subject_sets_and_reversed_operands_agree_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let unpinned = FieldTypes::new();
+
+    // (dsl, event level value, expected answer)
+    let cells: &[(&str, Value, Option<bool>)] = &[
+        // …and a list that names the SAME band twice, or a band and a
+        // point inside it, is still exactly that set (issue #82: the
+        // whole list renders as ONE membership test over ladder points,
+        // so the collapse must not change what matches).
+        (
+            r#"* | where sev(level) in ("error", "err", "error2")"#,
+            Value::String("error4".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level) in ("error", "err", "error2")"#,
+            Value::String("warn".into()),
+            Some(false),
+        ),
+        // A MIXED token/integer list, with the integer inside a named
+        // band: `warn` covers 13-16, so the 17 is the only addition.
+        (
+            r#"* | where sev(level) in ("warn", 17)"#,
+            Value::String("warn3".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level) in ("warn", 17)"#,
+            Value::String("error".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level) in ("warn", 17)"#,
+            Value::String("error2".into()),
+            Some(false),
+        ),
+        // An integer OUTSIDE the ladder joins the set unclamped and
+        // simply matches nothing, in both lanes.
+        (
+            r#"* | where sev(level) in ("warn", 99)"#,
+            Value::String("warn".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where sev(level) in ("warn", 99)"#,
+            Value::String("fatal".into()),
+            Some(false),
+        ),
+        // A NULL-producing value under a list is UNKNOWN, not false.
+        (
+            r#"* | where sev(level) in ("warn", "error")"#,
+            Value::String("gold".into()),
+            None,
+        ),
+        // Reversed scalar operands over the equality class: the subject
+        // is still the call, so the band still applies.
+        (
+            r#"* | where "error" == sev(level)"#,
+            Value::String("error3".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where "error" == sev(level)"#,
+            Value::String("warn".into()),
+            Some(false),
+        ),
+        (
+            r#"* | where "error" != sev(level)"#,
+            Value::String("warn".into()),
+            Some(true),
+        ),
+        (
+            r#"* | where "error" != sev(level)"#,
+            Value::String("error".into()),
+            Some(false),
+        ),
+        // The pipeline `!=` stays STRICT over a value with no reading —
+        // the complement of a set is still UNKNOWN for a NULL.
+        (
+            r#"* | where "error" != sev(level)"#,
+            Value::String("gold".into()),
+            None,
+        ),
+    ];
+
+    for (dsl, value, expected) in cells {
+        let event = event_with("level", value.clone());
+        assert_eq!(
+            run_cell(&conn, dsl, &event, &unpinned),
+            *expected,
+            "{dsl} over {value:?}"
+        );
+    }
+}
+
 /// The dialect argument travels with the subject: a syslog numeral
 /// inverts in both lanes, and its words are unaffected.
 #[test]

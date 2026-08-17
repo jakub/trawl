@@ -452,6 +452,12 @@ fn severity_band_parity_exhaustive() {
         "_severity!=info",
         "_severity=error,fatal",
         "_severity=trace,notice",
+        // Issue #82: the whole list collapses into ONE membership test
+        // over ladder points, so a list naming the same band twice, or a
+        // band beside a point inside it, must still be exactly that set.
+        "_severity=warn,17",
+        "_severity=error,err,error2",
+        "_severity=warn,99",
         "_severity=error2",
         "_severity=17",
         "_severity=warn*",
@@ -462,6 +468,42 @@ fn severity_band_parity_exhaustive() {
             assert_severity_parity(&conn, dsl, sev);
         }
     }
+}
+
+/// CHARACTERIZATION, not a blessing: in the SEARCH stage a comma list
+/// under `!=` means POSITIVE membership, in both lanes.
+///
+/// The parser keeps the written operator (`FilterOp::Ne`) on the filter,
+/// but both list consumers — `emitter::search`'s `FilterValue::List` arm
+/// and `filter.rs`'s `(_, FilterValue::List(values))` — resolve every
+/// element as an EQUALITY and render membership, so `_severity!=warn,error`
+/// answers exactly as `_severity=warn,error` does. That predates issue #82
+/// (the `IN` rendering changed the SQL text, not this) and is pinned here
+/// so the quirk cannot change silently: the two lanes agreeing is the
+/// property that matters, and they do.
+#[test]
+fn search_stage_ne_over_a_list_is_positive_membership_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    for sev in (1..=24).map(Some).chain([None]) {
+        let negated = assert_severity_parity(&conn, "_severity!=warn,error", sev);
+        let positive = assert_severity_parity(&conn, "_severity=warn,error", sev);
+        assert_eq!(
+            negated, positive,
+            "`!=` over a list is membership, not its complement (stored {sev:?})"
+        );
+    }
+    // …and it really is membership, not "always true": the WARN/ERROR
+    // bands match and a DEBUG number does not.
+    assert!(assert_severity_parity(
+        &conn,
+        "_severity!=warn,error",
+        Some(17)
+    ));
+    assert!(!assert_severity_parity(
+        &conn,
+        "_severity!=warn,error",
+        Some(5)
+    ));
 }
 
 /// A bare term matching only `_raw` content returns the event; negation
