@@ -2062,7 +2062,7 @@ pub(crate) fn repin_target_expr(
             quoted,
             &quote_ident(trawl_core::schema::RAW),
             folded,
-            pin,
+            trawl_core::conform::RepinTarget::otel(pin),
         )
     } else {
         trawl_core::conform::guarded_cast(&trawl_core::conform::untyped_text(quoted), pin)

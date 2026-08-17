@@ -384,3 +384,51 @@ fn renders_as_severity_folds_ascii_case() {
     assert!(!renders_as_severity("s2", &declared));
     assert!(!renders_as_severity("s", &[]));
 }
+
+/// The dialect-ambiguous set is EXACTLY the integers 1-7 (issue #79).
+///
+/// The two ladders overlap only there: `0` is emerg to syslog and nothing
+/// to `OTel`, 8-24 are `OTel` rungs syslog has no numeral for, and every
+/// token is dialect-free by construction. Pinned over a wide integer
+/// range and the whole token vocabulary, because this set is what the
+/// repin's ambiguity gate refuses on — a rung leaking in either direction
+/// is either a silent mistranslation or a refusal nothing can clear.
+#[test]
+fn dialect_ambiguity_is_exactly_the_syslog_overlap() {
+    for n in -30..=30i64 {
+        let text = n.to_string();
+        assert_eq!(
+            dialect_ambiguous(&text),
+            (1..=7).contains(&n),
+            "integer {n} misclassified"
+        );
+    }
+    // Spelling never decides: a sign, padding and leading zeros all read
+    // through to the same integer, so they carry its verdict.
+    for (text, ambiguous) in [
+        ("+3", true),
+        (" 3 ", true),
+        ("\u{a0}3\u{a0}", true),
+        ("007", true),
+        ("-3", false),
+        ("+17", false),
+        ("017", false),
+        ("3.0", false),
+        ("1e1", false),
+        ("0x3", false),
+        ("", false),
+        ("gold", false),
+    ] {
+        assert_eq!(dialect_ambiguous(text), ambiguous, "{text:?}");
+    }
+    // Words are dialect-free: every token and every exact short name reads
+    // the same in both dialects, whatever its case.
+    for (token, _) in token_entries() {
+        for spelling in [token.to_owned(), token.to_uppercase()] {
+            assert!(!dialect_ambiguous(&spelling), "token {spelling}");
+        }
+    }
+    for n in 1..=24u8 {
+        assert!(!dialect_ambiguous(otel_name(n).unwrap()), "exact name {n}");
+    }
+}

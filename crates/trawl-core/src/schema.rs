@@ -94,6 +94,32 @@ pub fn is_reserved_name(name: &str) -> bool {
     name.starts_with('_')
 }
 
+/// The envelope fields the SENDER asserts (ADR-0013 §1): bare names, but
+/// declared slots all the same — trawl mirrors `env`/`service` into the
+/// storage path, peer-fills `host`, and every result surface leads with
+/// `message`.
+///
+/// Bare because the sender is the authority on those VALUES; declared
+/// because their TYPE is part of the event contract, which is what
+/// [`is_contract_typed`] answers.
+pub const SENDER_ASSERTED_ENVELOPE: &[&str] = &[ENV, SERVICE, HOST, MESSAGE];
+
+/// Whether a field's TYPE is trawl's to declare rather than an operator's
+/// to change (issue #79).
+///
+/// The union of the two namespaces the envelope spans: everything under the
+/// sealed `_` prefix ([`is_reserved_name`], which covers every trawl-owned
+/// slot present AND future) plus the four sender-asserted bare names
+/// ([`SENDER_ASSERTED_ENVELOPE`]). A repin retypes ONE field's corpus, and
+/// these are exactly the fields whose type the rest of the system reasons
+/// from — the partition path, the peer fill, the severity ladder — so the
+/// refusal is a predicate over the contract rather than a list of names
+/// somewhere else that has to be kept in step with the envelope.
+#[must_use]
+pub fn is_contract_typed(name: &str) -> bool {
+    is_reserved_name(name) || SENDER_ASSERTED_ENVELOPE.contains(&name)
+}
+
 /// The one refusal text every pipeline write position shares, so the SQL
 /// lane and the streaming lane state the same rule in the same words.
 #[must_use]
@@ -428,6 +454,37 @@ mod tests {
             "a_b",
         ] {
             assert!(!is_reserved_name(name), "{name}");
+        }
+    }
+
+    /// The contract-typed predicate must cover the WHOLE declared envelope,
+    /// whichever namespace a slot lives in — it is what refuses a repin of
+    /// a field whose type the event contract fixes, and a slot added to
+    /// `ENVELOPE_TYPES` without a matching name here would become
+    /// repinnable silently.
+    #[test]
+    fn every_envelope_field_is_contract_typed() {
+        for (field, _) in ENVELOPE_TYPES {
+            assert!(is_contract_typed(field), "{field} escaped the predicate");
+        }
+        for name in SENDER_ASSERTED_ENVELOPE {
+            assert!(!is_reserved_name(name), "{name} is bare by design");
+            assert!(
+                ENVELOPE_TYPES.iter().any(|(f, _)| f == name),
+                "{name} must be a declared envelope field"
+            );
+        }
+        // Sender vocabulary is the operator's to repin, including the names
+        // that used to be envelope slots (ADR-0013 §7).
+        for name in [
+            "level",
+            "severity",
+            "timestamp",
+            "status",
+            "duration",
+            "env2",
+        ] {
+            assert!(!is_contract_typed(name), "{name}");
         }
     }
 
