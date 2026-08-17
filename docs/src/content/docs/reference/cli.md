@@ -218,6 +218,16 @@ cutover instant. If the sender really speaks syslog PRI, declare it in
 `[ingest] severity_from` (`dialect = "syslog"`) so live events read the
 same way, then repin the history.
 
+**What it costs.** The severity rung is the most expensive conform in the
+vocabulary: it is a token table, an ASCII gate and a guarded numeric read
+per value, measured at roughly **36 µs per affected row** — about 10× any
+other target — so a 100-million-row field is on the order of one CPU-hour
+of rewriting. Retention stands down for the job's whole life and the
+affected bytes are held twice until it sweeps, so size the window before
+starting: a repin that runs for hours is a repin that suppresses deletion
+for hours. Unaffected files are hardlinked and cost nothing, so the number
+that matters is `rows_carrying` in the dry run, not the corpus total.
+
 `repin --to severity` needs `schema_write` and a human, like every other
 repin. `_severity` itself — and every other declared envelope field — is
 refused: its type is part of the event contract.

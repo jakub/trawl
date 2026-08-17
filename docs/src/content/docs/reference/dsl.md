@@ -457,8 +457,19 @@ the column once:
 trawl schema repin level --to severity --dry-run   # plan first, always
 ```
 
-Then `level` behaves exactly as `_severity` does, in every lane, for
-history and for live events alike (ingest conforms through the same pin).
+Then `level` behaves as `_severity` does — bands, ordered comparison and
+token rendering — in every lane, for stored history and for events ingested
+after the cutover.
+
+One caveat, and it is the whole reason `--dialect` exists: the repin
+rewrites **history** with the dialect you assert, while live events keep
+taking the ingest-time reading, which is always OTel. Under `--dialect
+syslog` a historical `3` becomes 17 (`err`) and the next live `3` conforms
+as OTel 3 (`trace3`) — one column, two meanings, split at the cutover
+instant. Tokens are unaffected (`"error"` is 17 either way); only numerals
+carry the split. If the sender really speaks syslog PRI, declare it in
+`[ingest] severity_from` first, then repin the history.
+
 The dry run reports the values the ladder cannot read, and — for a corpus
 carrying numerals 1-7, which OTel and syslog PRI read as different
 severities — refuses until you assert `--dialect syslog` or pass `--force`.

@@ -39,7 +39,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   design, so without that a plan carrying loss or ambiguity read as a clean
   200 and the refusal arrived with the request that was meant to do the
   work; the verdict is computed from the row's own numbers through the same
-  decision the two live gates ask.
+  decision the two live gates ask, and is ABSENT (not `false`) until the
+  scan has recorded a plan.
+
+  **Cost, stated plainly**: the severity rung conforms at roughly 36 µs per
+  affected row — about 10× any other target, so ~1 CPU-hour per 100M rows
+  carrying the field — with retention suppressed and the affected bytes held
+  twice for the job's whole life. The dry run's `rows_carrying` is the number
+  to size that against.
 
 - **Producer profiles, configurable derivation sources, and `_producer`
   (ADR-0013 slice 2 rulings 1-6, #75).** All three producers now enter

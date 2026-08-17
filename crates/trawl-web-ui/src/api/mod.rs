@@ -280,6 +280,10 @@ pub async fn repin(
         // key is what the server folds and looks up.
         field: field.to_owned(),
         to: to.to_owned(),
+        // The SPA offers physical targets only (see `repin_flow::REPIN_LADDER`),
+        // and a dialect is meaningful for SEVERITY alone — the server 400s it
+        // on anything else, so sending one here could only ever be a bug.
+        dialect: None,
         dry_run,
         force,
     };

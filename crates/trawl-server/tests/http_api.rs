@@ -2122,18 +2122,22 @@ async fn repin_permission_matrix(pool: sqlx::PgPool) {
     assert!(ingest.schema_repin_status().await.is_err());
 }
 
-/// Envelope fields and unknown target types refuse with 400 before any
-/// job row exists — validation is side-effect-free.
+/// Contract-typed fields, unknown target types and unpinned fields refuse
+/// with 400 before any job row exists — validation is side-effect-free.
 #[sqlx::test(migrations = false)]
 async fn repin_validation_refusals_are_side_effect_free(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
 
     for (field, to) in [
-        ("_severity", "VARCHAR"), // envelope field
+        ("_severity", "VARCHAR"), // the derived slot: contract-typed
         ("_time", "VARCHAR"),     // envelope metadata
-        ("status", "UUID"),       // not a ladder type
-        ("status", "SEVERITY"),   // semantic pin: no physical spelling
+        ("service", "BIGINT"),    // sender-asserted, still contract-typed
+        ("status", "UUID"),       // not a catalog type
+        // SEVERITY is an admissible target since #79, so this row is
+        // refused for the OTHER reason a repin can be: nothing has pinned
+        // `status` on this server, so there is nothing to repin.
+        ("status", "SEVERITY"),
     ] {
         let err = client
             .schema_repin(field, to, None, true, false)
