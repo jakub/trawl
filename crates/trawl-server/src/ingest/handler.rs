@@ -172,12 +172,13 @@ pub async fn ingest(
     // Capture request-scoped context before moving into the blocking task.
     let arrival_instant = chrono::Utc::now();
     let arrival = arrival_instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-    let peer_host = peer_addr.ip().to_string();
+    let peer_ip = crate::syslog::canonical_peer(peer_addr.ip());
+    let peer_host = peer_ip.to_string();
     let peer_is_trusted_relay = state
         .ingest
         .trusted_relays
         .iter()
-        .any(|c| c.contains(peer_addr.ip()));
+        .any(|c| c.contains(peer_ip));
     let envs = Arc::clone(&state.ingest.envs);
     let default_env = Arc::clone(&state.ingest.default_env);
     let derivation = Arc::clone(&state.ingest.derivation);

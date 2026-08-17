@@ -110,6 +110,18 @@ pub fn spawn_syslog(
     handles
 }
 
+/// Canonicalize a peer address at the transport door: a dual-stack listener
+/// presents an IPv4 peer as an IPv4-mapped IPv6 address (`::ffff:10.1.2.3`),
+/// which would fail the family match in [`CidrEntry::contains`], miss a
+/// v4-keyed `source_service_map` entry, and render the mapped spelling into
+/// `host`. Every consumer downstream of an accept/recv sees ONE spelling.
+pub fn canonical_peer(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
 /// A parsed CIDR entry for allowlist checking.
 #[derive(Debug, Clone)]
 pub struct CidrEntry {
@@ -190,6 +202,25 @@ pub fn is_allowed(cidrs: &[CidrEntry], ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv4_mapped_peer_canonicalizes_to_v4() {
+        // A dual-stack listener hands us `::ffff:10.1.2.3` for a v4 peer; a
+        // v4-configured trusted relay must still recognize it (and `host`
+        // attribution must render the v4 spelling, not the mapped one).
+        let mapped: IpAddr = "::ffff:10.1.2.3".parse().unwrap();
+        let canonical = canonical_peer(mapped);
+        assert_eq!(canonical, "10.1.2.3".parse::<IpAddr>().unwrap());
+        let relay = parse_cidr("10.0.0.0/8").unwrap();
+        assert!(
+            !relay.contains(mapped),
+            "family mismatch is the bug's shape"
+        );
+        assert!(relay.contains(canonical));
+        // Genuine v6 peers pass through untouched.
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(canonical_peer(v6), v6);
+    }
 
     #[test]
     fn cidr_contains_ipv4() {

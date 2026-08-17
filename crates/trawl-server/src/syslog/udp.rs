@@ -55,7 +55,7 @@ pub async fn run_udp_listener(
 
             result = socket.recv_from(&mut buf) => {
                 let (len, src_addr) = result?;
-                let source_ip = src_addr.ip();
+                let source_ip = super::canonical_peer(src_addr.ip());
 
                 // Check CIDR allowlist
                 if !super::is_allowed(&cidrs, source_ip) {
