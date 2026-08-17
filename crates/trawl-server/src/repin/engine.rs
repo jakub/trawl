@@ -147,16 +147,19 @@ impl RepinEngine {
     ///
     /// Refusals are side-effect-free on the corpus; every claim leaves a
     /// job row (the dry-run report IS the row).
+    #[allow(clippy::too_many_arguments)] // one flag bundle per request field
     pub async fn start(
         self: &Arc<Self>,
         field: &str,
         to: &str,
+        dialect: Option<&str>,
         dry_run: bool,
         force: bool,
         requested_by: Option<&str>,
     ) -> Result<StartOutcome, ServerError> {
         let field = field.to_ascii_lowercase();
         let to = parse_target(to)?;
+        let dialect = resolve_dialect(to, dialect)?;
         // A PREDICATE, not the envelope list: the whole `_` prefix is
         // trawl's (`schema::is_contract_typed`), so a contract slot added
         // later is refused the day it exists rather than the day somebody
@@ -184,7 +187,15 @@ impl RepinEngine {
         // The one-running slot: a second request 409s here.
         let job_id = self
             .store
-            .claim(&field, from, to, dry_run, force, requested_by)
+            .claim(crate::store::RepinClaim {
+                field: &field,
+                from_type: from,
+                to_type: to,
+                dialect,
+                dry_run,
+                force,
+                requested_by,
+            })
             .await?;
 
         tracing::info!(
@@ -193,6 +204,7 @@ impl RepinEngine {
             field = %field,
             from = from.as_catalog(),
             to = to.as_catalog(),
+            dialect = dialect.map(trawl_core::severity::Dialect::token),
             dry_run,
             force,
             "repin job claimed; scanning the corpus"
@@ -273,15 +285,18 @@ impl RepinEngine {
                 return Err(ServerError::Internal(format!("repin scan failed: {e}")));
             }
         };
+        let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
         if let Err(e) = self
             .store
             .record_plan(
                 job_id,
-                i64::try_from(counts.files_total).unwrap_or(i64::MAX),
-                i64::try_from(counts.rows_carrying).unwrap_or(i64::MAX),
-                i64::try_from(counts.projected_nulls).unwrap_or(i64::MAX),
-                i64::try_from(counts.resurrectable).unwrap_or(i64::MAX),
-                i64::try_from(counts.affected_bytes).unwrap_or(i64::MAX),
+                crate::store::RepinPlanCounts {
+                    files_total: clamp(counts.files_total),
+                    rows_carrying: clamp(counts.rows_carrying),
+                    projected_nulls: clamp(counts.projected_nulls),
+                    resurrectable: clamp(counts.resurrectable),
+                    affected_bytes: clamp(counts.affected_bytes),
+                },
             )
             .await
         {
@@ -986,6 +1001,42 @@ fn run_pass_blocking(
 /// only other installer. What used to make the physical door the gate —
 /// "severity is not an operator decision" — is exactly what this slice
 /// reverses.
+/// Resolve the asserted numeral dialect for a target (issue #79).
+///
+/// A `SEVERITY` target always ends up with one — `otel` when the request
+/// says nothing, because that is what every other lane reads and a repin
+/// that changed the ladder by omission would be the silent mistranslation
+/// this whole feature exists to make deliberate.
+///
+/// Any OTHER target with a dialect is a 400, not an ignored field: the
+/// dialect only reaches the SEVERITY rung, so accepting it elsewhere would
+/// tell an operator their assertion was honoured when nothing read it.
+fn resolve_dialect(
+    to: CanonicalType,
+    dialect: Option<&str>,
+) -> Result<Option<trawl_core::severity::Dialect>, ServerError> {
+    use trawl_core::severity::{DIALECT_TOKENS, Dialect};
+
+    match (to, dialect) {
+        (CanonicalType::Severity, None) => Ok(Some(Dialect::Otel)),
+        (CanonicalType::Severity, Some(token)) => {
+            Dialect::from_token(token).map(Some).ok_or_else(|| {
+                ServerError::BadRequest(format!(
+                    "unknown severity dialect {token:?} — the vocabulary is {}",
+                    DIALECT_TOKENS.join(", ")
+                ))
+            })
+        }
+        (_, None) => Ok(None),
+        (_, Some(token)) => Err(ServerError::BadRequest(format!(
+            "dialect {token:?} is only meaningful for a SEVERITY target — \
+             the dialect reads NUMERALS onto the severity ladder, and {} \
+             has no ladder to read them onto",
+            to.as_catalog()
+        ))),
+    }
+}
+
 fn parse_target(to: &str) -> Result<CanonicalType, ServerError> {
     CanonicalType::from_catalog(&to.to_ascii_uppercase()).ok_or_else(|| {
         ServerError::BadRequest(format!(
@@ -1030,6 +1081,55 @@ mod tests {
             assert!(
                 matches!(err, ServerError::BadRequest(ref m) if m.contains("unknown repin target type")),
                 "{rejected}: {err:?}"
+            );
+        }
+    }
+
+    /// The dialect is a SEVERITY-only assertion: a severity target defaults
+    /// to `otel` (what every other lane reads), an unknown token names the
+    /// vocabulary, and a dialect on any other target is refused rather than
+    /// ignored — an ignored assertion is one an operator believes was
+    /// honoured.
+    #[test]
+    fn the_dialect_is_resolved_for_severity_targets_only() {
+        use trawl_core::severity::Dialect;
+
+        assert_eq!(
+            resolve_dialect(CanonicalType::Severity, None).unwrap(),
+            Some(Dialect::Otel),
+            "an omitted dialect is the OTel reading, never an absent one"
+        );
+        for (token, want) in [
+            ("otel", Dialect::Otel),
+            ("SYSLOG", Dialect::Syslog),
+            ("Syslog", Dialect::Syslog),
+        ] {
+            assert_eq!(
+                resolve_dialect(CanonicalType::Severity, Some(token)).unwrap(),
+                Some(want),
+                "{token}"
+            );
+        }
+        let err = resolve_dialect(CanonicalType::Severity, Some("rfc5424")).expect_err("refuse");
+        assert!(
+            matches!(err, ServerError::BadRequest(ref m)
+                if m.contains("unknown severity dialect") && m.contains("syslog")),
+            "{err:?}"
+        );
+
+        for pin in [
+            CanonicalType::Varchar,
+            CanonicalType::BigInt,
+            CanonicalType::Double,
+            CanonicalType::Timestamp,
+            CanonicalType::Boolean,
+        ] {
+            assert_eq!(resolve_dialect(pin, None).unwrap(), None, "{pin:?}");
+            let err = resolve_dialect(pin, Some("syslog")).expect_err("refuse");
+            assert!(
+                matches!(err, ServerError::BadRequest(ref m)
+                    if m.contains("only meaningful for a SEVERITY target")),
+                "{pin:?}: {err:?}"
             );
         }
     }

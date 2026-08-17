@@ -475,6 +475,7 @@ impl HttpClient {
         &self,
         field: &str,
         to: &str,
+        dialect: Option<&str>,
         dry_run: bool,
         force: bool,
     ) -> Result<RepinStart, ClientError> {
@@ -482,6 +483,7 @@ impl HttpClient {
         let body = trawl_api::RepinRequest {
             field: field.to_owned(),
             to: to.to_owned(),
+            dialect: dialect.map(str::to_owned),
             dry_run,
             force,
         };

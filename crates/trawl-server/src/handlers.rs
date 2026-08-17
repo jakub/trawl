@@ -1732,6 +1732,19 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
         rows_rewritten: clamp(job.rows_rewritten),
         rows_nulled: clamp(job.rows_nulled),
         rows_resurrected: clamp(job.rows_resurrected),
+        dialect: job.dialect,
+        ambiguous_numerals: clamp(job.ambiguous_numerals),
+        unmapped_samples: job.unmapped_samples,
+        // Presence IS the verdict, so both halves must be present: a row
+        // with an observation instant and no service is a partially-written
+        // job row, not a liveness warning.
+        liveness: job
+            .field_last_seen
+            .zip(job.field_last_service)
+            .map(|(last_seen, service)| trawl_api::RepinLiveness {
+                last_seen: iso8601(last_seen),
+                service,
+            }),
     }
 }
 
@@ -1743,8 +1756,9 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
 /// nulled values and no force flag was passed — the body is the plan the
 /// refusal is based on (a second concurrent repin also 409s, but with the
 /// error envelope). Validation refusals (unpinned field, envelope field,
-/// unknown target type, same-type without force) are 400s; a query-only
-/// node answers 503 — it owns nothing under the data root.
+/// unknown target type, same-type without force, a dialect on a
+/// non-`SEVERITY` target) are 400s; a query-only node answers 503 — it owns
+/// nothing under the data root.
 pub async fn schema_repin(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -1765,6 +1779,7 @@ pub async fn schema_repin(
         .start(
             &req.field,
             &req.to,
+            req.dialect.as_deref(),
             req.dry_run,
             req.force,
             Some(&verified.name),

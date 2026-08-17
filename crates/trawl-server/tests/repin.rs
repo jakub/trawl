@@ -249,7 +249,7 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values(pool: sqlx:
     // nothing lost (VARCHAR is the always-lossless target).
     let dry = match h
         .schema_admin
-        .schema_repin("status", "varchar", true, false)
+        .schema_repin("status", "varchar", None, true, false)
         .await
         .expect("dry run")
     {
@@ -265,7 +265,7 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values(pool: sqlx:
     // Execute; the dry-run projection is the rewrite's outcome.
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", false, false)
+        .schema_repin("status", "VARCHAR", None, false, false)
         .await
         .expect("execute")
     {
@@ -352,7 +352,7 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it(pool: sqlx::PgPo
     // Lossy without force: 409, plan attached, nothing changed.
     let refused = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", false, false)
+        .schema_repin("dur", "BIGINT", None, false, false)
         .await
         .expect("refusal is a decoded outcome, not a transport error")
     {
@@ -368,7 +368,7 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it(pool: sqlx::PgPo
     // evidence like any lossy conform.
     let started = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", false, true)
+        .schema_repin("dur", "BIGINT", None, false, true)
         .await
         .expect("forced execute")
     {
@@ -431,7 +431,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool
     }
     let dry = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", true, false)
+        .schema_repin("dur", "BIGINT", None, true, false)
         .await
         .expect("dry run")
     {
@@ -445,7 +445,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool
         .store(400, std::sync::atomic::Ordering::Relaxed);
     let started = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", false, false)
+        .schema_repin("dur", "BIGINT", None, false, false)
         .await
         .expect("execute")
     {
@@ -482,7 +482,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool
     // The operator's answer: the same repin, forced, accepts the loss.
     let forced = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", false, true)
+        .schema_repin("dur", "BIGINT", None, false, true)
         .await
         .expect("forced execute")
     {
@@ -520,7 +520,7 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPo
         .clone()
         .expect("an ingest-enabled node owns a repin engine");
     TEST_SCAN_DELAY_MS.store(500, Ordering::Relaxed);
-    let mut start = Box::pin(engine.start("status", "VARCHAR", true, false, Some("op")));
+    let mut start = Box::pin(engine.start("status", "VARCHAR", None, true, false, Some("op")));
     // Let the claim land and the scan begin, then drop the future exactly
     // as hyper drops a handler whose connection went away.
     assert!(
@@ -563,7 +563,7 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPo
     // And the slot is free: the next repin is served, not 409ed.
     match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", true, false)
+        .schema_repin("status", "VARCHAR", None, true, false)
         .await
         .expect("the running slot is free again")
     {
@@ -599,7 +599,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
         .store(250, std::sync::atomic::Ordering::Relaxed);
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", false, false)
+        .schema_repin("status", "VARCHAR", None, false, false)
         .await
         .expect("execute")
     {
@@ -611,7 +611,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     // through the error envelope.
     let second = h
         .schema_admin
-        .schema_repin("status", "DOUBLE", false, false)
+        .schema_repin("status", "DOUBLE", None, false, false)
         .await;
     match second {
         Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 409),
@@ -763,7 +763,7 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: 
     coordinator.set_cutover_hold_ms(3_000);
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", false, false)
+        .schema_repin("status", "VARCHAR", None, false, false)
         .await
         .expect("execute")
     {
@@ -913,14 +913,15 @@ async fn boot_reconciliation_completes_a_recovered_cutover(pool: sqlx::PgPool) {
         .state
         .storage
         .repin
-        .claim(
-            "status",
-            trawl_core::schema::CanonicalType::BigInt,
-            trawl_core::schema::CanonicalType::Varchar,
-            false,
-            false,
-            None,
-        )
+        .claim(trawl_server::store::RepinClaim {
+            field: "status",
+            from_type: trawl_core::schema::CanonicalType::BigInt,
+            to_type: trawl_core::schema::CanonicalType::Varchar,
+            dialect: None,
+            dry_run: false,
+            force: false,
+            requested_by: None,
+        })
         .await
         .unwrap();
     let tmp = tempfile::tempdir().unwrap();
@@ -1041,14 +1042,15 @@ async fn boot_reconciliation_completes_a_recovered_cutover(pool: sqlx::PgPool) {
         .state
         .storage
         .repin
-        .claim(
-            "status",
-            trawl_core::schema::CanonicalType::Varchar,
-            trawl_core::schema::CanonicalType::BigInt,
-            false,
-            false,
-            None,
-        )
+        .claim(trawl_server::store::RepinClaim {
+            field: "status",
+            from_type: trawl_core::schema::CanonicalType::Varchar,
+            to_type: trawl_core::schema::CanonicalType::BigInt,
+            dialect: None,
+            dry_run: false,
+            force: false,
+            requested_by: None,
+        })
         .await
         .unwrap();
     trawl_server::repin::recover::reconcile_store(
@@ -1086,7 +1088,7 @@ async fn resurrection_only_pass_recovers_without_retyping(pool: sqlx::PgPool) {
     // Same type without force is a 400 (nothing to do without intent).
     let err = h
         .schema_admin
-        .schema_repin("status", "BIGINT", false, false)
+        .schema_repin("status", "BIGINT", None, false, false)
         .await
         .expect_err("same-type without force refuses");
     match err {
@@ -1099,7 +1101,7 @@ async fn resurrection_only_pass_recovers_without_retyping(pool: sqlx::PgPool) {
     // zero (it was ALREADY null) — but a recoverable value would return.
     let dry = match h
         .schema_admin
-        .schema_repin("status", "BIGINT", true, true)
+        .schema_repin("status", "BIGINT", None, true, true)
         .await
         .expect("dry run")
     {
@@ -1111,4 +1113,102 @@ async fn resurrection_only_pass_recovers_without_retyping(pool: sqlx::PgPool) {
         "already-shelved values are not new losses"
     );
     assert_eq!(dry.resurrectable, 0, "`accepted` has no BIGINT reading");
+}
+
+/// Boot recovery over a SEVERITY cutover marker (issue #79): the engine
+/// writes the marker with the CATALOG spelling, so recovery has to read it
+/// back that way. The physical parse has no `SEVERITY` spelling at all,
+/// which made this the one replay path that could REFUSE — and it refuses
+/// after the corpus is already half-swapped, where forward is the only safe
+/// direction.
+#[sqlx::test(migrations = false)]
+async fn boot_reconciliation_replays_a_severity_cutover(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    // A sender field an operator repins onto the ladder.
+    h.ingest_and_compact(&[event("api", &json!({"level": "error"}))])
+        .await;
+    assert_eq!(h.pinned_type("level").await, "VARCHAR");
+
+    let job_id = h
+        .server
+        .state
+        .storage
+        .repin
+        .claim(trawl_server::store::RepinClaim {
+            field: "level",
+            from_type: trawl_core::schema::CanonicalType::Varchar,
+            to_type: trawl_core::schema::CanonicalType::Severity,
+            dialect: Some(trawl_core::severity::Dialect::Syslog),
+            dry_run: false,
+            force: true,
+            requested_by: None,
+        })
+        .await
+        .unwrap();
+
+    // A throwaway root crashed mid-cutover: the shadow holds the new
+    // generation, the marker names the SEVERITY target as the engine spells
+    // it (`CanonicalType::as_catalog`).
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let dir = data.join("prod/2026-01-01/10");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("svc.parquet"), b"old generation").unwrap();
+    let shadow = trawl_server::repin::shadow_root(&data);
+    let sdir = shadow.join("prod/2026-01-01/10");
+    std::fs::create_dir_all(&sdir).unwrap();
+    std::fs::write(sdir.join("svc.parquet"), b"new generation").unwrap();
+    trawl_server::repin::marker::write_marker(
+        &data,
+        &trawl_server::repin::RepinMarker {
+            job_id,
+            field: "level".to_owned(),
+            from_type: trawl_core::schema::CanonicalType::Varchar
+                .as_catalog()
+                .to_owned(),
+            to_type: trawl_core::schema::CanonicalType::Severity
+                .as_catalog()
+                .to_owned(),
+            phase: trawl_server::repin::RepinPhase::Cutover,
+        },
+    )
+    .unwrap();
+
+    let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
+        .unwrap()
+        .expect("marker present");
+    trawl_server::repin::recover::reconcile_store(
+        &h.server.state.storage,
+        &h.server.state.query.field_catalog,
+        &data,
+        Some(recovered),
+    )
+    .await
+    .expect("a severity cutover marker must replay, not refuse");
+
+    // Forward: the swap finished, the pin flipped in postgres and in the
+    // in-process cache, and the job completed.
+    assert_eq!(
+        std::fs::read(data.join("prod/2026-01-01/10/svc.parquet")).unwrap(),
+        b"new generation"
+    );
+    assert_eq!(h.pinned_type("level").await, "SEVERITY");
+    assert_eq!(
+        h.server.state.query.field_catalog.get("level"),
+        Some(trawl_core::schema::CanonicalType::Severity),
+        "the cache must hold the SEMANTIC pin, not the BIGINT under it"
+    );
+    let job = h
+        .server
+        .state
+        .storage
+        .repin
+        .get(job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, trawl_server::store::RepinJobStatus::Succeeded);
+    assert_eq!(job.dialect.as_deref(), Some("syslog"));
+    assert!(!trawl_server::repin::marker_path(&data).exists());
 }

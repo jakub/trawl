@@ -905,9 +905,16 @@ pub struct CatalogConflictRow {
 pub struct RepinRequest {
     /// The field to repin (folded to the catalog's ASCII-lowercase key).
     pub field: String,
-    /// Target candidate-ladder type (`BIGINT`, `DOUBLE`, `TIMESTAMP`,
-    /// `BOOLEAN`, `VARCHAR`; case-insensitive).
+    /// Target catalog type (`BIGINT`, `DOUBLE`, `TIMESTAMP`, `BOOLEAN`,
+    /// `VARCHAR`, `SEVERITY`; case-insensitive).
     pub to: String,
+    /// Which dialect the corpus's NUMERALS are read in for a `SEVERITY`
+    /// target: `otel` (default) or `syslog`. The two ladders overlap over
+    /// 1-7 with opposite meanings, so no value-shape rule can tell them
+    /// apart — the operator asserts provenance. A dialect with any other
+    /// target is a 400: it would be silently ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
     /// Scan and report only — no mutation.
     #[serde(default)]
     pub dry_run: bool,
@@ -962,6 +969,39 @@ pub struct RepinJobResponse {
     pub rows_nulled: u64,
     /// Outcome: values resurrected from `_raw`.
     pub rows_resurrected: u64,
+    /// The asserted numeral dialect — present exactly for a `SEVERITY`
+    /// target. Absent on a legacy job and on every other target: a
+    /// backfilled `otel` would report an assertion nobody made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
+    /// Rows whose numeral reads as a DIFFERENT severity in each dialect
+    /// (the 1-7 overlap) — the values only provenance can settle. Counted
+    /// whatever the dialect; what the dialect governs is the force gate.
+    #[serde(default)]
+    pub ambiguous_numerals: u64,
+    /// Up to five distinct sanitised samples of values the new pin cannot
+    /// read at all, `_raw` resurrection included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmapped_samples: Vec<String>,
+    /// Scan-time liveness, when something is still writing the field.
+    /// PRESENCE is the verdict — the consumer writes the words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<RepinLiveness>,
+}
+
+/// Evidence that a repin's subject is still being WRITTEN (issue #79).
+///
+/// A repin translates HISTORY. A field a live sender still feeds keeps
+/// arriving in the ingest-time reading, so a syslog-dialect rewrite leaves
+/// a discontinuity at the cutover instant — the fix for the live half is
+/// `[ingest] severity_from`, not another repin. Facts only, presence being
+/// the verdict (the `Option<DegradedVerdict>` shape).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepinLiveness {
+    /// Newest observation of the field (ISO 8601 UTC).
+    pub last_seen: String,
+    /// One service behind that observation.
+    pub service: String,
 }
 
 /// Response body for `POST /api/v1/schema/repin`. The HTTP status carries

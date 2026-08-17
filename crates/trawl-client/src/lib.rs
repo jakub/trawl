@@ -22,7 +22,8 @@ pub use types::{
     ExportFormat, ExportRequest, FieldValuesResponse, HealthResponse, HealthStatus,
     HistoryEntryResponse, HistoryResponse, IngestEventError, IngestResponse,
     ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
-    QueryResponse, QueryStatus, RepinJobResponse, RepinRequest, RepinResponse, RepinStatusResponse,
-    ReportRunResponse, ReportRunSummary, SavedQueryResponse, SchemaColumnResponse, SchemaResponse,
-    StatsResponse, StreamEvent, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    QueryResponse, QueryStatus, RepinJobResponse, RepinLiveness, RepinRequest, RepinResponse,
+    RepinStatusResponse, ReportRunResponse, ReportRunSummary, SavedQueryResponse,
+    SchemaColumnResponse, SchemaResponse, StatsResponse, StreamEvent, UpdateSavedRequest,
+    ValidationResponse, WhoAmIResponse,
 };

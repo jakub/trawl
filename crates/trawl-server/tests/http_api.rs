@@ -2070,7 +2070,7 @@ async fn repin_permission_matrix(pool: sqlx::PgPool) {
     // Admin: full legacy bundle, but NOT schema_write.
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
     let err = admin
-        .schema_repin("status", "VARCHAR", true, false)
+        .schema_repin("status", "VARCHAR", None, true, false)
         .await
         .expect_err("admin lacks schema_write");
     match err {
@@ -2089,7 +2089,7 @@ async fn repin_permission_matrix(pool: sqlx::PgPool) {
     // was AUTHORIZED and then refused on the merits, with no side effect).
     let schema_admin = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
     let err = schema_admin
-        .schema_repin("never_pinned_field", "VARCHAR", true, false)
+        .schema_repin("never_pinned_field", "VARCHAR", None, true, false)
         .await
         .expect_err("unpinned field refuses on the merits");
     match err {
@@ -2109,7 +2109,7 @@ async fn repin_permission_matrix(pool: sqlx::PgPool) {
     let status = reader.schema_repin_status().await.unwrap();
     assert!(status.job.is_none(), "no repin has run on this server");
     let err = reader
-        .schema_repin("status", "VARCHAR", true, false)
+        .schema_repin("status", "VARCHAR", None, true, false)
         .await
         .expect_err("reader lacks schema_write");
     match err {
@@ -2136,7 +2136,7 @@ async fn repin_validation_refusals_are_side_effect_free(pool: sqlx::PgPool) {
         ("status", "SEVERITY"),   // semantic pin: no physical spelling
     ] {
         let err = client
-            .schema_repin(field, to, true, false)
+            .schema_repin(field, to, None, true, false)
             .await
             .expect_err("must refuse");
         match err {

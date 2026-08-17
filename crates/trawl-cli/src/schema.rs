@@ -752,6 +752,8 @@ mod tests {
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)] // four independent CLI switches
 pub struct RepinFlags {
+    /// The asserted numeral dialect, for a `SEVERITY` target only.
+    pub dialect: Option<crate::cli::SeverityDialect>,
     /// Scan and report only.
     pub dry_run: bool,
     /// Accept a lossy projection / run a resurrection-only pass.
@@ -816,6 +818,15 @@ pub async fn run_repin(
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
     let format = resolve_format(format)?;
+    // Refused here as well as server-side, because this one is a typo an
+    // operator can fix without spending a job claim: the dialect reads
+    // numerals onto the severity ladder, so no other target has anywhere to
+    // put it.
+    if flags.dialect.is_some() && !to.eq_ignore_ascii_case("severity") {
+        return Err(CliError::Usage(format!(
+            "--dialect applies to --to severity only (got --to {to})"
+        )));
+    }
     if !flags.dry_run && !flags.yes {
         if io::stdin().is_terminal() && io::stdout().is_terminal() {
             eprint!(
@@ -839,7 +850,13 @@ pub async fn run_repin(
 
     let client = make_client(&conn)?;
     let outcome = client
-        .schema_repin(field, to, flags.dry_run, flags.force)
+        .schema_repin(
+            field,
+            to,
+            flags.dialect.map(crate::cli::SeverityDialect::token),
+            flags.dry_run,
+            flags.force,
+        )
         .await?;
     let (verdict, job) = match outcome {
         trawl_client::RepinStart::Report(job) => ("dry run", job),
@@ -942,6 +959,10 @@ mod repin_tests {
             rows_rewritten: 1200,
             rows_nulled: 0,
             rows_resurrected: 25,
+            dialect: None,
+            ambiguous_numerals: 0,
+            unmapped_samples: Vec::new(),
+            liveness: None,
         }
     }
 
@@ -982,6 +1003,7 @@ mod repin_tests {
             "status",
             "VARCHAR",
             RepinFlags {
+                dialect: None,
                 dry_run: false,
                 force: false,
                 yes: false,
@@ -996,5 +1018,57 @@ mod repin_tests {
             "got {err:?}"
         );
         assert!(out.is_empty(), "nothing rendered before the refusal");
+    }
+
+    /// `--dialect` is a SEVERITY-only assertion, refused here before any
+    /// network access — the server refuses it too, but this one is a typo
+    /// an operator can fix without spending a job claim. A severity target
+    /// carries it through (the refusal below is the `--yes` gate, i.e. the
+    /// dialect check passed).
+    #[tokio::test]
+    async fn dialect_applies_to_a_severity_target_only() {
+        let conn = ConnectionParams {
+            url: "https://127.0.0.1:1".into(),
+            token: "unused".into(),
+            insecure: true,
+        };
+        let flags = RepinFlags {
+            dialect: Some(crate::cli::SeverityDialect::Syslog),
+            dry_run: true,
+            force: false,
+            yes: false,
+            wait: false,
+        };
+        for to in ["VARCHAR", "bigint"] {
+            let mut out = Vec::new();
+            let err = run_repin(&mut out, conn.clone(), "level", to, flags, None)
+                .await
+                .expect_err("a dialect on a non-severity target must refuse");
+            assert!(
+                matches!(err, CliError::Usage(ref msg) if msg.contains("--to severity only")),
+                "{to}: got {err:?}"
+            );
+            assert!(out.is_empty());
+        }
+        // A severity target gets past the flag check and stops at the
+        // execute-confirmation gate instead.
+        let mut out = Vec::new();
+        let err = run_repin(
+            &mut out,
+            conn,
+            "level",
+            "severity",
+            RepinFlags {
+                dry_run: false,
+                ..flags
+            },
+            Some(OutputFormat::Json),
+        )
+        .await
+        .expect_err("no TTY, no --yes");
+        assert!(
+            matches!(err, CliError::Usage(ref msg) if msg.contains("--yes")),
+            "got {err:?}"
+        );
     }
 }

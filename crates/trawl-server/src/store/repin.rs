@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{AssertSqlSafe, PgPool, Row as _};
 use trawl_core::schema::CanonicalType;
+use trawl_core::severity::Dialect;
 
 use super::error::{PgViolation, StoreError, classify_violation};
 
@@ -70,9 +71,10 @@ pub struct RepinJob {
     pub id: i64,
     /// The repinned field (catalog key, folded).
     pub field: String,
-    /// The pin at claim time (`DuckDB` spelling).
+    /// The pin at claim time (CATALOG spelling — `SEVERITY` is not
+    /// `BIGINT`).
     pub from_type: String,
-    /// The target pin (`DuckDB` spelling).
+    /// The target pin (CATALOG spelling).
     pub to_type: String,
     /// Whether this job stops after the scan.
     pub dry_run: bool,
@@ -107,6 +109,64 @@ pub struct RepinJob {
     pub rows_nulled: i64,
     /// Outcome: values resurrected from `_raw`.
     pub rows_resurrected: i64,
+    /// The asserted dialect of the corpus's NUMERALS — `Some` exactly for a
+    /// `SEVERITY` target (issue #79). A legacy or non-severity job is
+    /// `None`, never a backfilled `otel` it did not assert.
+    pub dialect: Option<String>,
+    /// Rows whose numeral reads as a DIFFERENT severity in each dialect
+    /// (the 1-7 overlap): the scan's projection until the finished shadow
+    /// supersedes it with what the rewrite actually saw.
+    pub ambiguous_numerals: i64,
+    /// Up to five distinct sanitised samples of values the new pin cannot
+    /// read at all — `_raw` resurrection included.
+    pub unmapped_samples: Vec<String>,
+    /// Scan-time liveness: the newest observation of the field anywhere in
+    /// the catalog, or `None` when nothing has written it inside the
+    /// window.
+    pub field_last_seen: Option<DateTime<Utc>>,
+    /// One service behind that observation (audit/display only).
+    pub field_last_service: Option<String>,
+}
+
+/// What a repin job is claimed FOR — the row's immutable half.
+///
+/// A struct rather than seven positional arguments: `dialect` is the one
+/// piece an operator asserts that nothing else can derive, and threading it
+/// as the seventh `Option` past two booleans is how a call site ends up
+/// asserting syslog by accident.
+#[derive(Debug, Clone, Copy)]
+pub struct RepinClaim<'a> {
+    /// The field to repin (catalog key, folded).
+    pub field: &'a str,
+    /// The pin at claim time.
+    pub from_type: CanonicalType,
+    /// The target pin.
+    pub to_type: CanonicalType,
+    /// The asserted numeral dialect — `Some` exactly for a `SEVERITY`
+    /// target (the migration CHECKs the scope, so a mismatch is a 500, not
+    /// a silently stored lie).
+    pub dialect: Option<Dialect>,
+    /// Whether this job stops after the scan.
+    pub dry_run: bool,
+    /// Whether a lossy projection was explicitly accepted.
+    pub force: bool,
+    /// Requesting key's display name (audit).
+    pub requested_by: Option<&'a str>,
+}
+
+/// The scan's plan numbers, stamped onto the job row in one statement.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RepinPlanCounts {
+    /// Affected files.
+    pub files_total: i64,
+    /// Rows carrying a stored value for the field.
+    pub rows_carrying: i64,
+    /// Stored values the new pin cannot read (would null).
+    pub projected_nulls: i64,
+    /// Currently-shelved values `_raw` gives back under the new pin.
+    pub resurrectable: i64,
+    /// Bytes across the affected files (the double-hold peak).
+    pub affected_bytes: i64,
 }
 
 fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
@@ -135,12 +195,18 @@ fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
         rows_rewritten: row.try_get("rows_rewritten")?,
         rows_nulled: row.try_get("rows_nulled")?,
         rows_resurrected: row.try_get("rows_resurrected")?,
+        dialect: row.try_get("dialect")?,
+        ambiguous_numerals: row.try_get("ambiguous_numerals")?,
+        unmapped_samples: row.try_get("unmapped_samples")?,
+        field_last_seen: row.try_get("field_last_seen")?,
+        field_last_service: row.try_get("field_last_service")?,
     })
 }
 
 const JOB_COLS: &str = "id, field, from_type, to_type, dry_run, force, status, requested_by, \
      started_at, finished_at, error, files_total, rows_carrying, projected_nulls, \
-     resurrectable, affected_bytes, files_done, rows_rewritten, rows_nulled, rows_resurrected";
+     resurrectable, affected_bytes, files_done, rows_rewritten, rows_nulled, rows_resurrected, \
+     dialect, ambiguous_numerals, unmapped_samples, field_last_seen, field_last_service";
 
 /// Postgres-backed repin job store. Cheap to clone (shared pool).
 #[derive(Debug, Clone)]
@@ -157,26 +223,20 @@ impl RepinStore {
 
     /// Claim THE running slot: insert a `running` row, mapping a 23505 on
     /// `repin_jobs_one_running` to [`StoreError::RepinAlreadyRunning`].
-    pub async fn claim(
-        &self,
-        field: &str,
-        from_type: CanonicalType,
-        to_type: CanonicalType,
-        dry_run: bool,
-        force: bool,
-        requested_by: Option<&str>,
-    ) -> Result<i64, StoreError> {
+    pub async fn claim(&self, claim: RepinClaim<'_>) -> Result<i64, StoreError> {
         let result = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO repin_jobs (field, from_type, to_type, dry_run, force, requested_by)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO repin_jobs (field, from_type, to_type, dialect, dry_run, force,
+                                     requested_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id",
         )
-        .bind(field)
-        .bind(from_type.as_catalog())
-        .bind(to_type.as_catalog())
-        .bind(dry_run)
-        .bind(force)
-        .bind(requested_by)
+        .bind(claim.field)
+        .bind(claim.from_type.as_catalog())
+        .bind(claim.to_type.as_catalog())
+        .bind(claim.dialect.map(Dialect::token))
+        .bind(claim.dry_run)
+        .bind(claim.force)
+        .bind(claim.requested_by)
         .fetch_one(&self.pool)
         .await;
         result.map_err(|e| match classify_violation(&e) {
@@ -186,15 +246,7 @@ impl RepinStore {
     }
 
     /// Stamp the scan plan onto the job row.
-    pub async fn record_plan(
-        &self,
-        id: i64,
-        files_total: i64,
-        rows_carrying: i64,
-        projected_nulls: i64,
-        resurrectable: i64,
-        affected_bytes: i64,
-    ) -> Result<(), StoreError> {
+    pub async fn record_plan(&self, id: i64, plan: RepinPlanCounts) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE repin_jobs
              SET files_total = $2, rows_carrying = $3, projected_nulls = $4,
@@ -202,11 +254,11 @@ impl RepinStore {
              WHERE id = $1",
         )
         .bind(id)
-        .bind(files_total)
-        .bind(rows_carrying)
-        .bind(projected_nulls)
-        .bind(resurrectable)
-        .bind(affected_bytes)
+        .bind(plan.files_total)
+        .bind(plan.rows_carrying)
+        .bind(plan.projected_nulls)
+        .bind(plan.resurrectable)
+        .bind(plan.affected_bytes)
         .execute(&self.pool)
         .await?;
         Ok(())
