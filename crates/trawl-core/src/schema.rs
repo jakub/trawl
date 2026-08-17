@@ -224,8 +224,10 @@ impl CanonicalType {
     ///
     /// `BIGINT` resolves to [`Self::BigInt`] and nothing resolves to
     /// [`Self::Severity`] — the semantic pin has no physical spelling of
-    /// its own, which is exactly what keeps `repin --to severity` (slice
-    /// 2) out of the operator surface for now.
+    /// its own, so INFERENCE can never mint it (`DESCRIBE` reports the
+    /// physical type, and [`normalize_duckdb_type`] goes through this
+    /// door). An OPERATOR can now name it: `repin --to severity` parses
+    /// through [`Self::from_catalog`] (issue #79).
     #[must_use]
     pub fn from_duckdb(s: &str) -> Option<Self> {
         match s {
@@ -252,6 +254,13 @@ impl CanonicalType {
     /// Parse the catalog's stored spelling back into the enum. EXACT match
     /// only — the catalog is written by code, so any other spelling is
     /// corruption and must surface, not be guessed at.
+    ///
+    /// This is also the REPIN admission door (issue #79), which retracts
+    /// migration 0010's header claim that `repin --to severity` "parses
+    /// through the physical door": it parses here now, and `SEVERITY` is a
+    /// target an operator can name. What 0010 was really protecting still
+    /// holds — inference cannot mint the pin, because
+    /// [`normalize_duckdb_type`] goes through [`Self::from_duckdb`].
     #[must_use]
     pub fn from_catalog(s: &str) -> Option<Self> {
         match s {
@@ -542,8 +551,9 @@ mod tests {
     /// The PHYSICAL spelling is what casts and DDL use, and it is
     /// deliberately NOT injective: `SEVERITY` is a BIGINT on disk, so
     /// `from_duckdb` — the inverse of the physical spelling — cannot
-    /// name it. That is the structural reason `repin --to severity` is a
-    /// slice-2 feature rather than a live foot-gun.
+    /// name it. That is what keeps INFERENCE from minting the pin;
+    /// admission for an operator's `--to severity` goes through
+    /// `from_catalog` instead (issue #79).
     #[test]
     fn severity_is_physically_bigint_and_unreachable_by_physical_parse() {
         assert_eq!(CanonicalType::Severity.as_duckdb(), "BIGINT");

@@ -157,10 +157,11 @@ impl RepinEngine {
     ) -> Result<StartOutcome, ServerError> {
         let field = field.to_ascii_lowercase();
         let to = parse_target(to)?;
-        if trawl_core::schema::ENVELOPE_TYPES
-            .iter()
-            .any(|(name, _)| *name == field)
-        {
+        // A PREDICATE, not the envelope list: the whole `_` prefix is
+        // trawl's (`schema::is_contract_typed`), so a contract slot added
+        // later is refused the day it exists rather than the day somebody
+        // remembers this check.
+        if trawl_core::schema::is_contract_typed(&field) {
             return Err(ServerError::BadRequest(format!(
                 "{field:?} is a declared envelope field — its type is part \
                  of the event contract and cannot be repinned"
@@ -813,7 +814,11 @@ impl RepinEngine {
             .map(|(service, rows_nulled)| FieldConflict {
                 field: field.to_owned(),
                 service,
-                observed_type: from.as_duckdb().to_owned(),
+                // The CATALOG spelling: evidence a repin authors must name
+                // the pin the values were stored under, and `as_duckdb` is
+                // not injective — a SEVERITY source would indict itself as
+                // BIGINT, a pin the field never had.
+                observed_type: from.as_catalog().to_owned(),
                 expected_type: to,
                 rows_nulled,
                 // The rewrite counts what it nulled per service; it never
@@ -973,16 +978,19 @@ fn run_pass_blocking(
 
 /// Resolve a requested repin target to a canonical type.
 ///
-/// The parse is through `CanonicalType::from_duckdb` — the PHYSICAL
-/// spelling — deliberately: `SEVERITY` has no physical spelling of its
-/// own (ADR-0013), so `--to severity` is refused structurally here rather
-/// than by a hand-maintained deny-list. Making severity an operator
-/// decision is slice 2's job.
+/// The parse is through `CanonicalType::from_catalog` — the CATALOG
+/// spelling, the injective one — so `SEVERITY` is admitted (issue #79).
+/// It is a target an operator can only reach by naming it: inference still
+/// cannot mint it (`DESCRIBE` never says SEVERITY, so
+/// `normalize_duckdb_type` can never yield it), and the seed remains the
+/// only other installer. What used to make the physical door the gate —
+/// "severity is not an operator decision" — is exactly what this slice
+/// reverses.
 fn parse_target(to: &str) -> Result<CanonicalType, ServerError> {
-    CanonicalType::from_duckdb(&to.to_ascii_uppercase()).ok_or_else(|| {
+    CanonicalType::from_catalog(&to.to_ascii_uppercase()).ok_or_else(|| {
         ServerError::BadRequest(format!(
             "unknown repin target type {to:?} — the candidate ladder is \
-             BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, VARCHAR"
+             BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, VARCHAR, SEVERITY"
         ))
     })
 }
@@ -991,22 +999,69 @@ fn parse_target(to: &str) -> Result<CanonicalType, ServerError> {
 mod tests {
     use super::*;
 
+    /// The target vocabulary is the CATALOG's — the injective spelling —
+    /// so `SEVERITY` is a target an operator can name (issue #79) and
+    /// stays DISTINCT from the `BIGINT` it shares a physical type with:
+    /// the two mean different things to every comparison rule, and a parse
+    /// that collapsed them would repin a field to a pin nobody asked for.
     #[test]
-    fn repin_targets_are_the_physical_ladder_and_never_severity() {
+    fn repin_targets_are_the_catalog_vocabulary_severity_included() {
         for (spelling, expected) in [
             ("bigint", CanonicalType::BigInt),
             ("VARCHAR", CanonicalType::Varchar),
             ("TimeStamp", CanonicalType::Timestamp),
             ("double", CanonicalType::Double),
             ("boolean", CanonicalType::Boolean),
+            ("severity", CanonicalType::Severity),
+            ("SEVERITY", CanonicalType::Severity),
+            ("Severity", CanonicalType::Severity),
         ] {
             assert_eq!(parse_target(spelling).unwrap(), expected, "{spelling}");
         }
-        for rejected in ["severity", "SEVERITY", "json", ""] {
+        assert_ne!(
+            parse_target("severity").unwrap(),
+            parse_target("bigint").unwrap(),
+            "SEVERITY is a semantic pin over BIGINT, not a synonym for it"
+        );
+        // Still a closed vocabulary: `JSON` is an inference artifact, never
+        // a pin, and an empty target is a client bug.
+        for rejected in ["json", "", "sev", "otel", "hugeint"] {
             let err = parse_target(rejected).expect_err("must refuse");
             assert!(
                 matches!(err, ServerError::BadRequest(ref m) if m.contains("unknown repin target type")),
                 "{rejected}: {err:?}"
+            );
+        }
+    }
+
+    /// The FIELD side of admission: `start` gates on
+    /// `schema::is_contract_typed`, so every contract slot — the sealed `_`
+    /// namespace whole, present and future, plus the four sender-asserted
+    /// bare names — is refused before a job is ever claimed, while ordinary
+    /// sender vocabulary (including the names that used to be envelope
+    /// slots) is repinnable.
+    #[test]
+    fn contract_typed_fields_are_not_repin_subjects() {
+        for refused in [
+            trawl_core::schema::SEVERITY,
+            trawl_core::schema::TIME,
+            trawl_core::schema::RAW,
+            trawl_core::schema::ENV,
+            trawl_core::schema::SERVICE,
+            trawl_core::schema::HOST,
+            trawl_core::schema::MESSAGE,
+            "_x",
+            "_not_a_slot_yet",
+        ] {
+            assert!(
+                trawl_core::schema::is_contract_typed(refused),
+                "{refused} must be refused by the admission gate"
+            );
+        }
+        for admitted in ["level", "severity", "timestamp", "status", "duration"] {
+            assert!(
+                !trawl_core::schema::is_contract_typed(admitted),
+                "{admitted} is sender vocabulary and repinnable"
             );
         }
     }

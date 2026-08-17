@@ -181,7 +181,12 @@ pub async fn reconcile_store(
                     .map_err(|e| format!("failed to fail recovered repin job: {e}"))?;
             }
             RecoveredAction::CompletedCutover | RecoveredAction::SweptCleanup => {
-                let to = CanonicalType::from_duckdb(&marker.to_type).ok_or_else(|| {
+                // `from_catalog`, matching what the marker WRITES
+                // (`to.as_catalog()`): the physical parse has no `SEVERITY`
+                // spelling, so a severity cutover marker failed the boot
+                // replay here — the one recovery path that must never
+                // refuse, since the corpus is already half-swapped.
+                let to = CanonicalType::from_catalog(&marker.to_type).ok_or_else(|| {
                     format!("repin marker names non-canonical type {:?}", marker.to_type)
                 })?;
                 storage
