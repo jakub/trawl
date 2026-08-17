@@ -117,12 +117,28 @@ fn field_filter<'src>()
 }
 
 /// Parse a bare text search term, optionally negated with `-`.
+///
+/// A backtick is a METACHARACTER here, not a word byte: it opens a quoted
+/// field name (ADR-0013 ruling 7), and text search is the last alternative
+/// in the leaf choice. Were it accepted anywhere in the term, a quoted name
+/// the grammar refuses — or one whose filter never reaches an operator —
+/// would not error: no alternative would match, and the query would
+/// silently become a substring search for the literal ticks
+/// (`` service=`my service` `` for a search of the whole line). It ends the
+/// term in EVERY position, leading or mid-word, and under `-` as much as
+/// bare, so the tick is the one character no unquoted position can absorb —
+/// the same exclusion [`crate::parser::primitives::bare_value`] makes on the
+/// value side, and for the same reason: it is decided before the grammar
+/// runs, by the comment scanner. Cost, deliberate: a bare word carrying a
+/// tick must be double-quoted (`` "a`b" ``).
 fn text_search<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     let negated = just('-')
         .ignore_then(
             any()
-                .filter(|c: &char| !c.is_ascii_whitespace() && *c != '|' && *c != ')' && *c != '(')
+                .filter(|c: &char| {
+                    !c.is_ascii_whitespace() && *c != '|' && *c != ')' && *c != '(' && *c != '`'
+                })
                 .repeated()
                 .at_least(1)
                 .to_slice()
@@ -135,10 +151,6 @@ fn text_search<'src>()
             })
         });
 
-    // A LEADING backtick never falls through to text search: the term
-    // opened a quoted field name, so a failure there is a loud parse
-    // error rather than a silent search for the literal backtick
-    // (ADR-0013 ruling 7). Mid-word backticks stay ordinary text.
     let positive = any()
         .filter(|c: &char| {
             !c.is_ascii_whitespace()
@@ -148,13 +160,8 @@ fn text_search<'src>()
                 && *c != '('
                 && *c != '`'
         })
-        .then(
-            any()
-                .filter(|c: &char| {
-                    !c.is_ascii_whitespace() && *c != '|' && *c != '"' && *c != ')' && *c != '('
-                })
-                .repeated(),
-        )
+        .repeated()
+        .at_least(1)
         .to_slice()
         .map(|s: &str| {
             SearchToken::TextSearch(TextSearch {
@@ -163,7 +170,16 @@ fn text_search<'src>()
             })
         });
 
-    negated.or(positive).labelled("text search")
+    // Excluding the byte from both terms is not enough for the `-` case:
+    // it would leave `-` matching as a POSITIVE term of its own, so
+    // `` -`http-status`=500 `` would parse as a text search for `-` beside
+    // an un-negated field filter — the negation silently gone, which is
+    // worse than the term that matched nothing. Refusing the pair ahead of
+    // both arms is what makes a negated quoted name loud.
+    negated
+        .or(positive)
+        .and_is(just('-').then(just('`')).not())
+        .labelled("text search")
 }
 
 /// Parse `earliest="2026-03-14T03:00:00Z"` absolute time bound.
@@ -622,17 +638,58 @@ mod tests {
         }
     }
 
-    /// A backtick INSIDE a bare word is still ordinary text search — the
-    /// loud refusal is for a LEADING backtick that fails the quoted
-    /// production (see `parser::tests`).
+    /// A backtick ends a bare word and a bare VALUE alike, in every
+    /// position: no unquoted position may absorb the one character whose
+    /// meaning is settled before the grammar runs. Each shape below used
+    /// to answer something quietly different — a substring search for the
+    /// literal ticks, or a filter narrowed to half the value the user
+    /// wrote beside a stray text term.
     #[test]
-    fn mid_word_backtick_is_still_text_search() {
-        let result = search_stage().parse("er`ror").into_result().unwrap();
+    fn no_unquoted_position_absorbs_a_backtick() {
+        for dsl in [
+            "er`ror",                // a bare word carrying a tick
+            "service=`nginx`",       // the typo: ticks are not value quotes
+            "service=`my service`",  // …which read as a filter plus a term
+            "status=200,`a b` more", // …and as an IN-list element
+            "host=a+`b` more",       // a tick after an operator in a value
+            "-`http-status`=500",    // a negated quoted NAME, unspellable
+            "-`a b`",                // …and one the whitespace split in two
+        ] {
+            let result = search_stage().then_ignore(end()).parse(dsl).into_result();
+            assert!(
+                result.is_err(),
+                "{dsl} must be a loud parse error: {result:?}"
+            );
+        }
+    }
+
+    /// …and the double-quoted form is how a tick reaches a value or a
+    /// term, carrying it verbatim.
+    #[test]
+    fn a_double_quoted_value_still_carries_a_backtick() {
+        let result = search_stage()
+            .then_ignore(end())
+            .parse(r#"host="a`b""#)
+            .into_result()
+            .unwrap();
         assert_eq!(
             result.groups[0][0].node,
-            SearchToken::TextSearch(TextSearch {
-                term: "er`ror".to_string(),
-                negated: false,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "host".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("a`b".to_string()),
+            })
+        );
+
+        let result = search_stage()
+            .then_ignore(end())
+            .parse(r#""er`ror""#)
+            .into_result()
+            .unwrap();
+        assert_eq!(
+            result.groups[0][0].node,
+            SearchToken::QuotedSearch(QuotedSearch {
+                phrase: "er`ror".to_string(),
             })
         );
     }

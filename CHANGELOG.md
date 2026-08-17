@@ -265,6 +265,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   escape hatch.
 
 ### Fixed
+- **BREAKING — a backtick ends every unquoted position, and a name can be
+  quoted after an operator (#78 follow-up).** Backticks were never value
+  quotes, but a query that used them as such answered something quietly
+  narrower: `` service=`my service` `` parsed as a filter for the literal
+  text `` `my `` beside a stray search term, and `` host=`a # b` more ``
+  turned a comment's own words into AND-ed search terms. A backtick now **ends** an
+  unquoted value and an unquoted word alike, so every one of those shapes
+  is a loud parse error, and `` -`http-status`=500 `` — a negation the
+  search grammar has no production for — is one too (write
+  ``NOT `http-status`=500``). Text that genuinely contains a backtick is
+  double-quoted: `` host="a`b" ``, `` "er`ror" ``, which carry it verbatim.
+
+  With no unquoted position able to absorb a tick, the pre-parse comment
+  scanner can open a quoted name after an arithmetic operator as well:
+  `` | sort -`a#b` ``, `` | sort -`http://x` `` and `` | let x = 1+`a#b` ``
+  parse instead of dying as unterminated names, so a field whose name
+  carries a `#` or `//` can be sorted descending and used in expressions —
+  the contract `quote_dsl_field` already promised. `/` deliberately stays
+  out of that set: it opens a regex far more often than it divides.
 - **Backtick identifier follow-through after #81.** Catalog names are now
   declined when the DSL cannot represent them and otherwise flow through the
   shared renderer in every TUI/SPA query builder; URL facet state carries

@@ -101,14 +101,31 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 /// could START: the beginning of the input, after whitespace, or after one
 /// of the bytes a name may follow directly — `(` and `,` (argument and
 /// field lists), `|` (a stage boundary), `!` and the comparison bytes (a
-/// filter or expression operator). A backtick anywhere else is inside some
-/// other token, exactly as the search grammar reads a mid-word one as
-/// ordinary text.
+/// filter or expression operator), and the arithmetic operators, which an
+/// expression may equally put in front of a name (`` 1+`a b` ``). `-`
+/// covers both the arithmetic case and a descending sort key
+/// (`` | sort -`a#b` ``). A backtick anywhere else is inside some other
+/// token, exactly as the search grammar reads a mid-word one as ordinary
+/// text.
+///
+/// `/` is deliberately ABSENT: it opens a regex far more often than it
+/// divides, and a regex body is exactly the context this predicate exists
+/// to keep out. A quoted name divided into by a slash pays the
+/// unterminated-name error instead.
+///
+/// The set may be widened safely only because no UNQUOTED position can
+/// absorb a backtick: [`primitives::bare_value`] and the search grammar's
+/// bare word both END at one, so a tick this predicate mis-reads as an
+/// opener can reach a parse error but never a quietly different query.
 fn opens_quoted_name(prev: Option<u8>) -> bool {
     match prev {
         None => true,
         Some(b) => {
-            b.is_ascii_whitespace() || matches!(b, b'(' | b',' | b'|' | b'!' | b'=' | b'<' | b'>')
+            b.is_ascii_whitespace()
+                || matches!(
+                    b,
+                    b'(' | b',' | b'|' | b'!' | b'=' | b'<' | b'>' | b'-' | b'+' | b'*' | b'%'
+                )
         }
     }
 }
@@ -150,20 +167,24 @@ fn quoted_name_end(input: &str, open: usize) -> Option<usize> {
 /// Backtick-quoted field names are tracked beside double-quoted strings,
 /// so `` `a#b` `` is a name and not a comment (ADR-0013 ruling 7).
 ///
-/// A backtick opens a name only where one could actually START — at the
-/// beginning of the input, after whitespace, or after `(`, `,`, `|` or a
-/// filter operator's own bytes — and only when what follows would really
-/// lex as [`primitives::quoted_name`]: non-empty, closed, and free of the
+/// A backtick opens a name only where one could actually START
+/// ([`opens_quoted_name`]) and only when what follows would really lex as
+/// [`primitives::quoted_name`]: non-empty, closed, and free of the
 /// characters that production refuses (controls, a newline included, plus
-/// the bidi and zero-width formats). A stray backtick inside a VALUE — a
-/// regex literal (`` message=/a`b/ ``) or a glob (`` cmd=*`* ``) — fails
-/// both tests even when a later, legitimate backtick exists, so it cannot
-/// run a pseudo-name across the following comment and smuggle its words in
-/// as extra AND-ed search terms.
+/// the bidi and zero-width formats). A stray backtick inside a regex
+/// literal (`` message=/a`b/ ``) follows a body character, so it fails the
+/// first test outright and cannot run a pseudo-name across the following
+/// comment to smuggle its words in as extra AND-ed search terms.
 ///
-/// Residual, since this is a scan and not the grammar: a stray backtick
-/// that DOES sit at a token start and finds a partner on the same line
-/// still shields whatever lies between them.
+/// This is a scan and not the grammar, so it can only ever be a
+/// heuristic — an operator inside a bare VALUE looks exactly like
+/// arithmetic from outside (`host=a+` reads like `1+`), and the tick after
+/// it therefore engages the name state and shields a `#` behind it. The
+/// GRAMMAR is the backstop that keeps a mis-engaged scan from changing an
+/// answer quietly: no unquoted position may absorb a backtick
+/// ([`primitives::bare_value`], and the search stage's bare word), so the
+/// shielded region reaches a parse error instead of becoming part of a
+/// value. Loud, or correct — never something silently different.
 ///
 /// Known limitation: `#` inside regex literals (`/pattern#here/`) will be
 /// treated as a comment start. Use `//` comments on lines containing regex
@@ -785,12 +806,12 @@ mod tests {
         }
     }
 
-    /// A stray backtick inside a VALUE — a regex literal or a glob — must
-    /// not protect a later comment: the comment would parse as extra
-    /// AND-ed text-search terms and silently narrow the match set. That
-    /// holds whether or not a partner backtick appears later on: the stray
-    /// one is not at a name's start, and the region it would open carries
-    /// characters `quoted_name` refuses.
+    /// A stray backtick inside a REGEX literal must not protect a later
+    /// comment: the comment would parse as extra AND-ed text-search terms
+    /// and silently narrow the match set. That holds whether or not a
+    /// partner backtick appears later on: the stray one is not at a name's
+    /// start, and the region it would open carries characters
+    /// `quoted_name` refuses.
     #[test]
     fn stray_backtick_does_not_shield_later_comments() {
         let input = "message=/back`tick/ # comment";
@@ -803,7 +824,6 @@ mod tests {
         for input in [
             "message=/a`b/ # secret note\n`req id`=1",
             "message=/a`b/ // secret note\n`req id`=1",
-            "cmd=*`* # secret note\n`req id`=1",
         ] {
             let query = parse(input).unwrap_or_else(|e| panic!("{input:?} parses: {e:?}"));
             assert_eq!(
@@ -812,6 +832,122 @@ mod tests {
                 "{input:?}: only the two filters, never the comment's words"
             );
         }
+
+        // The glob shape reaches the same invariant from the other side:
+        // `*` now opens a name for the scanner, so the tick is no longer
+        // ordinary text — but a bare value cannot absorb it either, so the
+        // query is a loud parse error rather than a comment quietly read
+        // as part of a value.
+        assert!(parse("cmd=*`* # secret note\n`req id`=1").is_err());
+    }
+
+    /// The scanner's engage rule is a heuristic — an operator inside a
+    /// bare VALUE looks exactly like arithmetic from outside (`host=a+`
+    /// vs `1+`), so the tick after it engages the name state and shields
+    /// the `#` behind it. The grammar is the backstop: no unquoted
+    /// position absorbs a tick, so the shielded region is a parse error
+    /// rather than a comment silently folded into the query.
+    #[test]
+    fn a_value_never_absorbs_a_backtick_shielded_comment() {
+        for dsl in [
+            "host=a+`b#c` # outside",
+            "host=a*`b#c` # outside",
+            "host=a%`b#c` # outside",
+            "host=a-`b#c` # outside",
+            // the plain typo, and the one that used to turn a comment's
+            // own words into AND-ed search terms
+            "service=`my service`",
+            "host=`a # b` more",
+            "status=200,`a # b` more",
+        ] {
+            assert!(parse(dsl).is_err(), "{dsl} must be a loud parse error");
+        }
+
+        // A value that genuinely contains a tick is double-quoted, and the
+        // comment beside it is still a comment.
+        let query = parse(r#"host="a+`b" # outside"#).expect("the quoted form parses");
+        assert_eq!(query.search.groups[0].len(), 1);
+        assert_eq!(
+            query.search.groups[0][0].node,
+            SearchToken::FieldFilter(FieldFilter {
+                field: "host".to_string(),
+                op: FilterOp::Eq,
+                value: FilterValue::Literal("a+`b".to_string()),
+            })
+        );
+    }
+
+    /// An expression may put an ARITHMETIC operator in front of a name,
+    /// and a descending sort key puts a `-` there, so those predecessors
+    /// open a name too — otherwise `` -`a#b` `` loses its comment markers
+    /// to the stripper and dies as an unterminated name, and a field
+    /// `quote_dsl_field` happily renders could not be sorted descending.
+    #[test]
+    fn a_backtick_after_an_operator_opens_a_name() {
+        // the descending sort key, precisely: the name arrives whole, with
+        // the markers the stripper would have blanked
+        for (dsl, want) in [
+            ("* | sort -`a#b`", "a#b"),
+            ("* | sort -`http://x`", "http://x"),
+        ] {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl} must parse: {e:?}"));
+            match &query.pipeline[0].node {
+                PipeStage::Sort(s) => {
+                    assert_eq!(s.fields[0].field, want);
+                    assert_eq!(s.fields[0].direction, SortDirection::Desc);
+                }
+                other => panic!("expected Sort, got {other:?}"),
+            }
+        }
+
+        // …and every other operator an expression can put in front of one
+        for dsl in [
+            "* | let x = 1+`a#b`",
+            "* | let x = 2*`http://x`",
+            "* | let x = `a#b`%2",
+            "* | let x = 1-`a#b`",
+            "* | where `a#b`>1",
+            "* | stats count() by `a#b`",
+        ] {
+            assert!(parse(dsl).is_ok(), "{dsl} must parse");
+        }
+
+        // …and a tick inside a REGEX still follows a body character, never
+        // an operator, so that line's comment is still stripped.
+        let query = parse("host=/a+b`c/ # | bad_stage").expect("the comment must be stripped");
+        assert_eq!(
+            query.pipeline.len(),
+            0,
+            "the comment must not reach the parser"
+        );
+        assert_eq!(query.search.groups[0].len(), 1);
+    }
+
+    /// A negated quoted NAME has no production in the search grammar, so
+    /// it is a loud parse error. Reading it as text would search for the
+    /// literal ticks (matching nothing), and dropping the `-` to a term of
+    /// its own would silently discard the negation.
+    #[test]
+    fn a_negated_backtick_is_a_parse_error() {
+        for dsl in ["-`http-status`=500", "-`a b`", "error -`x", "-`"] {
+            assert!(parse(dsl).is_err(), "{dsl} must be a loud parse error");
+        }
+        // `NOT` is the spelling that negates a field filter, and it works.
+        let query = parse("NOT `http-status`=500").expect("NOT negates a quoted name");
+        assert_eq!(query.search.groups[0].len(), 1);
+        assert!(matches!(
+            &query.search.groups[0][0].node,
+            SearchToken::Not(_)
+        ));
+        // An ordinary negated term is untouched.
+        let query = parse("-debug").expect("parses");
+        assert_eq!(
+            query.search.groups[0][0].node,
+            SearchToken::TextSearch(TextSearch {
+                term: "debug".to_string(),
+                negated: true,
+            })
+        );
     }
 
     /// `strip_comments` stays linear on an adversarial backtick run. The
