@@ -7,7 +7,9 @@
 // Pure modules that don't touch Leptos/web-sys — keep them ungated so
 // their tests run under plain `cargo test` on native.
 mod context_query;
+mod drawer_query;
 mod facets;
+mod filter_codec;
 mod histogram;
 mod notice_key;
 mod offset;

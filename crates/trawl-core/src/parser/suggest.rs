@@ -163,16 +163,24 @@ fn is_bare_segment(segment: &str) -> bool {
 /// The one renderer every suggestion surface goes through — autocomplete
 /// insertions and the query formatter — so a name trawl offers is a name
 /// trawl can parse back.
+///
+/// Returns `None` when the field-name grammar cannot represent `name` at
+/// all: the empty name, or one carrying a control/invisible display
+/// character. Catalog-backed callers must decline those names rather than
+/// manufacture invalid DSL or splice the raw client-chosen key.
 #[must_use]
-pub fn quote_dsl_field(name: &str) -> String {
+pub fn quote_dsl_field(name: &str) -> Option<String> {
+    if name.is_empty() || name.chars().any(crate::sanitize::is_unsafe_display_char) {
+        return None;
+    }
     if is_bare_field_name(name)
         && !GRAMMAR_KEYWORDS.contains(&name)
         && !SEARCH_KEYWORDS.contains(&name)
         && !EXPRESSION_KEYWORDS.contains(&name)
     {
-        return name.to_string();
+        return Some(name.to_string());
     }
-    format!("`{}`", name.replace('`', "``"))
+    Some(format!("`{}`", name.replace('`', "``")))
 }
 
 /// Compute the Levenshtein edit distance between two strings.
@@ -256,17 +264,23 @@ mod tests {
             "_time",
             "a1",
         ] {
-            assert_eq!(quote_dsl_field(name), name, "{name}");
+            assert_eq!(quote_dsl_field(name).as_deref(), Some(name), "{name}");
         }
     }
 
     #[test]
     fn a_name_the_bare_production_cannot_spell_is_backticked() {
-        assert_eq!(quote_dsl_field("x-request-id"), "`x-request-id`");
-        assert_eq!(quote_dsl_field("request id"), "`request id`");
-        assert_eq!(quote_dsl_field("1st"), "`1st`");
-        assert_eq!(quote_dsl_field("über"), "`über`");
-        assert_eq!(quote_dsl_field("trailing."), "`trailing.`");
+        assert_eq!(
+            quote_dsl_field("x-request-id").as_deref(),
+            Some("`x-request-id`")
+        );
+        assert_eq!(
+            quote_dsl_field("request id").as_deref(),
+            Some("`request id`")
+        );
+        assert_eq!(quote_dsl_field("1st").as_deref(), Some("`1st`"));
+        assert_eq!(quote_dsl_field("über").as_deref(), Some("`über`"));
+        assert_eq!(quote_dsl_field("trailing.").as_deref(), Some("`trailing.`"));
     }
 
     /// The closed keyword set is THREE (ADR-0013 ruling 7 corrects §6),
@@ -277,7 +291,7 @@ mod tests {
     fn the_three_grammar_keywords_are_always_quoted() {
         assert_eq!(GRAMMAR_KEYWORDS, ["last", "earliest", "latest"]);
         for kw in GRAMMAR_KEYWORDS {
-            assert_eq!(quote_dsl_field(kw), format!("`{kw}`"));
+            assert_eq!(quote_dsl_field(kw), Some(format!("`{kw}`")));
         }
     }
 
@@ -291,7 +305,7 @@ mod tests {
         use crate::ast::{Expr, PipeStage};
 
         for kw in EXPRESSION_KEYWORDS {
-            let rendered = quote_dsl_field(kw);
+            let rendered = quote_dsl_field(kw).expect("keyword is representable");
             assert_eq!(rendered, format!("`{kw}`"), "{kw} must be quoted");
 
             for query in [
@@ -334,7 +348,7 @@ mod tests {
         use crate::ast::SearchToken;
 
         for kw in SEARCH_KEYWORDS {
-            let rendered = quote_dsl_field(kw);
+            let rendered = quote_dsl_field(kw).expect("keyword is representable");
             assert_eq!(rendered, format!("`{kw}`"), "{kw} must be quoted");
 
             let parsed = crate::parser::parse(&format!("{rendered}=x"))
@@ -365,7 +379,14 @@ mod tests {
 
     #[test]
     fn an_embedded_backtick_is_doubled() {
-        assert_eq!(quote_dsl_field("a`b"), "`a``b`");
+        assert_eq!(quote_dsl_field("a`b").as_deref(), Some("`a``b`"));
+    }
+
+    #[test]
+    fn an_inexpressible_catalog_name_is_declined() {
+        for name in ["", "a\u{1b}b", "a\u{200b}b", "a\u{202e}b", "a\u{00ad}b"] {
+            assert_eq!(quote_dsl_field(name), None, "{name:?}");
+        }
     }
 
     /// The drift guard: `is_bare_field_name` claims to mirror the bare
@@ -399,7 +420,7 @@ mod tests {
             "count",
             "|pipe",
         ] {
-            let rendered = quote_dsl_field(name);
+            let rendered = quote_dsl_field(name).expect("fixture name is representable");
             let query = crate::parser::parse(&format!("| table {rendered}"))
                 .unwrap_or_else(|e| panic!("{name:?} rendered as {rendered} must parse: {e:?}"));
             match &query.pipeline[0].node {

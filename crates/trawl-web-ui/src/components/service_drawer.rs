@@ -472,12 +472,13 @@ fn FieldDetail(
     let svc_for_q = svc.clone();
     let field_for_q = field_name.clone();
     let top = LocalResource::new(move || {
-        let q = format!(
-            r#"service="{}" last=7d | top 10 {}"#,
-            svc_for_q.replace('"', ""),
-            field_for_q
-        );
-        async move { api::query(&q, 0).await }
+        let q = crate::drawer_query::top_values_query(&svc_for_q, &field_for_q);
+        async move {
+            match q {
+                Some(q) => api::query(&q, 0).await,
+                None => Ok(declined_query_response()),
+            }
+        }
     });
 
     let cov_pct = super::service_card_fmt::cov_pct(col.null_count, col.total_count);
@@ -645,6 +646,20 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
 
 // ───────────────────────── Helpers ─────────────────────────
 
+fn declined_query_response() -> trawl_api::QueryResponse {
+    trawl_api::QueryResponse {
+        result: trawl_api::value::QueryResult::empty(),
+        truncated: false,
+        pagination: trawl_api::PaginationMeta {
+            limit: 0,
+            offset: 0,
+            returned: 0,
+        },
+        degraded_fields: Vec::new(),
+        severity_columns: Vec::new(),
+    }
+}
+
 fn cardinality_resource(
     svc: ServiceSchema,
 ) -> LocalResource<Result<HashMap<String, u64>, api::ApiError>> {
@@ -654,15 +669,9 @@ fn cardinality_resource(
         let svc_name = svc_name.clone();
         let fields = fields.clone();
         async move {
-            if fields.is_empty() {
+            let Some(q) = crate::drawer_query::cardinality_query(&svc_name, &fields) else {
                 return Ok(HashMap::new());
-            }
-            let dc_exprs: Vec<String> = fields.iter().map(|f| format!("dc({f}) as {f}")).collect();
-            let q = format!(
-                r#"service="{}" last=7d | stats {}"#,
-                svc_name.replace('"', ""),
-                dc_exprs.join(", ")
-            );
+            };
             let resp = api::query(&q, 0).await?;
             Ok(parse_cardinality(&resp))
         }

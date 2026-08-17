@@ -89,20 +89,27 @@ pub fn build_search_url(
 }
 
 fn encode_filters(filters: &[Filter]) -> String {
-    let parts: Vec<String> = filters
-        .iter()
-        .map(|f| {
-            let val = js_sys::encode_uri_component(&f.value)
-                .as_string()
-                .unwrap_or_default()
-                .replace(',', "%2C");
-            format!("{}{}={}", f.op.prefix(), f.field, val)
-        })
-        .collect();
-    parts.join(",")
+    crate::filter_codec::encode_payload(
+        filters
+            .iter()
+            .map(|f| (f.op.prefix(), f.field.as_str(), f.value.as_str())),
+    )
 }
 
 fn decode_filters(raw: &str) -> Vec<Filter> {
+    if let Some(parts) = crate::filter_codec::decode_payload(raw) {
+        return parts
+            .into_iter()
+            .filter_map(|(op, field, value)| {
+                let op = match op {
+                    '+' => FilterOp::Include,
+                    '-' => FilterOp::Exclude,
+                    _ => return None,
+                };
+                Some(Filter { field, value, op })
+            })
+            .collect();
+    }
     if raw.is_empty() {
         return Vec::new();
     }

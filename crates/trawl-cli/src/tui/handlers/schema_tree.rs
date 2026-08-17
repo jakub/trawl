@@ -284,6 +284,9 @@ impl App {
                 }
             }
             "common_field" | "service_field" => {
+                let Some(name) = trawl_core::parser::suggest::quote_dsl_field(&name) else {
+                    return;
+                };
                 self.tab.editor.insert_text(&name);
                 self.switch_to_main_tab(MainTab::Query);
                 self.focus = Focus::Editor;

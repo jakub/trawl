@@ -104,7 +104,9 @@ pub fn effective_query(base_q: &str, filters: &[Filter], range: &RangeSpec) -> S
 
     let mut prefix = String::new();
     for f in filters {
-        let clause = format_filter(f);
+        let Some(clause) = format_filter(f) else {
+            continue;
+        };
         if !prefix.is_empty() {
             prefix.push(' ');
         }
@@ -221,7 +223,7 @@ const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
 }
 
-fn format_filter(f: &Filter) -> String {
+fn format_filter(f: &Filter) -> Option<String> {
     let op = match f.op {
         FilterOp::Include => "=",
         FilterOp::Exclude => "!=",
@@ -232,7 +234,8 @@ fn format_filter(f: &Filter) -> String {
     // (`last`) needs backticks or the clause is not a filter at all
     // (ADR-0013 ruling 7).
     let quoted = format!("\"{}\"", f.value.replace('\\', "\\\\").replace('"', "\\\""));
-    format!("{}{}{}", quote_dsl_field(&f.field), op, quoted)
+    let field = quote_dsl_field(&f.field)?;
+    Some(format!("{field}{op}{quoted}"))
 }
 
 fn format_absolute_range(from: &str, to: &str) -> String {
@@ -305,6 +308,17 @@ mod tests {
             q,
             "host=\"web-01\" source!=\"auth.log\" last=1h _severity=error | stats count() by host"
         );
+    }
+
+    #[test]
+    fn unrepresentable_filter_names_contribute_no_query_logic() {
+        let q = effective_query(
+            "_severity=error",
+            &[inc("a\u{202e}b", "x"), inc("", "y"), inc("request id", "7")],
+            &quick("1h"),
+        );
+        assert_eq!(q, "`request id`=\"7\" last=1h _severity=error");
+        assert!(!q.contains('\u{202e}'));
     }
 
     #[test]
