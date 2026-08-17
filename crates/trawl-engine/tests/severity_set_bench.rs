@@ -16,10 +16,12 @@
 //! `IN` list, so the `IN` rendering is 3.6x slower for six bands and 62x
 //! slower for a single band.
 //!
-//! The shape that is actually fast is the third one this probe times:
-//! keep RANGES, but merge the ladder points into MINIMAL CONTIGUOUS ones.
-//! Six contiguous bands then collapse to a single `BETWEEN 1 AND 24` — the
-//! subject written once AND 5.5x faster than the pre-#82 rendering.
+//! What SHIPPED is the third shape this probe times: keep RANGES, but
+//! merge the ladder points into MINIMAL CONTIGUOUS ones. Six contiguous
+//! bands then collapse to a single `BETWEEN 1 AND 24` — the subject
+//! written once AND ~5.9x faster than the pre-#82 rendering. The `IN`
+//! shape stays in the matrix as the falsified-premise record, so a future
+//! reader who has the same idea can see it was measured and rejected.
 //!
 //! Not a correctness test and not run in CI — `#[ignore]`d, because a
 //! wall-clock ratio on a shared machine is evidence for a human reading a
@@ -31,18 +33,18 @@
 //!
 //! # Why it times SHAPES rather than two checkouts
 //!
-//! All four predicates are built here from the ONE subject builder
+//! Every predicate is built here from the ONE subject builder
 //! (`conform::severity_reading_sql_bind_once`), so the pre-#82 shape (the
-//! subject repeated once per band, ranges OR'd) and the post-#82 shape
-//! (the subject written once, ladder points in an `IN`) are measured in
-//! the SAME process, against the SAME corpus, with the same engine build.
+//! subject repeated once per band), the shipped merged-range shape and the
+//! rejected `IN` one are measured in the SAME process, against the SAME
+//! corpus, with the same engine build.
 //! Timing two git checkouts instead would compare two binaries built
 //! minutes apart, which is how a 60x "regression" that is really a
 //! build/cache artifact gets into a PR body.
 //!
 //! `emitted_shapes_match_the_hand_built_ones` is the guard that keeps this
-//! honest: the post-#82 strings the emitter actually produces are asserted
-//! equal to the hand-built ones this bench times.
+//! honest: the strings the emitter actually produces today are asserted
+//! equal to the hand-built merged-range ones this bench times.
 //!
 //! The corpus is 1M rows of a realistic token distribution over a VARCHAR
 //! `level` column — the shape a sender that never adopted `_severity`
@@ -75,6 +77,9 @@ const REPETITIONS: usize = 7;
 const SIX_BANDS: [(i64, i64); 6] = [(1, 4), (5, 8), (9, 12), (13, 16), (17, 20), (21, 24)];
 /// One band — what `sev(level) == "error"` resolves to.
 const ONE_BAND: [(i64, i64); 1] = [(17, 20)];
+/// A genuinely DISJOINT selection — `sev(level) in ("warn", "fatal")`,
+/// the one shape merging cannot collapse to a single range.
+const DISJOINT: [(i64, i64); 2] = [(13, 16), (21, 24)];
 
 fn conn() -> Connection {
     Connection::open_in_memory().expect("in-memory duckdb")
@@ -97,8 +102,37 @@ fn ranges_sql(bands: &[(i64, i64)]) -> String {
         .join(" OR ")
 }
 
-/// The post-#82 rendering: the subject once, every ladder point the bands
-/// cover inlined into one `IN`.
+/// The SHIPPED post-#82 rendering: the points merged back into minimal
+/// contiguous ranges, so contiguous bands share ONE subject.
+fn merged_sql(bands: &[(i64, i64)]) -> String {
+    let subject = subject();
+    let points: Vec<i64> = bands
+        .iter()
+        .flat_map(|(lo, hi)| *lo..=*hi)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let ranges = trawl_core::compare::severity_ranges(&points);
+    let positive = ranges
+        .iter()
+        .map(|(lo, hi)| {
+            if lo == hi {
+                format!("{subject} = {lo}")
+            } else {
+                format!("{subject} BETWEEN {lo} AND {hi}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    if ranges.len() > 1 {
+        format!("({positive})")
+    } else {
+        positive
+    }
+}
+
+/// The REJECTED post-#82 candidate, kept as the falsified-premise record:
+/// the subject once, every ladder point inlined into one `IN`.
 fn points_sql(bands: &[(i64, i64)]) -> String {
     let points: Vec<String> = bands
         .iter()
@@ -175,20 +209,21 @@ fn severity_predicate_shape_costs() {
     corpus(&conn, &file);
     let source = file.display().to_string();
 
+    // Three groups of three, in a fixed order the ratio loop indexes:
+    // pre-#82, the SHIPPED merged-range shape, the REJECTED `IN` one.
     let shapes = [
-        ("one band  before (BETWEEN)", ranges_sql(&ONE_BAND)),
-        ("one band  after  (IN)", points_sql(&ONE_BAND)),
-        ("six bands before (OR of BETWEENs)", ranges_sql(&SIX_BANDS)),
-        ("six bands after  (IN)", points_sql(&SIX_BANDS)),
-        ("six bands MERGED (one BETWEEN)", ranges_sql(&[(1, 24)])),
+        ("one band  before (1x BETWEEN)", ranges_sql(&ONE_BAND)),
+        ("one band  AFTER  (merged range)", merged_sql(&ONE_BAND)),
+        ("one band  rejected (IN)", points_sql(&ONE_BAND)),
         (
-            "two disjoint before (2 BETWEEN)",
-            ranges_sql(&[(13, 16), (21, 24)]),
+            "six bands before (6x BETWEEN, OR'd)",
+            ranges_sql(&SIX_BANDS),
         ),
-        (
-            "two disjoint after  (IN)",
-            points_sql(&[(13, 16), (21, 24)]),
-        ),
+        ("six bands AFTER  (merged range)", merged_sql(&SIX_BANDS)),
+        ("six bands rejected (IN)", points_sql(&SIX_BANDS)),
+        ("disjoint  before (2x BETWEEN)", ranges_sql(&DISJOINT)),
+        ("disjoint  AFTER  (2 merged ranges)", merged_sql(&DISJOINT)),
+        ("disjoint  rejected (IN)", points_sql(&DISJOINT)),
     ];
 
     println!("issue-82 severity set cost probe");
@@ -208,16 +243,19 @@ fn severity_predicate_shape_costs() {
     #[allow(clippy::cast_precision_loss)]
     let sql_ratio =
         |before: &Measured, after: &Measured| before.sql_len as f64 / after.sql_len as f64;
-    println!(
-        "  one band   speedup   {:.2}x  (SQL {:.2}x smaller)",
-        ratio(&measured[0], &measured[1]),
-        sql_ratio(&measured[0], &measured[1])
-    );
-    println!(
-        "  six bands  speedup   {:.2}x  (SQL {:.2}x smaller)",
-        ratio(&measured[2], &measured[3]),
-        sql_ratio(&measured[2], &measured[3])
-    );
+    for (label, before, after, rejected) in [
+        ("one band ", 0, 1, 2),
+        ("six bands", 3, 4, 5),
+        ("disjoint ", 6, 7, 8),
+    ] {
+        println!(
+            "  {label}  merged {:.2}x vs before (SQL {:.2}x smaller) | \
+             the rejected IN shape was {:.2}x vs before",
+            ratio(&measured[before], &measured[after]),
+            sql_ratio(&measured[before], &measured[after]),
+            ratio(&measured[before], &measured[rejected])
+        );
+    }
 
     // Not a threshold assertion — the numbers are the deliverable. Only
     // the sanity of the corpus is asserted, so a probe that silently
@@ -226,16 +264,20 @@ fn severity_predicate_shape_costs() {
         measured[0].rows > 0,
         "the one-band predicate must match rows"
     );
-    assert_eq!(
-        measured[0].rows, measured[1].rows,
-        "both one-band shapes must match the same rows"
-    );
-    assert_eq!(
-        measured[2].rows, measured[3].rows,
-        "both six-band shapes must match the same rows"
-    );
+    for group in [0, 3, 6] {
+        assert_eq!(
+            measured[group].rows,
+            measured[group + 1].rows,
+            "every shape in a group must match the same rows"
+        );
+        assert_eq!(
+            measured[group].rows,
+            measured[group + 2].rows,
+            "every shape in a group must match the same rows"
+        );
+    }
     assert!(
-        measured[2].rows > measured[0].rows,
+        measured[3].rows > measured[0].rows,
         "six bands must match more rows than one"
     );
 }
@@ -251,21 +293,29 @@ fn emitted_shapes_match_the_hand_built_ones() {
             .expect("emit succeeds")
             .sql;
         let (_, predicate) = sql.split_once("WHERE ").expect("a where clause");
-        // Strip exactly the ONE wrapping paren pair the pipeline arm adds
-        // — trimming greedily would eat the `IN (…)` list's own closer.
-        let predicate = predicate.trim();
-        predicate
-            .strip_prefix('(')
-            .and_then(|p| p.strip_suffix(')'))
-            .expect("the pinned arm parenthesizes its clause")
-            .to_owned()
+        predicate.trim().to_owned()
+    };
+    // The pipeline arm parenthesizes its clause for composition, but does
+    // NOT double-wrap one that already arrives grouped — which is exactly
+    // the multi-range case. Expect what that rule produces.
+    let composed = |bands: &[(i64, i64)]| {
+        let clause = merged_sql(bands);
+        if clause.starts_with('(') {
+            clause
+        } else {
+            format!("({clause})")
+        }
     };
     assert_eq!(
         emitted(r#"* | where sev(level) == "error""#),
-        points_sql(&ONE_BAND)
+        composed(&ONE_BAND)
     );
     assert_eq!(
         emitted(r#"* | where sev(level) in ("trace", "debug", "info", "warn", "error", "fatal")"#),
-        points_sql(&SIX_BANDS)
+        composed(&SIX_BANDS)
+    );
+    assert_eq!(
+        emitted(r#"* | where sev(level) in ("warn", "fatal")"#),
+        composed(&DISJOINT)
     );
 }
