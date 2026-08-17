@@ -181,6 +181,45 @@ trawld migrates this database automatically at boot (it is the sole writer) and 
 | `default_env` | string | `"prod"` | Fills a missing `env` on ingested events (repair code `env.defaulted`). Must pass the env charset and be a member of `envs` |
 | `envs` | string list | `[default_env]` | Environment allowlist (ADR-0009). Events with an unlisted `env` hard-reject. Entries must match `[a-z0-9_-]{1,32}`; `wal` and `scheduled` are reserved. Validated at load — trawld refuses to start otherwise. The allowlist gates writes, not reads: removing an env stops new ingest but its directories stay queryable and age out normally |
 | `trusted_relays` | CIDR list | `[]` | Peers (collectors/relays) whose address must never be stamped as an event's `host`: a host-less event from one of these is rejected instead of peer-repaired. Invalid entries are boot-fatal |
+| `severity_from` | source list | `["severity", "severity_text", "level"]` | Wire keys `_severity` derives from, in precedence order — first *mappable* wins. Empty is legal and derives nothing |
+| `time_from` | source list | `["_time", "timestamp", "@timestamp"]` | Wire keys `_time` derives from, in precedence order — first *present* wins. Must contain `_time` |
+
+#### Derivation sources (`severity_from` / `time_from`)
+
+`_severity` and `_time` are trawl-owned envelope slots, and these two lists are the whole of what they read. Derivation only **reads**: every source stays exactly where it arrived, as an ordinary queryable column under the name its sender chose, and a derivation into the `_` namespace touches nothing sender-visible, so it is never recorded as a repair.
+
+An entry takes either spelling:
+
+```toml
+[ingest]
+severity_from = ["severity", "severity_text", "level"]
+time_from = ["_time", "timestamp", "@timestamp"]
+
+# The typed form declares the dialect an entry's NUMERICS read in.
+severity_from = ["level", { field = "syslog_severity", dialect = "syslog" }]
+```
+
+`dialect` is `otel` (the default) or `syslog`, and it governs **numerics only** — a word like `error` always reads through the one token table, whichever dialect the entry declares. OTel numbers are 1–24 read straight; syslog numbers are 0–7 read inverted (`0` = emerg, `7` = debug). The ranges overlap, so no value-shape rule could tell the dialects apart: the operator asserting where a number came from is what licenses the inversion. That makes the typed form the **syslog-over-HTTP forwarder knob** — a collector that parses frames itself and ships the raw PRI numeral as its own field reaches exactly the inversion the native listener does, through the same mechanism rather than a privileged code path.
+
+Precedence differs between the two lists on purpose. `severity_from` takes the first source that *maps* to something on the ladder, so an unmappable `level: "gold"` falls through to the next source. `time_from` takes the first source that is *present*, and an unparseable value there falls to arrival time (with the `time.from_ingest` repair) rather than reaching past itself — what `_time` holds is always explicable from one input. Only `_time` itself is consumed and replaced with its canonical form; every other source is left alone.
+
+Both lists are validated at startup and **trawld refuses to start** on a bad entry, naming the list and the offending index — a source list that silently never matches would be the sharpest footgun in the design. The rules:
+
+| Rule | Applies to |
+|------|------------|
+| Field name non-empty, at most 255 bytes | both |
+| Already ASCII-lowercase (ingest folds every field name, so a `Level` entry could never match) | both |
+| No duplicate field names within one list | both |
+| At most 8 entries | both |
+| No reserved (`_`-prefixed) names | `severity_from` |
+| Must contain `_time`, which is also the *only* reserved name permitted | `time_from` |
+| `dialect` must be `otel` or `syslog`; an unknown token names the vocabulary | `severity_from` |
+| `dialect` on an entry is an error — dialects govern severity numerics alone | `time_from` |
+| Empty list | legal for `severity_from` (derive nothing), illegal for `time_from` |
+
+Changing either list is **forward-only**. There is no policy history and nothing re-derives stored events: an event keeps the `_severity` and `_time` it was written with, and the new lists apply from the next event onward. Reinterpreting an old corpus means a repin, not a config reload.
+
+**Profile-fixed sources are not configurable.** Each producer profile prepends its own transport-proven sources to these lists: the syslog listener contributes `{ field = "syslog_severity", dialect = "syslog" }` and `syslog_timestamp`, while the HTTP and trawld doors contribute none. Those fixed entries win over anything configured under the same name and do not count against the 8-entry bound — they are trawl's, not the operator's. Everything else about the two lists is global and identical at every door.
 
 ### `[retention]`
 
@@ -249,6 +288,8 @@ session_ttl_secs = 86400
 ### `[syslog]`
 
 Native syslog listener for receiving logs from network appliances.
+
+Frames enter the same envelope canonicalizer HTTP events do, under the `syslog` producer profile: the listener publishes what it parsed as ordinary columns — `syslog_severity` (the **raw** PRI numeral, 0–7, absent when the frame carried no PRI), `syslog_timestamp`, `syslog_facility`, `syslog_pid`, `syslog_msgid`, `syslog_source_ip` and the flattened `sd_*` structured-data pairs — and the profile's fixed derivation sources turn the first two into `_severity` and `_time`. `env` comes from `[ingest] default_env` and `host` from the frame's hostname, falling back to the peer address unless the peer is a configured `[ingest] trusted_relays` CIDR, in which case the event is kept with `host` absent. An APP-NAME that fails the service charset lands under `default_service` with a `service.from_profile` repair rather than being sanitized into a service name nobody sent.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

@@ -185,6 +185,36 @@ database_url = "postgres://fleet:fleet@localhost:5433/trawl"
 # trawl_telemetry_events_dropped_total{reason="buffer_cap"}.
 # telemetry_buffer_max_bytes = "16M"
 
+# Wire keys _severity derives from, in precedence order — first MAPPABLE
+# wins. Derivation only READS: every source stays exactly where it is, as
+# an ordinary queryable column under the name its sender chose. An empty
+# list is legal and means "derive nothing".
+# severity_from = ["severity", "severity_text", "level"]
+
+# An entry may also be written in the typed form, whose dialect governs
+# NUMERICS only: "otel" (the default) reads 1-24 straight, "syslog"
+# inverts 0-7. This is the syslog-over-HTTP forwarder knob — a collector
+# that ships the raw PRI numeral as its own field reaches the same
+# inversion the native listener does, because provenance is what licenses
+# it and the config is where provenance is asserted:
+# severity_from = ["severity", "severity_text", "level", { field = "syslog_severity", dialect = "syslog" }]
+
+# Wire keys _time derives from, in precedence order — first PRESENT wins
+# (an unparseable value falls to arrival time rather than reaching past
+# itself). Only _time is consumed; the other sources stay as columns. The
+# list must contain _time, which is also the only reserved name allowed
+# here, and a dialect on an entry is an error — dialects govern severity
+# numerics alone.
+# time_from = ["_time", "timestamp", "@timestamp"]
+
+# Both lists are validated at startup and trawld REFUSES TO START on a
+# bad entry: a source list that silently never matches would be the
+# sharpest footgun in the design. Changes are forward-only — nothing
+# re-derives stored events, so an event keeps the _severity and _time it
+# was written with. A producer profile's own fixed sources (the syslog
+# listener's syslog_severity/syslog_timestamp) prepend these lists and
+# are not configurable.
+
 [retention]
 # Delete date directories older than this many days. 0 = disabled.
 # Adjust based on your storage capacity and compliance requirements.

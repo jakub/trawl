@@ -569,7 +569,7 @@ async fn ingest_accepts_ndjson(pool: sqlx::PgPool) {
 /// The ADR-0013 worked examples, end to end.
 ///
 /// A vector-shaped payload (`timestamp` + `level`) lands as the declared
-/// nine-field envelope: `_time` derived AND `timestamp` stored verbatim,
+/// ten-field envelope: `_time` derived AND `timestamp` stored verbatim,
 /// `_severity` derived AND `level` stored verbatim, `_raw` populated —
 /// and the severity vocabulary rides `_severity`, which nothing can
 /// shadow. The game server's `level:"gold"` keeps its column and gets no

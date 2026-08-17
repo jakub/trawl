@@ -72,6 +72,13 @@ data:
     hot_buffer_max_bytes = {{ .Values.config.ingest.hotBufferMaxBytes | quote }}
     stats_interval_secs = {{ .Values.config.ingest.statsIntervalSecs | int }}
     telemetry_flush_interval_secs = {{ .Values.config.ingest.telemetryFlushIntervalSecs | int }}
+    {{- /* Derivation sources (ADR-0013 slice 2): each entry is a bare
+         name or a {field, dialect} map. Rendered rather than defaulted
+         away, because these lists are a packaging contract — the chart,
+         the Debian example, the code default and the docs state one
+         list (crates/trawl-config/tests/derivation_packaging_contract.rs). */}}
+    severity_from = [{{ range $i, $s := .Values.config.ingest.severityFrom }}{{ if $i }}, {{ end }}{{ if kindIs "map" $s }}{ field = {{ $s.field | quote }}{{ if $s.dialect }}, dialect = {{ $s.dialect | quote }}{{ end }} }{{ else }}{{ $s | quote }}{{ end }}{{ end }}]
+    time_from = [{{ range $i, $s := .Values.config.ingest.timeFrom }}{{ if $i }}, {{ end }}{{ if kindIs "map" $s }}{ field = {{ $s.field | quote }} }{{ else }}{{ $s | quote }}{{ end }}{{ end }}]
 
     [retention]
     max_age_days = {{ .Values.config.retention.maxAgeDays | int }}

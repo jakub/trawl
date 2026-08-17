@@ -372,12 +372,14 @@ _severity=warn*                 # glob over the canonical token text: 13-16
   compare the ladder number there (`_severity>=17`).
 
 `_severity` is **derived, never proposed**: ingest reads `severity` →
-`severity_text` → `level` (first mappable wins) and stores every one of
-them verbatim as your own columns. A word maps through the token table
-or the exact names; a number maps strictly as OTel 1-24, so `3` is
-`trace` — the syslog inversion happens only in the syslog listener,
-where the transport proves the dialect. An event with no mappable source
-simply has no `_severity`.
+`severity_text` → `level` (first mappable wins — the packaged default of
+`[ingest] severity_from`) and stores every one of them verbatim as your
+own columns. A word maps through the token table or the exact names; a
+number maps strictly as OTel 1-24, so `3` is `trace`, unless the source
+was configured with `dialect = "syslog"` — which is how the syslog
+listener's own `syslog_severity` numeral inverts, and how a
+syslog-over-HTTP forwarder reaches the same reading. An event with no
+mappable source simply has no `_severity`.
 
 #### Reading any field as a severity: `sev()`
 

@@ -54,6 +54,12 @@ So an existing remap that sets `.timestamp` and `.level` keeps working —
 and now keeps its fields too. The shipped configs emit `._time`
 natively, which is preferred.
 
+Both source lists are the packaged defaults of `[ingest] severity_from`
+and `[ingest] time_from` — see
+[Derivation sources](/reference/configuration/#derivation-sources-severity_from--time_from)
+if your shipper's vocabulary differs, or if it forwards parsed syslog
+and needs the `0-7` PRI numeral read as syslog rather than OTel.
+
 ### Severity tokens
 
 `severity`, `severity_text` and `level` values are matched
