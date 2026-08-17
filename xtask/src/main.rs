@@ -12,7 +12,8 @@
 //! - `design-cards` — emit static fleet-ui preview cards for
 //!   claude.ai/design (see `design_cards` module).
 //! - `ingest-fuzz` — emit deterministic, Vector-compatible NDJSON corpora
-//!   for the ingest canonicalizer and field-catalog pin/conform boundary.
+//!   for the ingest canonicalizer and field-catalog pin/conform boundary,
+//!   per producer profile (`--profile http|syslog|trawld`).
 //!
 //! Aliased as `cargo xtask` via `.cargo/config.toml`.
 
@@ -27,7 +28,7 @@ use std::process::{Command, ExitCode};
 use brotli::CompressorWriter;
 use clap::{Parser, Subcommand};
 use flate2::{Compression, GzBuilder};
-use ingest_fuzz::Phase;
+use ingest_fuzz::{Phase, Profile};
 
 const GZIP_BUDGET: u64 = 4 * 1024 * 1024;
 const BROTLI_BUDGET: u64 = 5 * 1024 * 1024 / 2;
@@ -71,6 +72,11 @@ enum Cmd {
         /// same seed and namespace to exercise already-pinned fields.
         #[arg(long, value_enum, default_value_t = Phase::Mutate)]
         phase: Phase,
+        /// Producer profile the `mutate` corpus is shaped for: `http`
+        /// wire events, or the payload map the `syslog`/`trawld` door
+        /// hands the one canonicalizer. Only `mutate` has a profile.
+        #[arg(long, value_enum, default_value_t = Profile::Http)]
+        profile: Profile,
         /// Seed controlling field names, values, and mutation selection.
         #[arg(long, default_value_t = 1)]
         seed: u64,
@@ -121,12 +127,14 @@ fn main() -> ExitCode {
         }
         Cmd::IngestFuzz {
             phase,
+            profile,
             seed,
             namespace,
             env,
             events,
         } => ingest_fuzz::run(&ingest_fuzz::Config {
             phase,
+            profile,
             seed,
             namespace,
             env,

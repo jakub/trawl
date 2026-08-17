@@ -160,10 +160,31 @@ curl -fsS \
 The generator writes only NDJSON to stdout; its row-count summary goes to
 stderr. `--seed`, `--namespace`, `--env`, and `--events` make it straightforward
 to wrap in a shell loop or CI job. The `mutate` phase emits accepted events
-covering scalar boundaries, nested values, timestamp and severity aliases,
-case-colliding and path-shaped field names, and the server's repair paths. The
-`rejects` phase emits valid JSON objects with invalid envelope fields so a test
-can assert the per-event rejection response.
+covering scalar boundaries, nested values, the `_time` and `_severity`
+derivation sources, case-colliding and path-shaped field names, and the
+server's repair paths. The `rejects` phase emits valid JSON objects with
+invalid envelope fields so a test can assert the per-event rejection response.
+
+`--profile` shapes the `mutate` corpus for one of the three producer
+profiles that share the canonicalizer:
+
+```bash
+cargo xtask ingest-fuzz --phase mutate --profile syslog --seed 42 > /tmp/syslog.ndjson
+cargo xtask ingest-fuzz --phase mutate --profile trawld --seed 42 > /tmp/trawld.ndjson
+```
+
+`http` (the default) emits wire events as a sender posts them. `syslog`
+emits the payload the syslog door builds from a frame — the `_raw` wire
+line, the `syslog_*` parse artifacts and the unfolded `sd_*` pairs — and
+`trawld` emits the payload the telemetry layer builds from a tracing
+event. Both are still ordinary NDJSON, so posting them to
+`/api/v1/ingest` replays them the way a syslog-over-HTTP forwarder's
+batch arrives; they land under `_producer=http` that way, since the
+column records the door an event actually entered through. The
+in-process proof that each shape survives its *own* door is
+`crates/trawl-server/tests/profile_fuzz.rs`, which runs in the ordinary
+test suite. Only `mutate` has a profile — the other phases describe the
+catalog boundary, not a door.
 
 Schema-pinning runs are deliberately split into phases. Post and compact the
 `pin` file before posting `conflicts`; otherwise both sets may share the first
