@@ -328,11 +328,32 @@ pub(crate) fn literal<'src>()
 // ---------------------------------------------------------------------------
 
 /// Parse a bare (unquoted) value in a field filter — stops at whitespace and `|`.
+///
+/// A backtick ENDS a bare value, the same exclusion the search stage's bare
+/// word makes and for the same reason: it is the one character whose
+/// meaning is decided before the grammar runs. The pre-parse comment
+/// scanner engages its backtick state wherever a NAME could start, and an
+/// operator inside a value looks exactly like that from outside
+/// (`host=a+` is a value, `1+` is arithmetic), so a value that could
+/// absorb a tick could absorb a shielded `#` with it — turning a comment
+/// into part of the value SILENTLY. Ending the value here makes the stray
+/// tick a parse error instead: loud, or correct, never quietly different.
+///
+/// This is the single bare-RHS production — single values, comma-separated
+/// IN lists and glob detection all route through it — so the exclusion
+/// covers every unquoted value shape at once. A value that genuinely
+/// contains a backtick is written double-quoted (`` host="a`b" ``), which
+/// the quoted arm has always accepted.
 pub(crate) fn bare_value<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     any()
         .filter(|c: &char| {
-            !c.is_ascii_whitespace() && *c != '|' && *c != ',' && *c != ')' && *c != '('
+            !c.is_ascii_whitespace()
+                && *c != '|'
+                && *c != ','
+                && *c != ')'
+                && *c != '('
+                && *c != '`'
         })
         .repeated()
         .at_least(1)

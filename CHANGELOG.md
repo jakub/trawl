@@ -265,6 +265,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   escape hatch.
 
 ### Fixed
+- **BREAKING — a backtick ends every unquoted position, and a name can be
+  quoted after an operator (#78 follow-up).** Backticks were never value
+  quotes, but a query that used them as such answered something quietly
+  narrower: `` service=`my service` `` parsed as a filter for the literal
+  text `` `my `` beside a stray search term, and `` host=`a # b` more ``
+  turned a comment's own words into AND-ed search terms. A backtick now **ends** an
+  unquoted value and an unquoted word alike, so every one of those shapes
+  is a loud parse error, and `` -`http-status`=500 `` — a negation the
+  search grammar has no production for — is one too (write
+  ``NOT `http-status`=500``). Text that genuinely contains a backtick is
+  double-quoted: `` host="a`b" ``, `` "er`ror" ``, which carry it verbatim.
+
+  With no unquoted position able to absorb a tick, the pre-parse comment
+  scanner can open a quoted name after an arithmetic operator as well:
+  `` | sort -`a#b` ``, `` | sort -`http://x` `` and `` | let x = 1+`a#b` ``
+  parse instead of dying as unterminated names, so a field whose name
+  carries a `#` or `//` can be sorted descending and used in expressions —
+  the contract `quote_dsl_field` already promised. `/` deliberately stays
+  out of that set: it opens a regex far more often than it divides.
+- **The web UI's field drill-in works for a field named `count` (#78
+  follow-up).** Expanding that row in the service drawer composed
+  `| top 10 count`, which projects the field beside a `count` column
+  `top` mints itself — two columns of one name, so the projection
+  collision check introduced with backtick identifiers answered 400. The
+  drawer now composes the aliased stats form for that one name and reads
+  the counts back from the column it actually asked for; every other
+  field keeps `top 10`.
+- **Query formatting no longer changes what a filter value means (#78
+  follow-up).** `/api/v1/validate`'s `formatted` field and the TUI/web
+  editors' reformat button render a filter value bare whenever the bare
+  grammar can spell it — but a value position re-lexes more than that.
+  `host="a#b"` and `host="a//b"` came back as a filter for `a`, because
+  comments are stripped before the grammar runs; `host="/foo/"` came back
+  a regex and `host="a*b"` a glob, so an exact match — or a `!=` — turned
+  into a pattern. Those shapes are now quoted, and nothing else is: a
+  value with an inner slash (`/foo/bar/`), a genuine glob (`path=/api/*`)
+  and a genuine regex still render exactly as before.
 - **Backtick identifier follow-through after #81.** Catalog names are now
   declined when the DSL cannot represent them and otherwise flow through the
   shared renderer in every TUI/SPA query builder; URL facet state carries

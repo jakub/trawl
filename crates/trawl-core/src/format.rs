@@ -20,8 +20,15 @@ use crate::parser::suggest::quote_dsl_field;
 /// Field names stored in an AST came through the parser, so the quoted-name
 /// grammar has already proved they are representable. Catalog-backed query
 /// builders use the fallible renderer directly instead.
+///
+/// The fallback echoes the raw name rather than panicking: `parse` cannot
+/// produce a name [`quote_dsl_field`] refuses — its refusal set IS that
+/// production's — so the branch is unreachable for any AST that came from
+/// a query, and a hand-built one is not worth a panic inside a response
+/// path (`/api/v1/validate` returns `formatted`, and both editors write it
+/// back).
 fn dsl_field(name: &str) -> String {
-    quote_dsl_field(name).expect("parsed AST field names are DSL-representable")
+    quote_dsl_field(name).unwrap_or_else(|| name.to_string())
 }
 
 /// Render a field-name list (`table a, b`, `by a, b`) as DSL text.
@@ -179,13 +186,48 @@ fn escape_quoted(text: &str) -> String {
 
 /// Whether a filter value literal needs quoting in the formatted output.
 ///
-/// This is the complement of `primitives::bare_value`, plus `"` which ends
-/// the quoted form. Keeping the sets aligned makes parse-format-parse stable.
-fn needs_quoting(s: &str) -> bool {
+/// The complement of `primitives::bare_value`, plus `"` which ends the
+/// quoted form — and, because a value position re-lexes more than that one
+/// production, three shapes whose BARE rendering would parse back as
+/// something else:
+///
+/// - a `#` or a `//`, which `strip_comments` blanks before the grammar
+///   runs at all, so half the predicate disappears (`host="a#b"` rendered
+///   bare comes back as a filter for `a`);
+/// - the regex shape `/…/`, which `search::filter_value` tries FIRST, so
+///   an exact match would come back a pattern (`host="/foo/"`);
+/// - a glob character, which the same production auto-detects and which
+///   then OVERRIDES the written operator, so `host!="a*b"` would come back
+///   a glob and lose its negation. A value the AST already marks
+///   [`FilterOp::Glob`] is exempt — there the wildcards are the point, and
+///   quoting them would turn the glob into an exact match instead.
+///
+/// Keeping the sets aligned is what makes format → reparse yield the same
+/// AST for every literal value shape.
+fn needs_quoting(s: &str, op: FilterOp) -> bool {
     s.is_empty()
         || s.contains('"')
+        || s.contains('#')
+        || s.contains("//")
+        || is_regex_shaped(s)
+        || (op != FilterOp::Glob && (s.contains('*') || s.contains('?')))
         || s.chars()
             .any(|c| c.is_ascii_whitespace() || matches!(c, '|' | '(' | ')' | ',' | '`'))
+}
+
+/// Whether a bare rendering would re-lex as a regex literal:
+/// `primitives::regex_pattern` is a `/`, a non-empty body carrying no `/`,
+/// and a closing `/`. `search::filter_value` then requires whitespace, a
+/// pipe or end of input after it — which is exactly what follows a value
+/// in formatted output, so the shape alone decides.
+///
+/// A value with an INNER slash (`/foo/bar/`) fails that production and
+/// stays bare: the rule quotes what would change meaning and nothing more.
+fn is_regex_shaped(s: &str) -> bool {
+    let Some(body) = s.strip_prefix('/').and_then(|rest| rest.strip_suffix('/')) else {
+        return false;
+    };
+    !body.is_empty() && !body.contains('/')
 }
 
 fn format_filter_value(value: &FilterValue, op: FilterOp, out: &mut String) {
@@ -193,7 +235,7 @@ fn format_filter_value(value: &FilterValue, op: FilterOp, out: &mut String) {
         FilterValue::Literal(s) => {
             if op == FilterOp::Regex {
                 let _ = write!(out, "/{s}/");
-            } else if needs_quoting(s) {
+            } else if needs_quoting(s, op) {
                 let escaped = escape_quoted(s);
                 let _ = write!(out, "\"{escaped}\"");
             } else {
@@ -571,6 +613,81 @@ mod tests {
             assert_eq!(once, twice, "{dsl}: formatter must be idempotent");
         }
         assert_eq!(fmt("host=web-01"), "host=web-01");
+    }
+
+    /// The invariant the whole formatter rests on: format → reparse
+    /// yields the SAME AST, for every literal value shape. Idempotence
+    /// alone does not prove it — a value that re-lexes as a different
+    /// OPERATOR reformats to itself while meaning something else — so
+    /// this compares the parsed token, which carries no spans.
+    #[test]
+    fn a_formatted_filter_value_reparses_to_the_same_ast() {
+        fn first_token(dsl: &str) -> SearchToken {
+            let query = crate::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+            query.search.groups[0][0].node.clone()
+        }
+
+        for dsl in [
+            // the comment openers: `strip_comments` runs BEFORE the
+            // grammar, so a bare rendering loses everything after them
+            r#"host="a#b""#,
+            r#"host="a//b""#,
+            r##"host="#lead""##,
+            r#"host="trail#""#,
+            r#"* | where message == "a#b""#,
+            // the shapes a value position re-lexes into another operator
+            r#"host="/foo/""#,
+            r#"host="a*b""#,
+            r#"host="a?b""#,
+            r#"host="*lead""#,
+            r#"host="trail*""#,
+            r#"host!="a*b""#,
+            r#"host>="/foo/""#,
+            // …and the ones that must STAY as they are: a real glob, a
+            // real regex, and values whose specials round-trip bare
+            "path=/api/*",
+            "message=/error.*/",
+            "host=/foo/bar/",
+            "host=a/b",
+            "host=web-01",
+            "status=200,301,404",
+            r#"host="a b""#,
+            r#"host="a`b""#,
+        ] {
+            let before = first_token(dsl);
+            let formatted = fmt(dsl);
+            let after = first_token(&formatted);
+            assert_eq!(before, after, "{dsl} formatted as {formatted}");
+            assert_eq!(formatted, fmt(&formatted), "{dsl}: not idempotent");
+        }
+    }
+
+    /// A hand-built AST can carry a name the grammar would never produce.
+    /// The formatter sits on a response path, so it renders what it was
+    /// given instead of panicking there.
+    #[test]
+    fn an_inexpressible_name_does_not_panic_the_formatter() {
+        let mut query = crate::parser::parse("| table host").expect("parses");
+        match &mut query.pipeline[0].node {
+            PipeStage::Table(t) => t.fields[0] = "a\u{202e}b".to_string(),
+            other => panic!("expected Table, got {other:?}"),
+        }
+        assert_eq!(format_query(&query), "| table a\u{202e}b");
+    }
+
+    /// …and the rule stays tight: a value whose bare spelling parses back
+    /// unchanged is not quoted just for carrying a special character.
+    #[test]
+    fn values_that_round_trip_bare_are_not_quoted() {
+        for (dsl, want) in [
+            ("host=/foo/bar/", "host=/foo/bar/"),
+            ("host=a/b", "host=a/b"),
+            ("path=/api/*", "path=/api/*"),
+            ("host=a-b.c", "host=a-b.c"),
+            ("host=200", "host=200"),
+        ] {
+            assert_eq!(fmt(dsl), want);
+        }
     }
 
     #[test]

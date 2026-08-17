@@ -449,6 +449,274 @@ mod tests {
         }
     }
 
+    // ── the round trip, over every field position ──────────────────────
+
+    /// Names chosen to break a naive helper: every grammar keyword and
+    /// literal, the three unconditional search spellings, stage names,
+    /// and the shapes only backticks can express.
+    ///
+    /// The keyword half is written out here rather than read from
+    /// [`GRAMMAR_KEYWORDS`]/[`SEARCH_KEYWORDS`]/[`EXPRESSION_KEYWORDS`] ON
+    /// PURPOSE — drawing the corpus from the constants under test would
+    /// make dropping a keyword invisible, since the name would leave the
+    /// corpus with it. This list comes from grepping `keyword(...)` and
+    /// `just("...=")` out of the grammar.
+    fn adversarial_names() -> Vec<&'static str> {
+        vec![
+            // shapes the bare grammar cannot express at all
+            "request id",
+            "http-status",
+            "x-request-id",
+            "a`b",
+            "a\"b",
+            "a'b",
+            "a b`c",
+            "日本語",
+            "über",
+            "2fast",
+            "1st",
+            "a-b.c",
+            "a.b.c",
+            "trailing.",
+            " ",
+            "a=b",
+            "a,b",
+            "a|b",
+            "a#b",
+            "a//b",
+            "http://x",
+            "(a)",
+            "*",
+            // shapes it can — including the ones the FOLD makes equal
+            "host",
+            "host.name",
+            "@timestamp",
+            "_time",
+            "Dur",
+            "dur",
+            "count",
+            "stats",
+            "where",
+            "table",
+            "sort",
+            "limit",
+            "eventstats",
+            "timechart",
+            // every keyword spelling the grammar matches
+            "true",
+            "false",
+            "null",
+            "and",
+            "or",
+            "not",
+            "OR",
+            "NOT",
+            "in",
+            "matches",
+            "like",
+            "ilike",
+            "as",
+            "by",
+            "on",
+            "from",
+            "sep",
+            "kv",
+            "span",
+            "run",
+            "saved",
+            "all",
+            "last",
+            "earliest",
+            "latest",
+            "head",
+            "tail",
+            "drop",
+            "dedup",
+            "rare",
+            "top",
+            "let",
+            "eval",
+            "rename",
+            "pivot",
+            "sample",
+            "fields",
+        ]
+    }
+
+    /// A field position for each door the helper's output must survive.
+    /// Read positions only: a write position adds the sealed-prefix
+    /// policy, which is not a quoting question.
+    fn read_positions(rendered: &str) -> Vec<String> {
+        vec![
+            format!("{rendered}=1"),
+            format!("* | where {rendered} == 1"),
+            format!("* | stats count() by {rendered}"),
+            format!("* | table {rendered}"),
+            format!("* | sort -{rendered}"),
+            format!("* | top 5 {rendered}"),
+        ]
+    }
+
+    fn walk_expr(expr: &crate::ast::Expr, out: &mut Vec<String>) {
+        use crate::ast::Expr;
+        match expr {
+            Expr::FieldRef(name) => out.push(name.clone()),
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    walk_expr(&a.node, out);
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                walk_expr(&lhs.node, out);
+                walk_expr(&rhs.node, out);
+            }
+            Expr::Unary { operand, .. } => walk_expr(&operand.node, out),
+            Expr::InList { expr, list } => {
+                walk_expr(&expr.node, out);
+                for item in list {
+                    walk_expr(&item.node, out);
+                }
+            }
+            Expr::Literal(_) => {}
+        }
+    }
+
+    fn walk_token(token: &crate::ast::SearchToken, out: &mut Vec<String>) {
+        use crate::ast::SearchToken;
+        match token {
+            SearchToken::FieldFilter(f) => out.push(f.field.clone()),
+            SearchToken::Not(inner) => walk_token(&inner.node, out),
+            SearchToken::Group(groups) => {
+                for group in groups {
+                    for t in group {
+                        walk_token(&t.node, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_aggs(aggs: &[crate::ast::AggExpr], out: &mut Vec<String>) {
+        for agg in aggs {
+            for a in &agg.args {
+                walk_expr(&a.node, out);
+            }
+            if let Some(alias) = &agg.alias {
+                out.push(alias.clone());
+            }
+        }
+    }
+
+    /// Every name the query carries in a field position, whatever door it
+    /// came through.
+    fn field_positions(query: &crate::ast::Query) -> Vec<String> {
+        use crate::ast::PipeStage;
+        let mut out = Vec::new();
+        for group in &query.search.groups {
+            for token in group {
+                walk_token(&token.node, &mut out);
+            }
+        }
+        for stage in &query.pipeline {
+            match &stage.node {
+                PipeStage::Stats(s) => {
+                    walk_aggs(&s.aggregations, &mut out);
+                    out.extend(s.group_by.iter().cloned());
+                }
+                PipeStage::EventStats(s) => {
+                    walk_aggs(&s.aggregations, &mut out);
+                    out.extend(s.group_by.iter().cloned());
+                }
+                PipeStage::Timechart(s) => {
+                    walk_aggs(&s.aggregations, &mut out);
+                    out.extend(s.group_by.iter().cloned());
+                }
+                PipeStage::Pivot(s) => {
+                    walk_aggs(std::slice::from_ref(&s.aggregation), &mut out);
+                    out.push(s.on_field.clone());
+                    out.extend(s.by.iter().cloned());
+                }
+                PipeStage::Where(s) => walk_expr(&s.condition.node, &mut out),
+                PipeStage::Let(s) => {
+                    for (target, value) in &s.assignments {
+                        out.push(target.clone());
+                        walk_expr(&value.node, &mut out);
+                    }
+                }
+                PipeStage::Sort(s) => out.extend(s.fields.iter().map(|f| f.field.clone())),
+                PipeStage::Table(s) => out.extend(s.fields.iter().cloned()),
+                PipeStage::Drop(s) => out.extend(s.fields.iter().cloned()),
+                PipeStage::Dedup(s) => out.extend(s.fields.iter().cloned()),
+                PipeStage::Top(s) => {
+                    out.push(s.field.clone());
+                    out.extend(s.by.iter().cloned());
+                }
+                PipeStage::Rare(s) => {
+                    out.push(s.field.clone());
+                    out.extend(s.by.iter().cloned());
+                }
+                PipeStage::Rename(s) => {
+                    for (from, to) in &s.renames {
+                        out.push(from.clone());
+                        out.push(to.clone());
+                    }
+                }
+                PipeStage::Extract(s) => out.extend(s.source_field.iter().cloned()),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The helper is the grammar's inverse: whatever it renders parses
+    /// back to the name it was given, in EVERY field position — that is
+    /// the contract every suggestion surface leans on, and one position
+    /// cannot stand in for the rest (`| sort -{name}` reads the tick
+    /// after an operator, `{name}=1` reads it at a token start).
+    #[test]
+    fn quote_dsl_field_round_trips_in_every_position() {
+        for original in adversarial_names() {
+            let Some(rendered) = quote_dsl_field(original) else {
+                // refused names are the ones the grammar cannot express;
+                // a caller declines to offer them rather than inventing one.
+                panic!("{original:?} was refused but is expressible");
+            };
+            for dsl in read_positions(&rendered) {
+                let query = crate::parser::parse(&dsl)
+                    .unwrap_or_else(|e| panic!("{original:?} rendered as {dsl:?}: {e:?}"));
+                assert!(
+                    field_positions(&query).iter().any(|n| n == original),
+                    "{original:?} rendered as {dsl:?} parsed as {:?}",
+                    field_positions(&query)
+                );
+            }
+        }
+    }
+
+    /// The half a forgotten keyword breaks: when the helper renders a name
+    /// BARE, the bare spelling must mean that name in every position.
+    /// `true` and `by` are good identifiers that never reach `field_ref`,
+    /// which is why `quote_dsl_field` backticks them even though
+    /// [`is_bare_field_name`] calls them lexable.
+    #[test]
+    fn a_bare_rendering_means_that_name_in_every_position() {
+        for original in adversarial_names() {
+            if quote_dsl_field(original).as_deref() != Some(original) {
+                continue;
+            }
+            for dsl in read_positions(original) {
+                let query = crate::parser::parse(&dsl)
+                    .unwrap_or_else(|e| panic!("{original:?} rendered bare: {dsl:?}: {e:?}"));
+                assert!(
+                    field_positions(&query).iter().any(|n| n == original),
+                    "{original:?} rendered bare but {dsl:?} parsed as {:?}",
+                    field_positions(&query)
+                );
+            }
+        }
+    }
+
     #[test]
     fn levenshtein_identical() {
         assert_eq!(levenshtein("stats", "stats"), 0);

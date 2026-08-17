@@ -317,6 +317,16 @@ aliases — so a name that exists is a name you can reach.
 **Not fields, so no backticks:** function names (`` `lower`(x) `` is a
 field reference, never a call), stage names, and saved-query names.
 
+A backtick also **ends an unquoted value and an unquoted word**, so text
+that contains one is written double-quoted — `` host="a`b" ``, `` "er`ror" ``
+— which carries the tick verbatim. Backticks are not value quotes:
+`` service=`nginx` `` and `` service=`my service` `` are parse errors, not
+filters on the literal text. Nor can `-` negate a quoted name: write
+``NOT `http-status`=500``, since `` -`http-status`=500 `` is an error too.
+(The tick is the one character whose meaning is settled before the grammar
+runs, by the comment stripper; ending unquoted text at it is what keeps a
+stray tick a parse error instead of a silently different query.)
+
 The search stage reads exactly three words before anything else —
 `last=`, `earliest=`, `latest=`. Backticks are how you reach fields with
 those names; everywhere else they are ordinary names already.
@@ -328,13 +338,16 @@ tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`,
 fields — ``| where `true` == 1`` filters on the column named `true`,
 while `| where true == 1` compares the boolean.
 
-A `#` or `//` inside backticks is part of the name, not a comment. The
-comment stripper opens a name only where one could start and only when
-the region would really lex as one, so a backtick inside a value — a
-regex literal or a glob — hides nothing. (A stray backtick that does sit
-at a token start and finds a partner on the same line still has the same
-shape of consequence as a `#` inside a regex literal: it can hide a later
-comment from the stripper.)
+A `#` or `//` inside backticks is part of the name, not a comment, so
+`` | sort -`a#b` `` sorts on the field `a#b`. The comment stripper opens a
+name only where one could start — the beginning of the line, after
+whitespace, or after `(`, `,`, `|`, a comparison operator or an arithmetic
+one — and only when the region would really lex as a name, so a backtick
+inside a regex literal hides nothing. Where the stripper does guess wrong
+(an operator inside a *value* looks exactly like arithmetic from outside)
+the grammar catches it: no unquoted position absorbs a tick, so
+`` host=a+`b#c` # outside `` is a parse error rather than a comment
+quietly folded into the value.
 
 ### Severity: `_severity`
 
