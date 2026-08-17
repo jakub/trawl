@@ -920,6 +920,46 @@ pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
     }
 }
 
+/// THE band→points expansion (issue #82): the ladder points a set of
+/// `SEVERITY`-pinned equality forms accepts, as one sorted, deduplicated
+/// list.
+///
+/// `Some(points)` exactly when the slice is non-empty and EVERY form is a
+/// severity equality form — a [`CompareForm::SeverityBand`] contributing
+/// its inclusive `lo..=hi`, or a [`CompareForm::SeverityExact`]
+/// contributing its number UNCLAMPED. Anything else (a mixed list, an
+/// empty one) is `None` and the caller keeps its per-element shape.
+///
+/// Unclamped is the point: `_severity=99` stays an honest matches-nothing
+/// and a negative literal stays negative, because the exact rung binds
+/// integers without consulting the ladder ([`compare_form`]'s rung 1).
+/// The set is what lets a whole severity list render its subject ONCE, as
+/// `subject IN (…)`, instead of once per band — a `sev()` subject is over
+/// a kilobyte of SQL, so the repetition was 4-6x on natural queries.
+///
+/// The points are `i64` because the exact rung is: `u8` would have to
+/// clamp, and clamping is exactly the silent meaning change this must not
+/// make.
+#[must_use]
+pub fn severity_points(forms: &[CompareForm]) -> Option<Vec<i64>> {
+    if forms.is_empty() {
+        return None;
+    }
+    let mut points = std::collections::BTreeSet::new();
+    for form in forms {
+        match form {
+            CompareForm::SeverityBand { lo, hi } => {
+                points.extend(i64::from(*lo)..=i64::from(*hi));
+            }
+            CompareForm::SeverityExact(n) => {
+                points.insert(*n);
+            }
+            _ => return None,
+        }
+    }
+    Some(points.into_iter().collect())
+}
+
 /// The `SeverityNumber` a SEVERITY-pinned column CONFORMS a stored text to
 /// — the live mirror of [`crate::conform::guarded_cast`]'s SEVERITY rung.
 ///
@@ -1821,6 +1861,82 @@ mod tests {
         assert_eq!(
             compare_form(sev, FilterOp::Eq, "99"),
             CompareForm::SeverityExact(99)
+        );
+    }
+
+    /// The drift guard for [`severity_points`] (issue #82): expanding a
+    /// form to ladder points must accept EXACTLY the numbers the form's
+    /// own rule accepts, for every literal the SEVERITY rung binds.
+    ///
+    /// Exhaustive and pure — every band token, every `OTel` exact short
+    /// name, and the integers around the ladder's edges, each checked
+    /// against every point on it. If the rule table ever grows a rung
+    /// whose membership is not `lo..=hi` or `== n`, this fails rather
+    /// than letting the `IN (…)` rendering quietly mean something else.
+    #[test]
+    fn severity_points_expands_exactly_the_forms_own_membership() {
+        let sev = Some(CanonicalType::Severity);
+        let literals = crate::severity::CANONICAL_TOKENS
+            .iter()
+            .map(|t| (*t).to_owned())
+            .chain((1..=24).map(|n| {
+                crate::severity::otel_name(n)
+                    .expect("1-24 name the ladder")
+                    .to_owned()
+            }))
+            .chain((-1..=26).map(|n: i64| n.to_string()));
+        for literal in literals {
+            let form = compare_form(sev, FilterOp::Eq, &literal);
+            let points = severity_points(std::slice::from_ref(&form))
+                .expect("a severity equality form always expands");
+            // Sorted and deduplicated, as the renderer relies on.
+            assert!(
+                points.windows(2).all(|w| w[0] < w[1]),
+                "{literal}: {points:?}"
+            );
+            for n in 1..=24_i64 {
+                let live = match form {
+                    CompareForm::SeverityBand { lo, hi } => {
+                        i64::from(lo) <= n && n <= i64::from(hi)
+                    }
+                    CompareForm::SeverityExact(exact) => exact == n,
+                    ref other => panic!("{literal} bound {other:?}"),
+                };
+                assert_eq!(points.contains(&n), live, "{literal} at {n}");
+            }
+            // Unclamped: an out-of-ladder integer keeps its own value, so
+            // `_severity=99` renders `IN (99)` and honestly matches nothing.
+            if let CompareForm::SeverityExact(exact) = form {
+                assert_eq!(points, vec![exact]);
+            }
+        }
+    }
+
+    /// `severity_points` is the SEVERITY set door and nothing else: a
+    /// non-severity form, or no forms at all, keeps the caller on its
+    /// per-element shape.
+    #[test]
+    fn severity_points_refuses_mixed_and_empty_form_sets() {
+        assert_eq!(severity_points(&[]), None);
+        assert_eq!(
+            severity_points(&[
+                CompareForm::SeverityExact(17),
+                CompareForm::Text("error".to_owned())
+            ]),
+            None
+        );
+        assert_eq!(
+            severity_points(&[CompareForm::TextOrNumeric("200".to_owned())]),
+            None
+        );
+        // Overlapping bands and duplicated points collapse to one set.
+        assert_eq!(
+            severity_points(&[
+                CompareForm::SeverityBand { lo: 17, hi: 20 },
+                CompareForm::SeverityExact(18),
+                CompareForm::SeverityBand { lo: 13, hi: 16 },
+            ]),
+            Some(vec![13, 14, 15, 16, 17, 18, 19, 20])
         );
     }
 
