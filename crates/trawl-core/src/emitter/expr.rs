@@ -314,7 +314,9 @@ fn try_pinned_in_list(
         };
         forms.push(form);
     }
-    // Subject first: `in_list_sql` pushes one parameter per element.
+    // Subject first, for parameter order: `in_list_sql` pushes one
+    // parameter per element — except the all-SEVERITY arm, which renders
+    // inlined ladder points and pushes none (issue #82).
     let subject = subject_sql(&subject, state)?;
     let clause = in_list_sql(&subject, forms, state);
     Ok(Some(if clause.starts_with('(') {

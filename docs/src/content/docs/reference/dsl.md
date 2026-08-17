@@ -360,9 +360,9 @@ the token vocabulary works identically in the SQL emitter, the live
 filter, the stream compiler and the post-SQL tail:
 
 ```
-_severity=error                 # BETWEEN 17 AND 20 (the ERROR band)
-_severity!=info                 # NOT BETWEEN 9 AND 12, or _severity IS NULL
-_severity=warn,error            # either band
+_severity=error                 # IN (17, 18, 19, 20) — the ERROR band
+_severity!=info                 # NOT IN (9, 10, 11, 12), or _severity IS NULL
+_severity=warn,error            # either band — one IN over both, 13-20
 _severity>=warn                 # >= 13 (the token's exact number)
 _severity=error2                # exactly 18 (the OTel exact short name)
 _severity=17                    # exactly 17

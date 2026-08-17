@@ -161,8 +161,8 @@ pub enum CompareForm {
     /// invert into a match.
     NumericOnText(String),
     /// The SEVERITY pin's equality-class form for a BAND token
-    /// (ADR-0013): `_severity=error` is the whole ERROR band, `BETWEEN 17
-    /// AND 20`, and `!=` its complement — the semantics the deleted
+    /// (ADR-0013): `_severity=error` is the whole ERROR band, 17-20, and
+    /// `!=` its complement — the semantics the deleted
     /// `level=` alias carried, now riding an unforgeable name through the
     /// pin rule table instead of a name special case.
     SeverityBand { lo: u8, hi: u8 },
@@ -864,7 +864,7 @@ fn form_over(
 /// 2. a BAND token ([`crate::severity::number_for_token`], the ADR-0009
 ///    table with its aliases) is the band under `=`/`!=`/IN and the
 ///    token's own number under an ordered operator — `_severity=error`
-///    is `BETWEEN 17 AND 20`, `_severity>=warn` is `>= 13`;
+///    is the band 17-20, `_severity>=warn` is `>= 13`;
 /// 3. an `OTel` EXACT short name ([`crate::severity::number_for_exact`])
 ///    is that exact number, whatever the operator — `error2` is 18. The
 ///    band table is consulted first, so the bare base names (`error`,

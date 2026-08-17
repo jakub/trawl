@@ -4,4 +4,4 @@ expression: "emit_dsl_with_pins(\"_severity=warn,error\", &SEVERITY_PIN)"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE ("_severity" BETWEEN 13 AND 16 OR "_severity" BETWEEN 17 AND 20)
+WHERE "_severity" IN (13, 14, 15, 16, 17, 18, 19, 20)

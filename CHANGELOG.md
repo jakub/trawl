@@ -352,6 +352,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   escape hatch.
 
 ### Changed
+- **A severity band or list writes its subject once (#82).** Every
+  `SEVERITY`-pinned equality, `!=` and IN now emits as one membership test
+  over the ladder points it accepts — `_severity=error` is
+  `IN (17, 18, 19, 20)` where it was `BETWEEN 17 AND 20`, and
+  `_severity=warn,error` is a single `IN (13, …, 20)` where it was an OR of
+  two ranges. Matching is unchanged in every lane (the expansion is exactly
+  the band's own `lo..=hi`, drift-guarded exhaustively), but the subject
+  stops being repeated per band: a `sev(field)` subject is over a kilobyte
+  of SQL, so a natural six-band query was carrying it four to six times.
+  The points are inlined `i64` from the closed ladder table, so a severity
+  filter now binds no parameters at all.
 - **Severity presentation metadata is computed inside the query permit
   (#79).** `severity_columns` on `/api/v1/query` is now decided by the
   executing task, under the catalog snapshot the rows were produced with,

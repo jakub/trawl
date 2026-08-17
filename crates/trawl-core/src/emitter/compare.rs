@@ -107,10 +107,14 @@ pub(crate) fn comparison_sql(
                 predicate
             }
         }
-        // SEVERITY pin + band token: the whole band, and `!=` its
-        // complement — the same NULL policy split as every other form.
-        CompareForm::SeverityBand { lo, hi } => {
-            let predicate = severity_band(field, op, lo, hi);
+        // SEVERITY pin + band token: the whole band as ladder points, and
+        // `!=` its complement — the same NULL policy split as every other
+        // form. The expansion is `compare::severity_points`' alone; this
+        // arm never reads `lo`/`hi`.
+        CompareForm::SeverityBand { .. } => {
+            let points = compare::severity_points(std::slice::from_ref(&form))
+                .expect("a lone SeverityBand always expands");
+            let predicate = severity_points_sql(field, op, &points);
             if op == FilterOp::Ne && policy == NullPolicy::NeMatchesNull {
                 format!("({predicate} OR {field} IS NULL)")
             } else {
@@ -133,18 +137,28 @@ pub(crate) fn comparison_sql(
 
 /// Render an IN list — each element binds like an equality.
 ///
-/// A `TextOrNumeric` element has no single bound value, so a list carrying
-/// one expands to the OR of its per-element equalities: the same set
-/// membership, and the same shape the live matcher evaluates (its
-/// `InList` is an OR of `=` comparisons). Lists with no such element keep
-/// the plain `IN (…)` shape, byte-identical to unpinned emission.
+/// An ALL-SEVERITY list is one set over the ladder: every element's band
+/// or exact number collapses into a single `IN (…)` whose subject is
+/// written once (issue #82). A `TextOrNumeric` element has no single bound
+/// value, so a list carrying one expands to the OR of its per-element
+/// equalities: the same set membership, and the same shape the live
+/// matcher evaluates (its `InList` is an OR of `=` comparisons). Lists
+/// with neither keep the plain `IN (…)` shape, byte-identical to unpinned
+/// emission.
 pub(crate) fn in_list_sql(
     field: &str,
     forms: Vec<CompareForm>,
     state: &mut EmitterState,
 ) -> String {
+    // A SEVERITY list is a set of ladder points, not a disjunction of
+    // ranges: one membership test, one subject, no parameters.
+    if let Some(points) = compare::severity_points(&forms) {
+        return severity_points_sql(field, FilterOp::Eq, &points);
+    }
     // The forms with no single bound value: the VARCHAR pin's two-armed
-    // equality, and the SEVERITY pin's band range.
+    // equality, and the SEVERITY pin's band range (reachable here only
+    // MIXED with a non-severity element, which no pin can produce today —
+    // the arm stays total rather than trusting that).
     let expands = |f: &CompareForm| {
         matches!(
             f,
@@ -158,7 +172,11 @@ pub(crate) fn in_list_sql(
                 CompareForm::TextOrNumeric(literal) => {
                     text_or_numeric(field, FilterOp::Eq, literal, state)
                 }
-                CompareForm::SeverityBand { lo, hi } => severity_band(field, FilterOp::Eq, lo, hi),
+                form @ CompareForm::SeverityBand { .. } => {
+                    let points = compare::severity_points(std::slice::from_ref(&form))
+                        .expect("a lone SeverityBand always expands");
+                    severity_points_sql(field, FilterOp::Eq, &points)
+                }
                 other => {
                     let placeholder = state.push_param(comparable_value(other));
                     format!("{field} = {placeholder}")
@@ -208,14 +226,34 @@ fn text_or_numeric(field: &str, op: FilterOp, literal: String, state: &mut Emitt
     }
 }
 
-/// The band range predicate for a `SEVERITY`-pinned equality-class
-/// comparison: the band's inclusive bounds, rendered as literals (they
-/// come from a closed table, never from user text).
-fn severity_band(field: &str, op: FilterOp, lo: u8, hi: u8) -> String {
+/// THE `SEVERITY` set renderer (issue #82): one membership test over the
+/// ladder points a comparison accepts, with the subject interpolated
+/// EXACTLY ONCE.
+///
+/// `points` comes from [`compare::severity_points`], the one expansion —
+/// a band's inclusive range, an exact number, or the union a whole IN list
+/// accepts. Rendering the set instead of a range (or a per-element OR) is
+/// what keeps a `sev(level)` subject — over a kilobyte of `list_transform`
+/// SQL — off the page once per band.
+///
+/// The points are INLINED, not bound: they are `i64` by type, produced by
+/// the closed ladder table, so no user text can reach the SQL through
+/// them. That is the same reasoning the band bounds were inlined under,
+/// and it keeps the parameter list of a severity filter empty — which is
+/// what lets a subject that DOES push parameters keep its positional
+/// order.
+fn severity_points_sql(subject: &str, op: FilterOp, points: &[i64]) -> String {
+    debug_assert!(
+        matches!(op, FilterOp::Eq | FilterOp::Ne),
+        "the severity set is an equality-class shape"
+    );
+    debug_assert!(!points.is_empty(), "an empty set renders no membership");
+    let set: Vec<String> = points.iter().map(i64::to_string).collect();
+    let set = set.join(", ");
     if op == FilterOp::Ne {
-        format!("{field} NOT BETWEEN {lo} AND {hi}")
+        format!("{subject} NOT IN ({set})")
     } else {
-        format!("{field} BETWEEN {lo} AND {hi}")
+        format!("{subject} IN ({set})")
     }
 }
 

@@ -1660,8 +1660,11 @@ mod tests {
         assert_snapshot!(emit_dsl_with_pins("_severity!=info", &SEVERITY_PIN));
     }
 
+    /// A whole severity list is ONE membership test over the ladder
+    /// points its bands cover — the subject written once, however many
+    /// bands the list names (issue #82).
     #[test]
-    fn pinned_severity_in_list_expands_to_or_of_bands() {
+    fn pinned_severity_in_list_binds_the_subject_once() {
         assert_snapshot!(emit_dsl_with_pins("_severity=warn,error", &SEVERITY_PIN));
     }
 
