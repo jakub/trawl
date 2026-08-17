@@ -107,6 +107,11 @@ fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError>
                     return Err(reserved_name_error("extract capture group", name));
                 }
             }
+            if let Some(message) =
+                crate::schema::duplicate_target_message(re.capture_names().flatten(), "extract")
+            {
+                return Err(EmitError::UnsupportedOperation { message });
+            }
         }
         ExtractMode::KeyValue { .. } => {
             // kv extraction is handled post-SQL by the Rust pipeline

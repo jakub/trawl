@@ -2,5 +2,5 @@
 source: crates/trawl-core/src/emitter/mod.rs
 expression: "emit_dsl(\"* | rename service as svc\")"
 ---
-SELECT * EXCLUDE ("service"), "service" AS "svc"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('service', 'svc')), "service" AS "svc"
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)

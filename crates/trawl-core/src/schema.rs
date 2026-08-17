@@ -98,6 +98,31 @@ pub fn reserved_name_message(what: &str, name: &str) -> String {
     )
 }
 
+/// Return the shared refusal text when two projection targets identify the
+/// same `DuckDB` column after ASCII folding.
+#[must_use]
+pub fn duplicate_target_message<'a>(
+    targets: impl Iterator<Item = &'a str>,
+    what: &str,
+) -> Option<String> {
+    let mut seen: Vec<(String, &str)> = Vec::new();
+    for name in targets {
+        let folded = catalog_key(name);
+        if let Some((_, first)) = seen.iter().find(|(key, _)| *key == folded) {
+            let both = if *first == name {
+                format!("`{name}` twice")
+            } else {
+                format!("`{first}` and `{name}`, which name one column")
+            };
+            return Some(format!(
+                "{what} writes {both} — give each target a name of its own"
+            ));
+        }
+        seen.push((folded, name));
+    }
+    None
+}
+
 /// The catalog spelling of a DSL field reference: an ASCII fold, and
 /// nothing else (ADR-0013 §6 — the DSL has zero aliases).
 ///

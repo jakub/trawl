@@ -274,6 +274,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   backticks, whitespace and backslashes in values. Streaming `count(1)` is
   restored as the row-count operation while unsupported computed aggregates
   remain loud errors.
+- **Projected field names now bind identically in batch and live pipelines
+  (#78 follow-up).** DuckDB treats identifiers as ASCII-case-insensitive;
+  live rows now use that same binding for every downstream field read, and
+  `let`, `rename`, regex extraction, and KV extraction replace any existing
+  case-variant of the column they write. Regex extraction also writes NULL
+  on no match, a missing optional group, or an empty capture, matching its
+  emitted `nullif(regexp_extract(...), '')` expression. A `let`/`eval`,
+  `rename`, or regex capture list that names one folded target twice is
+  refused instead of relying on DuckDB's suffix-based deduplication.
 - **A function call in an aggregation position no longer panics the
   emitter (#77, landed unclaimed in #80).** `stats split(message, ",", 1)`
   — any multi-argument scalar call where the pipeline expects an

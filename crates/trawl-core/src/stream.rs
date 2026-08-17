@@ -557,6 +557,11 @@ fn compile_extract(s: &ExtractStage) -> Result<CompiledStage, StreamPlanError> {
                     ));
                 }
             }
+            if let Some(message) =
+                crate::schema::duplicate_target_message(regex.capture_names().flatten(), "extract")
+            {
+                return Err(StreamPlanError::ProjectionCollision(message));
+            }
             Ok(CompiledStage::ExtractRegex {
                 regex,
                 source_field,
@@ -579,6 +584,19 @@ fn compile_dedup(s: &DedupStage) -> CompiledStage {
         seen: HashSet::new(),
         max_entries: 10_000,
     }
+}
+
+/// Read a live field using `DuckDB`'s ASCII-insensitive identifier binding.
+fn event_value<'e>(event: &'e Map<String, Value>, name: &str) -> Option<&'e Value> {
+    let key = bind_event_key(event, name)?;
+    event.get(key)
+}
+
+fn event_text(event: &Map<String, Value>, name: &str) -> String {
+    event_value(event, name).map_or_else(String::new, |value| match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    })
 }
 
 // ── stage application ──────────────────────────────────────────────
@@ -619,6 +637,7 @@ fn apply_rename(renames: &[(String, String)], event: &mut Map<String, Value>) {
         event.remove(source.as_str());
     }
     for (to, value) in resolved {
+        remove_folded_twins(event, to);
         match value {
             Some(v) => {
                 event.insert(to.to_string(), v);
@@ -627,6 +646,19 @@ fn apply_rename(renames: &[(String, String)], event: &mut Map<String, Value>) {
                 event.remove(to);
             }
         }
+    }
+}
+
+/// Remove other spellings of the column a projection is about to own.
+fn remove_folded_twins(event: &mut Map<String, Value>, name: &str) {
+    let folded = crate::schema::catalog_key(name);
+    let twins: Vec<String> = event
+        .keys()
+        .filter(|key| key.as_str() != name && crate::schema::catalog_key(key) == folded)
+        .cloned()
+        .collect();
+    for twin in twins {
+        event.remove(&twin);
     }
 }
 
@@ -686,7 +718,36 @@ fn apply_let(
         resolved.push((name.as_str(), value));
     }
     for (name, value) in resolved {
+        remove_folded_twins(event, name);
         event.insert(name.to_string(), value);
+    }
+}
+
+/// Apply regex extraction with the same write-always, empty-is-NULL
+/// semantics as the emitted `nullif(regexp_extract(...), '')` projection.
+fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Map<String, Value>) {
+    let text = match event_value(event, source_field) {
+        Some(Value::String(text)) => Some(text.clone()),
+        _ => None,
+    };
+    let captures = text.as_deref().and_then(|text| regex.captures(text));
+    let written: Vec<(String, Value)> = regex
+        .capture_names()
+        .flatten()
+        .map(|name| {
+            let value = captures
+                .as_ref()
+                .and_then(|captures| captures.name(name))
+                .filter(|capture| !capture.as_str().is_empty())
+                .map_or(Value::Null, |capture| {
+                    Value::String(capture.as_str().to_string())
+                });
+            (name.to_string(), value)
+        })
+        .collect();
+    for (name, value) in written {
+        remove_folded_twins(event, &name);
+        event.insert(name, value);
     }
 }
 
@@ -697,13 +758,19 @@ fn apply_let(
 pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) -> StageResult {
     match stage {
         CompiledStage::Table { fields } => {
-            event.retain(|k, _| fields.contains(k));
+            let keep: Vec<String> = fields
+                .iter()
+                .filter_map(|field| bind_event_key(event, field).map(str::to_owned))
+                .collect();
+            event.retain(|key, _| keep.iter().any(|kept| kept == key));
             StageResult::Pass
         }
 
         CompiledStage::Drop { fields } => {
-            for f in fields.iter() {
-                event.remove(f);
+            for field in fields.iter() {
+                if let Some(key) = bind_event_key(event, field).map(str::to_owned) {
+                    event.remove(&key);
+                }
             }
             StageResult::Pass
         }
@@ -748,21 +815,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
             regex,
             source_field,
         } => {
-            if let Some(Value::String(text)) = event.get(source_field)
-                && let Some(caps) = regex.captures(text)
-            {
-                let names: Vec<_> = regex
-                    .capture_names()
-                    .flatten()
-                    .filter_map(|name| {
-                        caps.name(name)
-                            .map(|m| (name.to_string(), m.as_str().to_string()))
-                    })
-                    .collect();
-                for (name, value) in names {
-                    event.insert(name, Value::String(value));
-                }
-            }
+            apply_extract_regex(regex, source_field, event);
             StageResult::Pass
         }
 
@@ -770,7 +823,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
             source_field,
             separator,
         } => {
-            if let Some(Value::String(text)) = event.get(source_field) {
+            if let Some(Value::String(text)) = event_value(event, source_field) {
                 let pairs = extract_key_value_pairs(text, *separator);
                 for (k, v) in pairs {
                     // The `_` namespace is sealed against LOG CONTENT too
@@ -782,6 +835,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
                     if crate::schema::is_reserved_name(&k) {
                         continue;
                     }
+                    remove_folded_twins(event, &k);
                     event.insert(k, coerce_kv_value(v));
                 }
             }
@@ -818,13 +872,7 @@ fn dedup_key(fields: &[String], event: &Map<String, Value>) -> Vec<String> {
     } else {
         fields
             .iter()
-            .map(|f| {
-                let mapped = f.as_str();
-                event.get(mapped).map_or_else(String::new, |v| match v {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-            })
+            .map(|field| event_text(event, field))
             .collect()
     }
 }
@@ -1246,12 +1294,7 @@ impl CompiledAggregation {
                 ..
             } => {
                 let group = make_group_key(by, event);
-                let field_val = event
-                    .get(field.as_str())
-                    .map_or_else(String::new, |v| match v {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    });
+                let field_val = event_text(event, field);
                 let counts = counters.entry(group).or_default();
                 *counts.entry(field_val).or_insert(0) += 1;
             }
@@ -1385,12 +1428,7 @@ fn snapshot_frequency(
 fn make_group_key(group_by: &[String], event: &Map<String, Value>) -> GroupKey {
     group_by
         .iter()
-        .map(|f| {
-            event.get(f).map_or_else(String::new, |v| match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-        })
+        .map(|field| event_text(event, field))
         .collect()
 }
 
@@ -1407,7 +1445,7 @@ fn event_time_bucket(event: &Map<String, Value>, span_secs: u64) -> i64 {
 }
 
 fn extract_f64(event: &Map<String, Value>, field: &str) -> Option<f64> {
-    event.get(field).and_then(|v| match v {
+    event_value(event, field).and_then(|v| match v {
         Value::Number(n) => n.as_f64(),
         _ => None,
     })
@@ -1418,7 +1456,7 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Map<String, Value>)
         AccState::Count(n) => *n += 1,
         AccState::CountField { non_null } => {
             if let Some(field) = &acc.field
-                && event.get(field).is_some_and(|v| !v.is_null())
+                && event_value(event, field).is_some_and(|v| !v.is_null())
             {
                 *non_null += 1;
             }
@@ -1458,14 +1496,14 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Map<String, Value>)
         AccState::First(stored) => {
             if stored.is_none()
                 && let Some(field) = &acc.field
-                && let Some(v) = event.get(field)
+                && let Some(v) = event_value(event, field)
             {
                 *stored = Some(v.clone());
             }
         }
         AccState::Last(stored) => {
             if let Some(field) = &acc.field
-                && let Some(v) = event.get(field)
+                && let Some(v) = event_value(event, field)
             {
                 *stored = Some(v.clone());
             }
@@ -1486,7 +1524,7 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Map<String, Value>)
 fn feed_acc_string_set(acc: &CompiledAcc, set: &mut HashSet<String>, event: &Map<String, Value>) {
     if let Some(field) = &acc.field
         && set.len() < MAX_DISTINCT
-        && let Some(v) = event.get(field)
+        && let Some(v) = event_value(event, field)
         && !v.is_null()
     {
         set.insert(match v {
@@ -2194,7 +2232,7 @@ mod tests {
         let mut ev = event(&json!({"a": 5}));
         apply_stage(&mut stage, &mut ev);
         assert_eq!(ev.get("A").unwrap(), 1);
-        assert_eq!(ev.get("a").unwrap(), 5);
+        assert!(!ev.contains_key("a"));
         assert_eq!(ev.get("b").unwrap(), 5);
     }
 
@@ -2243,17 +2281,58 @@ mod tests {
     }
 
     #[test]
-    fn extract_regex_no_match_is_noop() {
+    fn extract_regex_no_match_writes_null() {
         let mut stage = compile_extract(&ExtractStage {
             mode: ExtractMode::Regex(r"(?P<ip>\d+\.\d+\.\d+\.\d+)".into()),
             source_field: Some("message".into()),
             keyword: "extract",
         })
         .unwrap();
-        let mut ev = event(&json!({"message": "no ip here"}));
-        let orig_len = ev.len();
+        let mut ev = event(&json!({"message": "no ip here", "ip": "keep?"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.len(), orig_len);
+        assert_eq!(ev.get("ip"), Some(&Value::Null));
+        assert!(ev.contains_key("ip"));
+    }
+
+    #[test]
+    fn extract_regex_empty_capture_is_null() {
+        let mut stage = compile_extract(&ExtractStage {
+            mode: ExtractMode::Regex(r"(?P<x>a*)".into()),
+            source_field: Some("message".into()),
+            keyword: "extract",
+        })
+        .unwrap();
+        let mut ev = event(&json!({"message": "bbb"}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("x"), Some(&Value::Null));
+
+        let mut ev = event(&json!({"message": "aab"}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("x"), Some(&Value::from("aa")));
+    }
+
+    #[test]
+    fn extract_kv_write_owns_its_folded_name() {
+        let mut stage = compile_extract(&ExtractStage {
+            mode: ExtractMode::KeyValue { separator: '=' },
+            source_field: Some("message".into()),
+            keyword: "extract",
+        })
+        .unwrap();
+        let mut ev = event(&json!({"message": "Status=500", "status": 200}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("Status"), Some(&Value::from(500)));
+        assert!(!ev.contains_key("status"));
+
+        let mut ev = event(&json!({"message": "dur=1 DUR=2 Dur=3"}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.get("Dur"), Some(&Value::from(3)));
+        assert_eq!(
+            ev.keys()
+                .filter(|key| key.eq_ignore_ascii_case("dur"))
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -289,16 +289,29 @@ fn let_assignment<'src>()
         .then(expr())
 }
 
+fn let_assignments<'src>(
+    stage: &'static str,
+) -> impl Parser<'src, ParserInput<'src>, Vec<(String, Spanned<Expr>)>, ParserExtra<'src>> + Clone {
+    let_assignment()
+        .separated_by(just(',').padded())
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .try_map(move |assignments: Vec<(String, Spanned<Expr>)>, span| {
+            match crate::schema::duplicate_target_message(
+                assignments.iter().map(|(name, _)| name.as_str()),
+                stage,
+            ) {
+                Some(message) => Err(Rich::custom(span, message)),
+                None => Ok(assignments),
+            }
+        })
+}
+
 /// Parse a `let` stage: `let field = expr [, field = expr]*`
 fn let_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     keyword("let")
         .padded()
-        .ignore_then(
-            let_assignment()
-                .separated_by(just(',').padded())
-                .at_least(1)
-                .collect::<Vec<_>>(),
-        )
+        .ignore_then(let_assignments("let"))
         .map(|assignments| {
             PipeStage::Let(LetStage {
                 assignments,
@@ -313,12 +326,7 @@ fn eval_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
 {
     keyword("eval")
         .padded()
-        .ignore_then(
-            let_assignment()
-                .separated_by(just(',').padded())
-                .at_least(1)
-                .collect::<Vec<_>>(),
-        )
+        .ignore_then(let_assignments("eval"))
         .map(|assignments| {
             PipeStage::Let(LetStage {
                 assignments,
@@ -498,7 +506,16 @@ fn rename_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parse
             rename_pair
                 .separated_by(just(',').padded())
                 .at_least(1)
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>()
+                .try_map(|renames: Vec<(String, String)>, span| {
+                    match crate::schema::duplicate_target_message(
+                        renames.iter().map(|(_, to)| to.as_str()),
+                        "rename",
+                    ) {
+                        Some(message) => Err(Rich::custom(span, message)),
+                        None => Ok(renames),
+                    }
+                }),
         )
         .map(|renames| PipeStage::Rename(RenameStage { renames }))
         .labelled("rename stage")
@@ -1362,5 +1379,22 @@ mod tests {
         assert!(matches!(result[0].node, PipeStage::FromSaved(_)));
         assert!(matches!(result[1].node, PipeStage::Where(_)));
         assert!(matches!(result[2].node, PipeStage::Sort(_)));
+    }
+
+    #[test]
+    fn projection_assignment_targets_must_be_folded_distinct() {
+        for input in [
+            "| let A = 1, a = 2",
+            "| eval A = 1, a = 2",
+            "| rename a as X, b as x",
+        ] {
+            let errors = pipeline().parse(input).into_errors();
+            assert_eq!(errors.len(), 1, "{input}: {errors:?}");
+            assert!(
+                errors[0].to_string().contains("which name one column"),
+                "{input}: {}",
+                errors[0]
+            );
+        }
     }
 }

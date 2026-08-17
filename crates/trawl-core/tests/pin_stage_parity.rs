@@ -866,6 +866,165 @@ fn sev_subject_carries_its_dialect_in_both_lanes() {
     }
 }
 
+/// Cross-lane guard for the whole case-variant projection class. Each
+/// projection writes one folded column and each reader names either spelling.
+#[test]
+fn case_variant_projections_agree_across_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let field_types = FieldTypes::new();
+    let rows = [
+        serde_json::json!({"a": 5, "b": "x", "message": "mx", "_time": "2026-08-15T00:00:00Z"}),
+        serde_json::json!({"a": 7, "b": "x", "message": "my", "_time": "2026-08-15T00:00:01Z"}),
+    ];
+    let groups: [(&[&str], &[&str]); 2] = [
+        (
+            &["| let A = a", "| let A = 1", "| rename a as A"],
+            &[
+                "| where a > 0",
+                "| where A > 0",
+                "| stats count() by a",
+                "| stats count() by A",
+                "| stats sum(a) as s",
+                "| stats first(a) as f",
+                "| stats dc(a) as d",
+                "| table a",
+                "| table A, message",
+                "| drop a",
+                "| dedup a",
+                "| top 5 a",
+            ],
+        ),
+        (
+            &[
+                "| rename a as B",
+                "| let B = a",
+                r#"| extract "(?P<B>[a-z]+)" from message"#,
+                r#"| extract "(?P<B>ZZZ+)" from message"#,
+                r#"| extract "m(?P<B>ZZ)?" from message"#,
+                r#"| extract "(?P<B>mx)" from message"#,
+                r#"| extract "m(?P<B>z*)" from message"#,
+                r#"| extract "m(?P<B>z*)" from message | extract "(?P<B>q*)" from message"#,
+            ],
+            &[
+                "| table B, message",
+                "| table b, message",
+                "| stats count() by B",
+                "| stats count() by b",
+                "| stats first(B) as fb",
+                "| stats dc(b) as db",
+                "| dedup B",
+                "| top 5 b",
+                "| drop b",
+            ],
+        ),
+    ];
+
+    for (projections, readers) in groups {
+        for projection in projections {
+            for reader in readers {
+                let writes_one_value = projection.contains("= 1")
+                    || projection.contains("ZZ")
+                    || projection.contains("z*");
+                if reader.starts_with("| dedup") && writes_one_value {
+                    continue;
+                }
+                let dsl = format!("* {projection} {reader}");
+                let query = parser::parse(&dsl).expect("dsl parses");
+                let live = live_rows(&query, &rows, &field_types, &dsl);
+
+                let mut tmp = tempfile::Builder::new()
+                    .suffix(".ndjson")
+                    .tempfile()
+                    .unwrap();
+                for row in &rows {
+                    writeln!(tmp, "{row}").unwrap();
+                }
+                tmp.flush().unwrap();
+                let emitted =
+                    emitter::emit_with_pins(&query, tmp.path().to_str().unwrap(), &field_types)
+                        .expect("emit succeeds");
+                let rows_sql = format!("SELECT to_json(_sub) FROM ({}) AS _sub", emitted.sql);
+                let params = bind_params(&emitted.params);
+                let param_refs: Vec<&dyn duckdb::ToSql> =
+                    params.iter().map(AsRef::as_ref).collect();
+                let mut stmt = conn.prepare(&rows_sql).expect("sql prepares");
+                let batch: Vec<Map<String, Value>> = stmt
+                    .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+                    .unwrap_or_else(|error| panic!("{dsl}: sql must run: {error}\n{rows_sql}"))
+                    .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+                    .collect();
+
+                assert_eq!(
+                    comparable(&live),
+                    comparable(&batch),
+                    "lane divergence\ndsl: {dsl}\nlive: {live:?}\nbatch: {batch:?}"
+                );
+            }
+        }
+    }
+}
+
+fn live_rows(
+    query: &trawl_core::ast::Query,
+    rows: &[Value],
+    field_types: &FieldTypes,
+    dsl: &str,
+) -> Vec<Map<String, Value>> {
+    let plan = compile_stream_plan(&query.pipeline, &PinScope::root(field_types))
+        .unwrap_or_else(|error| panic!("{dsl}: plan must compile: {error}"));
+    let feed = |stages: &mut [trawl_core::stream::CompiledStage],
+                event: &mut Map<String, Value>| {
+        stages
+            .iter_mut()
+            .all(|stage| apply_stage(stage, event) == StageResult::Pass)
+    };
+    match plan {
+        StreamPlan::PassThrough(mut stages) => rows
+            .iter()
+            .filter_map(|row| {
+                let mut event = row.as_object().unwrap().clone();
+                feed(&mut stages, &mut event).then_some(event)
+            })
+            .collect(),
+        StreamPlan::Aggregate {
+            pre_stages: mut pre,
+            aggregation: mut aggregate,
+            ..
+        } => {
+            for row in rows {
+                let mut event = row.as_object().unwrap().clone();
+                if feed(&mut pre, &mut event) {
+                    aggregate.feed_event(&event);
+                }
+            }
+            aggregate.snapshot().1
+        }
+    }
+}
+
+fn comparable(rows: &[Map<String, Value>]) -> BTreeSet<Vec<(String, String)>> {
+    rows.iter()
+        .map(|row| {
+            let mut cells: Vec<(String, String)> = row
+                .iter()
+                .filter(|(key, _)| key.as_str() != "_time")
+                .map(|(key, value)| {
+                    let text = match value {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    let text = text
+                        .parse::<f64>()
+                        .map_or(text, |number| number.to_string());
+                    (trawl_core::schema::catalog_key(key), text)
+                })
+                .collect();
+            cells.sort();
+            cells
+        })
+        .collect()
+}
+
 /// A `let` target adopts the DECLARED pin, so the comparison downstream
 /// is the same comparison — and the value the two lanes project is the
 /// same number.
