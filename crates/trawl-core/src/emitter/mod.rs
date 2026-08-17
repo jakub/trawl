@@ -2254,6 +2254,102 @@ mod tests {
         assert_eq!(emit_dsl(r#"* | let s = sev(level, "OTel")"#), otel);
     }
 
+    /// Issue #82: a severity predicate names its subject ONCE, whatever
+    /// the shape — one band, its complement, a multi-band list, a mixed
+    /// token/integer list, and the `sev()` call in either lane.
+    ///
+    /// The `sev()` subject is derived from the ONE builder that emits it
+    /// (`conform::severity_reading_sql_bind_once` over
+    /// `conform::untyped_text`), never hand-typed: a substring that drifts
+    /// from the emitter would pass this test while asserting nothing.
+    #[test]
+    fn severity_predicates_render_the_subject_once() {
+        let column = r#""_severity""#;
+        let sev_subject = crate::conform::severity_reading_sql_bind_once(
+            &crate::conform::untyped_text(r#""level""#),
+            crate::severity::Dialect::Otel,
+        );
+        // The bare-column cases: the membership predicate names the column
+        // exactly once.
+        for dsl in [
+            "_severity=error",
+            "_severity=warn,error",
+            "_severity=warn,17",
+            r#"* | where _severity != "error""#,
+        ] {
+            let sql = emit_dsl_with_pins(dsl, &SEVERITY_PIN);
+            assert_eq!(sql.matches(column).count(), 1, "{dsl}: {sql}");
+        }
+        // The one documented second occurrence: the search stage's `!=`
+        // widening is `(pred OR "_severity" IS NULL)`, so the column
+        // appears twice — once as the membership subject, once inside the
+        // widening the pre-existing NULL policy owns.
+        let widened = emit_dsl_with_pins("_severity!=error", &SEVERITY_PIN);
+        assert_eq!(widened.matches(column).count(), 2, "{widened}");
+        assert_eq!(
+            widened.matches(&format!("{column} IS NULL")).count(),
+            1,
+            "{widened}"
+        );
+        assert_eq!(
+            widened.matches(&format!("{column} NOT IN (")).count(),
+            1,
+            "{widened}"
+        );
+        // The expensive subject: a `sev()` call is over a kilobyte of SQL,
+        // and it is written once per predicate however many bands the
+        // comparison names.
+        assert!(
+            sev_subject.len() > 500,
+            "the subject is the cost: {sev_subject}"
+        );
+        for dsl in [
+            r#"* | where sev(level) in ("error", "fatal")"#,
+            r#"* | where sev(level) == "error""#,
+            r#"* | where sev(level) != "error""#,
+        ] {
+            let sql = emit_dsl(dsl);
+            assert_eq!(sql.matches(sev_subject.as_str()).count(), 1, "{dsl}: {sql}");
+        }
+    }
+
+    /// Issue #82, AC3: the severity set is INLINED, so a subject that
+    /// pushes parameters keeps its positional order.
+    ///
+    /// No DSL shape reaches here with such a subject today — `subject_pin`
+    /// admits only a bare pinned field or `sev(<bare field>[, "dialect"])`,
+    /// and the dialect is inlined text rather than a bound parameter — so
+    /// the regression is taken at the renderer, where a future subject
+    /// (an arithmetic wrapper, a literal `sev()` operand) would arrive.
+    #[test]
+    fn a_severity_set_pushes_no_parameters_and_preserves_positions() {
+        let mut state = EmitterState::new("/data/**/*.parquet").expect("source");
+        let before = state.push_param(SqlValue::String("before".to_owned()));
+        let subject = format!("upper({before})");
+        let clause = compare::in_list_sql(
+            &subject,
+            vec![
+                crate::compare::CompareForm::SeverityBand { lo: 17, hi: 20 },
+                crate::compare::CompareForm::SeverityExact(13),
+            ],
+            &mut state,
+        );
+        let after = state.push_param(SqlValue::String("after".to_owned()));
+        assert_eq!(clause, format!("{subject} IN (13, 17, 18, 19, 20)"));
+        // Placeholders are positional `?`, so the ORDER of the collected
+        // params is the whole assertion: the set bound nothing between
+        // them, and `after` is still the second value.
+        assert_eq!(before, "?");
+        assert_eq!(after, "?");
+        assert_eq!(
+            state.into_params(),
+            vec![
+                SqlValue::String("before".to_owned()),
+                SqlValue::String("after".to_owned())
+            ]
+        );
+    }
+
     /// A literal subject carries its own type: `to_json(?)` gives `DuckDB`
     /// nothing to infer a parameter's type from.
     #[test]
