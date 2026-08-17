@@ -469,10 +469,14 @@ fn FieldDetail(
     on_use_field: Callback<String>,
     field_name: String,
 ) -> impl IntoView {
-    let svc_for_q = svc.clone();
-    let field_for_q = field_name.clone();
+    // Composed once: the counts do not always arrive under `count` (a
+    // field of that name takes the alias form), and the reader below has
+    // to be told which column the query it actually sent counts into.
+    let plan = crate::drawer_query::top_values_query(&svc, &field_name);
+    let count_column = plan.as_ref().map_or("count", |p| p.count_column);
+    let top_dsl = plan.map(|p| p.dsl);
     let top = LocalResource::new(move || {
-        let q = crate::drawer_query::top_values_query(&svc_for_q, &field_for_q);
+        let q = top_dsl.clone();
         async move {
             match q {
                 Some(q) => api::query(&q, 0).await,
@@ -500,7 +504,7 @@ fn FieldDetail(
                     state=Signal::derive(move || LoadState::from_resource(top.get()))
                     label="values"
                     render=Box::new(move |resp: QueryResponse| {
-                        let rows = parse_top_values(&resp, &field_name);
+                        let rows = parse_top_values(&resp, &field_name, count_column);
                         if rows.is_empty() {
                             return view! {
                                 <div class="sc-more">"No values"</div>
@@ -691,14 +695,17 @@ fn parse_cardinality(resp: &QueryResponse) -> HashMap<String, u64> {
     out
 }
 
-fn parse_top_values(resp: &QueryResponse, field: &str) -> Vec<(String, u64)> {
+fn parse_top_values(resp: &QueryResponse, field: &str, count_column: &str) -> Vec<(String, u64)> {
     let cols = &resp.result.columns;
     let fi = cols
         .iter()
         .position(|c| c.name == field || c.name == "value");
+    // `count_column` is whatever the query that produced this response
+    // counted into, which is not always `count`
+    // (`drawer_query::top_values_query`).
     let ci = cols
         .iter()
-        .position(|c| c.name == "count" || c.name.starts_with("count"));
+        .position(|c| c.name == count_column || c.name.starts_with(count_column));
     let (Some(fi), Some(ci)) = (fi, ci) else {
         return Vec::new();
     };

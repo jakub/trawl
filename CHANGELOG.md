@@ -284,6 +284,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   carries a `#` or `//` can be sorted descending and used in expressions —
   the contract `quote_dsl_field` already promised. `/` deliberately stays
   out of that set: it opens a regex far more often than it divides.
+- **The web UI's field drill-in works for a field named `count` (#78
+  follow-up).** Expanding that row in the service drawer composed
+  `| top 10 count`, which projects the field beside a `count` column
+  `top` mints itself — two columns of one name, so the projection
+  collision check introduced with backtick identifiers answered 400. The
+  drawer now composes the aliased stats form for that one name and reads
+  the counts back from the column it actually asked for; every other
+  field keeps `top 10`.
 - **Query formatting no longer changes what a filter value means (#78
   follow-up).** `/api/v1/validate`'s `formatted` field and the TUI/web
   editors' reformat button render a filter value bare whenever the bare
