@@ -180,7 +180,7 @@ trawld migrates this database automatically at boot (it is the sole writer) and 
 | `telemetry_buffer_max_bytes` | byte size | `"16M"` | One memory budget for everything self-telemetry holds while the WAL is unhealthy — active buffer, retry queue and the in-flight batch (estimated charge, like `hot_buffer_max_bytes`). Enforced as events arrive: over budget the oldest queued batches are shed first, then the incoming event itself, counted in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}` |
 | `default_env` | string | `"prod"` | Fills a missing `env` on ingested events (repair code `env.defaulted`). Must pass the env charset and be a member of `envs` |
 | `envs` | string list | `[default_env]` | Environment allowlist (ADR-0009). Events with an unlisted `env` hard-reject. Entries must match `[a-z0-9_-]{1,32}`; `wal` and `scheduled` are reserved. Validated at load — trawld refuses to start otherwise. The allowlist gates writes, not reads: removing an env stops new ingest but its directories stay queryable and age out normally |
-| `trusted_relays` | CIDR list | `[]` | Peers (collectors/relays) whose address must never be stamped as an event's `host`: a host-less event from one of these is rejected instead of peer-repaired. Invalid entries are boot-fatal |
+| `trusted_relays` | CIDR list | `[]` | Peers (collectors/relays) whose address must never be stamped as an event's `host`: a host-less event from one of these is rejected instead of peer-repaired (HTTP) or kept with `host` omitted (syslog). Invalid entries are boot-fatal. Peer addresses are canonicalized before matching — a dual-stack bind's IPv4-mapped peer (`::ffff:10.1.2.3`) matches a plain v4 entry (`10.0.0.0/8`), and a mapped-form entry folds to its v4 meaning at load |
 | `severity_from` | source list | `["severity", "severity_text", "level"]` | Wire keys `_severity` derives from, in precedence order — first *mappable* wins. Empty is legal and derives nothing |
 | `time_from` | source list | `["_time", "timestamp", "@timestamp"]` | Wire keys `_time` derives from, in precedence order — first *present* wins. Must contain `_time` |
 
@@ -306,8 +306,8 @@ Frames enter the same envelope canonicalizer HTTP events do, under the `syslog` 
 | `max_events_per_connection` | integer | `100000` | Per-connection event limit |
 | `consecutive_send_failures_limit` | integer | `100` | Close connection after N failed sends |
 | `channel_capacity` | integer | `10000` | Event queue between listeners and batcher |
-| `allow_cidrs` | string array | `[]` | Source IP allowlist in CIDR notation |
-| `source_service_map` | map | `{}` | Source IP → service name mapping |
+| `allow_cidrs` | string array | `[]` | Source IP allowlist in CIDR notation. Peer addresses canonicalize before matching (an IPv4-mapped peer matches a plain v4 entry); write v4 intent in v4 form. A v6 entry wide enough to cover the whole mapped range (`::/0`, `::ffff:0:0/95`) admits **all** v4 peers on every bind — it always did on a dual-stack bind, and the rule no longer depends on how the socket was bound |
+| `source_service_map` | map | `{}` | Source IP → service name mapping. IP-shaped keys canonicalize at load, so a mapped spelling (`"::ffff:10.1.2.3"`) and its v4 form are one key — two spellings naming *different* services refuse to start |
 
 ```toml
 [syslog]

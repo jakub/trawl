@@ -46,29 +46,8 @@ pub fn spawn_syslog(
     syslog_stats: Option<Arc<SyslogStats>>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<Vec<JoinHandle<()>>, String> {
-    // Canonicalize IP-shaped source_service_map keys so a mapped-form
-    // spelling (`::ffff:10.1.2.3` — the only form that matched on a
-    // dual-stack bind before peer canonicalization) keeps matching the
-    // canonical peer the listeners now hand to derive_service. Two keys
-    // folding to one address with different services is a contradiction
-    // the operator must resolve — boot-fatal, never a silent pick.
     let mut config = config.clone();
-    let mut folded = std::collections::HashMap::with_capacity(config.source_service_map.len());
-    for (key, service) in &config.source_service_map {
-        let canonical = key
-            .parse::<IpAddr>()
-            .map_or_else(|_| key.clone(), |ip| canonical_peer(ip).to_string());
-        if let Some(prev) = folded.get(&canonical)
-            && prev != service
-        {
-            return Err(format!(
-                "syslog.source_service_map: {key:?} folds to {canonical:?}, which \
-                 is already mapped to service {prev:?} (this entry says {service:?})"
-            ));
-        }
-        folded.insert(canonical, service.clone());
-    }
-    config.source_service_map = folded;
+    config.source_service_map = fold_source_service_map(&config.source_service_map)?;
     let config = &config;
 
     let batcher = SyslogBatcher::new(config, pipeline, syslog_stats.clone());
@@ -181,6 +160,34 @@ impl CidrEntry {
     }
 }
 
+/// Canonicalize IP-shaped `source_service_map` keys so a mapped-form
+/// spelling (`::ffff:10.1.2.3` — the only form that matched on a
+/// dual-stack bind before peer canonicalization) keeps matching the
+/// canonical peer the listeners now hand to `derive_service`. Non-IP
+/// keys pass through verbatim. Two keys folding to one address with
+/// DIFFERENT services is a contradiction the operator must resolve —
+/// boot-fatal, never a silent pick (equal services dedup silently).
+fn fold_source_service_map(
+    map: &std::collections::HashMap<String, String>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut folded = std::collections::HashMap::with_capacity(map.len());
+    for (key, service) in map {
+        let canonical = key
+            .parse::<IpAddr>()
+            .map_or_else(|_| key.clone(), |ip| canonical_peer(ip).to_string());
+        if let Some(prev) = folded.get(&canonical)
+            && prev != service
+        {
+            return Err(format!(
+                "syslog.source_service_map: {key:?} folds to {canonical:?}, which \
+                 is already mapped to service {prev:?} (this entry says {service:?})"
+            ));
+        }
+        folded.insert(canonical, service.clone());
+    }
+    Ok(folded)
+}
+
 /// A v6 entry wider than the mapped /96 block that covers it (`::/0`,
 /// `::ffff:0:0/95`, …) used to admit every mapped v4 peer on a dual-stack
 /// bind. Peers now fold to v4 before matching, so such an entry earns an
@@ -260,6 +267,44 @@ pub fn is_allowed(cidrs: &[CidrEntry], ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_service_map_keys_fold_with_the_peer() {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        // A mapped-form key folds to the spelling the listeners now
+        // produce; non-IP keys pass through verbatim; a genuine v6 key
+        // normalizes its rendering (case, compression).
+        let folded = fold_source_service_map(&map(&[
+            ("::ffff:10.1.2.3", "ap"),
+            ("host.local", "printer"),
+            ("2001:DB8::1", "router"),
+        ]))
+        .unwrap();
+        assert_eq!(folded.get("10.1.2.3").map(String::as_str), Some("ap"));
+        assert_eq!(
+            folded.get("host.local").map(String::as_str),
+            Some("printer")
+        );
+        assert_eq!(
+            folded.get("2001:db8::1").map(String::as_str),
+            Some("router")
+        );
+        // Two spellings of one address agreeing on the service dedup
+        // silently; disagreeing is boot-fatal, naming all three parties.
+        let agree = fold_source_service_map(&map(&[("10.1.2.3", "ap"), ("::ffff:10.1.2.3", "ap")]))
+            .unwrap();
+        assert_eq!(agree.len(), 1);
+        let err =
+            fold_source_service_map(&map(&[("10.1.2.3", "ap"), ("::ffff:10.1.2.3", "switch")]))
+                .unwrap_err();
+        assert!(err.contains("10.1.2.3"), "got: {err}");
+        assert!(err.contains("ap") && err.contains("switch"), "got: {err}");
+    }
 
     #[test]
     fn ipv4_mapped_peer_canonicalizes_to_v4() {
