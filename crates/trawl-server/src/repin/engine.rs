@@ -86,6 +86,30 @@ pub static TEST_FILE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_SCAN_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Test-only BARRIER on the build's first pass, arming a
+/// happened-before ordering a delay alone cannot give: pass 0 takes its
+/// source snapshot, publishes [`TEST_SNAPSHOT_TAKEN`], and then waits for
+/// [`TEST_RELEASE_BUILD`].
+///
+/// A test that ingests while the build merely runs SLOWLY proves nothing
+/// about catch-up: pass 0's own snapshot may already have seen the new
+/// file, and the assertion would hold even if catch-up passes read the
+/// wrong dialect. With the barrier the file provably lands AFTER the
+/// snapshot, so only a catch-up pass can carry it into the shadow.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_BARRIER_FIRST_PASS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the build once pass 0 has snapshotted the source tree.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_SNAPSHOT_TAKEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the test to let the barriered pass proceed.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_RELEASE_BUILD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// What `start` decided.
 #[derive(Debug)]
 pub enum StartOutcome {
@@ -1018,6 +1042,20 @@ fn run_pass_blocking(
     state: &mut BuildState,
 ) -> Result<usize, String> {
     let sources = snapshot_env_files(data_dir)?;
+
+    // Test-only happened-before edge: this snapshot is taken, and nothing
+    // moves until the test has written the file it wants a CATCH-UP pass to
+    // carry. Bounded so a mis-driven test fails rather than hangs.
+    #[cfg(any(test, feature = "test-support"))]
+    if TEST_BARRIER_FIRST_PASS.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        TEST_SNAPSHOT_TAKEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !TEST_RELEASE_BUILD.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     // Retirements: a source file that vanished (nothing should remove one
     // while retention and the rollup are suppressed, but an operator can)

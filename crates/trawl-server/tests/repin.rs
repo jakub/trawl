@@ -1467,6 +1467,10 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite(pool: sqlx::PgPo
         "the rewrite nulled exactly what the dry run projected"
     );
     assert_eq!(done.rows_resurrected, dry.resurrectable);
+    assert_eq!(
+        done.ambiguous_numerals, dry.ambiguous_numerals,
+        "the shadow saw the same dialect-ambiguous rows the scan projected"
+    );
     assert_eq!(h.pinned_type("level").await, "SEVERITY");
 
     // The pin now gives the sender's own field the ladder's vocabulary:
@@ -1667,13 +1671,23 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest(pool: sql
 /// trace3.
 #[sqlx::test(migrations = false)]
 async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel(pool: sqlx::PgPool) {
+    use std::sync::atomic::Ordering;
+
     let h = harness(pool).await;
     h.ingest_and_compact(&[event("api", &json!({"level": "error"}))])
         .await;
     assert_eq!(h.pinned_type("level").await, "VARCHAR");
 
-    trawl_server::repin::engine::TEST_FILE_DELAY_MS
-        .store(400, std::sync::atomic::Ordering::Relaxed);
+    // A BARRIER, not just a delay: pass 0 takes its source snapshot and then
+    // waits, so the file this test writes next provably did NOT exist when
+    // the build enumerated its sources — only a CATCH-UP pass can carry it
+    // into the shadow, which is the claim under test. A delay alone would
+    // let pass 0 see the file, and the assertions below would hold even if
+    // catch-up passes read the wrong dialect.
+    trawl_server::repin::engine::TEST_SNAPSHOT_TAKEN.store(false, Ordering::SeqCst);
+    trawl_server::repin::engine::TEST_RELEASE_BUILD.store(false, Ordering::SeqCst);
+    trawl_server::repin::engine::TEST_BARRIER_FIRST_PASS.store(true, Ordering::SeqCst);
+
     let started = match h
         .schema_admin
         .schema_repin("level", "severity", Some("syslog"), false, true)
@@ -1683,20 +1697,31 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel(poo
         RepinStart::Started(job) => job,
         other => panic!("expected started, got {other:?}"),
     };
-    // Written by compaction under the OLD pin while the shadow builds, so a
-    // catch-up pass is what carries it into the new generation.
+
+    for _ in 0..600 {
+        if trawl_server::repin::engine::TEST_SNAPSHOT_TAKEN.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        trawl_server::repin::engine::TEST_SNAPSHOT_TAKEN.load(Ordering::SeqCst),
+        "the build never reached its first snapshot"
+    );
+    // Written by compaction under the OLD pin, AFTER that snapshot.
     h.ingest_and_compact(&[event("api", &json!({"level": "3"}))])
         .await;
+    trawl_server::repin::engine::TEST_RELEASE_BUILD.store(true, Ordering::SeqCst);
+
     let done = h.wait_terminal(started.id).await;
-    trawl_server::repin::engine::TEST_FILE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
     // The mid-build row survived the swap, which only a catch-up pass can
     // do: the cutover publishes the shadow WHOLESALE, so a file the build
     // never folded in would be gone.
     assert_eq!(h.count("last=1h | stats count()").await, 2);
 
-    // And it took the job's syslog reading (err), not OTel's — the pass
-    // that folded it in rode the job's dialect, not the live default.
+    // And it took the job's syslog reading (err), not OTel's — the pass that
+    // folded it in rode the job's dialect, not the live default.
     assert_eq!(
         h.count("level=error last=1h | stats count()").await,
         2,
