@@ -427,13 +427,14 @@ mod tests {
     }
 
     #[test]
-    fn rename_collision_on_one_target_takes_the_last_source() {
-        // Two sources onto one target: the later mapping wins, as the
-        // later `AS` does in the emitted projection.
-        let scope = walk("* | rename status as x, dur as x", ROOT);
-        assert_eq!(scope.pin_for("x"), Some(CT::BigInt));
+    fn rename_onto_one_target_is_refused_before_any_scope_walk() {
+        assert!(parser::parse("* | rename status as x, dur as x").is_err());
+        assert!(parser::parse("* | rename status as X, dur as x").is_err());
+
+        let scope = walk("* | rename status as x, dur as y", ROOT);
+        assert_eq!(scope.pin_for("x"), Some(CT::Varchar));
+        assert_eq!(scope.pin_for("y"), Some(CT::BigInt));
         assert_eq!(scope.pin_for("status"), None);
-        assert_eq!(scope.pin_for("dur"), None);
     }
 
     #[test]

@@ -3,7 +3,7 @@ source: crates/trawl-core/src/emitter/mod.rs
 expression: "emit_dsl_with_pins(\"* | rename status as st | where st > 400\",\n&[(\"status\", CT::Varchar)])"
 ---
 WITH _s0 AS (
-  SELECT * EXCLUDE ("status"), "status" AS "st"
+  SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('status', 'st')), "status" AS "st"
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
 SELECT *

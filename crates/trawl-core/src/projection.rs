@@ -532,4 +532,41 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn duplicate_capture_names_are_refused_in_both_lanes() {
+        for dsl in [
+            r#"* | extract "(?P<A>.)(?P<a>.)" from message"#,
+            r#"* | extract "(?P<dur>.)(?P<DUR>.)" from message"#,
+        ] {
+            let query = parser::parse(dsl).expect("the parser does not read capture names");
+            let sql = crate::emitter::validate_pipeline(&query.pipeline)
+                .expect_err("the SQL lane must refuse")
+                .to_string();
+            let stream = crate::stream::compile_stream_plan(
+                &query.pipeline,
+                &crate::pin_scope::PinScope::unpinned(),
+            )
+            .expect_err("the stream lane must refuse")
+            .to_string();
+            assert_eq!(
+                sql.strip_prefix("unsupported operation: ").unwrap_or(&sql),
+                stream,
+                "{dsl}: both lanes must carry one refusal sentence"
+            );
+            assert!(
+                sql.contains("which name one column") && sql.contains("extract writes"),
+                "{dsl}: {sql}"
+            );
+        }
+
+        let dsl = r#"* | extract "(?P<ip>.)(?P<port>.)" from message"#;
+        let query = parser::parse(dsl).expect("parses");
+        crate::emitter::validate_pipeline(&query.pipeline).expect("SQL lane accepts");
+        crate::stream::compile_stream_plan(
+            &query.pipeline,
+            &crate::pin_scope::PinScope::unpinned(),
+        )
+        .expect("stream lane accepts");
+    }
 }

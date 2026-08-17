@@ -287,7 +287,10 @@ fn process_extract(
                 });
             }
 
-            let mut select_items = vec!["*".to_string()];
+            // A projection write owns its folded name. Exclude any input
+            // spelling of every capture before adding the capture aliases.
+            let owned: Vec<String> = group_names.iter().map(|name| (*name).to_string()).collect();
+            let mut select_items = vec![columns_excluding(&owned)];
             for (i, name) in group_names.iter().enumerate() {
                 let group_idx = i + 1;
                 let alias = quote_field(name);
@@ -436,10 +439,13 @@ fn process_tail(tail: &crate::ast::TailStage, ctx: &mut EmitterState) {
 fn process_rename(rename: &crate::ast::RenameStage, ctx: &mut EmitterState) {
     ctx.flush_if(FlushCondition::IfModified);
 
+    // Exclude both sources and targets through the folded COLUMNS predicate:
+    // `rename a as B` over an existing `b` must leave one column, not a
+    // DuckDB-deduplicated pair whose later binding differs from the live row.
     let excluded: Vec<String> = rename
         .renames
         .iter()
-        .map(|(old, _)| quote_field(old))
+        .flat_map(|(old, new)| [old.clone(), new.clone()])
         .collect();
     let aliases: Vec<String> = rename
         .renames
@@ -447,10 +453,7 @@ fn process_rename(rename: &crate::ast::RenameStage, ctx: &mut EmitterState) {
         .map(|(old, new)| format!("{} AS {}", quote_field(old), quote_field(new)))
         .collect();
 
-    ctx.select = vec![
-        format!("* EXCLUDE ({})", excluded.join(", ")),
-        aliases.join(", "),
-    ];
+    ctx.select = vec![columns_excluding(&excluded), aliases.join(", ")];
     ctx.has_projection = true;
 }
 
