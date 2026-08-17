@@ -1265,10 +1265,11 @@ mod repin_tests {
 
     /// The ROW carries every fact, in every machine format: a scripted
     /// caller must never have to parse the case file's prose (issue #79
-    /// review). CSV renders the sample array as escaped JSON text — the
-    /// same treatment every other array-valued cell gets — and the
-    /// formula-injection prefix still applies, because a sample is
-    /// sender-chosen text.
+    /// review). CSV joins the samples into ONE cell (", "-separated) so the
+    /// first sample's first character is the cell's first character — where
+    /// the formula-injection prefix actually fires; rendered as a JSON
+    /// array, a hostile sample would hide behind the `[`.  JSON keeps the
+    /// real array.
     #[test]
     fn the_repin_row_carries_the_evidence_in_every_machine_format() {
         let mut job = sample_job();
