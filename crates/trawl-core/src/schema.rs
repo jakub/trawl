@@ -3,7 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The declared event envelope (ADR-0009, reshaped by ADR-0013): field
-//! names, the sealed namespace predicate, and the derivation source list.
+//! names and the sealed namespace predicate.
+//!
+//! The derivation source lists are NOT here: they became `[ingest]`
+//! config (ADR-0013 slice 2, ruling 5), resolved boot-fatally by the
+//! server and threaded to the one canonicalizer.
 //!
 //! Namespace rule, one sentence: **underscore-prefixed names are trawl's
 //! contract slots** — trawl guarantees their semantics, the sender may
@@ -37,6 +41,15 @@ pub const HOST: &str = "host";
 pub const SEVERITY: &str = "_severity";
 /// The important part of the line (VARCHAR, by convention).
 pub const MESSAGE: &str = "message";
+/// Which door the event entered through (VARCHAR, required;
+/// server-stamped, closed vocabulary `http` | `syslog` | `trawld`).
+///
+/// Provenance is data (ADR-0013 slice 2, ruling 6): "which events came
+/// over syslog" and "why is this severity inverted" are queries, not
+/// archaeology through the config that was live at the time. The sender
+/// cannot forge it — an incoming `_producer` takes the standard
+/// reserved-prefix strip and lands as a bare `producer`.
+pub const PRODUCER: &str = "_producer";
 
 /// Envelope columns stored as TIMESTAMP on disk. Every seam that casts the
 /// hot (ndjson VARCHAR) side to match parquet must cover ALL of these —
@@ -66,13 +79,7 @@ pub fn is_storable_field_name(name: &str) -> bool {
 pub const LEADING_LOG_FIELDS: &[&str] = &[TIME, ENV, SERVICE, HOST, SEVERITY, MESSAGE];
 
 /// Trailing columns demoted to the end of result reordering.
-pub const TRAILING_LOG_FIELDS: &[&str] = &[RAW, INGESTED, REPAIRS];
-
-/// Wire keys read as the `_time` derivation's sources, in precedence
-/// order (ADR-0013 §2). Ingest OBSERVES these: the alias sources are
-/// stored verbatim as ordinary columns, and only `_time` itself — the
-/// proposal slot — is consumed and canonicalized.
-pub const TIME_ALIASES: &[&str] = &[TIME, "timestamp", "@timestamp"];
+pub const TRAILING_LOG_FIELDS: &[&str] = &[RAW, INGESTED, REPAIRS, PRODUCER];
 
 /// Whether a name belongs to trawl's contract namespace (ADR-0013 §1).
 ///
@@ -301,6 +308,7 @@ pub const ENVELOPE_TYPES: &[(&str, CanonicalType)] = &[
     (SERVICE, CanonicalType::Varchar),
     (HOST, CanonicalType::Varchar),
     (MESSAGE, CanonicalType::Varchar),
+    (PRODUCER, CanonicalType::Varchar),
 ];
 
 /// An ordered field → canonical-type map, as threaded from the server's
@@ -583,24 +591,25 @@ mod tests {
         );
     }
 
-    /// The envelope is NINE fields (ADR-0013 §1): five trawl-owned
-    /// under the `_` namespace and four sender-asserted bare ones.
-    /// `severity_text` is gone outright, and `severity` left the
-    /// envelope to become ordinary sender data.
+    /// The envelope is TEN fields (ADR-0013 §1 as amended by slice 2's
+    /// ruling 6): six trawl-owned under the `_` namespace and four
+    /// sender-asserted bare ones. `severity_text` is gone outright, and
+    /// `severity` left the envelope to become ordinary sender data.
     #[test]
-    fn envelope_types_cover_the_declared_nine() {
+    fn envelope_types_cover_the_declared_ten() {
         let fields: Vec<&str> = ENVELOPE_TYPES.iter().map(|(f, _)| *f).collect();
         assert_eq!(
             fields,
             vec![
-                TIME, INGESTED, RAW, REPAIRS, SEVERITY, ENV, SERVICE, HOST, MESSAGE
+                TIME, INGESTED, RAW, REPAIRS, SEVERITY, ENV, SERVICE, HOST, MESSAGE, PRODUCER
             ]
         );
         assert_eq!(SEVERITY, "_severity");
+        assert_eq!(PRODUCER, "_producer");
         assert!(!fields.contains(&"severity"));
         assert!(!fields.contains(&"severity_text"));
         // Trawl-owned names are exactly the reserved ones.
-        for f in [TIME, INGESTED, RAW, REPAIRS, SEVERITY] {
+        for f in [TIME, INGESTED, RAW, REPAIRS, SEVERITY, PRODUCER] {
             assert!(is_reserved_name(f), "{f} must be reserved");
         }
         for f in [ENV, SERVICE, HOST, MESSAGE] {
@@ -617,7 +626,7 @@ mod tests {
         assert_eq!(ty(TIME), CanonicalType::Timestamp);
         assert_eq!(ty(INGESTED), CanonicalType::Timestamp);
         assert_eq!(ty(SEVERITY), CanonicalType::Severity);
-        for f in [RAW, REPAIRS, ENV, SERVICE, HOST, MESSAGE] {
+        for f in [RAW, REPAIRS, ENV, SERVICE, HOST, MESSAGE, PRODUCER] {
             assert_eq!(ty(f), CanonicalType::Varchar, "{f}");
         }
     }

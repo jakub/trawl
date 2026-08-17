@@ -428,8 +428,8 @@ async fn schema_returns_columns(pool: sqlx::PgPool) {
     // raw alphabetical listing with `_ingested` first.
     assert_eq!(names[0], "_time", "envelope leads: {names:?}");
     assert_eq!(
-        &names[names.len() - 3..],
-        &["_raw", "_ingested", "_repairs"],
+        &names[names.len() - 4..],
+        &["_raw", "_ingested", "_repairs", "_producer"],
         "metadata trails: {names:?}"
     );
 
