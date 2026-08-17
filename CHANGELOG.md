@@ -18,9 +18,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the door a payload and get every one of those gates. Three latent
   defects close by arriving there rather than by new code: a >255-byte
   `tracing` field name used to reach the WAL and **permanently wedge
-  compaction for `service=trawld`**, a 64 KB syslog datagram used to
-  blow past `MAX_RAW_CHARS` untruncated, and the syslog batch key
-  ignored the event's `env`.
+  compaction for `service=trawld`**, the syslog lane never applied the
+  `MAX_RAW_CHARS` cap to `_raw` (unreachable via today's transports only
+  because two unrelated constants happen to be equal — now structural),
+  and the syslog batch key ignored the event's `env`.
 
   **`_producer` is a tenth envelope field** (`http`|`syslog`|`trawld`,
   catalog-seeded VARCHAR), so provenance is queryable data:

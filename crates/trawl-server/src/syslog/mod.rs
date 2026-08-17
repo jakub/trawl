@@ -181,13 +181,29 @@ pub(crate) fn parse_cidr(cidr: &str) -> Option<CidrEntry> {
         if prefix_len > max_prefix {
             return None;
         }
-        Some(CidrEntry { addr, prefix_len })
+        Some(canonicalize_entry(CidrEntry { addr, prefix_len }))
     } else {
         // Bare IP without prefix — treat as host address (/32 or /128)
         let addr: IpAddr = cidr.parse().ok()?;
         let prefix_len = if addr.is_ipv4() { 32 } else { 128 };
-        Some(CidrEntry { addr, prefix_len })
+        Some(canonicalize_entry(CidrEntry { addr, prefix_len }))
     }
+}
+
+/// Fold an IPv4-mapped entry (`::ffff:10.0.0.5/128`) into its v4 form so it
+/// matches the [`canonical_peer`] the doors now see. A prefix shorter than
+/// /96 spans more than the mapped range and is kept as genuine v6.
+fn canonicalize_entry(entry: CidrEntry) -> CidrEntry {
+    if let IpAddr::V6(v6) = entry.addr
+        && entry.prefix_len >= 96
+        && let Some(v4) = v6.to_ipv4_mapped()
+    {
+        return CidrEntry {
+            addr: IpAddr::V4(v4),
+            prefix_len: entry.prefix_len - 96,
+        };
+    }
+    entry
 }
 
 /// Check if a source IP is allowed by the CIDR allowlist.
@@ -217,6 +233,16 @@ mod tests {
             "family mismatch is the bug's shape"
         );
         assert!(relay.contains(canonical));
+        // The reverse spelling: a mapped-form CIDR entry (the only form
+        // that matched on a dual-stack bind before canonicalization)
+        // folds to v4 at parse, so it matches the canonical peer too.
+        let mapped_entry = parse_cidr("::ffff:10.0.0.5/128").unwrap();
+        assert!(mapped_entry.contains("10.0.0.5".parse().unwrap()));
+        let mapped_range = parse_cidr("::ffff:10.0.0.0/104").unwrap();
+        assert!(mapped_range.contains("10.1.2.3".parse().unwrap()));
+        // A prefix spanning more than the mapped range stays genuine v6.
+        let wide = parse_cidr("::ffff:0:0/95").unwrap();
+        assert!(!wide.contains("10.0.0.5".parse::<IpAddr>().unwrap()));
         // Genuine v6 peers pass through untouched.
         let v6: IpAddr = "2001:db8::1".parse().unwrap();
         assert_eq!(canonical_peer(v6), v6);

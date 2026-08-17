@@ -18,9 +18,12 @@
 //! the outage. Reviewing a diff is exactly when the invariant is at risk,
 //! so the guard belongs where a diff trips it.
 
-/// The two modules the invariant covers: the door and the profile types
-/// it reaches on every event.
-const GUARDED: [(&str, &str); 2] = [
+/// The modules the invariant covers: the door, the profile types it
+/// reaches on every event, and the metric label helpers the per-event
+/// counters call into — a `tracing` call in any of them re-enters
+/// telemetry's `on_event` per event, unbounded.
+const GUARDED: [(&str, &str); 3] = [
+    ("metrics.rs", include_str!("../src/metrics.rs")),
     (
         "ingest/envelope.rs",
         include_str!("../src/ingest/envelope.rs"),
@@ -81,7 +84,9 @@ fn the_guard_reads_real_sources() {
     // real, so a rename cannot turn this into a no-op.
     for (name, source) in GUARDED {
         assert!(
-            source.contains("pub fn canonicalize") || source.contains("pub enum ProducerKind"),
+            source.contains("pub fn canonicalize")
+                || source.contains("pub enum ProducerKind")
+                || source.contains("pub fn repair_service_label"),
             "{name} is not the module this guard means to cover"
         );
         assert!(
