@@ -378,7 +378,8 @@ decisions. Where a ruling amends this ADR's text, the amendment is stated.
    reader for ingest derivation, `sev()` in all three lanes, and the repin
    cast; the SQL form is generated from the same tables and probe-pinned.
 
-10. **`repin --to severity`**: the target parses through the CATALOG
+10. **`repin --to severity`** — SHIPPED (issue #79): the target parses
+    through the CATALOG
     vocabulary (`from_duckdb` stays incapable of it); the SEVERITY conform
     rung widens to the full token-aware reading as the pin's LIFETIME
     meaning (live conform included — otherwise a repin rewrites historical
@@ -395,6 +396,19 @@ decisions. Where a ruling amends this ADR's text, the amendment is stated.
     live stream belongs to `severity_from`. Envelope refusal becomes
     `is_reserved_name(field)` + the four sender-asserted names, replacing
     the `ENVELOPE_TYPES` list scan.
+
+    As shipped, two details are worth recording. The dialect is carried PER
+    ARM (`conform::RepinTarget`): a stored column that was ALREADY `SEVERITY`
+    holds canonical ladder positions, so its reading stays `OTel` in every
+    variant while the `_raw` re-extraction — the sender's own wire text —
+    takes the assertion; re-reading a stored `3` as syslog would corrupt it
+    to 17. And the ambiguity count is DERIVED from the whole target
+    expression (both wire dialects non-NULL and different) rather than
+    spelled out over the syslog domain a second time, which covers the
+    resurrection arm for free and keeps one-dialect values out — those are
+    visible loss the `projected_nulls` count already reports. The verdict
+    also rides every job row on the wire (`requires_force`), because a dry
+    run terminates `succeeded` and would otherwise read as a green light.
 
 11. **Slicing — four issues, dependency-ordered**: (1) severity kernel +
     `sev()` (trawl-core; first, both chains depend on the reader), (2)

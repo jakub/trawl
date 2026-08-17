@@ -1314,3 +1314,325 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
     };
     assert!(!forced.requires_force, "force clears the gate: {forced:?}");
 }
+
+/// The corpus every acceptance criterion is written against: one sender
+/// field carrying the five shapes a severity repin has to answer for — two
+/// case-variant tokens, an exact `OTel` short name, a dialect-ambiguous
+/// numeral, and a value no ladder rung reads.
+fn severity_corpus() -> Vec<serde_json::Value> {
+    ["error", "ERROR", "error2", "3", "gold"]
+        .iter()
+        .map(|level| event("api", &json!({"level": level})))
+        .collect()
+}
+
+/// AC2/AC5: the dry run's numbers ARE the executed rewrite's, and the
+/// report carries the evidence an operator decides on (which value cannot
+/// be read, and whether anything is still writing the field).
+#[sqlx::test(migrations = false)]
+async fn repin_to_severity_dry_run_matches_the_executed_rewrite(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    h.ingest_and_compact(&severity_corpus()).await;
+    assert_eq!(h.pinned_type("level").await, "VARCHAR");
+    assert_eq!(h.count("last=1h | stats count()").await, 5);
+
+    let dry = match h
+        .schema_admin
+        .schema_repin("level", "severity", None, true, false)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(dry.files_total, 1);
+    assert_eq!(dry.rows_carrying, 5, "every row carries a level");
+    assert_eq!(dry.projected_nulls, 1, "only `gold` has no reading");
+    assert_eq!(dry.resurrectable, 0, "nothing was shelved before this");
+    assert_eq!(
+        dry.ambiguous_numerals, 1,
+        "`3` reads differently per dialect"
+    );
+    assert_eq!(
+        dry.dialect.as_deref(),
+        Some("otel"),
+        "the default assertion"
+    );
+    // AC5: the evidence, not just the count.
+    assert_eq!(dry.unmapped_samples, vec!["gold".to_owned()]);
+    let live = dry.liveness.as_ref().expect("the sender just wrote");
+    assert_eq!(live.service, "api");
+    assert!(
+        dry.requires_force,
+        "loss AND ambiguity, neither accepted yet"
+    );
+
+    // The same plan, executed with force: the rewrite achieves exactly what
+    // the scan projected.
+    let started = match h
+        .schema_admin
+        .schema_repin("level", "severity", None, false, true)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(done.files_done, dry.files_total);
+    assert_eq!(done.rows_rewritten, dry.rows_carrying);
+    assert_eq!(
+        done.rows_nulled, dry.projected_nulls,
+        "the rewrite nulled exactly what the dry run projected"
+    );
+    assert_eq!(done.rows_resurrected, dry.resurrectable);
+    assert_eq!(h.pinned_type("level").await, "SEVERITY");
+
+    // The pin now gives the sender's own field the ladder's vocabulary:
+    // bands for equality, the exact number when ordered, and `gold` is a
+    // NULL the pin cannot hold (its original stays in _raw).
+    assert_eq!(h.count("level=error last=1h | stats count()").await, 3);
+    assert_eq!(h.count("level>=warn last=1h | stats count()").await, 3);
+    assert_eq!(
+        h.count("level=error2 last=1h | stats count()").await,
+        1,
+        "an exact short name is exact, not its band"
+    );
+    assert_eq!(
+        h.count("level=trace3 last=1h | stats count()").await,
+        1,
+        "the numeral 3 conformed as the OTel rung it names"
+    );
+    assert_eq!(h.count("level=* last=1h | stats count()").await, 4);
+    assert_eq!(
+        h.count("\"gold\" last=1h | stats count()").await,
+        1,
+        "the unreadable original is still findable in _raw"
+    );
+}
+
+/// AC3: the syslog assertion INVERTS the numeral, is persisted on the job
+/// row, and reads back off the status route — the one dialect-changing
+/// decision an operator can make about their own corpus.
+#[sqlx::test(migrations = false)]
+async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    h.ingest_and_compact(&severity_corpus()).await;
+
+    // The ambiguity gate does NOT fire under an explicit syslog assertion
+    // (AC4's other half is `a_dry_run_reports_the_force_verdict_it_would_hit`),
+    // but `gold` is still a loss, so this run is forced for that reason.
+    let started = match h
+        .schema_admin
+        .schema_repin("level", "severity", Some("syslog"), false, true)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(
+        done.dialect.as_deref(),
+        Some("syslog"),
+        "the assertion is persisted on the job row"
+    );
+
+    // Syslog counts DOWN: `3` is err (17), not trace3 (3). Words are
+    // dialect-free, so the three tokens read exactly as before.
+    assert_eq!(
+        h.count("level=error last=1h | stats count()").await,
+        4,
+        "error, ERROR, error2 and the inverted `3` are all in the error band"
+    );
+    assert_eq!(h.count("level=trace3 last=1h | stats count()").await, 0);
+    assert_eq!(h.count("level>=warn last=1h | stats count()").await, 4);
+}
+
+/// AC6 + ruling 13: a value a PRIOR conform shelved comes back under the
+/// new pin — including one whose `_raw` key still carries the sender's
+/// original mixed-case spelling, which the case-variant fallback recovers
+/// best-effort (the documented Unicode-`lower()`-vs-ASCII-fold edge).
+#[sqlx::test(migrations = false)]
+async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    // First typed sight pins BIGINT…
+    h.ingest_and_compact(&[event("api", &json!({"lvl": 17}))])
+        .await;
+    assert_eq!(h.pinned_type("lvl").await, "BIGINT");
+    // …and a token batch conflicts: the value is nulled and lives on in
+    // `_raw`, which holds the sender's ORIGINAL key spelling (`Lvl`),
+    // because `_raw` is captured before the name fold.
+    h.ingest_and_compact(&[event("api", &json!({"Lvl": "error"}))])
+        .await;
+    assert_eq!(
+        h.count("lvl=* last=1h | stats count()").await,
+        1,
+        "the token was shelved by the BIGINT pin"
+    );
+
+    let dry = match h
+        .schema_admin
+        .schema_repin("lvl", "severity", None, true, true)
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(
+        dry.resurrectable, 1,
+        "the shelved `error` is recoverable from _raw under a case-variant key"
+    );
+    assert_eq!(dry.projected_nulls, 0, "17 is already a ladder position");
+
+    let started = match h
+        .schema_admin
+        .schema_repin("lvl", "severity", None, false, true)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(done.rows_resurrected, 1);
+    assert_eq!(h.pinned_type("lvl").await, "SEVERITY");
+    assert_eq!(
+        h.count("lvl=error last=1h | stats count()").await,
+        2,
+        "the stored 17 and the resurrected `error` are one value now"
+    );
+}
+
+/// AC7: after the repin, the sender's own field IS on the ladder in every
+/// lane — the cold parquet, the hot buffer a live event lands in, the
+/// pipeline's `where`, and the in-memory matcher the live tail uses — and a
+/// newly-ingested `"error"` conforms to 17 with no further operator action.
+#[sqlx::test(migrations = false)]
+async fn post_repin_severity_binds_in_every_lane_including_live_ingest(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    h.ingest_and_compact(&severity_corpus()).await;
+    let started = match h
+        .schema_admin
+        .schema_repin("level", "severity", None, false, true)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+
+    // Cold: the rewritten corpus.
+    assert_eq!(h.count("level>=warn last=1h | stats count()").await, 3);
+
+    // LIVE INGEST, uncompacted: the hot branch conforms through the same
+    // catalog pin, so a brand-new `"error"` is 17 the moment it lands —
+    // nothing about the sender changed.
+    let live = event("api", &json!({"level": "error"}));
+    assert_eq!(
+        h.ingest
+            .ingest(std::slice::from_ref(&live))
+            .await
+            .unwrap()
+            .accepted,
+        1
+    );
+    assert_eq!(
+        h.count("level>=warn last=1h | stats count()").await,
+        4,
+        "the hot row reads on the ladder before compaction"
+    );
+    // The PIPELINE lane binds the same pin (ADR-0011 slice A′).
+    assert_eq!(
+        h.count("last=1h | where level >= \"error\" | stats count()")
+            .await,
+        4
+    );
+
+    // The LIVE-TAIL lane: the same filter the SSE stream compiles, over the
+    // same catalog snapshot the handler hands it.
+    let pins = h.server.state.query.field_catalog.all();
+    let matches = |dsl: &str| -> bool {
+        let ast = trawl_core::parser::parse(dsl).expect("parses");
+        let filter =
+            trawl_core::filter::CompiledFilter::compile(&ast.search, &pins).expect("compiles");
+        let event: serde_json::Map<String, serde_json::Value> =
+            live.as_object().cloned().expect("an object");
+        filter.matches_at(&event, chrono::Utc::now())
+    };
+    assert!(matches("level>=warn"), "the live tail binds the new pin");
+    assert!(matches("level=error"));
+    assert!(!matches("level=trace3"));
+
+    // And once it compacts, the answer does not move.
+    h.compact_tick().await;
+    assert_eq!(h.count("level>=warn last=1h | stats count()").await, 4);
+    assert_eq!(h.count("level=error last=1h | stats count()").await, 4);
+}
+
+/// Ruling 7: EVERY shadow pass — the initial build and the catch-up passes
+/// that fold in files compaction wrote meanwhile — rides the JOB's asserted
+/// dialect, while ordinary compaction stays on the `OTel` reading.
+///
+/// That combination is exactly the discontinuity the CLI warns about, so it
+/// is asserted rather than assumed: a `3` the catch-up rewrote reads as
+/// syslog err, and the next `3` to arrive after the cutover reads as `OTel`
+/// trace3.
+#[sqlx::test(migrations = false)]
+async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+    h.ingest_and_compact(&[event("api", &json!({"level": "error"}))])
+        .await;
+    assert_eq!(h.pinned_type("level").await, "VARCHAR");
+
+    trawl_server::repin::engine::TEST_FILE_DELAY_MS
+        .store(400, std::sync::atomic::Ordering::Relaxed);
+    let started = match h
+        .schema_admin
+        .schema_repin("level", "severity", Some("syslog"), false, true)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    // Written by compaction under the OLD pin while the shadow builds, so a
+    // catch-up pass is what carries it into the new generation.
+    h.ingest_and_compact(&[event("api", &json!({"level": "3"}))])
+        .await;
+    let done = h.wait_terminal(started.id).await;
+    trawl_server::repin::engine::TEST_FILE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    // The mid-build row survived the swap, which only a catch-up pass can
+    // do: the cutover publishes the shadow WHOLESALE, so a file the build
+    // never folded in would be gone.
+    assert_eq!(h.count("last=1h | stats count()").await, 2);
+
+    // And it took the job's syslog reading (err), not OTel's — the pass
+    // that folded it in rode the job's dialect, not the live default.
+    assert_eq!(
+        h.count("level=error last=1h | stats count()").await,
+        2,
+        "the token and the inverted numeral are both in the error band"
+    );
+    assert_eq!(h.count("level=trace3 last=1h | stats count()").await, 0);
+
+    // Ordinary compaction after the cutover conforms at OTel — the
+    // discontinuity the report's liveness warning exists to state.
+    h.ingest_and_compact(&[event("api", &json!({"level": "3"}))])
+        .await;
+    assert_eq!(
+        h.count("level=trace3 last=1h | stats count()").await,
+        1,
+        "a live `3` reads as the OTel rung it names; the repin translated \
+         HISTORY only"
+    );
+    assert_eq!(h.count("level=error last=1h | stats count()").await, 2);
+}

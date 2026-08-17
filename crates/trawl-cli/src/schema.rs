@@ -1104,6 +1104,76 @@ mod repin_tests {
         assert_eq!(parsed["projected_nulls"], 0);
     }
 
+    /// AC9: the operator-facing transcript of a `--dry-run` over the
+    /// acceptance corpus, rendered by the real CLI path.
+    ///
+    /// The numbers are the ones the server produces in
+    /// `trawl-server/tests/repin.rs::repin_to_severity_dry_run_matches_the_executed_rewrite`
+    /// (five rows carrying, one unreadable `gold`, one dialect-ambiguous
+    /// `3`), so this pins what an operator actually READS when the plan says
+    /// the executing request would refuse.
+    #[test]
+    fn the_dry_run_transcript_shows_the_plan_the_evidence_and_the_verdict() {
+        let job = trawl_client::RepinJobResponse {
+            id: 1,
+            field: "level".into(),
+            from_type: "VARCHAR".into(),
+            to_type: "SEVERITY".into(),
+            dry_run: true,
+            force: false,
+            status: "succeeded".into(),
+            requested_by: Some("ops".into()),
+            started_at: "2026-08-17T12:00:00Z".into(),
+            finished_at: Some("2026-08-17T12:00:01Z".into()),
+            error: None,
+            files_total: 1,
+            rows_carrying: 5,
+            projected_nulls: 1,
+            resurrectable: 0,
+            affected_bytes: 4096,
+            files_done: 0,
+            rows_rewritten: 0,
+            rows_nulled: 0,
+            rows_resurrected: 0,
+            dialect: Some("otel".into()),
+            ambiguous_numerals: 1,
+            unmapped_samples: vec!["gold".into()],
+            liveness: Some(trawl_client::RepinLiveness {
+                last_seen: "2026-08-17T11:59:58Z".into(),
+                service: "api".into(),
+            }),
+            requires_force: true,
+            requires_force_reason: Some(
+                "1 stored value(s) cannot be read as SEVERITY and would be nulled \
+                 (the originals stay findable in _raw)"
+                    .into(),
+            ),
+        };
+
+        let mut out = Vec::new();
+        writeln!(out, "repin {}: dry run", job.field).unwrap();
+        let (columns, rows) = repin_job_to_rows(&job);
+        render_driver_results(&columns, &rows, OutputFormat::Table, &mut out).unwrap();
+        render_repin_case_file(&mut out, true, &job).unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        // Printed so the run can be pasted into a PR body verbatim
+        // (`cargo nextest run --no-capture`).
+        println!("{text}");
+
+        for expected in [
+            "repin level: dry run",
+            "SEVERITY",
+            "otel",
+            "values the new pin cannot read:",
+            "- gold",
+            "STILL being written",
+            "requires --force:",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+    }
+
     /// The case file is the evidence a plan's NUMBERS cannot carry: the
     /// asserted dialect, the ambiguous rows, the values the pin cannot read,
     /// the force verdict — and, for a field something is still WRITING, the

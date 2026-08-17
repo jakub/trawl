@@ -446,12 +446,32 @@ applied at **query time**, to any field you name:
 - It works in embedded `--data` mode, where nothing else is pin-aware:
   the type is declared by the function, not looked up in a catalog.
 
+#### Putting the field itself on the ladder
+
+`sev()` reads a field on the ladder at QUERY time, every time. To make the
+field *be* a severity — so `level=error` is a band match, `level>=warn`
+compares ladder positions, and results render tokens — an operator repins
+the column once:
+
+```bash
+trawl schema repin level --to severity --dry-run   # plan first, always
+```
+
+Then `level` behaves exactly as `_severity` does, in every lane, for
+history and for live events alike (ingest conforms through the same pin).
+The dry run reports the values the ladder cannot read, and — for a corpus
+carrying numerals 1-7, which OTel and syslog PRI read as different
+severities — refuses until you assert `--dialect syslog` or pass `--force`.
+`_severity` itself cannot be repinned: its type is part of the event
+contract. See the [CLI reference](/reference/cli/#repin).
+
 :::caution[`level=error` is not a severity filter]
 `level` is an ordinary field now, so `level=error` compares the sender's
 own value. A game server emitting `{"service":"game","level":"gold"}`
 keeps a fully queryable `level` column — that is the point — but if you
 meant severity, you want `_severity>=error` — or `sev(level)>="error"`
-to read the sender's own field on the ladder. And a field no sender writes
+to read the sender's own field on the ladder, or
+`trawl schema repin level --to severity` to put it there for good. And a field no sender writes
 is not an error: it simply matches nothing, so a query written against
 the old alias comes back empty rather than failing. trawl says nothing
 about it — `level` is your vocabulary, not trawl's, and a notice keyed on

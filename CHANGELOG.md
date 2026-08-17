@@ -7,6 +7,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **`repin --to severity`: put a sender's own field on the OTel ladder
+  (ADR-0013 ruling 10, #79).** `trawl schema repin level --to severity`
+  (`POST /api/v1/schema/repin` with `"to": "SEVERITY"`) retypes one field's
+  whole corpus onto the severity ladder, so `level=error` becomes a band
+  match, `level>=warn` compares ladder positions, results render tokens and
+  live ingest conforms through the same pin from then on. Admission moved to
+  the CATALOG parse (`from_catalog`), which is what made the target
+  reachable at all; INFERENCE still cannot mint the pin, and the declared
+  envelope is refused as a PREDICATE (`schema::is_contract_typed` — the
+  whole sealed `_` prefix plus the four sender-asserted names), so a slot
+  added later is refused the day it exists.
+
+  **`--dialect otel|syslog`** (persisted on the job row, `otel` by default)
+  reads NUMERALS only — words go through the one token table whatever you
+  assert. The two ladders overlap over 1-7 with opposite meanings (`3` is
+  `trace3` to OTel and `err` to syslog) and no value-shape rule can tell
+  them apart, so a corpus carrying them is REFUSED under the OTel reading
+  until the operator asserts `syslog` or passes `--force`; the count of such
+  rows (`ambiguous_numerals`) is reported whatever the assertion. The
+  dialect is carried per ARM: a column that was already `SEVERITY` holds
+  canonical ladder positions and keeps its OTel reading, while the `_raw`
+  re-extraction — the sender's own wire text — takes the assertion.
+
+  The report gained the evidence a plan's numbers cannot carry: up to five
+  distinct `unmapped_samples` of the values the new pin cannot read, a
+  `liveness` fact when something is still WRITING the field (a repin
+  translates history — the CLI states the cutover discontinuity and points
+  at `[ingest] severity_from` for the live half), and **`requires_force`**,
+  which every job row now carries. A dry run terminates `succeeded` by
+  design, so without that a plan carrying loss or ambiguity read as a clean
+  200 and the refusal arrived with the request that was meant to do the
+  work; the verdict is computed from the row's own numbers through the same
+  decision the two live gates ask.
+
 - **Producer profiles, configurable derivation sources, and `_producer`
   (ADR-0013 slice 2 rulings 1-6, #75).** All three producers now enter
   through the ONE envelope canonicalizer as *profiles* — `http`,
@@ -309,6 +343,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `trawl_catalog_repin_*` metrics; retention stands down while a job is
   in flight. This retires the documented stop-trawld-and-do-surgery
   escape hatch.
+
+### Changed
+- **Severity presentation metadata is computed inside the query permit
+  (#79).** `severity_columns` on `/api/v1/query` is now decided by the
+  executing task, under the catalog snapshot the rows were produced with,
+  instead of by a second snapshot the handler took before execution. That
+  coherence used to be free — a `SEVERITY` pin could be neither created nor
+  destroyed at runtime — and `repin --to severity` makes it earnable. The
+  walk (a regex compiled per `extract` stage, so client-shaped cost) also
+  moves off the reactor thread to where `max_concurrent` bounds it and the
+  query timeout covers it.
+- **A `| from saved` query's severity presentation is rooted in an EMPTY
+  catalog (#79).** The DSL after `from saved` runs over a saved run's stored
+  parquet, and that stage's pin scope clears — so a column in those rows is
+  no longer typed by whatever this corpus happens to pin now. Machine
+  formats are unaffected (the number is what every wire format carries);
+  this is a token-rendering change only.
 
 ### Fixed
 - **BREAKING — a backtick ends every unquoted position, and a name can be
