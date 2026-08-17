@@ -24,6 +24,16 @@ use crate::ingest::wal::WalWriter;
 /// refuses to start) — decides from one definition.
 pub use trawl_config::{MAX_SERVICE_NAME_LEN, is_valid_service_char, is_valid_service_name};
 
+/// The batch key: `(env, service)`.
+///
+/// Two envs must never share a WAL batch, a hot-buffer drain key or a
+/// parquet partition (ADR-0009), so the env is part of the key on EVERY
+/// lane — the HTTP handler's and the syslog batcher's alike. It lives
+/// here, next to the writer that consumes it, because a batcher holding
+/// its own key type is exactly how the syslog lane came to file two envs
+/// under one name.
+pub type BatchKey = (String, String);
+
 /// Events for a single service within a batch, ready for WAL writing.
 #[derive(Debug, Default)]
 pub struct ServiceBatch {
@@ -56,9 +66,6 @@ pub struct PipelineWriter {
     wal_writer: Arc<WalWriter>,
     hot_buffer: Option<Arc<HotBuffer>>,
     event_bus: Option<Arc<LocalEventBus>>,
-    /// Env for service-keyed batch writers (syslog) that predate the env
-    /// dimension — their events are stamped with `default_env` upstream.
-    default_env: Arc<str>,
 }
 
 impl PipelineWriter {
@@ -66,13 +73,11 @@ impl PipelineWriter {
         wal_writer: Arc<WalWriter>,
         hot_buffer: Option<Arc<HotBuffer>>,
         event_bus: Option<Arc<LocalEventBus>>,
-        default_env: Arc<str>,
     ) -> Self {
         Self {
             wal_writer,
             hot_buffer,
             event_bus,
-            default_env,
         }
     }
 
@@ -84,12 +89,16 @@ impl PipelineWriter {
     /// Write batches through the pipeline: WAL → hot buffer → event bus.
     ///
     /// Returns the number of events successfully written. Events from
-    /// services that fail WAL writing are dropped (logged, not published).
-    pub fn write(&self, batches: IndexMap<String, ServiceBatch>) -> usize {
+    /// groups that fail WAL writing are dropped (logged, not published).
+    ///
+    /// The env comes from the KEY, never from a writer-held default: a
+    /// batcher that grouped by service alone would file every env it
+    /// received under one path root, silently. Deleting the field is what
+    /// makes that unrepresentable rather than merely fixed.
+    pub fn write(&self, batches: IndexMap<BatchKey, ServiceBatch>) -> usize {
         let mut total_written = 0;
-        let env = Arc::clone(&self.default_env);
 
-        for (svc, batch) in batches {
+        for ((env, svc), batch) in batches {
             let event_count = batch.maps.len();
 
             match self.wal_writer.write(&env, &svc, &batch.ndjson) {
@@ -100,7 +109,8 @@ impl PipelineWriter {
                 Err(e) => {
                     tracing::warn!(
                         event_type = "pipeline_wal_write_failed",
-                        service = %svc,
+                        batch_env = %env,
+                        batch_service = %svc,
                         events_lost = event_count,
                         error = %e,
                         "WAL write failed for batch"
@@ -140,7 +150,11 @@ impl PipelineWriter {
         }
         if let Some(bus) = &self.event_bus {
             let subscribers = bus.publish(ingest_batch);
-            tracing::debug!(service = %svc, subscribers, "published batch to event bus");
+            tracing::debug!(
+                batch_service = %svc,
+                subscribers,
+                "published batch to event bus"
+            );
         }
     }
 }

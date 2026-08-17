@@ -6,6 +6,19 @@
 //! boundary. The output is deliberately just JSON objects separated by `\n`:
 //! Vector's `file` source can decode it, and an HTTP test can post the same
 //! bytes directly as `application/x-ndjson`.
+//!
+//! Since ADR-0013 slice 2 there are three producer PROFILES behind one
+//! canonicalizer, so `--profile` selects which door's payload shape the
+//! `mutate` corpus imitates: `http` emits wire events exactly as a sender
+//! posts them, while `syslog` and `trawld` emit the payload MAPS their
+//! doors hand `envelope::canonicalize` — the `syslog_*`/`sd_*` parse
+//! artifacts and the tracing-visitor fields respectively. Those two are
+//! still ordinary NDJSON, so they replay over HTTP the way a
+//! syslog-over-HTTP forwarder's batch does; the in-process proof that
+//! each shape survives its OWN door is
+//! `crates/trawl-server/tests/profile_fuzz.rs`, which generates its own
+//! corpus deliberately — this command's job is a wire artifact, that
+//! test's job is the function.
 
 use std::io::{self, BufWriter, Write as _};
 use std::process::ExitCode;
@@ -41,9 +54,45 @@ pub enum Phase {
     Rejects,
 }
 
+/// Which producer PROFILE the `mutate` corpus is shaped for (ADR-0013
+/// slice 2, ruling 2).
+///
+/// The profiles share one canonicalizer, so what differs is only the
+/// payload a door hands it — which is exactly what a corpus can imitate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum Profile {
+    /// Wire events as an HTTP sender posts them: the door asserts nothing
+    /// and the sender owns every identity field.
+    #[default]
+    Http,
+    /// The payload the syslog door builds from a frame: the `_raw` wire
+    /// line, the `syslog_*` parse artifacts and the unfolded `sd_*`
+    /// structured-data pairs, with identity left to the profile's
+    /// assertion.
+    Syslog,
+    /// The payload the telemetry layer builds from a tracing event:
+    /// ordinary sender vocabulary (`level`, `target`, `event_type`,
+    /// `message`), a `_time` proposal, and whatever field names the
+    /// daemon's own call sites happened to use.
+    Trawld,
+}
+
+impl Profile {
+    /// The one spelling — the `--profile` token and the `_producer`
+    /// column value a replay of this corpus should land under.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Syslog => "syslog",
+            Self::Trawld => "trawld",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub phase: Phase,
+    pub profile: Profile,
     pub seed: u64,
     pub namespace: String,
     pub env: String,
@@ -91,8 +140,11 @@ pub fn run(config: &Config) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             eprintln!(
-                "xtask: emitted {rows} {:?} NDJSON events (seed={}, namespace={})",
-                config.phase, config.seed, config.namespace
+                "xtask: emitted {rows} {:?} NDJSON events (profile={}, seed={}, namespace={})",
+                config.phase,
+                config.profile.as_str(),
+                config.seed,
+                config.namespace
             );
             ExitCode::SUCCESS
         }
@@ -123,6 +175,20 @@ fn validate_config(config: &Config) -> Result<(), String> {
     if !env_ok {
         return Err("--env must match [a-z0-9_-]{1,32}".to_owned());
     }
+    // The fixed contract phases describe the catalog boundary, not a
+    // door: `pin`/`conflicts` are pin-ladder corpora and `rejects` is a
+    // list of things only the HTTP door can refuse (a profile producer
+    // asserts boot-validated identity and has nobody to reject to). A
+    // silently HTTP-shaped `--profile syslog --phase rejects` would be
+    // the worst of both.
+    if config.profile != Profile::Http && config.phase != Phase::Mutate {
+        return Err(format!(
+            "--profile {} shapes the `mutate` phase only; {:?} is a \
+             door-independent corpus",
+            config.profile.as_str(),
+            config.phase
+        ));
+    }
     Ok(())
 }
 
@@ -131,7 +197,11 @@ fn emit(config: &Config, out: &mut impl io::Write) -> io::Result<usize> {
     let events = match config.phase {
         Phase::Pin => pin_events(config, &names),
         Phase::Conflicts => conflict_events(config, &names),
-        Phase::Mutate => mutation_events(config, &names),
+        Phase::Mutate => match config.profile {
+            Profile::Http => mutation_events(config, &names),
+            Profile::Syslog => syslog_payload_events(config, &names),
+            Profile::Trawld => trawld_payload_events(config, &names),
+        },
         Phase::Rejects => reject_events(config, &names),
     };
     let rows = events.len();
@@ -319,48 +389,212 @@ fn mutation_events(config: &Config, names: &Names) -> Vec<Value> {
             if seq % 3 == 0 {
                 event.insert("severity_text".into(), json!(severity_value(seq + 1)));
             }
-            // The sealed `_` prefix at the ingest door (ADR-0013 §5):
-            // server-stamped slots, the internal provenance key, a
-            // journald-shaped name, an empty remainder, and the
-            // bare-name collision — every branch of the ONE strip rule.
-            if seq % 11 == 0 {
-                event.insert("_ingested".into(), json!("client-forged"));
-                event.insert("_repairs".into(), json!("client-forged"));
-                event.insert("_trawl_wal_file".into(), json!("client-forged"));
-            }
-            if seq % 4 == 0 {
-                event.insert("_HOSTNAME".into(), json!("journald-box"));
-                event.insert("__name__".into(), json!("prometheus-series"));
-            }
-            if seq % 9 == 0 {
-                event.insert("___".into(), json!("no bare remainder"));
-                event.insert(names.field("collide"), json!("bare wins"));
-                event.insert(format!("_{}", names.field("collide")), json!("loser"));
-            }
-            // A forged verdict: derivation-only, so it strips to bare
-            // `severity` and is then READ like any other source.
-            if seq % 6 == 0 {
-                event.insert("_severity".into(), json!(severity_value(seq)));
-            }
             if seq % 13 == 0 {
                 event.insert("timestamp".into(), timestamp_value(seq));
             }
             if seq % 8 == 0 {
                 event.insert("@timestamp".into(), timestamp_value(seq + 2));
             }
-            if seq % 17 == 0 {
-                event.insert(
-                    "x".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1),
-                    json!("dropped-but-retained-in-raw"),
-                );
-            }
             if seq % 19 == 0 {
                 event.insert(names.field("case_probe"), json!("lower-wins"));
                 event.insert(names.field("CASE_PROBE"), json!("folded-loses"));
             }
-            if seq % 23 == 0 {
-                event.insert("_raw".into(), json!({"forged": "object"}));
+            universal_gate_probes(&mut event, names, seq);
+            Value::Object(event)
+        })
+        .collect()
+}
+
+/// The gates EVERY door applies, probed on a deterministic cadence so no
+/// seed can miss a branch: the sealed `_` prefix (ADR-0013 §5) in each of
+/// its shapes — server-stamped slots, the internal provenance key, a
+/// journald-shaped name, an empty remainder, the bare-name collision, a
+/// forged verdict, a forged provenance stamp — plus the name-length cap
+/// and a non-string `_raw`.
+///
+/// One function for all three profiles on purpose: the universal gates
+/// are the thing slice 2 unified, so a corpus that probed them per-door
+/// could drift about what "adversarial" even means.
+fn universal_gate_probes(event: &mut Map<String, Value>, names: &Names, seq: usize) {
+    if seq.is_multiple_of(11) {
+        event.insert("_ingested".into(), json!("client-forged"));
+        event.insert("_repairs".into(), json!("client-forged"));
+        event.insert("_trawl_wal_file".into(), json!("client-forged"));
+        // Provenance is stamped by the door, so this must strip to a bare
+        // `producer` and never reach `_producer` (ADR-0013 slice 2).
+        event.insert("_producer".into(), json!("client-forged"));
+    }
+    if seq.is_multiple_of(4) {
+        event.insert("_HOSTNAME".into(), json!("journald-box"));
+        event.insert("__name__".into(), json!("prometheus-series"));
+    }
+    if seq.is_multiple_of(9) {
+        event.insert("___".into(), json!("no bare remainder"));
+        event.insert(names.field("collide"), json!("bare wins"));
+        event.insert(format!("_{}", names.field("collide")), json!("loser"));
+    }
+    // A forged verdict: derivation-only, so it strips to bare `severity`
+    // and is then READ like any other source.
+    if seq.is_multiple_of(6) {
+        event.insert("_severity".into(), json!(severity_value(seq)));
+    }
+    if seq.is_multiple_of(17) {
+        event.insert(
+            "x".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1),
+            json!("dropped-but-retained-in-raw"),
+        );
+    }
+    if seq.is_multiple_of(23) {
+        event.insert("_raw".into(), json!({"forged": "object"}));
+    }
+}
+
+/// The payload the SYSLOG door hands the canonicalizer: the pre-parse
+/// wire line as a `_raw` proposal, the `syslog_*` parse artifacts, and
+/// the `sd_*` structured-data pairs UNFOLDED and uncapped — the listener
+/// stopped owning any of those rules in ADR-0013 slice 2.
+///
+/// The identity fields are here too, because the profile ASSERTS them: a
+/// payload key that names one is the assertion-precedence case, and
+/// including them is also what makes the corpus replayable over HTTP the
+/// way a syslog-over-HTTP forwarder's batch is.
+fn syslog_payload_events(config: &Config, names: &Names) -> Vec<Value> {
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let values = mutation_values();
+
+    (0..config.mutation_events)
+        .map(|seq| {
+            let mut event = base_event(config, names, "syslog", seq);
+            // The syslog door never publishes a bare `severity` — and on an
+            // HTTP replay it would win the severity_from chain at position 0,
+            // shadowing the `syslog_severity` + dialect knob this corpus
+            // exists to exercise (the forwarder recipe in configuration.md).
+            event.remove("severity");
+            // The wire frame, proposed as `_raw`. Every eleventh one is
+            // past MAX_RAW_CHARS: a 64 KB datagram is exactly the case
+            // the listener never used to cap.
+            let frame = if seq % 11 == 0 {
+                format!("<{}>1 - - - - - {}", 13 + seq % 8, "A".repeat(70_000))
+            } else {
+                format!(
+                    "<{}>1 2026-02-15T12:00:{:02}Z host-{seq} app {seq} ID{seq} - frame {seq}",
+                    13 + seq % 8,
+                    seq % 60
+                )
+            };
+            event.insert("_raw".into(), json!(frame));
+
+            // The severity ARTIFACT: raw 0-7, sometimes out of the
+            // dialect's domain, sometimes absent (a PRI-less frame).
+            match seq % 10 {
+                8 => {}
+                9 => {
+                    event.insert("syslog_severity".into(), json!(99));
+                }
+                n => {
+                    event.insert("syslog_severity".into(), json!(n));
+                }
             }
+            // The timestamp ARTIFACT, omitted a third of the time so the
+            // configured chain and then arrival time take over.
+            if seq % 3 != 0 {
+                event.insert("syslog_timestamp".into(), timestamp_value(seq));
+            }
+            event.insert("syslog_facility".into(), json!("local0"));
+            event.insert("syslog_pid".into(), json!(format!("{seq}")));
+            event.insert("syslog_msgid".into(), json!(format!("ID{seq}")));
+            event.insert("syslog_source_ip".into(), json!("10.0.0.1"));
+
+            // Structured data, exactly as the listener now spells it:
+            // mixed case, `@`-bearing SD-IDs, an over-long key and a
+            // case-collision pair — all of which the DOOR resolves.
+            event.insert(
+                "sd_exampleSDID@32473_eventID".into(),
+                json!(format!("{seq}")),
+            );
+            event.insert("sd_examplesdid@32473_eventid".into(), json!("exact wins"));
+            if seq % 7 == 0 {
+                event.insert(
+                    format!(
+                        "sd_{}_k",
+                        "L".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES)
+                    ),
+                    json!("dropped-but-retained-in-raw"),
+                );
+            }
+            let value = values[rng.gen_range(0..values.len())].clone();
+            event.insert("sd_origin@32473_ip".into(), value);
+
+            universal_gate_probes(&mut event, names, seq);
+            Value::Object(event)
+        })
+        .collect()
+}
+
+/// The payload the TELEMETRY layer hands the canonicalizer: ordinary
+/// sender vocabulary (ruling 3 — no `trawld_` prefix), a `_time`
+/// proposal, and the arbitrary field names trawld's own `tracing` call
+/// sites carry.
+///
+/// The identity collisions are the point: a tracing field named
+/// `service` must lose to the profile's assertion with a repair rather
+/// than misfile the daemon's own logs, and a >255-byte field name must
+/// be dropped rather than reach the WAL and wedge compaction for
+/// `service=trawld` (the defect this issue exists to fix).
+fn trawld_payload_events(config: &Config, names: &Names) -> Vec<Value> {
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let values = mutation_values();
+    // Names a `tracing` field could carry, mixed case included: field
+    // names are Rust-side tokens, so `myField` is legal and the DOOR is
+    // what folds it.
+    let tracing_fields = [
+        "query_id".to_owned(),
+        "outcome".to_owned(),
+        "elapsed_ms".to_owned(),
+        "myField".to_owned(),
+        "myfield".to_owned(),
+        "error_class".to_owned(),
+        names.field("dynamic_00"),
+    ];
+
+    (0..config.mutation_events)
+        .map(|seq| {
+            let mut event = Map::new();
+            // What the layer always writes. `service`/`env`/`host` are
+            // NOT here — the profile asserts them — except where the
+            // collision probe below plants one.
+            event.insert("level".into(), json!(severity_value(seq)));
+            event.insert("target".into(), json!("trawl_server::ingest::handler"));
+            event.insert("event_type".into(), json!("fuzz_probe"));
+            event.insert("message".into(), json!(format!("telemetry fuzz {seq}")));
+            event.insert("_time".into(), timestamp_value(seq));
+            event.insert(
+                "trawl_fuzz_seed".into(),
+                json!(format!("{:016x}", config.seed)),
+            );
+            event.insert("trawl_fuzz_phase".into(), json!("trawld"));
+            event.insert("trawl_fuzz_seq".into(), json!(seq));
+
+            let fields = rng.gen_range(1..=4);
+            for _ in 0..fields {
+                let name = &tracing_fields[rng.gen_range(0..tracing_fields.len())];
+                let value = values[rng.gen_range(0..values.len())].clone();
+                event.insert(name.clone(), value);
+            }
+
+            // Identity collisions: every slot the profile asserts, one
+            // per cadence, so each is exercised alone and together.
+            if seq % 3 == 0 {
+                event.insert("service".into(), json!(names.service("trawld")));
+            }
+            if seq % 5 == 0 {
+                event.insert("env".into(), json!("client-forged"));
+            }
+            if seq % 7 == 0 {
+                event.insert("host".into(), json!("client-forged"));
+            }
+
+            universal_gate_probes(&mut event, names, seq);
             Value::Object(event)
         })
         .collect()
@@ -483,10 +717,18 @@ mod tests {
     fn config(phase: Phase) -> Config {
         Config {
             phase,
+            profile: Profile::Http,
             seed: 42,
             namespace: "test".to_owned(),
             env: "prod".to_owned(),
             mutation_events: 32,
+        }
+    }
+
+    fn profiled(profile: Profile) -> Config {
+        Config {
+            profile,
+            ..config(Phase::Mutate)
         }
     }
 
@@ -547,6 +789,120 @@ mod tests {
             let config = config(phase);
             assert!(!objects(&render(&config)).is_empty());
         }
+    }
+
+    #[test]
+    fn every_profile_corpus_is_deterministic_and_distinct() {
+        let mut rendered = Vec::new();
+        for profile in [Profile::Http, Profile::Syslog, Profile::Trawld] {
+            let config = profiled(profile);
+            let first = render(&config);
+            assert_eq!(
+                first,
+                render(&config),
+                "{} is not deterministic",
+                profile.as_str()
+            );
+            assert_eq!(objects(&first).len(), config.mutation_events);
+            rendered.push(first);
+        }
+        assert_ne!(rendered[0], rendered[1], "http and syslog corpora coincide");
+        assert_ne!(
+            rendered[1], rendered[2],
+            "syslog and trawld corpora coincide"
+        );
+    }
+
+    /// Every profile's corpus probes the gates the ONE canonicalizer
+    /// applies to all of them (ADR-0013 slice 2) — the branch coverage
+    /// `crates/trawl-server/tests/profile_fuzz.rs` asserts the outcome of.
+    #[test]
+    fn every_profile_corpus_probes_the_universal_gates() {
+        for profile in [Profile::Http, Profile::Syslog, Profile::Trawld] {
+            let events = objects(&render(&profiled(profile)));
+            let has = |key: &str| events.iter().any(|e| e.contains_key(key));
+            for key in ["_severity", "_producer", "_HOSTNAME", "___", "_raw"] {
+                assert!(has(key), "{} corpus never probes {key}", profile.as_str());
+            }
+            assert!(
+                events.iter().any(|e| e
+                    .keys()
+                    .any(|k| k.len() > trawl_core::schema::MAX_FIELD_NAME_BYTES)),
+                "{} corpus never probes the name-length cap",
+                profile.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn the_syslog_corpus_carries_the_parse_artifacts_the_listener_publishes() {
+        let events = objects(&render(&profiled(Profile::Syslog)));
+        let has = |key: &str| events.iter().any(|e| e.contains_key(key));
+        for key in [
+            "syslog_severity",
+            "syslog_timestamp",
+            "syslog_facility",
+            "syslog_pid",
+            "syslog_msgid",
+            "syslog_source_ip",
+            "sd_exampleSDID@32473_eventID",
+        ] {
+            assert!(has(key), "the syslog corpus must publish {key}");
+        }
+        // An absent PRI and an absent frame timestamp are both real
+        // shapes: absence is what makes the door fall through honestly.
+        assert!(
+            events.iter().any(|e| !e.contains_key("syslog_severity")),
+            "a PRI-less frame must appear"
+        );
+        assert!(
+            events.iter().any(|e| !e.contains_key("syslog_timestamp")),
+            "a timestamp-less frame must appear"
+        );
+        // The `_raw` cap, which the listener never used to apply.
+        assert!(
+            events.iter().any(|e| e["_raw"]
+                .as_str()
+                .is_some_and(|s| s.chars().count() > 65_536)),
+            "an oversized datagram must appear"
+        );
+    }
+
+    #[test]
+    fn the_trawld_corpus_collides_with_every_asserted_slot() {
+        let events = objects(&render(&profiled(Profile::Trawld)));
+        // `message` is deliberately absent here: the trawld profile does
+        // not assert it (the payload IS the message), so a payload one is
+        // ordinary data, not a collision.
+        for slot in ["service", "env", "host"] {
+            assert!(
+                events.iter().any(|e| e.contains_key(slot)),
+                "the trawld corpus must collide with the asserted {slot}"
+            );
+        }
+        // Ordinary sender vocabulary, no `trawld_` prefix (ruling 3).
+        assert!(
+            events
+                .iter()
+                .all(|e| e.keys().all(|k| !k.starts_with("trawld_"))),
+            "telemetry fields are ordinary vocabulary, never prefixed"
+        );
+    }
+
+    #[test]
+    fn a_profile_only_shapes_the_mutate_phase() {
+        for phase in [Phase::Pin, Phase::Conflicts, Phase::Rejects] {
+            let config = Config {
+                profile: Profile::Syslog,
+                ..config(phase)
+            };
+            let err = validate_config(&config).expect_err("a profiled contract phase must refuse");
+            assert!(
+                err.contains("syslog"),
+                "the message must name the profile: {err}"
+            );
+        }
+        assert!(validate_config(&profiled(Profile::Syslog)).is_ok());
     }
 
     #[test]

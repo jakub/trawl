@@ -182,7 +182,7 @@ pub const WELL_KNOWN_LOG_FIELDS: &[&str] =
 /// Envelope metadata columns demoted to the end of reordered results.
 ///
 /// Kept in sync with `trawl_core::schema::TRAILING_LOG_FIELDS`.
-pub const TRAILING_LOG_FIELDS: &[&str] = &["_raw", "_ingested", "_repairs"];
+pub const TRAILING_LOG_FIELDS: &[&str] = &["_raw", "_ingested", "_repairs", "_producer"];
 
 /// Display rank for a field name, mirroring query-result column order:
 /// `0` = leading envelope field ([`WELL_KNOWN_LOG_FIELDS`], in declared

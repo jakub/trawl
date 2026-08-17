@@ -88,7 +88,27 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // case warns AFTER the subscriber is up (visible because `trawld=info`
     // is part of the default).
     let log_filter = telemetry::resolve_log_filter(std::env::var("RUST_LOG").ok().as_deref());
-    let telemetry = init_tracing(&config, monitor_active, &log_filter.directives)?;
+
+    // The derivation policy is resolved BEFORE the subscriber, because
+    // the telemetry layer derives through it too (ADR-0013 slice 2,
+    // ruling 5) — trawld's own `level` rides the configured
+    // `severity_from` chain like any sender's. That puts it on the same
+    // pre-tracing boundary as the config load: boot-fatal, and the
+    // diagnostic can only reach stderr. Resolved UNCONDITIONALLY, before
+    // and independently of `ingest.enabled`, for the same reason.
+    let derivation = Arc::new(
+        trawl_server::ingest::producer::Derivation::resolve(&config.ingest).map_err(|e| {
+            eprintln!("[trawld] {e} — refusing to start");
+            e
+        })?,
+    );
+
+    let telemetry = init_tracing(
+        &config,
+        monitor_active,
+        &log_filter.directives,
+        Arc::clone(&derivation),
+    )?;
     if let Some(warning) = &log_filter.warning {
         tracing::warn!(event_type = "config_warning", "{warning}");
     }
@@ -120,6 +140,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     metrics_process::Collector::default().describe();
     trawl_server::metrics::describe_metrics();
+    // Publish the salvage profiles' rejection matrix at zero. The claim
+    // "telemetry is rejection-free by construction" (ADR-0013 slice 2,
+    // ruling 4) is evidenced by an absent INCREMENT on a present series —
+    // an absent series would leave a scrape unable to tell "never
+    // happened" from "never wired up".
+    trawl_server::ingest::producer::init_profile_reject_metrics();
 
     // Spawn upkeep task to prevent histogram bucket memory bloat.
     let prom_handle = metrics_handle.clone();
@@ -156,7 +182,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     );
     warn_unlisted_env_dirs(&config);
 
-    let (mut state, http_config) = AppState::from_config(&config, metrics_handle).await?;
+    let (mut state, http_config) =
+        AppState::from_config(&config, metrics_handle, derivation).await?;
 
     // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());
@@ -284,13 +311,28 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn syslog listeners if enabled (requires ingest to be enabled).
     let syslog_handle = if config.syslog.enabled && config.ingest.enabled {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // Everything the listeners need to reach the one door. The env
+        // allowlist, the relay CIDRs and the derivation policy all live
+        // on `IngestState` already, resolved boot-fatally there; before
+        // slice 2 none of them were threaded here, which is precisely
+        // why the listener hand-rolled its own envelope.
+        let door = Arc::new(trawl_server::syslog::convert::SyslogDoor {
+            envs: Arc::clone(&state.ingest.envs),
+            default_env: Arc::clone(&state.ingest.default_env),
+            trusted_relays: Arc::clone(&state.ingest.trusted_relays),
+            derivation: Arc::clone(&state.ingest.derivation),
+        });
         let handles = trawl_server::syslog::spawn_syslog(
             &config.syslog,
-            config.ingest.default_env.as_str().into(),
+            door,
             Arc::clone(state.ingest.pipeline.as_ref().expect("ingest enabled")),
             state.ingest.syslog_stats.clone(),
             shutdown_rx,
-        );
+        )
+        .map_err(|e| {
+            tracing::error!(event_type = "config_error", error = %e, "syslog config rejected — refusing to start");
+            e
+        })?;
         tracing::info!(
             event_type = "lifecycle",
             udp = config.syslog.udp_enabled,
@@ -532,7 +574,7 @@ fn warn_unlisted_env_dirs(config: &Config) {
         {
             tracing::warn!(
                 event_type = "env_not_in_allowlist",
-                env = %name,
+                unlisted_env = %name,
                 "on-disk env directory is not in ingest.envs — new ingest \
                  for it rejects, existing data stays queryable and ages out \
                  under retention"
@@ -555,6 +597,7 @@ fn init_tracing(
     config: &Config,
     monitor_active: bool,
     filter_directives: &str,
+    derivation: Arc<trawl_server::ingest::producer::Derivation>,
 ) -> Result<Option<(WalHandle, WalLayer)>, Box<dyn std::error::Error>> {
     // The directives were resolved (and validated when operator-supplied) by
     // `telemetry::resolve_log_filter`; each layer builds its own EnvFilter
@@ -571,7 +614,9 @@ fn init_tracing(
         let handle = WalHandle::new();
         let wal_layer = WalLayer::new_with_buffer_cap(
             handle.clone(),
+            &config.ingest.effective_envs(),
             &config.ingest.default_env,
+            derivation,
             config.ingest.telemetry_buffer_max_bytes,
         );
         let flush_layer = wal_layer.clone(); // same Arc<WalLayerInner>

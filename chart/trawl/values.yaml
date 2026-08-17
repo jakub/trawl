@@ -152,6 +152,22 @@ config:
     hotBufferMaxBytes: "100M"
     statsIntervalSecs: 60
     telemetryFlushIntervalSecs: 1
+    # Wire keys _severity derives from, first MAPPABLE wins. Sources are
+    # only READ, so each stays a queryable column. Empty derives nothing.
+    # An entry may be a bare name or {field, dialect}, where the dialect
+    # ("otel" default, "syslog" inverts 0-7) governs NUMERICS only — the
+    # syslog-over-HTTP forwarder knob:
+    #   - { field: syslog_severity, dialect: syslog }
+    severityFrom:
+      - severity
+      - severity_text
+      - level
+    # Wire keys _time derives from, first PRESENT wins. Must contain
+    # _time (the only reserved name allowed); a dialect here is an error.
+    timeFrom:
+      - _time
+      - timestamp
+      - "@timestamp"
 
   retention:
     maxAgeDays: 90

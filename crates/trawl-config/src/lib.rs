@@ -373,6 +373,134 @@ pub struct IngestConfig {
     /// Parsed (boot-fatal on a bad entry) by the server at startup.
     #[serde(default)]
     pub trusted_relays: Vec<String>,
+
+    /// Wire keys `_severity` derives from, in precedence order — first
+    /// MAPPABLE wins (ADR-0013 slice 2, ruling 5). Every source is READ
+    /// and left where it is, as an ordinary sender column.
+    ///
+    /// Entries take the bare-string shorthand (`"level"`) or the typed
+    /// form (`{ field = "syslog_severity", dialect = "syslog" }`); the
+    /// dialect governs NUMERICS only. A producer profile's FIXED sources
+    /// prepend this list and are not configurable.
+    ///
+    /// Empty is legal and means "derive nothing". Default:
+    /// [`DEFAULT_SEVERITY_FROM`] — a packaging contract, so the code
+    /// default, the Debian example, the Helm chart and the configuration
+    /// reference all state the same list.
+    ///
+    /// Semantics (bare names only, no post-fold duplicates, bounded
+    /// length, known dialect) are validated boot-fatally by the server:
+    /// this crate owns the SHAPE, trawl-server owns the rules.
+    #[serde(default = "default_severity_from")]
+    pub severity_from: Vec<DerivationSourceSpec>,
+
+    /// Wire keys `_time` derives from, in precedence order — first
+    /// PRESENT wins, and only `_time` itself is consumed (ADR-0013 §2).
+    ///
+    /// Must contain `_time`, which is also the sole reserved name
+    /// permitted here (server-validated, boot-fatal). A `dialect` on an
+    /// entry is an error — dialects govern severity numerics alone.
+    /// Default: [`DEFAULT_TIME_FROM`].
+    #[serde(default = "default_time_from")]
+    pub time_from: Vec<DerivationSourceSpec>,
+}
+
+/// One entry of a derivation source list, in either of its two TOML
+/// spellings (ADR-0013 slice 2, ruling 5).
+///
+/// ```toml
+/// severity_from = ["severity", { field = "syslog_severity", dialect = "syslog" }]
+/// ```
+///
+/// `dialect` is an `Option` rather than a defaulted `String` so the server
+/// can tell "explicitly otel" from "unset" — `time_from` refuses the key
+/// outright, and refusing it means refusing the SPELLING, not the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DerivationSourceSpec {
+    /// The shorthand: `"level"` ≡ `{ field = "level" }`.
+    Bare(String),
+    /// The typed form. Unknown keys are an error rather than a silent
+    /// default — a typo'd `dialct` would otherwise read as plain `otel`
+    /// and quietly stop inverting a syslog feed.
+    Typed {
+        /// The wire key to read.
+        field: String,
+        /// `otel` | `syslog`; absent means the server's default (`otel`).
+        dialect: Option<String>,
+    },
+}
+
+/// Hand-written because `deny_unknown_fields` is not a serde VARIANT
+/// attribute: the typed form is deserialized through a private struct that
+/// carries it, then folded back into the public enum shape. The refusal is
+/// the point — see [`DerivationSourceSpec::Typed`].
+impl<'de> Deserialize<'de> for DerivationSourceSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TypedSource {
+            field: String,
+            dialect: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Spec {
+            Bare(String),
+            Typed(TypedSource),
+        }
+
+        Ok(match Spec::deserialize(deserializer)? {
+            Spec::Bare(field) => Self::Bare(field),
+            Spec::Typed(TypedSource { field, dialect }) => Self::Typed { field, dialect },
+        })
+    }
+}
+
+impl DerivationSourceSpec {
+    /// The wire key this entry names, whichever spelling was used.
+    pub fn field(&self) -> &str {
+        match self {
+            Self::Bare(field) | Self::Typed { field, .. } => field,
+        }
+    }
+
+    /// The dialect token as written, or `None` when the entry did not
+    /// spell one (which is NOT the same as writing `dialect = "otel"`).
+    pub fn dialect(&self) -> Option<&str> {
+        match self {
+            Self::Bare(_) => None,
+            Self::Typed { dialect, .. } => dialect.as_deref(),
+        }
+    }
+}
+
+/// The packaged `severity_from` default (ADR-0013 §2): `severity` →
+/// `severity_text` → `level`, first mappable wins.
+///
+/// `severity_text` stays a SOURCE even though it left the envelope — it
+/// is ordinary sender vocabulary now, and a shipper that emits it still
+/// means severity by it.
+pub const DEFAULT_SEVERITY_FROM: &[&str] = &["severity", "severity_text", "level"];
+
+/// The packaged `time_from` default (ADR-0013 §2): `_time` →
+/// `timestamp` → `@timestamp`, first present wins.
+pub const DEFAULT_TIME_FROM: &[&str] = &["_time", "timestamp", "@timestamp"];
+
+/// Expand a packaged default into the bare-shorthand entries it stands for.
+fn bare_sources(names: &[&str]) -> Vec<DerivationSourceSpec> {
+    names
+        .iter()
+        .map(|f| DerivationSourceSpec::Bare((*f).to_owned()))
+        .collect()
+}
+
+fn default_severity_from() -> Vec<DerivationSourceSpec> {
+    bare_sources(DEFAULT_SEVERITY_FROM)
+}
+
+fn default_time_from() -> Vec<DerivationSourceSpec> {
+    bare_sources(DEFAULT_TIME_FROM)
 }
 
 impl IngestConfig {
@@ -450,6 +578,8 @@ impl Default for IngestConfig {
             default_env: default_env_name(),
             envs: Vec::new(),
             trusted_relays: Vec::new(),
+            severity_from: default_severity_from(),
+            time_from: default_time_from(),
         }
     }
 }
@@ -2619,5 +2749,121 @@ default_service = "syslog"
 "#,
         )
         .expect("valid syslog service names must load");
+    }
+
+    // -- [ingest] derivation sources (ADR-0013 slice 2, ruling 5) ---------
+    //
+    // Shape only: this crate parses the TOML, trawl-server's
+    // `ingest::producer::Derivation::resolve` owns every semantic rule
+    // (bare names, `_time` presence, fold collisions, dialect vocabulary,
+    // bounds) and is boot-fatal about them.
+
+    #[test]
+    fn derivation_sources_default_to_the_packaged_lists() {
+        let config = config_with_ingest("");
+        let names = |specs: &[DerivationSourceSpec]| -> Vec<String> {
+            specs.iter().map(|s| s.field().to_owned()).collect()
+        };
+        assert_eq!(names(&config.ingest.severity_from), DEFAULT_SEVERITY_FROM);
+        assert_eq!(names(&config.ingest.time_from), DEFAULT_TIME_FROM);
+        // The shorthand carries no dialect at all — "unset", which the
+        // server reads as otel, is distinct from an explicit "otel".
+        assert!(
+            config
+                .ingest
+                .severity_from
+                .iter()
+                .all(|s| s.dialect().is_none())
+        );
+        // The code default IS what `IngestConfig::default()` holds, so a
+        // programmatically-built config and a parsed empty one agree.
+        assert_eq!(
+            config.ingest.severity_from,
+            IngestConfig::default().severity_from
+        );
+        assert_eq!(config.ingest.time_from, IngestConfig::default().time_from);
+    }
+
+    #[test]
+    fn derivation_sources_accept_both_spellings_in_one_list() {
+        let config = config_with_ingest(
+            r#"
+severity_from = ["level", { field = "syslog_severity", dialect = "syslog" }, { field = "sev" }]
+time_from = ["_time"]
+"#,
+        );
+        assert_eq!(
+            config.ingest.severity_from,
+            vec![
+                DerivationSourceSpec::Bare("level".into()),
+                DerivationSourceSpec::Typed {
+                    field: "syslog_severity".into(),
+                    dialect: Some("syslog".into()),
+                },
+                DerivationSourceSpec::Typed {
+                    field: "sev".into(),
+                    dialect: None,
+                },
+            ]
+        );
+        assert_eq!(
+            config.ingest.time_from,
+            vec![DerivationSourceSpec::Bare("_time".into())]
+        );
+    }
+
+    #[test]
+    fn derivation_source_empty_list_parses() {
+        // Empty `severity_from` is legal ("derive nothing"); empty
+        // `time_from` is not — but that is a SEMANTIC rule the server
+        // enforces, so both must survive deserialization.
+        let config = config_with_ingest("severity_from = []\ntime_from = []");
+        assert!(config.ingest.severity_from.is_empty());
+        assert!(config.ingest.time_from.is_empty());
+    }
+
+    #[test]
+    fn derivation_source_typo_in_a_typed_entry_is_an_error() {
+        // A silently-defaulted `dialct` would stop inverting a syslog feed
+        // and say nothing, so an unknown key fails the whole parse.
+        let toml = r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+[ingest]
+severity_from = [{ field = "syslog_severity", dialct = "syslog" }]
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err().to_string();
+        assert!(err.contains("severity_from"), "got: {err}");
+    }
+
+    #[test]
+    fn derivation_source_entry_needs_a_field_key() {
+        let toml = r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+[ingest]
+time_from = [{ dialect = "otel" }]
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err().to_string();
+        assert!(err.contains("time_from"), "got: {err}");
+    }
+
+    #[test]
+    fn derivation_source_rejects_a_non_string_entry() {
+        // Neither spelling matches a bare integer, so the untagged enum
+        // fails rather than coercing it into a field name.
+        let toml = r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+[ingest]
+severity_from = [7]
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
     }
 }

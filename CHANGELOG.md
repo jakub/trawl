@@ -7,6 +7,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Producer profiles, configurable derivation sources, and `_producer`
+  (ADR-0013 slice 2 rulings 1-6, #75).** All three producers now enter
+  through the ONE envelope canonicalizer as *profiles* — `http`,
+  `syslog`, `trawld`, a closed set chosen by the server call site that
+  owns the transport, never by anything on the wire. The syslog listener
+  and the internal-telemetry layer used to hand-roll their own envelope
+  maps, skipping `_repairs`, the `_raw` cap, the env allowlist, the
+  field-name length cap and the sealed `_`-prefix strip; they now hand
+  the door a payload and get every one of those gates. Three latent
+  defects close by arriving there rather than by new code: a >255-byte
+  `tracing` field name used to reach the WAL and **permanently wedge
+  compaction for `service=trawld`**, the syslog lane never applied the
+  `MAX_RAW_CHARS` cap to `_raw` (unreachable via today's transports only
+  because two unrelated constants happen to be equal — now structural),
+  and the syslog batch key ignored the event's `env`.
+
+  **`_producer` is a tenth envelope field** (`http`|`syslog`|`trawld`,
+  catalog-seeded VARCHAR), so provenance is queryable data:
+  `_producer=syslog | stats count()`. It is server-stamped and
+  unforgeable — a `_producer` on the wire takes the ordinary
+  reserved-prefix strip and lands under a bare `producer`. Pre-upgrade
+  rows simply read `_producer IS NULL`.
+
+  **`[ingest] severity_from` / `time_from`** make the derivation source
+  lists config (defaults unchanged: `["severity", "severity_text",
+  "level"]` and `["_time", "timestamp", "@timestamp"]`). Entries take a
+  bare name or the typed `{ field, dialect }` form, where the dialect
+  (`otel`|`syslog`) governs NUMERICS only — which is how a
+  syslog-over-HTTP forwarder shipping the raw PRI numeral reaches the
+  same inversion the native listener does, through one mechanism rather
+  than a privileged writer. Both lists are boot-fatal on a bad entry (a
+  list that silently never matches is the sharpest footgun here) and
+  **forward-only**: nothing re-derives stored events.
+
+  Two consequences worth knowing. The syslog listener writes **no**
+  `_severity` any more — it publishes the raw PRI numeral as
+  `syslog_severity` and the frame's own time as `syslog_timestamp`, both
+  omitted when the frame carried neither, and the profile's fixed
+  sources derive from them; `_severity` on a syslog event means exactly
+  what it did before. And a hostile syslog frame or `tracing` field can
+  no longer be rejected by these doors, because there is nobody to
+  reject to: an unusable APP-NAME lands under the profile's
+  `default_service` with `service.from_profile`, a hostname-less frame
+  behind a `trusted_relays` peer keeps the event with `host` omitted and
+  `host.omitted`, and a payload key colliding with a profile-asserted
+  slot loses with `field.producer_asserted`, its value still in `_raw`.
 - **Backtick-quoted identifiers, and one rule for aggregate output names
   (ADR-0013 slice 2 rulings 7-8, #78).** Any field name can now be written
   between backticks, and a backticked name is **always** a field

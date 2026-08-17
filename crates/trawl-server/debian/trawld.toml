@@ -118,6 +118,22 @@ database_url = "postgres://trawl:CHANGE_ME@db.example.internal:5432/trawl"
 # How often buffered tracing events are flushed to WAL (seconds).
 # telemetry_flush_interval_secs = 1
 
+# Wire keys _severity derives from, first MAPPABLE wins. Sources are only
+# READ — each stays a queryable column. Empty means "derive nothing".
+# severity_from = ["severity", "severity_text", "level"]
+
+# The typed form declares the dialect an entry's NUMERICS read in: "otel"
+# (default) or "syslog", which inverts 0-7. Use it for a syslog-over-HTTP
+# forwarder that ships the raw PRI numeral:
+# severity_from = ["severity", "severity_text", "level", { field = "syslog_severity", dialect = "syslog" }]
+
+# Wire keys _time derives from, first PRESENT wins. Must contain _time
+# (the only reserved name allowed here); a dialect is an error.
+# time_from = ["_time", "timestamp", "@timestamp"]
+
+# Both are boot-fatal on a bad entry and forward-only on change: nothing
+# re-derives stored events.
+
 [retention]
 # Delete date directories older than this many days. 0 = disabled.
 # max_age_days = 90

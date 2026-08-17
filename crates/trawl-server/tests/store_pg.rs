@@ -1429,6 +1429,13 @@ mod catalog {
                 "{gone} left the envelope (ADR-0013 §1)"
             );
         }
+        // Slice 2's tenth field (ruling 6): server-stamped provenance,
+        // seeded VARCHAR by migration 0011 so the closed vocabulary
+        // (`http` | `syslog` | `trawld`) is never typed by inference.
+        assert_eq!(
+            pins.iter().find(|(f, _)| f == "_producer").map(|(_, t)| *t),
+            Some(CanonicalType::Varchar)
+        );
     }
 
     /// Migration 0010's DELETE is SCOPED to the rows migration 0002
@@ -1481,6 +1488,31 @@ mod catalog {
                 .await
                 .unwrap();
         [services, conflicts, stats]
+    }
+
+    /// The declared envelope AS OF migration 0010, written out.
+    ///
+    /// A migration-boundary assertion has to name the envelope of its own
+    /// moment. Deriving it from today's `ENVELOPE_TYPES` — even minus the
+    /// fields added since — keeps the frozen past coupled to the living
+    /// present: a RETYPED envelope field would silently rewrite what this
+    /// test claims 0010 produced, and every later growth would need
+    /// another subtraction here. sqlx migrations are immutable once
+    /// merged, so this list is too.
+    const ENVELOPE_AT_0010: &[(&str, CanonicalType)] = &[
+        ("_time", CanonicalType::Timestamp),
+        ("_ingested", CanonicalType::Timestamp),
+        ("_raw", CanonicalType::Varchar),
+        ("_repairs", CanonicalType::Varchar),
+        ("_severity", CanonicalType::Severity),
+        ("env", CanonicalType::Varchar),
+        ("service", CanonicalType::Varchar),
+        ("host", CanonicalType::Varchar),
+        ("message", CanonicalType::Varchar),
+    ];
+
+    fn envelope_at_0010() -> impl Iterator<Item = &'static (&'static str, CanonicalType)> {
+        ENVELOPE_AT_0010.iter()
     }
 
     /// Migration 0010 applied over a REAL pre-cutover catalog.
@@ -1565,14 +1597,23 @@ mod catalog {
         // The pin table: exactly the new declared envelope plus the
         // bystander. `load_pins` parsing at all proves the widened CHECK
         // constraint and `CanonicalType::from_catalog` agree on SEVERITY.
+        //
+        // "The envelope" here is the one 0010 declares — NINE fields.
+        // `_producer` is slice 2's tenth (migration 0011, proven in the
+        // sibling test below), so a migration boundary this test asserts
+        // at cannot borrow it from today's `ENVELOPE_TYPES`.
         let pins = catalog(&pool).load_pins().await.unwrap();
-        for (field, ty) in ENVELOPE_TYPES {
+        for (field, ty) in envelope_at_0010() {
             assert_eq!(
                 pins.iter().find(|(f, _)| f == field).map(|(_, t)| *t),
                 Some(*ty),
                 "declared {field} must stand after the reshape"
             );
         }
+        assert!(
+            !pins.iter().any(|(f, _)| f == "_producer"),
+            "`_producer` is 0011's, not 0010's: {pins:?}"
+        );
         assert_eq!(
             pins.iter().find(|(f, _)| f == "duration").map(|(_, t)| *t),
             Some(CanonicalType::BigInt),
@@ -1580,7 +1621,7 @@ mod catalog {
         );
         assert_eq!(
             pins.len(),
-            ENVELOPE_TYPES.len() + 1,
+            envelope_at_0010().count() + 1,
             "the reshape leaves the declared envelope plus the sender's own pin: {pins:?}"
         );
         // `_severity` is REPLACED, not merely present: the sender's VARCHAR
@@ -1629,6 +1670,139 @@ mod catalog {
             backfilled.is_some(),
             "the observation backfill flag is not the reshape's business"
         );
+    }
+
+    /// Migration 0011 (`_producer`, ADR-0013 slice 2 ruling 6) applied over
+    /// a catalog that already carries a SENDER-owned `_producer` pin.
+    ///
+    /// Such a pin can only date from before slice 1 sealed the `_` prefix,
+    /// which is exactly the catalog a live install replays 0010 and 0011
+    /// over in one boot. 0011's DELETEs claim the name unconditionally —
+    /// the column is server-stamped, so typing it by an old sender's data
+    /// would misread a closed vocabulary — and this is the only window in
+    /// which that scoping can be proven, since a merged migration is
+    /// immutable.
+    #[sqlx::test(migrations = false)]
+    async fn applying_0011_claims_producer_and_leaves_sender_pins_alone(pool: PgPool) {
+        static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+        MIGRATIONS
+            .run_to(9, &pool)
+            .await
+            .expect("apply 0001-0009 (the pre-cutover schema)");
+
+        // The era when `_` was an ordinary character: a sender pinned
+        // `_producer` from its own data, with observations and evidence.
+        // `duration` is the bystander nothing may touch.
+        sqlx::query(
+            "INSERT INTO field_types (field, duckdb_type, pinned_from, pinned_at) VALUES
+                 ('_producer', 'BIGINT', 'legacy-svc', now() - interval '30 days'),
+                 ('duration',  'BIGINT', 'svc-a',      now() - interval '30 days')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO field_services (field, service, row_count) VALUES
+                 ('_producer', 'legacy-svc', 10),
+                 ('duration',  'svc-a',      10)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO field_conflicts
+                 (field, service, observed_type, expected_type, rows_nulled, samples) VALUES
+                 ('_producer', 'legacy-svc', 'VARCHAR', 'BIGINT', 2, ARRAY['edge-1']),
+                 ('duration',  'svc-a',      'VARCHAR', 'BIGINT', 5, ARRAY['fast'])",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO field_conflict_stats (field, service, episodes, rows_nulled_total) VALUES
+                 ('_producer', 'legacy-svc', 4, 2),
+                 ('duration',  'svc-a',      6, 5)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        MIGRATIONS
+            .run_to(11, &pool)
+            .await
+            .expect("apply 0010 and 0011 over the pre-cutover catalog");
+
+        // The full declared envelope now stands, `_producer` included.
+        let pins = catalog(&pool).load_pins().await.unwrap();
+        for (field, ty) in ENVELOPE_TYPES {
+            assert_eq!(
+                pins.iter().find(|(f, _)| f == field).map(|(_, t)| *t),
+                Some(*ty),
+                "declared {field} must stand after 0011"
+            );
+        }
+        assert_eq!(
+            pins.len(),
+            ENVELOPE_TYPES.len() + 1,
+            "the ten declared fields plus the sender's own pin: {pins:?}"
+        );
+
+        // `_producer` is REPLACED, not merely present: the sender's BIGINT
+        // pin is gone, the row is the declared seed's, and the evidence
+        // describing the retired pin goes with it.
+        let pinned_from: Option<String> =
+            sqlx::query_scalar("SELECT pinned_from FROM field_types WHERE field = '_producer'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pinned_from.as_deref(), Some("_declared"));
+        assert_eq!(
+            evidence_of(&pool, "_producer").await,
+            [0, 0, 0],
+            "the retired pin's observations and evidence go with it"
+        );
+
+        // The bystander is untouched in every table.
+        assert_eq!(
+            pins.iter().find(|(f, _)| f == "duration").map(|(_, t)| *t),
+            Some(CanonicalType::BigInt)
+        );
+        assert_eq!(
+            evidence_of(&pool, "duration").await,
+            [1, 1, 1],
+            "an unrelated field's evidence survives 0011"
+        );
+    }
+
+    /// `_producer` is a NEW column on a corpus that never held one, so
+    /// 0011 must NOT re-arm the boot conformance pass: `UNION ALL BY NAME`
+    /// tolerates a column absent from older parquet, and a spurious
+    /// re-arm would make every upgrading node re-walk its whole archive.
+    #[sqlx::test(migrations = false)]
+    async fn migration_0011_leaves_the_conformance_flags_alone(pool: PgPool) {
+        static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+        MIGRATIONS.run_to(10, &pool).await.expect("apply 0001-0010");
+        sqlx::query(
+            "UPDATE catalog_state SET conformed_at = now(), services_backfilled_at = now()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        MIGRATIONS.run_to(11, &pool).await.expect("apply 0011");
+
+        let (conformed, backfilled): (
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as("SELECT conformed_at, services_backfilled_at FROM catalog_state")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            conformed.is_some(),
+            "adding a never-before-written column re-arms nothing"
+        );
+        assert!(backfilled.is_some());
     }
 
     #[sqlx::test]

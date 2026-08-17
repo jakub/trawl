@@ -8,4 +8,5 @@ pub mod compaction;
 pub mod envelope;
 pub mod handler;
 pub mod pipeline;
+pub mod producer;
 pub mod wal;

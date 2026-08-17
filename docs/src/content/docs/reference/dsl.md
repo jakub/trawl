@@ -275,8 +275,11 @@ One sentence, learned once (ADR-0013):
   `timestamp` — whatever your senders emit, stored verbatim under the
   name they sent. trawl never assigns meaning to a bare name.
 - **Underscore names are trawl's.** `_time`, `_ingested`, `_raw`,
-  `_repairs`, `_severity` are contract slots whose semantics trawl
-  guarantees on every corpus. The whole `_` prefix is reserved: an
+  `_repairs`, `_severity`, `_producer` are contract slots whose semantics
+  trawl guarantees on every corpus. `_producer` names the door an event
+  entered through (`http` | `syslog` | `trawld`), server-stamped and
+  unforgeable — `_producer=syslog | stats count()` is provenance as a
+  query. The whole `_` prefix is reserved: an
   incoming `_x` that is not a slot you may propose has its leading
   underscores stripped and lands under the bare remainder (`_HOSTNAME` →
   `hostname`), and the DSL cannot mint one either — `let _foo = 1`,
@@ -385,12 +388,14 @@ _severity=warn*                 # glob over the canonical token text: 13-16
   compare the ladder number there (`_severity>=17`).
 
 `_severity` is **derived, never proposed**: ingest reads `severity` →
-`severity_text` → `level` (first mappable wins) and stores every one of
-them verbatim as your own columns. A word maps through the token table
-or the exact names; a number maps strictly as OTel 1-24, so `3` is
-`trace` — the syslog inversion happens only in the syslog listener,
-where the transport proves the dialect. An event with no mappable source
-simply has no `_severity`.
+`severity_text` → `level` (first mappable wins — the packaged default of
+`[ingest] severity_from`) and stores every one of them verbatim as your
+own columns. A word maps through the token table or the exact names; a
+number maps strictly as OTel 1-24, so `3` is `trace`, unless the source
+was configured with `dialect = "syslog"` — which is how the syslog
+listener's own `syslog_severity` numeral inverts, and how a
+syslog-over-HTTP forwarder reaches the same reading. An event with no
+mappable source simply has no `_severity`.
 
 #### Reading any field as a severity: `sev()`
 

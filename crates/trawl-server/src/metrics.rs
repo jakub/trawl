@@ -20,6 +20,18 @@ pub const QUERY_DURATION: &str = "trawl_query_duration_seconds";
 pub const INGEST_EVENTS_TOTAL: &str = "trawl_ingest_events_total";
 pub const INGEST_EVENTS_REJECTED_TOTAL: &str = "trawl_ingest_events_rejected_total";
 pub const INGEST_REPAIRS_TOTAL: &str = "trawl_ingest_repairs_total";
+/// Events a PROFILE producer (syslog, telemetry) had to drop, by
+/// `{profile, reason}` — ADR-0013 slice 2, ruling 4.
+///
+/// Those producers have no one to reject to, so a drop means the server
+/// refused its own boot-validated assertion: a bug, not a sender's
+/// mistake. The whole closed label matrix is published at zero
+/// (`producer::init_profile_reject_metrics`), because an absent
+/// increment on a present series is what proves the salvage profiles are
+/// rejection-free — an absent series only proves nothing was wired up.
+/// The HTTP door keeps [`INGEST_EVENTS_REJECTED_TOTAL`], where per-event
+/// rejection is the contract.
+pub const INGEST_PROFILE_REJECT_TOTAL: &str = "trawl_ingest_profile_reject_total";
 /// Accepted events whose severity SOURCE mapped to nothing on the `OTel`
 /// ladder, so `_severity` was omitted (ADR-0013 §2). Deliberately a
 /// counter rather than a repair code: derivation into the `_` namespace
@@ -75,6 +87,13 @@ pub fn describe_metrics() {
     describe_counter!(
         INGEST_EVENTS_REJECTED_TOTAL,
         "Total number of rejected ingest events"
+    );
+    describe_counter!(
+        INGEST_PROFILE_REJECT_TOTAL,
+        "Events dropped by a producer profile that cannot reject to its \
+         sender (syslog, internal telemetry), labelled by profile and \
+         reason; the label matrix is zero-initialized, so a flat series \
+         is the rejection-free invariant holding"
     );
     describe_counter!(
         INGEST_REPAIRS_TOTAL,

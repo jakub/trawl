@@ -2,452 +2,758 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Convert parsed syslog messages to trawl event maps.
+//! Turn a parsed syslog frame into a PAYLOAD the one canonicalizer can
+//! admit (ADR-0013 slice 2, ruling 1).
 //!
-//! Produces the declared ADR-0009 envelope (`_time`, `_ingested`,
-//! `_raw`, `env`, `service`, `host`, `_severity`,
-//! `message`) so that queries work identically regardless of ingestion
-//! path. The syslog listener is an input-mapping ingestor: appnames are
-//! mapped *into* the service charset before validation, syslog numeric
-//! severities are inverted onto the `OTel` ladder, and `_raw` carries the
-//! pre-parse wire line verbatim.
+//! This module no longer builds an envelope. It owns exactly what the
+//! transport proves — the service the frame belongs to, the host it came
+//! from, the message body, and the parse ARTIFACTS (`syslog_severity`,
+//! `syslog_timestamp`, `syslog_facility`, `syslog_pid`, `syslog_msgid`,
+//! `syslog_source_ip`, the `sd_*` structured-data pairs) — and hands them
+//! to [`crate::ingest::envelope::canonicalize`] as an ordinary payload
+//! under the `syslog` profile.
+//!
+//! Two consequences are the whole point:
+//!
+//! - the listener writes NO `_severity`. It publishes the RAW 0-7 PRI
+//!   numeral as an ordinary column and the syslog profile's FIXED
+//!   derivation source reads it back with `dialect = "syslog"`. Provenance
+//!   still licenses the inversion — enforced by where the config lives
+//!   rather than by a privileged writer — so the native listener and a
+//!   syslog-over-HTTP forwarder reach it through one mechanism;
+//! - every universal gate now applies to syslog: the ASCII fold, the
+//!   sealed-prefix strip, the field-name length drop, nested
+//!   stringification, the `_raw` cap and `_repairs` assembly. The
+//!   producer-side caps that duplicated them (`MAX_SD_KEY_LEN`, the
+//!   ad-hoc SD fold) are deleted; the FRAME-level caps
+//!   ([`MAX_SD_ELEMENTS`], [`MAX_SD_PARAMS_TOTAL`]) stay here, because
+//!   they bound work done before there is a payload at all.
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::net::IpAddr;
+use std::sync::Arc;
 
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::Utc;
 use serde_json::{Map, Value, json};
 use syslog_loose::Message;
 
-use super::parse;
+use super::batch::SyslogEvent;
+use super::{CidrEntry, parse};
+use crate::ingest::envelope::{self, EnvelopeContext, RepairCode};
 use crate::ingest::pipeline;
+use crate::ingest::producer::{
+    self, Asserted, Derivation, Producer, ProducerKind, SYSLOG_SEVERITY_FIELD,
+    SYSLOG_TIMESTAMP_FIELD,
+};
 
 /// Maximum number of RFC 5424 structured data elements to extract.
 const MAX_SD_ELEMENTS: usize = 32;
 /// Maximum total structured data params across all elements.
 const MAX_SD_PARAMS_TOTAL: usize = 128;
-/// Maximum length of a structured data field key (`sd_{id}_{param}`).
+
+/// What the syslog transport proves about one frame, ready for the door.
 ///
-/// Exactly the catalog's own field-name bound: the syslog listener writes
-/// straight into the pipeline (it does not route through
-/// `envelope::canonicalize`), so a key admitted here becomes a column with
-/// no further gate — one byte over the catalog bound and the field could
-/// never be pinned.
-const MAX_SD_KEY_LEN: usize = trawl_core::schema::MAX_FIELD_NAME_BYTES;
-
-/// Last-resort service name when every candidate sanitizes away.
-const FALLBACK_SERVICE: &str = "syslog";
-
-/// Map a candidate into the service charset: drop invalid characters,
-/// drop leading dots, truncate to the length cap. Returns `None` when
-/// nothing usable survives.
-///
-/// The result always satisfies [`pipeline::is_valid_service_name`] — the
-/// syslog listener is an input-mapping ingestor, so it maps rather than
-/// rejects, but it may never emit a name HTTP ingest would refuse
-/// (ADR-0009: the name reaches WAL filenames verbatim).
-fn sanitize_service(raw: &str) -> Option<String> {
-    let filtered: String = raw
-        .bytes()
-        .filter(|b| pipeline::is_valid_service_char(*b))
-        .map(char::from)
-        .collect();
-
-    // Dot-leading names are `.`, `..` (path escape) or dotfiles; strip the
-    // leading run rather than rejecting the whole candidate.
-    let trimmed = filtered.trim_start_matches('.');
-    let capped = &trimmed[..trimmed.len().min(pipeline::MAX_SERVICE_NAME_LEN)];
-
-    if capped.is_empty() {
-        None
-    } else {
-        Some(capped.to_owned())
-    }
+/// The identity fields are ASSERTIONS (the profile is the authority on
+/// them); `map` holds only sender-visible payload — artifacts and
+/// structured data — and carries NO envelope field. `_raw` is the one
+/// exception, and it is a proposal rather than an envelope write: the
+/// pre-parse wire line is the most original form of a syslog event that
+/// exists, and the door caps it like any other.
+#[derive(Debug)]
+pub struct SyslogPayload {
+    /// The service this frame belongs to (see [`derive_service`]).
+    pub service: String,
+    /// The frame's hostname, else the peer address, else `None` — a
+    /// hostname-less frame behind a trusted relay is kept with `host`
+    /// absent rather than stamped with the relay's address (ruling 4).
+    pub host: Option<String>,
+    /// The parsed message body.
+    pub message: String,
+    /// The payload the door canonicalizes: `_raw`, the `syslog_*`
+    /// artifacts and the `sd_*` pairs.
+    pub map: Map<String, Value>,
+    /// Codes the PRODUCER contributed. The door assembles `_repairs`.
+    pub repairs: Vec<RepairCode>,
 }
 
-/// Derive the service name for a syslog event.
+/// Derive the service name for a syslog frame, and the repair it earned.
 ///
-/// Priority (each candidate sanitized, falling through when it maps to
-/// nothing):
-/// 1. `source_service_map` lookup by source IP (explicit user config)
-/// 2. APP-NAME / tag from the syslog message
-/// 3. `default_service` from config
-/// 4. [`FALLBACK_SERVICE`]
+/// Priority (ADR-0013 slice 2, ruling 7):
+/// 1. `source_service_map` lookup by source IP — explicit operator
+///    config, boot-validated as a service name, used verbatim;
+/// 2. a VALID APP-NAME / tag from the frame, verbatim;
+/// 3. `default_service` (also boot-validated) — with
+///    `service.from_profile` when an APP-NAME was PRESENT but unusable,
+///    and no repair at all when the frame simply carried none.
 ///
-/// The return value always satisfies [`pipeline::is_valid_service_name`].
+/// Note what is gone: the old sanitizer mapped `Living Room AP` onto
+/// `LivingRoomAP` and `../../escaped` onto `escaped`, inventing a service
+/// the sender never named and filing data under it silently. Falling back
+/// to the configured default and CONFESSING it is the honest answer —
+/// the original APP-NAME stays findable in `_raw`.
 pub fn derive_service<S: BuildHasher>(
     source_ip: IpAddr,
     appname: Option<&str>,
     source_service_map: &HashMap<String, String, S>,
     default_service: &str,
-) -> String {
-    let ip_str = source_ip.to_string();
-    source_service_map
-        .get(&ip_str)
-        .map(String::as_str)
-        .and_then(sanitize_service)
-        .or_else(|| appname.and_then(sanitize_service))
-        .or_else(|| sanitize_service(default_service))
-        .unwrap_or_else(|| FALLBACK_SERVICE.to_owned())
-}
-
-/// Format a syslog timestamp to RFC 3339 UTC at microsecond precision
-/// (the envelope's canonical `_time` spelling).
-fn format_timestamp(ts: Option<DateTime<FixedOffset>>) -> String {
-    match ts {
-        Some(dt) => dt
-            .with_timezone(&Utc)
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-        None => Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+) -> (String, Option<RepairCode>) {
+    if let Some(mapped) = source_service_map.get(&source_ip.to_string()) {
+        return (mapped.clone(), None);
+    }
+    match appname {
+        Some(name) if pipeline::is_valid_service_name(name) => (name.to_owned(), None),
+        Some(_) => (
+            default_service.to_owned(),
+            Some(RepairCode::ServiceFromProfile),
+        ),
+        None => (default_service.to_owned(), None),
     }
 }
 
-/// The syslog severity keyword and its `OTel` `SeverityNumber` (via the
-/// ADR-0009 inversion table — syslog counts down from Emergency 0, `OTel`
-/// counts up).
-fn severity_mapping(sev: syslog_loose::SyslogSeverity) -> (&'static str, Option<u8>) {
+/// The RAW PRI severity numeral, 0-7, exactly as the frame spelled it.
+///
+/// Deliberately NOT inverted here (ruling 1): the numeral is published as
+/// an ordinary column and the profile's fixed derivation source, which
+/// declares `dialect = "syslog"`, is what maps it onto the `OTel` ladder.
+const fn severity_numeral(sev: syslog_loose::SyslogSeverity) -> u8 {
     use syslog_loose::SyslogSeverity as S;
-    let (keyword, numeral) = match sev {
-        S::SEV_EMERG => ("emerg", 0),
-        S::SEV_ALERT => ("alert", 1),
-        S::SEV_CRIT => ("crit", 2),
-        S::SEV_ERR => ("err", 3),
-        S::SEV_WARNING => ("warning", 4),
-        S::SEV_NOTICE => ("notice", 5),
-        S::SEV_INFO => ("info", 6),
-        S::SEV_DEBUG => ("debug", 7),
-    };
-    (keyword, trawl_core::severity::from_syslog(numeral))
+    match sev {
+        S::SEV_EMERG => 0,
+        S::SEV_ALERT => 1,
+        S::SEV_CRIT => 2,
+        S::SEV_ERR => 3,
+        S::SEV_WARNING => 4,
+        S::SEV_NOTICE => 5,
+        S::SEV_INFO => 6,
+        S::SEV_DEBUG => 7,
+    }
 }
 
-/// Convert a parsed syslog message into a declared-envelope event map.
+/// Convert a parsed syslog message into a door-facing payload.
 ///
 /// `raw` is the pre-parse wire line — the most original form available —
-/// and lands in `_raw` verbatim. `default_env` stamps `env`.
-pub fn syslog_to_event<S: BuildHasher>(
+/// and is proposed as `_raw`. `peer_is_trusted_relay` decides the
+/// hostname-less case: behind a relay the peer address is confidently
+/// wrong, so the event is kept with no `host` at all.
+pub fn syslog_to_payload<S: BuildHasher>(
     raw: &str,
     msg: &Message<&str>,
     source_ip: IpAddr,
+    peer_is_trusted_relay: bool,
     source_service_map: &HashMap<String, String, S>,
     default_service: &str,
-    default_env: &str,
-) -> (String, Map<String, Value>) {
+) -> SyslogPayload {
     let mut map = Map::new();
+    let mut repairs = Vec::new();
 
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-    let service = derive_service(source_ip, msg.appname, source_service_map, default_service);
-    map.insert("service".into(), json!(service));
-    map.insert("env".into(), json!(default_env));
-    map.insert("_time".into(), json!(format_timestamp(msg.timestamp)));
-    map.insert("_ingested".into(), json!(now));
-    map.insert("_raw".into(), json!(raw));
-    map.insert(
-        "host".into(),
-        json!(msg.hostname.unwrap_or(&source_ip.to_string())),
-    );
-    // Severity: the listener KNOWS its input is syslog, so it is the one
-    // place trawl may invert the numeral onto the OTel ladder (ADR-0013
-    // §4) — and it therefore writes `_severity` itself rather than
-    // proposing a source for the generic derivation, which reads
-    // numerics strictly as OTel. The keyword and the numeral both stay
-    // findable in `_raw`, which is the provenance that proves the
-    // dialect. Absent severity is omitted, never guessed.
-    if let Some(sev) = msg.severity
-        && let (_, Some(n)) = severity_mapping(sev)
-    {
-        map.insert(trawl_core::schema::SEVERITY.into(), json!(n));
+    let (service, service_repair) =
+        derive_service(source_ip, msg.appname, source_service_map, default_service);
+    if let Some(code) = service_repair {
+        repairs.push(code);
     }
-    map.insert("message".into(), json!(msg.msg));
 
-    // Syslog-specific metadata (prefixed to avoid collisions)
+    // Host: the frame's own hostname is the only first-hand answer. The
+    // peer address is second-hand but honest for a direct sender; behind
+    // a configured relay it is the relay's, so absence beats the lie.
+    let host = match msg.hostname {
+        Some(hostname) => Some(hostname.to_owned()),
+        None if peer_is_trusted_relay => None,
+        None => {
+            repairs.push(RepairCode::HostFromPeer);
+            Some(source_ip.to_string())
+        }
+    };
+
+    // The pre-parse wire line: the syslog profile's `_raw` proposal. The
+    // door truncates it at `MAX_RAW_CHARS` like every other door's, which
+    // is what a 64 KB datagram needs and never used to get.
+    map.insert(trawl_core::schema::RAW.into(), json!(raw));
+
+    // The severity ARTIFACT: raw 0-7, OMITTED when the frame carried no
+    // PRI at all. An absent source is not an unmapped one — writing a
+    // placeholder would make every PRI-less frame look like a mapping
+    // failure to `trawl_severity_unmapped_total`.
+    if let Some(sev) = msg.severity {
+        map.insert(SYSLOG_SEVERITY_FIELD.into(), json!(severity_numeral(sev)));
+    }
+
+    // The timestamp ARTIFACT, canonicalized to the envelope's spelling so
+    // the profile's fixed `_time` source can read it. OMITTED when the
+    // frame carried none — the old code substituted `Utc::now()` here,
+    // which made an absent frame timestamp indistinguishable from a
+    // present one and hid `time.from_ingest` from `_repairs` forever.
+    if let Some(ts) = msg.timestamp {
+        map.insert(
+            SYSLOG_TIMESTAMP_FIELD.into(),
+            json!(
+                ts.with_timezone(&Utc)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+            ),
+        );
+    }
+
     if let Some(facility) = parse::facility_to_str(msg.facility) {
         map.insert("syslog_facility".into(), json!(facility));
     }
-
     if let Some(pid) = parse::procid_to_string(&msg.procid) {
         map.insert("syslog_pid".into(), json!(pid));
     }
-
     if let Some(msgid) = msg.msgid {
         map.insert("syslog_msgid".into(), json!(msgid));
     }
-
     map.insert("syslog_source_ip".into(), json!(source_ip.to_string()));
 
-    // Flatten RFC 5424 structured data elements (bounded to prevent
-    // memory exhaustion from malicious messages with huge SD payloads).
-    //
-    // Keys are ASCII-lowercased at construction — the fold-at-the-door
-    // rule (ADR-0009): this path writes straight into the pipeline without
-    // routing through `envelope::canonicalize`, and SD-IDs/param names are
-    // conventionally mixed-case (`exampleSDID@32473`, `eventID`), so an
-    // unfolded key here would reach the WAL and hot buffer under a
-    // spelling the (folded) catalog pin never matches. Two params folding
-    // to one key keep the FIRST value, mirroring the canonicalizer's
-    // collision rule.
+    // Flatten RFC 5424 structured data, bounded so a malicious frame with
+    // a huge SD payload cannot make the parse expensive. Keys go in as
+    // the frame spelled them: SD-IDs and param names are conventionally
+    // mixed-case (`exampleSDID@32473`, `eventID`), and folding them —
+    // along with dropping over-long ones and resolving collisions — is
+    // the door's job now, under the same rule every producer gets.
     let mut sd_param_count: usize = 0;
     'outer: for element in msg.structured_data.iter().take(MAX_SD_ELEMENTS) {
         for (param_name, param_value) in &element.params {
             if sd_param_count >= MAX_SD_PARAMS_TOTAL {
                 break 'outer;
             }
-            let key = format!("sd_{}_{}", element.id, param_name).to_ascii_lowercase();
-            if key.len() > MAX_SD_KEY_LEN {
-                continue;
-            }
-            map.entry(key).or_insert_with(|| json!(param_value));
+            map.entry(format!("sd_{}_{}", element.id, param_name))
+                .or_insert_with(|| json!(param_value));
             sd_param_count += 1;
         }
     }
 
-    (service, map)
+    SyslogPayload {
+        service,
+        host,
+        message: msg.msg.to_string(),
+        map,
+        repairs,
+    }
+}
+
+/// The boot-resolved policy a syslog listener needs to reach the door.
+///
+/// Threaded rather than reached through `AppState` so the listeners keep
+/// no handle on server state: the env allowlist and `default_env` come
+/// from `[ingest]` (the listener asserts a boot-VALIDATED env, so
+/// `env.defaulted` can never fire for it), `trusted_relays` is the same
+/// boot-parsed CIDR list the HTTP door consults, and `derivation` is the
+/// one resolved source policy every profile shares.
+#[derive(Debug)]
+pub struct SyslogDoor {
+    /// The effective env allowlist (never empty).
+    pub envs: Arc<[String]>,
+    /// The env every syslog event is filed under.
+    pub default_env: Arc<str>,
+    /// Peers whose address must never be stamped as an event's origin.
+    pub trusted_relays: Arc<[CidrEntry]>,
+    /// The boot-resolved per-profile derivation policy.
+    pub derivation: Arc<Derivation>,
+}
+
+impl SyslogDoor {
+    /// Parse one frame, canonicalize it under the `syslog` profile, and
+    /// return the event to batch — or `None` when the door refused it.
+    ///
+    /// A refusal here is a SERVER bug, not a sender's: everything the
+    /// profile asserts is boot-validated, and there is nobody to reject
+    /// to. It is therefore counted on `trawl_ingest_profile_reject_total`
+    /// (whose whole closed matrix is published at zero, so a flat series
+    /// is the invariant holding) and the frame is dropped.
+    pub fn admit<S: BuildHasher>(
+        &self,
+        raw: &str,
+        source_ip: IpAddr,
+        source_service_map: &HashMap<String, String, S>,
+        default_service: &str,
+        transport: &'static str,
+    ) -> Option<SyslogEvent> {
+        let parsed = parse::parse_syslog(raw);
+        // Membership, NOT `is_allowed`: an EMPTY relay list means "no
+        // relays configured", the exact opposite of the empty CIDR
+        // allowlist's "everything is allowed". Same predicate the HTTP
+        // door uses, spelled the same way.
+        let peer_is_trusted_relay = self
+            .trusted_relays
+            .iter()
+            .any(|cidr| cidr.contains(source_ip));
+        let payload = syslog_to_payload(
+            raw,
+            &parsed,
+            source_ip,
+            peer_is_trusted_relay,
+            source_service_map,
+            default_service,
+        );
+
+        let arrival_instant = Utc::now();
+        let arrival = arrival_instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let ctx = EnvelopeContext {
+            arrival: &arrival,
+            arrival_instant,
+            envs: &self.envs,
+            default_env: &self.default_env,
+            producer: Producer::Syslog(Asserted {
+                env: &self.default_env,
+                service: &payload.service,
+                host: payload.host.as_deref(),
+                message: Some(&payload.message),
+                repairs: &payload.repairs,
+            }),
+            derivation: &self.derivation,
+        };
+
+        match envelope::canonicalize(&payload.map, &ctx) {
+            Ok(canonical) => {
+                producer::count_event_outcome(&canonical);
+                Some(SyslogEvent {
+                    env: canonical.env,
+                    service: canonical.service,
+                    map: canonical.obj,
+                    transport,
+                })
+            }
+            Err((_, reason)) => {
+                producer::count_profile_reject(ProducerKind::Syslog, reason);
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syslog::parse::parse_syslog;
+
+    fn door() -> SyslogDoor {
+        SyslogDoor {
+            envs: vec!["prod".to_owned(), "lab".to_owned()].into(),
+            default_env: "prod".into(),
+            trusted_relays: Vec::new().into(),
+            derivation: Arc::new(Derivation::defaults()),
+        }
+    }
+
+    /// Drive a frame through the whole lane — parse, payload, door — as
+    /// the listeners do. Every assertion below is on what LANDS, because
+    /// the payload alone is no longer an event.
+    fn admit(raw: &str, source_ip: &str) -> SyslogEvent {
+        door()
+            .admit(
+                raw,
+                source_ip.parse().unwrap(),
+                &HashMap::new(),
+                "syslog",
+                "udp",
+            )
+            .expect("the syslog profile must not reject")
+    }
+
+    fn admit_with(
+        raw: &str,
+        source_ip: &str,
+        service_map: &HashMap<String, String>,
+    ) -> SyslogEvent {
+        door()
+            .admit(
+                raw,
+                source_ip.parse().unwrap(),
+                service_map,
+                "syslog",
+                "udp",
+            )
+            .expect("the syslog profile must not reject")
+    }
+
+    fn repairs(event: &SyslogEvent) -> Vec<&str> {
+        event.map.get("_repairs").map_or_else(Vec::new, |v| {
+            v.as_str().unwrap_or_default().split(',').collect()
+        })
+    }
 
     #[test]
     fn convert_rfc3164_unifi() {
         let raw = "<134>Mar 12 10:00:00 UGW kernel: [UFW BLOCK] IN=eth0 SRC=192.168.1.100";
-        let parsed = parse_syslog(raw);
-        let source_ip: IpAddr = "192.168.1.1".parse().unwrap();
-
         let mut service_map = HashMap::new();
         service_map.insert("192.168.1.1".to_string(), "unifi-gateway".to_string());
 
-        let (service, map) =
-            syslog_to_event(raw, &parsed, source_ip, &service_map, "syslog", "prod");
+        let event = admit_with(raw, "192.168.1.1", &service_map);
 
-        assert_eq!(service, "unifi-gateway");
-        assert_eq!(map["service"], "unifi-gateway");
-        assert_eq!(map["env"], "prod");
-        assert_eq!(map["host"], "UGW");
+        assert_eq!(event.service, "unifi-gateway");
+        assert_eq!(event.map["service"], "unifi-gateway");
+        assert_eq!(event.env, "prod");
+        assert_eq!(event.map["env"], "prod");
+        assert_eq!(event.map["host"], "UGW");
         assert_eq!(
-            map[trawl_core::schema::SEVERITY],
+            event.map[trawl_core::schema::SEVERITY],
             9,
-            "syslog 6 (info) inverts to OTel 9"
+            "syslog 6 (info) inverts to OTel 9 — through DERIVATION now"
         );
-        assert!(map["_time"].is_string());
-        assert!(map["_ingested"].is_string());
-        assert_eq!(map["_raw"], raw, "the pre-parse wire line lands in _raw");
-        assert!(map["message"].as_str().unwrap().contains("[UFW BLOCK]"));
-        assert_eq!(map["syslog_facility"], "local0");
-        assert_eq!(map["syslog_source_ip"], "192.168.1.1");
+        assert_eq!(
+            event.map[SYSLOG_SEVERITY_FIELD], 6,
+            "the raw numeral stays queryable"
+        );
+        assert!(event.map["_time"].is_string());
+        assert!(event.map["_ingested"].is_string());
+        assert_eq!(
+            event.map["_raw"], raw,
+            "the pre-parse wire line lands in _raw"
+        );
+        assert!(
+            event.map["message"]
+                .as_str()
+                .unwrap()
+                .contains("[UFW BLOCK]")
+        );
+        assert_eq!(event.map["syslog_facility"], "local0");
+        assert_eq!(event.map["syslog_source_ip"], "192.168.1.1");
     }
 
     #[test]
     fn convert_uses_appname_when_no_ip_mapping() {
-        let raw = "<13>Mar 12 10:00:00 myhost sshd[1234]: Accepted password";
-        let parsed = parse_syslog(raw);
-        let source_ip: IpAddr = "10.0.0.50".parse().unwrap();
-
-        let (service, map) =
-            syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "prod");
-
-        assert_eq!(service, "sshd");
-        assert_eq!(map["service"], "sshd");
-        assert_eq!(map["host"], "myhost");
+        let event = admit(
+            "<13>Mar 12 10:00:00 myhost sshd[1234]: Accepted password",
+            "10.0.0.50",
+        );
+        assert_eq!(event.service, "sshd");
+        assert_eq!(event.map["service"], "sshd");
+        assert_eq!(event.map["host"], "myhost");
     }
 
     #[test]
     fn convert_falls_back_to_default_service() {
-        let raw = "<13>test message only";
-        let parsed = parse_syslog(raw);
-        let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
-
-        let (service, _map) =
-            syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "prod");
-
-        assert_eq!(service, "syslog");
+        let event = admit("<13>test message only", "10.0.0.1");
+        assert_eq!(event.service, "syslog");
     }
 
     #[test]
     fn convert_host_falls_back_to_source_ip() {
-        // Message without hostname
-        let raw = "<13>test message";
-        let parsed = parse_syslog(raw);
-        let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
-
-        let (_service, map) =
-            syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "prod");
-
-        // If hostname is None, should use source IP
-        let host = map["host"].as_str().unwrap();
-        // hostname might be parsed from the message; if not, should be source IP
-        assert!(!host.is_empty());
+        // No hostname in the frame and a direct (non-relay) peer: the
+        // source address is second-hand but honest, and confessed.
+        let event = admit("<13>test message", "10.0.0.1");
+        assert_eq!(event.map["host"], "10.0.0.1");
+        assert!(repairs(&event).contains(&"host.from_peer"));
     }
 
-    /// Acceptance criterion (ADR-0009): syslog numerics are INVERTED —
-    /// 0 (emerg) maps into the FATAL band, 7 (debug) into DEBUG. A naive
-    /// passthrough would invert every severity in the corpus.
+    #[test]
+    fn a_hostname_less_frame_behind_a_trusted_relay_keeps_the_event() {
+        // Ruling 4: absent-but-honest beats both the peer-fill lie (the
+        // relay's own address) and dropping the event.
+        let relay = SyslogDoor {
+            trusted_relays: vec![super::super::parse_cidr("10.0.0.0/8").unwrap()].into(),
+            ..door()
+        };
+        let event = relay
+            .admit(
+                "<13>test message",
+                "10.0.0.1".parse().unwrap(),
+                &HashMap::new(),
+                "syslog",
+                "udp",
+            )
+            .expect("a hostname-less frame behind a relay still lands");
+        assert!(!event.map.contains_key("host"), "host must be OMITTED");
+        assert!(repairs(&event).contains(&"host.omitted"));
+        assert!(!repairs(&event).contains(&"host.from_peer"));
+
+        // A frame that DOES carry a hostname is unaffected by the relay.
+        let event = relay
+            .admit(
+                "<13>Mar 12 10:00:00 myhost app: hi",
+                "10.0.0.1".parse().unwrap(),
+                &HashMap::new(),
+                "syslog",
+                "udp",
+            )
+            .unwrap();
+        assert_eq!(event.map["host"], "myhost");
+    }
+
+    /// Acceptance criterion 1 (ADR-0013 slice 2, ruling 1): the listener
+    /// writes NO `_severity`. It publishes the raw 0-7 numeral and the
+    /// profile's FIXED derivation source inverts it — and the answer is
+    /// identical to the matrix the hand-rolled writer produced, band for
+    /// band. A naive passthrough would invert every severity in the
+    /// corpus.
     #[test]
     fn syslog_numerics_invert_onto_the_otel_ladder() {
-        let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
-        // PRI 0*8+0 = <0> emerg; PRI 0*8+7 = <7> debug (facility kern).
-        let emerg_raw = "<0>Mar 12 10:00:00 h app: the world is on fire";
-        let parsed = parse_syslog(emerg_raw);
-        let (_s, map) = syslog_to_event(
-            emerg_raw,
-            &parsed,
-            source_ip,
-            &HashMap::new(),
-            "syslog",
-            "prod",
-        );
-        assert_eq!(
-            map[trawl_core::schema::SEVERITY],
-            24,
-            "syslog 0 (emerg) is OTel 24 (FATAL band)"
-        );
-        // The keyword and the numeral both stay findable in `_raw`, the
-        // provenance that proves the dialect (ADR-0013 §4).
-        assert!(map["_raw"].as_str().unwrap().contains("<0>"));
+        // (PRI severity, the OTel number derivation must land on).
+        let matrix = [
+            (0, 24), // emerg  → FATAL4
+            (1, 23), // alert  → FATAL3
+            (2, 21), // crit   → FATAL
+            (3, 17), // err    → ERROR
+            (4, 13), // warning→ WARN
+            (5, 10), // notice → INFO2
+            (6, 9),  // info   → INFO
+            (7, 5),  // debug  → DEBUG
+        ];
+        for (pri, otel) in matrix {
+            let raw = format!("<{pri}>Mar 12 10:00:00 h app: a line");
+            let event = admit(&raw, "10.0.0.1");
+            assert_eq!(
+                event.map[trawl_core::schema::SEVERITY],
+                otel,
+                "syslog {pri} must derive to OTel {otel}"
+            );
+            assert_eq!(
+                event.map[SYSLOG_SEVERITY_FIELD], pri,
+                "the artifact keeps the RAW numeral, uninverted"
+            );
+            // The frame that proves the dialect stays findable.
+            assert!(
+                event.map["_raw"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("<{pri}>"))
+            );
+        }
 
-        let debug_raw = "<7>Mar 12 10:00:00 h app: noisy detail";
-        let parsed = parse_syslog(debug_raw);
-        let (_s, map) = syslog_to_event(
-            debug_raw,
-            &parsed,
-            source_ip,
-            &HashMap::new(),
-            "syslog",
-            "prod",
-        );
-        assert_eq!(
-            map[trawl_core::schema::SEVERITY],
-            5,
-            "syslog 7 (debug) is OTel 5 (DEBUG band)"
-        );
-        assert!(map["_raw"].as_str().unwrap().contains("<7>"));
+        // No PRI at all: the artifact is OMITTED rather than defaulted,
+        // so an absent source can never look like an unmapped one.
+        let event = admit("no pri here", "10.0.0.1");
+        assert!(!event.map.contains_key(SYSLOG_SEVERITY_FIELD));
+        assert!(!event.map.contains_key(trawl_core::schema::SEVERITY));
     }
 
-    /// The full envelope is present on every converted event.
+    /// The full TEN-field envelope, assembled by the door.
     #[test]
     fn converted_event_carries_the_envelope() {
         let raw = "<134>Mar 12 10:00:00 web01 nginx: GET /";
-        let parsed = parse_syslog(raw);
-        let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let (_s, map) = syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "lab");
+        let lab = SyslogDoor {
+            default_env: "lab".into(),
+            ..door()
+        };
+        let event = lab
+            .admit(
+                raw,
+                "10.0.0.1".parse().unwrap(),
+                &HashMap::new(),
+                "syslog",
+                "udp",
+            )
+            .unwrap();
         for key in [
             "_time",
             "_ingested",
             "_raw",
+            "_severity",
+            "_producer",
             "env",
             "service",
             "host",
             "message",
         ] {
-            assert!(map.contains_key(key), "envelope key {key} missing");
+            assert!(event.map.contains_key(key), "envelope key {key} missing");
         }
-        assert_eq!(map["env"], "lab");
-        assert!(!map.contains_key("level"), "level is never stored");
-        assert!(!map.contains_key("timestamp"), "timestamp is never stored");
+        assert_eq!(event.map["env"], "lab");
+        assert_eq!(
+            event.map["_producer"], "syslog",
+            "provenance is data (ruling 6)"
+        );
+        // `_repairs` is the tenth slot and is OMITTED when clean — this
+        // frame carries a hostname, a timestamp and a valid APP-NAME.
+        assert!(
+            !event.map.contains_key("_repairs"),
+            "a well-formed frame must be repair-free: {:?}",
+            event.map.get("_repairs")
+        );
+        assert!(!event.map.contains_key("level"), "level is never stored");
+        assert!(
+            !event.map.contains_key("timestamp"),
+            "timestamp is never stored"
+        );
+    }
+
+    #[test]
+    fn the_frame_timestamp_is_an_artifact_the_profile_reads_first() {
+        let event = admit(
+            "<165>1 2026-02-15T12:00:00+05:30 web01 app 1234 ID47 - boom",
+            "10.0.0.1",
+        );
+        assert_eq!(
+            event.map[SYSLOG_TIMESTAMP_FIELD], "2026-02-15T06:30:00.000000Z",
+            "the artifact is canonicalized to the envelope's spelling"
+        );
+        assert_eq!(event.map["_time"], "2026-02-15T06:30:00.000000Z");
+        assert!(!repairs(&event).contains(&"time.from_ingest"));
+
+        // A frame with NO parseable timestamp omits the artifact, so the
+        // door falls to arrival time and SAYS so. The old listener
+        // substituted `Utc::now()` inside the artifact itself, which made
+        // that indistinguishable from a frame that carried the time.
+        let event = admit("<13>no timestamp here", "10.0.0.1");
+        assert!(!event.map.contains_key(SYSLOG_TIMESTAMP_FIELD));
+        assert!(repairs(&event).contains(&"time.from_ingest"));
+    }
+
+    /// The `_raw` cap is the door's, and it now reaches syslog.
+    ///
+    /// Before the cutover the listener wrote `_raw` itself and nothing
+    /// truncated it. That went unnoticed because the two constants are
+    /// COINCIDENTALLY equal — the UDP receive buffer is 65 536 BYTES and
+    /// `MAX_RAW_CHARS` is 65 536 CHARS — so an all-ASCII datagram happens
+    /// to fit. A TCP frame is read to the same byte bound with no such
+    /// relationship, and either transport carrying multi-byte text has
+    /// fewer chars than bytes only in the safe direction; what actually
+    /// held the line was luck, not a check. Now it is structural.
+    #[test]
+    fn an_oversized_frame_is_truncated_by_the_doors_raw_cap() {
+        let long = format!(
+            "<13>Mar 12 10:00:00 h app: {}",
+            "x".repeat(envelope::MAX_RAW_CHARS + 1_000)
+        );
+        let event = admit(&long, "10.0.0.1");
+        assert_eq!(
+            event.map["_raw"].as_str().unwrap().chars().count(),
+            envelope::MAX_RAW_CHARS
+        );
+        assert!(repairs(&event).contains(&"field.truncated"));
     }
 
     /// RFC 5424 SD-IDs and param names are conventionally mixed-case
-    /// (`exampleSDID@32473`, `eventID`), and this path does NOT route
-    /// through `envelope::canonicalize` — so the fold happens at key
-    /// construction, or the key would reach the WAL and hot buffer under a
-    /// spelling the folded catalog pin never matches.
+    /// (`exampleSDID@32473`, `eventID`). The listener no longer folds
+    /// them itself — the door's universal fold does, so there is one
+    /// rule and one place it can drift from.
     #[test]
-    fn sd_keys_are_ascii_folded_at_construction() {
+    fn sd_keys_are_folded_by_the_door() {
         let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [exampleSDID@32473 eventID="1011" eventSource="Application"] boom"#;
-        let parsed = parse_syslog(raw);
-        let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let (_s, map) = syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "prod");
+        let event = admit(raw, "10.0.0.1");
 
-        assert_eq!(map["sd_examplesdid@32473_eventid"], "1011");
-        assert_eq!(map["sd_examplesdid@32473_eventsource"], "Application");
+        assert_eq!(event.map["sd_examplesdid@32473_eventid"], "1011");
+        assert_eq!(event.map["sd_examplesdid@32473_eventsource"], "Application");
         assert!(
-            map.keys()
+            event
+                .map
+                .keys()
                 .all(|k| !k.bytes().any(|b| b.is_ascii_uppercase())),
             "no key may carry ASCII uppercase: {:?}",
-            map.keys().collect::<Vec<_>>()
+            event.map.keys().collect::<Vec<_>>()
+        );
+        assert!(repairs(&event).contains(&"field.name_case_folded"));
+    }
+
+    /// Two params folding to one key keep ONE value, by the door's GLOBAL
+    /// case-collision rule rather than the listener-local one that used
+    /// to live here — and the event now CONFESSES the drop, which the
+    /// silent `or_insert` never did.
+    ///
+    /// The tiebreak genuinely changes, and that is the point of having
+    /// one rule: the old fold-at-construction kept the first spelling in
+    /// DOCUMENT order, while the door keeps the exact-lowercase spelling
+    /// when the event carries it and otherwise the
+    /// ASCII-lexicographically first variant. Deterministic either way;
+    /// now it is the same determinism every producer gets, and nothing
+    /// honest can be done with two values for one `DuckDB` column
+    /// anyway — the loser stays in `_raw`.
+    #[test]
+    fn sd_key_collision_after_folding_is_the_doors_global_rule() {
+        // Variant-only: `EVENTID` sorts before `eventID` in ASCII.
+        let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [x@1 eventID="doc-first" EVENTID="ascii-first"] boom"#;
+        let event = admit(raw, "10.0.0.1");
+        assert_eq!(
+            event.map["sd_x@1_eventid"], "ascii-first",
+            "with no exact spelling present, the lexicographically first variant wins"
+        );
+        assert!(repairs(&event).contains(&"field.name_case_collision"));
+        assert!(
+            event.map["_raw"].as_str().unwrap().contains("doc-first"),
+            "the losing value stays findable in _raw"
+        );
+
+        // With the exact (already-lowercase) spelling present, it wins
+        // regardless of where it sits.
+        let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [x@1 EVENTID="variant" eventid="exact"] boom"#;
+        let event = admit(raw, "10.0.0.1");
+        assert_eq!(event.map["sd_x@1_eventid"], "exact");
+    }
+
+    /// An SD key too long to be a catalog key used to be dropped SILENTLY
+    /// by `MAX_SD_KEY_LEN`. The door drops it too — and says so, and the
+    /// value stays in `_raw`.
+    #[test]
+    fn an_over_long_sd_key_is_dropped_by_the_doors_name_gate() {
+        let long_id = "z".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES);
+        let raw =
+            format!(r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [{long_id}@1 k="v"] boom"#);
+        let event = admit(&raw, "10.0.0.1");
+        assert!(
+            event
+                .map
+                .keys()
+                .all(|k| k.len() <= trawl_core::schema::MAX_FIELD_NAME_BYTES),
+            "an unstorable name must never become a column"
+        );
+        assert!(repairs(&event).contains(&"field.name_too_long"));
+        assert!(
+            event.map["_raw"].as_str().unwrap().contains(&long_id),
+            "the dropped key stays findable in _raw"
         );
     }
 
-    /// Two params folding to one key keep the FIRST value — the same
-    /// deterministic collision rule as the canonicalizer's.
+    /// Every universal gate reaches syslog now (AC2) — including the
+    /// sealed `_` prefix, which a structured-data param can spell.
     #[test]
-    fn sd_key_collision_after_folding_keeps_the_first_value() {
-        let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [x@1 eventID="first" EVENTID="second"] boom"#;
-        let parsed = parse_syslog(raw);
-        let source_ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let (_s, map) = syslog_to_event(raw, &parsed, source_ip, &HashMap::new(), "syslog", "prod");
-        assert_eq!(
-            map["sd_x@1_eventid"], "first",
-            "the first spelling in document order wins"
+    fn a_frame_faces_the_sealed_prefix_strip() {
+        let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [_@1 x="y"] boom"#;
+        let event = admit(raw, "10.0.0.1");
+        assert!(
+            event
+                .map
+                .keys()
+                .all(|k| !k.starts_with("sd__") || !trawl_core::schema::is_reserved_name(k)),
+            "keys: {:?}",
+            event.map.keys().collect::<Vec<_>>()
         );
+        // The `sd_` prefix means an SD param can never actually reach the
+        // reserved namespace — which is exactly the point of prefixing
+        // parse artifacts. The forgeable slot is `_producer`, stamped by
+        // the door from the profile and nothing else.
+        assert_eq!(event.map["_producer"], "syslog");
     }
 
-    /// The SD key bound IS the catalog's field-name bound: one byte over
-    /// and the key could be admitted here but never pinned.
     #[test]
-    fn sd_key_bound_matches_the_catalog_field_name_bound() {
-        assert_eq!(MAX_SD_KEY_LEN, trawl_core::schema::MAX_FIELD_NAME_BYTES);
-    }
-
-    #[test]
-    fn sanitize_service_strips_invalid_chars() {
-        assert_eq!(
-            sanitize_service("nginx/error"),
-            Some("nginxerror".to_string())
-        );
-        assert_eq!(
-            sanitize_service("my-app_v2.0"),
-            Some("my-app_v2.0".to_string())
-        );
-        assert_eq!(sanitize_service(""), None);
-        assert_eq!(sanitize_service("///"), None);
-        // Dot-leading names would become dotfile parquets; `..` is a path
-        // escape. Both lose their leading dot run.
-        assert_eq!(sanitize_service(".foo"), Some("foo".to_string()));
-        assert_eq!(sanitize_service(".."), None);
-        assert_eq!(
-            sanitize_service("../../escaped"),
-            Some("escaped".to_string())
-        );
-    }
-
-    /// ADR-0009 injectivity: the on-disk name IS the service value, so
-    /// every `derive_service` path — including the two unvalidated config
-    /// fields — must yield a name HTTP ingest would also accept. Before
-    /// this was enforced, a mapped service of `../../escaped` wrote WAL
-    /// files outside the WAL root (silent data loss) and `Living Room AP`
-    /// produced a parquet glob the emitter refuses.
-    #[test]
-    fn derive_service_output_is_always_a_valid_service_name() {
+    fn service_derivation_priority_and_its_one_repair() {
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
         let other: IpAddr = "10.0.0.1".parse().unwrap();
-
         let mut map = HashMap::new();
-        map.insert("192.168.1.1".to_string(), "../../escaped".to_string());
-        assert_eq!(derive_service(ip, None, &map, "syslog"), "escaped");
+        map.insert("192.168.1.1".to_string(), "mapped-svc".to_string());
 
-        let mut map = HashMap::new();
-        map.insert("192.168.1.1".to_string(), "Living Room AP".to_string());
-        assert_eq!(derive_service(ip, None, &map, "syslog"), "LivingRoomAP");
-
-        // A map value that sanitizes to nothing falls through to appname.
-        let mut map = HashMap::new();
-        map.insert("192.168.1.1".to_string(), "..".to_string());
-        assert_eq!(derive_service(ip, Some("sshd"), &map, "syslog"), "sshd");
-
-        // Dot-leading appnames never become dotfiles.
+        // The IP map wins over the APP-NAME, verbatim, no repair.
         assert_eq!(
-            derive_service(other, Some(".hidden"), &HashMap::new(), "syslog"),
-            "hidden"
+            derive_service(ip, Some("nginx"), &map, "default"),
+            ("mapped-svc".to_owned(), None)
         );
-
-        // An unusable default_service still yields a valid name.
+        // A valid APP-NAME is used verbatim.
         assert_eq!(
-            derive_service(other, None, &HashMap::new(), "/../"),
-            "syslog"
+            derive_service(other, Some("nginx"), &map, "default"),
+            ("nginx".to_owned(), None)
         );
+        // An ABSENT APP-NAME is not a defect: the default, no repair.
+        assert_eq!(
+            derive_service(other, None, &map, "default"),
+            ("default".to_owned(), None)
+        );
+        // A PRESENT but unusable one is: the default, CONFESSED. The old
+        // sanitizer invented `LivingRoomAP` and `escaped` here and filed
+        // data under a service nobody named.
+        for bad in ["Living Room AP", "../../escaped", ".hidden", "..", ""] {
+            assert_eq!(
+                derive_service(other, Some(bad), &HashMap::new(), "syslog"),
+                ("syslog".to_owned(), Some(RepairCode::ServiceFromProfile)),
+                "APP-NAME {bad:?} must fall to the profile default"
+            );
+        }
+    }
 
+    /// ADR-0009 injectivity: the on-disk name IS the service value. Every
+    /// path through `derive_service` must yield a name HTTP ingest would
+    /// also accept — the two config-sourced ones because config
+    /// validation refuses to start otherwise, the APP-NAME because it is
+    /// checked against the very same predicate.
+    #[test]
+    fn derive_service_output_is_always_a_valid_service_name() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for candidate in [
             "../../escaped",
             "Living Room AP",
@@ -456,32 +762,13 @@ mod tests {
             "/../",
             "",
             &"x".repeat(200),
+            "nginx",
         ] {
-            let derived = derive_service(other, Some(candidate), &HashMap::new(), candidate);
+            let (derived, _) = derive_service(ip, Some(candidate), &HashMap::new(), "syslog");
             assert!(
                 pipeline::is_valid_service_name(&derived),
                 "derive_service({candidate:?}) yielded invalid name {derived:?}"
             );
         }
-    }
-
-    #[test]
-    fn derive_service_priority() {
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
-        let mut map = HashMap::new();
-        map.insert("192.168.1.1".to_string(), "mapped-svc".to_string());
-
-        // IP mapping takes priority over appname
-        assert_eq!(
-            derive_service(ip, Some("nginx"), &map, "default"),
-            "mapped-svc"
-        );
-
-        // Without IP mapping, use appname
-        let ip2: IpAddr = "10.0.0.1".parse().unwrap();
-        assert_eq!(derive_service(ip2, Some("nginx"), &map, "default"), "nginx");
-
-        // Without appname, use default
-        assert_eq!(derive_service(ip2, None, &map, "default"), "default");
     }
 }
