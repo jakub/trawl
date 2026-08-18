@@ -17,6 +17,7 @@
 
 use std::fmt::Write;
 
+use trawl_core::parser::scan::scan_outside_quotes;
 use trawl_core::parser::suggest::quote_dsl_field;
 
 /// Include/exclude operator for a facet-driven filter.
@@ -141,56 +142,6 @@ pub fn effective_query(base_q: &str, filters: &[Filter], range: &RangeSpec) -> S
         Some(t) => format!("{new_search} | {}", t.trim_start_matches('|').trim()),
         None => new_search,
     }
-}
-
-/// Walk `input`'s bytes, calling `hit` only for bytes that sit OUTSIDE a
-/// delimited span — a double-quoted or single-quoted string, a
-/// `/`-delimited regex literal, or a backtick-quoted field name
-/// (ADR-0013 ruling 7). Returns the index of the first byte `hit`
-/// accepted.
-///
-/// Backticks matter as much as quotes here: a backticked name can spell
-/// any character, so it can carry a `|` or the text `last=` that these
-/// text-level walks would otherwise read as grammar. Backslash escapes
-/// are honoured everywhere except inside backticks, whose only escape is
-/// a doubled backtick (which this walk sees as a close immediately
-/// followed by a re-open, so no inner byte leaks out as bare).
-fn scan_outside_quotes<F>(input: &str, mut hit: F) -> Option<usize>
-where
-    F: FnMut(usize, u8) -> bool,
-{
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    let mut delim: Option<u8> = None;
-    while i < bytes.len() {
-        let b = bytes[i];
-        match delim {
-            None => match b {
-                b'\\' if i + 1 < bytes.len() => i += 2,
-                b'"' | b'\'' | b'/' | b'`' => {
-                    delim = Some(b);
-                    i += 1;
-                }
-                _ => {
-                    if hit(i, b) {
-                        return Some(i);
-                    }
-                    i += 1;
-                }
-            },
-            Some(d) => {
-                if d != b'`' && b == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
-                } else {
-                    if b == d {
-                        delim = None;
-                    }
-                    i += 1;
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Split on the first top-level `|` (skipping slash-delimited regex
@@ -430,6 +381,44 @@ mod tests {
     fn backticked_last_field_does_not_suppress_range() {
         let q = effective_query("`last`=5", &[], &quick("15m"));
         assert_eq!(q, "last=15m `last`=5");
+    }
+
+    /// A `//` in a value is ordinary data (ADR-0014 ruling 3), and the
+    /// shared scan primitive must not read the slashes as a regex open —
+    /// that would hide the user's own `last=` clause behind a phantom
+    /// span and silently override their time bound.
+    #[test]
+    fn slashes_in_a_value_do_not_hide_the_last_clause() {
+        for base in [
+            "url=https://a/b last=1h",
+            "path=/api//v1 last=1h",
+            "url=//cdn.example.com/x last=1h",
+        ] {
+            // the user's own `last=` wins: the quick range is suppressed
+            assert_eq!(effective_query(base, &[], &quick("15m")), base, "{base}");
+        }
+        // …and an absolute range still rewrites, with the search stage
+        // located correctly around the slashes.
+        let q = effective_query(
+            "url=https://a/b | stats count()",
+            &[],
+            &RangeSpec::Absolute {
+                from: "2026-01-01T00:00:00Z".into(),
+                to: "now".into(),
+            },
+        );
+        assert!(q.starts_with("_time>="), "{q}");
+        assert!(q.ends_with("url=https://a/b | stats count()"), "{q}");
+    }
+
+    /// A comment in the base query is prose: its words are not read as
+    /// grammar, and the range clause still lands in the search stage.
+    #[test]
+    fn a_comment_is_not_read_as_grammar() {
+        assert_eq!(
+            effective_query("service=x # last=1h", &[], &quick("15m")),
+            "last=15m service=x # last=1h"
+        );
     }
 
     #[test]

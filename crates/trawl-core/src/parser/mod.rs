@@ -18,6 +18,7 @@ pub(crate) mod comment;
 pub(crate) mod expr;
 pub(crate) mod pipe;
 pub(crate) mod primitives;
+pub mod scan;
 pub(crate) mod search;
 pub mod suggest;
 
