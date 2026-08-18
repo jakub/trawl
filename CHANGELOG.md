@@ -352,6 +352,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   escape hatch.
 
 ### Changed
+- **BREAKING — comments are a grammar production, and `//` is no longer a
+  comment (ADR-0014, #83).** The pre-parse comment scanner is deleted.
+  It blanked `#`/`//` runs to end-of-line before the grammar ran, which
+  meant it had to re-derive the parser's own decisions from outside the
+  parser — and it got them wrong on ordinary shapes, *successfully*:
+  `message=/a#b/` executed as `message == "/a"`, `url=https://example.com/x`
+  as `url == "https:"`, and `referrer=https://a.b/c status=200` **deleted
+  the `status=200` filter** and widened the result set. No error, no
+  warning.
+
+  A comment is now `#` to end of line, admitted only where the grammar
+  sits between tokens — the start of the input, or after whitespace. Two
+  breaking halves, both loud:
+
+  - **`//` stops being a comment opener.** A value carries it freely and
+    needs no quoting (`url=https://example.com/x`, `path=/api//v1`,
+    `url=//cdn.example.com/x`), and the sibling filters on the same line
+    survive. The loud half: a bare search **term** that *starts* with
+    `//` is a parse error naming `#`, so an existing `// note` line fails
+    instead of silently becoming AND-ed text terms that match nothing.
+  - **A `#` inside an unquoted token is a parse error**, never data and
+    never a comment: `foo#bar`, `color=#ff0000` and `a=1# note` each
+    report one error spanning the `#` byte, with a hint naming the quoted
+    form. Quote it to include it — a double-quoted value, a
+    backtick-quoted name and a regex body all carry `#` verbatim, because
+    none of them has a place inside where the grammar skips whitespace.
+
+  `a=1 # note` is unchanged. No query shape goes from working to silently
+  different; every changed shape moves to a correct answer or a loud
+  error. Parse-error spans are now natively correct — the scanner's
+  unstated byte-length-preserving invariant (which the web UI squiggles,
+  the TUI caret regions, the CLI caret renderer and the wire `ErrorSpan`
+  all leaned on) is retired rather than maintained. The DSL reference
+  gains the Comments section it never had.
+
+  Two smaller consequences: the formatter no longer quotes a value for
+  carrying `//`, and a filter list element may now be written quoted in
+  any position (`status=200,"a#b",301`), which is what lets a list
+  round-trip through `format`. The web UI's date-range walk consumes a
+  scan primitive exported from `trawl-core` instead of its own copy, and
+  now locates a `last=` clause correctly in a query carrying `//`.
 - **A severity list writes its subject once per contiguous range (#82).**
   Every `SEVERITY`-pinned equality, `!=` and IN now expands to the ladder
   points it accepts and emits the **minimal contiguous ranges** covering

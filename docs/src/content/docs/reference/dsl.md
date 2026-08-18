@@ -13,6 +13,55 @@ trawl uses a pipeline-oriented query language inspired by Splunk's SPL. Queries 
 
 The search stage is optional. Pipelines can start with `|` for raw log access.
 
+## Comments
+
+`#` starts a comment. It runs to the end of the line, and it is the
+**only** comment character — `//` is not one.
+
+```
+# find the noisy services
+_severity>=error last=1h    # only the last hour
+| stats count() by service
+# and only the interesting ones
+| where count > 10
+```
+
+A comment opens only where the query is **between tokens**: at the start
+of the input, or after whitespace. Inside an unquoted token a `#` is
+neither data nor a comment — it is a parse error naming the byte, with a
+hint to quote it:
+
+```
+a=1 # note        filter a=1, plus a comment
+a=1# note         error at the '#'
+foo#bar           error at the '#'  — write "foo#bar" to search for it
+color=#ff0000     error at the '#'  — write color="#ff0000"
+```
+
+To include a `#` in a value or a name, quote it. All three quoted forms
+carry it verbatim, because none of them has a place inside where the
+grammar skips whitespace:
+
+```
+host="a#b"        a double-quoted value
+`a#b`=1           a backtick-quoted field name
+message=/a#b/     a regex body
+```
+
+Because `//` is not a comment, a value carries it freely and needs no
+quoting — which is the everyday case in log data:
+
+```
+url=https://example.com/x          the value https://example.com/x
+referrer=https://a.b/c status=200  BOTH filters
+path=/api//v1                      the value /api//v1
+url=//cdn.example.com/x            an ordinary value
+```
+
+The one loud spot: a bare search **term** that *starts* with `//` is a
+parse error naming `#`, so an old `// note` line fails instead of quietly
+becoming two AND-ed text searches that match nothing.
+
 ## Search stage
 
 The search stage filters events before they enter the pipeline. Multiple conditions within a group are AND-joined.
@@ -326,9 +375,8 @@ that contains one is written double-quoted — `` host="a`b" ``, `` "er`ror" ``
 `` service=`nginx` `` and `` service=`my service` `` are parse errors, not
 filters on the literal text. Nor can `-` negate a quoted name: write
 ``NOT `http-status`=500``, since `` -`http-status`=500 `` is an error too.
-(The tick is the one character whose meaning is settled before the grammar
-runs, by the comment stripper; ending unquoted text at it is what keeps a
-stray tick a parse error instead of a silently different query.)
+(Ending unquoted text at the tick is what keeps a stray one a parse error
+instead of a silently different query.)
 
 The search stage reads exactly three words before anything else —
 `last=`, `earliest=`, `latest=`. Backticks are how you reach fields with
@@ -341,16 +389,10 @@ tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`,
 fields — ``| where `true` == 1`` filters on the column named `true`,
 while `| where true == 1` compares the boolean.
 
-A `#` or `//` inside backticks is part of the name, not a comment, so
-`` | sort -`a#b` `` sorts on the field `a#b`. The comment stripper opens a
-name only where one could start — the beginning of the line, after
-whitespace, or after `(`, `,`, `|`, a comparison operator or an arithmetic
-one — and only when the region would really lex as a name, so a backtick
-inside a regex literal hides nothing. Where the stripper does guess wrong
-(an operator inside a *value* looks exactly like arithmetic from outside)
-the grammar catches it: no unquoted position absorbs a tick, so
-`` host=a+`b#c` # outside `` is a parse error rather than a comment
-quietly folded into the value.
+A `#` inside backticks is part of the name, not a comment, so
+`` | sort -`a#b` `` sorts on the field `a#b`. Nothing decides that outside
+the grammar: a comment opens only where the grammar skips whitespace, and
+a quoted name has no such place inside it. See [Comments](#comments).
 
 ### Severity: `_severity`
 

@@ -59,8 +59,14 @@ point into the real input, so the invariant stops needing to exist.
 ### 2. Inside an unquoted token, a comment opener is an error — never data, never a comment
 
 A comment opens only where the grammar sits between tokens: start of input,
-after whitespace, after a delimiter. A `#` **inside** an unquoted token is a
-parse error carrying the byte position and a hint to quote:
+or after whitespace. ("After a delimiter" was in the original wording and
+is dropped: the delimiter set is unenumerable — `=` cannot qualify, or
+`color=#ff0000` stops erroring — so the rule is encoded structurally
+instead, as `layout = (whitespace+ comment?)*` plus one leading-comment
+site at the start of the input. The consequence is strictly the loud
+direction: `count(),# x` and `(#x` are parse errors rather than
+comments.) A `#` **inside** an unquoted token is a parse error carrying
+the byte position and a hint to quote:
 
 ```
 foo#bar        → error: '#' inside a search term — quote it ("foo#bar") to
