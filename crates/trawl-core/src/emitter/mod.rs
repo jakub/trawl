@@ -1165,6 +1165,42 @@ mod tests {
         );
     }
 
+    /// A multiline filter remains a bound value through ordinary CTE
+    /// finalization. This pins the parameter bytes before the PIVOT lane has
+    /// to inline the same value.
+    #[test]
+    fn cte_finalization_preserves_a_multiline_parameter() {
+        let query = parser::parse("message=\"a\nb\" | stats count()")
+            .expect("multiline string should parse");
+        let emitted = emit(&query, SRC).expect("emit should succeed");
+        assert_eq!(emitted.params, [SqlValue::String("a\nb".to_owned())]);
+        assert!(
+            emitted.sql.contains(r#""message" = ?"#),
+            "filter placeholder missing: {}",
+            emitted.sql
+        );
+    }
+
+    /// Once a stage follows PIVOT, the inlined PIVOT is finalized as a CTE.
+    /// Indentation belongs to SQL lines, never to bytes inside the literal.
+    #[test]
+    fn pivot_cte_finalization_preserves_a_multiline_literal() {
+        let query = parser::parse("message=\"a\nb\" | pivot count() on status | sort `200`")
+            .expect("multiline string should parse");
+        let emitted = emit(&query, SRC).expect("emit should succeed");
+        assert!(emitted.params.is_empty(), "PIVOT inlines every parameter");
+        assert!(
+            emitted.sql.contains("\"message\" = 'a\nb'"),
+            "literal bytes changed during finalization: {}",
+            emitted.sql
+        );
+        assert!(
+            !emitted.sql.contains("\"message\" = 'a\n  b'"),
+            "CTE indentation leaked into the literal: {}",
+            emitted.sql
+        );
+    }
+
     #[test]
     fn pipe_timechart_by_then_where() {
         assert_snapshot!(emit_dsl(

@@ -3673,6 +3673,38 @@ fn backticked_names_describe_as_the_names_the_dsl_spells() {
     }
 }
 
+/// A stage after PIVOT forces the inlined PIVOT through CTE finalization.
+/// Execute the historical multiline value end to end: reindentation used to
+/// insert two spaces after the embedded newline and silently filter this row.
+#[test]
+fn pivot_cte_finalization_preserves_multiline_literal_matching() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.parquet");
+    let conn = conn();
+    conn.execute_batch("CREATE TABLE logs(message VARCHAR, status BIGINT)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO logs VALUES (?, ?)",
+        duckdb::params!["a\nb", 200_i64],
+    )
+    .unwrap();
+    conn.execute_batch(&format!(
+        "COPY logs TO '{}' (FORMAT PARQUET)",
+        file.display()
+    ))
+    .unwrap();
+
+    let dsl = "message=\"a\nb\" | pivot count() on status | sort `200`";
+    let query = trawl_core::parser::parse(dsl).unwrap();
+    let emitted = trawl_core::emitter::emit(&query, &file.display().to_string()).unwrap();
+    assert!(emitted.params.is_empty(), "PIVOT inlines every parameter");
+
+    let matched: i64 = conn
+        .query_row(&emitted.sql, [], |row| row.get("200"))
+        .unwrap();
+    assert_eq!(matched, 1, "the historical multiline value must match");
+}
+
 /// An `eventstats` alias naming an incoming column OVERWRITES it, the
 /// way `let` does (ADR-0013 ruling 8 documents exactly that, which is
 /// why the collision check admits the shape). Executed, because the
