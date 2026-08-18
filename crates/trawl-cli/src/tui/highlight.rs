@@ -122,6 +122,15 @@ impl<'a> Highlighter<'a> {
     }
 
     /// Tokenize a line into (`TokenType`, text) pairs.
+    ///
+    /// **Display only, never correctness.** This is a colouring walk over
+    /// text the user is still typing, not a reading of the query: it has
+    /// no backtick awareness and no comment case, and it must never be
+    /// consulted for what a query MEANS. `trawl_core::parser` is the
+    /// authority on that, and `trawl_core::parser::scan` is the one
+    /// text-level walk allowed to change an answer (ADR-0014 ruling 5).
+    /// Unifying this walk with either needs a partial-input policy for an
+    /// unterminated token at the cursor, which is its own design problem.
     #[allow(clippy::too_many_lines)]
     fn tokenize(text: &str) -> Vec<(TokenType, std::string::String)> {
         let mut tokens = Vec::new();
@@ -129,20 +138,19 @@ impl<'a> Highlighter<'a> {
         let mut current = std::string::String::new();
 
         while let Some(ch) = chars.next() {
-            // Comment: // to end of line
-            if ch == '/' && chars.peek() == Some(&'/') {
-                if !current.is_empty() {
-                    tokens.push((Self::classify_word(&current), current.clone()));
-                    current.clear();
-                }
-                // Consume rest of line as comment
-                let mut comment = std::string::String::from("//");
-                chars.next(); // consume second /
+            // Comment: `#` to end of line (ADR-0014 — `//` is not an
+            // opener any more, and colouring it as one falsely dimmed
+            // every URL in a query).
+            if ch == '#' && current.is_empty() {
+                let mut comment = std::string::String::from('#');
                 for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
                     comment.push(c);
                 }
                 tokens.push((TokenType::Comment, comment));
-                break;
+                continue;
             }
 
             // Regex literal: /pattern/

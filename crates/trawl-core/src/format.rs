@@ -122,8 +122,10 @@ fn format_search_token(token: &SearchToken, out: &mut String) {
             if ts.negated {
                 out.push('-');
             }
-            // Bare words with special chars need quoting — but the parser only
-            // produces TextSearch for simple bare words, so no quoting needed.
+            // A parser-produced term is already a bare word the grammar
+            // accepts: it carries no whitespace, `|`, backtick or `#`,
+            // and does not open with `//` (ADR-0014), so it re-lexes as
+            // itself.
             out.push_str(&ts.term);
         }
         SearchToken::TimeFilter(tf) => {
@@ -191,9 +193,12 @@ fn escape_quoted(text: &str) -> String {
 /// production, three shapes whose BARE rendering would parse back as
 /// something else:
 ///
-/// - a `#` or a `//`, which `strip_comments` blanks before the grammar
-///   runs at all, so half the predicate disappears (`host="a#b"` rendered
-///   bare comes back as a filter for `a`);
+/// - a `#`, which the grammar refuses INSIDE an unquoted token
+///   (ADR-0014 ruling 2), so `host="a#b"` rendered bare would come back a
+///   parse error rather than the same AST. `//` is deliberately NOT in
+///   this set any more: with the second opener dropped (ruling 3) a value
+///   carries it freely, and quoting it would be a stale mirror of a
+///   deleted rule — the drift ADR-0014 exists to retire;
 /// - the regex shape `/…/`, which `search::filter_value` tries FIRST, so
 ///   an exact match would come back a pattern (`host="/foo/"`);
 /// - a glob character, which the same production auto-detects and which
@@ -208,7 +213,6 @@ fn needs_quoting(s: &str, op: FilterOp) -> bool {
     s.is_empty()
         || s.contains('"')
         || s.contains('#')
-        || s.contains("//")
         || is_regex_shaped(s)
         || (op != FilterOp::Glob && (s.contains('*') || s.contains('?')))
         || s.chars()
@@ -243,11 +247,18 @@ fn format_filter_value(value: &FilterValue, op: FilterOp, out: &mut String) {
             }
         }
         FilterValue::List(items) => {
+            // Each element re-lexes on its own, so each is quoted on its
+            // own: a `#` or a comma inside one would otherwise come back
+            // as a parse error or as two elements.
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
-                out.push_str(item);
+                if needs_quoting(item, FilterOp::Eq) {
+                    let _ = write!(out, "\"{}\"", escape_quoted(item));
+                } else {
+                    out.push_str(item);
+                }
             }
         }
     }
@@ -628,13 +639,23 @@ mod tests {
         }
 
         for dsl in [
-            // the comment openers: `strip_comments` runs BEFORE the
-            // grammar, so a bare rendering loses everything after them
+            // the comment opener: a `#` inside an unquoted token is a
+            // parse error (ADR-0014 ruling 2), so a bare rendering does
+            // not come back at all
             r#"host="a#b""#,
-            r#"host="a//b""#,
             r##"host="#lead""##,
             r#"host="trail#""#,
             r#"* | where message == "a#b""#,
+            // …while `//` is ordinary data now (ruling 3) and must NOT
+            // pick up stale quoting
+            "host=a//b",
+            "url=https://example.com/x",
+            "path=/api//v1",
+            "url=//cdn.example.com/x",
+            // LIST elements re-lex one at a time, so each carries its own
+            // quoting decision
+            r#"status=200,"a#b",301"#,
+            r#"host="a#b","c d""#,
             // the shapes a value position re-lexes into another operator
             r#"host="/foo/""#,
             r#"host="a*b""#,
@@ -685,6 +706,12 @@ mod tests {
             ("path=/api/*", "path=/api/*"),
             ("host=a-b.c", "host=a-b.c"),
             ("host=200", "host=200"),
+            // `//` is data: quoting it would be a stale mirror of a
+            // deleted rule (ADR-0014 ruling 3)
+            ("host=a//b", "host=a//b"),
+            ("url=https://example.com/x", "url=https://example.com/x"),
+            ("path=/api//v1", "path=/api//v1"),
+            ("url=//cdn.example.com/x", "url=//cdn.example.com/x"),
         ] {
             assert_eq!(fmt(dsl), want);
         }

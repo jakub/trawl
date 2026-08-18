@@ -61,32 +61,45 @@ fn filter_value<'src>()
         )
         .map(|pat| (FilterOp::Regex, FilterValue::Literal(pat)));
 
-    // quoted value: service="Activity Monitor" → strips quotes
-    let quoted_val = quoted_string().map(|s| (FilterOp::Eq, FilterValue::Literal(s)));
+    // One element: a quoted value (`service="Activity Monitor"` — quotes
+    // stripped) or a bare one. Quoted-ness rides along because it decides
+    // GLOB auto-detection: the wildcards in `host="a*b"` are data, while
+    // the ones in `host=a*b` are the pattern.
+    //
+    // Both spellings are admitted in EVERY position of a comma list, not
+    // just alone, so `format` can quote a list element that would
+    // otherwise re-lex as something else — a `#` in one is a parse error
+    // bare (ADR-0014 ruling 2), and the round trip has to survive it.
+    let element = choice((
+        quoted_string().map(|s| (true, s)),
+        bare_value().map(|s| (false, s)),
+    ));
 
-    // bare value(s), possibly comma-separated
-    let bare_vals = bare_value()
+    let values = element
         .separated_by(just(','))
         .at_least(1)
         .collect::<Vec<_>>()
         .map(|vals| {
             if vals.len() == 1 {
-                let val = vals
+                let (quoted, val) = vals
                     .into_iter()
                     .next()
                     .expect("at_least(1) guarantees a value");
-                let op = if has_glob_chars(&val) {
+                let op = if !quoted && has_glob_chars(&val) {
                     FilterOp::Glob
                 } else {
                     FilterOp::Eq
                 };
                 (op, FilterValue::Literal(val))
             } else {
-                (FilterOp::Eq, FilterValue::List(vals))
+                (
+                    FilterOp::Eq,
+                    FilterValue::List(vals.into_iter().map(|(_, v)| v).collect()),
+                )
             }
         });
 
-    choice((regex_val, quoted_val, bare_vals)).labelled("filter value")
+    choice((regex_val, values)).labelled("filter value")
 }
 
 /// Parse a `field=value` filter, including `field>=100`, `field!=200`,

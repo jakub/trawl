@@ -368,9 +368,15 @@ fn is_zero_arg_function(name: &str) -> bool {
 }
 
 /// Return the open quoted-name region ending at the cursor, opening tick
-/// included. This is editor state, not the comment pre-scanner: incomplete
-/// names are expected here. String/regex regions are skipped so a data
-/// backtick cannot disable completion for the rest of the line.
+/// included. String/regex regions are skipped so a data backtick cannot
+/// disable completion for the rest of the line.
+///
+/// **Completion only, never correctness.** This is editor state over
+/// half-typed text — an unterminated name at the cursor is the normal
+/// case, not an error — so it is a deliberate approximation and must
+/// never be consulted for what a query MEANS. `trawl_core::parser` is the
+/// authority on that, and `trawl_core::parser::scan` is the one
+/// text-level walk allowed to change an answer (ADR-0014 ruling 5).
 fn open_backtick_prefix(before: &str) -> Option<&str> {
     let bytes = before.as_bytes();
     let mut open = None;
@@ -429,6 +435,13 @@ fn extract_prefix(before_cursor: &str) -> &str {
 ///
 /// Counts unescaped `"` and `/` delimiters before the cursor. An odd
 /// count means we're inside one.
+///
+/// **Completion only, never correctness.** It has no backtick awareness
+/// and no comment case, and a `/` in a URL counts as a delimiter here. It
+/// decides whether to offer ghost text and nothing else; the grammar
+/// (`trawl_core::parser`) decides what the query means, and
+/// `trawl_core::parser::scan` is the one text-level walk allowed to
+/// change an answer (ADR-0014 ruling 5).
 fn inside_string_or_regex(before: &str) -> bool {
     let mut in_double_quote = false;
     let mut in_regex = false;
