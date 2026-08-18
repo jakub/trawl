@@ -7,7 +7,7 @@
 //! the fleet component.
 //!
 //! The `Atmosphere` mesh-gradient backdrop (ADR-0012) mounts as a
-//! sibling above `<Login/>`, the `shell_demo.rs` / coastwatch#311
+//! sibling above `<Login/>`, matching the fleet-ui workbench
 //! arrangement: the backdrop layer is fixed, full-viewport,
 //! `z-index: -1`, so the login card composes above it with no stacking
 //! work here. That only paints because fleet-ui's `.login-shell`

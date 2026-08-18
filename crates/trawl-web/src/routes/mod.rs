@@ -44,8 +44,8 @@ pub fn build(state: AppState) -> Router {
         // Block /ingest before it can match the generic forwarder.
         .route("/api/v1/ingest", any(proxy::block_ingest))
         .route("/api/v1/{*path}", any(proxy::forward))
-        // Coastwatch intel proxy — strips /api/intel prefix before forwarding.
-        .route("/api/intel/v1/{*path}", any(proxy::forward_intel));
+        // Keep unknown API namespaces out of the SPA fallback.
+        .route("/api/{*path}", any(proxy::not_found));
 
     // Attach the SPA fallback. `TRAWL_WEB_SPA_DIR` wins when set
     // (hot-iterate flow); otherwise the embedded bundle takes over.

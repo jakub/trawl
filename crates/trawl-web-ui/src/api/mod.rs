@@ -628,5 +628,3 @@ fn parse_content_disposition(header: Option<&str>, format: &ExportFormat) -> Str
     }
     .to_string()
 }
-
-pub mod intel;

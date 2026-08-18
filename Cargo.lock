@@ -940,14 +940,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
-name = "coastwatch-api-types"
-version = "0.4.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "codee"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6477,7 +6469,6 @@ version = "0.4.0"
 dependencies = [
  "base64ct",
  "chrono",
- "coastwatch-api-types",
  "console_error_panic_hook",
  "fleet-ui",
  "gloo-net 0.7.0",

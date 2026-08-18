@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Application mode (top-bar tabs): Search / Intel / Jobs / Settings.
+//! Application mode (top-bar tabs): Search / Jobs / Settings.
 //!
 //! Distinct from the search-page `Mode` (Snapshot/Live) — that one
 //! lives under `state::query` and only governs the search workspace's
@@ -24,19 +24,17 @@ use leptos_router::hooks::use_location;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
     Search,
-    Intel,
     Jobs,
     Settings,
 }
 
 impl AppMode {
-    pub const ALL: [Self; 4] = [Self::Search, Self::Intel, Self::Jobs, Self::Settings];
+    pub const ALL: [Self; 3] = [Self::Search, Self::Jobs, Self::Settings];
 
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Search => "Search",
-            Self::Intel => "Intel",
             Self::Jobs => "Jobs",
             Self::Settings => "Settings",
         }
@@ -46,7 +44,6 @@ impl AppMode {
     pub fn default_path(self) -> &'static str {
         match self {
             Self::Search => "/search",
-            Self::Intel => "/intel/stories",
             Self::Jobs => "/jobs/nets",
             Self::Settings => "/settings",
         }
@@ -54,9 +51,7 @@ impl AppMode {
 }
 
 fn mode_from_path(path: &str) -> AppMode {
-    if path.starts_with("/intel") {
-        AppMode::Intel
-    } else if path.starts_with("/jobs") {
+    if path.starts_with("/jobs") {
         AppMode::Jobs
     } else if path.starts_with("/settings") {
         AppMode::Settings

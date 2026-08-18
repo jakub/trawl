@@ -24,7 +24,6 @@ trawl-dashboard = { path = "crates/trawl-dashboard" }
 trawl-web = { path = "crates/trawl-web" }
 trawl-crashdump = { path = "crates/trawl-crashdump" }
 fleet-dev = { path = "crates/fleet-dev" }
-coastwatch-api-types = { path = "crates/coastwatch-api-types" }
 fleet-auth = { path = "crates/fleet-auth", default-features = false }
 fleet-ui = { path = "crates/fleet-ui" }
 

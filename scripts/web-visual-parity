@@ -87,8 +87,6 @@ MANIFEST=(
   "nets-confirm-modal|/jobs/nets|trigger a destructive action so the ConfirmModal opens"
   "schema|/search/schema|the schema page at rest"
   "schema-service-drawer|/search/schema|open a service drawer (fleet Drawer) — capture each tab"
-  "derivations|/intel/derivations|the derivations list at rest"
-  "derivations-reason-modal|/intel/derivations|open the reason modal (promoted ConfirmWithReasonModal)"
 )
 THEMES=(light dark)
 

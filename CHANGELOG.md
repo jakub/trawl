@@ -351,6 +351,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   in flight. This retires the documented stop-trawld-and-do-surgery
   escape hatch.
 
+### Removed
+- **Orphaned cross-app surface retired (ADR-0020, #112).** Removed the SPA
+  pages and navigation, browser API client, proxy relay and its optional
+  upstream config, plus the hand-vendored wire-types crate. The upstream API
+  never existed, and git history remains the archive until the producer owns
+  a real contract and authorization boundary.
+
 ### Changed
 - **BREAKING — comments are a grammar production, and `//` is no longer a
   comment (ADR-0014, #83).** The pre-parse comment scanner is deleted.
