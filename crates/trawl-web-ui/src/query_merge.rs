@@ -17,7 +17,7 @@
 
 use std::fmt::Write;
 
-use trawl_core::parser::scan::scan_outside_quotes;
+use trawl_core::parser::scan::{ends_inside_comment, scan_outside_quotes};
 use trawl_core::parser::suggest::quote_dsl_field;
 
 /// Include/exclude operator for a facet-driven filter.
@@ -139,6 +139,13 @@ pub fn effective_query(base_q: &str, filters: &[Filter], range: &RangeSpec) -> S
     };
 
     match tail {
+        // A search half that ENDS inside an open comment cannot be joined
+        // on one line: the `|` and everything after it would be comment
+        // text, and the result still PARSES — as a query with no
+        // pipeline. A newline closes the comment and nothing else moves.
+        Some(t) if ends_inside_comment(&new_search) => {
+            format!("{new_search}\n| {}", t.trim_start_matches('|').trim())
+        }
         Some(t) => format!("{new_search} | {}", t.trim_start_matches('|').trim()),
         None => new_search,
     }
@@ -418,6 +425,58 @@ mod tests {
         assert_eq!(
             effective_query("service=x # last=1h", &[], &quick("15m")),
             "last=15m service=x # last=1h"
+        );
+    }
+
+    /// A search half that ends inside an open comment gets its pipeline
+    /// back on a NEW LINE. Joined on one line the `|` and every stage
+    /// after it would be comment text — and the result would still parse,
+    /// as a query with no pipeline at all.
+    #[test]
+    fn a_pipeline_is_not_swallowed_by_an_open_comment() {
+        // the split trims the newline that used to close the comment, so
+        // the rejoin has to put one back
+        assert_eq!(
+            effective_query("service=x # note\n| stats count()", &[], &quick("15m")),
+            "last=15m service=x # note\n| stats count()"
+        );
+        // the newline is spent only where it is needed
+        assert_eq!(
+            effective_query("service=x | stats count()", &[], &quick("15m")),
+            "last=15m service=x | stats count()"
+        );
+        // …and a comment CLOSED by its own newline needs none either
+        assert_eq!(
+            effective_query(
+                "service=x # note\nhost=y | stats count()",
+                &[],
+                &quick("15m")
+            ),
+            "last=15m service=x # note\nhost=y | stats count()"
+        );
+    }
+
+    /// The scan and the grammar answer the same question: a `\` outside a
+    /// quoted span does not escape, and Unicode whitespace opens a
+    /// comment. Both shapes used to hide the base query's own `last=`,
+    /// which injected a SECOND time bound.
+    #[test]
+    fn the_scan_agrees_with_the_grammar_on_escapes_and_whitespace() {
+        // `last=1h` lives inside the quoted phrase — not a time clause,
+        // so the popover's own `last=15m` is injected
+        assert_eq!(
+            effective_query(r#"foo\" last=1h""#, &[], &quick("15m")),
+            r#"last=15m foo\" last=1h""#
+        );
+        // `last=1h` lives inside a comment opened after a no-break space
+        assert_eq!(
+            effective_query("message=\"x\"\u{a0}# last=1h", &[], &quick("15m")),
+            "last=15m message=\"x\"\u{a0}# last=1h"
+        );
+        // …while a real one still suppresses the injection
+        assert_eq!(
+            effective_query("message=\"x\" last=1h", &[], &quick("15m")),
+            "message=\"x\" last=1h"
         );
     }
 

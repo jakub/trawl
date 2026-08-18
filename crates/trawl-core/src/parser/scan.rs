@@ -17,6 +17,8 @@
 //! the authority on what a query MEANS; this only decides where to splice
 //! text.
 
+use crate::parser::comment::is_layout;
+
 /// Walk `input`'s bytes, calling `hit` only for bytes that sit OUTSIDE a
 /// delimited span — a double-quoted string, a `/`-delimited regex
 /// literal, a backtick-quoted field name (ADR-0013 ruling 7), or a
@@ -25,13 +27,18 @@
 ///
 /// Backticks matter as much as quotes: a backticked name can spell any
 /// character, so it can carry a `|` or the text `last=` these walks would
-/// otherwise read as grammar. Backslash escapes are honoured everywhere
-/// except inside backticks, whose only escape is a doubled backtick
-/// (which this walk sees as a close immediately followed by a re-open, so
-/// no inner byte leaks out as bare).
+/// otherwise read as grammar.
 ///
-/// Three rules are worth stating outright:
+/// Four rules are worth stating outright:
 ///
+/// * **A backslash escapes only INSIDE a quoted string or a regex body.**
+///   The grammar has no escape in an unquoted position — a bare `\` is
+///   ordinary text — so honouring one outside a delimited span made
+///   `foo\" last=1h"` read the `last=` as grammar while the parser reads
+///   it as the contents of a quoted phrase. Backticks have no backslash
+///   escape either: their only escape is a doubled backtick, which this
+///   walk sees as a close immediately followed by a re-open, so no inner
+///   byte leaks out as bare.
 /// * **`'` is not a delimiter.** The DSL has no single-quoted string, so
 ///   treating one as an opener made an apostrophe (`message=it's`)
 ///   swallow the rest of the query.
@@ -44,9 +51,13 @@
 ///   as a regex open. That is confined to the pipeline tail, which
 ///   neither consumer scans.
 /// * **A `#` opens a comment only after whitespace or at the start of
-///   input** — the same structural boundary the grammar uses
-///   (`parser::comment`). A comment runs to `\n`, and nothing inside it
-///   is offered to `hit`, so a `|` or `last=` written in one is prose.
+///   input** — the same structural boundary the grammar uses, tested
+///   with the grammar's OWN whitespace predicate
+///   (`parser::comment::is_layout`, Unicode and all), because an
+///   ASCII-only copy read `message="x"\u{a0}# last=1h` as grammar the
+///   parser reads as a comment. A comment runs to `\n`, and nothing
+///   inside it is offered to `hit`, so a `|` or `last=` written in one is
+///   prose.
 ///
 /// On unterminated input — a quote or regex the user has not closed yet —
 /// the open span runs to end of input and nothing after it is offered.
@@ -57,69 +68,100 @@ pub fn scan_outside_quotes<F>(input: &str, mut hit: F) -> Option<usize>
 where
     F: FnMut(usize, u8) -> bool,
 {
+    walk(input, &mut hit).0
+}
+
+/// Whether `input` ENDS inside an open comment — the walk's terminal
+/// state, which decides whether text appended to it would land in prose.
+///
+/// The web UI's date-range merge asks this before it joins a rewritten
+/// search stage back to its pipeline: `service=x # note` ends inside a
+/// comment, so a ` | stats …` tail spliced on the same line would be
+/// swallowed whole and the query would parse as something else entirely.
+#[must_use]
+pub fn ends_inside_comment(input: &str) -> bool {
+    matches!(walk(input, &mut |_, _| false).1, Span::Comment)
+}
+
+/// The state the walk can be in when it reaches the end of the input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Span {
+    /// Between tokens — bytes here are offered to `hit`.
+    Bare,
+    /// Inside a `"` string, a `/` regex body or a `` ` `` name.
+    Delim(u8),
+    /// Inside a comment, which ends at the next `\n`.
+    Comment,
+}
+
+fn walk<F>(input: &str, hit: &mut F) -> (Option<usize>, Span)
+where
+    F: FnMut(usize, u8) -> bool,
+{
     let bytes = input.as_bytes();
     let mut i = 0;
-    let mut delim: Option<u8> = None;
+    let mut span = Span::Bare;
     while i < bytes.len() {
         let b = bytes[i];
-        match delim {
-            None => match b {
-                b'\\' if i + 1 < bytes.len() => i += 2,
-                b'#' if at_layout_boundary(bytes, i) => {
-                    while i < bytes.len() && bytes[i] != b'\n' {
-                        i += 1;
-                    }
+        match span {
+            Span::Bare => match b {
+                b'#' if at_layout_boundary(input, i) => {
+                    span = Span::Comment;
+                    i += 1;
                 }
-                b'/' if at_boundary(bytes, i) => {
-                    delim = Some(b);
+                b'/' if at_boundary(input, i) => {
+                    span = Span::Delim(b);
                     i += 1;
                 }
                 b'"' | b'`' => {
-                    delim = Some(b);
+                    span = Span::Delim(b);
                     i += 1;
                 }
                 _ => {
                     if hit(i, b) {
-                        return Some(i);
+                        return (Some(i), span);
                     }
                     i += 1;
                 }
             },
-            Some(d) => {
+            Span::Comment => {
+                if b == b'\n' {
+                    span = Span::Bare;
+                }
+                i += 1;
+            }
+            Span::Delim(d) => {
                 if d != b'`' && b == b'\\' && i + 1 < bytes.len() {
                     i += 2;
                 } else {
                     if b == d {
-                        delim = None;
+                        span = Span::Bare;
                     }
                     i += 1;
                 }
             }
         }
     }
-    None
+    (None, span)
 }
 
 /// Whether the byte at `i` sits where the GRAMMAR admits a comment: the
-/// beginning of the input, or directly after whitespace
-/// (`parser::comment::ws` / `leading_ws`). Deliberately narrower than
-/// [`at_boundary`] — admitting `=` would read `color=#ff0000` as a
-/// comment, which is exactly the shape the grammar refuses.
-fn at_layout_boundary(bytes: &[u8], i: usize) -> bool {
-    i.checked_sub(1)
-        .map(|p| bytes[p])
-        .is_none_or(|p| p.is_ascii_whitespace())
+/// beginning of the input, or directly after a whitespace CHARACTER
+/// (`parser::comment::ws` / `leading_ws`, via the one shared predicate).
+/// Deliberately narrower than [`at_boundary`] — admitting `=` would read
+/// `color=#ff0000` as a comment, which is exactly the shape the grammar
+/// refuses.
+fn at_layout_boundary(input: &str, i: usize) -> bool {
+    input[..i].chars().next_back().is_none_or(is_layout)
 }
 
 /// Whether the byte at `i` sits where a new VALUE could START: the
 /// beginning of the input, after whitespace, or after one of the bytes a
 /// value or a regex may directly follow.
-fn at_boundary(bytes: &[u8], i: usize) -> bool {
-    match i.checked_sub(1).map(|p| bytes[p]) {
+fn at_boundary(input: &str, i: usize) -> bool {
+    match input[..i].chars().next_back() {
         None => true,
-        Some(p) => {
-            p.is_ascii_whitespace() || matches!(p, b'=' | b'<' | b'>' | b'!' | b',' | b'(' | b'|')
-        }
+        Some(p) => is_layout(p) || matches!(p, '=' | '<' | '>' | '!' | ',' | '(' | '|'),
     }
 }
 
@@ -175,6 +217,41 @@ mod tests {
         assert_eq!(first_pipe("service=x # | stats count()"), None);
         // …and a `#` INSIDE a token is not a comment (ADR-0014 ruling 2).
         assert!(has_last("color=#ff0000 last=1h"));
+    }
+
+    /// The grammar has no escape outside a delimited span, so a bare
+    /// backslash must not hide the quote that follows it — the walk read
+    /// `foo\"` as an escaped quote and offered the `last=` inside the
+    /// PHRASE the parser sees.
+    #[test]
+    fn a_backslash_escapes_only_inside_a_delimited_span() {
+        assert!(!has_last(r#"foo\" last=1h""#));
+        assert_eq!(first_pipe(r#"foo\" | stats"#), None);
+        // …while inside one it still does
+        assert!(has_last(r#"message="a\"b" last=1h"#));
+        assert_eq!(first_pipe(r#"message="a\"|b" | stats"#), Some(16));
+    }
+
+    /// The comment boundary is the GRAMMAR's whitespace, which is
+    /// Unicode's. An ASCII-only test read the `#` after a no-break space
+    /// as data and offered the `last=` the parser has in a comment.
+    #[test]
+    fn unicode_whitespace_opens_a_comment_as_the_grammar_does() {
+        assert!(!has_last("message=\"x\"\u{a0}# last=1h"));
+        assert!(!has_last("a=1\u{2003}# last=1h"));
+        assert_eq!(first_pipe("a=1\u{a0}# | stats count()"), None);
+    }
+
+    /// The walk's terminal state, which the date-range merge asks before
+    /// it splices a pipeline back on.
+    #[test]
+    fn ends_inside_comment_reports_the_open_comment() {
+        assert!(ends_inside_comment("service=x # note"));
+        assert!(ends_inside_comment("# note"));
+        assert!(!ends_inside_comment("service=x # note\n"));
+        assert!(!ends_inside_comment("service=x"));
+        assert!(!ends_inside_comment("service=\"# not a comment\""));
+        assert!(!ends_inside_comment("color=#ff0000"));
     }
 
     /// Quoted spans keep their contents out of the walk.
