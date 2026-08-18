@@ -4,4 +4,4 @@ expression: "emit_dsl_with_pins(\"_severity!=info\", &SEVERITY_PIN)"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE ("_severity" NOT BETWEEN 9 AND 12 OR "_severity" IS NULL)
+WHERE (NOT ("_severity" BETWEEN 9 AND 12) OR "_severity" IS NULL)

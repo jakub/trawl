@@ -352,6 +352,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   escape hatch.
 
 ### Changed
+- **A severity list writes its subject once per contiguous range (#82).**
+  Every `SEVERITY`-pinned equality, `!=` and IN now expands to the ladder
+  points it accepts and emits the **minimal contiguous ranges** covering
+  them, instead of one `BETWEEN` per named band. `_severity=error` is
+  unchanged (`BETWEEN 17 AND 20`), but `_severity=warn,error` collapses
+  from two OR'd ranges to a single `BETWEEN 13 AND 20`, and all six base
+  bands collapse to one `BETWEEN 1 AND 24`. Matching is unchanged in every
+  lane — the expansion is exactly each band's own `lo..=hi`, and the
+  points/ranges/live-membership agreement is drift-guarded exhaustively.
+  What changes is cost: the subject of a `sev(field)` comparison is over a
+  kilobyte of SQL, and a six-band query used to repeat it six times. Probed
+  over 1M rows, the six-band case goes from ~29.5 ms to ~5.0 ms (5.9x).
+  Range bounds are inlined `i64` from the closed ladder table, so a
+  band-or-list severity filter binds no parameters at all. A scalar exact
+  comparison (`_severity=17`) is unchanged and still binds its one value
+  as `= ?`.
+
+  Recorded because the first attempt shipped the wrong shape: collapsing
+  the bands into `IN (17, 18, 19, 20)` makes the SQL 5.7x smaller and the
+  query **3.7x to 66x slower** — `DuckDB` takes an `IN` list over a
+  computed left-hand side off its fast path. SQL text size was never the
+  cost. The probe that establishes this is committed and `#[ignore]`d at
+  `crates/trawl-engine/tests/severity_set_bench.rs`.
 - **Severity presentation metadata is computed inside the query permit
   (#79).** `severity_columns` on `/api/v1/query` is now decided by the
   executing task, under the catalog snapshot the rows were produced with,

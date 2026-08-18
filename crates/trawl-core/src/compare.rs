@@ -161,8 +161,8 @@ pub enum CompareForm {
     /// invert into a match.
     NumericOnText(String),
     /// The SEVERITY pin's equality-class form for a BAND token
-    /// (ADR-0013): `_severity=error` is the whole ERROR band, `BETWEEN 17
-    /// AND 20`, and `!=` its complement — the semantics the deleted
+    /// (ADR-0013): `_severity=error` is the whole ERROR band, 17-20, and
+    /// `!=` its complement — the semantics the deleted
     /// `level=` alias carried, now riding an unforgeable name through the
     /// pin rule table instead of a name special case.
     SeverityBand { lo: u8, hi: u8 },
@@ -864,7 +864,7 @@ fn form_over(
 /// 2. a BAND token ([`crate::severity::number_for_token`], the ADR-0009
 ///    table with its aliases) is the band under `=`/`!=`/IN and the
 ///    token's own number under an ordered operator — `_severity=error`
-///    is `BETWEEN 17 AND 20`, `_severity>=warn` is `>= 13`;
+///    is the band 17-20, `_severity>=warn` is `>= 13`;
 /// 3. an `OTel` EXACT short name ([`crate::severity::number_for_exact`])
 ///    is that exact number, whatever the operator — `error2` is 18. The
 ///    band table is consulted first, so the bare base names (`error`,
@@ -918,6 +918,134 @@ pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
         Some(CanonicalType::Boolean) => PatternForm::BooleanText,
         Some(CanonicalType::Severity) => PatternForm::SeverityText,
     }
+}
+
+/// THE band→points expansion (issue #82): the ladder points a set of
+/// `SEVERITY`-pinned equality forms accepts, as one sorted, deduplicated
+/// list.
+///
+/// `Some(points)` exactly when the slice is non-empty and EVERY form is a
+/// severity equality form — a [`CompareForm::SeverityBand`] contributing
+/// its inclusive `lo..=hi`, or a [`CompareForm::SeverityExact`]
+/// contributing its number UNCLAMPED. Anything else (a mixed list, an
+/// empty one) is `None` and the caller keeps its per-element shape.
+///
+/// Unclamped is the point: `_severity=99` stays an honest matches-nothing
+/// and a negative literal stays negative, because the exact rung binds
+/// integers without consulting the ladder ([`compare_form`]'s rung 1).
+/// The set is what lets a whole severity list render its subject ONCE, as
+/// `subject IN (…)`, instead of once per band — a `sev()` subject is over
+/// a kilobyte of SQL, so the repetition was 4-6x on natural queries.
+///
+/// The points are `i64` because the exact rung is: `u8` would have to
+/// clamp, and clamping is exactly the silent meaning change this must not
+/// make.
+#[must_use]
+pub fn severity_points(forms: &[CompareForm]) -> Option<Vec<i64>> {
+    if forms.is_empty() {
+        return None;
+    }
+    let mut points = std::collections::BTreeSet::new();
+    for form in forms {
+        match form {
+            CompareForm::SeverityBand { lo, hi } => {
+                points.extend(i64::from(*lo)..=i64::from(*hi));
+            }
+            CompareForm::SeverityExact(n) => {
+                points.insert(*n);
+            }
+            _ => return None,
+        }
+    }
+    Some(points.into_iter().collect())
+}
+
+/// Collapse sorted, deduplicated ladder points into MINIMAL CONTIGUOUS
+/// RANGES — the shape a severity predicate actually renders (issue #82).
+///
+/// Points in, inclusive `(lo, hi)` runs out, in ascending order: a run of
+/// one point is `(p, p)`, and two points are one run exactly when they are
+/// adjacent integers. The whole ERROR band is therefore ONE run, the six
+/// base bands together are ONE run (1-24), and a genuinely disjoint
+/// selection like `warn,fatal` is two.
+///
+/// Ranges rather than the point set itself, because the SET is what the
+/// comparison MEANS while the RANGE is what `DuckDB` executes cheaply: a
+/// probe over 1M rows (`trawl-engine/tests/severity_set_bench.rs`) puts a
+/// repeated-subject `BETWEEN` at ~6 ms against ~392 ms for the equivalent
+/// `IN` over the same points — the engine takes an `IN` list over a
+/// COMPUTED left-hand side off its fast path, and a `sev()` subject is
+/// exactly that. Merging is what makes the two goals one: the natural
+/// queries (a band, a contiguous run of bands) collapse to a SINGLE range,
+/// so the expensive subject is written once AND the predicate stays on the
+/// shape the engine likes.
+///
+/// # Out-of-ladder points collapse to ONE representative
+///
+/// Every non-adjacent point is its own run, and every run repeats the
+/// subject — so an unbounded run count is an unbounded SQL amplifier. A
+/// query is capped at 64 KB of TEXT, but `sev(level) in (1, 3, 5, …)`
+/// turns each cheap literal into a fresh ~1.2 KB copy of the subject, so
+/// the cap does not bound the SQL. The in-ladder points cannot amplify
+/// (1-24 admits at most 12 non-adjacent points, hence ≤12 runs), but the
+/// out-of-ladder ones are drawn from all of `i64`.
+///
+/// They are also all interchangeable, which is what makes the collapse
+/// sound. A `SEVERITY`-typed subject evaluates to 1-24 or NULL and
+/// nothing else — the conform rung guards a stored `_severity` or
+/// SEVERITY-pinned column into that range
+/// ([`crate::conform::guarded_cast`]'s ladder `CASE`), and the `sev()`
+/// kernel's declared result has the same domain
+/// ([`crate::severity::reading_text`]). So for any point `p` outside
+/// 1-24, `subject = p` is FALSE for every non-NULL subject and UNKNOWN
+/// for a NULL one — a contribution that depends on nothing but `p` being
+/// unmatchable, and therefore identical for every such `p`. Keeping the
+/// SMALLEST one (deterministic, so snapshots are stable) preserves the
+/// predicate's three-valued answer exactly while bounding the render at
+/// **≤13 runs**.
+///
+/// Dropping them entirely would NOT be equivalent: with no in-ladder
+/// points left there would be no predicate at all, and the NULL subject
+/// must still answer UNKNOWN rather than FALSE. The representative is
+/// what carries that.
+///
+/// This is a RENDERING equivalence only — [`severity_points`] keeps the
+/// exact semantic union, and the drift guard checks membership against
+/// it over the ladder domain.
+///
+/// The input should come from [`severity_points`]; duplicates and unsorted
+/// input are tolerated defensively, and a run's bounds are `i64` for the
+/// same reason the points are — an out-of-ladder literal keeps its own
+/// value.
+#[must_use]
+pub fn severity_ranges(points: &[i64]) -> Vec<(i64, i64)> {
+    let mut kept: Vec<i64> = Vec::with_capacity(points.len());
+    let mut representative: Option<i64> = None;
+    for &p in points {
+        if crate::severity::is_valid_number(p) {
+            kept.push(p);
+        } else {
+            representative = Some(representative.map_or(p, |r: i64| r.min(p)));
+        }
+    }
+    if let Some(r) = representative {
+        kept.push(r);
+    }
+    kept.sort_unstable();
+
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+    for p in kept {
+        match ranges.last_mut() {
+            // Already covered — a duplicate, or the representative landing
+            // inside a run it is adjacent to.
+            Some((_, hi)) if p <= *hi => {}
+            // `checked_add` rather than `hi + 1`: the points are unclamped,
+            // so `i64::MAX` is reachable by a literal and must not wrap.
+            Some((_, hi)) if hi.checked_add(1) == Some(p) => *hi = p,
+            _ => ranges.push((p, p)),
+        }
+    }
+    ranges
 }
 
 /// The `SeverityNumber` a SEVERITY-pinned column CONFORMS a stored text to
@@ -1822,6 +1950,166 @@ mod tests {
             compare_form(sev, FilterOp::Eq, "99"),
             CompareForm::SeverityExact(99)
         );
+    }
+
+    /// The drift guard for [`severity_points`] (issue #82): expanding a
+    /// form to ladder points must accept EXACTLY the numbers the form's
+    /// own rule accepts, for every literal the SEVERITY rung binds.
+    ///
+    /// Exhaustive and pure — every band token, every `OTel` exact short
+    /// name, and the integers around the ladder's edges, each checked
+    /// against every point on it. If the rule table ever grows a rung
+    /// whose membership is not `lo..=hi` or `== n`, this fails rather
+    /// than letting the `IN (…)` rendering quietly mean something else.
+    #[test]
+    fn severity_points_expands_exactly_the_forms_own_membership() {
+        let sev = Some(CanonicalType::Severity);
+        let literals = crate::severity::CANONICAL_TOKENS
+            .iter()
+            .map(|t| (*t).to_owned())
+            .chain((1..=24).map(|n| {
+                crate::severity::otel_name(n)
+                    .expect("1-24 name the ladder")
+                    .to_owned()
+            }))
+            .chain((-1..=26).map(|n: i64| n.to_string()));
+        for literal in literals {
+            let form = compare_form(sev, FilterOp::Eq, &literal);
+            let points = severity_points(std::slice::from_ref(&form))
+                .expect("a severity equality form always expands");
+            // Sorted and deduplicated, as the renderer relies on.
+            assert!(
+                points.windows(2).all(|w| w[0] < w[1]),
+                "{literal}: {points:?}"
+            );
+            // The RANGES the renderer actually emits must accept exactly
+            // the numbers the points do (issue #82): merging is a
+            // rendering choice, never a meaning change.
+            let ranges = severity_ranges(&points);
+            assert!(
+                ranges.iter().all(|(lo, hi)| lo <= hi),
+                "{literal}: {ranges:?}"
+            );
+            assert!(
+                ranges.windows(2).all(|w| w[0].1 + 1 < w[1].0),
+                "runs must be maximal and disjoint — {literal}: {ranges:?}"
+            );
+            // The amplification bound: ≤12 in-ladder runs plus at most one
+            // out-of-ladder representative (review finding A).
+            assert!(ranges.len() <= 13, "{literal}: {ranges:?}");
+            for n in 1..=24_i64 {
+                let live = match form {
+                    CompareForm::SeverityBand { lo, hi } => {
+                        i64::from(lo) <= n && n <= i64::from(hi)
+                    }
+                    CompareForm::SeverityExact(exact) => exact == n,
+                    ref other => panic!("{literal} bound {other:?}"),
+                };
+                assert_eq!(points.contains(&n), live, "{literal} at {n}");
+                assert_eq!(
+                    ranges.iter().any(|(lo, hi)| *lo <= n && n <= *hi),
+                    live,
+                    "{literal} at {n} through the merged ranges {ranges:?}"
+                );
+            }
+            // Unclamped: an out-of-ladder integer keeps its own value, so
+            // `_severity=99` renders `= 99` and honestly matches nothing.
+            if let CompareForm::SeverityExact(exact) = form {
+                assert_eq!(points, vec![exact]);
+            }
+        }
+    }
+
+    /// `severity_points` is the SEVERITY set door and nothing else: a
+    /// non-severity form, or no forms at all, keeps the caller on its
+    /// per-element shape.
+    #[test]
+    fn severity_points_refuses_mixed_and_empty_form_sets() {
+        assert_eq!(severity_points(&[]), None);
+        assert_eq!(
+            severity_points(&[
+                CompareForm::SeverityExact(17),
+                CompareForm::Text("error".to_owned())
+            ]),
+            None
+        );
+        assert_eq!(
+            severity_points(&[CompareForm::TextOrNumeric("200".to_owned())]),
+            None
+        );
+        // Overlapping bands and duplicated points collapse to one set.
+        assert_eq!(
+            severity_points(&[
+                CompareForm::SeverityBand { lo: 17, hi: 20 },
+                CompareForm::SeverityExact(18),
+                CompareForm::SeverityBand { lo: 13, hi: 16 },
+            ]),
+            Some(vec![13, 14, 15, 16, 17, 18, 19, 20])
+        );
+    }
+
+    /// The merge itself: maximal runs, in order, and adjacency is what
+    /// joins them (issue #82).
+    #[test]
+    fn severity_ranges_merges_adjacent_points_into_maximal_runs() {
+        // One band is one run; the six base bands together are ONE run,
+        // which is the case the merge exists for.
+        assert_eq!(severity_ranges(&[17, 18, 19, 20]), vec![(17, 20)]);
+        assert_eq!(
+            severity_ranges(&(1..=24).collect::<Vec<_>>()),
+            vec![(1, 24)]
+        );
+        // A genuinely disjoint selection stays two runs…
+        assert_eq!(
+            severity_ranges(&[13, 14, 15, 16, 21, 22, 23, 24]),
+            vec![(13, 16), (21, 24)]
+        );
+        // …and a point adjacent to a band extends it rather than splitting
+        // (`warn,17` is the contiguous 13-17).
+        assert_eq!(severity_ranges(&[13, 14, 15, 16, 17]), vec![(13, 17)]);
+        // Singletons stay singletons.
+        assert_eq!(severity_ranges(&[18]), vec![(18, 18)]);
+        assert_eq!(
+            severity_ranges(&[13, 14, 15, 16, 99]),
+            vec![(13, 16), (99, 99)]
+        );
+        assert_eq!(severity_ranges(&[]), vec![]);
+    }
+
+    /// Out-of-ladder points are interchangeable, so exactly ONE survives
+    /// the render — the amplification bound (issue #82, review finding A).
+    #[test]
+    fn severity_ranges_collapse_out_of_ladder_points_to_one_representative() {
+        // All out of ladder: one representative, the smallest.
+        assert_eq!(severity_ranges(&[-5, 99, 101]), vec![(-5, -5)]);
+        assert_eq!(severity_ranges(&[25, 26, 4000]), vec![(25, 25)]);
+        // Mixed: the in-ladder runs stand, plus the one representative.
+        assert_eq!(
+            severity_ranges(&[-5, 13, 14, 15, 16, 99, 101]),
+            vec![(-5, -5), (13, 16)]
+        );
+        // A representative ADJACENT to an in-ladder run simply extends it
+        // — 0 never matches a real value, so `BETWEEN 0 AND 4` accepts
+        // exactly what `BETWEEN 1 AND 4` does.
+        assert_eq!(severity_ranges(&[0, 1, 2, 3, 4]), vec![(0, 4)]);
+        // `i64::MAX` is reachable by an unclamped literal: neither the
+        // adjacency test nor the collapse may wrap.
+        assert_eq!(
+            severity_ranges(&[i64::MIN, i64::MAX]),
+            vec![(i64::MIN, i64::MIN)]
+        );
+        // THE BOUND: the ladder admits at most 12 non-adjacent points, so
+        // no input can render more than 13 runs however long it is.
+        let adversarial: Vec<i64> = (1..=24)
+            .step_by(2)
+            .chain((100..2000).map(|n| n * 2))
+            .collect();
+        assert!(
+            severity_ranges(&adversarial).len() <= 13,
+            "{:?}",
+            severity_ranges(&adversarial)
+        );
+        assert_eq!(severity_ranges(&adversarial).len(), 13);
     }
 
     /// Anything outside the vocabulary is an ERROR naming it — never a

@@ -1660,8 +1660,11 @@ mod tests {
         assert_snapshot!(emit_dsl_with_pins("_severity!=info", &SEVERITY_PIN));
     }
 
+    /// A whole severity list is ONE membership test over the ladder
+    /// points its bands cover — the subject written once, however many
+    /// bands the list names (issue #82).
     #[test]
-    fn pinned_severity_in_list_expands_to_or_of_bands() {
+    fn pinned_severity_in_list_binds_the_subject_once() {
         assert_snapshot!(emit_dsl_with_pins("_severity=warn,error", &SEVERITY_PIN));
     }
 
@@ -2249,6 +2252,282 @@ mod tests {
         // Case-insensitive, like every other token in the vocabulary.
         assert_eq!(emit_dsl(r#"* | let s = sev(level, "SYSLOG")"#), syslog);
         assert_eq!(emit_dsl(r#"* | let s = sev(level, "OTel")"#), otel);
+    }
+
+    /// Issue #82: a severity predicate names its subject once PER
+    /// CONTIGUOUS RANGE — which is once outright for every natural query,
+    /// because a band, a run of bands and a band-plus-adjacent-point all
+    /// merge into ONE range.
+    ///
+    /// The counting rule is the whole point of the merge: the pre-#82
+    /// rendering wrote the subject once per BAND (six copies for the six
+    /// base bands), and the subject is over a kilobyte of `sev()` SQL.
+    ///
+    /// That `sev()` substring is derived from the ONE builder that emits it
+    /// (`conform::severity_reading_sql_bind_once` over
+    /// `conform::untyped_text`), never hand-typed: a substring that drifts
+    /// from the emitter would pass this test while asserting nothing.
+    #[test]
+    fn severity_predicates_render_the_subject_once_per_range() {
+        let column = r#""_severity""#;
+        let sev_subject = crate::conform::severity_reading_sql_bind_once(
+            &crate::conform::untyped_text(r#""level""#),
+            crate::severity::Dialect::Otel,
+        );
+        // The bare-column cases, all contiguous: ERROR alone, WARN+ERROR
+        // (13-20), and WARN plus the adjacent point 17 (13-17).
+        for dsl in [
+            "_severity=error",
+            "_severity=warn,error",
+            "_severity=warn,17",
+            r#"* | where _severity != "error""#,
+        ] {
+            let sql = emit_dsl_with_pins(dsl, &SEVERITY_PIN);
+            assert_eq!(sql.matches(column).count(), 1, "{dsl}: {sql}");
+        }
+        // A genuinely DISJOINT selection is the documented exception: WARN
+        // (13-16) and FATAL (21-24) share no boundary, so there are two
+        // ranges and therefore two subjects. Nothing can merge them
+        // without changing what matches.
+        let disjoint = emit_dsl_with_pins("_severity=warn,fatal", &SEVERITY_PIN);
+        assert_eq!(disjoint.matches(column).count(), 2, "{disjoint}");
+        assert!(
+            disjoint.contains(&format!(
+                "({column} BETWEEN 13 AND 16 OR {column} BETWEEN 21 AND 24)"
+            )),
+            "{disjoint}"
+        );
+        // The one documented second occurrence for a CONTIGUOUS shape: the
+        // search stage's `!=` widening is `(pred OR "_severity" IS NULL)`,
+        // so the column appears twice — once as the range subject, once
+        // inside the widening the pre-existing NULL policy owns.
+        let widened = emit_dsl_with_pins("_severity!=error", &SEVERITY_PIN);
+        assert_eq!(widened.matches(column).count(), 2, "{widened}");
+        assert_eq!(
+            widened.matches(&format!("{column} IS NULL")).count(),
+            1,
+            "{widened}"
+        );
+        assert_eq!(
+            widened
+                .matches(&format!("NOT ({column} BETWEEN 17 AND 20)"))
+                .count(),
+            1,
+            "{widened}"
+        );
+        // A singleton run renders as an equality, not a degenerate range.
+        let singleton = emit_dsl_with_pins("_severity=error2,error2", &SEVERITY_PIN);
+        assert!(singleton.contains(&format!("{column} = 18")), "{singleton}");
+        // The expensive subject: a `sev()` call is over a kilobyte of SQL,
+        // and a contiguous comparison writes it once however many bands it
+        // names — `error`+`fatal` is 17-24, one range.
+        assert!(
+            sev_subject.len() > 500,
+            "the subject is the cost: {sev_subject}"
+        );
+        for dsl in [
+            r#"* | where sev(level) in ("error", "fatal")"#,
+            r#"* | where sev(level) in ("trace", "debug", "info", "warn", "error", "fatal")"#,
+            r#"* | where sev(level) == "error""#,
+            r#"* | where sev(level) != "error""#,
+        ] {
+            let sql = emit_dsl(dsl);
+            assert_eq!(sql.matches(sev_subject.as_str()).count(), 1, "{dsl}: {sql}");
+        }
+        // …and twice for the disjoint one, for the same structural reason.
+        let sql = emit_dsl(r#"* | where sev(level) in ("warn", "fatal")"#);
+        assert_eq!(sql.matches(sev_subject.as_str()).count(), 2, "{sql}");
+    }
+
+    /// Review finding A: out-of-ladder points cannot amplify the render.
+    ///
+    /// A `SEVERITY` subject evaluates to 1-24 or NULL, so every point
+    /// outside that range is unmatchable and they are all interchangeable
+    /// — the renderer keeps exactly ONE. Without the collapse each
+    /// non-adjacent literal would be its own run carrying its own ~1.2 KB
+    /// copy of a `sev()` subject, which the 64 KB query-text cap does not
+    /// bound.
+    #[test]
+    fn out_of_ladder_severity_points_render_one_representative() {
+        let column = r#""_severity""#;
+        // Entirely out of ladder: ONE comparison, the smallest point.
+        let all_out = emit_dsl_with_pins("_severity=99,101,250", &SEVERITY_PIN);
+        assert_eq!(all_out.matches(column).count(), 1, "{all_out}");
+        assert!(all_out.contains(&format!("{column} = 99")), "{all_out}");
+        // Mixed: the in-ladder band stands, plus the one representative.
+        let mixed = emit_dsl_with_pins("_severity=error,99,101,250", &SEVERITY_PIN);
+        assert_eq!(mixed.matches(column).count(), 2, "{mixed}");
+        assert!(
+            mixed.contains(&format!("({column} BETWEEN 17 AND 20 OR {column} = 99)")),
+            "{mixed}"
+        );
+        // A representative ADJACENT to an in-ladder run extends it rather
+        // than emitting separately: 0 never matches a stored severity, so
+        // `BETWEEN 0 AND 4` accepts exactly the TRACE band. The negation
+        // of this shape is the one that would expose an unsound widening,
+        // and it is exhaustively parity-tested in `filter_parity.rs`.
+        let adjacent = emit_dsl_with_pins("_severity=0,trace", &SEVERITY_PIN);
+        assert!(
+            adjacent.contains(&format!("{column} BETWEEN 0 AND 4")),
+            "{adjacent}"
+        );
+        assert_eq!(adjacent.matches(column).count(), 1, "{adjacent}");
+        // THE AMPLIFICATION GUARD: a long alternating in/out list renders
+        // at most 13 subjects — 12 possible in-ladder runs plus the one
+        // representative — however many literals it names.
+        let mut list: Vec<String> = Vec::new();
+        for n in (1..=23).step_by(2) {
+            list.push(n.to_string());
+        }
+        for n in (100..400).step_by(2) {
+            list.push(n.to_string());
+        }
+        let long = format!("_severity={}", list.join(","));
+        let sql = emit_dsl_with_pins(&long, &SEVERITY_PIN);
+        assert!(list.len() > 150, "the input must actually be long");
+        assert!(
+            sql.matches(column).count() <= 13,
+            "{} subjects for {} literals: {sql}",
+            sql.matches(column).count(),
+            list.len()
+        );
+        // The same bound over the EXPENSIVE subject, which is the case the
+        // finding is about.
+        let sev_subject = crate::conform::severity_reading_sql_bind_once(
+            &crate::conform::untyped_text(r#""level""#),
+            crate::severity::Dialect::Otel,
+        );
+        let sql = emit_dsl(&format!("* | where sev(level) in ({})", list.join(", ")));
+        assert!(
+            sql.matches(sev_subject.as_str()).count() <= 13,
+            "{} subjects for {} literals",
+            sql.matches(sev_subject.as_str()).count(),
+            list.len()
+        );
+    }
+
+    /// Issue #82, AC3: the severity set is INLINED, so it binds nothing
+    /// between a subject's parameters and whatever follows.
+    ///
+    /// The set is a SINGLE run here on purpose (review finding B). A
+    /// multi-run set repeats the subject, so a subject carrying `?`
+    /// placeholders would emit more placeholders than parameters were
+    /// pushed — that shape is out of contract, documented at
+    /// `severity_ranges_sql`, and structurally unreachable (see
+    /// [`severity_subjects_never_push_parameters`]). Asserting positions
+    /// over a repeated subject would document a contract the renderer
+    /// does not hold.
+    #[test]
+    fn a_severity_set_pushes_no_parameters_and_preserves_positions() {
+        let mut state = EmitterState::new("/data/**/*.parquet").expect("source");
+        let before = state.push_param(SqlValue::String("before".to_owned()));
+        let subject = format!("upper({before})");
+        let clause = compare::in_list_sql(
+            &subject,
+            vec![
+                crate::compare::CompareForm::SeverityBand { lo: 17, hi: 20 },
+                crate::compare::CompareForm::SeverityExact(18),
+            ],
+            &mut state,
+        );
+        let after = state.push_param(SqlValue::String("after".to_owned()));
+        // 18 sits inside the ERROR band, so this is ONE run and the
+        // subject is written exactly once.
+        assert_eq!(clause, format!("{subject} BETWEEN 17 AND 20"));
+        assert_eq!(clause.matches(&subject).count(), 1, "{clause}");
+        // Placeholders are positional `?`, so the ORDER of the collected
+        // params is the whole assertion: the set bound nothing between
+        // them, and `after` is still the second value.
+        assert_eq!(before, "?");
+        assert_eq!(after, "?");
+        assert_eq!(
+            state.into_params(),
+            vec![
+                SqlValue::String("before".to_owned()),
+                SqlValue::String("after".to_owned())
+            ]
+        );
+    }
+
+    /// The real regression guard behind AC3 (review finding B): NO subject
+    /// the pin scope admits can push a bound parameter, so the multi-run
+    /// repetition can never desynchronize placeholders from parameters.
+    ///
+    /// `PinScope::subject_pin` admits exactly two shapes — a bare pinned
+    /// field, and a pin-declaring call over a bare field whose remaining
+    /// arguments are string literals — and `sev()`'s dialect is inlined as
+    /// TEXT (`functions::literal_text_positions`) rather than bound. This
+    /// asserts that end to end: a severity predicate emits no parameters
+    /// at all, in the search stage and in both operand orders of the
+    /// pipeline, for single-run AND multi-run sets.
+    ///
+    /// The last block ties the guard to the TABLE rather than to the one
+    /// name `sev`: every `KNOWN_FUNCTIONS` entry that declares a SEVERITY
+    /// result is admitted by `subject_pin`, so a future Severity-returning
+    /// function joins this test automatically — and if its argument shape
+    /// makes the probe DSL unemittable, the panic names the obligation
+    /// instead of silently covering nothing.
+    #[test]
+    fn severity_subjects_never_push_parameters() {
+        for dsl in [
+            "_severity=error",
+            "_severity=warn,fatal",
+            "_severity!=error",
+            "_severity=99,101",
+        ] {
+            let sql = emit_dsl_with_pins(dsl, &SEVERITY_PIN);
+            assert!(!sql.contains("\n  0: "), "{dsl} bound a parameter: {sql}");
+        }
+        for dsl in [
+            r#"* | where sev(level) == "error""#,
+            r#"* | where "error" == sev(level)"#,
+            r#"* | where sev(level) in ("warn", "fatal")"#,
+            r#"* | where sev(level, "syslog") in ("warn", "fatal")"#,
+            r#"* | where sev(level) != "error""#,
+        ] {
+            let sql = emit_dsl(dsl);
+            assert!(!sql.contains("\n  0: "), "{dsl} bound a parameter: {sql}");
+        }
+
+        // Structural: derive the covered functions from the same table the
+        // emitter validates against, not from a hand-written list.
+        let severity_fns: Vec<&str> = crate::parser::suggest::KNOWN_FUNCTIONS
+            .iter()
+            .copied()
+            .filter(|f| {
+                functions::function_result_pin(f) == Some(crate::schema::CanonicalType::Severity)
+            })
+            .collect();
+        assert!(
+            severity_fns.contains(&"sev"),
+            "the SEVERITY-declaring set must not be empty, or this guard covers nothing"
+        );
+        for func in severity_fns {
+            for dsl in [
+                format!(r#"* | where {func}(level) == "error""#),
+                format!(r#"* | where {func}(level) in ("warn", "fatal")"#),
+            ] {
+                let query = parser::parse(&dsl).unwrap_or_else(|e| {
+                    panic!(
+                        "{func} declares a SEVERITY result, so it is a comparison SUBJECT and \
+                         must be covered by this guard — but the probe DSL {dsl:?} does not \
+                         parse ({e:?}). Give the guard a shape that fits {func}'s arguments."
+                    )
+                });
+                let emitted = emit(&query, SRC).unwrap_or_else(|e| {
+                    panic!(
+                        "{func} declares a SEVERITY result but the probe DSL {dsl:?} does not \
+                         emit ({e}). Give the guard a shape that fits {func}'s arguments."
+                    )
+                });
+                assert!(
+                    emitted.params.is_empty(),
+                    "{dsl} bound {} parameter(s): a subject that pushes parameters cannot be \
+                     repeated per range — see severity_ranges_sql's contract",
+                    emitted.params.len()
+                );
+            }
+        }
     }
 
     /// A literal subject carries its own type: `to_json(?)` gives `DuckDB`

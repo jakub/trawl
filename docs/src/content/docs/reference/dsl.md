@@ -362,7 +362,8 @@ filter, the stream compiler and the post-SQL tail:
 ```
 _severity=error                 # BETWEEN 17 AND 20 (the ERROR band)
 _severity!=info                 # NOT BETWEEN 9 AND 12, or _severity IS NULL
-_severity=warn,error            # either band
+_severity=warn,error            # either band — the two merge: BETWEEN 13 AND 20
+_severity=warn,fatal            # disjoint, so two ranges: 13-16 OR 21-24
 _severity>=warn                 # >= 13 (the token's exact number)
 _severity=error2                # exactly 18 (the OTel exact short name)
 _severity=17                    # exactly 17
@@ -373,6 +374,13 @@ _severity=warn*                 # glob over the canonical token text: 13-16
 - Equality and IN match the whole **band** containing the token
   (`notice` falls inside the INFO band); ordered comparisons use the
   token's **exact** number.
+- A comma list is one **set** over the ladder, emitted as the minimal
+  contiguous ranges covering it: adjacent bands merge into a single
+  `BETWEEN` (`warn,error` is 13-20, and all six base bands are one
+  `BETWEEN 1 AND 24`), a band and a point beside it merge too
+  (`warn,17` is 13-17), and only a genuinely disjoint selection emits
+  more than one range. This is a performance property — the merge never
+  changes which rows match.
 - OTel's exact short names (`trace2`, `warn3`, `error2`, …) name one
   number, under every operator.
 - Glob and regex match the **canonical token text** — the injective OTel

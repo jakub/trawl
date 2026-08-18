@@ -107,10 +107,14 @@ pub(crate) fn comparison_sql(
                 predicate
             }
         }
-        // SEVERITY pin + band token: the whole band, and `!=` its
-        // complement — the same NULL policy split as every other form.
-        CompareForm::SeverityBand { lo, hi } => {
-            let predicate = severity_band(field, op, lo, hi);
+        // SEVERITY pin + band token: the whole band as one ladder range,
+        // and `!=` its complement — the same NULL policy split as every
+        // other form. The expansion is `compare::severity_points`' alone;
+        // this arm never reads `lo`/`hi`.
+        CompareForm::SeverityBand { .. } => {
+            let points = compare::severity_points(std::slice::from_ref(&form))
+                .expect("a lone SeverityBand always expands");
+            let predicate = severity_ranges_sql(field, op, &points);
             if op == FilterOp::Ne && policy == NullPolicy::NeMatchesNull {
                 format!("({predicate} OR {field} IS NULL)")
             } else {
@@ -133,18 +137,29 @@ pub(crate) fn comparison_sql(
 
 /// Render an IN list — each element binds like an equality.
 ///
-/// A `TextOrNumeric` element has no single bound value, so a list carrying
-/// one expands to the OR of its per-element equalities: the same set
-/// membership, and the same shape the live matcher evaluates (its
-/// `InList` is an OR of `=` comparisons). Lists with no such element keep
-/// the plain `IN (…)` shape, byte-identical to unpinned emission.
+/// An ALL-SEVERITY list is one set over the ladder: every element's band
+/// or exact number collapses into the MINIMAL CONTIGUOUS RANGES covering
+/// them, so a contiguous list writes its subject exactly once
+/// (issue #82). A `TextOrNumeric` element has no single bound
+/// value, so a list carrying one expands to the OR of its per-element
+/// equalities: the same set membership, and the same shape the live
+/// matcher evaluates (its `InList` is an OR of `=` comparisons). Lists
+/// with neither keep the plain `IN (…)` shape, byte-identical to unpinned
+/// emission.
 pub(crate) fn in_list_sql(
     field: &str,
     forms: Vec<CompareForm>,
     state: &mut EmitterState,
 ) -> String {
+    // A SEVERITY list is ONE set over the ladder, rendered as the minimal
+    // ranges covering it — no parameters, and one subject per run.
+    if let Some(points) = compare::severity_points(&forms) {
+        return severity_ranges_sql(field, FilterOp::Eq, &points);
+    }
     // The forms with no single bound value: the VARCHAR pin's two-armed
-    // equality, and the SEVERITY pin's band range.
+    // equality, and the SEVERITY pin's band range (reachable here only
+    // MIXED with a non-severity element, which no pin can produce today —
+    // the arm stays total rather than trusting that).
     let expands = |f: &CompareForm| {
         matches!(
             f,
@@ -158,7 +173,11 @@ pub(crate) fn in_list_sql(
                 CompareForm::TextOrNumeric(literal) => {
                     text_or_numeric(field, FilterOp::Eq, literal, state)
                 }
-                CompareForm::SeverityBand { lo, hi } => severity_band(field, FilterOp::Eq, lo, hi),
+                form @ CompareForm::SeverityBand { .. } => {
+                    let points = compare::severity_points(std::slice::from_ref(&form))
+                        .expect("a lone SeverityBand always expands");
+                    severity_ranges_sql(field, FilterOp::Eq, &points)
+                }
                 other => {
                     let placeholder = state.push_param(comparable_value(other));
                     format!("{field} = {placeholder}")
@@ -208,14 +227,85 @@ fn text_or_numeric(field: &str, op: FilterOp, literal: String, state: &mut Emitt
     }
 }
 
-/// The band range predicate for a `SEVERITY`-pinned equality-class
-/// comparison: the band's inclusive bounds, rendered as literals (they
-/// come from a closed table, never from user text).
-fn severity_band(field: &str, op: FilterOp, lo: u8, hi: u8) -> String {
-    if op == FilterOp::Ne {
-        format!("{field} NOT BETWEEN {lo} AND {hi}")
+/// THE `SEVERITY` set renderer (issue #82): the ladder points a
+/// comparison accepts, rendered as MINIMAL CONTIGUOUS RANGES so the
+/// subject is written once per run — once outright for every natural
+/// query.
+///
+/// `points` comes from [`compare::severity_points`], the one expansion —
+/// a band's inclusive range, an exact number, or the union a whole IN list
+/// accepts — and [`compare::severity_ranges`] merges them. A run of one
+/// point renders `subject = p`, a longer run `subject BETWEEN lo AND hi`,
+/// and several runs are OR'd inside one paren group.
+///
+/// Why ranges and not the point set: the SET is what the comparison
+/// MEANS, but the RANGE is what `DuckDB` executes. An `IN` list over a
+/// COMPUTED left-hand side leaves the engine's fast path — probed over 1M
+/// rows in `trawl-engine/tests/severity_set_bench.rs`, a single band cost
+/// ~392 ms as `IN (17, 18, 19, 20)` against ~6 ms as `BETWEEN 17 AND 20`
+/// — and a `sev()` subject is exactly such a left-hand side. Merging
+/// serves BOTH goals at once, which is the whole point: `_severity=error`
+/// is one range, and the six base bands together are the single range
+/// `BETWEEN 1 AND 24`, so the kilobyte subject appears once and the
+/// predicate keeps the shape the engine likes.
+///
+/// `!=` wraps the positive shape in `NOT (…)` rather than inverting each
+/// range, so the range algebra lives in ONE place. That is also the right
+/// NULL behaviour: the positive shape over a NULL subject is UNKNOWN and
+/// `NOT (UNKNOWN)` is UNKNOWN, exactly as `NOT IN` answered — the strict
+/// pipeline lane is unchanged, and the search stage's widening still
+/// happens in [`comparison_sql`], outside this function.
+///
+/// The bounds are INLINED, not bound: they are `i64` by type, produced by
+/// the closed ladder table, so no user text can reach the SQL through
+/// them. That is the same reasoning the band bounds were always inlined
+/// under, and it keeps the parameter list of a severity filter empty.
+///
+/// # Contract: the subject must not carry bound placeholders
+///
+/// A multi-run set REPEATS the subject, while the emitter pushes one
+/// parameter per `push_param` call and not per occurrence — so a subject
+/// containing `?` would emit more placeholders than values were bound and
+/// desynchronize every parameter after it.
+///
+/// That shape is unreachable today, structurally rather than by care:
+/// [`crate::pin_scope::PinScope::subject_pin`] admits only a bare pinned
+/// field or a pin-declaring call over a bare field whose remaining
+/// arguments are string literals, and `sev()`'s dialect argument is
+/// inlined as TEXT (`super::functions::literal_text_positions`) instead of
+/// bound. `severity_subjects_never_push_parameters` asserts exactly that,
+/// end to end. **Anyone widening `PinnedSubject` must revisit this**: a
+/// subject that can bind parameters needs the runs to share one evaluation
+/// (a CTE or `list_transform` binding) rather than repeat it.
+fn severity_ranges_sql(subject: &str, op: FilterOp, points: &[i64]) -> String {
+    debug_assert!(
+        matches!(op, FilterOp::Eq | FilterOp::Ne),
+        "the severity set is an equality-class shape"
+    );
+    debug_assert!(!points.is_empty(), "an empty set renders no predicate");
+    let ranges = compare::severity_ranges(points);
+    let positive = ranges
+        .iter()
+        .map(|(lo, hi)| {
+            if lo == hi {
+                format!("{subject} = {lo}")
+            } else {
+                format!("{subject} BETWEEN {lo} AND {hi}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    // One run needs no group of its own; the callers parenthesize what
+    // they compose.
+    let positive = if ranges.len() > 1 {
+        format!("({positive})")
     } else {
-        format!("{field} BETWEEN {lo} AND {hi}")
+        positive
+    };
+    if op == FilterOp::Ne {
+        format!("NOT ({positive})")
+    } else {
+        positive
     }
 }
 
