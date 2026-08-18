@@ -12,6 +12,7 @@ use chumsky::prelude::*;
 use std::ops::Range;
 
 use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
+use crate::parser::comment::Spaced;
 use crate::parser::primitives::{
     ParserExtra, ParserInput, field_name, keyword, literal, plain_name, quoted_string,
     regex_pattern, spanned,
@@ -38,13 +39,13 @@ pub(crate) fn expr<'src>()
         // so `lower`(x) is a field reference, never a call (ADR-0013 §7).
         let func_call = spanned(
             plain_name()
-                .then_ignore(just('(').padded())
+                .then_ignore(just('(').spaced())
                 .then(
                     expr.clone()
-                        .separated_by(just(',').padded())
+                        .separated_by(just(',').spaced())
                         .collect::<Vec<_>>(),
                 )
-                .then_ignore(just(')').padded())
+                .then_ignore(just(')').spaced())
                 .map(|(name, args)| Expr::FunctionCall { name, args }),
         );
 
@@ -57,7 +58,7 @@ pub(crate) fn expr<'src>()
 
         let paren_expr = expr
             .clone()
-            .delimited_by(just('(').padded(), just(')').padded());
+            .delimited_by(just('(').spaced(), just(')').spaced());
 
         // order matters: func_call before field_ref, literal before field_ref
         // .boxed() here to break up deeply nested generic types that overflow
@@ -69,7 +70,7 @@ pub(crate) fn expr<'src>()
             paren_expr,
             field_ref,
         ))
-        .padded()
+        .spaced()
         .labelled("expression")
         .boxed();
 
@@ -91,7 +92,7 @@ pub(crate) fn expr<'src>()
             just('/').to(BinaryOp::Div),
             just('%').to(BinaryOp::Mod),
         ))
-        .padded();
+        .spaced();
 
         let multiplicative =
             unary_neg
@@ -109,7 +110,7 @@ pub(crate) fn expr<'src>()
                 });
 
         // --- precedence 5: additive `+` `-` ---
-        let add_op = choice((just('+').to(BinaryOp::Add), just('-').to(BinaryOp::Sub))).padded();
+        let add_op = choice((just('+').to(BinaryOp::Add), just('-').to(BinaryOp::Sub))).spaced();
 
         let additive = multiplicative.clone().foldl(
             add_op.then(multiplicative).repeated(),
@@ -135,7 +136,7 @@ pub(crate) fn expr<'src>()
             just("<=").to(BinaryOp::Lte),
             just("<").to(BinaryOp::Lt),
         ))
-        .padded();
+        .spaced();
 
         // `matches` is handled separately so the RHS can accept `/regex/`
         // literals without conflicting with `/` as the division operator
@@ -148,16 +149,16 @@ pub(crate) fn expr<'src>()
                 choice((
                     // matches with regex literal support
                     keyword("matches")
-                        .padded()
+                        .spaced()
                         .ignore_then(choice((regex_literal, additive.clone())))
                         .map(|rhs| CmpRhs::Binary(BinaryOp::Matches, rhs)),
                     // like / ilike pattern matching
                     keyword("ilike")
-                        .padded()
+                        .spaced()
                         .ignore_then(additive.clone())
                         .map(|rhs| CmpRhs::Binary(BinaryOp::ILike, rhs)),
                     keyword("like")
-                        .padded()
+                        .spaced()
                         .ignore_then(additive.clone())
                         .map(|rhs| CmpRhs::Binary(BinaryOp::Like, rhs)),
                     // other comparison operators
@@ -166,12 +167,12 @@ pub(crate) fn expr<'src>()
                         .map(|(op, rhs)| CmpRhs::Binary(op, rhs)),
                     // in list
                     keyword("in")
-                        .padded()
+                        .spaced()
                         .ignore_then(
                             expr.clone()
-                                .separated_by(just(',').padded())
+                                .separated_by(just(',').spaced())
                                 .collect::<Vec<_>>()
-                                .delimited_by(just('(').padded(), just(')').padded()),
+                                .delimited_by(just('(').spaced(), just(')').spaced()),
                         )
                         .map_with(|list, e| {
                             let span = e.span();
@@ -208,7 +209,7 @@ pub(crate) fn expr<'src>()
 
         // --- precedence 3: unary `not` ---
         let not_expr = keyword("not")
-            .padded()
+            .spaced()
             .repeated()
             .foldr(comparison, |_kw, operand| {
                 let span = operand.span.clone();
@@ -223,7 +224,7 @@ pub(crate) fn expr<'src>()
 
         // --- precedence 2: `and` ---
         let and_expr = not_expr.clone().foldl(
-            keyword("and").padded().ignore_then(not_expr).repeated(),
+            keyword("and").spaced().ignore_then(not_expr).repeated(),
             |lhs, rhs| {
                 let span = lhs.span.start..rhs.span.end;
                 Spanned::new(
@@ -239,7 +240,7 @@ pub(crate) fn expr<'src>()
 
         // --- precedence 1: `or` ---
         and_expr.clone().foldl(
-            keyword("or").padded().ignore_then(and_expr).repeated(),
+            keyword("or").spaced().ignore_then(and_expr).repeated(),
             |lhs, rhs| {
                 let span = lhs.span.start..rhs.span.end;
                 Spanned::new(

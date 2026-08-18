@@ -14,6 +14,7 @@
 //! 4. **Expressions** — recursive expression parser with operator precedence
 //! 5. **Pipe stages** — stats, where, sort, limit, table
 
+pub(crate) mod comment;
 pub(crate) mod expr;
 pub(crate) mod pipe;
 pub(crate) mod primitives;
@@ -73,20 +74,11 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
         }]);
     }
 
-    // Strip comments before parsing, replacing with spaces to preserve
-    // byte offsets for error spans.
-    let stripped = strip_comments(input);
-
-    // If the stripped input is all whitespace (e.g. comment-only input),
-    // parse empty string since the parser accepts "" but not "   ".
-    let parse_input = if stripped.trim().is_empty() {
-        ""
-    } else {
-        stripped.as_str()
-    };
-
+    // Comments are a grammar production (ADR-0014), so the raw input goes
+    // straight to the parser — no pre-pass, and error spans index the real
+    // text rather than a byte-length-preserving copy of it.
     let parser = query_parser();
-    let result = parser.parse(parse_input);
+    let result = parser.parse(input);
 
     match result.into_result() {
         Ok(query) => Ok(query),
@@ -95,158 +87,6 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
             .map(|e| rich_to_parse_error(&e, input))
             .collect()),
     }
-}
-
-/// Whether a backtick preceded by `prev` sits where a quoted field name
-/// could START: the beginning of the input, after whitespace, or after one
-/// of the bytes a name may follow directly — `(` and `,` (argument and
-/// field lists), `|` (a stage boundary), `!` and the comparison bytes (a
-/// filter or expression operator), and the arithmetic operators, which an
-/// expression may equally put in front of a name (`` 1+`a b` ``). `-`
-/// covers both the arithmetic case and a descending sort key
-/// (`` | sort -`a#b` ``). A backtick anywhere else is inside some other
-/// token, exactly as the search grammar reads a mid-word one as ordinary
-/// text.
-///
-/// `/` is deliberately ABSENT: it opens a regex far more often than it
-/// divides, and a regex body is exactly the context this predicate exists
-/// to keep out. A quoted name divided into by a slash pays the
-/// unterminated-name error instead.
-///
-/// The set may be widened safely only because no UNQUOTED position can
-/// absorb a backtick: [`primitives::bare_value`] and the search grammar's
-/// bare word both END at one, so a tick this predicate mis-reads as an
-/// opener can reach a parse error but never a quietly different query.
-fn opens_quoted_name(prev: Option<u8>) -> bool {
-    match prev {
-        None => true,
-        Some(b) => {
-            b.is_ascii_whitespace()
-                || matches!(
-                    b,
-                    b'(' | b',' | b'|' | b'!' | b'=' | b'<' | b'>' | b'-' | b'+' | b'*' | b'%'
-                )
-        }
-    }
-}
-
-/// Byte index of the backtick CLOSING a quoted name opened at `open`, or
-/// `None` when the region would not lex as one.
-///
-/// Mirrors [`primitives::quoted_name`]'s two refusals — an empty name and
-/// a character that cannot render as itself
-/// ([`crate::sanitize::is_unsafe_display_char`], which covers the newline
-/// like any other control) — plus the doubled backtick that escapes one.
-fn quoted_name_end(input: &str, open: usize) -> Option<usize> {
-    let rest = &input[open + 1..];
-    let mut chars = rest.char_indices();
-    let mut has_content = false;
-    while let Some((off, c)) = chars.next() {
-        if c == '`' {
-            if rest[off + 1..].starts_with('`') {
-                chars.next();
-                has_content = true;
-                continue;
-            }
-            return has_content.then_some(open + 1 + off);
-        }
-        if crate::sanitize::is_unsafe_display_char(c) {
-            return None;
-        }
-        has_content = true;
-    }
-    None
-}
-
-/// Replace `//` and `#` comments with spaces, preserving byte positions.
-///
-/// Handles `//` (line comment) and `#` (line comment) outside of quoted
-/// strings. Comment content is replaced with spaces so that error spans
-/// remain accurate.
-///
-/// Backtick-quoted field names are tracked beside double-quoted strings,
-/// so `` `a#b` `` is a name and not a comment (ADR-0013 ruling 7).
-///
-/// A backtick opens a name only where one could actually START
-/// ([`opens_quoted_name`]) and only when what follows would really lex as
-/// [`primitives::quoted_name`]: non-empty, closed, and free of the
-/// characters that production refuses (controls, a newline included, plus
-/// the bidi and zero-width formats). A stray backtick inside a regex
-/// literal (`` message=/a`b/ ``) follows a body character, so it fails the
-/// first test outright and cannot run a pseudo-name across the following
-/// comment to smuggle its words in as extra AND-ed search terms.
-///
-/// This is a scan and not the grammar, so it can only ever be a
-/// heuristic — an operator inside a bare VALUE looks exactly like
-/// arithmetic from outside (`host=a+` reads like `1+`), and the tick after
-/// it therefore engages the name state and shields a `#` behind it. The
-/// GRAMMAR is the backstop that keeps a mis-engaged scan from changing an
-/// answer quietly: no unquoted position may absorb a backtick
-/// ([`primitives::bare_value`], and the search stage's bare word), so the
-/// shielded region reaches a parse error instead of becoming part of a
-/// value. Loud, or correct — never something silently different.
-///
-/// Known limitation: `#` inside regex literals (`/pattern#here/`) will be
-/// treated as a comment start. Use `//` comments on lines containing regex
-/// literals, or move the regex to a different line.
-fn strip_comments(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = bytes.to_vec();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut in_string = false;
-
-    while i < len {
-        if in_string {
-            if bytes[i] == b'\\' && i + 1 < len {
-                // skip escaped character inside string
-                i += 2;
-            } else if bytes[i] == b'"' {
-                in_string = false;
-                i += 1;
-            } else {
-                i += 1;
-            }
-        } else if bytes[i] == b'"' {
-            in_string = true;
-            i += 1;
-        } else if bytes[i] == b'`' {
-            // Only a region that would really lex as a name quotes anything;
-            // anything else is an ordinary character. The name scan is
-            // attempted ONLY from a position where a name could open — check
-            // that cheap guard BEFORE the forward scan, never after. A stray
-            // backtick (in a value, a regex, or an adversarial run) has some
-            // non-opening byte before it, so it costs O(1) here instead of a
-            // full forward scan; a scan therefore runs at most once per
-            // genuine token boundary, and the whole pass stays linear. (The
-            // guard-after-scan form re-scanned from every backtick byte, an
-            // O(n^2) blowup a 64 KB backtick run could turn into ~1 s of CPU.)
-            let opens = opens_quoted_name(i.checked_sub(1).map(|p| bytes[p]));
-            match opens.then(|| quoted_name_end(input, i)).flatten() {
-                Some(end) => i = end + 1,
-                None => i += 1,
-            }
-        } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
-            // // comment — blank to end of line
-            while i < len && bytes[i] != b'\n' {
-                out[i] = b' ';
-                i += 1;
-            }
-        } else if bytes[i] == b'#' {
-            // # comment — blank to end of line
-            while i < len && bytes[i] != b'\n' {
-                out[i] = b' ';
-                i += 1;
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    // We only replaced ASCII bytes with ASCII spaces — multi-byte UTF-8
-    // sequences are untouched (continuation bytes are >= 0x80, never
-    // matching `"`, `#`, `/`, `\`, or `\n`). So from_utf8 always succeeds.
-    String::from_utf8(out).expect("comment stripping only replaces ASCII bytes with spaces")
 }
 
 /// Convert a chumsky `Rich` error into our `ParseError` with a human-friendly message.
@@ -260,9 +100,9 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
     if let RichReason::Custom(msg) = e.reason() {
         return ParseError {
             message: msg.clone(),
+            hint: comment::hint_for(msg, input, span.start),
             span: span.start..span.end,
             label,
-            hint: None,
         };
     }
 
@@ -344,6 +184,16 @@ fn find_pipe_command_word(input: &str, offset: usize) -> Option<String> {
     Some(candidate)
 }
 
+/// Whether `offset` sits at the start of the input or directly after a
+/// whitespace character — the two positions the grammar admits a comment
+/// at ([`comment::ws`] / [`comment::leading_ws`]).
+fn preceded_by_whitespace(input: &str, offset: usize) -> bool {
+    input[..offset]
+        .chars()
+        .next_back()
+        .is_none_or(char::is_whitespace)
+}
+
 /// Produce an enriched (message, hint) pair based on error context.
 fn enrich_error(
     input: &str,
@@ -355,6 +205,34 @@ fn enrich_error(
     let expects_end_quote = expected.iter().any(|e| e == "'\"'");
     let expects_close_paren = expected.iter().any(|e| e == "')'");
     let at_end = offset >= input.len();
+
+    // A comment opener the grammar could not admit (ADR-0014 ruling 2).
+    // The validators on the two productions that can CONSUME one — the
+    // bare value and the search-stage bare word — say this themselves and
+    // never reach here; this is the generic net for every other position
+    // (`| co#unt()`, a stage name, an expression) so a `#` never surfaces
+    // as "found '#', expected …".
+    if !at_end
+        && input[offset..].starts_with(comment::OPENER)
+        && !preceded_by_whitespace(input, offset)
+    {
+        return (
+            comment::MSG_OPENER_IN_TOKEN.to_string(),
+            comment::hint_for(comment::MSG_OPENER_IN_TOKEN, input, offset),
+        );
+    }
+
+    // …and the same net for the retired second opener, at the one place
+    // it could have been a comment: a token boundary (ADR-0014 ruling 3).
+    if !at_end
+        && comment::starts_with_slashes(&input[offset..])
+        && preceded_by_whitespace(input, offset)
+    {
+        return (
+            comment::MSG_SLASHES_NOT_A_COMMENT.to_string(),
+            comment::hint_for(comment::MSG_SLASHES_NOT_A_COMMENT, input, offset),
+        );
+    }
 
     // Unknown pipe stage: detected by scanning the input for a `|` before
     // the error position and extracting the word that follows it. chumsky's
@@ -402,8 +280,10 @@ fn enrich_error(
 
 /// Build the top-level query parser: search stage, then pipeline, then EOF.
 fn query_parser<'src>() -> impl Parser<'src, ParserInput<'src>, Query, ParserExtra<'src>> {
-    search::search_stage()
+    comment::leading_ws()
+        .ignore_then(search::search_stage())
         .then(pipe::pipeline())
+        .then_ignore(comment::ws())
         .then_ignore(end())
         .map(|(search, pipeline)| Query { search, pipeline })
         .labelled("query")
@@ -693,16 +573,21 @@ mod tests {
     // --- comment tests ---
 
     #[test]
-    fn test_hash_comment_stripped() {
+    fn test_hash_comment_at_start_of_input() {
         let query = parse("# this is a comment\nservice=nginx").unwrap();
         assert_eq!(query.search.groups[0].len(), 1);
     }
 
+    /// `//` stopped being a comment opener (ADR-0014 ruling 3), and the
+    /// removal is LOUD at the one place it could have been one: a bare
+    /// term at a token boundary. Silently reading it as two AND-ed text
+    /// terms would narrow the match set to nothing.
     #[test]
-    fn test_double_slash_comment_stripped() {
-        let query = parse("service=nginx // filter by service\n| stats count()").unwrap();
-        assert_eq!(query.search.groups[0].len(), 1);
-        assert_eq!(query.pipeline.len(), 1);
+    fn test_double_slash_is_no_longer_a_comment() {
+        let errors = parse("service=nginx // filter by service\n| stats count()").unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].message, comment::MSG_SLASHES_NOT_A_COMMENT);
+        assert_eq!(errors[0].span, 14..16);
     }
 
     #[test]
@@ -715,6 +600,33 @@ mod tests {
                 phrase: "hello # world".to_string(),
             })
         );
+    }
+
+    /// A `//` in a VALUE is ordinary data and needs no quoting — that is
+    /// the everyday half of ADR-0014 ruling 3.
+    #[test]
+    fn test_double_slash_in_a_value_is_data() {
+        for (dsl, field, value) in [
+            ("url=https://example.com/x", "url", "https://example.com/x"),
+            ("path=/api//v1", "path", "/api//v1"),
+            ("url=//cdn.example.com/x", "url", "//cdn.example.com/x"),
+        ] {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl} must parse: {e:?}"));
+            assert_eq!(query.search.groups[0].len(), 1, "{dsl}");
+            assert_eq!(
+                query.search.groups[0][0].node,
+                SearchToken::FieldFilter(FieldFilter {
+                    field: field.to_string(),
+                    op: FilterOp::Eq,
+                    value: FilterValue::Literal(value.to_string()),
+                }),
+                "{dsl}"
+            );
+        }
+        // …and a sibling filter on the same line survives, which the
+        // blanking scanner deleted.
+        let query = parse("referrer=https://a.b/c status=200").expect("both filters");
+        assert_eq!(query.search.groups[0].len(), 2);
     }
 
     #[test]
@@ -732,7 +644,7 @@ mod tests {
     #[test]
     fn test_multiline_comments() {
         let query =
-            parse("# find errors\nservice=nginx\n// only recent\nlast=1h | stats count() by host")
+            parse("# find errors\nservice=nginx\n# only recent\nlast=1h | stats count() by host")
                 .unwrap();
         assert_eq!(query.search.groups[0].len(), 1);
         assert!(query.search.time_filter.is_some());
@@ -754,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_only_comments_multiline() {
-        let query = parse("# line 1\n// line 2\n# line 3").unwrap();
+        let query = parse("# line 1\n# line 2\n# line 3").unwrap();
         assert!(query.search.groups.is_empty());
         assert_eq!(query.pipeline.len(), 0);
     }
@@ -772,24 +684,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn strip_comments_preserves_length() {
-        let input = "abc # comment\ndef // another\nghi";
-        let stripped = strip_comments(input);
-        assert_eq!(stripped.len(), input.len());
-    }
-
     // ── backtick escape (ADR-0013 ruling 7) ─────────────────────────────
 
-    /// Comment stripping tracks backticks beside double quotes, so a `#`
-    /// or `//` INSIDE a quoted name is part of the name — length still
-    /// preserved, since error spans point into the original input.
+    /// A backticked NAME is a quoted context, so a `#` or `//` inside it
+    /// is part of the name. Nothing re-derives that fact any more — the
+    /// comment production is simply unreachable from inside
+    /// [`primitives::quoted_name`].
     #[test]
-    fn strip_comments_leaves_backticked_names_alone() {
-        for input in ["| table `a#b`", "| table `a//b`, host"] {
-            let stripped = strip_comments(input);
-            assert_eq!(stripped, input, "backtick content must survive");
-            assert_eq!(stripped.len(), input.len());
+    fn backticked_names_carry_comment_openers_verbatim() {
+        for (dsl, want) in [("| table `a#b`", "a#b"), ("| table `a//b`", "a//b")] {
+            let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl} must parse: {e:?}"));
+            match &query.pipeline[0].node {
+                PipeStage::Table(t) => assert_eq!(t.fields, vec![want.to_string()], "{dsl}"),
+                other => panic!("expected Table, got {other:?}"),
+            }
+        }
+        let query = parse("| table `a//b`, host").expect("parses");
+        match &query.pipeline[0].node {
+            PipeStage::Table(t) => {
+                assert_eq!(t.fields, vec!["a//b".to_string(), "host".to_string()]);
+            }
+            other => panic!("expected Table, got {other:?}"),
         }
         // …and the name reaches the AST intact.
         let query = parse("| table `a#b`").expect("parses");
@@ -807,46 +722,35 @@ mod tests {
     }
 
     /// A stray backtick inside a REGEX literal must not protect a later
-    /// comment: the comment would parse as extra AND-ed text-search terms
-    /// and silently narrow the match set. That holds whether or not a
-    /// partner backtick appears later on: the stray one is not at a name's
-    /// start, and the region it would open carries characters
-    /// `quoted_name` refuses.
+    /// comment: the comment's own words would parse as extra AND-ed
+    /// text-search terms and silently narrow the match set. The grammar
+    /// answers this by construction now — a regex body is a production,
+    /// not a scanner state — so a partner backtick later on cannot open a
+    /// pseudo-name across the comment either.
     #[test]
     fn stray_backtick_does_not_shield_later_comments() {
-        let input = "message=/back`tick/ # comment";
-        assert_eq!(strip_comments(input), "message=/back`tick/          ");
-        let query = parse(input).expect("parses");
+        let query = parse("message=/back`tick/ # comment").expect("parses");
         assert_eq!(query.search.groups[0].len(), 1);
 
         // …and with a legitimate backticked name AFTER the comment, whose
         // presence used to open a pseudo-name across it.
-        for input in [
-            "message=/a`b/ # secret note\n`req id`=1",
-            "message=/a`b/ // secret note\n`req id`=1",
-        ] {
-            let query = parse(input).unwrap_or_else(|e| panic!("{input:?} parses: {e:?}"));
-            assert_eq!(
-                query.search.groups[0].len(),
-                2,
-                "{input:?}: only the two filters, never the comment's words"
-            );
-        }
+        let input = "message=/a`b/ # secret note\n`req id`=1";
+        let query = parse(input).unwrap_or_else(|e| panic!("{input:?} parses: {e:?}"));
+        assert_eq!(
+            query.search.groups[0].len(),
+            2,
+            "{input:?}: only the two filters, never the comment's words"
+        );
 
         // The glob shape reaches the same invariant from the other side:
-        // `*` now opens a name for the scanner, so the tick is no longer
-        // ordinary text — but a bare value cannot absorb it either, so the
-        // query is a loud parse error rather than a comment quietly read
-        // as part of a value.
+        // a bare value cannot absorb a tick, so the query is a loud parse
+        // error rather than a comment quietly read as part of a value.
         assert!(parse("cmd=*`* # secret note\n`req id`=1").is_err());
     }
 
-    /// The scanner's engage rule is a heuristic — an operator inside a
-    /// bare VALUE looks exactly like arithmetic from outside (`host=a+`
-    /// vs `1+`), so the tick after it engages the name state and shields
-    /// the `#` behind it. The grammar is the backstop: no unquoted
-    /// position absorbs a tick, so the shielded region is a parse error
-    /// rather than a comment silently folded into the query.
+    /// No unquoted position absorbs a backtick (ADR-0013 ruling 7), so a
+    /// value that runs into one is a loud parse error rather than a
+    /// quietly different query.
     #[test]
     fn a_value_never_absorbs_a_backtick_shielded_comment() {
         for dsl in [
@@ -877,15 +781,14 @@ mod tests {
         );
     }
 
-    /// An expression may put an ARITHMETIC operator in front of a name,
-    /// and a descending sort key puts a `-` there, so those predecessors
-    /// open a name too — otherwise `` -`a#b` `` loses its comment markers
-    /// to the stripper and dies as an unterminated name, and a field
-    /// `quote_dsl_field` happily renders could not be sorted descending.
+    /// A backticked name is a field reference in every field position,
+    /// including directly after an operator — a descending sort key or
+    /// arithmetic. It carries comment openers verbatim, because a quoted
+    /// name has no whitespace-skip site inside it for the comment
+    /// production to reach.
     #[test]
     fn a_backtick_after_an_operator_opens_a_name() {
-        // the descending sort key, precisely: the name arrives whole, with
-        // the markers the stripper would have blanked
+        // the descending sort key, precisely: the name arrives whole
         for (dsl, want) in [
             ("* | sort -`a#b`", "a#b"),
             ("* | sort -`http://x`", "http://x"),
@@ -912,9 +815,9 @@ mod tests {
             assert!(parse(dsl).is_ok(), "{dsl} must parse");
         }
 
-        // …and a tick inside a REGEX still follows a body character, never
-        // an operator, so that line's comment is still stripped.
-        let query = parse("host=/a+b`c/ # | bad_stage").expect("the comment must be stripped");
+        // …and a tick inside a REGEX is ordinary body content, with the
+        // trailing comment still a comment.
+        let query = parse("host=/a+b`c/ # | bad_stage").expect("the comment is a comment");
         assert_eq!(
             query.pipeline.len(),
             0,
@@ -950,28 +853,19 @@ mod tests {
         );
     }
 
-    /// `strip_comments` stays linear on an adversarial backtick run. The
-    /// guard-after-scan form re-scanned to end-of-input from every backtick
-    /// byte, so a 64 KB body of the shapes below burned 0.3–1.1 s of CPU
-    /// (O(n^2)); the fixed pass is well under 5 ms. The bound is generous
-    /// (200 ms) so it flags a return of the quadratic blowup — a ~40× jump
-    /// on this input — without flaking on a loaded machine.
+    /// An adversarial backtick run stays cheap. The retired scanner had a
+    /// quadratic shape here (a re-scan to end-of-input from every backtick
+    /// byte); the grammar has no such pass at all, so this is a plain
+    /// smoke test that the shapes still terminate with an answer.
     #[test]
-    fn strip_comments_is_linear_on_a_backtick_run() {
+    fn a_backtick_run_parses_without_blowing_up() {
         let n = 65_536;
         for body in [
-            "a``".repeat(n / 3),                // clean O(n^2): doubled ticks after content
-            format!("{} x", "`".repeat(n - 2)), // worst case found: a solid tick run
-            " ``a".repeat(n / 4),               // opens, fails, restarts
+            "a``".repeat(n / 3),
+            format!("{} x", "`".repeat(n - 2)),
+            " ``a".repeat(n / 4),
         ] {
-            let start = std::time::Instant::now();
-            let _ = strip_comments(&body);
-            let elapsed = start.elapsed();
-            assert!(
-                elapsed < std::time::Duration::from_millis(200),
-                "strip_comments took {elapsed:?} on a {}-byte backtick run — quadratic blowup is back",
-                body.len()
-            );
+            let _ = parse(&body);
         }
     }
 

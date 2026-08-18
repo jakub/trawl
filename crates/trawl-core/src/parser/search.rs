@@ -13,6 +13,7 @@ use crate::ast::{
     FieldFilter, FilterOp, FilterValue, QuotedSearch, SearchStage, SearchToken, Spanned,
     TextSearch, TimeFilter,
 };
+use crate::parser::comment::{self, Spaced};
 use crate::parser::primitives::{
     ParserExtra, ParserInput, bare_value, duration, field_name, filter_op, keyword, quoted_string,
     regex_pattern, spanned,
@@ -116,6 +117,42 @@ fn field_filter<'src>()
         .labelled("field filter")
 }
 
+/// Emit ADR-0014's diagnostics for a search-stage bare term.
+///
+/// A `#` anywhere in the term is ruling 2 — the opener is never data and
+/// never a comment inside a token. `//` at the START of a term is
+/// ruling 3's loud half: an old-style comment line must fail rather than
+/// silently become AND-ed text terms that narrow the match set to
+/// nothing. `slashes_open_a_line` is false for the NEGATED arm, where a
+/// leading `//` cannot have been meant as a comment (nothing negates
+/// one), so `-//cdn.example.com` stays an ordinary negated term.
+///
+/// The term is still produced and the diagnostics are EMITTED, so the
+/// branch succeeds structurally: chumsky ranks alternatives by how far
+/// they got, and a returned error here would lose to a worse one from a
+/// later arm. `into_result()` is still `Err`.
+fn check_term<'src>(
+    p: impl Parser<'src, ParserInput<'src>, &'src str, ParserExtra<'src>> + Clone,
+    slashes_open_a_line: bool,
+) -> impl Parser<'src, ParserInput<'src>, &'src str, ParserExtra<'src>> + Clone {
+    p.validate(move |s: &str, extra, emitter| {
+        let span: SimpleSpan = extra.span();
+        let start = span.start;
+        if slashes_open_a_line && comment::starts_with_slashes(s) {
+            emitter.emit(Rich::custom(
+                (start..start + comment::SLASHES.len()).into(),
+                comment::MSG_SLASHES_NOT_A_COMMENT,
+            ));
+        } else if let Some(at) = comment::first_opener(s) {
+            emitter.emit(Rich::custom(
+                (start + at..start + at + comment::OPENER.len_utf8()).into(),
+                comment::MSG_OPENER_IN_TOKEN,
+            ));
+        }
+        s
+    })
+}
+
 /// Parse a bare text search term, optionally negated with `-`.
 ///
 /// A backtick is a METACHARACTER here, not a word byte: it opens a quoted
@@ -128,47 +165,52 @@ fn field_filter<'src>()
 /// term in EVERY position, leading or mid-word, and under `-` as much as
 /// bare, so the tick is the one character no unquoted position can absorb —
 /// the same exclusion [`crate::parser::primitives::bare_value`] makes on the
-/// value side, and for the same reason: it is decided before the grammar
-/// runs, by the comment scanner. Cost, deliberate: a bare word carrying a
-/// tick must be double-quoted (`` "a`b" ``).
+/// value side. Cost, deliberate: a bare word carrying a tick must be
+/// double-quoted (`` "a`b" ``).
+///
+/// A comment opener inside the term, and a term OPENING with the retired
+/// `//`, are parse errors ([`check_term`], ADR-0014).
 fn text_search<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     let negated = just('-')
-        .ignore_then(
+        .ignore_then(check_term(
             any()
                 .filter(|c: &char| {
                     !c.is_ascii_whitespace() && *c != '|' && *c != ')' && *c != '(' && *c != '`'
                 })
                 .repeated()
                 .at_least(1)
-                .to_slice()
-                .map(String::from),
-        )
-        .map(|term| {
+                .to_slice(),
+            false,
+        ))
+        .map(|term: &str| {
             SearchToken::TextSearch(TextSearch {
-                term,
+                term: term.to_string(),
                 negated: true,
             })
         });
 
-    let positive = any()
-        .filter(|c: &char| {
-            !c.is_ascii_whitespace()
-                && *c != '|'
-                && *c != '"'
-                && *c != ')'
-                && *c != '('
-                && *c != '`'
-        })
-        .repeated()
-        .at_least(1)
-        .to_slice()
-        .map(|s: &str| {
-            SearchToken::TextSearch(TextSearch {
-                term: s.to_string(),
-                negated: false,
+    let positive = check_term(
+        any()
+            .filter(|c: &char| {
+                !c.is_ascii_whitespace()
+                    && *c != '|'
+                    && *c != '"'
+                    && *c != ')'
+                    && *c != '('
+                    && *c != '`'
             })
-        });
+            .repeated()
+            .at_least(1)
+            .to_slice(),
+        true,
+    )
+    .map(|s: &str| {
+        SearchToken::TextSearch(TextSearch {
+            term: s.to_string(),
+            negated: false,
+        })
+    });
 
     // Excluding the byte from both terms is not enough for the `-` case:
     // it would leave `-` matching as a POSITIVE term of its own, so
@@ -222,7 +264,7 @@ fn search_token<'src>()
                             || *c == '`'
                     })
                     .rewind()
-                    .padded(),
+                    .spaced(),
             )
             .ignore_then(spanned(token.clone()))
             .map(|inner| SearchToken::Not(Box::new(inner)));
@@ -233,11 +275,11 @@ fn search_token<'src>()
             .to(TokenOrSep::<Spanned<SearchToken>>::Or);
         let paren_token = spanned(token).map(TokenOrSep::Token);
         let paren_group = choice((or_marker, paren_token))
-            .padded()
+            .spaced()
             .repeated()
             .at_least(1)
             .collect::<Vec<_>>()
-            .delimited_by(just('(').padded(), just(')').padded())
+            .delimited_by(just('(').spaced(), just(')').spaced())
             .map(|items| {
                 let mut groups: Vec<Vec<_>> = vec![vec![]];
                 for item in items {
@@ -338,7 +380,7 @@ pub(crate) fn search_stage<'src>()
     let token = spanned(search_token()).map(TokenOrSep::Token);
 
     choice((or_marker, token))
-        .padded()
+        .spaced()
         .repeated()
         .collect::<Vec<_>>()
         .map(|items| {
