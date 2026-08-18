@@ -160,7 +160,7 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
         let (msg, exact) = comment::split_payload(raw);
         return ParseError {
             message: msg.to_string(),
-            hint: comment::hint_for(msg, exact, input, span.start),
+            hint: comment::hint_for(msg, exact),
             span: span.start..span.end,
             label,
         };
@@ -276,10 +276,13 @@ struct CommentDiagnostic {
 }
 
 impl CommentDiagnostic {
-    fn new(msg: &str, input: &str, at: usize, len: usize) -> Self {
+    /// No `exact`: this is the position-BLIND net, and a hint it minted a
+    /// spelling for would be guessing at both the token's bounds and the
+    /// position's escape (`comment::hint_for`).
+    fn new(msg: &str, at: usize, len: usize) -> Self {
         Self {
             message: msg.to_string(),
-            hint: comment::hint_for(msg, None, input, at),
+            hint: comment::hint_for(msg, None),
             span: at..at + len,
         }
     }
@@ -300,7 +303,6 @@ fn comment_diagnostic(input: &str, offset: usize) -> Option<CommentDiagnostic> {
     if rest.starts_with(comment::OPENER) && !preceded_by_whitespace(input, offset) {
         return Some(CommentDiagnostic::new(
             comment::MSG_OPENER_IN_TOKEN,
-            input,
             offset,
             comment::OPENER.len_utf8(),
         ));
@@ -313,7 +315,6 @@ fn comment_diagnostic(input: &str, offset: usize) -> Option<CommentDiagnostic> {
     if comment::starts_with_slashes(rest) && preceded_by_whitespace(input, offset) {
         return Some(CommentDiagnostic::new(
             comment::MSG_SLASHES_NOT_A_COMMENT,
-            input,
             offset,
             comment::SLASHES.len(),
         ));
@@ -326,7 +327,6 @@ fn comment_diagnostic(input: &str, offset: usize) -> Option<CommentDiagnostic> {
     let at = comment::opener_in_command_word(input, offset)?;
     Some(CommentDiagnostic::new(
         comment::MSG_OPENER_IN_COMMAND,
-        input,
         at,
         comment::OPENER.len_utf8(),
     ))

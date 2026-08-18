@@ -198,6 +198,21 @@ pub(crate) fn starts_with_slashes(text: &str) -> bool {
 /// after it.
 const PAYLOAD_SEP: char = '\u{1f}';
 
+/// The messages a [`payload`] may be minted with — the ONE list
+/// [`split_payload`] recognises.
+///
+/// The separator is not enough on its own: other productions build their
+/// custom message by INTERPOLATING user-derived text (an invalid regex's
+/// `Display`, a refused reserved name), so a query carrying a literal
+/// U+001F could hand the renderer a string that splits into a head this
+/// module never wrote. Splitting only on an exact head keeps a foreign
+/// message whole, message and all.
+const PAYLOAD_MESSAGES: [&str; 3] = [
+    MSG_OPENER_IN_TOKEN,
+    MSG_OPENER_IN_VALUE,
+    MSG_OPENER_IN_NEGATED_TERM,
+];
+
 /// The payload an emitting production sends when it HOLDS the offending
 /// token: the position message, plus the exact slice the grammar refused.
 ///
@@ -215,10 +230,15 @@ pub(crate) fn payload(msg: &str, exact: &str) -> String {
 
 /// Split a [`payload`] back into its message and the exact token, if it
 /// carries one. A custom error from anywhere else (an overflowing
-/// literal, an invalid regex) carries no separator and comes back whole.
+/// literal, an invalid regex, a refused reserved name) comes back whole —
+/// including one whose own interpolated text carries a [`PAYLOAD_SEP`],
+/// because the head must be byte-equal to a message this module mints
+/// ([`PAYLOAD_MESSAGES`]).
 pub(crate) fn split_payload(raw: &str) -> (&str, Option<&str>) {
-    raw.split_once(PAYLOAD_SEP)
-        .map_or((raw, None), |(msg, exact)| (msg, Some(exact)))
+    match raw.split_once(PAYLOAD_SEP) {
+        Some((msg, exact)) if PAYLOAD_MESSAGES.contains(&msg) => (msg, Some(exact)),
+        _ => (raw, None),
+    }
 }
 
 /// The hint for one of this module's messages. ONE owner: both emitters
@@ -226,47 +246,73 @@ pub(crate) fn split_payload(raw: &str) -> (&str, Option<&str>) {
 /// generic net in [`crate::parser::rich_to_parse_error`] — come here, so
 /// a position's working spelling is written down once.
 ///
-/// Every hint offers something the user can FOLLOW without changing what
-/// the query means, which is why the position rides in the message:
-/// quoting the whole of `color=#ff0000` is a phrase search, and quoting
-/// a `-`-negated term spells literal quote characters.
+/// Every hint offers something the user can FOLLOW, and says what
+/// following it costs, which is why the position rides in the message:
+/// quoting the whole of `color=#ff0000` is a phrase search, quoting a
+/// `-`-negated term spells literal quote characters, and quoting a value
+/// carrying `*`/`?` turns a glob into an exact match.
 ///
-/// `exact` is the slice the emitting production held ([`payload`]); it is
-/// `None` for the generic net, which has only the error's offset and
-/// recovers a token run from the input. That recovery is a GUESS — the
-/// run can span several grammar tokens — so its quoting advice is gated
-/// on [`quotable_verbatim`], and a hint whose quote half is unfollowable
-/// keeps only the half that always is.
-pub(crate) fn hint_for(
-    msg: &str,
-    exact: Option<&str>,
-    input: &str,
-    offset: usize,
-) -> Option<String> {
-    let comment_half = format!("put whitespace before the '{OPENER}' to start a comment");
-    let token = || exact.unwrap_or_else(|| token_around(input, offset));
+/// A CONCRETE rewrite is offered only where the emitting production held
+/// the exact slice ([`payload`]) AND the rewrite means what the hint
+/// claims. `exact` is `None` for the generic net in
+/// [`crate::parser::rich_to_parse_error`], which knows only an offset:
+/// the token run around it can span several grammar tokens, and the
+/// POSITION is unknown — `| sort "a#b"` does not parse and
+/// `| where a#b > 1` quietly becomes a string literal, whose escape is a
+/// backticked name, not quotes. So the net names the escapes ABSTRACTLY
+/// and mints no spelling.
+pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
     match msg {
         MSG_SLASHES_NOT_A_COMMENT => Some(HINT_SLASHES.to_string()),
-        MSG_OPENER_IN_TOKEN => Some(if quotable_verbatim(token()) {
-            format!(
-                "quote it (\"{}\") to search for it, or {comment_half}",
-                token()
-            )
-        } else {
-            comment_half
+        MSG_OPENER_IN_TOKEN => Some(match exact.filter(|t| quotable_as_term(t)) {
+            Some(term) => format!(
+                "quote it (\"{term}\") to search for it, or {}",
+                comment_half()
+            ),
+            None => generic_advice(),
         }),
-        MSG_OPENER_IN_VALUE => Some(if quotable_verbatim(token()) {
-            format!("quote the value (\"{}\"), or {comment_half}", token())
-        } else {
-            comment_half
+        MSG_OPENER_IN_VALUE => Some(match exact.filter(|t| quotable_verbatim(t)) {
+            // Quoting a value is not operator-neutral: an unquoted `*`/`?`
+            // is the glob PATTERN (`crate::parser::search::has_glob_chars`
+            // decides it), and quoted wildcards are data. The advice is
+            // still the right one — a value carrying a `#` cannot stay
+            // unquoted — so it states what it costs instead of hiding it.
+            Some(value) if crate::parser::search::has_glob_chars(value) => format!(
+                "quote the value (\"{value}\") to match it exactly \
+                 (a quoted value is never a pattern), or {}",
+                comment_half()
+            ),
+            Some(value) => format!("quote the value (\"{value}\"), or {}", comment_half()),
+            None => comment_half(),
         }),
-        MSG_OPENER_IN_NEGATED_TERM => Some(match quoted_term(token()) {
-            Some(spelling) => format!("write it as NOT {spelling}, or {comment_half}"),
-            None => comment_half,
+        MSG_OPENER_IN_NEGATED_TERM => Some(match exact.and_then(quoted_term) {
+            Some(spelling) => format!("write it as NOT {spelling}, or {}", comment_half()),
+            None => comment_half(),
         }),
-        MSG_OPENER_IN_COMMAND => Some(comment_half),
+        MSG_OPENER_IN_COMMAND => Some(comment_half()),
         _ => None,
     }
+}
+
+/// The one advice every hint here ends with, and the only one that is
+/// true in every position.
+fn comment_half() -> String {
+    format!("put whitespace before the '{OPENER}' to start a comment")
+}
+
+/// The position-BLIND advice: both escapes named, no spelling minted.
+///
+/// The generic net fires wherever the two validators do not — a sort key,
+/// an expression, a stage argument — and each of those positions escapes
+/// a `#` differently. Naming the two quoted contexts lets the user pick
+/// the one their position takes; printing `"a#b"` would pick for them,
+/// and pick wrong half the time.
+fn generic_advice() -> String {
+    format!(
+        "{}, or carry the '{OPENER}' inside a quoted value (\"…\") \
+         or a backticked field name (`…`)",
+        comment_half()
+    )
 }
 
 /// Whether `"{text}"` is a rewrite the grammar reads back as exactly
@@ -277,9 +323,9 @@ pub(crate) fn hint_for(
 /// hint does not spell, so `message="x"\u{a0}# note` would advise pasting
 /// a string that ends at its own second quote. And a run carrying a
 /// character no unquoted token may contain — `( ) , |`, a backtick,
-/// whitespace — is not ONE token at all: the generic net recovered
-/// several, and `* | stats count(),# x` would be advised to quote
-/// `count(),#`, which is not a thing any position accepts.
+/// whitespace — is not one token in the position that emitted it: a value
+/// stops at a `,` (it is the IN-list separator), so advising `"a,b"` there
+/// would name a value the unquoted spelling never held.
 ///
 /// This is the double-quote counterpart of
 /// [`crate::parser::suggest::quote_dsl_field`], not a caller of it: that
@@ -288,21 +334,44 @@ pub(crate) fn hint_for(
 /// user meant to search for text. The invisible-character half IS shared
 /// — both go through [`crate::sanitize::is_unsafe_display_char`].
 fn quotable_verbatim(text: &str) -> bool {
+    quotable(text, false)
+}
+
+/// [`quotable_verbatim`] for a SEARCH TERM, where a `,` is an ordinary
+/// word byte rather than a separator.
+///
+/// `foo,#bar` is ONE positive bare term — the term charset ends at
+/// whitespace, `|`, parens and a backtick, and nothing else — and
+/// `"foo,#bar"` is a `QuotedSearch` whose emitted SQL is the same
+/// substring match the bare term compiles to (`emitter/search.rs`). So
+/// the comma exclusion, which the value position needs, over-rejects
+/// here.
+fn quotable_as_term(text: &str) -> bool {
+    quotable(text, true)
+}
+
+fn quotable(text: &str, comma_is_data: bool) -> bool {
     !text.is_empty()
         && !text.chars().any(|c| {
-            matches!(c, '"' | '\\' | '(' | ')' | ',' | '|' | '`')
+            matches!(c, '"' | '\\' | '(' | ')' | '|' | '`')
+                || (c == ',' && !comma_is_data)
                 || c.is_whitespace()
                 || crate::sanitize::is_unsafe_display_char(c)
         })
 }
 
 /// The unquoted token surrounding `offset` and the byte it starts at: the
-/// run of non-ASCII-whitespace, non-`|` bytes around it. Used to render a
-/// hint, and to decide whether that token is a pipe stage name.
+/// run of non-ASCII-whitespace, non-`|` bytes around it. Used to decide
+/// whether that token is a pipe stage name.
+///
+/// It is deliberately NOT a hint source: a run recovered from an offset is
+/// a guess at both the token's bounds and its grammatical position, and a
+/// hint that quotes a guess is how `url=…?a=b#frag` came to be advised
+/// `"b#frag"`. Every concrete rewrite comes from the production that HELD
+/// the slice ([`payload`]).
 ///
 /// ASCII whitespace because that is where the unquoted token charsets end
-/// — a no-break space sits INSIDE a bare word, so a hint bounded by
-/// Unicode whitespace would quote less than the user has to change.
+/// — a no-break space sits INSIDE a bare word.
 pub(crate) fn token_span(input: &str, offset: usize) -> (usize, &str) {
     let ends = |c: char| c.is_ascii_whitespace() || c == '|';
     let start = input[..offset.min(input.len())].rfind(ends).map_or(0, |i| {
@@ -311,10 +380,6 @@ pub(crate) fn token_span(input: &str, offset: usize) -> (usize, &str) {
     let rest = &input[start..];
     let end = rest.find(ends).unwrap_or(rest.len());
     (start, &rest[..end])
-}
-
-fn token_around(input: &str, offset: usize) -> &str {
-    token_span(input, offset).1
 }
 
 /// A negated term's working spelling under `NOT`: the term without its
@@ -329,7 +394,7 @@ fn quoted_term(token: &str) -> Option<String> {
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
         .unwrap_or(inner);
-    quotable_verbatim(body).then(|| format!("\"{body}\""))
+    quotable_as_term(body).then(|| format!("\"{body}\""))
 }
 
 /// The comment opener inside a PIPE STAGE NAME containing `offset`, if
@@ -452,10 +517,10 @@ mod tests {
     }
 
     #[test]
-    fn token_around_recovers_the_offending_token() {
-        assert_eq!(token_around("foo#bar", 3), "foo#bar");
-        assert_eq!(token_around("a=1 color=#ff0000", 10), "color=#ff0000");
-        assert_eq!(token_around("x|color=#f", 8), "color=#f");
+    fn token_span_recovers_the_offending_token() {
+        assert_eq!(token_span("foo#bar", 3).1, "foo#bar");
+        assert_eq!(token_span("a=1 color=#ff0000", 10).1, "color=#ff0000");
+        assert_eq!(token_span("x|color=#f", 8).1, "color=#f");
     }
 
     /// A hint the user can FOLLOW: the value position quotes the EXACT
@@ -474,7 +539,7 @@ mod tests {
             "#a",
             "https://example.test/p?a=b#frag",
         ] {
-            let hint = hint_for(MSG_OPENER_IN_VALUE, Some(exact), "", 0).expect("value hint");
+            let hint = hint_for(MSG_OPENER_IN_VALUE, Some(exact)).expect("value hint");
             assert!(
                 hint.starts_with(&format!("quote the value (\"{exact}\")")),
                 "{exact:?}: {hint:?}"
@@ -490,6 +555,22 @@ mod tests {
         assert_eq!(split_payload(&raw), (MSG_OPENER_IN_VALUE, Some("a\u{1f}b")));
         // …and a custom error from anywhere else comes back whole
         assert_eq!(split_payload("regex too long"), ("regex too long", None));
+    }
+
+    /// A FOREIGN custom message carrying a separator round-trips whole:
+    /// other productions interpolate user-derived text into theirs (an
+    /// invalid regex's `Display`, a refused reserved name), so the
+    /// separator alone cannot decide.
+    #[test]
+    fn a_foreign_message_with_a_separator_is_not_split() {
+        for raw in [
+            "invalid regex: a\u{1f}b",
+            "\u{1f}",
+            "'#' inside an unquoted toke\u{1f}n",
+            "prefix '#' inside an unquoted token\u{1f}x",
+        ] {
+            assert_eq!(split_payload(raw), (raw, None), "{raw:?}");
+        }
     }
 
     /// The quote half is offered only where `"…"` reads back unchanged.
@@ -510,22 +591,41 @@ mod tests {
             assert!(!quotable_verbatim(text), "{text:?}");
         }
 
+        // …and a `,` is a word byte in a TERM, where nothing splits on it
+        for text in ["foo,#bar", "#a,#b"] {
+            assert!(quotable_as_term(text), "{text:?}");
+            assert!(!quotable_verbatim(text), "{text:?}");
+        }
+
         // …and the hint drops that half rather than print it
-        let hint = hint_for(MSG_OPENER_IN_TOKEN, Some("count(),#"), "", 0).expect("hint");
+        let hint = hint_for(MSG_OPENER_IN_VALUE, Some("a\"b#c")).expect("hint");
         assert_eq!(hint, "put whitespace before the '#' to start a comment");
+    }
+
+    /// The position-BLIND net mints no spelling: it does not know the
+    /// token's bounds, and it does not know whether the position takes a
+    /// quoted value or a backticked name.
+    #[test]
+    fn the_generic_net_names_the_escapes_without_spelling_one() {
+        let hint = hint_for(MSG_OPENER_IN_TOKEN, None).expect("hint");
+        assert_eq!(
+            hint,
+            "put whitespace before the '#' to start a comment, or carry the '#' \
+             inside a quoted value (\"…\") or a backticked field name (`…`)"
+        );
+        assert!(!hint.contains("quote it"), "{hint:?}");
     }
 
     /// Quoting is no escape under `-`: `-"a#b"` spells literal quotes.
     #[test]
     fn a_negated_term_hint_offers_the_not_spelling() {
         for (exact, want) in [("-\"a#b\"", "NOT \"a#b\""), ("-foo#bar", "NOT \"foo#bar\"")] {
-            let hint =
-                hint_for(MSG_OPENER_IN_NEGATED_TERM, Some(exact), "", 0).expect("negated hint");
+            let hint = hint_for(MSG_OPENER_IN_NEGATED_TERM, Some(exact)).expect("negated hint");
             assert!(hint.starts_with(&format!("write it as {want}")), "{hint:?}");
         }
 
         // …and a term no quoting can spell keeps only the comment half
-        let hint = hint_for(MSG_OPENER_IN_NEGATED_TERM, Some("-a\"b#c"), "", 0).expect("hint");
+        let hint = hint_for(MSG_OPENER_IN_NEGATED_TERM, Some("-a\"b#c")).expect("hint");
         assert_eq!(hint, "put whitespace before the '#' to start a comment");
     }
 
@@ -533,7 +633,7 @@ mod tests {
     /// whitespace one.
     #[test]
     fn a_command_hint_offers_only_the_comment_spelling() {
-        let hint = hint_for(MSG_OPENER_IN_COMMAND, None, "* | co#unt()", 6).expect("command hint");
+        let hint = hint_for(MSG_OPENER_IN_COMMAND, None).expect("command hint");
         assert_eq!(hint, "put whitespace before the '#' to start a comment");
     }
 

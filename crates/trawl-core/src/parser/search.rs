@@ -37,7 +37,12 @@ fn quoted_search<'src>()
 }
 
 /// Detect whether a value contains glob characters (`*` or `?`).
-fn has_glob_chars(s: &str) -> bool {
+///
+/// The ONE glob predicate: it decides the operator here, and it is what
+/// [`crate::parser::comment::hint_for`] asks before promising a quoted
+/// rewrite matches "exactly" — a hint whose claim came from a second
+/// spelling of this rule could contradict the parser that answers it.
+pub(crate) fn has_glob_chars(s: &str) -> bool {
     s.contains('*') || s.contains('?')
 }
 

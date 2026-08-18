@@ -14,7 +14,7 @@
 
 use trawl_core::ast::{
     BinaryOp, Expr, FieldFilter, FilterOp, FilterValue, LiteralValue, PipeStage, Query,
-    SearchToken, TextSearch,
+    QuotedSearch, SearchToken, TextSearch,
 };
 use trawl_core::parser::{ParseError, parse};
 
@@ -65,6 +65,22 @@ fn eq(field: &str, value: &str) -> FieldFilter {
         value: FilterValue::Literal(value.to_string()),
     }
 }
+
+/// The search tokens of a query, in order — so a hint's advised rewrite
+/// can be checked for what it MEANS, not merely that it parsed.
+fn tokens(query: &Query) -> Vec<&SearchToken> {
+    query.search.groups[0].iter().map(|t| &t.node).collect()
+}
+
+/// The one advice that holds in every position, and the tail of every
+/// hint here.
+const COMMENT_HALF: &str = "put whitespace before the '#' to start a comment";
+
+/// The position-BLIND net's whole hint: it knows neither the token's
+/// bounds nor which quoted context the position takes, so it names both
+/// escapes and mints no spelling.
+const GENERIC_ADVICE: &str = "put whitespace before the '#' to start a comment, \
+     or carry the '#' inside a quoted value (\"…\") or a backticked field name (`…`)";
 
 // ── the shapes that PARSE, and what they mean ────────────────────────
 
@@ -217,10 +233,31 @@ fn an_opener_inside_an_unquoted_token_is_a_loud_error() {
         let hint = err.hint.unwrap_or_else(|| panic!("{dsl:?} must hint"));
         assert_eq!(
             hint,
-            format!("{hint_fragment}, or put whitespace before the '#' to start a comment"),
+            format!("{hint_fragment}, or {COMMENT_HALF}"),
             "{dsl:?}"
         );
     }
+
+    // …and every spelling those hints offer is a query the grammar reads
+    // back as the thing the hint CLAIMS it is — a term hint claims a text
+    // search, a value hint claims a filter on that value.
+    assert_eq!(
+        tokens(&ok("\"foo#bar\"")),
+        vec![&SearchToken::QuotedSearch(QuotedSearch {
+            phrase: "foo#bar".to_string()
+        })]
+    );
+    assert_eq!(
+        filters(&ok("color=\"#ff0000\"")),
+        vec![&eq("color", "#ff0000")]
+    );
+    assert_eq!(filters(&ok("a=\"1#\"")), vec![&eq("a", "1#")]);
+    assert_eq!(
+        tokens(&ok("\"1=/foo#bar/\"")),
+        vec![&SearchToken::QuotedSearch(QuotedSearch {
+            phrase: "1=/foo#bar/".to_string()
+        })]
+    );
 }
 
 /// The value hint names the value the production HELD, never a slice
@@ -240,12 +277,103 @@ fn the_value_hint_names_the_whole_value() {
     assert_eq!(
         err.hint.as_deref(),
         Some(
-            "quote the value (\"https://example.test/p?a=b#frag\"), \
-             or put whitespace before the '#' to start a comment"
-        )
+            format!(
+                "quote the value (\"https://example.test/p?a=b#frag\") to match it exactly \
+                 (a quoted value is never a pattern), or {COMMENT_HALF}"
+            )
+            .as_str()
+        ),
+        "the value carries a '?', so quoting it is not operator-neutral"
     );
-    // …and the spelling it offers is the query the user meant
-    ok("url=\"https://example.test/p?a=b#frag\"");
+    // …and the spelling it offers is the query the user meant, with the
+    // operator the hint claims
+    assert_eq!(
+        filters(&ok("url=\"https://example.test/p?a=b#frag\"")),
+        vec![&eq("url", "https://example.test/p?a=b#frag")]
+    );
+}
+
+/// A quoted value is never a glob, so a hint that says "quote it" to a
+/// value carrying `*`/`?` is advising an OPERATOR change — `f=#a*` is a
+/// Glob filter and `f="#a*"` is an exact one. The advice stands (the `#`
+/// leaves no unquoted spelling), and it says what it costs.
+#[test]
+fn a_value_hint_admits_that_quoting_a_glob_makes_it_exact() {
+    for dsl in ["f=#a*", "f=#a?"] {
+        let err = one_error(dsl);
+        assert_eq!(err.message, MSG_OPENER_VALUE, "{dsl:?}");
+        let value = &dsl["f=".len()..];
+        assert_eq!(
+            err.hint.as_deref(),
+            Some(
+                format!(
+                    "quote the value (\"{value}\") to match it exactly \
+                     (a quoted value is never a pattern), or {COMMENT_HALF}"
+                )
+                .as_str()
+            ),
+            "{dsl:?}"
+        );
+
+        // …and the rewrite parses, as the EXACT match the hint claims
+        assert_eq!(
+            filters(&ok(&format!("f=\"{value}\""))),
+            vec![&eq("f", value)],
+            "{dsl:?}: the advised rewrite must be FilterOp::Eq"
+        );
+    }
+
+    // …while a value with no wildcard keeps the plain wording, and its
+    // rewrite is Eq because the unquoted spelling was Eq too
+    let err = one_error("f=#a");
+    assert_eq!(
+        err.hint.as_deref(),
+        Some(format!("quote the value (\"#a\"), or {COMMENT_HALF}").as_str())
+    );
+    assert_eq!(filters(&ok("f=\"#a\"")), vec![&eq("f", "#a")]);
+}
+
+/// A `,` is a word byte in a bare TERM — nothing splits on it there — so
+/// the value position's comma exclusion over-rejects. `foo,#bar` is one
+/// term, and `"foo,#bar"` is the quoted search that means the same thing.
+#[test]
+fn a_term_hint_admits_a_comma() {
+    let dsl = "foo,#bar";
+    let err = one_error(dsl);
+    assert_eq!(err.message, MSG_OPENER);
+    assert_eq!(&dsl[err.span.clone()], "#");
+    assert_eq!(
+        err.hint.as_deref(),
+        Some(format!("quote it (\"foo,#bar\") to search for it, or {COMMENT_HALF}").as_str())
+    );
+
+    // …and the rewrite parses as the substring search the hint claims
+    assert_eq!(
+        tokens(&ok("\"foo,#bar\"")),
+        vec![&SearchToken::QuotedSearch(QuotedSearch {
+            phrase: "foo,#bar".to_string()
+        })]
+    );
+
+    // …the same under `-`, whose working spelling is NOT
+    let err = one_error("-foo,#bar");
+    assert_eq!(err.message, MSG_OPENER_NEGATED);
+    assert_eq!(
+        err.hint.as_deref(),
+        Some(format!("write it as NOT \"foo,#bar\", or {COMMENT_HALF}").as_str())
+    );
+    let rewritten = ok("NOT \"foo,#bar\"");
+    let advised = tokens(&rewritten);
+    assert_eq!(advised.len(), 1, "the advised rewrite is one negated token");
+    let SearchToken::Not(inner) = advised[0] else {
+        panic!("expected a NOT token, got {:?}", advised[0]);
+    };
+    assert_eq!(
+        inner.node,
+        SearchToken::QuotedSearch(QuotedSearch {
+            phrase: "foo,#bar".to_string()
+        })
+    );
 }
 
 /// …and an IN list is still hinted per ELEMENT, because an element IS
@@ -276,32 +404,53 @@ fn an_in_list_is_hinted_one_element_at_a_time() {
         assert_eq!(err.message, MSG_OPENER_VALUE, "{dsl:?}");
         assert_eq!(err.hint.as_deref(), expected(value).as_deref(), "{dsl:?}");
     }
+
+    // …and quoting each element as advised gives back the IN list the
+    // user meant, element for element — the claim the per-element hint
+    // makes is that the LIST survives.
+    let query = ok("f=\"#a\",\"#b\",\"#c\"");
+    assert_eq!(
+        filters(&query),
+        vec![&FieldFilter {
+            field: "f".to_string(),
+            op: FilterOp::Eq,
+            value: FilterValue::List(vec!["#a".to_string(), "#b".to_string(), "#c".to_string()]),
+        }]
+    );
 }
 
-/// A hint offers quoting only where `"…"` is a rewrite the grammar reads
-/// back unchanged. Two shapes where it is not, and both drop that half
-/// rather than print advice that cannot be followed:
+/// A CONCRETE rewrite is offered only where the emitting production HELD
+/// the slice and the rewrite means what the hint claims. Two shapes where
+/// it does not, and neither prints advice that cannot be followed:
 ///
 /// * a token carrying a `"` or a `\` would need an escape the hint does
 ///   not spell, so the pasted string would end at its own second quote;
-/// * a run the GENERIC net recovered can span several grammar tokens —
-///   `count(),#` is not a token any position accepts.
+/// * the position-blind net knows only an offset — the run around it can
+///   span several grammar tokens, and each position escapes a `#`
+///   differently — so it names the escapes and spells none.
 ///
-/// The whitespace half is always true, so it is what remains.
+/// The whitespace half is always true, so it is what always remains.
 #[test]
 fn a_hint_drops_advice_the_grammar_cannot_read() {
-    const COMMENT_HALF: &str = "put whitespace before the '#' to start a comment";
+    // an embedded quote inside a value: the position is known, but no
+    // quoted spelling reads back unchanged, so only the true half remains
+    let err = one_error("f=a\"b#c");
+    assert_eq!(err.message, MSG_OPENER_VALUE);
+    assert_eq!(err.hint.as_deref(), Some(COMMENT_HALF));
 
-    for (dsl, msg) in [
-        // an embedded quote inside a value
-        ("f=a\"b#c", MSG_OPENER_VALUE),
-        // …and a recovered run that is not one token, in a pipeline
-        // position where quoting is not the fix at all
-        ("* | stats count(),# x", MSG_OPENER),
+    // …and the position-BLIND net mints no spelling at all. `"a#b"` does
+    // not parse as a sort key and quietly becomes a string LITERAL in an
+    // expression, whose escape is a backticked name — so the net names
+    // both escapes and picks neither.
+    for dsl in [
+        "* | stats count(),# x",
+        "* | sort a#b",
+        "* | where a#b > 1",
+        "* | table a#b",
     ] {
         let err = one_error(dsl);
-        assert_eq!(err.message, msg, "{dsl:?}");
-        assert_eq!(err.hint.as_deref(), Some(COMMENT_HALF), "{dsl:?}");
+        assert_eq!(err.message, MSG_OPENER, "{dsl:?}");
+        assert_eq!(err.hint.as_deref(), Some(GENERIC_ADVICE), "{dsl:?}");
     }
 
     // …while a term the production HELD is quotable even when the text
@@ -316,7 +465,20 @@ fn a_hint_drops_advice_the_grammar_cannot_read() {
             "quote it (\"#\") to search for it, or put whitespace before the '#' to start a comment"
         )
     );
-    ok("message=\"x\"\u{a0}\"#\" note");
+    let rewritten = ok("message=\"x\"\u{a0}\"#\" note");
+    assert_eq!(
+        tokens(&rewritten),
+        vec![
+            &SearchToken::FieldFilter(eq("message", "x")),
+            &SearchToken::QuotedSearch(QuotedSearch {
+                phrase: "#".to_string()
+            }),
+            &SearchToken::TextSearch(TextSearch {
+                term: "note".to_string(),
+                negated: false,
+            }),
+        ]
+    );
 }
 
 /// Quoting is no escape under `-`: `-"a#b"` is a bare NEGATED term that
@@ -339,8 +501,25 @@ fn a_negated_term_is_pointed_at_the_not_spelling() {
             format!("write it as {working}, or put whitespace before the '#' to start a comment"),
             "{dsl:?}"
         );
-        // …and the spelling the hint offers is one the grammar accepts
-        ok(working);
+        // …and the spelling the hint offers is one the grammar accepts,
+        // as the NEGATED phrase search the hint claims it is
+        let rewritten = ok(working);
+        let advised = tokens(&rewritten);
+        assert_eq!(advised.len(), 1, "{working:?}");
+        let SearchToken::Not(inner) = advised[0] else {
+            panic!("{working:?}: expected a NOT token, got {:?}", advised[0]);
+        };
+        let SearchToken::QuotedSearch(phrase) = &inner.node else {
+            panic!(
+                "{working:?}: expected a quoted search, got {:?}",
+                inner.node
+            );
+        };
+        assert_eq!(
+            phrase.phrase,
+            dsl.trim_start_matches('-').trim_matches('"'),
+            "{working:?}: the rewrite must search for the term the user wrote"
+        );
     }
 }
 
