@@ -9,13 +9,91 @@
 
 use chumsky::prelude::*;
 
+use std::cell::Cell;
 use std::ops::Range;
 
 use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
+use crate::parser::comment::Spaced;
 use crate::parser::primitives::{
     ParserExtra, ParserInput, field_name, keyword, literal, plain_name, quoted_string,
     regex_pattern, spanned,
 };
+
+/// How deeply one expression may nest before the grammar refuses it.
+///
+/// Every nesting level — a parenthesised sub-expression, a function
+/// call's arguments, an `in (…)` list — is one more recursive descent
+/// through the whole precedence chain, and each descent costs stack. The
+/// input cap (`MAX_QUERY_LEN`) alone does not bound that: `a(a(a(…` fits
+/// twenty thousand levels into 64 KiB of text, which is enough to walk a
+/// thread off the end of its stack. trawld parses inside its axum
+/// handlers, on a tokio worker whose stack is 2 MiB, so an unbounded
+/// grammar is a remote crash a single query can spell.
+///
+/// How much a level costs is a property of the BUILD, not of the DSL: a
+/// release build spends tens of bytes per level, while an unoptimized
+/// build with full debuginfo spends tens of KILOBYTES (LLVM cannot merge
+/// the stack slots of chumsky's enormous combinator types once every one
+/// of them is a named debugger variable). That spread — three orders of
+/// magnitude — is why an unbounded grammar cannot be argued safe from
+/// one measurement, and it is how this bound came to be written: CI,
+/// which builds exactly that way, took SIGSEGV on 300 nested parens
+/// while the same corpus passed on a developer's
+/// `debug = "line-tables-only"` build using a sixth of the stack it had.
+///
+/// So the number is set against the HUNGRIEST build, measured there and
+/// not extrapolated: in an unoptimized full-debuginfo build a 2 MiB
+/// stack carries nesting into the forties and dies in the sixties, so
+/// sixteen is the bound — about a quarter of what that build survives,
+/// and a rounding error in a release one.
+///
+/// Sixteen is still far past any query a person writes: `((a + b) * (c -
+/// d))` is two, and the deepest expression in this repository's tests,
+/// docs and UI-composed queries is three.
+pub(crate) const MAX_EXPR_DEPTH: usize = 16;
+
+thread_local! {
+    /// How many expression nesting levels the parse currently sits
+    /// inside. A thread-local because chumsky's parsers are shared,
+    /// immutable values with no state channel of their own, and one
+    /// `parse` call never leaves the thread it started on.
+    static DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Restores the nesting depth however the level is left — a match, a
+/// failed alternative chumsky will backtrack out of, or a panic. Without
+/// it a backtracked `(` would leak a level and later, legal nesting in
+/// the SAME query would be refused.
+struct DepthGuard;
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Run `inner` one nesting level deeper, refusing past [`MAX_EXPR_DEPTH`].
+///
+/// The refusal is a parse error carrying the limit, not a silent
+/// truncation and not a crash: an over-nested query is answered, in the
+/// same shape as every other thing the grammar declines.
+fn nested<'src, T: 'src>(
+    inner: impl Parser<'src, ParserInput<'src>, T, ParserExtra<'src>> + Clone + 'src,
+) -> impl Parser<'src, ParserInput<'src>, T, ParserExtra<'src>> + Clone {
+    custom(move |inp| {
+        let depth = DEPTH.with(Cell::get) + 1;
+        if depth > MAX_EXPR_DEPTH {
+            let before = inp.cursor();
+            return Err(Rich::custom(
+                inp.span_since(&before),
+                format!("expression nests deeper than {MAX_EXPR_DEPTH} levels"),
+            ));
+        }
+        DEPTH.with(|d| d.set(depth));
+        let _guard = DepthGuard;
+        inp.parse(inner.clone())
+    })
+}
 
 /// Parse an expression with full operator precedence.
 ///
@@ -38,13 +116,13 @@ pub(crate) fn expr<'src>()
         // so `lower`(x) is a field reference, never a call (ADR-0013 §7).
         let func_call = spanned(
             plain_name()
-                .then_ignore(just('(').padded())
-                .then(
+                .then_ignore(just('(').spaced())
+                .then(nested(
                     expr.clone()
-                        .separated_by(just(',').padded())
+                        .separated_by(just(',').spaced())
                         .collect::<Vec<_>>(),
-                )
-                .then_ignore(just(')').padded())
+                ))
+                .then_ignore(just(')').spaced())
                 .map(|(name, args)| Expr::FunctionCall { name, args }),
         );
 
@@ -55,9 +133,7 @@ pub(crate) fn expr<'src>()
 
         let field_ref = spanned(field_name().map(Expr::FieldRef));
 
-        let paren_expr = expr
-            .clone()
-            .delimited_by(just('(').padded(), just(')').padded());
+        let paren_expr = nested(expr.clone()).delimited_by(just('(').spaced(), just(')').spaced());
 
         // order matters: func_call before field_ref, literal before field_ref
         // .boxed() here to break up deeply nested generic types that overflow
@@ -69,7 +145,7 @@ pub(crate) fn expr<'src>()
             paren_expr,
             field_ref,
         ))
-        .padded()
+        .spaced()
         .labelled("expression")
         .boxed();
 
@@ -91,7 +167,7 @@ pub(crate) fn expr<'src>()
             just('/').to(BinaryOp::Div),
             just('%').to(BinaryOp::Mod),
         ))
-        .padded();
+        .spaced();
 
         let multiplicative =
             unary_neg
@@ -109,7 +185,7 @@ pub(crate) fn expr<'src>()
                 });
 
         // --- precedence 5: additive `+` `-` ---
-        let add_op = choice((just('+').to(BinaryOp::Add), just('-').to(BinaryOp::Sub))).padded();
+        let add_op = choice((just('+').to(BinaryOp::Add), just('-').to(BinaryOp::Sub))).spaced();
 
         let additive = multiplicative.clone().foldl(
             add_op.then(multiplicative).repeated(),
@@ -135,7 +211,7 @@ pub(crate) fn expr<'src>()
             just("<=").to(BinaryOp::Lte),
             just("<").to(BinaryOp::Lt),
         ))
-        .padded();
+        .spaced();
 
         // `matches` is handled separately so the RHS can accept `/regex/`
         // literals without conflicting with `/` as the division operator
@@ -148,16 +224,16 @@ pub(crate) fn expr<'src>()
                 choice((
                     // matches with regex literal support
                     keyword("matches")
-                        .padded()
+                        .spaced()
                         .ignore_then(choice((regex_literal, additive.clone())))
                         .map(|rhs| CmpRhs::Binary(BinaryOp::Matches, rhs)),
                     // like / ilike pattern matching
                     keyword("ilike")
-                        .padded()
+                        .spaced()
                         .ignore_then(additive.clone())
                         .map(|rhs| CmpRhs::Binary(BinaryOp::ILike, rhs)),
                     keyword("like")
-                        .padded()
+                        .spaced()
                         .ignore_then(additive.clone())
                         .map(|rhs| CmpRhs::Binary(BinaryOp::Like, rhs)),
                     // other comparison operators
@@ -166,12 +242,14 @@ pub(crate) fn expr<'src>()
                         .map(|(op, rhs)| CmpRhs::Binary(op, rhs)),
                     // in list
                     keyword("in")
-                        .padded()
+                        .spaced()
                         .ignore_then(
-                            expr.clone()
-                                .separated_by(just(',').padded())
-                                .collect::<Vec<_>>()
-                                .delimited_by(just('(').padded(), just(')').padded()),
+                            nested(
+                                expr.clone()
+                                    .separated_by(just(',').spaced())
+                                    .collect::<Vec<_>>(),
+                            )
+                            .delimited_by(just('(').spaced(), just(')').spaced()),
                         )
                         .map_with(|list, e| {
                             let span = e.span();
@@ -208,7 +286,7 @@ pub(crate) fn expr<'src>()
 
         // --- precedence 3: unary `not` ---
         let not_expr = keyword("not")
-            .padded()
+            .spaced()
             .repeated()
             .foldr(comparison, |_kw, operand| {
                 let span = operand.span.clone();
@@ -223,7 +301,7 @@ pub(crate) fn expr<'src>()
 
         // --- precedence 2: `and` ---
         let and_expr = not_expr.clone().foldl(
-            keyword("and").padded().ignore_then(not_expr).repeated(),
+            keyword("and").spaced().ignore_then(not_expr).repeated(),
             |lhs, rhs| {
                 let span = lhs.span.start..rhs.span.end;
                 Spanned::new(
@@ -239,7 +317,7 @@ pub(crate) fn expr<'src>()
 
         // --- precedence 1: `or` ---
         and_expr.clone().foldl(
-            keyword("or").padded().ignore_then(and_expr).repeated(),
+            keyword("or").spaced().ignore_then(and_expr).repeated(),
             |lhs, rhs| {
                 let span = lhs.span.start..rhs.span.end;
                 Spanned::new(

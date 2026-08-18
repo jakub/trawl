@@ -13,6 +13,7 @@ use crate::ast::{
     FieldFilter, FilterOp, FilterValue, QuotedSearch, SearchStage, SearchToken, Spanned,
     TextSearch, TimeFilter,
 };
+use crate::parser::comment::{self, Spaced};
 use crate::parser::primitives::{
     ParserExtra, ParserInput, bare_value, duration, field_name, filter_op, keyword, quoted_string,
     regex_pattern, spanned,
@@ -36,7 +37,12 @@ fn quoted_search<'src>()
 }
 
 /// Detect whether a value contains glob characters (`*` or `?`).
-fn has_glob_chars(s: &str) -> bool {
+///
+/// The ONE glob predicate: it decides the operator here, and it is what
+/// [`crate::parser::comment::hint_for`] asks before promising a quoted
+/// rewrite matches "exactly" — a hint whose claim came from a second
+/// spelling of this rule could contradict the parser that answers it.
+pub(crate) fn has_glob_chars(s: &str) -> bool {
     s.contains('*') || s.contains('?')
 }
 
@@ -60,32 +66,45 @@ fn filter_value<'src>()
         )
         .map(|pat| (FilterOp::Regex, FilterValue::Literal(pat)));
 
-    // quoted value: service="Activity Monitor" → strips quotes
-    let quoted_val = quoted_string().map(|s| (FilterOp::Eq, FilterValue::Literal(s)));
+    // One element: a quoted value (`service="Activity Monitor"` — quotes
+    // stripped) or a bare one. Quoted-ness rides along because it decides
+    // GLOB auto-detection: the wildcards in `host="a*b"` are data, while
+    // the ones in `host=a*b` are the pattern.
+    //
+    // Both spellings are admitted in EVERY position of a comma list, not
+    // just alone, so `format` can quote a list element that would
+    // otherwise re-lex as something else — a `#` in one is a parse error
+    // bare (ADR-0014 ruling 2), and the round trip has to survive it.
+    let element = choice((
+        quoted_string().map(|s| (true, s)),
+        bare_value().map(|s| (false, s)),
+    ));
 
-    // bare value(s), possibly comma-separated
-    let bare_vals = bare_value()
+    let values = element
         .separated_by(just(','))
         .at_least(1)
         .collect::<Vec<_>>()
         .map(|vals| {
             if vals.len() == 1 {
-                let val = vals
+                let (quoted, val) = vals
                     .into_iter()
                     .next()
                     .expect("at_least(1) guarantees a value");
-                let op = if has_glob_chars(&val) {
+                let op = if !quoted && has_glob_chars(&val) {
                     FilterOp::Glob
                 } else {
                     FilterOp::Eq
                 };
                 (op, FilterValue::Literal(val))
             } else {
-                (FilterOp::Eq, FilterValue::List(vals))
+                (
+                    FilterOp::Eq,
+                    FilterValue::List(vals.into_iter().map(|(_, v)| v).collect()),
+                )
             }
         });
 
-    choice((regex_val, quoted_val, bare_vals)).labelled("filter value")
+    choice((regex_val, values)).labelled("filter value")
 }
 
 /// Parse a `field=value` filter, including `field>=100`, `field!=200`,
@@ -116,6 +135,53 @@ fn field_filter<'src>()
         .labelled("field filter")
 }
 
+/// Emit ADR-0014's diagnostics for a search-stage bare term.
+///
+/// A `#` anywhere in the term is ruling 2 — the opener is never data and
+/// never a comment inside a token. `//` at the START of a term is
+/// ruling 3's loud half: an old-style comment line must fail rather than
+/// silently become AND-ed text terms that narrow the match set to
+/// nothing. The NEGATED arm passes `negated`, which does two things: a
+/// leading `//` cannot have been meant as a comment there (nothing
+/// negates one), so `-//cdn.example.com` stays an ordinary negated term;
+/// and the `#` message is the negated one, because quoting is no escape
+/// under `-` — `-"a#b"` is a bare term spelling literal quote
+/// characters, and `NOT "a#b"` is the working form the hint offers.
+///
+/// The term is still produced and the diagnostics are EMITTED, so the
+/// branch succeeds structurally: chumsky ranks alternatives by how far
+/// they got, and a returned error here would lose to a worse one from a
+/// later arm. `into_result()` is still `Err`.
+fn check_term<'src>(
+    p: impl Parser<'src, ParserInput<'src>, &'src str, ParserExtra<'src>> + Clone,
+    negated: bool,
+) -> impl Parser<'src, ParserInput<'src>, &'src str, ParserExtra<'src>> + Clone {
+    p.validate(move |s: &str, extra, emitter| {
+        let span: SimpleSpan = extra.span();
+        let start = span.start;
+        let opener_msg = if negated {
+            comment::MSG_OPENER_IN_NEGATED_TERM
+        } else {
+            comment::MSG_OPENER_IN_TOKEN
+        };
+        if !negated && comment::starts_with_slashes(s) {
+            emitter.emit(Rich::custom(
+                (start..start + comment::SLASHES.len()).into(),
+                comment::MSG_SLASHES_NOT_A_COMMENT,
+            ));
+        } else if let Some(at) = comment::first_opener(s) {
+            emitter.emit(Rich::custom(
+                (start + at..start + at + comment::OPENER.len_utf8()).into(),
+                // The term rides along with the message: this production
+                // holds the exact slice the grammar refused, so the hint
+                // never has to re-derive one from the raw text.
+                comment::payload(opener_msg, s),
+            ));
+        }
+        s
+    })
+}
+
 /// Parse a bare text search term, optionally negated with `-`.
 ///
 /// A backtick is a METACHARACTER here, not a word byte: it opens a quoted
@@ -128,47 +194,52 @@ fn field_filter<'src>()
 /// term in EVERY position, leading or mid-word, and under `-` as much as
 /// bare, so the tick is the one character no unquoted position can absorb —
 /// the same exclusion [`crate::parser::primitives::bare_value`] makes on the
-/// value side, and for the same reason: it is decided before the grammar
-/// runs, by the comment scanner. Cost, deliberate: a bare word carrying a
-/// tick must be double-quoted (`` "a`b" ``).
+/// value side. Cost, deliberate: a bare word carrying a tick must be
+/// double-quoted (`` "a`b" ``).
+///
+/// A comment opener inside the term, and a term OPENING with the retired
+/// `//`, are parse errors ([`check_term`], ADR-0014).
 fn text_search<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     let negated = just('-')
-        .ignore_then(
+        .ignore_then(check_term(
             any()
                 .filter(|c: &char| {
                     !c.is_ascii_whitespace() && *c != '|' && *c != ')' && *c != '(' && *c != '`'
                 })
                 .repeated()
                 .at_least(1)
-                .to_slice()
-                .map(String::from),
-        )
-        .map(|term| {
+                .to_slice(),
+            true,
+        ))
+        .map(|term: &str| {
             SearchToken::TextSearch(TextSearch {
-                term,
+                term: term.to_string(),
                 negated: true,
             })
         });
 
-    let positive = any()
-        .filter(|c: &char| {
-            !c.is_ascii_whitespace()
-                && *c != '|'
-                && *c != '"'
-                && *c != ')'
-                && *c != '('
-                && *c != '`'
-        })
-        .repeated()
-        .at_least(1)
-        .to_slice()
-        .map(|s: &str| {
-            SearchToken::TextSearch(TextSearch {
-                term: s.to_string(),
-                negated: false,
+    let positive = check_term(
+        any()
+            .filter(|c: &char| {
+                !c.is_ascii_whitespace()
+                    && *c != '|'
+                    && *c != '"'
+                    && *c != ')'
+                    && *c != '('
+                    && *c != '`'
             })
-        });
+            .repeated()
+            .at_least(1)
+            .to_slice(),
+        false,
+    )
+    .map(|s: &str| {
+        SearchToken::TextSearch(TextSearch {
+            term: s.to_string(),
+            negated: false,
+        })
+    });
 
     // Excluding the byte from both terms is not enough for the `-` case:
     // it would leave `-` matching as a POSITIVE term of its own, so
@@ -222,7 +293,7 @@ fn search_token<'src>()
                             || *c == '`'
                     })
                     .rewind()
-                    .padded(),
+                    .spaced(),
             )
             .ignore_then(spanned(token.clone()))
             .map(|inner| SearchToken::Not(Box::new(inner)));
@@ -233,11 +304,11 @@ fn search_token<'src>()
             .to(TokenOrSep::<Spanned<SearchToken>>::Or);
         let paren_token = spanned(token).map(TokenOrSep::Token);
         let paren_group = choice((or_marker, paren_token))
-            .padded()
+            .spaced()
             .repeated()
             .at_least(1)
             .collect::<Vec<_>>()
-            .delimited_by(just('(').padded(), just(')').padded())
+            .delimited_by(just('(').spaced(), just(')').spaced())
             .map(|items| {
                 let mut groups: Vec<Vec<_>> = vec![vec![]];
                 for item in items {
@@ -338,7 +409,7 @@ pub(crate) fn search_stage<'src>()
     let token = spanned(search_token()).map(TokenOrSep::Token);
 
     choice((or_marker, token))
-        .padded()
+        .spaced()
         .repeated()
         .collect::<Vec<_>>()
         .map(|items| {

@@ -59,8 +59,21 @@ point into the real input, so the invariant stops needing to exist.
 ### 2. Inside an unquoted token, a comment opener is an error — never data, never a comment
 
 A comment opens only where the grammar sits between tokens: start of input,
-after whitespace, after a delimiter. A `#` **inside** an unquoted token is a
-parse error carrying the byte position and a hint to quote:
+or after ASCII whitespace — one predicate, `comment::opens_comment_after`,
+asked by the grammar's layout run, by the error-rendering net and by the
+text-level scan alike. ASCII and not Unicode because the unquoted token
+charsets end on ASCII whitespace and nothing else: a no-break space sits
+INSIDE a bare word, so admitting it as a comment boundary would have the
+scanner reading `message="x"⍽# last=1h` (⍽ = U+00A0) as a comment while the
+token grammar reads it as an error. Layout CONSUMPTION between tokens stays
+Unicode, as chumsky's `.padded()` always was. ("After a delimiter" was in the original wording and
+is dropped: the delimiter set is unenumerable — `=` cannot qualify, or
+`color=#ff0000` stops erroring — so the rule is encoded structurally
+instead, as `layout = (whitespace+ comment?)*` plus one leading-comment
+site at the start of the input. The consequence is strictly the loud
+direction: `count(),# x` and `(#x` are parse errors rather than
+comments.) A `#` **inside** an unquoted token is a parse error carrying
+the byte position and a hint to quote:
 
 ```
 foo#bar        → error: '#' inside a search term — quote it ("foo#bar") to
@@ -110,7 +123,7 @@ discussion. There is no taught syntax to break.
 ### 4. One padding owner, enforced by lint
 
 There is no shared padding combinator today — the parser calls chumsky's
-built-in `.padded()` at 84 sites across `expr.rs`, `pipe.rs` and `search.rs`.
+built-in `.padded()` at 84 call sites across `expr.rs`, `pipe.rs` and `search.rs`.
 The comment rule is introduced as a single project-owned padding parser that
 every site adopts, and `chumsky::Parser::padded` is added to clippy's
 `disallowed_methods` so a missed site, or a new one added later, fails the
@@ -192,7 +205,15 @@ is exactly the drift this ADR is retiring.
   section it never had.
 - Every query shape whose meaning changes moves from a silently wrong answer
   to either a correct answer or a parse error with a hint. There is no shape
-  that goes from working to silently different.
+  that goes from working to silently different. (Amended at implementation:
+  that last sentence holds for every shape carrying a comment opener, but
+  not for the whole change. Ruling 6's round-trip requirement forced
+  filter-list elements to admit a quoted spelling in every position, and
+  four opener-free shapes read differently because of it — `a="x",y` and
+  `host="a b",c` were an equality plus a bare text term and are now IN
+  lists, while `a=1,"b"` and `a=1,"b",c` no longer carry literal quote
+  characters in their values. The widening stands: without it a list
+  element carrying a `#` cannot survive `format → reparse` at all.)
 - The byte-length-preserving span invariant is retired rather than
   maintained; the five consumers that leaned on it are served by real spans.
 - Residual: the two TUI display walkers keep their own reading of the query

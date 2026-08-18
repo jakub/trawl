@@ -15,6 +15,7 @@ use crate::ast::{
     SampleMode, SampleStage, SavedRunSelector, SortDirection, SortField, SortStage, Spanned,
     StatsStage, TableStage, TailStage, TimechartStage, TopStage, WhereStage,
 };
+use crate::parser::comment::Spaced;
 use crate::parser::expr::expr;
 use crate::parser::primitives::{
     ParserExtra, ParserInput, duration, field_name, keyword, plain_name, raw_quoted_string,
@@ -27,12 +28,12 @@ fn agg_expr<'src>() -> impl Parser<'src, ParserInput<'src>, AggExpr, ParserExtra
     // The function head takes the UNQUOTED production — a function name
     // is not a field name (ADR-0013 §7).
     plain_name()
-        .then_ignore(just('(').padded())
-        .then(expr().separated_by(just(',').padded()).collect::<Vec<_>>())
-        .then_ignore(just(')').padded())
+        .then_ignore(just('(').spaced())
+        .then(expr().separated_by(just(',').spaced()).collect::<Vec<_>>())
+        .then_ignore(just(')').spaced())
         .then(
             keyword("as")
-                .padded()
+                .spaced()
                 .ignore_then(assignment_target())
                 .or_not(),
         )
@@ -48,19 +49,19 @@ fn agg_expr<'src>() -> impl Parser<'src, ParserInput<'src>, AggExpr, ParserExtra
 fn stats_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("stats")
-        .padded()
+        .spaced()
         .ignore_then(
             agg_expr()
-                .separated_by(just(',').padded())
+                .separated_by(just(',').spaced())
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
         .then(
             keyword("by")
-                .padded()
+                .spaced()
                 .ignore_then(
                     field_name()
-                        .separated_by(just(',').padded())
+                        .separated_by(just(',').spaced())
                         .at_least(1)
                         .collect::<Vec<_>>(),
                 )
@@ -80,7 +81,7 @@ fn stats_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
 fn where_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("where")
-        .padded()
+        .spaced()
         .ignore_then(expr())
         .map(|condition| PipeStage::Where(WhereStage { condition }))
         .labelled("where stage")
@@ -107,10 +108,10 @@ fn sort_field<'src>() -> impl Parser<'src, ParserInput<'src>, SortField, ParserE
 fn sort_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("sort")
-        .padded()
+        .spaced()
         .ignore_then(
             sort_field()
-                .separated_by(just(',').padded())
+                .separated_by(just(',').spaced())
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
@@ -122,7 +123,7 @@ fn sort_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
 fn limit_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("limit")
-        .padded()
+        .spaced()
         .ignore_then(uint())
         .map(|count| {
             PipeStage::Limit(LimitStage {
@@ -137,7 +138,7 @@ fn limit_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
 fn head_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("head")
-        .padded()
+        .spaced()
         .ignore_then(uint())
         .map(|count| {
             PipeStage::Limit(LimitStage {
@@ -152,7 +153,7 @@ fn head_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
 fn tail_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("tail")
-        .padded()
+        .spaced()
         .ignore_then(uint())
         .map(|count| PipeStage::Tail(TailStage { count }))
         .labelled("tail stage")
@@ -162,10 +163,10 @@ fn tail_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
 fn table_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("table")
-        .padded()
+        .spaced()
         .ignore_then(
             field_name()
-                .separated_by(just(',').padded())
+                .separated_by(just(',').spaced())
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
@@ -182,10 +183,10 @@ fn table_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
 fn fields_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("fields")
-        .padded()
+        .spaced()
         .ignore_then(
             field_name()
-                .separated_by(just(',').padded())
+                .separated_by(just(',').spaced())
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
@@ -201,15 +202,15 @@ fn fields_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parse
 /// Parse a `top` stage: `top N field [by field(, field)*]`
 fn top_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     keyword("top")
-        .padded()
+        .spaced()
         .ignore_then(uint())
-        .then(field_name().padded())
+        .then(field_name().spaced())
         .then(
             keyword("by")
-                .padded()
+                .spaced()
                 .ignore_then(
                     field_name()
-                        .separated_by(just(',').padded())
+                        .separated_by(just(',').spaced())
                         .at_least(1)
                         .collect::<Vec<_>>(),
                 )
@@ -224,15 +225,15 @@ fn top_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserEx
 fn rare_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("rare")
-        .padded()
+        .spaced()
         .ignore_then(uint())
-        .then(field_name().padded())
+        .then(field_name().spaced())
         .then(
             keyword("by")
-                .padded()
+                .spaced()
                 .ignore_then(
                     field_name()
-                        .separated_by(just(',').padded())
+                        .separated_by(just(',').spaced())
                         .at_least(1)
                         .collect::<Vec<_>>(),
                 )
@@ -247,10 +248,10 @@ fn rare_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
 fn drop_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("drop")
-        .padded()
+        .spaced()
         .ignore_then(
             field_name()
-                .separated_by(just(',').padded())
+                .separated_by(just(',').spaced())
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
@@ -285,7 +286,7 @@ fn assignment_target<'src>()
 fn let_assignment<'src>()
 -> impl Parser<'src, ParserInput<'src>, (String, Spanned<Expr>), ParserExtra<'src>> + Clone {
     assignment_target()
-        .then_ignore(just('=').padded())
+        .then_ignore(just('=').spaced())
         .then(expr())
 }
 
@@ -293,7 +294,7 @@ fn let_assignments<'src>(
     stage: &'static str,
 ) -> impl Parser<'src, ParserInput<'src>, Vec<(String, Spanned<Expr>)>, ParserExtra<'src>> + Clone {
     let_assignment()
-        .separated_by(just(',').padded())
+        .separated_by(just(',').spaced())
         .at_least(1)
         .collect::<Vec<_>>()
         .try_map(move |assignments: Vec<(String, Spanned<Expr>)>, span| {
@@ -310,7 +311,7 @@ fn let_assignments<'src>(
 /// Parse a `let` stage: `let field = expr [, field = expr]*`
 fn let_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     keyword("let")
-        .padded()
+        .spaced()
         .ignore_then(let_assignments("let"))
         .map(|assignments| {
             PipeStage::Let(LetStage {
@@ -325,7 +326,7 @@ fn let_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserEx
 fn eval_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("eval")
-        .padded()
+        .spaced()
         .ignore_then(let_assignments("eval"))
         .map(|assignments| {
             PipeStage::Let(LetStage {
@@ -343,19 +344,19 @@ fn eval_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
 fn extract_like_stage<'src>(
     kw: &'static str,
 ) -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
-    let from_clause = keyword("from").padded().ignore_then(field_name()).or_not();
+    let from_clause = keyword("from").spaced().ignore_then(field_name()).or_not();
 
     // Optional `sep="X"` clause — a quoted single character.
     let sep_clause = keyword("sep")
         .then(just('='))
         .ignore_then(raw_quoted_string())
-        .padded()
+        .spaced()
         .or_not();
 
     let kv_mode = keyword(kw)
-        .padded()
+        .spaced()
         .ignore_then(keyword("kv"))
-        .padded()
+        .spaced()
         .ignore_then(sep_clause)
         .then(from_clause.clone())
         .map(move |(sep_str, source_field)| {
@@ -378,7 +379,7 @@ fn extract_like_stage<'src>(
         });
 
     let regex_mode = keyword(kw)
-        .padded()
+        .spaced()
         .ignore_then(raw_quoted_string())
         .then(from_clause)
         .map(move |(pattern, source_field)| {
@@ -410,10 +411,10 @@ fn rex_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserEx
 fn dedup_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("dedup")
-        .padded()
+        .spaced()
         .ignore_then(
             field_name()
-                .separated_by(just(',').padded())
+                .separated_by(just(',').spaced())
                 .at_least(1)
                 .collect::<Vec<_>>()
                 .or_not()
@@ -427,26 +428,26 @@ fn dedup_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
 fn timechart_stage<'src>()
 -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     keyword("timechart")
-        .padded()
+        .spaced()
         .ignore_then(
             keyword("span")
                 .then_ignore(just('='))
                 .ignore_then(duration())
-                .padded()
+                .spaced()
                 .or_not(),
         )
         .then(
             agg_expr()
-                .separated_by(just(',').padded())
+                .separated_by(just(',').spaced())
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
         .then(
             keyword("by")
-                .padded()
+                .spaced()
                 .ignore_then(
                     field_name()
-                        .separated_by(just(',').padded())
+                        .separated_by(just(',').spaced())
                         .at_least(1)
                         .collect::<Vec<_>>(),
                 )
@@ -467,16 +468,16 @@ fn timechart_stage<'src>()
 fn pivot_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("pivot")
-        .padded()
+        .spaced()
         .ignore_then(agg_expr())
-        .then_ignore(keyword("on").padded())
+        .then_ignore(keyword("on").spaced())
         .then(field_name())
         .then(
             keyword("by")
-                .padded()
+                .spaced()
                 .ignore_then(
                     field_name()
-                        .separated_by(just(',').padded())
+                        .separated_by(just(',').spaced())
                         .at_least(1)
                         .collect::<Vec<_>>(),
                 )
@@ -497,14 +498,14 @@ fn pivot_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
 fn rename_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     let rename_pair = field_name()
-        .then_ignore(keyword("as").padded())
+        .then_ignore(keyword("as").spaced())
         .then(assignment_target());
 
     keyword("rename")
-        .padded()
+        .spaced()
         .ignore_then(
             rename_pair
-                .separated_by(just(',').padded())
+                .separated_by(just(',').spaced())
                 .at_least(1)
                 .collect::<Vec<_>>()
                 .try_map(|renames: Vec<(String, String)>, span| {
@@ -525,7 +526,7 @@ fn rename_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parse
 fn sample_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("sample")
-        .padded()
+        .spaced()
         .ignore_then(uint().then(just('%').or_not()))
         .try_map(|(n, pct), span| {
             if pct.is_some() {
@@ -554,19 +555,19 @@ fn sample_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parse
 fn eventstats_stage<'src>()
 -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     keyword("eventstats")
-        .padded()
+        .spaced()
         .ignore_then(
             agg_expr()
-                .separated_by(just(',').padded())
+                .separated_by(just(',').spaced())
                 .at_least(1)
                 .collect::<Vec<_>>(),
         )
         .then(
             keyword("by")
-                .padded()
+                .spaced()
                 .ignore_then(
                     field_name()
-                        .separated_by(just(',').padded())
+                        .separated_by(just(',').spaced())
                         .at_least(1)
                         .collect::<Vec<_>>(),
                 )
@@ -598,13 +599,13 @@ fn from_saved_stage<'src>()
             keyword("all").to(SavedRunSelector::All),
             uint().map(|n| SavedRunSelector::Specific(i64::try_from(n).unwrap_or(i64::MAX))),
         )))
-        .padded()
+        .spaced()
         .or_not()
         .map(Option::unwrap_or_default);
 
     keyword("from")
-        .padded()
-        .ignore_then(keyword("saved").padded())
+        .spaced()
+        .ignore_then(keyword("saved").spaced())
         .ignore_then(name)
         .then(run_selector)
         .map(|(name, run)| PipeStage::FromSaved(FromSavedStage { name, run }))
@@ -646,7 +647,7 @@ fn pipe_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
 pub(crate) fn pipeline<'src>()
 -> impl Parser<'src, ParserInput<'src>, Vec<Spanned<PipeStage>>, ParserExtra<'src>> + Clone {
     just('|')
-        .padded()
+        .spaced()
         .ignore_then(spanned(pipe_stage()))
         .repeated()
         .collect()

@@ -122,27 +122,45 @@ impl<'a> Highlighter<'a> {
     }
 
     /// Tokenize a line into (`TokenType`, text) pairs.
+    ///
+    /// **Display only, never correctness.** This is a colouring walk over
+    /// text the user is still typing, not a reading of the query: it has
+    /// no backtick awareness and no comment case, and it must never be
+    /// consulted for what a query MEANS. `trawl_core::parser` is the
+    /// authority on that, and `trawl_core::parser::scan` is the one
+    /// text-level walk allowed to change an answer (ADR-0014 ruling 5).
+    /// Unifying this walk with either needs a partial-input policy for an
+    /// unterminated token at the cursor, which is its own design problem.
     #[allow(clippy::too_many_lines)]
     fn tokenize(text: &str) -> Vec<(TokenType, std::string::String)> {
         let mut tokens = Vec::new();
         let mut chars = text.chars().peekable();
         let mut current = std::string::String::new();
+        // Whether the cursor sits where the GRAMMAR admits a comment:
+        // start of line, or directly after whitespace. `current.is_empty()`
+        // is NOT that test — after `color=` it is empty too, and colouring
+        // `#ff0000` as a comment told the user prose where the parser
+        // reports an error (ADR-0014 ruling 2).
+        let mut at_layout_boundary = true;
 
         while let Some(ch) = chars.next() {
-            // Comment: // to end of line
-            if ch == '/' && chars.peek() == Some(&'/') {
-                if !current.is_empty() {
-                    tokens.push((Self::classify_word(&current), current.clone()));
-                    current.clear();
-                }
-                // Consume rest of line as comment
-                let mut comment = std::string::String::from("//");
-                chars.next(); // consume second /
+            let boundary = at_layout_boundary;
+            at_layout_boundary = false;
+
+            // Comment: `#` to end of line (ADR-0014 — `//` is not an
+            // opener any more, and colouring it as one falsely dimmed
+            // every URL in a query).
+            if ch == '#' && boundary {
+                let mut comment = std::string::String::from('#');
                 for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
                     comment.push(c);
                 }
                 tokens.push((TokenType::Comment, comment));
-                break;
+                at_layout_boundary = true;
+                continue;
             }
 
             // Regex literal: /pattern/
@@ -225,6 +243,7 @@ impl<'a> Highlighter<'a> {
                     current.clear();
                 }
                 tokens.push((TokenType::Whitespace, std::string::String::from(ch)));
+                at_layout_boundary = true;
                 continue;
             }
 
@@ -342,5 +361,44 @@ impl<'a> Highlighter<'a> {
                 | "typeof"
                 | "now"
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Highlighter, TokenType};
+
+    fn kinds(text: &str) -> Vec<(TokenType, String)> {
+        Highlighter::tokenize(text)
+    }
+
+    fn comment_text(text: &str) -> Option<String> {
+        kinds(text)
+            .into_iter()
+            .find(|(t, _)| *t == TokenType::Comment)
+            .map(|(_, s)| s)
+    }
+
+    /// A `#` colours as a comment only where the grammar opens one: line
+    /// start or after whitespace. Anywhere else the parser reports an
+    /// error, and dimming the rest of the line says the opposite.
+    #[test]
+    fn a_hash_colours_as_a_comment_only_at_a_layout_boundary() {
+        assert_eq!(comment_text("# note"), Some("# note".to_string()));
+        assert_eq!(
+            comment_text("a=1 # note"),
+            Some("# note".to_string()),
+            "after whitespace"
+        );
+        assert_eq!(comment_text("color=#ff0000"), None, "inside a token");
+        assert_eq!(comment_text("a=1# note"), None, "inside a value");
+        assert_eq!(comment_text("count(),# x"), None, "after a delimiter");
+    }
+
+    /// `//` is not an opener since ADR-0014 ruling 3, so a URL keeps its
+    /// ordinary colouring.
+    #[test]
+    fn slashes_are_not_a_comment() {
+        assert_eq!(comment_text("url=https://example.com/x"), None);
     }
 }

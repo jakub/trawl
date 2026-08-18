@@ -330,20 +330,27 @@ pub(crate) fn literal<'src>()
 /// Parse a bare (unquoted) value in a field filter — stops at whitespace and `|`.
 ///
 /// A backtick ENDS a bare value, the same exclusion the search stage's bare
-/// word makes and for the same reason: it is the one character whose
-/// meaning is decided before the grammar runs. The pre-parse comment
-/// scanner engages its backtick state wherever a NAME could start, and an
-/// operator inside a value looks exactly like that from outside
-/// (`host=a+` is a value, `1+` is arithmetic), so a value that could
-/// absorb a tick could absorb a shielded `#` with it — turning a comment
-/// into part of the value SILENTLY. Ending the value here makes the stray
-/// tick a parse error instead: loud, or correct, never quietly different.
+/// word makes and for the same reason (ADR-0013 ruling 7): a backticked
+/// name is a field reference in every field position, so no unquoted
+/// position may absorb one. A value that genuinely contains a backtick is
+/// written double-quoted (`` host="a`b" ``), which the quoted arm has
+/// always accepted.
+///
+/// A comment opener INSIDE the value is a parse error, not data and not a
+/// comment (ADR-0014 ruling 2) — `color=#ff0000` names its own `#`
+/// instead of quietly becoming a text search for `color=`. It carries the
+/// VALUE-position message, whose hint quotes the value alone
+/// (`color="#ff0000"`): quoting the whole token would turn a field filter
+/// into a phrase search, and a hint that changes what the query means is
+/// worse than none. The value is
+/// still produced, so the diagnostic is emitted rather than returned: a
+/// structurally-successful branch keeps chumsky's alternative selection
+/// from ranking a worse error from a later arm ahead of this one, while
+/// `into_result()` is still `Err`.
 ///
 /// This is the single bare-RHS production — single values, comma-separated
-/// IN lists and glob detection all route through it — so the exclusion
-/// covers every unquoted value shape at once. A value that genuinely
-/// contains a backtick is written double-quoted (`` host="a`b" ``), which
-/// the quoted arm has always accepted.
+/// IN lists and glob detection all route through it — so both exclusions
+/// cover every unquoted value shape at once.
 pub(crate) fn bare_value<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     any()
@@ -358,6 +365,22 @@ pub(crate) fn bare_value<'src>()
         .repeated()
         .at_least(1)
         .to_slice()
+        .validate(|s: &str, extra, emitter| {
+            if let Some(at) = crate::parser::comment::first_opener(s) {
+                let span: SimpleSpan = extra.span();
+                let start = span.start + at;
+                emitter.emit(Rich::custom(
+                    (start..start + crate::parser::comment::OPENER.len_utf8()).into(),
+                    // The exact value slice rides along: this production
+                    // is the one place its bounds are KNOWN, and an IN
+                    // list's element is its own `bare_value`, so the hint
+                    // names the element the user can act on without
+                    // re-deriving a boundary from the raw text.
+                    crate::parser::comment::payload(crate::parser::comment::MSG_OPENER_IN_VALUE, s),
+                ));
+            }
+            s
+        })
         .map(String::from)
         .labelled("value")
 }

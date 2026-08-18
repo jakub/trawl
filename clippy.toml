@@ -1,0 +1,10 @@
+# `.padded()` is chumsky's built-in whitespace padding — it skips
+# whitespace and nothing else. trawl's comments are a grammar production
+# admitted wherever the grammar skips whitespace (ADR-0014 ruling 4), so a
+# `.padded()` site is by construction a place comments do not work. There
+# is exactly one padding owner, `parser::comment::Spaced::spaced`, and
+# this entry is what makes a missed site — or a new one added later — fail
+# the build instead of silently reopening the hole.
+disallowed-methods = [
+    { path = "chumsky::Parser::padded", reason = "use parser::comment::Spaced::spaced — .padded() skips whitespace only, so comments would not work there (ADR-0014 ruling 4)" },
+]
