@@ -36,7 +36,14 @@ a=1 # note        filter a=1, plus a comment
 a=1# note         error at the '#'
 foo#bar           error at the '#'  — write "foo#bar" to search for it
 color=#ff0000     error at the '#'  — write color="#ff0000"
+-foo#bar          error at the '#'  — write NOT "foo#bar"
 ```
+
+The hint names the spelling that works **in that position**: quoting the
+whole of `color=#ff0000` would turn a field filter into a phrase search,
+and a leading `-` cannot negate a quoted term at all, so those two are
+pointed at `color="#ff0000"` and `NOT "foo#bar"` rather than at a quote
+around everything.
 
 To include a `#` in a value or a name, quote it. All three quoted forms
 carry it verbatim, because none of them has a place inside where the
@@ -79,6 +86,24 @@ env=prod                        # environment (path-pruned)
 ```
 
 **Operators:** `=`, `!=`, `>`, `>=`, `<`, `<=`
+
+#### Quoted list elements
+
+Any element of a comma-separated list may be written quoted, in any
+position — the quotes are quoting, not data:
+
+```
+status=200,"301",404             the three values 200, 301, 404
+host="db host",web-01            a value with a space, beside a bare one
+tag="a#b",plain                  a value carrying a comment opener
+```
+
+Quoting an element is how a value that the bare production cannot spell —
+a space, a backtick, a `#` — reaches a list at all, and it is what lets a
+list survive `format → reparse` unchanged. Note the consequence for a
+list whose first element is quoted and whose rest is bare: `a="x",y` is
+the list `a IN ("x","y")`, not an equality on `x` followed by a bare
+text search for `,y`.
 
 #### Pinned comparison semantics
 

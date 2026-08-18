@@ -13,12 +13,19 @@
 //! query".
 
 use trawl_core::ast::{
-    FieldFilter, FilterOp, FilterValue, PipeStage, Query, SearchToken, TextSearch,
+    BinaryOp, Expr, FieldFilter, FilterOp, FilterValue, LiteralValue, PipeStage, Query,
+    SearchToken, TextSearch,
 };
 use trawl_core::parser::{ParseError, parse};
 
-/// The one message a comment opener inside an unquoted token carries.
+/// The messages a comment opener inside an unquoted token carries. One
+/// rule, but the WORKING SPELLING differs by position, so the position
+/// rides in the message and each one's hint offers an escape that keeps
+/// the query MEANING what it meant.
 const MSG_OPENER: &str = "'#' inside an unquoted token";
+const MSG_OPENER_VALUE: &str = "'#' inside an unquoted value";
+const MSG_OPENER_NEGATED: &str = "'#' inside a negated search term";
+const MSG_OPENER_COMMAND: &str = "'#' inside a pipe stage name";
 /// The one message a bare term opening with the retired `//` carries.
 const MSG_SLASHES: &str = "'//' does not start a comment — '#' is the comment character";
 
@@ -118,10 +125,23 @@ fn quoted_contexts_carry_the_opener_verbatim() {
     let query = ok(r#"host="a#b""#);
     assert_eq!(filters(&query), vec![&eq("host", "a#b")]);
 
-    // …and a regex in expression position
+    // …and a regex in expression position — the whole condition, because
+    // "it is a Where stage" would hold just as well for a stage that
+    // matched the literal "/foo".
     let query = ok("* | where message matches /foo#bar/");
     assert_eq!(query.pipeline.len(), 1);
-    assert!(matches!(query.pipeline[0].node, PipeStage::Where(_)));
+    let PipeStage::Where(w) = &query.pipeline[0].node else {
+        panic!("expected Where, got {:?}", query.pipeline[0].node);
+    };
+    let Expr::Binary { lhs, op, rhs } = &w.condition.node else {
+        panic!("expected a binary condition, got {:?}", w.condition.node);
+    };
+    assert_eq!(*op, BinaryOp::Matches);
+    assert_eq!(lhs.node, Expr::FieldRef("message".to_string()));
+    assert_eq!(
+        rhs.node,
+        Expr::Literal(LiteralValue::String("foo#bar".to_string()))
+    );
 }
 
 /// `//` is ordinary data now (ruling 3), in every value position — and
@@ -161,34 +181,113 @@ fn slashes_in_a_value_are_data() {
 // ── the shapes that ERROR, and exactly how ───────────────────────────
 
 /// `foo#bar`, `color=#ff0000`, `a=1# note` — one error each, spanning
-/// the `#` byte, with a hint naming the quoted form (ruling 2).
+/// the `#` byte, with a hint whose advice a user can FOLLOW (ruling 2).
+///
+/// The hint is position-aware because the working spelling is: quoting
+/// the whole of `color=#ff0000` produces a phrase search, which is a
+/// different query, and following a hint must never change what a query
+/// means.
 #[test]
 fn an_opener_inside_an_unquoted_token_is_a_loud_error() {
-    for (dsl, at, quoted) in [
-        ("foo#bar", 3, "foo#bar"),
-        ("color=#ff0000", 6, "color=#ff0000"),
-        ("a=1# note", 3, "a=1#"),
-        ("1=/foo#bar/", 6, "1=/foo#bar/"),
+    for (dsl, at, msg, hint_fragment) in [
+        (
+            "foo#bar",
+            3,
+            MSG_OPENER,
+            "quote it (\"foo#bar\") to search for it",
+        ),
+        (
+            "color=#ff0000",
+            6,
+            MSG_OPENER_VALUE,
+            "quote the value (\"#ff0000\")",
+        ),
+        ("a=1# note", 3, MSG_OPENER_VALUE, "quote the value (\"1#\")"),
+        (
+            "1=/foo#bar/",
+            6,
+            MSG_OPENER,
+            "quote it (\"1=/foo#bar/\") to search for it",
+        ),
     ] {
         let err = one_error(dsl);
-        assert_eq!(err.message, MSG_OPENER, "{dsl:?}");
+        assert_eq!(err.message, msg, "{dsl:?}");
         assert_eq!(err.span, at..at + 1, "{dsl:?}: span must be the '#' byte");
         assert_eq!(&dsl[err.span.clone()], "#", "{dsl:?}");
         let hint = err.hint.unwrap_or_else(|| panic!("{dsl:?} must hint"));
-        assert!(
-            hint.contains(&format!("\"{quoted}\"")),
-            "{dsl:?}: hint must name the quoted form, got {hint:?}"
+        assert_eq!(
+            hint,
+            format!("{hint_fragment}, or put whitespace before the '#' to start a comment"),
+            "{dsl:?}"
         );
     }
+}
+
+/// Quoting is no escape under `-`: `-"a#b"` is a bare NEGATED term that
+/// spells literal quote characters, so a hint saying `quote it ("-"a#b"")`
+/// renders something the grammar cannot read at all. `NOT "a#b"` is the
+/// working form, and it parses.
+#[test]
+fn a_negated_term_is_pointed_at_the_not_spelling() {
+    for (dsl, at, working) in [
+        ("-\"a#b\"", 3, "NOT \"a#b\""),
+        ("-foo#bar", 4, "NOT \"foo#bar\""),
+    ] {
+        let err = one_error(dsl);
+        assert_eq!(err.message, MSG_OPENER_NEGATED, "{dsl:?}");
+        assert_eq!(err.span, at..at + 1, "{dsl:?}: span must be the '#' byte");
+        assert_eq!(&dsl[err.span.clone()], "#", "{dsl:?}");
+        let hint = err.hint.unwrap_or_else(|| panic!("{dsl:?} must hint"));
+        assert_eq!(
+            hint,
+            format!("write it as {working}, or put whitespace before the '#' to start a comment"),
+            "{dsl:?}"
+        );
+        // …and the spelling the hint offers is one the grammar accepts
+        ok(working);
+    }
+}
+
+/// A `#` in a pipe STAGE NAME is the comment rule, not a typo. chumsky
+/// reports the start of the word — the stage word ends at the `#` — and
+/// the unknown-command rule then invents a command the user never wrote
+/// (`unknown command 'co'`, "did you mean 'top'?").
+#[test]
+fn an_opener_in_a_stage_name_is_not_an_unknown_command() {
+    let err = one_error("* | co#unt()");
+    assert_eq!(err.message, MSG_OPENER_COMMAND);
+    assert_eq!(err.span, 6..7);
+    assert_eq!(
+        err.hint.as_deref(),
+        Some("put whitespace before the '#' to start a comment")
+    );
+
+    // …and the rule is narrow: the token holding the offset must BE the
+    // stage word, so a shape whose real problem is the `,` keeps its own
+    // diagnostic on its own byte.
+    let err = one_error("* | stats count(),# x");
+    assert_eq!(err.message, MSG_OPENER);
+    assert_eq!(err.span, 18..19);
+    let err = one_error("* | staats count()");
+    assert_eq!(err.message, "unknown command 'staats'");
 }
 
 /// A bare term OPENING with `//` names `#` as the comment character —
 /// the loud half of dropping the second opener (ruling 3).
 #[test]
 fn a_term_opening_with_slashes_names_the_real_opener() {
-    for dsl in ["// note", "service=x // filter by service"] {
+    // …in the search stage (the validator's own error) and in the
+    // pipeline (the generic net). BOTH slashes are the span in either
+    // lane: underlining one of two points at nothing the user can act on.
+    for dsl in [
+        "// note",
+        "service=x // filter by service",
+        "* | stats count() // note",
+        "* | stats count()\n// note",
+    ] {
         let err = one_error(dsl);
         assert_eq!(err.message, MSG_SLASHES, "{dsl:?}");
+        assert_eq!(err.span.len(), 2, "{dsl:?}: span must be both slashes");
         assert_eq!(&dsl[err.span.clone()], "//", "{dsl:?}");
         assert!(
             err.hint.is_some_and(|h| h.contains('#')),
@@ -235,5 +334,5 @@ fn a_span_after_a_comment_indexes_the_original_input() {
     let err = one_error(input);
     let at = input.rfind('#').expect("present");
     assert_eq!(err.span, at..at + 1);
-    assert_eq!(err.message, MSG_OPENER);
+    assert_eq!(err.message, MSG_OPENER_VALUE);
 }

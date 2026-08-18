@@ -116,7 +116,7 @@ discussion. There is no taught syntax to break.
 ### 4. One padding owner, enforced by lint
 
 There is no shared padding combinator today — the parser calls chumsky's
-built-in `.padded()` at 84 sites across `expr.rs`, `pipe.rs` and `search.rs`.
+built-in `.padded()` at 84 call sites across `expr.rs`, `pipe.rs` and `search.rs`.
 The comment rule is introduced as a single project-owned padding parser that
 every site adopts, and `chumsky::Parser::padded` is added to clippy's
 `disallowed_methods` so a missed site, or a new one added later, fails the
@@ -198,7 +198,15 @@ is exactly the drift this ADR is retiring.
   section it never had.
 - Every query shape whose meaning changes moves from a silently wrong answer
   to either a correct answer or a parse error with a hint. There is no shape
-  that goes from working to silently different.
+  that goes from working to silently different. (Amended at implementation:
+  that last sentence holds for every shape carrying a comment opener, but
+  not for the whole change. Ruling 6's round-trip requirement forced
+  filter-list elements to admit a quoted spelling in every position, and
+  four opener-free shapes read differently because of it — `a="x",y` and
+  `host="a b",c` were an equality plus a bare text term and are now IN
+  lists, while `a=1,"b"` and `a=1,"b",c` no longer carry literal quote
+  characters in their values. The widening stands: without it a list
+  element carrying a `#` cannot survive `format → reparse` at all.)
 - The byte-length-preserving span invariant is retired rather than
   maintained; the five consumers that leaned on it are served by real spans.
 - Residual: the two TUI display walkers keep their own reading of the query

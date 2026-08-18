@@ -379,9 +379,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     backtick-quoted name and a regex body all carry `#` verbatim, because
     none of them has a place inside where the grammar skips whitespace.
 
-  `a=1 # note` is unchanged. No query shape goes from working to silently
-  different; every changed shape moves to a correct answer or a loud
-  error. Parse-error spans are now natively correct — the scanner's
+  `a=1 # note` is unchanged. Every shape carrying a comment opener moves
+  to a correct answer or a loud error — none of them changes quietly.
+  One narrow class DOES change quietly, and it carries no opener at all:
+  a filter list may now be written with quoted elements in any position
+  (see below), so four shapes that used to read the quotes as data now
+  read them as quoting. `a="x",y` and `host="a b",c` were an equality
+  plus a separate bare text term `,y` / `,c`, and are now the IN lists
+  `a IN ("x","y")` / `host IN ("a b","c")`; `a=1,"b"` and `a=1,"b",c` had
+  literal `"` characters in their list values, and no longer do. The
+  widening is deliberate — it is what lets `format` quote a list element
+  that would otherwise re-lex as something else — but it is a silent
+  change, not a loud one. Parse-error spans are now natively correct — the scanner's
   unstated byte-length-preserving invariant (which the web UI squiggles,
   the TUI caret regions, the CLI caret renderer and the wire `ErrorSpan`
   all leaned on) is retired rather than maintained. The DSL reference
