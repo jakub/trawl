@@ -963,4 +963,49 @@ mod tests {
             "expected -o flag error, got: {err}"
         );
     }
+
+    /// Embedded parquet export is unbounded when the CLI supplies no row
+    /// limit. Exercise the public CLI lane and read the artifact back through
+    /// `DuckDB`: the old literal `LIMIT usize::MAX` failed before writing it.
+    #[tokio::test]
+    async fn embedded_parquet_export_without_limit_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.parquet");
+        let output = dir.path().join("output.parquet");
+        let executor = trawl_engine::executor::Executor::new().unwrap();
+        let source = QueryResult {
+            columns: vec![trawl_engine::value::Column {
+                name: "message".to_owned(),
+            }],
+            rows: vec![
+                vec![Value::String("first".to_owned())],
+                vec![Value::String("second".to_owned())],
+            ],
+        };
+        executor
+            .write_query_result_to_parquet(&source, &input)
+            .unwrap();
+
+        run_query(
+            "*",
+            input.to_str(),
+            Some(OutputFormat::Parquet),
+            Some(&output),
+            None,
+            "UTC",
+        )
+        .await
+        .unwrap();
+
+        let roundtrip = executor
+            .run_query(
+                "*",
+                output.to_str().unwrap(),
+                &trawl_core::schema::FieldTypes::new(),
+                usize::MAX,
+                0,
+            )
+            .unwrap();
+        assert_eq!(roundtrip, source);
+    }
 }

@@ -631,11 +631,20 @@ impl Executor {
             })
         })?;
 
-        // Create temp table from query results.
-        let create_sql = format!(
-            "CREATE TEMP TABLE __trawl_export AS (SELECT * FROM ({}) LIMIT {max_rows})",
-            emitted.sql
-        );
+        // Create temp table from query results. `usize::MAX` is the public
+        // sentinel for an unbounded read, but it is outside DuckDB's signed
+        // LIMIT domain on 64-bit targets, so the unbounded shape has no LIMIT.
+        let create_sql = if max_rows == usize::MAX {
+            format!(
+                "CREATE TEMP TABLE __trawl_export AS (SELECT * FROM ({}))",
+                emitted.sql
+            )
+        } else {
+            format!(
+                "CREATE TEMP TABLE __trawl_export AS (SELECT * FROM ({}) LIMIT {max_rows})",
+                emitted.sql
+            )
+        };
 
         let params = bind_params(&emitted.params);
         let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
