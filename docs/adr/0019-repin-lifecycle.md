@@ -59,7 +59,10 @@ and parked lifecycle extensions. This ADR rules on all five.
 
 9. `trawl schema gc-pins [--dry-run]` deletes a `field_types` row iff the
    field is provably dead on **both axes**: no `field_services`
-   observation inside max(retention window, GC window) AND no standing
+   observation inside the effective dead window — operator-set
+   `--older-than` (default 30d), floored at the maximum effective
+   retention age when retention is enabled, so a pin cannot be declared
+   dead while retained-by-policy files may still carry it — AND no standing
    parquet footer under any env dir names the column — evaluated under
    the compaction corpus gate. Metadata-only: no rewrite, no marker, no
    query exclusion. Being wrong costs a harmless re-pin, never a type
