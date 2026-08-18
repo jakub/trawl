@@ -990,17 +990,38 @@ mod tests {
     /// would keep passing while the server overflowed. This runs the
     /// corpus in a thread sized like the one that matters, and asserts it
     /// finishes rather than dies.
+    ///
+    /// Nesting is in the corpus at BOTH sides of the grammar's depth
+    /// bound: the deepest expression the DSL accepts must fit this stack
+    /// (that is the bound's whole claim), and one far past it must reach
+    /// a parse error rather than a recursion. What a level costs varies
+    /// hugely by build — an unoptimized full-debuginfo build spends
+    /// thousands of times what a release build does — so the shape that
+    /// used to sit here (300 nested parens, unbounded then) died on CI
+    /// while passing locally. The bound, not the measurement, is what
+    /// makes this test's claim true on every build.
     #[test]
     fn the_pathological_corpus_parses_within_a_tokio_workers_stack() {
         /// A tokio worker thread's default stack.
         const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
 
+        let deepest_legal = crate::parser::expr::MAX_EXPR_DEPTH;
         let corpus = vec![
             format!("*{}", "| head 1 ".repeat(2000)),
             format!("* | where a =={}1", " ".repeat(100_000)),
             "a=1 ".repeat(10_000),
             format!("a=1{}b=2", " ".repeat(60_000)),
-            format!("* | where {}1{}", "( ".repeat(300), ") ".repeat(300)),
+            format!(
+                "* | where {}1{}",
+                "( ".repeat(deepest_legal),
+                ") ".repeat(deepest_legal)
+            ),
+            format!(
+                "* | where {}1{}",
+                "abs(".repeat(deepest_legal),
+                ")".repeat(deepest_legal)
+            ),
+            format!("* | where {}1{}", "( ".repeat(4000), ") ".repeat(4000)),
         ];
 
         std::thread::Builder::new()
@@ -1014,6 +1035,78 @@ mod tests {
             .expect("spawn")
             .join()
             .expect("the parser must not overflow a 2 MiB stack");
+    }
+
+    /// Expression nesting is bounded by the grammar, and the refusal is
+    /// a parse error that names the bound — never a truncated query and
+    /// never a stack overflow (ADR-0014 follow-up: the depth of a
+    /// `where` clause is client-chosen, and `MAX_QUERY_LEN` alone lets
+    /// `a(a(a(…` spell twenty thousand levels inside 64 KiB).
+    ///
+    /// All three recursion sites are covered — parentheses, a function
+    /// call's arguments, an `in (…)` list — because each is one descent
+    /// through the whole precedence chain.
+    #[test]
+    fn expression_nesting_past_the_bound_is_a_loud_parse_error() {
+        let n = crate::parser::expr::MAX_EXPR_DEPTH;
+        let message = format!("expression nests deeper than {n} levels");
+
+        for (label, legal, over) in [
+            (
+                "parens",
+                format!("* | where {}1{}", "(".repeat(n), ")".repeat(n)),
+                format!("* | where {}1{}", "(".repeat(n + 1), ")".repeat(n + 1)),
+            ),
+            (
+                "calls",
+                format!("* | where {}1{}", "abs(".repeat(n), ")".repeat(n)),
+                format!("* | where {}1{}", "abs(".repeat(n + 1), ")".repeat(n + 1)),
+            ),
+            (
+                "in-list",
+                // the list itself is one level, so it nests n-1 parens
+                format!(
+                    "* | where x in ({}1{})",
+                    "(".repeat(n - 1),
+                    ")".repeat(n - 1)
+                ),
+                format!("* | where x in ({}1{})", "(".repeat(n), ")".repeat(n)),
+            ),
+        ] {
+            assert!(
+                parse(&legal).is_ok(),
+                "{label}: {n} levels is the bound, not past it"
+            );
+            let Err(errors) = parse(&over) else {
+                panic!("{label}: nesting past the bound must be refused");
+            };
+            assert!(
+                errors.iter().any(|e| e.message.contains(&message)),
+                "{label}: refusal must name the bound, got {errors:?}"
+            );
+        }
+    }
+
+    /// A backtracked nesting level is GIVEN BACK: the depth counter is
+    /// restored however chumsky leaves the level, so a query that tries
+    /// (and abandons) many nested alternatives still parses its own
+    /// legal nesting afterwards. A leak here would refuse valid queries
+    /// only after a long enough prefix — the worst kind of bug to find.
+    #[test]
+    fn abandoned_nesting_does_not_spend_the_depth_budget() {
+        let n = crate::parser::expr::MAX_EXPR_DEPTH;
+        // Each `(x)` opens and leaves a level; hundreds of them in
+        // sequence must not add up against the nesting that follows.
+        let sequential = format!(
+            "* | where {} and {}1{}",
+            "(1) + ".repeat(500).trim_end_matches("+ "),
+            "(".repeat(n),
+            ")".repeat(n)
+        );
+        assert!(
+            parse(&sequential).is_ok(),
+            "sequential nesting must not accumulate: {sequential:.80}…"
+        );
     }
 
     /// A LEADING backtick that fails the quoted production is a loud

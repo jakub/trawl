@@ -848,6 +848,13 @@ Used in `where`, `let`, and aggregation arguments.
 | Membership | `x in (1, 2, 3)` |
 | Grouping | `(count + 1) * 2` |
 
+Expressions may nest **16 levels deep**. A nesting level is a
+parenthesised sub-expression, a function call's arguments, or an
+`in (…)` list, so `abs((a + b) * 2)` is three. Deeper than that is a
+parse error naming the limit — parsing a nesting level costs stack, and
+the query text is chosen by the client, so the recursion is bounded
+rather than left to run a server thread off the end of its stack.
+
 ## Aggregation functions
 
 ### Basic stats
