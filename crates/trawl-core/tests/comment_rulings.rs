@@ -223,6 +223,102 @@ fn an_opener_inside_an_unquoted_token_is_a_loud_error() {
     }
 }
 
+/// The value hint names the value the production HELD, never a slice
+/// re-derived from the raw text.
+///
+/// `=`, `<`, `>` and `!` are all legal INSIDE a bare value, so a left
+/// boundary found by scanning backwards for one of them cuts a URL at its
+/// own query string: `url=…?a=b#frag` was hinted `quote the value
+/// ("b#frag")`, which is a different filter on a different value. The
+/// emitting production knows the exact bounds, so it sends them.
+#[test]
+fn the_value_hint_names_the_whole_value() {
+    let dsl = "url=https://example.test/p?a=b#frag";
+    let err = one_error(dsl);
+    assert_eq!(err.message, MSG_OPENER_VALUE);
+    assert_eq!(&dsl[err.span.clone()], "#");
+    assert_eq!(
+        err.hint.as_deref(),
+        Some(
+            "quote the value (\"https://example.test/p?a=b#frag\"), \
+             or put whitespace before the '#' to start a comment"
+        )
+    );
+    // …and the spelling it offers is the query the user meant
+    ok("url=\"https://example.test/p?a=b#frag\"");
+}
+
+/// …and an IN list is still hinted per ELEMENT, because an element IS
+/// its own value production: the comma bounding comes free with the exact
+/// slice, in every position of the list.
+#[test]
+fn an_in_list_is_hinted_one_element_at_a_time() {
+    let dsl = "f=#a,#b,#c";
+    let errors = parse(dsl).expect_err("every element carries a '#'");
+    let hints: Vec<Option<&str>> = errors.iter().map(|e| e.hint.as_deref()).collect();
+    let expected = |v: &str| {
+        Some(format!(
+            "quote the value (\"{v}\"), or put whitespace before the '#' to start a comment"
+        ))
+    };
+    assert_eq!(
+        hints,
+        vec![
+            expected("#a").as_deref(),
+            expected("#b").as_deref(),
+            expected("#c").as_deref(),
+        ]
+    );
+
+    // …and a sole element, and a middle one whose neighbours are clean
+    for (dsl, value) in [("f=#a", "#a"), ("f=ok,#b,ok", "#b")] {
+        let err = one_error(dsl);
+        assert_eq!(err.message, MSG_OPENER_VALUE, "{dsl:?}");
+        assert_eq!(err.hint.as_deref(), expected(value).as_deref(), "{dsl:?}");
+    }
+}
+
+/// A hint offers quoting only where `"…"` is a rewrite the grammar reads
+/// back unchanged. Two shapes where it is not, and both drop that half
+/// rather than print advice that cannot be followed:
+///
+/// * a token carrying a `"` or a `\` would need an escape the hint does
+///   not spell, so the pasted string would end at its own second quote;
+/// * a run the GENERIC net recovered can span several grammar tokens —
+///   `count(),#` is not a token any position accepts.
+///
+/// The whitespace half is always true, so it is what remains.
+#[test]
+fn a_hint_drops_advice_the_grammar_cannot_read() {
+    const COMMENT_HALF: &str = "put whitespace before the '#' to start a comment";
+
+    for (dsl, msg) in [
+        // an embedded quote inside a value
+        ("f=a\"b#c", MSG_OPENER_VALUE),
+        // …and a recovered run that is not one token, in a pipeline
+        // position where quoting is not the fix at all
+        ("* | stats count(),# x", MSG_OPENER),
+    ] {
+        let err = one_error(dsl);
+        assert_eq!(err.message, msg, "{dsl:?}");
+        assert_eq!(err.hint.as_deref(), Some(COMMENT_HALF), "{dsl:?}");
+    }
+
+    // …while a term the production HELD is quotable even when the text
+    // around it is not: the exact slice after a no-break space is the
+    // `#` alone, and `"#"` is a phrase search that parses.
+    let dsl = "message=\"x\"\u{a0}# note";
+    let err = one_error(dsl);
+    assert_eq!(err.message, MSG_OPENER);
+    assert_eq!(
+        err.hint.as_deref(),
+        Some(
+            "quote it (\"#\") to search for it, or put whitespace before the '#' to start a comment"
+        )
+    );
+    ok("message=\"x\"\u{a0}\"#\" note");
+}
+
 /// Quoting is no escape under `-`: `-"a#b"` is a bare NEGATED term that
 /// spells literal quote characters, so a hint saying `quote it ("-"a#b"")`
 /// renders something the grammar cannot read at all. `NOT "a#b"` is the
@@ -414,4 +510,51 @@ fn a_pathological_query_reports_a_bounded_number_of_diagnostics() {
         err.hint.as_deref(),
         Some("quote the value (\"#a\"), or put whitespace before the '#' to start a comment")
     );
+}
+
+/// The cap keeps the error that ENDED the parse, whatever the emitted
+/// list does to the budget.
+///
+/// The list is not purely positional: chumsky appends the terminal
+/// failure LAST, so a plain truncation reported eight value diagnostics
+/// and dropped `unknown command 'bogus_stage'` — the one error the query
+/// cannot succeed without fixing. The report is the first `CAP - 1` plus
+/// that final one, whose message says how many were left out.
+#[test]
+fn the_cap_keeps_the_terminal_error() {
+    /// Mirrors `parser::MAX_REPORTED_ERRORS`, which is private.
+    const CAP: usize = 8;
+
+    // Eight value diagnostics ahead of a `#` in the STAGE NAME.
+    let dsl = "f=#0,#1,#2,#3,#4,#5,#6,#7 | co#unt()";
+    let errors = parse(dsl).expect_err("nine violations");
+    assert_eq!(errors.len(), CAP);
+    let last = errors.last().expect("capped list is non-empty");
+    assert_eq!(
+        last.message,
+        format!("{MSG_OPENER_COMMAND} (1 earlier error omitted)")
+    );
+    assert_eq!(&dsl[last.span.clone()], "#");
+    assert_eq!(
+        last.hint.as_deref(),
+        Some("put whitespace before the '#' to start a comment")
+    );
+
+    // …and twelve ahead of an unknown stage, whose message is the one a
+    // user must act on.
+    let filters: Vec<String> = (0..12).map(|i| format!("f{i}=#a")).collect();
+    let dsl = format!("{} | bogus_stage", filters.join(" "));
+    let errors = parse(&dsl).expect_err("thirteen violations");
+    assert_eq!(errors.len(), CAP);
+    assert_eq!(
+        errors[CAP - 1].message,
+        "unknown command 'bogus_stage' (5 earlier errors omitted)"
+    );
+    assert_eq!(&dsl[errors[CAP - 1].span.clone()], "b");
+
+    // …and an uncapped list is untouched: no annotation, no reordering.
+    let errors = parse("f=#a,#b | bogus_stage").expect_err("three violations");
+    assert_eq!(errors.len(), 3);
+    assert_eq!(errors[0].message, MSG_OPENER_VALUE);
+    assert_eq!(errors[2].message, "unknown command 'bogus_stage'");
 }

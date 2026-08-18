@@ -70,7 +70,23 @@ const MAX_QUERY_LEN: usize = 65_536;
 ///
 /// Eight, not one: a parse error list is a work list, and chumsky orders
 /// it by position, so the first few are the ones a user reads.
+///
+/// The cap is not a plain truncation, because the list is not purely
+/// positional: the emitted diagnostics come first, and the failure that
+/// actually ENDED the parse is appended LAST. Truncating dropped it — an
+/// eight-element `f=#a,…` list hid `unknown command 'bogus_stage'`, the
+/// one error the query cannot succeed without fixing. So the report is
+/// the first `MAX_REPORTED_ERRORS - 1` PLUS that final one, whose message
+/// is annotated with how many were left out ([`omitted_suffix`]).
 const MAX_REPORTED_ERRORS: usize = 8;
+
+/// How the annotation on the last reported error reads, so the count the
+/// cap swallowed is never silent. `{n}` diagnostics between the reported
+/// prefix and the terminal error were not rendered.
+fn omitted_suffix(n: usize) -> String {
+    let plural = if n == 1 { "error" } else { "errors" };
+    format!(" ({n} earlier {plural} omitted)")
+}
 
 /// Parse a trawl DSL query string into a structured AST.
 ///
@@ -98,12 +114,35 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 
     match result.into_result() {
         Ok(query) => Ok(query),
-        Err(errors) => Err(errors
-            .into_iter()
-            .take(MAX_REPORTED_ERRORS)
-            .map(|e| rich_to_parse_error(&e, input))
-            .collect()),
+        Err(errors) => Err(report_errors(&errors, input)),
     }
+}
+
+/// Render at most [`MAX_REPORTED_ERRORS`] diagnostics from one parse,
+/// keeping the TERMINAL failure whatever the emitted list does to the
+/// budget. Rendering is done only for the errors reported, so a
+/// pathological query costs a constant amount of work, not a product.
+fn report_errors(errors: &[Rich<'_, char>], input: &str) -> Vec<ParseError> {
+    if errors.len() <= MAX_REPORTED_ERRORS {
+        return errors
+            .iter()
+            .map(|e| rich_to_parse_error(e, input))
+            .collect();
+    }
+
+    let omitted = errors.len() - MAX_REPORTED_ERRORS;
+    let mut reported: Vec<ParseError> = errors
+        .iter()
+        .take(MAX_REPORTED_ERRORS - 1)
+        .map(|e| rich_to_parse_error(e, input))
+        .collect();
+    let mut last = rich_to_parse_error(
+        errors.last().expect("the list is longer than the cap"),
+        input,
+    );
+    last.message.push_str(&omitted_suffix(omitted));
+    reported.push(last);
+    reported
 }
 
 /// Convert a chumsky `Rich` error into our `ParseError` with a human-friendly message.
@@ -114,10 +153,14 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
     let label = e.contexts().next().map(|(l, _)| l.to_string());
 
     // custom errors (e.g. overflow, invalid regex) carry their own message
-    if let RichReason::Custom(msg) = e.reason() {
+    if let RichReason::Custom(raw) = e.reason() {
+        // A comment diagnostic carries the exact token its production
+        // held, past the message it renders (`comment::payload`); every
+        // other custom error is its message and nothing else.
+        let (msg, exact) = comment::split_payload(raw);
         return ParseError {
-            message: msg.clone(),
-            hint: comment::hint_for(msg, input, span.start),
+            message: msg.to_string(),
+            hint: comment::hint_for(msg, exact, input, span.start),
             span: span.start..span.end,
             label,
         };
@@ -236,7 +279,7 @@ impl CommentDiagnostic {
     fn new(msg: &str, input: &str, at: usize, len: usize) -> Self {
         Self {
             message: msg.to_string(),
-            hint: comment::hint_for(msg, input, at),
+            hint: comment::hint_for(msg, None, input, at),
             span: at..at + len,
         }
     }

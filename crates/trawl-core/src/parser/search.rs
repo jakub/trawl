@@ -167,7 +167,10 @@ fn check_term<'src>(
         } else if let Some(at) = comment::first_opener(s) {
             emitter.emit(Rich::custom(
                 (start + at..start + at + comment::OPENER.len_utf8()).into(),
-                opener_msg,
+                // The term rides along with the message: this production
+                // holds the exact slice the grammar refused, so the hint
+                // never has to re-derive one from the raw text.
+                comment::payload(opener_msg, s),
             ));
         }
         s

@@ -371,7 +371,12 @@ pub(crate) fn bare_value<'src>()
                 let start = span.start + at;
                 emitter.emit(Rich::custom(
                     (start..start + crate::parser::comment::OPENER.len_utf8()).into(),
-                    crate::parser::comment::MSG_OPENER_IN_VALUE,
+                    // The exact value slice rides along: this production
+                    // is the one place its bounds are KNOWN, and an IN
+                    // list's element is its own `bare_value`, so the hint
+                    // names the element the user can act on without
+                    // re-deriving a boundary from the raw text.
+                    crate::parser::comment::payload(crate::parser::comment::MSG_OPENER_IN_VALUE, s),
                 ));
             }
             s

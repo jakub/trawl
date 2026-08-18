@@ -186,42 +186,114 @@ pub(crate) fn starts_with_slashes(text: &str) -> bool {
     text.starts_with(SLASHES)
 }
 
-/// The hint for one of this module's messages, derived from the real
-/// input and the error's own span. ONE owner: both emitters — the
-/// `validate` calls on the value and term productions, and the generic
-/// net in [`crate::parser::rich_to_parse_error`] — come here, so a
-/// position's working spelling is written down once.
+/// The byte that separates a position message from the EXACT token slice
+/// the emitting production held, inside one `Rich::custom` payload.
+///
+/// `Rich::custom` transports a string and nothing else, so a production
+/// that wants to hand the hint renderer more than its message has to
+/// spell both into that one string. A unit separator is the divider
+/// because the split takes the FIRST one: every message in this module is
+/// a `const` that carries none, so the head is always exactly the
+/// message, whatever control characters the user's own token carries
+/// after it.
+const PAYLOAD_SEP: char = '\u{1f}';
+
+/// The payload an emitting production sends when it HOLDS the offending
+/// token: the position message, plus the exact slice the grammar refused.
+///
+/// Passing the slice beats re-deriving it from the raw input. A left
+/// boundary re-derived by scanning backwards for `=`/`<`/`>`/`!` cuts
+/// `url=https://example.test/p?a=b#frag` at the query string's own `=`
+/// and hints `"b#frag"` — advice that, followed, means something else
+/// entirely. The production that emitted the error already knows where
+/// the value starts and ends, and an IN list's element is its own
+/// [`crate::parser::primitives::bare_value`], so the comma bounding the
+/// hint needs comes free with the slice.
+pub(crate) fn payload(msg: &str, exact: &str) -> String {
+    format!("{msg}{PAYLOAD_SEP}{exact}")
+}
+
+/// Split a [`payload`] back into its message and the exact token, if it
+/// carries one. A custom error from anywhere else (an overflowing
+/// literal, an invalid regex) carries no separator and comes back whole.
+pub(crate) fn split_payload(raw: &str) -> (&str, Option<&str>) {
+    raw.split_once(PAYLOAD_SEP)
+        .map_or((raw, None), |(msg, exact)| (msg, Some(exact)))
+}
+
+/// The hint for one of this module's messages. ONE owner: both emitters
+/// — the `validate` calls on the value and term productions, and the
+/// generic net in [`crate::parser::rich_to_parse_error`] — come here, so
+/// a position's working spelling is written down once.
 ///
 /// Every hint offers something the user can FOLLOW without changing what
 /// the query means, which is why the position rides in the message:
 /// quoting the whole of `color=#ff0000` is a phrase search, and quoting
 /// a `-`-negated term spells literal quote characters.
 ///
-/// The token is recovered from the input rather than carried in the
-/// message: `Rich::custom` transports a string and nothing else, and the
-/// error conversion in [`crate::parser::rich_to_parse_error`] already
-/// holds both the source text and the offset. That recovery is hint
-/// RENDERING only — it never decides what anything means, and the
-/// grammar has already refused the text by the time it runs.
-pub(crate) fn hint_for(msg: &str, input: &str, offset: usize) -> Option<String> {
+/// `exact` is the slice the emitting production held ([`payload`]); it is
+/// `None` for the generic net, which has only the error's offset and
+/// recovers a token run from the input. That recovery is a GUESS — the
+/// run can span several grammar tokens — so its quoting advice is gated
+/// on [`quotable_verbatim`], and a hint whose quote half is unfollowable
+/// keeps only the half that always is.
+pub(crate) fn hint_for(
+    msg: &str,
+    exact: Option<&str>,
+    input: &str,
+    offset: usize,
+) -> Option<String> {
     let comment_half = format!("put whitespace before the '{OPENER}' to start a comment");
+    let token = || exact.unwrap_or_else(|| token_around(input, offset));
     match msg {
         MSG_SLASHES_NOT_A_COMMENT => Some(HINT_SLASHES.to_string()),
-        MSG_OPENER_IN_TOKEN => Some(format!(
-            "quote it (\"{}\") to search for it, or {comment_half}",
-            token_around(input, offset)
-        )),
-        MSG_OPENER_IN_VALUE => Some(format!(
-            "quote the value (\"{}\"), or {comment_half}",
-            value_around(input, offset)
-        )),
-        MSG_OPENER_IN_NEGATED_TERM => Some(format!(
-            "write it as NOT {}, or {comment_half}",
-            quoted_term(token_around(input, offset))
-        )),
+        MSG_OPENER_IN_TOKEN => Some(if quotable_verbatim(token()) {
+            format!(
+                "quote it (\"{}\") to search for it, or {comment_half}",
+                token()
+            )
+        } else {
+            comment_half
+        }),
+        MSG_OPENER_IN_VALUE => Some(if quotable_verbatim(token()) {
+            format!("quote the value (\"{}\"), or {comment_half}", token())
+        } else {
+            comment_half
+        }),
+        MSG_OPENER_IN_NEGATED_TERM => Some(match quoted_term(token()) {
+            Some(spelling) => format!("write it as NOT {spelling}, or {comment_half}"),
+            None => comment_half,
+        }),
         MSG_OPENER_IN_COMMAND => Some(comment_half),
         _ => None,
     }
+}
+
+/// Whether `"{text}"` is a rewrite the grammar reads back as exactly
+/// `text` — the ONE gate on the quoting half of every hint here.
+///
+/// Two ways it is not, and both are reachable. A `"` or a `\` inside the
+/// text needs an escape (`quoted_string` reads `\"` and `\\`) that the
+/// hint does not spell, so `message="x"\u{a0}# note` would advise pasting
+/// a string that ends at its own second quote. And a run carrying a
+/// character no unquoted token may contain — `( ) , |`, a backtick,
+/// whitespace — is not ONE token at all: the generic net recovered
+/// several, and `* | stats count(),# x` would be advised to quote
+/// `count(),#`, which is not a thing any position accepts.
+///
+/// This is the double-quote counterpart of
+/// [`crate::parser::suggest::quote_dsl_field`], not a caller of it: that
+/// one answers how to spell a FIELD NAME, whose escape is backticks with
+/// doubling, and a backticked rendering here would name a field where the
+/// user meant to search for text. The invisible-character half IS shared
+/// — both go through [`crate::sanitize::is_unsafe_display_char`].
+fn quotable_verbatim(text: &str) -> bool {
+    !text.is_empty()
+        && !text.chars().any(|c| {
+            matches!(c, '"' | '\\' | '(' | ')' | ',' | '|' | '`')
+                || c.is_whitespace()
+                || crate::sanitize::is_unsafe_display_char(c)
+        })
 }
 
 /// The unquoted token surrounding `offset` and the byte it starts at: the
@@ -245,40 +317,19 @@ fn token_around(input: &str, offset: usize) -> &str {
     token_span(input, offset).1
 }
 
-/// The bytes a filter VALUE may directly follow. The value half of the
-/// token surrounding `offset` starts after the last of them — which is
-/// what lets the hint say `color="#ff0000"` rather than quoting the
-/// field name into the string with it.
-const VALUE_STARTERS: [char; 6] = ['=', '<', '>', '!', ',', '('];
-
-/// The value slice surrounding `offset` inside its token. Hint rendering
-/// only: it never decides what anything MEANS, and the grammar has
-/// already refused this token by the time it is called.
-///
-/// Bounded on BOTH sides by the comma-delimited element, not just on the
-/// left: an IN list is one whitespace-delimited token, so a hint that ran
-/// to the end of it copied every remaining element — and every element
-/// carrying a `#` emits its own diagnostic, which made the rendered
-/// hints quadratic in the length of the list. The element is also the
-/// only slice a user can act on: quoting `"#a"` is the fix, quoting
-/// `"#a,#b,#c"` is a different query.
-fn value_around(input: &str, offset: usize) -> &str {
-    let (start, token) = token_span(input, offset);
-    let at = offset.saturating_sub(start).min(token.len());
-    let from = token[..at].rfind(VALUE_STARTERS).map_or(0, |i| i + 1);
-    let end = token[at..].find(',').map_or(token.len(), |i| at + i);
-    &token[from..end]
-}
-
 /// A negated term's working spelling under `NOT`: the term without its
-/// leading `-`, double-quoted unless it already is.
-fn quoted_term(token: &str) -> String {
+/// leading `-`, double-quoted — or `None` when quoting it is not a
+/// rewrite the user can paste ([`quotable_verbatim`]).
+///
+/// A term that is ALREADY double-quoted is unwrapped first, so
+/// `-"a#b"` is answered `NOT "a#b"` and not `NOT "\"a#b\""`.
+fn quoted_term(token: &str) -> Option<String> {
     let inner = token.strip_prefix('-').unwrap_or(token);
-    if inner.len() >= 2 && inner.starts_with('"') && inner.ends_with('"') {
-        inner.to_string()
-    } else {
-        format!("\"{inner}\"")
-    }
+    let body = inner
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(inner);
+    quotable_verbatim(body).then(|| format!("\"{body}\""))
 }
 
 /// The comment opener inside a PIPE STAGE NAME containing `offset`, if
@@ -407,48 +458,82 @@ mod tests {
         assert_eq!(token_around("x|color=#f", 8), "color=#f");
     }
 
-    /// A hint the user can FOLLOW: quoting the whole `color=#ff0000`
-    /// would turn a field filter into a phrase search, so the value
-    /// position quotes the value alone.
+    /// A hint the user can FOLLOW: the value position quotes the EXACT
+    /// slice its production held, whatever the surrounding token looks
+    /// like. Re-deriving that slice from the raw text is what put a URL's
+    /// own query string inside the advice.
     #[test]
-    fn a_value_hint_quotes_only_the_value() {
-        for (input, offset, want) in [
-            ("color=#ff0000", 6, "\"#ff0000\""),
-            ("a=1# note", 3, "\"1#\""),
-            ("1=/foo#bar/", 6, "\"/foo#bar/\""),
-            ("status=200,#x", 11, "\"#x\""),
-            // an IN list is ONE token: the hint is the element, not the
-            // remaining suffix — quoting the rest would be a different
-            // query, and copying it made the hints quadratic
-            ("f=#a,#b,#c", 2, "\"#a\""),
-            ("f=#a,#b,#c", 5, "\"#b\""),
-            ("f=#a,#b,#c", 8, "\"#c\""),
+    fn a_value_hint_quotes_the_slice_the_production_held() {
+        for exact in [
+            "#ff0000",
+            "1#",
+            "/foo#bar/",
+            "#x",
+            // an IN list's element IS its own value production, so the
+            // comma bounding comes free
+            "#a",
+            "https://example.test/p?a=b#frag",
         ] {
-            let hint = hint_for(MSG_OPENER_IN_VALUE, input, offset).expect("value hint");
+            let hint = hint_for(MSG_OPENER_IN_VALUE, Some(exact), "", 0).expect("value hint");
             assert!(
-                hint.starts_with(&format!("quote the value ({want})")),
-                "{input:?}: {hint:?}"
+                hint.starts_with(&format!("quote the value (\"{exact}\")")),
+                "{exact:?}: {hint:?}"
             );
         }
+    }
+
+    /// The payload round-trips: the head is always the message, whatever
+    /// control characters the user's own token carries.
+    #[test]
+    fn a_payload_splits_back_into_its_halves() {
+        let raw = payload(MSG_OPENER_IN_VALUE, "a\u{1f}b");
+        assert_eq!(split_payload(&raw), (MSG_OPENER_IN_VALUE, Some("a\u{1f}b")));
+        // …and a custom error from anywhere else comes back whole
+        assert_eq!(split_payload("regex too long"), ("regex too long", None));
+    }
+
+    /// The quote half is offered only where `"…"` reads back unchanged.
+    #[test]
+    fn only_a_quotable_token_earns_the_quoting_half() {
+        for text in ["#ff0000", "foo#bar", "https://a.b/c?d=e#f", "-x#y"] {
+            assert!(quotable_verbatim(text), "{text:?}");
+        }
+        for text in [
+            "",
+            "a\"b#c",
+            "a\\b#c",
+            "count(),#",
+            "a b#c",
+            "a`b#c",
+            "a|b#c",
+        ] {
+            assert!(!quotable_verbatim(text), "{text:?}");
+        }
+
+        // …and the hint drops that half rather than print it
+        let hint = hint_for(MSG_OPENER_IN_TOKEN, Some("count(),#"), "", 0).expect("hint");
+        assert_eq!(hint, "put whitespace before the '#' to start a comment");
     }
 
     /// Quoting is no escape under `-`: `-"a#b"` spells literal quotes.
     #[test]
     fn a_negated_term_hint_offers_the_not_spelling() {
-        for (input, offset, want) in [
-            ("-\"a#b\"", 3, "NOT \"a#b\""),
-            ("-foo#bar", 4, "NOT \"foo#bar\""),
-        ] {
-            let hint = hint_for(MSG_OPENER_IN_NEGATED_TERM, input, offset).expect("negated hint");
+        for (exact, want) in [("-\"a#b\"", "NOT \"a#b\""), ("-foo#bar", "NOT \"foo#bar\"")] {
+            let hint =
+                hint_for(MSG_OPENER_IN_NEGATED_TERM, Some(exact), "", 0).expect("negated hint");
             assert!(hint.starts_with(&format!("write it as {want}")), "{hint:?}");
         }
+
+        // …and a term no quoting can spell keeps only the comment half
+        let hint = hint_for(MSG_OPENER_IN_NEGATED_TERM, Some("-a\"b#c"), "", 0).expect("hint");
+        assert_eq!(hint, "put whitespace before the '#' to start a comment");
     }
 
     /// A stage name is grammar, not data — so the only advice is the
     /// whitespace one.
     #[test]
     fn a_command_hint_offers_only_the_comment_spelling() {
-        let hint = hint_for(MSG_OPENER_IN_COMMAND, "* | co#unt()", 6).expect("command hint");
+        let hint = hint_for(MSG_OPENER_IN_COMMAND, None, "* | co#unt()", 6).expect("command hint");
         assert_eq!(hint, "put whitespace before the '#' to start a comment");
     }
 
