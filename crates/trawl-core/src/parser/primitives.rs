@@ -338,7 +338,11 @@ pub(crate) fn literal<'src>()
 ///
 /// A comment opener INSIDE the value is a parse error, not data and not a
 /// comment (ADR-0014 ruling 2) — `color=#ff0000` names its own `#`
-/// instead of quietly becoming a text search for `color=`. The value is
+/// instead of quietly becoming a text search for `color=`. It carries the
+/// VALUE-position message, whose hint quotes the value alone
+/// (`color="#ff0000"`): quoting the whole token would turn a field filter
+/// into a phrase search, and a hint that changes what the query means is
+/// worse than none. The value is
 /// still produced, so the diagnostic is emitted rather than returned: a
 /// structurally-successful branch keeps chumsky's alternative selection
 /// from ranking a worse error from a later arm ahead of this one, while
@@ -367,7 +371,7 @@ pub(crate) fn bare_value<'src>()
                 let start = span.start + at;
                 emitter.emit(Rich::custom(
                     (start..start + crate::parser::comment::OPENER.len_utf8()).into(),
-                    crate::parser::comment::MSG_OPENER_IN_TOKEN,
+                    crate::parser::comment::MSG_OPENER_IN_VALUE,
                 ));
             }
             s

@@ -136,9 +136,12 @@ fn field_filter<'src>()
 /// never a comment inside a token. `//` at the START of a term is
 /// ruling 3's loud half: an old-style comment line must fail rather than
 /// silently become AND-ed text terms that narrow the match set to
-/// nothing. `slashes_open_a_line` is false for the NEGATED arm, where a
-/// leading `//` cannot have been meant as a comment (nothing negates
-/// one), so `-//cdn.example.com` stays an ordinary negated term.
+/// nothing. The NEGATED arm passes `negated`, which does two things: a
+/// leading `//` cannot have been meant as a comment there (nothing
+/// negates one), so `-//cdn.example.com` stays an ordinary negated term;
+/// and the `#` message is the negated one, because quoting is no escape
+/// under `-` — `-"a#b"` is a bare term spelling literal quote
+/// characters, and `NOT "a#b"` is the working form the hint offers.
 ///
 /// The term is still produced and the diagnostics are EMITTED, so the
 /// branch succeeds structurally: chumsky ranks alternatives by how far
@@ -146,12 +149,17 @@ fn field_filter<'src>()
 /// later arm. `into_result()` is still `Err`.
 fn check_term<'src>(
     p: impl Parser<'src, ParserInput<'src>, &'src str, ParserExtra<'src>> + Clone,
-    slashes_open_a_line: bool,
+    negated: bool,
 ) -> impl Parser<'src, ParserInput<'src>, &'src str, ParserExtra<'src>> + Clone {
     p.validate(move |s: &str, extra, emitter| {
         let span: SimpleSpan = extra.span();
         let start = span.start;
-        if slashes_open_a_line && comment::starts_with_slashes(s) {
+        let opener_msg = if negated {
+            comment::MSG_OPENER_IN_NEGATED_TERM
+        } else {
+            comment::MSG_OPENER_IN_TOKEN
+        };
+        if !negated && comment::starts_with_slashes(s) {
             emitter.emit(Rich::custom(
                 (start..start + comment::SLASHES.len()).into(),
                 comment::MSG_SLASHES_NOT_A_COMMENT,
@@ -159,7 +167,7 @@ fn check_term<'src>(
         } else if let Some(at) = comment::first_opener(s) {
             emitter.emit(Rich::custom(
                 (start + at..start + at + comment::OPENER.len_utf8()).into(),
-                comment::MSG_OPENER_IN_TOKEN,
+                opener_msg,
             ));
         }
         s
@@ -194,7 +202,7 @@ fn text_search<'src>()
                 .repeated()
                 .at_least(1)
                 .to_slice(),
-            false,
+            true,
         ))
         .map(|term: &str| {
             SearchToken::TextSearch(TextSearch {
@@ -216,7 +224,7 @@ fn text_search<'src>()
             .repeated()
             .at_least(1)
             .to_slice(),
-        true,
+        false,
     )
     .map(|s: &str| {
         SearchToken::TextSearch(TextSearch {

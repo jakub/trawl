@@ -108,6 +108,21 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
     }
 
     let offset = span.start;
+
+    // A comment opener the grammar could not admit (ADR-0014 rulings 2
+    // and 3). This runs BEFORE the generic enrichment because it owns its
+    // own span: chumsky reports where the production died, which for
+    // `| co#unt()` is the start of the stage word and for `// note` is one
+    // slash of two — neither of which is the byte the user has to change.
+    if let Some(d) = comment_diagnostic(input, offset) {
+        return ParseError {
+            message: d.message,
+            span: d.span,
+            label,
+            hint: d.hint,
+        };
+    }
+
     let found = if offset >= input.len() {
         "end of input".to_string()
     } else {
@@ -195,6 +210,70 @@ fn preceded_by_whitespace(input: &str, offset: usize) -> bool {
         .is_none_or(char::is_whitespace)
 }
 
+/// A comment diagnostic, with the span of the byte the user must change.
+struct CommentDiagnostic {
+    message: String,
+    hint: Option<String>,
+    span: std::ops::Range<usize>,
+}
+
+impl CommentDiagnostic {
+    fn new(msg: &str, input: &str, at: usize, len: usize) -> Self {
+        Self {
+            message: msg.to_string(),
+            hint: comment::hint_for(msg, input, at),
+            span: at..at + len,
+        }
+    }
+}
+
+/// The generic net for a comment opener the grammar could not admit, at
+/// every position the two validators (the bare value and the search-stage
+/// bare word) do not cover — a stage name, an expression, a sort key. It
+/// exists so a `#` never surfaces as "found '#', expected …".
+fn comment_diagnostic(input: &str, offset: usize) -> Option<CommentDiagnostic> {
+    if offset >= input.len() {
+        return None;
+    }
+    let rest = &input[offset..];
+
+    // A `#` right where the parser died, and not at a boundary the
+    // grammar would have admitted a comment at (ADR-0014 ruling 2).
+    if rest.starts_with(comment::OPENER) && !preceded_by_whitespace(input, offset) {
+        return Some(CommentDiagnostic::new(
+            comment::MSG_OPENER_IN_TOKEN,
+            input,
+            offset,
+            comment::OPENER.len_utf8(),
+        ));
+    }
+
+    // …and the same net for the retired second opener, at the one place
+    // it could have been a comment: a token boundary (ADR-0014 ruling 3).
+    // The span is BOTH slashes — one of two underlines nothing the user
+    // can act on.
+    if comment::starts_with_slashes(rest) && preceded_by_whitespace(input, offset) {
+        return Some(CommentDiagnostic::new(
+            comment::MSG_SLASHES_NOT_A_COMMENT,
+            input,
+            offset,
+            comment::SLASHES.len(),
+        ));
+    }
+
+    // A `#` inside a PIPE STAGE NAME. chumsky reports the start of the
+    // word (the stage word ends at the `#`), which the unknown-command
+    // rule below then renders as `unknown command 'co'` plus a suggestion
+    // for a typo the user did not make.
+    let at = comment::opener_in_command_word(input, offset)?;
+    Some(CommentDiagnostic::new(
+        comment::MSG_OPENER_IN_COMMAND,
+        input,
+        at,
+        comment::OPENER.len_utf8(),
+    ))
+}
+
 /// Produce an enriched (message, hint) pair based on error context.
 fn enrich_error(
     input: &str,
@@ -206,34 +285,6 @@ fn enrich_error(
     let expects_end_quote = expected.iter().any(|e| e == "'\"'");
     let expects_close_paren = expected.iter().any(|e| e == "')'");
     let at_end = offset >= input.len();
-
-    // A comment opener the grammar could not admit (ADR-0014 ruling 2).
-    // The validators on the two productions that can CONSUME one — the
-    // bare value and the search-stage bare word — say this themselves and
-    // never reach here; this is the generic net for every other position
-    // (`| co#unt()`, a stage name, an expression) so a `#` never surfaces
-    // as "found '#', expected …".
-    if !at_end
-        && input[offset..].starts_with(comment::OPENER)
-        && !preceded_by_whitespace(input, offset)
-    {
-        return (
-            comment::MSG_OPENER_IN_TOKEN.to_string(),
-            comment::hint_for(comment::MSG_OPENER_IN_TOKEN, input, offset),
-        );
-    }
-
-    // …and the same net for the retired second opener, at the one place
-    // it could have been a comment: a token boundary (ADR-0014 ruling 3).
-    if !at_end
-        && comment::starts_with_slashes(&input[offset..])
-        && preceded_by_whitespace(input, offset)
-    {
-        return (
-            comment::MSG_SLASHES_NOT_A_COMMENT.to_string(),
-            comment::hint_for(comment::MSG_SLASHES_NOT_A_COMMENT, input, offset),
-        );
-    }
 
     // Unknown pipe stage: detected by scanning the input for a `|` before
     // the error position and extracting the word that follows it. chumsky's
@@ -868,6 +919,43 @@ mod tests {
         ] {
             let _ = parse(&body);
         }
+    }
+
+    /// The pathological corpus parses **inside a 2 MiB stack** — the size
+    /// of a tokio worker thread, which is where trawld actually runs the
+    /// parser.
+    ///
+    /// The padding rewrite (ADR-0014 ruling 4) put a project-owned
+    /// combinator at every whitespace site, which deepens the parser's
+    /// nested TYPE and so its per-frame stack cost. `cargo test`'s own
+    /// threads get 8 MiB by default, so a suite that merely calls `parse`
+    /// would keep passing while the server overflowed. This runs the
+    /// corpus in a thread sized like the one that matters, and asserts it
+    /// finishes rather than dies.
+    #[test]
+    fn the_pathological_corpus_parses_within_a_tokio_workers_stack() {
+        /// A tokio worker thread's default stack.
+        const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
+
+        let corpus = vec![
+            format!("*{}", "| head 1 ".repeat(2000)),
+            format!("* | where a =={}1", " ".repeat(100_000)),
+            "a=1 ".repeat(10_000),
+            format!("a=1{}b=2", " ".repeat(60_000)),
+            format!("* | where {}1{}", "( ".repeat(300), ") ".repeat(300)),
+        ];
+
+        std::thread::Builder::new()
+            .stack_size(TOKIO_WORKER_STACK)
+            .spawn(move || {
+                for body in &corpus {
+                    // the ANSWER is not the point — reaching one is
+                    let _ = parse(body);
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("the parser must not overflow a 2 MiB stack");
     }
 
     /// A LEADING backtick that fails the quoted production is a loud
