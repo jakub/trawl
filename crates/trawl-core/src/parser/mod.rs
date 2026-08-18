@@ -1107,6 +1107,24 @@ mod tests {
             parse(&sequential).is_ok(),
             "sequential nesting must not accumulate: {sequential:.80}…"
         );
+
+        // The counter is thread-local and a tokio worker is reused
+        // across requests, so the claim that actually matters in
+        // production: a parse that FAILS while holding nesting levels
+        // (aborted mid-expression, or refused at the depth bound) must
+        // not poison the next parse on the same thread.
+        let abandoned_midway = format!("* | where {}1 +", "(".repeat(n - 1));
+        assert!(parse(&abandoned_midway).is_err(), "prefix input must fail");
+        let over_the_bound = format!("* | where {}1{}", "(".repeat(200), ")".repeat(200));
+        assert!(
+            parse(&over_the_bound).is_err(),
+            "over-bound input must fail"
+        );
+        let legal_max = format!("* | where {}1{}", "(".repeat(n), ")".repeat(n));
+        assert!(
+            parse(&legal_max).is_ok(),
+            "a failed parse must not spend this thread's depth budget"
+        );
     }
 
     /// A LEADING backtick that fails the quoted production is a loud
