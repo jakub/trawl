@@ -225,6 +225,13 @@ const PAYLOAD_MESSAGES: [&str; 3] = [
 /// [`crate::parser::primitives::bare_value`], so the comma bounding the
 /// hint needs comes free with the slice.
 pub(crate) fn payload(msg: &str, exact: &str) -> String {
+    // The call sites and [`PAYLOAD_MESSAGES`] must stay one set: a payload
+    // minted with a message [`split_payload`] does not recognise comes back
+    // WHOLE, separator and slice and all, and would print as the message.
+    debug_assert!(
+        PAYLOAD_MESSAGES.contains(&msg),
+        "payload minted with an unlisted message: {msg:?}"
+    );
     format!("{msg}{PAYLOAD_SEP}{exact}")
 }
 
@@ -250,7 +257,7 @@ pub(crate) fn split_payload(raw: &str) -> (&str, Option<&str>) {
 /// following it costs, which is why the position rides in the message:
 /// quoting the whole of `color=#ff0000` is a phrase search, quoting a
 /// `-`-negated term spells literal quote characters, and quoting a value
-/// carrying `*`/`?` turns a glob into an exact match.
+/// carrying `*`/`?` stops it being a pattern.
 ///
 /// A CONCRETE rewrite is offered only where the emitting production held
 /// the exact slice ([`payload`]) AND the rewrite means what the hint
@@ -277,8 +284,18 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
             // decides it), and quoted wildcards are data. The advice is
             // still the right one — a value carrying a `#` cannot stay
             // unquoted — so it states what it costs instead of hiding it.
+            //
+            // What it costs is stated as the ONE thing true under every
+            // operator and every pin: a quoted value is never a pattern.
+            // The glob auto-detect overrides the operator the user typed
+            // (`f>a*` is a Glob, not a Gt), so quoting `f>#a*` yields a
+            // Gt comparison — "match it exactly" was true for `=` and
+            // false for every ordered operator. And the hint promises the
+            // `#` reaches the value, never that the value is one the
+            // field's pin admits: `_severity="#warn*"` carries the `#` and
+            // is then refused, loudly, by the severity vocabulary.
             Some(value) if crate::parser::search::has_glob_chars(value) => format!(
-                "quote the value (\"{value}\") to match it exactly \
+                "quote the value (\"{value}\") to carry the '{OPENER}' \
                  (a quoted value is never a pattern), or {}",
                 comment_half()
             ),

@@ -278,7 +278,7 @@ fn the_value_hint_names_the_whole_value() {
         err.hint.as_deref(),
         Some(
             format!(
-                "quote the value (\"https://example.test/p?a=b#frag\") to match it exactly \
+                "quote the value (\"https://example.test/p?a=b#frag\") to carry the '#' \
                  (a quoted value is never a pattern), or {COMMENT_HALF}"
             )
             .as_str()
@@ -293,12 +293,20 @@ fn the_value_hint_names_the_whole_value() {
     );
 }
 
-/// A quoted value is never a glob, so a hint that says "quote it" to a
-/// value carrying `*`/`?` is advising an OPERATOR change — `f=#a*` is a
-/// Glob filter and `f="#a*"` is an exact one. The advice stands (the `#`
-/// leaves no unquoted spelling), and it says what it costs.
+/// A quoted value is never a pattern, so a hint that says "quote it" to a
+/// value carrying `*`/`?` is advising an OPERATOR change. The advice
+/// stands (the `#` leaves no unquoted spelling), and it says what it
+/// costs — in the one wording that is true under EVERY operator.
+///
+/// "match it exactly" was not that wording. The glob auto-detect
+/// overrides the operator the user typed, so `f>#a*` is a Glob and its
+/// quoted rewrite is a Gt COMPARISON, not an exact match; only under `=`
+/// did the old sentence hold. And the promise is lexical — the `#`
+/// reaches the value — never that the field's pin admits the result:
+/// `_severity="#warn*"` carries the `#` and is refused by the severity
+/// vocabulary at emission.
 #[test]
-fn a_value_hint_admits_that_quoting_a_glob_makes_it_exact() {
+fn a_value_hint_admits_that_quoting_a_glob_drops_the_pattern() {
     for dsl in ["f=#a*", "f=#a?"] {
         let err = one_error(dsl);
         assert_eq!(err.message, MSG_OPENER_VALUE, "{dsl:?}");
@@ -307,7 +315,7 @@ fn a_value_hint_admits_that_quoting_a_glob_makes_it_exact() {
             err.hint.as_deref(),
             Some(
                 format!(
-                    "quote the value (\"{value}\") to match it exactly \
+                    "quote the value (\"{value}\") to carry the '#' \
                      (a quoted value is never a pattern), or {COMMENT_HALF}"
                 )
                 .as_str()
@@ -315,11 +323,49 @@ fn a_value_hint_admits_that_quoting_a_glob_makes_it_exact() {
             "{dsl:?}"
         );
 
-        // …and the rewrite parses, as the EXACT match the hint claims
+        // …and under `=` the rewrite is the exact match it always was
         assert_eq!(
             filters(&ok(&format!("f=\"{value}\""))),
             vec![&eq("f", value)],
             "{dsl:?}: the advised rewrite must be FilterOp::Eq"
+        );
+    }
+
+    // …while under an ORDERED operator the same hint's rewrite is that
+    // operator's comparison, which is why the wording may not say
+    // "exactly". The unquoted form is a Glob — the auto-detect discards
+    // the typed operator — so quoting is an operator change either way.
+    for (dsl, op) in [
+        ("f>#a*", FilterOp::Gt),
+        ("f<=#a?", FilterOp::Lte),
+        ("f!=#a*", FilterOp::Ne),
+    ] {
+        let err = one_error(dsl);
+        assert_eq!(err.message, MSG_OPENER_VALUE, "{dsl:?}");
+        let value = dsl
+            .rsplit_once('#')
+            .map(|(_, v)| format!("#{v}"))
+            .expect("#");
+        assert_eq!(
+            err.hint.as_deref(),
+            Some(
+                format!(
+                    "quote the value (\"{value}\") to carry the '#' \
+                     (a quoted value is never a pattern), or {COMMENT_HALF}"
+                )
+                .as_str()
+            ),
+            "{dsl:?}"
+        );
+        let quoted = dsl.replace(&value, &format!("\"{value}\""));
+        assert_eq!(
+            filters(&ok(&quoted)),
+            vec![&FieldFilter {
+                field: "f".to_string(),
+                op,
+                value: FilterValue::Literal(value.clone()),
+            }],
+            "{quoted:?}: the advised rewrite keeps the typed operator"
         );
     }
 
