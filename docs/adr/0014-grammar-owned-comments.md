@@ -59,7 +59,14 @@ point into the real input, so the invariant stops needing to exist.
 ### 2. Inside an unquoted token, a comment opener is an error — never data, never a comment
 
 A comment opens only where the grammar sits between tokens: start of input,
-or after whitespace. ("After a delimiter" was in the original wording and
+or after ASCII whitespace — one predicate, `comment::opens_comment_after`,
+asked by the grammar's layout run, by the error-rendering net and by the
+text-level scan alike. ASCII and not Unicode because the unquoted token
+charsets end on ASCII whitespace and nothing else: a no-break space sits
+INSIDE a bare word, so admitting it as a comment boundary would have the
+scanner reading `message="x"⍽# last=1h` (⍽ = U+00A0) as a comment while the
+token grammar reads it as an error. Layout CONSUMPTION between tokens stays
+Unicode, as chumsky's `.padded()` always was. ("After a delimiter" was in the original wording and
 is dropped: the delimiter set is unenumerable — `=` cannot qualify, or
 `color=#ff0000` stops erroring — so the rule is encoded structurally
 instead, as `layout = (whitespace+ comment?)*` plus one leading-comment

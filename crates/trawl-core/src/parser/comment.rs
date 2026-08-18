@@ -14,7 +14,9 @@
 //! The boundary is encoded structurally, with no lookback:
 //! [`ws`] is `(whitespace+ comment?)*`, so a comment is reachable only
 //! after consumed whitespace, and [`leading_ws`] adds the one other
-//! comment site — the start of the input. Consequence, deliberate:
+//! comment site — the start of the input. That whitespace must be ASCII
+//! ([`opens_comment_after`]), because the unquoted token charsets end on
+//! ASCII whitespace alone. Consequence, deliberate:
 //! `count(),# x` and `(#x` are parse errors, not comments (the "after a
 //! delimiter" case is unenumerable — admitting `=` would stop
 //! `color=#ff0000` erroring).
@@ -72,14 +74,31 @@ const HINT_SLASHES: &str =
 /// The `//` opener a search-stage bare term may not START with.
 pub(crate) const SLASHES: &str = "//";
 
-/// The ONE whitespace rule in the DSL: `char::is_whitespace`, Unicode and
-/// all. It is what [`skip_layout`] consumes, so it is also what decides
-/// where a comment may open — and [`crate::parser::scan`] asks the same
-/// question of the same predicate rather than keeping its own ASCII-only
-/// copy, which read `message="x"\u{a0}# last=1h` as grammar the parser
-/// reads as a comment.
+/// What counts as LAYOUT between tokens: `char::is_whitespace`, Unicode
+/// and all, exactly as chumsky's `.padded()` always was. This is
+/// consumption only — it says what separates two tokens, never where a
+/// comment may open.
 pub(crate) const fn is_layout(c: char) -> bool {
     c.is_whitespace()
+}
+
+/// Whether a comment may OPEN directly after `prev` — the character
+/// immediately before the `#`, or `None` at the start of the input.
+///
+/// The boundary is ASCII whitespace, deliberately NARROWER than
+/// [`is_layout`], because the unquoted token charsets end on ASCII
+/// whitespace and nothing else: a no-break space is an ordinary character
+/// INSIDE a bare word or value. Reading `message="x"\u{a0}# last=1h` as a
+/// comment while the token grammar reads `foo\u{a0}#` as one token would
+/// be the parser and the scanner answering the same question two ways.
+/// Both consequences are LOUD — `"x"\u{a0}# c` is a parse error at the
+/// `#`, `foo\u{a0}# c` is the inside-a-token error — never a silently
+/// different query.
+///
+/// The ONE predicate: [`skip_layout`] and [`crate::parser::scan`] both
+/// ask it, of the same character.
+pub(crate) fn opens_comment_after(prev: Option<char>) -> bool {
+    prev.is_none_or(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
 }
 
 /// Consume one comment if the cursor is sitting on its opener: the
@@ -105,15 +124,20 @@ fn skip_comment<'src>(inp: &mut InputRef<'src, '_, ParserInput<'src>, ParserExtr
 /// Each iteration consumes at least one whitespace character, so the walk
 /// always terminates. A comment is reachable only after that whitespace —
 /// which is precisely the token-boundary rule, encoded structurally
-/// rather than tested by a lookback.
+/// rather than tested by a lookback — and only when the LAST whitespace
+/// character consumed is one [`opens_comment_after`] admits, so the run
+/// `foo\u{a0}` leaves the following `#` to the token grammar.
 fn skip_layout<'src>(inp: &mut InputRef<'src, '_, ParserInput<'src>, ParserExtra<'src>>) {
     loop {
-        let mut saw_whitespace = false;
-        while inp.peek().is_some_and(is_layout) {
+        let mut last = None;
+        while let Some(c) = inp.peek() {
+            if !is_layout(c) {
+                break;
+            }
             inp.skip();
-            saw_whitespace = true;
+            last = Some(c);
         }
-        if !saw_whitespace {
+        if !(last.is_some() && opens_comment_after(last)) {
             return;
         }
         skip_comment(inp);
@@ -201,10 +225,14 @@ pub(crate) fn hint_for(msg: &str, input: &str, offset: usize) -> Option<String> 
 }
 
 /// The unquoted token surrounding `offset` and the byte it starts at: the
-/// run of non-whitespace, non-`|` bytes around it. Used to render a hint,
-/// and to decide whether that token is a pipe stage name.
+/// run of non-ASCII-whitespace, non-`|` bytes around it. Used to render a
+/// hint, and to decide whether that token is a pipe stage name.
+///
+/// ASCII whitespace because that is where the unquoted token charsets end
+/// — a no-break space sits INSIDE a bare word, so a hint bounded by
+/// Unicode whitespace would quote less than the user has to change.
 pub(crate) fn token_span(input: &str, offset: usize) -> (usize, &str) {
-    let ends = |c: char| is_layout(c) || c == '|';
+    let ends = |c: char| c.is_ascii_whitespace() || c == '|';
     let start = input[..offset.min(input.len())].rfind(ends).map_or(0, |i| {
         i + input[i..].chars().next().map_or(1, char::len_utf8)
     });
@@ -226,12 +254,20 @@ const VALUE_STARTERS: [char; 6] = ['=', '<', '>', '!', ',', '('];
 /// The value slice surrounding `offset` inside its token. Hint rendering
 /// only: it never decides what anything MEANS, and the grammar has
 /// already refused this token by the time it is called.
+///
+/// Bounded on BOTH sides by the comma-delimited element, not just on the
+/// left: an IN list is one whitespace-delimited token, so a hint that ran
+/// to the end of it copied every remaining element — and every element
+/// carrying a `#` emits its own diagnostic, which made the rendered
+/// hints quadratic in the length of the list. The element is also the
+/// only slice a user can act on: quoting `"#a"` is the fix, quoting
+/// `"#a,#b,#c"` is a different query.
 fn value_around(input: &str, offset: usize) -> &str {
     let (start, token) = token_span(input, offset);
-    let upto = offset.saturating_sub(start).min(token.len());
-    token[..upto]
-        .rfind(VALUE_STARTERS)
-        .map_or(token, |i| &token[i + 1..])
+    let at = offset.saturating_sub(start).min(token.len());
+    let from = token[..at].rfind(VALUE_STARTERS).map_or(0, |i| i + 1);
+    let end = token[at..].find(',').map_or(token.len(), |i| at + i);
+    &token[from..end]
 }
 
 /// A negated term's working spelling under `NOT`: the term without its
@@ -316,6 +352,42 @@ mod tests {
         );
     }
 
+    /// The boundary is ASCII whitespace: a no-break space is layout the
+    /// run consumes, but it does not open a comment, because the token
+    /// charsets carry it INSIDE a bare word.
+    #[test]
+    fn only_ascii_whitespace_opens_a_comment() {
+        for c in [' ', '\t', '\n', '\r'] {
+            assert!(opens_comment_after(Some(c)), "{c:?}");
+        }
+        for c in ['\u{a0}', '\u{2003}', '\u{feff}', 'x'] {
+            assert!(!opens_comment_after(Some(c)), "{c:?}");
+        }
+        assert!(opens_comment_after(None), "start of input");
+
+        // …and the layout run agrees: `\u{a0}#` leaves the `#` unconsumed
+        assert!(
+            ws().then_ignore(end())
+                .parse("\u{a0}# note")
+                .into_result()
+                .is_err()
+        );
+        // while a following ASCII space re-opens the site
+        assert!(
+            ws().then_ignore(end())
+                .parse("\u{a0} # note")
+                .into_result()
+                .is_ok()
+        );
+        // …and Unicode whitespace is still LAYOUT, consumed as ever
+        assert!(
+            ws().then_ignore(end())
+                .parse("\u{a0}\u{2003}")
+                .into_result()
+                .is_ok()
+        );
+    }
+
     /// The line boundary is `\n` alone; `\r` sits inside a comment.
     #[test]
     fn carriage_return_is_comment_content() {
@@ -345,6 +417,12 @@ mod tests {
             ("a=1# note", 3, "\"1#\""),
             ("1=/foo#bar/", 6, "\"/foo#bar/\""),
             ("status=200,#x", 11, "\"#x\""),
+            // an IN list is ONE token: the hint is the element, not the
+            // remaining suffix — quoting the rest would be a different
+            // query, and copying it made the hints quadratic
+            ("f=#a,#b,#c", 2, "\"#a\""),
+            ("f=#a,#b,#c", 5, "\"#b\""),
+            ("f=#a,#b,#c", 8, "\"#c\""),
         ] {
             let hint = hint_for(MSG_OPENER_IN_VALUE, input, offset).expect("value hint");
             assert!(

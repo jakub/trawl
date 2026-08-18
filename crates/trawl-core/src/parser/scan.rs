@@ -17,7 +17,7 @@
 //! the authority on what a query MEANS; this only decides where to splice
 //! text.
 
-use crate::parser::comment::is_layout;
+use crate::parser::comment::{is_layout, opens_comment_after};
 
 /// Walk `input`'s bytes, calling `hit` only for bytes that sit OUTSIDE a
 /// delimited span — a double-quoted string, a `/`-delimited regex
@@ -50,14 +50,16 @@ use crate::parser::comment::is_layout;
 ///   accepted: a division written with spaces (`| let x = 1 / 2`) reads
 ///   as a regex open. That is confined to the pipeline tail, which
 ///   neither consumer scans.
-/// * **A `#` opens a comment only after whitespace or at the start of
-///   input** — the same structural boundary the grammar uses, tested
-///   with the grammar's OWN whitespace predicate
-///   (`parser::comment::is_layout`, Unicode and all), because an
-///   ASCII-only copy read `message="x"\u{a0}# last=1h` as grammar the
-///   parser reads as a comment. A comment runs to `\n`, and nothing
-///   inside it is offered to `hit`, so a `|` or `last=` written in one is
-///   prose.
+/// * **A `#` opens a comment only after ASCII whitespace or at the start
+///   of input** — the same structural boundary the grammar uses, tested
+///   through the grammar's OWN predicate
+///   (`parser::comment::opens_comment_after`) rather than a copy that
+///   could drift. ASCII and not Unicode because the unquoted token
+///   charsets end on ASCII whitespace: `message="x"\u{a0}# last=1h` is a
+///   parse error, so a walk that read it as a comment would be answering
+///   a question the grammar answers differently. A comment runs to `\n`,
+///   and nothing inside it is offered to `hit`, so a `|` or `last=`
+///   written in one is prose.
 ///
 /// On unterminated input — a quote or regex the user has not closed yet —
 /// the open span runs to end of input and nothing after it is offered.
@@ -146,13 +148,13 @@ where
 }
 
 /// Whether the byte at `i` sits where the GRAMMAR admits a comment: the
-/// beginning of the input, or directly after a whitespace CHARACTER
-/// (`parser::comment::ws` / `leading_ws`, via the one shared predicate).
-/// Deliberately narrower than [`at_boundary`] — admitting `=` would read
-/// `color=#ff0000` as a comment, which is exactly the shape the grammar
-/// refuses.
+/// beginning of the input, or directly after an ASCII whitespace
+/// character — asked of `parser::comment`'s own predicate, the one both
+/// `ws`/`leading_ws` and this walk go through. Deliberately narrower than
+/// [`at_boundary`] — admitting `=` would read `color=#ff0000` as a
+/// comment, which is exactly the shape the grammar refuses.
 fn at_layout_boundary(input: &str, i: usize) -> bool {
-    input[..i].chars().next_back().is_none_or(is_layout)
+    opens_comment_after(input[..i].chars().next_back())
 }
 
 /// Whether the byte at `i` sits where a new VALUE could START: the
@@ -232,14 +234,20 @@ mod tests {
         assert_eq!(first_pipe(r#"message="a\"|b" | stats"#), Some(16));
     }
 
-    /// The comment boundary is the GRAMMAR's whitespace, which is
-    /// Unicode's. An ASCII-only test read the `#` after a no-break space
-    /// as data and offered the `last=` the parser has in a comment.
+    /// The comment boundary is ASCII whitespace, because the unquoted
+    /// token charsets end on ASCII whitespace: a `#` after a no-break
+    /// space is inside a token the grammar refuses, so the walk must not
+    /// read it as a comment and hide what follows.
     #[test]
-    fn unicode_whitespace_opens_a_comment_as_the_grammar_does() {
-        assert!(!has_last("message=\"x\"\u{a0}# last=1h"));
-        assert!(!has_last("a=1\u{2003}# last=1h"));
-        assert_eq!(first_pipe("a=1\u{a0}# | stats count()"), None);
+    fn only_ascii_whitespace_opens_a_comment() {
+        assert!(has_last("message=\"x\"\u{a0}# last=1h"));
+        assert!(has_last("a=1\u{2003}# last=1h"));
+        // `a=1` + a two-byte no-break space + `# ` puts the pipe at 7
+        assert_eq!(first_pipe("a=1\u{a0}# | stats count()"), Some(7));
+        // …every ASCII whitespace character does open one
+        for ws in [" ", "\t", "\n", "\r"] {
+            assert!(!has_last(&format!("a=1{ws}# last=1h")), "{ws:?}");
+        }
     }
 
     /// The walk's terminal state, which the date-range merge asks before

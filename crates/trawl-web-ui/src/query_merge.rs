@@ -457,9 +457,9 @@ mod tests {
     }
 
     /// The scan and the grammar answer the same question: a `\` outside a
-    /// quoted span does not escape, and Unicode whitespace opens a
-    /// comment. Both shapes used to hide the base query's own `last=`,
-    /// which injected a SECOND time bound.
+    /// quoted span does not escape, and a comment opens only after ASCII
+    /// whitespace. The escape shape used to hide the base query's own
+    /// `last=`, which injected a SECOND time bound.
     #[test]
     fn the_scan_agrees_with_the_grammar_on_escapes_and_whitespace() {
         // `last=1h` lives inside the quoted phrase — not a time clause,
@@ -468,10 +468,12 @@ mod tests {
             effective_query(r#"foo\" last=1h""#, &[], &quick("15m")),
             r#"last=15m foo\" last=1h""#
         );
-        // `last=1h` lives inside a comment opened after a no-break space
+        // a no-break space does NOT open a comment — the token charsets
+        // end on ASCII whitespace, so the grammar refuses this `#` rather
+        // than reading prose after it, and the `last=1h` is a real clause
         assert_eq!(
             effective_query("message=\"x\"\u{a0}# last=1h", &[], &quick("15m")),
-            "last=15m message=\"x\"\u{a0}# last=1h"
+            "message=\"x\"\u{a0}# last=1h"
         );
         // …while a real one still suppresses the injection
         assert_eq!(

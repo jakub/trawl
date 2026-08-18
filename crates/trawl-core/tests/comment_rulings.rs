@@ -336,3 +336,82 @@ fn a_span_after_a_comment_indexes_the_original_input() {
     assert_eq!(err.span, at..at + 1);
     assert_eq!(err.message, MSG_OPENER_VALUE);
 }
+
+// ── the boundary is ASCII whitespace ─────────────────────────────────
+
+/// A comment opens after ASCII whitespace or at the start of input, and
+/// after NOTHING else — because that is exactly where the unquoted token
+/// charsets end. A no-break space is an ordinary character INSIDE a bare
+/// word or value, so a `#` behind one is inside a token, and the outcome
+/// is the token error: loud, never a silently different query.
+#[test]
+fn a_comment_opens_only_after_ascii_whitespace() {
+    for ws in [" ", "\t", "\n", "\r\n"] {
+        let dsl = format!("a=1{ws}# note");
+        let query = ok(&dsl);
+        assert_eq!(filters(&query), vec![&eq("a", "1")], "{dsl:?}");
+    }
+
+    // …and a Unicode space is not a comment boundary in either lane.
+    for (dsl, msg) in [
+        ("message=\"x\"\u{a0}# note", MSG_OPENER),
+        ("foo\u{a0}# note", MSG_OPENER),
+        // …inside the VALUE, whose own escape quotes the value alone
+        ("a=1\u{2003}# note", MSG_OPENER_VALUE),
+    ] {
+        let err = one_error(dsl);
+        assert_eq!(err.message, msg, "{dsl:?}");
+        assert_eq!(&dsl[err.span.clone()], "#", "{dsl:?}");
+    }
+
+    // Layout CONSUMPTION is untouched: a no-break space separates
+    // nothing, exactly as it did before comments were a production —
+    // `a=1\u{a0}host=x` is one filter whose value carries the space.
+    let query = ok("a=1\u{a0}host=x");
+    assert_eq!(filters(&query), vec![&eq("a", "1\u{a0}host=x")]);
+}
+
+// ── diagnostics are bounded (parse-time, not just on the wire) ───────
+
+/// One query can carry unboundedly many independent violations, and each
+/// one renders a hint quoting the input. Both halves are bounded: the
+/// hint is cut to the comma-delimited ELEMENT the user must quote, and
+/// the reported list is capped before anything is rendered — so a
+/// 64 KiB list of `#`-bearing elements costs a constant number of
+/// constant-sized diagnostics, not their product.
+#[test]
+fn a_pathological_query_reports_a_bounded_number_of_diagnostics() {
+    /// Mirrors `parser::MAX_REPORTED_ERRORS`, which is private.
+    const CAP: usize = 8;
+
+    let mut dsl = String::from("f=");
+    while dsl.len() < 60_000 {
+        dsl.push_str("#a,");
+    }
+    dsl.pop();
+
+    let errors = parse(&dsl).expect_err("every element carries a '#'");
+    assert!(
+        errors.len() <= CAP,
+        "{} diagnostics for a {}-byte query",
+        errors.len(),
+        dsl.len()
+    );
+    let rendered: usize = errors
+        .iter()
+        .map(|e| e.message.len() + e.hint.as_ref().map_or(0, String::len))
+        .sum();
+    assert!(
+        rendered < 4 * 1024,
+        "{rendered} bytes of diagnostics for a {}-byte query",
+        dsl.len()
+    );
+
+    // …and the hint still names the element, not the rest of the list
+    let err = &errors[0];
+    assert_eq!(err.message, MSG_OPENER_VALUE);
+    assert_eq!(
+        err.hint.as_deref(),
+        Some("quote the value (\"#a\"), or put whitespace before the '#' to start a comment")
+    );
+}

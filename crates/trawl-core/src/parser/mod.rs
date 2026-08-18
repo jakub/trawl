@@ -57,6 +57,21 @@ impl std::fmt::Display for ParseError {
 /// Maximum query length in bytes. Prevents denial-of-service via pathological parser input.
 const MAX_QUERY_LEN: usize = 65_536;
 
+/// The most diagnostics ONE parse reports, however many the grammar
+/// emitted.
+///
+/// A single query can carry unboundedly many independent violations —
+/// `f=#a,#b,#c,…` emits one per element — and every one of them renders a
+/// hint quoting text from the input, so the reported bytes grow as the
+/// product of the two. The cap is applied HERE, before rendering, so the
+/// quadratic work is never done rather than merely never returned; the
+/// server serializes every detail it is handed, so this is the bound the
+/// wire sees too.
+///
+/// Eight, not one: a parse error list is a work list, and chumsky orders
+/// it by position, so the first few are the ones a user reads.
+const MAX_REPORTED_ERRORS: usize = 8;
+
 /// Parse a trawl DSL query string into a structured AST.
 ///
 /// # Errors
@@ -85,6 +100,7 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
         Ok(query) => Ok(query),
         Err(errors) => Err(errors
             .into_iter()
+            .take(MAX_REPORTED_ERRORS)
             .map(|e| rich_to_parse_error(&e, input))
             .collect()),
     }
@@ -200,14 +216,13 @@ fn find_pipe_command_word(input: &str, offset: usize) -> Option<String> {
     Some(candidate)
 }
 
-/// Whether `offset` sits at the start of the input or directly after a
-/// whitespace character — the two positions the grammar admits a comment
-/// at ([`comment::ws`] / [`comment::leading_ws`]).
+/// Whether `offset` sits at the start of the input or directly after an
+/// ASCII whitespace character — the two positions the grammar admits a
+/// comment at, asked of the one predicate that owns the question
+/// ([`comment::opens_comment_after`], which [`comment::ws`] and
+/// [`scan`] also go through).
 fn preceded_by_whitespace(input: &str, offset: usize) -> bool {
-    input[..offset]
-        .chars()
-        .next_back()
-        .is_none_or(char::is_whitespace)
+    comment::opens_comment_after(input[..offset].chars().next_back())
 }
 
 /// A comment diagnostic, with the span of the byte the user must change.

@@ -27,9 +27,9 @@ _severity>=error last=1h    # only the last hour
 ```
 
 A comment opens only where the query is **between tokens**: at the start
-of the input, or after whitespace. Inside an unquoted token a `#` is
-neither data nor a comment — it is a parse error naming the byte, with a
-hint to quote it:
+of the input, or after a space, tab, carriage return or newline. Inside
+an unquoted token a `#` is neither data nor a comment — it is a parse
+error naming the byte, with a hint to quote it:
 
 ```
 a=1 # note        filter a=1, plus a comment
@@ -38,6 +38,13 @@ foo#bar           error at the '#'  — write "foo#bar" to search for it
 color=#ff0000     error at the '#'  — write color="#ff0000"
 -foo#bar          error at the '#'  — write NOT "foo#bar"
 ```
+
+Only those four ASCII characters open a comment, because they are also
+the only ones that END an unquoted token: a no-break space is an
+ordinary character inside a word or a value, so `foo`, a no-break space
+and `# note` is one token carrying a `#` and gets the same parse error
+rather than a comment. Between tokens any
+Unicode whitespace still separates, exactly as it always has.
 
 The hint names the spelling that works **in that position**: quoting the
 whole of `color=#ff0000` would turn a field filter into a phrase search,
