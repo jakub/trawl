@@ -2,11 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The pure tone-vocabulary mappers (`run_status_tone`, `tone_for_var`)
-// live in the ungated [`crate::tone_vocab`] module so native `cargo test`
-// exercises them; re-exported here so call sites keep their existing
-// `components::…` / `super::…` paths.
-pub(crate) use crate::tone_vocab::{run_status_tone, tone_for_var};
+// The pure run-status tone mapper lives in the ungated
+// [`crate::tone_vocab`] module so native `cargo test` exercises it;
+// re-exported here so call sites keep their existing `components::…` path.
+pub(crate) use crate::tone_vocab::run_status_tone;
 
 // Same arrangement for the pure service formatters: they live ungated at
 // [`crate::service_card_fmt`] so their tests run natively, and are
@@ -23,18 +22,6 @@ pub(crate) fn enc_uri(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-pub(crate) fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut end = max.min(s.len());
-        while !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}\u{2026}", &s[..end])
-    }
-}
-
 pub mod chart;
 pub mod degraded_notice;
 pub mod editor;
@@ -43,8 +30,6 @@ pub mod export_modal;
 pub mod facet_sidebar;
 pub mod field_case_drawer;
 pub mod histogram;
-pub mod lineage_tree;
-pub mod linkage_graph;
 pub mod meta_strip;
 pub mod net_drawer;
 pub mod repin_modal;

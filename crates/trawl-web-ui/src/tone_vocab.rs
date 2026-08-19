@@ -31,24 +31,9 @@ pub(crate) fn run_status_tone(status: &str) -> fleet_ui::StatusTone {
     }
 }
 
-/// Map the intel color-var vocabulary (`--green`, `--red`, …) that the
-/// badge helper fns share with non-badge accents (timeline dots, text
-/// colors) onto the closed fleet-ui badge [`fleet_ui::Tone`] set. Known
-/// visible narrowing (sanctioned by ADR-0003, flagged in the PR): teal →
-/// Info, ink-2/ink-3/ink-4 → Neutral.
-pub(crate) fn tone_for_var(var: &str) -> fleet_ui::Tone {
-    match var {
-        "--green" => fleet_ui::Tone::Success,
-        "--red" => fleet_ui::Tone::Danger,
-        "--yellow" => fleet_ui::Tone::Warn,
-        "--blue" | "--teal" => fleet_ui::Tone::Info,
-        _ => fleet_ui::Tone::Neutral,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{run_status_tone, tone_for_var};
+    use super::run_status_tone;
 
     #[test]
     fn run_status_tone_maps_every_arm() {
@@ -65,22 +50,5 @@ mod tests {
     fn run_status_tone_unknown_falls_back_to_neutral() {
         assert_eq!(run_status_tone("queued"), fleet_ui::StatusTone::Neutral);
         assert_eq!(run_status_tone(""), fleet_ui::StatusTone::Neutral);
-    }
-
-    #[test]
-    fn tone_for_var_maps_known_vars() {
-        assert_eq!(tone_for_var("--green"), fleet_ui::Tone::Success);
-        assert_eq!(tone_for_var("--red"), fleet_ui::Tone::Danger);
-        assert_eq!(tone_for_var("--yellow"), fleet_ui::Tone::Warn);
-        assert_eq!(tone_for_var("--blue"), fleet_ui::Tone::Info);
-        // Sanctioned narrowing (ADR-0003): teal collapses onto Info.
-        assert_eq!(tone_for_var("--teal"), fleet_ui::Tone::Info);
-    }
-
-    #[test]
-    fn tone_for_var_unknown_falls_back_to_neutral() {
-        // Sanctioned narrowing (ADR-0003): ink-* accents → Neutral.
-        assert_eq!(tone_for_var("--ink-2"), fleet_ui::Tone::Neutral);
-        assert_eq!(tone_for_var("--whatever"), fleet_ui::Tone::Neutral);
     }
 }

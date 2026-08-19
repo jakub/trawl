@@ -87,8 +87,9 @@
   --ink-3:     oklch(55.6% 0 0);
   /* --ink-4 is a TEXT colour, not a hairline: the DEBUG level pill
    * (.lvl-debug, --fs-micro over actual log data), .editor-hd .dim, the
-   * DSL editor's gutter line numbers, .divider and .claim-meta .sep all
-   * read it. Mira's own step here is oklch(70.8%), which measures 2.59:1
+   * DSL editor's gutter line numbers and .divider all read it (so did
+   * trawl's .claim-meta .sep, until #112 retired that surface).
+   * Mira's own step here is oklch(70.8%), which measures 2.59:1
    * on --panel and 2.48:1 on the editor's --fill wash — under even the
    * 3:1 non-text floor. Hold the pre-Mira tone's luminance instead
    * (#82868e is oklch(61.9%), rendered neutral): 3.64:1 on --panel,
@@ -1096,11 +1097,13 @@ textarea:focus-visible,
  *  Small widgets (issue #31, ADR-0003 unification)
  *
  *  One canonical treatment per widget. New families first (.bdg,
- *  .seg, .load-hint, .actions-wrap — these REPLACE app-side
- *  .intel-badge / .fmt-btn / .seg-mini / bespoke loading markup);
- *  the verbatim moves (.kbd, .inp-wrap, .toggle, .status-dot, …)
- *  are appended by the per-family sweep commits so the move-not-copy
- *  invariant in trawl's css_move_invariant stays green per commit.
+ *  .seg, .load-hint, .actions-wrap — these REPLACED the app-side
+ *  .intel-badge / .fmt-btn / .seg-mini / bespoke loading markup they
+ *  were extracted from; trawl's .intel-badge sites went with the
+ *  surface #112 retired). The verbatim moves (.kbd, .inp-wrap,
+ *  .toggle, .status-dot, …) are appended by the per-family sweep
+ *  commits so the move-not-copy invariant in trawl's
+ *  css_move_invariant stays green per commit.
  * ─────────────────────────────────────────────────────────────── */
 
 /* Badge — <Badge tone=…>. `.bdg`, not `.badge`: the rail count chip

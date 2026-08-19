@@ -15,7 +15,8 @@
 //! - **prev/next** — pass `on_prev`/`on_next` (+ `can_prev`/`can_next`)
 //!   to render the compact pager buttons.
 //! - **custom trailing slot** — `children` render on the right (the
-//!   intel pages' cursor-based "load more" button).
+//!   cursor-based "load more" button of the intel pages this was
+//!   extracted from, retired in #112).
 
 use leptos::prelude::*;
 

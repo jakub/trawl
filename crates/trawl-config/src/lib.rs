@@ -1109,9 +1109,9 @@ impl Default for AuthConfig {
 }
 
 impl AuthConfig {
-    /// Resolve the fleet keystore URL: `FLEET_DATABASE_URL` env var first
-    /// (what coastwatch prod already reads), then `[auth] database_url` from
-    /// the config file. Empty values count as unset.
+    /// Resolve the fleet keystore URL: `FLEET_DATABASE_URL` env var first,
+    /// then `[auth] database_url` from the config file. Empty values count
+    /// as unset.
     ///
     /// The bare `DATABASE_URL` override was removed in ADR-0004 slice 3:
     /// that variable is ceded to the sqlx test harness (`#[sqlx::test]`
@@ -1222,13 +1222,9 @@ pub struct WebConfig {
     #[serde(default)]
     pub allow_insecure_cookies: bool,
 
-    /// URL for the coastwatch intel daemon. Optional — intel features are
-    /// disabled when absent. Example: `"https://coastwatch.internal:7700"`.
-    pub coastwatch_url: Option<String>,
-
     /// Parent domain for the shared `fleet_session` SSO cookie — the SSO
-    /// knob, named to mirror coastwatch's `session.shared_domain` so operator
-    /// docs can say "set the same value in both apps" (ADR-0004 slice 2).
+    /// knob shared by every fleet app so operator docs can say "set the same
+    /// value in every app" (ADR-0004 slice 2).
     ///
     /// When set (e.g. `".fleet.lab.ktle.net"`), the session cookie carries a
     /// `Domain=` attribute scoping it to the parent domain, so one login is
@@ -2353,6 +2349,26 @@ auth_cache_ttl_secs = 300
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.auth.audit_interval_secs, 30);
+    }
+
+    #[test]
+    fn retired_web_upstream_key_is_ignored_by_serde_default() {
+        // WebConfig intentionally has no deny_unknown_fields attribute, so
+        // deployed config files carrying a removed optional knob keep parsing.
+        let removed_key = "coastwatch_url";
+        let toml = format!(
+            r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[web]
+{removed_key} = "https://retired.invalid"
+"#
+        );
+
+        let config: Config = toml::from_str(&toml).unwrap();
+        assert!(config.web.shared_domain.is_none());
     }
 
     // -- [storage] database_url (ADR-0004 slice 3) ----------------------------
