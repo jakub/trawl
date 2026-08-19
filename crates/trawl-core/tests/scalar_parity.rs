@@ -714,7 +714,9 @@ fn eval_scalar(dsl: &str, event: &Map<String, Value>) -> EvalValue {
 
 /// Run a `let x = <expr>` query and return the outcome of the computed `x`
 /// column. A `DuckDB` error is surfaced as [`SqlOutcome::Errored`] (NOT skipped),
-/// so the harness can no longer hide a batch error behind a silent skip.
+/// so the harness can no longer hide a batch error behind a silent skip — at
+/// prepare, at query AND at fetch. Only genuinely impossible states (no row, no
+/// `x` column, unreadable text) panic as infrastructure failures.
 fn sql_scalar_result(conn: &Connection, dsl: &str, event: &Map<String, Value>) -> SqlOutcome {
     let query = parse_generated(dsl);
 
@@ -748,8 +750,22 @@ fn sql_scalar_result(conn: &Connection, dsl: &str, event: &Map<String, Value>) -
         Ok(rows) => rows,
         Err(error) => return SqlOutcome::Errored(error.to_string()),
     };
-    let Ok(Some(row)) = rows.next() else {
-        panic!("query infrastructure failure: generated scalar query returned no row: {dsl:?}");
+    // Three OUTCOMES, never two: a fetch-time `Err` is a real DuckDB execution
+    // error and must classify as one, exactly like the prepare/query failures
+    // above — collapsing it into the empty-result panic would make an overflow
+    // pin panic with the wrong reason instead of returning `Errored`. Measured
+    // against duckdb-rs 1.10505.0 today, `query()` materializes the result and
+    // every runtime error surfaces there (probed: an `error('boom')` guarded by
+    // a row predicate 2M rows in still errors at `query()`), so this arm is
+    // currently unreachable — which is a fact about THIS DuckDB, not a licence
+    // to launder a future streaming error into the wrong outcome.
+    let row = match rows.next() {
+        Ok(Some(row)) => row,
+        Err(error) => return SqlOutcome::Errored(error.to_string()),
+        Ok(None) => panic!(
+            "query infrastructure failure: generated scalar query returned an EMPTY \
+             result set — the one-row fixture did not come back: {dsl:?}"
+        ),
     };
 
     // Find the `x` column index, use ValueRef to inspect the DuckDB type
