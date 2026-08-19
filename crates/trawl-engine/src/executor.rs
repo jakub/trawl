@@ -521,6 +521,11 @@ impl Executor {
     ///
     /// Returns an error if the pipeline contains Rust post-processing stages
     /// (e.g. `extract kv`) since those can't be expressed as pure SQL.
+    ///
+    /// `max_rows` is a two-mode parameter: a row cap, or `usize::MAX` —
+    /// the caller-facing sentinel for an UNBOUNDED export, which emits no
+    /// LIMIT at all. Any cap above `DuckDB`'s INT64 LIMIT domain reads as
+    /// the sentinel, since a larger literal is a conversion error.
     pub fn export_parquet(
         &self,
         dsl: &str,
@@ -563,6 +568,11 @@ impl Executor {
     /// before the read, and a database failure over an existing cold corpus
     /// returns the error instead of silently exporting hot-only data
     /// (ADR-0008).
+    ///
+    /// `max_rows` is a two-mode parameter: a row cap, or `usize::MAX` —
+    /// the caller-facing sentinel for an UNBOUNDED export, which emits no
+    /// LIMIT at all. Any cap above `DuckDB`'s INT64 LIMIT domain reads as
+    /// the sentinel, since a larger literal is a conversion error.
     #[allow(clippy::too_many_arguments)]
     pub fn export_parquet_with_hot(
         &self,
@@ -632,18 +642,20 @@ impl Executor {
         })?;
 
         // Create temp table from query results. `usize::MAX` is the public
-        // sentinel for an unbounded read, but it is outside DuckDB's signed
-        // LIMIT domain on 64-bit targets, so the unbounded shape has no LIMIT.
-        let create_sql = if max_rows == usize::MAX {
-            format!(
-                "CREATE TEMP TABLE __trawl_export AS (SELECT * FROM ({}))",
-                emitted.sql
-            )
-        } else {
-            format!(
+        // sentinel for an unbounded read, but DuckDB's LIMIT domain is
+        // INT64: EVERY `usize` above `i64::MAX` is a Conversion Error
+        // rather than a bigger cap, and the sentinel is not the only way
+        // to land there (`max_export_rows` is operator-set), so the whole
+        // out-of-domain half takes the unbounded shape.
+        let create_sql = match i64::try_from(max_rows) {
+            Ok(max_rows) => format!(
                 "CREATE TEMP TABLE __trawl_export AS (SELECT * FROM ({}) LIMIT {max_rows})",
                 emitted.sql
-            )
+            ),
+            Err(_) => format!(
+                "CREATE TEMP TABLE __trawl_export AS (SELECT * FROM ({}))",
+                emitted.sql
+            ),
         };
 
         let params = bind_params(&emitted.params);
@@ -756,6 +768,11 @@ impl Executor {
         })?;
 
         let safe_path = path_str.replace('\'', "''");
+        // The same INT64 LIMIT domain the export lane clamps against: a
+        // larger `usize` is a Conversion Error, not a bigger cap. There is
+        // no unbounded shape here — the caller's `max_result_rows` is
+        // always a cap — so the ceiling is `i64::MAX`.
+        let max_rows = i64::try_from(max_rows).unwrap_or(i64::MAX);
         let sql = format!(
             "SELECT * FROM read_parquet('{safe_path}', union_by_name=true) LIMIT {max_rows}"
         );
