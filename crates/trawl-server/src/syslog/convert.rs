@@ -268,7 +268,8 @@ impl SyslogDoor {
         default_service: &str,
         transport: &'static str,
     ) -> Option<SyslogEvent> {
-        let parsed = parse::parse_syslog(raw);
+        let arrival_instant = Utc::now();
+        let parsed = parse::parse_syslog(raw, arrival_instant);
         // Membership, NOT `is_allowed`: an EMPTY relay list means "no
         // relays configured", the exact opposite of the empty CIDR
         // allowlist's "everything is allowed". Same predicate the HTTP
@@ -286,7 +287,6 @@ impl SyslogDoor {
             default_service,
         );
 
-        let arrival_instant = Utc::now();
         let arrival = arrival_instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let ctx = EnvelopeContext {
             arrival: &arrival,
