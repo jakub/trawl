@@ -2355,7 +2355,7 @@ auth_cache_ttl_secs = 300
     fn retired_web_upstream_key_is_ignored_by_serde_default() {
         // WebConfig intentionally has no deny_unknown_fields attribute, so
         // deployed config files carrying a removed optional knob keep parsing.
-        let removed_key = concat!("coast", "watch_url");
+        let removed_key = "coastwatch_url";
         let toml = format!(
             r#"
 [server]

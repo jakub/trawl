@@ -13,7 +13,7 @@ const APP: &str = include_str!("../src/app.rs");
 
 #[test]
 fn retired_surface_falls_through_to_the_not_found_view() {
-    let retired_root = concat!("/", "in", "tel");
+    let retired_root = "/intel";
     let registered_pattern = format!("path!(\"{retired_root}");
 
     assert!(
