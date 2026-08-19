@@ -421,10 +421,13 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
 enum SqlOutcome {
     /// `DuckDB` produced a value for `x`, with its declared logical type.
     Value(SqlCell),
-    /// `DuckDB` raised an error (prepare/query failed). The streaming evaluator
-    /// cannot error, so its contract is to yield `Null` wherever batch errors —
-    /// the property loop asserts that rather than silently skipping.
-    Errored,
+    /// `DuckDB` raised an error (prepare/query failed), carrying the error TEXT.
+    /// The streaming evaluator cannot error, so its contract is to yield `Null`
+    /// wherever batch errors — the property loop asserts that rather than
+    /// silently skipping. The text is carried (not discarded) for two reasons: a
+    /// mismatch prints the reason, and a pinned divergence test can assert WHICH
+    /// error it pinned, so a different error cannot keep the pin green.
+    Errored(String),
     /// The only value shapes the harness deliberately cannot read faithfully.
     Skip(SkipCategory),
 }
@@ -505,12 +508,15 @@ fn sql_scalar_result(conn: &Connection, dsl: &str, event: &Map<String, Value>) -
     let params = bind_params(&emitted.params);
     let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
 
-    // A prepare/query failure is a real DuckDB ERROR, not a skip.
-    let Ok(mut stmt) = conn.prepare(&emitted.sql) else {
-        return SqlOutcome::Errored;
+    // A prepare/query failure is a real DuckDB ERROR, not a skip — and the
+    // message is kept, so a pin cannot pass for the wrong reason.
+    let mut stmt = match conn.prepare(&emitted.sql) {
+        Ok(stmt) => stmt,
+        Err(error) => return SqlOutcome::Errored(error.to_string()),
     };
-    let Ok(mut rows) = stmt.query(param_refs.as_slice()) else {
-        return SqlOutcome::Errored;
+    let mut rows = match stmt.query(param_refs.as_slice()) {
+        Ok(rows) => rows,
+        Err(error) => return SqlOutcome::Errored(error.to_string()),
     };
     let Ok(Some(row)) = rows.next() else {
         panic!("query infrastructure failure: generated scalar query returned no row: {dsl:?}");
@@ -637,17 +643,39 @@ fn assert_parity_case(
             );
             None
         }
-        SqlOutcome::Errored => {
+        SqlOutcome::Errored(message) => {
             assert_eq!(
                 eval_result,
                 EvalValue::Null,
                 "BATCH ERRORED but streaming did NOT null ({label})\n\
                  dsl: {dsl:?}\n\
-                 eval: {eval_result:?}"
+                 eval: {eval_result:?}\n\
+                 duckdb error: {message}"
             );
             None
         }
         SqlOutcome::Skip(category) => Some(category),
+    }
+}
+
+/// Assert that `DuckDB` errored AND that it errored for the intended reason.
+///
+/// A bare `Errored` assertion keeps a pin green when `DuckDB` starts failing for
+/// a DIFFERENT reason (a binder change, a renamed function, a new overflow
+/// path) — the silent drift this harness exists to catch. Every pinned
+/// divergence test therefore names a distinguishing substring of today's error.
+fn assert_sql_errored(outcome: &SqlOutcome, expected_substring: &str, dsl: &str) {
+    match outcome {
+        SqlOutcome::Errored(message) => assert!(
+            message.contains(expected_substring),
+            "BATCH ERRORED FOR THE WRONG REASON\n\
+             dsl: {dsl:?}\n\
+             wanted substring: {expected_substring:?}\n\
+             actual error: {message}"
+        ),
+        other => panic!(
+            "expected a DuckDB error containing {expected_substring:?} for {dsl:?}, got {other:?}"
+        ),
     }
 }
 
@@ -904,7 +932,11 @@ fn current_second_timestamp_parser_accepts_nondigit_offset_child_105() {
     let event = fixed_event();
     let dsl = r#"* | let x = strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30+ab:cd""#;
     assert_eq!(eval_scalar(dsl, &event), EvalValue::Bool(true));
-    assert_eq!(sql_scalar_result(&conn, dsl, &event), SqlOutcome::Errored);
+    assert_sql_errored(
+        &sql_scalar_result(&conn, dsl, &event),
+        r#""2026-01-15 10:20:30+ab:cd" has a timestamp that is not UTC"#,
+        dsl,
+    );
 }
 
 #[test]
@@ -917,7 +949,11 @@ fn current_timestamp_lexical_fallback_is_pinned_both_orders_child_105() {
         r#"* | let x = "zzz" > strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S")"#,
     ] {
         assert_eq!(eval_scalar(dsl, &event), EvalValue::Bool(true));
-        assert_eq!(sql_scalar_result(&conn, dsl, &event), SqlOutcome::Errored);
+        assert_sql_errored(
+            &sql_scalar_result(&conn, dsl, &event),
+            r#"invalid timestamp field format: "zzz""#,
+            dsl,
+        );
     }
 }
 
@@ -980,10 +1016,22 @@ fn current_integer_overflow_panics_or_wraps_child_105() {
     // #105 makes every integer arithmetic overflow yield NULL in every build profile.
     let conn = utc_connection();
     let event = fixed_event();
-    for (dsl, release_wrap) in [
-        ("* | let x = 9223372036854775807 + 1", i64::MIN),
-        ("* | let x = -9223372036854775807 - 2", i64::MAX),
-        ("* | let x = 9223372036854775807 * 2", -2),
+    for (dsl, release_wrap, duckdb_error) in [
+        (
+            "* | let x = 9223372036854775807 + 1",
+            i64::MIN,
+            "Overflow in addition of INT64",
+        ),
+        (
+            "* | let x = -9223372036854775807 - 2",
+            i64::MAX,
+            "Overflow in subtraction of INT64",
+        ),
+        (
+            "* | let x = 9223372036854775807 * 2",
+            -2,
+            "Overflow in multiplication of INT64",
+        ),
     ] {
         let eval = std::panic::catch_unwind(|| eval_scalar(dsl, &event));
         if cfg!(debug_assertions) {
@@ -994,7 +1042,7 @@ fn current_integer_overflow_panics_or_wraps_child_105() {
         } else {
             assert_eq!(eval.unwrap(), EvalValue::Int(release_wrap));
         }
-        assert_eq!(sql_scalar_result(&conn, dsl, &event), SqlOutcome::Errored);
+        assert_sql_errored(&sql_scalar_result(&conn, dsl, &event), duckdb_error, dsl);
     }
 }
 
@@ -1010,7 +1058,11 @@ fn current_string_truthiness_is_pinned_child_105() {
             r#"* | let x = case("nonempty", 1, 2)"#
         };
         assert_eq!(eval_scalar(dsl, &event), EvalValue::Int(1));
-        assert_eq!(sql_scalar_result(&conn, dsl, &event), SqlOutcome::Errored);
+        assert_sql_errored(
+            &sql_scalar_result(&conn, dsl, &event),
+            "Could not convert string 'nonempty' to BOOL",
+            dsl,
+        );
     }
 }
 
@@ -1081,23 +1133,27 @@ fn hostile_timestamp_corpus_is_pinned_child_105() {
     let conn = utc_connection();
     let event = fixed_event();
     for (text, eval, sql) in [
-        ("+99:99", true, Some(true)),
-        ("+5:30", false, None),
-        ("+0530", false, Some(true)),
-        ("Z", true, Some(true)),
-        (" UTC", false, Some(true)),
+        ("+99:99", true, Ok(true)),
+        ("+5:30", false, Err("has a timestamp that is not UTC")),
+        ("+0530", false, Ok(true)),
+        ("Z", true, Ok(true)),
+        (" UTC", false, Ok(true)),
     ] {
         let dsl = format!(
             r#"* | let x = strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30{text}""#
         );
         assert_eq!(eval_scalar(&dsl, &event), EvalValue::Bool(eval));
-        let expected = sql.map_or(SqlOutcome::Errored, |value| {
-            SqlOutcome::Value(SqlCell {
-                logical_type: Type::Boolean,
-                value: DuckValue::Boolean(value),
-            })
-        });
-        assert_eq!(sql_scalar_result(&conn, &dsl, &event), expected);
+        let outcome = sql_scalar_result(&conn, &dsl, &event);
+        match sql {
+            Ok(value) => assert_eq!(
+                outcome,
+                SqlOutcome::Value(SqlCell {
+                    logical_type: Type::Boolean,
+                    value: DuckValue::Boolean(value),
+                })
+            ),
+            Err(duckdb_error) => assert_sql_errored(&outcome, duckdb_error, &dsl),
+        }
     }
     for (text, eval, sql) in [("epoch", false, true), ("infinity", false, false)] {
         let base = if text == "epoch" {
@@ -1252,49 +1308,17 @@ fn scalar_eval_matches_sql_parity() {
         let expr_str = random_scalar_expr(&mut rng)
             .expect("scalar generator infrastructure failure: no family selected");
 
-        let dsl = format!("* | let x = {expr_str}");
-
-        // ── Streaming path (eval_expr) ── computed first so it is available to
-        // assert against a DuckDB error (the streaming contract is: eval can't
-        // error, so it must yield Null wherever batch errors).
-        let eval_result = eval_scalar(&dsl, &event);
-        let eval_normalized = normalize_eval(&eval_result);
-
-        // ── Batch path (DuckDB) ──
-        match sql_scalar_result(&conn, &dsl, &event) {
-            SqlOutcome::Skip(SkipCategory::HugeIntOutsideI64) => {
-                hugeint_skips += 1;
-                continue;
-            }
-            SqlOutcome::Skip(SkipCategory::Blob) => {
-                blob_skips += 1;
-                continue;
-            }
-            SqlOutcome::Errored => {
-                // The harness no longer hides batch errors: assert eval also
-                // yields Null. A non-Null eval here is a genuine divergence.
-                assert_eq!(
-                    eval_normalized,
-                    Value::Null,
-                    "BATCH ERRORED but streaming did NOT null (iteration {i})\n\
-                     dsl: {dsl:?}\n\
-                     eval: {eval_normalized:?}"
-                );
-                passed += 1;
-                continue;
-            }
-            SqlOutcome::Value(sql_result) => {
-                assert!(
-                    values_match(&eval_result, &sql_result),
-                    "SCALAR PARITY MISMATCH (iteration {i})\n\
-                     dsl: {dsl:?}\n\
-                     eval: {eval_normalized:?}\n\
-                     sql:  {sql_result:?}"
-                );
-            }
+        // ONE implementation of the batch/eval contract: `assert_parity_case`
+        // owns both the value match and the batch-errored/eval-nulls rule. The
+        // bespoke copy that used to live here compared `normalize_eval(..)` to
+        // `Value::Null`, which is strictly WEAKER — `From<EvalValue> for Value`
+        // maps `Float(NaN)` and `Float(±inf)` onto `Value::Null`, so an eval
+        // NaN/inf where DuckDB errored was silently accepted.
+        match assert_parity_case(&conn, &event, &format!("iteration {i}"), &expr_str) {
+            Some(SkipCategory::HugeIntOutsideI64) => hugeint_skips += 1,
+            Some(SkipCategory::Blob) => blob_skips += 1,
+            None => passed += 1,
         }
-
-        passed += 1;
     }
 
     eprintln!(
@@ -1314,33 +1338,27 @@ fn scalar_eval_matches_sql_parity() {
 fn batch_errors_imply_streaming_null() {
     let conn = utc_connection();
     let event = fixed_event();
-    for dsl in [
-        r#"* | let x = replace("abc", "a", 5)"#, // wrong-type replace arg
-        "* | let x = service + 1",               // varchar + int
-        r#"* | let x = round("abc")"#,           // round of varchar
+    for (dsl, duckdb_error) in [
+        // wrong-type replace arg
+        (
+            r#"* | let x = replace("abc", "a", 5)"#,
+            "'replace(STRING_LITERAL, STRING_LITERAL, BIGINT)'",
+        ),
+        // varchar + int
+        ("* | let x = service + 1", "'+(VARCHAR, UNKNOWN)'"),
+        // round of varchar
+        (
+            r#"* | let x = round("abc")"#,
+            r#"the function call "round(STRING_LITERAL)""#,
+        ),
     ] {
+        assert_sql_errored(&sql_scalar_result(&conn, dsl, &event), duckdb_error, dsl);
+        // `EvalValue::Null`, never `normalize_eval(..) == Value::Null`: the
+        // `Value` conversion maps `Float(NaN)`/`Float(inf)` onto `Value::Null`
+        // too, so the weaker form would accept a non-null eval here.
         assert_eq!(
-            sql_scalar_result(&conn, dsl, &event),
-            SqlOutcome::Errored,
-            "expected DuckDB to error for {dsl:?}"
-        );
-
-        let query = parser::parse(dsl).unwrap();
-        let ls = query
-            .pipeline
-            .iter()
-            .find_map(|s| {
-                if let PipeStage::Let(ls) = &s.node {
-                    Some(ls)
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        let (_, expr) = ls.assignments.first().unwrap();
-        assert_eq!(
-            normalize_eval(&eval_expr(expr, &event)),
-            Value::Null,
+            eval_scalar(dsl, &event),
+            EvalValue::Null,
             "streaming eval must yield Null where batch errors for {dsl:?}"
         );
     }
@@ -1371,22 +1389,8 @@ fn strftime_over_strptime_binds_params_in_order() {
     );
 
     // Streaming path (eval).
-    let query = parser::parse(dsl).unwrap();
-    let ls = query
-        .pipeline
-        .iter()
-        .find_map(|s| {
-            if let PipeStage::Let(ls) = &s.node {
-                Some(ls)
-            } else {
-                None
-            }
-        })
-        .unwrap();
-    let (_, expr) = ls.assignments.first().unwrap();
-    let eval_result = eval_expr(expr, &event);
     assert_eq!(
-        normalize_eval(&eval_result),
+        normalize_eval(&eval_scalar(dsl, &event)),
         Value::String("2023".to_string())
     );
 }
@@ -1443,21 +1447,8 @@ fn strptime_partial_formats_match_duckdb() {
             "batch strptime partial-format must fill like DuckDB for {dsl:?}"
         );
 
-        let query = parser::parse(dsl).unwrap();
-        let ls = query
-            .pipeline
-            .iter()
-            .find_map(|s| {
-                if let PipeStage::Let(ls) = &s.node {
-                    Some(ls)
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        let (_, expr) = ls.assignments.first().unwrap();
         assert_eq!(
-            normalize_eval(&eval_expr(expr, &event)),
+            normalize_eval(&eval_scalar(dsl, &event)),
             Value::String(want.to_string()),
             "streaming strptime partial-format must match DuckDB for {dsl:?}"
         );
