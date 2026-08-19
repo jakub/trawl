@@ -37,7 +37,7 @@ pub struct RailItem {
 #[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn items_for(mode: AppMode) -> &'static [RailItem] {
-    use Icon::{Alert, Chart, Clock, Database, Grid, Link, News, Search as SearchIcon, User, Zap};
+    use Icon::{Chart, Clock, Database, Grid, Search as SearchIcon, User};
     match mode {
         AppMode::Search => &[
             RailItem {
@@ -57,38 +57,6 @@ pub fn items_for(mode: AppMode) -> &'static [RailItem] {
                 label: "Schema",
                 icon: Database,
                 path: "/search/schema",
-            },
-        ],
-        AppMode::Intel => &[
-            RailItem {
-                id: "stories",
-                label: "Stories",
-                icon: News,
-                path: "/intel/stories",
-            },
-            RailItem {
-                id: "queue",
-                label: "Queue",
-                icon: Alert,
-                path: "/intel/queue",
-            },
-            RailItem {
-                id: "entities",
-                label: "Entities",
-                icon: Link,
-                path: "/intel/entities",
-            },
-            RailItem {
-                id: "sources",
-                label: "Sources",
-                icon: Zap,
-                path: "/intel/sources",
-            },
-            RailItem {
-                id: "derivations",
-                label: "Derivations",
-                icon: Link,
-                path: "/intel/derivations",
             },
         ],
         AppMode::Jobs => &[

@@ -107,7 +107,7 @@ pub async fn login(
         .map_err(|_| ProxyError::Internal("session_ttl_secs out of i64 range".into()))?;
 
     // App-agnostic payload — {token, name, exp}, NO role. Byte-identical
-    // to what coastwatch-web mints, which is the SSO compat contract.
+    // across fleet apps, which is the SSO compatibility contract.
     let payload = SessionPayload {
         token: Zeroizing::new(req.api_key),
         name: whoami.name.clone(),
@@ -377,7 +377,7 @@ mod tests {
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
                 "bob",
-                "coastwatch-analyst",
+                "sibling-analyst",
                 &[],
             )))
             .mount(&upstream)
@@ -697,7 +697,7 @@ mod tests {
             .uri("/api/auth/logout")
             // form-POST content type: no CORS preflight, no response access
             .header("content-type", "application/x-www-form-urlencoded")
-            .header("origin", "https://coastwatch.fleet.test")
+            .header("origin", "https://sibling.fleet.test")
             .header("host", "trawl.fleet.test")
             .body(Body::empty())
             .unwrap();
@@ -784,7 +784,7 @@ mod tests {
             .method("POST")
             .uri("/api/auth/login")
             .header("content-type", "application/json")
-            .header("origin", "https://coastwatch.fleet.test")
+            .header("origin", "https://sibling.fleet.test")
             .header("host", "trawl.fleet.test")
             .body(Body::from(r#"{"api_key":"flt_token"}"#))
             .unwrap();
@@ -980,7 +980,7 @@ mod tests {
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
                 "alice",
-                "coastwatch-analyst",
+                "sibling-analyst",
                 &[],
             )))
             .mount(&upstream)

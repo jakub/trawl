@@ -351,6 +351,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   in flight. This retires the documented stop-trawld-and-do-surgery
   escape hatch.
 
+### Removed
+- **The orphaned Intel surface is retired (ADR-0020, #112).** The coastwatch
+  API it targeted does not exist, and its write controls gated on the wrong
+  app's permission, so the whole surface is gone rather than flagged off.
+  Removed: the SPA `/intel` pages, their navigation entry and browser API
+  client; trawl-web's `/api/intel/v1/{*path}` relay route; the `[web]`
+  `coastwatch_url` config key it alone consumed (nothing else read it —
+  `[web]` takes no `deny_unknown_fields`, so a deployed config still carrying
+  the key keeps parsing and the key is simply ignored); the hand-vendored
+  `coastwatch-api-types` crate; and the Intel-only rules in `main.css`.
+  Any request under `/api/intel` now returns the JSON 404 the retired
+  namespace shares with the rest of `/api/*`. Git history is the archive:
+  re-commissioning starts from ADR-0020, not from the removed stand-ins.
+
 ### Changed
 - **BREAKING — comments are a grammar production, and `//` is no longer a
   comment (ADR-0014, #83).** The pre-parse comment scanner is deleted.
