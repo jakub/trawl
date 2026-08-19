@@ -334,7 +334,9 @@ pub struct IngestConfig {
     /// (which hold roughly the same payload again) plus a fixed per-event
     /// overhead. Enforced as events arrive: over budget the oldest queued
     /// batches are shed first and then the incoming event itself, counted
-    /// in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}`.
+    /// in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}`. Must
+    /// be positive: set `internal_telemetry = false` to turn self-telemetry
+    /// off.
     #[serde(
         default = "default_telemetry_buffer_max_bytes",
         deserialize_with = "deserialize_byte_size"
@@ -1372,6 +1374,22 @@ fn reject_removed_fields(
     )))
 }
 
+/// Validate the one safety budget whose zero value is deliberately invalid.
+///
+/// Other caps use zero as an explicit off switch, but an unbounded telemetry
+/// buffer can grow indefinitely behind a wedged WAL write. Self-telemetry has
+/// its own boolean off switch, so zero has no valid interpretation (issue #94).
+fn validate_telemetry_buffer_max_bytes(bytes: usize) -> Result<(), ConfigError> {
+    if bytes == 0 {
+        return Err(ConfigError::Validation(
+            "ingest.telemetry_buffer_max_bytes must be a positive byte count; set \
+             ingest.internal_telemetry = false to disable internal telemetry"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
     /// Parse configuration from a TOML string.
     ///
@@ -1526,6 +1544,8 @@ impl Config {
                 "server.max_concurrent_queries must be > 0".into(),
             ));
         }
+
+        validate_telemetry_buffer_max_bytes(self.ingest.telemetry_buffer_max_bytes)?;
 
         if self.server.tls_cert_path.is_some() != self.server.tls_key_path.is_some() {
             return Err(ConfigError::Validation(
@@ -1984,6 +2004,27 @@ internal_telemetry = false
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ingest.internal_telemetry);
         assert!(!config.internal_telemetry_enabled());
+    }
+
+    #[test]
+    fn telemetry_buffer_zero_is_boot_fatal_with_the_off_switch() {
+        let err = Config::from_toml(
+            r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[ingest]
+telemetry_buffer_max_bytes = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "config validation error: ingest.telemetry_buffer_max_bytes must be a positive byte \
+             count; set ingest.internal_telemetry = false to disable internal telemetry"
+        );
     }
 
     #[test]

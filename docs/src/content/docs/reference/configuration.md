@@ -62,6 +62,13 @@ HTTPS listener, query limits, TLS, and rate limiting.
 | `query_log_max_bytes` | byte size | `"100M"` | Query debug log size cap with single-file rollover to `<path>.1`; `0` disables rollover |
 | `log_file` | path | *(none)* | JSON log file; superseded by `internal_telemetry` |
 
+For size, duration, and retention knobs, `0` disables the limit only where
+the field says so. In particular, `server.query_log_max_bytes = 0` disables
+query-log rollover and `retention.max_age_days = 0` disables the age sweep.
+`ingest.telemetry_buffer_max_bytes` is the deliberate exception: it must be a
+positive byte count because an unbounded buffer can grow without limit behind
+a wedged WAL write. To turn that pipeline off, set `internal_telemetry = false`.
+
 #### `[server.rate_limit]`
 
 Per-key rate limiting in requests per minute. Every API key gets an independent token bucket, sized per route class: `default_rpm` on the interactive API routes, `ingest_rpm` on `/api/v1/ingest`. Set a field to `0` to disable rate limiting for that route class.
@@ -177,7 +184,7 @@ trawld migrates this database automatically at boot (it is the sole writer) and 
 | `hot_buffer_max_bytes` | byte size | `"100M"` | Max hot buffer size (serialized) |
 | `stats_interval_secs` | integer | `60` | Server stats telemetry interval; `0` disables |
 | `telemetry_flush_interval_secs` | integer | `1` | Telemetry WAL flush interval |
-| `telemetry_buffer_max_bytes` | byte size | `"16M"` | One memory budget for everything self-telemetry holds while the WAL is unhealthy — active buffer, retry queue and the in-flight batch (estimated charge, like `hot_buffer_max_bytes`). Enforced as events arrive: over budget the oldest queued batches are shed first, then the incoming event itself, counted in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}` |
+| `telemetry_buffer_max_bytes` | byte size | `"16M"` | One memory budget for everything self-telemetry holds while the WAL is unhealthy — active buffer, retry queue and the in-flight batch (estimated charge, like `hot_buffer_max_bytes`). Must be positive; `0` is boot-fatal (use `internal_telemetry = false` to turn self-telemetry off). Enforced as events arrive: over budget the oldest queued batches are shed first, then the incoming event itself, counted in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}` |
 | `default_env` | string | `"prod"` | Fills a missing `env` on ingested events (repair code `env.defaulted`). Must pass the env charset and be a member of `envs` |
 | `envs` | string list | `[default_env]` | Environment allowlist (ADR-0009). Events with an unlisted `env` hard-reject. Entries must match `[a-z0-9_-]{1,32}`; `wal` and `scheduled` are reserved. Validated at load — trawld refuses to start otherwise. The allowlist gates writes, not reads: removing an env stops new ingest but its directories stay queryable and age out normally |
 | `trusted_relays` | CIDR list | `[]` | Peers (collectors/relays) whose address must never be stamped as an event's `host`: a host-less event from one of these is rejected instead of peer-repaired (HTTP) or kept with `host` omitted (syslog). Invalid entries are boot-fatal. Peer addresses are canonicalized before matching — a dual-stack bind's IPv4-mapped peer (`::ffff:10.1.2.3`) matches a plain v4 entry (`10.0.0.0/8`), and a mapped-form entry folds to its v4 meaning at load |
