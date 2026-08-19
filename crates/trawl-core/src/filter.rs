@@ -78,6 +78,7 @@ struct FieldMatcher {
 enum FieldPredicate {
     Compare { op: CompareOp, value: CoercedValue },
     InList { values: Vec<CoercedValue> },
+    NotInList { values: Vec<CoercedValue> },
     Glob { regex: Regex, form: PatternForm },
     Regex { regex: Regex, form: PatternForm },
 }
@@ -246,12 +247,22 @@ fn compile_token(
                     };
                     FieldPredicate::Regex { regex, form }
                 }
-                (_, FilterValue::List(values)) => FieldPredicate::InList {
-                    values: values
+                (op, FilterValue::List(values)) => {
+                    let values = values
                         .iter()
                         .map(|v| Ok(coerce_form(compare::compare_form(pin, FilterOp::Eq, v)?)))
-                        .collect::<Result<_, EmitError>>()?,
-                },
+                        .collect::<Result<_, EmitError>>()?;
+                    match op {
+                        FilterOp::Eq => FieldPredicate::InList { values },
+                        FilterOp::Ne => FieldPredicate::NotInList { values },
+                        FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
+                            unreachable!("ordered operators cannot reach a comma-separated list")
+                        }
+                        FilterOp::Glob | FilterOp::Regex => {
+                            unreachable!("pattern operators cannot reach a comma-separated list")
+                        }
+                    }
+                }
                 (op, FilterValue::Literal(v)) => FieldPredicate::Compare {
                     op: compile_op(*op),
                     value: coerce_form(compare::compare_form(pin, *op, v)?),
@@ -376,7 +387,8 @@ impl FieldMatcher {
             return match &self.predicate {
                 FieldPredicate::Compare {
                     op: CompareOp::Ne, ..
-                } => Some(true),
+                }
+                | FieldPredicate::NotInList { .. } => Some(true),
                 _ => None,
             };
         };
@@ -388,6 +400,11 @@ impl FieldMatcher {
             FieldPredicate::InList { values } => {
                 or_any(values.iter().map(|v| {
                     compare_values(event_val, CompareOp::Eq, v, NullReadPolicy::NeMatches)
+                }))
+            }
+            FieldPredicate::NotInList { values } => {
+                and_all(values.iter().map(|v| {
+                    compare_values(event_val, CompareOp::Ne, v, NullReadPolicy::NeMatches)
                 }))
             }
             FieldPredicate::Glob { regex, form } | FieldPredicate::Regex { regex, form } => {

@@ -432,6 +432,11 @@ mod tests {
     }
 
     #[test]
+    fn search_negated_list() {
+        assert_snapshot!(emit_dsl("status!=200,301,404"));
+    }
+
+    #[test]
     fn search_glob() {
         assert_snapshot!(emit_dsl("path=glob:/api/*"));
     }
@@ -1705,6 +1710,11 @@ mod tests {
     }
 
     #[test]
+    fn pinned_severity_negated_list_composes_scalar_widening() {
+        assert_snapshot!(emit_dsl_with_pins("_severity!=warn,error", &SEVERITY_PIN));
+    }
+
+    #[test]
     fn pinned_severity_glob_matches_the_canonical_token_text() {
         assert_snapshot!(emit_dsl_with_pins("_severity=warn*", &SEVERITY_PIN));
     }
@@ -1772,6 +1782,14 @@ mod tests {
     fn pinned_varchar_in_list_expands_to_or_of_equalities() {
         assert_snapshot!(emit_dsl_with_pins(
             "status=200,301,404",
+            &[("status", CT::Varchar)]
+        ));
+    }
+
+    #[test]
+    fn pinned_varchar_negated_list_composes_scalar_equalities() {
+        assert_snapshot!(emit_dsl_with_pins(
+            "status!=200,301",
             &[("status", CT::Varchar)]
         ));
     }

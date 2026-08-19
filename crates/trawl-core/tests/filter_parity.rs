@@ -458,6 +458,7 @@ fn severity_band_parity_exhaustive() {
         "_severity=warn,17",
         "_severity=error,err,error2",
         "_severity=warn,99",
+        "_severity!=warn,error",
         // Review finding A: out-of-ladder points collapse to ONE
         // representative in the render, because a SEVERITY subject is
         // 1-24 or NULL. These cells run over every stored number AND the
@@ -479,40 +480,35 @@ fn severity_band_parity_exhaustive() {
     }
 }
 
-/// CHARACTERIZATION, not a blessing: in the SEARCH stage a comma list
-/// under `!=` means POSITIVE membership, in both lanes.
-///
-/// The parser keeps the written operator (`FilterOp::Ne`) on the filter,
-/// but both list consumers — `emitter::search`'s `FilterValue::List` arm
-/// and `filter.rs`'s `(_, FilterValue::List(values))` — resolve every
-/// element as an EQUALITY and render membership, so `_severity!=warn,error`
-/// answers exactly as `_severity=warn,error` does. That predates issue #82
-/// (the `IN` rendering changed the SQL text, not this) and is pinned here
-/// so the quirk cannot change silently: the two lanes agreeing is the
-/// property that matters, and they do.
+/// Issue #91: search-stage `f!=a,b` is `f!=a AND f!=b`, including
+/// scalar `!=`'s NULL widening, in both lanes.
 #[test]
-fn search_stage_ne_over_a_list_is_positive_membership_in_both_lanes() {
+fn search_stage_ne_over_a_list_is_compositional_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
     for sev in (1..=24).map(Some).chain([None]) {
-        let negated = assert_severity_parity(&conn, "_severity!=warn,error", sev);
-        let positive = assert_severity_parity(&conn, "_severity=warn,error", sev);
+        let matched = assert_severity_parity(&conn, "_severity!=warn,error", sev);
+        let expected = sev.is_none_or(|n| !(13..=20).contains(&n));
         assert_eq!(
-            negated, positive,
-            "`!=` over a list is membership, not its complement (stored {sev:?})"
+            matched, expected,
+            "WARN and ERROR bands are excluded; outside/NULL matches (stored {sev:?})"
         );
     }
-    // …and it really is membership, not "always true": the WARN/ERROR
-    // bands match and a DEBUG number does not.
-    assert!(assert_severity_parity(
-        &conn,
-        "_severity!=warn,error",
-        Some(17)
-    ));
-    assert!(!assert_severity_parity(
-        &conn,
-        "_severity!=warn,error",
-        Some(5)
-    ));
+
+    let ft = pinned(&[("status", CanonicalType::Varchar)]);
+    for (event, expected) in [
+        (status_event(&Value::from("200")), false),
+        (status_event(&Value::from("0200")), false),
+        (status_event(&Value::from("200.0")), false),
+        (status_event(&Value::from("301")), false),
+        (status_event(&Value::from("404")), true),
+        (absent_status_event(), true),
+    ] {
+        assert_eq!(
+            assert_pinned_parity(&conn, "status!=200,301", &event, &ft),
+            expected,
+            "event {event:?}"
+        );
+    }
 }
 
 /// A bare term matching only `_raw` content returns the event; negation
@@ -959,6 +955,7 @@ fn pinned_varchar_matrix_parity() {
         "status=200",
         "status!=200",
         "status=200,301",
+        "status!=200,301",
         "status=200,accepted",
         "status=accepted",
         "status!=accepted",

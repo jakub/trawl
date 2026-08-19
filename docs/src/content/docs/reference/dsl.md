@@ -94,6 +94,12 @@ env=prod                        # environment (path-pruned)
 
 **Operators:** `=`, `!=`, `>`, `>=`, `<`, `<=`
 
+Comma-separated lists support `=` and `!=` only. A positive list is
+membership (`f=a,b`); a negated list is compositional non-membership:
+`f!=a,b` means `f!=a AND f!=b`. Because each term is the search stage's
+ordinary `!=`, the expression keeps ADR-0011's NULL widening: an event
+without `f` matches. Ordered spellings such as `f>=a,b` are parse errors.
+
 #### Quoted list elements
 
 Any element of a comma-separated list may be written quoted, in any
@@ -455,6 +461,10 @@ _severity=warn*                 # glob over the canonical token text: 13-16
   (`warn,17` is 13-17), and only a genuinely disjoint selection emits
   more than one range. This is a performance property — the merge never
   changes which rows match.
+- A negated comma list composes scalar `!=`: `_severity!=warn,error`
+  matches severities outside both bands (outside 13–20) and events with no
+  `_severity`. The positive `_severity=warn,error` remains membership in
+  the combined 13–20 range.
 - OTel's exact short names (`trace2`, `warn3`, `error2`, …) name one
   number, under every operator.
 - Glob and regex match the **canonical token text** — the injective OTel
