@@ -14,16 +14,12 @@ use syslog_loose::{Message, ProcId, SyslogFacility, Variant};
 ///
 /// Resolves year-less RFC 3164 timestamps to the year nearest the arrival
 /// instant. Auto-detects RFC 3164 vs RFC 5424 format.
-pub fn parse_syslog(raw: &str) -> Message<&str> {
-    syslog_loose::parse_message_with_year(raw, resolve_year, Variant::Either)
-}
-
-/// Year resolver for BSD syslog timestamps that lack a year component.
-///
-/// Chooses the closest valid candidate among the previous, current and next
-/// local year. Equal-distance candidates resolve to the past.
-fn resolve_year(date: syslog_loose::IncompleteDate) -> i32 {
-    resolve_year_at(date, Utc::now(), Local)
+pub fn parse_syslog(raw: &str, arrival: DateTime<Utc>) -> Message<&str> {
+    syslog_loose::parse_message_with_year(
+        raw,
+        |date| resolve_year_at(date, arrival, Local),
+        Variant::Either,
+    )
 }
 
 fn resolve_year_at<Tz: TimeZone + Copy>(
@@ -157,9 +153,19 @@ mod tests {
     }
 
     #[test]
+    fn rfc3164_parser_uses_supplied_arrival() {
+        let parsed = parse_syslog(
+            "<13>Dec 31 23:59:00 host app: message",
+            utc(2026, 1, 1, 0, 0),
+        );
+
+        assert_eq!(parsed.timestamp.unwrap().year(), 2025);
+    }
+
+    #[test]
     fn parse_rfc3164_unifi_style() {
         let msg = "<134>Mar 12 10:00:00 UGW kernel: [UFW BLOCK] IN=eth0 SRC=192.168.1.100";
-        let parsed = parse_syslog(msg);
+        let parsed = parse_syslog(msg, utc(2026, 3, 12, 10, 0));
 
         assert_eq!(parsed.hostname, Some("UGW"));
         assert_eq!(parsed.appname, Some("kernel"));
@@ -174,7 +180,7 @@ mod tests {
     #[test]
     fn parse_rfc5424() {
         let msg = "<165>1 2026-03-12T10:00:00.000Z router1 nginx 1234 - - GET /api/v1/health";
-        let parsed = parse_syslog(msg);
+        let parsed = parse_syslog(msg, utc(2026, 3, 12, 10, 0));
 
         assert_eq!(parsed.hostname, Some("router1"));
         assert_eq!(parsed.appname, Some("nginx"));
@@ -199,7 +205,7 @@ mod tests {
     fn parse_minimal_bsd() {
         // Some appliances send very minimal syslog
         let msg = "<13>test message without hostname";
-        let parsed = parse_syslog(msg);
+        let parsed = parse_syslog(msg, utc(2026, 3, 12, 10, 0));
         assert!(parsed.msg.contains("test message"));
     }
 }
