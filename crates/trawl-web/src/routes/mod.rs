@@ -44,7 +44,11 @@ pub fn build(state: AppState) -> Router {
         // Block /ingest before it can match the generic forwarder.
         .route("/api/v1/ingest", any(proxy::block_ingest))
         .route("/api/v1/{*path}", any(proxy::forward))
-        // Keep unknown API namespaces out of the SPA fallback.
+        // Keep unknown API namespaces out of the SPA fallback. The
+        // wildcard needs at least one segment, so bare `/api` is
+        // routed explicitly — otherwise it alone would fall through
+        // to the SPA and answer an API probe with index.html.
+        .route("/api", any(proxy::not_found))
         .route("/api/{*path}", any(proxy::not_found));
 
     // Attach the SPA fallback. `TRAWL_WEB_SPA_DIR` wins when set

@@ -58,13 +58,11 @@ pub async fn forward(
     auth: Auth,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
-    do_forward(&state, state.upstream_url(), "", auth, req).await
+    do_forward(&state, auth, req).await
 }
 
 async fn do_forward(
     state: &AppState,
-    base: &str,
-    strip_prefix: &str,
     auth: Auth,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
@@ -86,7 +84,7 @@ async fn do_forward(
         crate::routes::auth::check_origin(&parts.headers, &parts.uri, "proxy")?;
     }
 
-    let upstream_uri = build_upstream_uri(base, &parts.uri, strip_prefix)?;
+    let upstream_uri = build_upstream_uri(state.upstream_url(), &parts.uri)?;
 
     let mut upstream_req = http
         .request(reqwest_method(&parts.method), upstream_uri)
@@ -159,21 +157,18 @@ pub(crate) fn clear_cookie_for_proxied_response(
 
 const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-fn build_upstream_uri(base: &str, orig: &Uri, strip_prefix: &str) -> Result<String, ProxyError> {
+/// Compose the upstream URL: the configured base followed by the
+/// browser's own path and query, verbatim.
+///
+/// The proxy relays one namespace only (`/api/v1/*` to trawld's own
+/// `/api/v1/*`), so there is no prefix rewriting: what the browser asked
+/// for is what upstream sees.
+fn build_upstream_uri(base: &str, orig: &Uri) -> Result<String, ProxyError> {
     let path_and_query = orig
         .path_and_query()
         .map(axum::http::uri::PathAndQuery::as_str)
         .ok_or_else(|| ProxyError::Internal("request URI missing path".into()))?;
-    let stripped = if strip_prefix.is_empty() {
-        path_and_query
-    } else {
-        path_and_query.strip_prefix(strip_prefix).ok_or_else(|| {
-            ProxyError::Internal(format!(
-                "path '{path_and_query}' does not start with '{strip_prefix}'"
-            ))
-        })?
-    };
-    Ok(format!("{}{stripped}", base.trim_end_matches('/')))
+    Ok(format!("{}{path_and_query}", base.trim_end_matches('/')))
 }
 
 fn reqwest_method(m: &Method) -> reqwest::Method {
@@ -232,21 +227,30 @@ mod tests {
 
     #[tokio::test]
     async fn retired_api_namespace_is_not_routed_or_served_by_the_spa() {
-        let upstream = MockServer::start().await;
-        let app = build_app(state_pointing_at(&upstream));
-        let retired_path = concat!("/api/", "in", "tel", "/v1/stories");
+        // Bare `/api` is here on purpose: the catch-all `/api/{*path}`
+        // needs at least one segment, so without its own route the exact
+        // path falls through to the SPA fallback and answers 200 with
+        // index.html while every path below it answers the JSON 404.
+        for retired_path in ["/api/intel/v1/stories", "/api", "/api/v2/query"] {
+            let upstream = MockServer::start().await;
+            let app = build_app(state_pointing_at(&upstream));
 
-        let request = Request::builder()
-            .uri(retired_path)
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
+            let request = Request::builder()
+                .uri(retired_path)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert!(
-            upstream.received_requests().await.unwrap().is_empty(),
-            "the retired API namespace must not relay to the configured upstream"
-        );
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{retired_path} must answer the API 404, not the SPA"
+            );
+            assert!(
+                upstream.received_requests().await.unwrap().is_empty(),
+                "{retired_path} must not relay to the configured upstream"
+            );
+        }
     }
 
     async fn login_and_get_cookie(app: Router, upstream: &MockServer) -> String {
@@ -410,7 +414,7 @@ mod tests {
     #[test]
     fn upstream_uri_preserves_query_string() {
         let orig: Uri = "/api/v1/saved?limit=50&cursor=abc".parse().unwrap();
-        let built = build_upstream_uri("https://trawld:5514/", &orig, "").unwrap();
+        let built = build_upstream_uri("https://trawld:5514/", &orig).unwrap();
         assert_eq!(
             built,
             "https://trawld:5514/api/v1/saved?limit=50&cursor=abc"
