@@ -4,7 +4,7 @@ expression: "emit_dsl(r#\"service=nginx _severity=error last=2h \"connection ref
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE TRY_CAST("_time" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours' AND "service" = ? AND "_severity" = ? AND ("message" ILIKE ? OR "_raw" ILIKE ?) AND ("message" NOT ILIKE ? AND COALESCE("_raw" NOT ILIKE ?, TRUE))
+WHERE TRY_CAST("_time" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours' AND "service" = ? AND "_severity" = ? AND (COALESCE("message" ILIKE ?, FALSE) OR COALESCE("_raw" ILIKE ?, FALSE)) AND (COALESCE("message" NOT ILIKE ?, TRUE) AND COALESCE("_raw" NOT ILIKE ?, TRUE))
 ---
 params:
   0: 'nginx'

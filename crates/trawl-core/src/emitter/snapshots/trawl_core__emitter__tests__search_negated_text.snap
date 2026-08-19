@@ -4,7 +4,7 @@ expression: "emit_dsl(\"-debug\")"
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE ("message" NOT ILIKE ? AND COALESCE("_raw" NOT ILIKE ?, TRUE))
+WHERE (COALESCE("message" NOT ILIKE ?, TRUE) AND COALESCE("_raw" NOT ILIKE ?, TRUE))
 ---
 params:
   0: '%debug%'

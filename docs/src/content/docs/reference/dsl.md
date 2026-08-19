@@ -264,8 +264,7 @@ filtered out. Two consequences are worth knowing before you write an alert:
   NULL, which is unknown, which is filtered out. If you want "events
   missing `f`, plus events where it isn't `x`", write `f!=x`, not
   `NOT f=x`. The same holds for `NOT _severity=...` when an event has no
-  derived severity, and for `NOT <bare term>` when it has no
-  `message`/`_raw`.
+  derived severity.
 
 :::caution[Changed in the ADR-0011 release]
 Live tail previously treated a missing field as *false* rather than
@@ -604,7 +603,11 @@ error                           # bare word — substring match
 
 Bare-word and phrase search match the `message` column **and** `_raw`,
 so content that was parsed away is still findable. Negation excludes an
-event when either column matches.
+event when either column matches. Text containment is deliberately
+**two-valued** (ADR-0015):
+a missing or null `message`/`_raw` does not contain the term. Consequently
+`-debug`, `NOT debug`, and `NOT "debug"` agree even on foreign data that
+does not carry one or both columns.
 
 Because `_raw` holds the most original form of the event, searching it is
 **whole-event search**, and what "whole event" means depends on who filled

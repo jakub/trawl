@@ -103,10 +103,10 @@ fn emit_or_groups(
 /// Emit the two-column bare/quoted text-search predicate.
 ///
 /// Bare-word search hits `message` and additionally `_raw` where present
-/// (ADR-0009). Negation requires `message` present and the term absent
-/// from both columns — `COALESCE(..., TRUE)` keeps a NULL `_raw` from
-/// vetoing the row under SQL three-valued logic. The in-memory filter
-/// ([`crate::filter`]) mirrors these semantics exactly.
+/// (ADR-0009). Containment is total (ADR-0015): a NULL/missing column does
+/// not contain the term, so every positive or negated composition has a
+/// two-valued answer. The in-memory filter ([`crate::filter`]) mirrors these
+/// semantics exactly.
 ///
 /// Searching `_raw` is **whole-event search**, deliberately: except when a
 /// collector supplied its own pre-parse line, `_raw` is the server's JSON
@@ -128,10 +128,12 @@ fn push_text_search(pattern: String, negated: bool, state: &mut EmitterState) {
     let raw = state.raw_column();
     if negated {
         state.push_where(format!(
-            "(\"message\" NOT ILIKE {p1} AND COALESCE({raw} NOT ILIKE {p2}, TRUE))"
+            "(COALESCE(\"message\" NOT ILIKE {p1}, TRUE) AND COALESCE({raw} NOT ILIKE {p2}, TRUE))"
         ));
     } else {
-        state.push_where(format!("(\"message\" ILIKE {p1} OR {raw} ILIKE {p2})"));
+        state.push_where(format!(
+            "(COALESCE(\"message\" ILIKE {p1}, FALSE) OR COALESCE({raw} ILIKE {p2}, FALSE))"
+        ));
     }
 }
 
