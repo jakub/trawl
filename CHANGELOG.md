@@ -525,6 +525,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   genuinely empty time window still answers 200 with zero rows, and an
   export over one still surfaces the underlying error — there is no empty
   parquet for it to write.
+- **Embedded parquet export writes a file again (#113).** `trawl query
+  --data <glob> -f parquet --output <path>` asks for every row, and the
+  unbounded sentinel reached DuckDB as a literal `LIMIT
+  18446744073709551615` — outside its INT64 LIMIT domain, so the export
+  died with a conversion error before writing a byte. An unbounded
+  export now emits no LIMIT at all, and so does any cap past `i64::MAX`
+  (`[server] max_export_rows` is operator-set, so the sentinel was never
+  the only way to name one); a cap DuckDB can name still applies exactly
+  as before. The same clamp covers reading a scheduled run back from its
+  stored parquet.
+- **A multiline value survives PIVOT finalization (#113).** When a stage
+  follows `| pivot`, the pivot becomes a CTE and its parameters are
+  inlined as SQL literals. The CTE body was then indented line by line,
+  which pushed two spaces after EVERY newline — including the ones
+  INSIDE a string literal — so `message="a<newline>b" | pivot count() on
+  status | sort ...` searched for `a<newline>  b` and quietly matched
+  nothing. Indentation is now quote-aware, like the parameter inliner
+  beside it: a newline inside a `'…'` literal or a `"…"` identifier is
+  data and is copied verbatim, and both scans read ONE transition rule.
 
 ### Changed — behavior
 - **`| where` and `| let` comparisons follow the field catalog's pins
