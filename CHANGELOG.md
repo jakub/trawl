@@ -352,11 +352,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   escape hatch.
 
 ### Removed
-- **Orphaned cross-app surface retired (ADR-0020, #112).** Removed the SPA
-  pages and navigation, browser API client, proxy relay and its optional
-  upstream config, plus the hand-vendored wire-types crate. The upstream API
-  never existed, and git history remains the archive until the producer owns
-  a real contract and authorization boundary.
+- **The orphaned Intel surface is retired (ADR-0020, #112).** The coastwatch
+  API it targeted does not exist, and its write controls gated on the wrong
+  app's permission, so the whole surface is gone rather than flagged off.
+  Removed: the SPA `/intel` pages, their navigation entry and browser API
+  client; trawl-web's `/api/intel/v1/{*path}` relay route; the `[web]`
+  `coastwatch_url` config key it alone consumed (nothing else read it —
+  `[web]` takes no `deny_unknown_fields`, so a deployed config still carrying
+  the key keeps parsing and the key is simply ignored); the hand-vendored
+  `coastwatch-api-types` crate; and the Intel-only rules in `main.css`.
+  Any request under `/api/intel` now returns the JSON 404 the retired
+  namespace shares with the rest of `/api/*`. Git history is the archive:
+  re-commissioning starts from ADR-0020, not from the removed stand-ins.
 
 ### Changed
 - **BREAKING — comments are a grammar production, and `//` is no longer a

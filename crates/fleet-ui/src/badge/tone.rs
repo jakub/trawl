@@ -4,9 +4,10 @@
 
 //! Pure badge tone. No `leptos`, no `web_sys` — builds on every target
 //! so the per-tone CSS-class fragment is exercised by native unit
-//! tests (mirrors [`crate::button::variant`]). Issue #31 replaces
-//! trawl's 22 `class="intel-badge" style="background:…;color:…"` call
-//! sites with `<Badge tone=Tone::…>`; apps map their domain kinds
+//! tests (mirrors [`crate::button::variant`]). Originally extracted by
+//! issue #31 from trawl's 22 `class="intel-badge"
+//! style="background:…;color:…"` call sites (that surface was retired in
+//! #112; coastwatch carries the pattern on); apps map their domain kinds
 //! (story state, TLP marking, claim relationship, …) onto this closed
 //! tone set at the call site — there is deliberately NO color/style
 //! passthrough prop (ADR-0003 hard decision, human call 2026-07-10).

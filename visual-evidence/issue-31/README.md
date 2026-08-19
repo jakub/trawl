@@ -41,7 +41,24 @@ The service-card **status dots** also unify here — 6px flat → 7px ringed.
 |---|---|
 | ![before](before/schema.light.png) | ![after](after/schema.light.png) |
 
-### 3. History pager (`history`)
+### 3. Intel badges (`stories`) — surface retired
+
+> **Retired by #112 (ADR-0020).** The Intel surface this section reviewed no
+> longer exists, so its four captures (`before/stories.{light,dark}.png`,
+> `after/stories.{light,dark}.png`) were deleted with it. The section is kept
+> in place, numbered as it was reviewed: this record describes what issue #31
+> actually shipped, and renumbering it would rewrite that history. The tone
+> unification it evidenced lives on in `fleet_ui::Badge`.
+
+The headline unification: 22 per-call inline badge palettes collapse to the
+5-tone `Badge` set. Canned intel data exercises every tone —
+`ACTIVE`/`EMERGING`/`CLOSED`/`DEBUNKED` states, class chips (`Tone::Info`),
+and TLP/PAP markings (`RED`→Danger, `AMBER`→Warn, `GREEN`→Success, else
+Neutral). The visible delta: the `MONITORING` state chip drops its teal wash
+to Info/Neutral, and the one-off 9px / non-uppercase variants collapse onto
+the canonical 10px uppercase chip.
+
+### 4. History pager (`history`)
 
 The `.tbl-foot` table footer collapses onto the canonical `Pager`
 (`.results-footer`) — panel bg + 8px pad, Sm buttons.
@@ -50,7 +67,7 @@ The `.tbl-foot` table footer collapses onto the canonical `Pager`
 |---|---|
 | ![before](before/history.light.png) | ![after](after/history.light.png) |
 
-### 4. Loading state (`loading`)
+### 5. Loading state (`loading`)
 
 Schema data call delayed so the tri-state `Loaded` hint stays on screen.
 The copy normalizes to the canonical `loading {label}…` in the `.load-hint`
@@ -73,7 +90,10 @@ run's concrete steps:
    `dist/` dirs.
 2. Run two `trawl-web` proxies (`:8080` before, `:8081` after) via
    `TRAWL_WEB_SPA_DIR`, both pointing `[web].upstream_url` at one live
-   trawld.
+   trawld and `[web].coastwatch_url` at a small mock returning a canned
+   `stories` list (so the intel badge tones render deterministically).
+   Both that config key and the surface it fed were retired by #112, so
+   this step is no longer reproducible as written.
 3. Drive a headless Chromium (playwright) through login
    (`POST /api/auth/login`), seed the theme via `localStorage["trawl.ui"]`,
    and capture each surface. Modal/loading states are reached by clicking
