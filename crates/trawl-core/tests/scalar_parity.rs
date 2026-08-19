@@ -1261,6 +1261,46 @@ fn current_timestamp_lexical_fallback_is_pinned_both_orders_child_105() {
     }
 }
 
+/// The two ways [`current_now_is_sampled_per_call_child_106`] can fail, told
+/// apart instead of guessed at.
+///
+/// That pin needs ONE sample out of 100 in which two `now()` calls inside one
+/// expression read different instants, so it depends on the platform clock
+/// ticking between two back-to-back reads. A failure therefore has two possible
+/// causes with OPPOSITE remedies: #106 landed and the pin must be flipped, or
+/// this host's clock is too coarse to observe per-call sampling at all. The
+/// message asks the clock which one it is, with the same read `eval` makes
+/// (`eval.rs`: `chrono::Utc::now().naive_utc()`).
+///
+/// Measured on the development host (nanosecond `CLOCK_REALTIME`): worst case 1
+/// attempt over 2000 trials, so the coarse-clock branch is not a live flake
+/// here. #106 (ADR-0017 §3) owns removing the timing dependence outright.
+fn per_call_now_failure_message() -> String {
+    let clock_advances = (0..1_000).any(|_| {
+        let first = chrono::Utc::now().naive_utc();
+        let second = chrono::Utc::now().naive_utc();
+        first != second
+    });
+    if clock_advances {
+        "eval's now() no longer varies between calls in one expression, and this \
+         platform's clock DOES advance between two back-to-back reads (probed \
+         right here) — so what changed is the SAMPLING, not the timer. This is \
+         what #106 (ADR-0017 §3) lands: flip this test to assert ONE instant per \
+         unit of output instead of a per-call sample, and retire the child-106 \
+         pin."
+            .to_string()
+    } else {
+        "this platform's clock is too COARSE to observe per-call sampling: 1000 \
+         back-to-back `chrono::Utc::now()` reads never differed, so two `now()` \
+         calls in one expression cannot be told apart on this host and the pin \
+         cannot make its observation. Nothing is known about eval's sampling from \
+         this run — do NOT weaken or skip the pin to make it green. #106 \
+         (ADR-0017 §3) removes the timing dependence entirely; until it lands, \
+         this pin is unobservable here."
+            .to_string()
+    }
+}
+
 #[test]
 fn current_now_is_sampled_per_call_child_106() {
     // #106 anchors now() once per output unit. DuckDB already anchors per statement.
@@ -1269,12 +1309,12 @@ fn current_now_is_sampled_per_call_child_106() {
     let dsl = "* | let x = now() == now()";
     let saw_per_call_difference =
         (0..100).any(|_| eval_scalar(dsl, &event) == EvalValue::Bool(false));
+    // Built ONLY on failure, and it names WHICH of the two causes this is — see
+    // `per_call_now_failure_message`.
     assert!(
         saw_per_call_difference,
-        "eval's now() no longer varies between calls in one expression — this is \
-         what #106 (ADR-0017 §3) lands. Flip this test: assert ONE instant per \
-         unit of output instead of a per-call sample, and retire the child-106 \
-         pin."
+        "{}",
+        per_call_now_failure_message()
     );
     assert_eq!(
         sql_scalar_result(&conn, dsl, &event),
