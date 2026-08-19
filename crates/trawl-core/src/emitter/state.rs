@@ -24,6 +24,37 @@ enum Quoted {
     Ident,
 }
 
+impl Quoted {
+    /// Advance the quote state across ONE character of emitted SQL.
+    ///
+    /// `peek` is the character that FOLLOWS `ch`. Returns `true` when the
+    /// pair is a doubled delimiter (`''`, `""`) — one ESCAPED character
+    /// inside its own literal, never a close — which the caller must emit
+    /// whole and step past; `DuckDB` has no backslash escape in either
+    /// form, so there is nothing else to track.
+    ///
+    /// This is the ONE transition rule both finalization scans read.
+    /// Param inlining and CTE indentation have to agree byte for byte
+    /// about where a literal ends: two hand-written SQL-quoting scanners
+    /// drifting apart is exactly the bug the multiline-literal fix was.
+    fn advance(&mut self, ch: char, peek: Option<char>) -> bool {
+        let kind = match ch {
+            '\'' => Quoted::String,
+            '"' => Quoted::Ident,
+            _ => return false,
+        };
+        if *self == kind && peek == Some(ch) {
+            return true;
+        }
+        if *self == Quoted::No {
+            *self = kind;
+        } else if *self == kind {
+            *self = Quoted::No;
+        }
+        false
+    }
+}
+
 /// `DuckDB` PIVOT specification — set when `pivot` is the terminal stage.
 pub(crate) struct PivotSpec {
     pub agg_sql: String,
@@ -670,21 +701,10 @@ impl EmitterState {
         while let Some(ch) = chars.next() {
             output.push(ch);
 
-            let delimiter = match ch {
-                '\'' => Some(Quoted::String),
-                '"' => Some(Quoted::Ident),
-                _ => None,
-            };
-            if let Some(kind) = delimiter {
-                if quoted == kind && chars.peek() == Some(&ch) {
-                    // A doubled delimiter is one escaped character.
-                    output.push(ch);
-                    chars.next();
-                } else if quoted == Quoted::No {
-                    quoted = kind;
-                } else if quoted == kind {
-                    quoted = Quoted::No;
-                }
+            if quoted.advance(ch, chars.peek().copied()) {
+                // A doubled delimiter is one escaped character.
+                output.push(ch);
+                chars.next();
             } else if ch == '\n' && quoted == Quoted::No && chars.peek().is_some() {
                 output.push_str("  ");
             }
@@ -742,25 +762,11 @@ impl EmitterState {
         let mut quoted = Quoted::No;
         let mut chars = sql.chars().peekable();
         while let Some(ch) = chars.next() {
-            let delimiter = match ch {
-                '\'' => Some(Quoted::String),
-                '"' => Some(Quoted::Ident),
-                _ => None,
-            };
-            if let Some(kind) = delimiter {
-                if quoted == kind && chars.peek() == Some(&ch) {
-                    // A doubled delimiter is one escaped character.
-                    result.push(ch);
-                    result.push(ch);
-                    chars.next();
-                    continue;
-                }
-                if quoted == Quoted::No {
-                    quoted = kind;
-                } else if quoted == kind {
-                    quoted = Quoted::No;
-                }
+            if quoted.advance(ch, chars.peek().copied()) {
+                // A doubled delimiter is one escaped character.
                 result.push(ch);
+                result.push(ch);
+                chars.next();
                 continue;
             }
             if quoted == Quoted::No && ch == '?' && param_idx < params.len() {
