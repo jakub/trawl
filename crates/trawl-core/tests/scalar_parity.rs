@@ -68,8 +68,11 @@ const TS_VALS: &[&str] = &[
 // Date/time unit allowlists are imported from the emitter (see `use` above) so
 // the generator can never silently drift from the real allowlist: if the
 // emitter grows a unit, this test exercises it automatically. `date_part`'s
-// "epoch" is filtered out at generation time (float precision diverges between
-// eval and the DuckDB text roundtrip) — see `random_date_part`.
+// "epoch" is filtered out at generation time because eval and DuckDB round the
+// same instant to ADJACENT f64 values — nothing to do with text any more, the
+// harness compares owned `DuckValue`s. The divergence is pinned, not hidden, by
+// `current_date_part_epoch_precision_is_pinned_child_105` — see
+// `random_date_part`.
 
 // Include non-ASCII values so the parity harness exercises byte-vs-character
 // divergence in scalar fns like length() (DuckDB LENGTH counts characters).
@@ -121,12 +124,86 @@ const FLOAT_LITS: &[&str] = &[
     "0.0000000001", // 1e-10 -> renders "1e-10"
 ];
 
+// ── Random-generator completeness surface ─────────────────────────────
+//
+// `generated_cases()` carries a per-family case-count manifest; the RANDOM
+// generator carried NOTHING, which is how `ceil`/`floor` were dropped from
+// `random_numeric_fn` without a single test going red. A deleted generator arm
+// is a skip moved to generation time — exactly what ADR-0017 §5 outlaws — so
+// the random side now has two mechanical guards, both asserted by
+// `random_generator_surface_is_complete`:
+//
+//  1. every selector's arm count is a NAMED constant checked against a required
+//     value, so narrowing one cannot be an invisible literal edit; and
+//  2. the set of scalar functions the generator can actually emit is observed
+//     from a deterministic sample and checked for SET EQUALITY, so a function
+//     that stops being generated fails loudly even if the arm count is
+//     "fixed up" in the same edit.
+
+const SCALAR_FAMILY_ARMS: usize = 15;
+const STRING_FN_ARMS: usize = 8;
+const SEV_ARG_ARMS: usize = 5;
+const SEV_DIALECT_ARMS: usize = 3;
+const CONCAT_ARG_ARMS: usize = 3;
+const SUBSTR_WINDOW_ARMS: usize = 17;
+const STRPTIME_SHAPE_ARMS: usize = 4;
+
+/// (selector name, the constant the generator uses, the value it must hold).
+const REQUIRED_SELECTOR_ARMS: &[(&str, usize, usize)] = &[
+    ("random_scalar_expr family", SCALAR_FAMILY_ARMS, 15),
+    ("random_string_fn", STRING_FN_ARMS, 8),
+    ("random_numeric_fn", NUMERIC_FN_ARMS, 2),
+    ("random_sev argument", SEV_ARG_ARMS, 5),
+    ("random_sev dialect", SEV_DIALECT_ARMS, 3),
+    ("random_concat argument", CONCAT_ARG_ARMS, 3),
+    ("random_substr window", SUBSTR_WINDOW_ARMS, 17),
+    ("random_strptime shape", STRPTIME_SHAPE_ARMS, 4),
+];
+
+/// Every scalar function `random_scalar_expr` can put at the HEAD of a
+/// generated expression. `ceil`/`floor` are absent on purpose — see
+/// [`NUMERIC_FN_ARMS`].
+const REQUIRED_RANDOM_CALL_NAMES: &[&str] = &[
+    "abs",
+    "coalesce",
+    "concat",
+    "contains",
+    "date_diff",
+    "date_part",
+    "date_trunc",
+    "if",
+    "length",
+    "lower",
+    "ltrim",
+    "replace",
+    "round",
+    "rtrim",
+    "sev",
+    "strftime",
+    "strptime",
+    "substr",
+    "tonumber",
+    "tostring",
+    "trim",
+    "typeof",
+    "upper",
+];
+
+/// The function name at the head of a generated expression: every `random_*`
+/// arm emits a `name(...)` call, so the text before the first `(` names it.
+fn leading_call_name(expression: &str) -> &str {
+    let (name, _) = expression
+        .split_once('(')
+        .unwrap_or_else(|| panic!("generated expression is not a call: {expression:?}"));
+    name
+}
+
 // ── DSL expression generation ─────────────────────────────────────────
 
 /// Generate a scalar DSL expression string (no `now()`, no field refs
 /// that could be absent from the fixed event).
 fn random_scalar_expr(rng: &mut Rng) -> Option<String> {
-    match rng.range(15) {
+    match rng.range(SCALAR_FAMILY_ARMS) {
         0 => Some(random_string_fn(rng)),
         1 => Some(random_numeric_fn(rng)),
         2 => Some(random_conditional(rng)),
@@ -165,7 +242,7 @@ fn float_lit(rng: &mut Rng) -> String {
 }
 
 fn random_string_fn(rng: &mut Rng) -> String {
-    match rng.range(8) {
+    match rng.range(STRING_FN_ARMS) {
         0 => format!("lower({})", str_lit(rng)),
         1 => format!("upper({})", str_lit(rng)),
         2 => format!("length({})", str_lit(rng)),
@@ -183,9 +260,20 @@ fn random_string_fn(rng: &mut Rng) -> String {
     }
 }
 
+/// Arm count of `random_numeric_fn`'s selector.
+///
+/// `ceil`/`floor` are DELIBERATELY absent, and this is the only place that says
+/// so. Over an INTEGER argument they are a LIVE divergence — eval answers
+/// `Int(5)` while `DuckDB` answers `DOUBLE 5.0` (`typeof(ceil(5))` is DOUBLE,
+/// `typeof(round(5))` is BIGINT) — so generating them would turn the property
+/// loop red. The divergence is PINNED rather than skipped, by
+/// `current_ceil_floor_and_round_types_are_pinned_child_105`; when #105 fixes
+/// the return types, restore both arms and set this back to 4.
+const NUMERIC_FN_ARMS: usize = 2;
+
 fn random_numeric_fn(rng: &mut Rng) -> String {
     let i = int_lit(rng);
-    match rng.range(2) {
+    match rng.range(NUMERIC_FN_ARMS) {
         0 => format!("abs({i})"),
         1 => format!("round({i})"),
         _ => unreachable!(),
@@ -200,9 +288,12 @@ fn random_conditional(rng: &mut Rng) -> String {
 }
 
 fn random_date_part(rng: &mut Rng) -> String {
-    // Exclude "epoch": its float result diverges between eval and the DuckDB
-    // text roundtrip. Everything else in the emitter allowlist is fair game,
-    // so a newly-added unit flows in here without a test edit.
+    // Exclude "epoch": eval and DuckDB round the same instant to adjacent f64
+    // values (a value-domain divergence, not a rendering one — the harness
+    // stopped comparing through text), pinned by
+    // `current_date_part_epoch_precision_is_pinned_child_105`. Everything else
+    // in the emitter allowlist is fair game, so a newly-added unit flows in
+    // here without a test edit.
     let units: Vec<&&str> = DATE_PART_UNITS.iter().filter(|u| **u != "epoch").collect();
     let unit = rng.pick(&units);
     let ts = ts_lit(rng);
@@ -230,13 +321,13 @@ fn random_strftime(rng: &mut Rng) -> String {
 }
 
 fn random_strptime(rng: &mut Rng) -> String {
-    if rng.range(4) == 0 {
+    if rng.range(STRPTIME_SHAPE_ARMS) == 0 {
         // Unparseable input against a valid format: batch (TRY_STRPTIME) and
         // streaming both yield NULL, so the two paths agree on a data-parse
         // failure (TRY_STRPTIME nulls instead of erroring the whole query).
         return "strptime(\"not-a-date\", \"%Y-%m-%d %H:%M:%S\")".to_string();
     }
-    if rng.range(4) == 0 {
+    if rng.range(STRPTIME_SHAPE_ARMS) == 0 {
         // Partial format: streaming fills omitted components from the
         // 1900-01-01 00:00:00 base exactly like DuckDB. Render through strftime
         // so the filled timestamp is compared as a string.
@@ -280,12 +371,12 @@ fn random_tostring(rng: &mut Rng) -> String {
 fn random_substr(rng: &mut Rng) -> String {
     let s = str_lit(rng);
     #[allow(clippy::cast_possible_wrap)]
-    let start = rng.range(17) as i64 - 8; // -8..=8
+    let start = rng.range(SUBSTR_WINDOW_ARMS) as i64 - 8; // -8..=8
     if rng.bool() {
         format!("substr({s}, {start})")
     } else {
         #[allow(clippy::cast_possible_wrap)]
-        let len = rng.range(17) as i64 - 8; // -8..=8
+        let len = rng.range(SUBSTR_WINDOW_ARMS) as i64 - 8; // -8..=8
         format!("substr({s}, {start}, {len})")
     }
 }
@@ -330,7 +421,7 @@ const SEV_TEXTS: &[&str] = &[
 /// the SQL lane reads the column's TEXT form while eval reads the wire
 /// JSON, so a field arm is the one that proves the two readings agree.
 fn random_sev(rng: &mut Rng) -> String {
-    let arg = match rng.range(5) {
+    let arg = match rng.range(SEV_ARG_ARMS) {
         0 => format!("\"{}\"", rng.pick(SEV_TEXTS)),
         1 => rng.pick(&[0_i64, 1, 3, 7, 8, 17, 24, 25, -1]).to_string(),
         2 => "level".to_string(),
@@ -338,7 +429,7 @@ fn random_sev(rng: &mut Rng) -> String {
         4 => "status".to_string(),
         _ => unreachable!(),
     };
-    match rng.range(3) {
+    match rng.range(SEV_DIALECT_ARMS) {
         0 => format!("sev({arg})"),
         1 => format!("sev({arg}, \"otel\")"),
         2 => format!("sev({arg}, \"syslog\")"),
@@ -367,7 +458,7 @@ fn random_coalesce(rng: &mut Rng) -> String {
 fn random_concat(rng: &mut Rng) -> String {
     let n = 2 + rng.range(3); // 2..=4 args
     let args: Vec<String> = (0..n)
-        .map(|_| match rng.range(3) {
+        .map(|_| match rng.range(CONCAT_ARG_ARMS) {
             0 => str_lit(rng),
             1 => int_lit(rng),
             2 => "null".to_string(),
@@ -556,6 +647,15 @@ fn sql_scalar_result(conn: &Connection, dsl: &str, event: &Map<String, Value>) -
 
 /// Explicitly permitted representation widenings between streaming and batch.
 /// There is deliberately no string/numeric coercion and no timestamp/text arm.
+///
+/// CAVEAT, and #106 must read it: `sql` is duckdb-rs's `Type`, converted from
+/// the result column's Arrow `DataType`, and that conversion ERASES both the
+/// time unit and the time zone — `DataType::Timestamp(_, _) => Type::Timestamp`
+/// covers TIMESTAMP and TIMESTAMPTZ alike. This table therefore CANNOT
+/// distinguish them, which is exactly the split ADR-0017 §3 / #106 call
+/// observable when `now()` becomes a bound TIMESTAMP parameter. #106 must
+/// assert that distinction TEXTUALLY — `typeof(now())` compared as a string —
+/// and must not expect this widening table to reject a TIMESTAMPTZ.
 fn logical_type_matches(eval: &EvalValue, sql: &Type) -> bool {
     match eval {
         EvalValue::Null => true,
@@ -685,19 +785,9 @@ struct GeneratedCase {
     expression: &'static str,
 }
 
-const REQUIRED_GENERATED_FAMILIES: &[&str] = &[
-    "operators",
-    "numeric",
-    "coalesce",
-    "conditional",
-    "strftime",
-    "date_part",
-    "timestamp_comparison",
-    "json",
-    "tonumber",
-    "tostring",
-];
-
+/// Per-family case counts — the ONLY thing standing between this table and an
+/// F1-style silent deletion. Equal `BTreeMap`s imply equal key sets, so this
+/// subsumes a separate family-name manifest; there is deliberately not one.
 const REQUIRED_FAMILY_CASE_COUNTS: &[(&str, usize)] = &[
     ("operators", 22),
     ("numeric", 7),
@@ -889,27 +979,66 @@ fn timestamp_comparison_is_microsecond_exact() {
     );
 }
 
+/// The random generator's own completeness guard — see the
+/// "Random-generator completeness surface" block above.
+#[test]
+fn random_generator_surface_is_complete() {
+    use std::collections::BTreeSet;
+
+    for &(selector, actual, required) in REQUIRED_SELECTOR_ARMS {
+        assert_eq!(
+            actual, required,
+            "the {selector} selector now offers {actual} arms, not {required}. \
+             Deleting a generator arm is a SKIP MOVED TO GENERATION TIME, which \
+             ADR-0017 §5 outlaws. Restore the arm; or, if it was removed because \
+             it now diverges, add a named `current_*_child_105` test asserting \
+             TODAY'S divergence and update this constant in the SAME commit."
+        );
+    }
+
+    let mut rng = Rng::new(0x5EED_5CA1);
+    let mut observed = BTreeSet::new();
+    for _ in 0..20_000 {
+        let expression = random_scalar_expr(&mut rng)
+            .expect("scalar generator infrastructure failure: no family selected");
+        observed.insert(leading_call_name(&expression).to_string());
+    }
+    let required: BTreeSet<String> = REQUIRED_RANDOM_CALL_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    assert_eq!(
+        observed, required,
+        "the random scalar generator's function surface drifted. A name that \
+         DISAPPEARED was deleted from a `random_*` arm — pin the divergence in a \
+         named `current_*_child_105` test (ADR-0017 §5) and update \
+         REQUIRED_RANDOM_CALL_NAMES in the same commit; a name that APPEARED is \
+         new coverage and belongs in the constant."
+    );
+}
+
 #[test]
 fn generated_scalar_families_are_complete_and_match() {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     let conn = utc_connection();
     let event = fixed_event();
     let cases = generated_cases();
-    let generated_families: BTreeSet<_> = cases.iter().map(|case| case.family).collect();
-    let required_families: BTreeSet<_> = REQUIRED_GENERATED_FAMILIES.iter().copied().collect();
-    assert_eq!(
-        generated_families, required_families,
-        "generated scalar family manifest drifted"
-    );
     let mut generated_counts = BTreeMap::new();
     for case in &cases {
         *generated_counts.entry(case.family).or_insert(0) += 1;
     }
     assert_eq!(
         generated_counts,
-        REQUIRED_FAMILY_CASE_COUNTS.iter().copied().collect(),
-        "generated scalar case coverage drifted"
+        REQUIRED_FAMILY_CASE_COUNTS
+            .iter()
+            .copied()
+            .collect::<BTreeMap<_, _>>(),
+        "generated scalar case coverage drifted. If you ADDED or deliberately \
+         retired cases, update REQUIRED_FAMILY_CASE_COUNTS in the same commit. \
+         If a case was DELETED to make the suite green, that is a skip moved to \
+         generation time: put it back and pin the divergence in a named \
+         `current_*_child_105` test instead (ADR-0017 §5)."
     );
 
     let mut hugeint_skips = 0u32;
@@ -965,7 +1094,13 @@ fn current_now_is_sampled_per_call_child_106() {
     let dsl = "* | let x = now() == now()";
     let saw_per_call_difference =
         (0..100).any(|_| eval_scalar(dsl, &event) == EvalValue::Bool(false));
-    assert!(saw_per_call_difference);
+    assert!(
+        saw_per_call_difference,
+        "eval's now() no longer varies between calls in one expression — this is \
+         what #106 (ADR-0017 §3) lands. Flip this test: assert ONE instant per \
+         unit of output instead of a per-call sample, and retire the child-106 \
+         pin."
+    );
     assert_eq!(
         sql_scalar_result(&conn, dsl, &event),
         SqlOutcome::Value(SqlCell {
@@ -1077,6 +1212,16 @@ fn current_ceil_floor_and_round_types_are_pinned_child_105() {
         ("* | let x = ceil(0.0)", 0, 0.0),
         ("* | let x = floor(0.0)", 0, 0.0),
         ("* | let x = round(-1.5)", -2, -2.0),
+        // INTEGER inputs — ADR-0017 §5 names them explicitly. `typeof(ceil(5))`
+        // is DOUBLE while `typeof(round(5))` is BIGINT, so ceil/floor diverge
+        // over an integer argument and round does not. That asymmetry is why
+        // `random_numeric_fn` may still generate `round` and may NOT generate
+        // `ceil`/`floor` (see NUMERIC_FN_ARMS) — the exclusion is pinned here,
+        // not skipped there.
+        ("* | let x = ceil(5)", 5, 5.0),
+        ("* | let x = ceil(-5)", -5, -5.0),
+        ("* | let x = floor(5)", 5, 5.0),
+        ("* | let x = floor(-5)", -5, -5.0),
     ] {
         assert_eq!(eval_scalar(dsl, &event), EvalValue::Int(eval));
         assert_eq!(
@@ -1087,6 +1232,62 @@ fn current_ceil_floor_and_round_types_are_pinned_child_105() {
             })
         );
     }
+
+    // The contrast, and the reason `round` stays in the random generator:
+    // `round` over an INTEGER already AGREES (BIGINT on both sides), so #105
+    // must leave it alone.
+    assert_eq!(
+        assert_parity_case(&conn, &event, "numeric round over integer", "round(5)"),
+        None
+    );
+}
+
+#[test]
+fn current_division_by_zero_diverges_child_105() {
+    // #105 owns the division value domain, and its scope text currently claims
+    // division by zero is NULL in BOTH lanes. It is not. Measured today: eval
+    // nulls every division by zero, while DuckDB's `/` promotes to DOUBLE and
+    // answers an IEEE special. Codifying the scope text would be a THIRD
+    // semantics, which ADR-0017 §4 forbids — these are the values to fix
+    // toward.
+    let conn = utc_connection();
+    let event = fixed_event();
+    for (dsl, sql) in [
+        ("* | let x = 1 / 0", "inf"),
+        ("* | let x = -1 / 0", "-inf"),
+        ("* | let x = 0 / 0", "NaN"),
+        // Float `%` takes the same DOUBLE path as `/` — only the all-integer
+        // shape below agrees.
+        ("* | let x = 5 % 0.0", "NaN"),
+    ] {
+        assert_eq!(eval_scalar(dsl, &event), EvalValue::Null);
+        // Rendered, not compared: `NaN != NaN` under `DuckValue`'s `PartialEq`,
+        // so an `assert_eq!` against `DuckValue::Double(f64::NAN)` can never
+        // hold. `{}` on f64 gives exactly `inf` / `-inf` / `NaN`.
+        match sql_scalar_result(&conn, dsl, &event) {
+            SqlOutcome::Value(SqlCell {
+                logical_type: Type::Double,
+                value: DuckValue::Double(value),
+            }) => assert_eq!(format!("{value}"), sql, "for {dsl:?}"),
+            other => panic!("expected a DOUBLE result for {dsl:?}, got {other:?}"),
+        }
+    }
+
+    // The one AGREEING shape: INTEGER `%` 0 is NULL on both sides (a BIGINT
+    // column holding NULL), so #105 must not "fix" it into an IEEE special.
+    let modulo = "* | let x = 5 % 0";
+    assert_eq!(eval_scalar(modulo, &event), EvalValue::Null);
+    assert_eq!(
+        sql_scalar_result(&conn, modulo, &event),
+        SqlOutcome::Value(SqlCell {
+            logical_type: Type::BigInt,
+            value: DuckValue::Null,
+        })
+    );
+    assert_eq!(
+        assert_parity_case(&conn, &event, "operators integer modulo by zero", "5 % 0"),
+        None
+    );
 }
 
 #[test]
@@ -1274,14 +1475,17 @@ fn current_json_value_and_array_rendering_are_pinned_child_105() {
 #[test]
 fn duckdb_conditionals_and_coalesce_short_circuit() {
     // #105 may change evaluation order only if these DuckDB probes move.
+    //
+    // Only `error(...)` is load-bearing. `1 / 0` was probed and DuckDB does NOT
+    // raise on it — it answers `inf` (see
+    // `current_division_by_zero_diverges_child_105`) — so an untaken `1 / 0`
+    // branch returns 42 under fully EAGER evaluation too and proves nothing
+    // about short-circuiting. Those three rows are deleted.
     let conn = utc_connection();
     for sql in [
         "SELECT IF(false, error('untaken'), 42)",
         "SELECT CASE WHEN false THEN error('untaken') ELSE 42 END",
         "SELECT COALESCE(42, error('untaken'))",
-        "SELECT IF(false, 1 / 0, 42)",
-        "SELECT CASE WHEN false THEN 1 / 0 ELSE 42 END",
-        "SELECT COALESCE(42, 1 / 0)",
     ] {
         let value: f64 = infra_or_panic(
             conn.query_row(sql, [], |row| row.get(0)),
