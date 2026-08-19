@@ -328,6 +328,11 @@ The postgres DSNs still arrive via the `FLEET_DATABASE_URL` / `TRAWL_DATABASE_UR
 | `persistence.enabled` | bool | `true` | Enable persistent storage |
 | `persistence.size` | string | `50Gi` | PVC size |
 | `persistence.storageClass` | string | `""` | StorageClass (empty = default) |
+| `crashDump.enabled` | bool | `false` | Enable minidump capture; requires `persistence.enabled=true` |
+| `crashDump.size` | string | `2Gi` | Crash-dump PVC size |
+| `crashDump.storageClass` | string | `""` | Crash-dump StorageClass (empty = default) |
+| `crashDump.mountPath` | string | `/var/lib/trawl/cores` | Crash-dump PVC mount path |
+| `crashDump.retain` | int | `10` | Maximum number of retained minidumps |
 | `config.raw` | string | `""` | Raw trawld.toml (bypasses structured values) |
 | `config.server.httpAddr` | string | `0.0.0.0:5514` | Bind address |
 | `config.server.timeoutSecs` | int | `30` | Query timeout |

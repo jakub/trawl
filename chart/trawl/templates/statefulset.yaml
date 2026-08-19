@@ -1,3 +1,6 @@
+{{- if and .Values.crashDump.enabled (not .Values.persistence.enabled) -}}
+{{- fail "crashDump.enabled=true requires persistence.enabled=true so crash dumps and trawld data survive pod replacement; enable persistence.enabled or disable crashDump.enabled" -}}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
