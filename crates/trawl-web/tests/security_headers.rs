@@ -48,6 +48,12 @@ async fn every_response_has_csp_and_friends() {
     );
     assert!(csp.contains("default-src 'self'"));
     assert!(csp.contains("frame-ancestors 'none'"));
+    assert!(csp.contains("style-src 'self' 'unsafe-inline'"));
+    assert!(csp.contains("font-src 'self'"));
+    assert!(
+        !csp.contains("googleapis") && !csp.contains("gstatic"),
+        "self-hosted fonts must not leave third-party CSP allowances; got: {csp}"
+    );
 
     assert!(
         headers

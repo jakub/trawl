@@ -27,8 +27,8 @@
  * What this file ships:
  *   - Design tokens: :root + [data-theme="light"] + [data-theme="dark"]
  *   - Typography + spacing custom properties
- *   - Reset + base styles (box-sizing, fonts via font-family only,
- *     focus ring, scrollbars, ::selection)
+ *   - Self-hosted Geist / Geist Mono faces plus reset + base styles
+ *     (box-sizing, typography, focus ring, scrollbars, ::selection)
  *   - Universal keyframes: blink, spin, toastIn, fadeIn, modalFadeIn,
  *     modalIn
  *   - Base form/button: .field, .btn, .btn-full, .error-banner
@@ -62,6 +62,26 @@
  *     .sd-ttl .name / .sub, .name-edit
  *   - Anything app-specific: facets, editor, histogram, schema cards.
  */
+
+/* Self-hosted Geist 1.8.0 variable faces (issue #119). fleet-ui owns the
+ * committed WOFF2 files; every Trunk consumer copies `fonts/` beside the
+ * emitted stylesheet. Restrict the advertised axis to the weights the UI
+ * already uses so the typography contract remains 400/500/600/700. */
+@font-face {
+  font-family: "Geist";
+  src: url("fonts/Geist-Variable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("fonts/GeistMono-Variable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+}
 
 /* ─────────────────────────────────────────────────────────────────
  *  Design tokens

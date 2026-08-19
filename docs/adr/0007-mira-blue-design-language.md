@@ -2,6 +2,16 @@
 
 Status: accepted (2026-07-27)
 
+> **amendment (2026-08-19, #119):** Geist 1.8.0 and Geist Mono 1.8.0
+> are now self-hosted from two committed variable WOFF2 files owned by
+> `fleet-ui`, with the advertised axis constrained to the standing
+> 400/500/600/700 range. Both Trunk distributions copy the same font
+> directory, and generated design cards inline those committed bytes as
+> data URLs to preserve their single-file contract, including the OFL text
+> alongside the embedded font software. The Google Fonts runtime dependency
+> and its CSP allowances are deleted; source, SHA-256 checksums and OFL-1.1
+> attribution live with the assets in `crates/fleet-ui/fonts/`.
+
 ## Context
 
 ADR-0005 established the design-workbench process and the slate/blue palette
@@ -79,9 +89,10 @@ Key points:
   3.97:1 on the resting wash and 3.31:1 on the hover wash, under the 4.5:1
   AA floor, so light `--red` is deepened to `oklch(48% .177)` (6.03:1 /
   5.06:1). Dark `--red` sits on dark panels and keeps Mira's lighter tone.
-- **Fonts**: Geist / Geist Mono replace Open Sans / Fira Code. Loaded by the
-  consumer's `index.html` from Google Fonts, same mechanism as before;
-  self-hosting remains deferred.
+- **Fonts**: Geist / Geist Mono replace Open Sans / Fira Code. Since the #119
+  amendment, fleet-ui owns pinned self-hosted WOFF2 assets and consumers copy
+  that directory into their Trunk distributions; no runtime font request
+  leaves the application origin.
 - **Native widgets**: `color-scheme` is declared per theme and
   `scrollbar-color` set, so Firefox scrollbars and form controls follow the
   theme.

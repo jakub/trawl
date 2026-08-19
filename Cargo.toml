@@ -77,6 +77,7 @@ tokio-stream = "0.1"
 shellexpand = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 # Umbrella sqlx: the rusqlite (links = "sqlite3") collision that forced the
 # direct sqlx-core/sqlx-postgres workaround died with the trawl-auth crate in
 # ADR-0004 slice 3, closing issue #12. tls-rustls-ring-webpki keeps the same

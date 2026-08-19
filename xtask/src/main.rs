@@ -118,12 +118,13 @@ fn main() -> ExitCode {
         Cmd::DesignCards { out } => {
             let root = workspace_root();
             let css = root.join("crates/fleet-ui/styles/fleet-ui.css");
+            let fonts = root.join("crates/fleet-ui/fonts");
             let out = if out.is_absolute() {
                 out
             } else {
                 root.join(out)
             };
-            design_cards::generate(&css, &out)
+            design_cards::generate(&css, &fonts, &out)
         }
         Cmd::IngestFuzz {
             phase,

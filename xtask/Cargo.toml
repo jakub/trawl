@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+base64ct = { workspace = true, features = ["alloc"] }
 brotli = { workspace = true }
 clap = { workspace = true }
 flate2 = { workspace = true }
