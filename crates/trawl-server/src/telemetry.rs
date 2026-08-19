@@ -50,9 +50,12 @@
 //! While the volume is still failing nothing merges, so the cap keeps its
 //! per-tick shedding granularity.
 //!
-//! A failed write RETAINS the batch for retry (rate-limited stderr +
-//! `trawl_telemetry_wal_write_failures_total`); a transient storage error
-//! no longer loses the batch. Total retained memory is capped by
+//! A normal failed write RETAINS the batch for retry (rate-limited stderr +
+//! `trawl_telemetry_wal_write_failures_total`); a transient storage error no
+//! longer loses the batch. If the blocking write task itself panics or is
+//! cancelled, its consumed batch is unrecoverable and is counted once under
+//! drop reason `write_crashed` in addition to that one write-failure count.
+//! Total retained memory is capped by
 //! `[ingest] telemetry_buffer_max_bytes` — the charge is an ESTIMATE
 //! (serialized ndjson counted twice, once for the bytes and once for the
 //! retained maps which hold roughly the same payload, plus a fixed
@@ -115,6 +118,8 @@
 //! token is absent outside `#[cfg(test)]`.
 
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -472,6 +477,10 @@ struct DropCounters {
     cap_events: AtomicU64,
     /// ndjson bytes dropped by retry-queue overflow (exact).
     cap_bytes: AtomicU64,
+    /// Events consumed by a panicked or cancelled blocking write (exact).
+    crashed_events: AtomicU64,
+    /// ndjson bytes consumed by a panicked or cancelled write (exact).
+    crashed_bytes: AtomicU64,
 }
 
 struct WalLayerInner {
@@ -512,6 +521,16 @@ struct WalLayerInner {
     bus: OnceLock<Arc<crate::bus::LocalEventBus>>,
     /// Deferred hot buffer for synchronous insertion (query freshness).
     hot_buffer: OnceLock<Arc<crate::hot_buffer::HotBuffer>>,
+    /// Test-only fault injection at the ownership boundary where the
+    /// blocking closure has consumed a batch and a `JoinError` loses it.
+    #[cfg(test)]
+    panic_next_write: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+enum WriteFailureDisposition {
+    Retained,
+    Dropped,
 }
 
 impl std::fmt::Debug for WalLayer {
@@ -582,6 +601,8 @@ impl WalLayer {
                 last_stderr: Mutex::new(None),
                 bus: OnceLock::new(),
                 hot_buffer: OnceLock::new(),
+                #[cfg(test)]
+                panic_next_write: AtomicBool::new(false),
             }),
         }
     }
@@ -619,7 +640,8 @@ impl WalLayer {
                     self.inner.publish(env, &wal_path, batch);
                 }
                 Err(e) => {
-                    self.inner.record_write_failure(&e);
+                    self.inner
+                        .record_write_failure(&e, WriteFailureDisposition::Retained);
                     self.inner.requeue_front(batch);
                     break;
                 }
@@ -648,8 +670,12 @@ impl WalLayer {
             let batch_env = Arc::clone(env);
             // Captured before the batch moves into the closure, so a lost
             // batch can still be released from the shared accounting.
-            let in_flight = (batch.events.len(), batch_charge(&batch));
+            let in_flight = (batch.events.len(), batch_charge(&batch), batch.bytes.len());
+            #[cfg(test)]
+            let panic_write = self.inner.panic_next_write.swap(false, Ordering::Relaxed);
             let joined = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                assert!(!panic_write, "injected telemetry WAL write panic");
                 let result = w.write(&batch_env, TELEMETRY_SERVICE, &batch.bytes);
                 (result, batch)
             })
@@ -660,7 +686,8 @@ impl WalLayer {
                     self.inner.publish(env, &wal_path, batch);
                 }
                 Ok((Err(e), batch)) => {
-                    self.inner.record_write_failure(&e);
+                    self.inner
+                        .record_write_failure(&e, WriteFailureDisposition::Retained);
                     self.inner.requeue_front(batch);
                     break;
                 }
@@ -670,7 +697,11 @@ impl WalLayer {
                     // does not panic in practice.
                     self.inner.staged.release(in_flight.0, in_flight.1);
                     self.inner
-                        .record_write_failure(&std::io::Error::other(join_err));
+                        .record_crashed_drop(in_flight.0 as u64, in_flight.2 as u64);
+                    self.inner.record_write_failure(
+                        &std::io::Error::other(join_err),
+                        WriteFailureDisposition::Dropped,
+                    );
                     break;
                 }
             }
@@ -814,6 +845,28 @@ impl WalLayerInner {
         .increment(bytes);
     }
 
+    /// Count a batch irrecoverably consumed by a panicked or cancelled
+    /// blocking write task. This is separate from the one WAL failure count:
+    /// the two metrics describe different facts about the same attempt.
+    fn record_crashed_drop(&self, events: u64, bytes: u64) {
+        self.dropped
+            .crashed_events
+            .fetch_add(events, Ordering::Relaxed);
+        self.dropped
+            .crashed_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        metrics::counter!(
+            crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
+            "reason" => "write_crashed"
+        )
+        .increment(events);
+        metrics::counter!(
+            crate::metrics::TELEMETRY_BYTES_DROPPED_TOTAL,
+            "reason" => "write_crashed"
+        )
+        .increment(bytes);
+    }
+
     /// Pop the oldest pending batches for one write attempt. With
     /// `coalesce`, they are concatenated oldest-first while they fit in
     /// [`MAX_DRAIN_UNIT_BYTES`] (the first is always taken, however large).
@@ -895,15 +948,19 @@ impl WalLayerInner {
         let preinit_bytes = self.dropped.preinit_bytes.swap(0, Ordering::Relaxed);
         let cap_events = self.dropped.cap_events.swap(0, Ordering::Relaxed);
         let cap_bytes = self.dropped.cap_bytes.swap(0, Ordering::Relaxed);
-        if preinit_events + cap_events > 0 {
+        let crashed_events = self.dropped.crashed_events.swap(0, Ordering::Relaxed);
+        let crashed_bytes = self.dropped.crashed_bytes.swap(0, Ordering::Relaxed);
+        if preinit_events + cap_events + crashed_events > 0 {
             tracing::warn!(
                 event_type = "telemetry_dropped",
-                dropped_events = preinit_events + cap_events,
-                dropped_bytes = preinit_bytes + cap_bytes,
+                dropped_events = preinit_events + cap_events + crashed_events,
+                dropped_bytes = preinit_bytes + cap_bytes + crashed_bytes,
                 dropped_events_preinit_cap = preinit_events,
                 dropped_bytes_preinit_cap = preinit_bytes,
                 dropped_events_buffer_cap = cap_events,
                 dropped_bytes_buffer_cap = cap_bytes,
+                dropped_events_write_crashed = crashed_events,
+                dropped_bytes_write_crashed = crashed_bytes,
                 "telemetry events were lost (see reason totals; \
                  preinit_cap bytes are a mean-line-size estimate)"
             );
@@ -913,12 +970,16 @@ impl WalLayerInner {
     /// Record a WAL write failure: scrapeable counter plus rate-limited
     /// stderr (the independent last-resort channel while self-ingestion
     /// is unavailable). MUST NOT use tracing — see the module docs.
-    fn record_write_failure(&self, e: &std::io::Error) {
+    fn record_write_failure(&self, e: &std::io::Error, disposition: WriteFailureDisposition) {
         metrics::counter!(crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL).increment(1);
         let mut last = self.last_stderr.lock();
         let due = last.is_none_or(|t| t.elapsed() >= Duration::from_mins(1));
         if due {
-            eprintln!("[trawl-telemetry] WAL write failed (batch retained for retry): {e}");
+            let outcome = match disposition {
+                WriteFailureDisposition::Retained => "batch retained for retry",
+                WriteFailureDisposition::Dropped => "write task crashed; batch counted as dropped",
+            };
+            eprintln!("[trawl-telemetry] WAL write failed ({outcome}): {e}");
             *last = Some(Instant::now());
         }
     }
@@ -2266,6 +2327,115 @@ mod tests {
         let events = read_wal_events(&wal_root.join("prod"));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["event_type"], "retry_test");
+    }
+
+    /// A `JoinError` owns no batch to put back: prove the consumed unit is
+    /// accounted exactly once as dropped while the existing write-failure
+    /// signal remains exactly once and all depth accounting is released.
+    #[test]
+    fn panicked_blocking_write_accounts_the_lost_batch_exactly_once() {
+        use tracing_subscriber::prelude::*;
+
+        fn sample(rendered: &str, series: &str) -> u64 {
+            rendered
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.rsplit_once(' ')?;
+                    (name == series).then(|| value.parse::<u64>().unwrap())
+                })
+                .unwrap_or(0)
+        }
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = recorder.handle();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // The local recorder is thread-local, so keep the future on this
+        // thread. The panicking blocking task emits no metrics itself; its
+        // JoinError is accounted here after the await.
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let writer = Arc::new(WalWriter::new(tmp.path().join("wal")));
+                writer.ensure_dir().unwrap();
+
+                let handle = WalHandle::new();
+                handle.set(Arc::clone(&writer), "prod");
+
+                let layer = WalLayer::new(handle, "prod");
+                let layer_ref = layer.clone();
+                let subscriber = tracing_subscriber::registry().with(layer);
+                let _guard = tracing::subscriber::set_default(subscriber);
+
+                layer_ref.inner.update_gauges();
+                let before = metrics_handle.render();
+                let baseline_events = sample(&before, crate::metrics::TELEMETRY_BUFFER_EVENTS);
+                let baseline_bytes = sample(&before, crate::metrics::TELEMETRY_BUFFER_BYTES);
+
+                tracing::info!(event_type = "write_crash_test", "lost in blocking task");
+                layer_ref.inner.stage();
+                let (expected_events, expected_bytes) = {
+                    let pending = layer_ref.inner.pending.lock();
+                    let batch = pending.front().expect("event was staged");
+                    (
+                        u64::try_from(batch.events.len()).unwrap(),
+                        u64::try_from(batch.bytes.len()).unwrap(),
+                    )
+                };
+                layer_ref
+                    .inner
+                    .panic_next_write
+                    .store(true, Ordering::Relaxed);
+
+                layer_ref.flush_cycle().await;
+
+                let after = metrics_handle.render();
+                assert_eq!(
+                    sample(
+                        &after,
+                        "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}"
+                    ) - sample(
+                        &before,
+                        "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}"
+                    ),
+                    expected_events,
+                    "the staged event delta is counted once"
+                );
+                assert_eq!(
+                    sample(
+                        &after,
+                        "trawl_telemetry_bytes_dropped_total{reason=\"write_crashed\"}"
+                    ) - sample(
+                        &before,
+                        "trawl_telemetry_bytes_dropped_total{reason=\"write_crashed\"}"
+                    ),
+                    expected_bytes,
+                    "the staged ndjson-byte delta is counted once"
+                );
+                assert_eq!(
+                    sample(&after, crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL)
+                        - sample(&before, crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL),
+                    1,
+                    "the crashed attempt increments the write-failure counter once"
+                );
+                assert_eq!(
+                    sample(&after, crate::metrics::TELEMETRY_BUFFER_EVENTS),
+                    baseline_events,
+                    "event-depth gauge returns to baseline"
+                );
+                assert_eq!(
+                    sample(&after, crate::metrics::TELEMETRY_BUFFER_BYTES),
+                    baseline_bytes,
+                    "byte-depth gauge returns to baseline"
+                );
+                assert!(layer_ref.inner.pending.lock().is_empty());
+                assert_eq!(layer_ref.inner.staged.events.load(Ordering::Relaxed), 0);
+                assert_eq!(layer_ref.inner.staged.bytes.load(Ordering::Relaxed), 0);
+            });
+        });
     }
 
     #[tokio::test]

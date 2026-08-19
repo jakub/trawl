@@ -241,22 +241,23 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         TELEMETRY_WAL_WRITE_FAILURES_TOTAL,
-        "Self-telemetry WAL write failures; the failed batch is retained \
-         for retry, so a rising counter with no drops means the retry \
-         queue is absorbing a storage outage"
+        "Self-telemetry WAL write failures; an ordinary failed batch is \
+         retained for retry, while a panicked or cancelled write task also \
+         records its consumed batch under dropped reason write_crashed"
     );
     describe_counter!(
         TELEMETRY_EVENTS_DROPPED_TOTAL,
         "Self-telemetry events dropped, labelled by reason (preinit_cap = \
          bootstrap buffer overflow before the WAL writer was injected, \
          buffer_cap = the shared active+queue+in-flight memory budget was \
-         full during a prolonged WAL outage)"
+         full during a prolonged WAL outage, write_crashed = a panicked or \
+         cancelled blocking write consumed the batch)"
     );
     describe_counter!(
         TELEMETRY_BYTES_DROPPED_TOTAL,
         "Self-telemetry ndjson bytes dropped, labelled by reason (exact \
-         for buffer_cap; a mean-line-size estimate for preinit_cap, which \
-         drops before serialization)"
+         for buffer_cap and write_crashed; a mean-line-size estimate for \
+         preinit_cap, which drops before serialization)"
     );
     describe_gauge!(
         TELEMETRY_BUFFER_EVENTS,
