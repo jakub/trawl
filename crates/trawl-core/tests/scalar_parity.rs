@@ -1729,10 +1729,11 @@ fn scalar_eval_matches_sql_parity() {
 
         // ONE implementation of the batch/eval contract: `assert_parity_case`
         // owns both the value match and the batch-errored/eval-nulls rule. The
-        // bespoke copy that used to live here compared `normalize_eval(..)` to
-        // `Value::Null`, which is strictly WEAKER — `From<EvalValue> for Value`
-        // maps `Float(NaN)` and `Float(±inf)` onto `Value::Null`, so an eval
-        // NaN/inf where DuckDB errored was silently accepted.
+        // bespoke copy that used to live here compared the eval result's
+        // `serde_json::Value` form to `Value::Null`, which is strictly WEAKER —
+        // `From<EvalValue> for Value` maps `Float(NaN)` and `Float(±inf)` onto
+        // `Value::Null`, so an eval NaN/inf where DuckDB errored was silently
+        // accepted.
         match assert_parity_case(
             &conn,
             &event,
@@ -1777,9 +1778,10 @@ fn batch_errors_imply_streaming_null() {
         ),
     ] {
         assert_sql_errored(&sql_scalar_result(&conn, dsl, &event), duckdb_error, dsl);
-        // `EvalValue::Null`, never `normalize_eval(..) == Value::Null`: the
-        // `Value` conversion maps `Float(NaN)`/`Float(inf)` onto `Value::Null`
-        // too, so the weaker form would accept a non-null eval here.
+        // `EvalValue::Null`, never the `serde_json::Value` form compared to
+        // `Value::Null`: that conversion maps `Float(NaN)`/`Float(inf)` onto
+        // `Value::Null` too, so the weaker form would accept a non-null eval
+        // here.
         assert_eq!(
             eval_scalar(dsl, &event),
             EvalValue::Null,
@@ -1812,8 +1814,8 @@ fn strftime_over_strptime_binds_params_in_order() {
         "batch strftime(strptime(...)) must not error or null"
     );
 
-    // Streaming path (eval). Compared as an `EvalValue`, not through the
-    // retired `normalize_eval`: `From<EvalValue> for Value` maps BOTH `Str` and
+    // Streaming path (eval). Compared as an `EvalValue`, never through its
+    // `serde_json::Value` form: `From<EvalValue> for Value` maps BOTH `Str` and
     // `Timestamp` onto `Value::String`, so the serde form could not tell a
     // rendered string from a rendered instant.
     assert_eq!(
