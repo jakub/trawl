@@ -14,6 +14,47 @@ struct Cte {
     sql: String,
 }
 
+/// Which quoted region an emitted SQL scan is inside.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Quoted {
+    No,
+    /// `'…'` — a string literal.
+    String,
+    /// `"…"` — a quoted identifier.
+    Ident,
+}
+
+impl Quoted {
+    /// Advance the quote state across ONE character of emitted SQL.
+    ///
+    /// `peek` is the character that FOLLOWS `ch`. Returns `true` when the
+    /// pair is a doubled delimiter (`''`, `""`) — one ESCAPED character
+    /// inside its own literal, never a close — which the caller must emit
+    /// whole and step past; `DuckDB` has no backslash escape in either
+    /// form, so there is nothing else to track.
+    ///
+    /// This is the ONE transition rule both finalization scans read.
+    /// Param inlining and CTE indentation have to agree byte for byte
+    /// about where a literal ends: two hand-written SQL-quoting scanners
+    /// drifting apart is exactly the bug the multiline-literal fix was.
+    fn advance(&mut self, ch: char, peek: Option<char>) -> bool {
+        let kind = match ch {
+            '\'' => Quoted::String,
+            '"' => Quoted::Ident,
+            _ => return false,
+        };
+        if *self == kind && peek == Some(ch) {
+            return true;
+        }
+        if *self == Quoted::No {
+            *self = kind;
+        } else if *self == kind {
+            *self = Quoted::No;
+        }
+        false
+    }
+}
+
 /// `DuckDB` PIVOT specification — set when `pivot` is the terminal stage.
 pub(crate) struct PivotSpec {
     pub agg_sql: String,
@@ -632,11 +673,7 @@ impl EmitterState {
             }
             sql.push_str(&cte.name);
             sql.push_str(" AS (\n");
-            for line in cte.sql.lines() {
-                sql.push_str("  ");
-                sql.push_str(line);
-                sql.push('\n');
-            }
+            Self::push_indented_cte(&mut sql, &cte.sql);
             sql.push(')');
         }
         sql.push('\n');
@@ -649,6 +686,33 @@ impl EmitterState {
         }
 
         sql
+    }
+
+    /// Append a CTE body with its SQL lines indented, without inserting bytes
+    /// after newlines that belong to string literals or quoted identifiers.
+    fn push_indented_cte(output: &mut String, body: &str) {
+        if body.is_empty() {
+            return;
+        }
+
+        output.push_str("  ");
+        let mut quoted = Quoted::No;
+        let mut chars = body.chars().peekable();
+        while let Some(ch) = chars.next() {
+            output.push(ch);
+
+            if quoted.advance(ch, chars.peek().copied()) {
+                // A doubled delimiter is one escaped character.
+                output.push(ch);
+                chars.next();
+            } else if ch == '\n' && quoted == Quoted::No && chars.peek().is_some() {
+                output.push_str("  ");
+            }
+        }
+
+        if !body.ends_with('\n') {
+            output.push('\n');
+        }
     }
 
     /// Build a `DuckDB` PIVOT statement from the current source.
@@ -693,40 +757,16 @@ impl EmitterState {
     /// close; `DuckDB` has no backslash escape in either form, so there
     /// is nothing else to track.
     fn inline_params_counted(sql: &str, params: &[SqlValue], start_idx: usize) -> (String, usize) {
-        /// Which quoted region the scan is inside.
-        #[derive(PartialEq, Eq, Clone, Copy)]
-        enum Quoted {
-            No,
-            /// `'…'` — a string literal.
-            String,
-            /// `"…"` — a quoted identifier.
-            Ident,
-        }
-
         let mut result = String::with_capacity(sql.len());
         let mut param_idx = start_idx;
         let mut quoted = Quoted::No;
         let mut chars = sql.chars().peekable();
         while let Some(ch) = chars.next() {
-            let delimiter = match ch {
-                '\'' => Some(Quoted::String),
-                '"' => Some(Quoted::Ident),
-                _ => None,
-            };
-            if let Some(kind) = delimiter {
-                if quoted == kind && chars.peek() == Some(&ch) {
-                    // A doubled delimiter is one escaped character.
-                    result.push(ch);
-                    result.push(ch);
-                    chars.next();
-                    continue;
-                }
-                if quoted == Quoted::No {
-                    quoted = kind;
-                } else if quoted == kind {
-                    quoted = Quoted::No;
-                }
+            if quoted.advance(ch, chars.peek().copied()) {
+                // A doubled delimiter is one escaped character.
                 result.push(ch);
+                result.push(ch);
+                chars.next();
                 continue;
             }
             if quoted == Quoted::No && ch == '?' && param_idx < params.len() {
@@ -821,5 +861,20 @@ mod tests {
         let (third, used) = EmitterState::inline_params_counted("AND b = ?", &params, used);
         assert_eq!(third, "AND b = TRUE");
         assert_eq!(used, 2);
+    }
+
+    /// CTE indentation preserves every byte inside a string literal, including
+    /// CRLF and a doubled quote, while still indenting the next SQL line.
+    #[test]
+    fn cte_indentation_never_enters_a_multiline_string_literal() {
+        let mut output = String::new();
+        EmitterState::push_indented_cte(
+            &mut output,
+            "SELECT 'it''s\r\nstill data' AS value\nFROM logs",
+        );
+        assert_eq!(
+            output,
+            "  SELECT 'it''s\r\nstill data' AS value\n  FROM logs\n"
+        );
     }
 }

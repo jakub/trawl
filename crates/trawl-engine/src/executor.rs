@@ -521,6 +521,13 @@ impl Executor {
     ///
     /// Returns an error if the pipeline contains Rust post-processing stages
     /// (e.g. `extract kv`) since those can't be expressed as pure SQL.
+    ///
+    /// `max_rows` is a two-mode parameter: a row cap, or `usize::MAX` —
+    /// the caller-facing sentinel for an UNBOUNDED export, which emits no
+    /// LIMIT at all. Any cap above `DuckDB`'s INT64 LIMIT domain reads as
+    /// the sentinel too, since a larger literal is a conversion error.
+    /// Both halves are the one decision `export_row_limit` takes, on the
+    /// `usize` itself — so the contract holds at every pointer width.
     pub fn export_parquet(
         &self,
         dsl: &str,
@@ -563,6 +570,13 @@ impl Executor {
     /// before the read, and a database failure over an existing cold corpus
     /// returns the error instead of silently exporting hot-only data
     /// (ADR-0008).
+    ///
+    /// `max_rows` is a two-mode parameter: a row cap, or `usize::MAX` —
+    /// the caller-facing sentinel for an UNBOUNDED export, which emits no
+    /// LIMIT at all. Any cap above `DuckDB`'s INT64 LIMIT domain reads as
+    /// the sentinel too, since a larger literal is a conversion error.
+    /// Both halves are the one decision `export_row_limit` takes, on the
+    /// `usize` itself — so the contract holds at every pointer width.
     #[allow(clippy::too_many_arguments)]
     pub fn export_parquet_with_hot(
         &self,
@@ -631,11 +645,19 @@ impl Executor {
             })
         })?;
 
-        // Create temp table from query results.
-        let create_sql = format!(
-            "CREATE TEMP TABLE __trawl_export AS (SELECT * FROM ({}) LIMIT {max_rows})",
-            emitted.sql
-        );
+        // Create temp table from query results. Which shape the staging
+        // SELECT takes is ONE decision, `export_row_limit`, read off the
+        // caller's `usize` before any narrowing conversion.
+        let create_sql = match export_row_limit(max_rows) {
+            Some(max_rows) => format!(
+                "CREATE TEMP TABLE __trawl_export AS (SELECT * FROM ({}) LIMIT {max_rows})",
+                emitted.sql
+            ),
+            None => format!(
+                "CREATE TEMP TABLE __trawl_export AS (SELECT * FROM ({}))",
+                emitted.sql
+            ),
+        };
 
         let params = bind_params(&emitted.params);
         let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
@@ -747,6 +769,11 @@ impl Executor {
         })?;
 
         let safe_path = path_str.replace('\'', "''");
+        // The same INT64 LIMIT domain the export lane clamps against: a
+        // larger `usize` is a Conversion Error, not a bigger cap. There is
+        // no unbounded shape here — the caller's `max_result_rows` is
+        // always a cap — so the ceiling is `i64::MAX`.
+        let max_rows = i64::try_from(max_rows).unwrap_or(i64::MAX);
         let sql = format!(
             "SELECT * FROM read_parquet('{safe_path}', union_by_name=true) LIMIT {max_rows}"
         );
@@ -1058,6 +1085,29 @@ fn classify_export_outcome(outcome: &Result<(), EngineError>) -> HotColdOutcome 
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
         Err(_) => HotColdOutcome::Fatal,
     }
+}
+
+/// The LIMIT an export's staging SELECT carries, decided from the caller's
+/// `max_rows`.
+///
+/// `None` is the UNBOUNDED shape — no LIMIT clause at all — and it is the
+/// answer for two disjoint reasons. `usize::MAX` is the caller-facing
+/// sentinel for an unbounded export; and `DuckDB`'s LIMIT domain is INT64,
+/// so every `usize` above `i64::MAX` is a Conversion Error rather than a
+/// bigger cap, which the sentinel is not the only way to reach
+/// (`max_export_rows` is operator-set).
+///
+/// The sentinel is tested on the `usize` BEFORE the conversion, because the
+/// conversion alone only recognises it where `usize` is wider than `i64`:
+/// on a 32-bit target `usize::MAX` is `4_294_967_295` and converts cleanly,
+/// which would silently turn the documented unbounded export into a real
+/// `LIMIT 4294967295`. Reading the sentinel first is what makes the
+/// contract target-independent.
+fn export_row_limit(max_rows: usize) -> Option<i64> {
+    if max_rows == usize::MAX {
+        return None;
+    }
+    i64::try_from(max_rows).ok()
 }
 
 /// What a source's shape — and, for a list, the filesystem underneath it —
@@ -1526,7 +1576,7 @@ mod tests {
 
     use super::{
         ColdAction, ColdPresence, EngineError, Executor, FieldTypes, HotColdOutcome, HotLane,
-        ListEvidence, cold_action, error_class, glob_list_items, has_glob_meta,
+        ListEvidence, cold_action, error_class, export_row_limit, glob_list_items, has_glob_meta,
         is_conversion_error, is_no_files_error, literal_path_is_file, resolve_list_source,
     };
 
@@ -2674,5 +2724,45 @@ mod tests {
              the first-seen BIGINT, got `{}`",
             meta.data_type
         );
+    }
+
+    /// The export lane's LIMIT shape is decided on the caller's `usize`,
+    /// so the unbounded contract holds at every pointer width.
+    ///
+    /// This asserts the DECISION, not an execution, and that is what makes
+    /// it target-independent: `usize::MAX` here IS the target's sentinel,
+    /// whatever its width.
+    ///
+    /// Deciding by conversion alone — `i64::try_from` with the error arm
+    /// standing in for "unbounded" — passes on a 64-bit target and FAILS
+    /// on a 32-bit one, where `usize::MAX` is `4_294_967_295` and converts
+    /// cleanly into a real `LIMIT`.
+    #[test]
+    fn export_row_limit_sentinel_is_target_independent() {
+        assert_eq!(
+            export_row_limit(usize::MAX),
+            None,
+            "`usize::MAX` is the unbounded sentinel on every target"
+        );
+
+        // Ordinary caps are unchanged, including the degenerate zero: the
+        // bounded arm renders exactly the integer it is handed.
+        assert_eq!(export_row_limit(0), Some(0));
+        assert_eq!(export_row_limit(2), Some(2));
+        assert_eq!(export_row_limit(5_000), Some(5_000));
+
+        // `i64::MAX` is the largest cap DuckDB can name in a LIMIT. Ask
+        // only where a `usize` can hold it — on a 32-bit target the value
+        // does not exist, and the sentinel correctly answers first.
+        if let Ok(top) = usize::try_from(i64::MAX) {
+            assert_eq!(export_row_limit(top), Some(i64::MAX));
+        }
+
+        // Out of the INT64 domain but NOT the sentinel (`max_export_rows`
+        // is operator-set). Only reachable where `usize` is wider than
+        // `i64`'s positive range.
+        if let Ok(above) = usize::try_from(1_u128 << 63) {
+            assert_eq!(export_row_limit(above), None);
+        }
     }
 }

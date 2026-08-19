@@ -833,6 +833,61 @@ fn export_parquet_writes_valid_file() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A `max_rows` BELOW the query's own row count caps the written file.
+/// Every other export test passes a limit larger than the fixture, so the
+/// bounded arm could be deleted with the suite still green while
+/// `[server] max_export_rows` silently stopped applying.
+#[test]
+fn export_parquet_row_limit_binds() {
+    let (exec, glob) = setup();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_owned();
+    drop(tmp);
+
+    // The nginx fixture head is 3 rows; the cap is 2.
+    exec.export_parquet(
+        "service=nginx | head 3",
+        &glob,
+        &FieldTypes::new(),
+        &path,
+        2,
+    )
+    .unwrap();
+
+    let read_glob = format!("{}", path.display());
+    let result = exec.run_query_max("*", &read_glob).unwrap();
+    assert_eq!(result.row_count(), 2, "export must honour max_rows");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A cap ABOVE the INT64 LIMIT domain takes the unbounded shape rather
+/// than a `DuckDB` conversion error: `usize::MAX` is the sentinel, but
+/// `[server] max_export_rows` is operator-set and every value past
+/// `i64::MAX` is equally unnameable in a LIMIT.
+#[test]
+fn export_parquet_row_limit_above_i64_max_is_unbounded() {
+    let (exec, glob) = setup();
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_owned();
+    drop(tmp);
+
+    exec.export_parquet(
+        "service=nginx | head 3",
+        &glob,
+        &FieldTypes::new(),
+        &path,
+        usize::MAX - 1,
+    )
+    .unwrap();
+
+    let read_glob = format!("{}", path.display());
+    let result = exec.run_query_max("*", &read_glob).unwrap();
+    assert_eq!(result.row_count(), 3);
+
+    std::fs::remove_file(&path).ok();
+}
+
 #[test]
 fn export_parquet_with_stats_roundtrips() {
     let (exec, glob) = setup();
