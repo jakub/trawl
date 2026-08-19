@@ -49,6 +49,8 @@ The two salvage doors cannot reject, because there is nobody to reject *to*: a s
 
 The listener writes no envelope field of its own. It publishes what it parsed as ordinary prefixed columns — `syslog_severity` (the **raw** PRI numeral, 0–7, omitted entirely when the frame carried no PRI), `syslog_timestamp` (the frame's own time in RFC 3339 UTC, omitted when the frame carried none), plus `syslog_facility`, `syslog_pid`, `syslog_msgid`, `syslog_source_ip` and the flattened `sd_*` structured-data pairs — and the profile's fixed derivation sources read those back. That is why `_severity` on a syslog event is inverted correctly while the stored numeral is not: provenance licenses the inversion, and the config is where provenance is asserted.
 
+RFC 3164 timestamps carry no year. In the listener's local timezone, it evaluates the previous, current and next year and chooses the valid date nearest the event's arrival instant; an exact tie goes to the past. This keeps a late-December event received in early January in the previous year (and handles the reverse direction without landing months in the future). If none of those years can represent the date, such as a leap day surrounded by non-leap years, the timestamp remains unparseable and the normal `_time` derivation falls back to arrival time.
+
 **Back-compat.** `_severity` on syslog events means exactly what it always did, so existing queries and alerts are unaffected. Rows written before this change simply lack the new columns: `_producer`, `syslog_severity` and `syslog_timestamp` read as `NULL` on them, since `UNION ALL BY NAME` tolerates an absent column. Nothing rewrites history — derivation is forward-only, and reinterpreting an old corpus is a repin, not a config reload.
 
 #### Timestamps
