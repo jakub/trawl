@@ -134,11 +134,21 @@ const FLOAT_LITS: &[&str] = &[
 // `random_generator_surface_is_complete`:
 //
 //  1. every selector's arm count is a NAMED constant checked against a required
-//     value, so narrowing one cannot be an invisible literal edit; and
-//  2. the set of scalar functions the generator can actually emit is observed
-//     from a deterministic sample and checked for SET EQUALITY, so a function
-//     that stops being generated fails loudly even if the arm count is
-//     "fixed up" in the same edit.
+//     value — the cheap first line, so narrowing one cannot be an invisible
+//     literal edit;
+//  2. every generator ARM carries a stable label, the labels drawn over a
+//     deterministic sweep are checked for SET EQUALITY against
+//     [`REQUIRED_GENERATOR_ARMS`], and BRANCH IDENTITY — not the head symbol of
+//     the emitted text — is what that set is made of. Two arms can share a head
+//     symbol (`strptime` over a full vs. a PARTIAL format, `tostring` over an
+//     int vs. a FLOAT) and are distinct coverage classes: deleting either one
+//     leaves the function-name set below completely unchanged, which is the F1
+//     failure mode surviving one level down. It does not survive this guard; and
+//  3. the set of scalar function NAMES the generator actually emits is observed
+//     from the generated TEXT and checked for set equality too. A label is the
+//     generator's self-report and could lie about what its arm emits; this third
+//     projection reads the expression itself, so it catches an arm rewritten to
+//     emit something else under the same label.
 
 const SCALAR_FAMILY_ARMS: usize = 15;
 const STRING_FN_ARMS: usize = 8;
@@ -160,9 +170,81 @@ const REQUIRED_SELECTOR_ARMS: &[(&str, usize, usize)] = &[
     ("random_strptime shape", STRPTIME_SHAPE_ARMS, 4),
 ];
 
+/// A generated expression together with the generator ARMS that produced it.
+///
+/// `arms` is the guard's unit of identity. Most arms contribute exactly one
+/// label; an arm that composes INDEPENDENT sub-choices contributes one per
+/// choice (`sev` picks an argument shape and a dialect; `concat` picks a kind
+/// per argument), so deleting either axis is visible on its own. Duplicates are
+/// fine — the guard compares SETS.
+struct Generated {
+    arms: Vec<&'static str>,
+    expression: String,
+}
+
+impl Generated {
+    fn new(arm: &'static str, expression: String) -> Self {
+        Self {
+            arms: vec![arm],
+            expression,
+        }
+    }
+
+    /// Record a second, independent choice this arm made.
+    fn and(mut self, arm: &'static str) -> Self {
+        self.arms.push(arm);
+        self
+    }
+}
+
+/// Every coverage class the random generator can draw. One label per BRANCH,
+/// so a deleted arm is a missing label even when its neighbours keep emitting
+/// the same function name.
+const REQUIRED_GENERATOR_ARMS: &[&str] = &[
+    "coalesce",
+    "concat/arg_int",
+    "concat/arg_null",
+    "concat/arg_string",
+    "conditional/cond_false",
+    "conditional/cond_true",
+    "date_diff",
+    "date_part",
+    "date_trunc",
+    "numeric_fn/abs",
+    "numeric_fn/round",
+    "sev/arg_field_level",
+    "sev/arg_field_sev_num",
+    "sev/arg_field_status",
+    "sev/arg_integer_literal",
+    "sev/arg_text_literal",
+    "sev/dialect_default",
+    "sev/dialect_otel",
+    "sev/dialect_syslog",
+    "strftime",
+    "string_fn/contains",
+    "string_fn/length",
+    "string_fn/lower",
+    "string_fn/ltrim",
+    "string_fn/replace",
+    "string_fn/rtrim",
+    "string_fn/trim",
+    "string_fn/upper",
+    "strptime/full_format",
+    "strptime/partial_format",
+    "strptime/unparseable",
+    "substr/start_and_len",
+    "substr/start_only",
+    "tonumber/digit_separator_text",
+    "tonumber/integer_text",
+    "tostring/float",
+    "tostring/int",
+    "typeof",
+];
+
 /// Every scalar function `random_scalar_expr` can put at the HEAD of a
-/// generated expression. `ceil`/`floor` are absent on purpose — see
-/// [`NUMERIC_FN_ARMS`].
+/// generated expression — the THIRD projection, read off the emitted text
+/// rather than off an arm's self-reported label. `ceil`/`floor` are absent on
+/// purpose — see [`NUMERIC_FN_ARMS`].
 const REQUIRED_RANDOM_CALL_NAMES: &[&str] = &[
     "abs",
     "coalesce",
@@ -200,9 +282,9 @@ fn leading_call_name(expression: &str) -> &str {
 
 // ── DSL expression generation ─────────────────────────────────────────
 
-/// Generate a scalar DSL expression string (no `now()`, no field refs
-/// that could be absent from the fixed event).
-fn random_scalar_expr(rng: &mut Rng) -> Option<String> {
+/// Generate a scalar DSL expression (no `now()`, no field refs that could be
+/// absent from the fixed event), labelled with the arms that produced it.
+fn random_scalar_expr(rng: &mut Rng) -> Option<Generated> {
     match rng.range(SCALAR_FAMILY_ARMS) {
         0 => Some(random_string_fn(rng)),
         1 => Some(random_numeric_fn(rng)),
@@ -241,20 +323,26 @@ fn float_lit(rng: &mut Rng) -> String {
     (*rng.pick(FLOAT_LITS)).to_string()
 }
 
-fn random_string_fn(rng: &mut Rng) -> String {
+fn random_string_fn(rng: &mut Rng) -> Generated {
     match rng.range(STRING_FN_ARMS) {
-        0 => format!("lower({})", str_lit(rng)),
-        1 => format!("upper({})", str_lit(rng)),
-        2 => format!("length({})", str_lit(rng)),
-        3 => format!("trim({})", str_lit(rng)),
-        4 => format!("ltrim({})", str_lit(rng)),
-        5 => format!("rtrim({})", str_lit(rng)),
-        6 => format!("contains({}, {})", str_lit(rng), str_lit(rng)),
-        7 => format!(
-            "replace({}, {}, {})",
-            str_lit(rng),
-            str_lit(rng),
-            str_lit(rng)
+        0 => Generated::new("string_fn/lower", format!("lower({})", str_lit(rng))),
+        1 => Generated::new("string_fn/upper", format!("upper({})", str_lit(rng))),
+        2 => Generated::new("string_fn/length", format!("length({})", str_lit(rng))),
+        3 => Generated::new("string_fn/trim", format!("trim({})", str_lit(rng))),
+        4 => Generated::new("string_fn/ltrim", format!("ltrim({})", str_lit(rng))),
+        5 => Generated::new("string_fn/rtrim", format!("rtrim({})", str_lit(rng))),
+        6 => Generated::new(
+            "string_fn/contains",
+            format!("contains({}, {})", str_lit(rng), str_lit(rng)),
+        ),
+        7 => Generated::new(
+            "string_fn/replace",
+            format!(
+                "replace({}, {}, {})",
+                str_lit(rng),
+                str_lit(rng),
+                str_lit(rng)
+            ),
         ),
         _ => unreachable!(),
     }
@@ -271,23 +359,27 @@ fn random_string_fn(rng: &mut Rng) -> String {
 /// the return types, restore both arms and set this back to 4.
 const NUMERIC_FN_ARMS: usize = 2;
 
-fn random_numeric_fn(rng: &mut Rng) -> String {
+fn random_numeric_fn(rng: &mut Rng) -> Generated {
     let i = int_lit(rng);
     match rng.range(NUMERIC_FN_ARMS) {
-        0 => format!("abs({i})"),
-        1 => format!("round({i})"),
+        0 => Generated::new("numeric_fn/abs", format!("abs({i})")),
+        1 => Generated::new("numeric_fn/round", format!("round({i})")),
         _ => unreachable!(),
     }
 }
 
-fn random_conditional(rng: &mut Rng) -> String {
-    let cond = if rng.bool() { "true" } else { "false" };
+fn random_conditional(rng: &mut Rng) -> Generated {
+    let (arm, cond) = if rng.bool() {
+        ("conditional/cond_true", "true")
+    } else {
+        ("conditional/cond_false", "false")
+    };
     let a = str_lit(rng);
     let b = str_lit(rng);
-    format!("if({cond}, {a}, {b})")
+    Generated::new(arm, format!("if({cond}, {a}, {b})"))
 }
 
-fn random_date_part(rng: &mut Rng) -> String {
+fn random_date_part(rng: &mut Rng) -> Generated {
     // Exclude "epoch": eval and DuckDB round the same instant to adjacent f64
     // values (a value-domain divergence, not a rendering one — the harness
     // stopped comparing through text), pinned by
@@ -297,70 +389,88 @@ fn random_date_part(rng: &mut Rng) -> String {
     let units: Vec<&&str> = DATE_PART_UNITS.iter().filter(|u| **u != "epoch").collect();
     let unit = rng.pick(&units);
     let ts = ts_lit(rng);
-    format!("date_part(\"{unit}\", {ts})")
+    Generated::new("date_part", format!("date_part(\"{unit}\", {ts})"))
 }
 
-fn random_date_trunc(rng: &mut Rng) -> String {
+fn random_date_trunc(rng: &mut Rng) -> Generated {
     let unit = rng.pick(DATE_UNITS);
     let ts = ts_lit(rng);
-    format!("date_trunc(\"{unit}\", {ts})")
+    Generated::new("date_trunc", format!("date_trunc(\"{unit}\", {ts})"))
 }
 
-fn random_date_diff(rng: &mut Rng) -> String {
+fn random_date_diff(rng: &mut Rng) -> Generated {
     let unit = rng.pick(DATE_UNITS);
     let start = ts_lit(rng);
     let end = ts_lit(rng);
-    format!("date_diff(\"{unit}\", {start}, {end})")
+    Generated::new(
+        "date_diff",
+        format!("date_diff(\"{unit}\", {start}, {end})"),
+    )
 }
 
-fn random_strftime(rng: &mut Rng) -> String {
+fn random_strftime(rng: &mut Rng) -> Generated {
     let ts = ts_lit(rng);
     // Only test C-strftime formats chrono and DuckDB agree on
     let fmt = rng.pick(&["%Y-%m-%d", "%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y"]);
-    format!("strftime({ts}, \"{fmt}\")")
+    Generated::new("strftime", format!("strftime({ts}, \"{fmt}\")"))
 }
 
-fn random_strptime(rng: &mut Rng) -> String {
+fn random_strptime(rng: &mut Rng) -> Generated {
     if rng.range(STRPTIME_SHAPE_ARMS) == 0 {
         // Unparseable input against a valid format: batch (TRY_STRPTIME) and
         // streaming both yield NULL, so the two paths agree on a data-parse
         // failure (TRY_STRPTIME nulls instead of erroring the whole query).
-        return "strptime(\"not-a-date\", \"%Y-%m-%d %H:%M:%S\")".to_string();
+        return Generated::new(
+            "strptime/unparseable",
+            "strptime(\"not-a-date\", \"%Y-%m-%d %H:%M:%S\")".to_string(),
+        );
     }
     if rng.range(STRPTIME_SHAPE_ARMS) == 0 {
         // Partial format: streaming fills omitted components from the
         // 1900-01-01 00:00:00 base exactly like DuckDB. Render through strftime
-        // so the filled timestamp is compared as a string.
+        // so the filled timestamp is compared as a string. Its head symbol is
+        // `strftime`, exactly like the full-format arm below — which is why the
+        // completeness guard tracks THIS label and not that name.
         let (input, fmt) = rng.pick(STRPTIME_PARTIALS);
-        return format!("strftime(strptime(\"{input}\", \"{fmt}\"), \"%Y-%m-%d %H:%M:%S\")");
+        return Generated::new(
+            "strptime/partial_format",
+            format!("strftime(strptime(\"{input}\", \"{fmt}\"), \"%Y-%m-%d %H:%M:%S\")"),
+        );
     }
     let ts = rng.pick(TS_VALS);
     // strptime returns a Timestamp — wrap it in strftime to get a string for comparison
-    format!("strftime(strptime(\"{ts}\", \"%Y-%m-%d %H:%M:%S\"), \"%Y-%m-%d %H:%M:%S\")")
+    Generated::new(
+        "strptime/full_format",
+        format!("strftime(strptime(\"{ts}\", \"%Y-%m-%d %H:%M:%S\"), \"%Y-%m-%d %H:%M:%S\")"),
+    )
 }
 
-fn random_tonumber(rng: &mut Rng) -> String {
+fn random_tonumber(rng: &mut Rng) -> Generated {
     if rng.bool() {
         // Digit-separator strings: `1_000`/`1_0.0_5` parse to a value in BOTH
         // paths; `_1000` is unparseable in both (DuckDB returns NULL -> skipped).
         // Proves the underscore-strip rule stays in DuckDB TRY_CAST parity.
         let s = rng.pick(&["1_000", "1_0.0_5", "_1000"]);
-        format!("tonumber(\"{s}\")")
+        Generated::new(
+            "tonumber/digit_separator_text",
+            format!("tonumber(\"{s}\")"),
+        )
     } else {
         // Use integer string literals so the result is exact
         let n = rng.pick(INT_VALS).unsigned_abs();
-        format!("tonumber(\"{n}\")")
+        Generated::new("tonumber/integer_text", format!("tonumber(\"{n}\")"))
     }
 }
 
-fn random_tostring(rng: &mut Rng) -> String {
+fn random_tostring(rng: &mut Rng) -> Generated {
     // Mix ints AND floats: float text rendering (1.0 -> "1.0", 1e16 -> "1e+16")
     // is the F1 divergence this exercises. The String arm of values_match does
     // an exact compare, so DuckDB CAST(DOUBLE AS VARCHAR) must byte-match eval.
+    // Both arms emit a `tostring` call, so only their LABELS tell them apart.
     if rng.bool() {
-        format!("tostring({})", int_lit(rng))
+        Generated::new("tostring/int", format!("tostring({})", int_lit(rng)))
     } else {
-        format!("tostring({})", float_lit(rng))
+        Generated::new("tostring/float", format!("tostring({})", float_lit(rng)))
     }
 }
 
@@ -368,16 +478,19 @@ fn random_tostring(rng: &mut Rng) -> String {
 /// lengths — the F2 window-semantics blind spot. start in -8..=8, optional
 /// len in -8..=8 (incl. 0). Closes the gap that let `DuckDB`'s from-end /
 /// leftward-window behaviour drift from the streaming evaluator.
-fn random_substr(rng: &mut Rng) -> String {
+fn random_substr(rng: &mut Rng) -> Generated {
     let s = str_lit(rng);
     #[allow(clippy::cast_possible_wrap)]
     let start = rng.range(SUBSTR_WINDOW_ARMS) as i64 - 8; // -8..=8
     if rng.bool() {
-        format!("substr({s}, {start})")
+        Generated::new("substr/start_only", format!("substr({s}, {start})"))
     } else {
         #[allow(clippy::cast_possible_wrap)]
         let len = rng.range(SUBSTR_WINDOW_ARMS) as i64 - 8; // -8..=8
-        format!("substr({s}, {start}, {len})")
+        Generated::new(
+            "substr/start_and_len",
+            format!("substr({s}, {start}, {len})"),
+        )
     }
 }
 
@@ -420,52 +533,78 @@ const SEV_TEXTS: &[&str] = &[
 /// `sev(x[, dialect])` over literals AND over the event's own columns —
 /// the SQL lane reads the column's TEXT form while eval reads the wire
 /// JSON, so a field arm is the one that proves the two readings agree.
-fn random_sev(rng: &mut Rng) -> String {
-    let arg = match rng.range(SEV_ARG_ARMS) {
-        0 => format!("\"{}\"", rng.pick(SEV_TEXTS)),
-        1 => rng.pick(&[0_i64, 1, 3, 7, 8, 17, 24, 25, -1]).to_string(),
-        2 => "level".to_string(),
-        3 => "sev_num".to_string(),
-        4 => "status".to_string(),
+fn random_sev(rng: &mut Rng) -> Generated {
+    // Argument shape and dialect are INDEPENDENT choices, so each contributes
+    // its own label: dropping `syslog`, or dropping the `level` column arm,
+    // has to be visible on its own rather than masked by the other axis.
+    let (arg_arm, arg) = match rng.range(SEV_ARG_ARMS) {
+        0 => (
+            "sev/arg_text_literal",
+            format!("\"{}\"", rng.pick(SEV_TEXTS)),
+        ),
+        1 => (
+            "sev/arg_integer_literal",
+            rng.pick(&[0_i64, 1, 3, 7, 8, 17, 24, 25, -1]).to_string(),
+        ),
+        2 => ("sev/arg_field_level", "level".to_string()),
+        3 => ("sev/arg_field_sev_num", "sev_num".to_string()),
+        4 => ("sev/arg_field_status", "status".to_string()),
         _ => unreachable!(),
     };
-    match rng.range(SEV_DIALECT_ARMS) {
-        0 => format!("sev({arg})"),
-        1 => format!("sev({arg}, \"otel\")"),
-        2 => format!("sev({arg}, \"syslog\")"),
+    let (dialect_arm, expression) = match rng.range(SEV_DIALECT_ARMS) {
+        0 => ("sev/dialect_default", format!("sev({arg})")),
+        1 => ("sev/dialect_otel", format!("sev({arg}, \"otel\")")),
+        2 => ("sev/dialect_syslog", format!("sev({arg}, \"syslog\")")),
         _ => unreachable!(),
-    }
+    };
+    Generated::new(arg_arm, expression).and(dialect_arm)
 }
 
-fn random_typeof(rng: &mut Rng) -> String {
+fn random_typeof(rng: &mut Rng) -> Generated {
     // typeof on strings only: DuckDB returns BIGINT for integer literals (it
     // widens all integer literals to BIGINT) while eval returns INTEGER.
     // This is a documented eval/DuckDB divergence for typeof — only test
     // varchar inputs where both agree on "VARCHAR".
-    format!("typeof({})", str_lit(rng))
+    Generated::new("typeof", format!("typeof({})", str_lit(rng)))
 }
 
-fn random_coalesce(rng: &mut Rng) -> String {
+fn random_coalesce(rng: &mut Rng) -> Generated {
     let a = str_lit(rng);
     let b = str_lit(rng);
-    format!("coalesce({a}, {b})")
+    Generated::new("coalesce", format!("coalesce({a}, {b})"))
 }
 
 /// 2–4 concat args, each a string/int literal or a bare `null`. Exercises
 /// `DuckDB`'s CONCAT NULL-skipping and CAST-to-VARCHAR join against the
 /// streaming evaluator (the #22 batch-vs-live drift this fix closes).
 /// (Floats omitted: `DuckDB` float→text rendering differs from Rust's.)
-fn random_concat(rng: &mut Rng) -> String {
+fn random_concat(rng: &mut Rng) -> Generated {
     let n = 2 + rng.range(3); // 2..=4 args
+    // Labelled per ARGUMENT kind, so dropping the `null` argument arm — the
+    // whole point of the family — cannot hide behind the surviving string/int
+    // arguments of the same `concat(...)` call.
+    let mut arms = Vec::new();
     let args: Vec<String> = (0..n)
         .map(|_| match rng.range(CONCAT_ARG_ARMS) {
-            0 => str_lit(rng),
-            1 => int_lit(rng),
-            2 => "null".to_string(),
+            0 => {
+                arms.push("concat/arg_string");
+                str_lit(rng)
+            }
+            1 => {
+                arms.push("concat/arg_int");
+                int_lit(rng)
+            }
+            2 => {
+                arms.push("concat/arg_null");
+                "null".to_string()
+            }
             _ => unreachable!(),
         })
         .collect();
-    format!("concat({})", args.join(", "))
+    Generated {
+        arms,
+        expression: format!("concat({})", args.join(", ")),
+    }
 }
 
 // ── Event fixture (all fields present to avoid binder errors) ─────────
@@ -997,18 +1136,42 @@ fn random_generator_surface_is_complete() {
     }
 
     let mut rng = Rng::new(0x5EED_5CA1);
-    let mut observed = BTreeSet::new();
+    let mut observed_arms = BTreeSet::new();
+    let mut observed_names = BTreeSet::new();
     for _ in 0..20_000 {
-        let expression = random_scalar_expr(&mut rng)
+        let generated = random_scalar_expr(&mut rng)
             .expect("scalar generator infrastructure failure: no family selected");
-        observed.insert(leading_call_name(&expression).to_string());
+        observed_arms.extend(generated.arms.iter().copied());
+        observed_names.insert(leading_call_name(&generated.expression).to_string());
     }
-    let required: BTreeSet<String> = REQUIRED_RANDOM_CALL_NAMES
+
+    let required_arms: BTreeSet<&str> = REQUIRED_GENERATOR_ARMS.iter().copied().collect();
+    assert_eq!(
+        required_arms.len(),
+        REQUIRED_GENERATOR_ARMS.len(),
+        "REQUIRED_GENERATOR_ARMS holds a duplicate label — every arm needs its OWN \
+         discriminant, or two coverage classes share one slot and either can be \
+         deleted for free"
+    );
+    assert_eq!(
+        observed_arms, required_arms,
+        "the random scalar generator's ARM SET drifted. An arm that DISAPPEARED is \
+         a skip moved to generation time, which ADR-0017 §5 outlaws — and it is \
+         invisible to the function-name check below whenever a sibling arm emits \
+         the same head symbol (`strptime/partial_format` vs `strptime/full_format`, \
+         `tostring/float` vs `tostring/int`). What to do: RESTORE the arm; or, if \
+         it was removed because it now diverges, PIN the divergence in a named \
+         `current_*_child_105` test asserting TODAY'S behaviour and update \
+         REQUIRED_GENERATOR_ARMS in the SAME commit. An arm that APPEARED is new \
+         coverage and belongs in the constant."
+    );
+
+    let required_names: BTreeSet<String> = REQUIRED_RANDOM_CALL_NAMES
         .iter()
         .map(|name| (*name).to_string())
         .collect();
     assert_eq!(
-        observed, required,
+        observed_names, required_names,
         "the random scalar generator's function surface drifted. A name that \
          DISAPPEARED was deleted from a `random_*` arm — pin the divergence in a \
          named `current_*_child_105` test (ADR-0017 §5) and update \
@@ -1509,7 +1672,7 @@ fn scalar_eval_matches_sql_parity() {
     let mut blob_skips = 0u32;
 
     for i in 0..500 {
-        let expr_str = random_scalar_expr(&mut rng)
+        let generated = random_scalar_expr(&mut rng)
             .expect("scalar generator infrastructure failure: no family selected");
 
         // ONE implementation of the batch/eval contract: `assert_parity_case`
@@ -1518,7 +1681,12 @@ fn scalar_eval_matches_sql_parity() {
         // `Value::Null`, which is strictly WEAKER — `From<EvalValue> for Value`
         // maps `Float(NaN)` and `Float(±inf)` onto `Value::Null`, so an eval
         // NaN/inf where DuckDB errored was silently accepted.
-        match assert_parity_case(&conn, &event, &format!("iteration {i}"), &expr_str) {
+        match assert_parity_case(
+            &conn,
+            &event,
+            &format!("iteration {i}"),
+            &generated.expression,
+        ) {
             Some(SkipCategory::HugeIntOutsideI64) => hugeint_skips += 1,
             Some(SkipCategory::Blob) => blob_skips += 1,
             None => passed += 1,
