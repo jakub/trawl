@@ -875,10 +875,6 @@ fn values_match(eval: &EvalValue, sql: &SqlCell) -> bool {
     logical_type_matches(eval, &sql.logical_type) && scalar_values_match(eval, &sql.value)
 }
 
-fn normalize_eval(v: &EvalValue) -> Value {
-    v.clone().into()
-}
-
 fn assert_parity_case(
     conn: &Connection,
     event: &Map<String, Value>,
@@ -1776,10 +1772,14 @@ fn strftime_over_strptime_binds_params_in_order() {
         "batch strftime(strptime(...)) must not error or null"
     );
 
-    // Streaming path (eval).
+    // Streaming path (eval). Compared as an `EvalValue`, not through the
+    // retired `normalize_eval`: `From<EvalValue> for Value` maps BOTH `Str` and
+    // `Timestamp` onto `Value::String`, so the serde form could not tell a
+    // rendered string from a rendered instant.
     assert_eq!(
-        normalize_eval(&eval_scalar(dsl, &event)),
-        Value::String("2023".to_string())
+        eval_scalar(dsl, &event),
+        EvalValue::Str("2023".to_string()),
+        "streaming strftime(strptime(...)) must not error or null"
     );
 }
 
@@ -1836,8 +1836,8 @@ fn strptime_partial_formats_match_duckdb() {
         );
 
         assert_eq!(
-            normalize_eval(&eval_scalar(dsl, &event)),
-            Value::String(want.to_string()),
+            eval_scalar(dsl, &event),
+            EvalValue::Str(want.to_string()),
             "streaming strptime partial-format must match DuckDB for {dsl:?}"
         );
     }
