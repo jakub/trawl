@@ -319,6 +319,14 @@ fn schema_witness_event() -> Map<String, Value> {
     event
 }
 
+fn non_text_schema_witness_event() -> Map<String, Value> {
+    let mut event = schema_witness_event();
+    event.insert("message".into(), Value::from(123));
+    event.insert("_raw".into(), Value::Bool(false));
+    event.insert("service".into(), Value::String("non-text-witness".into()));
+    event
+}
+
 // ── Property test ─────────────────────────────────────────────────────
 
 #[test]
@@ -439,6 +447,9 @@ fn assert_sparse_text_parity(
         .unwrap();
     writeln!(tmp, "{}", Value::Object(target)).unwrap();
     writeln!(tmp, "{}", Value::Object(schema_witness_event())).unwrap();
+    // Force `read_json_auto` to infer heterogeneous text columns as JSON. The
+    // target row can then prove both genuine JSON strings and non-string cells.
+    writeln!(tmp, "{}", Value::Object(non_text_schema_witness_event())).unwrap();
     tmp.flush().unwrap();
 
     let emitted = emitter::emit(&query, tmp.path().to_str().unwrap()).expect("emit succeeds");
@@ -637,6 +648,10 @@ fn sparse_text_containment_is_total_in_both_lanes() {
         serde_json::json!({"message": null, "_raw": "needle multi word beta"}),
         serde_json::json!({"message": "clean", "_raw": "also clean"}),
         serde_json::json!({"message": "beta", "_raw": "clean"}),
+        serde_json::json!({"message": 123, "_raw": false}),
+        serde_json::json!({"message": true, "_raw": 123}),
+        serde_json::json!({"message": "123 true", "_raw": false}),
+        serde_json::json!({"message": true, "_raw": "123 true"}),
     ];
 
     for value in cases {
@@ -657,6 +672,10 @@ fn sparse_text_containment_is_total_in_both_lanes() {
             ("NOT needle", !contains("needle")),
             (r#"NOT "multi word""#, !contains("multi word")),
             ("alpha OR NOT beta", contains("alpha") || !contains("beta")),
+            ("123", contains("123")),
+            ("NOT 123", !contains("123")),
+            ("true", contains("true")),
+            ("NOT true", !contains("true")),
         ] {
             assert_sparse_text_parity(&conn, dsl, &event, expected);
         }

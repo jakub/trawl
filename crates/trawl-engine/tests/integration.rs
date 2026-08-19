@@ -709,6 +709,36 @@ fn text_containment_is_total_for_sparse_rows() {
     }
 }
 
+#[test]
+fn text_containment_treats_non_text_columns_as_non_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("non-text.parquet");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES
+             (1, 123, TRUE),
+             (2, NULL, FALSE)
+         ) t(case_id, message, _raw)) TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .expect("non-text fixture should be written");
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = path.display().to_string();
+    for dsl in ["123", "true"] {
+        let positive = exec.run_query_max(dsl, &source).expect("positive search");
+        assert!(
+            integer_column(&positive, "case_id").is_empty(),
+            "{dsl} must not stringify non-text columns"
+        );
+
+        let negative = exec
+            .run_query_max(&format!("NOT {dsl}"), &source)
+            .expect("negated search");
+        assert_eq!(integer_column(&negative, "case_id"), [1, 2]);
+    }
+}
+
 /// The fallback is evidence-based: it rescues a query whose only unbindable
 /// column was `_raw`. A genuinely unknown field still errors.
 #[test]

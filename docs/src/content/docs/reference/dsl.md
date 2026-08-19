@@ -605,7 +605,7 @@ Bare-word and phrase search match the `message` column **and** `_raw`,
 so content that was parsed away is still findable. Negation excludes an
 event when either column matches. Text containment is deliberately
 **two-valued** (ADR-0015):
-a missing or null `message`/`_raw` does not contain the term. Consequently
+a missing, null, or non-text `message`/`_raw` does not contain the term. Consequently
 `-debug`, `NOT debug`, and `NOT "debug"` agree even on foreign data that
 does not carry one or both columns.
 
