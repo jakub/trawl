@@ -65,6 +65,54 @@ fn conform(quoted: &str, pin: CanonicalType) -> String {
     guarded_cast(&untyped_text(quoted), pin)
 }
 
+/// Issue #91: execute the emitted negated-list predicate against a real
+/// VARCHAR parquet column. Every element must use the existing dual
+/// text/DECIMAL equality rule, and the search-stage NULL widening must
+/// survive their AND composition.
+#[test]
+fn varchar_negated_list_executes_as_pin_aware_not_in_with_null_widening() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("status.parquet");
+    let conn = conn();
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES ('200'), ('0200'), ('200.0'), ('301'), ('404'), \
+         (CAST(NULL AS VARCHAR))) AS t(status)) TO '{}' (FORMAT PARQUET)",
+        file.display()
+    ))
+    .unwrap();
+
+    let query = trawl_core::parser::parse("status!=200,301").unwrap();
+    let mut pins = trawl_core::schema::FieldTypes::new();
+    pins.insert("status", CanonicalType::Varchar);
+    let emitted =
+        trawl_core::emitter::emit_with_pins(&query, &file.display().to_string(), &pins).unwrap();
+    let params: Vec<Box<dyn duckdb::ToSql>> = emitted
+        .params
+        .iter()
+        .map(|value| -> Box<dyn duckdb::ToSql> {
+            match value {
+                trawl_core::emitter::SqlValue::String(value) => Box::new(value.clone()),
+                trawl_core::emitter::SqlValue::Int(value) => Box::new(*value),
+                trawl_core::emitter::SqlValue::Float(value) => Box::new(*value),
+                trawl_core::emitter::SqlValue::Bool(value) => Box::new(*value),
+            }
+        })
+        .collect();
+    let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+    let sql = format!(
+        "SELECT status FROM ({}) AS matched ORDER BY status NULLS LAST",
+        emitted.sql
+    );
+    let mut statement = conn.prepare(&sql).unwrap();
+    let rows: Vec<Option<String>> = statement
+        .query_map(param_refs.as_slice(), |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    assert_eq!(rows, vec![Some("404".to_owned()), None], "{sql}");
+}
+
 #[test]
 fn untyped_varchar_conform_expression_is_unquoted_across_inference_classes() {
     let dir = tempfile::tempdir().unwrap();

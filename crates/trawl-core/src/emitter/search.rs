@@ -203,7 +203,29 @@ fn emit_field_filter(
                 .iter()
                 .map(|v| compare::compare_form(pin, FilterOp::Eq, v))
                 .collect::<Result<_, _>>()?;
-            let clause = in_list_sql(&field, forms, state);
+            let clause = match ff.op {
+                // Positive lists keep the existing set-membership renderer.
+                FilterOp::Eq => in_list_sql(&field, forms, state),
+                // Search-stage `f!=a,b` is compositionally
+                // `f!=a AND f!=b`: every element binds through the same
+                // equality form as a positive list, then the scalar `!=`
+                // renderer supplies its established NULL widening.
+                FilterOp::Ne => forms
+                    .into_iter()
+                    .map(|form| {
+                        comparison_sql(&field, FilterOp::Ne, form, NullPolicy::NeMatchesNull, state)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND "),
+                // The parser rejects ordered comma lists before emission.
+                FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte => {
+                    unreachable!("ordered operators cannot reach a comma-separated list")
+                }
+                // Lists never auto-detect as patterns.
+                FilterOp::Glob | FilterOp::Regex => {
+                    unreachable!("pattern operators cannot reach a comma-separated list")
+                }
+            };
             state.push_where(clause);
         }
     }

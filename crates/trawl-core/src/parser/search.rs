@@ -123,9 +123,20 @@ fn field_filter<'src>()
         .ignore_then(field_name())
         .then(filter_op())
         .then(filter_value())
-        .map(|((field, op), (auto_op, value))| {
+        .validate(|((field, op), (auto_op, value)), extra, emitter| {
             // auto_op overrides for glob/regex detection
             let final_op = if auto_op == FilterOp::Eq { op } else { auto_op };
+            if matches!(value, FilterValue::List(_))
+                && !matches!(final_op, FilterOp::Eq | FilterOp::Ne)
+            {
+                // Emit while still returning the parsed token. A returned
+                // error would let the leaf choice recover as a bare text
+                // search for the whole `f>=a,b` spelling.
+                emitter.emit(Rich::custom(
+                    extra.span(),
+                    "comma-separated lists only support `=` and `!=`",
+                ));
+            }
             SearchToken::FieldFilter(FieldFilter {
                 field,
                 op: final_op,
@@ -547,6 +558,21 @@ mod tests {
                 ]),
             })
         );
+    }
+
+    #[test]
+    fn ordered_field_filter_lists_name_the_supported_operators() {
+        for dsl in ["status>a,b", "status>=a,b", "status<a,b", "status<=a,b"] {
+            let errors = crate::parser::parse(dsl).expect_err("ordered list must not parse");
+            assert!(
+                errors.iter().any(|error| {
+                    error
+                        .message
+                        .contains("comma-separated lists only support `=` and `!=`")
+                }),
+                "{dsl}: {errors:?}"
+            );
+        }
     }
 
     #[test]
