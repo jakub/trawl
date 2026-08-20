@@ -44,7 +44,10 @@ clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["bracketed-paste"] }
 dashmap = "6"
 comfy-table = "7"
-duckdb = { version = "1.5" }
+# duckdb-rs encodes DuckDB 1.5.x as 1.105xx.x. The version-sensitive probe
+# matrix is release-gating (ADR-0017 §5), so minor/major bumps require a
+# deliberate PR running the full probe and parity suites, never lockfile drift.
+duckdb = { version = ">=1.10500, <1.10600" }
 flate2 = "1"
 futures = "0.3"
 fs4 = "1.1"

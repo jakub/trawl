@@ -86,6 +86,8 @@ persistence:
 # (init-auth and trawl-web are untouched). The dump PVC is separate from the data
 # PVC, so dumps stay out of data backups and survive container restarts, pod
 # reschedules, and node reboots. Off by default.
+# Requires persistence.enabled=true; rendering fails instead of silently using
+# pod-local storage when crash dumps are enabled without persistent data.
 #
 # trawld reads the contract below from the environment:
 #   TRAWL_CRASH_DUMP_DIR    <- mountPath
