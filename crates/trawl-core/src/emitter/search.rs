@@ -103,10 +103,10 @@ fn emit_or_groups(
 /// Emit the two-column bare/quoted text-search predicate.
 ///
 /// Bare-word search hits `message` and additionally `_raw` where present
-/// (ADR-0009). Negation requires `message` present and the term absent
-/// from both columns — `COALESCE(..., TRUE)` keeps a NULL `_raw` from
-/// vetoing the row under SQL three-valued logic. The in-memory filter
-/// ([`crate::filter`]) mirrors these semantics exactly.
+/// (ADR-0009). Containment is total (ADR-0015): a NULL/missing column does
+/// not contain the term, so every positive or negated composition has a
+/// two-valued answer. The in-memory filter ([`crate::filter`]) mirrors these
+/// semantics exactly.
 ///
 /// Searching `_raw` is **whole-event search**, deliberately: except when a
 /// collector supplied its own pre-parse line, `_raw` is the server's JSON
@@ -126,13 +126,24 @@ fn push_text_search(pattern: String, negated: bool, state: &mut EmitterState) {
     let p1 = state.push_param(SqlValue::String(pattern.clone()));
     let p2 = state.push_param(SqlValue::String(pattern));
     let raw = state.raw_column();
+    let message_contains = text_contains(r#""message""#, &p1);
+    let raw_contains = text_contains(raw, &p2);
     if negated {
-        state.push_where(format!(
-            "(\"message\" NOT ILIKE {p1} AND COALESCE({raw} NOT ILIKE {p2}, TRUE))"
-        ));
+        state.push_where(format!("(NOT {message_contains} AND NOT {raw_contains})"));
     } else {
-        state.push_where(format!("(\"message\" ILIKE {p1} OR {raw} ILIKE {p2})"));
+        state.push_where(format!("({message_contains} OR {raw_contains})"));
     }
+}
+
+/// Bind `ILIKE` to a text value only. Foreign sources can carry a numeric or
+/// boolean `message`/`_raw`, and heterogeneous NDJSON is inferred as `JSON`;
+/// non-string cells must not become matches through stringification while a
+/// JSON string cell must remain searchable. The CASE produces nullable text
+/// before the single pattern placeholder is applied.
+fn text_contains(column: &str, param: &str) -> String {
+    format!(
+        "COALESCE((CASE WHEN typeof({column}) = 'VARCHAR' THEN CAST({column} AS VARCHAR) WHEN typeof({column}) = 'JSON' AND json_type(CAST({column} AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST({column} AS JSON), '$') ELSE NULL END) ILIKE {param}, FALSE)"
+    )
 }
 
 fn emit_search_token(

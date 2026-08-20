@@ -11,11 +11,13 @@
 //! Key invariant: `filter.matches(event)` must agree with running the
 //! emitted SQL against `DuckDB` for every `(event, search_stage)` pair.
 //!
-//! Evaluation is therefore three-valued, like the SQL it mirrors: every
-//! matcher answers [`Truth`] (`Some(true)`/`Some(false)`/`None` for
-//! UNKNOWN), UNKNOWN propagates through NOT/AND/OR by SQL's rules, and
-//! only a final `Some(true)` is a match. Collapsing UNKNOWN to `false`
-//! at the leaf would survive a top-level filter but invert under `NOT`:
+//! Evaluation is therefore three-valued, like the SQL it mirrors: field
+//! matchers answer [`Truth`] (`Some(true)`/`Some(false)`/`None` for UNKNOWN),
+//! UNKNOWN propagates through NOT/AND/OR by SQL's rules, and only a final
+//! `Some(true)` is a match. Text containment is the deliberate two-valued
+//! exception (ADR-0015): a missing `message`/`_raw` does not contain a term.
+//! Collapsing UNKNOWN to `false` at a field-comparison leaf would survive a
+//! top-level filter but invert under `NOT`:
 //! `NOT status>=400` over a VARCHAR-pinned `status="accepted"` is a live
 //! match while `NOT (TRY_CAST(status AS DECIMAL(38,6)) >= …)` stays NULL
 //! and is filtered out — a false-positive live alert.
@@ -365,7 +367,7 @@ impl TokenMatcher {
     fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
         match self {
             Self::Field(fm) => fm.eval(event),
-            Self::Text(tm) => tm.eval(event),
+            Self::Text(tm) => Some(tm.eval(event)),
             // `NOT UNKNOWN` is UNKNOWN, never a match — the SQL `NOT (...)`
             // this mirrors stays NULL and the row is filtered out.
             Self::Not(inner) => inner.eval(event).map(|b| !b),
@@ -421,36 +423,30 @@ impl TextMatcher {
     /// Bare-word search hits `message` and additionally `_raw` where
     /// present (ADR-0009). Mirrors the SQL exactly:
     ///
-    /// - positive: `("message" ILIKE p OR "_raw" ILIKE p)` — a match in
-    ///   either column passes; both missing/null → no match.
-    /// - negated: `("message" NOT ILIKE p AND COALESCE("_raw" NOT ILIKE p,
-    ///   TRUE))` — `message` must be present and term-free, and `_raw`
-    ///   (when present) term-free too.
+    /// - positive: `COALESCE("message" ILIKE p, FALSE) OR
+    ///   COALESCE("_raw" ILIKE p, FALSE)` — a match in either column passes;
+    ///   both missing/null is false.
+    /// - negated: the two-valued complement — every carried column must be
+    ///   term-free, and both missing/null is true.
     ///
     /// Searching `_raw` is whole-event search: unless a collector supplied a
     /// pre-parse line, `_raw` is the server's JSON serialization of the event,
     /// so a term matches another field's value *and* a field name — and the
     /// negated form excludes on the same basis (see
     /// [`crate::emitter`]'s `push_text_search` and the DSL reference).
-    /// A missing/non-string column is NULL, so the positive form is UNKNOWN
-    /// (not FALSE) when neither column matches and one is NULL — `NOT term`
-    /// must then leave the event unmatched, as `NOT (NULL OR NULL)` does.
-    /// The negated form's `COALESCE(... , TRUE)` makes its `_raw` side
-    /// total, so only a NULL `message` can make it UNKNOWN.
-    fn eval(&self, event: &serde_json::Map<String, Value>) -> Truth {
+    /// A missing/non-string column contributes false to containment. The leaf
+    /// therefore always has a true or false answer, and grammar compositions
+    /// such as `NOT term` inherit totality without a special case.
+    fn eval(&self, event: &serde_json::Map<String, Value>) -> bool {
         let msg = match event.get("message") {
-            Some(Value::String(s)) => Some(self.searcher.is_match(s)),
-            _ => None,
+            Some(Value::String(s)) => self.searcher.is_match(s),
+            _ => false,
         };
         let raw = match event.get("_raw") {
-            Some(Value::String(s)) => Some(self.searcher.is_match(s)),
-            _ => None,
+            Some(Value::String(s)) => self.searcher.is_match(s),
+            _ => false,
         };
-        if self.negated {
-            and_all([msg.map(|m| !m), Some(raw != Some(true))])
-        } else {
-            or_any([msg, raw])
-        }
+        self.negated != (msg || raw)
     }
 }
 
@@ -1205,9 +1201,10 @@ mod tests {
     fn text_search_missing_message() {
         // No message field: positive search → no match.
         assert!(!matches_event("error", r#"{"service": "nginx"}"#));
-        // Negated search: no message field → no match (SQL NULL semantics:
-        // NULL NOT ILIKE → NULL → excluded from results).
-        assert!(!matches_event("-debug", r#"{"service": "nginx"}"#));
+        // Text containment is total (ADR-0015): absent columns do not contain
+        // the term, so both negation spellings match.
+        assert!(matches_event("-debug", r#"{"service": "nginx"}"#));
+        assert!(matches_event("NOT debug", r#"{"service": "nginx"}"#));
     }
 
     // ── quoted search ─────────────────────────────────────────────────

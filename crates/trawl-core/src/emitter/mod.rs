@@ -612,7 +612,13 @@ mod tests {
     /// predicate degrades to `message` alone.
     #[test]
     fn text_search_carries_a_raw_free_variant() {
-        for dsl in ["boom", r#""boom error""#, "-boom service=nginx"] {
+        for dsl in [
+            "boom",
+            r#""boom error""#,
+            "-boom service=nginx",
+            "NOT boom",
+            r#"NOT "boom error""#,
+        ] {
             let query = parser::parse(dsl).expect("parse should succeed");
             let emitted = emit(&query, SRC).expect("emit should succeed");
             let raw_free = emitted

@@ -4,7 +4,7 @@ expression: "emit_dsl(r#\"service=nginx _severity=error last=2h \"connection ref
 ---
 SELECT *
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)
-WHERE TRY_CAST("_time" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours' AND "service" = ? AND "_severity" = ? AND ("message" ILIKE ? OR "_raw" ILIKE ?) AND ("message" NOT ILIKE ? AND COALESCE("_raw" NOT ILIKE ?, TRUE))
+WHERE TRY_CAST("_time" AS TIMESTAMP) >= now()::TIMESTAMP - INTERVAL '2 hours' AND "service" = ? AND "_severity" = ? AND (COALESCE((CASE WHEN typeof("message") = 'VARCHAR' THEN CAST("message" AS VARCHAR) WHEN typeof("message") = 'JSON' AND json_type(CAST("message" AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST("message" AS JSON), '$') ELSE NULL END) ILIKE ?, FALSE) OR COALESCE((CASE WHEN typeof("_raw") = 'VARCHAR' THEN CAST("_raw" AS VARCHAR) WHEN typeof("_raw") = 'JSON' AND json_type(CAST("_raw" AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST("_raw" AS JSON), '$') ELSE NULL END) ILIKE ?, FALSE)) AND (NOT COALESCE((CASE WHEN typeof("message") = 'VARCHAR' THEN CAST("message" AS VARCHAR) WHEN typeof("message") = 'JSON' AND json_type(CAST("message" AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST("message" AS JSON), '$') ELSE NULL END) ILIKE ?, FALSE) AND NOT COALESCE((CASE WHEN typeof("_raw") = 'VARCHAR' THEN CAST("_raw" AS VARCHAR) WHEN typeof("_raw") = 'JSON' AND json_type(CAST("_raw" AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST("_raw" AS JSON), '$') ELSE NULL END) ILIKE ?, FALSE))
 ---
 params:
   0: 'nginx'

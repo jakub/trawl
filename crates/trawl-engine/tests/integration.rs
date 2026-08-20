@@ -32,6 +32,24 @@ fn setup() -> (Executor, String) {
     (exec, glob)
 }
 
+fn integer_column(result: &QueryResult, name: &str) -> Vec<i64> {
+    let index = result
+        .columns
+        .iter()
+        .position(|column| column.name == name)
+        .unwrap_or_else(|| panic!("missing {name} column: {:?}", result.columns));
+    let mut values = result
+        .rows
+        .iter()
+        .map(|row| match row[index] {
+            Value::Integer(value) => value,
+            ref other => panic!("{name} must be an integer, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values
+}
+
 #[test]
 fn wildcard_returns_all_rows() {
     let (exec, glob) = setup();
@@ -600,9 +618,9 @@ fn foreign_parquet(dir: &std::path::Path) -> String {
     let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
     conn.execute_batch(&format!(
         "COPY (SELECT * FROM (VALUES
-             (TIMESTAMP '2024-01-15 10:00:00', 'nginx', 'boom error'),
-             (TIMESTAMP '2024-01-15 10:00:01', 'nginx', 'all quiet')
-         ) t(_time, service, message)) TO '{}' (FORMAT PARQUET)",
+             (1, TIMESTAMP '2024-01-15 10:00:00', 'nginx', 'boom error'),
+             (2, TIMESTAMP '2024-01-15 10:00:01', 'nginx', 'all quiet')
+         ) t(case_id, _time, service, message)) TO '{}' (FORMAT PARQUET)",
         path.display()
     ))
     .expect("foreign fixture should be written");
@@ -618,24 +636,107 @@ fn text_search_without_a_raw_column_searches_message() {
     let exec = Executor::new().expect("executor should initialize");
 
     let bare = exec.run_query_max("boom", &source).expect("bare word");
-    assert_eq!(bare.row_count(), 1, "bare word must match on message");
+    assert_eq!(
+        integer_column(&bare, "case_id"),
+        [1],
+        "bare word must match on message"
+    );
 
     let quoted = exec
         .run_query_max(r#""boom error""#, &source)
         .expect("quoted phrase");
-    assert_eq!(quoted.row_count(), 1, "quoted phrase must match on message");
-
-    let negated = exec.run_query_max("-boom", &source).expect("negated");
     assert_eq!(
-        negated.row_count(),
-        1,
-        "negation must not veto on a missing _raw"
+        integer_column(&quoted, "case_id"),
+        [1],
+        "quoted phrase must match on message"
     );
-    assert!(
-        !negated.columns.iter().any(|c| c.name == "_raw"),
-        "the fallback must not invent a _raw column: {:?}",
-        negated.columns
-    );
+
+    for dsl in ["-boom", "NOT boom", r#"NOT "boom error""#] {
+        let negated = exec.run_query_max(dsl, &source).expect("negated");
+        assert_eq!(
+            integer_column(&negated, "case_id"),
+            [2],
+            "{dsl} must be the complement on a missing _raw"
+        );
+        assert!(
+            !negated.columns.iter().any(|c| c.name == "_raw"),
+            "the fallback must not invent a _raw column: {:?}",
+            negated.columns
+        );
+    }
+}
+
+/// Every per-row presence/NULL combination of `message` and `_raw` has a
+/// two-valued containment answer (ADR-0015). A NULL cell is how a sparse
+/// parquet row represents an event that did not carry that field.
+#[test]
+fn text_containment_is_total_for_sparse_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sparse-text.parquet");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES
+             (1, NULL, NULL),
+             (2, NULL, 'clean'),
+             (3, 'clean', NULL),
+             (4, 'clean', 'also clean'),
+             (5, 'multi word needle', NULL),
+             (6, NULL, 'multi word needle'),
+             (7, 'multi word needle', 'clean'),
+             (8, 'clean', 'multi word needle'),
+             (9, 'multi word needle', 'multi word needle')
+         ) t(case_id, message, _raw)) TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .expect("sparse text fixture should be written");
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = path.display().to_string();
+    let positive = exec
+        .run_query_max("needle", &source)
+        .expect("positive containment");
+    assert_eq!(integer_column(&positive, "case_id"), [5, 6, 7, 8, 9]);
+
+    for dsl in ["-needle", "NOT needle", r#"NOT "multi word""#] {
+        let negative = exec
+            .run_query_max(dsl, &source)
+            .expect("negated containment");
+        assert_eq!(
+            integer_column(&negative, "case_id"),
+            [1, 2, 3, 4],
+            "{dsl} must include exactly rows where no carried column contains the term"
+        );
+    }
+}
+
+#[test]
+fn text_containment_treats_non_text_columns_as_non_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("non-text.parquet");
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES
+             (1, 123, TRUE),
+             (2, NULL, FALSE)
+         ) t(case_id, message, _raw)) TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .expect("non-text fixture should be written");
+
+    let exec = Executor::new().expect("executor should initialize");
+    let source = path.display().to_string();
+    for dsl in ["123", "true"] {
+        let positive = exec.run_query_max(dsl, &source).expect("positive search");
+        assert!(
+            integer_column(&positive, "case_id").is_empty(),
+            "{dsl} must not stringify non-text columns"
+        );
+
+        let negative = exec
+            .run_query_max(&format!("NOT {dsl}"), &source)
+            .expect("negated search");
+        assert_eq!(integer_column(&negative, "case_id"), [1, 2]);
+    }
 }
 
 /// The fallback is evidence-based: it rescues a query whose only unbindable

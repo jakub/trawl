@@ -104,13 +104,24 @@ fn random_dsl(rng: &mut Rng) -> String {
 }
 
 fn random_token(rng: &mut Rng) -> String {
-    match rng.range(6) {
+    match rng.range(9) {
         0 => random_field_eq(rng),
         1 => random_field_compare(rng),
         2 => random_field_list(rng),
         3 => random_text_search(rng),
         4 => random_quoted_search(rng),
         5 => random_field_glob(rng),
+        6 => format!("NOT {}", rng.pick(MESSAGE_WORDS)),
+        7 => {
+            let w1 = rng.pick(MESSAGE_WORDS);
+            let w2 = rng.pick(MESSAGE_WORDS);
+            format!(r#"NOT "{w1} {w2}""#)
+        }
+        8 => {
+            let included = rng.pick(MESSAGE_WORDS);
+            let excluded = rng.pick(MESSAGE_WORDS);
+            format!("{included} OR NOT {excluded}")
+        }
         _ => unreachable!(),
     }
 }
@@ -183,24 +194,27 @@ fn random_field_glob(rng: &mut Rng) -> String {
 fn random_event(rng: &mut Rng) -> Map<String, Value> {
     let mut event = Map::new();
 
-    // Include message ~80% of the time. Set to null ~20% to exercise
-    // NULL semantics in both CompiledFilter and DuckDB SQL
-    // (NULL ILIKE/NOT ILIKE → NULL → excluded from results).
-    // We use explicit null instead of omitting the key, because DuckDB's
-    // read_json_auto infers schema from the data — a missing column
-    // causes binder errors rather than NULL comparison semantics.
-    if rng.range(5) != 0 {
-        event.insert("message".to_string(), Value::String(random_message(rng)));
-    } else {
-        event.insert("message".to_string(), Value::Null);
+    // Exercise carried, null, and absent text columns. The SQL harness adds a
+    // schema-only sibling row, so an omitted key binds as a NULL cell rather
+    // than turning the parity check into a binder-error test.
+    match rng.range(6) {
+        0 => {}
+        1 => {
+            event.insert("message".to_string(), Value::Null);
+        }
+        _ => {
+            event.insert("message".to_string(), Value::String(random_message(rng)));
+        }
     }
 
-    // `_raw` present ~70% of the time (bare search covers message OR _raw);
-    // null otherwise to exercise the COALESCE semantics.
-    if rng.range(10) < 7 {
-        event.insert("_raw".to_string(), Value::String(random_message(rng)));
-    } else {
-        event.insert("_raw".to_string(), Value::Null);
+    match rng.range(6) {
+        0 => {}
+        1 => {
+            event.insert("_raw".to_string(), Value::Null);
+        }
+        _ => {
+            event.insert("_raw".to_string(), Value::String(random_message(rng)));
+        }
     }
 
     // Always include all filterable fields to avoid DuckDB binder errors.
@@ -256,8 +270,11 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
 }
 
 /// Execute emitted SQL against `DuckDB` and return whether any rows match.
-fn sql_matches(conn: &Connection, emitted: &EmittedQuery) -> bool {
-    let count_sql = format!("SELECT count(*)::BIGINT FROM ({}) AS _sub", emitted.sql);
+fn sql_matches_where(conn: &Connection, emitted: &EmittedQuery, row_filter: &str) -> bool {
+    let count_sql = format!(
+        "SELECT count(*)::BIGINT FROM ({}) AS _sub WHERE {row_filter}",
+        emitted.sql
+    );
 
     let params = bind_params(&emitted.params);
     let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
@@ -283,6 +300,31 @@ fn sql_matches(conn: &Connection, emitted: &EmittedQuery) -> bool {
             }
         }
     }
+}
+
+fn sql_matches(conn: &Connection, emitted: &EmittedQuery) -> bool {
+    sql_matches_where(conn, emitted, "TRUE")
+}
+
+fn schema_witness_event() -> Map<String, Value> {
+    let mut event = Map::new();
+    event.insert("message".into(), Value::String("schema witness".into()));
+    event.insert("_raw".into(), Value::String("schema witness".into()));
+    event.insert("service".into(), Value::String("schema-witness".into()));
+    event.insert("status".into(), Value::from(-1));
+    event.insert("host".into(), Value::String("schema-witness".into()));
+    event.insert("path".into(), Value::String("/schema-witness".into()));
+    event.insert("severity".into(), Value::from(1));
+    event.insert("_parity_target".into(), Value::Bool(false));
+    event
+}
+
+fn non_text_schema_witness_event() -> Map<String, Value> {
+    let mut event = schema_witness_event();
+    event.insert("message".into(), Value::from(123));
+    event.insert("_raw".into(), Value::Bool(false));
+    event.insert("service".into(), Value::String("non-text-witness".into()));
+    event
 }
 
 // ── Property test ─────────────────────────────────────────────────────
@@ -316,8 +358,11 @@ fn filter_matches_sql_parity() {
             .suffix(".ndjson")
             .tempfile()
             .unwrap();
-        let event_value = Value::Object(event.clone());
+        let mut target = event.clone();
+        target.insert("_parity_target".into(), Value::Bool(true));
+        let event_value = Value::Object(target);
         writeln!(tmp, "{event_value}").unwrap();
+        writeln!(tmp, "{}", Value::Object(schema_witness_event())).unwrap();
         tmp.flush().unwrap();
         let tmp_path = tmp.path().to_str().expect("temp path is valid UTF-8");
 
@@ -328,7 +373,7 @@ fn filter_matches_sql_parity() {
         };
 
         // DuckDB SQL result.
-        let sql_result = sql_matches(&conn, &emitted);
+        let sql_result = sql_matches_where(&conn, &emitted, r#""_parity_target" = TRUE"#);
 
         assert_eq!(
             filter_result, sql_result,
@@ -377,6 +422,46 @@ dsl: {dsl:?}
 event: {:?}
 sql: {}",
         event, emitted.sql
+    );
+}
+
+/// Assert text-search parity against a sparse target row while a second row
+/// supplies `read_json_auto` with both text columns. The outer target filter
+/// prevents the schema witness from affecting the answer under test.
+fn assert_sparse_text_parity(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    expected: bool,
+) {
+    let query = parser::parse(dsl).expect("dsl parses");
+    let filter =
+        CompiledFilter::compile(&query.search, &FieldTypes::new()).expect("filter compiles");
+    let filter_result = filter.matches(event);
+
+    let mut target = event.clone();
+    target.insert("_parity_target".into(), Value::Bool(true));
+    let mut tmp = tempfile::Builder::new()
+        .suffix(".ndjson")
+        .tempfile()
+        .unwrap();
+    writeln!(tmp, "{}", Value::Object(target)).unwrap();
+    writeln!(tmp, "{}", Value::Object(schema_witness_event())).unwrap();
+    // Force `read_json_auto` to infer heterogeneous text columns as JSON. The
+    // target row can then prove both genuine JSON strings and non-string cells.
+    writeln!(tmp, "{}", Value::Object(non_text_schema_witness_event())).unwrap();
+    tmp.flush().unwrap();
+
+    let emitted = emitter::emit(&query, tmp.path().to_str().unwrap()).expect("emit succeeds");
+    let sql_result = sql_matches_where(conn, &emitted, r#""_parity_target" = TRUE"#);
+    assert_eq!(
+        filter_result, sql_result,
+        "sparse text parity mismatch\ndsl: {dsl:?}\nevent: {event:?}\nsql: {}",
+        emitted.sql
+    );
+    assert_eq!(
+        filter_result, expected,
+        "wrong outcome for {dsl:?} on {event:?}"
     );
 }
 
@@ -543,6 +628,57 @@ fn bare_search_raw_parity() {
     for &(dsl, sev, message, raw) in cases {
         let event = envelope_event(sev, message, raw);
         assert_parity(&conn, dsl, &event);
+    }
+}
+
+/// ADR-0015: bare/quoted containment is the two-valued exception inside the
+/// otherwise three-valued search evaluator. Generate every query spelling
+/// over events whose text columns are carried, null, or absent, including an
+/// OR composition where leaf totality is observable under NOT.
+#[test]
+fn sparse_text_containment_is_total_in_both_lanes() {
+    let conn = Connection::open_in_memory().unwrap();
+    let cases = [
+        serde_json::json!({}),
+        serde_json::json!({"message": null}),
+        serde_json::json!({"_raw": null}),
+        serde_json::json!({"message": "clean"}),
+        serde_json::json!({"_raw": "clean"}),
+        serde_json::json!({"message": "needle multi word alpha", "_raw": null}),
+        serde_json::json!({"message": null, "_raw": "needle multi word beta"}),
+        serde_json::json!({"message": "clean", "_raw": "also clean"}),
+        serde_json::json!({"message": "beta", "_raw": "clean"}),
+        serde_json::json!({"message": 123, "_raw": false}),
+        serde_json::json!({"message": true, "_raw": 123}),
+        serde_json::json!({"message": "123 true", "_raw": false}),
+        serde_json::json!({"message": true, "_raw": "123 true"}),
+    ];
+
+    for value in cases {
+        let Value::Object(event) = value else {
+            unreachable!("fixtures are objects")
+        };
+        let contains = |needle: &str| {
+            ["message", "_raw"].iter().any(|field| {
+                event
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.to_ascii_lowercase().contains(needle))
+            })
+        };
+        for (dsl, expected) in [
+            ("needle", contains("needle")),
+            ("-needle", !contains("needle")),
+            ("NOT needle", !contains("needle")),
+            (r#"NOT "multi word""#, !contains("multi word")),
+            ("alpha OR NOT beta", contains("alpha") || !contains("beta")),
+            ("123", contains("123")),
+            ("NOT 123", !contains("123")),
+            ("true", contains("true")),
+            ("NOT true", !contains("true")),
+        ] {
+            assert_sparse_text_parity(&conn, dsl, &event, expected);
+        }
     }
 }
 
