@@ -33,6 +33,9 @@ atmosphere = []
 chrono = { workspace = true, features = ["wasmbind"] }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+sha2 = { workspace = true }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo-timers   = { version = "0.4", features = ["futures"] }
 js-sys        = "0.3"

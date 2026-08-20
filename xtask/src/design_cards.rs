@@ -30,18 +30,12 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use base64ct::{Base64, Encoding as _};
 use fleet_ui::badge::{Tone, badge_class};
 use fleet_ui::button::{Size, Variant, btn_class};
 use fleet_ui::segmented::segmented_class;
 use fleet_ui::sparkline::spark_path;
 use fleet_ui::status_dot::{StatusTone, dot_class};
-
-/// Google Fonts links, same families/weights as the consuming apps
-/// (`crates/trawl-web-ui/index.html`) — fleet-ui.css declares the
-/// families but deliberately does not load them.
-const FONT_LINKS: &str = r#"<link rel="preconnect" href="https://fonts.googleapis.com"/>
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;500;600;700&family=Fira+Code:wght@400;500;600;700&display=swap"/>"#;
 
 /// Gallery scaffolding: the light/dark split, section headings, swatch
 /// grid, and neutralizers for fleet's fixed-position overlay/toast
@@ -101,12 +95,17 @@ struct Card {
 }
 
 /// Generate all cards into `out_dir`. `css_path` is the canonical
-/// fleet-ui stylesheet (`crates/fleet-ui/styles/fleet-ui.css`).
-pub fn generate(css_path: &Path, out_dir: &Path) -> ExitCode {
-    let css = match fs::read_to_string(css_path) {
-        Ok(css) => css,
+/// fleet-ui stylesheet and `fonts_dir` its committed self-hosted assets.
+pub fn generate(css_path: &Path, fonts_dir: &Path, out_dir: &Path) -> ExitCode {
+    let assets = fs::read_to_string(css_path)
+        .and_then(|css| inline_fonts(css, fonts_dir))
+        .and_then(|css| {
+            fs::read_to_string(fonts_dir.join("OFL.txt")).map(|license| (css, license))
+        });
+    let (css, font_license) = match assets {
+        Ok(assets) => assets,
         Err(e) => {
-            eprintln!("xtask: failed to read {}: {e}", css_path.display());
+            eprintln!("xtask: failed to load design assets: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -114,7 +113,6 @@ pub fn generate(css_path: &Path, out_dir: &Path) -> ExitCode {
         eprintln!("xtask: failed to create {}: {e}", out_dir.display());
         return ExitCode::FAILURE;
     }
-
     let cards = [
         tokens_card(),
         actions_card(),
@@ -131,7 +129,7 @@ pub fn generate(css_path: &Path, out_dir: &Path) -> ExitCode {
 
     for card in &cards {
         let path = out_dir.join(format!("{}.html", card.slug));
-        let html = render_card(card, &css);
+        let html = render_card(card, &css, &font_license);
         if let Err(e) = fs::write(&path, html) {
             eprintln!("xtask: failed to write {}: {e}", path.display());
             return ExitCode::FAILURE;
@@ -141,10 +139,29 @@ pub fn generate(css_path: &Path, out_dir: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Keep each generated card self-contained by replacing the canonical
+/// stylesheet's dist-relative font URLs with data URLs sourced from the exact
+/// committed fleet-ui files. The Trunk consumers copy those same files.
+fn inline_fonts(mut css: String, fonts_dir: &Path) -> std::io::Result<String> {
+    for name in ["Geist-Variable.woff2", "GeistMono-Variable.woff2"] {
+        let bytes = fs::read(fonts_dir.join(name))?;
+        let relative = format!("fonts/{name}");
+        if !css.contains(&relative) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("fleet-ui.css has no `{relative}` font URL"),
+            ));
+        }
+        let data_url = format!("data:font/woff2;base64,{}", Base64::encode_string(&bytes));
+        css = css.replace(&relative, &data_url);
+    }
+    Ok(css)
+}
+
 /// Wrap a card body in the full HTML shell: `@dsCard` marker first
 /// line, inlined fleet CSS, then the same body stamped into a light
 /// pane and a dark pane.
-fn render_card(card: &Card, fleet_css: &str) -> String {
+fn render_card(card: &Card, fleet_css: &str, font_license: &str) -> String {
     format!(
         r#"<!-- @dsCard group="{group}" -->
 <!doctype html>
@@ -152,7 +169,9 @@ fn render_card(card: &Card, fleet_css: &str) -> String {
 <head>
 <meta charset="utf-8"/>
 <title>{title} — fleet-ui</title>
-{FONT_LINKS}
+<script type="text/plain" id="geist-font-license">
+{font_license}
+</script>
 <style>
 {fleet_css}
 </style>
@@ -175,6 +194,7 @@ fn render_card(card: &Card, fleet_css: &str) -> String {
         group = card.group,
         title = card.title,
         body = card.body,
+        font_license = font_license,
         stacked = if card.stacked { " ds-stacked" } else { "" },
     )
 }
@@ -318,14 +338,14 @@ fn tokens_card() -> Card {
     };
 
     let type_specimens = r#"
-<p class="ds-type" style="font-size:var(--fs-title); font-weight:600">Title — Open Sans 600 / var(--fs-title)</p>
-<p class="ds-type" style="font-size:var(--fs-section); font-weight:600">Section — Open Sans 600 / var(--fs-section)</p>
-<p class="ds-type" style="font-size:var(--fs-base)">Body — Open Sans 400 / var(--fs-base)</p>
-<p class="ds-type" style="font-size:var(--fs-control)">Control — Open Sans 400 / var(--fs-control)</p>
-<p class="ds-type" style="font-size:var(--fs-label)">Label — Open Sans 400 / var(--fs-label)</p>
-<p class="ds-type" style="font-size:var(--fs-small); color:var(--ink-3)">Small — Open Sans 400 / var(--fs-small)</p>
-<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--editor-fs)">Editor mono — Fira Code / var(--editor-fs)</p>
-<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--table-fs)">Table mono — Fira Code / var(--table-fs)</p>"#;
+<p class="ds-type" style="font-size:var(--fs-title); font-weight:600">Title — Geist 600 / var(--fs-title)</p>
+<p class="ds-type" style="font-size:var(--fs-section); font-weight:600">Section — Geist 600 / var(--fs-section)</p>
+<p class="ds-type" style="font-size:var(--fs-base)">Body — Geist 400 / var(--fs-base)</p>
+<p class="ds-type" style="font-size:var(--fs-control)">Control — Geist 400 / var(--fs-control)</p>
+<p class="ds-type" style="font-size:var(--fs-label)">Label — Geist 400 / var(--fs-label)</p>
+<p class="ds-type" style="font-size:var(--fs-small); color:var(--ink-3)">Small — Geist 400 / var(--fs-small)</p>
+<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--editor-fs)">Editor mono — Geist Mono / var(--editor-fs)</p>
+<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--table-fs)">Table mono — Geist Mono / var(--table-fs)</p>"#;
 
     let spacing_bars: String = ["--row-pad-y", "--row-pad-x", "--ui-gap", "--pad", "--row-h"]
         .iter()

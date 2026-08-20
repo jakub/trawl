@@ -5,12 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1"/>
     <title>fleet-ui shell demo</title>
 
-    <!-- Geist for chrome, Geist Mono for data (ADR-0007) — same faces
-         the real apps use, so the demo renders with production
-         typography. -->
-    <link rel="preconnect" href="https://fonts.googleapis.com"/>
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600;700&display=swap"/>
+    <!-- fleet-ui owns the self-hosted Geist faces and OFL attribution.
+         Copy the whole directory so the demo and distributed license
+         files come from the same pinned source (ADR-0007, issue #119). -->
+    <link data-trunk rel="copy-dir" href="fonts" data-target-path="fonts"/>
 
     <!--
       wasm-opt disabled: trunk 0.21 pins binaryen version_123, which

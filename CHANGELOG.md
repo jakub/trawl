@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Self-hosted Geist typography (#119).** `fleet-ui` now owns pinned Geist
+  1.8.0 and Geist Mono 1.8.0 variable WOFF2 assets, their SHA-256 checksums,
+  source record, and OFL-1.1 attribution. The SPA, fleet-ui workbench, and
+  generated design cards all load the same 400–700 faces locally; Google
+  Fonts links and the corresponding `fonts.googleapis.com` / `fonts.gstatic.com`
+  CSP allowances are removed.
+
 - **`repin --to severity`: put a sender's own field on the OTel ladder
   (ADR-0013 ruling 10, #79).** `trawl schema repin level --to severity`
   (`POST /api/v1/schema/repin` with `"to": "SEVERITY"`) retypes one field's

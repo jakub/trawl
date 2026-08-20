@@ -5,11 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1"/>
     <title>trawl</title>
 
-    <!-- Geist for chrome, Geist Mono for data (ADR-0007). Self-hosting
-         is a follow-up; CSP is extended in trawl-web to allow Google Fonts. -->
-    <link rel="preconnect" href="https://fonts.googleapis.com"/>
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600;700&display=swap"/>
+    <!-- The shared stylesheet references fleet-ui's pinned Geist assets;
+         copy the faces plus OFL/source/checksum attribution into this dist. -->
+    <link data-trunk rel="copy-dir" href="../fleet-ui/fonts" data-target-path="fonts"/>
 
     <!--
       wasm-opt temporarily disabled: trunk 0.21 pins binaryen version_123,
