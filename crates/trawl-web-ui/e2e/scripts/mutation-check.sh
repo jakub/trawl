@@ -90,19 +90,20 @@ for name in "${PATCHES[@]}"; do
 
   # Select the spec by FILE, not --grep: a renamed spec would make a grep
   # match nothing, and playwright's "no tests found" nonzero exit would
-  # read as a successful kill. Prove exactly one test resolves first, so
-  # an infra failure (missing browser, port collision, bad path) can't
-  # masquerade as one either.
+  # read as a successful kill. Prove the file resolves to at least one
+  # test first (a spec file may legitimately hold several — the mutation
+  # kills if any of them fails), so an infra failure (missing browser,
+  # port collision, bad path) can't masquerade as one either.
   echo "-- playwright test tests/$spec --"
   set +e
   listed=$(cd "$E2E_DIR" && npx playwright test "tests/$spec" --list 2>&1)
   list_status=$?
   set -e
-  if [[ $list_status -ne 0 ]] || ! grep -q 'Total: 1 test' <<<"$listed"; then
-    echo "mutation-check: tests/$spec did not resolve to exactly one test — infra/mapping failure, not a kill" >&2
+  if [[ $list_status -ne 0 ]] || ! grep -Eq 'Total: [1-9][0-9]* tests?' <<<"$listed"; then
+    echo "mutation-check: tests/$spec did not resolve to any tests — infra/mapping failure, not a kill" >&2
     echo "$listed" >&2
     cleanup_patch "$patch_path"
-    RESULT[$name]="INFRA-FAILED (spec did not resolve to exactly one test)"
+    RESULT[$name]="INFRA-FAILED (spec resolved to no tests)"
     trap - ERR INT TERM EXIT
     continue
   fi
