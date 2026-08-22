@@ -152,6 +152,16 @@ for the ordered pin/conflict workflow and file-source configuration.
 `lefthook install` wires the same suites into pre-push, split across both
 compose clusters so parallel runs don't collide.
 
+### Browser tests
+
+`cargo xtask e2e` runs a real-browser Playwright suite against the built
+SPA and a zero-npm-dependency stub server (no real trawld/postgres
+involved) — routing, CodeMirror input, SSE live-tail teardown, and
+inline error rendering. See
+[`crates/trawl-web-ui/e2e/README.md`](crates/trawl-web-ui/e2e/README.md)
+for options and the mutation-check tooling that proves the suite catches
+real regressions.
+
 ## License
 
 [MPL-2.0](LICENSE)
