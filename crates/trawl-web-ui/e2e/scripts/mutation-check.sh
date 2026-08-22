@@ -17,6 +17,11 @@
 # own uncommitted work can't be cleanly reverted, and a failed `git
 # apply -R` would otherwise silently leave a mutation live in your working
 # tree.
+#
+# Known residual: a transient failure confined to the target spec (a
+# flake that clears before the control runs) still reads as a kill. A
+# PASS here is evidence only NEXT TO a green baseline run of the full
+# suite on the same commit — which is exactly what CI enforces.
 
 set -euo pipefail
 
@@ -83,17 +88,18 @@ for name in "${PATCHES[@]}"; do
   fi
 
   echo "=== $name -> $spec ==="
-  # INT/TERM/EXIT too: the apply→revert window spans a trunk build plus a
-  # Playwright run, and a Ctrl-C in it must not strand a live mutation.
-  # Signals get their own handler because a bare-cleanup trap would let
-  # the loop CONTINUE past the interrupt (and count the 130 as a kill).
-  trap 'cleanup_patch "$patch_path"' ERR EXIT
+  # EXIT/INT/TERM: the apply→revert window spans a trunk build plus a
+  # Playwright run, and neither a fatal error (set -e exits → EXIT trap)
+  # nor a Ctrl-C may strand a live mutation. No ERR trap: bash fires ERR
+  # even inside set +e blocks, which would revert the patch mid-iteration
+  # the moment the target spec fails as expected.
+  trap 'cleanup_patch "$patch_path"' EXIT
   trap 'cleanup_patch "$patch_path"; exit 130' INT TERM
 
   if ! git apply "$patch_path"; then
     echo "mutation-check: failed to apply $name" >&2
     RESULT[$name]="APPLY-FAILED"
-    trap - ERR EXIT INT TERM
+    trap - EXIT INT TERM
     continue
   fi
 
@@ -102,7 +108,7 @@ for name in "${PATCHES[@]}"; do
     echo "mutation-check: trunk build failed for $name (unexpected — a Rust-level breakage, not a browser-observable one)" >&2
     cleanup_patch "$patch_path"
     RESULT[$name]="BUILD-FAILED"
-    trap - ERR EXIT INT TERM
+    trap - EXIT INT TERM
     continue
   }
 
@@ -122,7 +128,7 @@ for name in "${PATCHES[@]}"; do
     echo "$listed" >&2
     cleanup_patch "$patch_path"
     RESULT[$name]="INFRA-FAILED (spec resolved to no tests)"
-    trap - ERR EXIT INT TERM
+    trap - EXIT INT TERM
     continue
   fi
 
@@ -147,7 +153,7 @@ for name in "${PATCHES[@]}"; do
   fi
 
   cleanup_patch "$patch_path"
-  trap - ERR EXIT INT TERM
+  trap - EXIT INT TERM
 done
 
 echo
@@ -159,6 +165,15 @@ for name in "${PATCHES[@]}"; do
   printf '%-28s %s\n' "$name" "$outcome"
   [[ $outcome == PASS* ]] || overall=1
 done
+# A cleanup that could not cleanly reverse its patch (e.g. an affected
+# file changed underneath it) is silent inside cleanup_patch — refuse to
+# report success over a tree that still carries a mutation.
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "mutation-check: working tree is NOT clean after cleanup — a mutation may still be applied:" >&2
+  git status --short >&2
+  exit 2
+fi
+
 # Exit 0 only when every requested mutation was killed by its own spec —
 # an APPLY/BUILD/INFRA failure or a surviving mutation must fail the
 # command, not just color a table.
