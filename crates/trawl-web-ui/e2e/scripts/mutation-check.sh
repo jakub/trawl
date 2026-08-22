@@ -44,6 +44,20 @@ declare -A SPEC_FOR=(
   [04-error-fallback.patch]="api-failure.spec.ts"
 )
 
+# patch-file -> a CONTROL spec the mutation does NOT touch, which must
+# PASS in the same run environment. This is what tells a genuine kill
+# from an infra failure: a missing browser or dead stub fails the control
+# too, and playwright even records launch failures as executed-and-failed
+# tests, so neither exit codes nor the JSON reporter's stats can make
+# that call on the target spec alone (probed: an empty
+# PLAYWRIGHT_BROWSERS_PATH yields "3 tests failed", not "no tests").
+declare -A CONTROL_FOR=(
+  [01-route.patch]="api-failure.spec.ts"
+  [02-editor-onchange.patch]="routing.spec.ts"
+  [03-sse-teardown.patch]="routing.spec.ts"
+  [04-error-fallback.patch]="routing.spec.ts"
+)
+
 PATCHES=()
 if [[ $# -gt 0 ]]; then
   PATCHES=("$@")
@@ -112,29 +126,24 @@ for name in "${PATCHES[@]}"; do
     continue
   fi
 
-  # A kill is proven by an EXECUTED test that FAILED, not by exit code
-  # alone — a missing browser or port collision also exits nonzero. The
-  # JSON reporter's stats distinguish them: `unexpected` counts tests
-  # that ran and failed.
-  report="$E2E_DIR/test-results/mutation-report.json"
-  rm -f "$report"
   set +e
-  (cd "$E2E_DIR" && PLAYWRIGHT_JSON_OUTPUT_NAME="$report" \
-    npx playwright test "tests/$spec" --reporter=json > /dev/null)
+  (cd "$E2E_DIR" && npx playwright test "tests/$spec")
   status=$?
   set -e
 
-  unexpected=$(node -e "
-    const r = require(process.argv[1]);
-    console.log(r.stats ? r.stats.unexpected : 'no-stats');
-  " "$report" 2>/dev/null || echo "no-report")
+  control="${CONTROL_FOR[$name]}"
+  echo "-- control: playwright test tests/$control (must pass) --"
+  set +e
+  (cd "$E2E_DIR" && npx playwright test "tests/$control")
+  control_status=$?
+  set -e
 
-  if [[ $status -eq 0 ]]; then
-    RESULT[$name]="FAIL (suite passed despite the mutation — mechanism didn't catch it)"
-  elif [[ $unexpected =~ ^[1-9][0-9]*$ ]]; then
-    RESULT[$name]="PASS (suite correctly failed: $unexpected test(s) executed and failed)"
+  if [[ $control_status -ne 0 ]]; then
+    RESULT[$name]="INFRA-FAILED (control spec $control failed — the environment, not the mutation, is broken)"
+  elif [[ $status -ne 0 ]]; then
+    RESULT[$name]="PASS (target spec failed, control passed, exit $status)"
   else
-    RESULT[$name]="INFRA-FAILED (nonzero exit but no executed-and-failed test — unexpected=$unexpected)"
+    RESULT[$name]="FAIL (suite passed despite the mutation — mechanism didn't catch it)"
   fi
 
   cleanup_patch "$patch_path"
