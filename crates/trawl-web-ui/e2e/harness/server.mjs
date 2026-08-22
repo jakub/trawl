@@ -27,7 +27,9 @@ import {
 } from './fixtures.mjs';
 
 const HOST = '127.0.0.1';
-const PORT = 8123;
+// E2E_PORT lets parallel worktrees run without colliding; the Playwright
+// config reads the same variable, so server and baseURL can't disagree.
+const PORT = Number(process.env.E2E_PORT ?? 8123);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.resolve(

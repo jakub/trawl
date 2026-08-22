@@ -88,9 +88,27 @@ for name in "${PATCHES[@]}"; do
     continue
   }
 
-  echo "-- playwright test --grep $spec --"
+  # Select the spec by FILE, not --grep: a renamed spec would make a grep
+  # match nothing, and playwright's "no tests found" nonzero exit would
+  # read as a successful kill. Prove exactly one test resolves first, so
+  # an infra failure (missing browser, port collision, bad path) can't
+  # masquerade as one either.
+  echo "-- playwright test tests/$spec --"
   set +e
-  (cd "$E2E_DIR" && npx playwright test --grep "$spec")
+  listed=$(cd "$E2E_DIR" && npx playwright test "tests/$spec" --list 2>&1)
+  list_status=$?
+  set -e
+  if [[ $list_status -ne 0 ]] || ! grep -q 'Total: 1 test' <<<"$listed"; then
+    echo "mutation-check: tests/$spec did not resolve to exactly one test — infra/mapping failure, not a kill" >&2
+    echo "$listed" >&2
+    cleanup_patch "$patch_path"
+    RESULT[$name]="INFRA-FAILED (spec did not resolve to exactly one test)"
+    trap - ERR INT TERM EXIT
+    continue
+  fi
+
+  set +e
+  (cd "$E2E_DIR" && npx playwright test "tests/$spec")
   status=$?
   set -e
 
@@ -107,6 +125,13 @@ done
 echo
 echo "mutation-check results:"
 printf '%-28s %s\n' "patch" "outcome"
+overall=0
 for name in "${PATCHES[@]}"; do
-  printf '%-28s %s\n' "$name" "${RESULT[$name]:-not run}"
+  outcome="${RESULT[$name]:-not run}"
+  printf '%-28s %s\n' "$name" "$outcome"
+  [[ $outcome == PASS* ]] || overall=1
 done
+# Exit 0 only when every requested mutation was killed by its own spec —
+# an APPLY/BUILD/INFRA failure or a surviving mutation must fail the
+# command, not just color a table.
+exit $overall
