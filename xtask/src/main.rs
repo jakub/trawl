@@ -14,6 +14,10 @@
 //! - `ingest-fuzz` — emit deterministic, Vector-compatible NDJSON corpora
 //!   for the ingest canonicalizer and field-catalog pin/conform boundary,
 //!   per producer profile (`--profile http|syslog|trawld`).
+//! - `e2e` — the real-browser Playwright suite (issue #118,
+//!   `crates/trawl-web-ui/e2e/`): trunk-build the SPA, `npm ci` the
+//!   suite's own devDependency, install the chromium browser, then run
+//!   the suite against the zero-npm-dep stub server in `e2e/harness/`.
 //!
 //! Aliased as `cargo xtask` via `.cargo/config.toml`.
 
@@ -91,6 +95,24 @@ enum Cmd {
         #[arg(long, default_value_t = 100)]
         events: usize,
     },
+    /// Run the real-browser Playwright suite (issue #118).
+    E2e {
+        /// Skip the `trunk build` step — reuse whatever's already in
+        /// `crates/trawl-web-ui/dist/`. Fails loudly at server startup
+        /// if that dist/ doesn't exist.
+        #[arg(long)]
+        skip_build: bool,
+        /// Pass --release to the trunk build.
+        #[arg(long)]
+        release: bool,
+        /// Run the browser headed (visible window) instead of headless.
+        #[arg(long)]
+        headed: bool,
+        /// Only run specs whose title matches this pattern
+        /// (`playwright test --grep`).
+        #[arg(long)]
+        grep: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -141,7 +163,100 @@ fn main() -> ExitCode {
             env,
             mutation_events: events,
         }),
+        Cmd::E2e {
+            skip_build,
+            release,
+            headed,
+            grep,
+        } => run_e2e(skip_build, release, headed, grep.as_deref()),
     }
+}
+
+/// Is `tool` on `PATH`? Used to fail loudly and by name rather than let
+/// `Command::spawn` bubble up a bare "No such file or directory".
+fn tool_on_path(tool: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(tool).is_file()))
+}
+
+/// `cargo xtask e2e` — build the SPA, install the suite's own npm
+/// dependency + browser, then run Playwright against the zero-npm-dep
+/// stub server in `e2e/harness/server.mjs`.
+fn run_e2e(skip_build: bool, release: bool, headed: bool, grep: Option<&str>) -> ExitCode {
+    let root = workspace_root();
+    let web_ui = root.join("crates").join("trawl-web-ui");
+    let e2e = web_ui.join("e2e");
+
+    for (tool, hint) in [
+        ("node", "install Node.js (node/npm/npx)"),
+        ("npm", "install Node.js (node/npm/npx)"),
+        ("npx", "install Node.js (node/npm/npx)"),
+    ] {
+        if !tool_on_path(tool) {
+            eprintln!("xtask: `{tool}` not found on PATH — {hint}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if !skip_build && !tool_on_path("trunk") {
+        eprintln!(
+            "xtask: `trunk` not found on PATH — install it (`cargo install trunk`) \
+             or pass --skip-build to reuse an existing crates/trawl-web-ui/dist/"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    if !skip_build {
+        let mut trunk = Command::new("trunk");
+        trunk.current_dir(&web_ui).arg("build");
+        if release {
+            trunk.arg("--release");
+        }
+        eprintln!(
+            "xtask: trunk build{} (in {})",
+            if release { " --release" } else { "" },
+            web_ui.display()
+        );
+        if !run(trunk) {
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let mut npm_ci = Command::new("npm");
+    npm_ci
+        .current_dir(&e2e)
+        .args(["ci", "--no-audit", "--no-fund"]);
+    eprintln!("xtask: npm ci (in {})", e2e.display());
+    if !run(npm_ci) {
+        return ExitCode::FAILURE;
+    }
+
+    let mut install_browser = Command::new("npx");
+    install_browser
+        .current_dir(&e2e)
+        .args(["playwright", "install", "chromium"]);
+    eprintln!("xtask: npx playwright install chromium");
+    if !run(install_browser) {
+        return ExitCode::FAILURE;
+    }
+
+    let mut test = Command::new("npm");
+    test.current_dir(&e2e).args(["run", "test", "--"]);
+    if headed {
+        test.arg("--headed");
+    }
+    if let Some(pattern) = grep {
+        test.args(["--grep", pattern]);
+    }
+    eprintln!(
+        "xtask: npm run test{}{}",
+        if headed { " --headed" } else { "" },
+        grep.map_or_else(String::new, |g| format!(" --grep {g}")),
+    );
+    if !run(test) {
+        return ExitCode::FAILURE;
+    }
+
+    ExitCode::SUCCESS
 }
 
 fn build_web(release: bool) -> ExitCode {
