@@ -1,0 +1,13 @@
+diff --git a/crates/trawl-web-ui/src/components/editor.rs b/crates/trawl-web-ui/src/components/editor.rs
+index afd0502b..d827a226 100644
+--- a/crates/trawl-web-ui/src/components/editor.rs
++++ b/crates/trawl-web-ui/src/components/editor.rs
+@@ -215,7 +215,7 @@ pub fn DslEditor(
+         let html_el: web_sys::HtmlElement = (*element).clone().unchecked_into();
+ 
+         let on_change_cb = Closure::<dyn Fn(String)>::new(move |doc: String| {
+-            query.set(doc);
++            let _ = doc;
+         });
+ 
+         let on_submit_cb = Closure::<dyn Fn()>::new(move || {
