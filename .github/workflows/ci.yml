@@ -286,3 +286,43 @@ jobs:
       - name: Verify SPA was baked in
         run: test -f crates/trawl-web-ui/dist/index.html
       - run: cargo build --release -p trawl-web
+
+  web-ui-e2e:
+    name: web UI browser tests (playwright)
+    runs-on: k8s-small
+    needs: trunk-build
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
+      - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4
+        with:
+          name: trawl-web-ui-dist
+          path: crates/trawl-web-ui/dist
+      - name: Verify dist artifact
+        run: test -f crates/trawl-web-ui/dist/index.html
+      - run: npm ci --no-audit --no-fund
+        working-directory: crates/trawl-web-ui/e2e
+      # The browser binary cache is keyed on the lockfile: bumping
+      # @playwright/test invalidates it, so the installed Chromium always
+      # matches the pinned package version.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
+      - run: npx playwright install --with-deps chromium
+        working-directory: crates/trawl-web-ui/e2e
+      # retries=0 lives in playwright.config.ts (flake policy: fix or
+      # quarantine loudly, never retry past it).
+      - run: npm run test
+        working-directory: crates/trawl-web-ui/e2e
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: e2e-traces
+          path: crates/trawl-web-ui/e2e/test-results/
+          retention-days: 7
