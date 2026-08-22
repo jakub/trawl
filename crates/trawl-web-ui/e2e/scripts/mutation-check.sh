@@ -4,9 +4,10 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 # Evidence tooling, not CI: for each mutations/*.patch, apply it, rebuild
-# the SPA, run the ONE spec tagged as that mutation's subject, expect a
-# NONZERO exit (the mutation must break something the suite catches),
-# then revert. Prints a PASS/FAIL table at the end.
+# the SPA, run the spec file that is that mutation's subject, and require
+# at least one test to EXECUTE AND FAIL (exit code alone can't tell a
+# kill from a missing browser), then revert. Prints a PASS/FAIL table and
+# exits 0 only if every requested mutation was killed.
 #
 # Usage:
 #   e2e/scripts/mutation-check.sh                 # run all four
@@ -33,9 +34,9 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-# patch-file -> spec file -> grep pattern (the one test whose subject the
-# mutation breaks; keeping this narrow means an unrelated spec failure
-# doesn't get miscounted as this mutation's signal).
+# patch-file -> the spec FILE whose subject the mutation breaks (keeping
+# this narrow means an unrelated spec failure doesn't get miscounted as
+# this mutation's signal).
 declare -A SPEC_FOR=(
   [01-route.patch]="routing.spec.ts"
   [02-editor-onchange.patch]="editor-input.spec.ts"
@@ -70,12 +71,15 @@ for name in "${PATCHES[@]}"; do
   echo "=== $name -> $spec ==="
   # INT/TERM/EXIT too: the apply→revert window spans a trunk build plus a
   # Playwright run, and a Ctrl-C in it must not strand a live mutation.
-  trap 'cleanup_patch "$patch_path"' ERR INT TERM EXIT
+  # Signals get their own handler because a bare-cleanup trap would let
+  # the loop CONTINUE past the interrupt (and count the 130 as a kill).
+  trap 'cleanup_patch "$patch_path"' ERR EXIT
+  trap 'cleanup_patch "$patch_path"; exit 130' INT TERM
 
   if ! git apply "$patch_path"; then
     echo "mutation-check: failed to apply $name" >&2
     RESULT[$name]="APPLY-FAILED"
-    trap - ERR INT TERM EXIT
+    trap - ERR EXIT INT TERM
     continue
   fi
 
@@ -84,7 +88,7 @@ for name in "${PATCHES[@]}"; do
     echo "mutation-check: trunk build failed for $name (unexpected — a Rust-level breakage, not a browser-observable one)" >&2
     cleanup_patch "$patch_path"
     RESULT[$name]="BUILD-FAILED"
-    trap - ERR INT TERM EXIT
+    trap - ERR EXIT INT TERM
     continue
   }
 
@@ -104,23 +108,37 @@ for name in "${PATCHES[@]}"; do
     echo "$listed" >&2
     cleanup_patch "$patch_path"
     RESULT[$name]="INFRA-FAILED (spec resolved to no tests)"
-    trap - ERR INT TERM EXIT
+    trap - ERR EXIT INT TERM
     continue
   fi
 
+  # A kill is proven by an EXECUTED test that FAILED, not by exit code
+  # alone — a missing browser or port collision also exits nonzero. The
+  # JSON reporter's stats distinguish them: `unexpected` counts tests
+  # that ran and failed.
+  report="$E2E_DIR/test-results/mutation-report.json"
+  rm -f "$report"
   set +e
-  (cd "$E2E_DIR" && npx playwright test "tests/$spec")
+  (cd "$E2E_DIR" && PLAYWRIGHT_JSON_OUTPUT_NAME="$report" \
+    npx playwright test "tests/$spec" --reporter=json > /dev/null)
   status=$?
   set -e
 
-  if [[ $status -ne 0 ]]; then
-    RESULT[$name]="PASS (suite correctly failed, exit $status)"
-  else
+  unexpected=$(node -e "
+    const r = require(process.argv[1]);
+    console.log(r.stats ? r.stats.unexpected : 'no-stats');
+  " "$report" 2>/dev/null || echo "no-report")
+
+  if [[ $status -eq 0 ]]; then
     RESULT[$name]="FAIL (suite passed despite the mutation — mechanism didn't catch it)"
+  elif [[ $unexpected =~ ^[1-9][0-9]*$ ]]; then
+    RESULT[$name]="PASS (suite correctly failed: $unexpected test(s) executed and failed)"
+  else
+    RESULT[$name]="INFRA-FAILED (nonzero exit but no executed-and-failed test — unexpected=$unexpected)"
   fi
 
   cleanup_patch "$patch_path"
-  trap - ERR INT TERM EXIT
+  trap - ERR EXIT INT TERM
 done
 
 echo
