@@ -181,10 +181,15 @@ function serveStream(res) {
 // ---- request handling -------------------------------------------------------
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const p = url.pathname;
+  let url;
+  let p;
 
   try {
+    // Inside the try: a malformed Host header (only a non-browser local
+    // client can send one) must 500 this request, not crash the process
+    // via an unhandled async rejection.
+    url = new URL(req.url, `http://${req.headers.host}`);
+    p = url.pathname;
     // -- control plane ---------------------------------------------------
     if (p === '/__ctl/health' && req.method === 'GET') {
       res.writeHead(200, { 'content-type': 'text/plain' });
@@ -282,7 +287,11 @@ const server = http.createServer(async (req, res) => {
     // -- static SPA -------------------------------------------------------
     serveStatic(req, res, p);
   } catch (e) {
-    res.writeHead(500, { 'content-type': 'text/plain' });
+    // If headers already went out (e.g. a throw mid-SSE stream), writeHead
+    // would itself throw ERR_HTTP_HEADERS_SENT and kill the process.
+    if (!res.headersSent) {
+      res.writeHead(500, { 'content-type': 'text/plain' });
+    }
     res.end(String(e && e.stack ? e.stack : e));
   }
 });

@@ -292,8 +292,15 @@ jobs:
     runs-on: k8s-small
     needs: trunk-build
     timeout-minutes: 10
+    # This job executes third-party code (npm packages, a CDN-fetched
+    # browser): read-only token, and no credentials persisted into
+    # .git/config for that code to read.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
         with:
           node-version: '22'

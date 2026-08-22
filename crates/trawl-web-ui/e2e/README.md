@@ -35,9 +35,15 @@ stale build) if `dist/index.html` is missing.
 
 ## CI
 
-The same `cargo xtask e2e --release` invocation is the CI entry point —
-no separate CI-only script. `playwright.config.ts` switches its reporter
-to `['github', 'list']` under `CI=true` so failures annotate the PR diff.
+CI (the `web-ui-e2e` job in `.github/workflows/ci.yml`) does not rebuild
+the SPA: it downloads the `trawl-web-ui-dist` artifact from the
+`trunk-build` job, then runs `npm ci`, `npx playwright install
+--with-deps chromium`, and `npm run test` as discrete steps — so the
+browser job compiles no Rust. `cargo xtask e2e` is the local entry point
+only (and installs chromium without `--with-deps`; on a dev machine the
+shared libraries are your own problem). `playwright.config.ts` switches
+its reporter to `['github', 'list']` under `CI=true` so failures annotate
+the PR diff.
 
 ## What it (and doesn't) cover
 

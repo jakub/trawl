@@ -68,12 +68,14 @@ for name in "${PATCHES[@]}"; do
   fi
 
   echo "=== $name -> $spec ==="
-  trap 'cleanup_patch "$patch_path"' ERR
+  # INT/TERM/EXIT too: the apply→revert window spans a trunk build plus a
+  # Playwright run, and a Ctrl-C in it must not strand a live mutation.
+  trap 'cleanup_patch "$patch_path"' ERR INT TERM EXIT
 
   if ! git apply "$patch_path"; then
     echo "mutation-check: failed to apply $name" >&2
     RESULT[$name]="APPLY-FAILED"
-    trap - ERR
+    trap - ERR INT TERM EXIT
     continue
   fi
 
@@ -82,7 +84,7 @@ for name in "${PATCHES[@]}"; do
     echo "mutation-check: trunk build failed for $name (unexpected — a Rust-level breakage, not a browser-observable one)" >&2
     cleanup_patch "$patch_path"
     RESULT[$name]="BUILD-FAILED"
-    trap - ERR
+    trap - ERR INT TERM EXIT
     continue
   }
 
@@ -99,7 +101,7 @@ for name in "${PATCHES[@]}"; do
   fi
 
   cleanup_patch "$patch_path"
-  trap - ERR
+  trap - ERR INT TERM EXIT
 done
 
 echo
