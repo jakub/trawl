@@ -1,0 +1,15 @@
+diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/pages/search.rs
+index ce179fa9..024ebcf5 100644
+--- a/crates/trawl-web-ui/src/pages/search.rs
++++ b/crates/trawl-web-ui/src/pages/search.rs
+@@ -234,7 +234,9 @@ pub fn Search() -> impl IntoView {
+         StoredValue::new_local(None);
+     on_cleanup(move || {
+         stream_handle.update_value(|slot| {
+-            *slot = None;
++            if let Some(handle) = slot.take() {
++                std::mem::forget(handle);
++            }
+         });
+     });
+ 

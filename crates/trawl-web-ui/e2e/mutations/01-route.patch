@@ -1,0 +1,13 @@
+diff --git a/crates/trawl-web-ui/src/app.rs b/crates/trawl-web-ui/src/app.rs
+index fdf8f69f..fabf9451 100644
+--- a/crates/trawl-web-ui/src/app.rs
++++ b/crates/trawl-web-ui/src/app.rs
+@@ -35,7 +35,7 @@ pub fn App() -> impl IntoView {
+                 <ParentRoute path=path!("") view=AuthShell>
+                     <Route path=path!("/") view=|| view! { <RedirectTo path="/search"/> }/>
+                     <Route path=path!("/search") view=Search/>
+-                    <Route path=path!("/search/history") view=HistoryPage/>
++                    <Route path=path!("/search/histroy") view=HistoryPage/>
+                     <Route path=path!("/search/schema") view=SchemaPage/>
+                     <Route path=path!("/jobs") view=|| view! { <RedirectTo path="/jobs/nets"/> }/>
+                     <Route path=path!("/jobs/nets") view=NetsPage/>

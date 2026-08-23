@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-web-ui/src/components/results_table.rs b/crates/trawl-web-ui/src/components/results_table.rs
+index 5b5cc12e..bc8c5aab 100644
+--- a/crates/trawl-web-ui/src/components/results_table.rs
++++ b/crates/trawl-web-ui/src/components/results_table.rs
+@@ -52,6 +52,7 @@ pub fn ResultsTable(
+                         bus=bus
+                     />
+                 }.into_any())
++                error=Box::new(|_msg: String| view! {}.into_any())
+             />
+         </div>
+     }
