@@ -471,7 +471,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   destination is now reserved with `create_new` before the rename and a taken
   name yields `<path>.corrupt.1`, `.corrupt.2`, …; every artifact is kept, all
   of those names stay inert to the scan globs, a failed quarantine is still a
-  hard error, and an in-process rename failure removes its reservation.
+  hard error, and a rename failure triggers best-effort reservation cleanup;
+  a failed cleanup leaves a zero-byte artifact and warns
+  `quarantine_reservation_stranded`.
 - **A repin retypes `/api/v1/schema` immediately (#115).** The unscoped column
   listing is TTL-cached (`schema_cache_ttl_secs`, 60s by default), so after a
   repin cutover the endpoint that feeds autocomplete kept advertising the OLD
