@@ -4589,3 +4589,66 @@ fn a_stored_double_column_compares_in_that_same_total_order() {
         ]
     );
 }
+
+/// (SQL producing a NaN of a KNOWN sign, the text `DuckDB` renders).
+///
+/// `DuckDB`'s DOUBLE → VARCHAR cast honours the SIGN BIT, so a NaN has
+/// two renderings and a mirror with one is wrong for half of them. Every
+/// row here builds its NaN sign-EXPLICITLY — parsed from text, or negated
+/// (which flips the bit, probed below) — never from arithmetic: the sign
+/// of a computed NaN like `0.0 / 0.0` is the hardware's business and
+/// differs across platforms, so pinning one would pin this machine.
+const NAN_SIGN_RENDERINGS: &[(&str, &str)] = &[
+    ("'nan'::DOUBLE", "nan"),
+    ("'NaN'::DOUBLE", "nan"),
+    ("'-nan'::DOUBLE", "-nan"),
+    ("'-NAN'::DOUBLE", "-nan"),
+    ("-('nan'::DOUBLE)", "-nan"),
+    ("-('-nan'::DOUBLE)", "nan"),
+    ("TRY_CAST('nan' AS DOUBLE)", "nan"),
+    ("TRY_CAST('-nan' AS DOUBLE)", "-nan"),
+];
+
+#[test]
+fn a_rendered_nan_keeps_its_sign() {
+    let conn = conn();
+    for (expr, want) in NAN_SIGN_RENDERINGS {
+        let (dtype, text) = scalar_type_and_text(&conn, expr, &[]).unwrap();
+        assert_eq!(dtype, "DOUBLE");
+        assert_eq!(text.as_deref(), Some(*want), "{expr}");
+    }
+
+    // The same through a BOUND parameter, which is how a computed value
+    // reaches the engine from Rust.
+    for (value, want) in [
+        (f64::NAN, "nan"),
+        (-f64::NAN, "-nan"),
+        (f64::NAN.copysign(-1.0), "-nan"),
+        (f64::NAN.copysign(1.0), "nan"),
+    ] {
+        let (_, text) = scalar_type_and_text(&conn, "CAST(? AS DOUBLE)", &[&value]).unwrap();
+        assert_eq!(
+            text.as_deref(),
+            Some(want),
+            "bound {value} ({:?})",
+            value.is_sign_negative()
+        );
+    }
+
+    // Both spellings survive the DOUBLE pin's round-trip guard, so both
+    // are values a conformed column really holds — which is what makes
+    // the rendering a live-mirror question rather than a curiosity.
+    for text in ["nan", "-nan"] {
+        let conformed: Option<String> = conn
+            .query_row(
+                &format!(
+                    "SELECT CAST({} AS VARCHAR) FROM (SELECT ? AS v) probe",
+                    conform("v", CanonicalType::Double)
+                ),
+                [text],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(conformed.as_deref(), Some(text), "the guard keeps {text:?}");
+    }
+}
