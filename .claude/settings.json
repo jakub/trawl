@@ -1,27 +1,5 @@
 {
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/protect-files.sh",
-            "timeout": 5
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/block-dangerous.sh",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",
@@ -31,13 +9,22 @@
             "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/auto-fmt.sh",
             "timeout": 30,
             "statusMessage": "formatting rust"
-          },
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/async-clippy.sh",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/clippy.sh",
             "async": true,
-            "timeout": 120,
-            "statusMessage": "running clippy"
+            "timeout": 180,
+            "statusMessage": "running clippy",
+            "asyncRewake": true,
+            "rewakeMessage": "clippy findings on the workspace — fix them or say why they stand, then continue:",
+            "rewakeSummary": "clippy found issues"
           }
         ]
       }
