@@ -4447,3 +4447,92 @@ fn a_case_reads_its_arms_in_order_and_stops_at_the_first_true() {
         "an unreadable FIRST arm errors whatever follows it: {error}"
     );
 }
+
+/// The stored DOUBLE column a filter really compares against, spelled so
+/// every row is a value the SQL parser cannot constant-fold away: both
+/// NaN SIGNS, both zeros, both infinities.
+const STORED_DOUBLE_ROWS: &[&str] = &[
+    "'nan'::DOUBLE",
+    "-('nan'::DOUBLE)",
+    "'inf'::DOUBLE",
+    "'-inf'::DOUBLE",
+    "1.5::DOUBLE",
+    "0.0::DOUBLE",
+    "0.0::DOUBLE * -1",
+    "CAST(NULL AS DOUBLE)",
+];
+
+/// (operator, bound literal, the stored rows it returns — rendered).
+///
+/// The COLUMN shape, which is the one a pinned live filter mirrors: the
+/// scalar matrix above compares two bound values, and a constant-folded
+/// answer would prove nothing about a column read off parquet. Both
+/// answers are the same total order — every NaN equal to every other
+/// whatever its sign, NaN above `inf`, the two zeros tied, SQL NULL
+/// matching nothing.
+const STORED_DOUBLE_COMPARISONS: &[(&str, f64, &[&str])] = &[
+    ("=", f64::NAN, &["nan", "-nan"]),
+    ("=", -f64::NAN, &["nan", "-nan"]),
+    (">=", f64::NAN, &["nan", "-nan"]),
+    (">", f64::NAN, &[]),
+    ("<", f64::NAN, &["inf", "-inf", "1.5", "0.0", "-0.0"]),
+    ("!=", f64::NAN, &["inf", "-inf", "1.5", "0.0", "-0.0"]),
+    (">", 1.5, &["nan", "-nan", "inf"]),
+    ("<", 1.5, &["-inf", "0.0", "-0.0"]),
+    ("=", 0.0, &["0.0", "-0.0"]),
+    ("=", -0.0, &["0.0", "-0.0"]),
+    ("=", f64::INFINITY, &["inf"]),
+];
+
+#[test]
+fn a_stored_double_column_compares_in_that_same_total_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("metric.parquet");
+    let conn = conn();
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES ({})) AS t(metric)) TO '{}' (FORMAT PARQUET)",
+        STORED_DOUBLE_ROWS.join("), ("),
+        file.display()
+    ))
+    .unwrap();
+
+    for (op, literal, expected) in STORED_DOUBLE_COMPARISONS {
+        let sql = format!(
+            "SELECT CAST(metric AS VARCHAR) FROM read_parquet('{}') WHERE metric {op} ?",
+            file.display()
+        );
+        let mut statement = conn.prepare(&sql).unwrap();
+        let matched: Vec<String> = statement
+            .query_map([literal], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(matched, *expected, "metric {op} {literal}");
+    }
+
+    // …and the sort agrees with the comparison: the NaNs tie at the top,
+    // above `inf`, with SQL NULL after all of them.
+    let sql = format!(
+        "SELECT CAST(metric AS VARCHAR) FROM read_parquet('{}') ORDER BY metric",
+        file.display()
+    );
+    let mut statement = conn.prepare(&sql).unwrap();
+    let sorted: Vec<Option<String>> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        sorted,
+        vec![
+            Some("-inf".to_owned()),
+            Some("0.0".to_owned()),
+            Some("-0.0".to_owned()),
+            Some("1.5".to_owned()),
+            Some("inf".to_owned()),
+            Some("nan".to_owned()),
+            Some("-nan".to_owned()),
+            None,
+        ]
+    );
+}
