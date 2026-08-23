@@ -790,6 +790,13 @@ const MAX_QUARANTINE_ATTEMPTS: u32 = 1000;
 /// mutation of the trawl-owned data root (another process planting or renaming
 /// files under it) is outside the threat model; the workspace forbids `unsafe`,
 /// so the truly atomic `renameat2(RENAME_NOREPLACE)` is not reachable.
+///
+/// A crash between reservation and rename strands a zero-byte reservation
+/// under its `.corrupt`/`.corrupt.<n>` name: inert to every scan glob,
+/// skipped by later quarantines, and distinguishable from a real artifact
+/// only by its size. Accepted — closing it needs
+/// `renameat2(RENAME_NOREPLACE)`, unavailable under the workspace unsafe
+/// forbid.
 fn quarantine_target(path: &Path) -> Result<PathBuf, String> {
     for n in 0..MAX_QUARANTINE_ATTEMPTS {
         let mut candidate = path.as_os_str().to_owned();
@@ -866,7 +873,15 @@ fn quarantine_file(path: &Path, service: &str, event_type: &str) -> Result<PathB
         Err(e) => {
             // The reservation is ours and empty; drop it so a retry re-uses
             // the same name instead of accumulating zero-byte placeholders.
-            let _ = std::fs::remove_file(&quarantined);
+            if let Err(cleanup) = std::fs::remove_file(&quarantined) {
+                tracing::warn!(
+                    event_type = "quarantine_reservation_stranded",
+                    path = %quarantined.display(),
+                    error = %cleanup,
+                    "failed to remove the quarantine reservation after a failed rename; \
+                     a zero-byte artifact remains under this name"
+                );
+            }
             tracing::error!(
                 event_type,
                 compact_service = %service,
@@ -7105,6 +7120,10 @@ mod tests {
         if std::fs::File::create(dir.join(".probe")).is_ok() {
             // Running as root: mode bits are not enforced.
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            eprintln!(
+                "skipped: running as root, cannot make {} unwritable",
+                dir.display()
+            );
             return;
         }
 

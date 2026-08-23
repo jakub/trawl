@@ -560,6 +560,13 @@ pub async fn schema(
         // before the flip. Before: an entry whose SELECT straddles a flip is
         // then stamped with the OLD generation, so the next read discards it
         // rather than serving a type the corpus no longer has.
+        //
+        // A request whose SELECT began before a flip may still return
+        // pre-flip columns in its OWN response (its postgres snapshot
+        // legitimately predates the commit, and the corpus-facts walk below
+        // can delay that response's arrival) — ordinary concurrent-read
+        // semantics; the stale entry it stamps cannot be served to any
+        // later request.
         let generation = state.query.field_catalog.repin_generation();
         let slot = &mut cache[usize::from(since.is_some())];
         let fresh = slot

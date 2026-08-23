@@ -71,9 +71,13 @@ impl FieldCatalog {
     /// cutover holds every query permit, so no in-flight query can observe
     /// half a flip.
     ///
-    /// Bumps [`Self::repin_generation`] inside the write lock, so a reader
-    /// that takes the generation and then the pins can never see the new
-    /// pins under the old stamp.
+    /// The bump is Release inside the write-lock scope and
+    /// [`Self::repin_generation`] reads Acquire, and the postgres commit
+    /// precedes the bump — so a reader that observes the NEW stamp can never
+    /// see the old pins or the old postgres row. The converse is possible
+    /// and safe: a reader that loaded the old stamp may see post-flip state,
+    /// producing a cache entry stamped with the OLD generation, which the
+    /// next read discards (over-invalidation, never staleness).
     pub fn repin(&self, field: &str, ty: CanonicalType) {
         let mut guard = self.pins.write();
         guard.insert(field.to_owned(), ty);
