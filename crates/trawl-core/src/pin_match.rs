@@ -594,18 +594,18 @@ pub(crate) fn apply_ord(ord: std::cmp::Ordering, op: CompareOp) -> bool {
     }
 }
 
-/// Apply a comparison on f64 values.
+/// Apply a comparison on f64 values, in `DuckDB`'s order.
 ///
-/// Uses exact IEEE 754 operators to match `DuckDB`'s behavior.
-/// `NaN` comparisons return false, matching SQL semantics.
-#[allow(clippy::float_cmp)] // intentional: must match DuckDB's exact comparison
+/// NOT Rust's IEEE operators: `DuckDB` orders DOUBLE totally, so every
+/// NaN is EQUAL to every other NaN and GREATER than every real value,
+/// while IEEE `==` answers false and `<`/`>` answer false both ways. That
+/// difference is reachable from an ordinary query — a DOUBLE-pinned
+/// `metric=nan` binds a NaN literal against a column that may store one
+/// (the conform's round-trip guard keeps `nan` and `-nan` alike) — and it
+/// made the live tail drop an event the batch query returns.
+///
+/// One owner, one probe matrix: [`compare::double_total_cmp`], which
+/// `eval`'s comparison arms read too.
 fn apply_f64(a: f64, b: f64, op: CompareOp) -> bool {
-    match op {
-        CompareOp::Eq => a == b,
-        CompareOp::Ne => a != b,
-        CompareOp::Gt => a > b,
-        CompareOp::Gte => a >= b,
-        CompareOp::Lt => a < b,
-        CompareOp::Lte => a <= b,
-    }
+    apply_ord(compare::double_total_cmp(a, b), op)
 }

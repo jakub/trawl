@@ -11,6 +11,7 @@
 use std::borrow::Cow;
 
 use crate::ast::{BinaryOp, Expr, FilterOp, FloatLiteral, LiteralValue, Spanned, UnaryOp};
+use crate::compare;
 use crate::emitter::SqlValue;
 use crate::pin_match::{self, NullReadPolicy};
 use crate::pin_scope::{PinScope, PinnedSubject};
@@ -717,27 +718,6 @@ fn eval_mod(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
     }
 }
 
-/// Compare two DOUBLEs the way `DuckDB` does — a TOTAL order in which
-/// every NaN is EQUAL to every other NaN and GREATER than every real
-/// value, and `-0.0` ties `0.0`.
-///
-/// Rust's `f64::partial_cmp` answers `None` for a NaN, which would null
-/// out a comparison the batch lane returns a row for; NaN is ordinary
-/// reachable data now that `/` is true division (`0 / 0`). Probed:
-/// `double_comparison_orders_nan_greatest_and_ties_the_two_zeros`.
-fn duckdb_double_cmp(a: f64, b: f64) -> std::cmp::Ordering {
-    match (a.is_nan(), b.is_nan()) {
-        (true, true) => std::cmp::Ordering::Equal,
-        (true, false) => std::cmp::Ordering::Greater,
-        (false, true) => std::cmp::Ordering::Less,
-        // Neither side is NaN, so `partial_cmp` is total here — and it
-        // already ties the two zeros.
-        (false, false) => a
-            .partial_cmp(&b)
-            .expect("partial_cmp is total when neither operand is NaN"),
-    }
-}
-
 fn eval_eq(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
     match (lhs, rhs) {
         (EvalValue::Int(a), EvalValue::Int(b)) => EvalValue::Bool(a == b),
@@ -760,7 +740,7 @@ fn eval_eq(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
         // cross-type numeric comparison
         _ => match (lhs.as_f64(), rhs.as_f64()) {
             (Some(a), Some(b)) => {
-                EvalValue::Bool(duckdb_double_cmp(a, b) == std::cmp::Ordering::Equal)
+                EvalValue::Bool(compare::double_total_cmp(a, b) == std::cmp::Ordering::Equal)
             }
             // string coercion: compare as strings if one side is a string
             _ => match (lhs.as_str_repr(), rhs.as_str_repr()) {
@@ -793,7 +773,7 @@ fn eval_cmp(
             }
         }
         _ => match (lhs.as_f64(), rhs.as_f64()) {
-            (Some(a), Some(b)) => Some(duckdb_double_cmp(a, b)),
+            (Some(a), Some(b)) => Some(compare::double_total_cmp(a, b)),
             _ => None,
         },
     };

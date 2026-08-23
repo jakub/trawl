@@ -1410,6 +1410,42 @@ pub fn try_cast_boolean(text: &str) -> Option<bool> {
     None
 }
 
+/// Compare two DOUBLEs in `DuckDB`'s order — the ONE owner of that
+/// domain, read by every lane that compares a double.
+///
+/// `DuckDB` orders DOUBLE TOTALLY, and in two places Rust's IEEE
+/// operators do not:
+///
+/// - **every NaN is EQUAL to every other NaN**, whatever its sign bit,
+///   and GREATER than every real value — above `inf`, and last before
+///   SQL NULL in a sort. Rust answers `false` to `NaN == NaN` and `None`
+///   to `partial_cmp`, so an IEEE mirror answers "no match" where the
+///   batch query returns the row.
+/// - `-0.0` TIES `0.0`, which Rust's `partial_cmp` already gets right.
+///
+/// Probed against the engine both ways round — two bound values
+/// (`double_comparison_orders_nan_greatest_and_ties_the_two_zeros`) and a
+/// stored parquet column against a bound literal
+/// (`a_stored_double_column_compares_in_that_same_total_order`), because
+/// a scalar answer can be constant-folded and a column read cannot.
+///
+/// NaN is ordinary reachable data: `0 / 0` in a pipeline expression, a
+/// wire `"nan"` under a DOUBLE pin (the conform's round-trip guard keeps
+/// both spellings), and `metric=nan` as a filter literal.
+#[must_use]
+pub fn double_total_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        // Neither side is NaN, so `partial_cmp` is total here — and it
+        // already ties the two zeros.
+        (false, false) => a
+            .partial_cmp(&b)
+            .expect("partial_cmp is total when neither operand is NaN"),
+    }
+}
+
 /// Render a DOUBLE in the pattern text `DuckDB`'s `CAST(col AS VARCHAR)`
 /// produces — the live mirror of the DOUBLE pin's pattern target, and the
 /// same renderer `tostring()` uses in streaming eval (one renderer, so

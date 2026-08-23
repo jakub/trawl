@@ -4243,6 +4243,22 @@ fn double_comparison_orders_nan_greatest_and_ties_the_two_zeros() {
             Some(if *want { "true" } else { "false" }),
             "{lhs} {expr} {rhs}"
         );
+        // …and the live mirror, side by side with the engine: one owner
+        // for this order, read by eval's comparison arms and by the
+        // pinned matcher's `apply_f64`.
+        let ordering = trawl_core::compare::double_total_cmp(*lhs, *rhs);
+        let mirrored = match *expr {
+            "? = ?" => ordering.is_eq(),
+            "? != ?" => !ordering.is_eq(),
+            "? > ?" => ordering.is_gt(),
+            "? >= ?" => ordering.is_ge(),
+            "? < ?" => ordering.is_lt(),
+            other => panic!("the matrix grew an operator the mirror does not read: {other}"),
+        };
+        assert_eq!(
+            mirrored, *want,
+            "double_total_cmp disagrees: {lhs} {expr} {rhs}"
+        );
     }
     // A NaN of either sign is the same value to the comparison — the
     // rendering keeps the sign bit, the ordering does not.
@@ -4462,6 +4478,20 @@ const STORED_DOUBLE_ROWS: &[&str] = &[
     "CAST(NULL AS DOUBLE)",
 ];
 
+/// The same rows as [`STORED_DOUBLE_ROWS`], as (rendering, value) — what
+/// the live mirror reads. `None` is the SQL NULL row, which no comparison
+/// matches.
+const STORED_DOUBLE_ROW_VALUES: &[(&str, Option<f64>)] = &[
+    ("nan", Some(f64::NAN)),
+    ("-nan", Some(-f64::NAN)),
+    ("inf", Some(f64::INFINITY)),
+    ("-inf", Some(f64::NEG_INFINITY)),
+    ("1.5", Some(1.5)),
+    ("0.0", Some(0.0)),
+    ("-0.0", Some(-0.0)),
+    ("NULL", None),
+];
+
 /// (operator, bound literal, the stored rows it returns — rendered).
 ///
 /// The COLUMN shape, which is the one a pinned live filter mirrors: the
@@ -4508,6 +4538,29 @@ fn a_stored_double_column_compares_in_that_same_total_order() {
             .map(Result::unwrap)
             .collect();
         assert_eq!(matched, *expected, "metric {op} {literal}");
+
+        // The mirror decides the same row set from the same order. The
+        // stored rows are named by their RENDERING here, so the mirror
+        // reads the value each name stands for.
+        let mirrored: Vec<String> = STORED_DOUBLE_ROW_VALUES
+            .iter()
+            .filter_map(|(text, value)| {
+                let ordering = trawl_core::compare::double_total_cmp((*value)?, *literal);
+                let keep = match *op {
+                    "=" => ordering.is_eq(),
+                    "!=" => !ordering.is_eq(),
+                    ">" => ordering.is_gt(),
+                    ">=" => ordering.is_ge(),
+                    "<" => ordering.is_lt(),
+                    other => panic!("unmirrored operator {other}"),
+                };
+                keep.then(|| (*text).to_owned())
+            })
+            .collect();
+        assert_eq!(
+            mirrored, *expected,
+            "double_total_cmp disagrees over the stored column: metric {op} {literal}"
+        );
     }
 
     // …and the sort agrees with the comparison: the NaNs tie at the top,

@@ -1260,6 +1260,85 @@ fn pinned_double_pattern_parity() {
     }
 }
 
+/// The IEEE specials under a DOUBLE pin: a live filter compares them in
+/// `DuckDB`'s TOTAL order, not Rust's.
+///
+/// Every NaN equals every other NaN whatever its sign and outranks `inf`,
+/// so `metric=nan` MATCHES a stored NaN — the answer the matcher's own
+/// IEEE `==` used to get wrong while the batch query returned the row.
+/// The expected answers are stated, not merely agreed on: two lanes
+/// sharing one wrong comparator would pass a bare parity assertion.
+///
+/// The column is spelled out rather than inferred, because a wire `"nan"`
+/// and a wire `"-nan"` both conform to a DOUBLE the round-trip guard
+/// keeps (probed), and no `read_json` inference reproduces that.
+#[test]
+fn pinned_double_special_value_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .unwrap();
+    let ft = pinned(&[("status", CanonicalType::Double)]);
+
+    // (wire value, the stored DOUBLE, `status=nan`, `status>1.5`)
+    let cases = [
+        (Value::from("nan"), "CAST('nan' AS DOUBLE)", true, true),
+        (Value::from("-nan"), "CAST('-nan' AS DOUBLE)", true, true),
+        (Value::from("inf"), "CAST('inf' AS DOUBLE)", false, true),
+        (Value::from("-inf"), "CAST('-inf' AS DOUBLE)", false, false),
+        (Value::from(1.5), "CAST(1.5 AS DOUBLE)", false, false),
+        (Value::from(2.5), "CAST(2.5 AS DOUBLE)", false, true),
+        // Negative zero, spelled as a product: the SQL literal `-0.0`
+        // constant-folds to positive zero.
+        (Value::from(-0.0), "CAST(0.0 AS DOUBLE) * -1", false, false),
+        (Value::from(0), "CAST(0 AS DOUBLE)", false, false),
+    ];
+    // Every operator class against a NaN literal, plus the ordered
+    // comparisons that place NaN in the order at all.
+    let dsls = [
+        "status=nan",
+        "status=-nan",
+        "status!=nan",
+        "status<nan",
+        "status>nan",
+        "status>=nan",
+        "status<=nan",
+        "NOT status=nan",
+        "status>1.5",
+        "status<1.5",
+        "status=inf",
+        "status=0",
+        "status=-0.0",
+        "status=nan,1.5",
+        "status!=nan,1.5",
+    ];
+    for (wire, stored, equals_nan, above_one_and_a_half) in cases {
+        let event = status_event(&wire);
+        for dsl in dsls {
+            let agreed = assert_pinned_parity_over_column(&conn, dsl, &event, &ft, stored);
+            match dsl {
+                "status=nan" => assert_eq!(agreed, equals_nan, "{dsl} over {wire:?}"),
+                "status>1.5" => assert_eq!(agreed, above_one_and_a_half, "{dsl} over {wire:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    // A NULL column is UNKNOWN, not false: nothing matches it — except
+    // the search stage's `!=`, which is the one TOTAL comparison (it
+    // widens with `OR col IS NULL`, ADR-0011), and `NOT status=nan`,
+    // which does NOT, because `NOT (NULL)` is NULL.
+    for event in [status_event(&Value::Null), absent_status_event()] {
+        for dsl in dsls {
+            let widened = dsl.contains("!=");
+            assert_eq!(
+                assert_pinned_parity(&conn, dsl, &event, &ft),
+                widened,
+                "{dsl} over a NULL column"
+            );
+        }
+    }
+}
+
 /// A mixed-case DSL reference names ONE column on both sides: `DuckDB`
 /// folds `"Status"` onto the physical `status`, and ingest folds every
 /// incoming field name, so the matcher must read the same folded key.
