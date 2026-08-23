@@ -588,9 +588,9 @@ fn eval_binary(lhs: &EvalValue, op: BinaryOp, rhs: &EvalValue) -> EvalValue {
     }
 
     match op {
-        BinaryOp::Add => eval_arithmetic(lhs, rhs, |a, b| a + b, |a, b| a + b),
-        BinaryOp::Sub => eval_arithmetic(lhs, rhs, |a, b| a - b, |a, b| a - b),
-        BinaryOp::Mul => eval_arithmetic(lhs, rhs, |a, b| a * b, |a, b| a * b),
+        BinaryOp::Add => eval_arithmetic(lhs, rhs, i64::checked_add, |a, b| a + b),
+        BinaryOp::Sub => eval_arithmetic(lhs, rhs, i64::checked_sub, |a, b| a - b),
+        BinaryOp::Mul => eval_arithmetic(lhs, rhs, i64::checked_mul, |a, b| a * b),
         BinaryOp::Div => eval_div(lhs, rhs),
         BinaryOp::Mod => eval_mod(lhs, rhs),
         BinaryOp::Eq => eval_eq(lhs, rhs),
@@ -641,14 +641,27 @@ fn eval_or(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
     EvalValue::Bool(false)
 }
 
+/// `+ - *`, integer-exact where both operands are integers.
+///
+/// `int_op` is CHECKED and an overflow is `Null`: `DuckDB` raises
+/// `Out of Range Error` on every one of these (probed:
+/// `integer_arithmetic_overflow_is_an_error_never_a_wrap`), a streaming
+/// lane cannot raise a per-event error, and ADR-0017 §5's ratified rule
+/// is that eval nulls where batch errors. The unchecked form was a debug
+/// PANIC — a whole SSE subscription killed by one adversarial event —
+/// and a silent wrap in release. The DOUBLE arm is deliberately
+/// unchecked: `DuckDB` saturates a DOUBLE overflow to infinity rather
+/// than erroring, so IEEE is the mirror there.
 fn eval_arithmetic(
     lhs: &EvalValue,
     rhs: &EvalValue,
-    int_op: impl FnOnce(i64, i64) -> i64,
+    int_op: impl FnOnce(i64, i64) -> Option<i64>,
     float_op: impl FnOnce(f64, f64) -> f64,
 ) -> EvalValue {
     match (lhs, rhs) {
-        (EvalValue::Int(a), EvalValue::Int(b)) => EvalValue::Int(int_op(*a, *b)),
+        (EvalValue::Int(a), EvalValue::Int(b)) => {
+            int_op(*a, *b).map_or(EvalValue::Null, EvalValue::Int)
+        }
         _ => match (lhs.as_f64(), rhs.as_f64()) {
             (Some(a), Some(b)) => EvalValue::Float(float_op(a, b)),
             _ => EvalValue::Null,
@@ -656,47 +669,62 @@ fn eval_arithmetic(
     }
 }
 
+/// `/` — TRUE division, in DOUBLE, for every numeric pair.
+///
+/// `DuckDB`'s `/` has no integer form: `5 / 2` is `2.5` and both
+/// operands go through DOUBLE, so a dividend above 2^53 comes back
+/// rounded (probed: `integer_division_is_true_division_through_double`).
+/// Division by zero is IEEE — `±inf`, or NaN for `0 / 0` — never the
+/// NULL this used to answer, and `i64::MIN / -1` is an ordinary value
+/// rather than the overflow the same pair raises under `%`.
 fn eval_div(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
+    match (lhs.as_f64(), rhs.as_f64()) {
+        (Some(a), Some(b)) => EvalValue::Float(a / b),
+        _ => EvalValue::Null,
+    }
+}
+
+/// `%` — the one arithmetic operator that still splits on the operand
+/// types.
+///
+/// All-integer stays integral and `checked_rem` covers BOTH shapes
+/// `DuckDB` refuses to answer with a number: `x % 0` is NULL, and
+/// `i64::MIN % -1` is an overflow ERROR (probed:
+/// `division_by_zero_is_an_ieee_special_and_integer_modulo_by_zero_is_null`,
+/// `integer_arithmetic_overflow_is_an_error_never_a_wrap`) — so both land
+/// on the same NULL. A DOUBLE operand takes the IEEE path instead, where
+/// `5 % 0.0` is NaN rather than NULL; Rust's `%` is the truncated
+/// remainder `DuckDB` computes, sign following the dividend.
+fn eval_mod(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
     match (lhs, rhs) {
         (EvalValue::Int(a), EvalValue::Int(b)) => {
-            if *b == 0 {
-                EvalValue::Null
-            } else {
-                EvalValue::Int(a / b)
-            }
+            a.checked_rem(*b).map_or(EvalValue::Null, EvalValue::Int)
         }
         _ => match (lhs.as_f64(), rhs.as_f64()) {
-            (Some(a), Some(b)) => {
-                if b == 0.0 {
-                    EvalValue::Null
-                } else {
-                    EvalValue::Float(a / b)
-                }
-            }
+            (Some(a), Some(b)) => EvalValue::Float(a % b),
             _ => EvalValue::Null,
         },
     }
 }
 
-fn eval_mod(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
-    match (lhs, rhs) {
-        (EvalValue::Int(a), EvalValue::Int(b)) => {
-            if *b == 0 {
-                EvalValue::Null
-            } else {
-                EvalValue::Int(a % b)
-            }
-        }
-        _ => match (lhs.as_f64(), rhs.as_f64()) {
-            (Some(a), Some(b)) => {
-                if b == 0.0 {
-                    EvalValue::Null
-                } else {
-                    EvalValue::Float(a % b)
-                }
-            }
-            _ => EvalValue::Null,
-        },
+/// Compare two DOUBLEs the way `DuckDB` does — a TOTAL order in which
+/// every NaN is EQUAL to every other NaN and GREATER than every real
+/// value, and `-0.0` ties `0.0`.
+///
+/// Rust's `f64::partial_cmp` answers `None` for a NaN, which would null
+/// out a comparison the batch lane returns a row for; NaN is ordinary
+/// reachable data now that `/` is true division (`0 / 0`). Probed:
+/// `double_comparison_orders_nan_greatest_and_ties_the_two_zeros`.
+fn duckdb_double_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        // Neither side is NaN, so `partial_cmp` is total here — and it
+        // already ties the two zeros.
+        (false, false) => a
+            .partial_cmp(&b)
+            .expect("partial_cmp is total when neither operand is NaN"),
     }
 }
 
@@ -721,7 +749,9 @@ fn eval_eq(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
         }
         // cross-type numeric comparison
         _ => match (lhs.as_f64(), rhs.as_f64()) {
-            (Some(a), Some(b)) => EvalValue::Bool(a == b),
+            (Some(a), Some(b)) => {
+                EvalValue::Bool(duckdb_double_cmp(a, b) == std::cmp::Ordering::Equal)
+            }
             // string coercion: compare as strings if one side is a string
             _ => match (lhs.as_str_repr(), rhs.as_str_repr()) {
                 (Some(a), Some(b)) => EvalValue::Bool(a == b),
@@ -753,7 +783,7 @@ fn eval_cmp(
             }
         }
         _ => match (lhs.as_f64(), rhs.as_f64()) {
-            (Some(a), Some(b)) => a.partial_cmp(&b), // both are values, not refs
+            (Some(a), Some(b)) => Some(duckdb_double_cmp(a, b)),
             _ => None,
         },
     };
@@ -2071,14 +2101,65 @@ mod tests {
 
     #[test]
     fn div_ints() {
-        let expr = binary(lit_int(10), BinaryOp::Div, lit_int(3));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(3));
+        // TRUE division: `/` has no integer form in DuckDB.
+        let expr = binary(lit_int(10), BinaryOp::Div, lit_int(4));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(2.5));
     }
 
     #[test]
     fn div_by_zero_int() {
-        let expr = binary(lit_int(10), BinaryOp::Div, lit_int(0));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        for (dividend, want) in [(10_i64, f64::INFINITY), (-10_i64, f64::NEG_INFINITY)] {
+            let expr = binary(lit_int(dividend), BinaryOp::Div, lit_int(0));
+            assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(want));
+        }
+        let expr = binary(lit_int(0), BinaryOp::Div, lit_int(0));
+        let EvalValue::Float(value) = eval_expr(&expr, &empty_event()) else {
+            panic!("0 / 0 must be a float");
+        };
+        assert!(value.is_nan());
+    }
+
+    #[test]
+    fn int_arithmetic_overflow_is_null() {
+        for (lhs, op, rhs) in [
+            (i64::MAX, BinaryOp::Add, 1),
+            (i64::MIN, BinaryOp::Sub, 1),
+            (i64::MAX, BinaryOp::Mul, 2),
+            // The one `%` with no integer answer — an ERROR in DuckDB,
+            // not the NULL that `% 0` is, but the same NULL here.
+            (i64::MIN, BinaryOp::Mod, -1),
+        ] {
+            let expr = binary(lit_int(lhs), op, lit_int(rhs));
+            assert_eq!(
+                eval_expr(&expr, &empty_event()),
+                EvalValue::Null,
+                "{lhs:?} {op:?} {rhs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nan_compares_as_duckdb_orders_it() {
+        // NaN is equal to itself and greater than everything else.
+        let nan = || binary(lit_int(0), BinaryOp::Div, lit_int(0));
+        for (op, want) in [
+            (BinaryOp::Eq, true),
+            (BinaryOp::Ne, false),
+            (BinaryOp::Gte, true),
+            (BinaryOp::Lt, false),
+        ] {
+            let expr = binary(nan(), op, nan());
+            assert_eq!(
+                eval_expr(&expr, &empty_event()),
+                EvalValue::Bool(want),
+                "NaN {op:?} NaN"
+            );
+        }
+        let expr = binary(nan(), BinaryOp::Gt, lit_float(f64::MAX));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        // …while the two zeros tie.
+        let expr = binary(lit_float(-0.0), BinaryOp::Eq, lit_float(0.0));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
     }
 
     #[test]
@@ -2090,7 +2171,20 @@ mod tests {
     #[test]
     fn div_by_zero_float() {
         let expr = binary(lit_float(10.0), BinaryOp::Div, lit_float(0.0));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(
+            eval_expr(&expr, &empty_event()),
+            EvalValue::Float(f64::INFINITY)
+        );
+    }
+
+    #[test]
+    fn modulo_by_zero_float() {
+        // A DOUBLE operand takes the IEEE path, where `% 0` is NaN.
+        let expr = binary(lit_int(5), BinaryOp::Mod, lit_float(0.0));
+        let EvalValue::Float(value) = eval_expr(&expr, &empty_event()) else {
+            panic!("5 % 0.0 must be a float");
+        };
+        assert!(value.is_nan());
     }
 
     #[test]

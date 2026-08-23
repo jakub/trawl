@@ -973,7 +973,7 @@ struct GeneratedCase {
 /// F1-style silent deletion. Equal `BTreeMap`s imply equal key sets, so this
 /// subsumes a separate family-name manifest; there is deliberately not one.
 const REQUIRED_FAMILY_CASE_COUNTS: &[(&str, usize)] = &[
-    ("operators", 22),
+    ("operators", 27),
     ("numeric", 7),
     ("coalesce", 5),
     ("conditional", 4),
@@ -1007,6 +1007,17 @@ fn generated_cases() -> Vec<GeneratedCase> {
             "1 + 2.5",
             "-5.0 / 2",
             "5 / 2.0",
+            // Integer TRUE division and its IEEE edges. `0 / 0` and
+            // `5 % 0.0` are deliberately absent: both are NaN, the matcher
+            // compares floats BIT-exactly, and a NaN's bit pattern is the
+            // platform's business. They are pinned by
+            // `division_by_zero_matches_duckdbs_ieee_answer` instead, which
+            // compares the RENDERED value.
+            "5 / 2",
+            "-5 / 2",
+            "1 / 0",
+            "-1 / 0",
+            "5 % 0",
             "-5 % 2",
             "5 % -2",
             "-5 % -2",
@@ -1375,56 +1386,65 @@ fn tonumber_reads_a_boolean_the_way_try_cast_double_does() {
 }
 
 #[test]
-fn current_integer_division_truncates_child_105() {
-    // #105 changes Int/Int division to DuckDB true division.
+fn integer_division_is_true_division_like_duckdb() {
+    // Flipped from `current_integer_division_truncates_child_105` (#105).
+    // `/` has no integer form: both operands go through DOUBLE, so the last
+    // row — a dividend above 2^53 — comes back ROUNDED in both lanes rather
+    // than exact in one of them
+    // (`integer_division_is_true_division_through_double`).
     let conn = utc_connection();
     let event = fixed_event();
-    for (dsl, eval, sql) in [
-        ("* | let x = 5 / 2", 2, 2.5),
-        ("* | let x = -5 / 2", -2, -2.5),
+    for expression in [
+        "5 / 2",
+        "-5 / 2",
+        "4 / 2",
+        "9007199254740993 / 1",
+        "status / 3",
     ] {
-        assert_eq!(eval_scalar(dsl, &event), EvalValue::Int(eval));
         assert_eq!(
-            sql_scalar_result(&conn, dsl, &event),
-            SqlOutcome::Value(SqlCell {
-                logical_type: Type::Double,
-                value: DuckValue::Double(sql),
-            })
+            assert_parity_case(&conn, &event, "integer true division", expression),
+            None
         );
     }
 }
 
 #[test]
-fn current_integer_overflow_panics_or_wraps_child_105() {
-    // #105 makes every integer arithmetic overflow yield NULL in every build profile.
+fn integer_overflow_nulls_where_duckdb_errors() {
+    // Flipped from `current_integer_overflow_panics_or_wraps_child_105`
+    // (#105) — and it keeps the errored/null SHAPE, because that is the
+    // deliberate carve-out rather than an agreement: DuckDB raises
+    // `Out of Range Error` (probed:
+    // `integer_arithmetic_overflow_is_an_error_never_a_wrap`), a streaming
+    // lane cannot raise a per-event error, so the ratified rule applies and
+    // eval NULLS — in every build profile, where it used to panic in debug
+    // and wrap in release.
     let conn = utc_connection();
     let event = fixed_event();
-    for (dsl, release_wrap, duckdb_error) in [
+    for (dsl, duckdb_error) in [
         (
             "* | let x = 9223372036854775807 + 1",
-            i64::MIN,
             "Overflow in addition of INT64",
         ),
         (
             "* | let x = -9223372036854775807 - 2",
-            i64::MAX,
             "Overflow in subtraction of INT64",
         ),
         (
             "* | let x = 9223372036854775807 * 2",
-            -2,
             "Overflow in multiplication of INT64",
         ),
+        // The one remainder with no integer answer. DuckDB calls it a
+        // DIVISION overflow; `/` over the same pair is an ordinary DOUBLE.
+        (
+            "* | let x = (-9223372036854775807 - 1) % -1",
+            "Overflow in division of",
+        ),
     ] {
-        let eval = std::panic::catch_unwind(|| eval_scalar(dsl, &event));
-        if cfg!(debug_assertions) {
-            assert!(
-                eval.is_err(),
-                "debug eval must expose today's overflow panic for {dsl:?}"
-            );
-        } else {
-            assert_eq!(eval.unwrap(), EvalValue::Int(release_wrap));
-        }
+        assert_eq!(
+            eval_scalar(dsl, &event),
+            EvalValue::Null,
+            "streaming eval must null where batch errors for {dsl:?}"
+        );
         assert_sql_errored(&sql_scalar_result(&conn, dsl, &event), duckdb_error, dsl);
     }
 }
@@ -1487,38 +1507,40 @@ fn ceil_floor_and_round_return_duckdbs_argument_driven_shapes() {
 }
 
 #[test]
-fn current_division_by_zero_diverges_child_105() {
-    // #105 owns the division value domain, and its scope text currently claims
-    // division by zero is NULL in BOTH lanes. It is not. Measured today: eval
-    // nulls every division by zero, while DuckDB's `/` promotes to DOUBLE and
-    // answers an IEEE special. Codifying the scope text would be a THIRD
-    // semantics, which ADR-0017 §4 forbids — these are the values to fix
-    // toward.
+fn division_by_zero_matches_duckdbs_ieee_answer() {
+    // Flipped from `current_division_by_zero_diverges_child_105` (#105). Both
+    // lanes now answer the IEEE special DuckDB does — eval used to null every
+    // one of them — while INTEGER `%` 0 stays NULL on both sides.
     let conn = utc_connection();
     let event = fixed_event();
-    for (dsl, sql) in [
+    for (dsl, want) in [
         ("* | let x = 1 / 0", "inf"),
         ("* | let x = -1 / 0", "-inf"),
         ("* | let x = 0 / 0", "NaN"),
-        // Float `%` takes the same DOUBLE path as `/` — only the all-integer
-        // shape below agrees.
+        // A DOUBLE operand takes the IEEE path under `%` too — only the
+        // all-integer shape below is NULL.
         ("* | let x = 5 % 0.0", "NaN"),
+        ("* | let x = 5.0 % 0", "NaN"),
     ] {
-        assert_eq!(eval_scalar(dsl, &event), EvalValue::Null);
-        // Rendered, not compared: `NaN != NaN` under `DuckValue`'s `PartialEq`,
-        // so an `assert_eq!` against `DuckValue::Double(f64::NAN)` can never
-        // hold. `{}` on f64 gives exactly `inf` / `-inf` / `NaN`.
+        // Rendered, not compared: `NaN != NaN` under `PartialEq`, so an
+        // `assert_eq!` against a NaN can never hold and a bit-compare would
+        // pin the platform's NaN payload. `{}` on f64 gives exactly
+        // `inf` / `-inf` / `NaN` on both sides.
+        let EvalValue::Float(eval_value) = eval_scalar(dsl, &event) else {
+            panic!("expected a streaming DOUBLE for {dsl:?}");
+        };
+        assert_eq!(format!("{eval_value}"), want, "streaming, for {dsl:?}");
         match sql_scalar_result(&conn, dsl, &event) {
             SqlOutcome::Value(SqlCell {
                 logical_type: Type::Double,
                 value: DuckValue::Double(value),
-            }) => assert_eq!(format!("{value}"), sql, "for {dsl:?}"),
+            }) => assert_eq!(format!("{value}"), want, "batch, for {dsl:?}"),
             other => panic!("expected a DOUBLE result for {dsl:?}, got {other:?}"),
         }
     }
 
-    // The one AGREEING shape: INTEGER `%` 0 is NULL on both sides (a BIGINT
-    // column holding NULL), so #105 must not "fix" it into an IEEE special.
+    // INTEGER `%` 0 is NULL on both sides (a BIGINT column holding NULL) —
+    // the one shape that is NOT an IEEE special.
     let modulo = "* | let x = 5 % 0";
     assert_eq!(eval_scalar(modulo, &event), EvalValue::Null);
     assert_eq!(
