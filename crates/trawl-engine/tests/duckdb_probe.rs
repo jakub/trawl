@@ -4272,3 +4272,178 @@ fn double_comparison_orders_nan_greatest_and_ties_the_two_zeros() {
         ]
     );
 }
+
+// ── #105 M4: the CONDITION domain of `if` / `case` (ADR-0017 §4) ────
+//
+// `DuckDB` reads an `IF`/`CASE WHEN` condition as a BOOLEAN CAST, not as
+// truthiness: a string outside the boolean vocabulary is a Conversion
+// ERROR, and a TIMESTAMP or a list has no cast at all. Streaming eval
+// answered non-empty-string-is-true, which silently took the THEN branch
+// where the batch lane refuses the query. These probes pin the whole
+// domain — including which values are readable, which error, and the
+// order `CASE` reads its arms in, since "the whole call is NULL" and "skip
+// this arm" are different answers for a multi-arm `case`.
+
+/// The branch `DuckDB` took, or the text of its Conversion error.
+fn conditional_branch(
+    conn: &duckdb::Connection,
+    sql: &str,
+    params: &[&dyn duckdb::ToSql],
+) -> Result<Option<i64>, String> {
+    conn.query_row(sql, params, |row| row.get(0))
+        .map_err(|error| error.to_string())
+}
+
+/// `IF(cond, 1, 2)` and the `CASE` that must answer identically.
+const IF_OVER_BOUND_CONDITION: &str = "SELECT IF(?, 1, 2)";
+const CASE_OVER_BOUND_CONDITION: &str = "SELECT CASE WHEN ? THEN 1 ELSE 2 END";
+
+/// (text, the BOOLEAN `DuckDB` casts it to — `None` = Conversion error).
+///
+/// The same closed, case-insensitive, UNTRIMMED vocabulary
+/// `compare::try_cast_boolean` mirrors, which is why this probe asserts
+/// the mirror beside the engine rather than beside a second list.
+const CONDITION_STRINGS: &[(&str, Option<bool>)] = &[
+    ("true", Some(true)),
+    ("TRUE", Some(true)),
+    ("t", Some(true)),
+    ("yes", Some(true)),
+    ("y", Some(true)),
+    ("1", Some(true)),
+    ("false", Some(false)),
+    ("f", Some(false)),
+    ("no", Some(false)),
+    ("n", Some(false)),
+    ("0", Some(false)),
+    (" true ", None),
+    ("nonempty", None),
+    ("", None),
+    ("2", None),
+    ("1.0", None),
+    ("on", None),
+];
+
+/// (bound BIGINT condition, the branch it takes) — zero is the only
+/// false one, and a negative is TRUE.
+const CONDITION_INTEGERS: &[(i64, bool)] = &[
+    (0, false),
+    (1, true),
+    (2, true),
+    (-1, true),
+    (i64::MAX, true),
+    (i64::MIN, true),
+];
+
+/// (bound DOUBLE condition, the branch it takes) — both zeros are false
+/// and NaN is TRUE, so the reading is `!= 0`, not `> 0` and not a cast
+/// through an integer.
+const CONDITION_DOUBLES: &[(f64, bool)] = &[
+    (0.0, false),
+    (-0.0, false),
+    (1.5, true),
+    (-1.5, true),
+    (f64::NAN, true),
+    (f64::INFINITY, true),
+];
+
+#[test]
+fn an_if_condition_is_a_boolean_cast_not_truthiness() {
+    let conn = conn();
+    let branch = |taken: bool| Some(if taken { 1 } else { 2 });
+
+    for (text, reading) in CONDITION_STRINGS {
+        let want = reading.map(|value| branch(value).expect("a branch"));
+        for sql in [IF_OVER_BOUND_CONDITION, CASE_OVER_BOUND_CONDITION] {
+            let answer = conditional_branch(&conn, sql, &[&(*text).to_string()]);
+            if let Some(expected) = want {
+                assert_eq!(answer.ok().flatten(), Some(expected), "{sql} over {text:?}");
+            } else {
+                let error = answer.unwrap_err();
+                assert!(
+                    error.contains(&format!("Could not convert string '{text}' to BOOL")),
+                    "{sql} over {text:?}: {error}"
+                );
+            }
+        }
+        // The live mirror of that same cast, side by side with it.
+        assert_eq!(
+            trawl_core::compare::try_cast_boolean(text),
+            *reading,
+            "try_cast_boolean disagrees with the condition cast for {text:?}"
+        );
+    }
+
+    for (value, taken) in CONDITION_INTEGERS {
+        for sql in [IF_OVER_BOUND_CONDITION, CASE_OVER_BOUND_CONDITION] {
+            assert_eq!(
+                conditional_branch(&conn, sql, &[value]).unwrap(),
+                branch(*taken),
+                "{sql} over {value}"
+            );
+        }
+    }
+    for (value, taken) in CONDITION_DOUBLES {
+        for sql in [IF_OVER_BOUND_CONDITION, CASE_OVER_BOUND_CONDITION] {
+            assert_eq!(
+                conditional_branch(&conn, sql, &[value]).unwrap(),
+                branch(*taken),
+                "{sql} over {value}"
+            );
+        }
+    }
+
+    // NULL takes the ELSE branch — it is a false condition, not an
+    // unreadable one.
+    for sql in [
+        "SELECT IF(NULL, 1, 2)",
+        "SELECT CASE WHEN NULL THEN 1 ELSE 2 END",
+    ] {
+        assert_eq!(
+            conditional_branch(&conn, sql, &[]).unwrap(),
+            Some(2),
+            "{sql}"
+        );
+    }
+
+    // …while a TIMESTAMP or a list has no boolean cast at all.
+    for condition in ["TIMESTAMP '2026-01-15 10:20:30'", "[1, 2]"] {
+        for shape in [
+            format!("SELECT IF({condition}, 1, 2)"),
+            format!("SELECT CASE WHEN {condition} THEN 1 ELSE 2 END"),
+        ] {
+            let error = conditional_branch(&conn, &shape, &[]).unwrap_err();
+            assert!(
+                error.contains("Unimplemented type for cast"),
+                "{shape}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_case_reads_its_arms_in_order_and_stops_at_the_first_true() {
+    // The distinction eval has to reproduce: an unreadable condition is
+    // not "this arm does not match". It kills the whole call — unless an
+    // EARLIER arm already matched, in which case DuckDB never reads it.
+    let conn = conn();
+    let two_arms = "SELECT CASE WHEN ? THEN 1 WHEN ? THEN 2 ELSE 3 END";
+
+    assert_eq!(
+        conditional_branch(&conn, two_arms, &[&true, &"nonempty".to_string()]).unwrap(),
+        Some(1),
+        "a matched first arm means the second condition is never read"
+    );
+    for first in [&false as &dyn duckdb::ToSql, &Option::<bool>::None] {
+        let error =
+            conditional_branch(&conn, two_arms, &[first, &"nonempty".to_string()]).unwrap_err();
+        assert!(
+            error.contains("Could not convert string 'nonempty' to BOOL"),
+            "an unmatched first arm still reads the second: {error}"
+        );
+    }
+    let error = conditional_branch(&conn, two_arms, &[&"nonempty".to_string(), &true]).unwrap_err();
+    assert!(
+        error.contains("Could not convert string 'nonempty' to BOOL"),
+        "an unreadable FIRST arm errors whatever follows it: {error}"
+    );
+}
