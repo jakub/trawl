@@ -4068,3 +4068,207 @@ fn round_takes_a_precision_only_as_an_inlined_integer() {
     let (dtype, text) = scalar_type_and_text(&conn, "round(?, 1)", &[&5_i64]).unwrap();
     assert_eq!((dtype.as_str(), text.as_deref()), ("BIGINT", Some("5")));
 }
+
+// ── #105 M2: the ARITHMETIC value domain (ADR-0017 §4) ─────────────
+//
+// Three claims eval.rs makes about `+ - * / %` are measured here before
+// eval is moved onto them: `/` is true division (never truncating),
+// division by zero answers an IEEE special where integer `%` by zero
+// answers NULL, and an integer overflow is an ERROR — which is what
+// licenses the streaming lane's NULL for it, since SSE cannot raise a
+// per-event error and ADR-0017 §5's rule is "eval nulls where batch
+// errors". The comparison rows are here for the same reason: once `/`
+// can produce NaN, every comparison over one has to answer as DuckDB
+// does, and DuckDB orders NaN GREATEST rather than leaving it unordered.
+
+/// One scalar expression read back as a DOUBLE — the shape a text
+/// comparison cannot express, since `CAST(0/0 AS VARCHAR)` renders the
+/// hardware's SIGN bit (`-nan`) while the value is just NaN.
+fn scalar_double(
+    conn: &duckdb::Connection,
+    expr: &str,
+    params: &[&dyn duckdb::ToSql],
+) -> Result<Option<f64>, String> {
+    conn.query_row(&format!("SELECT ({expr})"), params, |row| row.get(0))
+        .map_err(|error| error.to_string())
+}
+
+/// (dividend, divisor, quotient) — `/` over two BIGINTs.
+///
+/// The last row is the i64 promotion: both operands go through DOUBLE,
+/// so a dividend above 2^53 comes back ROUNDED, and `i64::MIN / -1` —
+/// the one integer division that has no i64 answer — is an ordinary
+/// value rather than the overflow the `%` of the same pair raises.
+const TRUE_DIVISION_MATRIX: &[(i64, i64, f64)] = &[
+    (5, 2, 2.5),
+    (-5, 2, -2.5),
+    (4, 2, 2.0),
+    (9_007_199_254_740_993, 1, 9_007_199_254_740_992.0),
+    (i64::MIN, -1, 9_223_372_036_854_775_808.0),
+];
+
+#[test]
+fn integer_division_is_true_division_through_double() {
+    let conn = conn();
+    for (dividend, divisor, quotient) in TRUE_DIVISION_MATRIX {
+        let (dtype, _) = scalar_type_and_text(&conn, "? / ?", &[dividend, divisor]).unwrap();
+        assert_eq!(dtype, "DOUBLE", "{dividend} / {divisor}");
+        assert_eq!(
+            scalar_double(&conn, "? / ?", &[dividend, divisor]).unwrap(),
+            Some(*quotient),
+            "{dividend} / {divisor}"
+        );
+    }
+}
+
+/// (dividend, divisor, remainder) — `%` over two BIGINTs, both signs.
+///
+/// Truncated remainder (the sign follows the DIVIDEND), which is Rust's
+/// `%` and not a floored modulo.
+const INTEGER_REMAINDER_MATRIX: &[(i64, i64, i64)] = &[(5, 2, 1), (-5, 2, -1), (5, -2, 1)];
+
+/// (dividend, divisor, remainder) — `%` where either side is a DOUBLE.
+const DOUBLE_REMAINDER_MATRIX: &[(f64, f64, f64)] =
+    &[(5.5, 2.0, 1.5), (-5.5, 2.0, -1.5), (5.0, -2.0, 1.0)];
+
+#[test]
+fn division_by_zero_is_an_ieee_special_and_integer_modulo_by_zero_is_null() {
+    let conn = conn();
+    for (dividend, negative) in [(1_i64, false), (-1_i64, true)] {
+        let quotient = scalar_double(&conn, "? / ?", &[&dividend, &0_i64])
+            .unwrap()
+            .unwrap();
+        assert!(
+            quotient.is_infinite() && quotient.is_sign_negative() == negative,
+            "{dividend} / 0 is a signed infinity, got {quotient}"
+        );
+    }
+    assert!(
+        scalar_double(&conn, "? / ?", &[&0_i64, &0_i64])
+            .unwrap()
+            .unwrap()
+            .is_nan(),
+        "0 / 0 is NaN"
+    );
+
+    // `%` splits on the operand types where `/` does not: all-integer is
+    // NULL, and any DOUBLE operand takes the IEEE path.
+    let (dtype, text) = scalar_type_and_text(&conn, "? % ?", &[&5_i64, &0_i64]).unwrap();
+    assert_eq!((dtype.as_str(), text), ("BIGINT", None));
+    for params in [
+        [&5_i64 as &dyn duckdb::ToSql, &0.0_f64],
+        [&5.0_f64 as &dyn duckdb::ToSql, &0_i64],
+    ] {
+        assert!(
+            scalar_double(&conn, "? % ?", &params)
+                .unwrap()
+                .unwrap()
+                .is_nan(),
+            "a DOUBLE operand makes `% 0` NaN, not NULL"
+        );
+    }
+
+    for (dividend, divisor, remainder) in INTEGER_REMAINDER_MATRIX {
+        let (dtype, text) = scalar_type_and_text(&conn, "? % ?", &[dividend, divisor]).unwrap();
+        assert_eq!(dtype, "BIGINT");
+        assert_eq!(text.as_deref(), Some(remainder.to_string().as_str()));
+    }
+    for (dividend, divisor, remainder) in DOUBLE_REMAINDER_MATRIX {
+        assert_eq!(
+            scalar_double(&conn, "? % ?", &[dividend, divisor]).unwrap(),
+            Some(*remainder),
+            "{dividend} % {divisor}"
+        );
+    }
+}
+
+/// (expression, both operands, the substring of the error `DuckDB` raises).
+const INTEGER_OVERFLOW_MATRIX: &[(&str, i64, i64, &str)] = &[
+    ("? + ?", i64::MAX, 1, "Overflow in addition of INT64"),
+    ("? - ?", i64::MIN, 1, "Overflow in subtraction of INT64"),
+    ("? * ?", i64::MAX, 2, "Overflow in multiplication of INT64"),
+    // `%` is the only remainder that overflows, and it reports itself as
+    // a DIVISION overflow.
+    ("? % ?", i64::MIN, -1, "Overflow in division of"),
+];
+
+#[test]
+fn integer_arithmetic_overflow_is_an_error_never_a_wrap() {
+    let conn = conn();
+    for (expr, lhs, rhs, expected) in INTEGER_OVERFLOW_MATRIX {
+        let error = scalar_type_and_text(&conn, expr, &[lhs, rhs]).unwrap_err();
+        assert!(
+            error.contains(expected),
+            "{lhs} {expr} {rhs}: wanted {expected:?}, got {error}"
+        );
+    }
+    // The DOUBLE side does NOT error — it saturates to infinity, so an
+    // overflow rule written over `as_f64` operands would be wrong.
+    for (expr, rhs) in [("? + ?", f64::MAX), ("? * ?", 2.0)] {
+        assert_eq!(
+            scalar_double(&conn, expr, &[&f64::MAX, &rhs]).unwrap(),
+            Some(f64::INFINITY),
+            "{expr} over DOUBLEs saturates"
+        );
+    }
+}
+
+/// (expression, left, right, `DuckDB`'s answer) over the IEEE specials.
+///
+/// NaN is EQUAL to itself and GREATER than everything else — a total
+/// order, not Rust's `partial_cmp` (which answers `None` and would make
+/// eval null out where batch returns a row). The two zeros tie, which
+/// Rust's `partial_cmp` already gets right.
+const DOUBLE_COMPARISON_MATRIX: &[(&str, f64, f64, bool)] = &[
+    ("? = ?", f64::NAN, f64::NAN, true),
+    ("? != ?", f64::NAN, f64::NAN, false),
+    ("? >= ?", f64::NAN, f64::NAN, true),
+    ("? > ?", f64::NAN, f64::INFINITY, true),
+    ("? < ?", f64::NAN, f64::INFINITY, false),
+    ("? > ?", f64::NAN, 1e308, true),
+    ("? = ?", -0.0, 0.0, true),
+    ("? < ?", -0.0, 0.0, false),
+    ("? = ?", f64::INFINITY, f64::INFINITY, true),
+    ("? < ?", f64::NEG_INFINITY, -1e308, true),
+];
+
+#[test]
+fn double_comparison_orders_nan_greatest_and_ties_the_two_zeros() {
+    let conn = conn();
+    for (expr, lhs, rhs, want) in DOUBLE_COMPARISON_MATRIX {
+        let (dtype, text) = scalar_type_and_text(&conn, expr, &[lhs, rhs]).unwrap();
+        assert_eq!(dtype, "BOOLEAN");
+        assert_eq!(
+            text.as_deref(),
+            Some(if *want { "true" } else { "false" }),
+            "{lhs} {expr} {rhs}"
+        );
+    }
+    // A NaN of either sign is the same value to the comparison — the
+    // rendering keeps the sign bit, the ordering does not.
+    let (_, text) = scalar_type_and_text(&conn, "'-nan'::DOUBLE = 'NaN'::DOUBLE", &[]).unwrap();
+    assert_eq!(text.as_deref(), Some("true"));
+
+    // …and the same order sorts, with SQL NULL after all of them.
+    let mut statement = conn
+        .prepare(
+            "SELECT CAST(x AS VARCHAR) FROM (VALUES ('-inf'::DOUBLE), ('NaN'::DOUBLE), \
+             (1.0::DOUBLE), ('inf'::DOUBLE), (CAST(NULL AS DOUBLE))) t(x) ORDER BY x",
+        )
+        .unwrap();
+    let sorted: Vec<Option<String>> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        sorted,
+        vec![
+            Some("-inf".to_owned()),
+            Some("1.0".to_owned()),
+            Some("inf".to_owned()),
+            Some("nan".to_owned()),
+            None,
+        ]
+    );
+}
