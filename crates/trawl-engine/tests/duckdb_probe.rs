@@ -3896,3 +3896,175 @@ fn the_columns_exclusion_fold_mirrors_catalog_key() {
         "non-ASCII case is NOT folded by the binder"
     );
 }
+
+// ── #105 M1: the numeric / type LEAVES (ADR-0017 §1, §4) ───────────
+//
+// `eval.rs` answers `typeof`, `tonumber`, `ceil`, `floor` and `round`
+// out of its own head today. These probes are the measurement those
+// answers move TO — taken through the shape the batch lane actually
+// executes, which is not the shape a hand-written SQL literal has: the
+// emitter pushes one bound `SqlValue` per DSL literal
+// (`emitter::emit`), so a DSL `1` reaches `DuckDB` as a BIGINT
+// PARAMETER. A bare `typeof(1)` typed into SQL answers `INTEGER` and is
+// simply a different question.
+
+/// One scalar expression, executed and read back as (`typeof`, text) —
+/// the two facts a value-domain mirror has to reproduce.
+///
+/// `expr` carries `?` placeholders and appears exactly ONCE (inside a
+/// subquery), so the bound parameter list is the caller's rather than
+/// silently doubled by a second mention of the same expression.
+fn scalar_type_and_text(
+    conn: &duckdb::Connection,
+    expr: &str,
+    params: &[&dyn duckdb::ToSql],
+) -> Result<(String, Option<String>), String> {
+    let sql = format!("SELECT typeof(x), CAST(x AS VARCHAR) FROM (SELECT ({expr}) AS x) probe");
+    conn.query_row(&sql, params, |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| error.to_string())
+}
+
+/// The type name `DuckDB` gives a value the DSL lane BOUND, per literal
+/// shape the emitter can push.
+const BOUND_TYPEOF_SPELLINGS: &[&str] = &["BIGINT", "BIGINT", "DOUBLE", "BOOLEAN", "VARCHAR"];
+
+/// The shapes that reach `DuckDB` as SQL text rather than a parameter.
+///
+/// The last two are recorded, NOT mirrored: streaming eval spells the
+/// NULL type `NULL` (no quotes) and every list `ARRAY`, where `DuckDB`
+/// spells a list by its ELEMENT type. #105 M1 rules only on the
+/// `INTEGER`/`BIGINT` split; these two stay pinned as divergences in
+/// `trawl-core/tests/scalar_parity.rs`.
+const LITERAL_TYPEOF_SPELLINGS: &[(&str, &str)] = &[
+    ("TIMESTAMP '2026-01-15 10:20:30'", "TIMESTAMP"),
+    ("NULL", "\"NULL\""),
+    ("[1, 2]", "INTEGER[]"),
+];
+
+#[test]
+fn typeof_spells_a_bound_dsl_literal_by_its_bound_type() {
+    let conn = conn();
+    let bound: Vec<Box<dyn duckdb::ToSql>> = vec![
+        Box::new(1_i64),
+        Box::new(i64::MAX),
+        Box::new(1.5_f64),
+        Box::new(true),
+        Box::new("x".to_string()),
+    ];
+    for (value, want) in bound.iter().zip(BOUND_TYPEOF_SPELLINGS) {
+        let (outer, spelling) =
+            scalar_type_and_text(&conn, "typeof(?)", &[value.as_ref()]).unwrap();
+        assert_eq!(outer, "VARCHAR", "typeof() itself returns text");
+        assert_eq!(spelling.as_deref(), Some(*want));
+    }
+    for (expr, want) in LITERAL_TYPEOF_SPELLINGS {
+        let (_, spelling) = scalar_type_and_text(&conn, &format!("typeof({expr})"), &[]).unwrap();
+        assert_eq!(spelling.as_deref(), Some(*want), "typeof({expr})");
+    }
+}
+
+#[test]
+fn a_boolean_casts_to_double_as_one_and_zero() {
+    // `tonumber(x)` emits `TRY_CAST(x AS DOUBLE)`, so a boolean argument
+    // has a reading — it is not the NULL streaming eval answers today.
+    let conn = conn();
+    for (value, want) in [(true, "1.0"), (false, "0.0")] {
+        let (dtype, text) =
+            scalar_type_and_text(&conn, "TRY_CAST(? AS DOUBLE)", &[&value]).unwrap();
+        assert_eq!(dtype, "DOUBLE");
+        assert_eq!(text.as_deref(), Some(want), "TRY_CAST({value} AS DOUBLE)");
+    }
+}
+
+/// (function, return type over a BIGINT argument, over a DOUBLE one).
+///
+/// `round` is the odd one out and the reason #105 M1 leaves its integer
+/// arm alone: it is the only one of the three that keeps an integer
+/// argument integral.
+const ROUNDING_RETURN_TYPES: &[(&str, &str, &str)] = &[
+    ("ceil", "DOUBLE", "DOUBLE"),
+    ("floor", "DOUBLE", "DOUBLE"),
+    ("round", "BIGINT", "DOUBLE"),
+];
+
+/// (bound BIGINT argument, ceil text, floor text, round text).
+const ROUNDING_INTEGER_MATRIX: &[(i64, &str, &str, &str)] = &[
+    (5, "5.0", "5.0", "5"),
+    (-5, "-5.0", "-5.0", "-5"),
+    (0, "0.0", "0.0", "0"),
+];
+
+/// (bound DOUBLE argument, ceil text, floor text, round text).
+///
+/// The negative-zero rows are load-bearing: `DuckDB` KEEPS the sign
+/// (`ceil(-0.5)` is `-0.0`, not `0.0`), which is also what Rust's
+/// `f64::ceil` produces — a mirror that rounded through `i64` could not
+/// express it at all. `round` is half-away-from-zero on both engines.
+const ROUNDING_DOUBLE_MATRIX: &[(f64, &str, &str, &str)] = &[
+    (1.5, "2.0", "1.0", "2.0"),
+    (-1.5, "-1.0", "-2.0", "-2.0"),
+    (0.0, "0.0", "0.0", "0.0"),
+    (-0.0, "-0.0", "-0.0", "-0.0"),
+    (2.5, "3.0", "2.0", "3.0"),
+    (-2.5, "-2.0", "-3.0", "-3.0"),
+    (0.5, "1.0", "0.0", "1.0"),
+    (-0.5, "-0.0", "-1.0", "-1.0"),
+];
+
+#[test]
+fn ceil_floor_and_round_split_their_return_type_on_the_argument_type() {
+    let conn = conn();
+    for (function, over_integer, over_double) in ROUNDING_RETURN_TYPES {
+        let (dtype, _) = scalar_type_and_text(&conn, &format!("{function}(?)"), &[&5_i64]).unwrap();
+        assert_eq!(&dtype, over_integer, "{function} over a BIGINT");
+        let (dtype, _) =
+            scalar_type_and_text(&conn, &format!("{function}(?)"), &[&1.5_f64]).unwrap();
+        assert_eq!(&dtype, over_double, "{function} over a DOUBLE");
+    }
+
+    for (argument, ceil, floor, round) in ROUNDING_INTEGER_MATRIX {
+        for (function, want) in [("ceil", ceil), ("floor", floor), ("round", round)] {
+            let (_, text) =
+                scalar_type_and_text(&conn, &format!("{function}(?)"), &[argument]).unwrap();
+            assert_eq!(text.as_deref(), Some(*want), "{function}({argument})");
+        }
+    }
+    for (argument, ceil, floor, round) in ROUNDING_DOUBLE_MATRIX {
+        for (function, want) in [("ceil", ceil), ("floor", floor), ("round", round)] {
+            let (_, text) =
+                scalar_type_and_text(&conn, &format!("{function}(?)"), &[argument]).unwrap();
+            assert_eq!(text.as_deref(), Some(*want), "{function}({argument})");
+        }
+    }
+}
+
+#[test]
+fn round_takes_a_precision_only_as_an_inlined_integer() {
+    // There is no `round(DOUBLE, BIGINT)` overload, which is exactly why
+    // `emitter::functions::literal_int_positions` inlines `round`'s
+    // second argument instead of binding it. Probed so a future overload
+    // does not quietly make that inlining look optional.
+    let conn = conn();
+    let error = scalar_type_and_text(&conn, "round(?, ?)", &[&1.5_f64, &1_i64]).unwrap_err();
+    assert!(
+        error.contains("round(DOUBLE, BIGINT)"),
+        "a bound precision must still be a binder error: {error}"
+    );
+    for (argument, precision, dtype, want) in [
+        (1.25_f64, 1, "DOUBLE", "1.3"),
+        (-1.25_f64, 1, "DOUBLE", "-1.3"),
+        (1.5_f64, 0, "DOUBLE", "2.0"),
+    ] {
+        let (actual, text) =
+            scalar_type_and_text(&conn, &format!("round(?, {precision})"), &[&argument]).unwrap();
+        assert_eq!(actual, dtype);
+        assert_eq!(
+            text.as_deref(),
+            Some(want),
+            "round({argument}, {precision})"
+        );
+    }
+    // An integer argument keeps its BIGINT shape whatever the precision.
+    let (dtype, text) = scalar_type_and_text(&conn, "round(?, 1)", &[&5_i64]).unwrap();
+    assert_eq!((dtype.as_str(), text.as_deref()), ("BIGINT", Some("5")));
+}
