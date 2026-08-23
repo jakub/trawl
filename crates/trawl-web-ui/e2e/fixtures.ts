@@ -9,6 +9,10 @@
 
 import { test as base, expect } from '@playwright/test';
 
+// Same variable playwright.config.ts and harness/server.mjs read, so the
+// network guard below can never disagree with where the stub actually is.
+const E2E_ORIGIN = `http://127.0.0.1:${Number(process.env.E2E_PORT ?? 8123)}`;
+
 type PageErrors = { errors: Error[] };
 
 export const test = base.extend<{ pageErrors: PageErrors }>({
@@ -32,7 +36,7 @@ test.beforeEach(async ({ page, request }) => {
   await page.context().route('**/*', (route) => {
     const url = new URL(route.request().url());
     const ok =
-      url.origin === 'http://127.0.0.1:8123' ||
+      url.origin === E2E_ORIGIN ||
       url.protocol === 'data:' ||
       url.protocol === 'blob:';
     if (ok) {

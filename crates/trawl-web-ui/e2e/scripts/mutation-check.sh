@@ -156,6 +156,15 @@ for name in "${PATCHES[@]}"; do
   trap - EXIT INT TERM
 done
 
+# dist/ is gitignored, so the clean-tree check below can't see it — and it
+# still holds the LAST mutant's trunk build. Rebuild from the now-reverted
+# sources so a later `npm run test` exercises the real SPA, not a mutant.
+echo "-- trunk build (restore pristine dist) --"
+(cd "$WEB_UI_DIR" && trunk build) || {
+  echo "mutation-check: pristine rebuild failed — dist/ may still hold a mutant build" >&2
+  exit 2
+}
+
 echo
 echo "mutation-check results:"
 printf '%-28s %s\n' "patch" "outcome"

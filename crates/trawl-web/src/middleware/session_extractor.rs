@@ -6,6 +6,8 @@
 //! missing / tampered cookies with 401, and makes the payload available
 //! to handlers via `State<AppState>` + `Session`.
 
+use std::future::{self, Future};
+
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, header};
@@ -44,36 +46,42 @@ impl Session {
 impl FromRequestParts<AppState> for Session {
     type Rejection = ProxyError;
 
-    async fn from_request_parts(
+    // Not `async fn`: nothing here awaits (clippy::unused_async_trait_impl),
+    // the trait merely demands a future, so hand back a ready one.
+    fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let cookie_header = parts
-            .headers
-            .get(axum::http::header::COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .ok_or(ProxyError::Unauthorized)?;
-
-        let cookie_value =
-            find_cookie(cookie_header, state.cookie_name()).ok_or(ProxyError::Unauthorized)?;
-
-        let payload = session::decrypt(state.cookie_key(), cookie_value)
-            .map_err(|_| ProxyError::Unauthorized)?;
-
-        let now = chrono::Utc::now().timestamp();
-        if session::is_expired(&payload, now) {
-            // Expired is distinct from missing/tampered: the browser
-            // IS presenting a cookie, it just can't be redeemed. Tell
-            // it to drop the cookie so subsequent requests don't keep
-            // sending a token we'll always reject.
-            let clear_cookie = state
-                .build_clear_cookie()
-                .map_err(|e| ProxyError::Internal(e.to_string()))?;
-            return Err(ProxyError::ExpiredSession { clear_cookie });
-        }
-
-        Ok(Session(payload))
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        future::ready(session_from_parts(parts, state))
     }
+}
+
+fn session_from_parts(parts: &Parts, state: &AppState) -> Result<Session, ProxyError> {
+    let cookie_header = parts
+        .headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(ProxyError::Unauthorized)?;
+
+    let cookie_value =
+        find_cookie(cookie_header, state.cookie_name()).ok_or(ProxyError::Unauthorized)?;
+
+    let payload =
+        session::decrypt(state.cookie_key(), cookie_value).map_err(|_| ProxyError::Unauthorized)?;
+
+    let now = chrono::Utc::now().timestamp();
+    if session::is_expired(&payload, now) {
+        // Expired is distinct from missing/tampered: the browser
+        // IS presenting a cookie, it just can't be redeemed. Tell
+        // it to drop the cookie so subsequent requests don't keep
+        // sending a token we'll always reject.
+        let clear_cookie = state
+            .build_clear_cookie()
+            .map_err(|e| ProxyError::Internal(e.to_string()))?;
+        return Err(ProxyError::ExpiredSession { clear_cookie });
+    }
+
+    Ok(Session(payload))
 }
 
 /// Auth source for proxy handlers: either a decrypted cookie session or a
