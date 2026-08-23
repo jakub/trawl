@@ -161,7 +161,21 @@ impl Harness {
         panic!("repin job {id} did not reach a terminal state in time");
     }
 
-    /// The catalog's advertised type for a field, via `/api/v1/schema`.
+    /// The type `/api/v1/schema` advertises for a field — the TTL-CACHED
+    /// column listing, unlike [`Harness::pinned_type`], which reads
+    /// `/schema/fields` and bypasses that cache entirely.
+    async fn schema_endpoint_type(&self, field: &str) -> String {
+        let resp = self.query.schema().await.expect("schema");
+        resp.columns
+            .iter()
+            .find(|c| c.name == field)
+            .unwrap_or_else(|| panic!("{field} not in /schema columns"))
+            .data_type
+            .clone()
+    }
+
+    /// The catalog's advertised type for a field, via `/api/v1/schema/fields`
+    /// (no TTL cache in front of it).
     async fn pinned_type(&self, field: &str) -> String {
         let resp = self
             .query
@@ -313,6 +327,48 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values(pool: sqlx:
     h.ingest_and_compact(&[event("api", &json!({"status": 503}))])
         .await;
     assert_eq!(h.count("status>=400 last=1h | stats count()").await, 2);
+}
+
+/// `/api/v1/schema` caches its unscoped column listing for
+/// `schema_cache_ttl_secs`, so a repin cutover used to leave the endpoint
+/// advertising the OLD type for up to a TTL — the autocomplete surface
+/// disagreeing with the corpus it describes. The entry now carries the pin
+/// generation it was built under, so the flip invalidates it at once.
+///
+/// The harness TTL is 60s (`tests/common/mod.rs`) and this test sleeps
+/// nowhere, so TTL expiry cannot explain a pass.
+#[sqlx::test(migrations = false)]
+async fn a_cutover_retypes_the_schema_endpoint_immediately(pool: sqlx::PgPool) {
+    let h = harness(pool).await;
+
+    h.ingest_and_compact(&[
+        event("api", &json!({"status": 200})),
+        event("api", &json!({"status": 404})),
+    ])
+    .await;
+
+    // Prime the cache slot: this read populates it under the BIGINT pin.
+    assert_eq!(h.schema_endpoint_type("status").await, "BIGINT");
+
+    let started = match h
+        .schema_admin
+        .schema_repin("status", "VARCHAR", None, false, false)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+
+    // No sleep: the primed entry is still well inside its TTL, and it must
+    // not be served.
+    assert_eq!(
+        h.schema_endpoint_type("status").await,
+        "VARCHAR",
+        "/schema must retype the moment the cutover flips the pin"
+    );
 }
 
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

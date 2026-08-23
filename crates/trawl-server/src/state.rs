@@ -392,6 +392,31 @@ pub struct CachedSchemaColumns {
     pub columns: Vec<SchemaColumnResponse>,
     /// When this cache entry was created.
     pub cached_at: Instant,
+    /// [`crate::catalog::FieldCatalog::repin_generation`] at the moment the
+    /// entry's postgres read was issued. An entry built under an older
+    /// generation names a type a repin has since replaced, so it is stale
+    /// however young it is.
+    pub pins_generation: u64,
+}
+
+impl CachedSchemaColumns {
+    /// The ONE freshness rule for this cache: an entry serves iff it is
+    /// inside the TTL AND was built under the catalog's current repin
+    /// generation. Callers must not re-check `cached_at` themselves — a
+    /// second rule is exactly how the endpoint came to serve a retyped
+    /// field's OLD type for up to a TTL after a repin cutover.
+    ///
+    /// Accepted residual: the cutover is two-phase — the transactional
+    /// postgres flip, then [`crate::catalog::FieldCatalog::repin`] — and a
+    /// read landing between them still sees the old generation. That window
+    /// is microseconds, and postgres-first is load-bearing for boot-replay
+    /// crash consistency, so it is inherent rather than fixed here. What
+    /// this rule removes is the TTL-scale staleness.
+    #[must_use]
+    pub fn serve(&self, ttl_secs: u64, generation: u64) -> Option<Vec<SchemaColumnResponse>> {
+        (self.pins_generation == generation && self.cached_at.elapsed().as_secs() < ttl_secs)
+            .then(|| self.columns.clone())
+    }
 }
 
 /// A cached field value sample with an expiry timestamp.
@@ -697,6 +722,40 @@ mod tests {
 
     fn fields(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    fn cached_columns(age: Duration, generation: u64) -> CachedSchemaColumns {
+        CachedSchemaColumns {
+            columns: vec![SchemaColumnResponse {
+                name: "status".to_owned(),
+                data_type: "BIGINT".to_owned(),
+            }],
+            cached_at: Instant::now().checked_sub(age).expect("age fits"),
+            pins_generation: generation,
+        }
+    }
+
+    /// Both halves of the one freshness rule, in one place: an entry serves
+    /// only while it is young AND was built under the pin generation the
+    /// reader holds.
+    #[test]
+    fn cached_columns_serve_only_inside_the_ttl_and_generation() {
+        let entry = cached_columns(Duration::from_secs(1), 7);
+        assert_eq!(
+            entry.serve(60, 7).map(|c| c.len()),
+            Some(1),
+            "young entry under the current generation serves"
+        );
+        assert!(
+            entry.serve(60, 8).is_none(),
+            "a repin invalidates a within-TTL entry immediately"
+        );
+
+        let old = cached_columns(Duration::from_secs(90), 7);
+        assert!(
+            old.serve(60, 7).is_none(),
+            "an expired entry is stale even at the same generation"
+        );
     }
 
     /// The construction invariant the whole snapshot rests on: `by_service`
