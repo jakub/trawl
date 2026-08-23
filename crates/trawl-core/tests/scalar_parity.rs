@@ -246,6 +246,7 @@ const REQUIRED_GENERATOR_ARMS: &[&str] = &[
     "tonumber/integer_text",
     "tostring/float",
     "tostring/int",
+    "typeof",
     "typeof/arg_bool",
     "typeof/arg_float",
     "typeof/arg_int",
@@ -588,7 +589,7 @@ fn random_sev(rng: &mut Rng) -> Generated {
 /// diverge — the NULL type and a list — are NOT bound literals and are pinned
 /// by `current_typeof_null_and_list_spellings_are_pinned_child_105`.
 fn random_typeof(rng: &mut Rng) -> Generated {
-    let (arm, argument) = match rng.range(TYPEOF_ARG_ARMS) {
+    let (arg_arm, argument) = match rng.range(TYPEOF_ARG_ARMS) {
         0 => ("typeof/arg_string", str_lit(rng)),
         1 => ("typeof/arg_int", int_lit(rng)),
         2 => ("typeof/arg_float", float_lit(rng)),
@@ -598,7 +599,11 @@ fn random_typeof(rng: &mut Rng) -> Generated {
         ),
         _ => unreachable!(),
     };
-    Generated::new(arm, format!("typeof({argument})"))
+    // The BRANCH keeps its original label and the argument kind is a
+    // second, independent one (`sev` and `concat`'s idiom): the manifest
+    // only ever grows, so a reader can tell "this arm was deleted" from
+    // "this arm gained an axis" by looking at it.
+    Generated::new("typeof", format!("typeof({argument})")).and(arg_arm)
 }
 
 fn random_coalesce(rng: &mut Rng) -> Generated {
