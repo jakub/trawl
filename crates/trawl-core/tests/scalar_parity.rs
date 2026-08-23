@@ -1660,14 +1660,17 @@ fn typeof_spells_a_value_the_way_the_bound_literal_arrives() {
 }
 
 #[test]
-fn current_typeof_null_and_list_spellings_are_pinned_child_105() {
-    // NOT a #105 ruling — recorded, because the probe that measured the
-    // integer spelling measured these two beside it and an unpinned
-    // divergence is exactly what this harness exists to prevent. `DuckDB`
-    // spells the NULL type with quotes and a list by its ELEMENT type, where
-    // eval has one word for each. Neither is a bound literal, so neither is
-    // reachable from the generator surface; both are cheap to fix and nobody
-    // has ruled on them.
+fn current_typeof_null_and_list_spellings_are_pinned() {
+    // A known residual AWAITING A RULING — deliberately not a
+    // `*_child_105` pin, because those are audited as a set that #105
+    // flips and this one is not scheduled to flip in #105 at all. It is
+    // recorded because the probe that measured the integer spelling
+    // measured these two beside it, and an unpinned divergence is exactly
+    // what this harness exists to prevent: `DuckDB` spells the NULL type
+    // with quotes and a list by its ELEMENT type, where eval has one word
+    // for each. Neither is a bound literal, so neither is reachable from
+    // the generator surface; both are cheap to fix once somebody decides
+    // they should be.
     let conn = utc_connection();
     let event = fixed_event();
     for (dsl, eval, sql) in [
