@@ -770,10 +770,67 @@ fn is_valid_ndjson(path: &Path) -> bool {
     std::str::from_utf8(&bytes).is_ok()
 }
 
+/// How many `.corrupt` candidates one quarantine will try before giving up.
+///
+/// A path that corrupts a thousand times is a standing fault, not debris:
+/// exhaustion is a hard error so it surfaces rather than silently rotating.
+const MAX_QUARANTINE_ATTEMPTS: u32 = 1000;
+
+/// Pick — and RESERVE — a free quarantine name for `path`.
+///
+/// The first candidate is the bare `<path>.corrupt`; subsequent ones append a
+/// counter (`<path>.corrupt.1`, `.corrupt.2`, …). A candidate is claimed by
+/// creating it with `O_EXCL` (`create_new`), so the returned path is an empty
+/// file this caller owns and the subsequent `rename` overwrites nothing that
+/// was already there.
+///
+/// Scope, stated honestly: the reservation makes no-clobber hold between
+/// COOPERATING IN-PROCESS quarantiners — every quarantine in trawl funnels
+/// through `quarantine_file`, so that is the whole population. External
+/// mutation of the trawl-owned data root (another process planting or renaming
+/// files under it) is outside the threat model; the workspace forbids `unsafe`,
+/// so the truly atomic `renameat2(RENAME_NOREPLACE)` is not reachable.
+fn quarantine_target(path: &Path) -> Result<PathBuf, String> {
+    for n in 0..MAX_QUARANTINE_ATTEMPTS {
+        let mut candidate = path.as_os_str().to_owned();
+        if n == 0 {
+            candidate.push(".corrupt");
+        } else {
+            candidate.push(format!(".corrupt.{n}"));
+        }
+        let candidate = PathBuf::from(candidate);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(format!(
+                    "failed to reserve quarantine name {}: {e}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "no free quarantine name for {} after {MAX_QUARANTINE_ATTEMPTS} attempts",
+        path.display()
+    ))
+}
+
 /// Move a corrupt/unreadable file aside so it stops wedging compaction,
 /// preserving the bytes for forensics. Appends `.corrupt` to the filename,
 /// which makes it inert: it no longer matches the `*.parquet`/`*.tmp` globs
 /// the rollup scans, nor the `*.ndjson` glob WAL compaction scans.
+///
+/// The destination is RESERVED first (`quarantine_target`) rather than renamed
+/// onto blind: `std::fs::rename` silently replaces an existing destination, so
+/// a second corruption of a recurring path (`{env}/{date}/{HH}/{service}` is
+/// stable across ticks) would destroy the first forensic artifact. A taken name
+/// yields `<path>.corrupt.1`, `.corrupt.2`, … — every artifact is kept, and
+/// every one of those names is as inert to the scan globs as the bare form.
 ///
 /// `event_type` tags the structured log so operators can distinguish a
 /// rollup quarantine (`rollup_quarantine`) from a WAL-compaction one
@@ -781,11 +838,20 @@ fn is_valid_ndjson(path: &Path) -> bool {
 ///
 /// A failed rename is a HARD error: the bad file still matches the scan glob
 /// and would re-wedge on every tick forever, so callers must surface (and
-/// count) the failure rather than swallow it.
-fn quarantine_file(path: &Path, service: &str, event_type: &str) -> Result<(), String> {
-    let mut quarantined = path.as_os_str().to_owned();
-    quarantined.push(".corrupt");
-    let quarantined = PathBuf::from(quarantined);
+/// count) the failure rather than swallow it. The reservation is removed on
+/// that path so a failure leaves no empty `.corrupt` debris behind.
+///
+/// Returns the path the file now lives at.
+fn quarantine_file(path: &Path, service: &str, event_type: &str) -> Result<PathBuf, String> {
+    let quarantined = quarantine_target(path).inspect_err(|e| {
+        tracing::error!(
+            event_type,
+            compact_service = %service,
+            file = %path.display(),
+            error = %e,
+            "failed to quarantine corrupt file"
+        );
+    })?;
     match std::fs::rename(path, &quarantined) {
         Ok(()) => {
             tracing::warn!(
@@ -795,9 +861,12 @@ fn quarantine_file(path: &Path, service: &str, event_type: &str) -> Result<(), S
                 to = %quarantined.display(),
                 "quarantined corrupt file"
             );
-            Ok(())
+            Ok(quarantined)
         }
         Err(e) => {
+            // The reservation is ours and empty; drop it so a retry re-uses
+            // the same name instead of accumulating zero-byte placeholders.
+            let _ = std::fs::remove_file(&quarantined);
             tracing::error!(
                 event_type,
                 compact_service = %service,
@@ -6977,25 +7046,105 @@ mod tests {
         );
     }
 
+    /// A recurring path (`{env}/{date}/{HH}/{service}.parquet` is stable
+    /// across ticks) corrupting twice must leave TWO artifacts: `rename`
+    /// clobbers an existing destination, so the second quarantine used to
+    /// destroy the first one's bytes.
     #[test]
-    fn quarantine_file_signals_rename_failure() {
-        // E3: a failed quarantine-rename is a hard error, not a swallowed log.
+    fn repeated_quarantine_keeps_every_artifact() {
         let tmp = tempfile::tempdir().unwrap();
         let bad = tmp.path().join("svc.parquet");
+
+        std::fs::write(&bad, b"first corruption").unwrap();
+        let first = quarantine_file(&bad, "svc", "rollup_quarantine")
+            .expect("first quarantine must succeed");
+
+        // Same path corrupts again on a later tick.
+        std::fs::write(&bad, b"second corruption").unwrap();
+        let second = quarantine_file(&bad, "svc", "rollup_quarantine")
+            .expect("second quarantine must succeed");
+
+        assert_eq!(first, tmp.path().join("svc.parquet.corrupt"));
+        assert_eq!(second, tmp.path().join("svc.parquet.corrupt.1"));
+        assert_ne!(first, second, "the second artifact must take a new name");
+
+        assert_eq!(std::fs::read(&first).unwrap(), b"first corruption");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second corruption");
+        assert!(!bad.exists(), "both originals were renamed away");
+
+        // Both names stay inert to the scan globs.
+        for p in [&first, &second] {
+            let ext = p
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            assert!(
+                !["parquet", "ndjson", "tmp"].contains(&ext.as_str()),
+                "quarantined name {} must not match a scan glob",
+                p.display()
+            );
+        }
+    }
+
+    /// E3a: a failed RESERVATION is a hard error, not a swallowed log — the
+    /// bad file still matches the scan glob and would re-wedge every tick.
+    #[test]
+    #[cfg(unix)]
+    fn quarantine_file_signals_reservation_failure() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("locked");
+        std::fs::create_dir(&dir).unwrap();
+        let bad = dir.join("svc.parquet");
         std::fs::write(&bad, b"corrupt").unwrap();
 
-        // Pre-create the `.corrupt` target as a non-empty directory so the
-        // rename fails (cannot rename a file onto a non-empty directory).
-        let target = tmp.path().join("svc.parquet.corrupt");
-        std::fs::create_dir(&target).unwrap();
-        std::fs::write(target.join("blocker"), b"x").unwrap();
+        // Read+execute but not write: the reservation's `create_new` open
+        // cannot make a new entry in this directory.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::File::create(dir.join(".probe")).is_ok() {
+            // Running as root: mode bits are not enforced.
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+            return;
+        }
 
         let result = quarantine_file(&bad, "svc", "rollup_quarantine");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "quarantine must surface a reservation failure as Err"
+        );
+        assert!(bad.exists(), "original stays put when quarantine fails");
+    }
+
+    /// E3b: a failed RENAME is a hard error too — and it cleans up the
+    /// reservation, so a retry re-uses the bare `.corrupt` name instead of
+    /// stepping over zero-byte debris.
+    #[test]
+    fn quarantine_file_signals_rename_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No source file: the reservation at `<path>.corrupt` succeeds and
+        // the rename then fails ENOENT.
+        let missing = tmp.path().join("svc.parquet");
+
+        let result = quarantine_file(&missing, "svc", "rollup_quarantine");
         assert!(
             result.is_err(),
             "quarantine must surface a rename failure as Err"
         );
-        assert!(bad.exists(), "original stays put when quarantine fails");
+        assert!(
+            !tmp.path().join("svc.parquet.corrupt").exists(),
+            "a failed quarantine must not leave an empty reservation behind"
+        );
+        assert!(
+            std::fs::read_dir(tmp.path()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt")),
+            "no .corrupt debris in the directory"
+        );
     }
 
     /// A postgres outage does not fail fast — each write blocks on the pool's
