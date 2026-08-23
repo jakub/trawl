@@ -152,6 +152,8 @@ const FLOAT_LITS: &[&str] = &[
 
 const SCALAR_FAMILY_ARMS: usize = 15;
 const STRING_FN_ARMS: usize = 8;
+const TYPEOF_ARG_ARMS: usize = 4;
+const NUMERIC_ARG_ARMS: usize = 2;
 const SEV_ARG_ARMS: usize = 5;
 const SEV_DIALECT_ARMS: usize = 3;
 const CONCAT_ARG_ARMS: usize = 3;
@@ -162,7 +164,9 @@ const STRPTIME_SHAPE_ARMS: usize = 4;
 const REQUIRED_SELECTOR_ARMS: &[(&str, usize, usize)] = &[
     ("random_scalar_expr family", SCALAR_FAMILY_ARMS, 15),
     ("random_string_fn", STRING_FN_ARMS, 8),
-    ("random_numeric_fn", NUMERIC_FN_ARMS, 2),
+    ("random_numeric_fn", NUMERIC_FN_ARMS, 4),
+    ("random_numeric_fn argument", NUMERIC_ARG_ARMS, 2),
+    ("random_typeof argument", TYPEOF_ARG_ARMS, 4),
     ("random_sev argument", SEV_ARG_ARMS, 5),
     ("random_sev dialect", SEV_DIALECT_ARMS, 3),
     ("random_concat argument", CONCAT_ARG_ARMS, 3),
@@ -211,6 +215,10 @@ const REQUIRED_GENERATOR_ARMS: &[&str] = &[
     "date_part",
     "date_trunc",
     "numeric_fn/abs",
+    "numeric_fn/arg_float",
+    "numeric_fn/arg_int",
+    "numeric_fn/ceil",
+    "numeric_fn/floor",
     "numeric_fn/round",
     "sev/arg_field_level",
     "sev/arg_field_sev_num",
@@ -238,21 +246,25 @@ const REQUIRED_GENERATOR_ARMS: &[&str] = &[
     "tonumber/integer_text",
     "tostring/float",
     "tostring/int",
-    "typeof",
+    "typeof/arg_bool",
+    "typeof/arg_float",
+    "typeof/arg_int",
+    "typeof/arg_string",
 ];
 
 /// Every scalar function `random_scalar_expr` can put at the HEAD of a
 /// generated expression — the THIRD projection, read off the emitted text
-/// rather than off an arm's self-reported label. `ceil`/`floor` are absent on
-/// purpose — see [`NUMERIC_FN_ARMS`].
+/// rather than off an arm's self-reported label.
 const REQUIRED_RANDOM_CALL_NAMES: &[&str] = &[
     "abs",
+    "ceil",
     "coalesce",
     "concat",
     "contains",
     "date_diff",
     "date_part",
     "date_trunc",
+    "floor",
     "if",
     "length",
     "lower",
@@ -350,22 +362,30 @@ fn random_string_fn(rng: &mut Rng) -> Generated {
 
 /// Arm count of `random_numeric_fn`'s selector.
 ///
-/// `ceil`/`floor` are DELIBERATELY absent, and this is the only place that says
-/// so. Over an INTEGER argument they are a LIVE divergence — eval answers
-/// `Int(5)` while `DuckDB` answers `DOUBLE 5.0` (`typeof(ceil(5))` is DOUBLE,
-/// `typeof(round(5))` is BIGINT) — so generating them would turn the property
-/// loop red. The divergence is PINNED rather than skipped, by
-/// `current_ceil_floor_and_round_types_are_pinned_child_105`; when #105 fixes
-/// the return types, restore both arms and set this back to 4.
-const NUMERIC_FN_ARMS: usize = 2;
+/// All four are generated, over BOTH argument kinds. `ceil`/`floor` were
+/// excluded while eval answered `Int(5)` where `DuckDB` answers `DOUBLE 5.0`;
+/// #105 gave them `DuckDB`'s argument-driven return type
+/// (`ceil_floor_and_round_split_their_return_type_on_the_argument_type` in
+/// `trawl-engine/tests/duckdb_probe.rs`), so the exclusion is gone rather than
+/// re-pinned. `round` keeps a BIGINT argument integral and agrees too, which is
+/// why the argument kind is an INDEPENDENT draw with its own label — dropping
+/// float or integer coverage from any of the four has to be visible on its own.
+const NUMERIC_FN_ARMS: usize = 4;
 
 fn random_numeric_fn(rng: &mut Rng) -> Generated {
-    let i = int_lit(rng);
-    match rng.range(NUMERIC_FN_ARMS) {
-        0 => Generated::new("numeric_fn/abs", format!("abs({i})")),
-        1 => Generated::new("numeric_fn/round", format!("round({i})")),
+    let (arg_arm, argument) = if rng.range(NUMERIC_ARG_ARMS) == 0 {
+        ("numeric_fn/arg_int", int_lit(rng))
+    } else {
+        ("numeric_fn/arg_float", float_lit(rng))
+    };
+    let (arm, expression) = match rng.range(NUMERIC_FN_ARMS) {
+        0 => ("numeric_fn/abs", format!("abs({argument})")),
+        1 => ("numeric_fn/round", format!("round({argument})")),
+        2 => ("numeric_fn/ceil", format!("ceil({argument})")),
+        3 => ("numeric_fn/floor", format!("floor({argument})")),
         _ => unreachable!(),
-    }
+    };
+    Generated::new(arm, expression).and(arg_arm)
 }
 
 fn random_conditional(rng: &mut Rng) -> Generated {
@@ -560,12 +580,25 @@ fn random_sev(rng: &mut Rng) -> Generated {
     Generated::new(arg_arm, expression).and(dialect_arm)
 }
 
+/// `typeof(x)` over every literal shape the emitter BINDS.
+///
+/// Strings were once the only shape here, because eval spelled an integer
+/// `INTEGER` where the bound literal arrives as BIGINT; #105 moved eval onto
+/// the bound spelling, so the exclusion is gone. The two shapes that still
+/// diverge — the NULL type and a list — are NOT bound literals and are pinned
+/// by `current_typeof_null_and_list_spellings_are_pinned_child_105`.
 fn random_typeof(rng: &mut Rng) -> Generated {
-    // typeof on strings only: DuckDB returns BIGINT for integer literals (it
-    // widens all integer literals to BIGINT) while eval returns INTEGER.
-    // This is a documented eval/DuckDB divergence for typeof — only test
-    // varchar inputs where both agree on "VARCHAR".
-    Generated::new("typeof", format!("typeof({})", str_lit(rng)))
+    let (arm, argument) = match rng.range(TYPEOF_ARG_ARMS) {
+        0 => ("typeof/arg_string", str_lit(rng)),
+        1 => ("typeof/arg_int", int_lit(rng)),
+        2 => ("typeof/arg_float", float_lit(rng)),
+        3 => (
+            "typeof/arg_bool",
+            if rng.bool() { "true" } else { "false" }.to_string(),
+        ),
+        _ => unreachable!(),
+    };
+    Generated::new(arm, format!("typeof({argument})"))
 }
 
 fn random_coalesce(rng: &mut Rng) -> Generated {
@@ -1326,19 +1359,19 @@ fn current_now_is_sampled_per_call_child_106() {
 }
 
 #[test]
-fn current_tonumber_bool_is_null_child_105() {
-    // #105 makes tonumber(bool) mirror DuckDB's TRY_CAST.
+fn tonumber_reads_a_boolean_the_way_try_cast_double_does() {
+    // Flipped from `current_tonumber_bool_is_null_child_105` (#105): a boolean
+    // HAS a DOUBLE reading, probed by `a_boolean_casts_to_double_as_one_and_zero`
+    // in `trawl-engine/tests/duckdb_probe.rs`. It is now plain agreement, so it
+    // is asserted through the one contract implementation.
     let conn = utc_connection();
     let event = fixed_event();
-    let dsl = "* | let x = tonumber(true)";
-    assert_eq!(eval_scalar(dsl, &event), EvalValue::Null);
-    assert_eq!(
-        sql_scalar_result(&conn, dsl, &event),
-        SqlOutcome::Value(SqlCell {
-            logical_type: Type::Double,
-            value: DuckValue::Double(1.0),
-        })
-    );
+    for expression in ["tonumber(true)", "tonumber(false)"] {
+        assert_eq!(
+            assert_parity_case(&conn, &event, "tonumber over a boolean", expression),
+            None
+        );
+    }
 }
 
 #[test]
@@ -1417,44 +1450,40 @@ fn current_string_truthiness_is_pinned_child_105() {
 }
 
 #[test]
-fn current_ceil_floor_and_round_types_are_pinned_child_105() {
-    // #105 makes these return DuckDB's DOUBLE shape for DOUBLE inputs.
+fn ceil_floor_and_round_return_duckdbs_argument_driven_shapes() {
+    // Flipped from `current_ceil_floor_and_round_types_are_pinned_child_105`
+    // (#105). `CEIL`/`FLOOR` widen a BIGINT argument to DOUBLE while `ROUND`
+    // keeps it integral — the asymmetry is DuckDB's, probed by
+    // `ceil_floor_and_round_split_their_return_type_on_the_argument_type`, and
+    // it is why round's integer arm was left alone. With eval matching, all
+    // four scalars are generated again over both argument kinds
+    // (NUMERIC_FN_ARMS), so this test holds the SHAPES the generator's random
+    // draw does not name.
     let conn = utc_connection();
     let event = fixed_event();
-    for (dsl, eval, sql) in [
-        ("* | let x = ceil(-1.5)", -1, -1.0),
-        ("* | let x = floor(-1.5)", -2, -2.0),
-        ("* | let x = ceil(0.0)", 0, 0.0),
-        ("* | let x = floor(0.0)", 0, 0.0),
-        ("* | let x = round(-1.5)", -2, -2.0),
-        // INTEGER inputs — ADR-0017 §5 names them explicitly. `typeof(ceil(5))`
-        // is DOUBLE while `typeof(round(5))` is BIGINT, so ceil/floor diverge
-        // over an integer argument and round does not. That asymmetry is why
-        // `random_numeric_fn` may still generate `round` and may NOT generate
-        // `ceil`/`floor` (see NUMERIC_FN_ARMS) — the exclusion is pinned here,
-        // not skipped there.
-        ("* | let x = ceil(5)", 5, 5.0),
-        ("* | let x = ceil(-5)", -5, -5.0),
-        ("* | let x = floor(5)", 5, 5.0),
-        ("* | let x = floor(-5)", -5, -5.0),
+    for expression in [
+        "ceil(-1.5)",
+        "floor(-1.5)",
+        "ceil(0.0)",
+        "floor(0.0)",
+        "round(-1.5)",
+        // INTEGER arguments — the asymmetric half.
+        "ceil(5)",
+        "ceil(-5)",
+        "floor(5)",
+        "floor(-5)",
+        "round(5)",
+        "round(0)",
+        // An EXPLICIT zero precision takes the same DOUBLE arm as no
+        // precision at all.
+        "round(1.5, 0)",
+        "round(2.5, 0)",
     ] {
-        assert_eq!(eval_scalar(dsl, &event), EvalValue::Int(eval));
         assert_eq!(
-            sql_scalar_result(&conn, dsl, &event),
-            SqlOutcome::Value(SqlCell {
-                logical_type: Type::Double,
-                value: DuckValue::Double(sql),
-            })
+            assert_parity_case(&conn, &event, "numeric rounding shape", expression),
+            None
         );
     }
-
-    // The contrast, and the reason `round` stays in the random generator:
-    // `round` over an INTEGER already AGREES (BIGINT on both sides), so #105
-    // must leave it alone.
-    assert_eq!(
-        assert_parity_case(&conn, &event, "numeric round over integer", "round(5)"),
-        None
-    );
 }
 
 #[test]
@@ -1525,22 +1554,57 @@ fn current_date_part_epoch_precision_is_pinned_child_105() {
 }
 
 #[test]
-fn current_typeof_integer_spelling_is_pinned_child_105() {
-    // #105 reconciles EvalValue::Int's INTEGER spelling with DuckDB BIGINT.
+fn typeof_spells_a_value_the_way_the_bound_literal_arrives() {
+    // Flipped from `current_typeof_integer_spelling_is_pinned_child_105`
+    // (#105). The emitter BINDS every literal, so an integer reaches DuckDB as
+    // BIGINT — `INTEGER` is what a literal written into the SQL text answers,
+    // which this lane never produces
+    // (`typeof_spells_a_bound_dsl_literal_by_its_bound_type`).
     let conn = utc_connection();
     let event = fixed_event();
-    let dsl = "* | let x = typeof(1)";
-    assert_eq!(
-        eval_scalar(dsl, &event),
-        EvalValue::Str("INTEGER".to_string())
-    );
-    assert_eq!(
-        sql_scalar_result(&conn, dsl, &event),
-        SqlOutcome::Value(SqlCell {
-            logical_type: Type::Text,
-            value: DuckValue::Text("BIGINT".to_string()),
-        })
-    );
+    for expression in [
+        "typeof(1)",
+        "typeof(-1)",
+        "typeof(1.5)",
+        "typeof(true)",
+        r#"typeof("x")"#,
+        "typeof(status)",
+    ] {
+        assert_eq!(
+            assert_parity_case(&conn, &event, "typeof spelling", expression),
+            None
+        );
+    }
+}
+
+#[test]
+fn current_typeof_null_and_list_spellings_are_pinned_child_105() {
+    // NOT a #105 ruling — recorded, because the probe that measured the
+    // integer spelling measured these two beside it and an unpinned
+    // divergence is exactly what this harness exists to prevent. `DuckDB`
+    // spells the NULL type with quotes and a list by its ELEMENT type, where
+    // eval has one word for each. Neither is a bound literal, so neither is
+    // reachable from the generator surface; both are cheap to fix and nobody
+    // has ruled on them.
+    let conn = utc_connection();
+    let event = fixed_event();
+    for (dsl, eval, sql) in [
+        ("* | let x = typeof(null)", "NULL", "\"NULL\""),
+        (
+            r#"* | let x = typeof(json_keys("{\"a\":1}"))"#,
+            "ARRAY",
+            "VARCHAR[]",
+        ),
+    ] {
+        assert_eq!(eval_scalar(dsl, &event), EvalValue::Str(eval.to_string()));
+        assert_eq!(
+            sql_scalar_result(&conn, dsl, &event),
+            SqlOutcome::Value(SqlCell {
+                logical_type: Type::Text,
+                value: DuckValue::Text(sql.to_string()),
+            })
+        );
+    }
 }
 
 #[test]

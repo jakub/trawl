@@ -960,12 +960,21 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
         "isnotnull" => args.first().map_or(EvalValue::Null, |v| {
             EvalValue::Bool(!matches!(v, EvalValue::Null))
         }),
+        // The spellings `DuckDB` gives the values THIS lane can hold, probed
+        // in `trawl-engine/tests/duckdb_probe.rs`
+        // (`typeof_spells_a_bound_dsl_literal_by_its_bound_type`). An integer
+        // is BIGINT, not INTEGER: the emitter binds every DSL literal as a
+        // parameter, and a bound `i64` arrives as BIGINT — `INTEGER` is what a
+        // literal written into the SQL TEXT answers, which the batch lane
+        // never produces. Two spellings stay divergent on purpose (the NULL
+        // type and lists, pinned in `trawl-core/tests/scalar_parity.rs`); #105
+        // ruled only on this one.
         "typeof" => args.first().map_or(EvalValue::Null, |v| {
             EvalValue::Str(
                 match v {
                     EvalValue::Null => "NULL",
                     EvalValue::Bool(_) => "BOOLEAN",
-                    EvalValue::Int(_) => "INTEGER",
+                    EvalValue::Int(_) => "BIGINT",
                     EvalValue::Float(_) => "DOUBLE",
                     EvalValue::Str(_) => "VARCHAR",
                     EvalValue::Array(_) => "ARRAY",
@@ -1147,20 +1156,29 @@ fn unary_str(args: &[EvalValue], f: impl FnOnce(&str) -> String) -> EvalValue {
     })
 }
 
-#[allow(clippy::cast_possible_truncation)]
+/// `ceil(x)` — DOUBLE whatever the argument was.
+///
+/// `CEIL` returns DOUBLE over a BIGINT argument as well as over a DOUBLE
+/// one (probed: `ceil_floor_and_round_split_their_return_type_on_the_
+/// argument_type`), so an integer argument widens rather than passing
+/// through, and a fractional one may not be truncated into an `i64` —
+/// `ceil(-0.5)` is `-0.0`, a value no integer can carry.
+#[allow(clippy::cast_precision_loss)]
 fn eval_ceil(args: &[EvalValue]) -> EvalValue {
     args.first().map_or(EvalValue::Null, |v| match v {
-        EvalValue::Int(n) => EvalValue::Int(*n),
-        EvalValue::Float(n) => EvalValue::Int(n.ceil() as i64),
+        EvalValue::Int(n) => EvalValue::Float(*n as f64),
+        EvalValue::Float(n) => EvalValue::Float(n.ceil()),
         _ => EvalValue::Null,
     })
 }
 
-#[allow(clippy::cast_possible_truncation)]
+/// `floor(x)` — DOUBLE whatever the argument was, exactly like
+/// [`eval_ceil`].
+#[allow(clippy::cast_precision_loss)]
 fn eval_floor(args: &[EvalValue]) -> EvalValue {
     args.first().map_or(EvalValue::Null, |v| match v {
-        EvalValue::Int(n) => EvalValue::Int(*n),
-        EvalValue::Float(n) => EvalValue::Int(n.floor() as i64),
+        EvalValue::Int(n) => EvalValue::Float(*n as f64),
+        EvalValue::Float(n) => EvalValue::Float(n.floor()),
         _ => EvalValue::Null,
     })
 }
@@ -1223,6 +1241,14 @@ fn eval_substr(args: &[EvalValue]) -> EvalValue {
     EvalValue::Str(chars[(lo - 1) as usize..hi as usize].iter().collect())
 }
 
+/// `round(x [, precision])` — the one of the three rounding scalars that
+/// KEEPS an integer argument integral.
+///
+/// `ROUND` over a BIGINT returns BIGINT while `CEIL`/`FLOOR` widen to
+/// DOUBLE (probed: `ceil_floor_and_round_split_their_return_type_on_the_
+/// argument_type`), so the integer arm passes through unchanged and only
+/// the DOUBLE arm — including the precision-0 case, which used to answer
+/// an integer — stays DOUBLE.
 #[allow(clippy::cast_possible_truncation)]
 fn eval_round(args: &[EvalValue]) -> EvalValue {
     if args.is_empty() || args.len() > 2 {
@@ -1243,7 +1269,7 @@ fn eval_round(args: &[EvalValue]) -> EvalValue {
     };
 
     if precision == 0 {
-        EvalValue::Int(val.round() as i64)
+        EvalValue::Float(val.round())
     } else {
         let factor = 10_f64.powi(precision as i32);
         EvalValue::Float((val * factor).round() / factor)
@@ -1258,6 +1284,9 @@ fn eval_tonumber(args: &[EvalValue]) -> EvalValue {
     match args.first() {
         Some(EvalValue::Int(n)) => EvalValue::Float(*n as f64),
         Some(EvalValue::Float(n)) => EvalValue::Float(*n),
+        // A boolean HAS a DOUBLE reading — `TRY_CAST(true AS DOUBLE)` is
+        // 1.0, not NULL (probed: `a_boolean_casts_to_double_as_one_and_zero`).
+        Some(EvalValue::Bool(b)) => EvalValue::Float(if *b { 1.0 } else { 0.0 }),
         // One owner for the cast domain — whitespace trimming and `_`
         // digit separators alike (see `compare::try_cast_double`), so the
         // scalar and the DOUBLE pin's pattern text can't drift.
@@ -2726,25 +2755,56 @@ mod tests {
     #[test]
     fn fn_ceil() {
         let expr = call("ceil", vec![lit_float(1.2)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(2));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(2.0));
+    }
+
+    #[test]
+    fn fn_ceil_widens_an_integer_argument() {
+        // CEIL(BIGINT) is DOUBLE in DuckDB, so an integer argument may not
+        // pass through as one.
+        let expr = call("ceil", vec![lit_int(5)]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(5.0));
+    }
+
+    #[test]
+    fn fn_ceil_keeps_negative_zero() {
+        // `-0.0`, the value the retired i64 truncation could not carry.
+        let expr = call("ceil", vec![lit_float(-0.5)]);
+        let EvalValue::Float(value) = eval_expr(&expr, &empty_event()) else {
+            panic!("ceil(-0.5) must be a float");
+        };
+        assert!(value == 0.0 && value.is_sign_negative(), "{value}");
     }
 
     #[test]
     fn fn_ceiling_alias() {
         let expr = call("ceiling", vec![lit_float(1.2)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(2));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(2.0));
     }
 
     #[test]
     fn fn_floor() {
         let expr = call("floor", vec![lit_float(1.8)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(1));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(1.0));
+    }
+
+    #[test]
+    fn fn_floor_widens_an_integer_argument() {
+        let expr = call("floor", vec![lit_int(-5)]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(-5.0));
     }
 
     #[test]
     fn fn_round_no_precision() {
+        // ROUND(DOUBLE) is DOUBLE — only an INTEGER argument stays integral.
         let expr = call("round", vec![lit_float(1.6)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(2));
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(2.0));
+    }
+
+    #[test]
+    fn fn_round_explicit_zero_precision_stays_double() {
+        let expr = call("round", vec![lit_float(2.5), lit_int(0)]);
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(3.0));
     }
 
     #[test]
@@ -2814,7 +2874,7 @@ mod tests {
         let expr = call("typeof", vec![lit_int(5)]);
         assert_eq!(
             eval_expr(&expr, &empty_event()),
-            EvalValue::Str("INTEGER".to_string())
+            EvalValue::Str("BIGINT".to_string())
         );
     }
 
@@ -3083,6 +3143,15 @@ mod tests {
     fn fn_tonumber_from_float() {
         let expr = call("tonumber", vec![lit_float(1.5)]);
         assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(1.5));
+    }
+
+    #[test]
+    fn fn_tonumber_from_bool() {
+        // TRY_CAST(bool AS DOUBLE) has a reading in both directions.
+        for (input, want) in [(true, 1.0), (false, 0.0)] {
+            let expr = call("tonumber", vec![lit_bool(input)]);
+            assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(want));
+        }
     }
 
     #[test]
