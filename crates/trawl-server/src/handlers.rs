@@ -554,11 +554,24 @@ pub async fn schema(
         // alternating traffic cannot evict the other shape's entry — see
         // `schema_columns_cache` in state.rs.
         let mut cache = state.query.schema_columns_cache.lock().await;
+        // Read the repin generation AFTER the mutex and BEFORE the SELECT.
+        // After: a request that waited on the mutex would otherwise validate
+        // the entry the holder just built against a generation it sampled
+        // before the flip. Before: an entry whose SELECT straddles a flip is
+        // then stamped with the OLD generation, so the next read discards it
+        // rather than serving a type the corpus no longer has.
+        //
+        // A request whose SELECT began before a flip may still return
+        // pre-flip columns in its OWN response (its postgres snapshot
+        // legitimately predates the commit, and the corpus-facts walk below
+        // can delay that response's arrival) — ordinary concurrent-read
+        // semantics; the stale entry it stamps cannot be served to any
+        // later request.
+        let generation = state.query.field_catalog.repin_generation();
         let slot = &mut cache[usize::from(since.is_some())];
-        let fresh = slot.as_ref().and_then(|c| {
-            (c.cached_at.elapsed().as_secs() < state.query.schema_cache_ttl_secs)
-                .then(|| c.columns.clone())
-        });
+        let fresh = slot
+            .as_ref()
+            .and_then(|c| c.serve(state.query.schema_cache_ttl_secs, generation));
         if let Some(columns) = fresh {
             columns
         } else {
@@ -566,6 +579,7 @@ pub async fn schema(
             *slot = Some(crate::state::CachedSchemaColumns {
                 columns: columns.clone(),
                 cached_at: std::time::Instant::now(),
+                pins_generation: generation,
             });
             columns
         }
@@ -2491,7 +2505,6 @@ fn write_query_log(
             globs: debug.glob_count,
             service_filter: debug.service_filter.clone(),
             time_filter_secs: debug.time_filter_secs,
-            is_fallback: debug.is_fallback,
         },
         hot_buffer: HotBufferDebug {
             status: debug.hot_status,

@@ -39,6 +39,18 @@ use crate::store::CatalogStore;
 #[derive(Debug, Default)]
 pub struct FieldCatalog {
     pins: RwLock<HashMap<String, CanonicalType>>,
+    /// Bumped by — and ONLY by — [`FieldCatalog::repin`]: a stamp readers
+    /// hold beside a cached derivation of the pin set, so a repin can
+    /// invalidate that cache without the retyping path knowing it exists.
+    ///
+    /// Deliberately NOT bumped by [`FieldCatalog::merge`] or
+    /// [`FieldCatalog::replace`]: those are add-only (a new pin, or boot
+    /// hydration), and a caching reader that already served a page without
+    /// the new field is no more wrong than it was a millisecond earlier —
+    /// bumping there would spend the cache's whole TTL economics on every
+    /// compaction batch that pins something. Retyping is the only change
+    /// that makes a served answer WRONG rather than incomplete.
+    repin_generation: std::sync::atomic::AtomicU64,
 }
 
 impl FieldCatalog {
@@ -58,8 +70,32 @@ impl FieldCatalog {
     /// slice B), and the cache's first non-add-only path. Runs while the
     /// cutover holds every query permit, so no in-flight query can observe
     /// half a flip.
+    ///
+    /// The bump is Release inside the write-lock scope and
+    /// [`Self::repin_generation`] reads Acquire, and the postgres commit
+    /// precedes the bump — so a reader that observes the NEW stamp can never
+    /// see the old pins or the old postgres row. The converse is possible
+    /// and safe: a reader that loaded the old stamp may see post-flip state,
+    /// producing a cache entry stamped with the OLD generation, which the
+    /// next read discards (over-invalidation, never staleness).
     pub fn repin(&self, field: &str, ty: CanonicalType) {
-        self.pins.write().insert(field.to_owned(), ty);
+        let mut guard = self.pins.write();
+        guard.insert(field.to_owned(), ty);
+        self.repin_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// How many times a pin has been RETYPED in this process.
+    ///
+    /// Opaque; only equality is meaningful. A cached derivation of the pin
+    /// set (today: the `/api/v1/schema` column listing) stamps the value it
+    /// was built under and refuses to serve when it no longer matches, so a
+    /// repin cutover retypes that endpoint immediately instead of at the
+    /// next TTL expiry.
+    #[must_use]
+    pub fn repin_generation(&self) -> u64 {
+        self.repin_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Fold newly-durable pins into the cache, leaving every other entry
@@ -217,6 +253,31 @@ mod tests {
         assert_eq!(cache.get("status"), Some(CanonicalType::Varchar));
         assert_eq!(cache.get("dur"), Some(CanonicalType::Double));
         assert_eq!(cache.snapshot().len(), 2, "an overwrite, never an add");
+    }
+
+    /// The generation stamp exists so a cached derivation of the pin set can
+    /// tell "a field was RETYPED" (its answer is now wrong) from "a field was
+    /// ADDED" (its answer is merely incomplete, which the TTL already covers).
+    #[test]
+    fn only_a_repin_bumps_the_generation() {
+        let cache = catalog(&[("status", CanonicalType::BigInt)]);
+        let start = cache.repin_generation();
+
+        cache.merge([("dur".to_owned(), CanonicalType::Double)]);
+        assert_eq!(cache.repin_generation(), start, "merge is add-only");
+
+        cache.replace([("status".to_owned(), CanonicalType::BigInt)]);
+        assert_eq!(
+            cache.repin_generation(),
+            start,
+            "replace is boot hydration, not a retype"
+        );
+
+        cache.repin("status", CanonicalType::Varchar);
+        assert_eq!(cache.repin_generation(), start + 1, "a repin bumps");
+
+        cache.repin("status", CanonicalType::BigInt);
+        assert_eq!(cache.repin_generation(), start + 2, "every repin bumps");
     }
 
     #[test]

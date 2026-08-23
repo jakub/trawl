@@ -53,8 +53,6 @@ pub struct PoolDebugInfo {
     pub service_filter: Option<String>,
     /// Time filter duration in seconds, if any.
     pub time_filter_secs: Option<u64>,
-    /// Whether the source fell back to recursive glob.
-    pub is_fallback: bool,
     /// Hot buffer status: "disabled", "empty", or "active".
     pub hot_status: &'static str,
     /// Hot buffer event count at snapshot time.
@@ -202,7 +200,6 @@ fn run_query_blocking(
     max_result_rows: usize,
     utc_offset_secs: i32,
     capture_debug: bool,
-    fallback_glob: &str,
     pool_wait_ms: u64,
 ) -> (
     Executor,
@@ -235,7 +232,6 @@ fn run_query_blocking(
             source,
             hot_buffer,
             pins,
-            fallback_glob,
             pool_wait_ms,
         ))
     } else {
@@ -291,7 +287,6 @@ fn capture_pool_debug(
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
     pins: &trawl_core::schema::FieldTypes,
-    fallback_glob: &str,
     pool_wait_ms: u64,
 ) -> PoolDebugInfo {
     let glob_count = if source.starts_with('[') {
@@ -299,8 +294,6 @@ fn capture_pool_debug(
     } else {
         1
     };
-    let is_fallback = source == fallback_glob || source.ends_with("/**/*.parquet");
-
     // Re-parse AST to extract filters and emit SQL (cheap, <1ms).
     let (service_filter, time_filter_secs, sql, params) =
         if let Ok(ast) = trawl_core::parser::parse(dsl) {
@@ -357,7 +350,6 @@ fn capture_pool_debug(
         glob_count,
         service_filter,
         time_filter_secs,
-        is_fallback,
         hot_status,
         hot_events,
         hot_batches,
@@ -503,7 +495,6 @@ impl ExecutorPool {
 
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
-        let fallback_glob = Arc::clone(&self.fallback_glob);
         let max_result_rows = self.max_result_rows;
         let hot_buffer = self.hot_buffer.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
@@ -527,7 +518,7 @@ impl ExecutorPool {
                 }
             }
 
-            let source = compute_source(&base_dir, &dsl, &fallback_glob);
+            let source = compute_source(&base_dir, &dsl);
             let file_globs: usize = if source.starts_with('[') {
                 source.matches(',').count() + 1
             } else {
@@ -554,7 +545,6 @@ impl ExecutorPool {
                 max_result_rows,
                 utc_offset_secs,
                 capture_debug,
-                &fallback_glob,
                 pool_wait_ms,
             );
             // Inside the permit, on the blocking pool: the walk compiles a
@@ -678,7 +668,6 @@ impl ExecutorPool {
 
         let dsl = dsl.to_owned();
         let source = source.to_owned();
-        let fallback_glob = Arc::clone(&self.fallback_glob);
         let max_result_rows = self.max_result_rows;
         let field_catalog = Arc::clone(&self.field_catalog);
 
@@ -713,7 +702,6 @@ impl ExecutorPool {
                 max_result_rows,
                 utc_offset_secs,
                 capture_debug,
-                &fallback_glob,
                 pool_wait_ms,
             );
             // `dsl` here is what FOLLOWS `| from saved`, whose `PinScope`
@@ -968,7 +956,6 @@ impl ExecutorPool {
         let executor = self.take_executor();
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
-        let fallback_glob = Arc::clone(&self.fallback_glob);
         let hot_buffer = self.hot_buffer.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
@@ -977,7 +964,7 @@ impl ExecutorPool {
         let mut task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let _ = interrupt_tx.send(executor.interrupt_handle());
-            let source = compute_source(&base_dir, &dsl, &fallback_glob);
+            let source = compute_source(&base_dir, &dsl);
 
             // Write to a temp file, then read it back as bytes.
             let tmp = tempfile::NamedTempFile::new()
