@@ -1450,21 +1450,69 @@ fn integer_overflow_nulls_where_duckdb_errors() {
 }
 
 #[test]
-fn current_string_truthiness_is_pinned_child_105() {
-    // #105 adopts DuckDB's boolean condition domain.
+fn an_if_or_case_condition_takes_duckdbs_boolean_domain() {
+    // Flipped from `current_string_truthiness_is_pinned_child_105` (#105).
+    // Both halves are agreement now, and both go through the ONE contract
+    // implementation: a readable condition picks the same branch in both
+    // lanes, and an unreadable one — where DuckDB raises a Conversion error
+    // — nulls in streaming instead of silently taking a branch. The domain
+    // is probed by `an_if_condition_is_a_boolean_cast_not_truthiness`.
     let conn = utc_connection();
     let event = fixed_event();
     for function in ["if", "case"] {
-        let dsl = if function == "if" {
-            r#"* | let x = if("nonempty", 1, 2)"#
-        } else {
-            r#"* | let x = case("nonempty", 1, 2)"#
-        };
-        assert_eq!(eval_scalar(dsl, &event), EvalValue::Int(1));
-        assert_sql_errored(
-            &sql_scalar_result(&conn, dsl, &event),
-            "Could not convert string 'nonempty' to BOOL",
-            dsl,
+        for condition in [
+            // The readable vocabulary.
+            r#""true""#,
+            r#""TRUE""#,
+            r#""t""#,
+            r#""yes""#,
+            r#""1""#,
+            // Read as FALSE — truthiness used to take the THEN branch.
+            r#""0""#,
+            r#""no""#,
+            // No boolean reading at all: batch errors, streaming nulls.
+            r#""nonempty""#,
+            r#"" true ""#,
+            r#""""#,
+            r#""2""#,
+            // Non-string conditions, including the columns the fixture
+            // carries: `service` is a VARCHAR holding 'nginx' (no reading),
+            // `status` a BIGINT (non-zero, so true).
+            "0",
+            "1",
+            "-1",
+            "0.0",
+            "1.5",
+            "true",
+            "false",
+            "null",
+            "service",
+            "status",
+            r#"strptime("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")"#,
+        ] {
+            assert_eq!(
+                assert_parity_case(
+                    &conn,
+                    &event,
+                    function,
+                    &format!("{function}({condition}, 1, 2)")
+                ),
+                None
+            );
+        }
+    }
+
+    // Arm ORDER: an unreadable condition is not "this arm does not match",
+    // and an earlier match means it is never read.
+    for expression in [
+        r#"case(true, 1, "nonempty", 2, 3)"#,
+        r#"case(false, 1, "nonempty", 2, 3)"#,
+        r#"case(null, 1, "nonempty", 2, 3)"#,
+        r#"case("nonempty", 1, true, 2, 3)"#,
+    ] {
+        assert_eq!(
+            assert_parity_case(&conn, &event, "case arm order", expression),
+            None
         );
     }
 }

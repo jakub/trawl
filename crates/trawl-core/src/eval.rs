@@ -32,7 +32,17 @@ pub enum EvalValue {
 }
 
 impl EvalValue {
-    /// Truthiness check (SQL-style: `Null` and `false` are falsy).
+    /// The LEGACY logical predicate: `Null` and `false` are falsy, every
+    /// other value — including a non-empty string, a timestamp and a list
+    /// — is true.
+    ///
+    /// This is NOT `DuckDB`'s boolean domain. `DuckDB` CASTS a condition
+    /// and REFUSES a string outside its vocabulary (probed:
+    /// `an_if_condition_is_a_boolean_cast_not_truthiness`), which is what
+    /// [`read_condition`] mirrors and what `if`/`case` now read their
+    /// condition through. This predicate stays behind `and`/`or`/`not` and
+    /// the streaming `where` gate on purpose: those decide whether a LIVE
+    /// ALERT fires, and #105 was not licensed to change that.
     pub fn is_truthy(&self) -> bool {
         match self {
             Self::Null => false,
@@ -970,10 +980,10 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
             if args.len() != 3 {
                 return Some(EvalValue::Null);
             }
-            if args[0].is_truthy() {
-                args[1].clone()
-            } else {
-                args[2].clone()
+            match read_condition(&args[0]) {
+                ConditionRead::True => args[1].clone(),
+                ConditionRead::NotTaken => args[2].clone(),
+                ConditionRead::Unreadable => EvalValue::Null,
             }
         }
         "coalesce" => {
@@ -1019,8 +1029,17 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
         "case" => {
             let pairs = args.len() / 2;
             for i in 0..pairs {
-                if args[i * 2].is_truthy() {
-                    return Some(args[i * 2 + 1].clone());
+                match read_condition(&args[i * 2]) {
+                    ConditionRead::True => return Some(args[i * 2 + 1].clone()),
+                    // FALSE and NULL alike move to the next arm.
+                    ConditionRead::NotTaken => {}
+                    // An unreadable condition is NOT "this arm does not
+                    // match" — `DuckDB` errors, so the whole call is NULL.
+                    // Read in arm ORDER, so an earlier match returns before
+                    // this one is ever looked at, which is what `DuckDB`'s
+                    // per-arm short circuit does (probed:
+                    // `a_case_reads_its_arms_in_order_and_stops_at_the_first_true`).
+                    ConditionRead::Unreadable => return Some(EvalValue::Null),
                 }
             }
             // odd arg count → last arg is default
@@ -1176,6 +1195,50 @@ fn json_val_to_eval_val(v: &serde_json::Value) -> EvalValue {
             EvalValue::Array(arr.iter().map(json_val_to_eval_val).collect())
         }
         serde_json::Value::Object(_) => EvalValue::Str(v.to_string()),
+    }
+}
+
+/// What `DuckDB` makes of an `IF`/`CASE WHEN` condition.
+enum ConditionRead {
+    /// A true condition: take this branch.
+    True,
+    /// FALSE or SQL NULL — `DuckDB` treats both as not-taken and moves to
+    /// the else branch (or the next `CASE` arm).
+    NotTaken,
+    /// No boolean reading at all. `DuckDB` raises a Conversion error, so
+    /// the whole call is NULL under the ratified
+    /// eval-nulls-where-batch-errors rule.
+    Unreadable,
+}
+
+/// Read a condition the way `DuckDB` casts one — the domain probed by
+/// `an_if_condition_is_a_boolean_cast_not_truthiness`, NOT
+/// [`EvalValue::is_truthy`].
+///
+/// Strings go through the one owner of that cast vocabulary
+/// ([`crate::compare::try_cast_boolean`]) — closed, case-insensitive and
+/// UNTRIMMED, so `' true '` has no reading. Numbers read as `!= 0`,
+/// which makes both zeros false and NaN true; a timestamp or a list has
+/// no cast to BOOLEAN at all.
+fn read_condition(value: &EvalValue) -> ConditionRead {
+    let taken = match value {
+        EvalValue::Bool(b) => *b,
+        EvalValue::Null => return ConditionRead::NotTaken,
+        EvalValue::Int(n) => *n != 0,
+        // An exact zero test, both signs: `-0.0` is false and NaN — which
+        // no ordering comparison would call true — is true.
+        #[allow(clippy::float_cmp)]
+        EvalValue::Float(n) => *n != 0.0,
+        EvalValue::Str(s) => match crate::compare::try_cast_boolean(s) {
+            Some(b) => b,
+            None => return ConditionRead::Unreadable,
+        },
+        EvalValue::Timestamp(_) | EvalValue::Array(_) => return ConditionRead::Unreadable,
+    };
+    if taken {
+        ConditionRead::True
+    } else {
+        ConditionRead::NotTaken
     }
 }
 
@@ -2931,6 +2994,64 @@ mod tests {
             eval_expr(&expr, &empty_event()),
             EvalValue::Str("no".to_string())
         );
+    }
+
+    #[test]
+    fn fn_if_reads_its_condition_as_duckdb_casts_it() {
+        for (condition, want) in [
+            (lit_str("true"), Some("yes")),
+            (lit_str("YES"), Some("yes")),
+            // Read as FALSE, where truthiness took the THEN branch.
+            (lit_str("0"), Some("no")),
+            (lit_str("no"), Some("no")),
+            (lit_int(0), Some("no")),
+            (lit_int(-1), Some("yes")),
+            (lit_float(-0.0), Some("no")),
+            (lit_null(), Some("no")),
+            // No boolean reading: DuckDB errors, so the call is NULL —
+            // NOT the else branch, which would answer a question DuckDB
+            // refuses.
+            (lit_str("nonempty"), None),
+            (lit_str(" true "), None),
+            (lit_str(""), None),
+            (lit_str("2"), None),
+        ] {
+            let expr = call("if", vec![condition, lit_str("yes"), lit_str("no")]);
+            let expected = want.map_or(EvalValue::Null, |text| EvalValue::Str(text.to_string()));
+            assert_eq!(eval_expr(&expr, &empty_event()), expected);
+        }
+    }
+
+    #[test]
+    fn fn_case_stops_at_the_first_true_arm_and_nulls_on_an_unreadable_one() {
+        // An earlier match returns before the unreadable arm is read…
+        let expr = call(
+            "case",
+            vec![
+                lit_bool(true),
+                lit_int(1),
+                lit_str("nonempty"),
+                lit_int(2),
+                lit_int(3),
+            ],
+        );
+        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(1));
+
+        // …and an unreadable arm reached in order nulls the WHOLE call,
+        // whether the arm before it was false or NULL.
+        for first in [lit_bool(false), lit_null()] {
+            let expr = call(
+                "case",
+                vec![
+                    first,
+                    lit_int(1),
+                    lit_str("nonempty"),
+                    lit_int(2),
+                    lit_int(3),
+                ],
+            );
+            assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        }
     }
 
     #[test]
