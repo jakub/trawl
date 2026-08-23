@@ -982,7 +982,7 @@ const REQUIRED_FAMILY_CASE_COUNTS: &[(&str, usize)] = &[
     ("timestamp_comparison", 4),
     ("json", 7),
     ("tonumber", 7),
-    ("tostring", 6),
+    ("tostring", 8),
 ];
 
 #[allow(clippy::too_many_lines)]
@@ -1129,6 +1129,13 @@ fn generated_cases() -> Vec<GeneratedCase> {
             "tostring(-1.5)",
             r#"tostring("text")"#,
             r#"tostring(strptime("2024-12-30 23:05:07", "%Y-%m-%d %H:%M:%S"))"#,
+            // A NaN renders with its SIGN. Read through `tonumber`, whose
+            // cast domain (`compare::try_cast_double`, and TRY_CAST in
+            // batch) carries the sign from the TEXT — deliberately not
+            // `tostring(0 / 0)`, whose computed NaN takes its sign from
+            // the hardware and would pin this platform.
+            r#"tostring(tonumber("nan"))"#,
+            r#"tostring(tonumber("-nan"))"#,
         ],
     );
     cases

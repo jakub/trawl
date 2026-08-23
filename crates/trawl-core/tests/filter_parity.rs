@@ -2582,6 +2582,11 @@ fn wire_pool(pin: CanonicalType) -> Vec<Value> {
             Value::from(404),
             Value::from("accepted"),
             Value::from(true),
+            // Both NaN spellings survive the pin's round-trip guard, so
+            // both are values the corpus really holds — and they compare
+            // in DuckDB's TOTAL order, not Rust's IEEE one.
+            Value::from("nan"),
+            Value::from("-nan"),
             Value::Null,
         ],
         CanonicalType::Timestamp => vec![
@@ -2632,7 +2637,10 @@ fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
     match pin {
         CanonicalType::BigInt => &["1", "2", "404", "1.5", "-1", "9007199254740992"],
         CanonicalType::Boolean => &["true", "false"],
-        CanonicalType::Double => &["0", "1.5", "-1.5", "200", "404"],
+        // The NaN literal is QUOTED: a bare `nan` in an expression
+        // position is a FIELD reference, and the quoted spelling binds
+        // through the same content coercion the search stage applies.
+        CanonicalType::Double => &["0", "1.5", "-1.5", "200", "404", "\"nan\""],
         CanonicalType::Timestamp => &[
             "\"2026-01-15T00:00:00Z\"",
             "\"2026-01-15T09:00:00Z\"",

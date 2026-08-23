@@ -127,7 +127,11 @@ pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
 /// 4. The exponent ALWAYS carries a sign and is zero-padded to a minimum of two
 ///    digits (`e+05`, `e-05`, `e+16`, `e+100`), where Rust `{:?}` emits `e16` /
 ///    `e-5` (no sign, no pad).
-/// 5. Specials render lowercase: `inf`, `-inf`, `nan`.
+/// 5. Specials render lowercase: `inf`, `-inf`, `nan` — and a NaN KEEPS
+///    its sign bit like any other value, so a negative one renders
+///    `-nan` (probed in `a_rendered_nan_keeps_its_sign`). Both spellings
+///    pass the DOUBLE pin's round-trip guard, so both are values a
+///    conformed column really stores.
 ///
 /// This is the single renderer behind `tostring()`, `concat()`/`||`, and any
 /// other `CAST(… AS VARCHAR)` over a float in the batch path; mirroring it in
@@ -137,7 +141,9 @@ pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
 /// DOUBLE-pinned column matches the same string in both engines.
 pub(crate) fn duckdb_double_to_string(x: f64) -> String {
     if x.is_nan() {
-        return "nan".to_string();
+        // The sign bit, not the ordering: `-nan < 0.0` is false, so the
+        // infinity test below would not have caught it.
+        return if x.is_sign_negative() { "-nan" } else { "nan" }.to_string();
     }
     if x.is_infinite() {
         return if x < 0.0 { "-inf" } else { "inf" }.to_string();

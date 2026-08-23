@@ -1546,6 +1546,10 @@ fn double_pattern_text_is_duckdb_rendering_on_both_engines() {
         f64::INFINITY,
         f64::NEG_INFINITY,
         f64::NAN,
+        // A NaN renders with its SIGN, and a DOUBLE-pinned column can
+        // hold either spelling (`a_rendered_nan_keeps_its_sign`), so the
+        // pattern text has to carry the sign too.
+        -f64::NAN,
     ];
     for input in inputs {
         let sql: String = conn
