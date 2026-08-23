@@ -2498,7 +2498,6 @@ fn write_query_log(
             globs: debug.glob_count,
             service_filter: debug.service_filter.clone(),
             time_filter_secs: debug.time_filter_secs,
-            is_fallback: debug.is_fallback,
         },
         hot_buffer: HotBufferDebug {
             status: debug.hot_status,

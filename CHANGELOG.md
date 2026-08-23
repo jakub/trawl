@@ -463,6 +463,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   this is a token-rendering change only.
 
 ### Fixed
+- **A quarantine no longer destroys the previous forensic artifact (#115).**
+  Compaction moves a corrupt WAL or parquet file aside as `<path>.corrupt`,
+  but `rename` silently replaces an existing destination — and the paths that
+  corrupt are recurring ones (`{env}/{date}/{HH}/{service}.parquet` is stable
+  across ticks), so a second corruption erased the first one's bytes. The
+  destination is now reserved with `create_new` before the rename and a taken
+  name yields `<path>.corrupt.1`, `.corrupt.2`, …; every artifact is kept, all
+  of those names stay inert to the scan globs, and a failed quarantine is still
+  a hard error that leaves no empty reservation behind.
+- **A repin retypes `/api/v1/schema` immediately (#115).** The unscoped column
+  listing is TTL-cached (`schema_cache_ttl_secs`, 60s by default), so after a
+  repin cutover the endpoint that feeds autocomplete kept advertising the OLD
+  type for up to a full TTL while queries already answered under the new one. A
+  cache entry now carries the pin generation it was built under, and the
+  generation is bumped by the cutover's pin flip — the listing is invalidated
+  the moment the corpus is retyped, without the repin engine reaching into the
+  cache.
+- **The query planner has no path left to the `**` glob (#115).** The
+  parse-failure exit in source computation returned `{base}/**/*.parquet`, the
+  one glob that reaches past the env dimension into `scheduled/`. Nothing read
+  that value — the executor parses the same DSL text before it reads, and
+  rejects it — so the exit now takes the same no-match shape as every other
+  "nothing to read" exit and the fallback parameter is gone from the function
+  entirely. With no exit able to produce a recursive glob, the query debug log's
+  always-false `is_fallback` field is removed.
 - **BREAKING — a backtick ends every unquoted position, and a name can be
   quoted after an operator (#78 follow-up).** Backticks were never value
   quotes, but a query that used them as such answered something quietly

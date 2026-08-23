@@ -292,8 +292,6 @@ pub struct SourceDebug {
     pub service_filter: Option<String>,
     /// Time filter duration in seconds, if any.
     pub time_filter_secs: Option<u64>,
-    /// Whether the source fell back to recursive glob.
-    pub is_fallback: bool,
 }
 
 /// Debug info about the hot buffer state at query time.
@@ -352,7 +350,6 @@ mod tests {
                 globs: 0,
                 service_filter: None,
                 time_filter_secs: None,
-                is_fallback: false,
             },
             hot_buffer: HotBufferDebug {
                 status: "disabled",
