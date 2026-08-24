@@ -1606,6 +1606,53 @@ fn trunc_to_second(ts: NaiveDateTime) -> NaiveDateTime {
         .unwrap_or(ts)
 }
 
+/// Rewrite a user's format into the chrono spelling that MEANS what
+/// `DuckDB` means by it.
+///
+/// Exactly one specifier differs in UNIT rather than in syntax: a bare
+/// `%f` is a six-digit MICROSECOND field to `DuckDB` (probed:
+/// `percent_f_is_six_digit_microseconds`) and an unscaled NANOSECOND
+/// count to chrono — nine digits out, and a digit run read as
+/// nanoseconds in. chrono's fixed-width `%6f` is the same field
+/// `DuckDB` writes, so the translation is `%f` → `%6f` and nothing else.
+///
+/// `%%` is an ESCAPED percent, not a specifier: the `f` in `%%f` is a
+/// literal letter and must survive untouched, which is why this walks
+/// the format instead of replacing text.
+///
+/// This is eval's internal SPELLING of the user's format —
+/// `emitter::validate_format_literal` still judges the text the user
+/// wrote, since that is the text the batch lane sends to the engine.
+///
+/// Borrowed when there is nothing to rewrite, which is every format
+/// without an `%f` in it.
+fn duckdb_strftime_format(fmt: &str) -> Cow<'_, str> {
+    if !fmt.contains("%f") {
+        return Cow::Borrowed(fmt);
+    }
+    let mut out = String::with_capacity(fmt.len() + 1);
+    let mut chars = fmt.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            // The one unit difference.
+            Some('f') => out.push_str("%6f"),
+            // An escaped percent: both characters are literal, and the
+            // NEXT character is not a specifier letter.
+            Some('%') => out.push_str("%%"),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// `strftime(ts, fmt)` — DSL arg order is (ts, fmt); mirrors `STRFTIME(fmt, ts)`.
 fn eval_strftime(args: &[EvalValue]) -> EvalValue {
     if args.len() != 2 {
@@ -1621,6 +1668,10 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(fmt) = &args[1] else {
         return EvalValue::Null;
     };
+    // The chrono spelling of what the user asked for — `%f` means
+    // microseconds here, as it does to the engine.
+    let fmt = duckdb_strftime_format(fmt);
+    let fmt = fmt.as_ref();
     // A `fmt` is fully user-controlled. chrono turns an invalid/incompatible
     // specifier (e.g. `%Q`) into `Item::Error`, whose `Display` returns
     // `fmt::Error` — `ts.format(fmt).to_string()` would then PANIC ("a Display
@@ -1669,6 +1720,19 @@ fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(fmt) = &args[1] else {
         return EvalValue::Null;
     };
+    // The same translation as `strftime`'s, so one format spells one
+    // thing in both directions.
+    //
+    // RESIDUAL, one-directional: chrono's `%6f` is FIXED width, where
+    // `DuckDB` reads a variable-length fraction (`.5` is half a second,
+    // probed). A run of other than six digits therefore has no reading
+    // here and this returns NULL, where the engine returns the instant —
+    // an under-read, replacing a WRONG one (chrono's `%f` read those
+    // same digits as nanoseconds, so `.5` used to parse as five
+    // nanoseconds). Pinned by
+    // `current_strptime_reads_only_a_six_digit_fraction`.
+    let fmt = duckdb_strftime_format(fmt);
+    let fmt = fmt.as_ref();
     let mut parsed = chrono::format::Parsed::new();
     if chrono::format::parse(&mut parsed, s, chrono::format::StrftimeItems::new(fmt)).is_err() {
         return EvalValue::Null;
@@ -3847,6 +3911,76 @@ mod tests {
                 &EvalValue::Str(rhs.to_string()),
             );
             assert_eq!(answer, EvalValue::Bool(want), "{lhs} {op:?} {rhs}");
+        }
+    }
+
+    /// The translation rewrites the ONE specifier whose unit differs and
+    /// leaves an escaped percent alone.
+    #[test]
+    fn the_format_translation_touches_only_a_bare_percent_f() {
+        for (input, want) in [
+            ("%f", "%6f"),
+            ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%6f"),
+            // An escaped percent is a literal, so its `f` is a letter.
+            ("%%f", "%%f"),
+            ("x%%fy", "x%%fy"),
+            // …and a real specifier AFTER an escaped one still rewrites.
+            ("%%%f", "%%%6f"),
+            // Untouched formats come back borrowed.
+            ("%Y-%m-%d", "%Y-%m-%d"),
+            ("", ""),
+            ("100%", "100%"),
+        ] {
+            assert_eq!(duckdb_strftime_format(input), want, "{input:?}");
+        }
+        assert!(matches!(
+            duckdb_strftime_format("%Y-%m-%d"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// `%f` renders six digits, zero-FILLED — the engine's field, not
+    /// chrono's nanosecond count (probe:
+    /// `percent_f_is_six_digit_microseconds`).
+    #[test]
+    fn fn_strftime_percent_f_is_microseconds() {
+        for (text, want) in [
+            ("2026-01-15 09:00:00.123456", "123456"),
+            ("2026-01-15 09:00:00.500000", "500000"),
+            ("2026-01-15 09:00:00", "000000"),
+        ] {
+            let ts = EvalValue::Timestamp(compare::Instant::At(ndt(text)));
+            let answer = eval_scalar_fn("strftime", &[ts, EvalValue::Str("%f".into())]);
+            assert_eq!(answer, Some(EvalValue::Str(want.to_string())), "{text:?}");
+        }
+    }
+
+    /// The one-directional residual the fixed-width mirror leaves: a
+    /// fraction of other than six digits has no reading here, where the
+    /// engine reads it. It replaces a WRONG answer — chrono's `%f` read
+    /// those digits as nanoseconds, so `.5` parsed as five of them — and
+    /// is not scheduled to flip in #105.
+    #[test]
+    fn current_strptime_reads_only_a_six_digit_fraction() {
+        let parse = |text: &str| {
+            eval_scalar_fn(
+                "strptime",
+                &[
+                    EvalValue::Str(text.to_string()),
+                    EvalValue::Str("%Y-%m-%d %H:%M:%S.%f".into()),
+                ],
+            )
+        };
+        assert_eq!(
+            parse("2026-01-15 09:00:00.500000"),
+            Some(EvalValue::Timestamp(compare::Instant::At(ndt(
+                "2026-01-15 09:00:00.5"
+            )))),
+            "six digits read exactly"
+        );
+        // DuckDB reads these as .5 and .123; the mirror under-reads.
+        for text in ["2026-01-15 09:00:00.5", "2026-01-15 09:00:00.123"] {
+            assert_eq!(parse(text), Some(EvalValue::Null), "{text:?}");
         }
     }
 

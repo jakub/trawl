@@ -1778,22 +1778,29 @@ fn the_hostile_timestamp_corpus_agrees_in_both_lanes() {
 }
 
 #[test]
-fn current_percent_f_precision_is_pinned_child_105() {
-    // #105 reconciles `%f` with the DuckDB value domain.
+fn percent_f_is_microseconds_in_both_lanes() {
+    // Flipped from `current_percent_f_precision_is_pinned_child_105`
+    // (#105). `%f` is a six-digit MICROSECOND field to DuckDB and an
+    // unscaled NANOSECOND count to chrono, so eval printed `000123456`
+    // where the engine printed `123456` — and read a `.5` as five
+    // nanoseconds. One translation now spells the user's format the way
+    // the engine means it, in both directions.
     let conn = utc_connection();
     let event = fixed_event();
-    let percent_f = r#"* | let x = strftime(strptime("2024-12-30 23:05:07.123456", "%Y-%m-%d %H:%M:%S.%f"), "%f")"#;
-    assert_eq!(
-        eval_scalar(percent_f, &event),
-        EvalValue::Str("000123456".to_string())
-    );
-    assert_eq!(
-        sql_scalar_result(&conn, percent_f, &event),
-        SqlOutcome::Value(SqlCell {
-            logical_type: Type::Text,
-            value: DuckValue::Text("123456".to_string()),
-        })
-    );
+    for expression in [
+        r#"strftime(strptime("2024-12-30 23:05:07.123456", "%Y-%m-%d %H:%M:%S.%f"), "%f")"#,
+        r#"strftime(strptime("2024-12-30 23:05:07.123456", "%Y-%m-%d %H:%M:%S.%f"), "%Y-%m-%d %H:%M:%S.%f")"#,
+        // A zero fraction still fills six digits.
+        r#"strftime(strptime("2024-12-30 23:05:07", "%Y-%m-%d %H:%M:%S"), "%f")"#,
+        // An ESCAPED percent is a literal, and the translation leaves it
+        // alone in both lanes.
+        r#"strftime(strptime("2024-12-30 23:05:07", "%Y-%m-%d %H:%M:%S"), "%%f")"#,
+    ] {
+        assert_eq!(
+            assert_parity_case(&conn, &event, "percent f", expression),
+            None
+        );
+    }
 }
 
 #[test]
