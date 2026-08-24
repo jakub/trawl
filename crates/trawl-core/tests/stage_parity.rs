@@ -741,6 +741,44 @@ fn a_malformed_offset_drops_the_row_where_batch_refuses_the_query() {
     );
 }
 
+/// A stage-computed TIMESTAMP is TEXT to an `extract` — the reach the
+/// JSON row had, and the reach typing the row silently lost.
+///
+/// The two lanes do NOT agree on this shape, and never did: `DuckDB` has
+/// no `regexp_extract(TIMESTAMP, …)` overload and does not implicitly
+/// cast one to VARCHAR, so the emitted `regexp_extract("t", ?, 1)`
+/// (`emitter::pipeline::process_extract` quotes the source field and
+/// casts nothing) is a Binder Error and the batch lane returns no rows at
+/// all. That refusal is PRE-EXISTING — the emitter is untouched by this
+/// milestone — and is pinned here so adding a cast later is a deliberate
+/// change rather than a drift.
+///
+/// What this case protects is the LIVE answer. Before rows were typed,
+/// `EvalValue::Timestamp` crossed the stage boundary as the JSON STRING
+/// `timestamp_to_duckdb_text` wrote, so this extraction found `2026`;
+/// typed cells stopped matching the `Str` arm and it silently found
+/// nothing. And behind `extract kv` that same code IS the batch tail,
+/// where there is no SQL lane to refuse anything — so the loss was the
+/// whole answer, not half of it.
+#[test]
+fn extract_reads_a_computed_timestamp_where_batch_refuses_the_query() {
+    let conn = conn();
+    let events = one_event();
+    let dsl = r#"* | let t = strptime("2026-01-15 09:00:00", "%Y-%m-%d %H:%M:%S") | extract "(?P<y>\d{4})" from t | table y"#;
+
+    let error = batch_outcome(&conn, dsl, &events)
+        .expect_err("batch must refuse regexp_extract over a TIMESTAMP");
+    assert!(
+        error.contains("regexp_extract") && error.contains("TIMESTAMP"),
+        "the refusal must be the missing TIMESTAMP overload: {error}"
+    );
+
+    // The live lane reads the cell's cast text — the same bytes the JSON
+    // string held.
+    let live = live_rows(dsl, &events);
+    assert_eq!(column(&live, "y"), vec!["2026"]);
+}
+
 /// The D1 ordering guard: an SSE frame's BYTES are what they were before
 /// rows were typed.
 ///

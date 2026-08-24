@@ -725,13 +725,40 @@ fn apply_let(
     }
 }
 
+/// The TEXT an `extract` stage reads out of its source cell — the ONE
+/// answer both modes use, so the regex and kv arms cannot disagree about
+/// which cells an extraction reaches.
+///
+/// The reach is exactly what it was before rows were typed, no wider. A
+/// row then carried `serde_json::Value` cells and both arms read a
+/// `Value::String` only, so a number or a boolean was never extracted
+/// from — and still is not. A stage-computed instant, though, crossed
+/// that boundary AS a JSON string (`Value::from(EvalValue::Timestamp)`
+/// wrote `timestamp_to_duckdb_text`), so
+/// `let t = strptime(…) | extract … from t` extracted from the timestamp
+/// text; typing the row turned that cell into `EvalValue::Timestamp` and
+/// silently stopped extracting. [`row::cell_text`] renders a `Timestamp`
+/// as [`crate::compare::Instant::cast_text`] — the CAST-AS-VARCHAR text,
+/// the same bytes that JSON string held — so the arm below restores the
+/// old reach rather than widening it.
+///
+/// This lane is the only one that answers at all for a non-VARCHAR
+/// source: `DuckDB` has no `regexp_extract(TIMESTAMP, …)` overload and
+/// does not implicitly cast to VARCHAR, so the batch lane REFUSES such a
+/// query outright (Binder Error, probed in `stage_parity`), and behind
+/// `extract kv` there is no SQL lane — this code IS the batch tail.
+fn extract_source_text(event: &Row, source_field: &str) -> Option<String> {
+    match event_value(event, source_field)? {
+        EvalValue::Str(text) => Some(text.clone()),
+        cell @ EvalValue::Timestamp(_) => Some(row::cell_text(cell)),
+        _ => None,
+    }
+}
+
 /// Apply regex extraction with the same write-always, empty-is-NULL
 /// semantics as the emitted `nullif(regexp_extract(...), '')` projection.
 fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Row) {
-    let text = match event_value(event, source_field) {
-        Some(EvalValue::Str(text)) => Some(text.clone()),
-        _ => None,
-    };
+    let text = extract_source_text(event, source_field);
     let captures = text.as_deref().and_then(|text| regex.captures(text));
     let written: Vec<(String, EvalValue)> = regex
         .capture_names()
@@ -825,8 +852,8 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row) -> StageResult {
             source_field,
             separator,
         } => {
-            if let Some(EvalValue::Str(text)) = event_value(event, source_field) {
-                let pairs = extract_key_value_pairs(text, *separator);
+            if let Some(text) = extract_source_text(event, source_field) {
+                let pairs = extract_key_value_pairs(&text, *separator);
                 for (k, v) in pairs {
                     // The `_` namespace is sealed against LOG CONTENT too
                     // (ADR-0013 §1): a kv key is sender-controlled text, so
@@ -2418,6 +2445,75 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A stage-computed instant is extractable TEXT in BOTH modes — the
+    /// reach the JSON row had, restored (see [`extract_source_text`]).
+    ///
+    /// This lane is the whole answer for such a source: the batch SQL
+    /// lane REFUSES `regexp_extract(TIMESTAMP, …)` outright (pinned in
+    /// `stage_parity`), and behind `extract kv` there is no SQL lane at
+    /// all — this code is the batch tail.
+    #[test]
+    fn extract_reads_a_computed_timestamp_as_its_cast_text() {
+        let instant = crate::compare::Instant::At(
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+        );
+        // The cell's own cast text, `2026-01-15 09:00:00` — what the row
+        // carried as a JSON string before it was typed.
+        let text = row::cell_text(&EvalValue::Timestamp(instant));
+
+        let mut stage = compile_extract(&ExtractStage {
+            mode: ExtractMode::Regex(r"(?P<y>\d{4})".into()),
+            source_field: Some("t".into()),
+            keyword: "extract",
+        })
+        .unwrap();
+        let mut ev = event(&json!({"service": "nginx"}));
+        ev.insert("t".into(), EvalValue::Timestamp(instant));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(cell(&ev, "y"), "2026", "text was {text:?}");
+
+        // The kv arm reads the same text through the same door.
+        let mut stage = compile_extract(&ExtractStage {
+            mode: ExtractMode::KeyValue { separator: ':' },
+            source_field: Some("t".into()),
+            keyword: "extract",
+        })
+        .unwrap();
+        let mut ev = event(&json!({"service": "nginx"}));
+        ev.insert("t".into(), EvalValue::Timestamp(instant));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(cell_opt(&ev, "09"), Some(json!("00:00")));
+    }
+
+    /// …and NOT one byte wider: a number or a boolean was a JSON number
+    /// or boolean before the row was typed, which neither arm read, so
+    /// neither arm reads one now.
+    #[test]
+    fn extract_still_skips_a_numeric_or_boolean_source() {
+        let mut stage = compile_extract(&ExtractStage {
+            mode: ExtractMode::Regex(r"(?P<d>\d+)".into()),
+            source_field: Some("n".into()),
+            keyword: "extract",
+        })
+        .unwrap();
+        let mut ev = event(&json!({"n": 42}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(cell_opt(&ev, "d"), Some(Value::Null));
+
+        let mut stage = compile_extract(&ExtractStage {
+            mode: ExtractMode::KeyValue { separator: '=' },
+            source_field: Some("flag".into()),
+            keyword: "extract",
+        })
+        .unwrap();
+        let mut ev = event(&json!({"flag": true}));
+        apply_stage(&mut stage, &mut ev);
+        assert_eq!(ev.keys().count(), 1, "nothing extracted: {ev:?}");
     }
 
     #[test]
