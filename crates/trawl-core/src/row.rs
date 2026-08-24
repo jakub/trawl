@@ -90,7 +90,12 @@ pub fn to_json(row: Row) -> Map<String, Value> {
 /// A JSON `null` cell renders `"null"`, as the JSON `Display` it replaces
 /// did; an ABSENT field is the caller's empty string, not this
 /// function's.
-pub(crate) fn cell_text(cell: &EvalValue) -> String {
+///
+/// Public because the batch tail sorts through it too
+/// (`trawl-engine`'s `post_process`), and a second renderer there would
+/// be a second answer to "what does this cell say".
+#[must_use]
+pub fn cell_text(cell: &EvalValue) -> String {
     match cell {
         EvalValue::Null => "null".to_owned(),
         EvalValue::Bool(b) => b.to_string(),
