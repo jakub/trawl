@@ -600,7 +600,32 @@ backticks (<code dir="auto">`last`=5</code>).</p>
 <div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">drop message</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">drop host, raw</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="drop messagedrop host, raw"><div></div></button></div></figure></div>
 <div class="sl-heading-wrapper level-h3"><h3 id="let--eval">let / eval</h3><a class="sl-anchor-link" href="#let--eval"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “let / eval”</span></a></div>
 <p>Create computed fields.</p>
-<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">let duration_ms = duration * 1000</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">eval status_class = status / 100    # eval is an alias for let</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">let is_error = status &gt;= 400</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="let duration_ms = duration * 1000eval status_class = status / 100    # eval is an alias for letlet is_error = status >= 400"><div></div></button></div></figure></div>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">let duration_ms = duration * 1000</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">eval status_class = floor(status / 100)   # eval is an alias for let</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">let is_error = status &gt;= 400</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="let duration_ms = duration * 1000eval status_class = floor(status / 100)   # eval is an alias for letlet is_error = status >= 400"><div></div></button></div></figure></div>
+<div class="sl-heading-wrapper level-h4"><h4 id="arithmetic">Arithmetic</h4><a class="sl-anchor-link" href="#arithmetic"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Arithmetic”</span></a></div>
+<p><code dir="auto">/</code> is <strong>true division</strong>: <code dir="auto">status / 100</code> over a <code dir="auto">404</code> is <code dir="auto">4.04</code>, not <code dir="auto">4</code>,
+and the result is a DOUBLE whatever the operands were. Wrap it in
+<code dir="auto">floor()</code> for the integer part — <code dir="auto">floor(status / 100)</code> answers <code dir="auto">4.0</code>,
+also a DOUBLE (see <a href="#numeric-functions">Numeric functions</a>).</p>
+<p><code dir="auto">+</code>, <code dir="auto">-</code> and <code dir="auto">*</code> stay integral over two integers. An overflow has no
+answer: the batch lane raises an error and the streaming lane yields
+<code dir="auto">null</code>, because a live tail cannot raise a per-event error without
+killing the subscription.</p>
+<div class="sl-heading-wrapper level-h4"><h4 id="infinities-and-nan">Infinities and NaN</h4><a class="sl-anchor-link" href="#infinities-and-nan"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Infinities and NaN”</span></a></div>
+<p>Division never fails: <code dir="auto">1.0 / 0</code> is <code dir="auto">inf</code>, <code dir="auto">-1.0 / 0</code> is <code dir="auto">-inf</code> and
+<code dir="auto">0.0 / 0</code> is <code dir="auto">NaN</code>, exactly as in the query engine. <code dir="auto">%</code> follows <code dir="auto">/</code>
+whenever either side is a float (<code dir="auto">5 % 0.0</code> is <code dir="auto">NaN</code>), while integer
+<code dir="auto">% 0</code> stays <code dir="auto">null</code>.</p>
+<p>Those values flow between stages like any other number and compare the
+way DuckDB compares them — a <strong>total</strong> order, not IEEE’s: every NaN
+equals every other NaN and outranks every finite value (so
+<code dir="auto">| let x = 0.0 / 0 | where x == x</code> keeps the row, and <code dir="auto">max(x)</code> over a
+column holding one answers <code dir="auto">NaN</code>), and the two zeros compare equal, so
+<code dir="auto">-0.0</code> groups with <code dir="auto">0.0</code>.</p>
+<p>JSON has no spelling for any of them, so <strong>JSON output renders them
+<code dir="auto">null</code></strong>: the API wire, <code dir="auto">-f json</code>, and the SSE stream all show <code dir="auto">null</code>
+where a special was computed. The table and CSV renderers print the value
+itself (<code dir="auto">inf</code>, <code dir="auto">-inf</code>, <code dir="auto">NaN</code>) when the query runs embedded (<code dir="auto">--data</code>),
+which is the only path that does not cross the JSON wire.</p>
 <div class="sl-heading-wrapper level-h3"><h3 id="extract--rex">extract / rex</h3><a class="sl-anchor-link" href="#extract--rex"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “extract / rex”</span></a></div>
 <p>Extract fields from text using regex or key-value parsing.</p>
 <p><strong>Named capture groups:</strong></p>
@@ -863,15 +888,15 @@ rather than left to run a server thread off the end of its stack.</p>
 </tr>
 <tr>
 <td><code dir="auto">ceil(x)</code> / <code dir="auto">ceiling(x)</code></td>
-<td>Round up</td>
+<td>Round up — always a DOUBLE, even over an integer (<code dir="auto">ceil(5)</code> is <code dir="auto">5.0</code>)</td>
 </tr>
 <tr>
 <td><code dir="auto">floor(x)</code></td>
-<td>Round down</td>
+<td>Round down — always a DOUBLE, same as <code dir="auto">ceil</code></td>
 </tr>
 <tr>
 <td><code dir="auto">round(x[, n])</code></td>
-<td>Round to n decimal places</td>
+<td>Round to n decimal places — an INTEGER argument stays integral (<code dir="auto">round(5)</code> is <code dir="auto">5</code>), a float stays a float (<code dir="auto">round(1.5)</code> is <code dir="auto">2.0</code>)</td>
 </tr>
 </tbody>
 </table>
@@ -886,7 +911,7 @@ rather than left to run a server thread off the end of its stack.</p>
 <tbody>
 <tr>
 <td><code dir="auto">if(cond, then, else)</code></td>
-<td>Ternary conditional</td>
+<td>Ternary conditional — see <a href="#conditions">Conditions</a> for what counts as true</td>
 </tr>
 <tr>
 <td><code dir="auto">isnull(x)</code> / <code dir="auto">isnotnull(x)</code></td>
@@ -898,7 +923,7 @@ rather than left to run a server thread off the end of its stack.</p>
 </tr>
 <tr>
 <td><code dir="auto">typeof(x)</code></td>
-<td>Value type name (returns <code dir="auto">"VARCHAR"</code>, <code dir="auto">"DOUBLE"</code>, <code dir="auto">"TIMESTAMP"</code>, …)</td>
+<td>Value type name (<code dir="auto">"BIGINT"</code> for an integer, <code dir="auto">"DOUBLE"</code>, <code dir="auto">"VARCHAR"</code>, <code dir="auto">"TIMESTAMP"</code>, …)</td>
 </tr>
 <tr>
 <td><code dir="auto">now()</code></td>
@@ -906,7 +931,7 @@ rather than left to run a server thread off the end of its stack.</p>
 </tr>
 <tr>
 <td><code dir="auto">tonumber(x)</code></td>
-<td>Cast to float (<code dir="auto">null</code> on parse failure — mirrors <code dir="auto">TRY_CAST AS DOUBLE</code>)</td>
+<td>Cast to float (<code dir="auto">null</code> on parse failure — mirrors <code dir="auto">TRY_CAST AS DOUBLE</code>); a boolean reads as <code dir="auto">1.0</code>/<code dir="auto">0.0</code></td>
 </tr>
 <tr>
 <td><code dir="auto">tostring(x)</code></td>
@@ -918,10 +943,56 @@ rather than left to run a server thread off the end of its stack.</p>
 </tr>
 </tbody>
 </table>
+<div class="sl-heading-wrapper level-h4"><h4 id="conditions">Conditions</h4><a class="sl-anchor-link" href="#conditions"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Conditions”</span></a></div>
+<p><code dir="auto">if()</code> and <code dir="auto">case()</code> read their condition the way DuckDB casts one to
+BOOLEAN, not as “truthiness”:</p>
+<ul>
+<li>a <strong>boolean</strong> is itself, and SQL <code dir="auto">null</code> takes the else branch;</li>
+<li>a <strong>number</strong> is true when it is non-zero — both zeros are false, and
+<code dir="auto">NaN</code> is true;</li>
+<li>a <strong>string</strong> reads through DuckDB’s closed, case-insensitive
+vocabulary: <code dir="auto">true</code>/<code dir="auto">t</code>/<code dir="auto">yes</code>/<code dir="auto">y</code>/<code dir="auto">1</code> and <code dir="auto">false</code>/<code dir="auto">f</code>/<code dir="auto">no</code>/<code dir="auto">n</code>/<code dir="auto">0</code>.
+<strong>Any other string has no reading</strong> — <code dir="auto">"nonempty"</code>, and <code dir="auto">" true "</code>
+(with the spaces) too, because the cast does not trim;</li>
+<li>a <strong>timestamp</strong> or a <strong>list</strong> has no boolean cast at all.</li>
+</ul>
+<p>A condition with no reading has no answer, so the two lanes part exactly
+as they do for an <a href="#arithmetic">arithmetic overflow</a>: the batch lane
+raises a conversion error and the query returns no rows at all
+(<code dir="auto">Could not convert string 'nonempty' to BOOL</code>, or
+<code dir="auto">Unimplemented type for cast</code> for a timestamp or a list), while the
+streaming lane yields <code dir="auto">null</code> for the whole call — <code dir="auto">if("nonempty", 1, 2)</code>
+is <code dir="auto">null</code> there, not <code dir="auto">1</code> — because a live tail cannot raise a per-event
+error without killing the subscription.</p>
+<p><code dir="auto">case()</code> reads its arms in order and stops at the first true one, so an
+unreadable condition after a match is never looked at — but an unreadable
+one reached before any match takes down the whole call, in whichever way
+its lane does, rather than skipping that arm.</p>
+<p><code dir="auto">and</code>, <code dir="auto">or</code>, <code dir="auto">not</code> and the pipeline’s <code dir="auto">where</code> gate keep their older,
+wider predicate (anything non-null and non-<code dir="auto">false</code> passes); only <code dir="auto">if()</code>
+and <code dir="auto">case()</code> take the cast domain.</p>
+<div class="sl-heading-wrapper level-h4"><h4 id="typeof-and-large-integers">typeof and large integers</h4><a class="sl-anchor-link" href="#typeof-and-large-integers"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “typeof and large integers”</span></a></div>
+<p><code dir="auto">typeof</code> returns the type name of the value the expression READ. A wire
+integer above <code dir="auto">i64::MAX</code> is read as a <code dir="auto">DOUBLE</code> — so <code dir="auto">typeof(request_id)</code>
+says <code dir="auto">"DOUBLE"</code> for one — while the value itself keeps its digits
+wherever identity matters: on the wire, in a <code dir="auto">dedup</code> key, and in a
+<code dir="auto">stats … by</code> group.</p>
 <div class="sl-heading-wrapper level-h3"><h3 id="nested-fields-json">Nested fields (JSON)</h3><a class="sl-anchor-link" href="#nested-fields-json"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Nested fields (JSON)”</span></a></div>
 <p>Nested objects and arrays are stringified at ingest: a field like <code dir="auto">k8s: {"pod": "x", "ns": "default"}</code> is stored as its JSON text in a <code dir="auto">VARCHAR</code> column (the field catalog pins it as such), never as a <code dir="auto">STRUCT</code>. Reach into it with <code dir="auto">json_extract_string</code>:</p>
 <div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">service=kubelet | eval pod = json_extract_string(k8s, "$.pod") | where isnotnull(pod)</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="service=kubelet | eval pod = json_extract_string(k8s, &quot;$.pod&quot;) | where isnotnull(pod)"><div></div></button></div></figure></div>
 <p>Bare text search also matches inside the stringified value (it is part of <code dir="auto">_raw</code> and of the column’s text).</p>
+<p><code dir="auto">json_extract_string</code> is the UNQUOTING door: it returns a JSON string’s
+contents (<code dir="auto">"x"</code> → <code dir="auto">x</code>). <code dir="auto">json_extract</code> returns the value’s JSON text —
+for a string that keeps the quotes (<code dir="auto">"x"</code>), for a number, boolean or
+<code dir="auto">null</code> it is the value’s own text, and for an array or object it is
+compact JSON. Reach for <code dir="auto">json_extract_string</code> unless you want the JSON.</p>
+<p>One residual, on numbers of exotic magnitude: the streaming path
+re-renders a number from its <code dir="auto">f64</code> where the query engine renders the
+source spelling, so a value written <code dir="auto">1e16</code>…<code dir="auto">1e20</code>, or an integer with
+more digits than a 64-bit one holds, can come back spelled differently
+(<code dir="auto">1e20</code> against <code dir="auto">100000000000000000000</code>). Values inside those bounds —
+which is every number a log realistically carries — render identically
+in both paths.</p>
 <div class="sl-heading-wrapper level-h3"><h3 id="date-and-time-functions">Date and time functions</h3><a class="sl-anchor-link" href="#date-and-time-functions"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Date and time functions”</span></a></div>
 <p>Date/time functions operate on <strong>timestamps</strong> — the <code dir="auto">timestamp</code> field is stored as a timezone-naive <code dir="auto">TIMESTAMP</code> in both the batch and streaming paths. Ingest first canonicalizes the value to UTC, so an incoming offset is <em>applied</em> (<code dir="auto">12:00:00+05:30</code> becomes <code dir="auto">06:30:00Z</code>) rather than dropped in favour of its wall-clock components; the naive timestamp everything downstream sees is therefore UTC. See <a href="/architecture/data-flow/#timestamp-canonicalization">Data flow</a> for the accepted input grammar.</p>
 <table>
@@ -956,6 +1027,48 @@ rather than left to run a server thread off the end of its stack.</p>
 </table>
 <p><strong>Note:</strong> the argument order for <code dir="auto">strftime</code> is <code dir="auto">(timestamp, format)</code> — the opposite of C <code dir="auto">strftime</code>. DuckDB’s <code dir="auto">STRFTIME</code> is overloaded and accepts this order directly, so it is emitted unchanged.</p>
 <p><strong>Note:</strong> <code dir="auto">strptime</code> returns <code dir="auto">null</code> when a value cannot be parsed against the format — a single unparseable value yields <code dir="auto">null</code>, not a query error. This holds in both the batch path (emitted as DuckDB <code dir="auto">TRY_STRPTIME</code>) and the streaming path.</p>
+<div class="sl-heading-wrapper level-h4"><h4 id="comparing-a-timestamp-against-text">Comparing a timestamp against text</h4><a class="sl-anchor-link" href="#comparing-a-timestamp-against-text"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Comparing a timestamp against text”</span></a></div>
+<p>A timestamp compares against a string by reading the string as a
+timestamp — the same cast DuckDB applies to a bound parameter, which
+takes the wall-clock components and DISCARDS any offset
+(<code dir="auto">'…T09:00:00+05:30'</code> is 09:00). A text with <strong>no</strong> reading makes the
+comparison <code dir="auto">null</code>: there is no fallback to string ordering, so
+<code dir="auto">t &lt; "zzz"</code> is unknown rather than true, and a malformed offset like
+<code dir="auto">+ab:cd</code> matches nothing rather than being stripped and ignored.</p>
+<p>The accepted differences from the engine’s own parser are narrow and
+one-directional (the mirror reads less, never more): zone NAMES beyond
+<code dir="auto">UTC</code>, and years outside chrono’s calendar.</p>
+<div class="sl-heading-wrapper level-h4"><h4 id="infinity-timestamps">Infinity timestamps</h4><a class="sl-anchor-link" href="#infinity-timestamps"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Infinity timestamps”</span></a></div>
+<p><code dir="auto">infinity</code> and <code dir="auto">-infinity</code> are values a timestamp can hold, and they read
+from text like any other instant. They order below and above every date,
+render as their own words through <code dir="auto">tostring()</code>, and the date scalars
+treat them exactly as the engine does:</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Answer for <code dir="auto">±infinity</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">date_part(unit, ts)</code></td>
+<td><code dir="auto">null</code>, for every unit including <code dir="auto">epoch</code></td>
+</tr>
+<tr>
+<td><code dir="auto">date_trunc(unit, ts)</code></td>
+<td>the infinity, unchanged, for every unit</td>
+</tr>
+<tr>
+<td><code dir="auto">date_diff(unit, a, b)</code></td>
+<td><code dir="auto">null</code> whenever either side is infinite</td>
+</tr>
+<tr>
+<td><code dir="auto">strftime(ts, fmt)</code></td>
+<td><code dir="auto">infinity</code> / <code dir="auto">-infinity</code>, whatever the format asks for</td>
+</tr>
+</tbody>
+</table>
 <div class="sl-heading-wrapper level-h4"><h4 id="datetime-unit-allowlist">Date/time unit allowlist</h4><a class="sl-anchor-link" href="#datetime-unit-allowlist"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Date/time unit allowlist”</span></a></div>
 <p>The <code dir="auto">unit</code> argument to <code dir="auto">date_part</code>, <code dir="auto">date_trunc</code>, and <code dir="auto">date_diff</code> must be a <strong>string literal</strong> from the allowed set. Non-literal expressions (field refs, computed values) and unlisted units are rejected before execution in both batch and streaming modes (batch validates at SQL-emit time, streaming at stream-plan compile time).</p>
 <table>
@@ -985,6 +1098,7 @@ rather than left to run a server thread off the end of its stack.</p>
 <p><code dir="auto">date_diff</code> counts boundary crossings between the two timestamps for <code dir="auto">year</code>, <code dir="auto">quarter</code>, <code dir="auto">month</code>, <code dir="auto">day</code>, <code dir="auto">hour</code>, <code dir="auto">minute</code>, and <code dir="auto">second</code>. The <code dir="auto">week</code> unit is the exception: DuckDB computes it as the whole number of days between the dates divided by 7 (integer division toward zero), <strong>not</strong> week-boundary crossings.</p>
 <div class="sl-heading-wrapper level-h4"><h4 id="strftimestrptime-format-codes">strftime/strptime format codes</h4><a class="sl-anchor-link" href="#strftimestrptime-format-codes"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “strftime/strptime format codes”</span></a></div>
 <p>Standard C <code dir="auto">strftime</code> codes (<code dir="auto">%Y</code>, <code dir="auto">%m</code>, <code dir="auto">%d</code>, <code dir="auto">%H</code>, <code dir="auto">%M</code>, <code dir="auto">%S</code>, etc.) produce identical output in both batch (DuckDB) and streaming (chrono) paths. chrono operates on a timezone-naive timestamp, so it is <strong>not</strong> locale-dependent — but codes that depend on timezone or locale (<code dir="auto">%Z</code>, <code dir="auto">%z</code>, <code dir="auto">%c</code>, <code dir="auto">%x</code>, <code dir="auto">%X</code>) render empty or fixed under chrono’s naive semantics and can differ from DuckDB. Stick to explicit numeric codes for portable output.</p>
+<p><code dir="auto">%f</code> is a <strong>six-digit microsecond</strong> field in both paths: <code dir="auto">strftime(ts, "%f")</code> over <code dir="auto">…09:00:00.5</code> gives <code dir="auto">500000</code>, and a zero fraction gives <code dir="auto">000000</code>. (chrono spells that field <code dir="auto">%6f</code>; the streaming path translates a bare <code dir="auto">%f</code> for you, and leaves an escaped <code dir="auto">%%f</code> alone as the literal it is.) One residual comes with the fixed width: on the way IN, DuckDB reads a fraction of any length (<code dir="auto">.5</code> is half a second) where the streaming path reads exactly six digits and yields <code dir="auto">null</code> for anything else.</p>
 <p>Invalid format codes (e.g. <code dir="auto">%Q</code>, or a trailing <code dir="auto">%</code>) are rejected before execution in both paths when the format is a string literal — they no longer error in batch while silently nulling in streaming.</p>
 <p><strong>Partial formats:</strong> <code dir="auto">strptime</code> fills the components a format omits from a <code dir="auto">1900-01-01 00:00:00</code> base, identically in the batch (DuckDB) and streaming paths. A <strong>date-only</strong> format (e.g. <code dir="auto">%Y-%m-%d</code>) yields midnight (<code dir="auto">00:00:00</code>); a <strong>time-only</strong> format (e.g. <code dir="auto">%H:%M:%S</code>) yields the <code dir="auto">1900-01-01</code> base date; <strong>year-only</strong> (<code dir="auto">%Y</code> → <code dir="auto">2023-01-01 00:00:00</code>), <strong>year-month</strong> (<code dir="auto">%Y-%m</code> → <code dir="auto">2023-11-01 00:00:00</code>), a bare <strong>month-day</strong> (<code dir="auto">%m-%d</code> → <code dir="auto">1900-11-07 00:00:00</code>), and a date with an <em>incomplete</em> time (<code dir="auto">%Y-%m-%d %H</code> → <code dir="auto">…14:00:00</code>) all fill the same way. Exotic or locale-dependent codes follow chrono in the streaming path and may differ from DuckDB: a bare two-digit year (<code dir="auto">%y</code> alone) yields <code dir="auto">null</code> where DuckDB fills the base year, and timezone-offset codes (<code dir="auto">%Z</code>/<code dir="auto">%z</code>) keep chrono’s wall-clock time rather than normalizing to UTC. (A two-digit year <em>with</em> a month/day, like <code dir="auto">%y-%m-%d</code>, resolves via chrono’s pivot and matches DuckDB.)</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="examples">Examples</h2><a class="sl-anchor-link" href="#examples"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Examples”</span></a></div>
@@ -997,4 +1111,4 @@ rather than left to run a server thread off the end of its stack.</p>
 </div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53"># Pivot status codes by host</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">last=1h | pivot count() on status by host</span></div></div><div class="ec-line"><div class="code">
 </div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53"># Conditional field with null handling</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">* | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10</span></div></div><div class="ec-line"><div class="code">
 </div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53"># Distinct values per group</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">* | stats values(_severity), first(message) by service | head 10</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="# Errors in the last hour by service_severity>=error last=1h | stats count() by service | sort -count# Slow requests by endpointstatus=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10# 4xx/5xx rate by hoststatus>=400 last=2h | stats count() by host, status | where count > 10# Extract IPs and count&quot;connection from&quot; | rex &quot;(?P<ip>\d+\.\d+\.\d+\.\d+)&quot; from message | stats count() by ip | sort -count# Time series of error rate_severity>=error | timechart span=5m count() by service# Dedup flapping alertsservice=monitoring | dedup host, alert_name# Pivot status codes by hostlast=1h | pivot count() on status by host# Conditional field with null handling* | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10# Distinct values per group* | stats values(_severity), first(message) by service | head 10"><div></div></button></div></figure></div>
-</div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/dsl.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a><p>Last updated: <time datetime="2026-08-20T01:20:10.000Z">Aug 20, 2026</time></p></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/getting-started/vector-integration/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Vector Integration</span></span></a><a href="/reference/cli/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">CLI &amp; TUI</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
+</div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/dsl.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a><p>Last updated: <time datetime="2026-08-24T15:50:18.000Z">Aug 24, 2026</time></p></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/getting-started/vector-integration/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Vector Integration</span></span></a><a href="/reference/cli/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">CLI &amp; TUI</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
