@@ -1723,6 +1723,30 @@ mod tests {
         assert!(matches!(plan, StreamPlan::PassThrough(stages) if stages.is_empty()));
     }
 
+    /// The timechart bucket reads the INGRESS `_time`, which is a wire
+    /// STRING — JSON has no timestamp type, and no stage can mint one
+    /// under that name (`_time` is reserved, so `let`/`rename` refuse
+    /// it). A retype of this read would silently bucket every event at
+    /// the CURRENT time through the fallback, which no assertion about
+    /// counts would catch, so the bucket itself is asserted.
+    #[test]
+    fn the_time_bucket_reads_the_wire_string() {
+        let ev = event(&json!({"_time": "2026-01-15T09:07:00Z", "service": "nginx"}));
+        let span: u64 = 300; // five minutes
+        let bucket = event_time_bucket(&ev, span);
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:07:00Z")
+            .unwrap()
+            .timestamp()
+            / i64::try_from(span).unwrap();
+        assert_eq!(bucket, expected);
+
+        // …and an event with no `_time` falls back to now, which is a
+        // DIFFERENT bucket — the failure mode the assertion above rules
+        // out for a real event.
+        let bucketless = event(&json!({"service": "nginx"}));
+        assert_ne!(event_time_bucket(&bucketless, span), expected);
+    }
+
     // ── tier 1: table ──────────────────────────────────────────────
 
     #[test]

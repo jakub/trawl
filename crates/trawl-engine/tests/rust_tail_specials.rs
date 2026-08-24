@@ -186,6 +186,39 @@ fn a_timestamp_column_still_shifts_after_the_tail() {
     );
 }
 
+/// A timestamp the TAIL computes — an infinity included — survives a
+/// display-shifted run.
+///
+/// The shift re-parses the rendered text of the columns it tracks; an
+/// infinity renders as a WORD, which is not that rendering, so it passes
+/// through untouched while a real `_time` beside it still shifts. Both
+/// halves are asserted, because "nothing moved" is also what a broken
+/// shift looks like.
+#[test]
+fn a_tail_computed_infinity_survives_a_shifted_run() {
+    let (_dir, glob) = source(&[
+        r#"{"message":"k=v","service":"nginx","_time":"2026-01-15T09:00:00Z","_ingested":"2026-01-15T09:00:00Z"}"#,
+    ]);
+    let exec = Executor::new().unwrap();
+    let dsl =
+        r#"* | extract kv from message | let t = date_trunc("day", "infinity") | table _time, t"#;
+    let offset = 5 * 3600 + 1800; // +05:30
+
+    let shifted = exec
+        .run_query(dsl, &glob, &FieldTypes::new(), usize::MAX, offset)
+        .unwrap();
+    assert_eq!(
+        cell(&shifted, 0, "t"),
+        &Value::String("infinity".into()),
+        "a computed infinity must cross the bridge and the shift unchanged"
+    );
+    assert_eq!(
+        cell(&shifted, 0, "_time"),
+        &Value::String("2026-01-15 14:30:00".into()),
+        "…while the real timestamp column beside it still shifts"
+    );
+}
+
 /// (d) A DOUBLE-pinned infinity answers a tail's `| where d > 1` the way
 /// the batch lane does.
 ///
