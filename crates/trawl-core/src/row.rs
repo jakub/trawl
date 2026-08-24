@@ -42,10 +42,12 @@ pub type Row = BTreeMap<String, EvalValue>;
 /// The ONE JSON → row door: the event bus's wire JSON, or a batch result
 /// cell, read into typed cells.
 ///
-/// Per-cell reading is `EvalValue::from(&Value)` by IDENTITY — including
-/// its lossy arm, where a JSON integer above `i64::MAX` becomes a
-/// `Float`. That is what the evaluator already read for such a value, so
-/// preserving it keeps this change a re-TYPING and not a re-reading. A
+/// Per-cell reading is `EvalValue::from(&Value)` by IDENTITY. A JSON
+/// integer above `i64::MAX` becomes `UInt`, keeping its exact digits
+/// through the row (identity, egress, keys, `pin_read`) and widening to
+/// `Float` only when a numeric expression reads it — exactly the value
+/// the pre-typed-row evaluator computed, while the wire keeps the exact
+/// integer the pre-typed-row pass-through carried. A
 /// JSON object cannot appear here: ingest stringifies nested values
 /// before they reach the bus (`envelope::canonicalize`).
 #[must_use]
