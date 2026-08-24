@@ -15,8 +15,9 @@ use crate::compare;
 use crate::emitter::SqlValue;
 use crate::pin_match::{self, NullReadPolicy};
 use crate::pin_scope::{PinScope, PinnedSubject};
+use crate::row::Row;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 /// Result of evaluating an expression against an event.
 #[derive(Debug, Clone, PartialEq)]
@@ -268,7 +269,7 @@ impl From<&Value> for EvalValue {
 /// exactly as before ADR-0011 slice A′ — embedded mode's behavior, and the
 /// zero-cost path when no catalog exists. Catalog-backed callers go
 /// through [`eval_expr_with_pins`].
-pub fn eval_expr(expr: &Spanned<Expr>, event: &Map<String, Value>) -> EvalValue {
+pub fn eval_expr(expr: &Spanned<Expr>, event: &Row) -> EvalValue {
     static EMPTY: std::sync::LazyLock<PinScope> = std::sync::LazyLock::new(PinScope::unpinned);
     eval_expr_with_pins(expr, event, &EMPTY)
 }
@@ -282,11 +283,7 @@ pub fn eval_expr(expr: &Spanned<Expr>, event: &Map<String, Value>) -> EvalValue 
 /// — inside `if()` conditions, under `not`/`and`/`or`, in `| let` values.
 /// An empty scope short-circuits every pinned check, so the pin-blind
 /// path stays zero-cost.
-pub fn eval_expr_with_pins(
-    expr: &Spanned<Expr>,
-    event: &Map<String, Value>,
-    pins: &PinScope,
-) -> EvalValue {
+pub fn eval_expr_with_pins(expr: &Spanned<Expr>, event: &Row, pins: &PinScope) -> EvalValue {
     match &expr.node {
         Expr::Literal(lit) => eval_literal(lit),
         Expr::FieldRef(name) => {
@@ -298,7 +295,8 @@ pub fn eval_expr_with_pins(
             let mapped = name.as_str();
             bind_event_key(event, mapped)
                 .and_then(|key| event.get(key))
-                .map_or(EvalValue::Null, EvalValue::from)
+                .cloned()
+                .unwrap_or(EvalValue::Null)
         }
         Expr::Binary { lhs, op, rhs } => try_pinned_comparison(lhs, *op, rhs, event, pins)
             .unwrap_or_else(|| {
@@ -383,7 +381,7 @@ fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
 /// `DuckDB` answer to mirror — it errors — so this picks the
 /// lexicographically-first variant: deterministic regardless of map
 /// order, and the same tie-break ingest's own fold-collision rule uses.
-pub(crate) fn bind_event_key<'e>(event: &'e Map<String, Value>, name: &str) -> Option<&'e str> {
+pub(crate) fn bind_event_key<'e>(event: &'e Row, name: &str) -> Option<&'e str> {
     if let Some((key, _)) = event.get_key_value(name) {
         return Some(key.as_str());
     }
@@ -401,9 +399,9 @@ pub(crate) fn bind_event_key<'e>(event: &'e Map<String, Value>, name: &str) -> O
 /// non-nullness — decides which key is read: a bound key holding JSON
 /// null is that field's own NULL (UNKNOWN), never a reason to read a
 /// differently-cased sibling.
-fn pinned_event_value<'e>(event: &'e Map<String, Value>, name: &str) -> Option<&'e Value> {
+fn pinned_event_value<'e>(event: &'e Row, name: &str) -> Option<&'e EvalValue> {
     let key = bind_event_key(event, name)?;
-    event.get(key).filter(|v| !v.is_null())
+    event.get(key).filter(|v| !matches!(v, EvalValue::Null))
 }
 
 /// Truth → `EvalValue`: UNKNOWN is SQL NULL, which the existing
@@ -415,28 +413,44 @@ fn truth_to_eval(truth: Option<bool>) -> EvalValue {
 /// The value a pinned SUBJECT reads for one event — the column's own
 /// value, or the pin-declaring call's result — or `None` for a NULL
 /// subject (an absent field, a JSON null, a call with no reading).
-fn subject_value<'e>(
+fn subject_value(
     subject: &PinnedSubject<'_>,
-    event: &'e Map<String, Value>,
+    event: &Row,
     pins: &PinScope,
-) -> Option<std::borrow::Cow<'e, Value>> {
-    match subject {
-        PinnedSubject::Field(name) => {
-            pinned_event_value(event, name).map(std::borrow::Cow::Borrowed)
-        }
+) -> Option<serde_json::Value> {
+    let cell = match subject {
+        PinnedSubject::Field(name) => pinned_event_value(event, name)?.clone(),
         // Evaluated by the ordinary expression path — the same value
         // `| let s = sev(level)` would project, so a comparison and a
         // projection can never read one event two ways.
-        PinnedSubject::Call(call) => match eval_expr_with_pins(call, event, pins) {
-            EvalValue::Int(n) => Some(std::borrow::Cow::Owned(Value::from(n))),
-            EvalValue::Str(s) => Some(std::borrow::Cow::Owned(Value::from(s))),
-            EvalValue::Bool(b) => Some(std::borrow::Cow::Owned(Value::from(b))),
-            EvalValue::Float(f) => {
-                serde_json::Number::from_f64(f).map(|n| std::borrow::Cow::Owned(Value::Number(n)))
-            }
-            // NULL, and the shapes no declared-pin function produces.
-            EvalValue::Null | EvalValue::Timestamp(_) | EvalValue::Array(_) => None,
-        },
+        PinnedSubject::Call(call) => eval_expr_with_pins(call, event, pins),
+    };
+    if matches!(cell, EvalValue::Null) {
+        return None;
+    }
+    Some(pin_read(&cell))
+}
+
+/// The projection a pinned read gives one cell — the shape
+/// [`crate::pin_match`] conforms and compares, which is still the JSON
+/// domain (retyping the search-stage matcher would change what it reads
+/// off the firehose, and cost a conversion per event to do it).
+///
+/// Every arm is the value the row CARRIED before rows were typed, with
+/// exactly one deliberate difference: a non-finite double projects as its
+/// `DuckDB` TEXT (`inf`, `-inf`, `nan`, `-nan`) instead of vanishing.
+/// JSON cannot spell one, so the old row held `null` there and a
+/// DOUBLE-pinned `| where d > 1` answered UNKNOWN over a stored infinity
+/// the batch query compares happily. The text is not a workaround: it is
+/// what the conformed column HOLDS, and both
+/// [`crate::compare::try_cast_double`] and the SQL `TRY_CAST` read it
+/// back as the same double.
+fn pin_read(cell: &EvalValue) -> serde_json::Value {
+    match cell {
+        EvalValue::Float(f) if !f.is_finite() => {
+            serde_json::Value::String(crate::compare::canonical_double_text(*f))
+        }
+        other => serde_json::Value::from(other.clone()),
     }
 }
 
@@ -460,7 +474,7 @@ fn try_pinned_comparison(
     lhs: &Spanned<Expr>,
     op: BinaryOp,
     rhs: &Spanned<Expr>,
-    event: &Map<String, Value>,
+    event: &Row,
     pins: &PinScope,
 ) -> Option<EvalValue> {
     // Pattern operators: the subject is the LEFT operand only — the
@@ -552,7 +566,7 @@ fn try_pinned_comparison(
 fn try_pinned_in_list(
     target: &Spanned<Expr>,
     list: &[Spanned<Expr>],
-    event: &Map<String, Value>,
+    event: &Row,
     pins: &PinScope,
 ) -> Option<EvalValue> {
     let (subject, pin) = pins.subject_pin(target)?;
@@ -1669,6 +1683,7 @@ fn resolve_time(parsed: &mut chrono::format::Parsed) -> Option<NaiveTime> {
 mod tests {
     use super::*;
     use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned, UnaryOp};
+    use serde_json::Map;
     use serde_json::json;
 
     fn span<T>(node: T) -> Spanned<T> {
@@ -1701,7 +1716,7 @@ mod tests {
                 })
                 .expect("dsl has a where stage");
             let event: Map<String, Value> = serde_json::from_str(event).expect("valid event");
-            eval_expr_with_pins(&cond, &event, &PinScope::root(&ft))
+            eval_expr_with_pins(&cond, &crate::row::from_json(&event), &PinScope::root(&ft))
         }
 
         const VARCHAR_STATUS: &[(&str, CT)] = &[("status", CT::Varchar)];
@@ -1977,7 +1992,10 @@ mod tests {
                 _ => unreachable!(),
             };
             let event: Map<String, Value> = serde_json::from_str(r#"{"status": "404"}"#).unwrap();
-            assert_eq!(eval_expr(&cond, &event), EvalValue::Null);
+            assert_eq!(
+                eval_expr(&cond, &crate::row::from_json(&event)),
+                EvalValue::Null
+            );
         }
     }
 
@@ -2034,12 +2052,12 @@ mod tests {
         })
     }
 
-    fn empty_event() -> Map<String, Value> {
-        Map::new()
+    fn empty_event() -> Row {
+        Row::new()
     }
 
-    fn event(pairs: &Value) -> Map<String, Value> {
-        pairs.as_object().unwrap().clone()
+    fn event(pairs: &Value) -> Row {
+        crate::row::from_json(pairs.as_object().unwrap())
     }
 
     // ── literals ───────────────────────────────────────────────────

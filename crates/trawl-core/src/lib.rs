@@ -49,6 +49,10 @@ pub mod pin_scope;
 /// derivation every lane reads, and the shared collision check over it.
 pub mod projection;
 
+/// The typed row pipeline stages pass between them, and the two doors
+/// where it becomes JSON.
+pub mod row;
+
 /// Client-chosen text made safe to render: control and format characters
 /// that would rewrite or hide a terminal line.
 pub mod sanitize;

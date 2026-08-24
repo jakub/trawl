@@ -749,7 +749,9 @@ fn assert_where_parity_over_severity(
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
-        &condition, event, &scope,
+        &condition,
+        &trawl_core::row::from_json(event),
+        &scope,
     ));
 
     let tmp = tempfile::Builder::new()
@@ -2080,7 +2082,9 @@ fn assert_where_parity(
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
-        &condition, event, &scope,
+        &condition,
+        &trawl_core::row::from_json(event),
+        &scope,
     ));
 
     let _guard: Box<dyn std::any::Any>;
@@ -2138,7 +2142,9 @@ fn assert_where_parity_over_column(
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
-        &condition, event, &scope,
+        &condition,
+        &trawl_core::row::from_json(event),
+        &scope,
     ));
 
     let tmp = tempfile::Builder::new()
@@ -2188,7 +2194,7 @@ fn assert_pinned_let_parity(
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
         &assignment,
-        event,
+        &trawl_core::row::from_json(event),
         &scope,
     ));
     assert_eq!(
@@ -2483,7 +2489,9 @@ fn assert_where_parity_hot_only(
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
-        &condition, event, &scope,
+        &condition,
+        &trawl_core::row::from_json(event),
+        &scope,
     ));
 
     let (_snapshot, emitted) = emit_hot_only_over(&query, event, ft, siblings);
@@ -2522,7 +2530,7 @@ fn assert_let_parity_hot_only(
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
         &assignment,
-        event,
+        &trawl_core::row::from_json(event),
         &scope,
     ));
 

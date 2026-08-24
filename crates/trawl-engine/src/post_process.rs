@@ -16,6 +16,7 @@ use indexmap::IndexSet;
 use serde_json::{Map, Value};
 use trawl_core::ast::{PipeStage, SortDirection, Spanned};
 use trawl_core::pin_scope::PinScope;
+use trawl_core::row::{self, Row};
 use trawl_core::stream::{self, CompiledStage, StageResult, StreamPlan};
 
 use crate::error::EngineError;
@@ -67,14 +68,18 @@ pub fn apply_rust_stages(
         } => apply_aggregate(&mut pre_stages, &mut aggregation, &mut post_stages, events),
     };
 
+    // Back to JSON for the sort and the result rebuild — the bridge
+    // this milestone's next commit replaces with a direct one.
+    let processed: Vec<Map<String, Value>> = processed.into_iter().map(row::to_json).collect();
+
     // Apply deferred sort stages.
     let sorted = apply_sorts(processed, &sort_stages);
 
     Ok(events_to_result(&sorted))
 }
 
-/// Convert a columnar `QueryResult` into a vec of JSON object events.
-fn rows_to_events(result: &QueryResult) -> Vec<Map<String, Value>> {
+/// Convert a columnar `QueryResult` into a vec of typed pipeline rows.
+fn rows_to_events(result: &QueryResult) -> Vec<Row> {
     result
         .rows
         .iter()
@@ -83,7 +88,7 @@ fn rows_to_events(result: &QueryResult) -> Vec<Map<String, Value>> {
             for (col, cell) in result.columns.iter().zip(row.iter()) {
                 event.insert(col.name.clone(), cell_to_json(cell));
             }
-            event
+            row::from_json(&event)
         })
         .collect()
 }
@@ -155,10 +160,7 @@ fn json_to_cell(v: &Value) -> crate::value::Value {
 }
 
 /// Run pass-through stages on each event.
-fn apply_pass_through(
-    stages: &mut [CompiledStage],
-    events: Vec<Map<String, Value>>,
-) -> Vec<Map<String, Value>> {
+fn apply_pass_through(stages: &mut [CompiledStage], events: Vec<Row>) -> Vec<Row> {
     let mut output = Vec::new();
     'event: for mut event in events {
         for stage in stages.iter_mut() {
@@ -178,8 +180,8 @@ fn apply_aggregate(
     pre_stages: &mut [CompiledStage],
     aggregation: &mut stream::CompiledAggregation,
     post_stages: &mut [CompiledStage],
-    events: Vec<Map<String, Value>>,
-) -> Vec<Map<String, Value>> {
+    events: Vec<Row>,
+) -> Vec<Row> {
     // Feed events through pre-stages into the aggregation.
     'event: for mut event in events {
         for stage in pre_stages.iter_mut() {

@@ -16,8 +16,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde_json::{Map, Value};
-
 use crate::ast::{
     AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
     LiteralValue, PipeStage, RenameStage, Spanned, TableStage, WhereStage,
@@ -26,8 +24,9 @@ use crate::emitter::{
     format_literal_position, unit_literal_positions, validate_format_literal,
     validate_function_arity, validate_unit_literal,
 };
-use crate::eval::{bind_event_key, eval_expr_with_pins};
+use crate::eval::{EvalValue, bind_event_key, eval_expr_with_pins};
 use crate::pin_scope::PinScope;
+use crate::row::{self, Row};
 
 // ── stream plan ────────────────────────────────────────────────────
 
@@ -587,16 +586,16 @@ fn compile_dedup(s: &DedupStage) -> CompiledStage {
 }
 
 /// Read a live field using `DuckDB`'s ASCII-insensitive identifier binding.
-fn event_value<'e>(event: &'e Map<String, Value>, name: &str) -> Option<&'e Value> {
+fn event_value<'e>(event: &'e Row, name: &str) -> Option<&'e EvalValue> {
     let key = bind_event_key(event, name)?;
     event.get(key)
 }
 
-fn event_text(event: &Map<String, Value>, name: &str) -> String {
-    event_value(event, name).map_or_else(String::new, |value| match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    })
+/// A field's text for an identity or a display — [`row::cell_text`] for a
+/// cell the row carries, and the EMPTY string for one it does not (an
+/// absent field is not a NULL one, and never was).
+fn event_text(event: &Row, name: &str) -> String {
+    event_value(event, name).map_or_else(String::new, row::cell_text)
 }
 
 // ── stage application ──────────────────────────────────────────────
@@ -618,12 +617,12 @@ fn event_text(event: &Map<String, Value>, name: &str) -> String {
 /// case-insensitively, so `rename Status as st` has to carry the value
 /// across in this lane too — and the key REMOVED is the one that bound,
 /// never the verbatim source.
-fn apply_rename(renames: &[(String, String)], event: &mut Map<String, Value>) {
+fn apply_rename(renames: &[(String, String)], event: &mut Row) {
     let sources: Vec<Option<String>> = renames
         .iter()
         .map(|(from, _)| bind_event_key(event, from).map(str::to_owned))
         .collect();
-    let resolved: Vec<(&str, Option<Value>)> = renames
+    let resolved: Vec<(&str, Option<EvalValue>)> = renames
         .iter()
         .zip(&sources)
         .map(|((_, to), source)| {
@@ -650,7 +649,7 @@ fn apply_rename(renames: &[(String, String)], event: &mut Map<String, Value>) {
 }
 
 /// Remove other spellings of the column a projection is about to own.
-fn remove_folded_twins(event: &mut Map<String, Value>, name: &str) {
+fn remove_folded_twins(event: &mut Row, name: &str) {
     let folded = crate::schema::catalog_key(name);
     let twins: Vec<String> = event
         .keys()
@@ -694,7 +693,7 @@ fn remove_folded_twins(event: &mut Map<String, Value>, name: &str) {
 fn apply_let(
     assignments: &[(String, Spanned<crate::ast::Expr>)],
     pins: &PinScope,
-    event: &mut Map<String, Value>,
+    event: &mut Row,
 ) {
     // Decided against the PRE-stage row, before any alias lands: these
     // targets name a real column, so they stay invisible to their
@@ -707,9 +706,12 @@ fn apply_let(
         .iter()
         .map(|(name, _)| bind_event_key(event, name).is_some())
         .collect();
-    let mut resolved: Vec<(&str, Value)> = Vec::with_capacity(assignments.len());
+    let mut resolved: Vec<(&str, EvalValue)> = Vec::with_capacity(assignments.len());
     for ((name, expr), shadows_column) in assignments.iter().zip(shadowing) {
-        let value = Value::from(eval_expr_with_pins(expr, event, pins));
+        // Stored as the evaluator produced it. A JSON round trip here is
+        // what used to turn `0/0` into NULL one stage before the query
+        // asked about it (see [`crate::row`]).
+        let value = eval_expr_with_pins(expr, event, pins);
         if !shadows_column {
             // The lateral alias: a later sibling naming this target finds
             // no input column and reads what was just computed.
@@ -725,13 +727,13 @@ fn apply_let(
 
 /// Apply regex extraction with the same write-always, empty-is-NULL
 /// semantics as the emitted `nullif(regexp_extract(...), '')` projection.
-fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Map<String, Value>) {
+fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Row) {
     let text = match event_value(event, source_field) {
-        Some(Value::String(text)) => Some(text.clone()),
+        Some(EvalValue::Str(text)) => Some(text.clone()),
         _ => None,
     };
     let captures = text.as_deref().and_then(|text| regex.captures(text));
-    let written: Vec<(String, Value)> = regex
+    let written: Vec<(String, EvalValue)> = regex
         .capture_names()
         .flatten()
         .map(|name| {
@@ -739,8 +741,8 @@ fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Map
                 .as_ref()
                 .and_then(|captures| captures.name(name))
                 .filter(|capture| !capture.as_str().is_empty())
-                .map_or(Value::Null, |capture| {
-                    Value::String(capture.as_str().to_string())
+                .map_or(EvalValue::Null, |capture| {
+                    EvalValue::Str(capture.as_str().to_string())
                 });
             (name.to_string(), value)
         })
@@ -755,7 +757,7 @@ fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Map
 ///
 /// Returns whether the event should pass through, be filtered, or
 /// the stream is done.
-pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) -> StageResult {
+pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row) -> StageResult {
     match stage {
         CompiledStage::Table { fields } => {
             let keep: Vec<String> = fields
@@ -823,7 +825,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
             source_field,
             separator,
         } => {
-            if let Some(Value::String(text)) = event_value(event, source_field) {
+            if let Some(EvalValue::Str(text)) = event_value(event, source_field) {
                 let pairs = extract_key_value_pairs(text, *separator);
                 for (k, v) in pairs {
                     // The `_` namespace is sealed against LOG CONTENT too
@@ -863,10 +865,15 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Map<String, Value>) ->
 }
 
 /// Build a dedup key from field values. Empty fields → dedup on all values.
-fn dedup_key(fields: &[String], event: &Map<String, Value>) -> Vec<String> {
+fn dedup_key(fields: &[String], event: &Row) -> Vec<String> {
     if fields.is_empty() {
-        // dedup on entire event — use all values sorted by key
-        let mut pairs: Vec<_> = event.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        // dedup on entire event — every cell, kind-tagged so a string
+        // and a number of the same text stay different rows, exactly as
+        // JSON quoting made them ([`row::cell_key`]).
+        let mut pairs: Vec<_> = event
+            .iter()
+            .map(|(k, v)| format!("{k}={}", row::cell_key(v)))
+            .collect();
         pairs.sort();
         pairs
     } else {
@@ -877,22 +884,29 @@ fn dedup_key(fields: &[String], event: &Map<String, Value>) -> Vec<String> {
     }
 }
 
-/// Coerce a string value from kv extraction into the most specific JSON type.
+/// Coerce a string value from kv extraction into the most specific cell
+/// type.
 ///
 /// Tries integer, then float, then boolean, falling back to string.
-pub fn coerce_kv_value(s: String) -> Value {
+///
+/// The finiteness guard is DELIBERATE and survives the retyping: a kv
+/// pair is sender TEXT out of a log line, with no SQL lane to agree
+/// with, so `x=inf` stays the string `"inf"` it reads as rather than
+/// becoming an infinity the sender never wrote. (It mirrors exactly what
+/// `serde_json::Number::from_f64` used to reject here.)
+pub fn coerce_kv_value(s: String) -> EvalValue {
     if let Ok(i) = s.parse::<i64>() {
-        return serde_json::Number::from(i).into();
+        return EvalValue::Int(i);
     }
     if let Ok(f) = s.parse::<f64>()
-        && let Some(n) = serde_json::Number::from_f64(f)
+        && f.is_finite()
     {
-        return Value::Number(n);
+        return EvalValue::Float(f);
     }
     match s.as_str() {
-        "true" => Value::Bool(true),
-        "false" => Value::Bool(false),
-        _ => Value::String(s),
+        "true" => EvalValue::Bool(true),
+        "false" => EvalValue::Bool(false),
+        _ => EvalValue::Str(s),
     }
 }
 
@@ -1048,8 +1062,8 @@ pub enum AccState {
     Min(Option<f64>),
     Max(Option<f64>),
     Dc(HashSet<String>),
-    First(Option<Value>),
-    Last(Option<Value>),
+    First(Option<EvalValue>),
+    Last(Option<EvalValue>),
     Values(HashSet<String>),
     Median(Vec<f64>),
     Stddev(WelfordState),
@@ -1244,7 +1258,7 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
 
 impl CompiledAggregation {
     /// Feed an event into the aggregation accumulators.
-    pub fn feed_event(&mut self, event: &Map<String, Value>) {
+    pub fn feed_event(&mut self, event: &Row) {
         match self {
             Self::Stats {
                 accumulators,
@@ -1303,8 +1317,8 @@ impl CompiledAggregation {
 
     /// Take a snapshot of the current aggregation state as rows.
     ///
-    /// Returns `(column_names, rows)` where each row is a `Map`.
-    pub fn snapshot(&self) -> (Vec<String>, Vec<Map<String, Value>>) {
+    /// Returns `(column_names, rows)` where each row is a [`Row`].
+    pub fn snapshot(&self) -> (Vec<String>, Vec<Row>) {
         match self {
             Self::Stats {
                 accumulators,
@@ -1337,15 +1351,15 @@ fn snapshot_stats(
     accumulators: &[CompiledAcc],
     group_by: &[String],
     groups: &HashMap<GroupKey, Vec<AccState>>,
-) -> (Vec<String>, Vec<Map<String, Value>>) {
+) -> (Vec<String>, Vec<Row>) {
     let mut columns: Vec<String> = group_by.to_vec();
     columns.extend(accumulators.iter().map(|a| a.alias.clone()));
 
     let mut rows = Vec::new();
     for (key, states) in groups {
-        let mut row = Map::new();
+        let mut row = Row::new();
         for (col, val) in group_by.iter().zip(key.iter()) {
-            row.insert(col.clone(), Value::String(val.clone()));
+            row.insert(col.clone(), EvalValue::Str(val.clone()));
         }
         for (acc, state) in accumulators.iter().zip(states.iter()) {
             row.insert(acc.alias.clone(), snapshot_acc(state));
@@ -1361,7 +1375,7 @@ fn snapshot_timechart(
     group_by: &[String],
     buckets: &HashMap<i64, HashMap<GroupKey, Vec<AccState>>>,
     span_secs: u64,
-) -> (Vec<String>, Vec<Map<String, Value>>) {
+) -> (Vec<String>, Vec<Row>) {
     let mut columns = vec!["_time".to_string()];
     columns.extend(group_by.iter().cloned());
     columns.extend(accumulators.iter().map(|a| a.alias.clone()));
@@ -1373,12 +1387,12 @@ fn snapshot_timechart(
     for bucket in sorted_buckets {
         if let Some(group_map) = buckets.get(&bucket) {
             for (key, states) in group_map {
-                let mut row = Map::new();
+                let mut row = Row::new();
                 let ts = chrono::DateTime::from_timestamp(bucket * span_secs as i64, 0)
                     .map_or_else(|| bucket.to_string(), |dt| dt.to_rfc3339());
-                row.insert("_time".to_string(), Value::String(ts));
+                row.insert("_time".to_string(), EvalValue::Str(ts));
                 for (col, val) in group_by.iter().zip(key.iter()) {
-                    row.insert(col.clone(), Value::String(val.clone()));
+                    row.insert(col.clone(), EvalValue::Str(val.clone()));
                 }
                 for (acc, state) in accumulators.iter().zip(states.iter()) {
                     row.insert(acc.alias.clone(), snapshot_acc(state));
@@ -1399,7 +1413,7 @@ fn snapshot_frequency(
     by: &[String],
     count: u64,
     descending: bool,
-) -> (Vec<String>, Vec<Map<String, Value>>) {
+) -> (Vec<String>, Vec<Row>) {
     let mut columns: Vec<String> = by.to_vec();
     columns.push(field.to_string());
     columns.push("count".to_string());
@@ -1413,19 +1427,19 @@ fn snapshot_frequency(
             sorted.sort_by(|a, b| a.1.cmp(b.1));
         }
         for (val, cnt) in sorted.into_iter().take(count as usize) {
-            let mut row = Map::new();
+            let mut row = Row::new();
             for (col, gv) in by.iter().zip(group_key.iter()) {
-                row.insert(col.clone(), Value::String(gv.clone()));
+                row.insert(col.clone(), EvalValue::Str(gv.clone()));
             }
-            row.insert(field.to_string(), Value::String(val.clone()));
-            row.insert("count".to_string(), Value::from(*cnt));
+            row.insert(field.to_string(), EvalValue::Str(val.clone()));
+            row.insert("count".to_string(), row::count_value(*cnt));
             rows.push(row);
         }
     }
     (columns, rows)
 }
 
-fn make_group_key(group_by: &[String], event: &Map<String, Value>) -> GroupKey {
+fn make_group_key(group_by: &[String], event: &Row) -> GroupKey {
     group_by
         .iter()
         .map(|field| event_text(event, field))
@@ -1433,9 +1447,11 @@ fn make_group_key(group_by: &[String], event: &Map<String, Value>) -> GroupKey {
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
-fn event_time_bucket(event: &Map<String, Value>, span_secs: u64) -> i64 {
-    // Try to parse the _time field as RFC3339
-    if let Some(Value::String(ts)) = event.get("_time")
+fn event_time_bucket(event: &Row, span_secs: u64) -> i64 {
+    // Try to parse the _time field as RFC3339. The EXACT `_time` key,
+    // deliberately not `bind_event_key`: a pre-existing quirk of this
+    // lane, preserved rather than fixed here.
+    if let Some(EvalValue::Str(ts)) = event.get("_time")
         && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
     {
         return dt.timestamp() / span_secs as i64;
@@ -1444,19 +1460,26 @@ fn event_time_bucket(event: &Map<String, Value>, span_secs: u64) -> i64 {
     chrono::Utc::now().timestamp() / span_secs as i64
 }
 
-fn extract_f64(event: &Map<String, Value>, field: &str) -> Option<f64> {
+/// The numeric reading an accumulator takes off a cell.
+///
+/// Numbers ONLY — never a numeric-looking string, exactly as the JSON
+/// form read only `Value::Number`. Widening it would make `sum(x)` start
+/// counting text the SQL lane does not.
+#[allow(clippy::cast_precision_loss)]
+fn extract_f64(event: &Row, field: &str) -> Option<f64> {
     event_value(event, field).and_then(|v| match v {
-        Value::Number(n) => n.as_f64(),
+        EvalValue::Int(n) => Some(*n as f64),
+        EvalValue::Float(f) => Some(*f),
         _ => None,
     })
 }
 
-fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Map<String, Value>) {
+fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Row) {
     match state {
         AccState::Count(n) => *n += 1,
         AccState::CountField { non_null } => {
             if let Some(field) = &acc.field
-                && event_value(event, field).is_some_and(|v| !v.is_null())
+                && event_value(event, field).is_some_and(|v| !matches!(v, EvalValue::Null))
             {
                 *non_null += 1;
             }
@@ -1476,18 +1499,34 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Map<String, Value>)
                 *count += 1;
             }
         }
+        // `f64::min`/`f64::max` IGNORE a NaN (`f64::max(NaN, 3.0)` is
+        // 3.0), which would make `max(x)` skip the very value `DuckDB`
+        // orders GREATEST. Both extremes go through the one probed order
+        // instead ([`crate::compare::double_total_cmp`]).
         AccState::Min(current) => {
             if let Some(field) = &acc.field
                 && let Some(v) = extract_f64(event, field)
             {
-                *current = Some(current.map_or(v, |c| c.min(v)));
+                *current = Some(current.map_or(v, |c| {
+                    if crate::compare::double_total_cmp(v, c).is_lt() {
+                        v
+                    } else {
+                        c
+                    }
+                }));
             }
         }
         AccState::Max(current) => {
             if let Some(field) = &acc.field
                 && let Some(v) = extract_f64(event, field)
             {
-                *current = Some(current.map_or(v, |c| c.max(v)));
+                *current = Some(current.map_or(v, |c| {
+                    if crate::compare::double_total_cmp(v, c).is_gt() {
+                        v
+                    } else {
+                        c
+                    }
+                }));
             }
         }
         AccState::Dc(set) | AccState::Values(set) => {
@@ -1521,25 +1560,17 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Map<String, Value>)
     }
 }
 
-fn feed_acc_string_set(acc: &CompiledAcc, set: &mut HashSet<String>, event: &Map<String, Value>) {
+fn feed_acc_string_set(acc: &CompiledAcc, set: &mut HashSet<String>, event: &Row) {
     if let Some(field) = &acc.field
         && set.len() < MAX_DISTINCT
         && let Some(v) = event_value(event, field)
-        && !v.is_null()
+        && !matches!(v, EvalValue::Null)
     {
-        set.insert(match v {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        });
+        set.insert(row::cell_text(v));
     }
 }
 
-fn feed_acc_f64_vec(
-    acc: &CompiledAcc,
-    values: &mut Vec<f64>,
-    event: &Map<String, Value>,
-    max: usize,
-) {
+fn feed_acc_f64_vec(acc: &CompiledAcc, values: &mut Vec<f64>, event: &Row, max: usize) {
     if let Some(field) = &acc.field
         && values.len() < max
         && let Some(v) = extract_f64(event, field)
@@ -1548,44 +1579,60 @@ fn feed_acc_f64_vec(
     }
 }
 
+/// An accumulator's value as a cell.
+///
+/// A computed double is stored as one — the JSON nulling that used to
+/// happen here was a WIRE concern living inside an accumulator, and the
+/// wire door still applies it ([`row::to_json`]). An empty accumulator is
+/// NULL, exactly as before.
 #[allow(clippy::cast_precision_loss)]
-fn snapshot_acc(state: &AccState) -> Value {
+fn snapshot_acc(state: &AccState) -> EvalValue {
     match state {
-        AccState::Count(n) => Value::from(*n),
-        AccState::CountField { non_null } => Value::from(*non_null),
-        AccState::Sum(total) => json_f64(*total),
+        AccState::Count(n) => row::count_value(*n),
+        AccState::CountField { non_null } => row::count_value(*non_null),
+        AccState::Sum(total) => EvalValue::Float(*total),
         AccState::Avg { sum, count } => {
             if *count == 0 {
-                Value::Null
+                EvalValue::Null
             } else {
-                json_f64(*sum / *count as f64)
+                EvalValue::Float(*sum / *count as f64)
             }
         }
-        AccState::Min(v) | AccState::Max(v) => v.map_or(Value::Null, json_f64),
-        AccState::Dc(set) => Value::from(set.len() as u64),
-        AccState::First(v) | AccState::Last(v) => v.clone().unwrap_or(Value::Null),
+        AccState::Min(v) | AccState::Max(v) => v.map_or(EvalValue::Null, EvalValue::Float),
+        AccState::Dc(set) => row::count_value(set.len() as u64),
+        AccState::First(v) | AccState::Last(v) => v.clone().unwrap_or(EvalValue::Null),
         AccState::Values(set) => {
             let mut vals: Vec<_> = set.iter().cloned().collect();
             vals.sort();
-            Value::Array(vals.into_iter().map(Value::String).collect())
+            EvalValue::Array(vals.into_iter().map(EvalValue::Str).collect())
         }
         AccState::Median(values) => snapshot_median(values),
-        AccState::Stddev(welford) => welford.stddev().map_or(Value::Null, json_f64),
+        AccState::Stddev(welford) => welford.stddev().map_or(EvalValue::Null, EvalValue::Float),
         AccState::Percentile { values, target } => snapshot_percentile(values, *target),
     }
 }
 
-fn snapshot_median(values: &[f64]) -> Value {
-    if values.is_empty() {
-        return Value::Null;
-    }
+/// Order a sample for the positional aggregates.
+///
+/// `partial_cmp(…).unwrap_or(Equal)` left a NaN wherever it happened to
+/// sit, so `median(x)` depended on arrival order; the probed total order
+/// puts every NaN at the top, which is where `DuckDB` sorts it.
+fn sort_sample(values: &[f64]) -> Vec<f64> {
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| crate::compare::double_total_cmp(*a, *b));
+    sorted
+}
+
+fn snapshot_median(values: &[f64]) -> EvalValue {
+    if values.is_empty() {
+        return EvalValue::Null;
+    }
+    let sorted = sort_sample(values);
     let mid = sorted.len() / 2;
     if sorted.len().is_multiple_of(2) {
-        json_f64(f64::midpoint(sorted[mid - 1], sorted[mid]))
+        EvalValue::Float(f64::midpoint(sorted[mid - 1], sorted[mid]))
     } else {
-        json_f64(sorted[mid])
+        EvalValue::Float(sorted[mid])
     }
 }
 
@@ -1594,18 +1641,13 @@ fn snapshot_median(values: &[f64]) -> Value {
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn snapshot_percentile(values: &[f64], target: f64) -> Value {
+fn snapshot_percentile(values: &[f64], target: f64) -> EvalValue {
     if values.is_empty() {
-        return Value::Null;
+        return EvalValue::Null;
     }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let sorted = sort_sample(values);
     let idx = (target * (sorted.len() - 1) as f64).round() as usize;
-    json_f64(sorted[idx.min(sorted.len() - 1)])
-}
-
-fn json_f64(v: f64) -> Value {
-    serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number)
+    EvalValue::Float(sorted[idx.min(sorted.len() - 1)])
 }
 
 #[cfg(test)]
@@ -1616,14 +1658,28 @@ mod tests {
         LimitStage, LiteralValue, PipeStage, RareStage, RenameStage, StatsStage, TableStage,
         TopStage, WhereStage,
     };
+    use serde_json::Value;
     use serde_json::json;
 
     fn span<T>(node: T) -> Spanned<T> {
         Spanned { node, span: 0..0 }
     }
 
-    fn event(pairs: &Value) -> Map<String, Value> {
-        pairs.as_object().unwrap().clone()
+    fn event(pairs: &Value) -> Row {
+        crate::row::from_json(pairs.as_object().unwrap())
+    }
+
+    /// A row's cell as JSON, so the assertions below keep comparing
+    /// against the literals they always did (`serde_json::Value` knows
+    /// how to compare itself to a `&str`, an integer, a float…).
+    fn cell(row: &Row, key: &str) -> Value {
+        Value::from(row.get(key).cloned().expect("cell present"))
+    }
+
+    /// The same, for the assertions that distinguish "absent" from
+    /// "present and null".
+    fn cell_opt(row: &Row, key: &str) -> Option<Value> {
+        row.get(key).cloned().map(Value::from)
     }
 
     // ── compile_stream_plan: rejection ─────────────────────────────
@@ -1746,7 +1802,7 @@ mod tests {
         });
         let mut ev = event(&json!({"service": "nginx", "host": "web-1"}));
         assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
-        assert_eq!(ev.get("svc").unwrap(), "nginx");
+        assert_eq!(cell(&ev, "svc"), "nginx");
         assert!(!ev.contains_key("service"));
     }
 
@@ -1775,8 +1831,8 @@ mod tests {
         });
         let mut ev = event(&json!({"a": 1, "b": 2}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("b").unwrap(), 1);
-        assert_eq!(ev.get("c").unwrap(), 2);
+        assert_eq!(cell(&ev, "b"), 1);
+        assert_eq!(cell(&ev, "c"), 2);
         assert!(!ev.contains_key("a"));
     }
 
@@ -1787,8 +1843,8 @@ mod tests {
         });
         let mut ev = event(&json!({"a": 1, "b": 2}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("a").unwrap(), 2);
-        assert_eq!(ev.get("b").unwrap(), 1);
+        assert_eq!(cell(&ev, "a"), 2);
+        assert_eq!(cell(&ev, "b"), 1);
     }
 
     #[test]
@@ -1798,7 +1854,7 @@ mod tests {
         });
         let mut ev = event(&json!({"a": 1, "b": 2}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("x").unwrap(), 2);
+        assert_eq!(cell(&ev, "x"), 2);
         assert!(!ev.contains_key("a"));
         assert!(!ev.contains_key("b"));
     }
@@ -2132,7 +2188,7 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"duration": 2}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("duration_ms").unwrap(), 2000);
+        assert_eq!(cell(&ev, "duration_ms"), 2000);
     }
 
     #[test]
@@ -2154,7 +2210,7 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"service": "nginx"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("svc").unwrap(), "NGINX");
+        assert_eq!(cell(&ev, "svc"), "NGINX");
     }
 
     #[test]
@@ -2184,8 +2240,8 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"service": "nginx"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("ms").unwrap(), 1000);
-        assert_eq!(ev.get("total").unwrap(), 2000);
+        assert_eq!(cell(&ev, "ms"), 1000);
+        assert_eq!(cell(&ev, "total"), 2000);
     }
 
     #[test]
@@ -2207,8 +2263,8 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"a": 5}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("a").unwrap(), 1);
-        assert_eq!(ev.get("b").unwrap(), 5);
+        assert_eq!(cell(&ev, "a"), 1);
+        assert_eq!(cell(&ev, "b"), 5);
     }
 
     #[test]
@@ -2231,9 +2287,9 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"a": 5}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("A").unwrap(), 1);
+        assert_eq!(cell(&ev, "A"), 1);
         assert!(!ev.contains_key("a"));
-        assert_eq!(ev.get("b").unwrap(), 5);
+        assert_eq!(cell(&ev, "b"), 5);
     }
 
     #[test]
@@ -2261,8 +2317,8 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"a": 5}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("a").unwrap(), 6);
-        assert_eq!(ev.get("b").unwrap(), 5);
+        assert_eq!(cell(&ev, "a"), 6);
+        assert_eq!(cell(&ev, "b"), 5);
     }
 
     // ── tier 2: extract regex ──────────────────────────────────────
@@ -2277,7 +2333,7 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"message": "connection from 192.168.1.100 accepted"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("ip").unwrap(), "192.168.1.100");
+        assert_eq!(cell(&ev, "ip"), "192.168.1.100");
     }
 
     #[test]
@@ -2290,7 +2346,7 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"message": "no ip here", "ip": "keep?"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("ip"), Some(&Value::Null));
+        assert_eq!(cell_opt(&ev, "ip"), Some(Value::Null));
         assert!(ev.contains_key("ip"));
     }
 
@@ -2304,11 +2360,11 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"message": "bbb"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("x"), Some(&Value::Null));
+        assert_eq!(cell_opt(&ev, "x"), Some(Value::Null));
 
         let mut ev = event(&json!({"message": "aab"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("x"), Some(&Value::from("aa")));
+        assert_eq!(cell_opt(&ev, "x"), Some(Value::from("aa")));
     }
 
     #[test]
@@ -2321,12 +2377,12 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"message": "Status=500", "status": 200}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("Status"), Some(&Value::from(500)));
+        assert_eq!(cell_opt(&ev, "Status"), Some(Value::from(500)));
         assert!(!ev.contains_key("status"));
 
         let mut ev = event(&json!({"message": "dur=1 DUR=2 Dur=3"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("Dur"), Some(&Value::from(3)));
+        assert_eq!(cell_opt(&ev, "Dur"), Some(Value::from(3)));
         assert_eq!(
             ev.keys()
                 .filter(|key| key.eq_ignore_ascii_case("dur"))
@@ -2345,8 +2401,8 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"message": "GET /api/v1/users HTTP/1.1"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("method").unwrap(), "GET");
-        assert_eq!(ev.get("path").unwrap(), "/api/v1/users");
+        assert_eq!(cell(&ev, "method"), "GET");
+        assert_eq!(cell(&ev, "path"), "/api/v1/users");
     }
 
     #[test]
@@ -2372,9 +2428,9 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"message": "user=alice status=200 path=/api"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("user").unwrap(), "alice");
-        assert_eq!(ev.get("status").unwrap(), 200); // coerced to int
-        assert_eq!(ev.get("path").unwrap(), "/api");
+        assert_eq!(cell(&ev, "user"), "alice");
+        assert_eq!(cell(&ev, "status"), 200); // coerced to int
+        assert_eq!(cell(&ev, "path"), "/api");
     }
 
     #[test]
@@ -2387,8 +2443,8 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"message": r#"user="alice smith" action=login"#}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("user").unwrap(), "alice smith");
-        assert_eq!(ev.get("action").unwrap(), "login");
+        assert_eq!(cell(&ev, "user"), "alice smith");
+        assert_eq!(cell(&ev, "action"), "login");
     }
 
     #[test]
@@ -2401,8 +2457,8 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"message": "user:alice status:200"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("user").unwrap(), "alice");
-        assert_eq!(ev.get("status").unwrap(), 200);
+        assert_eq!(cell(&ev, "user"), "alice");
+        assert_eq!(cell(&ev, "status"), 200);
     }
 
     #[test]
@@ -2416,11 +2472,11 @@ mod tests {
         let mut ev =
             event(&json!({"message": "count=42 rate=1.5 flag=true name=hello empty=false"}));
         apply_stage(&mut stage, &mut ev);
-        assert_eq!(ev.get("count").unwrap(), 42);
-        assert_eq!(ev.get("rate").unwrap(), 1.5);
-        assert_eq!(ev.get("flag").unwrap(), true);
-        assert_eq!(ev.get("name").unwrap(), "hello");
-        assert_eq!(ev.get("empty").unwrap(), false);
+        assert_eq!(cell(&ev, "count"), 42);
+        assert_eq!(cell(&ev, "rate"), 1.5);
+        assert_eq!(cell(&ev, "flag"), true);
+        assert_eq!(cell(&ev, "name"), "hello");
+        assert_eq!(cell(&ev, "empty"), false);
     }
 
     // ── tier 2: dedup ──────────────────────────────────────────────
@@ -2539,9 +2595,9 @@ mod tests {
         // Log content cannot forge trawl's verdict slots (ADR-0013 §1):
         // the reserved pairs are dropped, the ordinary one lands, and an
         // existing `_severity` keeps trawl's own value.
-        assert_eq!(ev.get("a"), Some(&json!(1)));
-        assert_eq!(ev.get("_severity"), Some(&json!(9)));
-        assert!(ev.get("_time").is_none());
+        assert_eq!(cell_opt(&ev, "a"), Some(json!(1)));
+        assert_eq!(cell_opt(&ev, "_severity"), Some(json!(9)));
+        assert!(!ev.contains_key("_time"));
     }
 
     // ── multi-stage pipeline ───────────────────────────────────────
@@ -2714,7 +2770,7 @@ mod tests {
         let (columns, rows) = aggregation.snapshot();
         assert_eq!(columns, vec!["count"]);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("count").unwrap(), 3);
+        assert_eq!(cell(&rows[0], "count"), 3);
     }
 
     #[test]
@@ -2744,11 +2800,8 @@ mod tests {
         assert_eq!(rows.len(), 2);
 
         // Find the web-1 row
-        let web1 = rows
-            .iter()
-            .find(|r| r.get("host").unwrap() == "web-1")
-            .unwrap();
-        assert_eq!(web1.get("count").unwrap(), 2);
+        let web1 = rows.iter().find(|r| cell(r, "host") == "web-1").unwrap();
+        assert_eq!(cell(web1, "count"), 2);
     }
 
     #[test]
@@ -2794,10 +2847,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         // Default alias is {function}_{field}
-        assert_eq!(row.get("sum_v").unwrap(), 60.0);
-        assert_eq!(row.get("avg_v").unwrap(), 20.0);
-        assert_eq!(row.get("min_v").unwrap(), 10.0);
-        assert_eq!(row.get("max_v").unwrap(), 30.0);
+        assert_eq!(cell(row, "sum_v"), 60.0);
+        assert_eq!(cell(row, "avg_v"), 20.0);
+        assert_eq!(cell(row, "min_v"), 10.0);
+        assert_eq!(cell(row, "max_v"), 30.0);
     }
 
     #[test]
@@ -2831,8 +2884,9 @@ mod tests {
 
         let (_, rows) = aggregation.snapshot();
         let row = &rows[0];
-        assert_eq!(row.get("dc_svc").unwrap(), 2);
-        let vals = row.get("values_svc").unwrap().as_array().unwrap();
+        assert_eq!(cell(row, "dc_svc"), 2);
+        let values_svc = cell(row, "values_svc");
+        let vals = values_svc.as_array().unwrap();
         assert_eq!(vals.len(), 2);
     }
 
@@ -2867,8 +2921,8 @@ mod tests {
 
         let (_, rows) = aggregation.snapshot();
         let row = &rows[0];
-        assert_eq!(row.get("first_msg").unwrap(), "alpha");
-        assert_eq!(row.get("last_msg").unwrap(), "gamma");
+        assert_eq!(cell(row, "first_msg"), "alpha");
+        assert_eq!(cell(row, "last_msg"), "gamma");
     }
 
     #[test]
@@ -2894,7 +2948,7 @@ mod tests {
             aggregation.feed_event(&event(&json!({"v": val})));
         }
         let (_, rows) = aggregation.snapshot();
-        assert_eq!(rows[0].get("median_v").unwrap(), 5.0);
+        assert_eq!(cell(&rows[0], "median_v"), 5.0);
     }
 
     #[test]
@@ -2919,7 +2973,7 @@ mod tests {
             aggregation.feed_event(&event(&json!({"v": val})));
         }
         let (_, rows) = aggregation.snapshot();
-        assert_eq!(rows[0].get("median_v").unwrap(), 4.0);
+        assert_eq!(cell(&rows[0], "median_v"), 4.0);
     }
 
     #[test]
@@ -2946,7 +3000,7 @@ mod tests {
             aggregation.feed_event(&event(&json!({"v": val})));
         }
         let (_, rows) = aggregation.snapshot();
-        let sd = rows[0].get("stddev_v").unwrap().as_f64().unwrap();
+        let sd = cell(&rows[0], "stddev_v").as_f64().unwrap();
         assert!((sd - 2.138).abs() < 0.01, "stddev was {sd}");
     }
 
@@ -2974,7 +3028,7 @@ mod tests {
         aggregation.feed_event(&event(&json!({"v": 4})));
 
         let (_, rows) = aggregation.snapshot();
-        assert_eq!(rows[0].get("count_v").unwrap(), 2);
+        assert_eq!(cell(&rows[0], "count_v"), 2);
     }
 
     #[test]
@@ -2998,7 +3052,7 @@ mod tests {
         aggregation.feed_event(&event(&json!({"x": 1})));
         let (columns, rows) = aggregation.snapshot();
         assert_eq!(columns, vec!["total"]);
-        assert_eq!(rows[0].get("total").unwrap(), 1);
+        assert_eq!(cell(&rows[0], "total"), 1);
     }
 
     // ── aggregation: top/rare ───────────────────────────────────
@@ -3030,8 +3084,8 @@ mod tests {
         assert_eq!(columns, vec!["host", "count"]);
         assert_eq!(rows.len(), 2);
         // First row should be web-1 (most frequent)
-        assert_eq!(rows[0].get("host").unwrap(), "web-1");
-        assert_eq!(rows[0].get("count").unwrap(), 5);
+        assert_eq!(cell(&rows[0], "host"), "web-1");
+        assert_eq!(cell(&rows[0], "count"), 5);
     }
 
     #[test]
@@ -3056,8 +3110,8 @@ mod tests {
 
         let (_, rows) = aggregation.snapshot();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("host").unwrap(), "web-2");
-        assert_eq!(rows[0].get("count").unwrap(), 1);
+        assert_eq!(cell(&rows[0], "host"), "web-2");
+        assert_eq!(cell(&rows[0], "count"), 1);
     }
 
     #[test]

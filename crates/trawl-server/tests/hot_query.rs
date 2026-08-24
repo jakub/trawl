@@ -732,7 +732,7 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
                 if !filter.matches_at(event, now) {
                     return false;
                 }
-                let mut event = (*event).clone();
+                let mut event = trawl_core::row::from_json(event);
                 stages.iter_mut().all(|stage| {
                     matches!(
                         apply_stage(stage, &mut event),

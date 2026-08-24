@@ -341,7 +341,7 @@ fn call(name: &str, args: Vec<Spanned<Expr>>) -> Spanned<Expr> {
 
 #[test]
 fn eval_returns_for_every_composed_expression() {
-    let event = hostile_event();
+    let event = trawl_core::row::from_json(&hostile_event());
     let mut rng = Rng::new(0x0105_A57C_0DE0);
     for _ in 0..4_000 {
         let expression = compose(&mut rng, 4);
@@ -418,7 +418,7 @@ fn compose_dsl(rng: &mut Rng, depth: usize) -> String {
 
 #[test]
 fn eval_returns_for_every_parsed_dsl_expression() {
-    let event = hostile_event();
+    let event = trawl_core::row::from_json(&hostile_event());
     let mut rng = Rng::new(0x0105_D51C_0DE0);
     let mut evaluated = 0_u32;
     for _ in 0..4_000 {

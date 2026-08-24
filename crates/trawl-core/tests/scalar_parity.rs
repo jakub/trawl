@@ -747,7 +747,7 @@ fn eval_scalar(dsl: &str, event: &Map<String, Value>) -> EvalValue {
         .assignments
         .first()
         .unwrap_or_else(|| panic!("generated scalar query has no assignment: {dsl:?}"));
-    eval_expr(expr, event)
+    eval_expr(expr, &trawl_core::row::from_json(event))
 }
 
 /// Run a `let x = <expr>` query and return the outcome of the computed `x`

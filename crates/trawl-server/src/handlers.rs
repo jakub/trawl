@@ -2677,7 +2677,7 @@ fn sanitize_csv_formula(s: &str) -> Cow<'_, str> {
 /// `false` if filtered or done.
 fn apply_stages(
     stages: &mut [trawl_core::stream::CompiledStage],
-    event: &mut serde_json::Map<String, serde_json::Value>,
+    event: &mut trawl_core::row::Row,
 ) -> bool {
     for stage in stages.iter_mut() {
         match trawl_core::stream::apply_stage(stage, event) {
@@ -2707,7 +2707,8 @@ fn emit_agg_snapshot(
                     | trawl_core::stream::StageResult::Done => return None,
                 }
             }
-            Some(row)
+            // The wire door, and the only one on this path.
+            Some(trawl_core::row::to_json(row))
         })
         .collect();
 
@@ -2818,11 +2819,14 @@ pub async fn stream_query(
                         Ok(batch) => {
                             let now = chrono::Utc::now();
                             for event in &batch.events {
+                                // The search-stage filter reads the bus
+                                // JSON directly — no conversion on the
+                                // firehose, only on the events that match.
                                 if !filter.matches_at(event, now) {
                                     continue;
                                 }
 
-                                let mut event = event.clone();
+                                let mut event = trawl_core::row::from_json(event);
                                 let mut pass = true;
                                 for stage in &mut stages {
                                     match trawl_core::stream::apply_stage(stage, &mut event) {
@@ -2840,7 +2844,10 @@ pub async fn stream_query(
                                 }
 
                                 if pass {
-                                    let json = serde_json::to_string(&event).unwrap_or_default();
+                                    let json = serde_json::to_string(
+                                        &trawl_core::row::to_json(event),
+                                    )
+                                    .unwrap_or_default();
                                     yield Ok(Event::default().event("data").data(json));
                                 }
                             }
@@ -2889,7 +2896,7 @@ pub async fn stream_query(
                                         }
 
                                         // Apply pre-stages and feed accumulator.
-                                        let mut event = event.clone();
+                                        let mut event = trawl_core::row::from_json(event);
                                         if apply_stages(&mut pre_stages, &mut event) {
                                             aggregation.feed_event(&event);
                                             events_since_snapshot += 1;
