@@ -112,6 +112,34 @@ const STRINGS: &[&str] = &[
     "٢٠٢٤-٠١-٠١",
     "24:00:00",
     "-9999999999-01-01",
+    // The timestamp KEYWORDS, which are instants rather than dates.
+    "infinity",
+    "-infinity",
+    "inf",
+    "-inf",
+    "INFINITY",
+    "epoch",
+    "-epoch",
+    "epoch ",
+    // chrono's calendar bounds, either side of them.
+    "262143-12-31 23:59:59",
+    "262144-01-01 00:00:00",
+    "-262143-01-01 00:00:00",
+    "9999-12-31 23:59:59.999999999",
+    // Offsets: complete, malformed, out of range.
+    "2026-01-15 10:20:30+00:00",
+    "2026-01-15 10:20:30+99:99",
+    "2026-01-15 10:20:30+0530",
+    "2026-01-15 10:20:30 UTC",
+    "2026-01-15 10:20:30 Asia/Kolkata",
+    // The BOOLEAN cast vocabulary, and texts just outside it.
+    "true",
+    "TRUE",
+    "t",
+    "yes",
+    "no",
+    "on",
+    " true ",
 ];
 
 /// A string long enough that a length- or index-driven scalar cannot be
@@ -175,6 +203,11 @@ fn hostile_event() -> Map<String, Value> {
     event.insert("nested".into(), serde_json::json!({"a": {"b": [1, 2, 3]}}));
     event.insert("ts".into(), Value::String("2026-01-15 10:20:30".into()));
     event.insert("bad_ts".into(), Value::String("+99:99".into()));
+    event.insert("infinite_ts".into(), Value::String("infinity".into()));
+    event.insert(
+        "far_ts".into(),
+        Value::String("262143-12-31 23:59:59".into()),
+    );
     event
 }
 
@@ -195,6 +228,8 @@ const FIELDS: &[&str] = &[
     "nested",
     "ts",
     "bad_ts",
+    "infinite_ts",
+    "far_ts",
     "absent_field",
 ];
 
@@ -374,11 +409,19 @@ const DSL_ATOMS: &[&str] = &[
     "huge_text",
     "ts",
     "bad_ts",
+    "infinite_ts",
+    "far_ts",
     "list",
     "nested",
     r#""""#,
     r#""infinity""#,
+    r#""-infinity""#,
+    r#""epoch""#,
     r#""2026-01-15 10:20:30+ab:cd""#,
+    r#""2026-01-15 10:20:30+99:99""#,
+    r#""262143-12-31 23:59:59""#,
+    r#""true""#,
+    r#"" true ""#,
     r#""[a-""#,
 ];
 
@@ -391,7 +434,7 @@ fn compose_dsl(rng: &mut Rng, depth: usize) -> String {
     if depth == 0 {
         return (*rng.pick(DSL_ATOMS)).to_string();
     }
-    match rng.range(6) {
+    match rng.range(7) {
         0 => (*rng.pick(DSL_ATOMS)).to_string(),
         1 => format!(
             "({} {} {})",
@@ -406,6 +449,30 @@ fn compose_dsl(rng: &mut Rng, depth: usize) -> String {
             rng.pick(UNARY_SCALARS),
             compose_dsl(rng, depth - 1)
         ),
+        // The two-argument date scalars, whose unit/format argument is a
+        // closed vocabulary the generator draws from — including the
+        // units and formats that reject.
+        6 => {
+            let inner = compose_dsl(rng, depth - 1);
+            match rng.range(4) {
+                0 => format!(
+                    r#"date_part("{}", {inner})"#,
+                    rng.pick(&["epoch", "year", "dow", "nope"])
+                ),
+                1 => format!(
+                    r#"date_trunc("{}", {inner})"#,
+                    rng.pick(&["day", "week", "nope"])
+                ),
+                2 => format!(
+                    r#"strftime({inner}, "{}")"#,
+                    rng.pick(&["%Y-%m-%d", "%f", "%c"])
+                ),
+                _ => format!(
+                    r#"strptime({inner}, "{}")"#,
+                    rng.pick(&["%Y-%m-%d %H:%M:%S", "%y", "%z"])
+                ),
+            }
+        }
         5 => format!(
             "{}({}, {})",
             rng.pick(&["round", "substr", "date_diff", "coalesce", "concat"]),

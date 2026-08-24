@@ -63,6 +63,18 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
 /// VARCHAR rendering — the one form that can carry `inf`/`nan`, where
 /// `to_json` would null them out and hide exactly what is under test.
 fn batch_rows(conn: &Connection, dsl: &str, events: &[Value]) -> BTreeSet<TextRow> {
+    batch_outcome(conn, dsl, events)
+        .unwrap_or_else(|error| panic!("batch must run for {dsl:?}: {error}"))
+}
+
+/// The same, surfacing a `DuckDB` ERROR instead of panicking on it — the
+/// shape a case needs when the batch lane REFUSES the query and the
+/// streaming contract is "eval answers NULL / drops the row".
+fn batch_outcome(
+    conn: &Connection,
+    dsl: &str,
+    events: &[Value],
+) -> Result<BTreeSet<TextRow>, String> {
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let mut tmp = tempfile::Builder::new()
         .suffix(".ndjson")
@@ -82,11 +94,11 @@ fn batch_rows(conn: &Connection, dsl: &str, events: &[Value]) -> BTreeSet<TextRo
     // VARCHAR under its own name.
     let names: Vec<String> = {
         let describe = format!("DESCRIBE ({})", emitted.sql);
-        let mut stmt = conn.prepare(&describe).expect("DESCRIBE prepares");
+        let mut stmt = conn.prepare(&describe).map_err(|error| error.to_string())?;
         stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
-            .expect("DESCRIBE runs")
-            .map(Result::unwrap)
-            .collect()
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|error| error.to_string())?
     };
     let projection: Vec<String> = names
         .iter()
@@ -103,22 +115,24 @@ fn batch_rows(conn: &Connection, dsl: &str, events: &[Value]) -> BTreeSet<TextRo
         emitted.sql
     );
 
-    let mut stmt = conn.prepare(&sql).expect("VARCHAR projection prepares");
-    stmt.query_map(param_refs.as_slice(), |row| {
-        let mut cells: TextRow = Vec::new();
-        for (index, name) in names.iter().enumerate() {
-            if !compared(name) {
-                continue;
+    let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            let mut cells: TextRow = Vec::new();
+            for (index, name) in names.iter().enumerate() {
+                if !compared(name) {
+                    continue;
+                }
+                let text: Option<String> = row.get(index)?;
+                cells.push((name.clone(), text.unwrap_or_else(|| "null".to_owned())));
             }
-            let text: Option<String> = row.get(index)?;
-            cells.push((name.clone(), text.unwrap_or_else(|| "null".to_owned())));
-        }
-        cells.sort();
-        Ok(cells)
-    })
-    .expect("query runs")
-    .map(Result::unwrap)
-    .collect()
+            cells.sort();
+            Ok(cells)
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<BTreeSet<TextRow>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(rows)
 }
 
 /// Run the same pipeline through the live lane over the same events.
@@ -401,6 +415,80 @@ fn an_unsigned_number_keeps_its_identity_across_stages() {
         column(&groups, "request_id"),
         vec!["18446744073709551614", "18446744073709551615"],
         "the group key carries the digits the sender sent"
+    );
+}
+
+/// Whole pipelines over TIMESTAMP cells: the instant a stage computes
+/// compares, renders and groups the same in both lanes.
+///
+/// Deliberately not covered by the specials matrix above, which EXCLUDES
+/// `_time` — that exclusion is about the sender's wire text, and it would
+/// have hidden every case here.
+#[test]
+fn a_computed_timestamp_agrees_across_the_lanes() {
+    let conn = conn();
+    let events = vec![json!({"service": "nginx", "n": 1})];
+    let strptime = r#"strptime("2026-01-15 09:00:00", "%Y-%m-%d %H:%M:%S")"#;
+
+    // Compared against a text, in both operand orders.
+    for expression in [
+        format!(r#"* | let t = {strptime} | where t > "2020-01-01" | table service"#),
+        format!(r#"* | let t = {strptime} | where "2020-01-01" < t | table service"#),
+        // …and against an INFINITY, which orders above every date.
+        format!(r#"* | let t = {strptime} | where t < "infinity" | table service"#),
+        format!(r#"* | let t = {strptime} | where t > "-infinity" | table service"#),
+    ] {
+        let kept = agreed(&conn, &expression, &events);
+        assert_eq!(kept.len(), 1, "the row must be kept: {expression}");
+    }
+
+    // A comparison that does NOT hold drops the row in both lanes.
+    let dropped = agreed(
+        &conn,
+        &format!(r#"* | let t = {strptime} | where t > "2030-01-01" | table service"#),
+        &events,
+    );
+    assert!(dropped.is_empty(), "the row must be dropped: {dropped:?}");
+
+    // The instant's TEXT is DuckDB's own cast text on both sides.
+    let rendered = agreed(
+        &conn,
+        &format!("* | let t = {strptime} | let s = tostring(t) | table s"),
+        &events,
+    );
+    assert_eq!(column(&rendered, "s"), vec!["2026-01-15 09:00:00"]);
+
+    // An infinity is a value the comparison reaches, not a text it
+    // fails on: equality against one is FALSE for a finite instant in
+    // both lanes, where an unreadable text would have been UNKNOWN.
+    let unequal = agreed(
+        &conn,
+        &format!(r#"* | let t = {strptime} | let e = t == "infinity" | table e"#),
+        &events,
+    );
+    assert_eq!(column(&unequal, "e"), vec!["false"]);
+}
+
+/// A text with no timestamp reading DROPS the row live, because the batch
+/// lane refuses the query outright.
+///
+/// eval used to strip the malformed offset and compare the rest, so the
+/// row MATCHED where the equivalent query returned no rows at all.
+#[test]
+fn a_malformed_offset_drops_the_row_where_batch_refuses_the_query() {
+    let conn = conn();
+    let events = vec![json!({"service": "nginx", "n": 1})];
+    let dsl = r#"* | let t = strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") | where t == "2026-01-15 10:20:30+ab:cd" | table service"#;
+
+    let error = batch_outcome(&conn, dsl, &events)
+        .expect_err("batch must refuse a malformed timestamp literal");
+    assert!(
+        error.contains("timestamp"),
+        "the refusal must be about the timestamp: {error}"
+    );
+    assert!(
+        live_rows(dsl, &events).is_empty(),
+        "the live lane must drop the row where batch returns nothing at all"
     );
 }
 
