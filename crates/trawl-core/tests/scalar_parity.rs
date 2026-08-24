@@ -1319,13 +1319,21 @@ fn a_malformed_offset_has_no_timestamp_reading() {
     let conn = utc_connection();
     let event = fixed_event();
     for offset in ["+ab:cd", "+5:30"] {
-        let expression = format!(
-            r#"strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30{offset}""#
+        let dsl = format!(
+            r#"* | let x = strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30{offset}""#
         );
+        // Stated as the errored/null SHAPE, not through
+        // [`assert_parity_case`]: that helper answers `None` for an
+        // AGREEMENT too, so it would stay green the day a malformed
+        // offset gained a reading in both lanes — which is the whole
+        // claim under test.
         assert_eq!(
-            assert_parity_case(&conn, &event, "malformed offset", &expression),
-            None
+            eval_scalar(&dsl, &event),
+            EvalValue::Null,
+            "streaming eval must null where batch errors for {dsl:?}"
         );
+        let expected = format!(r#""2026-01-15 10:20:30{offset}" has a timestamp that is not UTC"#);
+        assert_sql_errored(&sql_scalar_result(&conn, &dsl, &event), &expected, &dsl);
     }
 }
 
@@ -1345,9 +1353,19 @@ fn a_failed_timestamp_coercion_is_null_in_both_operand_orders() {
         r#""zzz" > strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S")"#,
         r#"strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "zzz""#,
     ] {
+        // Same reason as the sibling above: the errored/null shape is
+        // asserted directly, because [`assert_parity_case`] cannot tell
+        // it from two lanes AGREEING on an answer.
+        let dsl = format!("* | let x = {expression}");
         assert_eq!(
-            assert_parity_case(&conn, &event, "unreadable timestamp text", expression),
-            None
+            eval_scalar(&dsl, &event),
+            EvalValue::Null,
+            "streaming eval must null where batch errors for {dsl:?}"
+        );
+        assert_sql_errored(
+            &sql_scalar_result(&conn, &dsl, &event),
+            r#"invalid timestamp field format: "zzz""#,
+            &dsl,
         );
     }
 }

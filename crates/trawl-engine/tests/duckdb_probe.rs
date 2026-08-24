@@ -4536,17 +4536,25 @@ fn a_stored_double_column_compares_in_that_same_total_order() {
             file.display()
         );
         let mut statement = conn.prepare(&sql).unwrap();
-        let matched: Vec<String> = statement
+        let mut matched: Vec<String> = statement
             .query_map([literal], |row| row.get(0))
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(matched, *expected, "metric {op} {literal}");
+        // A filtered scan has no ORDER BY, so the ROW SET is what this
+        // case pins, not the order a parquet scan happens to hand back.
+        // Sorted rather than set-compared, so multiplicity still counts.
+        // The dedicated ordering assertion at the end of this test is the
+        // one that pins an ORDER.
+        matched.sort();
+        let mut want: Vec<String> = expected.iter().map(|text| (*text).to_owned()).collect();
+        want.sort();
+        assert_eq!(matched, want, "metric {op} {literal}");
 
         // The mirror decides the same row set from the same order. The
         // stored rows are named by their RENDERING here, so the mirror
         // reads the value each name stands for.
-        let mirrored: Vec<String> = STORED_DOUBLE_ROW_VALUES
+        let mut mirrored: Vec<String> = STORED_DOUBLE_ROW_VALUES
             .iter()
             .filter_map(|(text, value)| {
                 let ordering = trawl_core::compare::double_total_cmp((*value)?, *literal);
@@ -4561,8 +4569,9 @@ fn a_stored_double_column_compares_in_that_same_total_order() {
                 keep.then(|| (*text).to_owned())
             })
             .collect();
+        mirrored.sort();
         assert_eq!(
-            mirrored, *expected,
+            mirrored, want,
             "double_total_cmp disagrees over the stored column: metric {op} {literal}"
         );
     }

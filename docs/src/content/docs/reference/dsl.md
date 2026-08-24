@@ -988,15 +988,23 @@ BOOLEAN, not as "truthiness":
   `NaN` is true;
 - a **string** reads through DuckDB's closed, case-insensitive
   vocabulary: `true`/`t`/`yes`/`y`/`1` and `false`/`f`/`no`/`n`/`0`.
-  **Any other string has no reading**, and the whole call is `null` —
-  `if("nonempty", 1, 2)` is `null`, not `1`, and `" true "` (with the
-  spaces) is `null` too, because the cast does not trim;
-- a **timestamp** or a **list** has no boolean cast at all: `null`.
+  **Any other string has no reading** — `"nonempty"`, and `" true "`
+  (with the spaces) too, because the cast does not trim;
+- a **timestamp** or a **list** has no boolean cast at all.
+
+A condition with no reading has no answer, so the two lanes part exactly
+as they do for an [arithmetic overflow](#arithmetic): the batch lane
+raises a conversion error and the query returns no rows at all
+(`Could not convert string 'nonempty' to BOOL`, or
+`Unimplemented type for cast` for a timestamp or a list), while the
+streaming lane yields `null` for the whole call — `if("nonempty", 1, 2)`
+is `null` there, not `1` — because a live tail cannot raise a per-event
+error without killing the subscription.
 
 `case()` reads its arms in order and stops at the first true one, so an
 unreadable condition after a match is never looked at — but an unreadable
-one reached before any match nulls the whole call rather than skipping
-that arm.
+one reached before any match takes down the whole call, in whichever way
+its lane does, rather than skipping that arm.
 
 `and`, `or`, `not` and the pipeline's `where` gate keep their older,
 wider predicate (anything non-null and non-`false` passes); only `if()`

@@ -516,9 +516,6 @@ fn a_signed_nan_string_crosses_a_stage_byte_for_byte() {
     for (expression, want) in [
         (r#"tostring(tonumber("-nan"))"#, "-nan"),
         (r#"tostring(tonumber("nan"))"#, "nan"),
-        // …and the same text through a second stage, so it crosses a
-        // boundary rather than being read where it was made.
-        (r#"tostring(tonumber("-nan"))"#, "-nan"),
     ] {
         let rows = agreed(
             &conn,
@@ -528,7 +525,9 @@ fn a_signed_nan_string_crosses_a_stage_byte_for_byte() {
         assert_eq!(column(&rows, "s"), vec![want], "{expression}");
     }
 
-    // Carried across two stages and compared as text at the end.
+    // …and the same text through a SECOND stage, so it crosses a
+    // boundary rather than being read where it was made: carried across
+    // two stages and compared as text at the end.
     let rows = agreed(
         &conn,
         r#"* | let s = tostring(tonumber("-nan")) | let t = s | where t != "" | table s, t"#,

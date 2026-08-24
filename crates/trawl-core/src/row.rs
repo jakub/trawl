@@ -320,6 +320,38 @@ mod tests {
         assert_eq!(&to_json(row), object);
     }
 
+    /// Both doors ORDER by key, whatever order the input arrived in —
+    /// the property an SSE frame's bytes and a result-column list rest
+    /// on, pinned with deliberately UNSORTED input keys.
+    ///
+    /// What this does NOT pin, stated so it is not mistaken for it: a
+    /// crate added anywhere in the graph can turn on `serde_json`'s
+    /// `preserve_order` feature (cargo unifies features) and swap
+    /// `Map`'s backing to `IndexMap`. [`to_json`] would survive that —
+    /// it collects in [`Row`] order, and `Row` is a `BTreeMap` in its
+    /// own right, not `serde_json::Map`'s alias — so this case would
+    /// stay green. The case that catches the flip is
+    /// `an_sse_frame_keeps_its_pre_change_bytes` in `stage_parity`,
+    /// which compares a WIRE map's own serialization against the
+    /// round trip: under `preserve_order` the wire side would keep its
+    /// insertion order while this side stays sorted.
+    #[test]
+    fn both_doors_order_by_key_whatever_the_input_order() {
+        let event = json!({"zeta": 1, "alpha": 2, "mid": 3});
+        let object = event.as_object().unwrap();
+        let row = from_json(object);
+        assert_eq!(
+            row.keys().collect::<Vec<_>>(),
+            vec!["alpha", "mid", "zeta"],
+            "the row door must order by key"
+        );
+        assert_eq!(
+            serde_json::to_string(&to_json(row)).unwrap(),
+            r#"{"alpha":2,"mid":3,"zeta":1}"#,
+            "the wire door must order by key"
+        );
+    }
+
     #[test]
     fn the_wire_door_is_the_one_place_a_special_becomes_null() {
         let mut row = Row::new();
