@@ -4802,3 +4802,92 @@ fn an_infinity_timestamp_cell_is_an_i64_sentinel() {
         assert_eq!(micros, want, "{expr}");
     }
 }
+
+// ── #105 M6: `date_part('epoch', ts)` ──────────────────────────────
+
+/// Timestamp texts spanning the epoch reading's whole range: the epoch
+/// itself, a pre-1970 instant with a fraction, an ordinary one, the
+/// far-future fixture whose rounding this test exists for, and the ends
+/// of the range BOTH engines can express.
+///
+/// `262143-12-31` is deliberately absent: `DuckDB` reads it and the
+/// mirror does not (chrono's calendar stops at +262142), which is one of
+/// [`trawl_core::compare::literal_timestamp`]'s two documented
+/// one-directional residuals — under-reading, never over-reading — and
+/// is guarded by `the_timestamp_mirror_residuals_are_one_directional`.
+const EPOCH_MATRIX: &[&str] = &[
+    "1970-01-01 00:00:00",
+    "1969-12-31 23:59:59.5",
+    "2026-01-15 10:20:30.123456",
+    // The pinned fixture: at this magnitude one f64 ulp spans 32
+    // microseconds, so the micro count ROUNDS on the way into the
+    // double and the fraction disappears. Summing seconds and a
+    // fraction separately gives …799.00003 instead — which is exactly
+    // the divergence this milestone closes.
+    "9999-12-31 23:59:59.000016",
+    "9999-12-31 23:59:59.999999",
+    "0001-01-01 00:00:00",
+    "262142-12-31 23:59:59",
+    "-262143-01-01 00:00:00",
+];
+
+/// The candidate: the instant's whole MICROSECOND count, divided once.
+///
+/// One division, one rounding. The reading it replaces summed
+/// `timestamp()` and `subsec_micros()/1e6`, which rounds twice and
+/// diverges once the seconds exceed the mantissa.
+#[allow(clippy::cast_precision_loss)]
+fn epoch_candidate(instant: trawl_core::compare::Instant) -> Option<f64> {
+    match instant {
+        trawl_core::compare::Instant::At(at) => {
+            Some((at.and_utc().timestamp_micros() as f64) / 1e6)
+        }
+        trawl_core::compare::Instant::Infinity | trawl_core::compare::Instant::NegInfinity => None,
+    }
+}
+
+#[test]
+fn the_epoch_reading_is_the_micro_count_divided_once() {
+    let conn = conn();
+    for text in EPOCH_MATRIX {
+        let engine: Option<f64> = conn
+            .query_row(
+                "SELECT date_part('epoch', TRY_CAST(? AS TIMESTAMP))",
+                [*text],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let engine = engine.unwrap_or_else(|| panic!("DuckDB must read {text:?}"));
+        let instant = trawl_core::compare::literal_timestamp(text)
+            .unwrap_or_else(|| panic!("the mirror must read {text:?}"));
+        let candidate =
+            epoch_candidate(instant).unwrap_or_else(|| panic!("{text:?} is a finite instant"));
+        // BIT-exact, never a tolerance: an epoch that is merely close is
+        // a different value to every comparison downstream of it.
+        assert_eq!(
+            candidate.to_bits(),
+            engine.to_bits(),
+            "epoch disagrees for {text:?}: engine {engine}, candidate {candidate}"
+        );
+    }
+
+    // An infinity has no epoch reading on either side.
+    for (sql, instant) in [
+        (
+            "'infinity'::TIMESTAMP",
+            trawl_core::compare::Instant::Infinity,
+        ),
+        (
+            "'-infinity'::TIMESTAMP",
+            trawl_core::compare::Instant::NegInfinity,
+        ),
+    ] {
+        let engine: Option<f64> = conn
+            .query_row(&format!("SELECT date_part('epoch', {sql})"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(engine, None, "{sql}");
+        assert_eq!(epoch_candidate(instant), None, "{sql}");
+    }
+}
