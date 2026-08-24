@@ -345,6 +345,28 @@ impl Instant {
         }
     }
 
+    /// The seconds-since-1970 `date_part('epoch', ts)` reads — this
+    /// instant's whole MICROSECOND count, divided ONCE.
+    ///
+    /// One division, one rounding. Summing `timestamp()` and
+    /// `subsec_micros() / 1e6` separately rounds twice, and the two
+    /// disagree the moment the seconds exceed the mantissa: at the year
+    /// 9999 one f64 ulp spans 32 microseconds, so the engine's answer
+    /// has NO fraction left and the summed form invents one
+    /// (`…799.00003`). Probed bit-for-bit across the whole range in
+    /// `the_epoch_reading_is_the_micro_count_divided_once`.
+    ///
+    /// `None` for an infinity, which is what `date_part` answers for one
+    /// — every unit, `epoch` included.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn epoch_seconds(self) -> Option<f64> {
+        match self {
+            Self::At(at) => Some((at.and_utc().timestamp_micros() as f64) / 1e6),
+            Self::Infinity | Self::NegInfinity => None,
+        }
+    }
+
     /// This instant in the TIMESTAMP pin's canonical pattern text — the
     /// in-memory mirror of `strftime(col, TIMESTAMP_PATTERN_SQL_FORMAT)`.
     #[must_use]

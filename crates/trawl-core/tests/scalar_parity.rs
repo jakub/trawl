@@ -67,12 +67,9 @@ const TS_VALS: &[&str] = &[
 
 // Date/time unit allowlists are imported from the emitter (see `use` above) so
 // the generator can never silently drift from the real allowlist: if the
-// emitter grows a unit, this test exercises it automatically. `date_part`'s
-// "epoch" is filtered out at generation time because eval and DuckDB round the
-// same instant to ADJACENT f64 values — nothing to do with text any more, the
-// harness compares owned `DuckValue`s. The divergence is pinned, not hidden, by
-// `current_date_part_epoch_precision_is_pinned_child_105` — see
-// `random_date_part`.
+// emitter grows a unit, this test exercises it automatically — `date_part`'s
+// `epoch` included, since #105 gave that reading one probe-pinned owner and
+// the two lanes stopped rounding the same instant to adjacent f64 values.
 
 // Include non-ASCII values so the parity harness exercises byte-vs-character
 // divergence in scalar fns like length() (DuckDB LENGTH counts characters).
@@ -401,14 +398,11 @@ fn random_conditional(rng: &mut Rng) -> Generated {
 }
 
 fn random_date_part(rng: &mut Rng) -> Generated {
-    // Exclude "epoch": eval and DuckDB round the same instant to adjacent f64
-    // values (a value-domain divergence, not a rendering one — the harness
-    // stopped comparing through text), pinned by
-    // `current_date_part_epoch_precision_is_pinned_child_105`. Everything else
-    // in the emitter allowlist is fair game, so a newly-added unit flows in
-    // here without a test edit.
-    let units: Vec<&&str> = DATE_PART_UNITS.iter().filter(|u| **u != "epoch").collect();
-    let unit = rng.pick(&units);
+    // Every unit in the emitter allowlist, `epoch` included: it was
+    // excluded while the two lanes rounded the same instant to adjacent
+    // doubles, and #105 gave the reading one probe-pinned owner. A
+    // newly-added unit flows in here without a test edit.
+    let unit = rng.pick(DATE_PART_UNITS);
     let ts = ts_lit(rng);
     Generated::new("date_part", format!("date_part(\"{unit}\", {ts})"))
 }
@@ -1658,22 +1652,34 @@ fn division_by_zero_matches_duckdbs_ieee_answer() {
 }
 
 #[test]
-fn current_date_part_epoch_precision_is_pinned_child_105() {
-    // #105 owns the epoch value domain. The addition and division forms round
-    // this far instant to adjacent f64 values.
+fn the_epoch_reading_agrees_at_every_magnitude() {
+    // Flipped from `current_date_part_epoch_precision_is_pinned_child_105`
+    // (#105). The two lanes rounded the same instant to ADJACENT doubles,
+    // because eval summed seconds and a fraction where the engine divides
+    // one microsecond count once
+    // (`the_epoch_reading_is_the_micro_count_divided_once`). The far
+    // fixture is the case that exposed it: at that magnitude an f64 ulp
+    // spans 32 microseconds, so the engine's answer has no fraction left
+    // and the summed form invented `…799.00003`.
     let conn = utc_connection();
     let event = fixed_event();
-    let dsl = r#"* | let x = date_part("epoch", event_ts_far)"#;
-    let eval_rounded = 253_402_300_799.000_03;
-    let sql_rounded = 253_402_300_799.0;
-    assert_eq!(eval_scalar(dsl, &event), EvalValue::Float(eval_rounded));
-    assert_eq!(
-        sql_scalar_result(&conn, dsl, &event),
-        SqlOutcome::Value(SqlCell {
-            logical_type: Type::Double,
-            value: DuckValue::Double(sql_rounded),
-        })
-    );
+    for expression in [
+        r#"date_part("epoch", event_ts_far)"#,
+        r#"date_part("epoch", event_ts)"#,
+        r#"date_part("epoch", strptime("1970-01-01 00:00:00", "%Y-%m-%d %H:%M:%S"))"#,
+        // Pre-1970, at second resolution. A FRACTIONAL pre-1970 instant
+        // is pinned bit-exactly by the probe instead: reaching one
+        // through `strptime` would exercise `%f`'s own divergence
+        // (chrono reads nanoseconds where DuckDB reads microseconds,
+        // pinned separately) rather than the epoch reading.
+        r#"date_part("epoch", strptime("1969-12-31 23:59:59", "%Y-%m-%d %H:%M:%S"))"#,
+        r#"date_part("epoch", strptime("0001-01-01 00:00:00", "%Y-%m-%d %H:%M:%S"))"#,
+    ] {
+        assert_eq!(
+            assert_parity_case(&conn, &event, "date_part epoch", expression),
+            None
+        );
+    }
 }
 
 #[test]

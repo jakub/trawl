@@ -1456,14 +1456,11 @@ fn eval_date_part(args: &[EvalValue]) -> EvalValue {
         // DuckDB: Sunday=0 … Saturday=6, exactly num_days_from_sunday().
         "dow" => EvalValue::Int(i64::from(ts.weekday().num_days_from_sunday())),
         "doy" => EvalValue::Int(i64::from(ts.ordinal())),
-        "epoch" => {
-            // seconds since Unix epoch as float (matches DuckDB EPOCH semantics)
-            let utc = ts.and_utc();
-            #[allow(clippy::cast_precision_loss)]
-            let epoch_secs =
-                utc.timestamp() as f64 + f64::from(utc.timestamp_subsec_micros()) / 1_000_000.0;
-            EvalValue::Float(epoch_secs)
-        }
+        // The one probe-pinned reading, owned by `compare` — this arm
+        // used to sum seconds and a fraction and rounded twice.
+        "epoch" => compare::Instant::At(ts)
+            .epoch_seconds()
+            .map_or(EvalValue::Null, EvalValue::Float),
         _ => EvalValue::Null,
     }
 }

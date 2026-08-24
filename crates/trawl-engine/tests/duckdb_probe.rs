@@ -4831,19 +4831,11 @@ const EPOCH_MATRIX: &[&str] = &[
     "-262143-01-01 00:00:00",
 ];
 
-/// The candidate: the instant's whole MICROSECOND count, divided once.
-///
-/// One division, one rounding. The reading it replaces summed
-/// `timestamp()` and `subsec_micros()/1e6`, which rounds twice and
-/// diverges once the seconds exceed the mantissa.
-#[allow(clippy::cast_precision_loss)]
+/// The live mirror under test: the instant's whole MICROSECOND count,
+/// divided once ([`trawl_core::compare::Instant::epoch_seconds`], which
+/// `date_part('epoch', …)` reads through in both in-memory lanes).
 fn epoch_candidate(instant: trawl_core::compare::Instant) -> Option<f64> {
-    match instant {
-        trawl_core::compare::Instant::At(at) => {
-            Some((at.and_utc().timestamp_micros() as f64) / 1e6)
-        }
-        trawl_core::compare::Instant::Infinity | trawl_core::compare::Instant::NegInfinity => None,
-    }
+    instant.epoch_seconds()
 }
 
 #[test]
