@@ -4883,3 +4883,82 @@ fn the_epoch_reading_is_the_micro_count_divided_once() {
         assert_eq!(epoch_candidate(instant), None, "{sql}");
     }
 }
+
+// ── #105 M7: `%f` is SIX-DIGIT MICROSECONDS ────────────────────────
+//
+// The one strftime/strptime specifier where `DuckDB` and chrono read the
+// same letter as different units: `DuckDB`'s bare `%f` is a 6-digit
+// microsecond field, chrono's is an UNSCALED NANOSECOND count (9 digits
+// out, and a variable-length run read as nanoseconds in). So
+// `strftime(ts, "%f")` printed `123456000` live against `123456` in
+// batch, and `strptime("….5", "….%f")` read five NANOseconds where the
+// engine reads half a second.
+
+/// (fractional part of the instant, the text `strftime(ts, '%f')` gives).
+///
+/// Always six digits, zero-padded and zero-FILLED: a `.5` is `500000`,
+/// not `5`, so the field is a fraction scaled to microseconds rather
+/// than a count of them.
+const PERCENT_F_RENDERINGS: &[(&str, &str)] = &[
+    ("2026-01-15 09:00:00.123456", "123456"),
+    ("2026-01-15 09:00:00.5", "500000"),
+    ("2026-01-15 09:00:00.123", "123000"),
+    ("2026-01-15 09:00:00.999999", "999999"),
+    ("2026-01-15 09:00:00", "000000"),
+];
+
+#[test]
+fn percent_f_is_six_digit_microseconds() {
+    let conn = conn();
+    for (text, want) in PERCENT_F_RENDERINGS {
+        let rendered: Option<String> = conn
+            .query_row(
+                "SELECT strftime(TRY_CAST(? AS TIMESTAMP), '%f')",
+                [*text],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rendered.as_deref(), Some(*want), "strftime({text:?}, '%f')");
+    }
+
+    // An ESCAPED percent is not a specifier: `%%f` is a literal `%` then
+    // the letter `f`, so a translation that rewrote `%f` blindly would
+    // corrupt it.
+    for (fmt, want) in [("%%f", "%f"), ("x%%fy", "x%fy"), ("%%%f", "%123456")] {
+        let rendered: Option<String> = conn
+            .query_row(
+                "SELECT strftime(TIMESTAMP '2026-01-15 09:00:00.123456', ?)",
+                [fmt],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rendered.as_deref(), Some(want), "strftime(…, {fmt:?})");
+    }
+}
+
+/// (input, the instant `strptime(input, '%Y-%m-%d %H:%M:%S.%f')` reads).
+///
+/// The fraction is VARIABLE length on the way in — `.5` is half a second
+/// — which is the half chrono's fixed-width `%6f` cannot reproduce for
+/// anything other than exactly six digits.
+const PERCENT_F_PARSES: &[(&str, &str)] = &[
+    ("2026-01-15 09:00:00.123456", "2026-01-15 09:00:00.123456"),
+    ("2026-01-15 09:00:00.500000", "2026-01-15 09:00:00.5"),
+    ("2026-01-15 09:00:00.5", "2026-01-15 09:00:00.5"),
+    ("2026-01-15 09:00:00.123", "2026-01-15 09:00:00.123"),
+];
+
+#[test]
+fn percent_f_parses_a_variable_length_fraction() {
+    let conn = conn();
+    for (input, want) in PERCENT_F_PARSES {
+        let parsed: Option<String> = conn
+            .query_row(
+                "SELECT CAST(TRY_STRPTIME(?, '%Y-%m-%d %H:%M:%S.%f') AS VARCHAR)",
+                [*input],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parsed.as_deref(), Some(*want), "strptime({input:?})");
+    }
+}
