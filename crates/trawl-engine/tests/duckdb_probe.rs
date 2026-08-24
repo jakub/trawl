@@ -4706,6 +4706,12 @@ fn a_timestamp_casts_to_the_text_duckdb_prints() {
         let (dtype, text) = scalar_type_and_text(&conn, expr, &[]).unwrap();
         assert_eq!(dtype, "TIMESTAMP", "{expr}");
         assert_eq!(text.as_deref(), Some(*want), "{expr}");
+
+        // The live mirror beside the engine: the instant that text
+        // denotes renders back to the same text.
+        let instant = trawl_core::compare::literal_timestamp(want)
+            .unwrap_or_else(|| panic!("the mirror must read {want:?}"));
+        assert_eq!(instant.cast_text(), *want, "cast_text disagrees for {expr}");
     }
 }
 

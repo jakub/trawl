@@ -892,6 +892,27 @@ fn integer_value(value: &DuckValue) -> Option<i64> {
     }
 }
 
+/// An instant as the MICROSECOND count duckdb-rs hands back for it.
+///
+/// The two infinities come back as i64 sentinels rather than as counts —
+/// `i64::MAX`, and `-i64::MAX` for the negative one, which is NOT
+/// `i64::MIN` (probed: `an_infinity_timestamp_cell_is_an_i64_sentinel`).
+/// A finite instant must be a whole number of microseconds, exactly as
+/// the retired matcher required, so a sub-microsecond eval value still
+/// fails rather than being rounded into agreement.
+fn timestamp_micros(instant: trawl_core::compare::Instant) -> Option<i64> {
+    match instant {
+        trawl_core::compare::Instant::Infinity => Some(i64::MAX),
+        trawl_core::compare::Instant::NegInfinity => Some(-i64::MAX),
+        trawl_core::compare::Instant::At(at) => {
+            let utc = at.and_utc();
+            utc.timestamp_subsec_nanos()
+                .is_multiple_of(1_000)
+                .then(|| utc.timestamp_micros())
+        }
+    }
+}
+
 fn scalar_values_match(eval: &EvalValue, sql: &DuckValue) -> bool {
     match (eval, sql) {
         (EvalValue::Null, DuckValue::Null) => true,
@@ -903,8 +924,7 @@ fn scalar_values_match(eval: &EvalValue, sql: &DuckValue) -> bool {
         (EvalValue::Float(a), DuckValue::Double(b)) => a.to_bits() == b.to_bits(),
         (EvalValue::Str(a), DuckValue::Text(b)) => a == b,
         (EvalValue::Timestamp(a), DuckValue::Timestamp(unit, b)) => {
-            a.and_utc().timestamp_subsec_nanos().is_multiple_of(1_000)
-                && a.and_utc().timestamp_micros() == unit.to_micros(*b)
+            timestamp_micros(*a) == Some(unit.to_micros(*b))
         }
         (EvalValue::Array(a), DuckValue::List(b) | DuckValue::Array(b)) => {
             a.len() == b.len()
@@ -1172,10 +1192,10 @@ fn timestamp_comparison_is_microsecond_exact() {
     use chrono::NaiveDateTime;
     use duckdb::types::TimeUnit;
 
-    let eval = EvalValue::Timestamp(
+    let eval = EvalValue::Timestamp(trawl_core::compare::Instant::At(
         NaiveDateTime::parse_from_str("2026-01-15 10:20:30.000001", "%Y-%m-%d %H:%M:%S%.f")
             .unwrap(),
-    );
+    ));
     let sql = SqlCell {
         logical_type: Type::Timestamp,
         value: DuckValue::Timestamp(
@@ -1293,33 +1313,47 @@ fn generated_scalar_families_are_complete_and_match() {
 }
 
 #[test]
-fn current_second_timestamp_parser_accepts_nondigit_offset_child_105() {
-    // #105 deletes eval's second timestamp parser in favour of the probed owner.
+fn a_malformed_offset_has_no_timestamp_reading() {
+    // Flipped from
+    // `current_second_timestamp_parser_accepts_nondigit_offset_child_105`
+    // (#105). eval's own parser STRIPPED a trailing offset without
+    // validating it, so `+ab:cd` compared equal to the same instant
+    // without it; the probe-pinned owner (`compare::literal_timestamp`,
+    // the TRY_CAST a bound string gets) has no reading for it, and the
+    // batch lane errors — so the streaming answer is NULL, which is the
+    // ratified rule and what `assert_parity_case` asserts.
     let conn = utc_connection();
     let event = fixed_event();
-    let dsl = r#"* | let x = strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30+ab:cd""#;
-    assert_eq!(eval_scalar(dsl, &event), EvalValue::Bool(true));
-    assert_sql_errored(
-        &sql_scalar_result(&conn, dsl, &event),
-        r#""2026-01-15 10:20:30+ab:cd" has a timestamp that is not UTC"#,
-        dsl,
-    );
+    for offset in ["+ab:cd", "+5:30"] {
+        let expression = format!(
+            r#"strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30{offset}""#
+        );
+        assert_eq!(
+            assert_parity_case(&conn, &event, "malformed offset", &expression),
+            None
+        );
+    }
 }
 
 #[test]
-fn current_timestamp_lexical_fallback_is_pinned_both_orders_child_105() {
-    // #105 withdraws the lexical fallback; failed coercion becomes NULL.
+fn a_failed_timestamp_coercion_is_null_in_both_operand_orders() {
+    // Flipped from
+    // `current_timestamp_lexical_fallback_is_pinned_both_orders_child_105`
+    // (#105, ADR-0017 §2). Comparing an instant against a text with no
+    // reading fell back to LEXICAL string ordering — an order DuckDB
+    // does not have, which inverted under `NOT` and depended on whether
+    // the other operand happened to parse. It is UNKNOWN now, in both
+    // operand orders, which is what the batch error implies.
     let conn = utc_connection();
     let event = fixed_event();
-    for dsl in [
-        r#"* | let x = strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") < "zzz""#,
-        r#"* | let x = "zzz" > strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S")"#,
+    for expression in [
+        r#"strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") < "zzz""#,
+        r#""zzz" > strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S")"#,
+        r#"strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "zzz""#,
     ] {
-        assert_eq!(eval_scalar(dsl, &event), EvalValue::Bool(true));
-        assert_sql_errored(
-            &sql_scalar_result(&conn, dsl, &event),
-            r#"invalid timestamp field format: "zzz""#,
-            dsl,
+        assert_eq!(
+            assert_parity_case(&conn, &event, "unreadable timestamp text", expression),
+            None
         );
     }
 }
@@ -1700,47 +1734,39 @@ fn current_typeof_null_and_list_spellings_are_pinned() {
 }
 
 #[test]
-fn hostile_timestamp_corpus_is_pinned_child_105() {
-    // #105 replaces all of these with the one probe-pinned timestamp domain.
+fn the_hostile_timestamp_corpus_agrees_in_both_lanes() {
+    // Flipped from `hostile_timestamp_corpus_is_pinned_child_105` (#105).
+    // Five of these seven texts diverged, each for its own reason —
+    // an unvalidated offset strip, a zone name eval could not resolve,
+    // the keywords it had never heard of. All of them now go through the
+    // ONE probe-pinned reader, so the whole corpus is plain agreement.
+    //
+    // `+99:99` stays ACCEPTED on both sides: it is syntactically a
+    // complete offset and the wall-clock cast throws it away without
+    // range-checking it — a documented property of the owner, not a gap
+    // here.
     let conn = utc_connection();
     let event = fixed_event();
-    for (text, eval, sql) in [
-        ("+99:99", true, Ok(true)),
-        ("+5:30", false, Err("has a timestamp that is not UTC")),
-        ("+0530", false, Ok(true)),
-        ("Z", true, Ok(true)),
-        (" UTC", false, Ok(true)),
-    ] {
-        let dsl = format!(
-            r#"* | let x = strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30{text}""#
+    for text in ["+99:99", "+5:30", "+0530", "Z", " UTC", "+00:00", ""] {
+        let expression = format!(
+            r#"strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30{text}""#
         );
-        assert_eq!(eval_scalar(&dsl, &event), EvalValue::Bool(eval));
-        let outcome = sql_scalar_result(&conn, &dsl, &event);
-        match sql {
-            Ok(value) => assert_eq!(
-                outcome,
-                SqlOutcome::Value(SqlCell {
-                    logical_type: Type::Boolean,
-                    value: DuckValue::Boolean(value),
-                })
-            ),
-            Err(duckdb_error) => assert_sql_errored(&outcome, duckdb_error, &dsl),
-        }
-    }
-    for (text, eval, sql) in [("epoch", false, true), ("infinity", false, false)] {
-        let base = if text == "epoch" {
-            "1970-01-01 00:00:00"
-        } else {
-            "2026-01-15 10:20:30"
-        };
-        let dsl = format!(r#"* | let x = strptime("{base}", "%Y-%m-%d %H:%M:%S") == "{text}""#);
-        assert_eq!(eval_scalar(&dsl, &event), EvalValue::Bool(eval));
         assert_eq!(
-            sql_scalar_result(&conn, &dsl, &event),
-            SqlOutcome::Value(SqlCell {
-                logical_type: Type::Boolean,
-                value: DuckValue::Boolean(sql),
-            })
+            assert_parity_case(&conn, &event, "hostile timestamp text", &expression),
+            None
+        );
+    }
+    // The two keyword instants, which eval could not read at all before:
+    // `epoch` IS 1970-01-01, and an infinity equals no calendar date.
+    for (base, text) in [
+        ("1970-01-01 00:00:00", "epoch"),
+        ("2026-01-15 10:20:30", "infinity"),
+        ("2026-01-15 10:20:30", "-infinity"),
+    ] {
+        let expression = format!(r#"strptime("{base}", "%Y-%m-%d %H:%M:%S") == "{text}""#);
+        assert_eq!(
+            assert_parity_case(&conn, &event, "timestamp keyword", &expression),
+            None
         );
     }
 }

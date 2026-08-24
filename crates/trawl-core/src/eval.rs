@@ -45,9 +45,19 @@ pub enum EvalValue {
     Float(f64),
     Str(String),
     Array(Vec<EvalValue>),
-    /// Timezone-naive timestamp, mirroring `DuckDB`'s `AS TIMESTAMP` cast
-    /// which discards any offset and keeps wall-clock components.
-    Timestamp(NaiveDateTime),
+    /// A `DuckDB` TIMESTAMP: the wall-clock instant its `AS TIMESTAMP`
+    /// cast produces, or one of the two INFINITIES no calendar date can
+    /// express.
+    ///
+    /// The payload is [`compare::Instant`], whose derived `Ord` IS
+    /// `DuckDB`'s TIMESTAMP ordering (`-infinity` below every date,
+    /// `infinity` above — probed). Carrying a bare `NaiveDateTime` meant
+    /// the infinities had nowhere to live: a stored one read as NULL live
+    /// while batch compared it happily. Never unwrap the finite arm
+    /// inside a comparison; that is what [`EvalValue::as_finite`] is for,
+    /// and it exists so a calendar function cannot invent its own
+    /// infinity rule.
+    Timestamp(compare::Instant),
 }
 
 impl EvalValue {
@@ -99,21 +109,37 @@ impl EvalValue {
             Self::UInt(n) => Some(duckdb_double_to_string(*n as f64)),
             Self::Float(n) => Some(duckdb_double_to_string(*n)),
             Self::Bool(b) => Some(b.to_string()),
-            Self::Timestamp(ts) => Some(timestamp_to_duckdb_text(ts)),
+            Self::Timestamp(instant) => Some(instant.cast_text()),
             Self::Null | Self::Array(_) => None,
         }
     }
 
-    /// Try to parse self as a `NaiveDateTime` (`DuckDB` ISO set).
+    /// This value as an INSTANT, infinities included.
     ///
-    /// Accepts: T or space separator, optional fractional seconds,
-    /// optional offset (discarded to match `AS TIMESTAMP` semantics),
-    /// date-only (→ midnight). Unparseable → `None`.
-    pub(crate) fn as_timestamp(&self) -> Option<NaiveDateTime> {
+    /// A string is read by [`compare::literal_timestamp`] — the
+    /// `TRY_CAST(text AS TIMESTAMP)` a bound VARCHAR parameter gets, the
+    /// one probe-pinned owner of that syntax. `eval` used to keep a
+    /// SECOND parser here, which accepted a malformed offset
+    /// (`+ab:cd`) the engine rejects and could not read an infinity at
+    /// all; deleting it is ADR-0017 §1.
+    pub(crate) fn as_instant(&self) -> Option<compare::Instant> {
         match self {
-            Self::Timestamp(ts) => Some(*ts),
-            Self::Str(s) => parse_timestamp(s),
+            Self::Timestamp(instant) => Some(*instant),
+            Self::Str(s) => compare::literal_timestamp(s),
             _ => None,
+        }
+    }
+
+    /// This value as a FINITE instant — the door every calendar function
+    /// reads through.
+    ///
+    /// An infinity is `None` here on purpose: `date_part` and `date_diff`
+    /// answer NULL for one (probed, every unit), and routing them through
+    /// this door makes that one rule instead of eleven.
+    pub(crate) fn as_finite(&self) -> Option<NaiveDateTime> {
+        match self.as_instant()? {
+            compare::Instant::At(at) => Some(at),
+            compare::Instant::Infinity | compare::Instant::NegInfinity => None,
         }
     }
 }
@@ -193,63 +219,6 @@ pub(crate) fn duckdb_double_to_string(x: f64) -> String {
     format!("{mantissa}e{sign}{mag:02}")
 }
 
-/// Parse a timestamp string using `DuckDB`'s practical ISO set.
-///
-/// Accepts T or space separator, optional fractional seconds (up to 6 digits),
-/// optional UTC offset (discarded — mirrors `CAST AS TIMESTAMP` semantics),
-/// and date-only (→ midnight).
-pub fn parse_timestamp(s: &str) -> Option<NaiveDateTime> {
-    // Try datetime formats (T and space separators, with/without fractional secs).
-    // Strip optional trailing offset (+HH:MM, -HH:MM, Z) before matching
-    // naive formats so offsets are silently discarded.
-    const DT_FMTS: &[&str] = &[
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-    ];
-
-    let s = strip_offset(s).unwrap_or(s);
-
-    for fmt in DT_FMTS {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(dt);
-        }
-    }
-
-    // Date-only → midnight.
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return Some(d.and_hms_opt(0, 0, 0).expect("midnight is valid"));
-    }
-
-    None
-}
-
-/// Strip a trailing UTC offset from a timestamp string, returning a borrowed
-/// slice of the input when an offset was found, or `None` if the string doesn't
-/// appear to carry one (the no-op case allocates nothing).
-fn strip_offset(s: &str) -> Option<&str> {
-    let s = s.trim();
-    // Check for trailing 'Z'
-    if let Some(base) = s.strip_suffix('Z') {
-        return Some(base);
-    }
-    // Check for trailing +HH:MM or -HH:MM (exactly 6 bytes at end).
-    // Use checked indexing: a non-char-boundary slice (e.g. when the byte at
-    // `len - 6` is a UTF-8 continuation byte of a multi-byte sequence) makes
-    // `s.get` return None rather than panicking. A valid offset is pure ASCII,
-    // so when `get` yields Some, `len - 6` is guaranteed a char boundary and
-    // the head slice below cannot panic either.
-    if let Some(tail) = s.len().checked_sub(6).and_then(|i| s.get(i..)) {
-        let bytes = tail.as_bytes();
-        let sign = bytes[0];
-        if (sign == b'+' || sign == b'-') && bytes[3] == b':' {
-            return s.get(..s.len() - 6);
-        }
-    }
-    None
-}
-
 impl From<EvalValue> for Value {
     fn from(v: EvalValue) -> Self {
         match v {
@@ -263,9 +232,12 @@ impl From<EvalValue> for Value {
             }
             EvalValue::Str(s) => Value::String(s),
             EvalValue::Array(a) => Value::Array(a.into_iter().map(Value::from).collect()),
-            // Serialize timestamps in DuckDB canonical text format so the event
-            // map round-trips correctly through serde_json.
-            EvalValue::Timestamp(ts) => Value::String(timestamp_to_duckdb_text(&ts)),
+            // Serialize timestamps in DuckDB's own cast text so the event
+            // map round-trips correctly through serde_json — byte-identical
+            // to the old rendering for every finite instant, and the words
+            // `infinity`/`-infinity` for the two that had no rendering at
+            // all before.
+            EvalValue::Timestamp(instant) => Value::String(instant.cast_text()),
         }
     }
 }
@@ -352,13 +324,25 @@ pub fn eval_expr_with_pins(expr: &Spanned<Expr>, event: &Row, pins: &PinScope) -
             if matches!(target_val, EvalValue::Null) {
                 return EvalValue::Null;
             }
+            // SQL's `IN` is three-valued: a TRUE anywhere wins, but an
+            // element that answers UNKNOWN makes a non-match UNKNOWN
+            // rather than FALSE — `x IN (a, b)` with a NULL `b` and no
+            // match is NULL, and collapsing it to FALSE inverts under
+            // `NOT`.
+            let mut unknown = false;
             for item in list {
                 let item_val = eval_expr_with_pins(item, event, pins);
-                if eval_eq(&target_val, &item_val) == EvalValue::Bool(true) {
-                    return EvalValue::Bool(true);
+                match eval_eq(&target_val, &item_val) {
+                    EvalValue::Bool(true) => return EvalValue::Bool(true),
+                    EvalValue::Bool(false) => {}
+                    _ => unknown = true,
                 }
             }
-            EvalValue::Bool(false)
+            if unknown {
+                EvalValue::Null
+            } else {
+                EvalValue::Bool(false)
+            }
         }
     }
 }
@@ -484,6 +468,13 @@ fn pin_read(cell: &EvalValue) -> serde_json::Value {
         // intact — `pin_match` reads a `u64` exactly, and a rounded
         // double would make a pinned comparison answer for the wrong id.
         EvalValue::UInt(n) => serde_json::Value::Number((*n).into()),
+        // An instant reaches the matcher as the text `DuckDB` casts it
+        // to: byte-identical to the old JSON string for a finite one, and
+        // a word for an infinity — which both `literal_timestamp` and
+        // `conformed_timestamp` read back as the instant it is, so a
+        // TIMESTAMP-pinned comparison over one answers rather than
+        // nulling.
+        EvalValue::Timestamp(instant) => serde_json::Value::String(instant.cast_text()),
         other => serde_json::Value::from(other.clone()),
     }
 }
@@ -777,19 +768,16 @@ fn eval_eq(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
         (EvalValue::Int(a), EvalValue::Int(b)) => EvalValue::Bool(a == b),
         (EvalValue::Bool(a), EvalValue::Bool(b)) => EvalValue::Bool(a == b),
         (EvalValue::Str(a), EvalValue::Str(b)) => EvalValue::Bool(a == b),
+        // The three timestamp shapes, spelled out so the two operand
+        // orders are symmetric BY CONSTRUCTION: two instants compare as
+        // instants, and a string is coerced — only ever the string side.
+        // A text with no reading is NULL, never a lexical comparison:
+        // ADR-0017 §2 withdrew that fallback, which invented an ordering
+        // `DuckDB` does not have and inverted under `NOT`.
         (EvalValue::Timestamp(a), EvalValue::Timestamp(b)) => EvalValue::Bool(a == b),
-        // Str vs Timestamp: coerce Str to Timestamp; fall back to Str-vs-Str on
-        // parse failure so non-timestamp strings don't regress.
-        (EvalValue::Timestamp(_), EvalValue::Str(_))
-        | (EvalValue::Str(_), EvalValue::Timestamp(_)) => {
-            match (lhs.as_timestamp(), rhs.as_timestamp()) {
-                (Some(a), Some(b)) => EvalValue::Bool(a == b),
-                // Str that doesn't parse as timestamp: fall through to str repr
-                _ => match (lhs.as_str_repr(), rhs.as_str_repr()) {
-                    (Some(a), Some(b)) => EvalValue::Bool(a == b),
-                    _ => EvalValue::Null,
-                },
-            }
+        (EvalValue::Timestamp(a), EvalValue::Str(text))
+        | (EvalValue::Str(text), EvalValue::Timestamp(a)) => {
+            compare::literal_timestamp(text).map_or(EvalValue::Null, |b| EvalValue::Bool(*a == b))
         }
         // cross-type numeric comparison
         _ => match (lhs.as_f64(), rhs.as_f64()) {
@@ -813,18 +801,16 @@ fn eval_cmp(
     let ordering = match (lhs, rhs) {
         (EvalValue::Int(a), EvalValue::Int(b)) => Some(a.cmp(b)),
         (EvalValue::Str(a), EvalValue::Str(b)) => Some(a.cmp(b)),
+        // `Instant`'s derived order IS DuckDB's TIMESTAMP order, so the
+        // infinities sort where the engine sorts them. The string side is
+        // coerced and only the string side; no reading is UNKNOWN, not a
+        // lexical guess (ADR-0017 §2).
         (EvalValue::Timestamp(a), EvalValue::Timestamp(b)) => Some(a.cmp(b)),
-        // Str vs Timestamp: coerce Str to Timestamp for ordering; fall back to
-        // Str-vs-Str so non-timestamp strings don't regress.
-        (EvalValue::Timestamp(_), EvalValue::Str(_))
-        | (EvalValue::Str(_), EvalValue::Timestamp(_)) => {
-            match (lhs.as_timestamp(), rhs.as_timestamp()) {
-                (Some(a), Some(b)) => Some(a.cmp(&b)),
-                _ => match (lhs.as_str_repr(), rhs.as_str_repr()) {
-                    (Some(a), Some(b)) => Some(a.cmp(&b)),
-                    _ => None,
-                },
-            }
+        (EvalValue::Timestamp(a), EvalValue::Str(text)) => {
+            compare::literal_timestamp(text).map(|b| a.cmp(&b))
+        }
+        (EvalValue::Str(text), EvalValue::Timestamp(b)) => {
+            compare::literal_timestamp(text).map(|a| a.cmp(b))
         }
         _ => match (lhs.as_f64(), rhs.as_f64()) {
             (Some(a), Some(b)) => Some(compare::double_total_cmp(a, b)),
@@ -1064,7 +1050,7 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
             )
         }),
         // now() returns a Timestamp (timezone-naive wall-clock UTC)
-        "now" => EvalValue::Timestamp(chrono::Utc::now().naive_utc()),
+        "now" => EvalValue::Timestamp(compare::Instant::At(chrono::Utc::now().naive_utc())),
         // conditional
         "case" => {
             let pairs = args.len() / 2;
@@ -1452,7 +1438,10 @@ fn eval_date_part(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(unit) = &args[0] else {
         return EvalValue::Null;
     };
-    let Some(ts) = args[1].as_timestamp() else {
+    // NULL for an infinity, every unit — probed
+    // (`the_date_scalars_answer_for_an_infinity`), and one door rather
+    // than eleven arms.
+    let Some(ts) = args[1].as_finite() else {
         return EvalValue::Null;
     };
     match unit.to_lowercase().as_str() {
@@ -1487,8 +1476,18 @@ fn eval_date_trunc(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(unit) = &args[0] else {
         return EvalValue::Null;
     };
-    let Some(ts) = args[1].as_timestamp() else {
-        return EvalValue::Null;
+    // An infinity truncates to ITSELF, for every unit (probed) — so the
+    // instant is read whole here and only the finite arm truncates.
+    let ts = match args[1].as_instant() {
+        Some(compare::Instant::At(at)) => at,
+        Some(infinite) => {
+            return if crate::emitter::DATE_UNITS.contains(&unit.to_lowercase().as_str()) {
+                EvalValue::Timestamp(infinite)
+            } else {
+                EvalValue::Null
+            };
+        }
+        None => return EvalValue::Null,
     };
     let truncated = match unit.to_lowercase().as_str() {
         "year" => NaiveDate::from_ymd_opt(ts.year(), 1, 1).and_then(|d| d.and_hms_opt(0, 0, 0)),
@@ -1515,7 +1514,9 @@ fn eval_date_trunc(args: &[EvalValue]) -> EvalValue {
         "second" => Some(trunc_to_second(ts)),
         _ => None,
     };
-    truncated.map_or(EvalValue::Null, EvalValue::Timestamp)
+    truncated.map_or(EvalValue::Null, |at| {
+        EvalValue::Timestamp(compare::Instant::At(at))
+    })
 }
 
 /// `date_diff(unit, start, end)` — mirrors `DATE_DIFF(unit, start, end)`.
@@ -1531,10 +1532,12 @@ fn eval_date_diff(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(unit) = &args[0] else {
         return EvalValue::Null;
     };
-    let Some(start) = args[1].as_timestamp() else {
+    // NULL whenever EITHER side is infinite, both signs, both
+    // positions — probed.
+    let Some(start) = args[1].as_finite() else {
         return EvalValue::Null;
     };
-    let Some(end) = args[2].as_timestamp() else {
+    let Some(end) = args[2].as_finite() else {
         return EvalValue::Null;
     };
     let count: i64 = match unit.to_lowercase().as_str() {
@@ -1611,8 +1614,12 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
     if args.len() != 2 {
         return EvalValue::Null;
     }
-    let Some(ts) = args[0].as_timestamp() else {
-        return EvalValue::Null;
+    // An infinity renders as the WORD for EVERY format (probed), so the
+    // format is never applied to one.
+    let ts = match args[0].as_instant() {
+        Some(compare::Instant::At(at)) => at,
+        Some(infinite) => return EvalValue::Str(infinite.cast_text()),
+        None => return EvalValue::Null,
     };
     let EvalValue::Str(fmt) = &args[1] else {
         return EvalValue::Null;
@@ -1671,10 +1678,10 @@ fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     }
     // A fully-specified datetime (or a `%s` epoch) resolves directly.
     if let Ok(dt) = parsed.to_naive_datetime_with_offset(0) {
-        return EvalValue::Timestamp(dt);
+        return EvalValue::Timestamp(compare::Instant::At(dt));
     }
     match (resolve_date(&mut parsed), resolve_time(&mut parsed)) {
-        (Some(date), Some(time)) => EvalValue::Timestamp(date.and_time(time)),
+        (Some(date), Some(time)) => EvalValue::Timestamp(compare::Instant::At(date.and_time(time))),
         _ => EvalValue::Null,
     }
 }
@@ -3172,8 +3179,14 @@ mod tests {
         let EvalValue::Timestamp(ts) = result else {
             panic!("expected Timestamp, got {result:?}");
         };
-        assert!(ts >= before, "now() timestamp should be >= start");
-        assert!(ts <= after, "now() timestamp should be <= end");
+        assert!(
+            ts >= compare::Instant::At(before),
+            "now() timestamp should be >= start"
+        );
+        assert!(
+            ts <= compare::Instant::At(after),
+            "now() timestamp should be <= end"
+        );
     }
 
     // ── Timestamp variant ──────────────────────────────────────────
@@ -3206,69 +3219,82 @@ mod tests {
         assert_eq!(timestamp_to_duckdb_text(&ts), "2026-01-15 14:30:00.1");
     }
 
+    /// The syntax the string door reads is `compare::literal_timestamp`'s
+    /// (probe-pinned), not a parser of eval's own: these cases used to
+    /// exercise the deleted `as_timestamp`, and they hold unchanged
+    /// through its replacement.
     #[test]
-    fn as_timestamp_from_t_separator() {
-        let v = EvalValue::Str("2026-01-15T14:30:00Z".to_string());
-        let ts = v.as_timestamp().unwrap();
-        assert_eq!(ts.to_string(), "2026-01-15 14:30:00");
+    fn as_finite_reads_the_literal_timestamp_syntax() {
+        for (text, want) in [
+            ("2026-01-15T14:30:00Z", "2026-01-15 14:30:00"),
+            ("2026-01-15 14:30:00", "2026-01-15 14:30:00"),
+            ("2026-01-15", "2026-01-15 00:00:00"),
+            // An offset is DISCARDED — the wall-clock cast a bound
+            // string parameter gets.
+            ("2026-01-15T14:30:00+02:00", "2026-01-15 14:30:00"),
+        ] {
+            let value = EvalValue::Str(text.to_string());
+            assert_eq!(value.as_finite().unwrap().to_string(), want, "{text:?}");
+        }
     }
 
     #[test]
-    fn as_timestamp_from_space_separator() {
-        let v = EvalValue::Str("2026-01-15 14:30:00".to_string());
-        let ts = v.as_timestamp().unwrap();
-        assert_eq!(ts.to_string(), "2026-01-15 14:30:00");
+    fn as_finite_is_none_for_a_text_with_no_reading() {
+        for text in [
+            "not-a-date",
+            // The MALFORMED offset eval's own parser used to accept by
+            // stripping it unvalidated; the engine rejects it.
+            "2026-01-15 10:20:30+ab:cd",
+            // Byte 'len - 6' lands mid-emoji — the old stripper sliced
+            // there and panicked.
+            "🦀🦀",
+            "err: 🦀🦀",
+        ] {
+            let value = EvalValue::Str(text.to_string());
+            assert!(value.as_finite().is_none(), "{text:?}");
+            assert!(value.as_instant().is_none(), "{text:?}");
+        }
     }
 
+    /// An INFINITY is an instant but not a finite one — the split every
+    /// calendar function reads through.
     #[test]
-    fn as_timestamp_date_only_is_midnight() {
-        let v = EvalValue::Str("2026-01-15".to_string());
-        let ts = v.as_timestamp().unwrap();
-        assert_eq!(ts.to_string(), "2026-01-15 00:00:00");
-    }
-
-    #[test]
-    fn as_timestamp_discards_offset() {
-        // Offset +02:00 is discarded, wall-clock components are kept.
-        let v = EvalValue::Str("2026-01-15T14:30:00+02:00".to_string());
-        let ts = v.as_timestamp().unwrap();
-        assert_eq!(ts.to_string(), "2026-01-15 14:30:00");
-    }
-
-    #[test]
-    fn as_timestamp_unparseable_is_none() {
-        let v = EvalValue::Str("not-a-date".to_string());
-        assert!(v.as_timestamp().is_none());
-    }
-
-    #[test]
-    fn as_timestamp_non_utf8_boundary_does_not_panic() {
-        // Regression: strip_offset's `&s[s.len() - 6..]` byte-sliced into the
-        // middle of a multi-byte UTF-8 sequence and panicked. "🦀🦀" is 8 bytes;
-        // index 2 (len - 6) is a continuation byte. This is reachable from
-        // ingested log field values via Str<->Timestamp coercion, so it must
-        // return None gracefully, not panic.
-        let v = EvalValue::Str("🦀🦀".to_string());
-        assert!(v.as_timestamp().is_none());
-
-        // A field value whose byte at len - 6 lands mid-emoji.
-        let v = EvalValue::Str("err: 🦀🦀".to_string());
-        assert!(v.as_timestamp().is_none());
+    fn as_instant_reads_an_infinity_that_as_finite_refuses() {
+        for (text, want) in [
+            ("infinity", compare::Instant::Infinity),
+            ("-infinity", compare::Instant::NegInfinity),
+            ("inf", compare::Instant::Infinity),
+        ] {
+            let value = EvalValue::Str(text.to_string());
+            assert_eq!(value.as_instant(), Some(want), "{text:?}");
+            assert!(value.as_finite().is_none(), "{text:?}");
+        }
     }
 
     #[test]
     fn timestamp_is_truthy() {
         let ts = chrono::NaiveDateTime::parse_from_str("2026-01-15 00:00:00", "%Y-%m-%d %H:%M:%S")
             .unwrap();
-        assert!(EvalValue::Timestamp(ts).is_truthy());
+        assert!(EvalValue::Timestamp(compare::Instant::At(ts)).is_truthy());
+        assert!(EvalValue::Timestamp(compare::Instant::Infinity).is_truthy());
     }
 
     #[test]
     fn timestamp_to_json_is_duckdb_text() {
         let ts = chrono::NaiveDateTime::parse_from_str("2026-01-15 14:30:00", "%Y-%m-%d %H:%M:%S")
             .unwrap();
-        let json_val = Value::from(EvalValue::Timestamp(ts));
+        let json_val = Value::from(EvalValue::Timestamp(compare::Instant::At(ts)));
         assert_eq!(json_val, json!("2026-01-15 14:30:00"));
+        // The two instants that had no JSON rendering at all before now
+        // egress as the words DuckDB casts them to.
+        assert_eq!(
+            Value::from(EvalValue::Timestamp(compare::Instant::Infinity)),
+            json!("infinity")
+        );
+        assert_eq!(
+            Value::from(EvalValue::Timestamp(compare::Instant::NegInfinity)),
+            json!("-infinity")
+        );
     }
 
     // ── EvalValue conversions ──────────────────────────────────────
@@ -3548,7 +3574,7 @@ mod tests {
         );
         assert_eq!(
             eval_expr(&expr, &empty_event()),
-            EvalValue::Timestamp(ndt("2026-01-01 00:00:00"))
+            EvalValue::Timestamp(compare::Instant::At(ndt("2026-01-01 00:00:00")))
         );
     }
 
@@ -3560,7 +3586,7 @@ mod tests {
         );
         assert_eq!(
             eval_expr(&expr, &empty_event()),
-            EvalValue::Timestamp(ndt("2026-07-01 00:00:00"))
+            EvalValue::Timestamp(compare::Instant::At(ndt("2026-07-01 00:00:00")))
         );
     }
 
@@ -3572,7 +3598,7 @@ mod tests {
         );
         assert_eq!(
             eval_expr(&expr, &empty_event()),
-            EvalValue::Timestamp(ndt("2026-07-15 00:00:00"))
+            EvalValue::Timestamp(compare::Instant::At(ndt("2026-07-15 00:00:00")))
         );
     }
 
@@ -3584,7 +3610,7 @@ mod tests {
         );
         assert_eq!(
             eval_expr(&expr, &empty_event()),
-            EvalValue::Timestamp(ndt("2026-07-15 10:00:00"))
+            EvalValue::Timestamp(compare::Instant::At(ndt("2026-07-15 10:00:00")))
         );
     }
 
@@ -3597,7 +3623,7 @@ mod tests {
         );
         assert_eq!(
             eval_expr(&expr, &empty_event()),
-            EvalValue::Timestamp(ndt("2026-07-13 00:00:00"))
+            EvalValue::Timestamp(compare::Instant::At(ndt("2026-07-13 00:00:00")))
         );
     }
 
@@ -3720,7 +3746,7 @@ mod tests {
         );
         assert_eq!(
             eval_expr(&expr, &empty_event()),
-            EvalValue::Timestamp(ndt("2026-03-15 10:20:30"))
+            EvalValue::Timestamp(compare::Instant::At(ndt("2026-03-15 10:20:30")))
         );
     }
 
@@ -3749,9 +3775,81 @@ mod tests {
             let expr = call("strptime", vec![lit_str(input), lit_str(fmt)]);
             assert_eq!(
                 eval_expr(&expr, &empty_event()),
-                EvalValue::Timestamp(ndt(want)),
+                EvalValue::Timestamp(compare::Instant::At(ndt(want))),
                 "strptime({input:?}, {fmt:?})"
             );
+        }
+    }
+
+    /// The date scalars over an infinity, one arm per PROBE row
+    /// (`the_date_scalars_answer_for_an_infinity`): `date_part` NULLs for
+    /// every unit, `date_trunc` passes the infinity through for every
+    /// unit, `date_diff` NULLs from either side, and `strftime` renders
+    /// the word whatever the format asks for.
+    #[test]
+    fn the_date_scalars_mirror_duckdb_over_an_infinity() {
+        for (word, instant) in [
+            ("infinity", compare::Instant::Infinity),
+            ("-infinity", compare::Instant::NegInfinity),
+        ] {
+            let ts = || span(Expr::Literal(LiteralValue::String(word.to_string())));
+            for unit in crate::emitter::DATE_PART_UNITS {
+                let expr = call("date_part", vec![lit_str(unit), ts()]);
+                assert_eq!(
+                    eval_expr(&expr, &empty_event()),
+                    EvalValue::Null,
+                    "date_part({unit:?}, {word})"
+                );
+            }
+            for unit in crate::emitter::DATE_UNITS {
+                let expr = call("date_trunc", vec![lit_str(unit), ts()]);
+                assert_eq!(
+                    eval_expr(&expr, &empty_event()),
+                    EvalValue::Timestamp(instant),
+                    "date_trunc({unit:?}, {word})"
+                );
+            }
+            for fmt in ["%Y-%m-%d %H:%M:%S", "%Y", "%j"] {
+                let expr = call("strftime", vec![ts(), lit_str(fmt)]);
+                assert_eq!(
+                    eval_expr(&expr, &empty_event()),
+                    EvalValue::Str(word.to_string()),
+                    "strftime({word}, {fmt:?})"
+                );
+            }
+            let finite = || lit_str("2026-01-15 09:00:00");
+            for (start, end) in [(ts(), finite()), (finite(), ts()), (ts(), ts())] {
+                let expr = call("date_diff", vec![lit_str("day"), start, end]);
+                assert_eq!(
+                    eval_expr(&expr, &empty_event()),
+                    EvalValue::Null,
+                    "date_diff over {word}"
+                );
+            }
+        }
+    }
+
+    /// `Instant`'s order IS `DuckDB`'s, so an infinity compares rather than
+    /// nulling — in both operand orders and against a plain text.
+    #[test]
+    fn an_infinity_compares_as_duckdb_orders_it() {
+        for (lhs, op, rhs, want) in [
+            ("infinity", BinaryOp::Gt, "2026-01-15 09:00:00", true),
+            ("-infinity", BinaryOp::Lt, "2026-01-15 09:00:00", true),
+            ("2026-01-15 09:00:00", BinaryOp::Lt, "infinity", true),
+            ("infinity", BinaryOp::Eq, "infinity", true),
+            ("infinity", BinaryOp::Eq, "-infinity", false),
+        ] {
+            // The left operand is a real TIMESTAMP cell and the right is
+            // the text the comparison coerces — two plain strings would
+            // compare as strings, so the cell is built directly.
+            let instant = EvalValue::Str(lhs.to_string()).as_instant().unwrap();
+            let answer = eval_binary(
+                &EvalValue::Timestamp(instant),
+                op,
+                &EvalValue::Str(rhs.to_string()),
+            );
+            assert_eq!(answer, EvalValue::Bool(want), "{lhs} {op:?} {rhs}");
         }
     }
 
@@ -3862,7 +3960,7 @@ mod tests {
         use crate::emitter::is_aggregate_function;
         use crate::parser::suggest::KNOWN_FUNCTIONS;
         // Generous arg list: enough variety that arity/type checks don't block.
-        let ts_val = EvalValue::Timestamp(ndt("2026-01-15 10:20:30"));
+        let ts_val = EvalValue::Timestamp(compare::Instant::At(ndt("2026-01-15 10:20:30")));
         let generous_args = vec![
             ts_val.clone(),
             EvalValue::Str("year".to_string()),

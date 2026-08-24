@@ -14,7 +14,7 @@
 
 use indexmap::IndexSet;
 use trawl_core::ast::{PipeStage, SortDirection, Spanned};
-use trawl_core::eval::{EvalValue, timestamp_to_duckdb_text};
+use trawl_core::eval::EvalValue;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::row::{self, Row};
 use trawl_core::stream::{self, CompiledStage, StageResult, StreamPlan};
@@ -135,7 +135,7 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
         EvalValue::UInt(u) => crate::value::Value::Float(*u as f64),
         EvalValue::Float(f) => crate::value::Value::Float(*f),
         EvalValue::Str(s) => crate::value::Value::String(s.clone()),
-        EvalValue::Timestamp(ts) => crate::value::Value::String(timestamp_to_duckdb_text(ts)),
+        EvalValue::Timestamp(instant) => crate::value::Value::String(instant.cast_text()),
         EvalValue::Array(arr) => crate::value::Value::Array(arr.iter().map(eval_to_cell).collect()),
     }
 }
@@ -357,8 +357,17 @@ mod tests {
             .and_hms_opt(9, 0, 0)
             .unwrap();
         assert_eq!(
-            eval_to_cell(&EvalValue::Timestamp(ts)),
+            eval_to_cell(&EvalValue::Timestamp(trawl_core::compare::Instant::At(ts))),
             crate::value::Value::String("2026-01-15 09:00:00".into())
+        );
+        // An infinity crosses as its WORD — a text the display-offset
+        // shift leaves alone (it re-parses only its own rendering), so a
+        // computed infinity survives a shifted run unchanged.
+        assert_eq!(
+            eval_to_cell(&EvalValue::Timestamp(
+                trawl_core::compare::Instant::Infinity
+            )),
+            crate::value::Value::String("infinity".into())
         );
     }
 

@@ -115,13 +115,16 @@ pub fn cell_text(cell: &EvalValue) -> String {
             }
         }
         EvalValue::Str(s) => s.clone(),
-        // The instant's own text, NOT the JSON string it becomes on the
-        // wire: rendering it through the wire door wrapped it in QUOTE
+        // The instant's own cast text, NOT the JSON string it becomes on
+        // the wire: rendering it through the wire door wrapped it in QUOTE
         // characters, which then landed inside a group key (`stats count()
         // by t` emitted `"2026-01-15 09:00:00"` live against
         // `2026-01-15 09:00:00` in batch) and split a `Timestamp` cell
-        // from a `Str` cell holding the same text.
-        EvalValue::Timestamp(ts) => crate::eval::timestamp_to_duckdb_text(ts),
+        // from a `Str` cell holding the same text. An infinity renders as
+        // its word, so `Timestamp(Infinity)` and `Str("infinity")` share
+        // one identity under the `s:` tag — which is the rule this cell
+        // has always followed, since on the wire it WAS a JSON string.
+        EvalValue::Timestamp(instant) => instant.cast_text(),
         // A list stays JSON text, as it has always been (`values()`
         // produces a string array).
         EvalValue::Array(_) => Value::from(cell.clone()).to_string(),
@@ -197,14 +200,21 @@ mod tests {
             .unwrap()
             .and_hms_opt(9, 0, 0)
             .unwrap();
+        let instant = crate::compare::Instant::At(ts);
         let text = crate::eval::timestamp_to_duckdb_text(&ts);
-        assert_eq!(cell_text(&EvalValue::Timestamp(ts)), text);
+        assert_eq!(cell_text(&EvalValue::Timestamp(instant)), text);
         assert!(!text.contains('"'), "no quote characters: {text:?}");
         // …so an instant and its text are ONE identity, which is what the
         // shared `s:` tag claims.
         assert_eq!(
-            cell_key(&EvalValue::Timestamp(ts)),
+            cell_key(&EvalValue::Timestamp(instant)),
             cell_key(&EvalValue::Str(text))
+        );
+        // An INFINITY keys as its word, for the same reason: on the wire
+        // this cell was a JSON string, and that is the identity it kept.
+        assert_eq!(
+            cell_key(&EvalValue::Timestamp(crate::compare::Instant::Infinity)),
+            cell_key(&EvalValue::Str("infinity".into()))
         );
     }
 

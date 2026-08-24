@@ -323,6 +323,28 @@ pub enum Instant {
 }
 
 impl Instant {
+    /// This instant as `CAST(ts AS VARCHAR)` renders it — the SCALAR
+    /// text, which is what `tostring()`, a `concat()` argument and a
+    /// projected cell show.
+    ///
+    /// Deliberately NOT [`Self::pattern_text`]: that one is the TIMESTAMP
+    /// pin's RFC 3339 `Z` form, the target a glob matches against a
+    /// stored column. The two differ for every finite instant (`T` and a
+    /// `Z` against a space and none), so a caller that reached for the
+    /// wrong one would print a string `DuckDB` never prints. Both
+    /// renderings are probed —
+    /// `a_timestamp_casts_to_the_text_duckdb_prints` for this one — and
+    /// the finite arm delegates to the renderer that already byte-matches
+    /// the engine, exactly as [`canonical_double_text`] delegates.
+    #[must_use]
+    pub fn cast_text(self) -> String {
+        match self {
+            Self::Infinity => "infinity".to_owned(),
+            Self::NegInfinity => "-infinity".to_owned(),
+            Self::At(at) => crate::eval::timestamp_to_duckdb_text(&at),
+        }
+    }
+
     /// This instant in the TIMESTAMP pin's canonical pattern text — the
     /// in-memory mirror of `strftime(col, TIMESTAMP_PATTERN_SQL_FORMAT)`.
     #[must_use]
