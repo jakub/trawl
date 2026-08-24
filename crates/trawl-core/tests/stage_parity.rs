@@ -237,6 +237,47 @@ fn agreed_folding_nan_in(conn: &Connection, dsl: &str, events: &[Value], column:
     assert_lanes_agree(conn, dsl, events, Some(column))
 }
 
+/// Both lanes over a case where one column holds a nondeterministic
+/// REPRESENTATIVE — which of several EQUAL rows each lane happened to
+/// keep, which `dedup` and a group-by both decide for themselves.
+///
+/// Deliberately not [`agreed_folding_nan_in`]: that one exists for a
+/// value whose SIGN is the hardware's, and stretching it to cover a
+/// representative choice would make its contract mean two things. Here
+/// every OTHER column is still compared byte-exactly, multiplicity
+/// included, and the named column comes back per lane so the caller can
+/// say what each lane must show.
+fn agreed_apart_from(
+    conn: &Connection,
+    dsl: &str,
+    events: &[Value],
+    representative: &str,
+) -> (Vec<String>, Vec<String>) {
+    let strip = |rows: &TextRows| -> TextRows {
+        sorted(
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .filter(|(name, _)| name != representative)
+                        .cloned()
+                        .collect()
+                })
+                .collect(),
+        )
+    };
+    let batch = batch_rows(conn, dsl, events);
+    let live = live_rows(dsl, events);
+    assert_eq!(
+        strip(&live),
+        strip(&batch),
+        "lane divergence outside {representative:?}\ndsl: {dsl:?}\nlive: {live:?}\nbatch: {batch:?}"
+    );
+    (
+        column(&live, representative),
+        column(&batch, representative),
+    )
+}
+
 fn assert_lanes_agree(
     conn: &Connection,
     dsl: &str,
@@ -436,6 +477,11 @@ fn two_nan_rows_dedup_to_one() {
     let conn = conn();
     let event = json!({"service": "nginx", "_time": "2026-01-15T09:00:00Z"});
     let events = vec![event.clone(), event];
+    // `x` is a COMPUTED NaN, so its sign is the hardware's and the two
+    // lanes render it through different doors — the one shape the fold
+    // exists for. The two source rows are identical, so which one
+    // survives cannot matter here; only the row COUNT is under test, and
+    // every other column is still compared byte-exactly.
     let rows = agreed_folding_nan_in(&conn, "* | let x = 0.0 / 0 | dedup x", &events, "x");
     assert_eq!(rows.len(), 1, "one row survives dedup: {rows:?}");
 }
@@ -546,12 +592,27 @@ fn the_two_nan_signs_are_one_identity() {
 
     // …and both `dedup` forms keep ONE row: the by-field form, and the
     // whole-row one that reads the same cell through `cell_key`.
+    //
+    // These NaNs are sign-EXPLICIT — they come from the text
+    // `tonumber("-nan")` reads, not from a computation — so nothing here
+    // is hardware-dependent. What each lane chooses for itself is which
+    // of the two equal rows SURVIVES, and the survivor carries its own
+    // spelling: `DuckDB` keeps whichever row it kept, while the live
+    // lane's identity ruling makes every NaN cell read `nan`.
     for dedup in ["dedup x", "drop flag | dedup"] {
         let dsl = format!("* | {signed} | {dedup}");
-        // Which of the two rows survives is DuckDB's choice, so the
-        // surviving cell carries whichever sign that row held.
-        let deduped = agreed_folding_nan_in(&conn, &dsl, &events, "x");
-        assert_eq!(deduped.len(), 1, "one row survives {dedup}: {deduped:?}");
+        let (live_x, batch_x) = agreed_apart_from(&conn, &dsl, &events, "x");
+        assert_eq!(live_x.len(), 1, "one row survives {dedup} live: {live_x:?}");
+        assert_eq!(
+            batch_x.len(),
+            1,
+            "one row survives {dedup} in batch: {batch_x:?}"
+        );
+        assert_eq!(live_x, vec!["nan"], "the live cell is canonically unsigned");
+        assert!(
+            batch_x == vec!["nan"] || batch_x == vec!["-nan"],
+            "the batch cell is the survivor's own spelling: {batch_x:?}"
+        );
     }
 }
 
