@@ -1546,6 +1546,10 @@ fn double_pattern_text_is_duckdb_rendering_on_both_engines() {
         f64::INFINITY,
         f64::NEG_INFINITY,
         f64::NAN,
+        // A NaN renders with its SIGN, and a DOUBLE-pinned column can
+        // hold either spelling (`a_rendered_nan_keeps_its_sign`), so the
+        // pattern text has to carry the sign too.
+        -f64::NAN,
     ];
     for input in inputs {
         let sql: String = conn
@@ -3895,4 +3899,1220 @@ fn the_columns_exclusion_fold_mirrors_catalog_key() {
         conn.prepare(r#"SELECT "ä" FROM t"#).is_err(),
         "non-ASCII case is NOT folded by the binder"
     );
+}
+
+// ── #105 M1: the numeric / type LEAVES (ADR-0017 §1, §4) ───────────
+//
+// `eval.rs` answers `typeof`, `tonumber`, `ceil`, `floor` and `round`
+// out of its own head today. These probes are the measurement those
+// answers move TO — taken through the shape the batch lane actually
+// executes, which is not the shape a hand-written SQL literal has: the
+// emitter pushes one bound `SqlValue` per DSL literal
+// (`emitter::emit`), so a DSL `1` reaches `DuckDB` as a BIGINT
+// PARAMETER. A bare `typeof(1)` typed into SQL answers `INTEGER` and is
+// simply a different question.
+
+/// One scalar expression, executed and read back as (`typeof`, text) —
+/// the two facts a value-domain mirror has to reproduce.
+///
+/// `expr` carries `?` placeholders and appears exactly ONCE (inside a
+/// subquery), so the bound parameter list is the caller's rather than
+/// silently doubled by a second mention of the same expression.
+fn scalar_type_and_text(
+    conn: &duckdb::Connection,
+    expr: &str,
+    params: &[&dyn duckdb::ToSql],
+) -> Result<(String, Option<String>), String> {
+    let sql = format!("SELECT typeof(x), CAST(x AS VARCHAR) FROM (SELECT ({expr}) AS x) probe");
+    conn.query_row(&sql, params, |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| error.to_string())
+}
+
+/// The type name `DuckDB` gives a value the DSL lane BOUND, per literal
+/// shape the emitter can push.
+const BOUND_TYPEOF_SPELLINGS: &[&str] = &["BIGINT", "BIGINT", "DOUBLE", "BOOLEAN", "VARCHAR"];
+
+/// The shapes that reach `DuckDB` as SQL text rather than a parameter.
+///
+/// The last two are recorded, NOT mirrored: streaming eval spells the
+/// NULL type `NULL` (no quotes) and every list `ARRAY`, where `DuckDB`
+/// spells a list by its ELEMENT type. #105 M1 rules only on the
+/// `INTEGER`/`BIGINT` split; these two stay pinned as divergences in
+/// `trawl-core/tests/scalar_parity.rs`.
+const LITERAL_TYPEOF_SPELLINGS: &[(&str, &str)] = &[
+    ("TIMESTAMP '2026-01-15 10:20:30'", "TIMESTAMP"),
+    ("NULL", "\"NULL\""),
+    ("[1, 2]", "INTEGER[]"),
+];
+
+#[test]
+fn typeof_spells_a_bound_dsl_literal_by_its_bound_type() {
+    let conn = conn();
+    let bound: Vec<Box<dyn duckdb::ToSql>> = vec![
+        Box::new(1_i64),
+        Box::new(i64::MAX),
+        Box::new(1.5_f64),
+        Box::new(true),
+        Box::new("x".to_string()),
+    ];
+    for (value, want) in bound.iter().zip(BOUND_TYPEOF_SPELLINGS) {
+        let (outer, spelling) =
+            scalar_type_and_text(&conn, "typeof(?)", &[value.as_ref()]).unwrap();
+        assert_eq!(outer, "VARCHAR", "typeof() itself returns text");
+        assert_eq!(spelling.as_deref(), Some(*want));
+    }
+    for (expr, want) in LITERAL_TYPEOF_SPELLINGS {
+        let (_, spelling) = scalar_type_and_text(&conn, &format!("typeof({expr})"), &[]).unwrap();
+        assert_eq!(spelling.as_deref(), Some(*want), "typeof({expr})");
+    }
+}
+
+#[test]
+fn a_boolean_casts_to_double_as_one_and_zero() {
+    // `tonumber(x)` emits `TRY_CAST(x AS DOUBLE)`, so a boolean argument
+    // has a reading — it is not the NULL streaming eval answers today.
+    let conn = conn();
+    for (value, want) in [(true, "1.0"), (false, "0.0")] {
+        let (dtype, text) =
+            scalar_type_and_text(&conn, "TRY_CAST(? AS DOUBLE)", &[&value]).unwrap();
+        assert_eq!(dtype, "DOUBLE");
+        assert_eq!(text.as_deref(), Some(want), "TRY_CAST({value} AS DOUBLE)");
+    }
+}
+
+/// (function, return type over a BIGINT argument, over a DOUBLE one).
+///
+/// `round` is the odd one out and the reason #105 M1 leaves its integer
+/// arm alone: it is the only one of the three that keeps an integer
+/// argument integral.
+const ROUNDING_RETURN_TYPES: &[(&str, &str, &str)] = &[
+    ("ceil", "DOUBLE", "DOUBLE"),
+    ("floor", "DOUBLE", "DOUBLE"),
+    ("round", "BIGINT", "DOUBLE"),
+];
+
+/// (bound BIGINT argument, ceil text, floor text, round text).
+const ROUNDING_INTEGER_MATRIX: &[(i64, &str, &str, &str)] = &[
+    (5, "5.0", "5.0", "5"),
+    (-5, "-5.0", "-5.0", "-5"),
+    (0, "0.0", "0.0", "0"),
+];
+
+/// (bound DOUBLE argument, ceil text, floor text, round text).
+///
+/// The negative-zero rows are load-bearing: `DuckDB` KEEPS the sign
+/// (`ceil(-0.5)` is `-0.0`, not `0.0`), which is also what Rust's
+/// `f64::ceil` produces — a mirror that rounded through `i64` could not
+/// express it at all. `round` is half-away-from-zero on both engines.
+const ROUNDING_DOUBLE_MATRIX: &[(f64, &str, &str, &str)] = &[
+    (1.5, "2.0", "1.0", "2.0"),
+    (-1.5, "-1.0", "-2.0", "-2.0"),
+    (0.0, "0.0", "0.0", "0.0"),
+    (-0.0, "-0.0", "-0.0", "-0.0"),
+    (2.5, "3.0", "2.0", "3.0"),
+    (-2.5, "-2.0", "-3.0", "-3.0"),
+    (0.5, "1.0", "0.0", "1.0"),
+    (-0.5, "-0.0", "-1.0", "-1.0"),
+];
+
+#[test]
+fn ceil_floor_and_round_split_their_return_type_on_the_argument_type() {
+    let conn = conn();
+    for (function, over_integer, over_double) in ROUNDING_RETURN_TYPES {
+        let (dtype, _) = scalar_type_and_text(&conn, &format!("{function}(?)"), &[&5_i64]).unwrap();
+        assert_eq!(&dtype, over_integer, "{function} over a BIGINT");
+        let (dtype, _) =
+            scalar_type_and_text(&conn, &format!("{function}(?)"), &[&1.5_f64]).unwrap();
+        assert_eq!(&dtype, over_double, "{function} over a DOUBLE");
+    }
+
+    for (argument, ceil, floor, round) in ROUNDING_INTEGER_MATRIX {
+        for (function, want) in [("ceil", ceil), ("floor", floor), ("round", round)] {
+            let (_, text) =
+                scalar_type_and_text(&conn, &format!("{function}(?)"), &[argument]).unwrap();
+            assert_eq!(text.as_deref(), Some(*want), "{function}({argument})");
+        }
+    }
+    for (argument, ceil, floor, round) in ROUNDING_DOUBLE_MATRIX {
+        for (function, want) in [("ceil", ceil), ("floor", floor), ("round", round)] {
+            let (_, text) =
+                scalar_type_and_text(&conn, &format!("{function}(?)"), &[argument]).unwrap();
+            assert_eq!(text.as_deref(), Some(*want), "{function}({argument})");
+        }
+    }
+}
+
+#[test]
+fn round_takes_a_precision_only_as_an_inlined_integer() {
+    // There is no `round(DOUBLE, BIGINT)` overload, which is exactly why
+    // `emitter::functions::literal_int_positions` inlines `round`'s
+    // second argument instead of binding it. Probed so a future overload
+    // does not quietly make that inlining look optional.
+    let conn = conn();
+    let error = scalar_type_and_text(&conn, "round(?, ?)", &[&1.5_f64, &1_i64]).unwrap_err();
+    assert!(
+        error.contains("round(DOUBLE, BIGINT)"),
+        "a bound precision must still be a binder error: {error}"
+    );
+    for (argument, precision, dtype, want) in [
+        (1.25_f64, 1, "DOUBLE", "1.3"),
+        (-1.25_f64, 1, "DOUBLE", "-1.3"),
+        (1.5_f64, 0, "DOUBLE", "2.0"),
+    ] {
+        let (actual, text) =
+            scalar_type_and_text(&conn, &format!("round(?, {precision})"), &[&argument]).unwrap();
+        assert_eq!(actual, dtype);
+        assert_eq!(
+            text.as_deref(),
+            Some(want),
+            "round({argument}, {precision})"
+        );
+    }
+    // An integer argument keeps its BIGINT shape whatever the precision.
+    let (dtype, text) = scalar_type_and_text(&conn, "round(?, 1)", &[&5_i64]).unwrap();
+    assert_eq!((dtype.as_str(), text.as_deref()), ("BIGINT", Some("5")));
+}
+
+// ── #105 M2: the ARITHMETIC value domain (ADR-0017 §4) ─────────────
+//
+// Three claims eval.rs makes about `+ - * / %` are measured here before
+// eval is moved onto them: `/` is true division (never truncating),
+// division by zero answers an IEEE special where integer `%` by zero
+// answers NULL, and an integer overflow is an ERROR — which is what
+// licenses the streaming lane's NULL for it, since SSE cannot raise a
+// per-event error and ADR-0017 §5's rule is "eval nulls where batch
+// errors". The comparison rows are here for the same reason: once `/`
+// can produce NaN, every comparison over one has to answer as DuckDB
+// does, and DuckDB orders NaN GREATEST rather than leaving it unordered.
+
+/// One scalar expression read back as a DOUBLE — the shape a text
+/// comparison cannot express, since `CAST(0/0 AS VARCHAR)` renders the
+/// hardware's SIGN bit (`-nan`) while the value is just NaN.
+fn scalar_double(
+    conn: &duckdb::Connection,
+    expr: &str,
+    params: &[&dyn duckdb::ToSql],
+) -> Result<Option<f64>, String> {
+    conn.query_row(&format!("SELECT ({expr})"), params, |row| row.get(0))
+        .map_err(|error| error.to_string())
+}
+
+/// (dividend, divisor, quotient) — `/` over two BIGINTs.
+///
+/// The last row is the i64 promotion: both operands go through DOUBLE,
+/// so a dividend above 2^53 comes back ROUNDED, and `i64::MIN / -1` —
+/// the one integer division that has no i64 answer — is an ordinary
+/// value rather than the overflow the `%` of the same pair raises.
+const TRUE_DIVISION_MATRIX: &[(i64, i64, f64)] = &[
+    (5, 2, 2.5),
+    (-5, 2, -2.5),
+    (4, 2, 2.0),
+    (9_007_199_254_740_993, 1, 9_007_199_254_740_992.0),
+    (i64::MIN, -1, 9_223_372_036_854_775_808.0),
+];
+
+#[test]
+fn integer_division_is_true_division_through_double() {
+    let conn = conn();
+    for (dividend, divisor, quotient) in TRUE_DIVISION_MATRIX {
+        let (dtype, _) = scalar_type_and_text(&conn, "? / ?", &[dividend, divisor]).unwrap();
+        assert_eq!(dtype, "DOUBLE", "{dividend} / {divisor}");
+        assert_eq!(
+            scalar_double(&conn, "? / ?", &[dividend, divisor]).unwrap(),
+            Some(*quotient),
+            "{dividend} / {divisor}"
+        );
+    }
+}
+
+/// (dividend, divisor, remainder) — `%` over two BIGINTs, both signs.
+///
+/// Truncated remainder (the sign follows the DIVIDEND), which is Rust's
+/// `%` and not a floored modulo.
+const INTEGER_REMAINDER_MATRIX: &[(i64, i64, i64)] = &[(5, 2, 1), (-5, 2, -1), (5, -2, 1)];
+
+/// (dividend, divisor, remainder) — `%` where either side is a DOUBLE.
+const DOUBLE_REMAINDER_MATRIX: &[(f64, f64, f64)] =
+    &[(5.5, 2.0, 1.5), (-5.5, 2.0, -1.5), (5.0, -2.0, 1.0)];
+
+#[test]
+fn division_by_zero_is_an_ieee_special_and_integer_modulo_by_zero_is_null() {
+    let conn = conn();
+    for (dividend, negative) in [(1_i64, false), (-1_i64, true)] {
+        let quotient = scalar_double(&conn, "? / ?", &[&dividend, &0_i64])
+            .unwrap()
+            .unwrap();
+        assert!(
+            quotient.is_infinite() && quotient.is_sign_negative() == negative,
+            "{dividend} / 0 is a signed infinity, got {quotient}"
+        );
+    }
+    assert!(
+        scalar_double(&conn, "? / ?", &[&0_i64, &0_i64])
+            .unwrap()
+            .unwrap()
+            .is_nan(),
+        "0 / 0 is NaN"
+    );
+
+    // `%` splits on the operand types where `/` does not: all-integer is
+    // NULL, and any DOUBLE operand takes the IEEE path.
+    let (dtype, text) = scalar_type_and_text(&conn, "? % ?", &[&5_i64, &0_i64]).unwrap();
+    assert_eq!((dtype.as_str(), text), ("BIGINT", None));
+    for params in [
+        [&5_i64 as &dyn duckdb::ToSql, &0.0_f64],
+        [&5.0_f64 as &dyn duckdb::ToSql, &0_i64],
+    ] {
+        assert!(
+            scalar_double(&conn, "? % ?", &params)
+                .unwrap()
+                .unwrap()
+                .is_nan(),
+            "a DOUBLE operand makes `% 0` NaN, not NULL"
+        );
+    }
+
+    for (dividend, divisor, remainder) in INTEGER_REMAINDER_MATRIX {
+        let (dtype, text) = scalar_type_and_text(&conn, "? % ?", &[dividend, divisor]).unwrap();
+        assert_eq!(dtype, "BIGINT");
+        assert_eq!(text.as_deref(), Some(remainder.to_string().as_str()));
+    }
+    for (dividend, divisor, remainder) in DOUBLE_REMAINDER_MATRIX {
+        assert_eq!(
+            scalar_double(&conn, "? % ?", &[dividend, divisor]).unwrap(),
+            Some(*remainder),
+            "{dividend} % {divisor}"
+        );
+    }
+}
+
+/// (expression, both operands, the substring of the error `DuckDB` raises).
+const INTEGER_OVERFLOW_MATRIX: &[(&str, i64, i64, &str)] = &[
+    ("? + ?", i64::MAX, 1, "Overflow in addition of INT64"),
+    ("? - ?", i64::MIN, 1, "Overflow in subtraction of INT64"),
+    ("? * ?", i64::MAX, 2, "Overflow in multiplication of INT64"),
+    // `%` is the only remainder that overflows, and it reports itself as
+    // a DIVISION overflow.
+    ("? % ?", i64::MIN, -1, "Overflow in division of"),
+];
+
+#[test]
+fn integer_arithmetic_overflow_is_an_error_never_a_wrap() {
+    let conn = conn();
+    for (expr, lhs, rhs, expected) in INTEGER_OVERFLOW_MATRIX {
+        let error = scalar_type_and_text(&conn, expr, &[lhs, rhs]).unwrap_err();
+        assert!(
+            error.contains(expected),
+            "{lhs} {expr} {rhs}: wanted {expected:?}, got {error}"
+        );
+    }
+    // The DOUBLE side does NOT error — it saturates to infinity, so an
+    // overflow rule written over `as_f64` operands would be wrong.
+    for (expr, rhs) in [("? + ?", f64::MAX), ("? * ?", 2.0)] {
+        assert_eq!(
+            scalar_double(&conn, expr, &[&f64::MAX, &rhs]).unwrap(),
+            Some(f64::INFINITY),
+            "{expr} over DOUBLEs saturates"
+        );
+    }
+}
+
+/// (expression, left, right, `DuckDB`'s answer) over the IEEE specials.
+///
+/// NaN is EQUAL to itself and GREATER than everything else — a total
+/// order, not Rust's `partial_cmp` (which answers `None` and would make
+/// eval null out where batch returns a row). The two zeros tie, which
+/// Rust's `partial_cmp` already gets right.
+const DOUBLE_COMPARISON_MATRIX: &[(&str, f64, f64, bool)] = &[
+    ("? = ?", f64::NAN, f64::NAN, true),
+    ("? != ?", f64::NAN, f64::NAN, false),
+    ("? >= ?", f64::NAN, f64::NAN, true),
+    ("? > ?", f64::NAN, f64::INFINITY, true),
+    ("? < ?", f64::NAN, f64::INFINITY, false),
+    ("? > ?", f64::NAN, 1e308, true),
+    ("? = ?", -0.0, 0.0, true),
+    ("? < ?", -0.0, 0.0, false),
+    ("? = ?", f64::INFINITY, f64::INFINITY, true),
+    ("? < ?", f64::NEG_INFINITY, -1e308, true),
+];
+
+#[test]
+fn double_comparison_orders_nan_greatest_and_ties_the_two_zeros() {
+    let conn = conn();
+    for (expr, lhs, rhs, want) in DOUBLE_COMPARISON_MATRIX {
+        let (dtype, text) = scalar_type_and_text(&conn, expr, &[lhs, rhs]).unwrap();
+        assert_eq!(dtype, "BOOLEAN");
+        assert_eq!(
+            text.as_deref(),
+            Some(if *want { "true" } else { "false" }),
+            "{lhs} {expr} {rhs}"
+        );
+        // …and the live mirror, side by side with the engine: one owner
+        // for this order, read by eval's comparison arms and by the
+        // pinned matcher's `apply_f64`.
+        let ordering = trawl_core::compare::double_total_cmp(*lhs, *rhs);
+        let mirrored = match *expr {
+            "? = ?" => ordering.is_eq(),
+            "? != ?" => !ordering.is_eq(),
+            "? > ?" => ordering.is_gt(),
+            "? >= ?" => ordering.is_ge(),
+            "? < ?" => ordering.is_lt(),
+            other => panic!("the matrix grew an operator the mirror does not read: {other}"),
+        };
+        assert_eq!(
+            mirrored, *want,
+            "double_total_cmp disagrees: {lhs} {expr} {rhs}"
+        );
+    }
+    // A NaN of either sign is the same value to the comparison — the
+    // rendering keeps the sign bit, the ordering does not.
+    let (_, text) = scalar_type_and_text(&conn, "'-nan'::DOUBLE = 'NaN'::DOUBLE", &[]).unwrap();
+    assert_eq!(text.as_deref(), Some("true"));
+
+    // …and the same order sorts, with SQL NULL after all of them.
+    let mut statement = conn
+        .prepare(
+            "SELECT CAST(x AS VARCHAR) FROM (VALUES ('-inf'::DOUBLE), ('NaN'::DOUBLE), \
+             (1.0::DOUBLE), ('inf'::DOUBLE), (CAST(NULL AS DOUBLE))) t(x) ORDER BY x",
+        )
+        .unwrap();
+    let sorted: Vec<Option<String>> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        sorted,
+        vec![
+            Some("-inf".to_owned()),
+            Some("1.0".to_owned()),
+            Some("inf".to_owned()),
+            Some("nan".to_owned()),
+            None,
+        ]
+    );
+}
+
+// ── #105 M4: the CONDITION domain of `if` / `case` (ADR-0017 §4) ────
+//
+// `DuckDB` reads an `IF`/`CASE WHEN` condition as a BOOLEAN CAST, not as
+// truthiness: a string outside the boolean vocabulary is a Conversion
+// ERROR, and a TIMESTAMP or a list has no cast at all. Streaming eval
+// answered non-empty-string-is-true, which silently took the THEN branch
+// where the batch lane refuses the query. These probes pin the whole
+// domain — including which values are readable, which error, and the
+// order `CASE` reads its arms in, since "the whole call is NULL" and "skip
+// this arm" are different answers for a multi-arm `case`.
+
+/// The branch `DuckDB` took, or the text of its Conversion error.
+fn conditional_branch(
+    conn: &duckdb::Connection,
+    sql: &str,
+    params: &[&dyn duckdb::ToSql],
+) -> Result<Option<i64>, String> {
+    conn.query_row(sql, params, |row| row.get(0))
+        .map_err(|error| error.to_string())
+}
+
+/// `IF(cond, 1, 2)` and the `CASE` that must answer identically.
+const IF_OVER_BOUND_CONDITION: &str = "SELECT IF(?, 1, 2)";
+const CASE_OVER_BOUND_CONDITION: &str = "SELECT CASE WHEN ? THEN 1 ELSE 2 END";
+
+/// (text, the BOOLEAN `DuckDB` casts it to — `None` = Conversion error).
+///
+/// The same closed, case-insensitive, UNTRIMMED vocabulary
+/// `compare::try_cast_boolean` mirrors, which is why this probe asserts
+/// the mirror beside the engine rather than beside a second list.
+const CONDITION_STRINGS: &[(&str, Option<bool>)] = &[
+    ("true", Some(true)),
+    ("TRUE", Some(true)),
+    ("t", Some(true)),
+    ("yes", Some(true)),
+    ("y", Some(true)),
+    ("1", Some(true)),
+    ("false", Some(false)),
+    ("f", Some(false)),
+    ("no", Some(false)),
+    ("n", Some(false)),
+    ("0", Some(false)),
+    (" true ", None),
+    ("nonempty", None),
+    ("", None),
+    ("2", None),
+    ("1.0", None),
+    ("on", None),
+];
+
+/// (bound BIGINT condition, the branch it takes) — zero is the only
+/// false one, and a negative is TRUE.
+const CONDITION_INTEGERS: &[(i64, bool)] = &[
+    (0, false),
+    (1, true),
+    (2, true),
+    (-1, true),
+    (i64::MAX, true),
+    (i64::MIN, true),
+];
+
+/// (bound DOUBLE condition, the branch it takes) — both zeros are false
+/// and NaN is TRUE, so the reading is `!= 0`, not `> 0` and not a cast
+/// through an integer.
+const CONDITION_DOUBLES: &[(f64, bool)] = &[
+    (0.0, false),
+    (-0.0, false),
+    (1.5, true),
+    (-1.5, true),
+    (f64::NAN, true),
+    (f64::INFINITY, true),
+];
+
+#[test]
+fn an_if_condition_is_a_boolean_cast_not_truthiness() {
+    let conn = conn();
+    let branch = |taken: bool| Some(if taken { 1 } else { 2 });
+
+    for (text, reading) in CONDITION_STRINGS {
+        let want = reading.map(|value| branch(value).expect("a branch"));
+        for sql in [IF_OVER_BOUND_CONDITION, CASE_OVER_BOUND_CONDITION] {
+            let answer = conditional_branch(&conn, sql, &[&(*text).to_string()]);
+            if let Some(expected) = want {
+                assert_eq!(answer.ok().flatten(), Some(expected), "{sql} over {text:?}");
+            } else {
+                let error = answer.unwrap_err();
+                assert!(
+                    error.contains(&format!("Could not convert string '{text}' to BOOL")),
+                    "{sql} over {text:?}: {error}"
+                );
+            }
+        }
+        // The live mirror of that same cast, side by side with it.
+        assert_eq!(
+            trawl_core::compare::try_cast_boolean(text),
+            *reading,
+            "try_cast_boolean disagrees with the condition cast for {text:?}"
+        );
+    }
+
+    for (value, taken) in CONDITION_INTEGERS {
+        for sql in [IF_OVER_BOUND_CONDITION, CASE_OVER_BOUND_CONDITION] {
+            assert_eq!(
+                conditional_branch(&conn, sql, &[value]).unwrap(),
+                branch(*taken),
+                "{sql} over {value}"
+            );
+        }
+    }
+    for (value, taken) in CONDITION_DOUBLES {
+        for sql in [IF_OVER_BOUND_CONDITION, CASE_OVER_BOUND_CONDITION] {
+            assert_eq!(
+                conditional_branch(&conn, sql, &[value]).unwrap(),
+                branch(*taken),
+                "{sql} over {value}"
+            );
+        }
+    }
+
+    // NULL takes the ELSE branch — it is a false condition, not an
+    // unreadable one.
+    for sql in [
+        "SELECT IF(NULL, 1, 2)",
+        "SELECT CASE WHEN NULL THEN 1 ELSE 2 END",
+    ] {
+        assert_eq!(
+            conditional_branch(&conn, sql, &[]).unwrap(),
+            Some(2),
+            "{sql}"
+        );
+    }
+
+    // …while a TIMESTAMP or a list has no boolean cast at all.
+    for condition in ["TIMESTAMP '2026-01-15 10:20:30'", "[1, 2]"] {
+        for shape in [
+            format!("SELECT IF({condition}, 1, 2)"),
+            format!("SELECT CASE WHEN {condition} THEN 1 ELSE 2 END"),
+        ] {
+            let error = conditional_branch(&conn, &shape, &[]).unwrap_err();
+            assert!(
+                error.contains("Unimplemented type for cast"),
+                "{shape}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_case_reads_its_arms_in_order_and_stops_at_the_first_true() {
+    // The distinction eval has to reproduce: an unreadable condition is
+    // not "this arm does not match". It kills the whole call — unless an
+    // EARLIER arm already matched, in which case DuckDB never reads it.
+    let conn = conn();
+    let two_arms = "SELECT CASE WHEN ? THEN 1 WHEN ? THEN 2 ELSE 3 END";
+
+    assert_eq!(
+        conditional_branch(&conn, two_arms, &[&true, &"nonempty".to_string()]).unwrap(),
+        Some(1),
+        "a matched first arm means the second condition is never read"
+    );
+    for first in [&false as &dyn duckdb::ToSql, &Option::<bool>::None] {
+        let error =
+            conditional_branch(&conn, two_arms, &[first, &"nonempty".to_string()]).unwrap_err();
+        assert!(
+            error.contains("Could not convert string 'nonempty' to BOOL"),
+            "an unmatched first arm still reads the second: {error}"
+        );
+    }
+    let error = conditional_branch(&conn, two_arms, &[&"nonempty".to_string(), &true]).unwrap_err();
+    assert!(
+        error.contains("Could not convert string 'nonempty' to BOOL"),
+        "an unreadable FIRST arm errors whatever follows it: {error}"
+    );
+}
+
+/// The stored DOUBLE column a filter really compares against, spelled so
+/// every row is a value the SQL parser cannot constant-fold away: both
+/// NaN SIGNS, both zeros, both infinities.
+const STORED_DOUBLE_ROWS: &[&str] = &[
+    "'nan'::DOUBLE",
+    "-('nan'::DOUBLE)",
+    "'inf'::DOUBLE",
+    "'-inf'::DOUBLE",
+    "1.5::DOUBLE",
+    "0.0::DOUBLE",
+    "0.0::DOUBLE * -1",
+    "CAST(NULL AS DOUBLE)",
+];
+
+/// The same rows as [`STORED_DOUBLE_ROWS`], as (rendering, value) — what
+/// the live mirror reads. `None` is the SQL NULL row, which no comparison
+/// matches.
+const STORED_DOUBLE_ROW_VALUES: &[(&str, Option<f64>)] = &[
+    ("nan", Some(f64::NAN)),
+    ("-nan", Some(-f64::NAN)),
+    ("inf", Some(f64::INFINITY)),
+    ("-inf", Some(f64::NEG_INFINITY)),
+    ("1.5", Some(1.5)),
+    ("0.0", Some(0.0)),
+    ("-0.0", Some(-0.0)),
+    ("NULL", None),
+];
+
+/// (operator, bound literal, the stored rows it returns — rendered).
+///
+/// The COLUMN shape, which is the one a pinned live filter mirrors: the
+/// scalar matrix above compares two bound values, and a constant-folded
+/// answer would prove nothing about a column read off parquet. Both
+/// answers are the same total order — every NaN equal to every other
+/// whatever its sign, NaN above `inf`, the two zeros tied, SQL NULL
+/// matching nothing.
+const STORED_DOUBLE_COMPARISONS: &[(&str, f64, &[&str])] = &[
+    ("=", f64::NAN, &["nan", "-nan"]),
+    ("=", -f64::NAN, &["nan", "-nan"]),
+    (">=", f64::NAN, &["nan", "-nan"]),
+    (">", f64::NAN, &[]),
+    ("<", f64::NAN, &["inf", "-inf", "1.5", "0.0", "-0.0"]),
+    ("!=", f64::NAN, &["inf", "-inf", "1.5", "0.0", "-0.0"]),
+    (">", 1.5, &["nan", "-nan", "inf"]),
+    ("<", 1.5, &["-inf", "0.0", "-0.0"]),
+    ("=", 0.0, &["0.0", "-0.0"]),
+    ("=", -0.0, &["0.0", "-0.0"]),
+    ("=", f64::INFINITY, &["inf"]),
+];
+
+#[test]
+fn a_stored_double_column_compares_in_that_same_total_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("metric.parquet");
+    let conn = conn();
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES ({})) AS t(metric)) TO '{}' (FORMAT PARQUET)",
+        STORED_DOUBLE_ROWS.join("), ("),
+        file.display()
+    ))
+    .unwrap();
+
+    for (op, literal, expected) in STORED_DOUBLE_COMPARISONS {
+        let sql = format!(
+            "SELECT CAST(metric AS VARCHAR) FROM read_parquet('{}') WHERE metric {op} ?",
+            file.display()
+        );
+        let mut statement = conn.prepare(&sql).unwrap();
+        let mut matched: Vec<String> = statement
+            .query_map([literal], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        // A filtered scan has no ORDER BY, so the ROW SET is what this
+        // case pins, not the order a parquet scan happens to hand back.
+        // Sorted rather than set-compared, so multiplicity still counts.
+        // The dedicated ordering assertion at the end of this test is the
+        // one that pins an ORDER.
+        matched.sort();
+        let mut want: Vec<String> = expected.iter().map(|text| (*text).to_owned()).collect();
+        want.sort();
+        assert_eq!(matched, want, "metric {op} {literal}");
+
+        // The mirror decides the same row set from the same order. The
+        // stored rows are named by their RENDERING here, so the mirror
+        // reads the value each name stands for.
+        let mut mirrored: Vec<String> = STORED_DOUBLE_ROW_VALUES
+            .iter()
+            .filter_map(|(text, value)| {
+                let ordering = trawl_core::compare::double_total_cmp((*value)?, *literal);
+                let keep = match *op {
+                    "=" => ordering.is_eq(),
+                    "!=" => !ordering.is_eq(),
+                    ">" => ordering.is_gt(),
+                    ">=" => ordering.is_ge(),
+                    "<" => ordering.is_lt(),
+                    other => panic!("unmirrored operator {other}"),
+                };
+                keep.then(|| (*text).to_owned())
+            })
+            .collect();
+        mirrored.sort();
+        assert_eq!(
+            mirrored, want,
+            "double_total_cmp disagrees over the stored column: metric {op} {literal}"
+        );
+    }
+
+    // …and the sort agrees with the comparison: the NaNs tie at the top,
+    // above `inf`, with SQL NULL after all of them.
+    let sql = format!(
+        "SELECT CAST(metric AS VARCHAR) FROM read_parquet('{}') ORDER BY metric",
+        file.display()
+    );
+    let mut statement = conn.prepare(&sql).unwrap();
+    let sorted: Vec<Option<String>> = statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        sorted,
+        vec![
+            Some("-inf".to_owned()),
+            Some("0.0".to_owned()),
+            Some("-0.0".to_owned()),
+            Some("1.5".to_owned()),
+            Some("inf".to_owned()),
+            Some("nan".to_owned()),
+            Some("-nan".to_owned()),
+            None,
+        ]
+    );
+}
+
+/// (SQL producing a NaN of a KNOWN sign, the text `DuckDB` renders).
+///
+/// `DuckDB`'s DOUBLE → VARCHAR cast honours the SIGN BIT, so a NaN has
+/// two renderings and a mirror with one is wrong for half of them. Every
+/// row here builds its NaN sign-EXPLICITLY — parsed from text, or negated
+/// (which flips the bit, probed below) — never from arithmetic: the sign
+/// of a computed NaN like `0.0 / 0.0` is the hardware's business and
+/// differs across platforms, so pinning one would pin this machine.
+const NAN_SIGN_RENDERINGS: &[(&str, &str)] = &[
+    ("'nan'::DOUBLE", "nan"),
+    ("'NaN'::DOUBLE", "nan"),
+    ("'-nan'::DOUBLE", "-nan"),
+    ("'-NAN'::DOUBLE", "-nan"),
+    ("-('nan'::DOUBLE)", "-nan"),
+    ("-('-nan'::DOUBLE)", "nan"),
+    ("TRY_CAST('nan' AS DOUBLE)", "nan"),
+    ("TRY_CAST('-nan' AS DOUBLE)", "-nan"),
+];
+
+#[test]
+fn a_rendered_nan_keeps_its_sign() {
+    let conn = conn();
+    for (expr, want) in NAN_SIGN_RENDERINGS {
+        let (dtype, text) = scalar_type_and_text(&conn, expr, &[]).unwrap();
+        assert_eq!(dtype, "DOUBLE");
+        assert_eq!(text.as_deref(), Some(*want), "{expr}");
+    }
+
+    // The same through a BOUND parameter, which is how a computed value
+    // reaches the engine from Rust.
+    for (value, want) in [
+        (f64::NAN, "nan"),
+        (-f64::NAN, "-nan"),
+        (f64::NAN.copysign(-1.0), "-nan"),
+        (f64::NAN.copysign(1.0), "nan"),
+    ] {
+        let (_, text) = scalar_type_and_text(&conn, "CAST(? AS DOUBLE)", &[&value]).unwrap();
+        assert_eq!(
+            text.as_deref(),
+            Some(want),
+            "bound {value} ({:?})",
+            value.is_sign_negative()
+        );
+    }
+
+    // Both spellings survive the DOUBLE pin's round-trip guard, so both
+    // are values a conformed column really holds — which is what makes
+    // the rendering a live-mirror question rather than a curiosity.
+    for text in ["nan", "-nan"] {
+        let conformed: Option<String> = conn
+            .query_row(
+                &format!(
+                    "SELECT CAST({} AS VARCHAR) FROM (SELECT ? AS v) probe",
+                    conform("v", CanonicalType::Double)
+                ),
+                [text],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(conformed.as_deref(), Some(text), "the guard keeps {text:?}");
+    }
+}
+
+// ── #105 M5: the TIMESTAMP value domain (ADR-0017 §1) ──────────────
+//
+// `eval` grew a second timestamp parser and a lexical fallback, and it
+// carries an instant as a bare `NaiveDateTime` — a type with no way to
+// spell the two values a `DuckDB` TIMESTAMP can hold beyond the calendar.
+// These probes are what the retyping moves to: how an instant RENDERS,
+// what each date scalar answers over an infinity, and what an infinity
+// looks like coming back through duckdb-rs (which the parity harness has
+// to recognise).
+
+/// (SQL timestamp expression, its `CAST(… AS VARCHAR)`).
+///
+/// The SCALAR rendering, which is NOT the TIMESTAMP pin's pattern text:
+/// that one is RFC 3339 with a `Z` for globbing a stored column
+/// (`TIMESTAMP_PATTERN_SQL_FORMAT`), this one is the space-separated form
+/// `tostring()` and a projected cell show. Two renderings, two owners; a
+/// mirror that reused the pattern text here would print the wrong string
+/// for every finite instant.
+const TIMESTAMP_CAST_TEXTS: &[(&str, &str)] = &[
+    ("TIMESTAMP '2026-01-15 09:00:00'", "2026-01-15 09:00:00"),
+    (
+        "TIMESTAMP '2026-01-15 09:00:00.123456'",
+        "2026-01-15 09:00:00.123456",
+    ),
+    // Trailing fractional zeros are trimmed, exactly as the live
+    // renderer trims them.
+    (
+        "TIMESTAMP '2026-01-15 09:00:00.100000'",
+        "2026-01-15 09:00:00.1",
+    ),
+    ("TIMESTAMP '0001-01-01 00:00:00'", "0001-01-01 00:00:00"),
+    (
+        "TIMESTAMP '9999-12-31 23:59:59.999999'",
+        "9999-12-31 23:59:59.999999",
+    ),
+    // The two instants no calendar date can express render as WORDS —
+    // and both spellings of the input reach the same value.
+    ("'infinity'::TIMESTAMP", "infinity"),
+    ("'-infinity'::TIMESTAMP", "-infinity"),
+    ("TRY_CAST('inf' AS TIMESTAMP)", "infinity"),
+];
+
+#[test]
+fn a_timestamp_casts_to_the_text_duckdb_prints() {
+    let conn = conn();
+    for (expr, want) in TIMESTAMP_CAST_TEXTS {
+        let (dtype, text) = scalar_type_and_text(&conn, expr, &[]).unwrap();
+        assert_eq!(dtype, "TIMESTAMP", "{expr}");
+        assert_eq!(text.as_deref(), Some(*want), "{expr}");
+
+        // The live mirror beside the engine: the instant that text
+        // denotes renders back to the same text.
+        let instant = trawl_core::compare::literal_timestamp(want)
+            .unwrap_or_else(|| panic!("the mirror must read {want:?}"));
+        assert_eq!(instant.cast_text(), *want, "cast_text disagrees for {expr}");
+    }
+}
+
+/// What each date scalar answers for `infinity` and `-infinity`.
+///
+/// Measured, not reasoned: the three families do three DIFFERENT things,
+/// and no rule derived from one of them predicts the others.
+///
+/// - `date_part` is NULL for EVERY unit, `epoch` included;
+/// - `date_trunc` returns the infinity UNCHANGED, for every unit;
+/// - `date_diff` is NULL whenever EITHER side is infinite — including
+///   both sides, and including two infinities of the same sign;
+/// - `strftime` renders the WORD whatever the format asks for.
+#[test]
+fn the_date_scalars_answer_for_an_infinity() {
+    let conn = conn();
+    for (infinity, word) in [
+        ("'infinity'::TIMESTAMP", "infinity"),
+        ("'-infinity'::TIMESTAMP", "-infinity"),
+    ] {
+        for unit in trawl_core::emitter::DATE_PART_UNITS {
+            let (_, text) =
+                scalar_type_and_text(&conn, &format!("date_part('{unit}', {infinity})"), &[])
+                    .unwrap();
+            assert_eq!(text, None, "date_part('{unit}', {infinity}) must be NULL");
+        }
+        for unit in trawl_core::emitter::DATE_UNITS {
+            let (dtype, text) =
+                scalar_type_and_text(&conn, &format!("date_trunc('{unit}', {infinity})"), &[])
+                    .unwrap();
+            assert_eq!(dtype, "TIMESTAMP");
+            assert_eq!(
+                text.as_deref(),
+                Some(word),
+                "date_trunc('{unit}', {infinity}) must pass the infinity through"
+            );
+        }
+        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y", "%j", "%f"] {
+            let (_, text) =
+                scalar_type_and_text(&conn, &format!("strftime({infinity}, '{fmt}')"), &[])
+                    .unwrap();
+            assert_eq!(text.as_deref(), Some(word), "strftime({infinity}, '{fmt}')");
+        }
+    }
+
+    let finite = "TIMESTAMP '2026-01-15 09:00:00'";
+    for unit in ["year", "day", "second"] {
+        for (start, end) in [
+            ("'infinity'::TIMESTAMP", finite),
+            (finite, "'infinity'::TIMESTAMP"),
+            ("'-infinity'::TIMESTAMP", finite),
+            ("'infinity'::TIMESTAMP", "'infinity'::TIMESTAMP"),
+            ("'infinity'::TIMESTAMP", "'-infinity'::TIMESTAMP"),
+        ] {
+            let (_, text) =
+                scalar_type_and_text(&conn, &format!("date_diff('{unit}', {start}, {end})"), &[])
+                    .unwrap();
+            assert_eq!(
+                text, None,
+                "date_diff('{unit}', {start}, {end}) must be NULL"
+            );
+        }
+    }
+}
+
+/// The i64 SENTINELS duckdb-rs hands back for the two infinities.
+///
+/// A result cell arrives as `Value::Timestamp(Microsecond, i64)`, and the
+/// infinities are the extremes of that range — note `-infinity` is
+/// `-i64::MAX`, NOT `i64::MIN`. The scalar parity harness compares eval
+/// against these cells, so it has to know the sentinels by value; a
+/// matcher that treated them as ordinary microsecond counts would read
+/// them as dates 292 thousand years out.
+#[test]
+fn an_infinity_timestamp_cell_is_an_i64_sentinel() {
+    let conn = conn();
+    for (expr, want) in [
+        ("'infinity'::TIMESTAMP", i64::MAX),
+        ("'-infinity'::TIMESTAMP", -i64::MAX),
+    ] {
+        let value: duckdb::types::Value = conn
+            .query_row(&format!("SELECT {expr}"), [], |row| row.get(0))
+            .unwrap();
+        let duckdb::types::Value::Timestamp(unit, micros) = value else {
+            panic!("{expr} must come back as a TIMESTAMP cell, got {value:?}");
+        };
+        assert_eq!(unit, duckdb::types::TimeUnit::Microsecond, "{expr}");
+        assert_eq!(micros, want, "{expr}");
+    }
+}
+
+// ── #105 M6: `date_part('epoch', ts)` ──────────────────────────────
+
+/// Timestamp texts spanning the epoch reading's whole range: the epoch
+/// itself, a pre-1970 instant with a fraction, an ordinary one, the
+/// far-future fixture whose rounding this test exists for, and the ends
+/// of the range BOTH engines can express.
+///
+/// `262143-12-31` is deliberately absent: `DuckDB` reads it and the
+/// mirror does not (chrono's calendar stops at +262142), which is one of
+/// [`trawl_core::compare::literal_timestamp`]'s two documented
+/// one-directional residuals — under-reading, never over-reading — and
+/// is guarded by `the_timestamp_mirror_residuals_are_one_directional`.
+const EPOCH_MATRIX: &[&str] = &[
+    "1970-01-01 00:00:00",
+    "1969-12-31 23:59:59.5",
+    "2026-01-15 10:20:30.123456",
+    // The pinned fixture: at this magnitude one f64 ulp spans 32
+    // microseconds, so the micro count ROUNDS on the way into the
+    // double and the fraction disappears. Summing seconds and a
+    // fraction separately gives …799.00003 instead — which is exactly
+    // the divergence this milestone closes.
+    "9999-12-31 23:59:59.000016",
+    "9999-12-31 23:59:59.999999",
+    "0001-01-01 00:00:00",
+    "262142-12-31 23:59:59",
+    "-262143-01-01 00:00:00",
+];
+
+/// The live mirror under test: the instant's whole MICROSECOND count,
+/// divided once ([`trawl_core::compare::Instant::epoch_seconds`], which
+/// `date_part('epoch', …)` reads through in both in-memory lanes).
+fn epoch_candidate(instant: trawl_core::compare::Instant) -> Option<f64> {
+    instant.epoch_seconds()
+}
+
+#[test]
+fn the_epoch_reading_is_the_micro_count_divided_once() {
+    let conn = conn();
+    for text in EPOCH_MATRIX {
+        let engine: Option<f64> = conn
+            .query_row(
+                "SELECT date_part('epoch', TRY_CAST(? AS TIMESTAMP))",
+                [*text],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let engine = engine.unwrap_or_else(|| panic!("DuckDB must read {text:?}"));
+        let instant = trawl_core::compare::literal_timestamp(text)
+            .unwrap_or_else(|| panic!("the mirror must read {text:?}"));
+        let candidate =
+            epoch_candidate(instant).unwrap_or_else(|| panic!("{text:?} is a finite instant"));
+        // BIT-exact, never a tolerance: an epoch that is merely close is
+        // a different value to every comparison downstream of it.
+        assert_eq!(
+            candidate.to_bits(),
+            engine.to_bits(),
+            "epoch disagrees for {text:?}: engine {engine}, candidate {candidate}"
+        );
+    }
+
+    // An infinity has no epoch reading on either side.
+    for (sql, instant) in [
+        (
+            "'infinity'::TIMESTAMP",
+            trawl_core::compare::Instant::Infinity,
+        ),
+        (
+            "'-infinity'::TIMESTAMP",
+            trawl_core::compare::Instant::NegInfinity,
+        ),
+    ] {
+        let engine: Option<f64> = conn
+            .query_row(&format!("SELECT date_part('epoch', {sql})"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(engine, None, "{sql}");
+        assert_eq!(epoch_candidate(instant), None, "{sql}");
+    }
+}
+
+// ── #105 M7: `%f` is SIX-DIGIT MICROSECONDS ────────────────────────
+//
+// The one strftime/strptime specifier where `DuckDB` and chrono read the
+// same letter as different units: `DuckDB`'s bare `%f` is a 6-digit
+// microsecond field, chrono's is an UNSCALED NANOSECOND count (9 digits
+// out, and a variable-length run read as nanoseconds in). So
+// `strftime(ts, "%f")` printed `123456000` live against `123456` in
+// batch, and `strptime("….5", "….%f")` read five NANOseconds where the
+// engine reads half a second.
+
+/// (fractional part of the instant, the text `strftime(ts, '%f')` gives).
+///
+/// Always six digits, zero-padded and zero-FILLED: a `.5` is `500000`,
+/// not `5`, so the field is a fraction scaled to microseconds rather
+/// than a count of them.
+const PERCENT_F_RENDERINGS: &[(&str, &str)] = &[
+    ("2026-01-15 09:00:00.123456", "123456"),
+    ("2026-01-15 09:00:00.5", "500000"),
+    ("2026-01-15 09:00:00.123", "123000"),
+    ("2026-01-15 09:00:00.999999", "999999"),
+    ("2026-01-15 09:00:00", "000000"),
+];
+
+#[test]
+fn percent_f_is_six_digit_microseconds() {
+    let conn = conn();
+    for (text, want) in PERCENT_F_RENDERINGS {
+        let rendered: Option<String> = conn
+            .query_row(
+                "SELECT strftime(TRY_CAST(? AS TIMESTAMP), '%f')",
+                [*text],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rendered.as_deref(), Some(*want), "strftime({text:?}, '%f')");
+    }
+
+    // An ESCAPED percent is not a specifier: `%%f` is a literal `%` then
+    // the letter `f`, so a translation that rewrote `%f` blindly would
+    // corrupt it.
+    for (fmt, want) in [("%%f", "%f"), ("x%%fy", "x%fy"), ("%%%f", "%123456")] {
+        let rendered: Option<String> = conn
+            .query_row(
+                "SELECT strftime(TIMESTAMP '2026-01-15 09:00:00.123456', ?)",
+                [fmt],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rendered.as_deref(), Some(want), "strftime(…, {fmt:?})");
+    }
+}
+
+/// (input, the instant `strptime(input, '%Y-%m-%d %H:%M:%S.%f')` reads).
+///
+/// The fraction is VARIABLE length on the way in — `.5` is half a second
+/// — which is the half chrono's fixed-width `%6f` cannot reproduce for
+/// anything other than exactly six digits.
+const PERCENT_F_PARSES: &[(&str, &str)] = &[
+    ("2026-01-15 09:00:00.123456", "2026-01-15 09:00:00.123456"),
+    ("2026-01-15 09:00:00.500000", "2026-01-15 09:00:00.5"),
+    ("2026-01-15 09:00:00.5", "2026-01-15 09:00:00.5"),
+    ("2026-01-15 09:00:00.123", "2026-01-15 09:00:00.123"),
+];
+
+#[test]
+fn percent_f_parses_a_variable_length_fraction() {
+    let conn = conn();
+    for (input, want) in PERCENT_F_PARSES {
+        let parsed: Option<String> = conn
+            .query_row(
+                "SELECT CAST(TRY_STRPTIME(?, '%Y-%m-%d %H:%M:%S.%f') AS VARCHAR)",
+                [*input],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parsed.as_deref(), Some(*want), "strptime({input:?})");
+    }
+}
+
+// ── #105 M8: `json_extract` returns JSON TEXT ──────────────────────
+//
+// `json_extract` yields JSON, not a decoded scalar: a string keeps its
+// QUOTES, a number is its own text, a composite is compact JSON. The
+// live mirror renders through `serde_json`, whose text IS `DuckDB`'s for
+// every shape but one — a positive exponent, which serde spells `e+300`
+// and `DuckDB` spells `e300`.
+
+/// (document, path, the TEXT `json_extract` returns).
+///
+/// Every class the mirror claims to reproduce: integers, floats, the
+/// exponent spellings, strings WITH escapes, booleans, JSON null,
+/// arrays, objects, a nested extract, and a missing path (SQL NULL).
+const JSON_EXTRACT_TEXTS: &[(&str, &str, Option<&str>)] = &[
+    (r#"{"a":1}"#, "$.a", Some("1")),
+    (r#"{"a":-1}"#, "$.a", Some("-1")),
+    (r#"{"a":1.5}"#, "$.a", Some("1.5")),
+    (r#"{"a":1.0}"#, "$.a", Some("1.0")),
+    (r#"{"a":0.1}"#, "$.a", Some("0.1")),
+    (r#"{"a":-0.0}"#, "$.a", Some("-0.0")),
+    (r#"{"a":1e2}"#, "$.a", Some("100.0")),
+    // The spelling the mirror normalizes…
+    (r#"{"a":1e300}"#, "$.a", Some("1e300")),
+    (r#"{"a":-1e300}"#, "$.a", Some("-1e300")),
+    (
+        r#"{"a":1.7976931348623157e308}"#,
+        "$.a",
+        Some("1.7976931348623157e308"),
+    ),
+    // …and the negative exponent that needs no normalizing.
+    (r#"{"a":1e-7}"#, "$.a", Some("1e-7")),
+    (r#"{"a":5e-324}"#, "$.a", Some("5e-324")),
+    // Integers up to the width serde keeps exactly.
+    (r#"{"a":9007199254740993}"#, "$.a", Some("9007199254740993")),
+    (
+        r#"{"a":18446744073709551615}"#,
+        "$.a",
+        Some("18446744073709551615"),
+    ),
+    // Strings keep their QUOTES and their escaping.
+    (r#"{"a":"x"}"#, "$.a", Some(r#""x""#)),
+    (
+        r#"{"a":"he said \"hi\""}"#,
+        "$.a",
+        Some(r#""he said \"hi\"""#),
+    ),
+    (r#"{"a":"tab\there"}"#, "$.a", Some(r#""tab\there""#)),
+    // A string whose CONTENT looks like an exponent must survive the
+    // normalization untouched.
+    (r#"{"a":"cost e+300"}"#, "$.a", Some(r#""cost e+300""#)),
+    (r#"{"a":true}"#, "$.a", Some("true")),
+    (r#"{"a":null}"#, "$.a", Some("null")),
+    (r#"{"a":[1,2]}"#, "$.a", Some("[1,2]")),
+    (
+        r#"{"a":{"b":[1,{"c":2}]}}"#,
+        "$.a",
+        Some(r#"{"b":[1,{"c":2}]}"#),
+    ),
+    (r#"{"a":{"b":"x"}}"#, "$.a.b", Some(r#""x""#)),
+    ("[1,2]", "$", Some("[1,2]")),
+    // A missing path is SQL NULL, where a JSON `null` above is a VALUE.
+    (r#"{"a":1}"#, "$.missing", None),
+];
+
+/// The live mirror — eval's OWN renderer, not a copy of it. A local
+/// re-implementation would be a second version of the rule under test,
+/// and the naive spelling of it (a blind `replace`) corrupts a string
+/// whose CONTENT contains `e+`.
+fn json_extract_mirror(doc: &str, path: &str) -> Option<String> {
+    let pointer = if path == "$" {
+        String::new()
+    } else {
+        path.trim_start_matches('$').replace('.', "/")
+    };
+    let value: serde_json::Value = serde_json::from_str(doc).ok()?;
+    Some(trawl_core::eval::duckdb_json_text(value.pointer(&pointer)?))
+}
+
+#[test]
+fn json_extract_returns_the_values_json_text() {
+    let conn = conn();
+    for (doc, path, want) in JSON_EXTRACT_TEXTS {
+        let engine: Option<String> = conn
+            .query_row("SELECT json_extract(?, ?)", [*doc, *path], |row| row.get(0))
+            .unwrap();
+        assert_eq!(engine.as_deref(), *want, "json_extract({doc}, {path})");
+        assert_eq!(
+            json_extract_mirror(doc, path).as_deref(),
+            *want,
+            "the mirror disagrees for json_extract({doc}, {path})"
+        );
+    }
+}
+
+/// The residual: `serde_json` re-renders a number from its `f64`, where
+/// `DuckDB` renders from the SOURCE spelling.
+///
+/// Two sub-classes, one cause. An exponent-form source below 1e21 is
+/// EXPANDED by `DuckDB` and kept in exponent form by serde; a digit-form
+/// source too wide for `u64` keeps its digits in `DuckDB` and collapses
+/// to exponent form in serde. Both need the source text, which only
+/// `serde_json`'s `arbitrary_precision` feature preserves — REJECTED for
+/// this change, because that flag changes number handling across the
+/// whole ingest plane.
+const JSON_NUMBER_SPELLING_RESIDUALS: &[(&str, &str, &str)] = &[
+    // (document, DuckDB's text, the mirror's text)
+    (r#"{"a":1e16}"#, "10000000000000000.0", "1e16"),
+    (r#"{"a":1e20}"#, "100000000000000000000.0", "1e20"),
+    (
+        r#"{"a":100000000000000000000}"#,
+        "100000000000000000000",
+        "1e20",
+    ),
+    // …and the two that agree either side of the band, so the class is
+    // bounded rather than open-ended.
+    (r#"{"a":1e15}"#, "1000000000000000.0", "1000000000000000.0"),
+    (r#"{"a":1e21}"#, "1e21", "1e21"),
+];
+
+#[test]
+fn current_json_number_spelling_follows_serdes_f64() {
+    let conn = conn();
+    for (doc, engine_text, mirror_text) in JSON_NUMBER_SPELLING_RESIDUALS {
+        let engine: Option<String> = conn
+            .query_row("SELECT json_extract(?, '$.a')", [*doc], |row| row.get(0))
+            .unwrap();
+        assert_eq!(engine.as_deref(), Some(*engine_text), "{doc}");
+        assert_eq!(
+            json_extract_mirror(doc, "$.a").as_deref(),
+            Some(*mirror_text),
+            "{doc}"
+        );
+    }
+
+    // A number outside `f64`'s range is a step further: serde cannot
+    // PARSE the document at all, so the whole call is NULL where the
+    // engine answers the number's text.
+    let doc = r#"{"a":1e400}"#;
+    let engine: Option<String> = conn
+        .query_row("SELECT json_extract(?, '$.a')", [doc], |row| row.get(0))
+        .unwrap();
+    assert_eq!(engine.as_deref(), Some("1e400"));
+    assert_eq!(json_extract_mirror(doc, "$.a"), None);
 }

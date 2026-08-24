@@ -323,6 +323,50 @@ pub enum Instant {
 }
 
 impl Instant {
+    /// This instant as `CAST(ts AS VARCHAR)` renders it — the SCALAR
+    /// text, which is what `tostring()`, a `concat()` argument and a
+    /// projected cell show.
+    ///
+    /// Deliberately NOT [`Self::pattern_text`]: that one is the TIMESTAMP
+    /// pin's RFC 3339 `Z` form, the target a glob matches against a
+    /// stored column. The two differ for every finite instant (`T` and a
+    /// `Z` against a space and none), so a caller that reached for the
+    /// wrong one would print a string `DuckDB` never prints. Both
+    /// renderings are probed —
+    /// `a_timestamp_casts_to_the_text_duckdb_prints` for this one — and
+    /// the finite arm delegates to the renderer that already byte-matches
+    /// the engine, exactly as [`canonical_double_text`] delegates.
+    #[must_use]
+    pub fn cast_text(self) -> String {
+        match self {
+            Self::Infinity => "infinity".to_owned(),
+            Self::NegInfinity => "-infinity".to_owned(),
+            Self::At(at) => crate::eval::timestamp_to_duckdb_text(&at),
+        }
+    }
+
+    /// The seconds-since-1970 `date_part('epoch', ts)` reads — this
+    /// instant's whole MICROSECOND count, divided ONCE.
+    ///
+    /// One division, one rounding. Summing `timestamp()` and
+    /// `subsec_micros() / 1e6` separately rounds twice, and the two
+    /// disagree the moment the seconds exceed the mantissa: at the year
+    /// 9999 one f64 ulp spans 32 microseconds, so the engine's answer
+    /// has NO fraction left and the summed form invents one
+    /// (`…799.00003`). Probed bit-for-bit across the whole range in
+    /// `the_epoch_reading_is_the_micro_count_divided_once`.
+    ///
+    /// `None` for an infinity, which is what `date_part` answers for one
+    /// — every unit, `epoch` included.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn epoch_seconds(self) -> Option<f64> {
+        match self {
+            Self::At(at) => Some((at.and_utc().timestamp_micros() as f64) / 1e6),
+            Self::Infinity | Self::NegInfinity => None,
+        }
+    }
+
     /// This instant in the TIMESTAMP pin's canonical pattern text — the
     /// in-memory mirror of `strftime(col, TIMESTAMP_PATTERN_SQL_FORMAT)`.
     #[must_use]
@@ -1408,6 +1452,42 @@ pub fn try_cast_boolean(text: &str) -> Option<bool> {
         return Some(false);
     }
     None
+}
+
+/// Compare two DOUBLEs in `DuckDB`'s order — the ONE owner of that
+/// domain, read by every lane that compares a double.
+///
+/// `DuckDB` orders DOUBLE TOTALLY, and in two places Rust's IEEE
+/// operators do not:
+///
+/// - **every NaN is EQUAL to every other NaN**, whatever its sign bit,
+///   and GREATER than every real value — above `inf`, and last before
+///   SQL NULL in a sort. Rust answers `false` to `NaN == NaN` and `None`
+///   to `partial_cmp`, so an IEEE mirror answers "no match" where the
+///   batch query returns the row.
+/// - `-0.0` TIES `0.0`, which Rust's `partial_cmp` already gets right.
+///
+/// Probed against the engine both ways round — two bound values
+/// (`double_comparison_orders_nan_greatest_and_ties_the_two_zeros`) and a
+/// stored parquet column against a bound literal
+/// (`a_stored_double_column_compares_in_that_same_total_order`), because
+/// a scalar answer can be constant-folded and a column read cannot.
+///
+/// NaN is ordinary reachable data: `0 / 0` in a pipeline expression, a
+/// wire `"nan"` under a DOUBLE pin (the conform's round-trip guard keeps
+/// both spellings), and `metric=nan` as a filter literal.
+#[must_use]
+pub fn double_total_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        // Neither side is NaN, so `partial_cmp` is total here — and it
+        // already ties the two zeros.
+        (false, false) => a
+            .partial_cmp(&b)
+            .expect("partial_cmp is total when neither operand is NaN"),
+    }
 }
 
 /// Render a DOUBLE in the pattern text `DuckDB`'s `CAST(col AS VARCHAR)`

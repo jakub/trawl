@@ -13,9 +13,10 @@
 //! the streaming engine's per-event transforms and aggregation machinery.
 
 use indexmap::IndexSet;
-use serde_json::{Map, Value};
 use trawl_core::ast::{PipeStage, SortDirection, Spanned};
+use trawl_core::eval::EvalValue;
 use trawl_core::pin_scope::PinScope;
+use trawl_core::row::{self, Row};
 use trawl_core::stream::{self, CompiledStage, StageResult, StreamPlan};
 
 use crate::error::EngineError;
@@ -73,32 +74,69 @@ pub fn apply_rust_stages(
     Ok(events_to_result(&sorted))
 }
 
-/// Convert a columnar `QueryResult` into a vec of JSON object events.
-fn rows_to_events(result: &QueryResult) -> Vec<Map<String, Value>> {
+/// Convert a columnar `QueryResult` into a vec of typed pipeline rows.
+fn rows_to_events(result: &QueryResult) -> Vec<Row> {
     result
         .rows
         .iter()
         .map(|row| {
-            let mut event = Map::new();
-            for (col, cell) in result.columns.iter().zip(row.iter()) {
-                event.insert(col.name.clone(), cell_to_json(cell));
-            }
-            event
+            result
+                .columns
+                .iter()
+                .zip(row.iter())
+                .map(|(col, cell)| (col.name.clone(), cell_to_eval(cell)))
+                .collect()
         })
         .collect()
 }
 
-/// Convert a `crate::value::Value` cell to `serde_json::Value`.
-fn cell_to_json(cell: &crate::value::Value) -> Value {
+/// A result cell as a pipeline cell — the DIRECT bridge, variant for
+/// variant.
+///
+/// It used to route through `serde_json`, which has no spelling for a
+/// non-finite double and turned one into NULL on the way IN: a SQL
+/// prefix computing `1.0/0` handed the `extract kv` tail a null, so the
+/// tail counted, compared and printed something the same query without
+/// the kv split never saw. Both directions are exhaustive with no `_`
+/// arm, so a new variant on either side is a compile error rather than a
+/// silent NULL.
+fn cell_to_eval(cell: &crate::value::Value) -> EvalValue {
     match cell {
-        crate::value::Value::Null => Value::Null,
-        crate::value::Value::Boolean(b) => Value::Bool(*b),
-        crate::value::Value::Integer(i) => Value::from(*i),
-        crate::value::Value::Float(f) => {
-            serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number)
-        }
-        crate::value::Value::String(s) => Value::String(s.clone()),
-        crate::value::Value::Array(arr) => Value::Array(arr.iter().map(cell_to_json).collect()),
+        crate::value::Value::Null => EvalValue::Null,
+        crate::value::Value::Boolean(b) => EvalValue::Bool(*b),
+        crate::value::Value::Integer(i) => EvalValue::Int(*i),
+        crate::value::Value::Float(f) => EvalValue::Float(*f),
+        crate::value::Value::String(s) => EvalValue::Str(s.clone()),
+        crate::value::Value::Array(arr) => EvalValue::Array(arr.iter().map(cell_to_eval).collect()),
+    }
+}
+
+/// A pipeline cell as a result cell.
+///
+/// A non-finite double SURVIVES as `Value::Float`; the ONE place it
+/// becomes `null` is `trawl_api::value`'s serializer, at the wire, which
+/// is also where the batch path has always nulled it. Adding a second
+/// nulling site here is exactly the bug this bridge removes.
+///
+/// A `Timestamp` becomes the STRING `executor::extract_value` renders,
+/// deliberately: the display-offset shift runs AFTER the tail and
+/// re-parses that text, so a cell retyped here would silently stop
+/// shifting (ADR-0011's unshifted-when-tail contract).
+fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
+    match cell {
+        EvalValue::Null => crate::value::Value::Null,
+        EvalValue::Bool(b) => crate::value::Value::Boolean(*b),
+        EvalValue::Int(i) => crate::value::Value::Integer(*i),
+        // `crate::value::Value::Integer` is signed, so a number above
+        // `i64::MAX` degrades to the double the JSON hop degraded it to.
+        // Unreachable from this bridge in practice — a result cell has no
+        // unsigned shape to arrive as — but stated rather than assumed.
+        #[allow(clippy::cast_precision_loss)]
+        EvalValue::UInt(u) => crate::value::Value::Float(*u as f64),
+        EvalValue::Float(f) => crate::value::Value::Float(*f),
+        EvalValue::Str(s) => crate::value::Value::String(s.clone()),
+        EvalValue::Timestamp(instant) => crate::value::Value::String(instant.cast_text()),
+        EvalValue::Array(arr) => crate::value::Value::Array(arr.iter().map(eval_to_cell).collect()),
     }
 }
 
@@ -106,7 +144,7 @@ fn cell_to_json(cell: &crate::value::Value) -> Value {
 ///
 /// Discovers the column set across all events (preserving insertion order)
 /// and fills missing keys with NULL.
-fn events_to_result(events: &[Map<String, Value>]) -> QueryResult {
+fn events_to_result(events: &[Row]) -> QueryResult {
     // Discover columns across all events, preserving insertion order.
     let mut col_set = IndexSet::new();
     for event in events {
@@ -125,7 +163,7 @@ fn events_to_result(events: &[Map<String, Value>]) -> QueryResult {
         .map(|event| {
             col_set
                 .iter()
-                .map(|col| json_to_cell(event.get(col).unwrap_or(&Value::Null)))
+                .map(|col| eval_to_cell(event.get(col).unwrap_or(&EvalValue::Null)))
                 .collect()
         })
         .collect();
@@ -133,32 +171,8 @@ fn events_to_result(events: &[Map<String, Value>]) -> QueryResult {
     QueryResult { columns, rows }
 }
 
-/// Convert a `serde_json::Value` back to `crate::value::Value`.
-fn json_to_cell(v: &Value) -> crate::value::Value {
-    match v {
-        Value::Null => crate::value::Value::Null,
-        Value::Bool(b) => crate::value::Value::Boolean(*b),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                crate::value::Value::Integer(i)
-            } else {
-                crate::value::Value::Float(n.as_f64().unwrap_or(0.0))
-            }
-        }
-        Value::String(s) => crate::value::Value::String(s.clone()),
-        Value::Array(arr) => crate::value::Value::Array(arr.iter().map(json_to_cell).collect()),
-        Value::Object(obj) => {
-            // Stringify objects (shouldn't normally happen).
-            crate::value::Value::String(Value::Object(obj.clone()).to_string())
-        }
-    }
-}
-
 /// Run pass-through stages on each event.
-fn apply_pass_through(
-    stages: &mut [CompiledStage],
-    events: Vec<Map<String, Value>>,
-) -> Vec<Map<String, Value>> {
+fn apply_pass_through(stages: &mut [CompiledStage], events: Vec<Row>) -> Vec<Row> {
     let mut output = Vec::new();
     'event: for mut event in events {
         for stage in stages.iter_mut() {
@@ -178,8 +192,8 @@ fn apply_aggregate(
     pre_stages: &mut [CompiledStage],
     aggregation: &mut stream::CompiledAggregation,
     post_stages: &mut [CompiledStage],
-    events: Vec<Map<String, Value>>,
-) -> Vec<Map<String, Value>> {
+    events: Vec<Row>,
+) -> Vec<Row> {
     // Feed events through pre-stages into the aggregation.
     'event: for mut event in events {
         for stage in pre_stages.iter_mut() {
@@ -214,10 +228,7 @@ fn apply_aggregate(
 ///
 /// Sort is rejected by the streaming compiler (contradicts arrival order)
 /// but is valid in batch post-processing.
-fn apply_sorts(
-    mut events: Vec<Map<String, Value>>,
-    sort_stages: &[Spanned<PipeStage>],
-) -> Vec<Map<String, Value>> {
+fn apply_sorts(mut events: Vec<Row>, sort_stages: &[Spanned<PipeStage>]) -> Vec<Row> {
     for stage in sort_stages {
         if let PipeStage::Sort(sort) = &stage.node {
             events.sort_by(|a, b| {
@@ -225,7 +236,7 @@ fn apply_sorts(
                     let key = field.field.as_str();
                     let va = a.get(key);
                     let vb = b.get(key);
-                    let cmp = compare_json_values(va, vb);
+                    let cmp = compare_cells(va, vb);
                     let cmp = match field.direction {
                         SortDirection::Asc => cmp,
                         SortDirection::Desc => cmp.reverse(),
@@ -241,39 +252,39 @@ fn apply_sorts(
     events
 }
 
-/// Compare two optional JSON values for sorting purposes.
+/// Compare two optional cells for sorting purposes.
 ///
-/// NULLs sort last. Numbers compare numerically. Everything else compares
-/// as strings.
-fn compare_json_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+/// NULLs sort last. Two numbers compare numerically, through the one
+/// probed DOUBLE order (`compare::double_total_cmp`) rather than
+/// `partial_cmp(…).unwrap_or(Equal)`, which left a NaN wherever arrival
+/// order happened to put it. Everything else compares as the text the
+/// cell shows (`row::cell_text`, the same renderer the live lane groups
+/// by).
+fn compare_cells(a: Option<&EvalValue>, b: Option<&EvalValue>) -> std::cmp::Ordering {
     match (a, b) {
-        (None | Some(Value::Null), None | Some(Value::Null)) => std::cmp::Ordering::Equal,
-        (None | Some(Value::Null), _) => std::cmp::Ordering::Greater, // NULLs last
-        (_, None | Some(Value::Null)) => std::cmp::Ordering::Less,
+        (None | Some(EvalValue::Null), None | Some(EvalValue::Null)) => std::cmp::Ordering::Equal,
+        (None | Some(EvalValue::Null), _) => std::cmp::Ordering::Greater, // NULLs last
+        (_, None | Some(EvalValue::Null)) => std::cmp::Ordering::Less,
         (Some(a), Some(b)) => {
             // Try numeric comparison first.
-            if let (Some(na), Some(nb)) = (as_f64(a), as_f64(b)) {
-                return na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal);
+            if let (Some(na), Some(nb)) = (numeric_cell(a), numeric_cell(b)) {
+                return trawl_core::compare::double_total_cmp(na, nb);
             }
-            // Fall back to string comparison.
-            let sa = value_to_sort_string(a);
-            let sb = value_to_sort_string(b);
-            sa.cmp(&sb)
+            // Fall back to the cell's own text.
+            row::cell_text(a).cmp(&row::cell_text(b))
         }
     }
 }
 
-fn as_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Number(n) => n.as_f64(),
+/// The numeric reading a sort takes — numbers only, exactly as the JSON
+/// form read only `Value::Number`.
+#[allow(clippy::cast_precision_loss)]
+fn numeric_cell(cell: &EvalValue) -> Option<f64> {
+    match cell {
+        EvalValue::Int(i) => Some(*i as f64),
+        EvalValue::UInt(u) => Some(*u as f64),
+        EvalValue::Float(f) => Some(*f),
         _ => None,
-    }
-}
-
-fn value_to_sort_string(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
     }
 }
 
@@ -296,6 +307,68 @@ mod tests {
                 .collect(),
             rows,
         }
+    }
+
+    /// The bridge is an identity on every cell shape a result can hold —
+    /// specials included, which is the whole point: the JSON hop this
+    /// replaced turned `inf` and `NaN` into NULL on the way in.
+    #[test]
+    fn the_bridge_round_trips_every_cell_shape() {
+        let cells = [
+            crate::value::Value::Null,
+            crate::value::Value::Boolean(true),
+            crate::value::Value::Boolean(false),
+            crate::value::Value::Integer(i64::MIN),
+            crate::value::Value::Integer(0),
+            crate::value::Value::Integer(i64::MAX),
+            crate::value::Value::Float(1.5),
+            crate::value::Value::Float(-0.0),
+            crate::value::Value::Float(f64::INFINITY),
+            crate::value::Value::Float(f64::NEG_INFINITY),
+            crate::value::Value::Float(f64::NAN),
+            crate::value::Value::Float(-f64::NAN),
+            crate::value::Value::String(String::new()),
+            crate::value::Value::String("nginx".into()),
+            crate::value::Value::Array(vec![
+                crate::value::Value::Integer(1),
+                crate::value::Value::Float(f64::INFINITY),
+                crate::value::Value::String("x".into()),
+            ]),
+        ];
+        for cell in cells {
+            let round_tripped = eval_to_cell(&cell_to_eval(&cell));
+            match (&cell, &round_tripped) {
+                // NaN is never equal to itself, so the pair is compared
+                // BITWISE — sign bit included, since DuckDB renders it.
+                (crate::value::Value::Float(a), crate::value::Value::Float(b)) => {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{cell:?}");
+                }
+                _ => assert_eq!(cell, round_tripped, "{cell:?}"),
+            }
+        }
+    }
+
+    /// A `Timestamp` cell — the one shape with no result-side twin —
+    /// lands as the STRING the shift machinery re-parses after the tail.
+    #[test]
+    fn a_timestamp_cell_leaves_the_bridge_as_text() {
+        let ts = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap();
+        assert_eq!(
+            eval_to_cell(&EvalValue::Timestamp(trawl_core::compare::Instant::At(ts))),
+            crate::value::Value::String("2026-01-15 09:00:00".into())
+        );
+        // An infinity crosses as its WORD — a text the display-offset
+        // shift leaves alone (it re-parses only its own rendering), so a
+        // computed infinity survives a shifted run unchanged.
+        assert_eq!(
+            eval_to_cell(&EvalValue::Timestamp(
+                trawl_core::compare::Instant::Infinity
+            )),
+            crate::value::Value::String("infinity".into())
+        );
     }
 
     #[test]

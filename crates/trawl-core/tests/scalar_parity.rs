@@ -67,12 +67,9 @@ const TS_VALS: &[&str] = &[
 
 // Date/time unit allowlists are imported from the emitter (see `use` above) so
 // the generator can never silently drift from the real allowlist: if the
-// emitter grows a unit, this test exercises it automatically. `date_part`'s
-// "epoch" is filtered out at generation time because eval and DuckDB round the
-// same instant to ADJACENT f64 values — nothing to do with text any more, the
-// harness compares owned `DuckValue`s. The divergence is pinned, not hidden, by
-// `current_date_part_epoch_precision_is_pinned_child_105` — see
-// `random_date_part`.
+// emitter grows a unit, this test exercises it automatically — `date_part`'s
+// `epoch` included, since #105 gave that reading one probe-pinned owner and
+// the two lanes stopped rounding the same instant to adjacent f64 values.
 
 // Include non-ASCII values so the parity harness exercises byte-vs-character
 // divergence in scalar fns like length() (DuckDB LENGTH counts characters).
@@ -152,6 +149,8 @@ const FLOAT_LITS: &[&str] = &[
 
 const SCALAR_FAMILY_ARMS: usize = 15;
 const STRING_FN_ARMS: usize = 8;
+const TYPEOF_ARG_ARMS: usize = 4;
+const NUMERIC_ARG_ARMS: usize = 2;
 const SEV_ARG_ARMS: usize = 5;
 const SEV_DIALECT_ARMS: usize = 3;
 const CONCAT_ARG_ARMS: usize = 3;
@@ -162,7 +161,9 @@ const STRPTIME_SHAPE_ARMS: usize = 4;
 const REQUIRED_SELECTOR_ARMS: &[(&str, usize, usize)] = &[
     ("random_scalar_expr family", SCALAR_FAMILY_ARMS, 15),
     ("random_string_fn", STRING_FN_ARMS, 8),
-    ("random_numeric_fn", NUMERIC_FN_ARMS, 2),
+    ("random_numeric_fn", NUMERIC_FN_ARMS, 4),
+    ("random_numeric_fn argument", NUMERIC_ARG_ARMS, 2),
+    ("random_typeof argument", TYPEOF_ARG_ARMS, 4),
     ("random_sev argument", SEV_ARG_ARMS, 5),
     ("random_sev dialect", SEV_DIALECT_ARMS, 3),
     ("random_concat argument", CONCAT_ARG_ARMS, 3),
@@ -211,6 +212,10 @@ const REQUIRED_GENERATOR_ARMS: &[&str] = &[
     "date_part",
     "date_trunc",
     "numeric_fn/abs",
+    "numeric_fn/arg_float",
+    "numeric_fn/arg_int",
+    "numeric_fn/ceil",
+    "numeric_fn/floor",
     "numeric_fn/round",
     "sev/arg_field_level",
     "sev/arg_field_sev_num",
@@ -239,20 +244,25 @@ const REQUIRED_GENERATOR_ARMS: &[&str] = &[
     "tostring/float",
     "tostring/int",
     "typeof",
+    "typeof/arg_bool",
+    "typeof/arg_float",
+    "typeof/arg_int",
+    "typeof/arg_string",
 ];
 
 /// Every scalar function `random_scalar_expr` can put at the HEAD of a
 /// generated expression — the THIRD projection, read off the emitted text
-/// rather than off an arm's self-reported label. `ceil`/`floor` are absent on
-/// purpose — see [`NUMERIC_FN_ARMS`].
+/// rather than off an arm's self-reported label.
 const REQUIRED_RANDOM_CALL_NAMES: &[&str] = &[
     "abs",
+    "ceil",
     "coalesce",
     "concat",
     "contains",
     "date_diff",
     "date_part",
     "date_trunc",
+    "floor",
     "if",
     "length",
     "lower",
@@ -350,22 +360,30 @@ fn random_string_fn(rng: &mut Rng) -> Generated {
 
 /// Arm count of `random_numeric_fn`'s selector.
 ///
-/// `ceil`/`floor` are DELIBERATELY absent, and this is the only place that says
-/// so. Over an INTEGER argument they are a LIVE divergence — eval answers
-/// `Int(5)` while `DuckDB` answers `DOUBLE 5.0` (`typeof(ceil(5))` is DOUBLE,
-/// `typeof(round(5))` is BIGINT) — so generating them would turn the property
-/// loop red. The divergence is PINNED rather than skipped, by
-/// `current_ceil_floor_and_round_types_are_pinned_child_105`; when #105 fixes
-/// the return types, restore both arms and set this back to 4.
-const NUMERIC_FN_ARMS: usize = 2;
+/// All four are generated, over BOTH argument kinds. `ceil`/`floor` were
+/// excluded while eval answered `Int(5)` where `DuckDB` answers `DOUBLE 5.0`;
+/// #105 gave them `DuckDB`'s argument-driven return type
+/// (`ceil_floor_and_round_split_their_return_type_on_the_argument_type` in
+/// `trawl-engine/tests/duckdb_probe.rs`), so the exclusion is gone rather than
+/// re-pinned. `round` keeps a BIGINT argument integral and agrees too, which is
+/// why the argument kind is an INDEPENDENT draw with its own label — dropping
+/// float or integer coverage from any of the four has to be visible on its own.
+const NUMERIC_FN_ARMS: usize = 4;
 
 fn random_numeric_fn(rng: &mut Rng) -> Generated {
-    let i = int_lit(rng);
-    match rng.range(NUMERIC_FN_ARMS) {
-        0 => Generated::new("numeric_fn/abs", format!("abs({i})")),
-        1 => Generated::new("numeric_fn/round", format!("round({i})")),
+    let (arg_arm, argument) = if rng.range(NUMERIC_ARG_ARMS) == 0 {
+        ("numeric_fn/arg_int", int_lit(rng))
+    } else {
+        ("numeric_fn/arg_float", float_lit(rng))
+    };
+    let (arm, expression) = match rng.range(NUMERIC_FN_ARMS) {
+        0 => ("numeric_fn/abs", format!("abs({argument})")),
+        1 => ("numeric_fn/round", format!("round({argument})")),
+        2 => ("numeric_fn/ceil", format!("ceil({argument})")),
+        3 => ("numeric_fn/floor", format!("floor({argument})")),
         _ => unreachable!(),
-    }
+    };
+    Generated::new(arm, expression).and(arg_arm)
 }
 
 fn random_conditional(rng: &mut Rng) -> Generated {
@@ -380,14 +398,11 @@ fn random_conditional(rng: &mut Rng) -> Generated {
 }
 
 fn random_date_part(rng: &mut Rng) -> Generated {
-    // Exclude "epoch": eval and DuckDB round the same instant to adjacent f64
-    // values (a value-domain divergence, not a rendering one — the harness
-    // stopped comparing through text), pinned by
-    // `current_date_part_epoch_precision_is_pinned_child_105`. Everything else
-    // in the emitter allowlist is fair game, so a newly-added unit flows in
-    // here without a test edit.
-    let units: Vec<&&str> = DATE_PART_UNITS.iter().filter(|u| **u != "epoch").collect();
-    let unit = rng.pick(&units);
+    // Every unit in the emitter allowlist, `epoch` included: it was
+    // excluded while the two lanes rounded the same instant to adjacent
+    // doubles, and #105 gave the reading one probe-pinned owner. A
+    // newly-added unit flows in here without a test edit.
+    let unit = rng.pick(DATE_PART_UNITS);
     let ts = ts_lit(rng);
     Generated::new("date_part", format!("date_part(\"{unit}\", {ts})"))
 }
@@ -560,12 +575,29 @@ fn random_sev(rng: &mut Rng) -> Generated {
     Generated::new(arg_arm, expression).and(dialect_arm)
 }
 
+/// `typeof(x)` over every literal shape the emitter BINDS.
+///
+/// Strings were once the only shape here, because eval spelled an integer
+/// `INTEGER` where the bound literal arrives as BIGINT; #105 moved eval onto
+/// the bound spelling, so the exclusion is gone. The two shapes that still
+/// diverge — the NULL type and a list — are NOT bound literals and are pinned
+/// by `current_typeof_null_and_list_spellings_are_pinned`.
 fn random_typeof(rng: &mut Rng) -> Generated {
-    // typeof on strings only: DuckDB returns BIGINT for integer literals (it
-    // widens all integer literals to BIGINT) while eval returns INTEGER.
-    // This is a documented eval/DuckDB divergence for typeof — only test
-    // varchar inputs where both agree on "VARCHAR".
-    Generated::new("typeof", format!("typeof({})", str_lit(rng)))
+    let (arg_arm, argument) = match rng.range(TYPEOF_ARG_ARMS) {
+        0 => ("typeof/arg_string", str_lit(rng)),
+        1 => ("typeof/arg_int", int_lit(rng)),
+        2 => ("typeof/arg_float", float_lit(rng)),
+        3 => (
+            "typeof/arg_bool",
+            if rng.bool() { "true" } else { "false" }.to_string(),
+        ),
+        _ => unreachable!(),
+    };
+    // The BRANCH keeps its original label and the argument kind is a
+    // second, independent one (`sev` and `concat`'s idiom): the manifest
+    // only ever grows, so a reader can tell "this arm was deleted" from
+    // "this arm gained an axis" by looking at it.
+    Generated::new("typeof", format!("typeof({argument})")).and(arg_arm)
 }
 
 fn random_coalesce(rng: &mut Rng) -> Generated {
@@ -709,7 +741,7 @@ fn eval_scalar(dsl: &str, event: &Map<String, Value>) -> EvalValue {
         .assignments
         .first()
         .unwrap_or_else(|| panic!("generated scalar query has no assignment: {dsl:?}"));
-    eval_expr(expr, event)
+    eval_expr(expr, &trawl_core::row::from_json(event))
 }
 
 /// Run a `let x = <expr>` query and return the outcome of the computed `x`
@@ -827,6 +859,11 @@ fn logical_type_matches(eval: &EvalValue, sql: &Type) -> bool {
                 | Type::UInt
                 | Type::UBigInt
         ),
+        // A cell above `i64::MAX`. No generated scalar produces one —
+        // the fixture carries no such field and no expression mints one —
+        // but the match is total by design, and the shapes DuckDB would
+        // answer with are the unsigned ones.
+        EvalValue::UInt(_) => matches!(sql, Type::UBigInt | Type::HugeInt),
         EvalValue::Float(_) => matches!(sql, Type::Float | Type::Double),
         EvalValue::Str(_) => matches!(sql, Type::Text),
         EvalValue::Array(_) => matches!(sql, Type::List(_) | Type::Array(_, _)),
@@ -849,17 +886,39 @@ fn integer_value(value: &DuckValue) -> Option<i64> {
     }
 }
 
+/// An instant as the MICROSECOND count duckdb-rs hands back for it.
+///
+/// The two infinities come back as i64 sentinels rather than as counts —
+/// `i64::MAX`, and `-i64::MAX` for the negative one, which is NOT
+/// `i64::MIN` (probed: `an_infinity_timestamp_cell_is_an_i64_sentinel`).
+/// A finite instant must be a whole number of microseconds, exactly as
+/// the retired matcher required, so a sub-microsecond eval value still
+/// fails rather than being rounded into agreement.
+fn timestamp_micros(instant: trawl_core::compare::Instant) -> Option<i64> {
+    match instant {
+        trawl_core::compare::Instant::Infinity => Some(i64::MAX),
+        trawl_core::compare::Instant::NegInfinity => Some(-i64::MAX),
+        trawl_core::compare::Instant::At(at) => {
+            let utc = at.and_utc();
+            utc.timestamp_subsec_nanos()
+                .is_multiple_of(1_000)
+                .then(|| utc.timestamp_micros())
+        }
+    }
+}
+
 fn scalar_values_match(eval: &EvalValue, sql: &DuckValue) -> bool {
     match (eval, sql) {
         (EvalValue::Null, DuckValue::Null) => true,
         (EvalValue::Bool(a), DuckValue::Boolean(b)) => a == b,
         (EvalValue::Int(a), value) => integer_value(value) == Some(*a),
+        (EvalValue::UInt(a), DuckValue::UBigInt(b)) => a == b,
+        (EvalValue::UInt(a), DuckValue::HugeInt(b)) => i128::from(*a) == *b,
         (EvalValue::Float(a), DuckValue::Float(b)) => a.to_bits() == f64::from(*b).to_bits(),
         (EvalValue::Float(a), DuckValue::Double(b)) => a.to_bits() == b.to_bits(),
         (EvalValue::Str(a), DuckValue::Text(b)) => a == b,
         (EvalValue::Timestamp(a), DuckValue::Timestamp(unit, b)) => {
-            a.and_utc().timestamp_subsec_nanos().is_multiple_of(1_000)
-                && a.and_utc().timestamp_micros() == unit.to_micros(*b)
+            timestamp_micros(*a) == Some(unit.to_micros(*b))
         }
         (EvalValue::Array(a), DuckValue::List(b) | DuckValue::Array(b)) => {
             a.len() == b.len()
@@ -940,7 +999,7 @@ struct GeneratedCase {
 /// F1-style silent deletion. Equal `BTreeMap`s imply equal key sets, so this
 /// subsumes a separate family-name manifest; there is deliberately not one.
 const REQUIRED_FAMILY_CASE_COUNTS: &[(&str, usize)] = &[
-    ("operators", 22),
+    ("operators", 27),
     ("numeric", 7),
     ("coalesce", 5),
     ("conditional", 4),
@@ -949,7 +1008,7 @@ const REQUIRED_FAMILY_CASE_COUNTS: &[(&str, usize)] = &[
     ("timestamp_comparison", 4),
     ("json", 7),
     ("tonumber", 7),
-    ("tostring", 6),
+    ("tostring", 8),
 ];
 
 #[allow(clippy::too_many_lines)]
@@ -974,6 +1033,17 @@ fn generated_cases() -> Vec<GeneratedCase> {
             "1 + 2.5",
             "-5.0 / 2",
             "5 / 2.0",
+            // Integer TRUE division and its IEEE edges. `0 / 0` and
+            // `5 % 0.0` are deliberately absent: both are NaN, the matcher
+            // compares floats BIT-exactly, and a NaN's bit pattern is the
+            // platform's business. They are pinned by
+            // `division_by_zero_matches_duckdbs_ieee_answer` instead, which
+            // compares the RENDERED value.
+            "5 / 2",
+            "-5 / 2",
+            "1 / 0",
+            "-1 / 0",
+            "5 % 0",
             "-5 % 2",
             "5 % -2",
             "-5 % -2",
@@ -1085,6 +1155,13 @@ fn generated_cases() -> Vec<GeneratedCase> {
             "tostring(-1.5)",
             r#"tostring("text")"#,
             r#"tostring(strptime("2024-12-30 23:05:07", "%Y-%m-%d %H:%M:%S"))"#,
+            // A NaN renders with its SIGN. Read through `tonumber`, whose
+            // cast domain (`compare::try_cast_double`, and TRY_CAST in
+            // batch) carries the sign from the TEXT — deliberately not
+            // `tostring(0 / 0)`, whose computed NaN takes its sign from
+            // the hardware and would pin this platform.
+            r#"tostring(tonumber("nan"))"#,
+            r#"tostring(tonumber("-nan"))"#,
         ],
     );
     cases
@@ -1109,10 +1186,10 @@ fn timestamp_comparison_is_microsecond_exact() {
     use chrono::NaiveDateTime;
     use duckdb::types::TimeUnit;
 
-    let eval = EvalValue::Timestamp(
+    let eval = EvalValue::Timestamp(trawl_core::compare::Instant::At(
         NaiveDateTime::parse_from_str("2026-01-15 10:20:30.000001", "%Y-%m-%d %H:%M:%S%.f")
             .unwrap(),
-    );
+    ));
     let sql = SqlCell {
         logical_type: Type::Timestamp,
         value: DuckValue::Timestamp(
@@ -1230,33 +1307,65 @@ fn generated_scalar_families_are_complete_and_match() {
 }
 
 #[test]
-fn current_second_timestamp_parser_accepts_nondigit_offset_child_105() {
-    // #105 deletes eval's second timestamp parser in favour of the probed owner.
+fn a_malformed_offset_has_no_timestamp_reading() {
+    // Flipped from
+    // `current_second_timestamp_parser_accepts_nondigit_offset_child_105`
+    // (#105). eval's own parser STRIPPED a trailing offset without
+    // validating it, so `+ab:cd` compared equal to the same instant
+    // without it; the probe-pinned owner (`compare::literal_timestamp`,
+    // the TRY_CAST a bound string gets) has no reading for it, and the
+    // batch lane errors — so the streaming answer is NULL, which is the
+    // ratified rule and what `assert_parity_case` asserts.
     let conn = utc_connection();
     let event = fixed_event();
-    let dsl = r#"* | let x = strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30+ab:cd""#;
-    assert_eq!(eval_scalar(dsl, &event), EvalValue::Bool(true));
-    assert_sql_errored(
-        &sql_scalar_result(&conn, dsl, &event),
-        r#""2026-01-15 10:20:30+ab:cd" has a timestamp that is not UTC"#,
-        dsl,
-    );
+    for offset in ["+ab:cd", "+5:30"] {
+        let dsl = format!(
+            r#"* | let x = strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30{offset}""#
+        );
+        // Stated as the errored/null SHAPE, not through
+        // [`assert_parity_case`]: that helper answers `None` for an
+        // AGREEMENT too, so it would stay green the day a malformed
+        // offset gained a reading in both lanes — which is the whole
+        // claim under test.
+        assert_eq!(
+            eval_scalar(&dsl, &event),
+            EvalValue::Null,
+            "streaming eval must null where batch errors for {dsl:?}"
+        );
+        let expected = format!(r#""2026-01-15 10:20:30{offset}" has a timestamp that is not UTC"#);
+        assert_sql_errored(&sql_scalar_result(&conn, &dsl, &event), &expected, &dsl);
+    }
 }
 
 #[test]
-fn current_timestamp_lexical_fallback_is_pinned_both_orders_child_105() {
-    // #105 withdraws the lexical fallback; failed coercion becomes NULL.
+fn a_failed_timestamp_coercion_is_null_in_both_operand_orders() {
+    // Flipped from
+    // `current_timestamp_lexical_fallback_is_pinned_both_orders_child_105`
+    // (#105, ADR-0017 §2). Comparing an instant against a text with no
+    // reading fell back to LEXICAL string ordering — an order DuckDB
+    // does not have, which inverted under `NOT` and depended on whether
+    // the other operand happened to parse. It is UNKNOWN now, in both
+    // operand orders, which is what the batch error implies.
     let conn = utc_connection();
     let event = fixed_event();
-    for dsl in [
-        r#"* | let x = strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") < "zzz""#,
-        r#"* | let x = "zzz" > strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S")"#,
+    for expression in [
+        r#"strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") < "zzz""#,
+        r#""zzz" > strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S")"#,
+        r#"strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "zzz""#,
     ] {
-        assert_eq!(eval_scalar(dsl, &event), EvalValue::Bool(true));
+        // Same reason as the sibling above: the errored/null shape is
+        // asserted directly, because [`assert_parity_case`] cannot tell
+        // it from two lanes AGREEING on an answer.
+        let dsl = format!("* | let x = {expression}");
+        assert_eq!(
+            eval_scalar(&dsl, &event),
+            EvalValue::Null,
+            "streaming eval must null where batch errors for {dsl:?}"
+        );
         assert_sql_errored(
-            &sql_scalar_result(&conn, dsl, &event),
+            &sql_scalar_result(&conn, &dsl, &event),
             r#"invalid timestamp field format: "zzz""#,
-            dsl,
+            &dsl,
         );
     }
 }
@@ -1326,170 +1435,225 @@ fn current_now_is_sampled_per_call_child_106() {
 }
 
 #[test]
-fn current_tonumber_bool_is_null_child_105() {
-    // #105 makes tonumber(bool) mirror DuckDB's TRY_CAST.
+fn tonumber_reads_a_boolean_the_way_try_cast_double_does() {
+    // Flipped from `current_tonumber_bool_is_null_child_105` (#105): a boolean
+    // HAS a DOUBLE reading, probed by `a_boolean_casts_to_double_as_one_and_zero`
+    // in `trawl-engine/tests/duckdb_probe.rs`. It is now plain agreement, so it
+    // is asserted through the one contract implementation.
     let conn = utc_connection();
     let event = fixed_event();
-    let dsl = "* | let x = tonumber(true)";
-    assert_eq!(eval_scalar(dsl, &event), EvalValue::Null);
-    assert_eq!(
-        sql_scalar_result(&conn, dsl, &event),
-        SqlOutcome::Value(SqlCell {
-            logical_type: Type::Double,
-            value: DuckValue::Double(1.0),
-        })
-    );
-}
-
-#[test]
-fn current_integer_division_truncates_child_105() {
-    // #105 changes Int/Int division to DuckDB true division.
-    let conn = utc_connection();
-    let event = fixed_event();
-    for (dsl, eval, sql) in [
-        ("* | let x = 5 / 2", 2, 2.5),
-        ("* | let x = -5 / 2", -2, -2.5),
-    ] {
-        assert_eq!(eval_scalar(dsl, &event), EvalValue::Int(eval));
+    for expression in ["tonumber(true)", "tonumber(false)"] {
         assert_eq!(
-            sql_scalar_result(&conn, dsl, &event),
-            SqlOutcome::Value(SqlCell {
-                logical_type: Type::Double,
-                value: DuckValue::Double(sql),
-            })
+            assert_parity_case(&conn, &event, "tonumber over a boolean", expression),
+            None
         );
     }
 }
 
 #[test]
-fn current_integer_overflow_panics_or_wraps_child_105() {
-    // #105 makes every integer arithmetic overflow yield NULL in every build profile.
+fn integer_division_is_true_division_like_duckdb() {
+    // Flipped from `current_integer_division_truncates_child_105` (#105).
+    // `/` has no integer form: both operands go through DOUBLE, so the last
+    // row — a dividend above 2^53 — comes back ROUNDED in both lanes rather
+    // than exact in one of them
+    // (`integer_division_is_true_division_through_double`).
     let conn = utc_connection();
     let event = fixed_event();
-    for (dsl, release_wrap, duckdb_error) in [
+    for expression in [
+        "5 / 2",
+        "-5 / 2",
+        "4 / 2",
+        "9007199254740993 / 1",
+        "status / 3",
+    ] {
+        assert_eq!(
+            assert_parity_case(&conn, &event, "integer true division", expression),
+            None
+        );
+    }
+}
+
+#[test]
+fn integer_overflow_nulls_where_duckdb_errors() {
+    // Flipped from `current_integer_overflow_panics_or_wraps_child_105`
+    // (#105) — and it keeps the errored/null SHAPE, because that is the
+    // deliberate carve-out rather than an agreement: DuckDB raises
+    // `Out of Range Error` (probed:
+    // `integer_arithmetic_overflow_is_an_error_never_a_wrap`), a streaming
+    // lane cannot raise a per-event error, so the ratified rule applies and
+    // eval NULLS — in every build profile, where it used to panic in debug
+    // and wrap in release.
+    let conn = utc_connection();
+    let event = fixed_event();
+    for (dsl, duckdb_error) in [
         (
             "* | let x = 9223372036854775807 + 1",
-            i64::MIN,
             "Overflow in addition of INT64",
         ),
         (
             "* | let x = -9223372036854775807 - 2",
-            i64::MAX,
             "Overflow in subtraction of INT64",
         ),
         (
             "* | let x = 9223372036854775807 * 2",
-            -2,
             "Overflow in multiplication of INT64",
         ),
+        // The one remainder with no integer answer. DuckDB calls it a
+        // DIVISION overflow; `/` over the same pair is an ordinary DOUBLE.
+        (
+            "* | let x = (-9223372036854775807 - 1) % -1",
+            "Overflow in division of",
+        ),
     ] {
-        let eval = std::panic::catch_unwind(|| eval_scalar(dsl, &event));
-        if cfg!(debug_assertions) {
-            assert!(
-                eval.is_err(),
-                "debug eval must expose today's overflow panic for {dsl:?}"
-            );
-        } else {
-            assert_eq!(eval.unwrap(), EvalValue::Int(release_wrap));
-        }
+        assert_eq!(
+            eval_scalar(dsl, &event),
+            EvalValue::Null,
+            "streaming eval must null where batch errors for {dsl:?}"
+        );
         assert_sql_errored(&sql_scalar_result(&conn, dsl, &event), duckdb_error, dsl);
     }
 }
 
 #[test]
-fn current_string_truthiness_is_pinned_child_105() {
-    // #105 adopts DuckDB's boolean condition domain.
+fn an_if_or_case_condition_takes_duckdbs_boolean_domain() {
+    // Flipped from `current_string_truthiness_is_pinned_child_105` (#105).
+    // Both halves are agreement now, and both go through the ONE contract
+    // implementation: a readable condition picks the same branch in both
+    // lanes, and an unreadable one — where DuckDB raises a Conversion error
+    // — nulls in streaming instead of silently taking a branch. The domain
+    // is probed by `an_if_condition_is_a_boolean_cast_not_truthiness`.
     let conn = utc_connection();
     let event = fixed_event();
     for function in ["if", "case"] {
-        let dsl = if function == "if" {
-            r#"* | let x = if("nonempty", 1, 2)"#
-        } else {
-            r#"* | let x = case("nonempty", 1, 2)"#
-        };
-        assert_eq!(eval_scalar(dsl, &event), EvalValue::Int(1));
-        assert_sql_errored(
-            &sql_scalar_result(&conn, dsl, &event),
-            "Could not convert string 'nonempty' to BOOL",
-            dsl,
-        );
+        for condition in [
+            // The readable vocabulary.
+            r#""true""#,
+            r#""TRUE""#,
+            r#""t""#,
+            r#""yes""#,
+            r#""1""#,
+            // Read as FALSE — truthiness used to take the THEN branch.
+            r#""0""#,
+            r#""no""#,
+            // No boolean reading at all: batch errors, streaming nulls.
+            r#""nonempty""#,
+            r#"" true ""#,
+            r#""""#,
+            r#""2""#,
+            // Non-string conditions, including the columns the fixture
+            // carries: `service` is a VARCHAR holding 'nginx' (no reading),
+            // `status` a BIGINT (non-zero, so true).
+            "0",
+            "1",
+            "-1",
+            "0.0",
+            "1.5",
+            "true",
+            "false",
+            "null",
+            "service",
+            "status",
+            r#"strptime("2024-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")"#,
+        ] {
+            assert_eq!(
+                assert_parity_case(
+                    &conn,
+                    &event,
+                    function,
+                    &format!("{function}({condition}, 1, 2)")
+                ),
+                None
+            );
+        }
     }
-}
 
-#[test]
-fn current_ceil_floor_and_round_types_are_pinned_child_105() {
-    // #105 makes these return DuckDB's DOUBLE shape for DOUBLE inputs.
-    let conn = utc_connection();
-    let event = fixed_event();
-    for (dsl, eval, sql) in [
-        ("* | let x = ceil(-1.5)", -1, -1.0),
-        ("* | let x = floor(-1.5)", -2, -2.0),
-        ("* | let x = ceil(0.0)", 0, 0.0),
-        ("* | let x = floor(0.0)", 0, 0.0),
-        ("* | let x = round(-1.5)", -2, -2.0),
-        // INTEGER inputs — ADR-0017 §5 names them explicitly. `typeof(ceil(5))`
-        // is DOUBLE while `typeof(round(5))` is BIGINT, so ceil/floor diverge
-        // over an integer argument and round does not. That asymmetry is why
-        // `random_numeric_fn` may still generate `round` and may NOT generate
-        // `ceil`/`floor` (see NUMERIC_FN_ARMS) — the exclusion is pinned here,
-        // not skipped there.
-        ("* | let x = ceil(5)", 5, 5.0),
-        ("* | let x = ceil(-5)", -5, -5.0),
-        ("* | let x = floor(5)", 5, 5.0),
-        ("* | let x = floor(-5)", -5, -5.0),
+    // Arm ORDER: an unreadable condition is not "this arm does not match",
+    // and an earlier match means it is never read.
+    for expression in [
+        r#"case(true, 1, "nonempty", 2, 3)"#,
+        r#"case(false, 1, "nonempty", 2, 3)"#,
+        r#"case(null, 1, "nonempty", 2, 3)"#,
+        r#"case("nonempty", 1, true, 2, 3)"#,
     ] {
-        assert_eq!(eval_scalar(dsl, &event), EvalValue::Int(eval));
         assert_eq!(
-            sql_scalar_result(&conn, dsl, &event),
-            SqlOutcome::Value(SqlCell {
-                logical_type: Type::Double,
-                value: DuckValue::Double(sql),
-            })
+            assert_parity_case(&conn, &event, "case arm order", expression),
+            None
         );
     }
-
-    // The contrast, and the reason `round` stays in the random generator:
-    // `round` over an INTEGER already AGREES (BIGINT on both sides), so #105
-    // must leave it alone.
-    assert_eq!(
-        assert_parity_case(&conn, &event, "numeric round over integer", "round(5)"),
-        None
-    );
 }
 
 #[test]
-fn current_division_by_zero_diverges_child_105() {
-    // #105 owns the division value domain, and its scope text currently claims
-    // division by zero is NULL in BOTH lanes. It is not. Measured today: eval
-    // nulls every division by zero, while DuckDB's `/` promotes to DOUBLE and
-    // answers an IEEE special. Codifying the scope text would be a THIRD
-    // semantics, which ADR-0017 §4 forbids — these are the values to fix
-    // toward.
+fn ceil_floor_and_round_return_duckdbs_argument_driven_shapes() {
+    // Flipped from `current_ceil_floor_and_round_types_are_pinned_child_105`
+    // (#105). `CEIL`/`FLOOR` widen a BIGINT argument to DOUBLE while `ROUND`
+    // keeps it integral — the asymmetry is DuckDB's, probed by
+    // `ceil_floor_and_round_split_their_return_type_on_the_argument_type`, and
+    // it is why round's integer arm was left alone. With eval matching, all
+    // four scalars are generated again over both argument kinds
+    // (NUMERIC_FN_ARMS), so this test holds the SHAPES the generator's random
+    // draw does not name.
     let conn = utc_connection();
     let event = fixed_event();
-    for (dsl, sql) in [
+    for expression in [
+        "ceil(-1.5)",
+        "floor(-1.5)",
+        "ceil(0.0)",
+        "floor(0.0)",
+        "round(-1.5)",
+        // INTEGER arguments — the asymmetric half.
+        "ceil(5)",
+        "ceil(-5)",
+        "floor(5)",
+        "floor(-5)",
+        "round(5)",
+        "round(0)",
+        // An EXPLICIT zero precision takes the same DOUBLE arm as no
+        // precision at all.
+        "round(1.5, 0)",
+        "round(2.5, 0)",
+    ] {
+        assert_eq!(
+            assert_parity_case(&conn, &event, "numeric rounding shape", expression),
+            None
+        );
+    }
+}
+
+#[test]
+fn division_by_zero_matches_duckdbs_ieee_answer() {
+    // Flipped from `current_division_by_zero_diverges_child_105` (#105). Both
+    // lanes now answer the IEEE special DuckDB does — eval used to null every
+    // one of them — while INTEGER `%` 0 stays NULL on both sides.
+    let conn = utc_connection();
+    let event = fixed_event();
+    for (dsl, want) in [
         ("* | let x = 1 / 0", "inf"),
         ("* | let x = -1 / 0", "-inf"),
         ("* | let x = 0 / 0", "NaN"),
-        // Float `%` takes the same DOUBLE path as `/` — only the all-integer
-        // shape below agrees.
+        // A DOUBLE operand takes the IEEE path under `%` too — only the
+        // all-integer shape below is NULL.
         ("* | let x = 5 % 0.0", "NaN"),
+        ("* | let x = 5.0 % 0", "NaN"),
     ] {
-        assert_eq!(eval_scalar(dsl, &event), EvalValue::Null);
-        // Rendered, not compared: `NaN != NaN` under `DuckValue`'s `PartialEq`,
-        // so an `assert_eq!` against `DuckValue::Double(f64::NAN)` can never
-        // hold. `{}` on f64 gives exactly `inf` / `-inf` / `NaN`.
+        // Rendered, not compared: `NaN != NaN` under `PartialEq`, so an
+        // `assert_eq!` against a NaN can never hold and a bit-compare would
+        // pin the platform's NaN payload. `{}` on f64 gives exactly
+        // `inf` / `-inf` / `NaN` on both sides.
+        let EvalValue::Float(eval_value) = eval_scalar(dsl, &event) else {
+            panic!("expected a streaming DOUBLE for {dsl:?}");
+        };
+        assert_eq!(format!("{eval_value}"), want, "streaming, for {dsl:?}");
         match sql_scalar_result(&conn, dsl, &event) {
             SqlOutcome::Value(SqlCell {
                 logical_type: Type::Double,
                 value: DuckValue::Double(value),
-            }) => assert_eq!(format!("{value}"), sql, "for {dsl:?}"),
+            }) => assert_eq!(format!("{value}"), want, "batch, for {dsl:?}"),
             other => panic!("expected a DOUBLE result for {dsl:?}, got {other:?}"),
         }
     }
 
-    // The one AGREEING shape: INTEGER `%` 0 is NULL on both sides (a BIGINT
-    // column holding NULL), so #105 must not "fix" it into an IEEE special.
+    // INTEGER `%` 0 is NULL on both sides (a BIGINT column holding NULL) —
+    // the one shape that is NOT an IEEE special.
     let modulo = "* | let x = 5 % 0";
     assert_eq!(eval_scalar(modulo, &event), EvalValue::Null);
     assert_eq!(
@@ -1506,106 +1670,155 @@ fn current_division_by_zero_diverges_child_105() {
 }
 
 #[test]
-fn current_date_part_epoch_precision_is_pinned_child_105() {
-    // #105 owns the epoch value domain. The addition and division forms round
-    // this far instant to adjacent f64 values.
+fn the_epoch_reading_agrees_at_every_magnitude() {
+    // Flipped from `current_date_part_epoch_precision_is_pinned_child_105`
+    // (#105). The two lanes rounded the same instant to ADJACENT doubles,
+    // because eval summed seconds and a fraction where the engine divides
+    // one microsecond count once
+    // (`the_epoch_reading_is_the_micro_count_divided_once`). The far
+    // fixture is the case that exposed it: at that magnitude an f64 ulp
+    // spans 32 microseconds, so the engine's answer has no fraction left
+    // and the summed form invented `…799.00003`.
     let conn = utc_connection();
     let event = fixed_event();
-    let dsl = r#"* | let x = date_part("epoch", event_ts_far)"#;
-    let eval_rounded = 253_402_300_799.000_03;
-    let sql_rounded = 253_402_300_799.0;
-    assert_eq!(eval_scalar(dsl, &event), EvalValue::Float(eval_rounded));
-    assert_eq!(
-        sql_scalar_result(&conn, dsl, &event),
-        SqlOutcome::Value(SqlCell {
-            logical_type: Type::Double,
-            value: DuckValue::Double(sql_rounded),
-        })
-    );
-}
-
-#[test]
-fn current_typeof_integer_spelling_is_pinned_child_105() {
-    // #105 reconciles EvalValue::Int's INTEGER spelling with DuckDB BIGINT.
-    let conn = utc_connection();
-    let event = fixed_event();
-    let dsl = "* | let x = typeof(1)";
-    assert_eq!(
-        eval_scalar(dsl, &event),
-        EvalValue::Str("INTEGER".to_string())
-    );
-    assert_eq!(
-        sql_scalar_result(&conn, dsl, &event),
-        SqlOutcome::Value(SqlCell {
-            logical_type: Type::Text,
-            value: DuckValue::Text("BIGINT".to_string()),
-        })
-    );
-}
-
-#[test]
-fn hostile_timestamp_corpus_is_pinned_child_105() {
-    // #105 replaces all of these with the one probe-pinned timestamp domain.
-    let conn = utc_connection();
-    let event = fixed_event();
-    for (text, eval, sql) in [
-        ("+99:99", true, Ok(true)),
-        ("+5:30", false, Err("has a timestamp that is not UTC")),
-        ("+0530", false, Ok(true)),
-        ("Z", true, Ok(true)),
-        (" UTC", false, Ok(true)),
+    for expression in [
+        r#"date_part("epoch", event_ts_far)"#,
+        r#"date_part("epoch", event_ts)"#,
+        r#"date_part("epoch", strptime("1970-01-01 00:00:00", "%Y-%m-%d %H:%M:%S"))"#,
+        // Pre-1970, at second resolution. A FRACTIONAL pre-1970 instant
+        // is pinned bit-exactly by the probe instead: reaching one
+        // through `strptime` would exercise `%f`'s own divergence
+        // (chrono reads nanoseconds where DuckDB reads microseconds,
+        // pinned separately) rather than the epoch reading.
+        r#"date_part("epoch", strptime("1969-12-31 23:59:59", "%Y-%m-%d %H:%M:%S"))"#,
+        r#"date_part("epoch", strptime("0001-01-01 00:00:00", "%Y-%m-%d %H:%M:%S"))"#,
     ] {
-        let dsl = format!(
-            r#"* | let x = strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30{text}""#
-        );
-        assert_eq!(eval_scalar(&dsl, &event), EvalValue::Bool(eval));
-        let outcome = sql_scalar_result(&conn, &dsl, &event);
-        match sql {
-            Ok(value) => assert_eq!(
-                outcome,
-                SqlOutcome::Value(SqlCell {
-                    logical_type: Type::Boolean,
-                    value: DuckValue::Boolean(value),
-                })
-            ),
-            Err(duckdb_error) => assert_sql_errored(&outcome, duckdb_error, &dsl),
-        }
-    }
-    for (text, eval, sql) in [("epoch", false, true), ("infinity", false, false)] {
-        let base = if text == "epoch" {
-            "1970-01-01 00:00:00"
-        } else {
-            "2026-01-15 10:20:30"
-        };
-        let dsl = format!(r#"* | let x = strptime("{base}", "%Y-%m-%d %H:%M:%S") == "{text}""#);
-        assert_eq!(eval_scalar(&dsl, &event), EvalValue::Bool(eval));
         assert_eq!(
-            sql_scalar_result(&conn, &dsl, &event),
+            assert_parity_case(&conn, &event, "date_part epoch", expression),
+            None
+        );
+    }
+}
+
+#[test]
+fn typeof_spells_a_value_the_way_the_bound_literal_arrives() {
+    // Flipped from `current_typeof_integer_spelling_is_pinned_child_105`
+    // (#105). The emitter BINDS every literal, so an integer reaches DuckDB as
+    // BIGINT — `INTEGER` is what a literal written into the SQL text answers,
+    // which this lane never produces
+    // (`typeof_spells_a_bound_dsl_literal_by_its_bound_type`).
+    let conn = utc_connection();
+    let event = fixed_event();
+    for expression in [
+        "typeof(1)",
+        "typeof(-1)",
+        "typeof(1.5)",
+        "typeof(true)",
+        r#"typeof("x")"#,
+        "typeof(status)",
+    ] {
+        assert_eq!(
+            assert_parity_case(&conn, &event, "typeof spelling", expression),
+            None
+        );
+    }
+}
+
+#[test]
+fn current_typeof_null_and_list_spellings_are_pinned() {
+    // A known residual AWAITING A RULING — deliberately not a
+    // `*_child_105` pin, because those are audited as a set that #105
+    // flips and this one is not scheduled to flip in #105 at all. It is
+    // recorded because the probe that measured the integer spelling
+    // measured these two beside it, and an unpinned divergence is exactly
+    // what this harness exists to prevent: `DuckDB` spells the NULL type
+    // with quotes and a list by its ELEMENT type, where eval has one word
+    // for each. Neither is a bound literal, so neither is reachable from
+    // the generator surface; both are cheap to fix once somebody decides
+    // they should be.
+    let conn = utc_connection();
+    let event = fixed_event();
+    for (dsl, eval, sql) in [
+        ("* | let x = typeof(null)", "NULL", "\"NULL\""),
+        (
+            r#"* | let x = typeof(json_keys("{\"a\":1}"))"#,
+            "ARRAY",
+            "VARCHAR[]",
+        ),
+    ] {
+        assert_eq!(eval_scalar(dsl, &event), EvalValue::Str(eval.to_string()));
+        assert_eq!(
+            sql_scalar_result(&conn, dsl, &event),
             SqlOutcome::Value(SqlCell {
-                logical_type: Type::Boolean,
-                value: DuckValue::Boolean(sql),
+                logical_type: Type::Text,
+                value: DuckValue::Text(sql.to_string()),
             })
         );
     }
 }
 
 #[test]
-fn current_percent_f_precision_is_pinned_child_105() {
-    // #105 reconciles `%f` with the DuckDB value domain.
+fn the_hostile_timestamp_corpus_agrees_in_both_lanes() {
+    // Flipped from `hostile_timestamp_corpus_is_pinned_child_105` (#105).
+    // Five of these seven texts diverged, each for its own reason —
+    // an unvalidated offset strip, a zone name eval could not resolve,
+    // the keywords it had never heard of. All of them now go through the
+    // ONE probe-pinned reader, so the whole corpus is plain agreement.
+    //
+    // `+99:99` stays ACCEPTED on both sides: it is syntactically a
+    // complete offset and the wall-clock cast throws it away without
+    // range-checking it — a documented property of the owner, not a gap
+    // here.
     let conn = utc_connection();
     let event = fixed_event();
-    let percent_f = r#"* | let x = strftime(strptime("2024-12-30 23:05:07.123456", "%Y-%m-%d %H:%M:%S.%f"), "%f")"#;
-    assert_eq!(
-        eval_scalar(percent_f, &event),
-        EvalValue::Str("000123456".to_string())
-    );
-    assert_eq!(
-        sql_scalar_result(&conn, percent_f, &event),
-        SqlOutcome::Value(SqlCell {
-            logical_type: Type::Text,
-            value: DuckValue::Text("123456".to_string()),
-        })
-    );
+    for text in ["+99:99", "+5:30", "+0530", "Z", " UTC", "+00:00", ""] {
+        let expression = format!(
+            r#"strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "2026-01-15 10:20:30{text}""#
+        );
+        assert_eq!(
+            assert_parity_case(&conn, &event, "hostile timestamp text", &expression),
+            None
+        );
+    }
+    // The two keyword instants, which eval could not read at all before:
+    // `epoch` IS 1970-01-01, and an infinity equals no calendar date.
+    for (base, text) in [
+        ("1970-01-01 00:00:00", "epoch"),
+        ("2026-01-15 10:20:30", "infinity"),
+        ("2026-01-15 10:20:30", "-infinity"),
+    ] {
+        let expression = format!(r#"strptime("{base}", "%Y-%m-%d %H:%M:%S") == "{text}""#);
+        assert_eq!(
+            assert_parity_case(&conn, &event, "timestamp keyword", &expression),
+            None
+        );
+    }
+}
+
+#[test]
+fn percent_f_is_microseconds_in_both_lanes() {
+    // Flipped from `current_percent_f_precision_is_pinned_child_105`
+    // (#105). `%f` is a six-digit MICROSECOND field to DuckDB and an
+    // unscaled NANOSECOND count to chrono, so eval printed `000123456`
+    // where the engine printed `123456` — and read a `.5` as five
+    // nanoseconds. One translation now spells the user's format the way
+    // the engine means it, in both directions.
+    let conn = utc_connection();
+    let event = fixed_event();
+    for expression in [
+        r#"strftime(strptime("2024-12-30 23:05:07.123456", "%Y-%m-%d %H:%M:%S.%f"), "%f")"#,
+        r#"strftime(strptime("2024-12-30 23:05:07.123456", "%Y-%m-%d %H:%M:%S.%f"), "%Y-%m-%d %H:%M:%S.%f")"#,
+        // A zero fraction still fills six digits.
+        r#"strftime(strptime("2024-12-30 23:05:07", "%Y-%m-%d %H:%M:%S"), "%f")"#,
+        // An ESCAPED percent is a literal, and the translation leaves it
+        // alone in both lanes.
+        r#"strftime(strptime("2024-12-30 23:05:07", "%Y-%m-%d %H:%M:%S"), "%%f")"#,
+    ] {
+        assert_eq!(
+            assert_parity_case(&conn, &event, "percent f", expression),
+            None
+        );
+    }
 }
 
 #[test]
@@ -1660,29 +1873,35 @@ fn accepted_locale_percent_c_residual_is_pinned() {
 }
 
 #[test]
-fn current_json_value_and_array_rendering_are_pinned_child_105() {
-    // #105 decides the value-domain answer for JSON-backed EvalValue variants.
+fn json_extract_returns_json_text_in_both_lanes() {
+    // Flipped from `current_json_value_and_array_rendering_are_pinned_child_105`
+    // (#105). `json_extract` yields JSON, not a decoded scalar: eval
+    // answered `Int(1)` where the engine answers the TEXT `1`, and an
+    // array became an `Array` cell that `tostring()` nulled where the
+    // engine prints `[1,2]`. Every shape now goes through the one
+    // renderer (`json_extract_returns_the_values_json_text` asserts it
+    // against the engine value by value).
     let conn = utc_connection();
     let event = fixed_event();
-    for (dsl, eval, sql) in [
-        (
-            r#"* | let x = json_extract("{\"a\":1}", "$.a")"#,
-            EvalValue::Int(1),
-            "1",
-        ),
-        (
-            r#"* | let x = tostring(json_extract("[1,2]", "$"))"#,
-            EvalValue::Null,
-            "[1,2]",
-        ),
+    for expression in [
+        r#"json_extract("{\"a\":1}", "$.a")"#,
+        r#"json_extract("{\"a\":1.5}", "$.a")"#,
+        // A string keeps its QUOTES — `json_extract_string` is the
+        // unquoting door, and it is unchanged.
+        r#"json_extract("{\"a\":\"x\"}", "$.a")"#,
+        r#"json_extract_string("{\"a\":\"x\"}", "$.a")"#,
+        r#"json_extract("{\"a\":true}", "$.a")"#,
+        r#"json_extract("{\"a\":null}", "$.a")"#,
+        r#"json_extract("{\"a\":1}", "$.missing")"#,
+        r#"json_extract("[1,2]", "$")"#,
+        r#"tostring(json_extract("[1,2]", "$"))"#,
+        r#"tostring(json_extract("{\"a\":1}", "$.a"))"#,
+        // The value a JSON number reads as, now that it arrives as text.
+        r#"tonumber(json_extract("{\"a\":1.5}", "$.a"))"#,
     ] {
-        assert_eq!(eval_scalar(dsl, &event), eval);
         assert_eq!(
-            sql_scalar_result(&conn, dsl, &event),
-            SqlOutcome::Value(SqlCell {
-                logical_type: Type::Text,
-                value: DuckValue::Text(sql.to_string()),
-            })
+            assert_parity_case(&conn, &event, "json_extract text", expression),
+            None
         );
     }
 }
@@ -1693,7 +1912,7 @@ fn duckdb_conditionals_and_coalesce_short_circuit() {
     //
     // Only `error(...)` is load-bearing. `1 / 0` was probed and DuckDB does NOT
     // raise on it — it answers `inf` (see
-    // `current_division_by_zero_diverges_child_105`) — so an untaken `1 / 0`
+    // `division_by_zero_matches_duckdbs_ieee_answer`) — so an untaken `1 / 0`
     // branch returns 42 under fully EAGER evaluation too and proves nothing
     // about short-circuiting. Those three rows are deleted.
     let conn = utc_connection();

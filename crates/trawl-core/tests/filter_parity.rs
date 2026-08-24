@@ -749,7 +749,9 @@ fn assert_where_parity_over_severity(
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
-        &condition, event, &scope,
+        &condition,
+        &trawl_core::row::from_json(event),
+        &scope,
     ));
 
     let tmp = tempfile::Builder::new()
@@ -1256,6 +1258,85 @@ fn pinned_double_pattern_parity() {
     for event in [status_event(&Value::Null), absent_status_event()] {
         for dsl in patterns.iter().chain(natives.iter()) {
             assert_pinned_parity(&conn, dsl, &event, &ft);
+        }
+    }
+}
+
+/// The IEEE specials under a DOUBLE pin: a live filter compares them in
+/// `DuckDB`'s TOTAL order, not Rust's.
+///
+/// Every NaN equals every other NaN whatever its sign and outranks `inf`,
+/// so `metric=nan` MATCHES a stored NaN — the answer the matcher's own
+/// IEEE `==` used to get wrong while the batch query returned the row.
+/// The expected answers are stated, not merely agreed on: two lanes
+/// sharing one wrong comparator would pass a bare parity assertion.
+///
+/// The column is spelled out rather than inferred, because a wire `"nan"`
+/// and a wire `"-nan"` both conform to a DOUBLE the round-trip guard
+/// keeps (probed), and no `read_json` inference reproduces that.
+#[test]
+fn pinned_double_special_value_parity() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
+        .unwrap();
+    let ft = pinned(&[("status", CanonicalType::Double)]);
+
+    // (wire value, the stored DOUBLE, `status=nan`, `status>1.5`)
+    let cases = [
+        (Value::from("nan"), "CAST('nan' AS DOUBLE)", true, true),
+        (Value::from("-nan"), "CAST('-nan' AS DOUBLE)", true, true),
+        (Value::from("inf"), "CAST('inf' AS DOUBLE)", false, true),
+        (Value::from("-inf"), "CAST('-inf' AS DOUBLE)", false, false),
+        (Value::from(1.5), "CAST(1.5 AS DOUBLE)", false, false),
+        (Value::from(2.5), "CAST(2.5 AS DOUBLE)", false, true),
+        // Negative zero, spelled as a product: the SQL literal `-0.0`
+        // constant-folds to positive zero.
+        (Value::from(-0.0), "CAST(0.0 AS DOUBLE) * -1", false, false),
+        (Value::from(0), "CAST(0 AS DOUBLE)", false, false),
+    ];
+    // Every operator class against a NaN literal, plus the ordered
+    // comparisons that place NaN in the order at all.
+    let dsls = [
+        "status=nan",
+        "status=-nan",
+        "status!=nan",
+        "status<nan",
+        "status>nan",
+        "status>=nan",
+        "status<=nan",
+        "NOT status=nan",
+        "status>1.5",
+        "status<1.5",
+        "status=inf",
+        "status=0",
+        "status=-0.0",
+        "status=nan,1.5",
+        "status!=nan,1.5",
+    ];
+    for (wire, stored, equals_nan, above_one_and_a_half) in cases {
+        let event = status_event(&wire);
+        for dsl in dsls {
+            let agreed = assert_pinned_parity_over_column(&conn, dsl, &event, &ft, stored);
+            match dsl {
+                "status=nan" => assert_eq!(agreed, equals_nan, "{dsl} over {wire:?}"),
+                "status>1.5" => assert_eq!(agreed, above_one_and_a_half, "{dsl} over {wire:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    // A NULL column is UNKNOWN, not false: nothing matches it — except
+    // the search stage's `!=`, which is the one TOTAL comparison (it
+    // widens with `OR col IS NULL`, ADR-0011), and `NOT status=nan`,
+    // which does NOT, because `NOT (NULL)` is NULL.
+    for event in [status_event(&Value::Null), absent_status_event()] {
+        for dsl in dsls {
+            let widened = dsl.contains("!=");
+            assert_eq!(
+                assert_pinned_parity(&conn, dsl, &event, &ft),
+                widened,
+                "{dsl} over a NULL column"
+            );
         }
     }
 }
@@ -2001,7 +2082,9 @@ fn assert_where_parity(
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
-        &condition, event, &scope,
+        &condition,
+        &trawl_core::row::from_json(event),
+        &scope,
     ));
 
     let _guard: Box<dyn std::any::Any>;
@@ -2059,7 +2142,9 @@ fn assert_where_parity_over_column(
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
-        &condition, event, &scope,
+        &condition,
+        &trawl_core::row::from_json(event),
+        &scope,
     ));
 
     let tmp = tempfile::Builder::new()
@@ -2109,7 +2194,7 @@ fn assert_pinned_let_parity(
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
         &assignment,
-        event,
+        &trawl_core::row::from_json(event),
         &scope,
     ));
     assert_eq!(
@@ -2404,7 +2489,9 @@ fn assert_where_parity_hot_only(
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
-        &condition, event, &scope,
+        &condition,
+        &trawl_core::row::from_json(event),
+        &scope,
     ));
 
     let (_snapshot, emitted) = emit_hot_only_over(&query, event, ft, siblings);
@@ -2443,7 +2530,7 @@ fn assert_let_parity_hot_only(
     let scope = trawl_core::pin_scope::PinScope::root(ft);
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
         &assignment,
-        event,
+        &trawl_core::row::from_json(event),
         &scope,
     ));
 
@@ -2503,6 +2590,11 @@ fn wire_pool(pin: CanonicalType) -> Vec<Value> {
             Value::from(404),
             Value::from("accepted"),
             Value::from(true),
+            // Both NaN spellings survive the pin's round-trip guard, so
+            // both are values the corpus really holds — and they compare
+            // in DuckDB's TOTAL order, not Rust's IEEE one.
+            Value::from("nan"),
+            Value::from("-nan"),
             Value::Null,
         ],
         CanonicalType::Timestamp => vec![
@@ -2553,7 +2645,10 @@ fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
     match pin {
         CanonicalType::BigInt => &["1", "2", "404", "1.5", "-1", "9007199254740992"],
         CanonicalType::Boolean => &["true", "false"],
-        CanonicalType::Double => &["0", "1.5", "-1.5", "200", "404"],
+        // The NaN literal is QUOTED: a bare `nan` in an expression
+        // position is a FIELD reference, and the quoted spelling binds
+        // through the same content coercion the search stage applies.
+        CanonicalType::Double => &["0", "1.5", "-1.5", "200", "404", "\"nan\""],
         CanonicalType::Timestamp => &[
             "\"2026-01-15T00:00:00Z\"",
             "\"2026-01-15T09:00:00Z\"",

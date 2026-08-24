@@ -380,7 +380,7 @@ drop host, raw
 **let** / **eval** — computed/derived fields
 ```
 let duration_ms = duration * 1000
-eval status_class = status / 100 # SPL alias for let
+eval status_class = floor(status / 100) # SPL alias for let
 let is_error = status >= 400
 let ms = 1000, total = ms * 2    # a target the row lacks IS a lateral alias (total = 2000)
 let a = a + 1, b = a             # a target the row HAS is invisible to siblings (b = original a)

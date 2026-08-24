@@ -82,7 +82,11 @@ fn run_cell(
             _ => None,
         })
         .expect("dsl has a where stage");
-    let eval_result = match eval_expr_with_pins(&condition, event, &PinScope::root(ft)) {
+    let eval_result = match eval_expr_with_pins(
+        &condition,
+        &trawl_core::row::from_json(event),
+        &PinScope::root(ft),
+    ) {
         EvalValue::Bool(b) => Some(b),
         EvalValue::Null => None,
         other => panic!("comparison answered {other:?} for {dsl:?}"),
@@ -136,7 +140,7 @@ fn run_pipeline_cell(
     let StreamPlan::PassThrough(mut stages) = plan else {
         panic!("{dsl:?} must compile to a per-event plan");
     };
-    let mut streamed = event.clone();
+    let mut streamed = trawl_core::row::from_json(event);
     let mut live_result = true;
     for stage in &mut stages {
         match apply_stage(stage, &mut streamed) {
@@ -193,7 +197,7 @@ fn run_let_cell(
     let StreamPlan::PassThrough(mut stages) = plan else {
         panic!("{dsl:?} must compile to a per-event plan");
     };
-    let mut streamed = event.clone();
+    let mut streamed = trawl_core::row::from_json(event);
     for stage in &mut stages {
         assert_eq!(
             apply_stage(stage, &mut streamed),
@@ -219,6 +223,7 @@ fn run_let_cell(
         .unwrap_or_else(|e| panic!("pinned let must not error: {e}\ndsl: {dsl:?}\nsql: {row_sql}"));
     let batch: Map<String, Value> = serde_json::from_str(&row_json).expect("row is a JSON object");
 
+    let streamed = trawl_core::row::to_json(streamed);
     for name in outputs {
         let batch_value = batch.get(*name).unwrap_or(&Value::Null);
         let streamed_value = streamed.get(*name).unwrap_or(&Value::Null);
@@ -409,7 +414,11 @@ fn pattern_form_coverage_in_both_pipeline_lanes() {
             _ => unreachable!(),
         };
         let event = event_with("f", Value::from("2026-01-15T09:00:00+05:30"));
-        let eval_result = eval_expr_with_pins(&condition, &event, &PinScope::root(&ft));
+        let eval_result = eval_expr_with_pins(
+            &condition,
+            &trawl_core::row::from_json(&event),
+            &PinScope::root(&ft),
+        );
         assert_eq!(eval_result, EvalValue::Bool(true));
 
         let tmp = tempfile::Builder::new()
@@ -1158,7 +1167,7 @@ fn live_rows(
     let plan = compile_stream_plan(&query.pipeline, &PinScope::root(field_types))
         .unwrap_or_else(|error| panic!("{dsl}: plan must compile: {error}"));
     let feed = |stages: &mut [trawl_core::stream::CompiledStage],
-                event: &mut Map<String, Value>| {
+                event: &mut trawl_core::row::Row| {
         stages
             .iter_mut()
             .all(|stage| apply_stage(stage, event) == StageResult::Pass)
@@ -1167,8 +1176,8 @@ fn live_rows(
         StreamPlan::PassThrough(mut stages) => rows
             .iter()
             .filter_map(|row| {
-                let mut event = row.as_object().unwrap().clone();
-                feed(&mut stages, &mut event).then_some(event)
+                let mut event = trawl_core::row::from_json(row.as_object().unwrap());
+                feed(&mut stages, &mut event).then(|| trawl_core::row::to_json(event))
             })
             .collect(),
         StreamPlan::Aggregate {
@@ -1177,12 +1186,17 @@ fn live_rows(
             ..
         } => {
             for row in rows {
-                let mut event = row.as_object().unwrap().clone();
+                let mut event = trawl_core::row::from_json(row.as_object().unwrap());
                 if feed(&mut pre, &mut event) {
                     aggregate.feed_event(&event);
                 }
             }
-            aggregate.snapshot().1
+            aggregate
+                .snapshot()
+                .1
+                .into_iter()
+                .map(trawl_core::row::to_json)
+                .collect()
         }
     }
 }

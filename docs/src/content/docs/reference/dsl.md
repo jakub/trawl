@@ -748,9 +748,41 @@ Create computed fields.
 
 ```
 let duration_ms = duration * 1000
-eval status_class = status / 100    # eval is an alias for let
+eval status_class = floor(status / 100)   # eval is an alias for let
 let is_error = status >= 400
 ```
+
+#### Arithmetic
+
+`/` is **true division**: `status / 100` over a `404` is `4.04`, not `4`,
+and the result is a DOUBLE whatever the operands were. Wrap it in
+`floor()` for the integer part — `floor(status / 100)` answers `4.0`,
+also a DOUBLE (see [Numeric functions](#numeric-functions)).
+
+`+`, `-` and `*` stay integral over two integers. An overflow has no
+answer: the batch lane raises an error and the streaming lane yields
+`null`, because a live tail cannot raise a per-event error without
+killing the subscription.
+
+#### Infinities and NaN
+
+Division never fails: `1.0 / 0` is `inf`, `-1.0 / 0` is `-inf` and
+`0.0 / 0` is `NaN`, exactly as in the query engine. `%` follows `/`
+whenever either side is a float (`5 % 0.0` is `NaN`), while integer
+`% 0` stays `null`.
+
+Those values flow between stages like any other number and compare the
+way DuckDB compares them — a **total** order, not IEEE's: every NaN
+equals every other NaN and outranks every finite value (so
+`| let x = 0.0 / 0 | where x == x` keeps the row, and `max(x)` over a
+column holding one answers `NaN`), and the two zeros compare equal, so
+`-0.0` groups with `0.0`.
+
+JSON has no spelling for any of them, so **JSON output renders them
+`null`**: the API wire, `-f json`, and the SSE stream all show `null`
+where a special was computed. The table and CSV renderers print the value
+itself (`inf`, `-inf`, `NaN`) when the query runs embedded (`--data`),
+which is the only path that does not cross the JSON wire.
 
 ### extract / rex
 
@@ -929,22 +961,62 @@ Available in `let`/`eval` and `where` expressions.
 | Function | Description |
 |----------|-------------|
 | `abs(x)` | Absolute value |
-| `ceil(x)` / `ceiling(x)` | Round up |
-| `floor(x)` | Round down |
-| `round(x[, n])` | Round to n decimal places |
+| `ceil(x)` / `ceiling(x)` | Round up — always a DOUBLE, even over an integer (`ceil(5)` is `5.0`) |
+| `floor(x)` | Round down — always a DOUBLE, same as `ceil` |
+| `round(x[, n])` | Round to n decimal places — an INTEGER argument stays integral (`round(5)` is `5`), a float stays a float (`round(1.5)` is `2.0`) |
 
 ### Conditional and type functions
 
 | Function | Description |
 |----------|-------------|
-| `if(cond, then, else)` | Ternary conditional |
+| `if(cond, then, else)` | Ternary conditional — see [Conditions](#conditions) for what counts as true |
 | `isnull(x)` / `isnotnull(x)` | Null checks |
 | `coalesce(a, b, ...)` | First non-null value |
-| `typeof(x)` | Value type name (returns `"VARCHAR"`, `"DOUBLE"`, `"TIMESTAMP"`, …) |
+| `typeof(x)` | Value type name (`"BIGINT"` for an integer, `"DOUBLE"`, `"VARCHAR"`, `"TIMESTAMP"`, …) |
 | `now()` | Current timestamp (timezone-naive, wall-clock UTC) |
-| `tonumber(x)` | Cast to float (`null` on parse failure — mirrors `TRY_CAST AS DOUBLE`) |
+| `tonumber(x)` | Cast to float (`null` on parse failure — mirrors `TRY_CAST AS DOUBLE`); a boolean reads as `1.0`/`0.0` |
 | `tostring(x)` | Cast to string (`null` for null/array input) |
 | `sev(x[, dialect])` | Read a value's OTel SeverityNumber (`null` when it has no reading). `dialect` is `"otel"` (default) or `"syslog"` — see [Reading any field as a severity](#reading-any-field-as-a-severity-sev) |
+
+#### Conditions
+
+`if()` and `case()` read their condition the way DuckDB casts one to
+BOOLEAN, not as "truthiness":
+
+- a **boolean** is itself, and SQL `null` takes the else branch;
+- a **number** is true when it is non-zero — both zeros are false, and
+  `NaN` is true;
+- a **string** reads through DuckDB's closed, case-insensitive
+  vocabulary: `true`/`t`/`yes`/`y`/`1` and `false`/`f`/`no`/`n`/`0`.
+  **Any other string has no reading** — `"nonempty"`, and `" true "`
+  (with the spaces) too, because the cast does not trim;
+- a **timestamp** or a **list** has no boolean cast at all.
+
+A condition with no reading has no answer, so the two lanes part exactly
+as they do for an [arithmetic overflow](#arithmetic): the batch lane
+raises a conversion error and the query returns no rows at all
+(`Could not convert string 'nonempty' to BOOL`, or
+`Unimplemented type for cast` for a timestamp or a list), while the
+streaming lane yields `null` for the whole call — `if("nonempty", 1, 2)`
+is `null` there, not `1` — because a live tail cannot raise a per-event
+error without killing the subscription.
+
+`case()` reads its arms in order and stops at the first true one, so an
+unreadable condition after a match is never looked at — but an unreadable
+one reached before any match takes down the whole call, in whichever way
+its lane does, rather than skipping that arm.
+
+`and`, `or`, `not` and the pipeline's `where` gate keep their older,
+wider predicate (anything non-null and non-`false` passes); only `if()`
+and `case()` take the cast domain.
+
+#### typeof and large integers
+
+`typeof` returns the type name of the value the expression READ. A wire
+integer above `i64::MAX` is read as a `DOUBLE` — so `typeof(request_id)`
+says `"DOUBLE"` for one — while the value itself keeps its digits
+wherever identity matters: on the wire, in a `dedup` key, and in a
+`stats … by` group.
 
 ### Nested fields (JSON)
 
@@ -955,6 +1027,20 @@ service=kubelet | eval pod = json_extract_string(k8s, "$.pod") | where isnotnull
 ```
 
 Bare text search also matches inside the stringified value (it is part of `_raw` and of the column's text).
+
+`json_extract_string` is the UNQUOTING door: it returns a JSON string's
+contents (`"x"` → `x`). `json_extract` returns the value's JSON text —
+for a string that keeps the quotes (`"x"`), for a number, boolean or
+`null` it is the value's own text, and for an array or object it is
+compact JSON. Reach for `json_extract_string` unless you want the JSON.
+
+One residual, on numbers of exotic magnitude: the streaming path
+re-renders a number from its `f64` where the query engine renders the
+source spelling, so a value written `1e16`…`1e20`, or an integer with
+more digits than a 64-bit one holds, can come back spelled differently
+(`1e20` against `100000000000000000000`). Values inside those bounds —
+which is every number a log realistically carries — render identically
+in both paths.
 
 ### Date and time functions
 
@@ -971,6 +1057,34 @@ Date/time functions operate on **timestamps** — the `timestamp` field is store
 **Note:** the argument order for `strftime` is `(timestamp, format)` — the opposite of C `strftime`. DuckDB's `STRFTIME` is overloaded and accepts this order directly, so it is emitted unchanged.
 
 **Note:** `strptime` returns `null` when a value cannot be parsed against the format — a single unparseable value yields `null`, not a query error. This holds in both the batch path (emitted as DuckDB `TRY_STRPTIME`) and the streaming path.
+
+#### Comparing a timestamp against text
+
+A timestamp compares against a string by reading the string as a
+timestamp — the same cast DuckDB applies to a bound parameter, which
+takes the wall-clock components and DISCARDS any offset
+(`'…T09:00:00+05:30'` is 09:00). A text with **no** reading makes the
+comparison `null`: there is no fallback to string ordering, so
+`t < "zzz"` is unknown rather than true, and a malformed offset like
+`+ab:cd` matches nothing rather than being stripped and ignored.
+
+The accepted differences from the engine's own parser are narrow and
+one-directional (the mirror reads less, never more): zone NAMES beyond
+`UTC`, and years outside chrono's calendar.
+
+#### Infinity timestamps
+
+`infinity` and `-infinity` are values a timestamp can hold, and they read
+from text like any other instant. They order below and above every date,
+render as their own words through `tostring()`, and the date scalars
+treat them exactly as the engine does:
+
+| Function | Answer for `±infinity` |
+|----------|------------------------|
+| `date_part(unit, ts)` | `null`, for every unit including `epoch` |
+| `date_trunc(unit, ts)` | the infinity, unchanged, for every unit |
+| `date_diff(unit, a, b)` | `null` whenever either side is infinite |
+| `strftime(ts, fmt)` | `infinity` / `-infinity`, whatever the format asks for |
 
 #### Date/time unit allowlist
 
@@ -991,6 +1105,8 @@ The `unit` argument to `date_part`, `date_trunc`, and `date_diff` must be a **st
 #### strftime/strptime format codes
 
 Standard C `strftime` codes (`%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, etc.) produce identical output in both batch (DuckDB) and streaming (chrono) paths. chrono operates on a timezone-naive timestamp, so it is **not** locale-dependent — but codes that depend on timezone or locale (`%Z`, `%z`, `%c`, `%x`, `%X`) render empty or fixed under chrono's naive semantics and can differ from DuckDB. Stick to explicit numeric codes for portable output.
+
+`%f` is a **six-digit microsecond** field in both paths: `strftime(ts, "%f")` over `…09:00:00.5` gives `500000`, and a zero fraction gives `000000`. (chrono spells that field `%6f`; the streaming path translates a bare `%f` for you, and leaves an escaped `%%f` alone as the literal it is.) One residual comes with the fixed width: on the way IN, DuckDB reads a fraction of any length (`.5` is half a second) where the streaming path reads exactly six digits and yields `null` for anything else.
 
 Invalid format codes (e.g. `%Q`, or a trailing `%`) are rejected before execution in both paths when the format is a string literal — they no longer error in batch while silently nulling in streaming.
 
