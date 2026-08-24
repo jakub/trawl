@@ -976,6 +976,7 @@ Available in `let`/`eval` and `where` expressions.
 | `now()` | Current timestamp (timezone-naive, wall-clock UTC) |
 | `tonumber(x)` | Cast to float (`null` on parse failure — mirrors `TRY_CAST AS DOUBLE`); a boolean reads as `1.0`/`0.0` |
 | `tostring(x)` | Cast to string (`null` for null/array input) |
+| `sev(x[, dialect])` | Read a value's OTel SeverityNumber (`null` when it has no reading). `dialect` is `"otel"` (default) or `"syslog"` — see [Reading any field as a severity](#reading-any-field-as-a-severity-sev) |
 
 #### Conditions
 
@@ -1008,7 +1009,6 @@ integer above `i64::MAX` is read as a `DOUBLE` — so `typeof(request_id)`
 says `"DOUBLE"` for one — while the value itself keeps its digits
 wherever identity matters: on the wire, in a `dedup` key, and in a
 `stats … by` group.
-| `sev(x[, dialect])` | Read a value's OTel SeverityNumber (`null` when it has no reading). `dialect` is `"otel"` (default) or `"syslog"` — see [Reading any field as a severity](#reading-any-field-as-a-severity-sev) |
 
 ### Nested fields (JSON)
 

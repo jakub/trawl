@@ -581,7 +581,7 @@ fn random_sev(rng: &mut Rng) -> Generated {
 /// `INTEGER` where the bound literal arrives as BIGINT; #105 moved eval onto
 /// the bound spelling, so the exclusion is gone. The two shapes that still
 /// diverge — the NULL type and a list — are NOT bound literals and are pinned
-/// by `current_typeof_null_and_list_spellings_are_pinned_child_105`.
+/// by `current_typeof_null_and_list_spellings_are_pinned`.
 fn random_typeof(rng: &mut Rng) -> Generated {
     let (arg_arm, argument) = match rng.range(TYPEOF_ARG_ARMS) {
         0 => ("typeof/arg_string", str_lit(rng)),
@@ -1894,7 +1894,7 @@ fn duckdb_conditionals_and_coalesce_short_circuit() {
     //
     // Only `error(...)` is load-bearing. `1 / 0` was probed and DuckDB does NOT
     // raise on it — it answers `inf` (see
-    // `current_division_by_zero_diverges_child_105`) — so an untaken `1 / 0`
+    // `division_by_zero_matches_duckdbs_ieee_answer`) — so an untaken `1 / 0`
     // branch returns 42 under fully EAGER evaluation too and proves nothing
     // about short-circuiting. Those three rows are deleted.
     let conn = utc_connection();

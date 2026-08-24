@@ -154,6 +154,41 @@ fn huge_string() -> String {
 /// `round`'s precision, `substr`'s start and length, `split`'s index.
 const ABUSIVE_BOUNDS: &[i64] = &[i64::MIN, -1_000_000, -1, 0, 1, 1_000_000, i64::MAX];
 
+/// Documents the json door is fed — ones that PARSE (so the renderer
+/// runs) and ones that do not (so its error path does).
+const JSON_DOCUMENTS: &[&str] = &[
+    r#"{"a":1}"#,
+    r#"{"a":1e300}"#,
+    r#"{"a":1e400}"#,
+    r#"{"a":"cost e+300"}"#,
+    r#"{"a":"quote \" then e+5"}"#,
+    r#"{"a":{"b":[1,{"c":2}]}}"#,
+    r#"{"a":null}"#,
+    r#"{"a":18446744073709551615}"#,
+    "[1,2]",
+    "0",
+    r#""bare string""#,
+    // …and the shapes that do not parse at all.
+    "{",
+    "[a-",
+    "",
+    "not-json",
+];
+
+/// Paths for the same door, including ones that reach nothing and ones
+/// that are not paths at all.
+const JSON_PATHS: &[&str] = &[
+    "$",
+    "$.a",
+    "$.a.b",
+    "$.a.b.c",
+    "$.missing",
+    "$[0]",
+    "",
+    "not-a-path",
+    "$..a",
+];
+
 /// Scalars whose arity is 1 and whose argument is the composed
 /// subexpression.
 const UNARY_SCALARS: &[&str] = &[
@@ -188,8 +223,9 @@ fn hostile_event() -> Map<String, Value> {
         "fractional".into(),
         Value::Number(serde_json::Number::from_f64(-1.5).expect("finite")),
     );
-    // Beyond i64 AND beyond f64's exact range — `From<&Value>` reads it
-    // as a lossy double.
+    // Beyond `i64`: the row keeps its digits (`EvalValue::UInt`) while
+    // every value-domain rule still reads it as the double it computes
+    // as — both halves are reachable from here.
     event.insert(
         "beyond_i64".into(),
         serde_json::from_str::<Value>("9223372036854775808").expect("valid JSON number"),
@@ -288,7 +324,7 @@ fn compose(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
     if depth == 0 {
         return leaf(rng);
     }
-    match rng.range(9) {
+    match rng.range(10) {
         0 => leaf(rng),
         1 => spanned(Expr::Binary {
             lhs: Box::new(compose(rng, depth - 1)),
@@ -331,7 +367,7 @@ fn compose(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
             call("substr", args)
         }
         7 => {
-            let name = *rng.pick(&["date_part", "date_trunc", "strftime", "strptime", "json"]);
+            let name = *rng.pick(&["date_part", "date_trunc", "strftime", "strptime"]);
             let unit = *rng.pick(&[
                 "epoch",
                 "year",
@@ -342,9 +378,9 @@ fn compose(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
                 "$.a.b",
                 "not-a-unit",
             ]);
-            // `strftime`/`json` take the value first, the rest take it
-            // second — both orders reach a different guard.
-            let args = if matches!(name, "strftime" | "strptime" | "json") {
+            // `strftime` takes the value first, the rest take it second
+            // — both orders reach a different guard.
+            let args = if matches!(name, "strftime" | "strptime") {
                 vec![
                     compose(rng, depth - 1),
                     literal(LiteralValue::String(unit.to_string())),
@@ -356,6 +392,34 @@ fn compose(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
                 ]
             };
             call(name, args)
+        }
+        // The json door: the most parser-shaped code here — it decodes a
+        // document, walks a pointer and RENDERS what it finds, and the
+        // renderer scans text tracking string state. The document and
+        // the path are drawn TOGETHER, because pairing them by lottery
+        // (a path against a format string, say) never reaches the
+        // renderer at all.
+        9 => {
+            let name = *rng.pick(&["json_extract", "json", "json_extract_string", "json_valid"]);
+            let document = if rng.range(4) == 0 {
+                // Still a hostile arbitrary expression some of the time.
+                compose(rng, depth - 1)
+            } else {
+                literal(LiteralValue::String(
+                    (*rng.pick(JSON_DOCUMENTS)).to_string(),
+                ))
+            };
+            if name == "json_valid" {
+                call(name, vec![document])
+            } else {
+                call(
+                    name,
+                    vec![
+                        document,
+                        literal(LiteralValue::String((*rng.pick(JSON_PATHS)).to_string())),
+                    ],
+                )
+            }
         }
         8 => {
             let name = *rng.pick(&["if", "case", "coalesce", "concat", "date_diff", "split"]);
@@ -416,6 +480,7 @@ const DSL_ATOMS: &[&str] = &[
     r#""""#,
     r#""infinity""#,
     r#""-infinity""#,
+    r#""{\"a\":1e300}""#,
     r#""epoch""#,
     r#""2026-01-15 10:20:30+ab:cd""#,
     r#""2026-01-15 10:20:30+99:99""#,
@@ -434,7 +499,7 @@ fn compose_dsl(rng: &mut Rng, depth: usize) -> String {
     if depth == 0 {
         return (*rng.pick(DSL_ATOMS)).to_string();
     }
-    match rng.range(7) {
+    match rng.range(8) {
         0 => (*rng.pick(DSL_ATOMS)).to_string(),
         1 => format!(
             "({} {} {})",
@@ -478,6 +543,18 @@ fn compose_dsl(rng: &mut Rng, depth: usize) -> String {
             rng.pick(&["round", "substr", "date_diff", "coalesce", "concat"]),
             compose_dsl(rng, depth - 1),
             rng.pick(ABUSIVE_BOUNDS)
+        ),
+        // The json door through the PARSER, document and path drawn
+        // together so the renderer is reached rather than only its
+        // error path. The document is escaped as the DSL spells a
+        // string literal.
+        7 => format!(
+            r#"{}("{}", "{}")"#,
+            rng.pick(&["json_extract", "json_extract_string", "json"]),
+            rng.pick(JSON_DOCUMENTS)
+                .replace('\\', "\\\\")
+                .replace('"', "\\\""),
+            rng.pick(JSON_PATHS)
         ),
         _ => unreachable!(),
     }

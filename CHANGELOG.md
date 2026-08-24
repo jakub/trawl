@@ -476,8 +476,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   This changes answers. In rough order of how likely you are to notice:
 
   - **`/` is true division.** `status / 100` over a `404` is `4.04`, not `4`,
-    and the result is a DOUBLE whatever the operands were. Use
-    `floor(status / 100)` for the old integer answer. Division by zero is
+    and the result is a DOUBLE whatever the operands were.
+    `floor(status / 100)` gets the old value back — as a DOUBLE `4.0`,
+    since `floor` widens too. Division by zero is
     IEEE — `1.0 / 0` is `inf`, `0.0 / 0` is `NaN` — where the evaluator used
     to answer NULL; `%` follows `/` whenever either side is a float
     (`5 % 0.0` is `NaN`), while integer `% 0` stays NULL.
