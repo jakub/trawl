@@ -4656,3 +4656,143 @@ fn a_rendered_nan_keeps_its_sign() {
         assert_eq!(conformed.as_deref(), Some(text), "the guard keeps {text:?}");
     }
 }
+
+// ── #105 M5: the TIMESTAMP value domain (ADR-0017 §1) ──────────────
+//
+// `eval` grew a second timestamp parser and a lexical fallback, and it
+// carries an instant as a bare `NaiveDateTime` — a type with no way to
+// spell the two values a `DuckDB` TIMESTAMP can hold beyond the calendar.
+// These probes are what the retyping moves to: how an instant RENDERS,
+// what each date scalar answers over an infinity, and what an infinity
+// looks like coming back through duckdb-rs (which the parity harness has
+// to recognise).
+
+/// (SQL timestamp expression, its `CAST(… AS VARCHAR)`).
+///
+/// The SCALAR rendering, which is NOT the TIMESTAMP pin's pattern text:
+/// that one is RFC 3339 with a `Z` for globbing a stored column
+/// (`TIMESTAMP_PATTERN_SQL_FORMAT`), this one is the space-separated form
+/// `tostring()` and a projected cell show. Two renderings, two owners; a
+/// mirror that reused the pattern text here would print the wrong string
+/// for every finite instant.
+const TIMESTAMP_CAST_TEXTS: &[(&str, &str)] = &[
+    ("TIMESTAMP '2026-01-15 09:00:00'", "2026-01-15 09:00:00"),
+    (
+        "TIMESTAMP '2026-01-15 09:00:00.123456'",
+        "2026-01-15 09:00:00.123456",
+    ),
+    // Trailing fractional zeros are trimmed, exactly as the live
+    // renderer trims them.
+    (
+        "TIMESTAMP '2026-01-15 09:00:00.100000'",
+        "2026-01-15 09:00:00.1",
+    ),
+    ("TIMESTAMP '0001-01-01 00:00:00'", "0001-01-01 00:00:00"),
+    (
+        "TIMESTAMP '9999-12-31 23:59:59.999999'",
+        "9999-12-31 23:59:59.999999",
+    ),
+    // The two instants no calendar date can express render as WORDS —
+    // and both spellings of the input reach the same value.
+    ("'infinity'::TIMESTAMP", "infinity"),
+    ("'-infinity'::TIMESTAMP", "-infinity"),
+    ("TRY_CAST('inf' AS TIMESTAMP)", "infinity"),
+];
+
+#[test]
+fn a_timestamp_casts_to_the_text_duckdb_prints() {
+    let conn = conn();
+    for (expr, want) in TIMESTAMP_CAST_TEXTS {
+        let (dtype, text) = scalar_type_and_text(&conn, expr, &[]).unwrap();
+        assert_eq!(dtype, "TIMESTAMP", "{expr}");
+        assert_eq!(text.as_deref(), Some(*want), "{expr}");
+    }
+}
+
+/// What each date scalar answers for `infinity` and `-infinity`.
+///
+/// Measured, not reasoned: the three families do three DIFFERENT things,
+/// and no rule derived from one of them predicts the others.
+///
+/// - `date_part` is NULL for EVERY unit, `epoch` included;
+/// - `date_trunc` returns the infinity UNCHANGED, for every unit;
+/// - `date_diff` is NULL whenever EITHER side is infinite — including
+///   both sides, and including two infinities of the same sign;
+/// - `strftime` renders the WORD whatever the format asks for.
+#[test]
+fn the_date_scalars_answer_for_an_infinity() {
+    let conn = conn();
+    for (infinity, word) in [
+        ("'infinity'::TIMESTAMP", "infinity"),
+        ("'-infinity'::TIMESTAMP", "-infinity"),
+    ] {
+        for unit in trawl_core::emitter::DATE_PART_UNITS {
+            let (_, text) =
+                scalar_type_and_text(&conn, &format!("date_part('{unit}', {infinity})"), &[])
+                    .unwrap();
+            assert_eq!(text, None, "date_part('{unit}', {infinity}) must be NULL");
+        }
+        for unit in trawl_core::emitter::DATE_UNITS {
+            let (dtype, text) =
+                scalar_type_and_text(&conn, &format!("date_trunc('{unit}', {infinity})"), &[])
+                    .unwrap();
+            assert_eq!(dtype, "TIMESTAMP");
+            assert_eq!(
+                text.as_deref(),
+                Some(word),
+                "date_trunc('{unit}', {infinity}) must pass the infinity through"
+            );
+        }
+        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y", "%j", "%f"] {
+            let (_, text) =
+                scalar_type_and_text(&conn, &format!("strftime({infinity}, '{fmt}')"), &[])
+                    .unwrap();
+            assert_eq!(text.as_deref(), Some(word), "strftime({infinity}, '{fmt}')");
+        }
+    }
+
+    let finite = "TIMESTAMP '2026-01-15 09:00:00'";
+    for unit in ["year", "day", "second"] {
+        for (start, end) in [
+            ("'infinity'::TIMESTAMP", finite),
+            (finite, "'infinity'::TIMESTAMP"),
+            ("'-infinity'::TIMESTAMP", finite),
+            ("'infinity'::TIMESTAMP", "'infinity'::TIMESTAMP"),
+            ("'infinity'::TIMESTAMP", "'-infinity'::TIMESTAMP"),
+        ] {
+            let (_, text) =
+                scalar_type_and_text(&conn, &format!("date_diff('{unit}', {start}, {end})"), &[])
+                    .unwrap();
+            assert_eq!(
+                text, None,
+                "date_diff('{unit}', {start}, {end}) must be NULL"
+            );
+        }
+    }
+}
+
+/// The i64 SENTINELS duckdb-rs hands back for the two infinities.
+///
+/// A result cell arrives as `Value::Timestamp(Microsecond, i64)`, and the
+/// infinities are the extremes of that range — note `-infinity` is
+/// `-i64::MAX`, NOT `i64::MIN`. The scalar parity harness compares eval
+/// against these cells, so it has to know the sentinels by value; a
+/// matcher that treated them as ordinary microsecond counts would read
+/// them as dates 292 thousand years out.
+#[test]
+fn an_infinity_timestamp_cell_is_an_i64_sentinel() {
+    let conn = conn();
+    for (expr, want) in [
+        ("'infinity'::TIMESTAMP", i64::MAX),
+        ("'-infinity'::TIMESTAMP", -i64::MAX),
+    ] {
+        let value: duckdb::types::Value = conn
+            .query_row(&format!("SELECT {expr}"), [], |row| row.get(0))
+            .unwrap();
+        let duckdb::types::Value::Timestamp(unit, micros) = value else {
+            panic!("{expr} must come back as a TIMESTAMP cell, got {value:?}");
+        };
+        assert_eq!(unit, duckdb::types::TimeUnit::Microsecond, "{expr}");
+        assert_eq!(micros, want, "{expr}");
+    }
+}
