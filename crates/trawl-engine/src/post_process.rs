@@ -302,6 +302,59 @@ mod tests {
         }
     }
 
+    /// The bridge is an identity on every cell shape a result can hold —
+    /// specials included, which is the whole point: the JSON hop this
+    /// replaced turned `inf` and `NaN` into NULL on the way in.
+    #[test]
+    fn the_bridge_round_trips_every_cell_shape() {
+        let cells = [
+            crate::value::Value::Null,
+            crate::value::Value::Boolean(true),
+            crate::value::Value::Boolean(false),
+            crate::value::Value::Integer(i64::MIN),
+            crate::value::Value::Integer(0),
+            crate::value::Value::Integer(i64::MAX),
+            crate::value::Value::Float(1.5),
+            crate::value::Value::Float(-0.0),
+            crate::value::Value::Float(f64::INFINITY),
+            crate::value::Value::Float(f64::NEG_INFINITY),
+            crate::value::Value::Float(f64::NAN),
+            crate::value::Value::Float(-f64::NAN),
+            crate::value::Value::String(String::new()),
+            crate::value::Value::String("nginx".into()),
+            crate::value::Value::Array(vec![
+                crate::value::Value::Integer(1),
+                crate::value::Value::Float(f64::INFINITY),
+                crate::value::Value::String("x".into()),
+            ]),
+        ];
+        for cell in cells {
+            let round_tripped = eval_to_cell(&cell_to_eval(&cell));
+            match (&cell, &round_tripped) {
+                // NaN is never equal to itself, so the pair is compared
+                // BITWISE — sign bit included, since DuckDB renders it.
+                (crate::value::Value::Float(a), crate::value::Value::Float(b)) => {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{cell:?}");
+                }
+                _ => assert_eq!(cell, round_tripped, "{cell:?}"),
+            }
+        }
+    }
+
+    /// A `Timestamp` cell — the one shape with no result-side twin —
+    /// lands as the STRING the shift machinery re-parses after the tail.
+    #[test]
+    fn a_timestamp_cell_leaves_the_bridge_as_text() {
+        let ts = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap();
+        assert_eq!(
+            eval_to_cell(&EvalValue::Timestamp(ts)),
+            crate::value::Value::String("2026-01-15 09:00:00".into())
+        );
+    }
+
     #[test]
     fn kv_extraction_on_result() {
         let result = make_result(

@@ -463,6 +463,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   this is a token-rendering change only.
 
 ### Fixed
+- **Pipeline stages carry typed rows, so a computed infinity or NaN survives
+  them (#105).** Streaming stages passed rows to each other as JSON, which has
+  no spelling for a non-finite double: `| let x = 0.0 / 0 | where x == x` kept
+  the row in batch and dropped it live, and the `extract kv` batch tail
+  received a NULL where its own SQL prefix had computed `1.0 / 0`. Rows now
+  carry typed cells end to end and JSON appears only at the wire, where the
+  behaviour is unchanged — the API, `-f json` and SSE still render a special
+  as `null`, once, at the edge. Visible deltas:
+  - the batch tail behind `extract kv` now **counts, compares, aggregates and
+    prints** specials it used to see as NULL (`max(x)` over an infinity is
+    `inf`, not empty; a `where` over one keeps its rows);
+  - a computed special survives a stage boundary in the LIVE lane, so a live
+    tail and the equivalent `/query` answer the same;
+  - group keys, `dedup` keys, `top`/`rare` values and `values()` members
+    render floats through DuckDB's own text, so `1e-7` reads `1e-07` where it
+    used to read `1e-7`;
+  - `-0.0` groups with `0.0` and renders `0.0` (they compare equal, so a key
+    that split them contradicted the comparison), and a NaN group key renders
+    `nan` rather than JSON `null` — all NaNs in one group, as DuckDB groups
+    them;
+  - `min`/`max`/`median`/percentiles and the batch tail's `sort` order through
+    the probed DOUBLE total order, so a NaN is no longer silently skipped by
+    `max()` or left wherever arrival order put it;
+  - whole-row `dedup` key BYTES changed (cells are kind-tagged now that JSON
+    quoting no longer distinguishes them); the equivalence classes did not.
 - **A quarantine no longer destroys the previous forensic artifact (#115).**
   Compaction moves a corrupt WAL or parquet file aside as `<path>.corrupt`,
   but `rename` silently replaces an existing destination — and the paths that

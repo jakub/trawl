@@ -752,6 +752,22 @@ eval status_class = status / 100    # eval is an alias for let
 let is_error = status >= 400
 ```
 
+#### Infinities and NaN
+
+Division never fails: `1.0 / 0` is `inf`, `-1.0 / 0` is `-inf` and
+`0.0 / 0` is `NaN`, exactly as in the query engine. Those values flow
+between stages like any other number and compare the way DuckDB compares
+them — every NaN equals every other NaN and outranks every finite value,
+so `| let x = 0.0 / 0 | where x == x` keeps the row, and `max(x)` over a
+column holding one answers `NaN`. The two zeros compare equal, so
+`-0.0` groups with `0.0`.
+
+JSON has no spelling for any of them, so **JSON output renders them
+`null`**: the API wire, `-f json`, and the SSE stream all show `null`
+where a special was computed. The table and CSV renderers print the value
+itself (`inf`, `-inf`, `NaN`) when the query runs embedded (`--data`),
+which is the only path that does not cross the JSON wire.
+
 ### extract / rex
 
 Extract fields from text using regex or key-value parsing.
