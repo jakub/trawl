@@ -353,6 +353,37 @@ fn finite_floats_render_the_same_in_both_lanes() {
     assert_eq!(column(&rows, "c"), vec!["-1.5"]);
 }
 
+/// A number above `i64::MAX` is its OWN identity, not the double it
+/// computes as.
+///
+/// The row's door reads every cell now, so a pass-through field carrying
+/// `18446744073709551615` would have rounded on the way in — collapsing
+/// it with its neighbour in a `dedup`, and merging two groups into one.
+#[test]
+fn an_unsigned_number_keeps_its_identity_across_stages() {
+    let conn = conn();
+    let events = vec![
+        json!({"service": "nginx", "_time": "2026-01-15T09:00:00Z", "request_id": u64::MAX}),
+        json!({"service": "nginx", "_time": "2026-01-15T09:00:01Z", "request_id": u64::MAX - 1}),
+    ];
+
+    let deduped = agreed(&conn, "* | dedup request_id", &events);
+    assert_eq!(
+        deduped.len(),
+        2,
+        "two ids one apart are two rows: {deduped:?}"
+    );
+
+    let groups = agreed(&conn, "* | stats count() by request_id", &events);
+    assert_eq!(groups.len(), 2, "…and two groups: {groups:?}");
+    assert_eq!(column(&groups, "count"), vec!["1", "1"]);
+    assert_eq!(
+        column(&groups, "request_id"),
+        vec!["18446744073709551614", "18446744073709551615"],
+        "the group key carries the digits the sender sent"
+    );
+}
+
 /// The D1 ordering guard: an SSE frame's BYTES are what they were before
 /// rows were typed.
 ///
@@ -371,6 +402,9 @@ fn an_sse_frame_keeps_its_pre_change_bytes() {
         "flag": true,
         "missing": null,
         "message": "hello",
+        // Above `i64::MAX`: the frame must carry the digits, not the
+        // double they round to.
+        "request_id": u64::MAX,
     });
     let map = event.as_object().unwrap();
 
@@ -381,7 +415,7 @@ fn an_sse_frame_keeps_its_pre_change_bytes() {
     assert_eq!(after, before, "the frame bytes changed");
     assert_eq!(
         after,
-        r#"{"_time":"2026-01-15T09:00:00Z","flag":true,"message":"hello","missing":null,"rate":1.5,"service":"nginx","status":200}"#,
+        r#"{"_time":"2026-01-15T09:00:00Z","flag":true,"message":"hello","missing":null,"rate":1.5,"request_id":18446744073709551615,"service":"nginx","status":200}"#,
         "the frame's key order or cell rendering changed"
     );
 }

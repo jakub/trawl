@@ -25,6 +25,23 @@ pub enum EvalValue {
     Null,
     Bool(bool),
     Int(i64),
+    /// An unsigned integer ABOVE `i64::MAX` — the one JSON number shape
+    /// no signed integer can hold.
+    ///
+    /// It exists for IDENTITY and nothing else. Every value-domain
+    /// operation reads it exactly as it read the `f64` this used to
+    /// become at the row's door — arithmetic, comparison, `typeof`
+    /// (`DOUBLE`), truthiness, `tonumber`, the accumulators — because
+    /// that is what a field carrying `18446744073709551615` has always
+    /// answered. What it does NOT do is round on the way THROUGH: the
+    /// wire egress, `cell_text`, `cell_key` and the pinned read
+    /// reproduce the digits the sender sent, so a pass-through field
+    /// survives, `dedup` cannot merge two ids one apart, and a group is
+    /// still a group.
+    ///
+    /// Give it no novel semantics. A rule that treats it as anything but
+    /// "a double with its digits kept" is a rule the JSON row never had.
+    UInt(u64),
     Float(f64),
     Str(String),
     Array(Vec<EvalValue>),
@@ -50,6 +67,7 @@ impl EvalValue {
             Self::Null => false,
             Self::Bool(b) => *b,
             Self::Int(n) => *n != 0,
+            Self::UInt(n) => *n != 0,
             Self::Float(n) => *n != 0.0,
             Self::Str(s) => !s.is_empty(),
             Self::Array(a) => !a.is_empty(),
@@ -62,6 +80,9 @@ impl EvalValue {
     fn as_f64(&self) -> Option<f64> {
         match self {
             Self::Int(n) => Some(*n as f64),
+            // The rounding the JSON row did at its door, kept in the one
+            // place every numeric rule reads through.
+            Self::UInt(n) => Some(*n as f64),
             Self::Float(n) => Some(*n),
             _ => None,
         }
@@ -72,6 +93,10 @@ impl EvalValue {
         match self {
             Self::Str(s) => Some(s.clone()),
             Self::Int(n) => Some(n.to_string()),
+            // `tostring()`/`concat()` render what the EXPRESSION read,
+            // which was the rounded double.
+            #[allow(clippy::cast_precision_loss)]
+            Self::UInt(n) => Some(duckdb_double_to_string(*n as f64)),
             Self::Float(n) => Some(duckdb_double_to_string(*n)),
             Self::Bool(b) => Some(b.to_string()),
             Self::Timestamp(ts) => Some(timestamp_to_duckdb_text(ts)),
@@ -231,6 +256,8 @@ impl From<EvalValue> for Value {
             EvalValue::Null => Value::Null,
             EvalValue::Bool(b) => Value::Bool(b),
             EvalValue::Int(n) => Value::Number(n.into()),
+            // Verbatim: this is the whole reason the variant exists.
+            EvalValue::UInt(n) => Value::Number(n.into()),
             EvalValue::Float(n) => {
                 serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number)
             }
@@ -250,6 +277,9 @@ impl From<&Value> for EvalValue {
             Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
                     Self::Int(i)
+                } else if let Some(u) = n.as_u64() {
+                    // Above `i64::MAX`: kept exactly, read as a double.
+                    Self::UInt(u)
                 } else if let Some(f) = n.as_f64() {
                     Self::Float(f)
                 } else {
@@ -450,6 +480,10 @@ fn pin_read(cell: &EvalValue) -> serde_json::Value {
         EvalValue::Float(f) if !f.is_finite() => {
             serde_json::Value::String(crate::compare::canonical_double_text(*f))
         }
+        // The raw `Number` the JSON row handed the matcher, digits
+        // intact — `pin_match` reads a `u64` exactly, and a rounded
+        // double would make a pinned comparison answer for the wrong id.
+        EvalValue::UInt(n) => serde_json::Value::Number((*n).into()),
         other => serde_json::Value::from(other.clone()),
     }
 }
@@ -858,6 +892,8 @@ fn eval_unary(op: UnaryOp, operand: EvalValue) -> EvalValue {
             // checked_neg returns None on i64::MIN; null out rather than
             // panic (debug) / wrap (release), consistent with div/mod guards.
             EvalValue::Int(n) => n.checked_neg().map_or(EvalValue::Null, EvalValue::Int),
+            #[allow(clippy::cast_precision_loss)]
+            EvalValue::UInt(n) => EvalValue::Float(-(n as f64)),
             EvalValue::Float(n) => EvalValue::Float(-n),
             _ => EvalValue::Null,
         },
@@ -968,6 +1004,8 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
             // checked_abs returns None on i64::MIN; null out rather than
             // panic (debug) / wrap (release), consistent with div/mod guards.
             EvalValue::Int(n) => n.checked_abs().map_or(EvalValue::Null, EvalValue::Int),
+            #[allow(clippy::cast_precision_loss)]
+            EvalValue::UInt(n) => EvalValue::Float(*n as f64),
             EvalValue::Float(n) => EvalValue::Float(n.abs()),
             _ => EvalValue::Null,
         }),
@@ -1015,7 +1053,9 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
                     EvalValue::Null => "NULL",
                     EvalValue::Bool(_) => "BOOLEAN",
                     EvalValue::Int(_) => "BIGINT",
-                    EvalValue::Float(_) => "DOUBLE",
+                    // A field above `i64::MAX` read as a DOUBLE before
+                    // this variant existed, and still does.
+                    EvalValue::UInt(_) | EvalValue::Float(_) => "DOUBLE",
                     EvalValue::Str(_) => "VARCHAR",
                     EvalValue::Array(_) => "ARRAY",
                     EvalValue::Timestamp(_) => "TIMESTAMP",
@@ -1225,6 +1265,7 @@ fn read_condition(value: &EvalValue) -> ConditionRead {
         EvalValue::Bool(b) => *b,
         EvalValue::Null => return ConditionRead::NotTaken,
         EvalValue::Int(n) => *n != 0,
+        EvalValue::UInt(n) => *n != 0,
         // An exact zero test, both signs: `-0.0` is false and NaN — which
         // no ordering comparison would call true — is true.
         #[allow(clippy::float_cmp)]
@@ -1260,6 +1301,7 @@ fn unary_str(args: &[EvalValue], f: impl FnOnce(&str) -> String) -> EvalValue {
 fn eval_ceil(args: &[EvalValue]) -> EvalValue {
     args.first().map_or(EvalValue::Null, |v| match v {
         EvalValue::Int(n) => EvalValue::Float(*n as f64),
+        EvalValue::UInt(n) => EvalValue::Float(*n as f64),
         EvalValue::Float(n) => EvalValue::Float(n.ceil()),
         _ => EvalValue::Null,
     })
@@ -1271,6 +1313,7 @@ fn eval_ceil(args: &[EvalValue]) -> EvalValue {
 fn eval_floor(args: &[EvalValue]) -> EvalValue {
     args.first().map_or(EvalValue::Null, |v| match v {
         EvalValue::Int(n) => EvalValue::Float(*n as f64),
+        EvalValue::UInt(n) => EvalValue::Float(*n as f64),
         EvalValue::Float(n) => EvalValue::Float(n.floor()),
         _ => EvalValue::Null,
     })
@@ -1349,6 +1392,8 @@ fn eval_round(args: &[EvalValue]) -> EvalValue {
     }
     let val = match &args[0] {
         EvalValue::Int(n) => return EvalValue::Int(*n),
+        #[allow(clippy::cast_precision_loss)]
+        EvalValue::UInt(n) => *n as f64,
         EvalValue::Float(n) => *n,
         _ => return EvalValue::Null,
     };
@@ -1376,6 +1421,7 @@ fn eval_round(args: &[EvalValue]) -> EvalValue {
 fn eval_tonumber(args: &[EvalValue]) -> EvalValue {
     match args.first() {
         Some(EvalValue::Int(n)) => EvalValue::Float(*n as f64),
+        Some(EvalValue::UInt(n)) => EvalValue::Float(*n as f64),
         Some(EvalValue::Float(n)) => EvalValue::Float(*n),
         // A boolean HAS a DOUBLE reading — `TRY_CAST(true AS DOUBLE)` is
         // 1.0, not NULL (probed: `a_boolean_casts_to_double_as_one_and_zero`).

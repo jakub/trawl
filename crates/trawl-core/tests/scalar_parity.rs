@@ -865,6 +865,11 @@ fn logical_type_matches(eval: &EvalValue, sql: &Type) -> bool {
                 | Type::UInt
                 | Type::UBigInt
         ),
+        // A cell above `i64::MAX`. No generated scalar produces one —
+        // the fixture carries no such field and no expression mints one —
+        // but the match is total by design, and the shapes DuckDB would
+        // answer with are the unsigned ones.
+        EvalValue::UInt(_) => matches!(sql, Type::UBigInt | Type::HugeInt),
         EvalValue::Float(_) => matches!(sql, Type::Float | Type::Double),
         EvalValue::Str(_) => matches!(sql, Type::Text),
         EvalValue::Array(_) => matches!(sql, Type::List(_) | Type::Array(_, _)),
@@ -892,6 +897,8 @@ fn scalar_values_match(eval: &EvalValue, sql: &DuckValue) -> bool {
         (EvalValue::Null, DuckValue::Null) => true,
         (EvalValue::Bool(a), DuckValue::Boolean(b)) => a == b,
         (EvalValue::Int(a), value) => integer_value(value) == Some(*a),
+        (EvalValue::UInt(a), DuckValue::UBigInt(b)) => a == b,
+        (EvalValue::UInt(a), DuckValue::HugeInt(b)) => i128::from(*a) == *b,
         (EvalValue::Float(a), DuckValue::Float(b)) => a.to_bits() == f64::from(*b).to_bits(),
         (EvalValue::Float(a), DuckValue::Double(b)) => a.to_bits() == b.to_bits(),
         (EvalValue::Str(a), DuckValue::Text(b)) => a == b,

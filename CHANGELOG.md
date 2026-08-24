@@ -488,6 +488,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `max()` or left wherever arrival order put it;
   - whole-row `dedup` key BYTES changed (cells are kind-tagged now that JSON
     quoting no longer distinguishes them); the equivalence classes did not.
+
+  A JSON number above `i64::MAX` keeps its digits through all of this: it
+  carries as its own cell, egresses verbatim, and identifies itself exactly
+  in group, `dedup`, `dc`/`values` and `top`/`rare` keys, while every
+  value-domain rule still reads it as the double it always computed as.
 - **A quarantine no longer destroys the previous forensic artifact (#115).**
   Compaction moves a corrupt WAL or parquet file aside as `<path>.corrupt`,
   but `rename` silently replaces an existing destination — and the paths that

@@ -1469,6 +1469,11 @@ fn event_time_bucket(event: &Row, span_secs: u64) -> i64 {
 fn extract_f64(event: &Row, field: &str) -> Option<f64> {
     event_value(event, field).and_then(|v| match v {
         EvalValue::Int(n) => Some(*n as f64),
+        // A JSON number above `i64::MAX` was readable here before it had
+        // its own cell — `Value::Number::as_f64` answered for it — so
+        // `sum`/`avg`/`min`/`max` still see it, rounded exactly as they
+        // saw it then.
+        EvalValue::UInt(n) => Some(*n as f64),
         EvalValue::Float(f) => Some(*f),
         _ => None,
     })

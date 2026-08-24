@@ -100,6 +100,10 @@ pub fn cell_text(cell: &EvalValue) -> String {
         EvalValue::Null => "null".to_owned(),
         EvalValue::Bool(b) => b.to_string(),
         EvalValue::Int(n) => n.to_string(),
+        // EXACT digits, never the double it computes as: a group key and
+        // a `dedup` key are identities, and two ids one apart must not
+        // collapse into one.
+        EvalValue::UInt(n) => n.to_string(),
         EvalValue::Float(f) => {
             let text = compare::canonical_double_text(*f);
             // Only the sign of zero is normalized; `-nan` keeps its sign
@@ -134,21 +138,23 @@ pub(crate) fn cell_key(cell: &EvalValue) -> String {
     let tag = match cell {
         EvalValue::Null => 'n',
         EvalValue::Bool(_) => 'b',
-        EvalValue::Int(_) | EvalValue::Float(_) => '#',
+        EvalValue::Int(_) | EvalValue::UInt(_) | EvalValue::Float(_) => '#',
         EvalValue::Str(_) | EvalValue::Timestamp(_) => 's',
         EvalValue::Array(_) => 'a',
     };
     format!("{tag}:{}", cell_text(cell))
 }
 
-/// A `u64` counter as a cell, read the way the JSON round trip read it:
-/// an integer while it fits, a double past that.
+/// A `u64` counter as a cell: an integer while it fits, and the
+/// unsigned cell past that — which is what the JSON row carried, digits
+/// intact.
 ///
-/// `count()`, `count(field)` and `dc()` all produce one. The wire bytes
-/// are unchanged for every count a stream can actually reach.
-#[allow(clippy::cast_precision_loss)]
+/// `count()`, `count(field)` and `dc()` all produce one. No stream
+/// reaches the second arm (it would need `i64::MAX` events), but the
+/// counter IS a `u64` and this is the reading that does not invent a
+/// rounding.
 pub(crate) fn count_value(n: u64) -> EvalValue {
-    i64::try_from(n).map_or_else(|_| EvalValue::Float(n as f64), EvalValue::Int)
+    i64::try_from(n).map_or(EvalValue::UInt(n), EvalValue::Int)
 }
 
 #[cfg(test)]
@@ -213,7 +219,34 @@ mod tests {
         #[allow(clippy::cast_sign_loss)]
         let max = i64::MAX as u64;
         assert_eq!(count_value(max), EvalValue::Int(i64::MAX));
-        assert!(matches!(count_value(max + 1), EvalValue::Float(_)));
+        assert_eq!(count_value(max + 1), EvalValue::UInt(max + 1));
+    }
+
+    /// A number above `i64::MAX` keeps its digits through both doors and
+    /// in every identity — the JSON row did, and a rounded double makes
+    /// `dedup`, `stats … by` and `dc()` merge ids that differ.
+    #[test]
+    fn an_unsigned_number_keeps_its_digits() {
+        let event = json!({ "request_id": u64::MAX, "near": u64::MAX - 1 });
+        let object = event.as_object().unwrap();
+        let row = from_json(object);
+        assert_eq!(row.get("request_id"), Some(&EvalValue::UInt(u64::MAX)));
+        assert_eq!(&to_json(row.clone()), object, "the wire keeps the digits");
+
+        assert_eq!(
+            cell_text(&EvalValue::UInt(u64::MAX)),
+            "18446744073709551615"
+        );
+        assert_ne!(
+            cell_key(row.get("request_id").unwrap()),
+            cell_key(row.get("near").unwrap()),
+            "two ids one apart are two keys"
+        );
+        // …and it is still a NUMBER to a key, not a string.
+        assert_ne!(
+            cell_key(&EvalValue::UInt(7)),
+            cell_key(&EvalValue::Str("7".into()))
+        );
     }
 
     #[test]

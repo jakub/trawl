@@ -127,6 +127,12 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
         EvalValue::Null => crate::value::Value::Null,
         EvalValue::Bool(b) => crate::value::Value::Boolean(*b),
         EvalValue::Int(i) => crate::value::Value::Integer(*i),
+        // `crate::value::Value::Integer` is signed, so a number above
+        // `i64::MAX` degrades to the double the JSON hop degraded it to.
+        // Unreachable from this bridge in practice — a result cell has no
+        // unsigned shape to arrive as — but stated rather than assumed.
+        #[allow(clippy::cast_precision_loss)]
+        EvalValue::UInt(u) => crate::value::Value::Float(*u as f64),
         EvalValue::Float(f) => crate::value::Value::Float(*f),
         EvalValue::Str(s) => crate::value::Value::String(s.clone()),
         EvalValue::Timestamp(ts) => crate::value::Value::String(timestamp_to_duckdb_text(ts)),
@@ -276,6 +282,7 @@ fn compare_cells(a: Option<&EvalValue>, b: Option<&EvalValue>) -> std::cmp::Orde
 fn numeric_cell(cell: &EvalValue) -> Option<f64> {
     match cell {
         EvalValue::Int(i) => Some(*i as f64),
+        EvalValue::UInt(u) => Some(*u as f64),
         EvalValue::Float(f) => Some(*f),
         _ => None,
     }
