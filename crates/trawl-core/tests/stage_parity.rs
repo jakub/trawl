@@ -19,7 +19,6 @@
 //! displayed cell already are. Each case also states the ANSWER, because
 //! two lanes can agree on the wrong one.
 
-use std::collections::BTreeSet;
 use std::io::Write as _;
 
 use duckdb::Connection;
@@ -34,6 +33,13 @@ use trawl_core::stream::{StageResult, StreamPlan, apply_stage, compile_stream_pl
 /// comparison never depends on projection order.
 type TextRow = Vec<(String, String)>;
 
+/// A lane's whole answer: rows SORTED, so the comparison ignores order,
+/// and a `Vec` rather than a set, so it does not ignore MULTIPLICITY.
+/// A set would have compared a lane emitting one row equal to a lane
+/// emitting the same row twice — exactly the failure a broken `dedup`
+/// produces.
+type TextRows = Vec<TextRow>;
+
 /// Whether a column takes part in the cell-by-cell comparison.
 ///
 /// `_time` does not, for the reason `pin_stage_parity` excludes it too:
@@ -43,6 +49,30 @@ type TextRow = Vec<(String, String)>;
 /// this milestone does not touch, and it would mask every case here.
 fn compared(column: &str) -> bool {
     column != "_time"
+}
+
+/// The one text normalization the comparison applies, to BOTH lanes
+/// alike: a NaN's SIGN.
+///
+/// The sign of a computed NaN is the hardware's, not the engine's
+/// (`0.0 / 0` is `-nan` on x86 and need not be elsewhere), and the two
+/// lanes reach their text through different renderers: the live side
+/// through the IDENTITY path, which deliberately ties the two signs so a
+/// group is one group ([`row::cell_text`]), the batch side through
+/// `::VARCHAR`, which prints whichever sign the value carries. No
+/// production path compares those bytes across lanes — the wire renders
+/// a NaN `null` on both sides — so the harness folds the sign rather
+/// than pinning this machine's.
+///
+/// Applied SYMMETRICALLY, so it can hide no divergence: whatever it
+/// does to one lane it does to the other, and every other byte stays
+/// exact.
+fn fold_nan_sign(text: String) -> String {
+    if text == "-nan" {
+        "nan".to_owned()
+    } else {
+        text
+    }
 }
 
 fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
@@ -62,7 +92,7 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
 /// Run the pipeline as SQL and read every cell back as `DuckDB`'s own
 /// VARCHAR rendering — the one form that can carry `inf`/`nan`, where
 /// `to_json` would null them out and hide exactly what is under test.
-fn batch_rows(conn: &Connection, dsl: &str, events: &[Value]) -> BTreeSet<TextRow> {
+fn batch_rows(conn: &Connection, dsl: &str, events: &[Value]) -> TextRows {
     batch_outcome(conn, dsl, events)
         .unwrap_or_else(|error| panic!("batch must run for {dsl:?}: {error}"))
 }
@@ -70,11 +100,7 @@ fn batch_rows(conn: &Connection, dsl: &str, events: &[Value]) -> BTreeSet<TextRo
 /// The same, surfacing a `DuckDB` ERROR instead of panicking on it — the
 /// shape a case needs when the batch lane REFUSES the query and the
 /// streaming contract is "eval answers NULL / drops the row".
-fn batch_outcome(
-    conn: &Connection,
-    dsl: &str,
-    events: &[Value],
-) -> Result<BTreeSet<TextRow>, String> {
+fn batch_outcome(conn: &Connection, dsl: &str, events: &[Value]) -> Result<TextRows, String> {
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let mut tmp = tempfile::Builder::new()
         .suffix(".ndjson")
@@ -124,19 +150,22 @@ fn batch_outcome(
                     continue;
                 }
                 let text: Option<String> = row.get(index)?;
-                cells.push((name.clone(), text.unwrap_or_else(|| "null".to_owned())));
+                cells.push((
+                    name.clone(),
+                    fold_nan_sign(text.unwrap_or_else(|| "null".to_owned())),
+                ));
             }
             cells.sort();
             Ok(cells)
         })
         .map_err(|error| error.to_string())?
-        .collect::<Result<BTreeSet<TextRow>, _>>()
+        .collect::<Result<TextRows, _>>()
         .map_err(|error| error.to_string())?;
-    Ok(rows)
+    Ok(sorted(rows))
 }
 
 /// Run the same pipeline through the live lane over the same events.
-fn live_rows(dsl: &str, events: &[Value]) -> BTreeSet<TextRow> {
+fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let plan = compile_stream_plan(&query.pipeline, &PinScope::unpinned()).expect("plan compiles");
     let rows: Vec<Row> = events
@@ -181,23 +210,31 @@ fn live_rows(dsl: &str, events: &[Value]) -> BTreeSet<TextRow> {
         }
     };
 
-    emitted
+    let rendered: TextRows = emitted
         .into_iter()
         .map(|event| {
             let mut cells: TextRow = event
                 .iter()
                 .filter(|(name, _)| compared(name))
-                .map(|(name, cell)| (name.clone(), row::cell_text(cell)))
+                .map(|(name, cell)| (name.clone(), fold_nan_sign(row::cell_text(cell))))
                 .collect();
             cells.sort();
             cells
         })
-        .collect()
+        .collect();
+    sorted(rendered)
+}
+
+/// Row order is an implementation detail of each lane; the CONTENT and
+/// how many times it appears are not.
+fn sorted(mut rows: TextRows) -> TextRows {
+    rows.sort();
+    rows
 }
 
 /// Both lanes, same events, same answer — returned so the caller can say
 /// what the answer must BE.
-fn agreed(conn: &Connection, dsl: &str, events: &[Value]) -> BTreeSet<TextRow> {
+fn agreed(conn: &Connection, dsl: &str, events: &[Value]) -> TextRows {
     let batch = batch_rows(conn, dsl, events);
     let live = live_rows(dsl, events);
     assert_eq!(
@@ -207,8 +244,9 @@ fn agreed(conn: &Connection, dsl: &str, events: &[Value]) -> BTreeSet<TextRow> {
     batch
 }
 
-/// The value of one column across the agreed rows.
-fn column(rows: &BTreeSet<TextRow>, name: &str) -> Vec<String> {
+/// The value of one column across the agreed rows, sorted — one entry
+/// per row, so a repeated row is a repeated value.
+fn column(rows: &TextRows, name: &str) -> Vec<String> {
     let mut values: Vec<String> = rows
         .iter()
         .map(|row| {
@@ -269,6 +307,12 @@ fn an_infinity_compares_in_a_later_stage() {
 
 /// A NaN group key is ONE group, rendered `nan` — not a null group, and
 /// not one group per row.
+///
+/// The key's TEXT is the parked divergence `-0.0` has: the identity path
+/// normalizes the sign the total order ties, while `DuckDB` displays
+/// whichever representative row it kept (`0.0 / 0` produces a NaN whose
+/// sign is the hardware's). So the GROUPING is compared across lanes and
+/// the rendering is asserted per lane.
 #[test]
 fn a_nan_group_key_is_one_group() {
     let conn = conn();
@@ -276,13 +320,20 @@ fn a_nan_group_key_is_one_group() {
         json!({"service": "nginx", "n": 1}),
         json!({"service": "nginx", "n": 2}),
     ];
-    let rows = agreed(&conn, "* | let x = 0.0 / 0 | stats count() by x", &events);
-    assert_eq!(rows.len(), 1, "one group: {rows:?}");
-    assert_eq!(column(&rows, "count"), vec!["2"]);
-    let key = column(&rows, "x");
+    let dsl = "* | let x = 0.0 / 0 | stats count() by x";
+    let live = live_rows(dsl, &events);
+    let batch = batch_rows(&conn, dsl, &events);
+
+    assert_eq!(live.len(), 1, "one group live: {live:?}");
+    assert_eq!(batch.len(), 1, "one group in batch: {batch:?}");
+    assert_eq!(column(&live, "count"), column(&batch, "count"));
+    assert_eq!(column(&live, "count"), vec!["2"]);
+
+    assert_eq!(column(&live, "x"), vec!["nan"], "the live key is unsigned");
+    let batch_key = column(&batch, "x");
     assert!(
-        key == vec!["nan"] || key == vec!["-nan"],
-        "the group key renders as a NaN, sign included: {key:?}"
+        batch_key == vec!["nan"] || batch_key == vec!["-nan"],
+        "the batch key is whichever NaN DuckDB kept: {batch_key:?}"
     );
 }
 
@@ -365,6 +416,67 @@ fn finite_floats_render_the_same_in_both_lanes() {
     assert_eq!(column(&rows, "a"), vec!["2.5"]);
     assert_eq!(column(&rows, "b"), vec!["25.0"]);
     assert_eq!(column(&rows, "c"), vec!["-1.5"]);
+}
+
+/// The two NaN SIGNS are one identity: one group, one distinct value,
+/// one row after `dedup`.
+///
+/// `cell_text` renders a float through `DuckDB`'s own text, which
+/// carries the sign — right for `tostring()`, wrong for a KEY, because
+/// the comparator ties the two signs (`NaN = NaN` is true). A signed key
+/// split a group the engine does not split.
+///
+/// The GROUPING is asserted in both lanes; the key's TEXT is the same
+/// parked divergence `-0.0` has, since `DuckDB` displays whichever
+/// representative row it kept.
+#[test]
+fn the_two_nan_signs_are_one_identity() {
+    let conn = conn();
+    let events = vec![
+        json!({"service": "nginx", "_time": "2026-01-15T09:00:00Z", "flag": true}),
+        json!({"service": "nginx", "_time": "2026-01-15T09:00:00Z", "flag": false}),
+    ];
+    // `tonumber` carries the sign from the TEXT in both lanes, so the
+    // two rows really do hold differently-signed NaNs.
+    let signed = r#"let x = if(flag, tonumber("nan"), tonumber("-nan"))"#;
+
+    for (stage, column_name, want) in [
+        ("stats count() by x", "count", "2"),
+        ("stats dc(x) as d", "d", "1"),
+    ] {
+        let dsl = format!("* | {signed} | {stage}");
+        let live = live_rows(&dsl, &events);
+        let batch = batch_rows(&conn, &dsl, &events);
+        assert_eq!(live.len(), 1, "one live row: {live:?}");
+        assert_eq!(batch.len(), 1, "one batch row: {batch:?}");
+        assert_eq!(column(&live, column_name), vec![want], "{dsl}");
+        assert_eq!(column(&batch, column_name), vec![want], "{dsl}");
+    }
+
+    // The group key itself: unsigned live, whichever sign DuckDB kept in
+    // batch.
+    let grouped = format!("* | {signed} | stats count() by x");
+    assert_eq!(column(&live_rows(&grouped, &events), "x"), vec!["nan"]);
+    let batch_key = column(&batch_rows(&conn, &grouped, &events), "x");
+    assert!(
+        batch_key == vec!["nan"] || batch_key == vec!["-nan"],
+        "the batch key is whichever NaN DuckDB kept: {batch_key:?}"
+    );
+
+    // `values()` collects ONE member — it used to list both signs.
+    let listed = format!("* | {signed} | stats values(x) as vs");
+    assert_eq!(
+        column(&live_rows(&listed, &events), "vs"),
+        vec![r#"["nan"]"#]
+    );
+
+    // …and both `dedup` forms keep ONE row: the by-field form, and the
+    // whole-row one that reads the same cell through `cell_key`.
+    for dedup in ["dedup x", "drop flag | dedup"] {
+        let dsl = format!("* | {signed} | {dedup}");
+        let deduped = agreed(&conn, &dsl, &events);
+        assert_eq!(deduped.len(), 1, "one row survives {dedup}: {deduped:?}");
+    }
 }
 
 /// A computed TIMESTAMP groups by the text `DuckDB` prints — not by the

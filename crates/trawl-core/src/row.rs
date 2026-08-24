@@ -106,12 +106,24 @@ pub fn cell_text(cell: &EvalValue) -> String {
         EvalValue::UInt(n) => n.to_string(),
         EvalValue::Float(f) => {
             let text = compare::canonical_double_text(*f);
-            // Only the sign of zero is normalized; `-nan` keeps its sign
-            // because `DuckDB` renders it and a pattern matches it.
-            if text == "-0.0" {
-                "0.0".to_owned()
-            } else {
-                text
+            // The identity path normalizes what the ORDER ties: the two
+            // zeros compare equal and so do the two NaN signs
+            // ([`compare::double_total_cmp`]), so each pair is ONE key
+            // and one group — a signed key would split a group `DuckDB`
+            // does not split, make `dc()` say two and let `dedup` keep
+            // both rows.
+            //
+            // The scalar CAST domain keeps its sign:
+            // `duckdb_double_to_string` (hence `tostring()`, `concat()`
+            // and the DOUBLE pin's glob text) still renders `-0.0` and
+            // `-nan`, because that is the text the engine prints for
+            // one. Same parked caveat both times: `DuckDB` DISPLAYS
+            // whichever representative row it kept, so a group key it
+            // prints may carry a sign this one does not.
+            match text.as_str() {
+                "-0.0" => "0.0".to_owned(),
+                "-nan" => "nan".to_owned(),
+                _ => text,
             }
         }
         EvalValue::Str(s) => s.clone(),
@@ -184,9 +196,12 @@ mod tests {
             (EvalValue::Float(1e-7), "1e-07"),
             (EvalValue::Float(f64::INFINITY), "inf"),
             (EvalValue::Float(f64::NEG_INFINITY), "-inf"),
+            // The ruling, twice over: an identity normalizes what the
+            // total order TIES, so both NaN signs read `nan` and both
+            // zeros read `0.0`. The scalar cast text keeps its sign —
+            // that is `duckdb_double_to_string`'s job, not this one.
             (EvalValue::Float(f64::NAN), "nan"),
-            (EvalValue::Float(-f64::NAN), "-nan"),
-            // The ruling: negative zero groups WITH positive zero.
+            (EvalValue::Float(-f64::NAN), "nan"),
             (EvalValue::Float(-0.0), "0.0"),
             (EvalValue::Float(0.0), "0.0"),
         ] {
@@ -243,6 +258,12 @@ mod tests {
             cell_key(&EvalValue::Float(-0.0)),
             cell_key(&EvalValue::Float(0.0))
         );
+        // …and so do the two NaN signs, which the total order ties too.
+        assert_eq!(
+            cell_key(&EvalValue::Float(-f64::NAN)),
+            cell_key(&EvalValue::Float(f64::NAN))
+        );
+        assert_eq!(cell_text(&EvalValue::Float(-f64::NAN)), "nan");
     }
 
     #[test]
