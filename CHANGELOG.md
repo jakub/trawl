@@ -463,57 +463,87 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   this is a token-rendering change only.
 
 ### Fixed
-- **Timestamps in the streaming lanes read through the one probed owner
-  (#105).** `eval` carried an instant as a bare `NaiveDateTime` and parsed
-  timestamp text with a parser of its own, so three answers differed from the
-  query engine's. Visible deltas:
-  - a MALFORMED offset (`2026-01-15 10:20:30+ab:cd`) was stripped unvalidated
-    and compared equal to the same instant without it; it has no reading now,
-    so the comparison is UNKNOWN and the row drops — which is what the batch
-    query, who refuses to run at all, implies;
-  - comparing a timestamp against a text with no reading fell back to LEXICAL
-    string ordering (ADR-0017 §2 withdrew it): `t < "zzz"` was TRUE, it is
-    UNKNOWN now, in both operand orders;
-  - the two instants beyond the calendar — `infinity` and `-infinity` — are
-    values rather than parse failures: they compare in DuckDB's order, render
-    as their words through `tostring()` and a projected cell, pass through
-    `date_trunc` unchanged, and NULL out `date_part`/`date_diff` exactly as
-    the engine does;
-  - `date_part("epoch", …)` is the instant's microsecond count divided once
-    rather than seconds plus a fraction, so a far-future timestamp no longer
-    answers `253402300799.00003` where the engine answers `253402300799`;
-  - `x in (…)` is three-valued: an element that answers UNKNOWN makes a
-    non-match UNKNOWN rather than FALSE, which used to invert under `NOT`.
-- **Pipeline stages carry typed rows, so a computed infinity or NaN survives
-  them (#105).** Streaming stages passed rows to each other as JSON, which has
-  no spelling for a non-finite double: `| let x = 0.0 / 0 | where x == x` kept
-  the row in batch and dropped it live, and the `extract kv` batch tail
-  received a NULL where its own SQL prefix had computed `1.0 / 0`. Rows now
-  carry typed cells end to end and JSON appears only at the wire, where the
-  behaviour is unchanged — the API, `-f json` and SSE still render a special
-  as `null`, once, at the edge. Visible deltas:
-  - the batch tail behind `extract kv` now **counts, compares, aggregates and
-    prints** specials it used to see as NULL (`max(x)` over an infinity is
-    `inf`, not empty; a `where` over one keeps its rows);
-  - a computed special survives a stage boundary in the LIVE lane, so a live
-    tail and the equivalent `/query` answer the same;
-  - group keys, `dedup` keys, `top`/`rare` values and `values()` members
-    render floats through DuckDB's own text, so `1e-7` reads `1e-07` where it
-    used to read `1e-7`;
-  - `-0.0` groups with `0.0` and renders `0.0` (they compare equal, so a key
-    that split them contradicted the comparison), and a NaN group key renders
-    `nan` rather than JSON `null` — all NaNs in one group, as DuckDB groups
-    them;
-  - `min`/`max`/`median`/percentiles and the batch tail's `sort` order through
-    the probed DOUBLE total order, so a NaN is no longer silently skipped by
-    `max()` or left wherever arrival order put it;
-  - whole-row `dedup` key BYTES changed (cells are kind-tagged now that JSON
-    quoting no longer distinguishes them); the equivalence classes did not.
+- **The streaming evaluator answers what the query engine answers (#105).**
+  Every DSL expression runs in two lanes — `DuckDB` SQL for `/api/v1/query`,
+  an in-memory evaluator for the SSE live tail and for the `rust_stages`
+  batch tail behind `extract kv` — and the evaluator had grown value-domain
+  rules of its own. It has none now: each answer that depends on how `DuckDB`
+  parses, casts, compares or renders a value goes through one probe-pinned
+  owner, and every rule below is executed against the bundled engine in
+  `trawl-engine/tests/duckdb_probe.rs` rather than reasoned out (ADR-0017).
+  A live alert and the query you wrote it from now agree event for event.
 
-  A JSON number above `i64::MAX` keeps its digits through all of this: it
-  carries as its own cell, egresses verbatim, and identifies itself exactly
-  in group, `dedup`, `dc`/`values` and `top`/`rare` keys, while every
-  value-domain rule still reads it as the double it always computed as.
+  This changes answers. In rough order of how likely you are to notice:
+
+  - **`/` is true division.** `status / 100` over a `404` is `4.04`, not `4`,
+    and the result is a DOUBLE whatever the operands were. Use
+    `floor(status / 100)` for the old integer answer. Division by zero is
+    IEEE — `1.0 / 0` is `inf`, `0.0 / 0` is `NaN` — where the evaluator used
+    to answer NULL; `%` follows `/` whenever either side is a float
+    (`5 % 0.0` is `NaN`), while integer `% 0` stays NULL.
+  - **`+`, `-`, `*` overflow to NULL in the live lane.** `DuckDB` raises an
+    `Out of Range` error for one, and an SSE subscription cannot raise a
+    per-event error without dying, so the evaluator nulls where batch errors
+    (ADR-0017 §4). It used to PANIC in a debug build and wrap silently in a
+    release one.
+  - **`if()` and `case()` take `DuckDB`'s boolean cast, not truthiness.** A
+    string reads through the closed vocabulary `true`/`t`/`yes`/`y`/`1` and
+    `false`/`f`/`no`/`n`/`0`; **any other string nulls the whole call** where
+    a non-empty one used to take the THEN branch, `" true "` included (the
+    cast does not trim). Numbers are non-zero, `NaN` is true, a timestamp or
+    a list has no reading. `and`/`or`/`not` and the `where` gate keep the
+    older, wider predicate on purpose — they decide whether a live alert
+    fires, and this release was not licensed to change that.
+  - **`ceil`/`floor` return DOUBLE** over an integer argument too (`ceil(5)`
+    is `5.0`); `round` keeps an integer argument integral. `typeof` of an
+    integer is `BIGINT` (the emitter binds literals as parameters, so
+    `INTEGER` was a spelling the batch lane never produced), and a wire
+    integer above `i64::MAX` reads as `DOUBLE` in an expression.
+    `tonumber(true)` is `1.0`, not NULL.
+  - **NaN compares in `DuckDB`'s TOTAL order**: every NaN equals every other
+    NaN and outranks every finite value, and the two zeros tie. This also
+    fixes a live filter — a DOUBLE-pinned `metric=nan` matched in batch and
+    matched nothing on the live tail. A NaN also RENDERS with its sign now
+    (`-nan`), which is the text a DOUBLE-pinned glob matches.
+  - **Timestamps read through one owner.** The evaluator's own parser is
+    gone: a text coerces through the same `TRY_CAST` a bound parameter gets,
+    so a malformed offset (`+ab:cd`) has no reading instead of being stripped
+    unvalidated, and a text with no reading makes the comparison UNKNOWN —
+    the lexical string fallback is withdrawn (ADR-0017 §2), so `t < "zzz"`
+    is unknown rather than true, in both operand orders. `infinity` and
+    `-infinity` became values rather than parse failures: they order below
+    and above every date, render as their words, pass through `date_trunc`
+    unchanged, and null `date_part`/`date_diff` exactly as the engine does.
+    `date_part("epoch", …)` is the microsecond count divided once, so a
+    far-future instant no longer answers `253402300799.00003` where the
+    engine answers `253402300799`. `%f` is a six-digit MICROSECOND field in
+    both lanes (it was chrono's nine-digit nanosecond count); the fixed width
+    leaves one under-read on the way in, where `DuckDB` accepts a fraction of
+    any length. `x in (…)` is three-valued: an element that answers UNKNOWN
+    makes a non-match UNKNOWN rather than FALSE, which used to invert under
+    `NOT`.
+  - **Rows carry typed cells between stages.** They used to cross each stage
+    boundary as JSON, which cannot spell a non-finite double — so
+    `| let x = 0.0 / 0 | where x == x` kept the row in batch and dropped it
+    live, and the `extract kv` batch tail received a NULL where its own SQL
+    prefix had computed `1.0 / 0`. That tail now counts, compares, aggregates
+    and prints those values; a computed special survives a stage boundary
+    live; group/`dedup`/`top`/`rare`/`values()` keys render floats through
+    `DuckDB`'s own text (`1e-7` reads `1e-07`); `-0.0` groups with `0.0` and
+    a NaN group key renders `nan` rather than JSON `null`;
+    `min`/`max`/`median`/percentiles and the batch tail's `sort` order
+    through the same total order, so `max()` no longer silently skips a NaN;
+    and whole-row `dedup` key BYTES changed (cells are kind-tagged now that
+    JSON quoting no longer tells a string from a number) while the
+    equivalence classes did not. A number above `i64::MAX` keeps its digits
+    through all of it — on the wire, in a `dedup` key, in a group — while
+    still computing as the double it always did.
+
+  **The wire is unchanged.** JSON has no spelling for an infinity or a NaN,
+  so the API, `-f json` and the SSE stream still render one as `null` — once,
+  at the edge, in both lanes. `-f table` and `-f csv` print `inf`/`-inf`/`NaN`
+  under embedded `--data`, the one path that does not cross JSON.
+
 - **A quarantine no longer destroys the previous forensic artifact (#115).**
   Compaction moves a corrupt WAL or parquet file aside as `<path>.corrupt`,
   but `rename` silently replaces an existing destination — and the paths that
