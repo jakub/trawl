@@ -353,6 +353,26 @@ fn finite_floats_render_the_same_in_both_lanes() {
     assert_eq!(column(&rows, "c"), vec!["-1.5"]);
 }
 
+/// A computed TIMESTAMP groups by the text `DuckDB` prints — not by the
+/// JSON string it becomes on the wire, quote characters and all.
+#[test]
+fn a_timestamp_group_key_is_the_instants_own_text() {
+    let conn = conn();
+    let events = vec![
+        json!({"service": "nginx", "n": 1}),
+        json!({"service": "nginx", "n": 2}),
+    ];
+    let rows = agreed(
+        &conn,
+        "* | let t = strptime(\"2026-01-15 09:00:00\", \"%Y-%m-%d %H:%M:%S\") \
+         | stats count() by t",
+        &events,
+    );
+    assert_eq!(rows.len(), 1, "one group: {rows:?}");
+    assert_eq!(column(&rows, "t"), vec!["2026-01-15 09:00:00"]);
+    assert_eq!(column(&rows, "count"), vec!["2"]);
+}
+
 /// A number above `i64::MAX` is its OWN identity, not the double it
 /// computes as.
 ///
