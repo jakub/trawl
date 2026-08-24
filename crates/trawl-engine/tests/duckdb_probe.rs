@@ -4962,3 +4962,148 @@ fn percent_f_parses_a_variable_length_fraction() {
         assert_eq!(parsed.as_deref(), Some(*want), "strptime({input:?})");
     }
 }
+
+// ── #105 M8: `json_extract` returns JSON TEXT ──────────────────────
+//
+// `json_extract` yields JSON, not a decoded scalar: a string keeps its
+// QUOTES, a number is its own text, a composite is compact JSON. The
+// live mirror renders through `serde_json`, whose text IS `DuckDB`'s for
+// every shape but one — a positive exponent, which serde spells `e+300`
+// and `DuckDB` spells `e300`.
+
+/// (document, path, the TEXT `json_extract` returns).
+///
+/// Every class the mirror claims to reproduce: integers, floats, the
+/// exponent spellings, strings WITH escapes, booleans, JSON null,
+/// arrays, objects, a nested extract, and a missing path (SQL NULL).
+const JSON_EXTRACT_TEXTS: &[(&str, &str, Option<&str>)] = &[
+    (r#"{"a":1}"#, "$.a", Some("1")),
+    (r#"{"a":-1}"#, "$.a", Some("-1")),
+    (r#"{"a":1.5}"#, "$.a", Some("1.5")),
+    (r#"{"a":1.0}"#, "$.a", Some("1.0")),
+    (r#"{"a":0.1}"#, "$.a", Some("0.1")),
+    (r#"{"a":-0.0}"#, "$.a", Some("-0.0")),
+    (r#"{"a":1e2}"#, "$.a", Some("100.0")),
+    // The spelling the mirror normalizes…
+    (r#"{"a":1e300}"#, "$.a", Some("1e300")),
+    (r#"{"a":-1e300}"#, "$.a", Some("-1e300")),
+    (
+        r#"{"a":1.7976931348623157e308}"#,
+        "$.a",
+        Some("1.7976931348623157e308"),
+    ),
+    // …and the negative exponent that needs no normalizing.
+    (r#"{"a":1e-7}"#, "$.a", Some("1e-7")),
+    (r#"{"a":5e-324}"#, "$.a", Some("5e-324")),
+    // Integers up to the width serde keeps exactly.
+    (r#"{"a":9007199254740993}"#, "$.a", Some("9007199254740993")),
+    (
+        r#"{"a":18446744073709551615}"#,
+        "$.a",
+        Some("18446744073709551615"),
+    ),
+    // Strings keep their QUOTES and their escaping.
+    (r#"{"a":"x"}"#, "$.a", Some(r#""x""#)),
+    (
+        r#"{"a":"he said \"hi\""}"#,
+        "$.a",
+        Some(r#""he said \"hi\"""#),
+    ),
+    (r#"{"a":"tab\there"}"#, "$.a", Some(r#""tab\there""#)),
+    // A string whose CONTENT looks like an exponent must survive the
+    // normalization untouched.
+    (r#"{"a":"cost e+300"}"#, "$.a", Some(r#""cost e+300""#)),
+    (r#"{"a":true}"#, "$.a", Some("true")),
+    (r#"{"a":null}"#, "$.a", Some("null")),
+    (r#"{"a":[1,2]}"#, "$.a", Some("[1,2]")),
+    (
+        r#"{"a":{"b":[1,{"c":2}]}}"#,
+        "$.a",
+        Some(r#"{"b":[1,{"c":2}]}"#),
+    ),
+    (r#"{"a":{"b":"x"}}"#, "$.a.b", Some(r#""x""#)),
+    ("[1,2]", "$", Some("[1,2]")),
+    // A missing path is SQL NULL, where a JSON `null` above is a VALUE.
+    (r#"{"a":1}"#, "$.missing", None),
+];
+
+/// The live mirror — eval's OWN renderer, not a copy of it. A local
+/// re-implementation would be a second version of the rule under test,
+/// and the naive spelling of it (a blind `replace`) corrupts a string
+/// whose CONTENT contains `e+`.
+fn json_extract_mirror(doc: &str, path: &str) -> Option<String> {
+    let pointer = if path == "$" {
+        String::new()
+    } else {
+        path.trim_start_matches('$').replace('.', "/")
+    };
+    let value: serde_json::Value = serde_json::from_str(doc).ok()?;
+    Some(trawl_core::eval::duckdb_json_text(value.pointer(&pointer)?))
+}
+
+#[test]
+fn json_extract_returns_the_values_json_text() {
+    let conn = conn();
+    for (doc, path, want) in JSON_EXTRACT_TEXTS {
+        let engine: Option<String> = conn
+            .query_row("SELECT json_extract(?, ?)", [*doc, *path], |row| row.get(0))
+            .unwrap();
+        assert_eq!(engine.as_deref(), *want, "json_extract({doc}, {path})");
+        assert_eq!(
+            json_extract_mirror(doc, path).as_deref(),
+            *want,
+            "the mirror disagrees for json_extract({doc}, {path})"
+        );
+    }
+}
+
+/// The residual: `serde_json` re-renders a number from its `f64`, where
+/// `DuckDB` renders from the SOURCE spelling.
+///
+/// Two sub-classes, one cause. An exponent-form source below 1e21 is
+/// EXPANDED by `DuckDB` and kept in exponent form by serde; a digit-form
+/// source too wide for `u64` keeps its digits in `DuckDB` and collapses
+/// to exponent form in serde. Both need the source text, which only
+/// `serde_json`'s `arbitrary_precision` feature preserves — REJECTED for
+/// this change, because that flag changes number handling across the
+/// whole ingest plane.
+const JSON_NUMBER_SPELLING_RESIDUALS: &[(&str, &str, &str)] = &[
+    // (document, DuckDB's text, the mirror's text)
+    (r#"{"a":1e16}"#, "10000000000000000.0", "1e16"),
+    (r#"{"a":1e20}"#, "100000000000000000000.0", "1e20"),
+    (
+        r#"{"a":100000000000000000000}"#,
+        "100000000000000000000",
+        "1e20",
+    ),
+    // …and the two that agree either side of the band, so the class is
+    // bounded rather than open-ended.
+    (r#"{"a":1e15}"#, "1000000000000000.0", "1000000000000000.0"),
+    (r#"{"a":1e21}"#, "1e21", "1e21"),
+];
+
+#[test]
+fn current_json_number_spelling_follows_serdes_f64() {
+    let conn = conn();
+    for (doc, engine_text, mirror_text) in JSON_NUMBER_SPELLING_RESIDUALS {
+        let engine: Option<String> = conn
+            .query_row("SELECT json_extract(?, '$.a')", [*doc], |row| row.get(0))
+            .unwrap();
+        assert_eq!(engine.as_deref(), Some(*engine_text), "{doc}");
+        assert_eq!(
+            json_extract_mirror(doc, "$.a").as_deref(),
+            Some(*mirror_text),
+            "{doc}"
+        );
+    }
+
+    // A number outside `f64`'s range is a step further: serde cannot
+    // PARSE the document at all, so the whole call is NULL where the
+    // engine answers the number's text.
+    let doc = r#"{"a":1e400}"#;
+    let engine: Option<String> = conn
+        .query_row("SELECT json_extract(?, '$.a')", [doc], |row| row.get(0))
+        .unwrap();
+    assert_eq!(engine.as_deref(), Some("1e400"));
+    assert_eq!(json_extract_mirror(doc, "$.a"), None);
+}

@@ -1189,6 +1189,19 @@ fn eval_json_extract_string(args: &[EvalValue]) -> EvalValue {
     }
 }
 
+/// `json_extract(doc, path)` — the value's JSON TEXT, as `DuckDB`
+/// returns it.
+///
+/// `DuckDB`'s `json_extract` yields JSON, not a decoded scalar: a string
+/// keeps its QUOTES (`"x"`), a number is its own text, and an
+/// array/object is compact JSON. eval used to decode instead — `Int(1)`
+/// for a number, an unquoted `Str` for a string — so the same call
+/// answered differently in the two lanes and `tostring()` over the
+/// result disagreed outright.
+///
+/// A MISSING path is SQL NULL; a path that finds a JSON `null` is the
+/// TEXT `null`, which is a value. [`eval_json_extract_string`] is the
+/// unquoting door and is deliberately unchanged.
 fn eval_json_extract(args: &[EvalValue]) -> EvalValue {
     if args.len() != 2 {
         return EvalValue::Null;
@@ -1198,30 +1211,70 @@ fn eval_json_extract(args: &[EvalValue]) -> EvalValue {
             let pointer = jsonpath_to_pointer(path);
             serde_json::from_str::<serde_json::Value>(json_str)
                 .ok()
-                .and_then(|val| val.pointer(&pointer).map(json_val_to_eval_val))
-                .unwrap_or(EvalValue::Null)
+                .and_then(|val| val.pointer(&pointer).map(duckdb_json_text))
+                .map_or(EvalValue::Null, EvalValue::Str)
         }
         _ => EvalValue::Null,
     }
 }
 
-fn json_val_to_eval_val(v: &serde_json::Value) -> EvalValue {
-    match v {
-        serde_json::Value::Null => EvalValue::Null,
-        serde_json::Value::Bool(b) => EvalValue::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                EvalValue::Int(i)
-            } else {
-                EvalValue::Float(n.as_f64().unwrap_or(0.0))
-            }
-        }
-        serde_json::Value::String(s) => EvalValue::Str(s.clone()),
-        serde_json::Value::Array(arr) => {
-            EvalValue::Array(arr.iter().map(json_val_to_eval_val).collect())
-        }
-        serde_json::Value::Object(_) => EvalValue::Str(v.to_string()),
+/// One JSON value in the text `DuckDB` renders it as.
+///
+/// `serde_json`'s own rendering IS that text for every shape but one:
+/// it spells a positive exponent `e+300` where `DuckDB` spells it
+/// `e300` (measured — negative exponents already agree, and serde emits
+/// a lowercase `e`; `E` is handled defensively). So the rendering is
+/// serde's, with that ONE spelling normalized.
+///
+/// The pass is string-AWARE: a JSON string may contain the bytes `e+`
+/// (`{"note":"cost e+300"}`), and rewriting those would corrupt the
+/// document. It therefore walks the text tracking whether it is inside a
+/// string — consuming the character after a backslash, so an escaped
+/// quote does not end one — and only ever drops a `+` that FOLLOWS an
+/// `e` outside a string, which in valid JSON is only ever an exponent's
+/// sign (`true`/`false` carry an `e` too, never followed by `+`).
+///
+/// RESIDUAL: serde re-renders a number from its `f64`, where `DuckDB`
+/// renders from the source SPELLING, so exotic magnitudes still differ —
+/// pinned by `current_json_number_spelling_follows_serdes_f64`.
+///
+/// Public because the probe asserts it side by side with the engine, as
+/// it does [`timestamp_to_duckdb_text`]; a probe-local copy of this rule
+/// would be a second implementation of the very thing under test (and
+/// the naive one — a blind `replace` — corrupts a string containing
+/// `e+`).
+#[must_use]
+pub fn duckdb_json_text(value: &serde_json::Value) -> String {
+    let rendered = value.to_string();
+    if !rendered.contains("e+") && !rendered.contains("E+") {
+        return rendered;
     }
+    let mut out = String::with_capacity(rendered.len());
+    let mut chars = rendered.chars();
+    let mut in_string = false;
+    while let Some(ch) = chars.next() {
+        out.push(ch);
+        if in_string {
+            match ch {
+                // The escaped character is consumed whole, so a `\"`
+                // cannot be read as the end of the string.
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                }
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+        } else if matches!(ch, 'e' | 'E') && chars.as_str().starts_with('+') {
+            chars.next();
+        }
+    }
+    out
 }
 
 /// What `DuckDB` makes of an `IF`/`CASE WHEN` condition.
@@ -3981,6 +4034,69 @@ mod tests {
         // DuckDB reads these as .5 and .123; the mirror under-reads.
         for text in ["2026-01-15 09:00:00.5", "2026-01-15 09:00:00.123"] {
             assert_eq!(parse(text), Some(EvalValue::Null), "{text:?}");
+        }
+    }
+
+    /// The spelling pass rewrites an exponent's `+` and NOTHING else —
+    /// least of all the bytes inside a JSON string.
+    #[test]
+    fn the_json_spelling_pass_only_touches_an_exponent_sign() {
+        let render = |doc: &str| {
+            let value: serde_json::Value = serde_json::from_str(doc).expect("valid JSON");
+            duckdb_json_text(&value)
+        };
+        // A bare number, and one nested in each composite shape.
+        assert_eq!(render("1e300"), "1e300");
+        assert_eq!(render("-1e300"), "-1e300");
+        assert_eq!(render("[1e300,2]"), "[1e300,2]");
+        assert_eq!(render(r#"{"a":{"b":[1e300]}}"#), r#"{"a":{"b":[1e300]}}"#);
+        // A negative exponent already agrees and is left alone.
+        assert_eq!(render("1e-7"), "1e-7");
+        // Text that merely LOOKS like an exponent survives verbatim…
+        assert_eq!(render(r#"{"a":"cost e+300"}"#), r#"{"a":"cost e+300"}"#);
+        assert_eq!(render(r#"["e+1",1e300]"#), r#"["e+1",1e300]"#);
+        // …including across an escaped quote, which must not be read as
+        // the end of the string.
+        assert_eq!(
+            render(r#"{"a":"quote \" then e+5","b":1e300}"#),
+            r#"{"a":"quote \" then e+5","b":1e300}"#
+        );
+        // The shapes with no exponent at all take the fast path.
+        assert_eq!(
+            render(r#"{"a":"x","b":[1,true,null]}"#),
+            r#"{"a":"x","b":[1,true,null]}"#
+        );
+        // `true`/`false` carry an `e` and must not lose anything.
+        assert_eq!(render("[true,false,1e300]"), "[true,false,1e300]");
+    }
+
+    /// `json_extract` returns JSON TEXT — a string keeps its quotes, a
+    /// missing path is NULL, and a JSON `null` is the text `null`.
+    #[test]
+    fn fn_json_extract_returns_json_text() {
+        let extract = |doc: &str, path: &str| {
+            eval_scalar_fn(
+                "json_extract",
+                &[
+                    EvalValue::Str(doc.to_string()),
+                    EvalValue::Str(path.to_string()),
+                ],
+            )
+        };
+        for (doc, path, want) in [
+            (r#"{"a":1}"#, "$.a", Some("1")),
+            (r#"{"a":1.5}"#, "$.a", Some("1.5")),
+            (r#"{"a":"x"}"#, "$.a", Some(r#""x""#)),
+            (r#"{"a":true}"#, "$.a", Some("true")),
+            (r#"{"a":null}"#, "$.a", Some("null")),
+            (r#"{"a":[1,2]}"#, "$.a", Some("[1,2]")),
+            (r#"{"a":{"b":1}}"#, "$.a", Some(r#"{"b":1}"#)),
+            ("[1,2]", "$", Some("[1,2]")),
+            (r#"{"a":1}"#, "$.missing", None),
+        ] {
+            let answer = extract(doc, path);
+            let expected = want.map_or(EvalValue::Null, |text| EvalValue::Str(text.to_string()));
+            assert_eq!(answer, Some(expected), "json_extract({doc}, {path})");
         }
     }
 

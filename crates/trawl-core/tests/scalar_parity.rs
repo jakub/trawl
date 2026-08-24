@@ -1855,29 +1855,35 @@ fn accepted_locale_percent_c_residual_is_pinned() {
 }
 
 #[test]
-fn current_json_value_and_array_rendering_are_pinned_child_105() {
-    // #105 decides the value-domain answer for JSON-backed EvalValue variants.
+fn json_extract_returns_json_text_in_both_lanes() {
+    // Flipped from `current_json_value_and_array_rendering_are_pinned_child_105`
+    // (#105). `json_extract` yields JSON, not a decoded scalar: eval
+    // answered `Int(1)` where the engine answers the TEXT `1`, and an
+    // array became an `Array` cell that `tostring()` nulled where the
+    // engine prints `[1,2]`. Every shape now goes through the one
+    // renderer (`json_extract_returns_the_values_json_text` asserts it
+    // against the engine value by value).
     let conn = utc_connection();
     let event = fixed_event();
-    for (dsl, eval, sql) in [
-        (
-            r#"* | let x = json_extract("{\"a\":1}", "$.a")"#,
-            EvalValue::Int(1),
-            "1",
-        ),
-        (
-            r#"* | let x = tostring(json_extract("[1,2]", "$"))"#,
-            EvalValue::Null,
-            "[1,2]",
-        ),
+    for expression in [
+        r#"json_extract("{\"a\":1}", "$.a")"#,
+        r#"json_extract("{\"a\":1.5}", "$.a")"#,
+        // A string keeps its QUOTES — `json_extract_string` is the
+        // unquoting door, and it is unchanged.
+        r#"json_extract("{\"a\":\"x\"}", "$.a")"#,
+        r#"json_extract_string("{\"a\":\"x\"}", "$.a")"#,
+        r#"json_extract("{\"a\":true}", "$.a")"#,
+        r#"json_extract("{\"a\":null}", "$.a")"#,
+        r#"json_extract("{\"a\":1}", "$.missing")"#,
+        r#"json_extract("[1,2]", "$")"#,
+        r#"tostring(json_extract("[1,2]", "$"))"#,
+        r#"tostring(json_extract("{\"a\":1}", "$.a"))"#,
+        // The value a JSON number reads as, now that it arrives as text.
+        r#"tonumber(json_extract("{\"a\":1.5}", "$.a"))"#,
     ] {
-        assert_eq!(eval_scalar(dsl, &event), eval);
         assert_eq!(
-            sql_scalar_result(&conn, dsl, &event),
-            SqlOutcome::Value(SqlCell {
-                logical_type: Type::Text,
-                value: DuckValue::Text(sql.to_string()),
-            })
+            assert_parity_case(&conn, &event, "json_extract text", expression),
+            None
         );
     }
 }

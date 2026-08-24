@@ -1021,9 +1021,18 @@ service=kubelet | eval pod = json_extract_string(k8s, "$.pod") | where isnotnull
 Bare text search also matches inside the stringified value (it is part of `_raw` and of the column's text).
 
 `json_extract_string` is the UNQUOTING door: it returns a JSON string's
-contents (`"x"` → `x`). `json_extract` returns the value's JSON, which
-for a string keeps its quotes — reach for `json_extract_string` unless
-you want the JSON text itself.
+contents (`"x"` → `x`). `json_extract` returns the value's JSON text —
+for a string that keeps the quotes (`"x"`), for a number, boolean or
+`null` it is the value's own text, and for an array or object it is
+compact JSON. Reach for `json_extract_string` unless you want the JSON.
+
+One residual, on numbers of exotic magnitude: the streaming path
+re-renders a number from its `f64` where the query engine renders the
+source spelling, so a value written `1e16`…`1e20`, or an integer with
+more digits than a 64-bit one holds, can come back spelled differently
+(`1e20` against `100000000000000000000`). Values inside those bounds —
+which is every number a log realistically carries — render identically
+in both paths.
 
 ### Date and time functions
 

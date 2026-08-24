@@ -522,6 +522,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     any length. `x in (…)` is three-valued: an element that answers UNKNOWN
     makes a non-match UNKNOWN rather than FALSE, which used to invert under
     `NOT`.
+  - **`json_extract` returns JSON TEXT**, as the engine does: a string
+    keeps its quotes (`"x"`), a number/boolean/`null` is its own text, and
+    an array or object is compact JSON. It used to decode — `1` came back
+    as an integer and an array as a list `tostring()` nulled. Reach for
+    `json_extract_string`, unchanged, when you want a string's contents.
+    One residual, on numbers of exotic magnitude: the streaming path
+    re-renders from `f64` where the engine renders the source spelling, so
+    `1e16`…`1e20` and integers wider than 64 bits can come back spelled
+    differently.
   - **Rows carry typed cells between stages.** They used to cross each stage
     boundary as JSON, which cannot spell a non-finite double — so
     `| let x = 0.0 / 0 | where x == x` kept the row in batch and dropped it
