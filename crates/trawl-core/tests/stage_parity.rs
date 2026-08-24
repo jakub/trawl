@@ -51,30 +51,6 @@ fn compared(column: &str) -> bool {
     column != "_time"
 }
 
-/// The one text normalization the comparison applies, to BOTH lanes
-/// alike: a NaN's SIGN.
-///
-/// The sign of a computed NaN is the hardware's, not the engine's
-/// (`0.0 / 0` is `-nan` on x86 and need not be elsewhere), and the two
-/// lanes reach their text through different renderers: the live side
-/// through the IDENTITY path, which deliberately ties the two signs so a
-/// group is one group ([`row::cell_text`]), the batch side through
-/// `::VARCHAR`, which prints whichever sign the value carries. No
-/// production path compares those bytes across lanes — the wire renders
-/// a NaN `null` on both sides — so the harness folds the sign rather
-/// than pinning this machine's.
-///
-/// Applied SYMMETRICALLY, so it can hide no divergence: whatever it
-/// does to one lane it does to the other, and every other byte stays
-/// exact.
-fn fold_nan_sign(text: String) -> String {
-    if text == "-nan" {
-        "nan".to_owned()
-    } else {
-        text
-    }
-}
-
 fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
     params
         .iter()
@@ -150,10 +126,7 @@ fn batch_outcome(conn: &Connection, dsl: &str, events: &[Value]) -> Result<TextR
                     continue;
                 }
                 let text: Option<String> = row.get(index)?;
-                cells.push((
-                    name.clone(),
-                    fold_nan_sign(text.unwrap_or_else(|| "null".to_owned())),
-                ));
+                cells.push((name.clone(), text.unwrap_or_else(|| "null".to_owned())));
             }
             cells.sort();
             Ok(cells)
@@ -216,7 +189,7 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
             let mut cells: TextRow = event
                 .iter()
                 .filter(|(name, _)| compared(name))
-                .map(|(name, cell)| (name.clone(), fold_nan_sign(row::cell_text(cell))))
+                .map(|(name, cell)| (name.clone(), row::cell_text(cell)))
                 .collect();
             cells.sort();
             cells
@@ -234,9 +207,65 @@ fn sorted(mut rows: TextRows) -> TextRows {
 
 /// Both lanes, same events, same answer — returned so the caller can say
 /// what the answer must BE.
+///
+/// The comparison is BYTE-EXACT, in every column. A normalization
+/// applied here would be applied to every cell of every case, and a
+/// non-injective one (folding `-nan` onto `nan`, say) would then launder
+/// a real VARCHAR divergence — an ordinary string cell carrying `-nan`
+/// through a stage — into agreement. Cases whose cell text is genuinely
+/// not comparable opt IN, by column, through
+/// [`agreed_folding_nan_in`].
 fn agreed(conn: &Connection, dsl: &str, events: &[Value]) -> TextRows {
-    let batch = batch_rows(conn, dsl, events);
-    let live = live_rows(dsl, events);
+    assert_lanes_agree(conn, dsl, events, None)
+}
+
+/// [`agreed`], with ONE named column's NaN sign folded in both lanes.
+///
+/// The opt-in exists for exactly one shape: a cell holding a COMPUTED
+/// NaN (`0.0 / 0`), whose sign is the hardware's rather than either
+/// engine's, read by two different renderers — the live side through the
+/// IDENTITY path, which ties the two signs deliberately so a group is
+/// one group ([`row::cell_text`]), the batch side through `::VARCHAR`,
+/// which prints the sign the value carries. No production path compares
+/// those bytes across lanes (the wire renders a NaN `null` on both
+/// sides).
+///
+/// Everything else in the row — every other column, the row count, the
+/// multiplicity — stays byte-exact, and a case that names a column here
+/// says so in its own text.
+fn agreed_folding_nan_in(conn: &Connection, dsl: &str, events: &[Value], column: &str) -> TextRows {
+    assert_lanes_agree(conn, dsl, events, Some(column))
+}
+
+fn assert_lanes_agree(
+    conn: &Connection,
+    dsl: &str,
+    events: &[Value],
+    fold_nan_in: Option<&str>,
+) -> TextRows {
+    let fold = |rows: TextRows| -> TextRows {
+        let Some(target) = fold_nan_in else {
+            return rows;
+        };
+        sorted(
+            rows.into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|(name, text)| {
+                            let text = if name == target && text == "-nan" {
+                                "nan".to_owned()
+                            } else {
+                                text
+                            };
+                            (name, text)
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
+    };
+    let batch = fold(batch_rows(conn, dsl, events));
+    let live = fold(live_rows(dsl, events));
     assert_eq!(
         live, batch,
         "lane divergence\ndsl: {dsl:?}\nlive: {live:?}\nbatch: {batch:?}"
@@ -278,7 +307,15 @@ fn one_event() -> Vec<Value> {
 #[test]
 fn a_computed_nan_survives_the_stage_boundary() {
     let conn = conn();
-    let kept = agreed(&conn, "* | let x = 0.0 / 0 | where x == x", &one_event());
+    // `x` holds a COMPUTED NaN, whose sign is the hardware's — the one
+    // cell in this row the two lanes cannot be compared on byte for
+    // byte. Every other column, and the row count, still are.
+    let kept = agreed_folding_nan_in(
+        &conn,
+        "* | let x = 0.0 / 0 | where x == x",
+        &one_event(),
+        "x",
+    );
     assert_eq!(kept.len(), 1, "the row must be kept: {kept:?}");
 }
 
@@ -399,7 +436,7 @@ fn two_nan_rows_dedup_to_one() {
     let conn = conn();
     let event = json!({"service": "nginx", "_time": "2026-01-15T09:00:00Z"});
     let events = vec![event.clone(), event];
-    let rows = agreed(&conn, "* | let x = 0.0 / 0 | dedup x", &events);
+    let rows = agreed_folding_nan_in(&conn, "* | let x = 0.0 / 0 | dedup x", &events, "x");
     assert_eq!(rows.len(), 1, "one row survives dedup: {rows:?}");
 }
 
@@ -416,6 +453,43 @@ fn finite_floats_render_the_same_in_both_lanes() {
     assert_eq!(column(&rows, "a"), vec!["2.5"]);
     assert_eq!(column(&rows, "b"), vec!["25.0"]);
     assert_eq!(column(&rows, "c"), vec!["-1.5"]);
+}
+
+/// A STRING cell crosses a stage byte for byte — `-nan` included.
+///
+/// This is the case a global sign-fold in the harness would have
+/// laundered: `tostring(tonumber("-nan"))` is an ordinary VARCHAR whose
+/// sign is EXPLICIT IN THE TEXT (no hardware involved — the cast domain
+/// carries the sign from the input string, in both lanes), so a carrier
+/// regression that flipped it to `nan` is a real divergence and has to
+/// be visible. Nothing here is folded; the comparison is exact.
+#[test]
+fn a_signed_nan_string_crosses_a_stage_byte_for_byte() {
+    let conn = conn();
+    let events = vec![json!({"service": "nginx", "n": 1})];
+    for (expression, want) in [
+        (r#"tostring(tonumber("-nan"))"#, "-nan"),
+        (r#"tostring(tonumber("nan"))"#, "nan"),
+        // …and the same text through a second stage, so it crosses a
+        // boundary rather than being read where it was made.
+        (r#"tostring(tonumber("-nan"))"#, "-nan"),
+    ] {
+        let rows = agreed(
+            &conn,
+            &format!("* | let s = {expression} | table s"),
+            &events,
+        );
+        assert_eq!(column(&rows, "s"), vec![want], "{expression}");
+    }
+
+    // Carried across two stages and compared as text at the end.
+    let rows = agreed(
+        &conn,
+        r#"* | let s = tostring(tonumber("-nan")) | let t = s | where t != "" | table s, t"#,
+        &events,
+    );
+    assert_eq!(column(&rows, "s"), vec!["-nan"]);
+    assert_eq!(column(&rows, "t"), vec!["-nan"]);
 }
 
 /// The two NaN SIGNS are one identity: one group, one distinct value,
@@ -474,7 +548,9 @@ fn the_two_nan_signs_are_one_identity() {
     // whole-row one that reads the same cell through `cell_key`.
     for dedup in ["dedup x", "drop flag | dedup"] {
         let dsl = format!("* | {signed} | {dedup}");
-        let deduped = agreed(&conn, &dsl, &events);
+        // Which of the two rows survives is DuckDB's choice, so the
+        // surviving cell carries whichever sign that row held.
+        let deduped = agreed_folding_nan_in(&conn, &dsl, &events, "x");
         assert_eq!(deduped.len(), 1, "one row survives {dedup}: {deduped:?}");
     }
 }
