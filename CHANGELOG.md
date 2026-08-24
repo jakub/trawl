@@ -463,6 +463,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   this is a token-rendering change only.
 
 ### Fixed
+- **Timestamps in the streaming lanes read through the one probed owner
+  (#105).** `eval` carried an instant as a bare `NaiveDateTime` and parsed
+  timestamp text with a parser of its own, so three answers differed from the
+  query engine's. Visible deltas:
+  - a MALFORMED offset (`2026-01-15 10:20:30+ab:cd`) was stripped unvalidated
+    and compared equal to the same instant without it; it has no reading now,
+    so the comparison is UNKNOWN and the row drops — which is what the batch
+    query, who refuses to run at all, implies;
+  - comparing a timestamp against a text with no reading fell back to LEXICAL
+    string ordering (ADR-0017 §2 withdrew it): `t < "zzz"` was TRUE, it is
+    UNKNOWN now, in both operand orders;
+  - the two instants beyond the calendar — `infinity` and `-infinity` — are
+    values rather than parse failures: they compare in DuckDB's order, render
+    as their words through `tostring()` and a projected cell, pass through
+    `date_trunc` unchanged, and NULL out `date_part`/`date_diff` exactly as
+    the engine does;
+  - `date_part("epoch", …)` is the instant's microsecond count divided once
+    rather than seconds plus a fraction, so a far-future timestamp no longer
+    answers `253402300799.00003` where the engine answers `253402300799`;
+  - `x in (…)` is three-valued: an element that answers UNKNOWN makes a
+    non-match UNKNOWN rather than FALSE, which used to invert under `NOT`.
 - **Pipeline stages carry typed rows, so a computed infinity or NaN survives
   them (#105).** Streaming stages passed rows to each other as JSON, which has
   no spelling for a non-finite double: `| let x = 0.0 / 0 | where x == x` kept
