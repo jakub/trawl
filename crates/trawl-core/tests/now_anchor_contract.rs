@@ -140,8 +140,9 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 ///    failing loud.
 /// 2. **The surviving lines are joined**, and the gap a path may carry
 ///    after its own `::` is closed ([`path_gap`]) — whitespace, a line
-///    break, a block comment. So `Utc:: now()`, a path broken across two
-///    lines, and `Utc::/*x*/now()` are all seen as the single-line
+///    break, a block comment, a trailing `//` comment. So `Utc:: now()`,
+///    a path broken across two lines, `Utc::/*x*/now()` and
+///    `Utc:: // why` + newline + `now()` are all seen as the single-line
 ///    spelling is.
 /// 3. **A needle then counts at a word boundary** — the rule
 ///    [`CLOCK_CALLS`] documents.
@@ -162,14 +163,18 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 /// gate holds has a second owner, which is what this one exists to
 /// remove.
 ///
-/// DELIBERATE evasion is out of scope and always will be. Nothing here
-/// parses Rust, so a macro that assembles the path, an `include!`, a
-/// re-export under another name, or a `/*` nested inside another block
-/// comment all get past it. That is review's job, not this file's. The
-/// line between the two is drawn where a reviewer would plausibly miss
-/// it: an ordinary-looking call is caught however it is spelled, and a
-/// spelling contrived to dodge a text scan is visible as contrivance on
-/// the diff.
+/// With whitespace, block comments and line comments all consumed in the
+/// path's own gap, every spelling of the call that a reviewer could read
+/// past as ordinary source is now caught. THE LINE IS DRAWN THERE.
+///
+/// What remains is deliberate-evasion territory, out of scope and always
+/// will be, because nothing here parses Rust: a macro that assembles the
+/// path, an `include!`, a raw identifier (`r#now`), a `/*` nested inside
+/// another block comment, a re-export under a different name. Each of
+/// those is contrivance, visible as contrivance on the diff, and
+/// review's job rather than this file's. A scanner cannot out-argue
+/// someone who is trying; it can only make sure nobody arrives here by
+/// accident.
 fn call_lines(source: &str, needles: &[&str]) -> Vec<usize> {
     let mut text = String::with_capacity(source.len());
     let mut line_of: Vec<usize> = Vec::with_capacity(source.len());
@@ -237,22 +242,42 @@ fn call_lines(source: &str, needles: &[&str]) -> Vec<usize> {
 }
 
 /// The byte length of the gap a path may carry after its `::` —
-/// whitespace and TERMINATED block comments, in any order.
+/// whitespace, TERMINATED block comments, and `//` line comments, in any
+/// order.
 ///
-/// Scoped to that position on purpose. Stripping every `/* … */` from the
-/// whole source instead would be a far worse instrument than the hole it
-/// closes: this crate writes glob patterns in string literals
-/// (`"path=/api/*"`, `"/data/**/*.parquet"`), each of which contains a
-/// literal `/*`, and a blanket strip reads them as comment OPENERS.
-/// Measured on `src/filter.rs`: a blanket strip deletes 12 201 of its
-/// 39 498 bytes, and a `Utc::now()` planted on the line after
-/// `"path=/api/*"` DISAPPEARS from the scan. Trading a fmt-clean evasion
-/// for a fmt-clean BLIND SPOT is the wrong direction — a contract that
-/// fails to see is worse than one that can be dodged on purpose.
+/// The line-comment arm is not redundant with the comment-LINE strip in
+/// [`call_lines`]: that one drops lines which BEGIN with `//`, and the
+/// gap this closes is a TRAILING comment on a line that begins with code:
+///
+/// ```text
+/// let _ = chrono::Utc:: // use UTC
+///     now();
+/// ```
+///
+/// Ordinary-looking, valid, and rustfmt leaves it exactly as written.
+///
+/// Scoped to the post-`::` position on purpose. Stripping every
+/// `/* … */` from the whole source instead would be a far worse
+/// instrument than the hole it closes: this crate writes glob patterns in
+/// string literals (`"path=/api/*"`, `"/data/**/*.parquet"`), each of
+/// which contains a literal `/*`, and a blanket strip reads them as
+/// comment OPENERS. Measured on `src/filter.rs`: a blanket strip deletes
+/// 12 201 of its 39 498 bytes, and a `Utc::now()` planted on the line
+/// after `"path=/api/*"` DISAPPEARS from the scan. Trading a fmt-clean
+/// evasion for a fmt-clean BLIND SPOT is the wrong direction — a contract
+/// that fails to see is worse than one that can be dodged on purpose.
 ///
 /// An UNTERMINATED `/*` is left alone for the same reason: at this
 /// position it is far likelier to be a glob than a comment, and consuming
 /// to end-of-file would blind everything after it.
+///
+/// The anchoring is also what makes the comment arms SAFE rather than
+/// merely narrow. They run only inside a gap that a real `::` already
+/// opened, and each consumes a bounded span — to the `*/`, or to the end
+/// of one line. The worst a string literal shaped like `":: // x"` can do
+/// is join its `::` to whatever the next joined line begins with, i.e.
+/// FALSE-POSITIVE. That is the documented side to err on: this contract
+/// may cry wolf, it may not go blind.
 fn path_gap(rest: &str) -> usize {
     let mut taken = 0;
     loop {
@@ -266,6 +291,12 @@ fn path_gap(rest: &str) -> usize {
             && let Some(close) = tail.find("*/")
         {
             taken += close + 2;
+            continue;
+        }
+        if tail.starts_with("//") {
+            // Through the newline, so the path continues on the next
+            // line. A comment ending the text ends the gap with it.
+            taken += tail.find('\n').map_or(tail.len(), |end| end + 1);
             continue;
         }
         return taken;
@@ -429,6 +460,28 @@ fn the_scan_counts_calls_not_mentions() {
         "a path broken after its `::` must be caught, at the line the `::` is on"
     );
 
+    // …and a TRAILING line comment may sit in that break. The
+    // comment-LINE strip cannot help here: this line BEGINS with code.
+    // Ordinary-looking, valid, and rustfmt leaves it as written.
+    let commented_path = "let _ = chrono::Utc:: // use UTC\n\
+                          \x20   now();\n";
+    assert_eq!(
+        call_lines(commented_path, CLOCK_CALLS),
+        vec![1],
+        "a line comment in the path's own gap must be caught, at the line the \
+         `::` is on"
+    );
+
+    // The same with no space before the comment, so the gap opens on the
+    // `//` itself.
+    let tight_comment = "let _ = chrono::Utc::// c\n\
+                         now();\n";
+    assert_eq!(
+        call_lines(tight_comment, CLOCK_CALLS),
+        vec![1],
+        "a line comment flush against the `::` must be caught too"
+    );
+
     // …and the word boundary is what lets the needles be paren-less:
     // these continue into an IDENTIFIER byte, so the needle does not end
     // where it appears to and they are not the things this contract
@@ -445,6 +498,9 @@ fn the_scan_counts_calls_not_mentions() {
             "a glob literal that opens no comment",
             "let g = \"path=/api/*\";",
         ),
+        // A gap that runs off the end of the text ends with it — the
+        // consumer is bounded, never looping.
+        ("a comment that ends the text", "let x = foo:: // c"),
     ] {
         assert_eq!(
             call_lines(&format!("{innocent}\n"), CLOCK_CALLS),
