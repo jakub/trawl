@@ -147,6 +147,11 @@ pub enum EmitError {
         func_name: String,
         format: String,
     },
+    /// A literal the ADR-0011 pin rule table refuses under the field's
+    /// catalog pin. Reads as an unsupported operation, and carries the
+    /// typed cause so a caller can classify the refusal without reading
+    /// its prose (see the [`From`] impl below).
+    Comparison(crate::compare::CompareError),
 }
 
 impl fmt::Display for EmitError {
@@ -163,6 +168,7 @@ impl fmt::Display for EmitError {
             Self::UnsupportedOperation { message } => {
                 write!(f, "unsupported operation: {message}")
             }
+            Self::Comparison(err) => write!(f, "unsupported operation: {err}"),
             Self::InvalidFormat { func_name, format } => {
                 write!(f, "{func_name}(): invalid format string {format:?}")
             }
@@ -176,11 +182,19 @@ impl std::error::Error for EmitError {}
 /// is an unsupported operation to every emitter caller — one conversion,
 /// so the search stage, the pipeline emitter, the live filter and the
 /// stream compiler all report the same sentence.
+///
+/// The SENTENCE is unchanged: [`EmitError::Comparison`] renders through
+/// the same `unsupported operation: {…}` arm the stringified form used to
+/// take, so no user-facing text, snapshot or wire message moves. What
+/// changed is that the cause survives as a TYPE instead of as prose. The
+/// pin-aware fuzz target (issue #114) has to decide whether an emitter
+/// refusal is a legitimate outcome for the pin map it invented — an
+/// `_severity` pin plus a literal naming no ladder point is expected, a
+/// panic never is — and that verdict must not be a substring test against
+/// an error message anyone is free to reword.
 impl From<crate::compare::CompareError> for EmitError {
     fn from(err: crate::compare::CompareError) -> Self {
-        Self::UnsupportedOperation {
-            message: err.to_string(),
-        }
+        Self::Comparison(err)
     }
 }
 
@@ -2946,6 +2960,37 @@ mod tests {
                 SqlValue::Int(1),
                 SqlValue::Int(3),
             ]
+        );
+    }
+
+    /// A refused pinned comparison keeps its cause as a TYPE and renders
+    /// the sentence it always rendered.
+    ///
+    /// Both halves matter and they pull in opposite directions. The type
+    /// is what the pin-aware fuzz target classifies on (issue #114): a
+    /// `SEVERITY` pin plus a literal naming no ladder point is a
+    /// legitimate outcome, so the target must recognize it without
+    /// matching prose. The TEXT is what users, snapshots and the wire
+    /// already see, so the `unsupported operation: ` prefix stays exactly
+    /// where the stringifying `From` impl used to put it.
+    #[test]
+    fn a_refused_pinned_comparison_keeps_its_type_and_its_sentence() {
+        let query = parser::parse("_severity=nosuchlevel").expect("parse should succeed");
+        let mut pins = crate::schema::FieldTypes::new();
+        pins.insert("_severity", crate::schema::CanonicalType::Severity);
+        let err = emit_with_pins(&query, SRC, &pins, anchor()).expect_err("the token is unknown");
+
+        let EmitError::Comparison(crate::compare::CompareError::UnknownSeverityToken { token }) =
+            &err
+        else {
+            panic!("expected a typed comparison refusal, got {err:?}");
+        };
+        assert_eq!(token, "nosuchlevel");
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("unsupported operation: unknown severity value 'nosuchlevel'"),
+            "{rendered}"
         );
     }
 }
