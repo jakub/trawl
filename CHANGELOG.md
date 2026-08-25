@@ -409,6 +409,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     SILENTLY (an `earliest=` bound answered as the aggregate). The emitter
     now flushes the pending predicate into a CTE exactly when an aggregate
     appended a parameter, leaving `stats count() by host` unnested.
+  - **A second `pivot` reads the first one's output.** A pending pivot is
+    flushed to a CTE before any following stage, and that used to exclude
+    another `pivot` — but the pivot stage opens with an ordinary flush
+    that does not render a pending `PIVOT`, then overwrites it. So
+    `pivot count() on status by host | pivot sum(status) on status by host`
+    silently returned the SECOND pivot alone, computed over pre-pivot
+    rows. Consecutive pivots now compose, and naming a column the first
+    pivot consumed into dynamic columns is a loud `unknown field` instead
+    of a quietly different answer.
   - **A `head`/`sort` before an aggregating stage now applies to the
     aggregation's INPUT.** SQL applies LIMIT and ORDER BY *after* an
     aggregation, and both clauses used to stay on the same SELECT, so

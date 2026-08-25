@@ -2146,6 +2146,18 @@ fn run_at_anchor(exec: &Executor, dsl: &str, source: &str) -> Result<QueryResult
     exec.execute_emitted(&emitted, usize::MAX, 0)
 }
 
+fn integer_at(result: &QueryResult, row: usize, name: &str) -> i64 {
+    let index = result
+        .columns
+        .iter()
+        .position(|column| column.name == name)
+        .unwrap_or_else(|| panic!("missing {name} column: {:?}", result.columns));
+    match &result.rows[row][index] {
+        Value::Integer(value) => *value,
+        other => panic!("{name} must be an integer, got {other:?}"),
+    }
+}
+
 fn text_cell(result: &QueryResult, row: usize, name: &str) -> String {
     let index = result
         .columns
@@ -2468,4 +2480,89 @@ fn a_pending_sort_orders_the_frequency_stages_input() {
     );
     assert_eq!(text_cell(&result, 0, "host"), "web02");
     assert_eq!(integer_column(&result, "count"), vec![2]);
+}
+
+// ── a pivot follows a pivot (#106, review round 4 finding 1) ──────────
+//
+// A pending pivot is flushed to a CTE before any following stage — and
+// that used to EXCLUDE another pivot. `process_pivot` opens with an
+// ordinary `flush_to_cte`, whose `build_select` does not render the
+// pending `PIVOT`, and then overwrites the spec: the first pivot was
+// silently dropped and the second ran over PRE-pivot input.
+
+/// The second pivot reads the FIRST one's dynamic output columns.
+///
+/// Over the six nginx fixture rows the first pivot counts statuses per
+/// host — `web01` has two 200s, `web02` none — so its `200` column holds
+/// `{2, 0}`, and pivoting on THAT column is only expressible if the first
+/// pivot actually ran.
+#[test]
+fn a_second_pivot_reads_the_first_pivots_output() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | pivot count() on status by host | pivot count() on `200` by host",
+        &glob,
+    )
+    .expect("the second pivot must read the first's output columns");
+
+    let columns: Vec<&str> = result
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert_eq!(
+        columns,
+        vec!["host", "0", "2"],
+        "the pivoted-on values are the first pivot's own 200-counts"
+    );
+    assert_eq!(result.row_count(), 2);
+    for row in 0..result.row_count() {
+        let (zero, two) = (integer_at(&result, row, "0"), integer_at(&result, row, "2"));
+        match text_cell(&result, row, "host").as_str() {
+            "web01" => assert_eq!((zero, two), (0, 1), "web01 served two 200s"),
+            "web02" => assert_eq!((zero, two), (1, 0), "web02 served none"),
+            other => panic!("unexpected host {other}"),
+        }
+    }
+}
+
+/// A column the FIRST pivot consumed into dynamic columns is gone, and
+/// naming it is a loud error rather than a quietly different answer.
+///
+/// Before the fix this query "succeeded", returning the second pivot
+/// alone computed over pre-pivot rows — `sum(status)` per status per
+/// host, with the first pivot's `count()` nowhere in the result.
+#[test]
+fn a_second_pivot_cannot_see_a_column_the_first_consumed() {
+    let (exec, glob) = setup();
+    let error = run_at_anchor(
+        &exec,
+        "service=nginx | pivot count() on status by host | pivot sum(status) on status by host",
+        &glob,
+    )
+    .expect_err("`status` no longer exists after the first pivot consumed it");
+    assert!(
+        error.to_string().contains("unknown field: status"),
+        "the refusal must name the missing column, got: {error}"
+    );
+}
+
+/// A TERMINAL pivot is still never flushed by the loop — no stage
+/// follows it, so `finalize` renders it, inlining every parameter.
+#[test]
+fn a_terminal_pivot_is_unchanged() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | pivot count() on status by host",
+        &glob,
+    )
+    .expect("the terminal pivot must run");
+    let columns: Vec<&str> = result
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert_eq!(columns, vec!["host", "200", "301", "404", "500", "502"]);
 }

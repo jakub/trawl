@@ -384,10 +384,20 @@ fn emit_from_state(
             break;
         }
 
-        // If a pivot is pending and the next stage isn't another pivot,
-        // flush the pivot to a CTE so downstream stages can reference
-        // the pivot-generated columns.
-        if state.has_pivot() && !matches!(stage.node, PipeStage::Pivot(_)) {
+        // A pending pivot is flushed to a CTE before ANY following
+        // stage, so that stage reads the pivot's dynamic output columns.
+        //
+        // Including another PIVOT. The exception that used to sit here
+        // (`&& !matches!(stage.node, PipeStage::Pivot(_))`) dates from
+        // the commit that lifted the pivot-must-be-terminal restriction
+        // and predates any pivot-of-pivot case: `process_pivot` opens
+        // with an ORDINARY `flush_to_cte`, whose `build_select` does not
+        // render `self.pivot`, and then OVERWRITES the pending spec —
+        // so skipping the flush silently dropped the first pivot and ran
+        // the second over pre-pivot input. A pivot that is TERMINAL is
+        // still never flushed here (no stage follows it); `finalize`
+        // renders it.
+        if state.has_pivot() {
             state.flush_pivot_to_cte()?;
         }
         pipeline::process_stage(&stage.node, &mut state)?;
@@ -399,7 +409,7 @@ fn emit_from_state(
     let needs_column_reorder = state.needs_column_reorder();
     let referenced_raw = state.bound_raw_column();
     let anchor = state.anchor();
-    let sql = state.finalize();
+    let sql = state.finalize()?;
     let params = state.into_params();
 
     Ok((

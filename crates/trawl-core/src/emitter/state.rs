@@ -784,7 +784,7 @@ impl EmitterState {
     /// For PIVOT queries, inlines all `?` params directly into the SQL
     /// and clears the param list — `DuckDB` doesn't support parameterized
     /// PIVOT statements.
-    pub(crate) fn finalize(&mut self) -> String {
+    pub(crate) fn finalize(&mut self) -> Result<String, super::EmitError> {
         let body = if let Some(pivot) = &self.pivot {
             self.build_pivot(pivot)
         } else {
@@ -792,7 +792,10 @@ impl EmitterState {
         };
 
         if self.ctes.is_empty() {
-            return body;
+            // Never a pending pivot: `process_pivot` opens with a
+            // `flush_to_cte`, so a pivot always leaves at least one CTE
+            // behind and reaches the inlining below.
+            return Ok(body);
         }
 
         let mut sql = String::from("WITH ");
@@ -809,12 +812,25 @@ impl EmitterState {
         sql.push_str(&body);
 
         if self.pivot.is_some() {
-            let inlined = Self::inline_params(&sql, &self.params);
+            let (inlined, consumed) = Self::inline_params_counted(&sql, &self.params, 0);
+            // The same refusal [`Self::flush_pivot_to_cte`] makes, for
+            // the same reason: the parameter list is DROPPED on the next
+            // line, so one left behind is a `?` nothing will ever bind.
+            // A terminal pivot inlines the WHOLE statement at once, so
+            // the count is over every placeholder in it.
+            if consumed != self.params.len() {
+                return Err(super::EmitError::UnsupportedOperation {
+                    message: format!(
+                        "pivot inlining consumed {consumed} of {} parameters",
+                        self.params.len()
+                    ),
+                });
+            }
             self.params.clear();
-            return inlined;
+            return Ok(inlined);
         }
 
-        sql
+        Ok(sql)
     }
 
     /// Append a CTE body with its SQL lines indented, without inserting bytes
@@ -862,12 +878,6 @@ impl EmitterState {
         }
 
         sql
-    }
-
-    /// Replace `?` placeholders with literal values for engines that
-    /// don't support parameterized queries (e.g. `DuckDB` PIVOT).
-    fn inline_params(sql: &str, params: &[SqlValue]) -> String {
-        Self::inline_params_counted(sql, params, 0).0
     }
 
     /// Replace `?` placeholders starting from `start_idx` in the params slice.
