@@ -120,6 +120,14 @@ pub(crate) struct EmitterState {
     /// [`Self::with_source`], so there is exactly one way for an emission
     /// to acquire an anchor and no way for it to acquire two.
     anchor: crate::context::EvalContext,
+    /// How many of [`Self::params`] are already inside a CTE — i.e. how
+    /// many render BEFORE anything the current level emits.
+    ///
+    /// The remainder were pushed at the CURRENT level, where the only
+    /// parameter-bearing clause is the WHERE, which renders AFTER the
+    /// SELECT list. That difference is the whole input to
+    /// [`Self::emit_ordered_select`].
+    flushed_params: usize,
 }
 
 /// How the `_raw` column is bound by text search in one emission pass.
@@ -421,6 +429,7 @@ impl EmitterState {
             raw_binding: RawBinding::Available,
             pin_scope: crate::pin_scope::PinScope::unpinned(),
             anchor,
+            flushed_params: 0,
         }
     }
 
@@ -561,6 +570,64 @@ impl EmitterState {
         self.has_aggregation = false;
         self.has_projection = false;
         self.sample = None;
+        // Everything pushed so far now renders inside that CTE.
+        self.flushed_params = self.params.len();
+    }
+
+    /// Emit SELECT-list expressions that MAY push parameters, keeping the
+    /// parameter list aligned with the placeholders in the rendered SQL.
+    ///
+    /// `DuckDB` binds `?` POSITIONALLY, so the parameter list has to run
+    /// in the order the placeholders appear in the text. A built SELECT
+    /// renders `SELECT … FROM … WHERE …`, but the emitter walks the
+    /// SEARCH stage first: a parameter the search predicate pushed sits
+    /// FIRST in the list while its placeholder sits LAST in the
+    /// statement. So the moment an aggregating stage pushes a parameter
+    /// of its own into the SELECT list, the two lists disagree and the
+    /// predicate's value is fed to the SELECT's placeholder — a
+    /// conversion error when the types clash, and a SILENT value swap
+    /// when they don't (an `earliest=` bound against `now()`'s anchor).
+    ///
+    /// `let`/`extract`/`eventstats` prevent this by flushing to a CTE
+    /// UNCONDITIONALLY: a CTE renders before the outer SELECT, which
+    /// restores the order. An aggregating stage cannot pay that
+    /// unconditionally — most aggregates push nothing, and wrapping every
+    /// `stats count() by host` in a CTE would be a pointless nesting on
+    /// the commonest query in the language. So the decision is taken from
+    /// what the emission ACTUALLY DID — the parameter list grew — never
+    /// from what its expressions are called.
+    ///
+    /// `build` therefore runs at most twice, and the first run is
+    /// discarded WHOLE. That is sound because the only state a SELECT
+    /// expression emission can touch is the parameter list (it quotes
+    /// fields, translates calls and pushes literals; it binds no `_raw`
+    /// and appends no WHERE clause), so truncating the parameters undoes
+    /// it exactly.
+    pub(crate) fn emit_ordered_select<T>(
+        &mut self,
+        build: impl Fn(&mut Self) -> Result<T, super::EmitError>,
+    ) -> Result<T, super::EmitError> {
+        let pending = self.params.len();
+        if pending == self.flushed_params {
+            // Nothing at this level has pushed yet, so nothing this
+            // build pushes can land out of order.
+            return build(self);
+        }
+
+        let where_count = self.where_clauses.len();
+        let attempt = build(self)?;
+        debug_assert_eq!(
+            where_count,
+            self.where_clauses.len(),
+            "a SELECT expression emission must not append WHERE clauses"
+        );
+        if self.params.len() == pending {
+            return Ok(attempt);
+        }
+
+        self.params.truncate(pending);
+        self.flush_to_cte();
+        build(self)
     }
 
     /// Build a SELECT statement from the current accumulated state.

@@ -85,6 +85,35 @@ fn process_stats(
 ) -> Result<(), EmitError> {
     ctx.flush_if(FlushCondition::IfModified);
 
+    // The aggregation expressions FIRST, through the ordering guard:
+    // they are the only part of this stage that can push a parameter,
+    // and a parameter in the SELECT list must not jump ahead of one the
+    // rendered statement puts after it (see
+    // [`EmitterState::emit_ordered_select`]). The group-by items are
+    // pure field quoting, so emitting them second changes no SQL text —
+    // and they MUST come second, because the guard may flush to a CTE,
+    // which clears `group_by`.
+    let agg_items = ctx.emit_ordered_select(|ctx| {
+        let mut items = Vec::with_capacity(agg_stage.aggregations.len());
+        for agg in &agg_stage.aggregations {
+            // The SAME argument walk the expression lane uses: an
+            // aggregation position is still a call, and its per-position
+            // literal rules (`sev()`'s dialect) apply there too.
+            let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
+
+            let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
+
+            // determine alias
+            let alias = match &agg.alias {
+                Some(a) => quote_field(a),
+                None => default_agg_alias(agg),
+            };
+
+            items.push(format!("{sql_func} AS {alias}"));
+        }
+        Ok(items)
+    })?;
+
     let mut select_items = Vec::new();
 
     // group-by fields go first in SELECT and GROUP BY
@@ -93,24 +122,7 @@ fn process_stats(
         select_items.push(quoted.clone());
         ctx.group_by.push(quoted);
     }
-
-    // aggregation expressions
-    for agg in &agg_stage.aggregations {
-        // The SAME argument walk the expression lane uses: an
-        // aggregation position is still a call, and its per-position
-        // literal rules (`sev()`'s dialect) apply there too.
-        let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
-
-        let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
-
-        // determine alias
-        let alias = match &agg.alias {
-            Some(a) => quote_field(a),
-            None => default_agg_alias(agg),
-        };
-
-        select_items.push(format!("{sql_func} AS {alias}"));
-    }
+    select_items.extend(agg_items);
 
     ctx.select = select_items;
     ctx.has_aggregation = true;
@@ -370,6 +382,31 @@ fn process_timechart(
     // aggregation (one group per input row).
     let bucket = format!("time_bucket(INTERVAL '{interval}', TRY_CAST(\"_time\" AS TIMESTAMP))");
 
+    // Same ordering guard as `stats`, for the same reason: the
+    // aggregations are the only parameter-pushing part of this stage,
+    // and the bucket/group items that surround them are pure text — so
+    // they are assembled after the guard has had its chance to flush
+    // (which would otherwise clear `group_by` and `order_by`).
+    let agg_items = ctx.emit_ordered_select(|ctx| {
+        let mut items = Vec::with_capacity(tc.aggregations.len());
+        for agg in &tc.aggregations {
+            // The SAME argument walk the expression lane uses: an
+            // aggregation position is still a call, and its per-position
+            // literal rules (`sev()`'s dialect) apply there too.
+            let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
+
+            let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
+
+            let alias = match &agg.alias {
+                Some(a) => quote_field(a),
+                None => default_agg_alias(agg),
+            };
+
+            items.push(format!("{sql_func} AS {alias}"));
+        }
+        Ok(items)
+    })?;
+
     let mut select_items = vec![format!("{bucket} AS \"_time\"")];
     let mut group_items = vec![bucket.clone()];
 
@@ -378,22 +415,7 @@ fn process_timechart(
         select_items.push(q.clone());
         group_items.push(q);
     }
-
-    for agg in &tc.aggregations {
-        // The SAME argument walk the expression lane uses: an
-        // aggregation position is still a call, and its per-position
-        // literal rules (`sev()`'s dialect) apply there too.
-        let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
-
-        let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
-
-        let alias = match &agg.alias {
-            Some(a) => quote_field(a),
-            None => default_agg_alias(agg),
-        };
-
-        select_items.push(format!("{sql_func} AS {alias}"));
-    }
+    select_items.extend(agg_items);
 
     ctx.select = select_items;
     ctx.group_by = group_items;

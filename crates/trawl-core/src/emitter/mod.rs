@@ -2815,4 +2815,87 @@ mod tests {
             "TIMESTAMP '2026-02-03 04:05:06.000000'"
         );
     }
+
+    /// The ordering guard is STRUCTURAL: an aggregate that pushed a
+    /// parameter gets the pending predicate flushed into a CTE, so the
+    /// CTE's placeholder renders before the SELECT list's and the
+    /// positional binding matches the parameter list.
+    #[test]
+    fn an_aggregate_that_pushes_a_parameter_flushes_the_predicate_first() {
+        let query = parser::parse("service=nginx | stats max(now()) as n").expect("parse");
+        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
+        assert!(emitted.sql.starts_with("WITH _s0 AS ("), "{}", emitted.sql);
+        let predicate = emitted
+            .sql
+            .find("WHERE \"service\" = ?")
+            .expect("the predicate keeps its placeholder");
+        let aggregate = emitted
+            .sql
+            .find("MAX(CAST(? AS TIMESTAMP))")
+            .expect("the aggregate keeps its placeholder");
+        assert!(
+            predicate < aggregate,
+            "the predicate's placeholder must render FIRST: {}",
+            emitted.sql
+        );
+        assert_eq!(
+            emitted.params,
+            vec![
+                SqlValue::String("nginx".to_owned()),
+                SqlValue::Timestamp(anchor().now_timestamp()),
+            ],
+            "and the parameter list must run in that same order"
+        );
+    }
+
+    /// …and only then. An aggregate that pushes nothing keeps the plain
+    /// single-SELECT shape — the commonest query in the language must
+    /// not grow a pointless CTE.
+    #[test]
+    fn an_aggregate_that_pushes_nothing_is_left_unnested() {
+        let query = parser::parse("service=nginx | stats count() by host").expect("parse");
+        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
+        assert!(
+            !emitted.sql.contains("WITH "),
+            "no parameter was pushed into the SELECT list: {}",
+            emitted.sql
+        );
+        assert_eq!(emitted.params, vec![SqlValue::String("nginx".to_owned())]);
+    }
+
+    /// The same guard on `timechart`, whose aggregate SELECT list is
+    /// built the same way.
+    #[test]
+    fn a_timechart_aggregate_parameter_flushes_the_predicate_first() {
+        let query =
+            parser::parse("service=nginx | timechart span=1m max(now()) as n").expect("parse");
+        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
+        assert!(emitted.sql.starts_with("WITH _s0 AS ("), "{}", emitted.sql);
+        assert_eq!(
+            emitted.params,
+            vec![
+                SqlValue::String("nginx".to_owned()),
+                SqlValue::Timestamp(anchor().now_timestamp()),
+            ]
+        );
+    }
+
+    /// The bug the guard fixes is not the anchor's: an ordinary literal
+    /// inside an aggregate argument has always pushed a parameter into
+    /// the SELECT list, and mis-bound the same way.
+    #[test]
+    fn an_aggregate_literal_argument_takes_the_same_guard() {
+        let query =
+            parser::parse("service=nginx | stats max(substr(message, 1, 3)) as m").expect("parse");
+        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
+        assert!(emitted.sql.starts_with("WITH _s0 AS ("), "{}", emitted.sql);
+        assert_eq!(
+            emitted.params,
+            vec![
+                SqlValue::String("nginx".to_owned()),
+                SqlValue::Int(1),
+                SqlValue::Int(3),
+            ]
+        );
+    }
 }
