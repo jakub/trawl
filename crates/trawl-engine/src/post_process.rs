@@ -220,7 +220,16 @@ fn apply_aggregate(
             match stream::apply_stage(stage, &mut event, anchor) {
                 StageResult::Pass => {}
                 StageResult::Filtered => continue 'event,
-                StageResult::Done => break,
+                // `Done` ends the INPUT, not just this event's stage
+                // run. It used to break only the inner loop, which then
+                // fed the very event an exhausted `limit` had just
+                // refused — and went on to the next one, so
+                // `extract kv | limit 1 | stats count()` counted every
+                // row. Exhaustion is sticky, so no later event could be
+                // admitted either; stopping here is the same row set,
+                // read once. It is also what the post-stage loop below
+                // has always done with `Done`.
+                StageResult::Done => break 'event,
             }
         }
         // The BATCH rule: one statement anchor for every row, the

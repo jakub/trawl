@@ -365,3 +365,40 @@ fn the_cold_start_fallback_keeps_the_statements_anchor() {
         "the re-emitted hot-only SQL must inherit the statement's anchor"
     );
 }
+
+/// A `limit` among the kv tail's PRE-stages caps what reaches the
+/// aggregation, exactly as the same query without the split does.
+///
+/// The tail's aggregate arm used to treat `StageResult::Done` as "stop
+/// running stages for THIS event" — it broke the inner stage loop and
+/// then fed the very event an exhausted `limit` had just refused, and
+/// went on to the next one. `extract kv | limit 1 | stats count()`
+/// counted every row.
+#[test]
+fn a_pre_stage_limit_caps_what_the_kv_tail_aggregates() {
+    let (_dir, glob) = source(&[
+        r#"{"message":"k=1","service":"nginx"}"#,
+        r#"{"message":"k=2","service":"nginx"}"#,
+        r#"{"message":"k=3","service":"nginx"}"#,
+    ]);
+    let exec = Executor::new().unwrap();
+
+    let with_tail = run(
+        &exec,
+        "* | extract kv from message | limit 1 | stats count()",
+        &glob,
+    );
+    let without_tail = run(&exec, "* | limit 1 | stats count()", &glob);
+
+    assert_eq!(with_tail.rows.len(), 1, "{with_tail:?}");
+    assert_eq!(
+        cell(&with_tail, 0, "count"),
+        &Value::Integer(1),
+        "the limit admits one event; the aggregation counts one"
+    );
+    assert_eq!(
+        cell(&with_tail, 0, "count"),
+        cell(&without_tail, 0, "count"),
+        "the kv split may not change the answer"
+    );
+}
