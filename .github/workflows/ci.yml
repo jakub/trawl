@@ -345,3 +345,93 @@ jobs:
           name: e2e-traces
           path: crates/trawl-web-ui/e2e/test-results/
           retention-days: 7
+
+  fuzz-smoke:
+    name: pin-aware fuzz smoke (parse_emit)
+    # A bounded gating run of the pin-aware parse/emit fuzz target: parse
+    # arbitrary DSL, invent a catalog pin for every field it binds, emit SQL
+    # under those pins, and assert the differential oracle in the target.
+    # It links no DuckDB and needs no postgres, so the small runner is
+    # enough and ten minutes is generous (the measured run is ~25s of build
+    # plus ~10s of fuzzing).
+    runs-on: k8s-small
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Pinned by DATE. cargo-fuzz needs a nightly compiler (-Zsanitizer),
+      # and a floating `nightly` is the one input that can redden a merge
+      # gate with no code change in the PR: a compiler published overnight
+      # can add a lint, change a codegen flag or break libfuzzer-sys, and
+      # the failure lands on whoever opens a PR that morning. Bump this
+      # line deliberately, on its own, so the bump is what gets reviewed.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+        with:
+          toolchain: nightly-2026-08-24
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Its own key and its own workspace: a different compiler, a
+          # different RUSTFLAGS (see below) and a different target dir than
+          # every stable job here, so sharing a key would make the two sides
+          # evict each other's artifacts on every run.
+          shared-key: fuzz-smoke
+          workspaces: crates/trawl-core/fuzz
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # cargo-fuzz
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Fuzz parse_emit
+        working-directory: crates/trawl-core
+        env:
+          # RUSTFLAGS is overridden, and this is not cosmetic. The
+          # workflow-level `RUSTFLAGS: -D warnings` is inherited by every
+          # job, cargo-fuzz APPENDS its sanitizer flags to whatever it
+          # inherits, and nightly 1.100 deprecates
+          # `AtomicU64::fetch_update` (renamed `try_update`), which
+          # crates/trawl-core/src/stream.rs uses. So the inherited flag
+          # turns that warning into an error and the fuzz build dies before
+          # a single input runs. Renaming the method is NOT the fix:
+          # `try_update` does not exist on stable 1.98, so adopting it would
+          # break every other job in this file. The deprecation is
+          # unresolvable until the MSRV moves, and until then this job
+          # compiles trawl-core without `-D warnings`. The stable clippy job
+          # is what actually gates warnings.
+          RUSTFLAGS: ""
+        run: |
+          # A writable scratch corpus FIRST, the committed inputs after:
+          # libFuzzer writes new coverage-increasing units into the first
+          # directory only, so the committed seeds and the parse corpus stay
+          # read-only and CI never produces a dirty tree.
+          mkdir -p "$RUNNER_TEMP/corpus"
+          # -runs counts corpus REPLAY first, and the committed inputs are
+          # 3842 parse-corpus files plus 6 seeds. Measured here: libFuzzer
+          # reaches `#3849 INITED` before it mutates anything, so any -runs
+          # below ~3850 is a load test wearing a fuzzing costume: it exits
+          # 0 having explored nothing new. 25000 leaves ~21k mutation runs
+          # (measured: 628 new coverage units, ~3100 exec/s, ~8s), roughly
+          # 5.5x the replay floor. Raise it freely; never lower it below the
+          # floor, or the job stops fuzzing without ever going red.
+          #
+          # -seed=114 is deliberate. libFuzzer's mutation sequence is a pure
+          # function of (seed, binary, corpus), so a gating job stays
+          # reproducible: a new crash means THIS PR made a previously
+          # explored path panic, rather than the job being a lottery that
+          # reddens an unrelated PR and goes green on re-run.
+          #
+          # The input paths are relative to THIS step's working directory,
+          # crates/trawl-core: cargo-fuzz does not chdir into fuzz/ before
+          # exec'ing the target, so `seeds/parse_emit` would resolve to
+          # nothing and libFuzzer exits 1 with "No such file or directory"
+          # (verified, not assumed).
+          cargo +nightly-2026-08-24 fuzz run parse_emit \
+            "$RUNNER_TEMP/corpus" fuzz/seeds/parse_emit fuzz/corpus/parse \
+            -- -runs=25000 -seed=114 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -print_final_stats=1
+      # A crash must arrive with the input that reproduces it, because the
+      # bytes are the whole bug report. `if: failure()` only, so this never
+      # affects job status; the job fails on the fuzzer's nonzero exit and
+      # on nothing else.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: fuzz-parse-emit-artifacts
+          path: crates/trawl-core/fuzz/artifacts/
+          retention-days: 7
+          if-no-files-found: ignore
