@@ -1048,8 +1048,9 @@ What "unit of output" means per lane:
 Boundaries worth stating plainly:
 
 - the search stage's `last=` window in a BATCH query evaluates on
-  DuckDB's own statement clock, a separate clock domain from `now()` —
-  microseconds apart at most, but not the same read;
+  DuckDB's own statement clock, a separate clock domain from `now()`:
+  two reads taken at two moments, with no bound on the gap between them
+  (query preparation, thread scheduling and a retry all sit in it);
 - wall-clock sampling makes no monotonic guarantee: NTP can step the
   clock backward, so a later event's instant can precede an earlier
   one's;

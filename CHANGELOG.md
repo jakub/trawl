@@ -398,7 +398,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     Aggregate streams: every row of one emitted snapshot shares one instant,
     while the events that fed it each sampled their own. The batch `last=`
     window is deliberately still DuckDB's own statement clock — a separate
-    clock domain, microseconds away.
+    clock domain, read at its own moment, with no bound on the gap between
+    the two reads.
   - **Aggregate SELECT parameters bind in rendered order.** DuckDB binds `?`
     positionally, and the emitter walks the search stage before the SELECT
     list it renders first, so any parameter a `stats`/`timechart` aggregate

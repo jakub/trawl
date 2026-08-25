@@ -2157,27 +2157,57 @@ async fn repin_validation_refusals_are_side_effect_free(pool: sqlx::PgPool) {
 
 /// Read from an open SSE response until `needle` shows up, or fail loud.
 async fn read_sse_until(resp: &mut reqwest::Response, needle: &str) -> String {
-    let mut buf = String::new();
-    tokio::time::timeout(Duration::from_secs(15), async {
+    let mut bytes: Vec<u8> = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let chunk = resp.chunk().await.unwrap().expect("stream ended early");
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            if buf.contains(needle) {
-                break;
+            bytes.extend_from_slice(&chunk);
+            // The WHOLE buffer is re-read each time rather than appended
+            // as text: a chunk can split a UTF-8 codepoint, and starting
+            // from the front heals it on the next chunk.
+            let text = String::from_utf8_lossy(&bytes);
+            // Seeing the needle is not enough to stop. A chunk boundary
+            // can land inside the `data:` line carrying it, and half a
+            // JSON payload does not parse — so read on until that
+            // frame's terminator (`\n\n`) has arrived too.
+            if let Some(at) = text.find(needle)
+                && text[at..].contains("\n\n")
+            {
+                return text.into_owned();
             }
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("needle {needle:?} never arrived; got: {buf}"));
-    buf
+    .await;
+    read.unwrap_or_else(|_| {
+        panic!(
+            "needle {needle:?} never arrived; got: {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
 }
 
-/// Every `data:` payload in an SSE buffer, parsed.
+/// Every `data:` payload in the COMPLETE frames of an SSE buffer.
+///
+/// The read stops at a frame terminator, but the bytes after it can be
+/// the first half of the NEXT frame — so the buffer is cut at its last
+/// terminator and the remainder is dropped rather than parsed.
 fn sse_payloads(buf: &str) -> Vec<serde_json::Value> {
-    buf.lines()
+    let complete = buf.rfind("\n\n").map_or("", |end| &buf[..end + 2]);
+    complete
+        .lines()
         .filter_map(|line| line.strip_prefix("data: "))
         .map(|json| serde_json::from_str(json).expect("an SSE payload is JSON"))
         .collect()
+}
+
+/// A read stops at the frame it was waiting for, and the bytes after it
+/// can be the first half of the next one — which is not JSON yet.
+#[test]
+fn sse_payloads_ignores_a_half_arrived_frame() {
+    let buf = "event: data\ndata: {\"a\":1}\n\nevent: data\ndata: {\"b\":";
+    let payloads = sse_payloads(buf);
+    assert_eq!(payloads.len(), 1, "only the complete frame is parsed");
+    assert_eq!(payloads[0]["a"], 1);
 }
 
 /// ADR-0017 §3 through the REAL SSE loop, on a live server.
