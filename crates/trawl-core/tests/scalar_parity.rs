@@ -7,7 +7,15 @@
 //!
 //! Generates random scalar DSL expressions (`let x = <expr>`), evaluates
 //! them against a fixed event via both paths, and asserts type-aware
-//! normalized equality. Excludes `now()` (nondeterministic).
+//! normalized equality.
+//!
+//! `now()` is IN, not excluded: since #106 neither lane reads a clock
+//! during evaluation, so a case is deterministic once the harness hands
+//! both lanes the SAME [`EvalContext`] — the streaming side as its
+//! evaluation context, the batch side as the emit call's anchor, which
+//! rides into the SQL as a bound TIMESTAMP parameter (ADR-0017 §3). One
+//! anchor per case, [`now_anchor`], never a second capture and never a
+//! fake clock either lane could read differently.
 //!
 //! Modelled on `tests/filter_parity.rs`.
 
@@ -17,6 +25,7 @@ use duckdb::Connection;
 use duckdb::types::{Type, Value as DuckValue};
 use serde_json::{Map, Value};
 use trawl_core::ast::PipeStage;
+use trawl_core::context::EvalContext;
 use trawl_core::emitter::{self, DATE_PART_UNITS, DATE_UNITS, SqlValue};
 use trawl_core::eval::{EvalValue, eval_expr};
 use trawl_core::parser;
@@ -52,6 +61,30 @@ impl Rng {
     fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[self.range(items.len())]
     }
+}
+
+// ── The `now()` anchor ────────────────────────────────────────────────
+
+/// The instant every case in this harness reads `now()` at.
+///
+/// FIXED, and with NONZERO microseconds on purpose: a whole-second
+/// anchor would pass `strftime(now(), "…%f")` even if the anchor lost its
+/// sub-second precision on the way into either lane. The date is
+/// arbitrary; what matters is that ONE value reaches both lanes — the
+/// streaming evaluator as its [`EvalContext`], `DuckDB` as the bound
+/// TIMESTAMP parameter the emit call's anchor produces.
+const NOW_ANCHOR_TEXT: &str = "2026-02-03T03:04:05.123456Z";
+
+/// The anchor as `DuckDB` renders it (`CAST(TIMESTAMP AS VARCHAR)`): a
+/// space separator and exactly the microseconds it holds.
+const NOW_ANCHOR_RENDERED: &str = "2026-02-03 03:04:05.123456";
+
+fn now_anchor() -> EvalContext {
+    EvalContext::at(
+        chrono::DateTime::parse_from_rfc3339(NOW_ANCHOR_TEXT)
+            .expect("anchor fixture infrastructure failure: NOW_ANCHOR_TEXT is not RFC 3339")
+            .with_timezone(&chrono::Utc),
+    )
 }
 
 // ── Timestamp fixtures ────────────────────────────────────────────────
@@ -147,7 +180,7 @@ const FLOAT_LITS: &[&str] = &[
 //     projection reads the expression itself, so it catches an arm rewritten to
 //     emit something else under the same label.
 
-const SCALAR_FAMILY_ARMS: usize = 15;
+const SCALAR_FAMILY_ARMS: usize = 16;
 const STRING_FN_ARMS: usize = 8;
 const TYPEOF_ARG_ARMS: usize = 4;
 const NUMERIC_ARG_ARMS: usize = 2;
@@ -156,10 +189,11 @@ const SEV_DIALECT_ARMS: usize = 3;
 const CONCAT_ARG_ARMS: usize = 3;
 const SUBSTR_WINDOW_ARMS: usize = 17;
 const STRPTIME_SHAPE_ARMS: usize = 4;
+const NOW_SHAPE_ARMS: usize = 4;
 
 /// (selector name, the constant the generator uses, the value it must hold).
 const REQUIRED_SELECTOR_ARMS: &[(&str, usize, usize)] = &[
-    ("random_scalar_expr family", SCALAR_FAMILY_ARMS, 15),
+    ("random_scalar_expr family", SCALAR_FAMILY_ARMS, 16),
     ("random_string_fn", STRING_FN_ARMS, 8),
     ("random_numeric_fn", NUMERIC_FN_ARMS, 4),
     ("random_numeric_fn argument", NUMERIC_ARG_ARMS, 2),
@@ -169,6 +203,7 @@ const REQUIRED_SELECTOR_ARMS: &[(&str, usize, usize)] = &[
     ("random_concat argument", CONCAT_ARG_ARMS, 3),
     ("random_substr window", SUBSTR_WINDOW_ARMS, 17),
     ("random_strptime shape", STRPTIME_SHAPE_ARMS, 4),
+    ("random_now shape", NOW_SHAPE_ARMS, 4),
 ];
 
 /// A generated expression together with the generator ARMS that produced it.
@@ -211,6 +246,10 @@ const REQUIRED_GENERATOR_ARMS: &[&str] = &[
     "date_diff",
     "date_part",
     "date_trunc",
+    "now/bare",
+    "now/date_part",
+    "now/rendered",
+    "now/self_equality",
     "numeric_fn/abs",
     "numeric_fn/arg_float",
     "numeric_fn/arg_int",
@@ -267,6 +306,7 @@ const REQUIRED_RANDOM_CALL_NAMES: &[&str] = &[
     "length",
     "lower",
     "ltrim",
+    "now",
     "replace",
     "round",
     "rtrim",
@@ -292,8 +332,12 @@ fn leading_call_name(expression: &str) -> &str {
 
 // ── DSL expression generation ─────────────────────────────────────────
 
-/// Generate a scalar DSL expression (no `now()`, no field refs that could be
-/// absent from the fixed event), labelled with the arms that produced it.
+/// Generate a scalar DSL expression (no field refs that could be absent
+/// from the fixed event), labelled with the arms that produced it.
+///
+/// `now()` IS generated: both lanes read the one anchor
+/// [`assert_parity_case`] hands them, so a `now()` draw is as
+/// deterministic as any other (ADR-0017 §3).
 fn random_scalar_expr(rng: &mut Rng) -> Option<Generated> {
     match rng.range(SCALAR_FAMILY_ARMS) {
         0 => Some(random_string_fn(rng)),
@@ -311,6 +355,7 @@ fn random_scalar_expr(rng: &mut Rng) -> Option<Generated> {
         12 => Some(random_concat(rng)),
         13 => Some(random_substr(rng)),
         14 => Some(random_sev(rng)),
+        15 => Some(random_now(rng)),
         _ => unreachable!(),
     }
 }
@@ -639,6 +684,28 @@ fn random_concat(rng: &mut Rng) -> Generated {
     }
 }
 
+/// `now()`, bare and composed.
+///
+/// Three of the four arms put a DIFFERENT head symbol in front of the
+/// anchor (`tostring`, `date_part`), which is exactly why the arm LABELS
+/// and not the emitted function names are what the completeness guard is
+/// made of. The composed arms matter on their own: the batch lane reaches
+/// `now()` as a bound `CAST(? AS TIMESTAMP)`, so a wrapper is where a
+/// parameter-ordering or result-type mistake would show up, and
+/// `now() == now()` is the one-instant rule itself (ADR-0017 §3).
+fn random_now(rng: &mut Rng) -> Generated {
+    match rng.range(NOW_SHAPE_ARMS) {
+        0 => Generated::new("now/bare", "now()".to_string()),
+        1 => Generated::new("now/self_equality", "now() == now()".to_string()),
+        2 => Generated::new("now/rendered", "tostring(now())".to_string()),
+        3 => {
+            let unit = rng.pick(DATE_PART_UNITS);
+            Generated::new("now/date_part", format!("date_part(\"{unit}\", now())"))
+        }
+        _ => unreachable!(),
+    }
+}
+
 // ── Event fixture (all fields present to avoid binder errors) ─────────
 
 fn fixed_event() -> Map<String, Value> {
@@ -728,7 +795,7 @@ fn utc_connection() -> Connection {
     conn
 }
 
-fn eval_scalar(dsl: &str, event: &Map<String, Value>) -> EvalValue {
+fn eval_scalar(dsl: &str, event: &Map<String, Value>, anchor: EvalContext) -> EvalValue {
     let query = parse_generated(dsl);
     let let_stage = query
         .pipeline
@@ -745,11 +812,7 @@ fn eval_scalar(dsl: &str, event: &Map<String, Value>) -> EvalValue {
         .assignments
         .first()
         .unwrap_or_else(|| panic!("generated scalar query has no assignment: {dsl:?}"));
-    eval_expr(
-        expr,
-        &trawl_core::row::from_json(event),
-        &trawl_core::context::EvalContext::capture(),
-    )
+    eval_expr(expr, &trawl_core::row::from_json(event), &anchor)
 }
 
 /// Run a `let x = <expr>` query and return the outcome of the computed `x`
@@ -757,7 +820,12 @@ fn eval_scalar(dsl: &str, event: &Map<String, Value>) -> EvalValue {
 /// so the harness can no longer hide a batch error behind a silent skip — at
 /// prepare, at query AND at fetch. Only genuinely impossible states (no row, no
 /// `x` column, unreadable text) panic as infrastructure failures.
-fn sql_scalar_result(conn: &Connection, dsl: &str, event: &Map<String, Value>) -> SqlOutcome {
+fn sql_scalar_result(
+    conn: &Connection,
+    dsl: &str,
+    event: &Map<String, Value>,
+    anchor: EvalContext,
+) -> SqlOutcome {
     let query = parse_generated(dsl);
 
     let mut tmp = infra_or_panic(
@@ -774,12 +842,8 @@ fn sql_scalar_result(conn: &Connection, dsl: &str, event: &Map<String, Value>) -
         .to_str()
         .expect("fixture path infrastructure failure: path is not UTF-8");
 
-    let emitted = emitter::emit(
-        &query,
-        tmp_path,
-        trawl_core::context::EvalContext::capture(),
-    )
-    .unwrap_or_else(|error| panic!("generated grammar failed to emit {dsl:?}: {error:?}"));
+    let emitted = emitter::emit(&query, tmp_path, anchor)
+        .unwrap_or_else(|error| panic!("generated grammar failed to emit {dsl:?}: {error:?}"));
 
     let params = bind_params(&emitted.params);
     let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
@@ -953,8 +1017,13 @@ fn assert_parity_case(
     expression: &str,
 ) -> Option<SkipCategory> {
     let dsl = format!("* | let x = {expression}");
-    let eval_result = eval_scalar(&dsl, event);
-    match sql_scalar_result(conn, &dsl, event) {
+    // ONE anchor, both lanes: the streaming evaluator reads it as its
+    // evaluation context and the emitter binds the SAME instant as the
+    // statement's TIMESTAMP parameter, so a generated `now()` is an
+    // ordinary deterministic case rather than a race between two clocks.
+    let anchor = now_anchor();
+    let eval_result = eval_scalar(&dsl, event, anchor);
+    match sql_scalar_result(conn, &dsl, event, anchor) {
         SqlOutcome::Value(sql_result) => {
             assert!(
                 values_match(&eval_result, &sql_result),
@@ -1021,6 +1090,7 @@ const REQUIRED_FAMILY_CASE_COUNTS: &[(&str, usize)] = &[
     ("json", 7),
     ("tonumber", 7),
     ("tostring", 8),
+    ("now", 11),
 ];
 
 #[allow(clippy::too_many_lines)]
@@ -1174,6 +1244,36 @@ fn generated_cases() -> Vec<GeneratedCase> {
             // the hardware and would pin this platform.
             r#"tostring(tonumber("nan"))"#,
             r#"tostring(tonumber("-nan"))"#,
+        ],
+    );
+    add(
+        "now",
+        &[
+            // The anchor itself, and the one-instant rule.
+            "now()",
+            "now() == now()",
+            // Its TYPE and its TEXT. `typeof` is here as a VARCHAR case on
+            // purpose: `logical_type_matches` reads duckdb-rs's `Type`,
+            // which erases the TIMESTAMP/TIMESTAMPTZ split (see the caveat
+            // on that function), so only the spelling can see it. The
+            // rendered forms carry SIX fractional digits, which is what
+            // makes a lost microsecond visible.
+            "typeof(now())",
+            "tostring(now())",
+            r#"strftime(now(), "%Y-%m-%d %H:%M:%S.%f")"#,
+            // Timestamp semantics through composition — the anchor arrives
+            // as a bound `CAST(? AS TIMESTAMP)`, so each wrapper is a place
+            // a parameter-ordering or result-type mistake would surface.
+            r#"date_diff("second", now(), now())"#,
+            r#"date_part("year", now())"#,
+            r#"date_trunc("second", now())"#,
+            "if(true, now(), now())",
+            "coalesce(now(), now())",
+            // The ladder function over a bound TIMESTAMP: NULL in both
+            // lanes. Agreement is all this arm claims — that the batch lane
+            // does not ERROR is a stronger claim, and it is pinned by
+            // `sev_over_the_now_anchor_is_null_never_a_binder_error`.
+            "sev(now())",
         ],
     );
     cases
@@ -1340,12 +1440,16 @@ fn a_malformed_offset_has_no_timestamp_reading() {
         // offset gained a reading in both lanes — which is the whole
         // claim under test.
         assert_eq!(
-            eval_scalar(&dsl, &event),
+            eval_scalar(&dsl, &event, now_anchor()),
             EvalValue::Null,
             "streaming eval must null where batch errors for {dsl:?}"
         );
         let expected = format!(r#""2026-01-15 10:20:30{offset}" has a timestamp that is not UTC"#);
-        assert_sql_errored(&sql_scalar_result(&conn, &dsl, &event), &expected, &dsl);
+        assert_sql_errored(
+            &sql_scalar_result(&conn, &dsl, &event, now_anchor()),
+            &expected,
+            &dsl,
+        );
     }
 }
 
@@ -1370,12 +1474,12 @@ fn a_failed_timestamp_coercion_is_null_in_both_operand_orders() {
         // it from two lanes AGREEING on an answer.
         let dsl = format!("* | let x = {expression}");
         assert_eq!(
-            eval_scalar(&dsl, &event),
+            eval_scalar(&dsl, &event, now_anchor()),
             EvalValue::Null,
             "streaming eval must null where batch errors for {dsl:?}"
         );
         assert_sql_errored(
-            &sql_scalar_result(&conn, &dsl, &event),
+            &sql_scalar_result(&conn, &dsl, &event, now_anchor()),
             r#"invalid timestamp field format: "zzz""#,
             &dsl,
         );
@@ -1395,18 +1499,158 @@ fn a_failed_timestamp_coercion_is_null_in_both_operand_orders() {
 fn now_is_one_instant_per_unit_of_output() {
     let conn = utc_connection();
     let event = fixed_event();
+    // ONE context, both lanes — the eval side reads it directly, the SQL
+    // side binds it as the emit call's anchor.
+    let anchor = now_anchor();
     let dsl = "* | let x = now() == now()";
     assert_eq!(
-        eval_scalar(dsl, &event),
+        eval_scalar(dsl, &event, anchor),
         EvalValue::Bool(true),
         "two now() calls in one expression must read one instant"
     );
     assert_eq!(
-        sql_scalar_result(&conn, dsl, &event),
+        sql_scalar_result(&conn, dsl, &event, anchor),
         SqlOutcome::Value(SqlCell {
             logical_type: Type::Boolean,
             value: DuckValue::Boolean(true),
         })
+    );
+}
+
+/// The anchor is the VALUE both lanes answer with — not merely the same
+/// value as each other.
+///
+/// `assert_parity_case` proves the two lanes agree; it cannot prove they
+/// agree on the INSTANT THE CALLER HANDED THEM, and a bug that dropped
+/// the anchor's microseconds in the emitter and in `eval` alike would
+/// still agree. Every expectation here is written from the fixture, so
+/// the anchor's sub-second digits have to survive the trip through the
+/// bound parameter.
+#[test]
+fn now_reads_the_statements_anchor_in_both_lanes() {
+    use duckdb::types::TimeUnit;
+
+    let conn = utc_connection();
+    let event = fixed_event();
+    let anchor = now_anchor();
+    let micros = anchor.now_utc().timestamp_micros();
+    // The same instant with its fractional second dropped — the answer
+    // `date_trunc("second", ...)` owes, written from the fixture rather
+    // than from either lane.
+    let whole_second_micros = micros - i64::from(anchor.now_utc().timestamp_subsec_micros());
+    let whole_second = chrono::DateTime::from_timestamp_micros(whole_second_micros)
+        .expect("fixture infrastructure failure: the anchor is not a representable instant")
+        .naive_utc();
+
+    let instant = |micros: i64| {
+        SqlOutcome::Value(SqlCell {
+            logical_type: Type::Timestamp,
+            value: DuckValue::Timestamp(TimeUnit::Microsecond, micros),
+        })
+    };
+    let text = |value: &str| {
+        SqlOutcome::Value(SqlCell {
+            logical_type: Type::Text,
+            value: DuckValue::Text(value.to_string()),
+        })
+    };
+    let bigint = |value: i64| {
+        SqlOutcome::Value(SqlCell {
+            logical_type: Type::BigInt,
+            value: DuckValue::BigInt(value),
+        })
+    };
+
+    for (expression, eval_want, sql_want) in [
+        // The anchor, undecorated.
+        ("now()", anchor.now_value(), instant(micros)),
+        (
+            "if(true, now(), now())",
+            anchor.now_value(),
+            instant(micros),
+        ),
+        (
+            "coalesce(now(), now())",
+            anchor.now_value(),
+            instant(micros),
+        ),
+        (
+            r#"date_trunc("second", now())"#,
+            EvalValue::Timestamp(trawl_core::compare::Instant::At(whole_second)),
+            instant(whole_second_micros),
+        ),
+        // The TYPE, spelled — the one thing `logical_type_matches` cannot
+        // see, because duckdb-rs's `Type` erases the TIMESTAMPTZ split.
+        // `TIMESTAMP` is what the explicit `CAST(? AS TIMESTAMP)` in the
+        // emitted SQL makes it; a bare `now()` would say `TIMESTAMP WITH
+        // TIME ZONE` here.
+        (
+            "typeof(now())",
+            EvalValue::Str("TIMESTAMP".to_string()),
+            text("TIMESTAMP"),
+        ),
+        // The TEXT, byte for byte, with the fixture's microseconds in it.
+        (
+            "tostring(now())",
+            EvalValue::Str(NOW_ANCHOR_RENDERED.to_string()),
+            text(NOW_ANCHOR_RENDERED),
+        ),
+        (
+            r#"strftime(now(), "%Y-%m-%d %H:%M:%S.%f")"#,
+            EvalValue::Str(NOW_ANCHOR_RENDERED.to_string()),
+            text(NOW_ANCHOR_RENDERED),
+        ),
+        // Two reads of the anchor, differenced: zero, because there is
+        // only one instant to difference.
+        (
+            r#"date_diff("second", now(), now())"#,
+            EvalValue::Int(0),
+            bigint(0),
+        ),
+        (
+            r#"date_part("year", now())"#,
+            EvalValue::Int(2026),
+            bigint(2026),
+        ),
+    ] {
+        let dsl = format!("* | let x = {expression}");
+        assert_eq!(
+            eval_scalar(&dsl, &event, anchor),
+            eval_want,
+            "streaming must answer the anchor it was handed for {dsl:?}"
+        );
+        assert_eq!(
+            sql_scalar_result(&conn, &dsl, &event, anchor),
+            sql_want,
+            "batch must answer the anchor it bound for {dsl:?}"
+        );
+    }
+}
+
+/// `sev(now())` is NULL — and specifically NOT a `DuckDB` error.
+///
+/// The distinction is the point: the ladder reads its argument through
+/// `to_json(...)`, so a bound TIMESTAMP parameter has to stay TYPEABLE
+/// there. If it stopped being, the batch lane would ERROR and the
+/// ratified null-where-batch-errors rule would keep every parity assertion
+/// green while `sev()` over any timestamp-valued expression failed for
+/// real users. That is why this is not left to the family's `sev(now())`
+/// arm.
+#[test]
+fn sev_over_the_now_anchor_is_null_never_a_binder_error() {
+    let conn = utc_connection();
+    let event = fixed_event();
+    let anchor = now_anchor();
+    let dsl = "* | let x = sev(now())";
+
+    assert_eq!(eval_scalar(dsl, &event, anchor), EvalValue::Null);
+    assert_eq!(
+        sql_scalar_result(&conn, dsl, &event, anchor),
+        SqlOutcome::Value(SqlCell {
+            logical_type: Type::BigInt,
+            value: DuckValue::Null,
+        }),
+        "the anchor must survive `to_json` as a value, not a binder error"
     );
 }
 
@@ -1482,11 +1726,15 @@ fn integer_overflow_nulls_where_duckdb_errors() {
         ),
     ] {
         assert_eq!(
-            eval_scalar(dsl, &event),
+            eval_scalar(dsl, &event, now_anchor()),
             EvalValue::Null,
             "streaming eval must null where batch errors for {dsl:?}"
         );
-        assert_sql_errored(&sql_scalar_result(&conn, dsl, &event), duckdb_error, dsl);
+        assert_sql_errored(
+            &sql_scalar_result(&conn, dsl, &event, now_anchor()),
+            duckdb_error,
+            dsl,
+        );
     }
 }
 
@@ -1615,11 +1863,11 @@ fn division_by_zero_matches_duckdbs_ieee_answer() {
         // `assert_eq!` against a NaN can never hold and a bit-compare would
         // pin the platform's NaN payload. `{}` on f64 gives exactly
         // `inf` / `-inf` / `NaN` on both sides.
-        let EvalValue::Float(eval_value) = eval_scalar(dsl, &event) else {
+        let EvalValue::Float(eval_value) = eval_scalar(dsl, &event, now_anchor()) else {
             panic!("expected a streaming DOUBLE for {dsl:?}");
         };
         assert_eq!(format!("{eval_value}"), want, "streaming, for {dsl:?}");
-        match sql_scalar_result(&conn, dsl, &event) {
+        match sql_scalar_result(&conn, dsl, &event, now_anchor()) {
             SqlOutcome::Value(SqlCell {
                 logical_type: Type::Double,
                 value: DuckValue::Double(value),
@@ -1631,9 +1879,9 @@ fn division_by_zero_matches_duckdbs_ieee_answer() {
     // INTEGER `%` 0 is NULL on both sides (a BIGINT column holding NULL) —
     // the one shape that is NOT an IEEE special.
     let modulo = "* | let x = 5 % 0";
-    assert_eq!(eval_scalar(modulo, &event), EvalValue::Null);
+    assert_eq!(eval_scalar(modulo, &event, now_anchor()), EvalValue::Null);
     assert_eq!(
-        sql_scalar_result(&conn, modulo, &event),
+        sql_scalar_result(&conn, modulo, &event, now_anchor()),
         SqlOutcome::Value(SqlCell {
             logical_type: Type::BigInt,
             value: DuckValue::Null,
@@ -1722,9 +1970,12 @@ fn current_typeof_null_and_list_spellings_are_pinned() {
             "VARCHAR[]",
         ),
     ] {
-        assert_eq!(eval_scalar(dsl, &event), EvalValue::Str(eval.to_string()));
         assert_eq!(
-            sql_scalar_result(&conn, dsl, &event),
+            eval_scalar(dsl, &event, now_anchor()),
+            EvalValue::Str(eval.to_string())
+        );
+        assert_eq!(
+            sql_scalar_result(&conn, dsl, &event, now_anchor()),
             SqlOutcome::Value(SqlCell {
                 logical_type: Type::Text,
                 value: DuckValue::Text(sql.to_string()),
@@ -1802,9 +2053,9 @@ fn accepted_bare_percent_y_strptime_residual_is_pinned() {
     let conn = utc_connection();
     let event = fixed_event();
     let dsl = r#"* | let x = tostring(strptime("24", "%y"))"#;
-    assert_eq!(eval_scalar(dsl, &event), EvalValue::Null);
+    assert_eq!(eval_scalar(dsl, &event, now_anchor()), EvalValue::Null);
     assert_eq!(
-        sql_scalar_result(&conn, dsl, &event),
+        sql_scalar_result(&conn, dsl, &event, now_anchor()),
         SqlOutcome::Value(SqlCell {
             logical_type: Type::Text,
             value: DuckValue::Text("2024-01-01 00:00:00".to_string()),
@@ -1818,11 +2069,11 @@ fn accepted_percent_z_strptime_wall_clock_residual_is_pinned() {
     let event = fixed_event();
     let dsl = r#"* | let x = strftime(strptime("2024-12-30 23:05:07 +0530", "%Y-%m-%d %H:%M:%S %z"), "%Y-%m-%d %H:%M:%S")"#;
     assert_eq!(
-        eval_scalar(dsl, &event),
+        eval_scalar(dsl, &event, now_anchor()),
         EvalValue::Str("2024-12-30 23:05:07".to_string())
     );
     assert_eq!(
-        sql_scalar_result(&conn, dsl, &event),
+        sql_scalar_result(&conn, dsl, &event, now_anchor()),
         SqlOutcome::Value(SqlCell {
             logical_type: Type::Text,
             value: DuckValue::Text("2024-12-30 17:35:07".to_string()),
@@ -1836,11 +2087,11 @@ fn accepted_locale_percent_c_residual_is_pinned() {
     let event = fixed_event();
     let dsl = r#"* | let x = strftime(strptime("2024-12-30 23:05:07", "%Y-%m-%d %H:%M:%S"), "%c")"#;
     assert_eq!(
-        eval_scalar(dsl, &event),
+        eval_scalar(dsl, &event, now_anchor()),
         EvalValue::Str("Mon Dec 30 23:05:07 2024".to_string())
     );
     assert_eq!(
-        sql_scalar_result(&conn, dsl, &event),
+        sql_scalar_result(&conn, dsl, &event, now_anchor()),
         SqlOutcome::Value(SqlCell {
             logical_type: Type::Text,
             value: DuckValue::Text("2024-12-30 23:05:07".to_string()),
@@ -1972,13 +2223,17 @@ fn batch_errors_imply_streaming_null() {
             r#"the function call "round(STRING_LITERAL)""#,
         ),
     ] {
-        assert_sql_errored(&sql_scalar_result(&conn, dsl, &event), duckdb_error, dsl);
+        assert_sql_errored(
+            &sql_scalar_result(&conn, dsl, &event, now_anchor()),
+            duckdb_error,
+            dsl,
+        );
         // `EvalValue::Null`, never the `serde_json::Value` form compared to
         // `Value::Null`: that conversion maps `Float(NaN)`/`Float(inf)` onto
         // `Value::Null` too, so the weaker form would accept a non-null eval
         // here.
         assert_eq!(
-            eval_scalar(dsl, &event),
+            eval_scalar(dsl, &event, now_anchor()),
             EvalValue::Null,
             "streaming eval must yield Null where batch errors for {dsl:?}"
         );
@@ -2001,7 +2256,7 @@ fn strftime_over_strptime_binds_params_in_order() {
 
     // Batch path (real DuckDB).
     assert_eq!(
-        sql_scalar_result(&conn, dsl, &event),
+        sql_scalar_result(&conn, dsl, &event, now_anchor()),
         SqlOutcome::Value(SqlCell {
             logical_type: Type::Text,
             value: DuckValue::Text("2023".to_string()),
@@ -2014,7 +2269,7 @@ fn strftime_over_strptime_binds_params_in_order() {
     // `Timestamp` onto `Value::String`, so the serde form could not tell a
     // rendered string from a rendered instant.
     assert_eq!(
-        eval_scalar(dsl, &event),
+        eval_scalar(dsl, &event, now_anchor()),
         EvalValue::Str("2023".to_string()),
         "streaming strftime(strptime(...)) must not error or null"
     );
@@ -2064,7 +2319,7 @@ fn strptime_partial_formats_match_duckdb() {
         ),
     ] {
         assert_eq!(
-            sql_scalar_result(&conn, dsl, &event),
+            sql_scalar_result(&conn, dsl, &event, now_anchor()),
             SqlOutcome::Value(SqlCell {
                 logical_type: Type::Text,
                 value: DuckValue::Text(want.to_string()),
@@ -2073,7 +2328,7 @@ fn strptime_partial_formats_match_duckdb() {
         );
 
         assert_eq!(
-            eval_scalar(dsl, &event),
+            eval_scalar(dsl, &event, now_anchor()),
             EvalValue::Str(want.to_string()),
             "streaming strptime partial-format must match DuckDB for {dsl:?}"
         );
