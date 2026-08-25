@@ -2405,3 +2405,67 @@ fn a_limit_before_timechart_applies_before_the_aggregation() {
         "the bucket must count the 2 limited rows"
     );
 }
+
+// ── `top`/`rare` place the same way (#106, review F3 extended) ────────
+//
+// `top`/`rare` desugar to `stats count() by field | sort count | limit N`
+// through `process_frequency`, which flushed only `IfModified` — so a
+// pending LIMIT or ORDER BY was absorbed into the AGGREGATION's own
+// SELECT. `head 2 | top 3 host` therefore counted all six matching rows
+// and then kept two GROUPS, which is a different question from the one
+// the pipeline asks.
+
+/// Every `count` a frequency stage produced, summed — the rows the
+/// aggregation actually SAW. Deliberately order-independent: `head` with
+/// no sort takes whichever rows the scan yields, so the identity of the
+/// survivors is not the assertion, their NUMBER is.
+fn counted_rows(result: &QueryResult) -> i64 {
+    integer_column(result, "count").iter().sum()
+}
+
+/// (a) `head` before `top` limits the INPUT to the frequency count.
+#[test]
+fn a_limit_before_top_applies_before_the_aggregation() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(&exec, "service=nginx | head 2 | top 3 host", &glob)
+        .expect("the limited frequency stage must run");
+    assert_eq!(
+        counted_rows(&result),
+        2,
+        "top must count the 2 limited rows, not all 6 nginx rows: {result:?}"
+    );
+}
+
+/// (b) `rare` shares the desugaring, so it shares the placement.
+#[test]
+fn a_limit_before_rare_applies_before_the_aggregation() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(&exec, "service=nginx | head 2 | rare 3 host", &glob)
+        .expect("the limited frequency stage must run");
+    assert_eq!(
+        counted_rows(&result),
+        2,
+        "rare must count the 2 limited rows, not all 6 nginx rows: {result:?}"
+    );
+}
+
+/// (c) A pending `sort` orders the frequency stage's INPUT rather than
+/// being appended to its grouped output. Sorting `host` descending puts
+/// both `web02` rows first, so `head 2` leaves exactly them.
+#[test]
+fn a_pending_sort_orders_the_frequency_stages_input() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | sort -host | head 2 | top 3 host",
+        &glob,
+    )
+    .expect("the sorted-and-limited frequency stage must run");
+    assert_eq!(
+        result.row_count(),
+        1,
+        "only the rows the sort+limit kept reach the count: {result:?}"
+    );
+    assert_eq!(text_cell(&result, 0, "host"), "web02");
+    assert_eq!(integer_column(&result, "count"), vec![2]);
+}

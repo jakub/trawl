@@ -195,7 +195,13 @@ fn process_frequency(
     sort_dir: &str,
     ctx: &mut EmitterState,
 ) {
-    ctx.flush_if(FlushCondition::IfModified);
+    // `top`/`rare` desugar to an AGGREGATION, so they take the same
+    // placement rule `stats`/`timechart` do: a pending ORDER BY or LIMIT
+    // belongs to the input being counted, and leaving either here would
+    // absorb it into the aggregation's own SELECT — `head 2 | top 3 host`
+    // counting all six matching rows and then keeping two GROUPS, which
+    // is a different question from the one the pipeline asks.
+    ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
 
     let field_quoted = quote_field(field);
     let mut select_items = vec![field_quoted.clone()];
