@@ -233,8 +233,9 @@ fn describe(conn: &duckdb::Connection, path: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Replay one seed end to end and return the pins it decoded.
-fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> FieldTypes {
+/// Replay one seed end to end and return the pins it decoded plus whether
+/// this seed reached the `raw_free_sql` prepare.
+fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> (FieldTypes, bool) {
     let label = seed.display().to_string();
     let text = std::fs::read_to_string(seed)
         .unwrap_or_else(|err| panic!("seed {label} is not readable UTF-8: {err}"));
@@ -270,6 +271,7 @@ fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> FieldTy
     );
 
     prepare_ok(conn, &emitted.sql, emitted.params.len(), &label, "sql");
+    let reached_raw_free = emitted.raw_free_sql.is_some();
     if let Some(raw_free) = &emitted.raw_free_sql {
         // The one emitted SQL string nothing else in the suite executes:
         // the executor only reaches it when a source turns out to have no
@@ -277,7 +279,7 @@ fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> FieldTy
         prepare_ok(conn, raw_free, emitted.params.len(), &label, "raw_free_sql");
     }
 
-    pins
+    (pins, reached_raw_free)
 }
 
 /// Prepare one emitted statement and check its placeholder count.
@@ -320,10 +322,28 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
     );
 
     let mut covered: BTreeSet<CanonicalType> = BTreeSet::new();
+    let mut raw_free_reached = 0usize;
     for seed in &seeds {
-        let pins = check_seed(&conn, scratch.path(), seed);
+        let (pins, reached_raw_free) = check_seed(&conn, scratch.path(), seed);
         covered.extend(pins.iter().map(|(_, ty)| ty));
+        if reached_raw_free {
+            raw_free_reached += 1;
+        }
     }
+
+    // A FLOOR, not an equality: a second bare-text-search seed must not
+    // redden this. `raw_free_sql` is `Some` only when a bare text search
+    // binds `_raw`, and it is the one emitted SQL string nothing else in
+    // the suite executes (see `check_seed`). Without a seed that carries a
+    // bare term, that branch goes unprepared and this file would report
+    // green while never having run it. Keep at least one seed with a bare
+    // term under crates/trawl-core/fuzz/seeds/parse_emit/.
+    assert!(
+        raw_free_reached >= 1,
+        "no committed seed produced Some(raw_free_sql); a seed with a bare text search (which \
+         binds `_raw`) must exist under crates/trawl-core/fuzz/seeds/parse_emit/ to keep that \
+         prepare exercised"
+    );
 
     // Acceptance criterion 3, and the designed drift guard for
     // `CanonicalType::ALL`: the vocabulary is iterated, never re-listed
