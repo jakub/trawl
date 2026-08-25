@@ -308,11 +308,13 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
     let seeds = seed_files();
 
     // A renamed or emptied directory must be red, never a quiet pass over
-    // zero files. Six is what seat B committed; the floor moves up when
-    // seeds are added, never down.
+    // zero files. Seven is what is committed today — six pin seeds plus the
+    // bare-text-search one that reaches the `raw_free_sql` prepare. A FLOOR,
+    // not an equality: an eighth seed is a legitimate addition and must not
+    // redden this.
     assert!(
-        seeds.len() >= 6,
-        "expected at least the six committed .case seeds under {}, found {}",
+        seeds.len() >= 7,
+        "expected at least the seven committed .case seeds under {}, found {}",
         seeds_dir().display(),
         seeds.len()
     );
