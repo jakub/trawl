@@ -605,8 +605,15 @@ async fn driver_send(
 /// query text and server responses.
 fn open_tui_log(path: &std::path::Path) -> io::Result<std::fs::File> {
     let (file, chmod_error) = trawl_config::fs::open_with_mode(path, 0o600, |opts| {
-        opts.create(true).write(true).truncate(true);
+        opts.create(true).write(true);
     })?;
+    finish_tui_log_open(file, chmod_error)
+}
+
+fn finish_tui_log_open(
+    file: std::fs::File,
+    chmod_error: Option<io::Error>,
+) -> io::Result<std::fs::File> {
     // A log we cannot tighten is a log we do not write: unlike the
     // server's opt-in query log, this one is created fresh per run under
     // a user-chosen path, so a failing chmod means something is wrong
@@ -614,12 +621,18 @@ fn open_tui_log(path: &std::path::Path) -> io::Result<std::fs::File> {
     if let Some(err) = chmod_error {
         return Err(err);
     }
+    // Opening with `truncate(true)` would erase an existing file before
+    // the chmod result above is known. Truncate only after the owner-only
+    // policy has accepted the opened file.
+    file.set_len(0)?;
     Ok(file)
 }
 
 #[cfg(all(test, unix))]
 mod tui_log_tests {
-    use super::open_tui_log;
+    use std::io;
+
+    use super::{finish_tui_log_open, open_tui_log};
 
     fn mode_of(path: &std::path::Path) -> u32 {
         use std::os::unix::fs::PermissionsExt as _;
@@ -644,6 +657,27 @@ mod tui_log_tests {
 
         let _file = open_tui_log(&path).unwrap();
         assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn tui_log_chmod_failure_preserves_existing_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tui.log");
+        std::fs::write(&path, "keep me").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+        let err = finish_tui_log_open(
+            file,
+            Some(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected chmod failure",
+            )),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
     }
 }
 

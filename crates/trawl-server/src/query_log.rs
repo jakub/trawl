@@ -19,10 +19,10 @@
 //! backs off a whole cap before trying again, so an unrotatable path
 //! costs one attempt per `max_bytes` written rather than one per query.
 //! A rollover that lands its rename but cannot reopen the active path
-//! (fd exhaustion, a re-planted symlink) is undone; in the one case
-//! where even the undo fails the writer is left holding a file that is
-//! no longer the configured path, so the log *stops* rather than growing
-//! an unbounded, unwatched file full of identity and query text.
+//! attempts a no-clobber undo. If the active name was reoccupied, both
+//! files are preserved and the writer is left holding a file that is no
+//! longer the configured path, so the log *stops* rather than growing an
+//! unbounded, unwatched file full of identity and query text.
 //!
 //! Tightening is best-effort in exactly one direction: POSIX `chmod`
 //! requires the caller to own the file, so a pre-existing log owned by
@@ -33,7 +33,7 @@
 //! turning an opt-in debug feature into a boot failure.
 
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -74,12 +74,25 @@ struct Inner {
 /// Open `path` for appending, owner-only on Unix (`0600` at creation,
 /// and a pre-existing looser file is tightened).
 fn open_owner_only(path: &Path) -> io::Result<File> {
+    open_owner_only_with(path, |opts| {
+        opts.create(true).append(true);
+    })
+}
+
+/// Create a fresh owner-only active generation during rollover. `create_new`
+/// makes the absent active path part of the atomic open: a regular file planted
+/// after the rename is refused just like any other reoccupation of the path.
+fn create_owner_only(path: &Path) -> io::Result<File> {
+    open_owner_only_with(path, |opts| {
+        opts.create_new(true).append(true);
+    })
+}
+
+fn open_owner_only_with(path: &Path, configure: impl FnOnce(&mut OpenOptions)) -> io::Result<File> {
     // The helper sets `0600` at creation AND re-applies it to a
     // pre-existing looser file, handing back a failed `chmod` instead of
     // raising it — the tolerance below is this log's own policy.
-    let (file, chmod_error) = trawl_config::fs::open_with_mode(path, 0o600, |opts| {
-        opts.create(true).append(true);
-    })?;
+    let (file, chmod_error) = trawl_config::fs::open_with_mode(path, 0o600, configure)?;
     #[cfg(unix)]
     if let Some(err) = chmod_error {
         tolerate_chmod_failure(&file, path, &err)?;
@@ -208,7 +221,7 @@ impl Inner {
     /// Should the undo itself fail, the writer is unrecoverably detached
     /// from `path` and the log is closed rather than left unbounded.
     fn rollover(&mut self) -> io::Result<()> {
-        self.rollover_with(open_owner_only)
+        self.rollover_with(create_owner_only)
     }
 
     /// `rollover`, with the reopen injected so the post-rename failure
@@ -225,7 +238,7 @@ impl Inner {
                 Ok(())
             }
             Err(err) => {
-                if let Err(restore) = std::fs::rename(&rotated, &self.path) {
+                if let Err(restore) = restore_rotated(&rotated, &self.path) {
                     self.detached = true;
                     tracing::error!(
                         error = %restore,
@@ -246,6 +259,22 @@ impl Inner {
         rotated.push(".1");
         PathBuf::from(rotated)
     }
+}
+
+/// Restore a renamed active log without replacing a path another process
+/// created in the reopen window. The hard link claims the active name
+/// atomically; after that, removing the rotated name completes the undo.
+fn restore_rotated(rotated: &Path, active: &Path) -> io::Result<()> {
+    std::fs::hard_link(rotated, active)?;
+    if let Err(err) = std::fs::remove_file(rotated) {
+        // Do not leave the writer reachable through both names: the rotated
+        // alias would then grow past the configured cap. Best effort is enough
+        // here because the caller treats every restore error as detached and
+        // closes the writer.
+        let _ = std::fs::remove_file(active);
+        return Err(err);
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for QueryLog {
@@ -550,6 +579,44 @@ mod tests {
         assert!(!rotated.exists(), "still nothing at the rotated path");
     }
 
+    /// The active name is absent after the rename, but another process can
+    /// occupy it before the reopen. Rollover must neither append to nor replace
+    /// that file. The atomic create-new refusal and no-clobber rollback preserve
+    /// both generations, then close the now-detached writer.
+    #[cfg(unix)]
+    #[test]
+    fn rollover_refuses_a_replacement_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        let rotated = tmp.path().join("query.log.1");
+
+        let log = QueryLog::open(&path, 4096).unwrap();
+        log.write(&entry("before"));
+
+        let err = log
+            .inner
+            .lock()
+            .unwrap()
+            .rollover_with(|active| {
+                std::fs::write(active, "replacement")?;
+                create_owner_only(active)
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "replacement",
+            "the file that won the race is preserved"
+        );
+        let rotated_content = std::fs::read_to_string(&rotated).unwrap();
+        assert!(
+            rotated_content.contains("before"),
+            "the original log is preserved at the rotated path"
+        );
+        assert!(log.inner.lock().unwrap().detached);
+    }
+
     /// ...and when even the undo fails — here the reopen loses a race to
     /// a directory planted at the path — the writer is holding a file
     /// that is no longer `path` and never can be rotated again, so the
@@ -568,7 +635,7 @@ mod tests {
             .lock()
             .unwrap()
             .rollover_with(|p| {
-                // Occupy the active path so the undo rename cannot land.
+                // Occupy the active path so the no-clobber undo cannot claim it.
                 std::fs::create_dir(p)?;
                 Err(io::Error::other("reopen refused"))
             })
