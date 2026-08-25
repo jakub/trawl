@@ -358,16 +358,29 @@ jobs:
     # It links no DuckDB and needs no postgres, so ten minutes is generous
     # (the measured run is ~25s of build plus ~10s of fuzzing).
     #
-    # This is the one job in the file that is NOT on the self-hosted
-    # runners, and moving it back to k8s-small for consistency breaks it.
-    # `cargo fuzz` builds for the HOST target and compiles the target with
-    # AddressSanitizer; the k8s-small image is musl-based, so the host
-    # triple there is x86_64-unknown-linux-musl and the build fails twice
-    # over — "sanitizer is incompatible with statically linked libc", and
-    # no musl std installed to link against even if it did. ASan needs a
-    # dynamically linked libc, which here means glibc, which means a
-    # GitHub-hosted runner. A glibc dev machine never sees this, which is
-    # why it reached CI.
+    # The build target is pinned explicitly below, and that flag is
+    # load-bearing. `cargo fuzz` does NOT default `--target` to the host
+    # triple: it defaults to the triple cargo-fuzz ITSELF was compiled for,
+    # baked in at its own build time via
+    # `current_platform::CURRENT_PLATFORM`. The only Linux artifact the
+    # cargo-fuzz 0.13.2 release publishes is
+    # `cargo-fuzz-0.13.2-x86_64-unknown-linux-musl.tar.gz`, so
+    # install-action hands every Linux runner, glibc or not, a musl-static
+    # binary that then builds the fuzz target for musl. That fails twice
+    # over: AddressSanitizer cannot instrument a statically linked libc
+    # ("sanitizer is incompatible with statically linked libc"), and no
+    # musl std is installed to link against anyway. A dev machine whose
+    # cargo-fuzz came from `cargo install` is built against glibc and
+    # defaults to gnu, which is why this only ever showed up in CI.
+    # `--target x86_64-unknown-linux-gnu` makes the build independent of
+    # how the tool was packaged.
+    #
+    # This is also the one job here NOT on the self-hosted runners, and
+    # that is deliberate rather than accidental. Nothing is known to be
+    # wrong with k8s-small: the failure above describes the BUILD target
+    # and says nothing about that image, and the host triple there was
+    # never measured. But every step of this job is demonstrated working on
+    # `ubuntu-latest`, so it stays where the evidence is.
     #
     # `ubuntu-latest` rather than a pinned image, unlike the nightly below,
     # because nothing this build depends on comes FROM the image: the ASan
@@ -448,6 +461,7 @@ jobs:
           # nothing and libFuzzer exits 1 with "No such file or directory"
           # (verified, not assumed).
           cargo +nightly-2026-08-24 fuzz run parse_emit \
+            --target x86_64-unknown-linux-gnu \
             "$RUNNER_TEMP/corpus" fuzz/seeds/parse_emit fuzz/corpus/parse \
             -- -runs=25000 -seed=114 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -print_final_stats=1
       # A crash must arrive with the input that reproduces it, because the
