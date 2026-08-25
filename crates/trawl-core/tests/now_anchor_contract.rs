@@ -39,15 +39,30 @@ use std::path::{Path, PathBuf};
 ///   the per-call sampling it removed, and no clock-name needle can see
 ///   it.
 ///
-/// A needle alone is not a match: [`call_lines`] requires an open paren
-/// after it, so the crate may keep MENTIONING `Utc::now` in prose (the
-/// module note in `context.rs`, the sampling note in `filter.rs`) and
-/// `::captures(` — a different function — is not `::capture(`. The paren
-/// may be separated by any run of whitespace, NEWLINES INCLUDED, because
-/// `Utc::now ()` and a call split across two lines are the same call to
-/// the compiler and were the same bypass to a per-line literal scan. A
-/// STRING LITERAL shaped like a call would be flagged; that errs loud,
-/// which is the right side to err on.
+/// A needle matches at a WORD BOUNDARY: [`call_lines`] counts it when
+/// the byte that follows is not an identifier character. Deliberately
+/// NOT "followed by `(`" — that spelling reads only the ordinary call
+/// and misses every way Rust has of naming a function without calling it
+/// on the spot:
+///
+/// ```text
+/// supplied.unwrap_or_else(EvalContext::capture)   // callback
+/// let f = EvalContext::capture;   f()             // fn pointer
+/// Utc::now /* why */ ()                           // comment between
+/// Utc::now ()                                     // whitespace between
+/// ```
+///
+/// each of which reads the clock exactly as `Utc::now()` does. The
+/// boundary is what keeps the paren-less needles honest: `::nowhere` and
+/// `::captures` continue into an identifier byte and do not match.
+///
+/// What the crate loses is the ability to MENTION a needle in running
+/// code — a string literal `"Utc::now"` is flagged, because nothing here
+/// parses Rust and a literal is indistinguishable from a path. Prose is
+/// still free: comment lines are stripped before the scan, which is
+/// where the crate explains this rule (the module note in `context.rs`,
+/// the sampling note in `filter.rs`). Erring loud on a literal is the
+/// right side to err on.
 const CLOCK_CALLS: &[&str] = &["::now", "::capture"];
 
 /// The clock read proper — the needle
@@ -125,21 +140,14 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 /// loud.
 ///
 /// The surviving lines are then scanned JOINED rather than one at a
-/// time, and a needle counts only when the next non-whitespace byte
-/// after it is `(`. Rust puts no constraint on the whitespace between a
-/// path and its call paren, so `Utc::now ()` and
-///
-/// ```text
-/// EvalContext::capture
-///     ()
-/// ```
-///
-/// are ordinary calls that a per-line literal `::now(` scan walked
-/// straight past. Leaning on rustfmt to normalize the spacing would make
-/// this contract depend on a DIFFERENT gate holding, which is exactly the
-/// kind of second owner it exists to remove. Requiring the paren is also
-/// what keeps the paren-less needles honest: `::nowhere` and `::captures`
-/// continue past it into a non-paren byte and do not match.
+/// time, and a needle counts when the byte after it is not an identifier
+/// character — the word-boundary rule [`CLOCK_CALLS`] documents. Nothing
+/// about a match depends on where the lines happen to break, so a path
+/// naming the clock at the end of one line and calling it at the start of
+/// the next is seen exactly as the single-line spelling is. Leaning on
+/// rustfmt to normalize such things would make this contract depend on a
+/// DIFFERENT gate holding, which is the kind of second owner it exists to
+/// remove.
 ///
 /// Each byte of the joined text remembers the ORIGINAL line it came
 /// from, so a violation is still reported at the line the needle starts
@@ -165,7 +173,13 @@ fn call_lines(source: &str, needles: &[&str]) -> Vec<usize> {
         while let Some(offset) = text[from..].find(needle) {
             let at = from + offset;
             let after = at + needle.len();
-            if text[after..].trim_start().starts_with('(') {
+            // A word boundary, not a paren: `::now` ENDS here unless the
+            // source continues the identifier (`::nowhere`, `::captures`).
+            let continues = text[after..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_alphanumeric() || next == '_');
+            if !continues {
                 found.push(line_of[at]);
             }
             from = after;
@@ -266,9 +280,10 @@ fn the_scan_counts_calls_not_mentions() {
                    Self::at(Utc::now())\n";
     assert_eq!(
         call_lines(fixture, CLOCK_CALLS),
-        vec![5],
-        "only the CALL line counts: a doc, inner-doc or bare comment mentioning \
-         a clock read is prose"
+        vec![4, 5],
+        "the three COMMENT lines are prose and drop out; the string literal on \
+         line 4 does NOT, because the word-boundary rule cannot tell a literal \
+         from a path and erring loud is the documented side to err on"
     );
 
     // The bypasses a `Utc::now(` needle could not see, each of which puts
@@ -287,6 +302,18 @@ fn the_scan_counts_calls_not_mentions() {
         // paren, so neither may this scan.
         ("a space before the paren", "Utc::now ()"),
         ("a tab before the paren", "Utc::now\t()"),
+        ("a comment before the paren", "Utc::now /* why */ ()"),
+        // …and no paren at all is still a clock read: these NAME the
+        // function and something else calls it.
+        (
+            "a callback",
+            "supplied.unwrap_or_else(EvalContext::capture)",
+        ),
+        ("a clock callback", "supplied.unwrap_or_else(Utc::now)"),
+        ("a fn-pointer binding", "let f = EvalContext::capture;"),
+        // Not legal Rust for an inherent associated function anyway, so
+        // flagging it costs nothing and errs loud.
+        ("a use declaration", "use chrono::Utc::now;"),
     ] {
         assert_eq!(
             call_lines(&format!("let x = {bypass};\n"), CLOCK_CALLS),
@@ -306,14 +333,15 @@ fn the_scan_counts_calls_not_mentions() {
          path starts on"
     );
 
-    // …and the paren requirement is what lets the needles be paren-less:
-    // these continue into a byte that is not `(`, so they are not calls
-    // to the things this contract forbids.
+    // …and the word boundary is what lets the needles be paren-less:
+    // these continue into an IDENTIFIER byte, so the needle does not end
+    // where it appears to and they are not the things this contract
+    // forbids.
     for (case, innocent) in [
         ("a name that merely starts with the needle", "foo::nowhere;"),
         ("a different function", "let c = Regex::captures(&re, s);"),
-        ("a mention in a string", "let s = \"Utc::now\";"),
-        ("a use declaration", "use chrono::Utc::now;"),
+        ("a longer capture name", "let c = Thing::capture_all();"),
+        ("a longer now name", "let n = Thing::now_ish();"),
     ] {
         assert_eq!(
             call_lines(&format!("{innocent}\n"), CLOCK_CALLS),
