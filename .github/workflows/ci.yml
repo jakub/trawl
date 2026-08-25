@@ -392,8 +392,16 @@ jobs:
     # third runner convention.
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # This job executes code the PR controls: a fuzz target running mutated
+    # input through PR-authored code, and every build script in the
+    # dependency tree, which runs at build time. Read-only token, and no
+    # credentials persisted into .git/config for that code to read.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       # Pinned by DATE. cargo-fuzz needs a nightly compiler (-Zsanitizer),
       # and a floating `nightly` is the one input that can redden a merge
       # gate with no code change in the PR: a compiler published overnight
