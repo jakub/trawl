@@ -71,6 +71,14 @@ pub(crate) enum FlushCondition {
     IfModifiedOrOrdered,
     /// Flush if modified OR if there's an existing LIMIT.
     IfModifiedOrLimited,
+    /// Flush if modified OR if there is a pending ORDER BY or LIMIT.
+    ///
+    /// What an AGGREGATING stage needs: SQL applies both clauses AFTER
+    /// the aggregation, so leaving either on the same SELECT would make
+    /// `head 2 | stats count()` count the whole input and then limit a
+    /// one-row result. Flushing puts them in the CTE the aggregate reads,
+    /// which is where the pipeline reads them.
+    IfModifiedOrderedOrLimited,
     /// Always flush (stage requires clean state for param ordering).
     Always,
 }
@@ -541,6 +549,12 @@ impl EmitterState {
             }
             FlushCondition::IfModifiedOrLimited => {
                 self.has_aggregation || self.has_projection || self.limit.is_some()
+            }
+            FlushCondition::IfModifiedOrderedOrLimited => {
+                self.has_aggregation
+                    || self.has_projection
+                    || !self.order_by.is_empty()
+                    || self.limit.is_some()
             }
             FlushCondition::Always => true,
         };

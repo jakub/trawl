@@ -408,6 +408,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     SILENTLY (an `earliest=` bound answered as the aggregate). The emitter
     now flushes the pending predicate into a CTE exactly when an aggregate
     appended a parameter, leaving `stats count() by host` unnested.
+  - **A `head`/`sort` before `stats` or `timechart` now applies to the
+    aggregation's INPUT.** SQL applies LIMIT and ORDER BY *after* an
+    aggregation, and both clauses used to stay on the same SELECT, so
+    `service=nginx | head 2 | stats count() as c` counted every matching
+    row and then limited the one-row result. An aggregating stage now
+    flushes whenever either clause is pending, which also stops the answer
+    depending on a SIBLING: before this, `stats count() as c` and
+    `stats count() as c, max(now()) as n` disagreed, because only the
+    second bound a parameter and got flushed for that reason.
 
 - **BREAKING — comments are a grammar production, and `//` is no longer a
   comment (ADR-0014, #83).** The pre-parse comment scanner is deleted.

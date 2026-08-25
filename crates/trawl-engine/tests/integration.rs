@@ -2319,3 +2319,89 @@ fn a_timechart_aggregate_after_a_pivot_binds_after_the_predicate() {
         assert_eq!(text_cell(&result, row, "n"), ANCHOR_TEXT);
     }
 }
+
+// ── an aggregating stage's PLACEMENT (#106, review F3) ────────────────
+//
+// `stats`/`timechart` flushed only `IfModified`, so a pending LIMIT or
+// ORDER BY stayed on the SAME SELECT as the aggregation — where SQL
+// applies both AFTER it. `head 2 | stats count()` therefore counted the
+// whole input and then limited a one-row result.
+//
+// The ordering guard (#106) made that WORSE by making it depend on a
+// SIBLING: `stats count() as c` answered the un-limited count while
+// `stats count() as c, max(now()) as n` answered the limited one, because
+// the second pushed a parameter and got flushed. Placement must not key
+// off parameter accounting, so an aggregating stage now flushes whenever
+// a LIMIT or ORDER BY is pending, and both spellings agree.
+
+/// `head` before `stats` limits the INPUT to the aggregation.
+#[test]
+fn a_limit_before_stats_applies_before_the_aggregation() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(&exec, "service=nginx | head 2 | stats count() as c", &glob)
+        .expect("the limited aggregate must run");
+    assert_eq!(
+        integer_column(&result, "c"),
+        vec![2],
+        "the aggregation must see the 2 limited rows, not all 6 nginx rows"
+    );
+}
+
+/// …and the answer does not depend on whether a SIBLING aggregate
+/// happens to bind a parameter.
+#[test]
+fn a_limit_before_stats_answers_the_same_beside_a_bound_sibling() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | head 2 | stats count() as c, max(now()) as n",
+        &glob,
+    )
+    .expect("the limited aggregate must run");
+    assert_eq!(integer_column(&result, "c"), vec![2]);
+    assert_eq!(text_cell(&result, 0, "n"), ANCHOR_TEXT);
+}
+
+/// A pending ORDER BY is the same trap: it has to order the AGGREGATION'S
+/// INPUT, so `sort -duration | head 2 | stats sum(duration)` sums the two
+/// LARGEST durations rather than every row.
+#[test]
+fn a_pending_sort_orders_the_aggregations_input() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | sort -duration | head 2 | stats sum(duration) as s",
+        &glob,
+    )
+    .expect("the sorted-and-limited aggregate must run");
+    let sum = match &result.rows[0][result
+        .columns
+        .iter()
+        .position(|column| column.name == "s")
+        .expect("missing s column")]
+    {
+        Value::Float(value) => *value,
+        other => panic!("s must be a float, got {other:?}"),
+    };
+    assert!(
+        (sum - 6.234).abs() < 1e-9,
+        "the two largest nginx durations are 5.000 and 1.234, got {sum}"
+    );
+}
+
+/// `timechart` places the same way.
+#[test]
+fn a_limit_before_timechart_applies_before_the_aggregation() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | head 2 | timechart span=1h count() as c",
+        &glob,
+    )
+    .expect("the limited timechart must run");
+    assert_eq!(
+        integer_column(&result, "c"),
+        vec![2],
+        "the bucket must count the 2 limited rows"
+    );
+}

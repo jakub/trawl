@@ -83,7 +83,14 @@ fn process_stats(
     agg_stage: &crate::ast::StatsStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
-    ctx.flush_if(FlushCondition::IfModified);
+    // A pending ORDER BY or LIMIT belongs to the aggregation's INPUT, and
+    // SQL would apply both to its OUTPUT — so they move into the CTE
+    // first, whether or not anything else modified the state. Placement
+    // is a property of the STAGE, never of what its arguments happen to
+    // bind: keying it off the parameter guard below made
+    // `head 2 | stats count() as c` and
+    // `head 2 | stats count() as c, max(now()) as n` answer differently.
+    ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
 
     // The aggregation expressions FIRST, through the ordering guard:
     // they are the only part of this stage that can push a parameter,
@@ -368,7 +375,8 @@ fn process_timechart(
     tc: &crate::ast::TimechartStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
-    ctx.flush_if(FlushCondition::IfModified);
+    // Same placement rule as `stats` above.
+    ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
 
     let interval = match &tc.span {
         Some(d) => d.to_interval_string(),
