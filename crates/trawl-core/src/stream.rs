@@ -271,7 +271,11 @@ pub enum CompiledStage {
     /// Rename fields (from → to).
     Rename { renames: Vec<(String, String)> },
     /// Cap output to N events.
-    Limit { remaining: AtomicU64 },
+    ///
+    /// `count` is the cap as written, kept beside the live counter
+    /// because a POST-aggregation limit is re-armed for every emitted
+    /// snapshot ([`reset_limit`](CompiledStage::reset_limit)).
+    Limit { count: u64, remaining: AtomicU64 },
     /// Pass through (ring buffer sizing is handled by the TUI).
     Tail { count: u64 },
     /// Filter events by condition.
@@ -310,8 +314,9 @@ impl fmt::Debug for CompiledStage {
             Self::Table { fields } => f.debug_struct("Table").field("fields", fields).finish(),
             Self::Drop { fields } => f.debug_struct("Drop").field("fields", fields).finish(),
             Self::Rename { renames } => f.debug_struct("Rename").field("renames", renames).finish(),
-            Self::Limit { remaining } => f
+            Self::Limit { count, remaining } => f
                 .debug_struct("Limit")
+                .field("count", count)
                 .field("remaining", &remaining.load(Ordering::Relaxed))
                 .finish(),
             Self::Tail { count } => f.debug_struct("Tail").field("count", count).finish(),
@@ -341,6 +346,32 @@ impl fmt::Debug for CompiledStage {
                 .field("fields", fields)
                 .field("max_entries", max_entries)
                 .finish(),
+        }
+    }
+}
+
+impl CompiledStage {
+    /// Re-arm a `limit`, and leave every other stage alone.
+    ///
+    /// The one caller is [`emit_snapshot`], because the two ends of an
+    /// aggregate plan cap two different things (ADR-0001: batch is the
+    /// contract, streaming the mirror):
+    ///
+    /// - a PRE-aggregation `limit` caps the INPUT set, which batch also
+    ///   does exactly once, so its exhaustion stays sticky for the life
+    ///   of the subscription;
+    /// - a POST-aggregation `limit` caps the RESULT set, and an emitted
+    ///   snapshot IS the live rendering of the batch result set — so it
+    ///   caps each snapshot, exactly as batch caps its one. Spending it
+    ///   for the plan's life would leave the stream permanently silent
+    ///   while the aggregation kept evolving, which mirrors nothing.
+    ///
+    /// Deliberately narrow: a `dedup` in the same position keeps its
+    /// seen-set across snapshots, which is a separate question about
+    /// what a live `dedup` means and is not answered here.
+    fn reset_limit(&mut self) {
+        if let Self::Limit { count, remaining } = self {
+            remaining.store(*count, Ordering::Relaxed);
         }
     }
 }
@@ -469,16 +500,27 @@ impl SnapshotContext {
 /// Take an aggregate snapshot and run its post-stages, every row under
 /// the ONE snapshot instant.
 ///
+/// Each pass re-arms the post-stages' `limit`s
+/// ([`CompiledStage::reset_limit`]): a snapshot is the live rendering of
+/// the batch result set, so `| stats … | limit N` caps EVERY snapshot at
+/// N, exactly as batch caps its one result set. The plan's pre-stages
+/// are not touched here and stay sticky — they cap the input.
+///
 /// Deliberately NOT shared with `post_process::apply_aggregate`, whose
 /// `StageResult::Done` ends the whole result set: here it drops the
 /// current row and the next row still gets its chance, which is what
 /// the live lane has always done. Merging the two loops would silently
-/// change one lane's row set.
+/// change one lane's row set. (That lane emits ONE snapshot from a
+/// freshly compiled plan, so its counters start armed and this re-arming
+/// would be a no-op there.)
 pub fn emit_snapshot(
     aggregation: &CompiledAggregation,
     post_stages: &mut [CompiledStage],
     ctx: &SnapshotContext,
 ) -> (Vec<String>, Vec<Row>) {
+    for stage in post_stages.iter_mut() {
+        stage.reset_limit();
+    }
     let (columns, rows) = aggregation.snapshot();
     let rows = rows
         .into_iter()
@@ -529,6 +571,7 @@ fn compile_rename(s: &RenameStage) -> CompiledStage {
 
 fn compile_limit(s: &LimitStage) -> CompiledStage {
     CompiledStage::Limit {
+        count: s.count,
         remaining: AtomicU64::new(s.count),
     }
 }
@@ -956,7 +999,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext
             StageResult::Pass
         }
 
-        CompiledStage::Limit { remaining } => {
+        CompiledStage::Limit { remaining, .. } => {
             // Exhaustion is STICKY, and `checked_sub` is what makes it
             // so: a plain `fetch_sub` on a zero counter WRAPS to
             // `u64::MAX`, so `Done` fired exactly once and the very next

@@ -525,20 +525,20 @@ fn a_bucketless_event_buckets_at_its_own_contexts_instant() {
     );
 }
 
-/// A post-stage `limit`'s counter is PLAN-LIFETIME, not per-snapshot:
-/// the first snapshot carries its N rows and every later snapshot
-/// carries none.
+/// A post-stage `limit` caps EVERY snapshot, not the plan's lifetime.
 ///
-/// Pinned as today's behaviour rather than fixed here (ADR-0017 §5
-/// discipline). The batch lane's `LIMIT N` applies to each emitted
-/// result set, and each SSE snapshot IS a result set, so per-snapshot
-/// truncation is arguable — but resetting the counter is a semantic
-/// ruling about what a live `limit` after an aggregation means, not a
-/// consequence of exhaustion being sticky. What the sticky fix
-/// guarantees is the direction that matters for a standing alert: never
-/// MORE than N, and never an arbitrary row set.
+/// ADR-0001 makes batch the contract and streaming the mirror, and an
+/// emitted snapshot is the live rendering of the batch result set: what
+/// `| stats count() by host | limit 1` caps there is one result set, so
+/// here it caps each snapshot. Spending the limit once would leave the
+/// stream permanently silent while the aggregation kept evolving —
+/// a mirror of nothing.
+///
+/// The asymmetry with a PRE-aggregation `limit`, which stays sticky for
+/// the subscription's life, is the batch-mirroring one: that end caps
+/// the INPUT set, and batch reads its input once.
 #[test]
-fn a_post_stage_limits_counter_spans_snapshots() {
+fn a_post_stage_limit_is_re_armed_for_each_snapshot() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
         aggregate("* | stats count() by host | limit 1");
     let ctx = at("2026-08-24T12:00:00Z");
@@ -559,14 +559,39 @@ fn a_post_stage_limits_counter_spans_snapshots() {
         &mut post_stages,
         &SnapshotContext::new(at("2026-08-24T12:05:00Z")),
     );
-    assert_eq!(first.len(), 1);
+    assert_eq!(first.len(), 1, "the first snapshot carries its one row");
     let (_, second) = stream::emit_snapshot(
         &aggregation,
         &mut post_stages,
         &SnapshotContext::new(at("2026-08-24T12:05:30Z")),
     );
-    assert!(
-        second.is_empty(),
-        "the limit is spent for the plan's life: {second:?}"
-    );
+    assert_eq!(second.len(), 1, "and so does the next one: {second:?}");
+
+    // A pre-stage limit is the other rule, in the same plan shape: it
+    // caps the input once and stays spent.
+    let (filter, mut pre_stages, mut aggregation, mut post_stages) =
+        aggregate("* | limit 1 | stats count()");
+    for i in 0..3 {
+        let ev = event(&json!({"message": format!("event-{i}")}));
+        let admitted = stream::accept_event_into_aggregate(
+            &filter,
+            &mut pre_stages,
+            &mut aggregation,
+            &ev,
+            &ctx,
+        );
+        assert_eq!(admitted, i == 0, "only the first event feeds");
+    }
+    for snapshot in 0..2 {
+        let (_, rows) = stream::emit_snapshot(
+            &aggregation,
+            &mut post_stages,
+            &SnapshotContext::new(at("2026-08-24T12:06:00Z")),
+        );
+        assert_eq!(
+            cell(&rows[0], "count"),
+            "1",
+            "snapshot {snapshot} counts the one admitted event"
+        );
+    }
 }

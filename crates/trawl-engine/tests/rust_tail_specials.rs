@@ -402,3 +402,34 @@ fn a_pre_stage_limit_caps_what_the_kv_tail_aggregates() {
         "the kv split may not change the answer"
     );
 }
+
+/// The batch tail's POST-aggregation `limit` is unaffected by the live
+/// lane's per-snapshot re-arming.
+///
+/// This lane emits ONE snapshot from a freshly compiled plan, so its
+/// counter is armed once and spent once — the same answer before and
+/// after the live rule changed, and the same answer the query gives
+/// without the kv split.
+#[test]
+fn a_post_stage_limit_caps_the_kv_tails_one_snapshot() {
+    let (_dir, glob) = source(&[
+        r#"{"message":"k=1","host":"web-1"}"#,
+        r#"{"message":"k=2","host":"web-2"}"#,
+        r#"{"message":"k=3","host":"web-3"}"#,
+    ]);
+    let exec = Executor::new().unwrap();
+
+    let with_tail = run(
+        &exec,
+        "* | extract kv from message | stats count() by host | limit 1",
+        &glob,
+    );
+    let without_tail = run(&exec, "* | stats count() by host | limit 1", &glob);
+
+    assert_eq!(with_tail.rows.len(), 1, "{with_tail:?}");
+    assert_eq!(
+        with_tail.rows.len(),
+        without_tail.rows.len(),
+        "the kv split may not change the row count"
+    );
+}
