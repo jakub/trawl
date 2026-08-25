@@ -16,8 +16,8 @@
 //! without executing anything.
 //!
 //! This is NOT [`duckdb_probe`](../duckdb_probe.rs)'s job and does not
-//! belong in that file. The probe establishes GROUND TRUTH — what a cast
-//! domain actually contains, what a live mirror must reproduce — by
+//! belong in that file. The probe establishes GROUND TRUTH, meaning what a
+//! cast domain actually contains and what a live mirror must reproduce, by
 //! executing statements and reading values back. Here nothing is executed
 //! and no value is read: the oracle is "does the binder accept it", so the
 //! two files fail for disjoint reasons and share no fixtures.
@@ -35,7 +35,7 @@
 //!
 //! The fixture parquet gets one column per PINNED field plus the declared
 //! envelope, and nothing else (see [`fixture_columns`]). So a seed may
-//! reference an unpinned name only when the PIPELINE produces that name —
+//! reference an unpinned name only when the PIPELINE produces that name.
 //! `| rename status as code` mints `code`, and materialising a `code`
 //! column would collide with the rename's own output. A future seed that
 //! reads an unpinned name out of the source instead makes this test red
@@ -151,9 +151,9 @@ fn varchar_sample(name: &str) -> &'static str {
 /// 2. Every field in the DERIVED PIN MAP, at
 ///    [`CanonicalType::as_duckdb`] for its pin. A pinned field is by
 ///    definition a catalog field, which is to say a real source column.
-///    `as_duckdb` is deliberately not injective — SEVERITY is a BIGINT on
-///    disk — so a SEVERITY pin lands a BIGINT column here, exactly as
-///    compaction would write it.
+///    `as_duckdb` is deliberately not injective, since SEVERITY is a
+///    BIGINT on disk, so a SEVERITY pin lands a BIGINT column here,
+///    exactly as compaction would write it.
 /// 3. A pin WINS over the envelope type for the same name, and the column
 ///    appears ONCE. The severity seed pins `_severity` (to SEVERITY, which
 ///    is what the envelope declares anyway), and emitting the name twice
@@ -182,8 +182,8 @@ fn fixture_columns(pins: &FieldTypes) -> Vec<(String, CanonicalType)> {
 /// `DESCRIBE` that it came back with the names and physical types asked
 /// for.
 ///
-/// The read-back is not ceremony. If the fixture were silently wrong —
-/// a column missing, a `CAST` collapsing two types into one — every
+/// The read-back is not ceremony. If the fixture were silently wrong, say
+/// a column missing or a `CAST` collapsing two types into one, every
 /// prepare downstream would fail with a message about the emitted SQL, and
 /// the file would look like it had found an emitter bug.
 fn write_fixture(conn: &duckdb::Connection, path: &Path, columns: &[(String, CanonicalType)]) {
@@ -282,8 +282,8 @@ fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> FieldTy
 
 /// Prepare one emitted statement and check its placeholder count.
 ///
-/// The `?` placeholders are handed to `DuckDB` exactly as emitted —
-/// nothing here rewrites or inlines them, because the placeholder count IS
+/// The `?` placeholders are handed to `DuckDB` exactly as emitted.
+/// Nothing here rewrites or inlines them, because the placeholder count IS
 /// half the claim. An emitter that dropped a parameter would still produce
 /// preparable SQL; it would just bind the wrong values at runtime.
 fn prepare_ok(conn: &duckdb::Connection, sql: &str, params: usize, label: &str, lane: &str) {
