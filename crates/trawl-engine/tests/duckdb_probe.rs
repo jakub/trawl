@@ -5220,3 +5220,39 @@ fn the_inlined_anchor_literal_matches_the_bound_form() {
         assert_eq!(inlined, bound, "{literal} must denote the bound instant");
     }
 }
+
+/// A year outside `0..=9999` must still produce a literal `DuckDB` can
+/// parse (#106, review F5).
+///
+/// chrono SIGNS such a year — `+10000-01-01` — and `DuckDB`'s timestamp
+/// parser accepts a leading `-` but not a leading `+`, so the inlined
+/// PIVOT literal for one of those instants was a conversion error while
+/// the bound parameter for the same instant was fine: the two renderings
+/// of one anchor disagreed at the edge of the domain. Unreachable from a
+/// production clock, but `EvalContext::at` is public.
+#[test]
+fn the_anchor_literal_parses_at_every_year_chrono_can_render() {
+    let conn = conn();
+    for (year, month, day) in [
+        (-1_i32, 1_u32, 1_u32),
+        (1, 1, 1),
+        (9999, 12, 31),
+        (10_000, 1, 1),
+        (99_999, 1, 1),
+    ] {
+        let at = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .expect("a valid date")
+            .and_hms_micro_opt(0, 0, 0, 0)
+            .expect("a valid time");
+        let literal = trawl_core::emitter::SqlValue::Timestamp(at).to_string();
+        let inlined = scalar_type_and_text(&conn, &literal, &[])
+            .unwrap_or_else(|error| panic!("{literal} must parse: {error}"));
+        assert_eq!(inlined.0, "TIMESTAMP", "{literal}");
+
+        // And it must denote the same instant the parameter binds — the
+        // whole point of there being ONE rendering.
+        let bound = scalar_type_and_text(&conn, "CAST(? AS TIMESTAMP)", &[&bound_anchor(at)])
+            .unwrap_or_else(|error| panic!("the bound form of {literal} must run: {error}"));
+        assert_eq!(inlined, bound, "{literal} must denote the bound instant");
+    }
+}

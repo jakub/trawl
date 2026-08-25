@@ -103,8 +103,18 @@ pub enum SqlValue {
 /// `DuckDB`'s domain does not hold. Trailing zeros are kept: `DuckDB`
 /// parses `…:00.000000` and `…:00` to the same instant, and a fixed width
 /// is one rule instead of two.
+///
+/// The leading `+` chrono puts on a year outside `0..=9999` is STRIPPED:
+/// `DuckDB`'s timestamp parser accepts a leading `-` but not a leading
+/// `+`, so `+10000-01-01` is a conversion error where the SAME instant
+/// bound as a parameter is fine — the two renderings of one anchor
+/// disagreeing at the edge of the domain. A production clock never gets
+/// there, but [`crate::context::EvalContext::at`] is public. Probed in
+/// `trawl-engine/tests/duckdb_probe.rs`.
 fn timestamp_literal(at: chrono::NaiveDateTime) -> String {
-    format!("TIMESTAMP '{}'", at.format("%Y-%m-%d %H:%M:%S%.6f"))
+    let rendered = at.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    let unsigned = rendered.strip_prefix('+').unwrap_or(&rendered);
+    format!("TIMESTAMP '{unsigned}'")
 }
 
 impl fmt::Display for SqlValue {
@@ -2798,6 +2808,36 @@ mod tests {
     fn the_inlined_and_displayed_anchor_agree() {
         let value = SqlValue::Timestamp(anchor().now_timestamp());
         assert_eq!(value.to_string(), "TIMESTAMP '2026-02-03 04:05:06.789012'");
+    }
+
+    /// A year outside `0..=9999` renders UNSIGNED (#106, review F5).
+    ///
+    /// chrono writes `+10000-01-01`, which `DuckDB`'s parser refuses
+    /// while accepting the same year unsigned and a negative year signed
+    /// — so the sign would make the inlined PIVOT literal fail for an
+    /// instant the bound parameter handles. Executed against the engine
+    /// in `trawl-engine/tests/duckdb_probe.rs`.
+    #[test]
+    fn a_year_outside_four_digits_renders_without_a_plus() {
+        let at = |year: i32| {
+            chrono::NaiveDate::from_ymd_opt(year, 1, 1)
+                .expect("a valid date")
+                .and_hms_micro_opt(0, 0, 0, 0)
+                .expect("a valid time")
+        };
+        assert_eq!(
+            SqlValue::Timestamp(at(10_000)).to_string(),
+            "TIMESTAMP '10000-01-01 00:00:00.000000'"
+        );
+        assert_eq!(
+            SqlValue::Timestamp(at(9_999)).to_string(),
+            "TIMESTAMP '9999-01-01 00:00:00.000000'"
+        );
+        // A negative year KEEPS its sign — that spelling `DuckDB` reads.
+        assert_eq!(
+            SqlValue::Timestamp(at(-1)).to_string(),
+            "TIMESTAMP '-0001-01-01 00:00:00.000000'"
+        );
     }
 
     /// A whole-second anchor still renders six fractional digits — one
