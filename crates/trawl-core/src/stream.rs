@@ -957,14 +957,24 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext
         }
 
         CompiledStage::Limit { remaining } => {
-            let prev = remaining.fetch_sub(1, Ordering::Relaxed);
-            if prev == 0 {
-                StageResult::Done
-            } else if prev == 1 {
-                // this is the last event — pass it but signal done next time
+            // Exhaustion is STICKY, and `checked_sub` is what makes it
+            // so: a plain `fetch_sub` on a zero counter WRAPS to
+            // `u64::MAX`, so `Done` fired exactly once and the very next
+            // event read a full counter and passed. Every lane that
+            // keeps asking after a `Done` — the aggregate feed, which
+            // runs for the life of the subscription, and a snapshot's
+            // post-stages, which walk every row — admitted events past
+            // the limit, and the live pass-through door would have too
+            // for any caller that did not stop at the first `Done`.
+            if remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
                 StageResult::Pass
             } else {
-                StageResult::Pass
+                StageResult::Done
             }
         }
 
@@ -2131,6 +2141,33 @@ mod tests {
         assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Done);
     }
 
+    /// Exhaustion is STICKY: once a `limit` has said `Done` it says it
+    /// forever.
+    ///
+    /// The counter used to be decremented with `fetch_sub`, which WRAPS
+    /// at zero — so `Done` fired exactly once and the very next event
+    /// read `u64::MAX` and passed. Every lane that keeps asking after a
+    /// `Done` (the aggregate feed, a snapshot's post-stages) therefore
+    /// admitted events past the limit.
+    #[test]
+    fn limit_exhaustion_is_sticky() {
+        let mut stage = compile_limit(&LimitStage {
+            count: 2,
+            keyword: "limit",
+        });
+        let mut ev = event(&json!({"i": 1}));
+
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
+        for attempt in 0..5 {
+            assert_eq!(
+                apply_stage(&mut stage, &mut ev, &ctx()),
+                StageResult::Done,
+                "attempt {attempt} after exhaustion must still be Done"
+            );
+        }
+    }
+
     #[test]
     fn limit_zero_is_done_immediately() {
         let mut stage = compile_limit(&LimitStage {
@@ -2139,6 +2176,11 @@ mod tests {
         });
         let mut ev = event(&json!({"i": 1}));
         assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Done);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev, &ctx()),
+            StageResult::Done,
+            "a zero limit never becomes passable"
+        );
     }
 
     // ── tier 2: where ──────────────────────────────────────────────

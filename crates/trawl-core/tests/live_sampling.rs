@@ -197,6 +197,12 @@ fn the_filter_and_the_stages_cannot_read_different_clocks() {
 
 /// The door's `Done` is what ends a subscription, and it does not emit
 /// the event that produced it — the handler stops at the first one.
+///
+/// It also does not UN-say it. The subscription's events arrive in bus
+/// batches, and the handler's `break` only covers the batch in hand; a
+/// door that answered `Done` once and then went back to emitting would
+/// put the next batch's events on the wire past `limit N`. The extra
+/// calls below are that next batch.
 #[test]
 fn a_limit_reports_done_rather_than_emitting() {
     let (filter, mut stages) = pass_through("* | limit 1");
@@ -207,10 +213,84 @@ fn a_limit_reports_done_rather_than_emitting() {
         stream::accept_event(&filter, &mut stages, &ev, &ctx),
         LiveOutcome::Emit(_)
     ));
-    assert_eq!(
-        stream::accept_event(&filter, &mut stages, &ev, &ctx),
-        LiveOutcome::Done
+    for attempt in 0..4 {
+        assert_eq!(
+            stream::accept_event(&filter, &mut stages, &ev, &ctx),
+            LiveOutcome::Done,
+            "call {attempt} after the limit must stay Done, never Emit"
+        );
+    }
+}
+
+/// The aggregate lane's pre-stages honour a `limit` too: exactly N
+/// events reach the accumulators.
+///
+/// This lane never stops asking — an aggregate subscription keeps
+/// running so its snapshots stay current — so a `Done` that fired once
+/// and then lapsed let every later event feed the accumulators, and the
+/// snapshot counted them.
+#[test]
+fn a_pre_stage_limit_caps_what_reaches_the_accumulators() {
+    let (filter, mut pre_stages, mut aggregation, mut post_stages) =
+        aggregate("* | limit 1 | stats count()");
+    let ctx = at("2026-08-24T12:00:00Z");
+
+    let mut admitted = 0;
+    for i in 0..5 {
+        let ev = event(&json!({"message": format!("event-{i}")}));
+        if stream::accept_event_into_aggregate(
+            &filter,
+            &mut pre_stages,
+            &mut aggregation,
+            &ev,
+            &ctx,
+        ) {
+            admitted += 1;
+        }
+    }
+    assert_eq!(admitted, 1, "`limit 1` admits one event, then none");
+
+    let (_, rows) = stream::emit_snapshot(
+        &aggregation,
+        &mut post_stages,
+        &SnapshotContext::new(at("2026-08-24T12:05:00Z")),
     );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        cell(&rows[0], "count"),
+        "1",
+        "the snapshot counts the events the limit ADMITTED: {rows:?}"
+    );
+}
+
+/// A `limit` after the aggregation caps the SNAPSHOT's rows.
+///
+/// Three groups, `limit 1`: the snapshot carries one row. A lapsing
+/// `Done` dropped the second row and then let the third through, which
+/// is both over the limit and a silently arbitrary row set.
+#[test]
+fn a_post_stage_limit_caps_a_snapshots_rows() {
+    let (filter, mut pre_stages, mut aggregation, mut post_stages) =
+        aggregate("* | stats count() by host | limit 1");
+    let ctx = at("2026-08-24T12:00:00Z");
+
+    for host in ["web-1", "web-2", "web-3"] {
+        let ev = event(&json!({"host": host, "message": "hello"}));
+        assert!(stream::accept_event_into_aggregate(
+            &filter,
+            &mut pre_stages,
+            &mut aggregation,
+            &ev,
+            &ctx,
+        ));
+    }
+
+    let (_, rows) = stream::emit_snapshot(
+        &aggregation,
+        &mut post_stages,
+        &SnapshotContext::new(at("2026-08-24T12:05:00Z")),
+    );
+    assert_eq!(rows.len(), 1, "one row, not one DROPPED row: {rows:?}");
 }
 
 // ── aggregates: one instant per emitted snapshot ───────────────────
@@ -442,5 +522,51 @@ fn a_bucketless_event_buckets_at_its_own_contexts_instant() {
         ],
         "one bucket each side of the boundary, from the EVENTS' contexts \
          — never the snapshot's, and never a fresh clock's"
+    );
+}
+
+/// A post-stage `limit`'s counter is PLAN-LIFETIME, not per-snapshot:
+/// the first snapshot carries its N rows and every later snapshot
+/// carries none.
+///
+/// Pinned as today's behaviour rather than fixed here (ADR-0017 §5
+/// discipline). The batch lane's `LIMIT N` applies to each emitted
+/// result set, and each SSE snapshot IS a result set, so per-snapshot
+/// truncation is arguable — but resetting the counter is a semantic
+/// ruling about what a live `limit` after an aggregation means, not a
+/// consequence of exhaustion being sticky. What the sticky fix
+/// guarantees is the direction that matters for a standing alert: never
+/// MORE than N, and never an arbitrary row set.
+#[test]
+fn a_post_stage_limits_counter_spans_snapshots() {
+    let (filter, mut pre_stages, mut aggregation, mut post_stages) =
+        aggregate("* | stats count() by host | limit 1");
+    let ctx = at("2026-08-24T12:00:00Z");
+
+    for host in ["web-1", "web-2", "web-3"] {
+        let ev = event(&json!({"host": host, "message": "hello"}));
+        assert!(stream::accept_event_into_aggregate(
+            &filter,
+            &mut pre_stages,
+            &mut aggregation,
+            &ev,
+            &ctx,
+        ));
+    }
+
+    let (_, first) = stream::emit_snapshot(
+        &aggregation,
+        &mut post_stages,
+        &SnapshotContext::new(at("2026-08-24T12:05:00Z")),
+    );
+    assert_eq!(first.len(), 1);
+    let (_, second) = stream::emit_snapshot(
+        &aggregation,
+        &mut post_stages,
+        &SnapshotContext::new(at("2026-08-24T12:05:30Z")),
+    );
+    assert!(
+        second.is_empty(),
+        "the limit is spent for the plan's life: {second:?}"
     );
 }
