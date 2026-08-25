@@ -355,7 +355,12 @@ fn filter_matches_sql_parity() {
             skipped += 1;
             continue;
         };
-        let filter_result = filter.matches(&event);
+        // ONE anchor for both lanes (ADR-0017 §3): `last=` is
+        // clock-relative, so a second capture would let the matcher and
+        // the SQL disagree about the window rather than about the
+        // property under test.
+        let anchor = trawl_core::context::EvalContext::capture();
+        let filter_result = filter.matches_at(&event, &anchor);
 
         // Write event as ndjson (suffix required for emitter dispatch).
         let mut tmp = tempfile::Builder::new()
@@ -371,11 +376,7 @@ fn filter_matches_sql_parity() {
         let tmp_path = tmp.path().to_str().expect("temp path is valid UTF-8");
 
         // Emit SQL.
-        let Ok(emitted) = emitter::emit(
-            &query,
-            tmp_path,
-            trawl_core::context::EvalContext::capture(),
-        ) else {
+        let Ok(emitted) = emitter::emit(&query, tmp_path, anchor) else {
             skipped += 1;
             continue;
         };
@@ -412,7 +413,8 @@ fn assert_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>) {
     let query = parser::parse(dsl).expect("dsl parses");
     let filter =
         CompiledFilter::compile(&query.search, &FieldTypes::new()).expect("filter compiles");
-    let filter_result = filter.matches(event);
+    let anchor = trawl_core::context::EvalContext::capture();
+    let filter_result = filter.matches_at(event, &anchor);
 
     let mut tmp = tempfile::Builder::new()
         .suffix(".ndjson")
@@ -420,12 +422,8 @@ fn assert_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>) {
         .unwrap();
     writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
     tmp.flush().unwrap();
-    let emitted = emitter::emit(
-        &query,
-        tmp.path().to_str().unwrap(),
-        trawl_core::context::EvalContext::capture(),
-    )
-    .expect("emit succeeds");
+    let emitted =
+        emitter::emit(&query, tmp.path().to_str().unwrap(), anchor).expect("emit succeeds");
     let sql_result = sql_matches(conn, &emitted);
 
     assert_eq!(
@@ -450,7 +448,8 @@ fn assert_sparse_text_parity(
     let query = parser::parse(dsl).expect("dsl parses");
     let filter =
         CompiledFilter::compile(&query.search, &FieldTypes::new()).expect("filter compiles");
-    let filter_result = filter.matches(event);
+    let anchor = trawl_core::context::EvalContext::capture();
+    let filter_result = filter.matches_at(event, &anchor);
 
     let mut target = event.clone();
     target.insert("_parity_target".into(), Value::Bool(true));
@@ -465,12 +464,8 @@ fn assert_sparse_text_parity(
     writeln!(tmp, "{}", Value::Object(non_text_schema_witness_event())).unwrap();
     tmp.flush().unwrap();
 
-    let emitted = emitter::emit(
-        &query,
-        tmp.path().to_str().unwrap(),
-        trawl_core::context::EvalContext::capture(),
-    )
-    .expect("emit succeeds");
+    let emitted =
+        emitter::emit(&query, tmp.path().to_str().unwrap(), anchor).expect("emit succeeds");
     let sql_result = sql_matches_where(conn, &emitted, r#""_parity_target" = TRUE"#);
     assert_eq!(
         filter_result, sql_result,
@@ -513,7 +508,8 @@ fn assert_severity_parity(conn: &Connection, dsl: &str, stored: Option<i64>) -> 
     if let Some(n) = stored {
         event.insert("_severity".into(), Value::from(n));
     }
-    let filter_result = filter.matches(&event);
+    let anchor = trawl_core::context::EvalContext::capture();
+    let filter_result = filter.matches_at(&event, &anchor);
 
     let tmp = tempfile::Builder::new()
         .suffix(".parquet")
@@ -530,13 +526,7 @@ fn assert_severity_parity(conn: &Connection, dsl: &str, stored: Option<i64>) -> 
     ))
     .expect("write typed parquet");
 
-    let emitted = emitter::emit_with_pins(
-        &query,
-        &source,
-        &ft,
-        trawl_core::context::EvalContext::capture(),
-    )
-    .expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(&query, &source, &ft, anchor).expect("emit succeeds");
     let sql_result = sql_matches_strict(conn, &emitted);
     assert_eq!(
         filter_result, sql_result,
@@ -892,7 +882,8 @@ fn assert_pinned_parity(
 ) -> bool {
     let query = parser::parse(dsl).expect("dsl parses");
     let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
-    let filter_result = filter.matches(event);
+    let anchor = trawl_core::context::EvalContext::capture();
+    let filter_result = filter.matches_at(event, &anchor);
 
     // Keep the temp files alive for the duration of the SQL run.
     let _guard: Box<dyn std::any::Any>;
@@ -924,13 +915,7 @@ fn assert_pinned_parity(
         _guard = Box::new(tmp);
         path
     };
-    let emitted = emitter::emit_with_pins(
-        &query,
-        &source,
-        ft,
-        trawl_core::context::EvalContext::capture(),
-    )
-    .expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(&query, &source, ft, anchor).expect("emit succeeds");
     let sql_result = sql_matches_strict(conn, &emitted);
 
     assert_eq!(
@@ -962,7 +947,8 @@ fn assert_pinned_parity_over_column(
 ) -> bool {
     let query = parser::parse(dsl).expect("dsl parses");
     let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
-    let filter_result = filter.matches(event);
+    let anchor = trawl_core::context::EvalContext::capture();
+    let filter_result = filter.matches_at(event, &anchor);
 
     let tmp = tempfile::Builder::new()
         .suffix(".parquet")
@@ -975,13 +961,7 @@ fn assert_pinned_parity_over_column(
     ))
     .expect("write typed parquet");
 
-    let emitted = emitter::emit_with_pins(
-        &query,
-        &source,
-        ft,
-        trawl_core::context::EvalContext::capture(),
-    )
-    .expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(&query, &source, ft, anchor).expect("emit succeeds");
     let sql_result = sql_matches_strict(conn, &emitted);
 
     assert_eq!(
@@ -1530,14 +1510,10 @@ fn pinned_timestamp_pattern_parity() {
         for dsl in dsls {
             let query = parser::parse(dsl).expect("dsl parses");
             let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
-            let filter_result = filter.matches(&event);
-            let emitted = emitter::emit_with_pins(
-                &query,
-                &path,
-                &ft,
-                trawl_core::context::EvalContext::capture(),
-            )
-            .expect("emit succeeds");
+            let anchor = trawl_core::context::EvalContext::capture();
+            let filter_result = filter.matches_at(&event, &anchor);
+            let emitted =
+                emitter::emit_with_pins(&query, &path, &ft, anchor).expect("emit succeeds");
             let sql_result = sql_matches_strict(&conn, &emitted);
             assert_eq!(
                 filter_result, sql_result,
@@ -1598,19 +1574,20 @@ fn pinned_hot_cold_union_parity() {
         let query = parser::parse(dsl).expect("dsl parses");
         // hot_pins = pins ∩ hot keys; `status` is observed in the hot
         // snapshot, so both sets carry it here.
+        let anchor = trawl_core::context::EvalContext::capture();
         let emitted = emitter::emit_with_hot_source(
             &query,
             cold_tmp.path().to_str().unwrap(),
             hot_tmp.path().to_str().unwrap(),
             &ft,
             &ft,
-            trawl_core::context::EvalContext::capture(),
+            anchor,
         )
         .expect("emit succeeds");
         let sql_result = sql_matches_strict(&conn, &emitted);
 
         let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
-        let filter_result = filter.matches(&cold) || filter.matches(&hot);
+        let filter_result = filter.matches_at(&cold, &anchor) || filter.matches_at(&hot, &anchor);
 
         assert_eq!(
             filter_result, sql_result,
@@ -1631,6 +1608,7 @@ fn emit_hot_only_over(
     event: &Map<String, Value>,
     ft: &FieldTypes,
     siblings: &[Map<String, Value>],
+    anchor: trawl_core::context::EvalContext,
 ) -> (tempfile::NamedTempFile, EmittedQuery) {
     let mut tmp = tempfile::Builder::new()
         .suffix(".ndjson")
@@ -1653,14 +1631,9 @@ fn emit_hot_only_over(
             hot_pins.insert(field, ty);
         }
     }
-    let emitted = emitter::emit_hot_only(
-        query,
-        tmp.path().to_str().unwrap(),
-        &hot_pins,
-        ft,
-        trawl_core::context::EvalContext::capture(),
-    )
-    .expect("emit succeeds");
+    let emitted =
+        emitter::emit_hot_only(query, tmp.path().to_str().unwrap(), &hot_pins, ft, anchor)
+            .expect("emit succeeds");
     (tmp, emitted)
 }
 
@@ -1699,9 +1672,10 @@ fn assert_hot_only_parity_beside(
 ) {
     let query = parser::parse(dsl).expect("dsl parses");
     let filter = CompiledFilter::compile(&query.search, ft).expect("filter compiles");
-    let filter_result = filter.matches(event);
+    let anchor = trawl_core::context::EvalContext::capture();
+    let filter_result = filter.matches_at(event, &anchor);
 
-    let (_snapshot, emitted) = emit_hot_only_over(&query, event, ft, siblings);
+    let (_snapshot, emitted) = emit_hot_only_over(&query, event, ft, siblings, anchor);
     let sql_result = sql_matches_strict_row(conn, &emitted, "message = 'hello'");
 
     assert_eq!(
@@ -2571,14 +2545,16 @@ fn assert_where_parity_hot_only(
 ) -> Option<bool> {
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
+    // ONE anchor for both lanes (ADR-0017 §3).
+    let anchor = trawl_core::context::EvalContext::capture();
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
         &condition,
         &trawl_core::row::from_json(event),
         &scope,
-        &trawl_core::context::EvalContext::capture(),
+        &anchor,
     ));
 
-    let (_snapshot, emitted) = emit_hot_only_over(&query, event, ft, siblings);
+    let (_snapshot, emitted) = emit_hot_only_over(&query, event, ft, siblings, anchor);
     let sql_result = sql_matches_strict_row(conn, &emitted, "message = 'hello'");
 
     assert_eq!(
@@ -2612,14 +2588,16 @@ fn assert_let_parity_hot_only(
         })
         .expect("dsl has a let stage");
     let scope = trawl_core::pin_scope::PinScope::root(ft);
+    // ONE anchor for both lanes (ADR-0017 §3).
+    let anchor = trawl_core::context::EvalContext::capture();
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
         &assignment,
         &trawl_core::row::from_json(event),
         &scope,
-        &trawl_core::context::EvalContext::capture(),
+        &anchor,
     ));
 
-    let (_snapshot, emitted) = emit_hot_only_over(&query, event, ft, siblings);
+    let (_snapshot, emitted) = emit_hot_only_over(&query, event, ft, siblings, anchor);
     let sql_result = let_value(conn, &emitted, "message = 'hello'");
 
     assert_eq!(

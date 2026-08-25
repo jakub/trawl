@@ -8,8 +8,11 @@
 //! WHERE clauses emitted by the search stage emitter. Used for real-time
 //! event filtering in the SSE streaming endpoint.
 //!
-//! Key invariant: `filter.matches(event)` must agree with running the
-//! emitted SQL against `DuckDB` for every `(event, search_stage)` pair.
+//! Key invariant: `filter.matches_at(event, ctx)` must agree with
+//! running the emitted SQL against `DuckDB` for every
+//! `(event, search_stage)` pair — under the SAME `now()` anchor, since
+//! `last=` is clock-relative and both lanes read the instant the caller
+//! hands them (ADR-0017 §3).
 //!
 //! Evaluation is therefore three-valued, like the SQL it mirrors: field
 //! matchers answer [`Truth`] (`Some(true)`/`Some(false)`/`None` for UNKNOWN),
@@ -28,6 +31,7 @@ use serde_json::Value;
 
 use crate::ast::{FilterOp, FilterValue, SearchStage, SearchToken};
 use crate::compare::{self, PatternForm};
+use crate::context::EvalContext;
 use crate::emitter::EmitError;
 use crate::pin_match::{
     CoercedValue, CompareOp, NullReadPolicy, Truth, and_all, coerce_form, compare_values, or_any,
@@ -144,28 +148,24 @@ impl CompiledFilter {
         })
     }
 
-    /// Test whether a JSON event matches this filter.
+    /// Test whether a JSON event matches this filter, under the
+    /// evaluation context this event is being processed with.
     ///
-    /// Convenience wrapper that computes `Utc::now()` per call. For batch
-    /// filtering (e.g. SSE streams), prefer [`matches_at`](Self::matches_at)
-    /// with a pre-computed timestamp to avoid a syscall per event.
-    pub fn matches(&self, event: &serde_json::Map<String, Value>) -> bool {
-        self.matches_at(event, chrono::Utc::now())
-    }
-
-    /// Test whether a JSON event matches this filter using a pre-computed
-    /// timestamp for the time filter cutoff.
+    /// `last=`/`earliest=`/`latest=` are clock-relative, so the filter is
+    /// a `now()` reader like any other and takes its instant from the
+    /// caller's [`EvalContext`] — never from a clock of its own
+    /// (ADR-0017 §3). In the live lane that context is the event's own,
+    /// which is what makes the window this filter applies and the
+    /// `now()` a later `| where` reads ONE instant; there is no second
+    /// door that samples per batch, because a bus batch is an upstream
+    /// client's POST size and not a boundary a query author can see.
     ///
-    /// Avoids a `Utc::now()` syscall per event — compute `now` once per
-    /// batch and pass it to each event.
-    pub fn matches_at(
-        &self,
-        event: &serde_json::Map<String, Value>,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> bool {
+    /// This is the whole reason the convenience `matches(event)` is
+    /// gone: it hid a clock read behind a call that looked pure.
+    pub fn matches_at(&self, event: &serde_json::Map<String, Value>, ctx: &EvalContext) -> bool {
         // Check time filter first (global, not per-group).
         if let Some(tf) = &self.time_filter
-            && !matches_time_filter_at(event, tf, now)
+            && !matches_time_filter_at(event, tf, ctx.now_utc())
         {
             return false;
         }
@@ -646,6 +646,18 @@ mod tests {
     use super::*;
     use crate::parser;
 
+    /// The fixed instant these tests evaluate at.
+    ///
+    /// Nothing here samples a clock: a filter's window is measured
+    /// against the context it is HANDED (ADR-0017 §3), so a test that
+    /// read `Utc::now()` would be racing the wall clock between event
+    /// construction and evaluation for no gain.
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:00Z")
+            .expect("literal is RFC 3339")
+            .with_timezone(&chrono::Utc)
+    }
+
     /// Helper: parse DSL, compile filter, test against event.
     fn matches_event(dsl: &str, event_json: &str) -> bool {
         let query = parser::parse(dsl).expect("parse should succeed");
@@ -653,7 +665,7 @@ mod tests {
             .expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
-        filter.matches(&event)
+        filter.matches_at(&event, &EvalContext::at(fixed_now()))
     }
 
     /// Helper: like `matches_event`, with catalog pins (ADR-0011 slice A).
@@ -670,19 +682,19 @@ mod tests {
         let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
-        filter.matches(&event)
+        filter.matches_at(&event, &EvalContext::at(fixed_now()))
     }
 
-    /// Helper: like `matches_event`, but with an injected `now`. Time-window
-    /// tests must use this — going through `matches()` races the wall clock
-    /// between event construction and evaluation, which flakes under load.
+    /// Helper: like `matches_event`, with an explicit `now`. Time-window
+    /// tests use this to name the instant the window is measured from,
+    /// rather than inheriting the file-wide fixture.
     fn matches_event_at(dsl: &str, event_json: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
         let query = parser::parse(dsl).expect("parse should succeed");
         let filter = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
             .expect("filter compiles");
         let event: serde_json::Map<String, Value> =
             serde_json::from_str(event_json).expect("valid JSON object");
-        filter.matches_at(&event, now)
+        filter.matches_at(&event, &EvalContext::at(now))
     }
 
     // ── field filters ─────────────────────────────────────────────────
@@ -1322,7 +1334,7 @@ mod tests {
             let query = parser::parse(dsl).expect("parse should succeed");
             let filter = CompiledFilter::compile(&query.search, &ft).expect("compiles");
             let ev: serde_json::Map<String, Value> = serde_json::from_str(json).unwrap();
-            filter.matches(&ev)
+            filter.matches_at(&ev, &EvalContext::at(fixed_now()))
         };
         assert!(matches("_severity=error", r#"{"_severity": 17}"#));
         assert!(matches("_severity=error,fatal", r#"{"_severity": 21}"#));
@@ -1493,7 +1505,7 @@ mod tests {
     #[test]
     fn time_filter_recent_event_matches() {
         // Event 1 second before `now` → matches last=1h.
-        let now = chrono::Utc::now();
+        let now = fixed_now();
         let recent = (now - chrono::Duration::seconds(1)).to_rfc3339();
         let event = event_with_timestamp(&recent);
         assert!(matches_event_at(
@@ -1506,7 +1518,7 @@ mod tests {
     #[test]
     fn time_filter_old_event_excluded() {
         // Event 2 hours before `now` → does NOT match last=1h.
-        let now = chrono::Utc::now();
+        let now = fixed_now();
         let old = (now - chrono::Duration::hours(2)).to_rfc3339();
         let event = event_with_timestamp(&old);
         assert!(!matches_event_at(
@@ -1521,7 +1533,7 @@ mod tests {
         // Event at exactly the cutoff (3600 seconds before `now`) → matches:
         // the window comparison is >=. Injected `now` makes the boundary
         // exact — the wall-clock variant needed slack and still flaked.
-        let now = chrono::Utc::now();
+        let now = fixed_now();
         let boundary = (now - chrono::Duration::seconds(3600)).to_rfc3339();
         let event = event_with_timestamp(&boundary);
         assert!(matches_event_at(
@@ -1534,7 +1546,7 @@ mod tests {
     #[test]
     fn time_filter_just_past_boundary_excluded() {
         // Event 1 second past the cutoff → does NOT match last=1h.
-        let now = chrono::Utc::now();
+        let now = fixed_now();
         let past = (now - chrono::Duration::seconds(3601)).to_rfc3339();
         let event = event_with_timestamp(&past);
         assert!(!matches_event_at(
@@ -1546,7 +1558,7 @@ mod tests {
 
     #[test]
     fn time_filter_epoch_seconds_event() {
-        let now = chrono::Utc::now();
+        let now = fixed_now();
 
         // Epoch-seconds timestamp 1 second before `now` → matches last=1h.
         let event = event_with_epoch_secs(now.timestamp() - 1);
@@ -1568,29 +1580,31 @@ mod tests {
         assert!(!matches_event("last=1h", &json));
     }
 
-    // ── matches_at with explicit timestamp ──────────────────────────
+    // ── matches_at reads the context it is handed ───────────────────
 
     #[test]
-    fn matches_at_uses_provided_now() {
+    fn matches_at_uses_the_contexts_instant() {
         let query = parser::parse("last=1h").expect("parse should succeed");
         let filter = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
             .expect("filter compiles");
 
         // Event 30 min ago from "now".
-        let now = chrono::Utc::now();
+        let now = fixed_now();
         let event_ts = (now - chrono::Duration::minutes(30)).to_rfc3339();
         let event = event_with_timestamp(&event_ts);
 
-        // With real now → should match (30 min < 1 hour).
-        assert!(filter.matches_at(&event, now));
+        // Under that instant → matches (30 min < 1 hour).
+        assert!(filter.matches_at(&event, &EvalContext::at(now)));
 
-        // With a fake "now" that is 2 hours before the event → event
-        // is in the future relative to this now, should match.
+        // Under an instant 3 hours earlier the event is in the FUTURE,
+        // which the window admits.
         let old_now = now - chrono::Duration::hours(3);
-        assert!(filter.matches_at(&event, old_now));
+        assert!(filter.matches_at(&event, &EvalContext::at(old_now)));
 
-        // With a fake "now" where event is >1h old → should NOT match.
+        // Under an instant 2 hours later the event is >1h old → no
+        // match. Three answers from one filter and one event: the
+        // context is the only input that moved.
         let future_now = now + chrono::Duration::hours(2);
-        assert!(!filter.matches_at(&event, future_now));
+        assert!(!filter.matches_at(&event, &EvalContext::at(future_now)));
     }
 }

@@ -148,6 +148,10 @@ fn batch_outcome(conn: &Connection, dsl: &str, events: &[Value]) -> Result<TextR
 
 /// Run the same pipeline through the live lane over the same events.
 fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
+    // ONE anchor for the whole comparison: these cases are about the
+    // CARRIER, not about the clock, so both lanes stay pinned to a
+    // single instant (ADR-0017 §3).
+    let anchor = trawl_core::context::EvalContext::capture();
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let plan = compile_stream_plan(&query.pipeline, &PinScope::unpinned()).expect("plan compiles");
     let rows: Vec<Row> = events
@@ -161,13 +165,7 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
             .filter_map(|mut event| {
                 stages
                     .iter_mut()
-                    .all(|stage| {
-                        apply_stage(
-                            stage,
-                            &mut event,
-                            &trawl_core::context::EvalContext::capture(),
-                        ) == StageResult::Pass
-                    })
+                    .all(|stage| apply_stage(stage, &mut event, &anchor) == StageResult::Pass)
                     .then_some(event)
             })
             .collect(),
@@ -177,14 +175,11 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
             mut post_stages,
         } => {
             for mut event in rows {
-                if pre_stages.iter_mut().all(|stage| {
-                    apply_stage(
-                        stage,
-                        &mut event,
-                        &trawl_core::context::EvalContext::capture(),
-                    ) == StageResult::Pass
-                }) {
-                    aggregation.feed_event(&event);
+                if pre_stages
+                    .iter_mut()
+                    .all(|stage| apply_stage(stage, &mut event, &anchor) == StageResult::Pass)
+                {
+                    aggregation.feed_event(&event, &anchor);
                 }
             }
             aggregation
@@ -194,13 +189,7 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
                 .filter_map(|mut event| {
                     post_stages
                         .iter_mut()
-                        .all(|stage| {
-                            apply_stage(
-                                stage,
-                                &mut event,
-                                &trawl_core::context::EvalContext::capture(),
-                            ) == StageResult::Pass
-                        })
+                        .all(|stage| apply_stage(stage, &mut event, &anchor) == StageResult::Pass)
                         .then_some(event)
                 })
                 .collect()

@@ -356,6 +356,145 @@ pub enum StageResult {
     Done,
 }
 
+// ── the live lane's sampling boundaries (ADR-0017 §3) ──────────────
+
+/// What ONE live event produced.
+///
+/// The live lane's unit of output is the EVENT, so this is also the
+/// unit an [`EvalContext`] covers: everything that reads `now()` on the
+/// way from the bus to the wire — the search-stage window, a
+/// `| where now() - _time < …`, a `| let age = now()` — reads the one
+/// instant [`accept_event`] was handed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiveOutcome {
+    /// The event matched and survived every stage: the row to emit.
+    Emit(Row),
+    /// The filter rejected it, or a stage dropped it.
+    Filtered,
+    /// A `limit` stage ended the subscription. The event is NOT emitted
+    /// (the stage that says `Done` has already refused it).
+    Done,
+}
+
+/// The ONE per-event door of the live lane: match the search stage,
+/// then run the pipeline stages, both under a SINGLE instant.
+///
+/// This exists to make one-context-per-event STRUCTURAL. The filter's
+/// `last=` window and the pipeline's `now()` used to be two separate
+/// samples — the filter's taken once per BUS BATCH, the pipeline's per
+/// event — so one event could be admitted by a stale clock and rejected
+/// by a fresh one (or the reverse) inside a single query. There is one
+/// `ctx` parameter here and no clock read anywhere below it, so a
+/// caller cannot reintroduce the split.
+///
+/// The caller samples: one [`EvalContext::capture`] per event, at the
+/// top of the loop. A subscription's clock therefore ADVANCES between
+/// rows while each row stays internally frozen, which is exactly what
+/// ADR-0017 §3 asks of live pass-through (per-batch sampling was
+/// rejected: a bus batch is an upstream client's POST size, not a
+/// boundary the query author can see).
+pub fn accept_event(
+    filter: &crate::filter::CompiledFilter,
+    stages: &mut [CompiledStage],
+    event: &serde_json::Map<String, serde_json::Value>,
+    ctx: &EvalContext,
+) -> LiveOutcome {
+    // The search-stage filter reads the bus JSON directly — no
+    // conversion on the firehose, only on the events that match.
+    if !filter.matches_at(event, ctx) {
+        return LiveOutcome::Filtered;
+    }
+
+    let mut row = row::from_json(event);
+    for stage in stages.iter_mut() {
+        match apply_stage(stage, &mut row, ctx) {
+            StageResult::Pass => {}
+            StageResult::Filtered => return LiveOutcome::Filtered,
+            StageResult::Done => return LiveOutcome::Done,
+        }
+    }
+    LiveOutcome::Emit(row)
+}
+
+/// The aggregate lane's per-event door: the SAME [`accept_event`] rule,
+/// with the surviving row fed into the accumulators.
+///
+/// Returns whether the event reached the aggregation — the caller's
+/// snapshot-threshold counter. A pre-stage `Done` drops the event and
+/// does NOT end the subscription here: an aggregate stream's output is
+/// the snapshot, and a `limit` before the aggregation bounds what feeds
+/// it, which is the behaviour this lane has always had.
+///
+/// Both `now()` readers on this path — the filter window and any
+/// `| where`/`| let` before the aggregation — plus the timechart
+/// bucket's absent-`_time` fallback take the ONE `ctx` handed in, so a
+/// fed event is bucketed at the instant it was admitted under.
+pub fn accept_event_into_aggregate(
+    filter: &crate::filter::CompiledFilter,
+    pre_stages: &mut [CompiledStage],
+    aggregation: &mut CompiledAggregation,
+    event: &serde_json::Map<String, serde_json::Value>,
+    ctx: &EvalContext,
+) -> bool {
+    match accept_event(filter, pre_stages, event, ctx) {
+        LiveOutcome::Emit(row) => {
+            aggregation.feed_event(&row, ctx);
+            true
+        }
+        LiveOutcome::Filtered | LiveOutcome::Done => false,
+    }
+}
+
+/// The instant ONE emitted aggregate snapshot reads `now()` at.
+///
+/// A distinct TYPE, not a second `EvalContext` parameter, because the
+/// two boundaries meet in one function and conflating them is the
+/// defect this milestone removes: a snapshot's post-stage rows are one
+/// unit of output together (ADR-0017 §3), while the events that FED
+/// that snapshot each sampled their own instant, possibly seconds
+/// earlier. Neither can be passed where the other is expected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotContext(EvalContext);
+
+impl SnapshotContext {
+    /// The snapshot's instant, sampled by the caller at the start of the
+    /// snapshot attempt — BEFORE the rows are taken, so the sample point
+    /// is deterministic even when the post-stages later drop every row.
+    #[must_use]
+    pub fn new(at: EvalContext) -> Self {
+        Self(at)
+    }
+}
+
+/// Take an aggregate snapshot and run its post-stages, every row under
+/// the ONE snapshot instant.
+///
+/// Deliberately NOT shared with `post_process::apply_aggregate`, whose
+/// `StageResult::Done` ends the whole result set: here it drops the
+/// current row and the next row still gets its chance, which is what
+/// the live lane has always done. Merging the two loops would silently
+/// change one lane's row set.
+pub fn emit_snapshot(
+    aggregation: &CompiledAggregation,
+    post_stages: &mut [CompiledStage],
+    ctx: &SnapshotContext,
+) -> (Vec<String>, Vec<Row>) {
+    let (columns, rows) = aggregation.snapshot();
+    let rows = rows
+        .into_iter()
+        .filter_map(|mut row| {
+            for stage in post_stages.iter_mut() {
+                match apply_stage(stage, &mut row, &ctx.0) {
+                    StageResult::Pass => {}
+                    StageResult::Filtered | StageResult::Done => return None,
+                }
+            }
+            Some(row)
+        })
+        .collect();
+    (columns, rows)
+}
+
 // ── stage compilation ──────────────────────────────────────────────
 
 fn compile_table(s: &TableStage) -> CompiledStage {
@@ -1293,7 +1432,15 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
 
 impl CompiledAggregation {
     /// Feed an event into the aggregation accumulators.
-    pub fn feed_event(&mut self, event: &Row) {
+    ///
+    /// `ctx` is the EVENT's own evaluation context (ADR-0017 §3): the
+    /// timechart bucket falls back to `now()` when the row carries no
+    /// readable `_time`, and that reading must be the instant the event
+    /// was admitted under, not a fresh clock — a second read would put
+    /// the event in a different span bucket than the one its own
+    /// context names. In the batch tail behind `extract kv` this is the
+    /// statement anchor, for every row alike.
+    pub fn feed_event(&mut self, event: &Row, ctx: &EvalContext) {
         match self {
             Self::Stats {
                 accumulators,
@@ -1317,7 +1464,7 @@ impl CompiledAggregation {
                 group_by,
                 buckets,
             } => {
-                let bucket = event_time_bucket(event, *span_secs);
+                let bucket = event_time_bucket(event, *span_secs, ctx);
                 let key = make_group_key(group_by, event);
                 let group_map = buckets.entry(bucket).or_default();
                 if group_map.len() >= MAX_GROUPS && !group_map.contains_key(&key) {
@@ -1481,8 +1628,16 @@ fn make_group_key(group_by: &[String], event: &Row) -> GroupKey {
         .collect()
 }
 
+/// The span bucket an event lands in.
+///
+/// The fallback for a row with no readable `_time` is `now()` — and
+/// `now()` here is the EVENT's context, the same instant its filter
+/// window and its `| where` read. Sampling a clock of its own would
+/// make a bucketless event land in a bucket nothing else in the query
+/// can name, and across a span boundary that is a different ROW in the
+/// snapshot.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
-fn event_time_bucket(event: &Row, span_secs: u64) -> i64 {
+fn event_time_bucket(event: &Row, span_secs: u64, ctx: &EvalContext) -> i64 {
     // Try to parse the _time field as RFC3339. The EXACT `_time` key,
     // deliberately not `bind_event_key`: a pre-existing quirk of this
     // lane, preserved rather than fixed here.
@@ -1491,8 +1646,8 @@ fn event_time_bucket(event: &Row, span_secs: u64) -> i64 {
     {
         return dt.timestamp() / span_secs as i64;
     }
-    // Fallback: use current time
-    chrono::Utc::now().timestamp() / span_secs as i64
+    // Fallback: the context's instant, never a fresh clock read.
+    ctx.now_utc().timestamp() / span_secs as i64
 }
 
 /// The numeric reading an accumulator takes off a cell.
@@ -1707,11 +1862,15 @@ mod tests {
 
     /// The evaluation context these tests evaluate under.
     ///
-    /// Each call is its own unit of output, which is exactly what a test
-    /// asserting one expression is; the cases that care about `now()`
-    /// hold a context of their own and assert against it.
+    /// A FIXED instant, not a capture: nothing below reaches for a
+    /// clock, so neither does its fixture — the cases that care about
+    /// `now()` name their own instant and assert against it.
     fn ctx() -> EvalContext {
-        EvalContext::capture()
+        EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:00Z")
+                .expect("literal is RFC 3339")
+                .with_timezone(&chrono::Utc),
+        )
     }
 
     fn event(pairs: &Value) -> Row {
@@ -1777,18 +1936,18 @@ mod tests {
     fn the_time_bucket_reads_the_wire_string() {
         let ev = event(&json!({"_time": "2026-01-15T09:07:00Z", "service": "nginx"}));
         let span: u64 = 300; // five minutes
-        let bucket = event_time_bucket(&ev, span);
+        let bucket = event_time_bucket(&ev, span, &ctx());
         let expected = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:07:00Z")
             .unwrap()
             .timestamp()
             / i64::try_from(span).unwrap();
         assert_eq!(bucket, expected);
 
-        // …and an event with no `_time` falls back to now, which is a
-        // DIFFERENT bucket — the failure mode the assertion above rules
-        // out for a real event.
+        // …and an event with no `_time` falls back to the CONTEXT's
+        // instant, which is a DIFFERENT bucket — the failure mode the
+        // assertion above rules out for a real event.
         let bucketless = event(&json!({"service": "nginx"}));
-        assert_ne!(event_time_bucket(&bucketless, span), expected);
+        assert_ne!(event_time_bucket(&bucketless, span, &ctx()), expected);
     }
 
     // ── tier 1: table ──────────────────────────────────────────────
@@ -2933,9 +3092,9 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"host": "a"})));
-        aggregation.feed_event(&event(&json!({"host": "b"})));
-        aggregation.feed_event(&event(&json!({"host": "c"})));
+        aggregation.feed_event(&event(&json!({"host": "a"})), &ctx());
+        aggregation.feed_event(&event(&json!({"host": "b"})), &ctx());
+        aggregation.feed_event(&event(&json!({"host": "c"})), &ctx());
 
         let (columns, rows) = aggregation.snapshot();
         assert_eq!(columns, vec!["count"]);
@@ -2961,9 +3120,9 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"host": "web-1"})));
-        aggregation.feed_event(&event(&json!({"host": "web-2"})));
-        aggregation.feed_event(&event(&json!({"host": "web-1"})));
+        aggregation.feed_event(&event(&json!({"host": "web-1"})), &ctx());
+        aggregation.feed_event(&event(&json!({"host": "web-2"})), &ctx());
+        aggregation.feed_event(&event(&json!({"host": "web-1"})), &ctx());
 
         let (columns, rows) = aggregation.snapshot();
         assert_eq!(columns, vec!["host", "count"]);
@@ -3010,7 +3169,7 @@ mod tests {
         };
 
         for val in [10, 20, 30] {
-            aggregation.feed_event(&event(&json!({"v": val})));
+            aggregation.feed_event(&event(&json!({"v": val})), &ctx());
         }
 
         let (_, rows) = aggregation.snapshot();
@@ -3048,9 +3207,9 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"svc": "nginx"})));
-        aggregation.feed_event(&event(&json!({"svc": "postgres"})));
-        aggregation.feed_event(&event(&json!({"svc": "nginx"}))); // duplicate
+        aggregation.feed_event(&event(&json!({"svc": "nginx"})), &ctx());
+        aggregation.feed_event(&event(&json!({"svc": "postgres"})), &ctx());
+        aggregation.feed_event(&event(&json!({"svc": "nginx"})), &ctx()); // duplicate
 
         let (_, rows) = aggregation.snapshot();
         let row = &rows[0];
@@ -3085,9 +3244,9 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"msg": "alpha"})));
-        aggregation.feed_event(&event(&json!({"msg": "beta"})));
-        aggregation.feed_event(&event(&json!({"msg": "gamma"})));
+        aggregation.feed_event(&event(&json!({"msg": "alpha"})), &ctx());
+        aggregation.feed_event(&event(&json!({"msg": "beta"})), &ctx());
+        aggregation.feed_event(&event(&json!({"msg": "gamma"})), &ctx());
 
         let (_, rows) = aggregation.snapshot();
         let row = &rows[0];
@@ -3115,7 +3274,7 @@ mod tests {
 
         // Odd count: median is middle value
         for val in [1, 3, 5, 7, 9] {
-            aggregation.feed_event(&event(&json!({"v": val})));
+            aggregation.feed_event(&event(&json!({"v": val})), &ctx());
         }
         let (_, rows) = aggregation.snapshot();
         assert_eq!(cell(&rows[0], "median_v"), 5.0);
@@ -3140,7 +3299,7 @@ mod tests {
         };
 
         for val in [1, 3, 5, 7] {
-            aggregation.feed_event(&event(&json!({"v": val})));
+            aggregation.feed_event(&event(&json!({"v": val})), &ctx());
         }
         let (_, rows) = aggregation.snapshot();
         assert_eq!(cell(&rows[0], "median_v"), 4.0);
@@ -3167,7 +3326,7 @@ mod tests {
         // sample stddev of [2, 4, 4, 4, 5, 5, 7, 9]:
         // mean=5, Σ(x-μ)²=32, s=√(32/7)≈2.138
         for val in [2, 4, 4, 4, 5, 5, 7, 9] {
-            aggregation.feed_event(&event(&json!({"v": val})));
+            aggregation.feed_event(&event(&json!({"v": val})), &ctx());
         }
         let (_, rows) = aggregation.snapshot();
         let sd = cell(&rows[0], "stddev_v").as_f64().unwrap();
@@ -3192,10 +3351,10 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"v": 1})));
-        aggregation.feed_event(&event(&json!({"v": null})));
-        aggregation.feed_event(&event(&json!({"other": 3}))); // v missing
-        aggregation.feed_event(&event(&json!({"v": 4})));
+        aggregation.feed_event(&event(&json!({"v": 1})), &ctx());
+        aggregation.feed_event(&event(&json!({"v": null})), &ctx());
+        aggregation.feed_event(&event(&json!({"other": 3})), &ctx()); // v missing
+        aggregation.feed_event(&event(&json!({"v": 4})), &ctx());
 
         let (_, rows) = aggregation.snapshot();
         assert_eq!(cell(&rows[0], "count_v"), 2);
@@ -3219,7 +3378,7 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"x": 1})));
+        aggregation.feed_event(&event(&json!({"x": 1})), &ctx());
         let (columns, rows) = aggregation.snapshot();
         assert_eq!(columns, vec!["total"]);
         assert_eq!(cell(&rows[0], "total"), 1);
@@ -3243,12 +3402,12 @@ mod tests {
         };
 
         for _ in 0..5 {
-            aggregation.feed_event(&event(&json!({"host": "web-1"})));
+            aggregation.feed_event(&event(&json!({"host": "web-1"})), &ctx());
         }
         for _ in 0..3 {
-            aggregation.feed_event(&event(&json!({"host": "web-2"})));
+            aggregation.feed_event(&event(&json!({"host": "web-2"})), &ctx());
         }
-        aggregation.feed_event(&event(&json!({"host": "web-3"})));
+        aggregation.feed_event(&event(&json!({"host": "web-3"})), &ctx());
 
         let (columns, rows) = aggregation.snapshot();
         assert_eq!(columns, vec!["host", "count"]);
@@ -3274,9 +3433,9 @@ mod tests {
         };
 
         for _ in 0..5 {
-            aggregation.feed_event(&event(&json!({"host": "web-1"})));
+            aggregation.feed_event(&event(&json!({"host": "web-1"})), &ctx());
         }
-        aggregation.feed_event(&event(&json!({"host": "web-2"})));
+        aggregation.feed_event(&event(&json!({"host": "web-2"})), &ctx());
 
         let (_, rows) = aggregation.snapshot();
         assert_eq!(rows.len(), 1);

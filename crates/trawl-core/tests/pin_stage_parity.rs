@@ -1208,12 +1208,14 @@ fn live_rows(
 ) -> Vec<Map<String, Value>> {
     let plan = compile_stream_plan(&query.pipeline, &PinScope::root(field_types))
         .unwrap_or_else(|error| panic!("{dsl}: plan must compile: {error}"));
+    // ONE anchor for the whole lane comparison (ADR-0017 §3): these
+    // cases are about pins, so the clock is held still.
+    let anchor = trawl_core::context::EvalContext::capture();
     let feed = |stages: &mut [trawl_core::stream::CompiledStage],
                 event: &mut trawl_core::row::Row| {
-        stages.iter_mut().all(|stage| {
-            apply_stage(stage, event, &trawl_core::context::EvalContext::capture())
-                == StageResult::Pass
-        })
+        stages
+            .iter_mut()
+            .all(|stage| apply_stage(stage, event, &anchor) == StageResult::Pass)
     };
     match plan {
         StreamPlan::PassThrough(mut stages) => rows
@@ -1231,7 +1233,7 @@ fn live_rows(
             for row in rows {
                 let mut event = trawl_core::row::from_json(row.as_object().unwrap());
                 if feed(&mut pre, &mut event) {
-                    aggregate.feed_event(&event);
+                    aggregate.feed_event(&event, &anchor);
                 }
             }
             aggregate

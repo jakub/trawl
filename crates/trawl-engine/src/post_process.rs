@@ -223,7 +223,9 @@ fn apply_aggregate(
                 StageResult::Done => break,
             }
         }
-        aggregation.feed_event(&event);
+        // The BATCH rule: one statement anchor for every row, the
+        // pre-stages and the accumulator feed alike (ADR-0017 §3).
+        aggregation.feed_event(&event, anchor);
     }
 
     // Snapshot the aggregation results.

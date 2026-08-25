@@ -625,7 +625,7 @@ async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours(
 async fn pinned_where_let_hot_cold_and_stream_agree() {
     use trawl_core::filter::CompiledFilter;
     use trawl_core::pin_scope::PinScope;
-    use trawl_core::stream::{StreamPlan, apply_stage, compile_stream_plan};
+    use trawl_core::stream::{StreamPlan, compile_stream_plan};
     use trawl_server::catalog::FieldCatalog;
 
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
@@ -725,24 +725,18 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
         let StreamPlan::PassThrough(mut stages) = plan else {
             panic!("pass-through pipelines only in this test");
         };
-        let now = chrono::Utc::now();
         events
             .iter()
             .filter(|event| {
-                if !filter.matches_at(event, now) {
-                    return false;
-                }
-                let mut event = trawl_core::row::from_json(event);
-                stages.iter_mut().all(|stage| {
-                    matches!(
-                        apply_stage(
-                            stage,
-                            &mut event,
-                            &trawl_core::context::EvalContext::capture(),
-                        ),
-                        trawl_core::stream::StageResult::Pass
-                    )
-                })
+                // The handler's own shape: ONE instant per event, and
+                // ONE door owning both the filter and the stages
+                // (ADR-0017 §3) — a test that sampled two clocks would
+                // stop mirroring the lane it is here to mirror.
+                let ctx = trawl_core::context::EvalContext::capture();
+                matches!(
+                    trawl_core::stream::accept_event(&filter, &mut stages, event, &ctx),
+                    trawl_core::stream::LiveOutcome::Emit(_)
+                )
             })
             .count()
     };
@@ -893,10 +887,9 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
         let ast = trawl_core::parser::parse(dsl).expect("parses");
         let pins = catalog.all();
         let filter = CompiledFilter::compile(&ast.search, &pins).expect("filter compiles");
-        let now = chrono::Utc::now();
         events
             .iter()
-            .filter(|event| filter.matches_at(event, now))
+            .filter(|event| filter.matches_at(event, &trawl_core::context::EvalContext::capture()))
             .count()
     };
     for (dsl, expected) in cases {
