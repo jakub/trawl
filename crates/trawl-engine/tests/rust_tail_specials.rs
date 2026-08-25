@@ -275,3 +275,93 @@ fn a_double_pinned_infinity_compares_in_the_tail() {
         "the tail must answer as the SQL lane does"
     );
 }
+
+// ── the now() anchor across the kv split (ADR-0017 §3, #106) ──────────
+
+/// One row of real parquet, written by `DuckDB` itself — the shape the
+/// production cold lane reads.
+fn parquet_source() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.parquet");
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT TIMESTAMP '2024-01-15 10:00:00' AS \"_time\", \
+         'nginx' AS service, 'k=v' AS message) TO '{}' (FORMAT PARQUET)",
+        path.display()
+    ))
+    .unwrap();
+    (dir, path.display().to_string())
+}
+
+/// AC1: the SQL prefix and the `rust_stages` tail read ONE instant.
+///
+/// `now()` appears three times in one statement across the kv split —
+/// twice in the SQL prefix (a `let` and a `where`) and once in the tail.
+/// The prefix's cell and the tail's cell must be the same string: one
+/// unit of output, one instant, whichever side of the split computed it.
+#[test]
+fn the_kv_tail_and_the_sql_prefix_read_one_now() {
+    let (_dir, glob) = parquet_source();
+    let exec = Executor::new().unwrap();
+
+    let result = run(
+        &exec,
+        "* | let sql_now = now() | where now() >= _time \
+         | extract kv from message | let tail_now = now() \
+         | table sql_now, tail_now",
+        &glob,
+    );
+
+    assert_eq!(result.row_count(), 1, "the where must keep the row");
+    let prefix = cell(&result, 0, "sql_now");
+    let tail = cell(&result, 0, "tail_now");
+    assert!(
+        matches!(prefix, Value::String(_)),
+        "the prefix cell arrives as rendered timestamp text: {prefix:?}"
+    );
+    assert_eq!(
+        prefix, tail,
+        "the SQL prefix and the kv tail must render one instant byte for byte"
+    );
+}
+
+/// The same guarantee where the tail's anchor could most easily drift:
+/// the COLD-START lane, where the union attempt finds no parquet and the
+/// query is RE-EMITTED hot-only. The tail keeps evaluating under the
+/// original emission's anchor, so a re-capture at the re-emission would
+/// split the two cells apart.
+#[test]
+fn the_cold_start_fallback_keeps_the_statements_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\
+         \"service\":\"svc\",\"message\":\"k=v\"}\n",
+    )
+    .unwrap();
+    let exec = Executor::new().unwrap();
+    // A glob that reaches no parquet at all: the union errors and the
+    // executor falls back to reading the hot buffer alone.
+    let cold = format!("{}/nonexistent/*.parquet", dir.path().display());
+
+    let result = exec
+        .run_query_with_hot(
+            "* | let sql_now = now() | extract kv from message \
+             | let tail_now = now() | table sql_now, tail_now",
+            &cold,
+            hot.to_str().unwrap(),
+            &FieldTypes::new(),
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
+        .expect("the cold-start fallback must answer");
+
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(
+        cell(&result, 0, "sql_now"),
+        cell(&result, 0, "tail_now"),
+        "the re-emitted hot-only SQL must inherit the statement's anchor"
+    );
+}

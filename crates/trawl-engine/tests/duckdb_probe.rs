@@ -5138,3 +5138,85 @@ fn current_json_number_spelling_follows_serdes_f64() {
     assert_eq!(engine.as_deref(), Some("1e400"));
     assert_eq!(json_extract_mirror(doc, "$.a"), None);
 }
+
+// ── the now() anchor's bound TIMESTAMP (ADR-0017 §3, #106) ────────────
+//
+// `now()` no longer emits `DuckDB`'s own clock: the statement's instant
+// is captured in Rust and BOUND as a microsecond TIMESTAMP under an
+// explicit `CAST(? AS TIMESTAMP)` (`emitter::functions`). Three claims
+// that design rests on are measured here rather than assumed — what the
+// bound parameter's TYPE is, what it RENDERS as, and that the typed
+// literal the PIVOT lane inlines instead names the same instant.
+
+/// The anchor as duckdb-rs binds it: microseconds since the epoch, the
+/// domain `EvalContext` truncates to at capture.
+fn bound_anchor(at: chrono::NaiveDateTime) -> duckdb::types::Value {
+    duckdb::types::Value::Timestamp(
+        duckdb::types::TimeUnit::Microsecond,
+        at.and_utc().timestamp_micros(),
+    )
+}
+
+/// The two anchor shapes the emitter can produce: a fractional instant
+/// and a whole-second one (whose canonical text carries NO fraction).
+fn anchor_probe_instants() -> Vec<chrono::NaiveDateTime> {
+    ["2026-02-03T04:05:06.789012Z", "2026-02-03T04:05:06Z"]
+        .iter()
+        .map(|text| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .expect("a valid RFC 3339 instant")
+                .naive_utc()
+        })
+        .collect()
+}
+
+/// A bound anchor under `CAST(? AS TIMESTAMP)` is a TIMESTAMP — read as
+/// `typeof`'s own TEXT, not the driver's `Type` enum, which erases the
+/// TIMESTAMP/TIMESTAMPTZ distinction this whole change exists to settle.
+#[test]
+fn a_bound_anchor_is_a_timestamp_not_a_timestamptz() {
+    let conn = conn();
+    for at in anchor_probe_instants() {
+        let value = bound_anchor(at);
+        let (dtype, _) = scalar_type_and_text(&conn, "CAST(? AS TIMESTAMP)", &[&value]).unwrap();
+        assert_eq!(dtype, "TIMESTAMP", "{at}");
+    }
+}
+
+/// The bound anchor renders as the canonical text the in-memory lane
+/// prints for the same instant — so a `now()` cell computed by the SQL
+/// prefix and one computed by the `rust_stages` tail are the same string.
+#[test]
+fn a_bound_anchor_renders_as_the_canonical_timestamp_text() {
+    let conn = conn();
+    for at in anchor_probe_instants() {
+        let value = bound_anchor(at);
+        let (_, text) = scalar_type_and_text(&conn, "CAST(? AS TIMESTAMP)", &[&value]).unwrap();
+        assert_eq!(
+            text.as_deref(),
+            Some(trawl_core::eval::timestamp_to_duckdb_text(&at).as_str()),
+            "{at}"
+        );
+    }
+}
+
+/// The PIVOT lane cannot take parameters, so it INLINES the anchor as a
+/// typed literal. The literal and the bound form must be
+/// indistinguishable — same type, same text — or one query shape would
+/// answer `now()` differently from another.
+#[test]
+fn the_inlined_anchor_literal_matches_the_bound_form() {
+    let conn = conn();
+    for at in anchor_probe_instants() {
+        let value = bound_anchor(at);
+        let bound = scalar_type_and_text(&conn, "CAST(? AS TIMESTAMP)", &[&value]).unwrap();
+
+        // The very text `SqlValue::Timestamp`'s Display (and the PIVOT
+        // inliner behind it) emits, taken from the emitter rather than
+        // rebuilt here — a second spelling is the drift this pins.
+        let literal = trawl_core::emitter::SqlValue::Timestamp(at).to_string();
+        let inlined = scalar_type_and_text(&conn, &literal, &[]).unwrap();
+
+        assert_eq!(inlined, bound, "{literal} must denote the bound instant");
+    }
+}
