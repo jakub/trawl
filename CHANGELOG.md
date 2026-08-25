@@ -373,6 +373,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   re-commissioning starts from ADR-0020, not from the removed stand-ins.
 
 ### Changed
+- **`now()` is one instant per unit of output (ADR-0017 §3, #106).** It used
+  to be read per CALL SITE: a `let` and a `where` in one statement could see
+  different instants, and the streaming lane sampled its filter window once
+  per bus batch and its pipeline once per event, so a single event could be
+  admitted by one clock and evaluated against another. The instant is now
+  captured once per unit of output and handed to every reader.
+
+  Three observable changes:
+
+  - **`typeof(now())` is `TIMESTAMP` in batch**, where it used to be
+    `TIMESTAMP WITH TIME ZONE`. The batch lane no longer emits SQL's own
+    `now()`; it binds the captured instant as a TIMESTAMP parameter under an
+    explicit cast, so the type is trawl's answer rather than the driver's
+    parameter inference. Comparisons and `strftime`/`tostring` renderings
+    are unaffected — the session is UTC either way — but an expression that
+    read the *spelling* changes.
+  - **Two `now()` reads in one statement are equal, in every lane.** Batch:
+    one instant per logical query invocation, inherited by a retry, by the
+    hot-only cold-start fallback and by the `rust_stages` tail behind
+    `extract kv`. Live pass-through: one per event, so each row is frozen
+    while successive rows advance, and the search stage's
+    `last=`/`earliest=`/`latest=` window reads that same per-event instant.
+    Aggregate streams: every row of one emitted snapshot shares one instant,
+    while the events that fed it each sampled their own. The batch `last=`
+    window is deliberately still DuckDB's own statement clock — a separate
+    clock domain, microseconds away.
+  - **Aggregate SELECT parameters bind in rendered order.** DuckDB binds `?`
+    positionally, and the emitter walks the search stage before the SELECT
+    list it renders first, so any parameter a `stats`/`timechart` aggregate
+    pushed collided with a predicate's. This predates the anchor and hit
+    ordinary literal arguments — `stats max(substr(message, 1, 3))` — as
+    well as `stats max(now())`, and the type-compatible collisions swapped
+    SILENTLY (an `earliest=` bound answered as the aggregate). The emitter
+    now flushes the pending predicate into a CTE exactly when an aggregate
+    appended a parameter, leaving `stats count() by host` unnested.
+
 - **BREAKING — comments are a grammar production, and `//` is no longer a
   comment (ADR-0014, #83).** The pre-parse comment scanner is deleted.
   It blanked `#`/`//` runs to end-of-line before the grammar ran, which
