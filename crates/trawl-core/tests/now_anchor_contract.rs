@@ -130,29 +130,46 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 
 /// The 1-based lines of `source` that CALL one of `needles`.
 ///
-/// Comment lines — `//`, `///`, `//!` alike — are dropped before the
-/// match, because the crate documents the rule in prose beside the one
-/// call that implements it and a `contains` over the raw text would be
-/// green today for the wrong reason and red tomorrow for no reason. The
-/// crate uses no block comments (checked by eye and by this file's own
-/// fixture test), so `/* … */` is deliberately not handled; a TRAILING
-/// comment mentioning a call still counts, which errs toward failing
-/// loud.
+/// Three steps, and it is worth being exact about what each one buys.
 ///
-/// The surviving lines are then scanned JOINED rather than one at a
-/// time, and a needle counts when the byte after it is not an identifier
-/// character — the word-boundary rule [`CLOCK_CALLS`] documents. Nothing
-/// about a match depends on where the lines happen to break, so a path
-/// naming the clock at the end of one line and calling it at the start of
-/// the next is seen exactly as the single-line spelling is. Leaning on
-/// rustfmt to normalize such things would make this contract depend on a
-/// DIFFERENT gate holding, which is the kind of second owner it exists to
+/// 1. **Comment LINES** — `//`, `///`, `//!` alike — are dropped,
+///    because the crate documents this rule in prose beside the one call
+///    that implements it and a `contains` over the raw text would be
+///    green today for the wrong reason and red tomorrow for no reason. A
+///    TRAILING comment mentioning a call still counts, which errs toward
+///    failing loud.
+/// 2. **The surviving lines are joined**, and the gap a path may carry
+///    after its own `::` is closed ([`path_gap`]) — whitespace, a line
+///    break, a block comment. So `Utc:: now()`, a path broken across two
+///    lines, and `Utc::/*x*/now()` are all seen as the single-line
+///    spelling is.
+/// 3. **A needle then counts at a word boundary** — the rule
+///    [`CLOCK_CALLS`] documents.
+///
+/// Each byte remembers the ORIGINAL line it came from, so a violation is
+/// reported at the line its `::` sits on. Best effort for a split path,
+/// which is the line a reader wants anyway.
+///
+/// # What this defends against, and what it does not
+///
+/// The threat is ACCIDENTAL reintroduction: someone adds a clock read to
+/// an evaluation path — or reaches for
+/// `EvalContext::capture()` because a context is inconvenient to thread
+/// — and no value test can see it, because a test sampling its own clock
+/// agrees with an evaluator sampling its own. Against that, the scan is
+/// the whole defence, and it deliberately does not lean on rustfmt to
+/// normalize spacing first: a contract that only holds while a DIFFERENT
+/// gate holds has a second owner, which is what this one exists to
 /// remove.
 ///
-/// Each byte of the joined text remembers the ORIGINAL line it came
-/// from, so a violation is still reported at the line the needle starts
-/// on — best effort for a split call, which is the line a reader wants
-/// anyway.
+/// DELIBERATE evasion is out of scope and always will be. Nothing here
+/// parses Rust, so a macro that assembles the path, an `include!`, a
+/// re-export under another name, or a `/*` nested inside another block
+/// comment all get past it. That is review's job, not this file's. The
+/// line between the two is drawn where a reviewer would plausibly miss
+/// it: an ordinary-looking call is caught however it is spelled, and a
+/// spelling contrived to dodge a text scan is visible as contrivance on
+/// the diff.
 fn call_lines(source: &str, needles: &[&str]) -> Vec<usize> {
     let mut text = String::with_capacity(source.len());
     let mut line_of: Vec<usize> = Vec::with_capacity(source.len());
@@ -166,6 +183,33 @@ fn call_lines(source: &str, needles: &[&str]) -> Vec<usize> {
         text.push_str(line);
         text.push('\n');
     }
+
+    // Close the path's OWN gaps. A needle is a fragment of a path, and
+    // Rust lets a path carry whitespace, a line break or a block comment
+    // between its `::` and the name that follows — `Utc:: now()`,
+    // `Utc::\n    now()`, `Utc::/*x*/now()` — each of which reads the
+    // clock while a literal `::now` scan sees nothing. Only the gap AFTER
+    // a `::` can hide a needle: the needle STARTS at `::`, so whatever
+    // precedes it is not part of the match.
+    let mut text_line = Vec::with_capacity(line_of.len());
+    let mut collapsed = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < text.len() {
+        if text[cursor..].starts_with("::") {
+            collapsed.push_str("::");
+            text_line.push(line_of[cursor]);
+            text_line.push(line_of[cursor]);
+            cursor += 2 + path_gap(&text[cursor + 2..]);
+            continue;
+        }
+        let ch = text[cursor..].chars().next().expect("cursor is in bounds");
+        for _ in 0..ch.len_utf8() {
+            text_line.push(line_of[cursor]);
+        }
+        collapsed.push(ch);
+        cursor += ch.len_utf8();
+    }
+    let (text, line_of) = (collapsed, text_line);
 
     let mut found: Vec<usize> = Vec::new();
     for needle in needles {
@@ -190,6 +234,42 @@ fn call_lines(source: &str, needles: &[&str]) -> Vec<usize> {
     // on one line is one violation to fix.
     found.dedup();
     found
+}
+
+/// The byte length of the gap a path may carry after its `::` —
+/// whitespace and TERMINATED block comments, in any order.
+///
+/// Scoped to that position on purpose. Stripping every `/* … */` from the
+/// whole source instead would be a far worse instrument than the hole it
+/// closes: this crate writes glob patterns in string literals
+/// (`"path=/api/*"`, `"/data/**/*.parquet"`), each of which contains a
+/// literal `/*`, and a blanket strip reads them as comment OPENERS.
+/// Measured on `src/filter.rs`: a blanket strip deletes 12 201 of its
+/// 39 498 bytes, and a `Utc::now()` planted on the line after
+/// `"path=/api/*"` DISAPPEARS from the scan. Trading a fmt-clean evasion
+/// for a fmt-clean BLIND SPOT is the wrong direction — a contract that
+/// fails to see is worse than one that can be dodged on purpose.
+///
+/// An UNTERMINATED `/*` is left alone for the same reason: at this
+/// position it is far likelier to be a glob than a comment, and consuming
+/// to end-of-file would blind everything after it.
+fn path_gap(rest: &str) -> usize {
+    let mut taken = 0;
+    loop {
+        let tail = &rest[taken..];
+        let space = tail.len() - tail.trim_start().len();
+        if space > 0 {
+            taken += space;
+            continue;
+        }
+        if tail.starts_with("/*")
+            && let Some(close) = tail.find("*/")
+        {
+            taken += close + 2;
+            continue;
+        }
+        return taken;
+    }
 }
 
 #[test]
@@ -303,6 +383,12 @@ fn the_scan_counts_calls_not_mentions() {
         ("a space before the paren", "Utc::now ()"),
         ("a tab before the paren", "Utc::now\t()"),
         ("a comment before the paren", "Utc::now /* why */ ()"),
+        // …and the same gaps INSIDE the path, which a literal `::now`
+        // scan walked past. The first two rustfmt would normalize before
+        // they could land; the third it leaves exactly as written.
+        ("a space inside the path", "Utc :: now()"),
+        ("a comment inside the path", "Utc::/*x*/now()"),
+        ("a comment and a space inside the path", "Utc:: /*x*/ now()"),
         // …and no paren at all is still a clock read: these NAME the
         // function and something else calls it.
         (
@@ -333,6 +419,16 @@ fn the_scan_counts_calls_not_mentions() {
          path starts on"
     );
 
+    // The break can also fall INSIDE the path, between its `::` and the
+    // name — still one path to the compiler, still reported at its `::`.
+    let split_path = "let x = Utc::\n\
+                      now();\n";
+    assert_eq!(
+        call_lines(split_path, CLOCK_CALLS),
+        vec![1],
+        "a path broken after its `::` must be caught, at the line the `::` is on"
+    );
+
     // …and the word boundary is what lets the needles be paren-less:
     // these continue into an IDENTIFIER byte, so the needle does not end
     // where it appears to and they are not the things this contract
@@ -342,6 +438,13 @@ fn the_scan_counts_calls_not_mentions() {
         ("a different function", "let c = Regex::captures(&re, s);"),
         ("a longer capture name", "let c = Thing::capture_all();"),
         ("a longer now name", "let n = Thing::now_ish();"),
+        // An UNTERMINATED `/*` is a glob in a string literal far more
+        // often than a comment in this crate, and [`path_gap`] leaves it
+        // alone precisely so it cannot blind the rest of the scan.
+        (
+            "a glob literal that opens no comment",
+            "let g = \"path=/api/*\";",
+        ),
     ] {
         assert_eq!(
             call_lines(&format!("{innocent}\n"), CLOCK_CALLS),
