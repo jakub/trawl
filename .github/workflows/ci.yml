@@ -349,8 +349,12 @@ jobs:
   fuzz-smoke:
     name: pin-aware fuzz smoke (parse_emit)
     # A bounded gating run of the pin-aware parse/emit fuzz target: parse
-    # arbitrary DSL, invent a catalog pin for every field it binds, emit SQL
-    # under those pins, and assert the differential oracle in the target.
+    # arbitrary DSL, invent a catalog pin for every name
+    # `field_refs::referenced_fields` reports out of the parsed query, emit
+    # SQL under those pins, and assert the differential oracle in the
+    # target. (Not every field the query binds: bare-word search terms and
+    # time bounds are excluded there, and those envelope fields have fixed
+    # production types, so there is no pin to vary.)
     # It links no DuckDB and needs no postgres, so the small runner is
     # enough and ten minutes is generous (the measured run is ~25s of build
     # plus ~10s of fuzzing).
@@ -401,14 +405,17 @@ jobs:
           # directory only, so the committed seeds and the parse corpus stay
           # read-only and CI never produces a dirty tree.
           mkdir -p "$RUNNER_TEMP/corpus"
-          # -runs counts corpus REPLAY first, and the committed inputs are
-          # 3842 parse-corpus files plus 6 seeds. Measured here: libFuzzer
-          # reaches `#3849 INITED` before it mutates anything, so any -runs
-          # below ~3850 is a load test wearing a fuzzing costume: it exits
-          # 0 having explored nothing new. 25000 leaves ~21k mutation runs
-          # (measured: 628 new coverage units, ~3100 exec/s, ~8s), roughly
-          # 5.5x the replay floor. Raise it freely; never lower it below the
-          # floor, or the job stops fuzzing without ever going red.
+          # -runs counts corpus REPLAY first: libFuzzer loads every
+          # committed input under the paths below before it mutates
+          # anything, and prints the total as `#N INITED`. That N is the
+          # floor, and the job log is where to read it — a count written
+          # down here rots the next time someone commits a seed. Any -runs
+          # under it is a load test wearing a fuzzing costume: the job
+          # exits 0 having explored nothing new. When this was last
+          # measured the line read `#3849 INITED` and 25000 left ~21k
+          # mutation runs (628 new coverage units, ~3100 exec/s, ~8s).
+          # Raise -runs freely; never lower it below the `#N INITED` the
+          # log reports, or the job stops fuzzing without ever going red.
           #
           # -seed=114 is deliberate. libFuzzer's mutation sequence is a pure
           # function of (seed, binary, corpus), so a gating job stays

@@ -2,8 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Parse arbitrary DSL text, invent a catalog pin for every field it
-//! binds, and emit SQL twice: once pin-blind and once under those pins.
+//! Parse arbitrary DSL text, invent a catalog pin for every name
+//! `trawl_core::field_refs::referenced_fields` reports out of the parsed
+//! query, and emit SQL twice: once pin-blind and once under those pins.
+//!
+//! Not "every field the query binds". `referenced_fields` skips bare-word
+//! search terms and the time bounds, so `error last=1h` runs with an
+//! EMPTY pin map even though it reads `message`, `_raw` and `_time` —
+//! envelope fields whose production types are fixed, so there is no pin
+//! for the selector to vary and nothing is lost here.
 //!
 //! The wire encoding and the pin derivation live in
 //! [`trawl_core::fuzz_input`], not here, because the PREPARE fixture in

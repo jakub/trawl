@@ -6,7 +6,8 @@
 //!
 //! The pin-aware fuzz target feeds one byte string into two places at once:
 //! the DSL text the parser reads, and a selector that invents a catalog pin
-//! for every field the parsed query binds. Both halves are decoded here, so
+//! for every name [`crate::field_refs::referenced_fields`] reports out of
+//! the parsed query. Both halves are decoded here, so
 //! the target and the PREPARE fixture in trawl-engine cannot drift. The
 //! fixture replays committed cases through this same decoder and asserts
 //! they cover every entry of [`CanonicalType::ALL`]; if the encoding
@@ -90,7 +91,16 @@ pub fn decode_case(input: &str) -> DecodedCase<'_> {
     }
 }
 
-/// Invent a catalog pin map for the fields `query` binds.
+/// Invent a catalog pin map for the names
+/// [`crate::field_refs::referenced_fields`] reports out of `query`.
+///
+/// Not "every field the query binds", which would overstate it:
+/// `referenced_fields` deliberately skips bare-word search terms and the
+/// time bounds, so `error last=1h` derives an EMPTY map even though it
+/// reads `message`, `_raw` and `_time` (asserted by
+/// `a_query_binding_no_fields_yields_an_empty_catalog`). That costs this
+/// target nothing. All three are envelope fields with fixed production
+/// types, so there is no pin for a selector byte to vary.
 ///
 /// Field *i* of [`crate::field_refs::referenced_fields`] reads
 /// `selector[i % selector.len()]`, or 0 when the selector is empty.
