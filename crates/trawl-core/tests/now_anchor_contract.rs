@@ -24,32 +24,36 @@ use std::path::{Path, PathBuf};
 
 /// The calls this crate may not make outside its one door.
 ///
-/// Two needles, both deliberately shaped as `::verb(` rather than as one
+/// Two needles, both deliberately shaped as `::verb` rather than as one
 /// fully-qualified spelling:
 ///
-/// - `::now(` — the clock itself. Naming only `Utc::now(` left three
-///   doors open beside it: `chrono::Local::now()`,
+/// - `::now` — the clock itself. Naming only `Utc::now` left three doors
+///   open beside it: `chrono::Local::now()`,
 ///   `std::time::SystemTime::now()`/`Instant::now()`, and an alias import
 ///   (`use chrono::Utc as U; U::now()`) that renames the type without
 ///   changing the call.
-/// - `::capture(` — the door, from the inside. Nothing under `src/` may
+/// - `::capture` — the door, from the inside. Nothing under `src/` may
 ///   MINT its own [`trawl_core::context::EvalContext`]: a unit of output
 ///   RECEIVES its instant. `EvalContext::capture().now_value()` inside an
 ///   evaluator is this PR's own public API used to reintroduce exactly
 ///   the per-call sampling it removed, and no clock-name needle can see
 ///   it.
 ///
-/// The open paren is load-bearing: the crate MENTIONS `Utc::now` in prose
-/// (the module note in `context.rs`, the sampling note in `filter.rs`),
-/// and a mention is documentation, not a call. A STRING LITERAL
-/// containing either needle would be flagged; that errs loud, which is
-/// the right side to err on.
-const CLOCK_CALLS: &[&str] = &["::now(", "::capture("];
+/// A needle alone is not a match: [`call_lines`] requires an open paren
+/// after it, so the crate may keep MENTIONING `Utc::now` in prose (the
+/// module note in `context.rs`, the sampling note in `filter.rs`) and
+/// `::captures(` — a different function — is not `::capture(`. The paren
+/// may be separated by any run of whitespace, NEWLINES INCLUDED, because
+/// `Utc::now ()` and a call split across two lines are the same call to
+/// the compiler and were the same bypass to a per-line literal scan. A
+/// STRING LITERAL shaped like a call would be flagged; that errs loud,
+/// which is the right side to err on.
+const CLOCK_CALLS: &[&str] = &["::now", "::capture"];
 
 /// The clock read proper — the needle
 /// [`the_clock_has_exactly_one_door`] counts inside the owner, which is
 /// allowed to mint contexts freely.
-const CLOCK_READ: &str = "::now(";
+const CLOCK_READ: &str = "::now";
 
 /// The file allowed to make them, as a path RELATIVE TO `src/`.
 ///
@@ -119,14 +123,59 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 /// fixture test), so `/* … */` is deliberately not handled; a TRAILING
 /// comment mentioning a call still counts, which errs toward failing
 /// loud.
+///
+/// The surviving lines are then scanned JOINED rather than one at a
+/// time, and a needle counts only when the next non-whitespace byte
+/// after it is `(`. Rust puts no constraint on the whitespace between a
+/// path and its call paren, so `Utc::now ()` and
+///
+/// ```text
+/// EvalContext::capture
+///     ()
+/// ```
+///
+/// are ordinary calls that a per-line literal `::now(` scan walked
+/// straight past. Leaning on rustfmt to normalize the spacing would make
+/// this contract depend on a DIFFERENT gate holding, which is exactly the
+/// kind of second owner it exists to remove. Requiring the paren is also
+/// what keeps the paren-less needles honest: `::nowhere` and `::captures`
+/// continue past it into a non-paren byte and do not match.
+///
+/// Each byte of the joined text remembers the ORIGINAL line it came
+/// from, so a violation is still reported at the line the needle starts
+/// on — best effort for a split call, which is the line a reader wants
+/// anyway.
 fn call_lines(source: &str, needles: &[&str]) -> Vec<usize> {
-    source
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim_start().starts_with("//"))
-        .filter(|(_, line)| needles.iter().any(|needle| line.contains(needle)))
-        .map(|(index, _)| index + 1)
-        .collect()
+    let mut text = String::with_capacity(source.len());
+    let mut line_of: Vec<usize> = Vec::with_capacity(source.len());
+    for (index, line) in source.lines().enumerate() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        // One entry per BYTE pushed, so `line_of[offset]` is exact for a
+        // byte offset into `text` whatever the line holds.
+        line_of.extend(std::iter::repeat_n(index + 1, line.len() + 1));
+        text.push_str(line);
+        text.push('\n');
+    }
+
+    let mut found: Vec<usize> = Vec::new();
+    for needle in needles {
+        let mut from = 0;
+        while let Some(offset) = text[from..].find(needle) {
+            let at = from + offset;
+            let after = at + needle.len();
+            if text[after..].trim_start().starts_with('(') {
+                found.push(line_of[at]);
+            }
+            from = after;
+        }
+    }
+    found.sort_unstable();
+    // One report per LINE, as the per-line scan gave: two needles meeting
+    // on one line is one violation to fix.
+    found.dedup();
+    found
 }
 
 #[test]
@@ -234,11 +283,42 @@ fn the_scan_counts_calls_not_mentions() {
         ("a monotonic read", "std::time::Instant::now()"),
         ("the local zone", "chrono::Local::now()"),
         ("an alias import", "U::now()"),
+        // Rust puts no constraint on the whitespace before a call's
+        // paren, so neither may this scan.
+        ("a space before the paren", "Utc::now ()"),
+        ("a tab before the paren", "Utc::now\t()"),
     ] {
         assert_eq!(
             call_lines(&format!("let x = {bypass};\n"), CLOCK_CALLS),
             vec![1],
             "{case} must be caught: {bypass}"
+        );
+    }
+
+    // A call SPLIT across lines is one call to the compiler, and it is
+    // reported at the line the path starts on.
+    let split = "let x = EvalContext::capture\n\
+                 ();\n";
+    assert_eq!(
+        call_lines(split, CLOCK_CALLS),
+        vec![1],
+        "a call whose paren is on the next line must be caught, at the line the \
+         path starts on"
+    );
+
+    // …and the paren requirement is what lets the needles be paren-less:
+    // these continue into a byte that is not `(`, so they are not calls
+    // to the things this contract forbids.
+    for (case, innocent) in [
+        ("a name that merely starts with the needle", "foo::nowhere;"),
+        ("a different function", "let c = Regex::captures(&re, s);"),
+        ("a mention in a string", "let s = \"Utc::now\";"),
+        ("a use declaration", "use chrono::Utc::now;"),
+    ] {
+        assert_eq!(
+            call_lines(&format!("{innocent}\n"), CLOCK_CALLS),
+            Vec::<usize>::new(),
+            "{case} is not a clock call: {innocent}"
         );
     }
 
