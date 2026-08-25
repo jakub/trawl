@@ -562,12 +562,22 @@ mod tests {
         strs.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// A FIXED anchor: nothing in this crate's `src/` may self-serve an
+    /// evaluation context (`tests/now_anchor_contract.rs`), and a test
+    /// that samples its own clock cannot prove per-unit freezing.
+    fn anchor() -> crate::context::EvalContext {
+        crate::context::EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:00Z")
+                .expect("literal is RFC 3339")
+                .with_timezone(&chrono::Utc),
+        )
+    }
+
     /// A throwaway emitter state for translation tests. Only the `now`
     /// arm reads it — every other arm is a pure string rewrite — and the
     /// anchor it carries is asserted against explicitly where it matters.
     fn state() -> super::super::state::EmitterState {
-        super::super::state::EmitterState::new("t.parquet", crate::context::EvalContext::capture())
-            .expect("a valid source")
+        super::super::state::EmitterState::new("t.parquet", anchor()).expect("a valid source")
     }
 
     // ── translate_function: aggregates ──────────────────────────────────
@@ -1097,12 +1107,7 @@ mod tests {
         use crate::emitter::emit;
         use crate::parser;
         let q = parser::parse(r#"* | let h = date_part("nanosecond", timestamp)"#).unwrap();
-        let err = emit(
-            &q,
-            "/data/**/*.parquet",
-            crate::context::EvalContext::capture(),
-        )
-        .unwrap_err();
+        let err = emit(&q, "/data/**/*.parquet", anchor()).unwrap_err();
         assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
     }
 
@@ -1111,12 +1116,7 @@ mod tests {
         use crate::emitter::emit;
         use crate::parser;
         let q = parser::parse(r#"* | let d = date_trunc("dow", timestamp)"#).unwrap();
-        let err = emit(
-            &q,
-            "/data/**/*.parquet",
-            crate::context::EvalContext::capture(),
-        )
-        .unwrap_err();
+        let err = emit(&q, "/data/**/*.parquet", anchor()).unwrap_err();
         assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
     }
 
@@ -1153,12 +1153,7 @@ mod tests {
         use crate::emitter::emit;
         use crate::parser;
         let q = parser::parse(r#"* | let s = strftime(timestamp, "%Q")"#).unwrap();
-        let err = emit(
-            &q,
-            "/data/**/*.parquet",
-            crate::context::EvalContext::capture(),
-        )
-        .unwrap_err();
+        let err = emit(&q, "/data/**/*.parquet", anchor()).unwrap_err();
         assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
     }
 
@@ -1167,12 +1162,7 @@ mod tests {
         use crate::emitter::emit;
         use crate::parser;
         let q = parser::parse(r#"* | let t = strptime(message, "%Q")"#).unwrap();
-        let err = emit(
-            &q,
-            "/data/**/*.parquet",
-            crate::context::EvalContext::capture(),
-        )
-        .unwrap_err();
+        let err = emit(&q, "/data/**/*.parquet", anchor()).unwrap_err();
         assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
     }
 

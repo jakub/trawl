@@ -1875,11 +1875,17 @@ mod tests {
 
     /// The evaluation context these tests evaluate under.
     ///
-    /// Each call is its own unit of output, which is exactly what a test
-    /// asserting one expression is; the cases that care about `now()`
-    /// hold a context of their own and assert against it.
+    /// FIXED, never captured: a test that samples its own clock cannot
+    /// prove per-unit freezing, and nothing in this crate's `src/` may
+    /// self-serve a context (`tests/now_anchor_contract.rs`). The cases
+    /// that care about `now()` hold a context of their own and assert
+    /// against it.
     fn ctx() -> EvalContext {
-        EvalContext::capture()
+        EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:00Z")
+                .expect("literal is RFC 3339")
+                .with_timezone(&chrono::Utc),
+        )
     }
 
     // ── pinned where/let comparisons (ADR-0011 slice A′) ─────────────

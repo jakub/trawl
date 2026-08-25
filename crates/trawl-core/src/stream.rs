@@ -2397,13 +2397,9 @@ mod tests {
             assert!(err.contains(sentence), "{dsl}: {err}");
             // The batch lane's message for the same text, verbatim.
             let query = crate::parser::parse(dsl).expect("parses");
-            let batch = crate::emitter::emit(
-                &query,
-                "/data/*.parquet",
-                crate::context::EvalContext::capture(),
-            )
-            .expect_err("batch must refuse too")
-            .to_string();
+            let batch = crate::emitter::emit(&query, "/data/*.parquet", ctx())
+                .expect_err("batch must refuse too")
+                .to_string();
             assert!(batch.contains(sentence), "{dsl}: {batch}");
         }
         // An unknown function is refused here too, with the suggestion.

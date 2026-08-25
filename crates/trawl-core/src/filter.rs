@@ -1311,12 +1311,8 @@ mod tests {
             "level=/err.*/",
         ] {
             let query = parser::parse(dsl).expect("parse should succeed");
-            crate::emitter::emit(
-                &query,
-                "/data/**/*.parquet",
-                crate::context::EvalContext::capture(),
-            )
-            .expect("emits");
+            crate::emitter::emit(&query, "/data/**/*.parquet", EvalContext::at(fixed_now()))
+                .expect("emits");
             CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
                 .expect("compiles");
         }
@@ -1348,7 +1344,7 @@ mod tests {
             &query,
             "/data/**/*.parquet",
             &ft,
-            crate::context::EvalContext::capture(),
+            EvalContext::at(fixed_now()),
         )
         .expect_err("emit refuses")
         .to_string();

@@ -22,14 +22,40 @@
 
 use std::path::{Path, PathBuf};
 
-/// The clock call this crate may not make outside its one door.
+/// The calls this crate may not make outside its one door.
+///
+/// Two needles, both deliberately shaped as `::verb(` rather than as one
+/// fully-qualified spelling:
+///
+/// - `::now(` — the clock itself. Naming only `Utc::now(` left three
+///   doors open beside it: `chrono::Local::now()`,
+///   `std::time::SystemTime::now()`/`Instant::now()`, and an alias import
+///   (`use chrono::Utc as U; U::now()`) that renames the type without
+///   changing the call.
+/// - `::capture(` — the door, from the inside. Nothing under `src/` may
+///   MINT its own [`trawl_core::context::EvalContext`]: a unit of output
+///   RECEIVES its instant. `EvalContext::capture().now_value()` inside an
+///   evaluator is this PR's own public API used to reintroduce exactly
+///   the per-call sampling it removed, and no clock-name needle can see
+///   it.
 ///
 /// The open paren is load-bearing: the crate MENTIONS `Utc::now` in prose
 /// (the module note in `context.rs`, the sampling note in `filter.rs`),
-/// and a mention is documentation, not a clock read.
-const CLOCK_CALL: &str = "Utc::now(";
+/// and a mention is documentation, not a call. A STRING LITERAL
+/// containing either needle would be flagged; that errs loud, which is
+/// the right side to err on.
+const CLOCK_CALLS: &[&str] = &["::now(", "::capture("];
 
-/// The file allowed to make it, relative to `src/`.
+/// The clock read proper — the needle
+/// [`the_clock_has_exactly_one_door`] counts inside the owner, which is
+/// allowed to mint contexts freely.
+const CLOCK_READ: &str = "::now(";
+
+/// The file allowed to make them, as a path RELATIVE TO `src/`.
+///
+/// Compared against the relative path, never against the file NAME: a
+/// future `src/anything/context.rs` would otherwise be exempt from the
+/// rule by virtue of its basename alone.
 const CLOCK_OWNER: &str = "context.rs";
 
 /// Named once, printed by every failure: a violation is not "delete the
@@ -42,6 +68,12 @@ fn src_root() -> PathBuf {
 }
 
 /// Every `.rs` file under `src/`, recursively.
+///
+/// A SYMLINK of any kind is refused rather than followed. A symlinked
+/// directory can point the walk outside the tree it is auditing (making
+/// the scan pass over sources that are not these), or back into it
+/// (making the walk loop), and either way the set of files scanned stops
+/// being "this crate's sources". Refusing is loud; following is silent.
 fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
@@ -54,7 +86,20 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
         let path = entry
             .unwrap_or_else(|error| panic!("source walk infrastructure failure: {error}"))
             .path();
-        if path.is_dir() {
+        let meta = std::fs::symlink_metadata(&path).unwrap_or_else(|error| {
+            panic!(
+                "source walk infrastructure failure at {}: {error}",
+                path.display()
+            )
+        });
+        assert!(
+            !meta.file_type().is_symlink(),
+            "source walk infrastructure failure: {} is a symlink, and this scan \
+             must audit THESE sources — a symlinked directory can point the walk \
+             out of the tree or back into it",
+            path.display()
+        );
+        if meta.is_dir() {
             found.extend(rust_sources(&path));
         } else if path.extension().is_some_and(|ext| ext == "rs") {
             found.push(path);
@@ -64,7 +109,7 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// The 1-based lines of `source` that CALL the clock.
+/// The 1-based lines of `source` that CALL one of `needles`.
 ///
 /// Comment lines — `//`, `///`, `//!` alike — are dropped before the
 /// match, because the crate documents the rule in prose beside the one
@@ -72,14 +117,14 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 /// green today for the wrong reason and red tomorrow for no reason. The
 /// crate uses no block comments (checked by eye and by this file's own
 /// fixture test), so `/* … */` is deliberately not handled; a TRAILING
-/// comment mentioning the call still counts, which errs toward failing
+/// comment mentioning a call still counts, which errs toward failing
 /// loud.
-fn clock_call_lines(source: &str) -> Vec<usize> {
+fn call_lines(source: &str, needles: &[&str]) -> Vec<usize> {
     source
         .lines()
         .enumerate()
         .filter(|(_, line)| !line.trim_start().starts_with("//"))
-        .filter(|(_, line)| line.contains(CLOCK_CALL))
+        .filter(|(_, line)| needles.iter().any(|needle| line.contains(needle)))
         .map(|(index, _)| index + 1)
         .collect()
 }
@@ -96,8 +141,13 @@ fn no_evaluation_path_in_trawl_core_reads_the_clock() {
     );
 
     let mut violations = Vec::new();
+    let mut saw_owner = false;
     for path in &sources {
-        if path.file_name().is_some_and(|name| name == CLOCK_OWNER) {
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or_else(|error| panic!("{} is not under src: {error}", path.display()));
+        if relative == Path::new(CLOCK_OWNER) {
+            saw_owner = true;
             continue;
         }
         let source = std::fs::read_to_string(path).unwrap_or_else(|error| {
@@ -106,20 +156,25 @@ fn no_evaluation_path_in_trawl_core_reads_the_clock() {
                 path.display()
             )
         });
-        let relative = path.strip_prefix(&root).unwrap_or(path);
-        for line in clock_call_lines(&source) {
+        for line in call_lines(&source, CLOCK_CALLS) {
             violations.push(format!("{}:{line}", relative.display()));
         }
     }
+    assert!(
+        saw_owner,
+        "source walk infrastructure failure: src/{CLOCK_OWNER} was not visited, \
+         so the exemption is pinned to a path that no longer exists"
+    );
 
     assert!(
         violations.is_empty(),
         "{REMEDY}\n\
-         {CLOCK_CALL} appears outside src/{CLOCK_OWNER}, at: {violations:?}\n\
+         one of {CLOCK_CALLS:?} appears outside src/{CLOCK_OWNER}, at: {violations:?}\n\
          The instant belongs to the unit of output — a query, an event, an \
          emitted snapshot — and reaches an evaluator as a parameter \
-         (`EvalContext`), never as a fresh sample. Test code counts: a test \
-         that samples its own clock cannot prove per-unit freezing."
+         (`EvalContext`), never as a fresh sample or a fresh capture. Test code \
+         counts: a test that samples its own clock cannot prove per-unit \
+         freezing."
     );
 }
 
@@ -132,12 +187,12 @@ fn the_clock_has_exactly_one_door() {
             owner.display()
         )
     });
-    let calls = clock_call_lines(&source);
+    let calls = call_lines(&source, &[CLOCK_READ]);
     assert_eq!(
         calls.len(),
         1,
         "{REMEDY}\n\
-         src/{CLOCK_OWNER} must hold EXACTLY ONE {CLOCK_CALL} — the capture \
+         src/{CLOCK_OWNER} must hold EXACTLY ONE {CLOCK_READ} — the capture \
          `EvalContext::capture()` performs — and it holds {} (lines {calls:?}). \
          A second one is a second clock domain inside the door that exists to \
          remove them.",
@@ -145,7 +200,8 @@ fn the_clock_has_exactly_one_door() {
     );
 }
 
-/// The instrument's own test: the scan counts CALLS, not mentions.
+/// The instrument's own test: the scan counts CALLS, not mentions, and it
+/// counts the bypasses a clock-name needle cannot see.
 ///
 /// Without the comment filter this contract would be red today — the
 /// crate's prose names the call it forbids — and the tempting fix (drop
@@ -160,11 +216,31 @@ fn the_scan_counts_calls_not_mentions() {
                    let mention = \"Utc::now\";\n\
                    Self::at(Utc::now())\n";
     assert_eq!(
-        clock_call_lines(fixture),
+        call_lines(fixture, CLOCK_CALLS),
         vec![5],
         "only the CALL line counts: a doc, inner-doc or bare comment mentioning \
-         {CLOCK_CALL} is prose"
+         a clock read is prose"
     );
+
+    // The bypasses a `Utc::now(` needle could not see, each of which puts
+    // a second clock domain inside an evaluation path.
+    for (case, bypass) in [
+        ("this PR's own API", "EvalContext::capture().now_value()"),
+        (
+            "a qualified capture",
+            "crate::context::EvalContext::capture()",
+        ),
+        ("the std clock", "std::time::SystemTime::now()"),
+        ("a monotonic read", "std::time::Instant::now()"),
+        ("the local zone", "chrono::Local::now()"),
+        ("an alias import", "U::now()"),
+    ] {
+        assert_eq!(
+            call_lines(&format!("let x = {bypass};\n"), CLOCK_CALLS),
+            vec![1],
+            "{case} must be caught: {bypass}"
+        );
+    }
 
     let mut documented = 0usize;
     for path in rust_sources(&src_root()) {

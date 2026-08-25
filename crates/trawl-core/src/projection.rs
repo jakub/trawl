@@ -292,6 +292,16 @@ mod tests {
     use crate::ast::PipeStage;
     use crate::parser;
 
+    /// A FIXED anchor: nothing in this crate's `src/` may self-serve an
+    /// evaluation context (`tests/now_anchor_contract.rs`).
+    fn fixed_anchor() -> crate::context::EvalContext {
+        crate::context::EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:00Z")
+                .expect("literal is RFC 3339")
+                .with_timezone(&chrono::Utc),
+        )
+    }
+
     fn aggs(dsl: &str) -> Vec<AggExpr> {
         let query = parser::parse(dsl).expect("dsl parses");
         match &query.pipeline[0].node {
@@ -469,7 +479,7 @@ mod tests {
         ] {
             let query = parser::parse(dsl).expect("dsl parses");
 
-            let sql = crate::emitter::emit(&query, "src", crate::context::EvalContext::capture())
+            let sql = crate::emitter::emit(&query, "src", fixed_anchor())
                 .expect("emit succeeds")
                 .sql;
             assert!(
