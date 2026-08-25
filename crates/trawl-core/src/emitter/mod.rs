@@ -2980,17 +2980,19 @@ mod tests {
         pins.insert("_severity", crate::schema::CanonicalType::Severity);
         let err = emit_with_pins(&query, SRC, &pins, anchor()).expect_err("the token is unknown");
 
-        let EmitError::Comparison(crate::compare::CompareError::UnknownSeverityToken { token }) =
-            &err
+        let EmitError::Comparison(
+            cause @ crate::compare::CompareError::UnknownSeverityToken { token },
+        ) = &err
         else {
             panic!("expected a typed comparison refusal, got {err:?}");
         };
         assert_eq!(token, "nosuchlevel");
 
-        let rendered = err.to_string();
-        assert!(
-            rendered.starts_with("unsupported operation: unknown severity value 'nosuchlevel'"),
-            "{rendered}"
-        );
+        // The WHOLE rendering, composed from the typed cause. This was a
+        // `starts_with` against a prefix, which is no guard at all for a
+        // test whose only job is that the sentence has not moved: appending
+        // ` [comparison refusal]` to the `Display` impl would have sailed
+        // straight through it.
+        assert_eq!(err.to_string(), format!("unsupported operation: {cause}"));
     }
 }
