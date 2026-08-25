@@ -25,14 +25,34 @@
 //! `query \0 selector`, split at the FIRST NUL. With no NUL anywhere, the
 //! whole input is BOTH halves: the query text, and the selector bytes.
 //!
-//! That fallback is the load-bearing choice. All 3842 committed seeds under
-//! `crates/trawl-core/fuzz/corpus/parse/` are NUL-free DSL, so they decode
-//! to themselves byte for byte and each one immediately invents a
-//! non-trivial pin map out of its own text. Reserving a length prefix or a
-//! fixed header would have eaten bytes off the front of every seed and
-//! turned valid DSL into parse errors, throwing away the corpus the parse
-//! target spent its runs building. libFuzzer reaches the independently
-//! mutable form on its own by inserting a NUL, which it does constantly.
+//! That fallback is what keeps the committed parse corpus usable as a seed
+//! corpus here, though only part of it. Audited 2026-08-25 against the 3842
+//! files under `crates/trawl-core/fuzz/corpus/parse/` as committed at
+//! `b9dafad3`: 2373 carry at least one NUL, 1214 are not valid UTF-8, and
+//! 1072 are both valid UTF-8 and NUL-free. 74 begin with a NUL, 213 end
+//! with one, 1973 hold more than one. Those files are libFuzzer mutation
+//! output rather than DSL anyone typed, so that shape is the expected one.
+//! `the_parse_corpus_decodes_within_the_encoding_contract` re-measures it
+//! on every test run and asserts a floor, not these exact counts.
+//!
+//! So the promise is narrow, and worth stating exactly. A NUL-free
+//! valid-UTF-8 seed decodes to itself byte for byte and gains a pin map
+//! derived from its own text; 1072 files do that, which is real DSL enough
+//! to seed the pin-aware target with. A NUL-bearing seed decodes to a
+//! shorter query plus a selector. That is a different fuzz input and a
+//! valid one, not corruption: libFuzzer treats a corpus as a starting
+//! population to mutate, never as a specification, so a seed that decodes
+//! to something other than itself costs coverage-seeding fidelity and
+//! nothing else.
+//!
+//! A length prefix or a fixed header would still be worse. It would eat
+//! bytes off the front of all 3842 files rather than off the 2373 that
+//! already carry a NUL. The 1214 non-UTF-8 files are unreachable either
+//! way, and were before this module existed: the older `parse` target
+//! takes `&str` too, so libFuzzer already discarded them there. That is
+//! pre-existing shared behaviour, not something this encoding introduced.
+//! libFuzzer reaches the independently mutable form on its own by inserting
+//! a NUL, which it does constantly.
 
 use crate::ast::Query;
 use crate::schema::{CanonicalType, FieldTypes};
@@ -122,14 +142,81 @@ mod tests {
         crate::parser::parse(dsl).expect("test DSL should parse")
     }
 
-    /// The corpus-compatibility case, and the reason the no-NUL fallback
-    /// exists: a committed parse seed is DSL with no NUL in it, and it has
-    /// to survive the decode unchanged while still carrying a selector.
+    /// The corpus audit, in place of one handcrafted string that used to
+    /// stand in for the whole corpus. These are the invariants the module
+    /// doc's rationale rests on, measured against the real files:
+    ///
+    /// * `decode_case` returns for every valid-UTF-8 file (a panic fails
+    ///   the test where it happens, so there is nothing else to assert).
+    /// * The decoded query is a byte prefix of the input, always.
+    /// * A valid-UTF-8, NUL-free file decodes to itself in both halves.
+    ///
+    /// The count assertion is a FLOOR rather than equality. Committing more
+    /// mutation output is a legitimate thing to do to a fuzz corpus and
+    /// would break an exact count for no reason; what has to stay true is
+    /// that enough real DSL still travels the fallback path to seed it.
     #[test]
-    fn a_nul_free_input_is_both_halves() {
-        let decoded = decode_case("service=nginx status>=400");
-        assert_eq!(decoded.query, "service=nginx status>=400");
-        assert_eq!(decoded.selector, b"service=nginx status>=400");
+    fn the_parse_corpus_decodes_within_the_encoding_contract() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fuzz")
+            .join("corpus")
+            .join("parse");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            // The fuzz package declares its own workspace and the root
+            // excludes it, so a sparse checkout or a packaged crate can
+            // arrive without this tree at all. Absent is not drift.
+            eprintln!("skipping corpus audit: no directory at {}", dir.display());
+            return;
+        };
+
+        let mut total = 0usize;
+        let mut utf8 = 0usize;
+        let mut nul_free = 0usize;
+
+        for entry in entries {
+            let path = entry.expect("corpus entry should be readable").path();
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("corpus file should be readable");
+            total += 1;
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                // Never reachable as fuzz input: both targets take `&str`,
+                // so libFuzzer discards these before any decoding.
+                continue;
+            };
+            utf8 += 1;
+
+            let name = path.display();
+            let decoded = decode_case(text);
+            assert!(
+                bytes.starts_with(decoded.query.as_bytes()),
+                "{name}: the decoded query is not a byte prefix of the file"
+            );
+            if !bytes.contains(&0) {
+                nul_free += 1;
+                assert_eq!(decoded.query, text, "{name}: a NUL-free query moved");
+                assert_eq!(
+                    decoded.selector,
+                    bytes.as_slice(),
+                    "{name}: a NUL-free selector moved"
+                );
+            }
+        }
+
+        // An empty directory IS drift: it means the corpus was dropped or
+        // the path moved, and the audit would otherwise pass vacuously.
+        assert!(
+            total > 0,
+            "corpus directory holds no files: {}",
+            dir.display()
+        );
+        assert!(
+            nul_free >= 1000,
+            "only {nul_free} of {total} corpus files ({utf8} valid UTF-8) decode to \
+             themselves; the module doc measured 1072 and the rationale needs a bulk \
+             of real DSL on the no-NUL path"
+        );
     }
 
     #[test]
