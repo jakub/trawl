@@ -310,13 +310,13 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
     let seeds = seed_files();
 
     // A renamed or emptied directory must be red, never a quiet pass over
-    // zero files. Seven is what is committed today — six pin seeds plus the
-    // bare-text-search one that reaches the `raw_free_sql` prepare. A FLOOR,
-    // not an equality: an eighth seed is a legitimate addition and must not
-    // redden this.
+    // zero files. Eight is what is committed today — six pin seeds, the
+    // bare-text-search one that reaches the `raw_free_sql` prepare, and the
+    // NaN regression, which reaches it too. A FLOOR, not an equality: a
+    // ninth seed is a legitimate addition and must not redden this.
     assert!(
-        seeds.len() >= 7,
-        "expected at least the seven committed .case seeds under {}, found {}",
+        seeds.len() >= 8,
+        "expected at least the eight committed .case seeds under {}, found {}",
         seeds_dir().display(),
         seeds.len()
     );
