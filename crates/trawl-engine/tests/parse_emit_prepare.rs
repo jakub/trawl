@@ -106,6 +106,17 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// A path as the body of a single-quoted SQL string literal, with `'`
+/// doubled the way SQL escapes it.
+///
+/// `tempfile` names are alphanumeric, so this only bites under a `TMPDIR`
+/// carrying an apostrophe — at which point the literal would close early
+/// and the fixture would fail for a reason that has nothing to do with the
+/// emitter.
+fn sql_path(path: &Path) -> String {
+    path.display().to_string().replace('\'', "''")
+}
+
 /// A plausible one-row value for a column, as a SQL literal.
 ///
 /// Plausible rather than arbitrary: the planner is allowed to look at the
@@ -178,6 +189,24 @@ fn fixture_columns(pins: &FieldTypes) -> Vec<(String, CanonicalType)> {
     columns
 }
 
+/// The same columns with `_raw` removed: the fixture the `raw_free_sql`
+/// prepare reads.
+///
+/// This is NOT duplication of [`fixture_columns`] and must not be merged
+/// back into it. `raw_free_sql` exists for sources that have no `_raw` at
+/// all — user-owned parquet in embedded mode, where `_raw` is a server
+/// guarantee the file never made (see
+/// [`trawl_core::emitter::EmittedQuery::raw_free_sql`]). Prepared against
+/// the `_raw`-bearing fixture it is a tautology: a regression that left a
+/// `"_raw"` reference inside the raw-free pass would bind cleanly here and
+/// fail only on the real sources the lane was written for. The two
+/// fixtures differ by exactly the column whose absence the lane is about.
+fn raw_free_fixture_columns(pins: &FieldTypes) -> Vec<(String, CanonicalType)> {
+    let mut columns = fixture_columns(pins);
+    columns.retain(|(name, _)| name != schema::RAW);
+    columns
+}
+
 /// Write a one-row parquet with exactly `columns`, then prove by
 /// `DESCRIBE` that it came back with the names and physical types asked
 /// for.
@@ -201,7 +230,7 @@ fn write_fixture(conn: &duckdb::Connection, path: &Path, columns: &[(String, Can
         .join(", ");
     let copy = format!(
         "COPY (SELECT {projection}) TO '{}' (FORMAT PARQUET)",
-        path.display()
+        sql_path(path)
     );
     conn.execute_batch(&copy)
         .unwrap_or_else(|err| panic!("the fixture write failed: {err}\n  {copy}"));
@@ -220,7 +249,7 @@ fn write_fixture(conn: &duckdb::Connection, path: &Path, columns: &[(String, Can
 
 /// `DESCRIBE` a parquet file: `(column_name, column_type)` in file order.
 fn describe(conn: &duckdb::Connection, path: &Path) -> Vec<(String, String)> {
-    let sql = format!("DESCRIBE SELECT * FROM read_parquet('{}')", path.display());
+    let sql = format!("DESCRIBE SELECT * FROM read_parquet('{}')", sql_path(path));
     let mut statement = conn
         .prepare(&sql)
         .unwrap_or_else(|err| panic!("DESCRIBE failed to prepare: {err}\n  {sql}"));
@@ -233,9 +262,20 @@ fn describe(conn: &duckdb::Connection, path: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Replay one seed end to end and return the pins it decoded plus whether
-/// this seed reached the `raw_free_sql` prepare.
-fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> (FieldTypes, bool) {
+/// What replaying one seed established, for the corpus-wide assertions
+/// that run after the loop.
+struct SeedOutcome {
+    /// The query half of the seed, as `decode_case` read it.
+    query: String,
+    /// The pins `derive_field_types` read out of the selector half.
+    pins: FieldTypes,
+    /// Whether the emitter produced `raw_free_sql`, which is to say
+    /// whether this seed reached the raw-free prepare.
+    reached_raw_free: bool,
+}
+
+/// Replay one seed end to end.
+fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> SeedOutcome {
     let label = seed.display().to_string();
     let text = std::fs::read_to_string(seed)
         .unwrap_or_else(|err| panic!("seed {label} is not readable UTF-8: {err}"));
@@ -251,12 +291,12 @@ fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> (FieldT
     });
     let pins = fuzz_input::derive_field_types(&query, case.selector);
 
-    let fixture = scratch.join(format!(
-        "{}.parquet",
-        seed.file_stem()
-            .expect("a .case file has a stem")
-            .to_string_lossy()
-    ));
+    let stem = seed
+        .file_stem()
+        .expect("a .case file has a stem")
+        .to_string_lossy()
+        .into_owned();
+    let fixture = scratch.join(format!("{stem}.parquet"));
     write_fixture(conn, &fixture, &fixture_columns(&pins));
 
     let source = fixture.display().to_string();
@@ -272,14 +312,46 @@ fn check_seed(conn: &duckdb::Connection, scratch: &Path, seed: &Path) -> (FieldT
 
     prepare_ok(conn, &emitted.sql, emitted.params.len(), &label, "sql");
     let reached_raw_free = emitted.raw_free_sql.is_some();
-    if let Some(raw_free) = &emitted.raw_free_sql {
+    if reached_raw_free {
         // The one emitted SQL string nothing else in the suite executes:
         // the executor only reaches it when a source turns out to have no
         // `_raw` column, which no other test sets up.
-        prepare_ok(conn, raw_free, emitted.params.len(), &label, "raw_free_sql");
+        //
+        // So it gets a source with no `_raw` column, which means a SECOND
+        // emission: the path is baked into the SQL, and re-preparing the
+        // first emission's raw-free string would read the `_raw`-bearing
+        // fixture again (see `raw_free_fixture_columns`). Everything else
+        // is identical — same query, same pins — so the only difference
+        // between the two prepares is the column whose absence this lane
+        // exists for.
+        let raw_free_fixture = scratch.join(format!("{stem}.raw-free.parquet"));
+        write_fixture(conn, &raw_free_fixture, &raw_free_fixture_columns(&pins));
+        let raw_free_source = raw_free_fixture.display().to_string();
+        let raw_free_emitted =
+            emitter::emit_with_pins(&query, &raw_free_source, &pins, EvalContext::capture())
+                .unwrap_or_else(|err| {
+                    panic!("seed {label} failed to re-emit for the raw-free source: {err}")
+                });
+        let raw_free = raw_free_emitted.raw_free_sql.as_deref().unwrap_or_else(|| {
+            panic!(
+                "seed {label} produced raw_free_sql for one source and not the other, so \
+                 emission depends on the source path rather than the query"
+            )
+        });
+        prepare_ok(
+            conn,
+            raw_free,
+            raw_free_emitted.params.len(),
+            &label,
+            "raw_free_sql",
+        );
     }
 
-    (pins, reached_raw_free)
+    SeedOutcome {
+        query: case.query.to_owned(),
+        pins,
+        reached_raw_free,
+    }
 }
 
 /// Prepare one emitted statement and check its placeholder count.
@@ -323,13 +395,33 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
 
     let mut covered: BTreeSet<CanonicalType> = BTreeSet::new();
     let mut raw_free_reached = 0usize;
+    let mut nan_regression_replayed = false;
     for seed in &seeds {
-        let (pins, reached_raw_free) = check_seed(&conn, scratch.path(), seed);
-        covered.extend(pins.iter().map(|(_, ty)| ty));
-        if reached_raw_free {
+        let outcome = check_seed(&conn, scratch.path(), seed);
+        covered.extend(outcome.pins.iter().map(|(_, ty)| ty));
+        if outcome.reached_raw_free {
             raw_free_reached += 1;
         }
+        // The seed-count floor above says how MANY seeds exist, not which,
+        // so on its own it lets someone delete a regression seed, add an
+        // unrelated one, and stay green. This pins the case behind the NaN
+        // panic by what it DOES rather than by its filename: `hello a=nan`
+        // pins `a` to DOUBLE, so the raw-free pass pushes a NaN parameter,
+        // and the two passes' parameter lists have to compare equal by
+        // BITS for the emitter not to panic. Renaming the file is fine.
+        // Losing that shape is not.
+        nan_regression_replayed |= outcome.query == "hello a=nan"
+            && outcome.pins.get("a") == Some(CanonicalType::Double)
+            && outcome.reached_raw_free;
     }
+
+    assert!(
+        nan_regression_replayed,
+        "no committed seed replays the NaN raw-free regression: the corpus needs one whose \
+         query is `hello a=nan`, whose selector pins `a` to DOUBLE, and which reaches the \
+         raw_free_sql prepare (today that is \
+         crates/trawl-core/fuzz/seeds/parse_emit/regression_nan_param_raw_free.case)"
+    );
 
     // A FLOOR, not an equality: a second bare-text-search seed must not
     // redden this. `raw_free_sql` is `Some` only when a bare text search
@@ -385,7 +477,7 @@ fn control_prepare_rejects_a_missing_column() {
 
     let sql = format!(
         "SELECT definitely_missing_column FROM read_parquet('{}')",
-        fixture.display()
+        sql_path(&fixture)
     );
     let err = conn.prepare(&sql).err().unwrap_or_else(|| {
         panic!(
@@ -410,7 +502,7 @@ fn control_prepare_rejects_a_missing_column() {
 fn control_prepare_rejects_a_missing_source_file() {
     let scratch = tempfile::tempdir().expect("a scratch dir");
     let absent = scratch.path().join("no-such-file.parquet");
-    let sql = format!("SELECT * FROM read_parquet('{}')", absent.display());
+    let sql = format!("SELECT * FROM read_parquet('{}')", sql_path(&absent));
     let err = conn().prepare(&sql).err().unwrap_or_else(|| {
         panic!(
             "DuckDB prepared a read of a file that does not exist, so a fixture that never got \
@@ -439,7 +531,7 @@ fn control_prepare_rejects_a_type_invalid_expression() {
     let conn = conn();
     let fixture = scratch.path().join("types.parquet");
     write_fixture(&conn, &fixture, &fixture_columns(&FieldTypes::new()));
-    let source = format!("read_parquet('{}')", fixture.display());
+    let source = format!("read_parquet('{}')", sql_path(&fixture));
 
     let valid = format!("SELECT abs(\"_severity\") FROM {source}");
     conn.prepare(&valid).unwrap_or_else(|err| {
