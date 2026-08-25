@@ -673,6 +673,10 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
                 SqlValue::Int(i) => Box::new(*i),
                 SqlValue::Float(f) => Box::new(*f),
                 SqlValue::Bool(b) => Box::new(*b),
+                SqlValue::Timestamp(at) => Box::new(duckdb::types::Value::Timestamp(
+                    duckdb::types::TimeUnit::Microsecond,
+                    at.and_utc().timestamp_micros(),
+                )),
             }
         })
         .collect()
@@ -766,8 +770,12 @@ fn sql_scalar_result(conn: &Connection, dsl: &str, event: &Map<String, Value>) -
         .to_str()
         .expect("fixture path infrastructure failure: path is not UTF-8");
 
-    let emitted = emitter::emit(&query, tmp_path)
-        .unwrap_or_else(|error| panic!("generated grammar failed to emit {dsl:?}: {error:?}"));
+    let emitted = emitter::emit(
+        &query,
+        tmp_path,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .unwrap_or_else(|error| panic!("generated grammar failed to emit {dsl:?}: {error:?}"));
 
     let params = bind_params(&emitted.params);
     let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();

@@ -198,7 +198,13 @@ impl Executor {
                 // `status=200.0` over a VARCHAR-pinned field would match a
                 // hot numeric `200` here and stop matching the moment a
                 // parquet file appeared.
-                let hot_emitted = emitter::emit_hot_only(&ast, hot_source, hot_pins, pins)?;
+                let hot_emitted = emitter::emit_hot_only(
+                    &ast,
+                    hot_source,
+                    hot_pins,
+                    pins,
+                    trawl_core::context::EvalContext::capture(),
+                )?;
                 match self.execute_emitted_tracked(&hot_emitted, max_rows, sql_offset) {
                     // Hot-only also hit a binder/emit error (e.g. empty ndjson
                     // between compaction cycles). Treat as empty, not error.
@@ -602,7 +608,13 @@ impl Executor {
                 // Hot-only, conformed like the union's hot branch — an
                 // export must not write JSON-inferred types where the
                 // hot+cold lane would have written the catalog's.
-                let hot_emitted = emitter::emit_hot_only(&ast, hot_source, hot_pins, pins)?;
+                let hot_emitted = emitter::emit_hot_only(
+                    &ast,
+                    hot_source,
+                    hot_pins,
+                    pins,
+                    trawl_core::context::EvalContext::capture(),
+                )?;
                 self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows)
             }
             // Same invariant as `export_parquet`: only an `is_no_files_error`
@@ -1161,7 +1173,12 @@ impl ResolvedSource {
         query: &Query,
         pins: &FieldTypes,
     ) -> Result<EmittedQuery, emitter::EmitError> {
-        emitter::emit_with_pins(query, &self.sql, pins)
+        emitter::emit_with_pins(
+            query,
+            &self.sql,
+            pins,
+            trawl_core::context::EvalContext::capture(),
+        )
     }
 
     /// Emit the hot+cold union read over this source.
@@ -1176,7 +1193,14 @@ impl ResolvedSource {
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
     ) -> Result<EmittedQuery, emitter::EmitError> {
-        emitter::emit_with_hot_source(query, &self.sql, hot_source, hot_pins, pins)
+        emitter::emit_with_hot_source(
+            query,
+            &self.sql,
+            hot_source,
+            hot_pins,
+            pins,
+            trawl_core::context::EvalContext::capture(),
+        )
     }
 }
 
@@ -1314,6 +1338,14 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
                 SqlValue::Int(i) => Box::new(*i),
                 SqlValue::Float(f) => Box::new(*f),
                 SqlValue::Bool(b) => Box::new(*b),
+                // The statement's `now()` anchor (ADR-0017 §3). Bound as
+                // MICROSECONDS because that is `DuckDB`'s TIMESTAMP
+                // domain and the anchor is truncated to it at capture, so
+                // the bound value is exact — never rounded at the wire.
+                SqlValue::Timestamp(at) => Box::new(duckdb::types::Value::Timestamp(
+                    duckdb::types::TimeUnit::Microsecond,
+                    at.and_utc().timestamp_micros(),
+                )),
             }
         })
         .collect()

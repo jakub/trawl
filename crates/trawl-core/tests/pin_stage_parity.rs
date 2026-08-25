@@ -37,6 +37,10 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
                 SqlValue::Int(i) => Box::new(*i),
                 SqlValue::Float(f) => Box::new(*f),
                 SqlValue::Bool(b) => Box::new(*b),
+                SqlValue::Timestamp(at) => Box::new(duckdb::types::Value::Timestamp(
+                    duckdb::types::TimeUnit::Microsecond,
+                    at.and_utc().timestamp_micros(),
+                )),
             }
         })
         .collect()
@@ -99,7 +103,13 @@ fn run_cell(
     writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
     tmp.flush().unwrap();
     let source = tmp.path().to_str().unwrap().to_owned();
-    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
 
     let count_sql = format!("SELECT count(*)::BIGINT FROM ({}) AS _sub", emitted.sql);
     let params = bind_params(&emitted.params);
@@ -159,7 +169,13 @@ fn run_pipeline_cell(
     writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
     tmp.flush().unwrap();
     let source = tmp.path().to_str().unwrap().to_owned();
-    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let count_sql = format!("SELECT count(*)::BIGINT FROM ({}) AS _sub", emitted.sql);
     let params = bind_params(&emitted.params);
     let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
@@ -214,7 +230,13 @@ fn run_let_cell(
     writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
     tmp.flush().unwrap();
     let source = tmp.path().to_str().unwrap().to_owned();
-    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let row_sql = format!("SELECT to_json(_sub) FROM ({}) AS _sub", emitted.sql);
     let params = bind_params(&emitted.params);
     let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
@@ -431,7 +453,13 @@ fn pattern_form_coverage_in_both_pipeline_lanes() {
              TO '{source}' (FORMAT PARQUET)"
         ))
         .unwrap();
-        let emitted = emitter::emit_with_pins(&query, &source, &ft).expect("emit succeeds");
+        let emitted = emitter::emit_with_pins(
+            &query,
+            &source,
+            &ft,
+            trawl_core::context::EvalContext::capture(),
+        )
+        .expect("emit succeeds");
         let params = bind_params(&emitted.params);
         let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
         let count: i64 = conn
@@ -1134,9 +1162,13 @@ fn case_variant_projections_agree_across_lanes() {
                     writeln!(tmp, "{row}").unwrap();
                 }
                 tmp.flush().unwrap();
-                let emitted =
-                    emitter::emit_with_pins(&query, tmp.path().to_str().unwrap(), &field_types)
-                        .expect("emit succeeds");
+                let emitted = emitter::emit_with_pins(
+                    &query,
+                    tmp.path().to_str().unwrap(),
+                    &field_types,
+                    trawl_core::context::EvalContext::capture(),
+                )
+                .expect("emit succeeds");
                 let rows_sql = format!("SELECT to_json(_sub) FROM ({}) AS _sub", emitted.sql);
                 let params = bind_params(&emitted.params);
                 let param_refs: Vec<&dyn duckdb::ToSql> =
@@ -1278,8 +1310,13 @@ fn sev_subject_refuses_an_unknown_token_in_both_lanes() {
         r#"* | let hot = sev(level) == "spicy""#,
     ] {
         let query = parser::parse(dsl).expect("parses");
-        let emit_err = emitter::emit_with_pins(&query, "/data/*.parquet", &unpinned)
-            .expect_err("batch must refuse");
+        let emit_err = emitter::emit_with_pins(
+            &query,
+            "/data/*.parquet",
+            &unpinned,
+            trawl_core::context::EvalContext::capture(),
+        )
+        .expect_err("batch must refuse");
         let stream_err = compile_stream_plan(&query.pipeline, &PinScope::unpinned())
             .expect_err("live must refuse");
         assert!(

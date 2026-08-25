@@ -67,6 +67,16 @@ pub struct EmittedQuery {
     /// raw-free pass pushes the same parameters in the same order — so the
     /// executor can retry with this SQL against a source that has no `_raw`.
     pub raw_free_sql: Option<String>,
+    /// The instant this statement's `now()` reads (ADR-0017 §3).
+    ///
+    /// Captured ONCE per logical query by the caller and stamped here, so
+    /// every reader of this emission shares one clock: the SQL prefix
+    /// binds it as a TIMESTAMP parameter, and the `rust_stages` tail
+    /// behind `extract kv` evaluates under the SAME anchor
+    /// ([`crate::context::EvalContext`]). A re-emission of the same
+    /// logical query — the executor's hot-only fallback — INHERITS this
+    /// value rather than sampling a second one.
+    pub anchor: crate::context::EvalContext,
 }
 
 /// A parameter value for a SQL query placeholder.
@@ -76,6 +86,25 @@ pub enum SqlValue {
     Int(i64),
     Float(f64),
     Bool(bool),
+    /// A naive UTC instant bound as `DuckDB` TIMESTAMP — the statement's
+    /// `now()` anchor (ADR-0017 §3). Zoneless because `DuckDB`'s
+    /// TIMESTAMP is, and every conforming connection runs under
+    /// `TimeZone='UTC'` ([`crate::conform::SESSION_TIME_ZONE_SQL`]).
+    Timestamp(chrono::NaiveDateTime),
+}
+
+/// The TIMESTAMP literal text a bound [`SqlValue::Timestamp`] denotes —
+/// the ONE rendering, shared by [`fmt::Display`] and the PIVOT lane's
+/// parameter inlining, so the inlined form and the bound form can never
+/// name different instants.
+///
+/// Typed (`TIMESTAMP '…'`) so the literal has a type wherever it lands,
+/// and FIXED six-digit microseconds so no value renders with a precision
+/// `DuckDB`'s domain does not hold. Trailing zeros are kept: `DuckDB`
+/// parses `…:00.000000` and `…:00` to the same instant, and a fixed width
+/// is one rule instead of two.
+fn timestamp_literal(at: chrono::NaiveDateTime) -> String {
+    format!("TIMESTAMP '{}'", at.format("%Y-%m-%d %H:%M:%S%.6f"))
 }
 
 impl fmt::Display for SqlValue {
@@ -85,6 +114,7 @@ impl fmt::Display for SqlValue {
             Self::Int(n) => write!(f, "{n}"),
             Self::Float(n) => write!(f, "{n}"),
             Self::Bool(b) => write!(f, "{b}"),
+            Self::Timestamp(at) => write!(f, "{}", timestamp_literal(*at)),
         }
     }
 }
@@ -179,8 +209,16 @@ impl EmitError {
 /// `--data` queries, the fuzz target and the snapshot tests; every
 /// catalog-backed caller goes through [`emit_with_pins`] or
 /// [`emit_with_hot_source`].
-pub fn emit(query: &Query, source: &str) -> Result<EmittedQuery, EmitError> {
-    emit_with_raw_fallback(query, || EmitterState::new(source))
+///
+/// `anchor` is the statement's `now()` instant (ADR-0017 §3): capture it
+/// ONCE per logical query, at the head of the operation, and pass the
+/// same value to every emission that operation performs.
+pub fn emit(
+    query: &Query,
+    source: &str,
+    anchor: crate::context::EvalContext,
+) -> Result<EmittedQuery, EmitError> {
+    emit_with_raw_fallback(query, || EmitterState::new(source, anchor))
 }
 
 /// Emit SQL with the field catalog's pins typing the search-stage
@@ -201,9 +239,10 @@ pub fn emit_with_pins(
     query: &Query,
     source: &str,
     pins: &crate::schema::FieldTypes,
+    anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
     emit_with_raw_fallback(query, || {
-        Ok(EmitterState::new(source)?.with_compare_pins(pins))
+        Ok(EmitterState::new(source, anchor)?.with_compare_pins(pins))
     })
 }
 
@@ -235,9 +274,13 @@ pub fn emit_with_hot_source(
     hot_source: &str,
     hot_pins: &crate::schema::FieldTypes,
     pins: &crate::schema::FieldTypes,
+    anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
     emit_with_raw_fallback(query, || {
-        Ok(EmitterState::with_hot_source(source, hot_source, hot_pins)?.with_compare_pins(pins))
+        Ok(
+            EmitterState::with_hot_source(source, hot_source, hot_pins, anchor)?
+                .with_compare_pins(pins),
+        )
     })
 }
 
@@ -251,14 +294,23 @@ pub fn emit_with_hot_source(
 /// [`emit_with_pins`] instead would let `read_json`'s inference, not the
 /// catalog, decide a hot column's type, so a query's answer would change
 /// the moment the first parquet file landed.
+/// The `anchor` is the ORIGINAL emission's
+/// ([`EmittedQuery::anchor`]), never a fresh capture: this lane re-emits
+/// one logical query against a narrower source, so re-sampling the clock
+/// here would make the fallback answer a `now()` comparison differently
+/// from the union attempt it replaces.
 pub fn emit_hot_only(
     query: &Query,
     hot_source: &str,
     hot_pins: &crate::schema::FieldTypes,
     pins: &crate::schema::FieldTypes,
+    anchor: crate::context::EvalContext,
 ) -> Result<EmittedQuery, EmitError> {
     emit_with_raw_fallback(query, || {
-        Ok(EmitterState::with_hot_only_source(hot_source, hot_pins)?.with_compare_pins(pins))
+        Ok(
+            EmitterState::with_hot_only_source(hot_source, hot_pins, anchor)?
+                .with_compare_pins(pins),
+        )
     })
 }
 
@@ -336,6 +388,7 @@ fn emit_from_state(
 
     let needs_column_reorder = state.needs_column_reorder();
     let referenced_raw = state.bound_raw_column();
+    let anchor = state.anchor();
     let sql = state.finalize();
     let params = state.into_params();
 
@@ -347,6 +400,7 @@ fn emit_from_state(
             rust_stage_pins,
             needs_column_reorder,
             raw_free_sql: None,
+            anchor,
         },
         referenced_raw,
     ))
@@ -360,17 +414,30 @@ mod tests {
 
     const SRC: &str = "/data/**/*.parquet";
 
+    /// The instant emitter tests emit under.
+    ///
+    /// FIXED, not captured: `now()` binds the anchor as a parameter
+    /// (ADR-0017 §3), so a snapshot of a query carrying one would
+    /// otherwise change on every run.
+    fn anchor() -> crate::context::EvalContext {
+        crate::context::EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-02-03T04:05:06.789012Z")
+                .expect("a valid RFC 3339 instant")
+                .into(),
+        )
+    }
+
     /// Parse a DSL string and emit SQL; format both for snapshot comparison.
     fn emit_dsl(input: &str) -> String {
         let query = parser::parse(input).expect("parse should succeed");
-        let result = emit(&query, SRC).expect("emit should succeed");
+        let result = emit(&query, SRC, anchor()).expect("emit should succeed");
         format_result(&result)
     }
 
     /// Parse and emit, expecting an `EmitError`; return its Display string.
     fn emit_dsl_err(input: &str) -> String {
         let query = parser::parse(input).expect("parse should succeed");
-        let err = emit(&query, SRC).expect_err("emit should fail");
+        let err = emit(&query, SRC, anchor()).expect_err("emit should fail");
         err.to_string()
     }
 
@@ -539,7 +606,7 @@ mod tests {
             r#"* | where level in ("error")"#,
         ] {
             let query = parser::parse(dsl).expect("parse should succeed");
-            emit(&query, SRC).unwrap_or_else(|e| panic!("{dsl} must emit, got {e}"));
+            emit(&query, SRC, anchor()).unwrap_or_else(|e| panic!("{dsl} must emit, got {e}"));
         }
     }
 
@@ -620,7 +687,7 @@ mod tests {
             r#"NOT "boom error""#,
         ] {
             let query = parser::parse(dsl).expect("parse should succeed");
-            let emitted = emit(&query, SRC).expect("emit should succeed");
+            let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
             let raw_free = emitted
                 .raw_free_sql
                 .as_ref()
@@ -652,7 +719,7 @@ mod tests {
     fn queries_without_text_search_have_no_raw_free_variant() {
         for dsl in ["service=nginx", "* | stats count() by host", "last=1h"] {
             let query = parser::parse(dsl).expect("parse should succeed");
-            let emitted = emit(&query, SRC).expect("emit should succeed");
+            let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
             assert!(
                 emitted.raw_free_sql.is_none(),
                 "{dsl} must not carry a raw-free variant"
@@ -861,7 +928,7 @@ mod tests {
     #[test]
     fn rejects_source_with_single_quote() {
         let query = parser::parse("*").unwrap();
-        let err = emit(&query, "/data/foo';DROP TABLE x;--/*.parquet")
+        let err = emit(&query, "/data/foo';DROP TABLE x;--/*.parquet", anchor())
             .expect_err("should reject single quote in source path");
         assert!(err.to_string().contains("invalid characters"));
     }
@@ -869,7 +936,7 @@ mod tests {
     #[test]
     fn rejects_source_with_semicolon() {
         let query = parser::parse("*").unwrap();
-        let err = emit(&query, "/data/foo;bar.parquet")
+        let err = emit(&query, "/data/foo;bar.parquet", anchor())
             .expect_err("should reject semicolon in source path");
         assert!(err.to_string().contains("invalid characters"));
     }
@@ -877,21 +944,21 @@ mod tests {
     #[test]
     fn accepts_valid_glob_source() {
         let query = parser::parse("*").unwrap();
-        let result = emit(&query, "/data/**/*.parquet");
+        let result = emit(&query, "/data/**/*.parquet", anchor());
         assert!(result.is_ok());
     }
 
     #[test]
     fn rejects_tilde_source() {
         let query = parser::parse("*").unwrap();
-        let result = emit(&query, "~/.trawl/data/*.parquet");
+        let result = emit(&query, "~/.trawl/data/*.parquet", anchor());
         assert!(result.is_err());
     }
 
     #[test]
     fn rejects_dotdot_source() {
         let query = parser::parse("*").unwrap();
-        let result = emit(&query, "/data/../etc/passwd/*.parquet");
+        let result = emit(&query, "/data/../etc/passwd/*.parquet", anchor());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("path traversal"));
@@ -1139,7 +1206,7 @@ mod tests {
     fn pivot_inlining_never_splices_into_a_quoted_region() {
         let query = parser::parse(r#"* | let `a?b` = "v" | pivot count() on status"#)
             .expect("parse should succeed");
-        let emitted = emit(&query, SRC).expect("emit should succeed");
+        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
         assert!(
             emitted.sql.contains(r"NOT IN ('a?b')"),
             "lambda name corrupted: {}",
@@ -1153,7 +1220,7 @@ mod tests {
         assert!(emitted.params.is_empty(), "pivot inlines every param");
 
         let query = parser::parse("`a?b`=v | pivot count() on status").expect("parse");
-        let emitted = emit(&query, SRC).expect("emit should succeed");
+        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
         assert!(
             emitted.sql.contains(r#""a?b" = 'v'"#),
             "filter corrupted: {}",
@@ -1163,7 +1230,8 @@ mod tests {
         // Not a backtick story: a `?` glob in the source path sits in a
         // string literal too.
         let query = parser::parse("service=nginx | pivot count() on status").expect("parse");
-        let globbed = emit(&query, "/data/2026-01-0?/*.parquet").expect("emit should succeed");
+        let globbed =
+            emit(&query, "/data/2026-01-0?/*.parquet", anchor()).expect("emit should succeed");
         assert!(
             globbed.sql.contains("'/data/2026-01-0?/*.parquet'"),
             "source glob corrupted: {}",
@@ -1183,7 +1251,7 @@ mod tests {
     fn cte_finalization_preserves_a_multiline_parameter() {
         let query = parser::parse("message=\"a\nb\" | stats count()")
             .expect("multiline string should parse");
-        let emitted = emit(&query, SRC).expect("emit should succeed");
+        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
         assert_eq!(emitted.params, [SqlValue::String("a\nb".to_owned())]);
         assert!(
             emitted.sql.contains(r#""message" = ?"#),
@@ -1198,7 +1266,7 @@ mod tests {
     fn pivot_cte_finalization_preserves_a_multiline_literal() {
         let query = parser::parse("message=\"a\nb\" | pivot count() on status | sort `200`")
             .expect("multiline string should parse");
-        let emitted = emit(&query, SRC).expect("emit should succeed");
+        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
         assert!(emitted.params.is_empty(), "PIVOT inlines every parameter");
         assert!(
             emitted.sql.contains("\"message\" = 'a\nb'"),
@@ -1491,6 +1559,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &crate::schema::FieldTypes::new(),
             &crate::schema::FieldTypes::new(),
+            anchor(),
         )
         .unwrap();
         assert_snapshot!(format_result(&result));
@@ -1505,6 +1574,7 @@ mod tests {
             "/tmp/bad;path.ndjson",
             &crate::schema::FieldTypes::new(),
             &crate::schema::FieldTypes::new(),
+            anchor(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
@@ -1522,6 +1592,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &pins,
             &crate::schema::FieldTypes::new(),
+            anchor(),
         )
         .unwrap()
         .sql;
@@ -1572,6 +1643,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &pins,
             &crate::schema::FieldTypes::new(),
+            anchor(),
         )
         .unwrap()
         .sql;
@@ -1594,6 +1666,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &pins,
             &crate::schema::FieldTypes::new(),
+            anchor(),
         )
         .unwrap()
         .sql;
@@ -1625,6 +1698,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &crate::schema::FieldTypes::new(),
             &crate::schema::FieldTypes::new(),
+            anchor(),
         )
         .unwrap()
         .sql;
@@ -1661,7 +1735,8 @@ mod tests {
     /// Parse a DSL string and emit pin-aware SQL; format for snapshots.
     fn emit_dsl_with_pins(input: &str, entries: &[(&str, crate::schema::CanonicalType)]) -> String {
         let query = parser::parse(input).expect("parse should succeed");
-        let result = emit_with_pins(&query, SRC, &pins(entries)).expect("emit should succeed");
+        let result =
+            emit_with_pins(&query, SRC, &pins(entries), anchor()).expect("emit should succeed");
         format_result(&result)
     }
 
@@ -1671,7 +1746,7 @@ mod tests {
         entries: &[(&str, crate::schema::CanonicalType)],
     ) -> String {
         let query = parser::parse(input).expect("parse should succeed");
-        emit_with_pins(&query, SRC, &pins(entries))
+        emit_with_pins(&query, SRC, &pins(entries), anchor())
             .expect_err("emit should fail")
             .to_string()
     }
@@ -1865,7 +1940,7 @@ mod tests {
         let ft = pins(&[("status", CT::Varchar)]);
         for dsl in ["status=200", "Status=200"] {
             let query = parser::parse(dsl).expect("parse should succeed");
-            let emitted = emit_with_pins(&query, SRC, &ft).expect("emit should succeed");
+            let emitted = emit_with_pins(&query, SRC, &ft, anchor()).expect("emit should succeed");
             assert_eq!(
                 emitted.params,
                 vec![
@@ -1892,6 +1967,7 @@ mod tests {
             "/tmp/hot_abc123.ndjson",
             &hot_pins,
             &comparison,
+            anchor(),
         )
         .unwrap();
         assert_snapshot!(format_result(&result));
@@ -2010,9 +2086,10 @@ mod tests {
         let quoted = parser::parse("`Status`=200").expect("parse should succeed");
         let bare = parser::parse("status=200").expect("parse should succeed");
 
-        let quoted_sql = emit_with_pins(&quoted, SRC, &pins(entries)).expect("pinned emit");
-        let bare_sql = emit_with_pins(&bare, SRC, &pins(entries)).expect("pinned emit");
-        let unpinned = emit(&quoted, SRC).expect("unpinned emit");
+        let quoted_sql =
+            emit_with_pins(&quoted, SRC, &pins(entries), anchor()).expect("pinned emit");
+        let bare_sql = emit_with_pins(&bare, SRC, &pins(entries), anchor()).expect("pinned emit");
+        let unpinned = emit(&quoted, SRC, anchor()).expect("unpinned emit");
 
         assert!(
             quoted_sql.sql.contains(r#""Status""#),
@@ -2036,9 +2113,9 @@ mod tests {
     fn pinned_where_after_computed_let_is_literal_driven() {
         let query = parser::parse("* | let status = length(status) | where status > 400")
             .expect("parse should succeed");
-        let pinned =
-            emit_with_pins(&query, SRC, &pins(&[("status", CT::Varchar)])).expect("pinned emit");
-        let unpinned = emit(&query, SRC).expect("unpinned emit");
+        let pinned = emit_with_pins(&query, SRC, &pins(&[("status", CT::Varchar)]), anchor())
+            .expect("pinned emit");
+        let unpinned = emit(&query, SRC, anchor()).expect("unpinned emit");
         assert_eq!(pinned.sql, unpinned.sql);
         assert_eq!(pinned.params, unpinned.params);
     }
@@ -2069,9 +2146,10 @@ mod tests {
                 &query,
                 SRC,
                 &pins(&[("status", CT::Varchar), ("other", CT::Varchar)]),
+                anchor(),
             )
             .expect("pinned emit");
-            let unpinned = emit(&query, SRC).expect("unpinned emit");
+            let unpinned = emit(&query, SRC, anchor()).expect("unpinned emit");
             assert_eq!(pinned.sql, unpinned.sql, "{dsl}");
             assert_eq!(pinned.params, unpinned.params, "{dsl}");
         }
@@ -2084,9 +2162,9 @@ mod tests {
     fn pinned_where_typed_pin_comparison_is_byte_identical() {
         for dsl in ["* | where dur > 400", "* | where dur == 400"] {
             let query = parser::parse(dsl).expect("parse should succeed");
-            let pinned =
-                emit_with_pins(&query, SRC, &pins(&[("dur", CT::BigInt)])).expect("pinned emit");
-            let unpinned = emit(&query, SRC).expect("unpinned emit");
+            let pinned = emit_with_pins(&query, SRC, &pins(&[("dur", CT::BigInt)]), anchor())
+                .expect("pinned emit");
+            let unpinned = emit(&query, SRC, anchor()).expect("unpinned emit");
             assert_eq!(pinned.sql, unpinned.sql, "{dsl}");
             assert_eq!(pinned.params, unpinned.params, "{dsl}");
         }
@@ -2099,7 +2177,7 @@ mod tests {
     fn kv_split_stamps_rust_stage_pins_at_the_boundary() {
         let query = parser::parse("* | rename status as st | extract kv | where st > 400").unwrap();
         let ft = pins(&[("status", CT::Varchar)]);
-        let emitted = emit_with_pins(&query, SRC, &ft).unwrap();
+        let emitted = emit_with_pins(&query, SRC, &ft, anchor()).unwrap();
         assert_eq!(emitted.rust_stages.len(), 2);
         assert_eq!(
             emitted.rust_stage_pins.pin_for("st"),
@@ -2109,7 +2187,7 @@ mod tests {
         assert_eq!(emitted.rust_stage_pins.pin_for("status"), None);
 
         // The pin-blind door stamps an empty scope.
-        let blind = emit(&query, SRC).unwrap();
+        let blind = emit(&query, SRC, anchor()).unwrap();
         assert!(blind.rust_stage_pins.is_empty());
     }
 
@@ -2154,9 +2232,10 @@ mod tests {
                     let Ok(query) = parser::parse(&dsl) else {
                         continue;
                     };
-                    let unpinned = emit(&query, SRC).expect("unpinned emit");
+                    let unpinned = emit(&query, SRC, anchor()).expect("unpinned emit");
                     let entries: Vec<(&str, CT)> = pin.map(|t| ("f", t)).into_iter().collect();
-                    let pinned = emit_with_pins(&query, SRC, &pins(&entries)).expect("pinned emit");
+                    let pinned = emit_with_pins(&query, SRC, &pins(&entries), anchor())
+                        .expect("pinned emit");
 
                     let is_pattern = matches!(op, FilterOp::Glob | FilterOp::Regex);
                     let changed = match pin {
@@ -2221,9 +2300,10 @@ mod tests {
                     let Ok(query) = parser::parse(&dsl) else {
                         continue;
                     };
-                    let unpinned = emit(&query, SRC).expect("unpinned emit");
+                    let unpinned = emit(&query, SRC, anchor()).expect("unpinned emit");
                     let entries: Vec<(&str, CT)> = pin.map(|t| ("f", t)).into_iter().collect();
-                    let pinned = emit_with_pins(&query, SRC, &pins(&entries)).expect("pinned emit");
+                    let pinned = emit_with_pins(&query, SRC, &pins(&entries), anchor())
+                        .expect("pinned emit");
 
                     let changed = match pin {
                         Some(CT::Varchar) => !is_pattern && numeric,
@@ -2253,6 +2333,7 @@ mod tests {
         let result = emit(
             &query,
             "['/data/2026-02-12/14/*.parquet', '/data/2026-02-12/15/*.parquet']",
+            anchor(),
         )
         .unwrap();
         assert_snapshot!(format_result(&result));
@@ -2261,14 +2342,19 @@ mod tests {
     #[test]
     fn list_source_rejects_invalid_path() {
         let query = parser::parse("*").unwrap();
-        let err = emit(&query, "['/data/ok/*.parquet', '/data/bad;drop/*.parquet']").unwrap_err();
+        let err = emit(
+            &query,
+            "['/data/ok/*.parquet', '/data/bad;drop/*.parquet']",
+            anchor(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("invalid characters"));
     }
 
     #[test]
     fn list_source_rejects_malformed_list() {
         let query = parser::parse("*").unwrap();
-        let err = emit(&query, "[not-quoted]").unwrap_err();
+        let err = emit(&query, "[not-quoted]", anchor()).unwrap_err();
         assert!(err.to_string().contains("invalid source list element"));
     }
 
@@ -2479,7 +2565,7 @@ mod tests {
     /// does not hold.
     #[test]
     fn a_severity_set_pushes_no_parameters_and_preserves_positions() {
-        let mut state = EmitterState::new("/data/**/*.parquet").expect("source");
+        let mut state = EmitterState::new("/data/**/*.parquet", anchor()).expect("source");
         let before = state.push_param(SqlValue::String("before".to_owned()));
         let subject = format!("upper({before})");
         let clause = compare::in_list_sql(
@@ -2574,7 +2660,7 @@ mod tests {
                          parse ({e:?}). Give the guard a shape that fits {func}'s arguments."
                     )
                 });
-                let emitted = emit(&query, SRC).unwrap_or_else(|e| {
+                let emitted = emit(&query, SRC, anchor()).unwrap_or_else(|e| {
                     panic!(
                         "{func} declares a SEVERITY result but the probe DSL {dsl:?} does not \
                          emit ({e}). Give the guard a shape that fits {func}'s arguments."
@@ -2645,5 +2731,88 @@ mod tests {
         let sql = emit_dsl("* | stats sev(level)");
         assert!(sql.contains("AS \"sev_level\""), "{sql}");
         assert!(!sql.contains("GROUP BY"), "{sql}");
+    }
+
+    // ── the now() anchor (ADR-0017 §3) ──────────────────────────────────
+
+    /// One instant per STATEMENT: `now()` in two positions binds the same
+    /// value twice, so a `let` and a `where` in one query cannot see
+    /// different clocks.
+    #[test]
+    fn two_now_calls_bind_one_instant() {
+        let query = parser::parse(
+            "* | let age = date_diff(\"second\", _time, now()) | where _time < now()",
+        )
+        .expect("parse");
+        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
+        let bound: Vec<&SqlValue> = emitted
+            .params
+            .iter()
+            .filter(|p| matches!(p, SqlValue::Timestamp(_)))
+            .collect();
+        assert_eq!(
+            bound.len(),
+            2,
+            "one parameter per call site: {:?}",
+            emitted.params
+        );
+        assert_eq!(bound[0], bound[1], "both name the statement's anchor");
+        assert_eq!(
+            *bound[0],
+            SqlValue::Timestamp(anchor().now_timestamp()),
+            "and the anchor is the caller's, not a fresh clock read"
+        );
+        assert_eq!(emitted.anchor, anchor(), "stamped onto the emission");
+        assert_eq!(
+            emitted.sql.matches("CAST(? AS TIMESTAMP)").count(),
+            2,
+            "{}",
+            emitted.sql
+        );
+    }
+
+    /// PIVOT cannot take parameters, so its lane INLINES them — the
+    /// anchor lands as the typed literal that denotes the very instant
+    /// the bound form does.
+    #[test]
+    fn a_pivot_inlines_the_anchor_as_a_typed_literal() {
+        let query = parser::parse("* | pivot max(now()) on status").expect("parse");
+        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
+        assert!(
+            emitted
+                .sql
+                .contains("TIMESTAMP '2026-02-03 04:05:06.789012'"),
+            "{}",
+            emitted.sql
+        );
+        assert!(
+            !emitted.sql.contains('?'),
+            "a pivot leaves no placeholder behind: {}",
+            emitted.sql
+        );
+    }
+
+    /// The `Display` rendering and the PIVOT inlining are the SAME text —
+    /// they have to be, or the two lanes would name different instants.
+    #[test]
+    fn the_inlined_and_displayed_anchor_agree() {
+        let value = SqlValue::Timestamp(anchor().now_timestamp());
+        assert_eq!(value.to_string(), "TIMESTAMP '2026-02-03 04:05:06.789012'");
+    }
+
+    /// A whole-second anchor still renders six fractional digits — one
+    /// width, so no value can render at a precision `DuckDB` does not
+    /// hold.
+    #[test]
+    fn a_whole_second_anchor_renders_six_digits() {
+        let at = crate::context::EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-02-03T04:05:06Z")
+                .expect("a valid RFC 3339 instant")
+                .into(),
+        );
+        assert_eq!(
+            SqlValue::Timestamp(at.now_timestamp()).to_string(),
+            "TIMESTAMP '2026-02-03 04:05:06.000000'"
+        );
     }
 }

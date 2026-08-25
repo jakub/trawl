@@ -42,7 +42,7 @@ pub(crate) fn emit_expr(
         }
         Expr::FunctionCall { name, args } => {
             let translated_args = emit_call_args(name, args, state)?;
-            translate_function(name, &translated_args)
+            translate_function(name, &translated_args, state)
         }
         Expr::InList { expr: target, list } => {
             // A pinned bare-field target with an all-literal list routes

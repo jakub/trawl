@@ -469,7 +469,7 @@ mod tests {
         ] {
             let query = parser::parse(dsl).expect("dsl parses");
 
-            let sql = crate::emitter::emit(&query, "src")
+            let sql = crate::emitter::emit(&query, "src", crate::context::EvalContext::capture())
                 .expect("emit succeeds")
                 .sql;
             assert!(

@@ -101,7 +101,7 @@ fn process_stats(
         // literal rules (`sev()`'s dialect) apply there too.
         let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
 
-        let sql_func = translate_function(&agg.function, &arg_strings)?;
+        let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
 
         // determine alias
         let alias = match &agg.alias {
@@ -385,7 +385,7 @@ fn process_timechart(
         // literal rules (`sev()`'s dialect) apply there too.
         let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
 
-        let sql_func = translate_function(&agg.function, &arg_strings)?;
+        let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
 
         let alias = match &agg.alias {
             Some(a) => quote_field(a),
@@ -477,7 +477,7 @@ fn process_pivot(pivot: &crate::ast::PivotStage, ctx: &mut EmitterState) -> Resu
 
     let arg_strings = emit_call_args(&pivot.aggregation.function, &pivot.aggregation.args, ctx)?;
 
-    let agg_sql = translate_function(&pivot.aggregation.function, &arg_strings)?;
+    let agg_sql = translate_function(&pivot.aggregation.function, &arg_strings, ctx)?;
 
     ctx.set_pivot(agg_sql, pivot.on_field.clone(), pivot.by.clone());
     ctx.had_explicit_columns = true;
@@ -524,7 +524,7 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
         // aggregation position is still a call, and its per-position
         // literal rules (`sev()`'s dialect) apply there too.
         let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
-        let sql_func = translate_function(&agg.function, &arg_strings)?;
+        let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
         // `eventstats` demands an explicit `as` (ADR-0013 ruling 8,
         // checked in `projection::check_projection`); the alias-less
         // name is defensive for a hand-built AST that skipped validation.

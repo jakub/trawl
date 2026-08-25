@@ -1299,7 +1299,12 @@ mod tests {
             "level=/err.*/",
         ] {
             let query = parser::parse(dsl).expect("parse should succeed");
-            crate::emitter::emit(&query, "/data/**/*.parquet").expect("emits");
+            crate::emitter::emit(
+                &query,
+                "/data/**/*.parquet",
+                crate::context::EvalContext::capture(),
+            )
+            .expect("emits");
             CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
                 .expect("compiles");
         }
@@ -1327,9 +1332,14 @@ mod tests {
 
         // An unknown value refuses in BOTH lanes, with one sentence.
         let query = parser::parse("_severity=spicy").expect("parse should succeed");
-        let emit_error = crate::emitter::emit_with_pins(&query, "/data/**/*.parquet", &ft)
-            .expect_err("emit refuses")
-            .to_string();
+        let emit_error = crate::emitter::emit_with_pins(
+            &query,
+            "/data/**/*.parquet",
+            &ft,
+            crate::context::EvalContext::capture(),
+        )
+        .expect_err("emit refuses")
+        .to_string();
         let compile_error = CompiledFilter::compile(&query.search, &ft)
             .expect_err("filter refuses")
             .to_string();

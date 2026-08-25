@@ -84,8 +84,13 @@ fn varchar_negated_list_executes_as_pin_aware_not_in_with_null_widening() {
     let query = trawl_core::parser::parse("status!=200,301").unwrap();
     let mut pins = trawl_core::schema::FieldTypes::new();
     pins.insert("status", CanonicalType::Varchar);
-    let emitted =
-        trawl_core::emitter::emit_with_pins(&query, &file.display().to_string(), &pins).unwrap();
+    let emitted = trawl_core::emitter::emit_with_pins(
+        &query,
+        &file.display().to_string(),
+        &pins,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .unwrap();
     let params: Vec<Box<dyn duckdb::ToSql>> = emitted
         .params
         .iter()
@@ -95,6 +100,12 @@ fn varchar_negated_list_executes_as_pin_aware_not_in_with_null_widening() {
                 trawl_core::emitter::SqlValue::Int(value) => Box::new(*value),
                 trawl_core::emitter::SqlValue::Float(value) => Box::new(*value),
                 trawl_core::emitter::SqlValue::Bool(value) => Box::new(*value),
+                trawl_core::emitter::SqlValue::Timestamp(value) => {
+                    Box::new(duckdb::types::Value::Timestamp(
+                        duckdb::types::TimeUnit::Microsecond,
+                        value.and_utc().timestamp_micros(),
+                    ))
+                }
             }
         })
         .collect();
@@ -3719,7 +3730,9 @@ fn backticked_names_describe_as_the_names_the_dsl_spells() {
         ),
     ] {
         let query = trawl_core::parser::parse(dsl).unwrap();
-        let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+        let emitted =
+            trawl_core::emitter::emit(&query, &source, trawl_core::context::EvalContext::capture())
+                .unwrap();
         assert!(emitted.params.is_empty(), "{dsl} binds no parameters");
         assert_eq!(describe(&emitted.sql), expected, "{dsl}: {}", emitted.sql);
     }
@@ -3748,7 +3761,12 @@ fn pivot_cte_finalization_preserves_multiline_literal_matching() {
 
     let dsl = "message=\"a\nb\" | pivot count() on status | sort `200`";
     let query = trawl_core::parser::parse(dsl).unwrap();
-    let emitted = trawl_core::emitter::emit(&query, &file.display().to_string()).unwrap();
+    let emitted = trawl_core::emitter::emit(
+        &query,
+        &file.display().to_string(),
+        trawl_core::context::EvalContext::capture(),
+    )
+    .unwrap();
     assert!(emitted.params.is_empty(), "PIVOT inlines every parameter");
 
     let matched: i64 = conn
@@ -3777,7 +3795,9 @@ fn eventstats_alias_overwrites_the_incoming_column() {
     let source = file.display().to_string();
 
     let query = trawl_core::parser::parse("* | eventstats count() as status by service").unwrap();
-    let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+    let emitted =
+        trawl_core::emitter::emit(&query, &source, trawl_core::context::EvalContext::capture())
+            .unwrap();
 
     let columns: Vec<String> = {
         let mut stmt = conn.prepare(&format!("DESCRIBE {}", emitted.sql)).unwrap();
@@ -3821,7 +3841,9 @@ fn eventstats_case_variant_alias_overwrites_the_incoming_column() {
     let source = file.display().to_string();
 
     let query = trawl_core::parser::parse("* | eventstats count() as `Status` by service").unwrap();
-    let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+    let emitted =
+        trawl_core::emitter::emit(&query, &source, trawl_core::context::EvalContext::capture())
+            .unwrap();
 
     let columns: Vec<String> = {
         let mut stmt = conn.prepare(&format!("DESCRIBE {}", emitted.sql)).unwrap();

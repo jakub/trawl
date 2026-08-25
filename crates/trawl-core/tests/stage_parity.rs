@@ -60,6 +60,10 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
                 SqlValue::Int(i) => Box::new(*i),
                 SqlValue::Float(f) => Box::new(*f),
                 SqlValue::Bool(b) => Box::new(*b),
+                SqlValue::Timestamp(at) => Box::new(duckdb::types::Value::Timestamp(
+                    duckdb::types::TimeUnit::Microsecond,
+                    at.and_utc().timestamp_micros(),
+                )),
             }
         })
         .collect()
@@ -87,8 +91,13 @@ fn batch_outcome(conn: &Connection, dsl: &str, events: &[Value]) -> Result<TextR
     }
     tmp.flush().unwrap();
     let source = tmp.path().to_str().unwrap().to_owned();
-    let emitted =
-        emitter::emit_with_pins(&query, &source, &FieldTypes::new()).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        &FieldTypes::new(),
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let params = bind_params(&emitted.params);
     let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
 

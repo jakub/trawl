@@ -264,6 +264,10 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
                 SqlValue::Int(i) => Box::new(*i),
                 SqlValue::Float(f) => Box::new(*f),
                 SqlValue::Bool(b) => Box::new(*b),
+                SqlValue::Timestamp(at) => Box::new(duckdb::types::Value::Timestamp(
+                    duckdb::types::TimeUnit::Microsecond,
+                    at.and_utc().timestamp_micros(),
+                )),
             }
         })
         .collect()
@@ -367,7 +371,11 @@ fn filter_matches_sql_parity() {
         let tmp_path = tmp.path().to_str().expect("temp path is valid UTF-8");
 
         // Emit SQL.
-        let Ok(emitted) = emitter::emit(&query, tmp_path) else {
+        let Ok(emitted) = emitter::emit(
+            &query,
+            tmp_path,
+            trawl_core::context::EvalContext::capture(),
+        ) else {
             skipped += 1;
             continue;
         };
@@ -412,7 +420,12 @@ fn assert_parity(conn: &Connection, dsl: &str, event: &Map<String, Value>) {
         .unwrap();
     writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
     tmp.flush().unwrap();
-    let emitted = emitter::emit(&query, tmp.path().to_str().unwrap()).expect("emit succeeds");
+    let emitted = emitter::emit(
+        &query,
+        tmp.path().to_str().unwrap(),
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let sql_result = sql_matches(conn, &emitted);
 
     assert_eq!(
@@ -452,7 +465,12 @@ fn assert_sparse_text_parity(
     writeln!(tmp, "{}", Value::Object(non_text_schema_witness_event())).unwrap();
     tmp.flush().unwrap();
 
-    let emitted = emitter::emit(&query, tmp.path().to_str().unwrap()).expect("emit succeeds");
+    let emitted = emitter::emit(
+        &query,
+        tmp.path().to_str().unwrap(),
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let sql_result = sql_matches_where(conn, &emitted, r#""_parity_target" = TRUE"#);
     assert_eq!(
         filter_result, sql_result,
@@ -512,7 +530,13 @@ fn assert_severity_parity(conn: &Connection, dsl: &str, stored: Option<i64>) -> 
     ))
     .expect("write typed parquet");
 
-    let emitted = emitter::emit_with_pins(&query, &source, &ft).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        &ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let sql_result = sql_matches_strict(conn, &emitted);
     assert_eq!(
         filter_result, sql_result,
@@ -769,7 +793,13 @@ fn assert_where_parity_over_severity(
     ))
     .expect("write typed parquet");
 
-    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let sql_result = sql_matches_strict(conn, &emitted);
     assert_eq!(
         eval_result == Some(true),
@@ -893,7 +923,13 @@ fn assert_pinned_parity(
         _guard = Box::new(tmp);
         path
     };
-    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let sql_result = sql_matches_strict(conn, &emitted);
 
     assert_eq!(
@@ -938,7 +974,13 @@ fn assert_pinned_parity_over_column(
     ))
     .expect("write typed parquet");
 
-    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let sql_result = sql_matches_strict(conn, &emitted);
 
     assert_eq!(
@@ -1044,7 +1086,13 @@ fn pinned_severity_matrix_parity() {
     // An unknown token is an ERROR in BOTH lanes, with the same sentence.
     let query = parser::parse("status=spicy").expect("dsl parses");
     let filter_err = CompiledFilter::compile(&query.search, &ft).expect_err("filter refuses");
-    let emit_err = emitter::emit_with_pins(&query, "/x/*.parquet", &ft).expect_err("emit refuses");
+    let emit_err = emitter::emit_with_pins(
+        &query,
+        "/x/*.parquet",
+        &ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect_err("emit refuses");
     assert_eq!(filter_err.to_string(), emit_err.to_string());
     assert!(
         filter_err.to_string().contains("unknown severity value"),
@@ -1482,7 +1530,13 @@ fn pinned_timestamp_pattern_parity() {
             let query = parser::parse(dsl).expect("dsl parses");
             let filter = CompiledFilter::compile(&query.search, &ft).expect("filter compiles");
             let filter_result = filter.matches(&event);
-            let emitted = emitter::emit_with_pins(&query, &path, &ft).expect("emit succeeds");
+            let emitted = emitter::emit_with_pins(
+                &query,
+                &path,
+                &ft,
+                trawl_core::context::EvalContext::capture(),
+            )
+            .expect("emit succeeds");
             let sql_result = sql_matches_strict(&conn, &emitted);
             assert_eq!(
                 filter_result, sql_result,
@@ -1549,6 +1603,7 @@ fn pinned_hot_cold_union_parity() {
             hot_tmp.path().to_str().unwrap(),
             &ft,
             &ft,
+            trawl_core::context::EvalContext::capture(),
         )
         .expect("emit succeeds");
         let sql_result = sql_matches_strict(&conn, &emitted);
@@ -1597,8 +1652,14 @@ fn emit_hot_only_over(
             hot_pins.insert(field, ty);
         }
     }
-    let emitted = emitter::emit_hot_only(query, tmp.path().to_str().unwrap(), &hot_pins, ft)
-        .expect("emit succeeds");
+    let emitted = emitter::emit_hot_only(
+        query,
+        tmp.path().to_str().unwrap(),
+        &hot_pins,
+        ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     (tmp, emitted)
 }
 
@@ -2116,7 +2177,13 @@ fn assert_where_parity(
         _guard = Box::new(tmp);
         path
     };
-    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let sql_result = sql_matches_strict(conn, &emitted);
 
     assert_eq!(
@@ -2158,7 +2225,13 @@ fn assert_where_parity_over_column(
     ))
     .expect("write typed parquet");
 
-    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let sql_result = sql_matches_strict(conn, &emitted);
 
     assert_eq!(
@@ -2209,7 +2282,13 @@ fn assert_pinned_let_parity(
     writeln!(tmp, "{}", Value::Object(event.clone())).unwrap();
     tmp.flush().unwrap();
     let source = tmp.path().to_str().unwrap().to_owned();
-    let emitted = emitter::emit_with_pins(&query, &source, ft).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        ft,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
 
     let sql_result = let_value(conn, &emitted, "TRUE");
     assert_eq!(

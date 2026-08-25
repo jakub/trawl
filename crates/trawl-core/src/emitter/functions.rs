@@ -219,8 +219,16 @@ pub(crate) fn validate_format_literal(func_name: &str, fmt: &str) -> Result<(), 
 }
 
 /// Translate a DSL function call to `DuckDB` SQL.
+///
+/// `state` is here for ONE arm: `now()` binds the statement's anchor as a
+/// parameter (ADR-0017 §3). Nothing else in this function may push a
+/// parameter — see the arm's own note.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, EmitError> {
+pub(crate) fn translate_function(
+    name: &str,
+    args: &[String],
+    state: &mut super::state::EmitterState,
+) -> Result<String, EmitError> {
     match name {
         "count" => {
             if args.is_empty() {
@@ -278,7 +286,32 @@ pub(crate) fn translate_function(name: &str, args: &[String]) -> Result<String, 
                 format!("ROUND({}, {})", a[0], a[1])
             }
         }),
-        "now" => require_n_args(name, args, 0, |_| "now()".to_string()),
+        // ADR-0017 §3: `now()` is ONE instant per unit of output. The
+        // instant is captured in Rust at the head of the query and bound
+        // here as a TIMESTAMP parameter, so the SQL prefix and the
+        // `rust_stages` tail behind `extract kv` read the same value by
+        // construction — and so the result has a settled TYPE, instead of
+        // the naive-vs-TIMESTAMPTZ split a bare `now()` produced.
+        //
+        // The explicit `CAST(? AS TIMESTAMP)` is not decoration: an
+        // unadorned placeholder leaves the result type to the driver's
+        // parameter inference, so `typeof(now())` would depend on it.
+        //
+        // ONLY the zero-arg `now` may push a parameter in this function.
+        // A pushing arm WITH arguments would push after its arguments'
+        // own placeholders were rendered by `emit_call_args`, putting the
+        // parameter list out of order with the `?`s in the SQL.
+        //
+        // The search stage's `last=` window deliberately keeps `DuckDB`'s
+        // own clock (`emitter::search`) and does not come through here.
+        "now" => {
+            let anchor = state.anchor();
+            require_n_args(name, args, 0, |_| {
+                let placeholder =
+                    state.push_param(super::SqlValue::Timestamp(anchor.now_timestamp()));
+                format!("CAST({placeholder} AS TIMESTAMP)")
+            })
+        }
         "typeof" => require_one_arg(name, args, |a| format!("TYPEOF({a})")),
         "tonumber" => require_one_arg(name, args, |a| format!("TRY_CAST({a} AS DOUBLE)")),
         // The ladder function (ADR-0013 slice 2, ruling 9): the ONE
@@ -529,17 +562,28 @@ mod tests {
         strs.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// A throwaway emitter state for translation tests. Only the `now`
+    /// arm reads it — every other arm is a pure string rewrite — and the
+    /// anchor it carries is asserted against explicitly where it matters.
+    fn state() -> super::super::state::EmitterState {
+        super::super::state::EmitterState::new("t.parquet", crate::context::EvalContext::capture())
+            .expect("a valid source")
+    }
+
     // ── translate_function: aggregates ──────────────────────────────────
 
     #[test]
     fn translate_count_no_args() {
-        assert_eq!(translate_function("count", &[]).unwrap(), "COUNT(*)");
+        assert_eq!(
+            translate_function("count", &[], &mut state()).unwrap(),
+            "COUNT(*)"
+        );
     }
 
     #[test]
     fn translate_count_with_field() {
         assert_eq!(
-            translate_function("count", &args(&["host"])).unwrap(),
+            translate_function("count", &args(&["host"]), &mut state()).unwrap(),
             "COUNT(host)"
         );
     }
@@ -547,7 +591,7 @@ mod tests {
     #[test]
     fn translate_avg() {
         assert_eq!(
-            translate_function("avg", &args(&["duration"])).unwrap(),
+            translate_function("avg", &args(&["duration"]), &mut state()).unwrap(),
             "AVG(duration)"
         );
     }
@@ -555,7 +599,7 @@ mod tests {
     #[test]
     fn translate_sum() {
         assert_eq!(
-            translate_function("sum", &args(&["bytes"])).unwrap(),
+            translate_function("sum", &args(&["bytes"]), &mut state()).unwrap(),
             "SUM(bytes)"
         );
     }
@@ -563,7 +607,7 @@ mod tests {
     #[test]
     fn translate_min() {
         assert_eq!(
-            translate_function("min", &args(&["latency"])).unwrap(),
+            translate_function("min", &args(&["latency"]), &mut state()).unwrap(),
             "MIN(latency)"
         );
     }
@@ -571,7 +615,7 @@ mod tests {
     #[test]
     fn translate_max() {
         assert_eq!(
-            translate_function("max", &args(&["latency"])).unwrap(),
+            translate_function("max", &args(&["latency"]), &mut state()).unwrap(),
             "MAX(latency)"
         );
     }
@@ -579,7 +623,7 @@ mod tests {
     #[test]
     fn translate_dc() {
         assert_eq!(
-            translate_function("dc", &args(&["host"])).unwrap(),
+            translate_function("dc", &args(&["host"]), &mut state()).unwrap(),
             "COUNT(DISTINCT host)"
         );
     }
@@ -587,7 +631,7 @@ mod tests {
     #[test]
     fn translate_distinct_count() {
         assert_eq!(
-            translate_function("distinct_count", &args(&["host"])).unwrap(),
+            translate_function("distinct_count", &args(&["host"]), &mut state()).unwrap(),
             "COUNT(DISTINCT host)"
         );
     }
@@ -595,7 +639,7 @@ mod tests {
     #[test]
     fn translate_p50() {
         assert_eq!(
-            translate_function("p50", &args(&["duration"])).unwrap(),
+            translate_function("p50", &args(&["duration"]), &mut state()).unwrap(),
             "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration)"
         );
     }
@@ -603,7 +647,7 @@ mod tests {
     #[test]
     fn translate_p90() {
         assert_eq!(
-            translate_function("p90", &args(&["duration"])).unwrap(),
+            translate_function("p90", &args(&["duration"]), &mut state()).unwrap(),
             "PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY duration)"
         );
     }
@@ -611,7 +655,7 @@ mod tests {
     #[test]
     fn translate_p95() {
         assert_eq!(
-            translate_function("p95", &args(&["duration"])).unwrap(),
+            translate_function("p95", &args(&["duration"]), &mut state()).unwrap(),
             "PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration)"
         );
     }
@@ -619,7 +663,7 @@ mod tests {
     #[test]
     fn translate_p99() {
         assert_eq!(
-            translate_function("p99", &args(&["duration"])).unwrap(),
+            translate_function("p99", &args(&["duration"]), &mut state()).unwrap(),
             "PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration)"
         );
     }
@@ -629,7 +673,7 @@ mod tests {
     #[test]
     fn translate_lower() {
         assert_eq!(
-            translate_function("lower", &args(&["host"])).unwrap(),
+            translate_function("lower", &args(&["host"]), &mut state()).unwrap(),
             "LOWER(host)"
         );
     }
@@ -637,7 +681,7 @@ mod tests {
     #[test]
     fn translate_upper() {
         assert_eq!(
-            translate_function("upper", &args(&["host"])).unwrap(),
+            translate_function("upper", &args(&["host"]), &mut state()).unwrap(),
             "UPPER(host)"
         );
     }
@@ -645,7 +689,7 @@ mod tests {
     #[test]
     fn translate_length() {
         assert_eq!(
-            translate_function("length", &args(&["msg"])).unwrap(),
+            translate_function("length", &args(&["msg"]), &mut state()).unwrap(),
             "LENGTH(msg)"
         );
     }
@@ -653,7 +697,7 @@ mod tests {
     #[test]
     fn translate_len_alias() {
         assert_eq!(
-            translate_function("len", &args(&["msg"])).unwrap(),
+            translate_function("len", &args(&["msg"]), &mut state()).unwrap(),
             "LENGTH(msg)"
         );
     }
@@ -661,7 +705,7 @@ mod tests {
     #[test]
     fn translate_coalesce() {
         assert_eq!(
-            translate_function("coalesce", &args(&["a", "b", "c"])).unwrap(),
+            translate_function("coalesce", &args(&["a", "b", "c"]), &mut state()).unwrap(),
             "COALESCE(a, b, c)"
         );
     }
@@ -671,7 +715,7 @@ mod tests {
     #[test]
     fn translate_if() {
         assert_eq!(
-            translate_function("if", &args(&["x > 0", "'pos'", "'neg'"])).unwrap(),
+            translate_function("if", &args(&["x > 0", "'pos'", "'neg'"]), &mut state()).unwrap(),
             "IF(x > 0, 'pos', 'neg')"
         );
     }
@@ -679,7 +723,7 @@ mod tests {
     #[test]
     fn translate_replace() {
         assert_eq!(
-            translate_function("replace", &args(&["msg", "'foo'", "'bar'"])).unwrap(),
+            translate_function("replace", &args(&["msg", "'foo'", "'bar'"]), &mut state()).unwrap(),
             "REPLACE(msg, 'foo', 'bar')"
         );
     }
@@ -687,7 +731,7 @@ mod tests {
     #[test]
     fn translate_substr_two_args() {
         assert_eq!(
-            translate_function("substr", &args(&["msg", "1"])).unwrap(),
+            translate_function("substr", &args(&["msg", "1"]), &mut state()).unwrap(),
             "SUBSTR(msg, 1)"
         );
     }
@@ -695,7 +739,7 @@ mod tests {
     #[test]
     fn translate_substr_three_args() {
         assert_eq!(
-            translate_function("substr", &args(&["msg", "1", "5"])).unwrap(),
+            translate_function("substr", &args(&["msg", "1", "5"]), &mut state()).unwrap(),
             "SUBSTR(msg, 1, 5)"
         );
     }
@@ -703,7 +747,7 @@ mod tests {
     #[test]
     fn translate_trim() {
         assert_eq!(
-            translate_function("trim", &args(&["msg"])).unwrap(),
+            translate_function("trim", &args(&["msg"]), &mut state()).unwrap(),
             "TRIM(msg)"
         );
     }
@@ -711,7 +755,7 @@ mod tests {
     #[test]
     fn translate_isnull() {
         assert_eq!(
-            translate_function("isnull", &args(&["x"])).unwrap(),
+            translate_function("isnull", &args(&["x"]), &mut state()).unwrap(),
             "(x IS NULL)"
         );
     }
@@ -719,20 +763,23 @@ mod tests {
     #[test]
     fn translate_isnotnull() {
         assert_eq!(
-            translate_function("isnotnull", &args(&["x"])).unwrap(),
+            translate_function("isnotnull", &args(&["x"]), &mut state()).unwrap(),
             "(x IS NOT NULL)"
         );
     }
 
     #[test]
     fn translate_abs() {
-        assert_eq!(translate_function("abs", &args(&["x"])).unwrap(), "ABS(x)");
+        assert_eq!(
+            translate_function("abs", &args(&["x"]), &mut state()).unwrap(),
+            "ABS(x)"
+        );
     }
 
     #[test]
     fn translate_ceil() {
         assert_eq!(
-            translate_function("ceil", &args(&["x"])).unwrap(),
+            translate_function("ceil", &args(&["x"]), &mut state()).unwrap(),
             "CEIL(x)"
         );
     }
@@ -740,7 +787,7 @@ mod tests {
     #[test]
     fn translate_ceiling_alias() {
         assert_eq!(
-            translate_function("ceiling", &args(&["x"])).unwrap(),
+            translate_function("ceiling", &args(&["x"]), &mut state()).unwrap(),
             "CEIL(x)"
         );
     }
@@ -748,7 +795,7 @@ mod tests {
     #[test]
     fn translate_floor() {
         assert_eq!(
-            translate_function("floor", &args(&["x"])).unwrap(),
+            translate_function("floor", &args(&["x"]), &mut state()).unwrap(),
             "FLOOR(x)"
         );
     }
@@ -756,7 +803,7 @@ mod tests {
     #[test]
     fn translate_round_one_arg() {
         assert_eq!(
-            translate_function("round", &args(&["x"])).unwrap(),
+            translate_function("round", &args(&["x"]), &mut state()).unwrap(),
             "ROUND(x)"
         );
     }
@@ -764,20 +811,32 @@ mod tests {
     #[test]
     fn translate_round_two_args() {
         assert_eq!(
-            translate_function("round", &args(&["x", "2"])).unwrap(),
+            translate_function("round", &args(&["x", "2"]), &mut state()).unwrap(),
             "ROUND(x, 2)"
         );
     }
 
+    /// `now()` is the statement ANCHOR, bound as a TIMESTAMP parameter
+    /// under an explicit cast — never `DuckDB`'s own clock (ADR-0017 §3).
     #[test]
-    fn translate_now() {
-        assert_eq!(translate_function("now", &[]).unwrap(), "now()");
+    fn translate_now_binds_the_anchor_under_an_explicit_cast() {
+        let mut st = state();
+        let anchor = st.anchor();
+        assert_eq!(
+            translate_function("now", &[], &mut st).unwrap(),
+            "CAST(? AS TIMESTAMP)"
+        );
+        assert_eq!(
+            st.into_params(),
+            vec![super::super::SqlValue::Timestamp(anchor.now_timestamp())],
+            "the pushed parameter is the anchor itself"
+        );
     }
 
     #[test]
     fn translate_typeof() {
         assert_eq!(
-            translate_function("typeof", &args(&["x"])).unwrap(),
+            translate_function("typeof", &args(&["x"]), &mut state()).unwrap(),
             "TYPEOF(x)"
         );
     }
@@ -785,7 +844,7 @@ mod tests {
     #[test]
     fn translate_tonumber() {
         assert_eq!(
-            translate_function("tonumber", &args(&["x"])).unwrap(),
+            translate_function("tonumber", &args(&["x"]), &mut state()).unwrap(),
             "TRY_CAST(x AS DOUBLE)"
         );
     }
@@ -793,7 +852,7 @@ mod tests {
     #[test]
     fn translate_tostring() {
         assert_eq!(
-            translate_function("tostring", &args(&["x"])).unwrap(),
+            translate_function("tostring", &args(&["x"]), &mut state()).unwrap(),
             "CAST(x AS VARCHAR)"
         );
     }
@@ -804,7 +863,7 @@ mod tests {
         // DuckDB so no swap is needed, and emitting in DSL order keeps the `?`
         // placeholders aligned with emit_expr's DSL-order param push.
         assert_eq!(
-            translate_function("strftime", &args(&["ts", "fmt"])).unwrap(),
+            translate_function("strftime", &args(&["ts", "fmt"]), &mut state()).unwrap(),
             "STRFTIME(ts, fmt)"
         );
     }
@@ -814,7 +873,7 @@ mod tests {
         // TRY_STRPTIME nulls on unparseable input (matches streaming eval), so a
         // single bad value never errors the whole batch query.
         assert_eq!(
-            translate_function("strptime", &args(&["s", "fmt"])).unwrap(),
+            translate_function("strptime", &args(&["s", "fmt"]), &mut state()).unwrap(),
             "TRY_STRPTIME(s, fmt)"
         );
     }
@@ -824,7 +883,7 @@ mod tests {
     #[test]
     fn translate_first() {
         assert_eq!(
-            translate_function("first", &args(&["msg"])).unwrap(),
+            translate_function("first", &args(&["msg"]), &mut state()).unwrap(),
             "FIRST(msg)"
         );
     }
@@ -832,7 +891,7 @@ mod tests {
     #[test]
     fn translate_last() {
         assert_eq!(
-            translate_function("last", &args(&["msg"])).unwrap(),
+            translate_function("last", &args(&["msg"]), &mut state()).unwrap(),
             "LAST(msg)"
         );
     }
@@ -840,7 +899,7 @@ mod tests {
     #[test]
     fn translate_values() {
         assert_eq!(
-            translate_function("values", &args(&["level"])).unwrap(),
+            translate_function("values", &args(&["level"]), &mut state()).unwrap(),
             "LIST(DISTINCT level)"
         );
     }
@@ -848,7 +907,7 @@ mod tests {
     #[test]
     fn translate_list_alias() {
         assert_eq!(
-            translate_function("list", &args(&["level"])).unwrap(),
+            translate_function("list", &args(&["level"]), &mut state()).unwrap(),
             "LIST(DISTINCT level)"
         );
     }
@@ -856,7 +915,7 @@ mod tests {
     #[test]
     fn translate_median() {
         assert_eq!(
-            translate_function("median", &args(&["dur"])).unwrap(),
+            translate_function("median", &args(&["dur"]), &mut state()).unwrap(),
             "MEDIAN(dur)"
         );
     }
@@ -864,7 +923,7 @@ mod tests {
     #[test]
     fn translate_stddev() {
         assert_eq!(
-            translate_function("stddev", &args(&["dur"])).unwrap(),
+            translate_function("stddev", &args(&["dur"]), &mut state()).unwrap(),
             "STDDEV(dur)"
         );
     }
@@ -873,7 +932,7 @@ mod tests {
 
     #[test]
     fn translate_unknown_function() {
-        let err = translate_function("bogus", &[]).unwrap_err();
+        let err = translate_function("bogus", &[], &mut state()).unwrap_err();
         assert_eq!(
             err,
             EmitError::UnknownFunction {
@@ -885,25 +944,25 @@ mod tests {
 
     #[test]
     fn translate_avg_no_args_errors() {
-        let err = translate_function("avg", &[]).unwrap_err();
+        let err = translate_function("avg", &[], &mut state()).unwrap_err();
         assert!(matches!(err, EmitError::InvalidAggregation { .. }));
     }
 
     #[test]
     fn translate_avg_too_many_args_errors() {
-        let err = translate_function("avg", &args(&["a", "b"])).unwrap_err();
+        let err = translate_function("avg", &args(&["a", "b"]), &mut state()).unwrap_err();
         assert!(matches!(err, EmitError::InvalidAggregation { .. }));
     }
 
     #[test]
     fn translate_coalesce_no_args_errors() {
-        let err = translate_function("coalesce", &[]).unwrap_err();
+        let err = translate_function("coalesce", &[], &mut state()).unwrap_err();
         assert!(matches!(err, EmitError::InvalidAggregation { .. }));
     }
 
     #[test]
     fn translate_p99_no_args_errors() {
-        let err = translate_function("p99", &[]).unwrap_err();
+        let err = translate_function("p99", &[], &mut state()).unwrap_err();
         assert!(matches!(err, EmitError::InvalidAggregation { .. }));
     }
 
@@ -1038,7 +1097,12 @@ mod tests {
         use crate::emitter::emit;
         use crate::parser;
         let q = parser::parse(r#"* | let h = date_part("nanosecond", timestamp)"#).unwrap();
-        let err = emit(&q, "/data/**/*.parquet").unwrap_err();
+        let err = emit(
+            &q,
+            "/data/**/*.parquet",
+            crate::context::EvalContext::capture(),
+        )
+        .unwrap_err();
         assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
     }
 
@@ -1047,7 +1111,12 @@ mod tests {
         use crate::emitter::emit;
         use crate::parser;
         let q = parser::parse(r#"* | let d = date_trunc("dow", timestamp)"#).unwrap();
-        let err = emit(&q, "/data/**/*.parquet").unwrap_err();
+        let err = emit(
+            &q,
+            "/data/**/*.parquet",
+            crate::context::EvalContext::capture(),
+        )
+        .unwrap_err();
         assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
     }
 
@@ -1084,7 +1153,12 @@ mod tests {
         use crate::emitter::emit;
         use crate::parser;
         let q = parser::parse(r#"* | let s = strftime(timestamp, "%Q")"#).unwrap();
-        let err = emit(&q, "/data/**/*.parquet").unwrap_err();
+        let err = emit(
+            &q,
+            "/data/**/*.parquet",
+            crate::context::EvalContext::capture(),
+        )
+        .unwrap_err();
         assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
     }
 
@@ -1093,7 +1167,12 @@ mod tests {
         use crate::emitter::emit;
         use crate::parser;
         let q = parser::parse(r#"* | let t = strptime(message, "%Q")"#).unwrap();
-        let err = emit(&q, "/data/**/*.parquet").unwrap_err();
+        let err = emit(
+            &q,
+            "/data/**/*.parquet",
+            crate::context::EvalContext::capture(),
+        )
+        .unwrap_err();
         assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
     }
 
@@ -1145,17 +1224,31 @@ mod tests {
     /// missing one.
     #[test]
     fn sev_refuses_a_dialect_it_cannot_parse_rather_than_defaulting() {
-        let otel = translate_function("sev", &["\"x\"".to_owned(), "otel".to_owned()]).unwrap();
-        let syslog = translate_function("sev", &["\"x\"".to_owned(), "syslog".to_owned()]).unwrap();
+        let otel = translate_function(
+            "sev",
+            &["\"x\"".to_owned(), "otel".to_owned()],
+            &mut state(),
+        )
+        .unwrap();
+        let syslog = translate_function(
+            "sev",
+            &["\"x\"".to_owned(), "syslog".to_owned()],
+            &mut state(),
+        )
+        .unwrap();
         assert_ne!(otel, syslog);
         // Bypassing the arg walk (this is the defensive door): an
         // unparseable token is an error naming the vocabulary, and the
         // emitted SQL is never the OTel one.
-        let err = translate_function("sev", &["\"x\"".to_owned(), "bogus".to_owned()])
-            .expect_err("an unknown dialect must be refused");
+        let err = translate_function(
+            "sev",
+            &["\"x\"".to_owned(), "bogus".to_owned()],
+            &mut state(),
+        )
+        .expect_err("an unknown dialect must be refused");
         assert!(err.to_string().contains("otel, syslog"), "{err}");
         // Arity is still checked first.
-        let err = translate_function("sev", &[]).expect_err("arity");
+        let err = translate_function("sev", &[], &mut state()).expect_err("arity");
         assert!(err.to_string().contains("1 to 2 arguments"), "{err}");
     }
 }

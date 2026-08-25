@@ -115,6 +115,11 @@ pub(crate) struct EmitterState {
     /// [`Self::with_hot_source`] — empty for pin-blind emission
     /// (embedded mode, [`super::emit`]).
     pin_scope: crate::pin_scope::PinScope,
+    /// The statement's `now()` instant (ADR-0017 §3), handed in by the
+    /// caller and never sampled here. Every source shape funnels through
+    /// [`Self::with_source`], so there is exactly one way for an emission
+    /// to acquire an anchor and no way for it to acquire two.
+    anchor: crate::context::EvalContext,
 }
 
 /// How the `_raw` column is bound by text search in one emission pass.
@@ -320,9 +325,12 @@ pub fn hot_source_reader(hot: &str) -> Result<String, super::EmitError> {
 }
 
 impl EmitterState {
-    pub(crate) fn new(source: &str) -> Result<Self, super::EmitError> {
+    pub(crate) fn new(
+        source: &str,
+        anchor: crate::context::EvalContext,
+    ) -> Result<Self, super::EmitError> {
         let reader = build_reader(source)?;
-        Ok(Self::with_source(reader))
+        Ok(Self::with_source(reader, anchor))
     }
 
     /// Construct with a composite source that unions parquet with hot buffer ndjson.
@@ -353,6 +361,7 @@ impl EmitterState {
         primary: &str,
         hot: &str,
         hot_pins: &crate::schema::FieldTypes,
+        anchor: crate::context::EvalContext,
     ) -> Result<Self, super::EmitError> {
         let primary_reader = build_reader(primary)?;
         let hot_reader = hot_reader(hot)?;
@@ -362,7 +371,7 @@ impl EmitterState {
             "(SELECT * FROM {primary_reader} UNION ALL BY NAME \
              SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
         );
-        Ok(Self::with_source(composite))
+        Ok(Self::with_source(composite, anchor))
     }
 
     /// Construct with the hot-buffer ndjson as the SOLE source, carrying the
@@ -380,15 +389,19 @@ impl EmitterState {
     pub(crate) fn with_hot_only_source(
         hot: &str,
         hot_pins: &crate::schema::FieldTypes,
+        anchor: crate::context::EvalContext,
     ) -> Result<Self, super::EmitError> {
         let hot_reader = hot_reader(hot)?;
         let hot_replace = hot_replace_list(hot_pins);
-        Ok(Self::with_source(format!(
-            "(SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
-        )))
+        Ok(Self::with_source(
+            format!("(SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"),
+            anchor,
+        ))
     }
 
-    fn with_source(source: String) -> Self {
+    /// The ONE constructor: every source shape ends here, so the anchor
+    /// is a required argument of building any emission at all.
+    fn with_source(source: String, anchor: crate::context::EvalContext) -> Self {
         Self {
             step: 0,
             source,
@@ -407,7 +420,15 @@ impl EmitterState {
             params: Vec::new(),
             raw_binding: RawBinding::Available,
             pin_scope: crate::pin_scope::PinScope::unpinned(),
+            anchor,
         }
+    }
+
+    /// The statement's `now()` anchor — read by the `now` translation
+    /// arm to bind its parameter, and stamped onto
+    /// [`super::EmittedQuery::anchor`] for the `rust_stages` tail.
+    pub(crate) fn anchor(&self) -> crate::context::EvalContext {
+        self.anchor
     }
 
     /// Attach the comparison pin set (ADR-0011 slice A). Builder-style so
@@ -785,6 +806,13 @@ impl EmitterState {
                     }
                     SqlValue::Bool(b) => {
                         result.push_str(if *b { "TRUE" } else { "FALSE" });
+                    }
+                    // The typed literal form of the bound parameter —
+                    // ONE rendering shared with `SqlValue`'s `Display`,
+                    // because PIVOT (which cannot take parameters) must
+                    // read the very instant the parameterized lanes bind.
+                    SqlValue::Timestamp(at) => {
+                        result.push_str(&super::timestamp_literal(*at));
                     }
                 }
                 param_idx += 1;
