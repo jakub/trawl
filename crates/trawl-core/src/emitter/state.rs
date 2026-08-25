@@ -699,9 +699,17 @@ impl EmitterState {
     /// accumulated `?` placeholders across all CTEs and the PIVOT body,
     /// then clear the param list. Subsequent stages can add fresh `?`
     /// params as normal.
-    pub(crate) fn flush_pivot_to_cte(&mut self) {
+    ///
+    /// Clearing the list also RESETS [`Self::flushed_params`]: that
+    /// counter answers "how many parameters render before anything this
+    /// level emits", and after inlining the answer is none — there are no
+    /// parameters at all. Leaving it stale made
+    /// [`Self::emit_ordered_select`] read a post-pivot parameter count
+    /// that had merely climbed back to the old value as "this level has
+    /// pushed nothing", and skip the flush it exists to perform.
+    pub(crate) fn flush_pivot_to_cte(&mut self) -> Result<(), super::EmitError> {
         let Some(pivot) = self.pivot.take() else {
-            return;
+            return Ok(());
         };
 
         let pivot_sql = self.build_pivot(&pivot);
@@ -716,8 +724,25 @@ impl EmitterState {
             cte.sql = inlined;
             param_idx = consumed;
         }
-        let (pivot_inlined, _) = Self::inline_params_counted(&pivot_sql, &self.params, param_idx);
+        let (pivot_inlined, consumed) =
+            Self::inline_params_counted(&pivot_sql, &self.params, param_idx);
+
+        // Every accumulated parameter must have found a placeholder: the
+        // list is about to be DROPPED, so one left behind is a `?` that
+        // survives into SQL nothing will ever bind — or that silently
+        // takes the NEXT stage's value. Two integers to check, and
+        // undiagnosable downstream, so it is a real error rather than a
+        // debug assertion.
+        if consumed != self.params.len() {
+            return Err(super::EmitError::UnsupportedOperation {
+                message: format!(
+                    "pivot inlining consumed {consumed} of {} parameters",
+                    self.params.len()
+                ),
+            });
+        }
         self.params.clear();
+        self.flushed_params = 0;
 
         // Push the pivot as a new CTE.
         let cte_name = format!("_s{}", self.step);
@@ -736,6 +761,8 @@ impl EmitterState {
         self.limit = None;
         self.has_aggregation = false;
         self.has_projection = false;
+
+        Ok(())
     }
 
     /// Produce the final SQL string including any accumulated CTEs.

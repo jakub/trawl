@@ -378,7 +378,7 @@ fn emit_from_state(
         // flush the pivot to a CTE so downstream stages can reference
         // the pivot-generated columns.
         if state.has_pivot() && !matches!(stage.node, PipeStage::Pivot(_)) {
-            state.flush_pivot_to_cte();
+            state.flush_pivot_to_cte()?;
         }
         pipeline::process_stage(&stage.node, &mut state)?;
         // AFTER the stage: its own expressions resolve against the

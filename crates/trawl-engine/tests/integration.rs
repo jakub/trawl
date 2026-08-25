@@ -2245,3 +2245,77 @@ fn an_aggregate_literal_argument_binds_after_the_search_predicate() {
     assert_eq!(result.row_count(), 1);
     assert_eq!(text_cell(&result, 0, "m"), "POS");
 }
+
+// ── the same guard after a PIVOT (#106, review F1) ────────────────────
+//
+// `DuckDB` cannot parameterize PIVOT, so `flush_pivot_to_cte` INLINES
+// every accumulated placeholder and empties the parameter list. The
+// ordering guard's "has this level pushed anything yet" reading is a
+// comparison against how many parameters are already inside a CTE, and
+// that count was not reset by the inlining — so once the post-pivot
+// parameter count climbed back to the stale value, the guard read
+// "nothing pushed here" and skipped the flush it exists to perform.
+
+/// The pivot's own output columns, so a `where` downstream has something
+/// real to bind: `host` plus one column per status value.
+const PIVOT_PREFIX: &str = "service=nginx | pivot count() on status by host";
+
+/// (a) The loud half after a pivot: the predicate's text reaches the
+/// anchor's TIMESTAMP cast.
+#[test]
+fn an_aggregate_now_after_a_pivot_binds_after_the_predicate() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        &format!(r#"{PIVOT_PREFIX} | where host == "web01" | stats max(now()) as n"#),
+        &glob,
+    )
+    .expect("the predicate's value must not reach the anchor's cast");
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(text_cell(&result, 0, "n"), ANCHOR_TEXT);
+}
+
+/// (b) The silent half after a pivot: three string parameters, all
+/// type-compatible, so nothing errors and every one of them lands in the
+/// wrong placeholder.
+#[test]
+fn an_aggregate_literal_after_a_pivot_binds_after_the_predicate() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        &format!(
+            r#"{PIVOT_PREFIX} | where host == "web01" | stats max(replace(host, "w", "W")) as m"#
+        ),
+        &glob,
+    )
+    .expect("the pivoted aggregate must run");
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(
+        text_cell(&result, 0, "m"),
+        "Web01",
+        "the predicate must filter on 'web01' and replace must rewrite 'w' as 'W'"
+    );
+}
+
+/// (c) `timechart` after a pivot takes the same guard. The pivot groups
+/// BY `_time` so the bucket column survives into the downstream stage.
+#[test]
+fn a_timechart_aggregate_after_a_pivot_binds_after_the_predicate() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        r#"service=nginx | pivot count() on status by _time \
+           | where _time >= "2024-01-15 10:00:00" | timechart span=1m max(now()) as n"#
+            .replace(" \\\n           ", " ")
+            .as_str(),
+        &glob,
+    )
+    .expect("the pivoted timechart must run");
+    assert!(
+        result.row_count() >= 1,
+        "the window must keep rows: {result:?}"
+    );
+    for row in 0..result.row_count() {
+        assert_eq!(text_cell(&result, row, "n"), ANCHOR_TEXT);
+    }
+}
