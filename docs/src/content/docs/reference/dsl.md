@@ -1038,7 +1038,9 @@ What "unit of output" means per lane:
   advance. The search stage's `last=`/`earliest=`/`latest=` window reads
   that same per-event instant, so one event cannot be admitted by one
   clock and evaluated against another.
-- **aggregate streams** (SSE over `stats`/`timechart`/`pivot`): stages
+- **aggregate streams** (SSE over `stats`/`timechart`/`top`/`rare` — the
+  live compiler's whole aggregate set; `pivot` is refused live, because
+  its dynamic column structure breaks progressive rendering): stages
   BEFORE the aggregation read the per-event instant of the source event;
   every row of ONE emitted snapshot shares one instant, and the next
   snapshot advances.
