@@ -355,10 +355,29 @@ jobs:
     # target. (Not every field the query binds: bare-word search terms and
     # time bounds are excluded there, and those envelope fields have fixed
     # production types, so there is no pin to vary.)
-    # It links no DuckDB and needs no postgres, so the small runner is
-    # enough and ten minutes is generous (the measured run is ~25s of build
-    # plus ~10s of fuzzing).
-    runs-on: k8s-small
+    # It links no DuckDB and needs no postgres, so ten minutes is generous
+    # (the measured run is ~25s of build plus ~10s of fuzzing).
+    #
+    # This is the one job in the file that is NOT on the self-hosted
+    # runners, and moving it back to k8s-small for consistency breaks it.
+    # `cargo fuzz` builds for the HOST target and compiles the target with
+    # AddressSanitizer; the k8s-small image is musl-based, so the host
+    # triple there is x86_64-unknown-linux-musl and the build fails twice
+    # over — "sanitizer is incompatible with statically linked libc", and
+    # no musl std installed to link against even if it did. ASan needs a
+    # dynamically linked libc, which here means glibc, which means a
+    # GitHub-hosted runner. A glibc dev machine never sees this, which is
+    # why it reached CI.
+    #
+    # `ubuntu-latest` rather than a pinned image, unlike the nightly below,
+    # because nothing this build depends on comes FROM the image: the ASan
+    # runtime ships inside the pinned nightly toolchain, cargo-fuzz is
+    # version-pinned by install-action, and the target needs no system
+    # library beyond the C toolchain and linker every Ubuntu image carries.
+    # An image bump has nothing here to break. docs.yml already runs on
+    # `ubuntu-latest`, so this follows the repo instead of inventing a
+    # third runner convention.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
