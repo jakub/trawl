@@ -208,6 +208,28 @@ pub enum CanonicalType {
 }
 
 impl CanonicalType {
+    /// Every variant, once, in declaration order. The ONE ordered list of
+    /// the vocabulary.
+    ///
+    /// Two consumers read it. The fuzz pin selector in `crate::fuzz_input`
+    /// maps a selector byte onto a pin by indexing here, so the ladder's
+    /// length is the modulus and no fuzz code hardcodes a count. The
+    /// PREPARE fixture in trawl-engine asserts that its committed cases
+    /// exercise every entry.
+    ///
+    /// A variant added to the enum must be added here too. Nothing in the
+    /// language enforces that, so what actually fails is the fixture
+    /// coverage assertion: a new variant no committed case reaches is a
+    /// gap the fixture reports by name.
+    pub const ALL: [Self; 6] = [
+        Self::Boolean,
+        Self::BigInt,
+        Self::Double,
+        Self::Timestamp,
+        Self::Varchar,
+        Self::Severity,
+    ];
+
     /// The PHYSICAL `DuckDB` type spelling — what a cast, a `DESCRIBE`
     /// comparison, a repin rewrite and the hot branch's `REPLACE` all
     /// name. NOT injective: `SEVERITY` is a `BIGINT` on disk.
@@ -534,20 +556,42 @@ mod tests {
     /// canonical type, `SEVERITY` included.
     #[test]
     fn canonical_type_catalog_spellings_round_trip() {
-        for ty in [
-            CanonicalType::Boolean,
-            CanonicalType::BigInt,
-            CanonicalType::Double,
-            CanonicalType::Timestamp,
-            CanonicalType::Varchar,
-            CanonicalType::Severity,
-        ] {
+        for ty in CanonicalType::ALL {
             assert_eq!(CanonicalType::from_catalog(ty.as_catalog()), Some(ty));
         }
         assert_eq!(CanonicalType::BigInt.as_catalog(), "BIGINT");
         assert_eq!(CanonicalType::Severity.as_catalog(), "SEVERITY");
         assert_eq!(CanonicalType::from_catalog("JSON"), None);
         assert_eq!(CanonicalType::from_catalog("bigint"), None);
+    }
+
+    /// `ALL` is what the fuzz pin selector indexes and what the trawl-engine
+    /// PREPARE fixture walks, so a duplicate entry would quietly bias the
+    /// selector (two byte values landing on one pin) and a missing entry
+    /// would leave a type unfuzzed.
+    ///
+    /// The length check is a reminder, not a proof: Rust offers no variant
+    /// count for a plain enum, so nothing here can notice a seventh variant
+    /// that was never added to `ALL`. The teeth are in the fixture's
+    /// coverage assertion, which fails when a committed case never pins the
+    /// new type.
+    #[test]
+    fn canonical_type_all_is_exhaustive_and_duplicate_free() {
+        assert_eq!(
+            CanonicalType::ALL.len(),
+            6,
+            "CanonicalType::ALL must list every variant once; a new variant \
+             also needs a PREPARE fixture case, which is what the engine's \
+             coverage assertion checks"
+        );
+        let unique: std::collections::BTreeSet<CanonicalType> =
+            CanonicalType::ALL.into_iter().collect();
+        assert_eq!(
+            unique.len(),
+            CanonicalType::ALL.len(),
+            "duplicate entry in CanonicalType::ALL would bias the fuzz pin \
+             selector and skew the trawl-engine fixture's coverage"
+        );
     }
 
     /// The PHYSICAL spelling is what casts and DDL use, and it is
