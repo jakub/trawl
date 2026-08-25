@@ -14,6 +14,7 @@
 
 use indexmap::IndexSet;
 use trawl_core::ast::{PipeStage, SortDirection, Spanned};
+use trawl_core::context::EvalContext;
 use trawl_core::eval::EvalValue;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::row::{self, Row};
@@ -32,10 +33,18 @@ use crate::value::{Column, QueryResult};
 /// `where`/`let` evaluate under the same interpretation the SQL prefix
 /// used. Sort stages are partitioned out below without walking the scope
 /// — they pass it through unchanged.
+///
+/// `anchor` is the STATEMENT's `now()` instant
+/// (`EmittedQuery::anchor`, ADR-0017 §3). The batch rule dominates the
+/// whole tail: EVERY row — pre-stage, accumulator feed, snapshot,
+/// post-stage — evaluates under this one instant, because the tail is
+/// part of one unit of output with the SQL prefix that bound it. Nothing
+/// here samples a clock.
 pub fn apply_rust_stages(
     result: QueryResult,
     stages: &[Spanned<PipeStage>],
     pins: &PinScope,
+    anchor: EvalContext,
 ) -> Result<QueryResult, EngineError> {
     if stages.is_empty() {
         return Ok(result);
@@ -59,13 +68,19 @@ pub fn apply_rust_stages(
 
     let processed = match plan {
         StreamPlan::PassThrough(mut compiled_stages) => {
-            apply_pass_through(&mut compiled_stages, events)
+            apply_pass_through(&mut compiled_stages, events, &anchor)
         }
         StreamPlan::Aggregate {
             mut pre_stages,
             mut aggregation,
             mut post_stages,
-        } => apply_aggregate(&mut pre_stages, &mut aggregation, &mut post_stages, events),
+        } => apply_aggregate(
+            &mut pre_stages,
+            &mut aggregation,
+            &mut post_stages,
+            events,
+            &anchor,
+        ),
     };
 
     // Apply deferred sort stages.
@@ -172,11 +187,15 @@ fn events_to_result(events: &[Row]) -> QueryResult {
 }
 
 /// Run pass-through stages on each event.
-fn apply_pass_through(stages: &mut [CompiledStage], events: Vec<Row>) -> Vec<Row> {
+fn apply_pass_through(
+    stages: &mut [CompiledStage],
+    events: Vec<Row>,
+    anchor: &EvalContext,
+) -> Vec<Row> {
     let mut output = Vec::new();
     'event: for mut event in events {
         for stage in stages.iter_mut() {
-            match stream::apply_stage(stage, &mut event) {
+            match stream::apply_stage(stage, &mut event, anchor) {
                 StageResult::Pass => {}
                 StageResult::Filtered => continue 'event,
                 StageResult::Done => return output,
@@ -193,11 +212,12 @@ fn apply_aggregate(
     aggregation: &mut stream::CompiledAggregation,
     post_stages: &mut [CompiledStage],
     events: Vec<Row>,
+    anchor: &EvalContext,
 ) -> Vec<Row> {
     // Feed events through pre-stages into the aggregation.
     'event: for mut event in events {
         for stage in pre_stages.iter_mut() {
-            match stream::apply_stage(stage, &mut event) {
+            match stream::apply_stage(stage, &mut event, anchor) {
                 StageResult::Pass => {}
                 StageResult::Filtered => continue 'event,
                 StageResult::Done => break,
@@ -213,7 +233,7 @@ fn apply_aggregate(
     let mut output = Vec::new();
     'row: for mut row in snapshot_rows {
         for stage in post_stages.iter_mut() {
-            match stream::apply_stage(stage, &mut row) {
+            match stream::apply_stage(stage, &mut row, anchor) {
                 StageResult::Pass => {}
                 StageResult::Filtered => continue 'row,
                 StageResult::Done => return output,
@@ -387,7 +407,13 @@ mod tests {
             keyword: "extract",
         }))];
 
-        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
+        let out = apply_rust_stages(
+            result,
+            &stages,
+            &PinScope::unpinned(),
+            EvalContext::capture(),
+        )
+        .unwrap();
         assert_eq!(out.columns.len(), 3); // message, user, status
         assert_eq!(out.rows.len(), 2);
 
@@ -429,7 +455,13 @@ mod tests {
             })),
         ];
 
-        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
+        let out = apply_rust_stages(
+            result,
+            &stages,
+            &PinScope::unpinned(),
+            EvalContext::capture(),
+        )
+        .unwrap();
         assert_eq!(out.rows.len(), 1);
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
         assert_eq!(
@@ -473,7 +505,13 @@ mod tests {
             })),
         ];
 
-        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
+        let out = apply_rust_stages(
+            result,
+            &stages,
+            &PinScope::unpinned(),
+            EvalContext::capture(),
+        )
+        .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
         assert_eq!(
             out.rows[0][col_idx("total")],
@@ -508,7 +546,13 @@ mod tests {
             })),
         ];
 
-        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
+        let out = apply_rust_stages(
+            result,
+            &stages,
+            &PinScope::unpinned(),
+            EvalContext::capture(),
+        )
+        .unwrap();
         assert_eq!(out.rows.len(), 2);
 
         // Find GET row — should have count=2.
@@ -546,7 +590,13 @@ mod tests {
             })),
         ];
 
-        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
+        let out = apply_rust_stages(
+            result,
+            &stages,
+            &PinScope::unpinned(),
+            EvalContext::capture(),
+        )
+        .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
         let scores: Vec<_> = out.rows.iter().map(|r| &r[col_idx("score")]).collect();
         assert_eq!(
@@ -574,7 +624,13 @@ mod tests {
             keyword: "extract",
         }))];
 
-        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
+        let out = apply_rust_stages(
+            result,
+            &stages,
+            &PinScope::unpinned(),
+            EvalContext::capture(),
+        )
+        .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
         assert_eq!(
             out.rows[0][col_idx("user")],
@@ -601,7 +657,13 @@ mod tests {
             keyword: "extract",
         }))];
 
-        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
+        let out = apply_rust_stages(
+            result,
+            &stages,
+            &PinScope::unpinned(),
+            EvalContext::capture(),
+        )
+        .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
         assert_eq!(
             out.rows[0][col_idx("count")],
@@ -629,7 +691,13 @@ mod tests {
             source_field: None,
             keyword: "extract",
         }))];
-        let out = apply_rust_stages(result, &stages, &PinScope::unpinned()).unwrap();
+        let out = apply_rust_stages(
+            result,
+            &stages,
+            &PinScope::unpinned(),
+            EvalContext::capture(),
+        )
+        .unwrap();
         assert!(out.is_empty());
     }
 }

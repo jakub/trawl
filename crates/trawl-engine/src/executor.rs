@@ -132,6 +132,7 @@ impl Executor {
                 result,
                 &emitted.rust_stages,
                 &emitted.rust_stage_pins,
+                emitted.anchor,
             )?;
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
@@ -220,6 +221,7 @@ impl Executor {
                 result,
                 &emitted.rust_stages,
                 &emitted.rust_stage_pins,
+                emitted.anchor,
             )?;
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);

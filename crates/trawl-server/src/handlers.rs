@@ -2679,8 +2679,13 @@ fn apply_stages(
     stages: &mut [trawl_core::stream::CompiledStage],
     event: &mut trawl_core::row::Row,
 ) -> bool {
+    // #106 M5: one instant for this event's whole stage run, which is
+    // what ADR-0017 §3 asks of the live lane — the SSE lane's sampling
+    // boundaries are M5's to ratify, and this is the compile-forced
+    // placeholder, not that ruling.
+    let ctx = trawl_core::context::EvalContext::capture();
     for stage in stages.iter_mut() {
-        match trawl_core::stream::apply_stage(stage, event) {
+        match trawl_core::stream::apply_stage(stage, event, &ctx) {
             trawl_core::stream::StageResult::Pass => {}
             trawl_core::stream::StageResult::Filtered | trawl_core::stream::StageResult::Done => {
                 return false;
@@ -2697,11 +2702,13 @@ fn emit_agg_snapshot(
     post_stages: &mut [trawl_core::stream::CompiledStage],
 ) -> Event {
     let (columns, rows) = aggregation.snapshot();
+    // #106 M5: one instant for every post-stage row of THIS snapshot.
+    let ctx = trawl_core::context::EvalContext::capture();
     let filtered_rows: Vec<_> = rows
         .into_iter()
         .filter_map(|mut row| {
             for stage in post_stages.iter_mut() {
-                match trawl_core::stream::apply_stage(stage, &mut row) {
+                match trawl_core::stream::apply_stage(stage, &mut row, &ctx) {
                     trawl_core::stream::StageResult::Pass => {}
                     trawl_core::stream::StageResult::Filtered
                     | trawl_core::stream::StageResult::Done => return None,
@@ -2827,9 +2834,12 @@ pub async fn stream_query(
                                 }
 
                                 let mut event = trawl_core::row::from_json(event);
+                                // #106 M5: one instant per event, as
+                                // above — the boundary itself is M5's.
+                                let ctx = trawl_core::context::EvalContext::capture();
                                 let mut pass = true;
                                 for stage in &mut stages {
-                                    match trawl_core::stream::apply_stage(stage, &mut event) {
+                                    match trawl_core::stream::apply_stage(stage, &mut event, &ctx) {
                                         trawl_core::stream::StageResult::Pass => {}
                                         trawl_core::stream::StageResult::Filtered => {
                                             pass = false;

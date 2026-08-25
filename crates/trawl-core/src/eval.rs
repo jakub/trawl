@@ -12,6 +12,7 @@ use std::borrow::Cow;
 
 use crate::ast::{BinaryOp, Expr, FilterOp, FloatLiteral, LiteralValue, Spanned, UnaryOp};
 use crate::compare;
+use crate::context::EvalContext;
 use crate::emitter::SqlValue;
 use crate::pin_match::{self, NullReadPolicy};
 use crate::pin_scope::{PinScope, PinnedSubject};
@@ -271,9 +272,9 @@ impl From<&Value> for EvalValue {
 /// exactly as before ADR-0011 slice A′ — embedded mode's behavior, and the
 /// zero-cost path when no catalog exists. Catalog-backed callers go
 /// through [`eval_expr_with_pins`].
-pub fn eval_expr(expr: &Spanned<Expr>, event: &Row) -> EvalValue {
+pub fn eval_expr(expr: &Spanned<Expr>, event: &Row, ctx: &EvalContext) -> EvalValue {
     static EMPTY: std::sync::LazyLock<PinScope> = std::sync::LazyLock::new(PinScope::unpinned);
-    eval_expr_with_pins(expr, event, &EMPTY)
+    eval_expr_with_pins(expr, event, &EMPTY, ctx)
 }
 
 /// Evaluate an expression with the catalog's pin scope typing bare
@@ -285,7 +286,12 @@ pub fn eval_expr(expr: &Spanned<Expr>, event: &Row) -> EvalValue {
 /// — inside `if()` conditions, under `not`/`and`/`or`, in `| let` values.
 /// An empty scope short-circuits every pinned check, so the pin-blind
 /// path stays zero-cost.
-pub fn eval_expr_with_pins(expr: &Spanned<Expr>, event: &Row, pins: &PinScope) -> EvalValue {
+pub fn eval_expr_with_pins(
+    expr: &Spanned<Expr>,
+    event: &Row,
+    pins: &PinScope,
+    ctx: &EvalContext,
+) -> EvalValue {
     match &expr.node {
         Expr::Literal(lit) => eval_literal(lit),
         Expr::FieldRef(name) => {
@@ -300,27 +306,29 @@ pub fn eval_expr_with_pins(expr: &Spanned<Expr>, event: &Row, pins: &PinScope) -
                 .cloned()
                 .unwrap_or(EvalValue::Null)
         }
-        Expr::Binary { lhs, op, rhs } => try_pinned_comparison(lhs, *op, rhs, event, pins)
+        Expr::Binary { lhs, op, rhs } => try_pinned_comparison(lhs, *op, rhs, event, pins, ctx)
             .unwrap_or_else(|| {
                 eval_binary(
-                    &eval_expr_with_pins(lhs, event, pins),
+                    &eval_expr_with_pins(lhs, event, pins, ctx),
                     *op,
-                    &eval_expr_with_pins(rhs, event, pins),
+                    &eval_expr_with_pins(rhs, event, pins, ctx),
                 )
             }),
-        Expr::Unary { op, operand } => eval_unary(*op, eval_expr_with_pins(operand, event, pins)),
+        Expr::Unary { op, operand } => {
+            eval_unary(*op, eval_expr_with_pins(operand, event, pins, ctx))
+        }
         Expr::FunctionCall { name, args } => {
             let evaluated: Vec<EvalValue> = args
                 .iter()
-                .map(|a| eval_expr_with_pins(a, event, pins))
+                .map(|a| eval_expr_with_pins(a, event, pins, ctx))
                 .collect();
-            eval_scalar_fn(name, &evaluated).unwrap_or(EvalValue::Null)
+            eval_scalar_fn(name, &evaluated, ctx).unwrap_or(EvalValue::Null)
         }
         Expr::InList { expr: target, list } => {
-            if let Some(answer) = try_pinned_in_list(target, list, event, pins) {
+            if let Some(answer) = try_pinned_in_list(target, list, event, pins, ctx) {
                 return answer;
             }
-            let target_val = eval_expr_with_pins(target, event, pins);
+            let target_val = eval_expr_with_pins(target, event, pins, ctx);
             if matches!(target_val, EvalValue::Null) {
                 return EvalValue::Null;
             }
@@ -331,7 +339,7 @@ pub fn eval_expr_with_pins(expr: &Spanned<Expr>, event: &Row, pins: &PinScope) -
             // `NOT`.
             let mut unknown = false;
             for item in list {
-                let item_val = eval_expr_with_pins(item, event, pins);
+                let item_val = eval_expr_with_pins(item, event, pins, ctx);
                 match eval_eq(&target_val, &item_val) {
                     EvalValue::Bool(true) => return EvalValue::Bool(true),
                     EvalValue::Bool(false) => {}
@@ -431,13 +439,14 @@ fn subject_value(
     subject: &PinnedSubject<'_>,
     event: &Row,
     pins: &PinScope,
+    ctx: &EvalContext,
 ) -> Option<serde_json::Value> {
     let cell = match subject {
         PinnedSubject::Field(name) => pinned_event_value(event, name)?.clone(),
         // Evaluated by the ordinary expression path — the same value
         // `| let s = sev(level)` would project, so a comparison and a
         // projection can never read one event two ways.
-        PinnedSubject::Call(call) => eval_expr_with_pins(call, event, pins),
+        PinnedSubject::Call(call) => eval_expr_with_pins(call, event, pins, ctx),
     };
     if matches!(cell, EvalValue::Null) {
         return None;
@@ -501,6 +510,7 @@ fn try_pinned_comparison(
     rhs: &Spanned<Expr>,
     event: &Row,
     pins: &PinScope,
+    ctx: &EvalContext,
 ) -> Option<EvalValue> {
     // Pattern operators: the subject is the LEFT operand only — the
     // right operand is the pattern.
@@ -510,7 +520,7 @@ fn try_pinned_comparison(
             return None;
         };
         let form = crate::compare::pattern_form(Some(pin));
-        let Some(value) = subject_value(&subject, event, pins) else {
+        let Some(value) = subject_value(&subject, event, pins, ctx) else {
             return Some(EvalValue::Null);
         };
         // No canonical text (a BIGINT pin over "4.5") is a NULL pattern
@@ -573,7 +583,7 @@ fn try_pinned_comparison(
     }
     let coerced = pin_match::coerce_form(form);
     let compare_op = pin_match::CompareOp::from_filter(filter_op)?;
-    let Some(value) = subject_value(&subject, event, pins) else {
+    let Some(value) = subject_value(&subject, event, pins, ctx) else {
         // Plain SQL null propagation — strict, no `!=` widening.
         return Some(EvalValue::Null);
     };
@@ -593,6 +603,7 @@ fn try_pinned_in_list(
     list: &[Spanned<Expr>],
     event: &Row,
     pins: &PinScope,
+    ctx: &EvalContext,
 ) -> Option<EvalValue> {
     let (subject, pin) = pins.subject_pin(target)?;
     let forms: Vec<crate::compare::CompareForm> = list
@@ -604,7 +615,7 @@ fn try_pinned_in_list(
                 .flatten()
         })
         .collect::<Option<_>>()?;
-    let Some(value) = subject_value(&subject, event, pins) else {
+    let Some(value) = subject_value(&subject, event, pins, ctx) else {
         return Some(EvalValue::Null);
     };
     let truth = pin_match::or_any(forms.into_iter().map(|form| {
@@ -896,7 +907,7 @@ fn eval_unary(op: UnaryOp, operand: EvalValue) -> EvalValue {
 /// EvalValue::Null` so existing behaviour is preserved; the `Option`
 /// wrapper exists so the coverage test can detect un-implemented scalars.
 #[allow(clippy::too_many_lines)]
-fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
+fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<EvalValue> {
     let v = match name {
         // string
         "lower" => unary_str(args, str::to_lowercase),
@@ -1049,8 +1060,13 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue]) -> Option<EvalValue> {
                 .to_string(),
             )
         }),
-        // now() returns a Timestamp (timezone-naive wall-clock UTC)
-        "now" => EvalValue::Timestamp(compare::Instant::At(chrono::Utc::now().naive_utc())),
+        // ADR-0017 §3: `now()` reads the CONTEXT's instant, never the
+        // clock. One unit of output — a batch statement, a streamed
+        // event, an emitted aggregate snapshot — sees one instant, so
+        // two calls inside one expression can no longer disagree and the
+        // batch tail behind `extract kv` answers exactly what the SQL
+        // prefix bound.
+        "now" => ctx.now_value(),
         // conditional
         "case" => {
             let pairs = args.len() / 2;
@@ -1857,6 +1873,15 @@ mod tests {
         Spanned { node, span: 0..0 }
     }
 
+    /// The evaluation context these tests evaluate under.
+    ///
+    /// Each call is its own unit of output, which is exactly what a test
+    /// asserting one expression is; the cases that care about `now()`
+    /// hold a context of their own and assert against it.
+    fn ctx() -> EvalContext {
+        EvalContext::capture()
+    }
+
     // ── pinned where/let comparisons (ADR-0011 slice A′) ─────────────
 
     mod pinned {
@@ -1883,7 +1908,12 @@ mod tests {
                 })
                 .expect("dsl has a where stage");
             let event: Map<String, Value> = serde_json::from_str(event).expect("valid event");
-            eval_expr_with_pins(&cond, &crate::row::from_json(&event), &PinScope::root(&ft))
+            eval_expr_with_pins(
+                &cond,
+                &crate::row::from_json(&event),
+                &PinScope::root(&ft),
+                &ctx(),
+            )
         }
 
         const VARCHAR_STATUS: &[(&str, CT)] = &[("status", CT::Varchar)];
@@ -2160,7 +2190,7 @@ mod tests {
             };
             let event: Map<String, Value> = serde_json::from_str(r#"{"status": "404"}"#).unwrap();
             assert_eq!(
-                eval_expr(&cond, &crate::row::from_json(&event)),
+                eval_expr(&cond, &crate::row::from_json(&event), &ctx()),
                 EvalValue::Null
             );
         }
@@ -2231,13 +2261,16 @@ mod tests {
 
     #[test]
     fn literal_int() {
-        assert_eq!(eval_expr(&lit_int(42), &empty_event()), EvalValue::Int(42));
+        assert_eq!(
+            eval_expr(&lit_int(42), &empty_event(), &ctx()),
+            EvalValue::Int(42)
+        );
     }
 
     #[test]
     fn literal_float() {
         assert_eq!(
-            eval_expr(&lit_float(1.5), &empty_event()),
+            eval_expr(&lit_float(1.5), &empty_event(), &ctx()),
             EvalValue::Float(1.5)
         );
     }
@@ -2245,7 +2278,7 @@ mod tests {
     #[test]
     fn literal_string() {
         assert_eq!(
-            eval_expr(&lit_str("hello"), &empty_event()),
+            eval_expr(&lit_str("hello"), &empty_event(), &ctx()),
             EvalValue::Str("hello".to_string())
         );
     }
@@ -2253,14 +2286,17 @@ mod tests {
     #[test]
     fn literal_bool() {
         assert_eq!(
-            eval_expr(&lit_bool(true), &empty_event()),
+            eval_expr(&lit_bool(true), &empty_event(), &ctx()),
             EvalValue::Bool(true)
         );
     }
 
     #[test]
     fn literal_null() {
-        assert_eq!(eval_expr(&lit_null(), &empty_event()), EvalValue::Null);
+        assert_eq!(
+            eval_expr(&lit_null(), &empty_event(), &ctx()),
+            EvalValue::Null
+        );
     }
 
     // ── field refs ─────────────────────────────────────────────────
@@ -2269,14 +2305,17 @@ mod tests {
     fn field_ref_present() {
         let ev = event(&json!({"host": "web-1"}));
         assert_eq!(
-            eval_expr(&field("host"), &ev),
+            eval_expr(&field("host"), &ev, &ctx()),
             EvalValue::Str("web-1".to_string())
         );
     }
 
     #[test]
     fn field_ref_missing() {
-        assert_eq!(eval_expr(&field("host"), &empty_event()), EvalValue::Null);
+        assert_eq!(
+            eval_expr(&field("host"), &empty_event(), &ctx()),
+            EvalValue::Null
+        );
     }
 
     #[test]
@@ -2284,10 +2323,13 @@ mod tests {
     /// and `_time` is not that key.
     fn field_ref_timestamp_is_not_an_alias_for_time() {
         let ev = event(&json!({"_time": "2026-01-01T00:00:00Z"}));
-        assert_eq!(eval_expr(&field("@timestamp"), &ev), EvalValue::Null);
+        assert_eq!(
+            eval_expr(&field("@timestamp"), &ev, &ctx()),
+            EvalValue::Null
+        );
         let ev = event(&json!({"@timestamp": "2026-01-01T00:00:00Z"}));
         assert_eq!(
-            eval_expr(&field("@timestamp"), &ev),
+            eval_expr(&field("@timestamp"), &ev, &ctx()),
             EvalValue::Str("2026-01-01T00:00:00Z".to_string())
         );
     }
@@ -2296,7 +2338,7 @@ mod tests {
     fn field_ref_time_alias() {
         let ev = event(&json!({"_time": "2026-01-01T00:00:00Z"}));
         assert_eq!(
-            eval_expr(&field("_time"), &ev),
+            eval_expr(&field("_time"), &ev, &ctx()),
             EvalValue::Str("2026-01-01T00:00:00Z".to_string())
         );
     }
@@ -2304,7 +2346,10 @@ mod tests {
     #[test]
     fn field_ref_numeric() {
         let ev = event(&json!({"status": 200}));
-        assert_eq!(eval_expr(&field("status"), &ev), EvalValue::Int(200));
+        assert_eq!(
+            eval_expr(&field("status"), &ev, &ctx()),
+            EvalValue::Int(200)
+        );
     }
 
     // ── arithmetic ─────────────────────────────────────────────────
@@ -2312,42 +2357,51 @@ mod tests {
     #[test]
     fn add_ints() {
         let expr = binary(lit_int(2), BinaryOp::Add, lit_int(3));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(5));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(5));
     }
 
     #[test]
     fn add_int_float() {
         let expr = binary(lit_int(2), BinaryOp::Add, lit_float(1.5));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(3.5));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(3.5)
+        );
     }
 
     #[test]
     fn sub_ints() {
         let expr = binary(lit_int(10), BinaryOp::Sub, lit_int(3));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(7));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(7));
     }
 
     #[test]
     fn mul_ints() {
         let expr = binary(lit_int(4), BinaryOp::Mul, lit_int(5));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(20));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(20));
     }
 
     #[test]
     fn div_ints() {
         // TRUE division: `/` has no integer form in DuckDB.
         let expr = binary(lit_int(10), BinaryOp::Div, lit_int(4));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(2.5));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(2.5)
+        );
     }
 
     #[test]
     fn div_by_zero_int() {
         for (dividend, want) in [(10_i64, f64::INFINITY), (-10_i64, f64::NEG_INFINITY)] {
             let expr = binary(lit_int(dividend), BinaryOp::Div, lit_int(0));
-            assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(want));
+            assert_eq!(
+                eval_expr(&expr, &empty_event(), &ctx()),
+                EvalValue::Float(want)
+            );
         }
         let expr = binary(lit_int(0), BinaryOp::Div, lit_int(0));
-        let EvalValue::Float(value) = eval_expr(&expr, &empty_event()) else {
+        let EvalValue::Float(value) = eval_expr(&expr, &empty_event(), &ctx()) else {
             panic!("0 / 0 must be a float");
         };
         assert!(value.is_nan());
@@ -2365,7 +2419,7 @@ mod tests {
         ] {
             let expr = binary(lit_int(lhs), op, lit_int(rhs));
             assert_eq!(
-                eval_expr(&expr, &empty_event()),
+                eval_expr(&expr, &empty_event(), &ctx()),
                 EvalValue::Null,
                 "{lhs:?} {op:?} {rhs:?}"
             );
@@ -2384,29 +2438,38 @@ mod tests {
         ] {
             let expr = binary(nan(), op, nan());
             assert_eq!(
-                eval_expr(&expr, &empty_event()),
+                eval_expr(&expr, &empty_event(), &ctx()),
                 EvalValue::Bool(want),
                 "NaN {op:?} NaN"
             );
         }
         let expr = binary(nan(), BinaryOp::Gt, lit_float(f64::MAX));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
         // …while the two zeros tie.
         let expr = binary(lit_float(-0.0), BinaryOp::Eq, lit_float(0.0));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn div_floats() {
         let expr = binary(lit_float(10.0), BinaryOp::Div, lit_float(4.0));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(2.5));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(2.5)
+        );
     }
 
     #[test]
     fn div_by_zero_float() {
         let expr = binary(lit_float(10.0), BinaryOp::Div, lit_float(0.0));
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Float(f64::INFINITY)
         );
     }
@@ -2415,7 +2478,7 @@ mod tests {
     fn modulo_by_zero_float() {
         // A DOUBLE operand takes the IEEE path, where `% 0` is NaN.
         let expr = binary(lit_int(5), BinaryOp::Mod, lit_float(0.0));
-        let EvalValue::Float(value) = eval_expr(&expr, &empty_event()) else {
+        let EvalValue::Float(value) = eval_expr(&expr, &empty_event(), &ctx()) else {
             panic!("5 % 0.0 must be a float");
         };
         assert!(value.is_nan());
@@ -2424,26 +2487,26 @@ mod tests {
     #[test]
     fn modulo_ints() {
         let expr = binary(lit_int(10), BinaryOp::Mod, lit_int(3));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(1));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(1));
     }
 
     #[test]
     fn modulo_by_zero() {
         let expr = binary(lit_int(10), BinaryOp::Mod, lit_int(0));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     #[test]
     fn arithmetic_null_propagation() {
         let expr = binary(lit_int(5), BinaryOp::Add, lit_null());
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     #[test]
     fn arithmetic_with_field() {
         let ev = event(&json!({"duration": 100}));
         let expr = binary(field("duration"), BinaryOp::Mul, lit_int(1000));
-        assert_eq!(eval_expr(&expr, &ev), EvalValue::Int(100_000));
+        assert_eq!(eval_expr(&expr, &ev, &ctx()), EvalValue::Int(100_000));
     }
 
     // ── comparison ─────────────────────────────────────────────────
@@ -2451,61 +2514,88 @@ mod tests {
     #[test]
     fn eq_ints() {
         let expr = binary(lit_int(5), BinaryOp::Eq, lit_int(5));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn eq_int_float_cross() {
         let expr = binary(lit_int(5), BinaryOp::Eq, lit_float(5.0));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn ne_ints() {
         let expr = binary(lit_int(5), BinaryOp::Ne, lit_int(3));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn gt_ints() {
         let expr = binary(lit_int(5), BinaryOp::Gt, lit_int(3));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn gt_false() {
         let expr = binary(lit_int(3), BinaryOp::Gt, lit_int(5));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(false)
+        );
     }
 
     #[test]
     fn gte_equal() {
         let expr = binary(lit_int(5), BinaryOp::Gte, lit_int(5));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn lt_ints() {
         let expr = binary(lit_int(3), BinaryOp::Lt, lit_int(5));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn lte_equal() {
         let expr = binary(lit_int(5), BinaryOp::Lte, lit_int(5));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn cmp_strings() {
         let expr = binary(lit_str("apple"), BinaryOp::Lt, lit_str("banana"));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn cmp_null_propagation() {
         let expr = binary(lit_int(5), BinaryOp::Gt, lit_null());
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     // ── Timestamp vs Str coercion in eval_cmp/eval_eq ──────────────
@@ -2518,7 +2608,10 @@ mod tests {
             BinaryOp::Gt,
             lit_str("2000-01-01 00:00:00"),
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
@@ -2528,7 +2621,10 @@ mod tests {
             BinaryOp::Lt,
             lit_str("2999-12-31 23:59:59"),
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
@@ -2542,7 +2638,10 @@ mod tests {
             BinaryOp::Eq,
             lit_str("2026-01-15 10:20:30"),
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
@@ -2550,7 +2649,7 @@ mod tests {
         // Event with far-future timestamp: `_time > now()` should be true.
         let ev = event(&json!({"_time": "2999-12-31 23:59:59"}));
         let expr = binary(field("_time"), BinaryOp::Gt, call("now", vec![]));
-        assert_eq!(eval_expr(&expr, &ev), EvalValue::Bool(true));
+        assert_eq!(eval_expr(&expr, &ev, &ctx()), EvalValue::Bool(true));
     }
 
     #[test]
@@ -2558,7 +2657,7 @@ mod tests {
         // Event with past timestamp: `_time > now()` should be false.
         let ev = event(&json!({"_time": "2000-01-01 00:00:00"}));
         let expr = binary(field("_time"), BinaryOp::Gt, call("now", vec![]));
-        assert_eq!(eval_expr(&expr, &ev), EvalValue::Bool(false));
+        assert_eq!(eval_expr(&expr, &ev, &ctx()), EvalValue::Bool(false));
     }
 
     // ── logical ops ────────────────────────────────────────────────
@@ -2566,44 +2665,59 @@ mod tests {
     #[test]
     fn and_true_true() {
         let expr = binary(lit_bool(true), BinaryOp::And, lit_bool(true));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn and_true_false() {
         let expr = binary(lit_bool(true), BinaryOp::And, lit_bool(false));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(false)
+        );
     }
 
     #[test]
     fn and_false_null() {
         // false AND null = false (SQL short-circuit)
         let expr = binary(lit_bool(false), BinaryOp::And, lit_null());
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(false)
+        );
     }
 
     #[test]
     fn and_null_true() {
         let expr = binary(lit_null(), BinaryOp::And, lit_bool(true));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     #[test]
     fn or_true_null() {
         let expr = binary(lit_bool(true), BinaryOp::Or, lit_null());
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn or_false_false() {
         let expr = binary(lit_bool(false), BinaryOp::Or, lit_bool(false));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(false)
+        );
     }
 
     #[test]
     fn or_null_false() {
         let expr = binary(lit_null(), BinaryOp::Or, lit_bool(false));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     // ── matches ────────────────────────────────────────────────────
@@ -2615,7 +2729,10 @@ mod tests {
             BinaryOp::Matches,
             lit_str("prod-.*"),
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
@@ -2625,7 +2742,10 @@ mod tests {
             BinaryOp::Matches,
             lit_str("^prod-.*"),
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(false)
+        );
     }
 
     // ── like / ilike ────────────────────────────────────────────────
@@ -2633,37 +2753,52 @@ mod tests {
     #[test]
     fn like_percent_wildcard() {
         let expr = binary(lit_str("prod-web-01"), BinaryOp::Like, lit_str("prod-%"));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn like_no_match() {
         let expr = binary(lit_str("staging-01"), BinaryOp::Like, lit_str("prod-%"));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(false)
+        );
     }
 
     #[test]
     fn like_underscore_wildcard() {
         let expr = binary(lit_str("a1"), BinaryOp::Like, lit_str("a_"));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn like_case_sensitive() {
         let expr = binary(lit_str("PROD-01"), BinaryOp::Like, lit_str("prod-%"));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(false)
+        );
     }
 
     #[test]
     fn ilike_case_insensitive() {
         let expr = binary(lit_str("PROD-01"), BinaryOp::ILike, lit_str("prod-%"));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn like_null_propagation() {
         let expr = binary(lit_null(), BinaryOp::Like, lit_str("prod-%"));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     // ── unary ──────────────────────────────────────────────────────
@@ -2671,31 +2806,43 @@ mod tests {
     #[test]
     fn not_true() {
         let expr = unary(UnaryOp::Not, lit_bool(true));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(false)
+        );
     }
 
     #[test]
     fn not_false() {
         let expr = unary(UnaryOp::Not, lit_bool(false));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn not_null() {
         let expr = unary(UnaryOp::Not, lit_null());
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     #[test]
     fn neg_int() {
         let expr = unary(UnaryOp::Neg, lit_int(42));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(-42));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Int(-42)
+        );
     }
 
     #[test]
     fn neg_float() {
         let expr = unary(UnaryOp::Neg, lit_float(1.5));
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(-1.5));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(-1.5)
+        );
     }
 
     // ── in list ────────────────────────────────────────────────────
@@ -2703,19 +2850,25 @@ mod tests {
     #[test]
     fn in_list_found() {
         let expr = in_list(lit_int(200), vec![lit_int(200), lit_int(301), lit_int(404)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn in_list_not_found() {
         let expr = in_list(lit_int(500), vec![lit_int(200), lit_int(301)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(false)
+        );
     }
 
     #[test]
     fn in_list_null_target() {
         let expr = in_list(lit_null(), vec![lit_int(200)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     // ── scalar functions: string ───────────────────────────────────
@@ -2724,7 +2877,7 @@ mod tests {
     fn fn_lower() {
         let expr = call("lower", vec![lit_str("HELLO")]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("hello".to_string())
         );
     }
@@ -2733,7 +2886,7 @@ mod tests {
     fn fn_upper() {
         let expr = call("upper", vec![lit_str("hello")]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("HELLO".to_string())
         );
     }
@@ -2741,27 +2894,27 @@ mod tests {
     #[test]
     fn fn_length() {
         let expr = call("length", vec![lit_str("hello")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(5));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(5));
     }
 
     #[test]
     fn fn_length_counts_chars_not_bytes() {
         // DuckDB LENGTH() returns character count; "café" is 4 chars / 5 bytes.
         let expr = call("length", vec![lit_str("café")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(4));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(4));
     }
 
     #[test]
     fn fn_len_alias() {
         let expr = call("len", vec![lit_str("hi")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(2));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(2));
     }
 
     #[test]
     fn fn_trim() {
         let expr = call("trim", vec![lit_str("  hello  ")]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("hello".to_string())
         );
     }
@@ -2770,7 +2923,7 @@ mod tests {
     fn fn_ltrim() {
         let expr = call("ltrim", vec![lit_str("  hello  ")]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("hello  ".to_string())
         );
     }
@@ -2779,7 +2932,7 @@ mod tests {
     fn fn_rtrim() {
         let expr = call("rtrim", vec![lit_str("  hello  ")]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("  hello".to_string())
         );
     }
@@ -2791,7 +2944,7 @@ mod tests {
             vec![lit_str("foo bar foo"), lit_str("foo"), lit_str("baz")],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("baz bar baz".to_string())
         );
     }
@@ -2800,7 +2953,7 @@ mod tests {
     fn fn_substr_two_args() {
         let expr = call("substr", vec![lit_str("hello world"), lit_int(7)]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("world".to_string())
         );
     }
@@ -2812,7 +2965,7 @@ mod tests {
             vec![lit_str("hello world"), lit_int(1), lit_int(5)],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("hello".to_string())
         );
     }
@@ -2820,7 +2973,7 @@ mod tests {
     #[test]
     fn fn_substr_null() {
         let expr = call("substr", vec![lit_null(), lit_int(1)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     #[test]
@@ -2901,14 +3054,20 @@ mod tests {
     fn abs_and_neg_null_on_i64_min_overflow() {
         // abs(i64::MIN) and -(i64::MIN) overflow; both must null out, not panic.
         let abs_expr = call("abs", vec![lit_int(i64::MIN)]);
-        assert_eq!(eval_expr(&abs_expr, &empty_event()), EvalValue::Null);
+        assert_eq!(
+            eval_expr(&abs_expr, &empty_event(), &ctx()),
+            EvalValue::Null
+        );
 
         let neg_expr = unary(UnaryOp::Neg, lit_int(i64::MIN));
-        assert_eq!(eval_expr(&neg_expr, &empty_event()), EvalValue::Null);
+        assert_eq!(
+            eval_expr(&neg_expr, &empty_event(), &ctx()),
+            EvalValue::Null
+        );
 
         // Sanity: ordinary values still work.
         let ok = call("abs", vec![lit_int(-5)]);
-        assert_eq!(eval_expr(&ok, &empty_event()), EvalValue::Int(5));
+        assert_eq!(eval_expr(&ok, &empty_event(), &ctx()), EvalValue::Int(5));
     }
 
     #[test]
@@ -3004,7 +3163,7 @@ mod tests {
         // tostring(1.0) -> "1.0" (DuckDB), not "1" (Rust to_string).
         let expr = call("tostring", vec![lit_float(1.0)]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("1.0".to_string())
         );
     }
@@ -3013,12 +3172,12 @@ mod tests {
     fn fn_concat_float_renders_duckdb_way() {
         let expr = call("concat", vec![lit_str("x="), lit_float(0.1)]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("x=0.1".to_string())
         );
         let expr = call("concat", vec![lit_str("n="), lit_float(2.0)]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("n=2.0".to_string())
         );
     }
@@ -3031,7 +3190,7 @@ mod tests {
             vec![lit_str("n="), lit_int(42), lit_str("/"), lit_bool(true)],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("n=42/true".to_string())
         );
     }
@@ -3041,7 +3200,7 @@ mod tests {
         // DuckDB CONCAT *ignores* NULL args (unlike `||`): CONCAT('a',NULL,'b')=='ab'.
         let expr = call("concat", vec![lit_str("a"), lit_null(), lit_str("b")]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("ab".to_string())
         );
     }
@@ -3051,7 +3210,7 @@ mod tests {
         // CONCAT('x','-',NULL) == 'x-' (the #22 batch-vs-live drift case).
         let expr = call("concat", vec![lit_str("x"), lit_str("-"), lit_null()]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("x-".to_string())
         );
     }
@@ -3061,7 +3220,7 @@ mod tests {
         // DuckDB CONCAT(NULL) == '' (empty string), NOT NULL.
         let expr = call("concat", vec![lit_null(), lit_null()]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str(String::new())
         );
     }
@@ -3071,19 +3230,25 @@ mod tests {
     #[test]
     fn fn_abs_positive() {
         let expr = call("abs", vec![lit_int(-42)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(42));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(42));
     }
 
     #[test]
     fn fn_abs_float() {
         let expr = call("abs", vec![lit_float(-1.5)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(1.5));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(1.5)
+        );
     }
 
     #[test]
     fn fn_ceil() {
         let expr = call("ceil", vec![lit_float(1.2)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(2.0));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(2.0)
+        );
     }
 
     #[test]
@@ -3091,14 +3256,17 @@ mod tests {
         // CEIL(BIGINT) is DOUBLE in DuckDB, so an integer argument may not
         // pass through as one.
         let expr = call("ceil", vec![lit_int(5)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(5.0));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(5.0)
+        );
     }
 
     #[test]
     fn fn_ceil_keeps_negative_zero() {
         // `-0.0`, the value the retired i64 truncation could not carry.
         let expr = call("ceil", vec![lit_float(-0.5)]);
-        let EvalValue::Float(value) = eval_expr(&expr, &empty_event()) else {
+        let EvalValue::Float(value) = eval_expr(&expr, &empty_event(), &ctx()) else {
             panic!("ceil(-0.5) must be a float");
         };
         assert!(value == 0.0 && value.is_sign_negative(), "{value}");
@@ -3107,44 +3275,62 @@ mod tests {
     #[test]
     fn fn_ceiling_alias() {
         let expr = call("ceiling", vec![lit_float(1.2)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(2.0));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(2.0)
+        );
     }
 
     #[test]
     fn fn_floor() {
         let expr = call("floor", vec![lit_float(1.8)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(1.0));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(1.0)
+        );
     }
 
     #[test]
     fn fn_floor_widens_an_integer_argument() {
         let expr = call("floor", vec![lit_int(-5)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(-5.0));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(-5.0)
+        );
     }
 
     #[test]
     fn fn_round_no_precision() {
         // ROUND(DOUBLE) is DOUBLE — only an INTEGER argument stays integral.
         let expr = call("round", vec![lit_float(1.6)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(2.0));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(2.0)
+        );
     }
 
     #[test]
     fn fn_round_explicit_zero_precision_stays_double() {
         let expr = call("round", vec![lit_float(2.5), lit_int(0)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(3.0));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(3.0)
+        );
     }
 
     #[test]
     fn fn_round_with_precision() {
         let expr = call("round", vec![lit_float(1.456), lit_int(2)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(1.46));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(1.46)
+        );
     }
 
     #[test]
     fn fn_round_int_passthrough() {
         let expr = call("round", vec![lit_int(42)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(42));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(42));
     }
 
     // ── scalar functions: conditional ──────────────────────────────
@@ -3153,7 +3339,7 @@ mod tests {
     fn fn_if_true() {
         let expr = call("if", vec![lit_bool(true), lit_str("yes"), lit_str("no")]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("yes".to_string())
         );
     }
@@ -3162,7 +3348,7 @@ mod tests {
     fn fn_if_false() {
         let expr = call("if", vec![lit_bool(false), lit_str("yes"), lit_str("no")]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("no".to_string())
         );
     }
@@ -3189,7 +3375,7 @@ mod tests {
         ] {
             let expr = call("if", vec![condition, lit_str("yes"), lit_str("no")]);
             let expected = want.map_or(EvalValue::Null, |text| EvalValue::Str(text.to_string()));
-            assert_eq!(eval_expr(&expr, &empty_event()), expected);
+            assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), expected);
         }
     }
 
@@ -3206,7 +3392,7 @@ mod tests {
                 lit_int(3),
             ],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(1));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(1));
 
         // …and an unreadable arm reached in order nulls the WHOLE call,
         // whether the arm before it was false or NULL.
@@ -3221,45 +3407,54 @@ mod tests {
                     lit_int(3),
                 ],
             );
-            assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+            assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
         }
     }
 
     #[test]
     fn fn_coalesce_first_non_null() {
         let expr = call("coalesce", vec![lit_null(), lit_int(42), lit_int(99)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(42));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(42));
     }
 
     #[test]
     fn fn_coalesce_all_null() {
         let expr = call("coalesce", vec![lit_null(), lit_null()]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     #[test]
     fn fn_isnull_null() {
         let expr = call("isnull", vec![lit_null()]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn fn_isnull_not_null() {
         let expr = call("isnull", vec![lit_int(5)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(false)
+        );
     }
 
     #[test]
     fn fn_isnotnull() {
         let expr = call("isnotnull", vec![lit_str("hi")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
+        );
     }
 
     #[test]
     fn fn_typeof_int() {
         let expr = call("typeof", vec![lit_int(5)]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("BIGINT".to_string())
         );
     }
@@ -3268,7 +3463,7 @@ mod tests {
     fn fn_typeof_string() {
         let expr = call("typeof", vec![lit_str("hi")]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("VARCHAR".to_string())
         );
     }
@@ -3277,29 +3472,42 @@ mod tests {
     fn fn_typeof_null() {
         let expr = call("typeof", vec![lit_null()]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("NULL".to_string())
         );
     }
 
-    // now() returns a Timestamp, so this asserts Timestamp(_) rather than a
-    // string/int representation.
+    /// `now()` reads the CONTEXT, not the clock (ADR-0017 §3) — a
+    /// Timestamp, and specifically the anchor's own value.
+    ///
+    /// Asserted against a FIXED context rather than bracketed between two
+    /// clock reads: the anchor is truncated to microseconds, so a
+    /// bracketing test would fail whenever the capture landed in the same
+    /// microsecond as its lower bound.
     #[test]
-    fn fn_now_returns_timestamp() {
-        let before = chrono::Utc::now().naive_utc();
-        let expr = call("now", vec![]);
-        let result = eval_expr(&expr, &empty_event());
-        let after = chrono::Utc::now().naive_utc();
-        let EvalValue::Timestamp(ts) = result else {
-            panic!("expected Timestamp, got {result:?}");
-        };
-        assert!(
-            ts >= compare::Instant::At(before),
-            "now() timestamp should be >= start"
+    fn fn_now_returns_the_contexts_instant() {
+        let at = EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-02-03T04:05:06.789012Z")
+                .expect("a valid RFC 3339 instant")
+                .into(),
         );
-        assert!(
-            ts <= compare::Instant::At(after),
-            "now() timestamp should be <= end"
+        let result = eval_expr(&call("now", vec![]), &empty_event(), &at);
+        assert_eq!(
+            result,
+            EvalValue::Timestamp(compare::Instant::At(at.now_timestamp()))
+        );
+        assert_eq!(result, at.now_value(), "and it IS the context's own value");
+    }
+
+    /// One instant per unit of output: two `now()` calls in ONE
+    /// expression can no longer disagree, however coarse or fine the
+    /// platform clock is.
+    #[test]
+    fn two_now_calls_in_one_expression_are_one_instant() {
+        let expr = binary(call("now", vec![]), BinaryOp::Eq, call("now", vec![]));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Bool(true)
         );
     }
 
@@ -3465,7 +3673,7 @@ mod tests {
             BinaryOp::And,
             binary(field("status"), BinaryOp::Lt, lit_int(500)),
         );
-        assert_eq!(eval_expr(&expr, &ev), EvalValue::Bool(true));
+        assert_eq!(eval_expr(&expr, &ev, &ctx()), EvalValue::Bool(true));
     }
 
     #[test]
@@ -3477,7 +3685,7 @@ mod tests {
             BinaryOp::Add,
             lit_int(50),
         );
-        assert_eq!(eval_expr(&expr, &ev), EvalValue::Int(2050));
+        assert_eq!(eval_expr(&expr, &ev, &ctx()), EvalValue::Int(2050));
     }
 
     #[test]
@@ -3485,7 +3693,7 @@ mod tests {
         // upper(lower("HeLLo"))
         let expr = call("upper", vec![call("lower", vec![lit_str("HeLLo")])]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("HELLO".to_string())
         );
     }
@@ -3502,7 +3710,7 @@ mod tests {
                 lit_int(0),
             ],
         );
-        assert_eq!(eval_expr(&expr, &ev), EvalValue::Int(11));
+        assert_eq!(eval_expr(&expr, &ev, &ctx()), EvalValue::Int(11));
     }
 
     #[test]
@@ -3516,7 +3724,7 @@ mod tests {
                 lit_int(0),
             ],
         );
-        assert_eq!(eval_expr(&expr, &ev), EvalValue::Int(0));
+        assert_eq!(eval_expr(&expr, &ev, &ctx()), EvalValue::Int(0));
     }
 
     // ── date/time scalar functions ─────────────────────────────────
@@ -3535,19 +3743,28 @@ mod tests {
     #[test]
     fn fn_tonumber_from_str() {
         let expr = call("tonumber", vec![lit_str("1.23")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(1.23));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(1.23)
+        );
     }
 
     #[test]
     fn fn_tonumber_from_int() {
         let expr = call("tonumber", vec![lit_int(42)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(42.0));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(42.0)
+        );
     }
 
     #[test]
     fn fn_tonumber_from_float() {
         let expr = call("tonumber", vec![lit_float(1.5)]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(1.5));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(1.5)
+        );
     }
 
     #[test]
@@ -3555,24 +3772,33 @@ mod tests {
         // TRY_CAST(bool AS DOUBLE) has a reading in both directions.
         for (input, want) in [(true, 1.0), (false, 0.0)] {
             let expr = call("tonumber", vec![lit_bool(input)]);
-            assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(want));
+            assert_eq!(
+                eval_expr(&expr, &empty_event(), &ctx()),
+                EvalValue::Float(want)
+            );
         }
     }
 
     #[test]
     fn fn_tonumber_non_numeric_str() {
         let expr = call("tonumber", vec![lit_str("nope")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     #[test]
     fn fn_tonumber_honors_inner_digit_separators() {
         // `_` flanked by ASCII digits on both sides is dropped (DuckDB TRY_CAST).
         let expr = call("tonumber", vec![lit_str("1_000")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(1000.0));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(1000.0)
+        );
 
         let expr = call("tonumber", vec![lit_str("1_0.0_5")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Float(10.05));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Float(10.05)
+        );
     }
 
     #[test]
@@ -3582,7 +3808,7 @@ mod tests {
         for bad in ["_1000", "1000_", "1__000", "1_e3", "1,000"] {
             let expr = call("tonumber", vec![lit_str(bad)]);
             assert_eq!(
-                eval_expr(&expr, &empty_event()),
+                eval_expr(&expr, &empty_event(), &ctx()),
                 EvalValue::Null,
                 "tonumber({bad:?}) should be Null"
             );
@@ -3594,7 +3820,7 @@ mod tests {
     fn fn_tostring_int() {
         let expr = call("tostring", vec![lit_int(42)]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("42".to_string())
         );
     }
@@ -3602,7 +3828,7 @@ mod tests {
     #[test]
     fn fn_tostring_null() {
         let expr = call("tostring", vec![lit_null()]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     #[test]
@@ -3615,7 +3841,7 @@ mod tests {
             )],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("2026-01-15 14:30:00".to_string())
         );
     }
@@ -3627,7 +3853,10 @@ mod tests {
             "date_part",
             vec![lit_str("year"), ts("2026-03-15 10:20:30")],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(2026));
+        assert_eq!(
+            eval_expr(&expr, &empty_event(), &ctx()),
+            EvalValue::Int(2026)
+        );
     }
 
     #[test]
@@ -3636,13 +3865,13 @@ mod tests {
             "date_part",
             vec![lit_str("month"), ts("2026-03-15 10:20:30")],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(3));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(3));
     }
 
     #[test]
     fn fn_date_part_day() {
         let expr = call("date_part", vec![lit_str("day"), ts("2026-03-15 10:20:30")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(15));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(15));
     }
 
     #[test]
@@ -3651,14 +3880,14 @@ mod tests {
             "date_part",
             vec![lit_str("hour"), ts("2026-03-15 10:20:30")],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(10));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(10));
     }
 
     #[test]
     fn fn_date_part_dow_sunday() {
         // 2026-03-15 is a Sunday → DOW=0
         let expr = call("date_part", vec![lit_str("dow"), ts("2026-03-15 00:00:00")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(0));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(0));
     }
 
     #[test]
@@ -3667,7 +3896,7 @@ mod tests {
             "date_part",
             vec![lit_str("quarter"), ts("2026-07-01 00:00:00")],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(3));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(3));
     }
 
     #[test]
@@ -3676,7 +3905,7 @@ mod tests {
             "date_part",
             vec![lit_str("millennium"), ts("2026-01-01 00:00:00")],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     // date_trunc
@@ -3687,7 +3916,7 @@ mod tests {
             vec![lit_str("year"), ts("2026-07-15 10:20:30")],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Timestamp(compare::Instant::At(ndt("2026-01-01 00:00:00")))
         );
     }
@@ -3699,7 +3928,7 @@ mod tests {
             vec![lit_str("month"), ts("2026-07-15 10:20:30")],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Timestamp(compare::Instant::At(ndt("2026-07-01 00:00:00")))
         );
     }
@@ -3711,7 +3940,7 @@ mod tests {
             vec![lit_str("day"), ts("2026-07-15 10:20:30")],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Timestamp(compare::Instant::At(ndt("2026-07-15 00:00:00")))
         );
     }
@@ -3723,7 +3952,7 @@ mod tests {
             vec![lit_str("hour"), ts("2026-07-15 10:20:30")],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Timestamp(compare::Instant::At(ndt("2026-07-15 10:00:00")))
         );
     }
@@ -3736,7 +3965,7 @@ mod tests {
             vec![lit_str("week"), ts("2026-07-15 10:20:30")],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Timestamp(compare::Instant::At(ndt("2026-07-13 00:00:00")))
         );
     }
@@ -3753,7 +3982,7 @@ mod tests {
                 ts("2026-01-02 00:00:00"),
             ],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(1));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(1));
     }
 
     #[test]
@@ -3766,7 +3995,7 @@ mod tests {
                 ts("2026-01-08 00:00:00"),
             ],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(7));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(7));
     }
 
     #[test]
@@ -3779,7 +4008,7 @@ mod tests {
                 ts("2026-03-15 00:00:00"),
             ],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(2));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(2));
     }
 
     #[test]
@@ -3793,7 +4022,7 @@ mod tests {
                 ts("2026-01-01 00:00:00"),
             ],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(-7));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(-7));
     }
 
     #[test]
@@ -3807,7 +4036,7 @@ mod tests {
                 ts("2026-07-20 00:00:00"),
             ],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Int(1));
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(1));
     }
 
     // strftime
@@ -3818,7 +4047,7 @@ mod tests {
             vec![ts("2026-03-15 10:20:30"), lit_str("%Y-%m-%d")],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("2026-03-15".to_string())
         );
     }
@@ -3830,7 +4059,7 @@ mod tests {
             vec![ts("2026-03-15 10:20:30"), lit_str("%Y-%m-%d %H:%M:%S")],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("2026-03-15 10:20:30".to_string())
         );
     }
@@ -3841,14 +4070,14 @@ mod tests {
         // Display returns fmt::Error, so the old `.to_string()` panicked.
         // Remote-triggerable via the SSE streaming path (#22 reviewer finding).
         let expr = call("strftime", vec![ts("2026-03-15 10:20:30"), lit_str("%Q")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     #[test]
     fn fn_strftime_trailing_percent_returns_null_not_panic() {
         // A dangling `%` is also an Item::Error in chrono.
         let expr = call("strftime", vec![ts("2026-03-15 10:20:30"), lit_str("%Y-%")]);
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     // strptime
@@ -3859,7 +4088,7 @@ mod tests {
             vec![lit_str("2026-03-15 10:20:30"), lit_str("%Y-%m-%d %H:%M:%S")],
         );
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Timestamp(compare::Instant::At(ndt("2026-03-15 10:20:30")))
         );
     }
@@ -3870,7 +4099,7 @@ mod tests {
             "strptime",
             vec![lit_str("not-a-date"), lit_str("%Y-%m-%d %H:%M:%S")],
         );
-        assert_eq!(eval_expr(&expr, &empty_event()), EvalValue::Null);
+        assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     // Partial formats fill omitted components from DuckDB's 1900-01-01 00:00:00
@@ -3888,7 +4117,7 @@ mod tests {
         ] {
             let expr = call("strptime", vec![lit_str(input), lit_str(fmt)]);
             assert_eq!(
-                eval_expr(&expr, &empty_event()),
+                eval_expr(&expr, &empty_event(), &ctx()),
                 EvalValue::Timestamp(compare::Instant::At(ndt(want))),
                 "strptime({input:?}, {fmt:?})"
             );
@@ -3910,7 +4139,7 @@ mod tests {
             for unit in crate::emitter::DATE_PART_UNITS {
                 let expr = call("date_part", vec![lit_str(unit), ts()]);
                 assert_eq!(
-                    eval_expr(&expr, &empty_event()),
+                    eval_expr(&expr, &empty_event(), &ctx()),
                     EvalValue::Null,
                     "date_part({unit:?}, {word})"
                 );
@@ -3918,7 +4147,7 @@ mod tests {
             for unit in crate::emitter::DATE_UNITS {
                 let expr = call("date_trunc", vec![lit_str(unit), ts()]);
                 assert_eq!(
-                    eval_expr(&expr, &empty_event()),
+                    eval_expr(&expr, &empty_event(), &ctx()),
                     EvalValue::Timestamp(instant),
                     "date_trunc({unit:?}, {word})"
                 );
@@ -3926,7 +4155,7 @@ mod tests {
             for fmt in ["%Y-%m-%d %H:%M:%S", "%Y", "%j"] {
                 let expr = call("strftime", vec![ts(), lit_str(fmt)]);
                 assert_eq!(
-                    eval_expr(&expr, &empty_event()),
+                    eval_expr(&expr, &empty_event(), &ctx()),
                     EvalValue::Str(word.to_string()),
                     "strftime({word}, {fmt:?})"
                 );
@@ -3935,7 +4164,7 @@ mod tests {
             for (start, end) in [(ts(), finite()), (finite(), ts()), (ts(), ts())] {
                 let expr = call("date_diff", vec![lit_str("day"), start, end]);
                 assert_eq!(
-                    eval_expr(&expr, &empty_event()),
+                    eval_expr(&expr, &empty_event(), &ctx()),
                     EvalValue::Null,
                     "date_diff over {word}"
                 );
@@ -4003,7 +4232,7 @@ mod tests {
             ("2026-01-15 09:00:00", "000000"),
         ] {
             let ts = EvalValue::Timestamp(compare::Instant::At(ndt(text)));
-            let answer = eval_scalar_fn("strftime", &[ts, EvalValue::Str("%f".into())]);
+            let answer = eval_scalar_fn("strftime", &[ts, EvalValue::Str("%f".into())], &ctx());
             assert_eq!(answer, Some(EvalValue::Str(want.to_string())), "{text:?}");
         }
     }
@@ -4022,6 +4251,7 @@ mod tests {
                     EvalValue::Str(text.to_string()),
                     EvalValue::Str("%Y-%m-%d %H:%M:%S.%f".into()),
                 ],
+                &ctx(),
             )
         };
         assert_eq!(
@@ -4081,6 +4311,7 @@ mod tests {
                     EvalValue::Str(doc.to_string()),
                     EvalValue::Str(path.to_string()),
                 ],
+                &ctx(),
             )
         };
         for (doc, path, want) in [
@@ -4105,7 +4336,7 @@ mod tests {
     fn fn_typeof_now_is_timestamp() {
         let expr = call("typeof", vec![call("now", vec![])]);
         assert_eq!(
-            eval_expr(&expr, &empty_event()),
+            eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str("TIMESTAMP".to_string())
         );
     }
@@ -4135,31 +4366,31 @@ mod tests {
             ("", EvalValue::Null),
         ] {
             assert_eq!(
-                eval_expr(&call("sev", vec![lit_str(text)]), &empty_event()),
+                eval_expr(&call("sev", vec![lit_str(text)]), &empty_event(), &ctx()),
                 expected,
                 "sev({text:?})"
             );
         }
         assert_eq!(
-            eval_expr(&call("sev", vec![lit_int(17)]), &empty_event()),
+            eval_expr(&call("sev", vec![lit_int(17)]), &empty_event(), &ctx()),
             EvalValue::Int(17)
         );
         assert_eq!(
-            eval_expr(&call("sev", vec![lit_int(25)]), &empty_event()),
+            eval_expr(&call("sev", vec![lit_int(25)]), &empty_event(), &ctx()),
             EvalValue::Null
         );
         // A shape that names no rung — a float, a boolean, a missing
         // field — has no reading.
         assert_eq!(
-            eval_expr(&call("sev", vec![lit_float(17.0)]), &empty_event()),
+            eval_expr(&call("sev", vec![lit_float(17.0)]), &empty_event(), &ctx()),
             EvalValue::Null
         );
         assert_eq!(
-            eval_expr(&call("sev", vec![lit_bool(true)]), &empty_event()),
+            eval_expr(&call("sev", vec![lit_bool(true)]), &empty_event(), &ctx()),
             EvalValue::Null
         );
         assert_eq!(
-            eval_expr(&call("sev", vec![field("level")]), &empty_event()),
+            eval_expr(&call("sev", vec![field("level")]), &empty_event(), &ctx()),
             EvalValue::Null
         );
     }
@@ -4169,7 +4400,11 @@ mod tests {
     #[test]
     fn fn_sev_dialect_inverts_numerics_only() {
         let sev = |arg: Spanned<Expr>, dialect: &str| {
-            eval_expr(&call("sev", vec![arg, lit_str(dialect)]), &empty_event())
+            eval_expr(
+                &call("sev", vec![arg, lit_str(dialect)]),
+                &empty_event(),
+                &ctx(),
+            )
         };
         assert_eq!(sev(lit_int(3), "syslog"), EvalValue::Int(17));
         assert_eq!(sev(lit_int(3), "otel"), EvalValue::Int(3));
@@ -4188,13 +4423,14 @@ mod tests {
     fn fn_sev_over_event_columns() {
         let ev = event(&json!({"level": "warn", "syslog_severity": 3}));
         assert_eq!(
-            eval_expr(&call("sev", vec![field("level")]), &ev),
+            eval_expr(&call("sev", vec![field("level")]), &ev, &ctx()),
             EvalValue::Int(13)
         );
         assert_eq!(
             eval_expr(
                 &call("sev", vec![field("syslog_severity"), lit_str("syslog")]),
-                &ev
+                &ev,
+                &ctx()
             ),
             EvalValue::Int(17)
         );
@@ -4219,10 +4455,10 @@ mod tests {
             if is_aggregate_function(func) {
                 continue; // aggregates are not in eval_scalar_fn
             }
-            let result = eval_scalar_fn(func, &generous_args);
+            let result = eval_scalar_fn(func, &generous_args, &ctx());
             assert!(
                 result.is_some(),
-                "eval_scalar_fn({func:?}, ...) returned None — \
+                "eval_scalar_fn({func:?}, ..., &ctx()) returned None — \
                  add it to eval_scalar_fn or the coverage test will keep failing"
             );
         }

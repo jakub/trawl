@@ -735,7 +735,11 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
                 let mut event = trawl_core::row::from_json(event);
                 stages.iter_mut().all(|stage| {
                     matches!(
-                        apply_stage(stage, &mut event),
+                        apply_stage(
+                            stage,
+                            &mut event,
+                            &trawl_core::context::EvalContext::capture(),
+                        ),
                         trawl_core::stream::StageResult::Pass
                     )
                 })

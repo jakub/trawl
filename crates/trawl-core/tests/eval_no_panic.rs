@@ -446,7 +446,11 @@ fn eval_returns_for_every_composed_expression() {
         let expression = compose(&mut rng, 4);
         // The ONLY assertion: control comes back. Which value it carries
         // is `scalar_parity.rs`'s question, not this test's.
-        let _answer = eval_expr(&expression, &event);
+        let _answer = eval_expr(
+            &expression,
+            &event,
+            &trawl_core::context::EvalContext::capture(),
+        );
     }
 }
 
@@ -580,7 +584,11 @@ fn eval_returns_for_every_parsed_dsl_expression() {
             .assignments
             .first()
             .unwrap_or_else(|| panic!("generated let stage has no assignment: {dsl:?}"));
-        let _answer = eval_expr(expression, &event);
+        let _answer = eval_expr(
+            expression,
+            &event,
+            &trawl_core::context::EvalContext::capture(),
+        );
         evaluated += 1;
     }
     // A generator that stopped parsing anything would pass the loop above

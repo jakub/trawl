@@ -776,6 +776,7 @@ fn assert_where_parity_over_severity(
         &condition,
         &trawl_core::row::from_json(event),
         &scope,
+        &trawl_core::context::EvalContext::capture(),
     ));
 
     let tmp = tempfile::Builder::new()
@@ -2146,6 +2147,7 @@ fn assert_where_parity(
         &condition,
         &trawl_core::row::from_json(event),
         &scope,
+        &trawl_core::context::EvalContext::capture(),
     ));
 
     let _guard: Box<dyn std::any::Any>;
@@ -2212,6 +2214,7 @@ fn assert_where_parity_over_column(
         &condition,
         &trawl_core::row::from_json(event),
         &scope,
+        &trawl_core::context::EvalContext::capture(),
     ));
 
     let tmp = tempfile::Builder::new()
@@ -2269,6 +2272,7 @@ fn assert_pinned_let_parity(
         &assignment,
         &trawl_core::row::from_json(event),
         &scope,
+        &trawl_core::context::EvalContext::capture(),
     ));
     assert_eq!(
         eval_result, expected,
@@ -2571,6 +2575,7 @@ fn assert_where_parity_hot_only(
         &condition,
         &trawl_core::row::from_json(event),
         &scope,
+        &trawl_core::context::EvalContext::capture(),
     ));
 
     let (_snapshot, emitted) = emit_hot_only_over(&query, event, ft, siblings);
@@ -2611,6 +2616,7 @@ fn assert_let_parity_hot_only(
         &assignment,
         &trawl_core::row::from_json(event),
         &scope,
+        &trawl_core::context::EvalContext::capture(),
     ));
 
     let (_snapshot, emitted) = emit_hot_only_over(&query, event, ft, siblings);

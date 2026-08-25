@@ -20,6 +20,7 @@ use crate::ast::{
     AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
     LiteralValue, PipeStage, RenameStage, Spanned, TableStage, WhereStage,
 };
+use crate::context::EvalContext;
 use crate::emitter::{
     format_literal_position, unit_literal_positions, validate_format_literal,
     validate_function_arity, validate_unit_literal,
@@ -694,6 +695,7 @@ fn apply_let(
     assignments: &[(String, Spanned<crate::ast::Expr>)],
     pins: &PinScope,
     event: &mut Row,
+    ctx: &EvalContext,
 ) {
     // Decided against the PRE-stage row, before any alias lands: these
     // targets name a real column, so they stay invisible to their
@@ -711,7 +713,7 @@ fn apply_let(
         // Stored as the evaluator produced it. A JSON round trip here is
         // what used to turn `0/0` into NULL one stage before the query
         // asked about it (see [`crate::row`]).
-        let value = eval_expr_with_pins(expr, event, pins);
+        let value = eval_expr_with_pins(expr, event, pins, ctx);
         if !shadows_column {
             // The lateral alias: a later sibling naming this target finds
             // no input column and reads what was just computed.
@@ -784,7 +786,13 @@ fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Row
 ///
 /// Returns whether the event should pass through, be filtered, or
 /// the stream is done.
-pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row) -> StageResult {
+///
+/// `ctx` is the evaluation context this row is being processed under —
+/// the instant its `now()` reads (ADR-0017 §3). The caller owns the
+/// question of what a "unit of output" is: the batch tail behind
+/// `extract kv` passes the statement's anchor for every row, while the
+/// live lane samples per event.
+pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext) -> StageResult {
     match stage {
         CompiledStage::Table { fields } => {
             let keep: Vec<String> = fields
@@ -827,7 +835,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row) -> StageResult {
         }
 
         CompiledStage::Where { condition, pins } => {
-            let result = eval_expr_with_pins(condition, event, pins);
+            let result = eval_expr_with_pins(condition, event, pins, ctx);
             if result.is_truthy() {
                 StageResult::Pass
             } else {
@@ -836,7 +844,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row) -> StageResult {
         }
 
         CompiledStage::Let { assignments, pins } => {
-            apply_let(assignments, pins, event);
+            apply_let(assignments, pins, event, ctx);
             StageResult::Pass
         }
 
@@ -1697,6 +1705,15 @@ mod tests {
         Spanned { node, span: 0..0 }
     }
 
+    /// The evaluation context these tests evaluate under.
+    ///
+    /// Each call is its own unit of output, which is exactly what a test
+    /// asserting one expression is; the cases that care about `now()`
+    /// hold a context of their own and assert against it.
+    fn ctx() -> EvalContext {
+        EvalContext::capture()
+    }
+
     fn event(pairs: &Value) -> Row {
         crate::row::from_json(pairs.as_object().unwrap())
     }
@@ -1785,7 +1802,7 @@ mod tests {
         let mut ev = event(
             &json!({"host": "web-1", "service": "nginx", "message": "hello", "level": "info"}),
         );
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         assert_eq!(ev.len(), 2);
         assert!(ev.contains_key("host"));
         assert!(ev.contains_key("service"));
@@ -1820,7 +1837,7 @@ mod tests {
             keyword: "table",
         });
         let mut ev = event(&json!({"_time": "2026-01-01", "host": "web-1", "message": "hi"}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         assert!(ev.contains_key("_time"));
         assert!(ev.contains_key("host"));
         assert!(!ev.contains_key("message"));
@@ -1834,7 +1851,7 @@ mod tests {
             fields: vec!["message".into(), "raw".into()],
         });
         let mut ev = event(&json!({"host": "web-1", "message": "hello", "raw": "bytes"}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         assert_eq!(ev.len(), 1);
         assert!(ev.contains_key("host"));
     }
@@ -1845,7 +1862,7 @@ mod tests {
             fields: vec!["nonexistent".into()],
         });
         let mut ev = event(&json!({"host": "web-1"}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         assert_eq!(ev.len(), 1);
     }
 
@@ -1857,7 +1874,7 @@ mod tests {
             renames: vec![("service".into(), "svc".into())],
         });
         let mut ev = event(&json!({"service": "nginx", "host": "web-1"}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         assert_eq!(cell(&ev, "svc"), "nginx");
         assert!(!ev.contains_key("service"));
     }
@@ -1871,7 +1888,7 @@ mod tests {
             ],
         });
         let mut ev = event(&json!({"service": "nginx", "host": "web-1"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert!(ev.contains_key("svc"));
         assert!(ev.contains_key("hostname"));
         assert!(!ev.contains_key("service"));
@@ -1886,7 +1903,7 @@ mod tests {
             renames: vec![("a".into(), "b".into()), ("b".into(), "c".into())],
         });
         let mut ev = event(&json!({"a": 1, "b": 2}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "b"), 1);
         assert_eq!(cell(&ev, "c"), 2);
         assert!(!ev.contains_key("a"));
@@ -1898,7 +1915,7 @@ mod tests {
             renames: vec![("a".into(), "b".into()), ("b".into(), "a".into())],
         });
         let mut ev = event(&json!({"a": 1, "b": 2}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "a"), 2);
         assert_eq!(cell(&ev, "b"), 1);
     }
@@ -1909,7 +1926,7 @@ mod tests {
             renames: vec![("a".into(), "x".into()), ("b".into(), "x".into())],
         });
         let mut ev = event(&json!({"a": 1, "b": 2}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "x"), 2);
         assert!(!ev.contains_key("a"));
         assert!(!ev.contains_key("b"));
@@ -1924,7 +1941,7 @@ mod tests {
             renames: vec![("nonexistent".into(), "host".into())],
         });
         let mut ev = event(&json!({"host": "web-1"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert!(!ev.contains_key("host"));
     }
 
@@ -1934,7 +1951,7 @@ mod tests {
             renames: vec![("nonexistent".into(), "alias".into())],
         });
         let mut ev = event(&json!({"host": "web-1"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(ev.len(), 1);
         assert!(!ev.contains_key("alias"));
     }
@@ -1949,10 +1966,10 @@ mod tests {
         });
         let mut ev = event(&json!({"i": 1}));
 
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Done);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Done);
     }
 
     #[test]
@@ -1962,7 +1979,7 @@ mod tests {
             keyword: "limit",
         });
         let mut ev = event(&json!({"i": 1}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Done);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Done);
     }
 
     // ── tier 2: where ──────────────────────────────────────────────
@@ -1976,7 +1993,7 @@ mod tests {
         });
         let mut stage = compile_where(&WhereStage { condition }, &PinScope::unpinned()).unwrap();
         let mut ev = event(&json!({"status": 500}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
     }
 
     #[test]
@@ -1988,7 +2005,10 @@ mod tests {
         });
         let mut stage = compile_where(&WhereStage { condition }, &PinScope::unpinned()).unwrap();
         let mut ev = event(&json!({"status": 200}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Filtered);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev, &ctx()),
+            StageResult::Filtered
+        );
     }
 
     #[test]
@@ -2000,7 +2020,10 @@ mod tests {
         });
         let mut stage = compile_where(&WhereStage { condition }, &PinScope::unpinned()).unwrap();
         let mut ev = event(&json!({"host": "web-1"}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Filtered);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev, &ctx()),
+            StageResult::Filtered
+        );
     }
 
     /// `where level == "..."` is an ORDINARY comparison on the sender's
@@ -2024,12 +2047,21 @@ mod tests {
         let mut stage = level_where(BinaryOp::Eq, "gold").unwrap();
         // The game server's `level` field means what it says.
         let mut gold = event(&json!({"service": "game", "level": "gold"}));
-        assert_eq!(apply_stage(&mut stage, &mut gold), StageResult::Pass);
+        assert_eq!(
+            apply_stage(&mut stage, &mut gold, &ctx()),
+            StageResult::Pass
+        );
         let mut silver = event(&json!({"service": "game", "level": "silver"}));
-        assert_eq!(apply_stage(&mut stage, &mut silver), StageResult::Filtered);
+        assert_eq!(
+            apply_stage(&mut stage, &mut silver, &ctx()),
+            StageResult::Filtered
+        );
         // No `level` key is NULL, not a severity lookup.
         let mut none = event(&json!({"severity": 17}));
-        assert_eq!(apply_stage(&mut stage, &mut none), StageResult::Filtered);
+        assert_eq!(
+            apply_stage(&mut stage, &mut none, &ctx()),
+            StageResult::Filtered
+        );
     }
 
     /// There is no severity vocabulary on a bare name any more, so
@@ -2247,7 +2279,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"duration": 2}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "duration_ms"), 2000);
     }
 
@@ -2269,7 +2301,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"service": "nginx"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "svc"), "NGINX");
     }
 
@@ -2299,7 +2331,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"service": "nginx"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "ms"), 1000);
         assert_eq!(cell(&ev, "total"), 2000);
     }
@@ -2322,7 +2354,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"a": 5}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "a"), 1);
         assert_eq!(cell(&ev, "b"), 5);
     }
@@ -2346,7 +2378,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"a": 5}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "A"), 1);
         assert!(!ev.contains_key("a"));
         assert_eq!(cell(&ev, "b"), 5);
@@ -2376,7 +2408,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"a": 5}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "a"), 6);
         assert_eq!(cell(&ev, "b"), 5);
     }
@@ -2392,7 +2424,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "connection from 192.168.1.100 accepted"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "ip"), "192.168.1.100");
     }
 
@@ -2405,7 +2437,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "no ip here", "ip": "keep?"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "ip"), Some(Value::Null));
         assert!(ev.contains_key("ip"));
     }
@@ -2419,11 +2451,11 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "bbb"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "x"), Some(Value::Null));
 
         let mut ev = event(&json!({"message": "aab"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "x"), Some(Value::from("aa")));
     }
 
@@ -2436,12 +2468,12 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "Status=500", "status": 200}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "Status"), Some(Value::from(500)));
         assert!(!ev.contains_key("status"));
 
         let mut ev = event(&json!({"message": "dur=1 DUR=2 Dur=3"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "Dur"), Some(Value::from(3)));
         assert_eq!(
             ev.keys()
@@ -2478,7 +2510,7 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"service": "nginx"}));
         ev.insert("t".into(), EvalValue::Timestamp(instant));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "y"), "2026", "text was {text:?}");
 
         // The kv arm reads the same text through the same door.
@@ -2490,7 +2522,7 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"service": "nginx"}));
         ev.insert("t".into(), EvalValue::Timestamp(instant));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "09"), Some(json!("00:00")));
     }
 
@@ -2506,7 +2538,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"n": 42}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "d"), Some(Value::Null));
 
         let mut stage = compile_extract(&ExtractStage {
@@ -2516,7 +2548,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"flag": true}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(ev.keys().count(), 1, "nothing extracted: {ev:?}");
     }
 
@@ -2529,7 +2561,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "GET /api/v1/users HTTP/1.1"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "method"), "GET");
         assert_eq!(cell(&ev, "path"), "/api/v1/users");
     }
@@ -2556,7 +2588,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "user=alice status=200 path=/api"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "user"), "alice");
         assert_eq!(cell(&ev, "status"), 200); // coerced to int
         assert_eq!(cell(&ev, "path"), "/api");
@@ -2571,7 +2603,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": r#"user="alice smith" action=login"#}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "user"), "alice smith");
         assert_eq!(cell(&ev, "action"), "login");
     }
@@ -2585,7 +2617,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "user:alice status:200"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "user"), "alice");
         assert_eq!(cell(&ev, "status"), 200);
     }
@@ -2600,7 +2632,7 @@ mod tests {
         .unwrap();
         let mut ev =
             event(&json!({"message": "count=42 rate=1.5 flag=true name=hello empty=false"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "count"), 42);
         assert_eq!(cell(&ev, "rate"), 1.5);
         assert_eq!(cell(&ev, "flag"), true);
@@ -2620,9 +2652,12 @@ mod tests {
         let mut ev2 = event(&json!({"host": "web-1", "i": 2}));
         let mut ev3 = event(&json!({"host": "web-2", "i": 3}));
 
-        assert_eq!(apply_stage(&mut stage, &mut ev1), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev2), StageResult::Filtered);
-        assert_eq!(apply_stage(&mut stage, &mut ev3), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev1, &ctx()), StageResult::Pass);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev2, &ctx()),
+            StageResult::Filtered
+        );
+        assert_eq!(apply_stage(&mut stage, &mut ev3, &ctx()), StageResult::Pass);
     }
 
     #[test]
@@ -2635,9 +2670,12 @@ mod tests {
         let mut ev2 = event(&json!({"host": "web-1", "service": "nginx"}));
         let mut ev3 = event(&json!({"host": "web-1", "service": "postgres"}));
 
-        assert_eq!(apply_stage(&mut stage, &mut ev1), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev2), StageResult::Filtered);
-        assert_eq!(apply_stage(&mut stage, &mut ev3), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev1, &ctx()), StageResult::Pass);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev2, &ctx()),
+            StageResult::Filtered
+        );
+        assert_eq!(apply_stage(&mut stage, &mut ev3, &ctx()), StageResult::Pass);
     }
 
     #[test]
@@ -2648,9 +2686,12 @@ mod tests {
         let mut ev2 = event(&json!({"host": "web-1", "level": "info"}));
         let mut ev3 = event(&json!({"host": "web-1", "level": "error"}));
 
-        assert_eq!(apply_stage(&mut stage, &mut ev1), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev2), StageResult::Filtered);
-        assert_eq!(apply_stage(&mut stage, &mut ev3), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev1, &ctx()), StageResult::Pass);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev2, &ctx()),
+            StageResult::Filtered
+        );
+        assert_eq!(apply_stage(&mut stage, &mut ev3, &ctx()), StageResult::Pass);
     }
 
     // ── extract_key_value_pairs ────────────────────────────────────
@@ -2720,7 +2761,7 @@ mod tests {
             "_severity": 9,
         }));
 
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         // Log content cannot forge trawl's verdict slots (ADR-0013 §1):
         // the reserved pairs are dropped, the ordinary one lands, and an
         // existing `_severity` keeps trawl's own value.
@@ -2749,7 +2790,7 @@ mod tests {
 
         let mut ev = event(&json!({"host": "web-1", "service": "nginx", "message": "hi"}));
         for stage in &mut stages {
-            let result = apply_stage(stage, &mut ev);
+            let result = apply_stage(stage, &mut ev, &ctx());
             assert_eq!(result, StageResult::Pass);
         }
         assert_eq!(ev.len(), 2);
@@ -2781,7 +2822,7 @@ mod tests {
         let mut ev = event(&json!({"status": 500}));
         let mut result = StageResult::Pass;
         for stage in &mut stages {
-            result = apply_stage(stage, &mut ev);
+            result = apply_stage(stage, &mut ev, &ctx());
             if result != StageResult::Pass {
                 break;
             }
@@ -2792,7 +2833,7 @@ mod tests {
         let mut ev = event(&json!({"status": 200}));
         result = StageResult::Pass;
         for stage in &mut stages {
-            result = apply_stage(stage, &mut ev);
+            result = apply_stage(stage, &mut ev, &ctx());
             if result != StageResult::Pass {
                 break;
             }
@@ -2803,7 +2844,7 @@ mod tests {
         let mut ev = event(&json!({"status": 404}));
         result = StageResult::Pass;
         for stage in &mut stages {
-            result = apply_stage(stage, &mut ev);
+            result = apply_stage(stage, &mut ev, &ctx());
             if result != StageResult::Pass {
                 break;
             }
@@ -2814,7 +2855,7 @@ mod tests {
         let mut ev = event(&json!({"status": 503}));
         result = StageResult::Pass;
         for stage in &mut stages {
-            result = apply_stage(stage, &mut ev);
+            result = apply_stage(stage, &mut ev, &ctx());
             if result != StageResult::Pass {
                 break;
             }

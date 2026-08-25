@@ -745,7 +745,11 @@ fn eval_scalar(dsl: &str, event: &Map<String, Value>) -> EvalValue {
         .assignments
         .first()
         .unwrap_or_else(|| panic!("generated scalar query has no assignment: {dsl:?}"));
-    eval_expr(expr, &trawl_core::row::from_json(event))
+    eval_expr(
+        expr,
+        &trawl_core::row::from_json(event),
+        &trawl_core::context::EvalContext::capture(),
+    )
 }
 
 /// Run a `let x = <expr>` query and return the outcome of the computed `x`
@@ -1378,60 +1382,24 @@ fn a_failed_timestamp_coercion_is_null_in_both_operand_orders() {
     }
 }
 
-/// The two ways [`current_now_is_sampled_per_call_child_106`] can fail, told
-/// apart instead of guessed at.
+/// ADR-0017 §3: `now()` is ONE instant per unit of output.
 ///
-/// That pin needs ONE sample out of 100 in which two `now()` calls inside one
-/// expression read different instants, so it depends on the platform clock
-/// ticking between two back-to-back reads. A failure therefore has two possible
-/// causes with OPPOSITE remedies: #106 landed and the pin must be flipped, or
-/// this host's clock is too coarse to observe per-call sampling at all. The
-/// message asks the clock which one it is, with the same read `eval` makes
-/// (`eval.rs`: `chrono::Utc::now().naive_utc()`).
-///
-/// Measured on the development host (nanosecond `CLOCK_REALTIME`): worst case 1
-/// attempt over 2000 trials, so the coarse-clock branch is not a live flake
-/// here. #106 (ADR-0017 §3) owns removing the timing dependence outright.
-fn per_call_now_failure_message() -> String {
-    let clock_advances = (0..1_000).any(|_| {
-        let first = chrono::Utc::now().naive_utc();
-        let second = chrono::Utc::now().naive_utc();
-        first != second
-    });
-    if clock_advances {
-        "eval's now() no longer varies between calls in one expression, and this \
-         platform's clock DOES advance between two back-to-back reads (probed \
-         right here) — so what changed is the SAMPLING, not the timer. This is \
-         what #106 (ADR-0017 §3) lands: flip this test to assert ONE instant per \
-         unit of output instead of a per-call sample, and retire the child-106 \
-         pin."
-            .to_string()
-    } else {
-        "this platform's clock is too COARSE to observe per-call sampling: 1000 \
-         back-to-back `chrono::Utc::now()` reads never differed, so two `now()` \
-         calls in one expression cannot be told apart on this host and the pin \
-         cannot make its observation. Nothing is known about eval's sampling from \
-         this run — do NOT weaken or skip the pin to make it green. #106 \
-         (ADR-0017 §3) removes the timing dependence entirely; until it lands, \
-         this pin is unobservable here."
-            .to_string()
-    }
-}
-
+/// Flipped from `current_now_is_sampled_per_call_child_106` (#106), whose
+/// own note asked for exactly this once the anchor landed. It took 100
+/// attempts to CATCH a per-call difference and depended on the platform
+/// clock ticking between two back-to-back reads; the property it replaces
+/// needs neither, because neither lane reads a clock during evaluation
+/// any more. The batch lane binds the statement's anchor at both call
+/// sites, and `eval` reads the evaluation context it was handed.
 #[test]
-fn current_now_is_sampled_per_call_child_106() {
-    // #106 anchors now() once per output unit. DuckDB already anchors per statement.
+fn now_is_one_instant_per_unit_of_output() {
     let conn = utc_connection();
     let event = fixed_event();
     let dsl = "* | let x = now() == now()";
-    let saw_per_call_difference =
-        (0..100).any(|_| eval_scalar(dsl, &event) == EvalValue::Bool(false));
-    // Built ONLY on failure, and it names WHICH of the two causes this is — see
-    // `per_call_now_failure_message`.
-    assert!(
-        saw_per_call_difference,
-        "{}",
-        per_call_now_failure_message()
+    assert_eq!(
+        eval_scalar(dsl, &event),
+        EvalValue::Bool(true),
+        "two now() calls in one expression must read one instant"
     );
     assert_eq!(
         sql_scalar_result(&conn, dsl, &event),

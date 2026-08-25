@@ -90,6 +90,7 @@ fn run_cell(
         &condition,
         &trawl_core::row::from_json(event),
         &PinScope::root(ft),
+        &trawl_core::context::EvalContext::capture(),
     ) {
         EvalValue::Bool(b) => Some(b),
         EvalValue::Null => None,
@@ -153,7 +154,11 @@ fn run_pipeline_cell(
     let mut streamed = trawl_core::row::from_json(event);
     let mut live_result = true;
     for stage in &mut stages {
-        match apply_stage(stage, &mut streamed) {
+        match apply_stage(
+            stage,
+            &mut streamed,
+            &trawl_core::context::EvalContext::capture(),
+        ) {
             StageResult::Pass => {}
             StageResult::Filtered | StageResult::Done => {
                 live_result = false;
@@ -216,7 +221,11 @@ fn run_let_cell(
     let mut streamed = trawl_core::row::from_json(event);
     for stage in &mut stages {
         assert_eq!(
-            apply_stage(stage, &mut streamed),
+            apply_stage(
+                stage,
+                &mut streamed,
+                &trawl_core::context::EvalContext::capture()
+            ),
             StageResult::Pass,
             "{dsl:?} must not filter the event"
         );
@@ -440,6 +449,7 @@ fn pattern_form_coverage_in_both_pipeline_lanes() {
             &condition,
             &trawl_core::row::from_json(&event),
             &PinScope::root(&ft),
+            &trawl_core::context::EvalContext::capture(),
         );
         assert_eq!(eval_result, EvalValue::Bool(true));
 
@@ -1200,9 +1210,10 @@ fn live_rows(
         .unwrap_or_else(|error| panic!("{dsl}: plan must compile: {error}"));
     let feed = |stages: &mut [trawl_core::stream::CompiledStage],
                 event: &mut trawl_core::row::Row| {
-        stages
-            .iter_mut()
-            .all(|stage| apply_stage(stage, event) == StageResult::Pass)
+        stages.iter_mut().all(|stage| {
+            apply_stage(stage, event, &trawl_core::context::EvalContext::capture())
+                == StageResult::Pass
+        })
     };
     match plan {
         StreamPlan::PassThrough(mut stages) => rows

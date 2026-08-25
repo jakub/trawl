@@ -161,7 +161,13 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
             .filter_map(|mut event| {
                 stages
                     .iter_mut()
-                    .all(|stage| apply_stage(stage, &mut event) == StageResult::Pass)
+                    .all(|stage| {
+                        apply_stage(
+                            stage,
+                            &mut event,
+                            &trawl_core::context::EvalContext::capture(),
+                        ) == StageResult::Pass
+                    })
                     .then_some(event)
             })
             .collect(),
@@ -171,10 +177,13 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
             mut post_stages,
         } => {
             for mut event in rows {
-                if pre_stages
-                    .iter_mut()
-                    .all(|stage| apply_stage(stage, &mut event) == StageResult::Pass)
-                {
+                if pre_stages.iter_mut().all(|stage| {
+                    apply_stage(
+                        stage,
+                        &mut event,
+                        &trawl_core::context::EvalContext::capture(),
+                    ) == StageResult::Pass
+                }) {
                     aggregation.feed_event(&event);
                 }
             }
@@ -185,7 +194,13 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
                 .filter_map(|mut event| {
                     post_stages
                         .iter_mut()
-                        .all(|stage| apply_stage(stage, &mut event) == StageResult::Pass)
+                        .all(|stage| {
+                            apply_stage(
+                                stage,
+                                &mut event,
+                                &trawl_core::context::EvalContext::capture(),
+                            ) == StageResult::Pass
+                        })
                         .then_some(event)
                 })
                 .collect()
