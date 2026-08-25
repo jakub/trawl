@@ -217,10 +217,12 @@ impl CanonicalType {
     /// PREPARE fixture in trawl-engine asserts that its committed cases
     /// exercise every entry.
     ///
-    /// A variant added to the enum must be added here too. Nothing in the
-    /// language enforces that, so what actually fails is the fixture
-    /// coverage assertion: a new variant no committed case reaches is a
-    /// gap the fixture reports by name.
+    /// A variant added to the enum must be added here too. The language
+    /// cannot enforce that outright, but `index` below is an exhaustive
+    /// match sitting right here, so a seventh variant stops the build on
+    /// this screen. What proves the new variant is actually EXERCISED is
+    /// still the fixture coverage assertion: a variant no committed case
+    /// reaches is a gap the fixture reports by name.
     pub const ALL: [Self; 6] = [
         Self::Boolean,
         Self::BigInt,
@@ -229,6 +231,34 @@ impl CanonicalType {
         Self::Varchar,
         Self::Severity,
     ];
+
+    /// This variant's slot in [`Self::ALL`].
+    ///
+    /// A signpost, not reflection. The match has no wildcard arm, so a new
+    /// variant fails to COMPILE here, a few lines from `ALL`, with this
+    /// comment telling the author to add it to `ALL` as well. That is the
+    /// whole of what it buys. Stable Rust cannot count an enum's variants
+    /// without a derive macro and one is not worth a dependency for this,
+    /// so `canonical_type_all_is_exhaustive_and_duplicate_free` still
+    /// cannot catch an omission on its own, and the trawl-engine PREPARE
+    /// fixture's coverage assertion is still the guard with teeth.
+    ///
+    /// Test-only: nothing in production wants the inverse of `ALL`, and a
+    /// `pub`/`pub(crate)` version unused outside tests is either dead code
+    /// or public API nobody calls. The pre-commit hook runs clippy with
+    /// `--all-targets`, so the compile error lands before the commit
+    /// rather than in CI.
+    #[cfg(test)]
+    const fn index(self) -> usize {
+        match self {
+            Self::Boolean => 0,
+            Self::BigInt => 1,
+            Self::Double => 2,
+            Self::Timestamp => 3,
+            Self::Varchar => 4,
+            Self::Severity => 5,
+        }
+    }
 
     /// The PHYSICAL `DuckDB` type spelling — what a cast, a `DESCRIBE`
     /// comparison, a repin rewrite and the hot branch's `REPLACE` all
@@ -571,10 +601,12 @@ mod tests {
     /// would leave a type unfuzzed.
     ///
     /// The length check is a reminder, not a proof: Rust offers no variant
-    /// count for a plain enum, so nothing here can notice a seventh variant
-    /// that was never added to `ALL`. The teeth are in the fixture's
-    /// coverage assertion, which fails when a committed case never pins the
-    /// new type.
+    /// count for a plain enum, and `ALL` is a `[Self; 6]`, so a seventh
+    /// variant nobody added to it leaves this assertion passing. The slot
+    /// walk below narrows that gap without closing it: `index` is an
+    /// exhaustive match beside `ALL`, so the new variant fails to compile
+    /// there. The teeth are still in the fixture's coverage assertion,
+    /// which fails when a committed case never pins the new type.
     #[test]
     fn canonical_type_all_is_exhaustive_and_duplicate_free() {
         assert_eq!(
@@ -584,6 +616,9 @@ mod tests {
              also needs a PREPARE fixture case, which is what the engine's \
              coverage assertion checks"
         );
+        for (slot, ty) in CanonicalType::ALL.into_iter().enumerate() {
+            assert_eq!(ty.index(), slot, "{ty:?} sits in the wrong ALL slot");
+        }
         let unique: std::collections::BTreeSet<CanonicalType> =
             CanonicalType::ALL.into_iter().collect();
         assert_eq!(
