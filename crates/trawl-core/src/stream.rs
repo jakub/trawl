@@ -20,6 +20,7 @@ use crate::ast::{
     AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
     LiteralValue, PipeStage, RenameStage, Spanned, TableStage, WhereStage,
 };
+use crate::context::EvalContext;
 use crate::emitter::{
     format_literal_position, unit_literal_positions, validate_format_literal,
     validate_function_arity, validate_unit_literal,
@@ -270,7 +271,11 @@ pub enum CompiledStage {
     /// Rename fields (from → to).
     Rename { renames: Vec<(String, String)> },
     /// Cap output to N events.
-    Limit { remaining: AtomicU64 },
+    ///
+    /// `count` is the cap as written, kept beside the live counter
+    /// because a POST-aggregation limit is re-armed for every emitted
+    /// snapshot ([`reset_limit`](CompiledStage::reset_limit)).
+    Limit { count: u64, remaining: AtomicU64 },
     /// Pass through (ring buffer sizing is handled by the TUI).
     Tail { count: u64 },
     /// Filter events by condition.
@@ -309,8 +314,9 @@ impl fmt::Debug for CompiledStage {
             Self::Table { fields } => f.debug_struct("Table").field("fields", fields).finish(),
             Self::Drop { fields } => f.debug_struct("Drop").field("fields", fields).finish(),
             Self::Rename { renames } => f.debug_struct("Rename").field("renames", renames).finish(),
-            Self::Limit { remaining } => f
+            Self::Limit { count, remaining } => f
                 .debug_struct("Limit")
+                .field("count", count)
                 .field("remaining", &remaining.load(Ordering::Relaxed))
                 .finish(),
             Self::Tail { count } => f.debug_struct("Tail").field("count", count).finish(),
@@ -344,6 +350,32 @@ impl fmt::Debug for CompiledStage {
     }
 }
 
+impl CompiledStage {
+    /// Re-arm a `limit`, and leave every other stage alone.
+    ///
+    /// The one caller is [`emit_snapshot`], because the two ends of an
+    /// aggregate plan cap two different things (ADR-0001: batch is the
+    /// contract, streaming the mirror):
+    ///
+    /// - a PRE-aggregation `limit` caps the INPUT set, which batch also
+    ///   does exactly once, so its exhaustion stays sticky for the life
+    ///   of the subscription;
+    /// - a POST-aggregation `limit` caps the RESULT set, and an emitted
+    ///   snapshot IS the live rendering of the batch result set — so it
+    ///   caps each snapshot, exactly as batch caps its one. Spending it
+    ///   for the plan's life would leave the stream permanently silent
+    ///   while the aggregation kept evolving, which mirrors nothing.
+    ///
+    /// Deliberately narrow: a `dedup` in the same position keeps its
+    /// seen-set across snapshots, which is a separate question about
+    /// what a live `dedup` means and is not answered here.
+    fn reset_limit(&mut self) {
+        if let Self::Limit { count, remaining } = self {
+            remaining.store(*count, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Result of applying a stage to an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageResult {
@@ -353,6 +385,156 @@ pub enum StageResult {
     Filtered,
     /// Stream is done (e.g. limit reached).
     Done,
+}
+
+// ── the live lane's sampling boundaries (ADR-0017 §3) ──────────────
+
+/// What ONE live event produced.
+///
+/// The live lane's unit of output is the EVENT, so this is also the
+/// unit an [`EvalContext`] covers: everything that reads `now()` on the
+/// way from the bus to the wire — the search-stage window, a
+/// `| where now() - _time < …`, a `| let age = now()` — reads the one
+/// instant [`accept_event`] was handed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiveOutcome {
+    /// The event matched and survived every stage: the row to emit.
+    Emit(Row),
+    /// The filter rejected it, or a stage dropped it.
+    Filtered,
+    /// A `limit` stage ended the subscription. The event is NOT emitted
+    /// (the stage that says `Done` has already refused it).
+    Done,
+}
+
+/// The ONE per-event door of the live lane: match the search stage,
+/// then run the pipeline stages, both under a SINGLE instant.
+///
+/// This exists to make one-context-per-event STRUCTURAL. The filter's
+/// `last=` window and the pipeline's `now()` used to be two separate
+/// samples — the filter's taken once per BUS BATCH, the pipeline's per
+/// event — so one event could be admitted by a stale clock and rejected
+/// by a fresh one (or the reverse) inside a single query. There is one
+/// `ctx` parameter here and no clock read anywhere below it, so a
+/// caller cannot reintroduce the split.
+///
+/// The caller samples: one [`EvalContext::capture`] per event, at the
+/// top of the loop. A subscription's clock therefore ADVANCES between
+/// rows while each row stays internally frozen, which is exactly what
+/// ADR-0017 §3 asks of live pass-through (per-batch sampling was
+/// rejected: a bus batch is an upstream client's POST size, not a
+/// boundary the query author can see).
+pub fn accept_event(
+    filter: &crate::filter::CompiledFilter,
+    stages: &mut [CompiledStage],
+    event: &serde_json::Map<String, serde_json::Value>,
+    ctx: &EvalContext,
+) -> LiveOutcome {
+    // The search-stage filter reads the bus JSON directly — no
+    // conversion on the firehose, only on the events that match.
+    if !filter.matches_at(event, ctx) {
+        return LiveOutcome::Filtered;
+    }
+
+    let mut row = row::from_json(event);
+    for stage in stages.iter_mut() {
+        match apply_stage(stage, &mut row, ctx) {
+            StageResult::Pass => {}
+            StageResult::Filtered => return LiveOutcome::Filtered,
+            StageResult::Done => return LiveOutcome::Done,
+        }
+    }
+    LiveOutcome::Emit(row)
+}
+
+/// The aggregate lane's per-event door: the SAME [`accept_event`] rule,
+/// with the surviving row fed into the accumulators.
+///
+/// Returns whether the event reached the aggregation — the caller's
+/// snapshot-threshold counter. A pre-stage `Done` drops the event and
+/// does NOT end the subscription here: an aggregate stream's output is
+/// the snapshot, and a `limit` before the aggregation bounds what feeds
+/// it, which is the behaviour this lane has always had.
+///
+/// Both `now()` readers on this path — the filter window and any
+/// `| where`/`| let` before the aggregation — plus the timechart
+/// bucket's absent-`_time` fallback take the ONE `ctx` handed in, so a
+/// fed event is bucketed at the instant it was admitted under.
+pub fn accept_event_into_aggregate(
+    filter: &crate::filter::CompiledFilter,
+    pre_stages: &mut [CompiledStage],
+    aggregation: &mut CompiledAggregation,
+    event: &serde_json::Map<String, serde_json::Value>,
+    ctx: &EvalContext,
+) -> bool {
+    match accept_event(filter, pre_stages, event, ctx) {
+        LiveOutcome::Emit(row) => {
+            aggregation.feed_event(&row, ctx);
+            true
+        }
+        LiveOutcome::Filtered | LiveOutcome::Done => false,
+    }
+}
+
+/// The instant ONE emitted aggregate snapshot reads `now()` at.
+///
+/// A distinct TYPE, not a second `EvalContext` parameter, because the
+/// two boundaries meet in one function and conflating them is the
+/// defect this milestone removes: a snapshot's post-stage rows are one
+/// unit of output together (ADR-0017 §3), while the events that FED
+/// that snapshot each sampled their own instant, possibly seconds
+/// earlier. Neither can be passed where the other is expected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotContext(EvalContext);
+
+impl SnapshotContext {
+    /// The snapshot's instant, sampled by the caller at the start of the
+    /// snapshot attempt — BEFORE the rows are taken, so the sample point
+    /// is deterministic even when the post-stages later drop every row.
+    #[must_use]
+    pub fn new(at: EvalContext) -> Self {
+        Self(at)
+    }
+}
+
+/// Take an aggregate snapshot and run its post-stages, every row under
+/// the ONE snapshot instant.
+///
+/// Each pass re-arms the post-stages' `limit`s
+/// ([`CompiledStage::reset_limit`]): a snapshot is the live rendering of
+/// the batch result set, so `| stats … | limit N` caps EVERY snapshot at
+/// N, exactly as batch caps its one result set. The plan's pre-stages
+/// are not touched here and stay sticky — they cap the input.
+///
+/// Deliberately NOT shared with `post_process::apply_aggregate`, whose
+/// `StageResult::Done` ends the whole result set: here it drops the
+/// current row and the next row still gets its chance, which is what
+/// the live lane has always done. Merging the two loops would silently
+/// change one lane's row set. (That lane emits ONE snapshot from a
+/// freshly compiled plan, so its counters start armed and this re-arming
+/// would be a no-op there.)
+pub fn emit_snapshot(
+    aggregation: &CompiledAggregation,
+    post_stages: &mut [CompiledStage],
+    ctx: &SnapshotContext,
+) -> (Vec<String>, Vec<Row>) {
+    for stage in post_stages.iter_mut() {
+        stage.reset_limit();
+    }
+    let (columns, rows) = aggregation.snapshot();
+    let rows = rows
+        .into_iter()
+        .filter_map(|mut row| {
+            for stage in post_stages.iter_mut() {
+                match apply_stage(stage, &mut row, &ctx.0) {
+                    StageResult::Pass => {}
+                    StageResult::Filtered | StageResult::Done => return None,
+                }
+            }
+            Some(row)
+        })
+        .collect();
+    (columns, rows)
 }
 
 // ── stage compilation ──────────────────────────────────────────────
@@ -389,6 +571,7 @@ fn compile_rename(s: &RenameStage) -> CompiledStage {
 
 fn compile_limit(s: &LimitStage) -> CompiledStage {
     CompiledStage::Limit {
+        count: s.count,
         remaining: AtomicU64::new(s.count),
     }
 }
@@ -694,6 +877,7 @@ fn apply_let(
     assignments: &[(String, Spanned<crate::ast::Expr>)],
     pins: &PinScope,
     event: &mut Row,
+    ctx: &EvalContext,
 ) {
     // Decided against the PRE-stage row, before any alias lands: these
     // targets name a real column, so they stay invisible to their
@@ -711,7 +895,7 @@ fn apply_let(
         // Stored as the evaluator produced it. A JSON round trip here is
         // what used to turn `0/0` into NULL one stage before the query
         // asked about it (see [`crate::row`]).
-        let value = eval_expr_with_pins(expr, event, pins);
+        let value = eval_expr_with_pins(expr, event, pins, ctx);
         if !shadows_column {
             // The lateral alias: a later sibling naming this target finds
             // no input column and reads what was just computed.
@@ -784,7 +968,13 @@ fn apply_extract_regex(regex: &regex::Regex, source_field: &str, event: &mut Row
 ///
 /// Returns whether the event should pass through, be filtered, or
 /// the stream is done.
-pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row) -> StageResult {
+///
+/// `ctx` is the evaluation context this row is being processed under —
+/// the instant its `now()` reads (ADR-0017 §3). The caller owns the
+/// question of what a "unit of output" is: the batch tail behind
+/// `extract kv` passes the statement's anchor for every row, while the
+/// live lane samples per event.
+pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext) -> StageResult {
     match stage {
         CompiledStage::Table { fields } => {
             let keep: Vec<String> = fields
@@ -809,15 +999,25 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row) -> StageResult {
             StageResult::Pass
         }
 
-        CompiledStage::Limit { remaining } => {
-            let prev = remaining.fetch_sub(1, Ordering::Relaxed);
-            if prev == 0 {
-                StageResult::Done
-            } else if prev == 1 {
-                // this is the last event — pass it but signal done next time
+        CompiledStage::Limit { remaining, .. } => {
+            // Exhaustion is STICKY, and `checked_sub` is what makes it
+            // so: a plain `fetch_sub` on a zero counter WRAPS to
+            // `u64::MAX`, so `Done` fired exactly once and the very next
+            // event read a full counter and passed. Every lane that
+            // keeps asking after a `Done` — the aggregate feed, which
+            // runs for the life of the subscription, and a snapshot's
+            // post-stages, which walk every row — admitted events past
+            // the limit, and the live pass-through door would have too
+            // for any caller that did not stop at the first `Done`.
+            if remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
                 StageResult::Pass
             } else {
-                StageResult::Pass
+                StageResult::Done
             }
         }
 
@@ -827,7 +1027,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row) -> StageResult {
         }
 
         CompiledStage::Where { condition, pins } => {
-            let result = eval_expr_with_pins(condition, event, pins);
+            let result = eval_expr_with_pins(condition, event, pins, ctx);
             if result.is_truthy() {
                 StageResult::Pass
             } else {
@@ -836,7 +1036,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row) -> StageResult {
         }
 
         CompiledStage::Let { assignments, pins } => {
-            apply_let(assignments, pins, event);
+            apply_let(assignments, pins, event, ctx);
             StageResult::Pass
         }
 
@@ -1285,7 +1485,15 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
 
 impl CompiledAggregation {
     /// Feed an event into the aggregation accumulators.
-    pub fn feed_event(&mut self, event: &Row) {
+    ///
+    /// `ctx` is the EVENT's own evaluation context (ADR-0017 §3): the
+    /// timechart bucket falls back to `now()` when the row carries no
+    /// readable `_time`, and that reading must be the instant the event
+    /// was admitted under, not a fresh clock — a second read would put
+    /// the event in a different span bucket than the one its own
+    /// context names. In the batch tail behind `extract kv` this is the
+    /// statement anchor, for every row alike.
+    pub fn feed_event(&mut self, event: &Row, ctx: &EvalContext) {
         match self {
             Self::Stats {
                 accumulators,
@@ -1309,7 +1517,7 @@ impl CompiledAggregation {
                 group_by,
                 buckets,
             } => {
-                let bucket = event_time_bucket(event, *span_secs);
+                let bucket = event_time_bucket(event, *span_secs, ctx);
                 let key = make_group_key(group_by, event);
                 let group_map = buckets.entry(bucket).or_default();
                 if group_map.len() >= MAX_GROUPS && !group_map.contains_key(&key) {
@@ -1473,8 +1681,16 @@ fn make_group_key(group_by: &[String], event: &Row) -> GroupKey {
         .collect()
 }
 
+/// The span bucket an event lands in.
+///
+/// The fallback for a row with no readable `_time` is `now()` — and
+/// `now()` here is the EVENT's context, the same instant its filter
+/// window and its `| where` read. Sampling a clock of its own would
+/// make a bucketless event land in a bucket nothing else in the query
+/// can name, and across a span boundary that is a different ROW in the
+/// snapshot.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
-fn event_time_bucket(event: &Row, span_secs: u64) -> i64 {
+fn event_time_bucket(event: &Row, span_secs: u64, ctx: &EvalContext) -> i64 {
     // Try to parse the _time field as RFC3339. The EXACT `_time` key,
     // deliberately not `bind_event_key`: a pre-existing quirk of this
     // lane, preserved rather than fixed here.
@@ -1483,8 +1699,8 @@ fn event_time_bucket(event: &Row, span_secs: u64) -> i64 {
     {
         return dt.timestamp() / span_secs as i64;
     }
-    // Fallback: use current time
-    chrono::Utc::now().timestamp() / span_secs as i64
+    // Fallback: the context's instant, never a fresh clock read.
+    ctx.now_utc().timestamp() / span_secs as i64
 }
 
 /// The numeric reading an accumulator takes off a cell.
@@ -1697,6 +1913,19 @@ mod tests {
         Spanned { node, span: 0..0 }
     }
 
+    /// The evaluation context these tests evaluate under.
+    ///
+    /// A FIXED instant, not a capture: nothing below reaches for a
+    /// clock, so neither does its fixture — the cases that care about
+    /// `now()` name their own instant and assert against it.
+    fn ctx() -> EvalContext {
+        EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:00Z")
+                .expect("literal is RFC 3339")
+                .with_timezone(&chrono::Utc),
+        )
+    }
+
     fn event(pairs: &Value) -> Row {
         crate::row::from_json(pairs.as_object().unwrap())
     }
@@ -1760,18 +1989,18 @@ mod tests {
     fn the_time_bucket_reads_the_wire_string() {
         let ev = event(&json!({"_time": "2026-01-15T09:07:00Z", "service": "nginx"}));
         let span: u64 = 300; // five minutes
-        let bucket = event_time_bucket(&ev, span);
+        let bucket = event_time_bucket(&ev, span, &ctx());
         let expected = chrono::DateTime::parse_from_rfc3339("2026-01-15T09:07:00Z")
             .unwrap()
             .timestamp()
             / i64::try_from(span).unwrap();
         assert_eq!(bucket, expected);
 
-        // …and an event with no `_time` falls back to now, which is a
-        // DIFFERENT bucket — the failure mode the assertion above rules
-        // out for a real event.
+        // …and an event with no `_time` falls back to the CONTEXT's
+        // instant, which is a DIFFERENT bucket — the failure mode the
+        // assertion above rules out for a real event.
         let bucketless = event(&json!({"service": "nginx"}));
-        assert_ne!(event_time_bucket(&bucketless, span), expected);
+        assert_ne!(event_time_bucket(&bucketless, span, &ctx()), expected);
     }
 
     // ── tier 1: table ──────────────────────────────────────────────
@@ -1785,7 +2014,7 @@ mod tests {
         let mut ev = event(
             &json!({"host": "web-1", "service": "nginx", "message": "hello", "level": "info"}),
         );
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         assert_eq!(ev.len(), 2);
         assert!(ev.contains_key("host"));
         assert!(ev.contains_key("service"));
@@ -1820,7 +2049,7 @@ mod tests {
             keyword: "table",
         });
         let mut ev = event(&json!({"_time": "2026-01-01", "host": "web-1", "message": "hi"}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         assert!(ev.contains_key("_time"));
         assert!(ev.contains_key("host"));
         assert!(!ev.contains_key("message"));
@@ -1834,7 +2063,7 @@ mod tests {
             fields: vec!["message".into(), "raw".into()],
         });
         let mut ev = event(&json!({"host": "web-1", "message": "hello", "raw": "bytes"}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         assert_eq!(ev.len(), 1);
         assert!(ev.contains_key("host"));
     }
@@ -1845,7 +2074,7 @@ mod tests {
             fields: vec!["nonexistent".into()],
         });
         let mut ev = event(&json!({"host": "web-1"}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         assert_eq!(ev.len(), 1);
     }
 
@@ -1857,7 +2086,7 @@ mod tests {
             renames: vec![("service".into(), "svc".into())],
         });
         let mut ev = event(&json!({"service": "nginx", "host": "web-1"}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         assert_eq!(cell(&ev, "svc"), "nginx");
         assert!(!ev.contains_key("service"));
     }
@@ -1871,7 +2100,7 @@ mod tests {
             ],
         });
         let mut ev = event(&json!({"service": "nginx", "host": "web-1"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert!(ev.contains_key("svc"));
         assert!(ev.contains_key("hostname"));
         assert!(!ev.contains_key("service"));
@@ -1886,7 +2115,7 @@ mod tests {
             renames: vec![("a".into(), "b".into()), ("b".into(), "c".into())],
         });
         let mut ev = event(&json!({"a": 1, "b": 2}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "b"), 1);
         assert_eq!(cell(&ev, "c"), 2);
         assert!(!ev.contains_key("a"));
@@ -1898,7 +2127,7 @@ mod tests {
             renames: vec![("a".into(), "b".into()), ("b".into(), "a".into())],
         });
         let mut ev = event(&json!({"a": 1, "b": 2}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "a"), 2);
         assert_eq!(cell(&ev, "b"), 1);
     }
@@ -1909,7 +2138,7 @@ mod tests {
             renames: vec![("a".into(), "x".into()), ("b".into(), "x".into())],
         });
         let mut ev = event(&json!({"a": 1, "b": 2}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "x"), 2);
         assert!(!ev.contains_key("a"));
         assert!(!ev.contains_key("b"));
@@ -1924,7 +2153,7 @@ mod tests {
             renames: vec![("nonexistent".into(), "host".into())],
         });
         let mut ev = event(&json!({"host": "web-1"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert!(!ev.contains_key("host"));
     }
 
@@ -1934,7 +2163,7 @@ mod tests {
             renames: vec![("nonexistent".into(), "alias".into())],
         });
         let mut ev = event(&json!({"host": "web-1"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(ev.len(), 1);
         assert!(!ev.contains_key("alias"));
     }
@@ -1949,10 +2178,37 @@ mod tests {
         });
         let mut ev = event(&json!({"i": 1}));
 
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Done);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Done);
+    }
+
+    /// Exhaustion is STICKY: once a `limit` has said `Done` it says it
+    /// forever.
+    ///
+    /// The counter used to be decremented with `fetch_sub`, which WRAPS
+    /// at zero — so `Done` fired exactly once and the very next event
+    /// read `u64::MAX` and passed. Every lane that keeps asking after a
+    /// `Done` (the aggregate feed, a snapshot's post-stages) therefore
+    /// admitted events past the limit.
+    #[test]
+    fn limit_exhaustion_is_sticky() {
+        let mut stage = compile_limit(&LimitStage {
+            count: 2,
+            keyword: "limit",
+        });
+        let mut ev = event(&json!({"i": 1}));
+
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
+        for attempt in 0..5 {
+            assert_eq!(
+                apply_stage(&mut stage, &mut ev, &ctx()),
+                StageResult::Done,
+                "attempt {attempt} after exhaustion must still be Done"
+            );
+        }
     }
 
     #[test]
@@ -1962,7 +2218,12 @@ mod tests {
             keyword: "limit",
         });
         let mut ev = event(&json!({"i": 1}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Done);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Done);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev, &ctx()),
+            StageResult::Done,
+            "a zero limit never becomes passable"
+        );
     }
 
     // ── tier 2: where ──────────────────────────────────────────────
@@ -1976,7 +2237,7 @@ mod tests {
         });
         let mut stage = compile_where(&WhereStage { condition }, &PinScope::unpinned()).unwrap();
         let mut ev = event(&json!({"status": 500}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
     }
 
     #[test]
@@ -1988,7 +2249,10 @@ mod tests {
         });
         let mut stage = compile_where(&WhereStage { condition }, &PinScope::unpinned()).unwrap();
         let mut ev = event(&json!({"status": 200}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Filtered);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev, &ctx()),
+            StageResult::Filtered
+        );
     }
 
     #[test]
@@ -2000,7 +2264,10 @@ mod tests {
         });
         let mut stage = compile_where(&WhereStage { condition }, &PinScope::unpinned()).unwrap();
         let mut ev = event(&json!({"host": "web-1"}));
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Filtered);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev, &ctx()),
+            StageResult::Filtered
+        );
     }
 
     /// `where level == "..."` is an ORDINARY comparison on the sender's
@@ -2024,12 +2291,21 @@ mod tests {
         let mut stage = level_where(BinaryOp::Eq, "gold").unwrap();
         // The game server's `level` field means what it says.
         let mut gold = event(&json!({"service": "game", "level": "gold"}));
-        assert_eq!(apply_stage(&mut stage, &mut gold), StageResult::Pass);
+        assert_eq!(
+            apply_stage(&mut stage, &mut gold, &ctx()),
+            StageResult::Pass
+        );
         let mut silver = event(&json!({"service": "game", "level": "silver"}));
-        assert_eq!(apply_stage(&mut stage, &mut silver), StageResult::Filtered);
+        assert_eq!(
+            apply_stage(&mut stage, &mut silver, &ctx()),
+            StageResult::Filtered
+        );
         // No `level` key is NULL, not a severity lookup.
         let mut none = event(&json!({"severity": 17}));
-        assert_eq!(apply_stage(&mut stage, &mut none), StageResult::Filtered);
+        assert_eq!(
+            apply_stage(&mut stage, &mut none, &ctx()),
+            StageResult::Filtered
+        );
     }
 
     /// There is no severity vocabulary on a bare name any more, so
@@ -2206,7 +2482,7 @@ mod tests {
             assert!(err.contains(sentence), "{dsl}: {err}");
             // The batch lane's message for the same text, verbatim.
             let query = crate::parser::parse(dsl).expect("parses");
-            let batch = crate::emitter::emit(&query, "/data/*.parquet")
+            let batch = crate::emitter::emit(&query, "/data/*.parquet", ctx())
                 .expect_err("batch must refuse too")
                 .to_string();
             assert!(batch.contains(sentence), "{dsl}: {batch}");
@@ -2243,7 +2519,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"duration": 2}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "duration_ms"), 2000);
     }
 
@@ -2265,7 +2541,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"service": "nginx"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "svc"), "NGINX");
     }
 
@@ -2295,7 +2571,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"service": "nginx"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "ms"), 1000);
         assert_eq!(cell(&ev, "total"), 2000);
     }
@@ -2318,7 +2594,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"a": 5}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "a"), 1);
         assert_eq!(cell(&ev, "b"), 5);
     }
@@ -2342,7 +2618,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"a": 5}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "A"), 1);
         assert!(!ev.contains_key("a"));
         assert_eq!(cell(&ev, "b"), 5);
@@ -2372,7 +2648,7 @@ mod tests {
         )
         .unwrap();
         let mut ev = event(&json!({"a": 5}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "a"), 6);
         assert_eq!(cell(&ev, "b"), 5);
     }
@@ -2388,7 +2664,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "connection from 192.168.1.100 accepted"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "ip"), "192.168.1.100");
     }
 
@@ -2401,7 +2677,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "no ip here", "ip": "keep?"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "ip"), Some(Value::Null));
         assert!(ev.contains_key("ip"));
     }
@@ -2415,11 +2691,11 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "bbb"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "x"), Some(Value::Null));
 
         let mut ev = event(&json!({"message": "aab"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "x"), Some(Value::from("aa")));
     }
 
@@ -2432,12 +2708,12 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "Status=500", "status": 200}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "Status"), Some(Value::from(500)));
         assert!(!ev.contains_key("status"));
 
         let mut ev = event(&json!({"message": "dur=1 DUR=2 Dur=3"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "Dur"), Some(Value::from(3)));
         assert_eq!(
             ev.keys()
@@ -2474,7 +2750,7 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"service": "nginx"}));
         ev.insert("t".into(), EvalValue::Timestamp(instant));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "y"), "2026", "text was {text:?}");
 
         // The kv arm reads the same text through the same door.
@@ -2486,7 +2762,7 @@ mod tests {
         .unwrap();
         let mut ev = event(&json!({"service": "nginx"}));
         ev.insert("t".into(), EvalValue::Timestamp(instant));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "09"), Some(json!("00:00")));
     }
 
@@ -2502,7 +2778,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"n": 42}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell_opt(&ev, "d"), Some(Value::Null));
 
         let mut stage = compile_extract(&ExtractStage {
@@ -2512,7 +2788,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"flag": true}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(ev.keys().count(), 1, "nothing extracted: {ev:?}");
     }
 
@@ -2525,7 +2801,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "GET /api/v1/users HTTP/1.1"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "method"), "GET");
         assert_eq!(cell(&ev, "path"), "/api/v1/users");
     }
@@ -2552,7 +2828,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "user=alice status=200 path=/api"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "user"), "alice");
         assert_eq!(cell(&ev, "status"), 200); // coerced to int
         assert_eq!(cell(&ev, "path"), "/api");
@@ -2567,7 +2843,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": r#"user="alice smith" action=login"#}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "user"), "alice smith");
         assert_eq!(cell(&ev, "action"), "login");
     }
@@ -2581,7 +2857,7 @@ mod tests {
         })
         .unwrap();
         let mut ev = event(&json!({"message": "user:alice status:200"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "user"), "alice");
         assert_eq!(cell(&ev, "status"), 200);
     }
@@ -2596,7 +2872,7 @@ mod tests {
         .unwrap();
         let mut ev =
             event(&json!({"message": "count=42 rate=1.5 flag=true name=hello empty=false"}));
-        apply_stage(&mut stage, &mut ev);
+        apply_stage(&mut stage, &mut ev, &ctx());
         assert_eq!(cell(&ev, "count"), 42);
         assert_eq!(cell(&ev, "rate"), 1.5);
         assert_eq!(cell(&ev, "flag"), true);
@@ -2616,9 +2892,12 @@ mod tests {
         let mut ev2 = event(&json!({"host": "web-1", "i": 2}));
         let mut ev3 = event(&json!({"host": "web-2", "i": 3}));
 
-        assert_eq!(apply_stage(&mut stage, &mut ev1), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev2), StageResult::Filtered);
-        assert_eq!(apply_stage(&mut stage, &mut ev3), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev1, &ctx()), StageResult::Pass);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev2, &ctx()),
+            StageResult::Filtered
+        );
+        assert_eq!(apply_stage(&mut stage, &mut ev3, &ctx()), StageResult::Pass);
     }
 
     #[test]
@@ -2631,9 +2910,12 @@ mod tests {
         let mut ev2 = event(&json!({"host": "web-1", "service": "nginx"}));
         let mut ev3 = event(&json!({"host": "web-1", "service": "postgres"}));
 
-        assert_eq!(apply_stage(&mut stage, &mut ev1), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev2), StageResult::Filtered);
-        assert_eq!(apply_stage(&mut stage, &mut ev3), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev1, &ctx()), StageResult::Pass);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev2, &ctx()),
+            StageResult::Filtered
+        );
+        assert_eq!(apply_stage(&mut stage, &mut ev3, &ctx()), StageResult::Pass);
     }
 
     #[test]
@@ -2644,9 +2926,12 @@ mod tests {
         let mut ev2 = event(&json!({"host": "web-1", "level": "info"}));
         let mut ev3 = event(&json!({"host": "web-1", "level": "error"}));
 
-        assert_eq!(apply_stage(&mut stage, &mut ev1), StageResult::Pass);
-        assert_eq!(apply_stage(&mut stage, &mut ev2), StageResult::Filtered);
-        assert_eq!(apply_stage(&mut stage, &mut ev3), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev1, &ctx()), StageResult::Pass);
+        assert_eq!(
+            apply_stage(&mut stage, &mut ev2, &ctx()),
+            StageResult::Filtered
+        );
+        assert_eq!(apply_stage(&mut stage, &mut ev3, &ctx()), StageResult::Pass);
     }
 
     // ── extract_key_value_pairs ────────────────────────────────────
@@ -2716,7 +3001,7 @@ mod tests {
             "_severity": 9,
         }));
 
-        assert_eq!(apply_stage(&mut stage, &mut ev), StageResult::Pass);
+        assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Pass);
         // Log content cannot forge trawl's verdict slots (ADR-0013 §1):
         // the reserved pairs are dropped, the ordinary one lands, and an
         // existing `_severity` keeps trawl's own value.
@@ -2745,7 +3030,7 @@ mod tests {
 
         let mut ev = event(&json!({"host": "web-1", "service": "nginx", "message": "hi"}));
         for stage in &mut stages {
-            let result = apply_stage(stage, &mut ev);
+            let result = apply_stage(stage, &mut ev, &ctx());
             assert_eq!(result, StageResult::Pass);
         }
         assert_eq!(ev.len(), 2);
@@ -2777,7 +3062,7 @@ mod tests {
         let mut ev = event(&json!({"status": 500}));
         let mut result = StageResult::Pass;
         for stage in &mut stages {
-            result = apply_stage(stage, &mut ev);
+            result = apply_stage(stage, &mut ev, &ctx());
             if result != StageResult::Pass {
                 break;
             }
@@ -2788,7 +3073,7 @@ mod tests {
         let mut ev = event(&json!({"status": 200}));
         result = StageResult::Pass;
         for stage in &mut stages {
-            result = apply_stage(stage, &mut ev);
+            result = apply_stage(stage, &mut ev, &ctx());
             if result != StageResult::Pass {
                 break;
             }
@@ -2799,7 +3084,7 @@ mod tests {
         let mut ev = event(&json!({"status": 404}));
         result = StageResult::Pass;
         for stage in &mut stages {
-            result = apply_stage(stage, &mut ev);
+            result = apply_stage(stage, &mut ev, &ctx());
             if result != StageResult::Pass {
                 break;
             }
@@ -2810,7 +3095,7 @@ mod tests {
         let mut ev = event(&json!({"status": 503}));
         result = StageResult::Pass;
         for stage in &mut stages {
-            result = apply_stage(stage, &mut ev);
+            result = apply_stage(stage, &mut ev, &ctx());
             if result != StageResult::Pass {
                 break;
             }
@@ -2888,9 +3173,9 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"host": "a"})));
-        aggregation.feed_event(&event(&json!({"host": "b"})));
-        aggregation.feed_event(&event(&json!({"host": "c"})));
+        aggregation.feed_event(&event(&json!({"host": "a"})), &ctx());
+        aggregation.feed_event(&event(&json!({"host": "b"})), &ctx());
+        aggregation.feed_event(&event(&json!({"host": "c"})), &ctx());
 
         let (columns, rows) = aggregation.snapshot();
         assert_eq!(columns, vec!["count"]);
@@ -2916,9 +3201,9 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"host": "web-1"})));
-        aggregation.feed_event(&event(&json!({"host": "web-2"})));
-        aggregation.feed_event(&event(&json!({"host": "web-1"})));
+        aggregation.feed_event(&event(&json!({"host": "web-1"})), &ctx());
+        aggregation.feed_event(&event(&json!({"host": "web-2"})), &ctx());
+        aggregation.feed_event(&event(&json!({"host": "web-1"})), &ctx());
 
         let (columns, rows) = aggregation.snapshot();
         assert_eq!(columns, vec!["host", "count"]);
@@ -2965,7 +3250,7 @@ mod tests {
         };
 
         for val in [10, 20, 30] {
-            aggregation.feed_event(&event(&json!({"v": val})));
+            aggregation.feed_event(&event(&json!({"v": val})), &ctx());
         }
 
         let (_, rows) = aggregation.snapshot();
@@ -3003,9 +3288,9 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"svc": "nginx"})));
-        aggregation.feed_event(&event(&json!({"svc": "postgres"})));
-        aggregation.feed_event(&event(&json!({"svc": "nginx"}))); // duplicate
+        aggregation.feed_event(&event(&json!({"svc": "nginx"})), &ctx());
+        aggregation.feed_event(&event(&json!({"svc": "postgres"})), &ctx());
+        aggregation.feed_event(&event(&json!({"svc": "nginx"})), &ctx()); // duplicate
 
         let (_, rows) = aggregation.snapshot();
         let row = &rows[0];
@@ -3040,9 +3325,9 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"msg": "alpha"})));
-        aggregation.feed_event(&event(&json!({"msg": "beta"})));
-        aggregation.feed_event(&event(&json!({"msg": "gamma"})));
+        aggregation.feed_event(&event(&json!({"msg": "alpha"})), &ctx());
+        aggregation.feed_event(&event(&json!({"msg": "beta"})), &ctx());
+        aggregation.feed_event(&event(&json!({"msg": "gamma"})), &ctx());
 
         let (_, rows) = aggregation.snapshot();
         let row = &rows[0];
@@ -3070,7 +3355,7 @@ mod tests {
 
         // Odd count: median is middle value
         for val in [1, 3, 5, 7, 9] {
-            aggregation.feed_event(&event(&json!({"v": val})));
+            aggregation.feed_event(&event(&json!({"v": val})), &ctx());
         }
         let (_, rows) = aggregation.snapshot();
         assert_eq!(cell(&rows[0], "median_v"), 5.0);
@@ -3095,7 +3380,7 @@ mod tests {
         };
 
         for val in [1, 3, 5, 7] {
-            aggregation.feed_event(&event(&json!({"v": val})));
+            aggregation.feed_event(&event(&json!({"v": val})), &ctx());
         }
         let (_, rows) = aggregation.snapshot();
         assert_eq!(cell(&rows[0], "median_v"), 4.0);
@@ -3122,7 +3407,7 @@ mod tests {
         // sample stddev of [2, 4, 4, 4, 5, 5, 7, 9]:
         // mean=5, Σ(x-μ)²=32, s=√(32/7)≈2.138
         for val in [2, 4, 4, 4, 5, 5, 7, 9] {
-            aggregation.feed_event(&event(&json!({"v": val})));
+            aggregation.feed_event(&event(&json!({"v": val})), &ctx());
         }
         let (_, rows) = aggregation.snapshot();
         let sd = cell(&rows[0], "stddev_v").as_f64().unwrap();
@@ -3147,10 +3432,10 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"v": 1})));
-        aggregation.feed_event(&event(&json!({"v": null})));
-        aggregation.feed_event(&event(&json!({"other": 3}))); // v missing
-        aggregation.feed_event(&event(&json!({"v": 4})));
+        aggregation.feed_event(&event(&json!({"v": 1})), &ctx());
+        aggregation.feed_event(&event(&json!({"v": null})), &ctx());
+        aggregation.feed_event(&event(&json!({"other": 3})), &ctx()); // v missing
+        aggregation.feed_event(&event(&json!({"v": 4})), &ctx());
 
         let (_, rows) = aggregation.snapshot();
         assert_eq!(cell(&rows[0], "count_v"), 2);
@@ -3174,7 +3459,7 @@ mod tests {
             panic!("expected Aggregate");
         };
 
-        aggregation.feed_event(&event(&json!({"x": 1})));
+        aggregation.feed_event(&event(&json!({"x": 1})), &ctx());
         let (columns, rows) = aggregation.snapshot();
         assert_eq!(columns, vec!["total"]);
         assert_eq!(cell(&rows[0], "total"), 1);
@@ -3198,12 +3483,12 @@ mod tests {
         };
 
         for _ in 0..5 {
-            aggregation.feed_event(&event(&json!({"host": "web-1"})));
+            aggregation.feed_event(&event(&json!({"host": "web-1"})), &ctx());
         }
         for _ in 0..3 {
-            aggregation.feed_event(&event(&json!({"host": "web-2"})));
+            aggregation.feed_event(&event(&json!({"host": "web-2"})), &ctx());
         }
-        aggregation.feed_event(&event(&json!({"host": "web-3"})));
+        aggregation.feed_event(&event(&json!({"host": "web-3"})), &ctx());
 
         let (columns, rows) = aggregation.snapshot();
         assert_eq!(columns, vec!["host", "count"]);
@@ -3229,9 +3514,9 @@ mod tests {
         };
 
         for _ in 0..5 {
-            aggregation.feed_event(&event(&json!({"host": "web-1"})));
+            aggregation.feed_event(&event(&json!({"host": "web-1"})), &ctx());
         }
-        aggregation.feed_event(&event(&json!({"host": "web-2"})));
+        aggregation.feed_event(&event(&json!({"host": "web-2"})), &ctx());
 
         let (_, rows) = aggregation.snapshot();
         assert_eq!(rows.len(), 1);

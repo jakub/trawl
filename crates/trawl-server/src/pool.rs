@@ -321,7 +321,14 @@ fn capture_pool_debug(
             // it renders the PLANNER's source, and the executor may narrow a
             // list source's elements (dropping ones no file backs) before it
             // reads — so the logged source can be wider than the one that ran.
-            let (sql, params) = match trawl_core::emitter::emit_with_pins(&ast, source, pins) {
+            // Its `now()` anchor is its own for the same reason: a preview is
+            // not the run, and there is no run's anchor to inherit here.
+            let (sql, params) = match trawl_core::emitter::emit_with_pins(
+                &ast,
+                source,
+                pins,
+                trawl_core::context::EvalContext::capture(),
+            ) {
                 Ok(emitted) => (
                     emitted.sql,
                     emitted.params.iter().map(ToString::to_string).collect(),

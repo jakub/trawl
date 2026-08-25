@@ -84,8 +84,13 @@ fn varchar_negated_list_executes_as_pin_aware_not_in_with_null_widening() {
     let query = trawl_core::parser::parse("status!=200,301").unwrap();
     let mut pins = trawl_core::schema::FieldTypes::new();
     pins.insert("status", CanonicalType::Varchar);
-    let emitted =
-        trawl_core::emitter::emit_with_pins(&query, &file.display().to_string(), &pins).unwrap();
+    let emitted = trawl_core::emitter::emit_with_pins(
+        &query,
+        &file.display().to_string(),
+        &pins,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .unwrap();
     let params: Vec<Box<dyn duckdb::ToSql>> = emitted
         .params
         .iter()
@@ -95,6 +100,12 @@ fn varchar_negated_list_executes_as_pin_aware_not_in_with_null_widening() {
                 trawl_core::emitter::SqlValue::Int(value) => Box::new(*value),
                 trawl_core::emitter::SqlValue::Float(value) => Box::new(*value),
                 trawl_core::emitter::SqlValue::Bool(value) => Box::new(*value),
+                trawl_core::emitter::SqlValue::Timestamp(value) => {
+                    Box::new(duckdb::types::Value::Timestamp(
+                        duckdb::types::TimeUnit::Microsecond,
+                        value.and_utc().timestamp_micros(),
+                    ))
+                }
             }
         })
         .collect();
@@ -3719,7 +3730,9 @@ fn backticked_names_describe_as_the_names_the_dsl_spells() {
         ),
     ] {
         let query = trawl_core::parser::parse(dsl).unwrap();
-        let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+        let emitted =
+            trawl_core::emitter::emit(&query, &source, trawl_core::context::EvalContext::capture())
+                .unwrap();
         assert!(emitted.params.is_empty(), "{dsl} binds no parameters");
         assert_eq!(describe(&emitted.sql), expected, "{dsl}: {}", emitted.sql);
     }
@@ -3748,7 +3761,12 @@ fn pivot_cte_finalization_preserves_multiline_literal_matching() {
 
     let dsl = "message=\"a\nb\" | pivot count() on status | sort `200`";
     let query = trawl_core::parser::parse(dsl).unwrap();
-    let emitted = trawl_core::emitter::emit(&query, &file.display().to_string()).unwrap();
+    let emitted = trawl_core::emitter::emit(
+        &query,
+        &file.display().to_string(),
+        trawl_core::context::EvalContext::capture(),
+    )
+    .unwrap();
     assert!(emitted.params.is_empty(), "PIVOT inlines every parameter");
 
     let matched: i64 = conn
@@ -3777,7 +3795,9 @@ fn eventstats_alias_overwrites_the_incoming_column() {
     let source = file.display().to_string();
 
     let query = trawl_core::parser::parse("* | eventstats count() as status by service").unwrap();
-    let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+    let emitted =
+        trawl_core::emitter::emit(&query, &source, trawl_core::context::EvalContext::capture())
+            .unwrap();
 
     let columns: Vec<String> = {
         let mut stmt = conn.prepare(&format!("DESCRIBE {}", emitted.sql)).unwrap();
@@ -3821,7 +3841,9 @@ fn eventstats_case_variant_alias_overwrites_the_incoming_column() {
     let source = file.display().to_string();
 
     let query = trawl_core::parser::parse("* | eventstats count() as `Status` by service").unwrap();
-    let emitted = trawl_core::emitter::emit(&query, &source).unwrap();
+    let emitted =
+        trawl_core::emitter::emit(&query, &source, trawl_core::context::EvalContext::capture())
+            .unwrap();
 
     let columns: Vec<String> = {
         let mut stmt = conn.prepare(&format!("DESCRIBE {}", emitted.sql)).unwrap();
@@ -5115,4 +5137,122 @@ fn current_json_number_spelling_follows_serdes_f64() {
         .unwrap();
     assert_eq!(engine.as_deref(), Some("1e400"));
     assert_eq!(json_extract_mirror(doc, "$.a"), None);
+}
+
+// ── the now() anchor's bound TIMESTAMP (ADR-0017 §3, #106) ────────────
+//
+// `now()` no longer emits `DuckDB`'s own clock: the statement's instant
+// is captured in Rust and BOUND as a microsecond TIMESTAMP under an
+// explicit `CAST(? AS TIMESTAMP)` (`emitter::functions`). Three claims
+// that design rests on are measured here rather than assumed — what the
+// bound parameter's TYPE is, what it RENDERS as, and that the typed
+// literal the PIVOT lane inlines instead names the same instant.
+
+/// The anchor as duckdb-rs binds it: microseconds since the epoch, the
+/// domain `EvalContext` truncates to at capture.
+fn bound_anchor(at: chrono::NaiveDateTime) -> duckdb::types::Value {
+    duckdb::types::Value::Timestamp(
+        duckdb::types::TimeUnit::Microsecond,
+        at.and_utc().timestamp_micros(),
+    )
+}
+
+/// The two anchor shapes the emitter can produce: a fractional instant
+/// and a whole-second one (whose canonical text carries NO fraction).
+fn anchor_probe_instants() -> Vec<chrono::NaiveDateTime> {
+    ["2026-02-03T04:05:06.789012Z", "2026-02-03T04:05:06Z"]
+        .iter()
+        .map(|text| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .expect("a valid RFC 3339 instant")
+                .naive_utc()
+        })
+        .collect()
+}
+
+/// A bound anchor under `CAST(? AS TIMESTAMP)` is a TIMESTAMP — read as
+/// `typeof`'s own TEXT, not the driver's `Type` enum, which erases the
+/// TIMESTAMP/TIMESTAMPTZ distinction this whole change exists to settle.
+#[test]
+fn a_bound_anchor_is_a_timestamp_not_a_timestamptz() {
+    let conn = conn();
+    for at in anchor_probe_instants() {
+        let value = bound_anchor(at);
+        let (dtype, _) = scalar_type_and_text(&conn, "CAST(? AS TIMESTAMP)", &[&value]).unwrap();
+        assert_eq!(dtype, "TIMESTAMP", "{at}");
+    }
+}
+
+/// The bound anchor renders as the canonical text the in-memory lane
+/// prints for the same instant — so a `now()` cell computed by the SQL
+/// prefix and one computed by the `rust_stages` tail are the same string.
+#[test]
+fn a_bound_anchor_renders_as_the_canonical_timestamp_text() {
+    let conn = conn();
+    for at in anchor_probe_instants() {
+        let value = bound_anchor(at);
+        let (_, text) = scalar_type_and_text(&conn, "CAST(? AS TIMESTAMP)", &[&value]).unwrap();
+        assert_eq!(
+            text.as_deref(),
+            Some(trawl_core::eval::timestamp_to_duckdb_text(&at).as_str()),
+            "{at}"
+        );
+    }
+}
+
+/// The PIVOT lane cannot take parameters, so it INLINES the anchor as a
+/// typed literal. The literal and the bound form must be
+/// indistinguishable — same type, same text — or one query shape would
+/// answer `now()` differently from another.
+#[test]
+fn the_inlined_anchor_literal_matches_the_bound_form() {
+    let conn = conn();
+    for at in anchor_probe_instants() {
+        let value = bound_anchor(at);
+        let bound = scalar_type_and_text(&conn, "CAST(? AS TIMESTAMP)", &[&value]).unwrap();
+
+        // The very text `SqlValue::Timestamp`'s Display (and the PIVOT
+        // inliner behind it) emits, taken from the emitter rather than
+        // rebuilt here — a second spelling is the drift this pins.
+        let literal = trawl_core::emitter::SqlValue::Timestamp(at).to_string();
+        let inlined = scalar_type_and_text(&conn, &literal, &[]).unwrap();
+
+        assert_eq!(inlined, bound, "{literal} must denote the bound instant");
+    }
+}
+
+/// A year outside `0..=9999` must still produce a literal `DuckDB` can
+/// parse (#106, review F5).
+///
+/// chrono SIGNS such a year — `+10000-01-01` — and `DuckDB`'s timestamp
+/// parser accepts a leading `-` but not a leading `+`, so the inlined
+/// PIVOT literal for one of those instants was a conversion error while
+/// the bound parameter for the same instant was fine: the two renderings
+/// of one anchor disagreed at the edge of the domain. Unreachable from a
+/// production clock, but `EvalContext::at` is public.
+#[test]
+fn the_anchor_literal_parses_at_every_year_chrono_can_render() {
+    let conn = conn();
+    for (year, month, day) in [
+        (-1_i32, 1_u32, 1_u32),
+        (1, 1, 1),
+        (9999, 12, 31),
+        (10_000, 1, 1),
+        (99_999, 1, 1),
+    ] {
+        let at = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .expect("a valid date")
+            .and_hms_micro_opt(0, 0, 0, 0)
+            .expect("a valid time");
+        let literal = trawl_core::emitter::SqlValue::Timestamp(at).to_string();
+        let inlined = scalar_type_and_text(&conn, &literal, &[])
+            .unwrap_or_else(|error| panic!("{literal} must parse: {error}"));
+        assert_eq!(inlined.0, "TIMESTAMP", "{literal}");
+
+        // And it must denote the same instant the parameter binds — the
+        // whole point of there being ONE rendering.
+        let bound = scalar_type_and_text(&conn, "CAST(? AS TIMESTAMP)", &[&bound_anchor(at)])
+            .unwrap_or_else(|error| panic!("the bound form of {literal} must run: {error}"));
+        assert_eq!(inlined, bound, "{literal} must denote the bound instant");
+    }
 }

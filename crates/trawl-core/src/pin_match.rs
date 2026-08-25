@@ -179,6 +179,20 @@ pub(crate) fn coerce_form(form: CompareForm) -> CoercedValue {
         CompareForm::Native(SqlValue::String(s)) | CompareForm::Text(s) => CoercedValue::Str(s),
         // coerce_filter_value never yields Bool; keep the match total.
         CompareForm::Native(SqlValue::Bool(b)) => CoercedValue::Str(b.to_string()),
+        // Nor a Timestamp: the emitter mints `SqlValue::Timestamp` for
+        // exactly one thing — `now()`'s statement anchor (ADR-0017 §3) —
+        // and an anchor is never a comparison literal, so no door in
+        // `compare.rs` can produce this form. Kept total, answering
+        // UNKNOWN (matches nothing, and `NOT` cannot invert it) rather
+        // than inventing a comparison rule for a shape that cannot
+        // arrive.
+        CompareForm::Native(SqlValue::Timestamp(_)) => {
+            debug_assert!(false, "an anchor is not a comparison literal");
+            CoercedValue::Conformed {
+                pin: CanonicalType::Timestamp,
+                literal: PinLiteral::Unreadable,
+            }
+        }
         CompareForm::Conformed { pin, literal } => CoercedValue::Conformed {
             pin,
             literal: pin_literal(pin, &literal),

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use duckdb::Connection;
 use duckdb::types::{TimeUnit, ValueRef};
 use trawl_core::ast::{PipeStage, Query, Spanned};
+use trawl_core::context::EvalContext;
 use trawl_core::emitter::{self, EmittedQuery, SqlValue};
 use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
@@ -112,7 +113,7 @@ impl Executor {
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let resolved = self.resolve_source(source);
-        let emitted = resolved.emit_cold(&ast, pins)?;
+        let emitted = resolved.emit_cold(&ast, pins, EvalContext::capture())?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
         let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset);
         // Same gate as the hot lanes, one column over: with no hot buffer to
@@ -132,6 +133,7 @@ impl Executor {
                 result,
                 &emitted.rust_stages,
                 &emitted.rust_stage_pins,
+                emitted.anchor,
             )?;
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
@@ -169,7 +171,8 @@ impl Executor {
     ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let resolved = self.resolve_source(source);
-        let emitted = resolved.emit_union(&ast, hot_source, hot_pins, pins)?;
+        let emitted =
+            resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
         let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset);
 
@@ -198,7 +201,13 @@ impl Executor {
                 // `status=200.0` over a VARCHAR-pinned field would match a
                 // hot numeric `200` here and stop matching the moment a
                 // parquet file appeared.
-                let hot_emitted = emitter::emit_hot_only(&ast, hot_source, hot_pins, pins)?;
+                // The anchor is INHERITED, never re-captured: this is
+                // the same logical query reading a narrower source, so a
+                // second clock read would let the fallback answer a
+                // `now()` comparison differently from the union attempt
+                // it replaces (ADR-0017 §3).
+                let hot_emitted =
+                    emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)?;
                 match self.execute_emitted_tracked(&hot_emitted, max_rows, sql_offset) {
                     // Hot-only also hit a binder/emit error (e.g. empty ndjson
                     // between compaction cycles). Treat as empty, not error.
@@ -214,6 +223,7 @@ impl Executor {
                 result,
                 &emitted.rust_stages,
                 &emitted.rust_stage_pins,
+                emitted.anchor,
             )?;
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
@@ -538,7 +548,7 @@ impl Executor {
     ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let resolved = self.resolve_source(source);
-        let emitted = resolved.emit_cold(&ast, pins)?;
+        let emitted = resolved.emit_cold(&ast, pins, EvalContext::capture())?;
         let outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
         // The same gate the query lanes run, on the same classification. An
         // all-missing source keeps surfacing DuckDB's own "no files" error
@@ -590,7 +600,8 @@ impl Executor {
     ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let resolved = self.resolve_source(source);
-        let emitted = resolved.emit_union(&ast, hot_source, hot_pins, pins)?;
+        let emitted =
+            resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())?;
         let outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
 
         match self.cold_action_for(
@@ -602,7 +613,13 @@ impl Executor {
                 // Hot-only, conformed like the union's hot branch — an
                 // export must not write JSON-inferred types where the
                 // hot+cold lane would have written the catalog's.
-                let hot_emitted = emitter::emit_hot_only(&ast, hot_source, hot_pins, pins)?;
+                // The anchor is INHERITED, never re-captured: this is
+                // the same logical query reading a narrower source, so a
+                // second clock read would let the fallback answer a
+                // `now()` comparison differently from the union attempt
+                // it replaces (ADR-0017 §3).
+                let hot_emitted =
+                    emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)?;
                 self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows)
             }
             // Same invariant as `export_parquet`: only an `is_no_files_error`
@@ -1160,8 +1177,9 @@ impl ResolvedSource {
         &self,
         query: &Query,
         pins: &FieldTypes,
+        anchor: EvalContext,
     ) -> Result<EmittedQuery, emitter::EmitError> {
-        emitter::emit_with_pins(query, &self.sql, pins)
+        emitter::emit_with_pins(query, &self.sql, pins, anchor)
     }
 
     /// Emit the hot+cold union read over this source.
@@ -1175,8 +1193,9 @@ impl ResolvedSource {
         hot_source: &str,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
+        anchor: EvalContext,
     ) -> Result<EmittedQuery, emitter::EmitError> {
-        emitter::emit_with_hot_source(query, &self.sql, hot_source, hot_pins, pins)
+        emitter::emit_with_hot_source(query, &self.sql, hot_source, hot_pins, pins, anchor)
     }
 }
 
@@ -1314,6 +1333,14 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
                 SqlValue::Int(i) => Box::new(*i),
                 SqlValue::Float(f) => Box::new(*f),
                 SqlValue::Bool(b) => Box::new(*b),
+                // The statement's `now()` anchor (ADR-0017 §3). Bound as
+                // MICROSECONDS because that is `DuckDB`'s TIMESTAMP
+                // domain and the anchor is truncated to it at capture, so
+                // the bound value is exact — never rounded at the wire.
+                SqlValue::Timestamp(at) => Box::new(duckdb::types::Value::Timestamp(
+                    duckdb::types::TimeUnit::Microsecond,
+                    at.and_utc().timestamp_micros(),
+                )),
             }
         })
         .collect()
@@ -1575,9 +1602,10 @@ mod tests {
     use duckdb::Connection;
 
     use super::{
-        ColdAction, ColdPresence, EngineError, Executor, FieldTypes, HotColdOutcome, HotLane,
-        ListEvidence, cold_action, error_class, export_row_limit, glob_list_items, has_glob_meta,
-        is_conversion_error, is_no_files_error, literal_path_is_file, resolve_list_source,
+        ColdAction, ColdPresence, EngineError, EvalContext, Executor, FieldTypes, HotColdOutcome,
+        HotLane, ListEvidence, cold_action, emitter, error_class, export_row_limit,
+        glob_list_items, has_glob_meta, is_conversion_error, is_no_files_error,
+        literal_path_is_file, resolve_list_source, with_raw_fallback,
     };
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
@@ -1852,6 +1880,43 @@ mod tests {
             result.row_count(),
             2,
             "both rows must survive the merged-STRUCT union read"
+        );
+    }
+
+    /// The `_raw`-free retry re-runs the SAME emission with one SQL
+    /// string swapped, so it inherits the statement's anchor by
+    /// construction. Verified rather than assumed: the retry builds its
+    /// query with struct update syntax, and a future field added by hand
+    /// instead could quietly re-sample.
+    #[test]
+    fn the_raw_free_retry_inherits_the_anchor() {
+        let anchor = EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-02-03T04:05:06.789012Z")
+                .expect("a valid RFC 3339 instant")
+                .into(),
+        );
+        let query = trawl_core::parser::parse("hello | let n = now()").expect("parse");
+        let emitted = emitter::emit(&query, "/data/**/*.parquet", anchor).expect("emit");
+        assert!(
+            emitted.raw_free_sql.is_some(),
+            "a bare-word search must bind `_raw` and produce the fallback"
+        );
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, |attempt| {
+            seen.borrow_mut().push(attempt.anchor);
+            Err(EngineError::Emit(
+                trawl_core::emitter::EmitError::UnsupportedOperation {
+                    message: "column not found".to_string(),
+                },
+            ))
+        });
+        assert!(outcome.is_err());
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), 2, "both passes must have been attempted");
+        assert!(
+            seen.iter().all(|attempt| *attempt == anchor),
+            "the retry must carry the original anchor: {seen:?}"
         );
     }
 

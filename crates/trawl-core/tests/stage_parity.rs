@@ -60,6 +60,10 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
                 SqlValue::Int(i) => Box::new(*i),
                 SqlValue::Float(f) => Box::new(*f),
                 SqlValue::Bool(b) => Box::new(*b),
+                SqlValue::Timestamp(at) => Box::new(duckdb::types::Value::Timestamp(
+                    duckdb::types::TimeUnit::Microsecond,
+                    at.and_utc().timestamp_micros(),
+                )),
             }
         })
         .collect()
@@ -87,8 +91,13 @@ fn batch_outcome(conn: &Connection, dsl: &str, events: &[Value]) -> Result<TextR
     }
     tmp.flush().unwrap();
     let source = tmp.path().to_str().unwrap().to_owned();
-    let emitted =
-        emitter::emit_with_pins(&query, &source, &FieldTypes::new()).expect("emit succeeds");
+    let emitted = emitter::emit_with_pins(
+        &query,
+        &source,
+        &FieldTypes::new(),
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
     let params = bind_params(&emitted.params);
     let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
 
@@ -139,6 +148,10 @@ fn batch_outcome(conn: &Connection, dsl: &str, events: &[Value]) -> Result<TextR
 
 /// Run the same pipeline through the live lane over the same events.
 fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
+    // ONE anchor for the whole comparison: these cases are about the
+    // CARRIER, not about the clock, so both lanes stay pinned to a
+    // single instant (ADR-0017 §3).
+    let anchor = trawl_core::context::EvalContext::capture();
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let plan = compile_stream_plan(&query.pipeline, &PinScope::unpinned()).expect("plan compiles");
     let rows: Vec<Row> = events
@@ -152,7 +165,7 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
             .filter_map(|mut event| {
                 stages
                     .iter_mut()
-                    .all(|stage| apply_stage(stage, &mut event) == StageResult::Pass)
+                    .all(|stage| apply_stage(stage, &mut event, &anchor) == StageResult::Pass)
                     .then_some(event)
             })
             .collect(),
@@ -164,9 +177,9 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
             for mut event in rows {
                 if pre_stages
                     .iter_mut()
-                    .all(|stage| apply_stage(stage, &mut event) == StageResult::Pass)
+                    .all(|stage| apply_stage(stage, &mut event, &anchor) == StageResult::Pass)
                 {
-                    aggregation.feed_event(&event);
+                    aggregation.feed_event(&event, &anchor);
                 }
             }
             aggregation
@@ -176,7 +189,7 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
                 .filter_map(|mut event| {
                     post_stages
                         .iter_mut()
-                        .all(|stage| apply_stage(stage, &mut event) == StageResult::Pass)
+                        .all(|stage| apply_stage(stage, &mut event, &anchor) == StageResult::Pass)
                         .then_some(event)
                 })
                 .collect()

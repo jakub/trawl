@@ -27,6 +27,10 @@ pub mod compare;
 /// its catalog type, shared by compaction and the hot branch.
 pub mod conform;
 
+/// The evaluation context: the ONE instant a unit of output reads
+/// `now()` at (ADR-0017 §3).
+pub mod context;
+
 pub mod eval;
 
 /// Which catalog keys a query binds — the incomplete-results notice's

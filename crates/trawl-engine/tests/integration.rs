@@ -2103,3 +2103,466 @@ fn extract_kv_tail_computed_value_stays_as_rendered() {
         "a derived value keeps the tail's own rendering"
     );
 }
+
+// ── parameter ordering across an aggregate SELECT list (#106) ─────────
+//
+// `DuckDB` binds `?` POSITIONALLY, so the parameter list has to run in
+// the order the placeholders appear in the rendered SQL. A built SELECT
+// renders `SELECT … FROM … WHERE …`, but the emitter walks the SEARCH
+// stage first — so a parameter the search predicate pushed sits FIRST in
+// the list while its placeholder sits LAST in the text. Any parameter an
+// aggregating stage pushes into the SELECT list therefore collides with
+// it: the predicate's value is fed to the SELECT's placeholder.
+//
+// `let`/`extract`/`eventstats` avoid this by flushing to a CTE (a CTE
+// renders BEFORE the outer SELECT, restoring the order); `stats` and
+// `timechart` did not. The failure is worst when the two values happen to
+// be type-compatible — a timestamp-shaped window bound against `now()`'s
+// TIMESTAMP anchor — because then nothing errors and the query answers
+// the wrong values in both places.
+//
+// These execute against real `DuckDB` rather than asserting on SQL text:
+// the bug IS the binding, and only the engine can show it.
+
+/// The anchor these emit under, so an assertion can name the exact
+/// instant `now()` has to answer.
+fn fixed_anchor() -> trawl_core::context::EvalContext {
+    trawl_core::context::EvalContext::at(
+        chrono::DateTime::parse_from_rfc3339("2026-02-03T04:05:06.789012Z")
+            .expect("a valid RFC 3339 instant")
+            .into(),
+    )
+}
+
+/// How `DuckDB` renders [`fixed_anchor`] once bound and cast.
+const ANCHOR_TEXT: &str = "2026-02-03 04:05:06.789012";
+
+/// Emit under the fixed anchor and execute through the production
+/// emit-and-bind seam (including the `_raw`-free retry).
+fn run_at_anchor(exec: &Executor, dsl: &str, source: &str) -> Result<QueryResult, EngineError> {
+    let query = trawl_core::parser::parse(dsl).expect("dsl parses");
+    let emitted =
+        trawl_core::emitter::emit(&query, source, fixed_anchor()).expect("emit should succeed");
+    exec.execute_emitted(&emitted, usize::MAX, 0)
+}
+
+fn integer_at(result: &QueryResult, row: usize, name: &str) -> i64 {
+    let index = result
+        .columns
+        .iter()
+        .position(|column| column.name == name)
+        .unwrap_or_else(|| panic!("missing {name} column: {:?}", result.columns));
+    match &result.rows[row][index] {
+        Value::Integer(value) => *value,
+        other => panic!("{name} must be an integer, got {other:?}"),
+    }
+}
+
+fn text_cell(result: &QueryResult, row: usize, name: &str) -> String {
+    let index = result
+        .columns
+        .iter()
+        .position(|column| column.name == name)
+        .unwrap_or_else(|| panic!("missing {name} column: {:?}", result.columns));
+    match &result.rows[row][index] {
+        Value::String(text) => text.clone(),
+        other => panic!("{name} must be text, got {other:?}"),
+    }
+}
+
+/// (a) The loud half: a plain filter's value cannot be cast to a
+/// TIMESTAMP, so the swap took the whole query down.
+#[test]
+fn an_aggregate_now_binds_after_the_search_predicate() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(&exec, "service=nginx | stats max(now()) as n", &glob)
+        .expect("the search predicate's value must not reach the anchor's cast");
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(text_cell(&result, 0, "n"), ANCHOR_TEXT);
+}
+
+/// (b) The silent half: a timestamp-shaped window bound and the anchor
+/// are type-compatible, so the swapped query SUCCEEDS and answers the
+/// window bound as `max(now())` while filtering on the anchor.
+#[test]
+fn a_time_window_bound_cannot_swap_with_an_aggregate_now() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        r#"earliest="2024-01-15T10:01:00Z" | stats max(now()) as n, count() as c"#,
+        &glob,
+    )
+    .expect("the windowed aggregate must run");
+    assert_eq!(
+        text_cell(&result, 0, "n"),
+        ANCHOR_TEXT,
+        "max(now()) must answer the anchor, not the window bound"
+    );
+    let count = integer_column(&result, "c");
+    assert_eq!(
+        count,
+        vec![7],
+        "and the window must filter on ITS bound: the 7 rows at or after 10:01:00"
+    );
+}
+
+/// (c) `timechart` builds its aggregate SELECT the same way `stats` does.
+#[test]
+fn a_timechart_aggregate_now_binds_after_the_search_predicate() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | timechart span=1m max(now()) as n",
+        &glob,
+    )
+    .expect("the search predicate's value must not reach the anchor's cast");
+    assert!(result.row_count() >= 1);
+    for row in 0..result.row_count() {
+        assert_eq!(text_cell(&result, row, "n"), ANCHOR_TEXT);
+    }
+}
+
+/// (d) The `_raw`-free twin pushes the same parameters in the same order,
+/// so the realignment has to reach BOTH passes — asserted over a source
+/// that HAS `_raw` (the first pass runs) and one that does not (the retry
+/// runs).
+#[test]
+fn a_bare_text_search_keeps_aggregate_params_aligned_in_both_raw_variants() {
+    let (exec, glob) = setup();
+    let with_raw = run_at_anchor(&exec, "gateway | stats max(now()) as n", &glob)
+        .expect("the `_raw`-bound pass must run");
+    assert_eq!(text_cell(&with_raw, 0, "n"), ANCHOR_TEXT);
+
+    let dir = tempfile::tempdir().unwrap();
+    let raw_free_source = foreign_parquet(dir.path());
+    let raw_free = run_at_anchor(&exec, "boom | stats max(now()) as n", &raw_free_source)
+        .expect("the `_raw`-free retry must run");
+    assert_eq!(text_cell(&raw_free, 0, "n"), ANCHOR_TEXT);
+}
+
+/// The bug is not `now()`'s: ANY parameter an aggregate argument pushes
+/// hits it. This shape — an integer literal inside an aggregate — has
+/// been mis-binding since long before the anchor existed, and is the
+/// reason the fix keys on "the emission pushed a parameter" rather than
+/// on the anchor.
+#[test]
+fn an_aggregate_literal_argument_binds_after_the_search_predicate() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | stats max(substr(message, 1, 3)) as m",
+        &glob,
+    )
+    .expect("the search predicate's value must not reach substr's offsets");
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(text_cell(&result, 0, "m"), "POS");
+}
+
+// ── the same guard after a PIVOT (#106, review F1) ────────────────────
+//
+// `DuckDB` cannot parameterize PIVOT, so `flush_pivot_to_cte` INLINES
+// every accumulated placeholder and empties the parameter list. The
+// ordering guard's "has this level pushed anything yet" reading is a
+// comparison against how many parameters are already inside a CTE, and
+// that count was not reset by the inlining — so once the post-pivot
+// parameter count climbed back to the stale value, the guard read
+// "nothing pushed here" and skipped the flush it exists to perform.
+
+/// The pivot's own output columns, so a `where` downstream has something
+/// real to bind: `host` plus one column per status value.
+const PIVOT_PREFIX: &str = "service=nginx | pivot count() on status by host";
+
+/// (a) The loud half after a pivot: the predicate's text reaches the
+/// anchor's TIMESTAMP cast.
+#[test]
+fn an_aggregate_now_after_a_pivot_binds_after_the_predicate() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        &format!(r#"{PIVOT_PREFIX} | where host == "web01" | stats max(now()) as n"#),
+        &glob,
+    )
+    .expect("the predicate's value must not reach the anchor's cast");
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(text_cell(&result, 0, "n"), ANCHOR_TEXT);
+}
+
+/// (b) The silent half after a pivot: three string parameters, all
+/// type-compatible, so nothing errors and every one of them lands in the
+/// wrong placeholder.
+#[test]
+fn an_aggregate_literal_after_a_pivot_binds_after_the_predicate() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        &format!(
+            r#"{PIVOT_PREFIX} | where host == "web01" | stats max(replace(host, "w", "W")) as m"#
+        ),
+        &glob,
+    )
+    .expect("the pivoted aggregate must run");
+    assert_eq!(result.row_count(), 1);
+    assert_eq!(
+        text_cell(&result, 0, "m"),
+        "Web01",
+        "the predicate must filter on 'web01' and replace must rewrite 'w' as 'W'"
+    );
+}
+
+/// (c) `timechart` after a pivot takes the same guard. The pivot groups
+/// BY `_time` so the bucket column survives into the downstream stage.
+#[test]
+fn a_timechart_aggregate_after_a_pivot_binds_after_the_predicate() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        r#"service=nginx | pivot count() on status by _time \
+           | where _time >= "2024-01-15 10:00:00" | timechart span=1m max(now()) as n"#
+            .replace(" \\\n           ", " ")
+            .as_str(),
+        &glob,
+    )
+    .expect("the pivoted timechart must run");
+    assert!(
+        result.row_count() >= 1,
+        "the window must keep rows: {result:?}"
+    );
+    for row in 0..result.row_count() {
+        assert_eq!(text_cell(&result, row, "n"), ANCHOR_TEXT);
+    }
+}
+
+// ── an aggregating stage's PLACEMENT (#106, review F3) ────────────────
+//
+// `stats`/`timechart` flushed only `IfModified`, so a pending LIMIT or
+// ORDER BY stayed on the SAME SELECT as the aggregation — where SQL
+// applies both AFTER it. `head 2 | stats count()` therefore counted the
+// whole input and then limited a one-row result.
+//
+// The ordering guard (#106) made that WORSE by making it depend on a
+// SIBLING: `stats count() as c` answered the un-limited count while
+// `stats count() as c, max(now()) as n` answered the limited one, because
+// the second pushed a parameter and got flushed. Placement must not key
+// off parameter accounting, so an aggregating stage now flushes whenever
+// a LIMIT or ORDER BY is pending, and both spellings agree.
+
+/// `head` before `stats` limits the INPUT to the aggregation.
+#[test]
+fn a_limit_before_stats_applies_before_the_aggregation() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(&exec, "service=nginx | head 2 | stats count() as c", &glob)
+        .expect("the limited aggregate must run");
+    assert_eq!(
+        integer_column(&result, "c"),
+        vec![2],
+        "the aggregation must see the 2 limited rows, not all 6 nginx rows"
+    );
+}
+
+/// …and the answer does not depend on whether a SIBLING aggregate
+/// happens to bind a parameter.
+#[test]
+fn a_limit_before_stats_answers_the_same_beside_a_bound_sibling() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | head 2 | stats count() as c, max(now()) as n",
+        &glob,
+    )
+    .expect("the limited aggregate must run");
+    assert_eq!(integer_column(&result, "c"), vec![2]);
+    assert_eq!(text_cell(&result, 0, "n"), ANCHOR_TEXT);
+}
+
+/// A pending ORDER BY is the same trap: it has to order the AGGREGATION'S
+/// INPUT, so `sort -duration | head 2 | stats sum(duration)` sums the two
+/// LARGEST durations rather than every row.
+#[test]
+fn a_pending_sort_orders_the_aggregations_input() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | sort -duration | head 2 | stats sum(duration) as s",
+        &glob,
+    )
+    .expect("the sorted-and-limited aggregate must run");
+    let sum = match &result.rows[0][result
+        .columns
+        .iter()
+        .position(|column| column.name == "s")
+        .expect("missing s column")]
+    {
+        Value::Float(value) => *value,
+        other => panic!("s must be a float, got {other:?}"),
+    };
+    assert!(
+        (sum - 6.234).abs() < 1e-9,
+        "the two largest nginx durations are 5.000 and 1.234, got {sum}"
+    );
+}
+
+/// `timechart` places the same way.
+#[test]
+fn a_limit_before_timechart_applies_before_the_aggregation() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | head 2 | timechart span=1h count() as c",
+        &glob,
+    )
+    .expect("the limited timechart must run");
+    assert_eq!(
+        integer_column(&result, "c"),
+        vec![2],
+        "the bucket must count the 2 limited rows"
+    );
+}
+
+// ── `top`/`rare` place the same way (#106, review F3 extended) ────────
+//
+// `top`/`rare` desugar to `stats count() by field | sort count | limit N`
+// through `process_frequency`, which flushed only `IfModified` — so a
+// pending LIMIT or ORDER BY was absorbed into the AGGREGATION's own
+// SELECT. `head 2 | top 3 host` therefore counted all six matching rows
+// and then kept two GROUPS, which is a different question from the one
+// the pipeline asks.
+
+/// Every `count` a frequency stage produced, summed — the rows the
+/// aggregation actually SAW. Deliberately order-independent: `head` with
+/// no sort takes whichever rows the scan yields, so the identity of the
+/// survivors is not the assertion, their NUMBER is.
+fn counted_rows(result: &QueryResult) -> i64 {
+    integer_column(result, "count").iter().sum()
+}
+
+/// (a) `head` before `top` limits the INPUT to the frequency count.
+#[test]
+fn a_limit_before_top_applies_before_the_aggregation() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(&exec, "service=nginx | head 2 | top 3 host", &glob)
+        .expect("the limited frequency stage must run");
+    assert_eq!(
+        counted_rows(&result),
+        2,
+        "top must count the 2 limited rows, not all 6 nginx rows: {result:?}"
+    );
+}
+
+/// (b) `rare` shares the desugaring, so it shares the placement.
+#[test]
+fn a_limit_before_rare_applies_before_the_aggregation() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(&exec, "service=nginx | head 2 | rare 3 host", &glob)
+        .expect("the limited frequency stage must run");
+    assert_eq!(
+        counted_rows(&result),
+        2,
+        "rare must count the 2 limited rows, not all 6 nginx rows: {result:?}"
+    );
+}
+
+/// (c) A pending `sort` orders the frequency stage's INPUT rather than
+/// being appended to its grouped output. Sorting `host` descending puts
+/// both `web02` rows first, so `head 2` leaves exactly them.
+#[test]
+fn a_pending_sort_orders_the_frequency_stages_input() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | sort -host | head 2 | top 3 host",
+        &glob,
+    )
+    .expect("the sorted-and-limited frequency stage must run");
+    assert_eq!(
+        result.row_count(),
+        1,
+        "only the rows the sort+limit kept reach the count: {result:?}"
+    );
+    assert_eq!(text_cell(&result, 0, "host"), "web02");
+    assert_eq!(integer_column(&result, "count"), vec![2]);
+}
+
+// ── a pivot follows a pivot (#106, review round 4 finding 1) ──────────
+//
+// A pending pivot is flushed to a CTE before any following stage — and
+// that used to EXCLUDE another pivot. `process_pivot` opens with an
+// ordinary `flush_to_cte`, whose `build_select` does not render the
+// pending `PIVOT`, and then overwrites the spec: the first pivot was
+// silently dropped and the second ran over PRE-pivot input.
+
+/// The second pivot reads the FIRST one's dynamic output columns.
+///
+/// Over the six nginx fixture rows the first pivot counts statuses per
+/// host — `web01` has two 200s, `web02` none — so its `200` column holds
+/// `{2, 0}`, and pivoting on THAT column is only expressible if the first
+/// pivot actually ran.
+#[test]
+fn a_second_pivot_reads_the_first_pivots_output() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | pivot count() on status by host | pivot count() on `200` by host",
+        &glob,
+    )
+    .expect("the second pivot must read the first's output columns");
+
+    let columns: Vec<&str> = result
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert_eq!(
+        columns,
+        vec!["host", "0", "2"],
+        "the pivoted-on values are the first pivot's own 200-counts"
+    );
+    assert_eq!(result.row_count(), 2);
+    for row in 0..result.row_count() {
+        let (zero, two) = (integer_at(&result, row, "0"), integer_at(&result, row, "2"));
+        match text_cell(&result, row, "host").as_str() {
+            "web01" => assert_eq!((zero, two), (0, 1), "web01 served two 200s"),
+            "web02" => assert_eq!((zero, two), (1, 0), "web02 served none"),
+            other => panic!("unexpected host {other}"),
+        }
+    }
+}
+
+/// A column the FIRST pivot consumed into dynamic columns is gone, and
+/// naming it is a loud error rather than a quietly different answer.
+///
+/// Before the fix this query "succeeded", returning the second pivot
+/// alone computed over pre-pivot rows — `sum(status)` per status per
+/// host, with the first pivot's `count()` nowhere in the result.
+#[test]
+fn a_second_pivot_cannot_see_a_column_the_first_consumed() {
+    let (exec, glob) = setup();
+    let error = run_at_anchor(
+        &exec,
+        "service=nginx | pivot count() on status by host | pivot sum(status) on status by host",
+        &glob,
+    )
+    .expect_err("`status` no longer exists after the first pivot consumed it");
+    assert!(
+        error.to_string().contains("unknown field: status"),
+        "the refusal must name the missing column, got: {error}"
+    );
+}
+
+/// A TERMINAL pivot is still never flushed by the loop — no stage
+/// follows it, so `finalize` renders it, inlining every parameter.
+#[test]
+fn a_terminal_pivot_is_unchanged() {
+    let (exec, glob) = setup();
+    let result = run_at_anchor(
+        &exec,
+        "service=nginx | pivot count() on status by host",
+        &glob,
+    )
+    .expect("the terminal pivot must run");
+    let columns: Vec<&str> = result
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert_eq!(columns, vec!["host", "200", "301", "404", "500", "502"]);
+}

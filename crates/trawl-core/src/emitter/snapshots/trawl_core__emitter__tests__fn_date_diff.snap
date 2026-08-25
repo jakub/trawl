@@ -6,8 +6,9 @@ WITH _s0 AS (
   SELECT *
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
 )
-SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('age')), (DATE_DIFF(?, "timestamp", now())) AS "age"
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('age')), (DATE_DIFF(?, "timestamp", CAST(? AS TIMESTAMP))) AS "age"
 FROM "_s0"
 ---
 params:
   0: 'second'
+  1: TIMESTAMP '2026-02-03 04:05:06.789012'

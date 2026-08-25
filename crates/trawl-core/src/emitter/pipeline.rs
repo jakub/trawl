@@ -83,7 +83,43 @@ fn process_stats(
     agg_stage: &crate::ast::StatsStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
-    ctx.flush_if(FlushCondition::IfModified);
+    // A pending ORDER BY or LIMIT belongs to the aggregation's INPUT, and
+    // SQL would apply both to its OUTPUT — so they move into the CTE
+    // first, whether or not anything else modified the state. Placement
+    // is a property of the STAGE, never of what its arguments happen to
+    // bind: keying it off the parameter guard below made
+    // `head 2 | stats count() as c` and
+    // `head 2 | stats count() as c, max(now()) as n` answer differently.
+    ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
+
+    // The aggregation expressions FIRST, through the ordering guard:
+    // they are the only part of this stage that can push a parameter,
+    // and a parameter in the SELECT list must not jump ahead of one the
+    // rendered statement puts after it (see
+    // [`EmitterState::emit_ordered_select`]). The group-by items are
+    // pure field quoting, so emitting them second changes no SQL text —
+    // and they MUST come second, because the guard may flush to a CTE,
+    // which clears `group_by`.
+    let agg_items = ctx.emit_ordered_select(|ctx| {
+        let mut items = Vec::with_capacity(agg_stage.aggregations.len());
+        for agg in &agg_stage.aggregations {
+            // The SAME argument walk the expression lane uses: an
+            // aggregation position is still a call, and its per-position
+            // literal rules (`sev()`'s dialect) apply there too.
+            let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
+
+            let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
+
+            // determine alias
+            let alias = match &agg.alias {
+                Some(a) => quote_field(a),
+                None => default_agg_alias(agg),
+            };
+
+            items.push(format!("{sql_func} AS {alias}"));
+        }
+        Ok(items)
+    })?;
 
     let mut select_items = Vec::new();
 
@@ -93,24 +129,7 @@ fn process_stats(
         select_items.push(quoted.clone());
         ctx.group_by.push(quoted);
     }
-
-    // aggregation expressions
-    for agg in &agg_stage.aggregations {
-        // The SAME argument walk the expression lane uses: an
-        // aggregation position is still a call, and its per-position
-        // literal rules (`sev()`'s dialect) apply there too.
-        let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
-
-        let sql_func = translate_function(&agg.function, &arg_strings)?;
-
-        // determine alias
-        let alias = match &agg.alias {
-            Some(a) => quote_field(a),
-            None => default_agg_alias(agg),
-        };
-
-        select_items.push(format!("{sql_func} AS {alias}"));
-    }
+    select_items.extend(agg_items);
 
     ctx.select = select_items;
     ctx.has_aggregation = true;
@@ -176,7 +195,13 @@ fn process_frequency(
     sort_dir: &str,
     ctx: &mut EmitterState,
 ) {
-    ctx.flush_if(FlushCondition::IfModified);
+    // `top`/`rare` desugar to an AGGREGATION, so they take the same
+    // placement rule `stats`/`timechart` do: a pending ORDER BY or LIMIT
+    // belongs to the input being counted, and leaving either here would
+    // absorb it into the aggregation's own SELECT — `head 2 | top 3 host`
+    // counting all six matching rows and then keeping two GROUPS, which
+    // is a different question from the one the pipeline asks.
+    ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
 
     let field_quoted = quote_field(field);
     let mut select_items = vec![field_quoted.clone()];
@@ -356,7 +381,8 @@ fn process_timechart(
     tc: &crate::ast::TimechartStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
-    ctx.flush_if(FlushCondition::IfModified);
+    // Same placement rule as `stats` above.
+    ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
 
     let interval = match &tc.span {
         Some(d) => d.to_interval_string(),
@@ -370,6 +396,31 @@ fn process_timechart(
     // aggregation (one group per input row).
     let bucket = format!("time_bucket(INTERVAL '{interval}', TRY_CAST(\"_time\" AS TIMESTAMP))");
 
+    // Same ordering guard as `stats`, for the same reason: the
+    // aggregations are the only parameter-pushing part of this stage,
+    // and the bucket/group items that surround them are pure text — so
+    // they are assembled after the guard has had its chance to flush
+    // (which would otherwise clear `group_by` and `order_by`).
+    let agg_items = ctx.emit_ordered_select(|ctx| {
+        let mut items = Vec::with_capacity(tc.aggregations.len());
+        for agg in &tc.aggregations {
+            // The SAME argument walk the expression lane uses: an
+            // aggregation position is still a call, and its per-position
+            // literal rules (`sev()`'s dialect) apply there too.
+            let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
+
+            let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
+
+            let alias = match &agg.alias {
+                Some(a) => quote_field(a),
+                None => default_agg_alias(agg),
+            };
+
+            items.push(format!("{sql_func} AS {alias}"));
+        }
+        Ok(items)
+    })?;
+
     let mut select_items = vec![format!("{bucket} AS \"_time\"")];
     let mut group_items = vec![bucket.clone()];
 
@@ -378,22 +429,7 @@ fn process_timechart(
         select_items.push(q.clone());
         group_items.push(q);
     }
-
-    for agg in &tc.aggregations {
-        // The SAME argument walk the expression lane uses: an
-        // aggregation position is still a call, and its per-position
-        // literal rules (`sev()`'s dialect) apply there too.
-        let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
-
-        let sql_func = translate_function(&agg.function, &arg_strings)?;
-
-        let alias = match &agg.alias {
-            Some(a) => quote_field(a),
-            None => default_agg_alias(agg),
-        };
-
-        select_items.push(format!("{sql_func} AS {alias}"));
-    }
+    select_items.extend(agg_items);
 
     ctx.select = select_items;
     ctx.group_by = group_items;
@@ -477,7 +513,7 @@ fn process_pivot(pivot: &crate::ast::PivotStage, ctx: &mut EmitterState) -> Resu
 
     let arg_strings = emit_call_args(&pivot.aggregation.function, &pivot.aggregation.args, ctx)?;
 
-    let agg_sql = translate_function(&pivot.aggregation.function, &arg_strings)?;
+    let agg_sql = translate_function(&pivot.aggregation.function, &arg_strings, ctx)?;
 
     ctx.set_pivot(agg_sql, pivot.on_field.clone(), pivot.by.clone());
     ctx.had_explicit_columns = true;
@@ -524,7 +560,7 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
         // aggregation position is still a call, and its per-position
         // literal rules (`sev()`'s dialect) apply there too.
         let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
-        let sql_func = translate_function(&agg.function, &arg_strings)?;
+        let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
         // `eventstats` demands an explicit `as` (ADR-0013 ruling 8,
         // checked in `projection::check_projection`); the alias-less
         // name is defensive for a hand-built AST that skipped validation.

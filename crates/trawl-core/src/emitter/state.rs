@@ -71,6 +71,14 @@ pub(crate) enum FlushCondition {
     IfModifiedOrOrdered,
     /// Flush if modified OR if there's an existing LIMIT.
     IfModifiedOrLimited,
+    /// Flush if modified OR if there is a pending ORDER BY or LIMIT.
+    ///
+    /// What an AGGREGATING stage needs: SQL applies both clauses AFTER
+    /// the aggregation, so leaving either on the same SELECT would make
+    /// `head 2 | stats count()` count the whole input and then limit a
+    /// one-row result. Flushing puts them in the CTE the aggregate reads,
+    /// which is where the pipeline reads them.
+    IfModifiedOrderedOrLimited,
     /// Always flush (stage requires clean state for param ordering).
     Always,
 }
@@ -115,6 +123,19 @@ pub(crate) struct EmitterState {
     /// [`Self::with_hot_source`] — empty for pin-blind emission
     /// (embedded mode, [`super::emit`]).
     pin_scope: crate::pin_scope::PinScope,
+    /// The statement's `now()` instant (ADR-0017 §3), handed in by the
+    /// caller and never sampled here. Every source shape funnels through
+    /// [`Self::with_source`], so there is exactly one way for an emission
+    /// to acquire an anchor and no way for it to acquire two.
+    anchor: crate::context::EvalContext,
+    /// How many of [`Self::params`] are already inside a CTE — i.e. how
+    /// many render BEFORE anything the current level emits.
+    ///
+    /// The remainder were pushed at the CURRENT level, where the only
+    /// parameter-bearing clause is the WHERE, which renders AFTER the
+    /// SELECT list. That difference is the whole input to
+    /// [`Self::emit_ordered_select`].
+    flushed_params: usize,
 }
 
 /// How the `_raw` column is bound by text search in one emission pass.
@@ -320,9 +341,12 @@ pub fn hot_source_reader(hot: &str) -> Result<String, super::EmitError> {
 }
 
 impl EmitterState {
-    pub(crate) fn new(source: &str) -> Result<Self, super::EmitError> {
+    pub(crate) fn new(
+        source: &str,
+        anchor: crate::context::EvalContext,
+    ) -> Result<Self, super::EmitError> {
         let reader = build_reader(source)?;
-        Ok(Self::with_source(reader))
+        Ok(Self::with_source(reader, anchor))
     }
 
     /// Construct with a composite source that unions parquet with hot buffer ndjson.
@@ -353,6 +377,7 @@ impl EmitterState {
         primary: &str,
         hot: &str,
         hot_pins: &crate::schema::FieldTypes,
+        anchor: crate::context::EvalContext,
     ) -> Result<Self, super::EmitError> {
         let primary_reader = build_reader(primary)?;
         let hot_reader = hot_reader(hot)?;
@@ -362,7 +387,7 @@ impl EmitterState {
             "(SELECT * FROM {primary_reader} UNION ALL BY NAME \
              SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
         );
-        Ok(Self::with_source(composite))
+        Ok(Self::with_source(composite, anchor))
     }
 
     /// Construct with the hot-buffer ndjson as the SOLE source, carrying the
@@ -380,15 +405,19 @@ impl EmitterState {
     pub(crate) fn with_hot_only_source(
         hot: &str,
         hot_pins: &crate::schema::FieldTypes,
+        anchor: crate::context::EvalContext,
     ) -> Result<Self, super::EmitError> {
         let hot_reader = hot_reader(hot)?;
         let hot_replace = hot_replace_list(hot_pins);
-        Ok(Self::with_source(format!(
-            "(SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"
-        )))
+        Ok(Self::with_source(
+            format!("(SELECT * REPLACE ({hot_replace}) FROM {hot_reader})"),
+            anchor,
+        ))
     }
 
-    fn with_source(source: String) -> Self {
+    /// The ONE constructor: every source shape ends here, so the anchor
+    /// is a required argument of building any emission at all.
+    fn with_source(source: String, anchor: crate::context::EvalContext) -> Self {
         Self {
             step: 0,
             source,
@@ -407,7 +436,16 @@ impl EmitterState {
             params: Vec::new(),
             raw_binding: RawBinding::Available,
             pin_scope: crate::pin_scope::PinScope::unpinned(),
+            anchor,
+            flushed_params: 0,
         }
+    }
+
+    /// The statement's `now()` anchor — read by the `now` translation
+    /// arm to bind its parameter, and stamped onto
+    /// [`super::EmittedQuery::anchor`] for the `rust_stages` tail.
+    pub(crate) fn anchor(&self) -> crate::context::EvalContext {
+        self.anchor
     }
 
     /// Attach the comparison pin set (ADR-0011 slice A). Builder-style so
@@ -512,6 +550,12 @@ impl EmitterState {
             FlushCondition::IfModifiedOrLimited => {
                 self.has_aggregation || self.has_projection || self.limit.is_some()
             }
+            FlushCondition::IfModifiedOrderedOrLimited => {
+                self.has_aggregation
+                    || self.has_projection
+                    || !self.order_by.is_empty()
+                    || self.limit.is_some()
+            }
             FlushCondition::Always => true,
         };
         if should_flush {
@@ -540,6 +584,64 @@ impl EmitterState {
         self.has_aggregation = false;
         self.has_projection = false;
         self.sample = None;
+        // Everything pushed so far now renders inside that CTE.
+        self.flushed_params = self.params.len();
+    }
+
+    /// Emit SELECT-list expressions that MAY push parameters, keeping the
+    /// parameter list aligned with the placeholders in the rendered SQL.
+    ///
+    /// `DuckDB` binds `?` POSITIONALLY, so the parameter list has to run
+    /// in the order the placeholders appear in the text. A built SELECT
+    /// renders `SELECT … FROM … WHERE …`, but the emitter walks the
+    /// SEARCH stage first: a parameter the search predicate pushed sits
+    /// FIRST in the list while its placeholder sits LAST in the
+    /// statement. So the moment an aggregating stage pushes a parameter
+    /// of its own into the SELECT list, the two lists disagree and the
+    /// predicate's value is fed to the SELECT's placeholder — a
+    /// conversion error when the types clash, and a SILENT value swap
+    /// when they don't (an `earliest=` bound against `now()`'s anchor).
+    ///
+    /// `let`/`extract`/`eventstats` prevent this by flushing to a CTE
+    /// UNCONDITIONALLY: a CTE renders before the outer SELECT, which
+    /// restores the order. An aggregating stage cannot pay that
+    /// unconditionally — most aggregates push nothing, and wrapping every
+    /// `stats count() by host` in a CTE would be a pointless nesting on
+    /// the commonest query in the language. So the decision is taken from
+    /// what the emission ACTUALLY DID — the parameter list grew — never
+    /// from what its expressions are called.
+    ///
+    /// `build` therefore runs at most twice, and the first run is
+    /// discarded WHOLE. That is sound because the only state a SELECT
+    /// expression emission can touch is the parameter list (it quotes
+    /// fields, translates calls and pushes literals; it binds no `_raw`
+    /// and appends no WHERE clause), so truncating the parameters undoes
+    /// it exactly.
+    pub(crate) fn emit_ordered_select<T>(
+        &mut self,
+        build: impl Fn(&mut Self) -> Result<T, super::EmitError>,
+    ) -> Result<T, super::EmitError> {
+        let pending = self.params.len();
+        if pending == self.flushed_params {
+            // Nothing at this level has pushed yet, so nothing this
+            // build pushes can land out of order.
+            return build(self);
+        }
+
+        let where_count = self.where_clauses.len();
+        let attempt = build(self)?;
+        debug_assert_eq!(
+            where_count,
+            self.where_clauses.len(),
+            "a SELECT expression emission must not append WHERE clauses"
+        );
+        if self.params.len() == pending {
+            return Ok(attempt);
+        }
+
+        self.params.truncate(pending);
+        self.flush_to_cte();
+        build(self)
     }
 
     /// Build a SELECT statement from the current accumulated state.
@@ -611,9 +713,17 @@ impl EmitterState {
     /// accumulated `?` placeholders across all CTEs and the PIVOT body,
     /// then clear the param list. Subsequent stages can add fresh `?`
     /// params as normal.
-    pub(crate) fn flush_pivot_to_cte(&mut self) {
+    ///
+    /// Clearing the list also RESETS [`Self::flushed_params`]: that
+    /// counter answers "how many parameters render before anything this
+    /// level emits", and after inlining the answer is none — there are no
+    /// parameters at all. Leaving it stale made
+    /// [`Self::emit_ordered_select`] read a post-pivot parameter count
+    /// that had merely climbed back to the old value as "this level has
+    /// pushed nothing", and skip the flush it exists to perform.
+    pub(crate) fn flush_pivot_to_cte(&mut self) -> Result<(), super::EmitError> {
         let Some(pivot) = self.pivot.take() else {
-            return;
+            return Ok(());
         };
 
         let pivot_sql = self.build_pivot(&pivot);
@@ -628,8 +738,25 @@ impl EmitterState {
             cte.sql = inlined;
             param_idx = consumed;
         }
-        let (pivot_inlined, _) = Self::inline_params_counted(&pivot_sql, &self.params, param_idx);
+        let (pivot_inlined, consumed) =
+            Self::inline_params_counted(&pivot_sql, &self.params, param_idx);
+
+        // Every accumulated parameter must have found a placeholder: the
+        // list is about to be DROPPED, so one left behind is a `?` that
+        // survives into SQL nothing will ever bind — or that silently
+        // takes the NEXT stage's value. Two integers to check, and
+        // undiagnosable downstream, so it is a real error rather than a
+        // debug assertion.
+        if consumed != self.params.len() {
+            return Err(super::EmitError::UnsupportedOperation {
+                message: format!(
+                    "pivot inlining consumed {consumed} of {} parameters",
+                    self.params.len()
+                ),
+            });
+        }
         self.params.clear();
+        self.flushed_params = 0;
 
         // Push the pivot as a new CTE.
         let cte_name = format!("_s{}", self.step);
@@ -648,6 +775,8 @@ impl EmitterState {
         self.limit = None;
         self.has_aggregation = false;
         self.has_projection = false;
+
+        Ok(())
     }
 
     /// Produce the final SQL string including any accumulated CTEs.
@@ -655,7 +784,7 @@ impl EmitterState {
     /// For PIVOT queries, inlines all `?` params directly into the SQL
     /// and clears the param list — `DuckDB` doesn't support parameterized
     /// PIVOT statements.
-    pub(crate) fn finalize(&mut self) -> String {
+    pub(crate) fn finalize(&mut self) -> Result<String, super::EmitError> {
         let body = if let Some(pivot) = &self.pivot {
             self.build_pivot(pivot)
         } else {
@@ -663,7 +792,10 @@ impl EmitterState {
         };
 
         if self.ctes.is_empty() {
-            return body;
+            // Never a pending pivot: `process_pivot` opens with a
+            // `flush_to_cte`, so a pivot always leaves at least one CTE
+            // behind and reaches the inlining below.
+            return Ok(body);
         }
 
         let mut sql = String::from("WITH ");
@@ -680,12 +812,25 @@ impl EmitterState {
         sql.push_str(&body);
 
         if self.pivot.is_some() {
-            let inlined = Self::inline_params(&sql, &self.params);
+            let (inlined, consumed) = Self::inline_params_counted(&sql, &self.params, 0);
+            // The same refusal [`Self::flush_pivot_to_cte`] makes, for
+            // the same reason: the parameter list is DROPPED on the next
+            // line, so one left behind is a `?` nothing will ever bind.
+            // A terminal pivot inlines the WHOLE statement at once, so
+            // the count is over every placeholder in it.
+            if consumed != self.params.len() {
+                return Err(super::EmitError::UnsupportedOperation {
+                    message: format!(
+                        "pivot inlining consumed {consumed} of {} parameters",
+                        self.params.len()
+                    ),
+                });
+            }
             self.params.clear();
-            return inlined;
+            return Ok(inlined);
         }
 
-        sql
+        Ok(sql)
     }
 
     /// Append a CTE body with its SQL lines indented, without inserting bytes
@@ -735,12 +880,6 @@ impl EmitterState {
         sql
     }
 
-    /// Replace `?` placeholders with literal values for engines that
-    /// don't support parameterized queries (e.g. `DuckDB` PIVOT).
-    fn inline_params(sql: &str, params: &[SqlValue]) -> String {
-        Self::inline_params_counted(sql, params, 0).0
-    }
-
     /// Replace `?` placeholders starting from `start_idx` in the params slice.
     /// Returns the inlined SQL and the next param index (for chaining across
     /// multiple SQL fragments).
@@ -785,6 +924,13 @@ impl EmitterState {
                     }
                     SqlValue::Bool(b) => {
                         result.push_str(if *b { "TRUE" } else { "FALSE" });
+                    }
+                    // The typed literal form of the bound parameter —
+                    // ONE rendering shared with `SqlValue`'s `Display`,
+                    // because PIVOT (which cannot take parameters) must
+                    // read the very instant the parameterized lanes bind.
+                    SqlValue::Timestamp(at) => {
+                        result.push_str(&super::timestamp_literal(*at));
                     }
                 }
                 param_idx += 1;

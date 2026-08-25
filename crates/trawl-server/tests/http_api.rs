@@ -2154,3 +2154,150 @@ async fn repin_validation_refusals_are_side_effect_free(pool: sqlx::PgPool) {
     let status = client.schema_repin_status().await.unwrap();
     assert!(status.job.is_none(), "validation refusals claim no job");
 }
+
+/// Read from an open SSE response until `needle` shows up, or fail loud.
+async fn read_sse_until(resp: &mut reqwest::Response, needle: &str) -> String {
+    let mut bytes: Vec<u8> = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let chunk = resp.chunk().await.unwrap().expect("stream ended early");
+            bytes.extend_from_slice(&chunk);
+            // The WHOLE buffer is re-read each time rather than appended
+            // as text: a chunk can split a UTF-8 codepoint, and starting
+            // from the front heals it on the next chunk.
+            let text = String::from_utf8_lossy(&bytes);
+            // Seeing the needle is not enough to stop. A chunk boundary
+            // can land inside the `data:` line carrying it, and half a
+            // JSON payload does not parse — so read on until that
+            // frame's terminator (`\n\n`) has arrived too.
+            if let Some(at) = text.find(needle)
+                && text[at..].contains("\n\n")
+            {
+                return text.into_owned();
+            }
+        }
+    })
+    .await;
+    read.unwrap_or_else(|_| {
+        panic!(
+            "needle {needle:?} never arrived; got: {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
+}
+
+/// Every `data:` payload in the COMPLETE frames of an SSE buffer.
+///
+/// The read stops at a frame terminator, but the bytes after it can be
+/// the first half of the NEXT frame — so the buffer is cut at its last
+/// terminator and the remainder is dropped rather than parsed.
+fn sse_payloads(buf: &str) -> Vec<serde_json::Value> {
+    let complete = buf.rfind("\n\n").map_or("", |end| &buf[..end + 2]);
+    complete
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|json| serde_json::from_str(json).expect("an SSE payload is JSON"))
+        .collect()
+}
+
+/// A read stops at the frame it was waiting for, and the bytes after it
+/// can be the first half of the next one — which is not JSON yet.
+#[test]
+fn sse_payloads_ignores_a_half_arrived_frame() {
+    let buf = "event: data\ndata: {\"a\":1}\n\nevent: data\ndata: {\"b\":";
+    let payloads = sse_payloads(buf);
+    assert_eq!(payloads.len(), 1, "only the complete frame is parsed");
+    assert_eq!(payloads[0]["a"], 1);
+}
+
+/// ADR-0017 §3 through the REAL SSE loop, on a live server.
+///
+/// The fake-clock cases in `trawl-core`'s `live_sampling` pin the rule;
+/// this pins the WIRING — that `stream_query` samples one instant per
+/// event on the pass-through lane and one per emitted snapshot on the
+/// aggregate lane, which no in-process test of the door can observe.
+/// The clock here is the real one, so the assertions are the ones a real
+/// clock can carry: reads that must be EQUAL. Under any per-read or
+/// per-row sampling they would differ by the microseconds it takes to
+/// evaluate the next stage, which is why equality is the discriminating
+/// direction.
+#[sqlx::test(migrations = false)]
+async fn sse_freezes_now_per_event_and_per_snapshot(pool: sqlx::PgPool) {
+    let server = setup(pool).await;
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+    let raw = raw_client();
+
+    // ── pass-through: one instant per event, across stages ──────────
+    let mut stream = raw
+        .get(format!("{}/api/v1/stream", server.url))
+        .query(&[(
+            "query",
+            "service=now-svc | let a = now(), b = now() | let c = now()",
+        )])
+        .bearer_auth(&server.analyst_token)
+        .send()
+        .await
+        .expect("open pass-through stream");
+    assert!(stream.status().is_success(), "{stream:?}");
+
+    let records = vec![
+        serde_json::json!({"service": "now-svc", "host": "web-1", "message": "now-needle-1"}),
+        serde_json::json!({"service": "now-svc", "host": "web-2", "message": "now-needle-2"}),
+    ];
+    assert_eq!(ingest.ingest(&records).await.unwrap().accepted, 2);
+
+    let buf = read_sse_until(&mut stream, "now-needle-2").await;
+    let rows = sse_payloads(&buf);
+    assert_eq!(rows.len(), 2, "both events must arrive: {buf}");
+    for row in &rows {
+        let a = row["a"].as_str().expect("a is a timestamp text");
+        assert_eq!(row["b"].as_str(), Some(a), "sibling `let` reads: {row}");
+        assert_eq!(row["c"].as_str(), Some(a), "a later stage's read: {row}");
+    }
+    drop(stream);
+
+    // ── aggregate: one instant per emitted snapshot ─────────────────
+    let mut stream = raw
+        .get(format!("{}/api/v1/stream", server.url))
+        .query(&[(
+            "query",
+            "service=agg-svc | stats count() by host | let seen = now(), seen2 = now()",
+        )])
+        .bearer_auth(&server.analyst_token)
+        .send()
+        .await
+        .expect("open aggregate stream");
+    assert!(stream.status().is_success(), "{stream:?}");
+
+    let records = vec![
+        serde_json::json!({"service": "agg-svc", "host": "agg-1", "message": "one"}),
+        serde_json::json!({"service": "agg-svc", "host": "agg-2", "message": "two"}),
+    ];
+    assert_eq!(ingest.ingest(&records).await.unwrap().accepted, 2);
+
+    // Both groups in one snapshot is what makes "one instant per
+    // snapshot" discriminable from "one instant per row".
+    let buf = read_sse_until(&mut stream, "agg-2").await;
+    let snapshot = sse_payloads(&buf)
+        .into_iter()
+        .rfind(|payload| {
+            payload["rows"]
+                .as_array()
+                .is_some_and(|rows| rows.len() == 2)
+        })
+        .unwrap_or_else(|| panic!("a snapshot carrying both groups: {buf}"));
+    let rows = snapshot["rows"].as_array().expect("rows is an array");
+    let first = rows[0]["seen"].as_str().expect("seen is a timestamp text");
+    for row in rows {
+        assert_eq!(
+            row["seen"].as_str(),
+            Some(first),
+            "every group row of one snapshot carries ONE instant: {snapshot}"
+        );
+        assert_eq!(
+            row["seen2"].as_str(),
+            Some(first),
+            "…and one per row, not one per read: {snapshot}"
+        );
+    }
+}

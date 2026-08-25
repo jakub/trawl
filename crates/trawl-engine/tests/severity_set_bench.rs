@@ -289,9 +289,10 @@ fn severity_predicate_shape_costs() {
 fn emitted_shapes_match_the_hand_built_ones() {
     let emitted = |dsl: &str| {
         let query = trawl_core::parser::parse(dsl).expect("dsl parses");
-        let sql = trawl_core::emitter::emit(&query, "X")
-            .expect("emit succeeds")
-            .sql;
+        let sql =
+            trawl_core::emitter::emit(&query, "X", trawl_core::context::EvalContext::capture())
+                .expect("emit succeeds")
+                .sql;
         let (_, predicate) = sql.split_once("WHERE ").expect("a where clause");
         predicate.trim().to_owned()
     };

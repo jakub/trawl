@@ -973,7 +973,7 @@ Available in `let`/`eval` and `where` expressions.
 | `isnull(x)` / `isnotnull(x)` | Null checks |
 | `coalesce(a, b, ...)` | First non-null value |
 | `typeof(x)` | Value type name (`"BIGINT"` for an integer, `"DOUBLE"`, `"VARCHAR"`, `"TIMESTAMP"`, …) |
-| `now()` | Current timestamp (timezone-naive, wall-clock UTC) |
+| `now()` | The query's instant (timezone-naive, wall-clock UTC, microsecond resolution) — one value per unit of output, see [now() and the unit of output](#now-and-the-unit-of-output) |
 | `tonumber(x)` | Cast to float (`null` on parse failure — mirrors `TRY_CAST AS DOUBLE`); a boolean reads as `1.0`/`0.0` |
 | `tostring(x)` | Cast to string (`null` for null/array input) |
 | `sev(x[, dialect])` | Read a value's OTel SeverityNumber (`null` when it has no reading). `dialect` is `"otel"` (default) or `"syslog"` — see [Reading any field as a severity](#reading-any-field-as-a-severity-sev) |
@@ -1017,6 +1017,49 @@ integer above `i64::MAX` is read as a `DOUBLE` — so `typeof(request_id)`
 says `"DOUBLE"` for one — while the value itself keeps its digits
 wherever identity matters: on the wire, in a `dedup` key, and in a
 `stats … by` group.
+
+#### now() and the unit of output
+
+`now()` is read ONCE per unit of output, not once per call site. Two
+`now()` reads in one statement are always equal, and `typeof(now())` is
+`"TIMESTAMP"` (never `"TIMESTAMP WITH TIME ZONE"`): the instant is
+sampled in trawl and bound as a TIMESTAMP parameter, so its type does not
+depend on the connection.
+
+What "unit of output" means per lane:
+
+- **batch** (`trawl query`, `/api/v1/query`, `/api/v1/export`): one
+  instant per logical query invocation. A retried statement, the hot-only
+  cold-start fallback and the `rust_stages` tail behind `extract kv` all
+  read the SAME instant as the first attempt — a re-emission of one
+  logical query never re-samples.
+- **live pass-through** (SSE, no aggregation): processing time, sampled
+  once per event. Each row is internally frozen and successive rows
+  advance. The search stage's `last=`/`earliest=`/`latest=` window reads
+  that same per-event instant, so one event cannot be admitted by one
+  clock and evaluated against another.
+- **aggregate streams** (SSE over `stats`/`timechart`/`top`/`rare` — the
+  live compiler's whole aggregate set; `pivot` is refused live, because
+  its dynamic column structure breaks progressive rendering): stages
+  BEFORE the aggregation read the per-event instant of the source event;
+  every row of ONE emitted snapshot shares one instant, and the next
+  snapshot advances.
+
+Boundaries worth stating plainly:
+
+- the search stage's `last=` window in a BATCH query evaluates on
+  DuckDB's own statement clock, a separate clock domain from `now()`:
+  two reads taken at two moments, with no bound on the gap between them
+  (query preparation, thread scheduling and a retry all sit in it);
+- wall-clock sampling makes no monotonic guarantee: NTP can step the
+  clock backward, so a later event's instant can precede an earlier
+  one's;
+- an SSE reconnect is a NEW subscription with a fresh clock — nothing is
+  carried across it;
+- `strftime(now(), …)` and `tostring(now())` return TEXT. The display
+  timezone offset applies to TIMESTAMP result cells only, and a value
+  the `extract kv` tail computed renders as UTC text — both pre-existing
+  display rules, unchanged here.
 
 ### Nested fields (JSON)
 

@@ -2673,50 +2673,35 @@ fn sanitize_csv_formula(s: &str) -> Cow<'_, str> {
     }
 }
 
-/// Apply pipeline stages to an event. Returns `true` if the event passes,
-/// `false` if filtered or done.
-fn apply_stages(
-    stages: &mut [trawl_core::stream::CompiledStage],
-    event: &mut trawl_core::row::Row,
-) -> bool {
-    for stage in stages.iter_mut() {
-        match trawl_core::stream::apply_stage(stage, event) {
-            trawl_core::stream::StageResult::Pass => {}
-            trawl_core::stream::StageResult::Filtered | trawl_core::stream::StageResult::Done => {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 /// Build an SSE snapshot event from the current aggregation state,
 /// applying post-stages to each row.
+///
+/// `ctx` is the instant this ONE snapshot evaluates `now()` at, for
+/// every post-stage row alike (ADR-0017 §3) — a distinct type from the
+/// per-event context the feeding loop samples, so the two cannot be
+/// swapped at a call site. The caller samples it at the start of the
+/// snapshot attempt, before any row is taken, so the sample point does
+/// not depend on how many rows survive.
 fn emit_agg_snapshot(
     aggregation: &trawl_core::stream::CompiledAggregation,
     post_stages: &mut [trawl_core::stream::CompiledStage],
+    ctx: &trawl_core::stream::SnapshotContext,
 ) -> Event {
-    let (columns, rows) = aggregation.snapshot();
-    let filtered_rows: Vec<_> = rows
-        .into_iter()
-        .filter_map(|mut row| {
-            for stage in post_stages.iter_mut() {
-                match trawl_core::stream::apply_stage(stage, &mut row) {
-                    trawl_core::stream::StageResult::Pass => {}
-                    trawl_core::stream::StageResult::Filtered
-                    | trawl_core::stream::StageResult::Done => return None,
-                }
-            }
-            // The wire door, and the only one on this path.
-            Some(trawl_core::row::to_json(row))
-        })
-        .collect();
+    let (columns, rows) = trawl_core::stream::emit_snapshot(aggregation, post_stages, ctx);
+    // The wire door, and the only one on this path.
+    let rows: Vec<_> = rows.into_iter().map(trawl_core::row::to_json).collect();
 
     let payload = serde_json::json!({
         "columns": columns,
-        "rows": filtered_rows,
+        "rows": rows,
     });
     Event::default().event("snapshot").data(payload.to_string())
+}
+
+/// The snapshot instant, sampled here and nowhere deeper: trawl-core
+/// takes a context as DATA and never reaches for a clock.
+fn snapshot_context() -> trawl_core::stream::SnapshotContext {
+    trawl_core::stream::SnapshotContext::new(trawl_core::context::EvalContext::capture())
 }
 
 /// `GET /api/v1/stream` — stream live events via Server-Sent Events (SSE).
@@ -2817,38 +2802,32 @@ pub async fn stream_query(
 
                     match subscriber.recv().await {
                         Ok(batch) => {
-                            let now = chrono::Utc::now();
                             for event in &batch.events {
-                                // The search-stage filter reads the bus
-                                // JSON directly — no conversion on the
-                                // firehose, only on the events that match.
-                                if !filter.matches_at(event, now) {
-                                    continue;
-                                }
-
-                                let mut event = trawl_core::row::from_json(event);
-                                let mut pass = true;
-                                for stage in &mut stages {
-                                    match trawl_core::stream::apply_stage(stage, &mut event) {
-                                        trawl_core::stream::StageResult::Pass => {}
-                                        trawl_core::stream::StageResult::Filtered => {
-                                            pass = false;
-                                            break;
-                                        }
-                                        trawl_core::stream::StageResult::Done => {
-                                            stream_done = true;
-                                            pass = false;
-                                            break;
-                                        }
+                                // ONE instant per event (ADR-0017 §3),
+                                // sampled here and handed to the single
+                                // door that owns both the search-stage
+                                // window and the pipeline stages — the
+                                // filter and the `now()` in a `| where`
+                                // cannot read different clocks.
+                                let ctx = trawl_core::context::EvalContext::capture();
+                                match trawl_core::stream::accept_event(
+                                    &filter,
+                                    &mut stages,
+                                    event,
+                                    &ctx,
+                                ) {
+                                    trawl_core::stream::LiveOutcome::Emit(row) => {
+                                        let json = serde_json::to_string(
+                                            &trawl_core::row::to_json(row),
+                                        )
+                                        .unwrap_or_default();
+                                        yield Ok(Event::default().event("data").data(json));
                                     }
-                                }
-
-                                if pass {
-                                    let json = serde_json::to_string(
-                                        &trawl_core::row::to_json(event),
-                                    )
-                                    .unwrap_or_default();
-                                    yield Ok(Event::default().event("data").data(json));
+                                    trawl_core::stream::LiveOutcome::Filtered => {}
+                                    trawl_core::stream::LiveOutcome::Done => {
+                                        stream_done = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -2889,16 +2868,21 @@ pub async fn stream_query(
                         result = subscriber.recv() => {
                             match result {
                                 Ok(batch) => {
-                                    let now = chrono::Utc::now();
                                     for event in &batch.events {
-                                        if !filter.matches_at(event, now) {
-                                            continue;
-                                        }
-
-                                        // Apply pre-stages and feed accumulator.
-                                        let mut event = trawl_core::row::from_json(event);
-                                        if apply_stages(&mut pre_stages, &mut event) {
-                                            aggregation.feed_event(&event);
+                                        // Same per-event instant, same
+                                        // single door: the filter, the
+                                        // pre-stages and the timechart
+                                        // bucket's absent-`_time`
+                                        // fallback all read it.
+                                        let ctx =
+                                            trawl_core::context::EvalContext::capture();
+                                        if trawl_core::stream::accept_event_into_aggregate(
+                                            &filter,
+                                            &mut pre_stages,
+                                            &mut aggregation,
+                                            event,
+                                            &ctx,
+                                        ) {
                                             events_since_snapshot += 1;
                                         }
                                     }
@@ -2908,6 +2892,7 @@ pub async fn stream_query(
                                         let snapshot = emit_agg_snapshot(
                                             &aggregation,
                                             &mut post_stages,
+                                            &snapshot_context(),
                                         );
                                         yield Ok(snapshot);
                                         events_since_snapshot = 0;
@@ -2934,6 +2919,7 @@ pub async fn stream_query(
                                 let snapshot = emit_agg_snapshot(
                                     &aggregation,
                                     &mut post_stages,
+                                    &snapshot_context(),
                                 );
                                 yield Ok(snapshot);
                                 events_since_snapshot = 0;
