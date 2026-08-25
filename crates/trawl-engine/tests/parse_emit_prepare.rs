@@ -302,7 +302,7 @@ fn prepare_ok(conn: &duckdb::Connection, sql: &str, params: usize, label: &str, 
 }
 
 /// The main event: every committed seed's emitted SQL prepares, and the
-/// seeds between them reach every canonical pin.
+/// seeds between them pin every entry of `CanonicalType::ALL`.
 #[test]
 fn every_committed_seed_emits_sql_duckdb_can_prepare() {
     let scratch = tempfile::tempdir().expect("a scratch dir");
@@ -345,21 +345,26 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
          prepare exercised"
     );
 
-    // Acceptance criterion 3, and the designed drift guard for
-    // `CanonicalType::ALL`: the vocabulary is iterated, never re-listed
-    // here, so a seventh variant widens what this assertion demands
+    // Acceptance criterion 3: every entry of `CanonicalType::ALL` is
+    // pinned by some committed seed. The vocabulary is iterated, never
+    // re-listed here, so ADDING an entry to `ALL` widens what this demands
     // without anyone editing this file.
+    //
+    // What it cannot demand is a seed for a variant left OUT of `ALL`:
+    // `covered` comes from `derive_field_types`, which draws its pins from
+    // `ALL` too, so both sides of this comparison read the same list. That
+    // also makes `covered` a subset of `all` by construction, which is why
+    // the emptiness of `missing` is the only assertion here — an equality
+    // check would be a line that cannot fail. `ALL`'s own completeness has
+    // no test anywhere; the compile error at `CanonicalType::index` is the
+    // signpost that stands in for one.
     let all: BTreeSet<CanonicalType> = CanonicalType::ALL.into_iter().collect();
     let missing: Vec<CanonicalType> = all.difference(&covered).copied().collect();
     assert!(
         missing.is_empty(),
-        "no committed seed pins {missing:?}; a new CanonicalType needs a new seed under \
-         crates/trawl-core/fuzz/seeds/parse_emit/ that pins a field to it, or the fuzzer and \
-         this fixture both stop exercising the type"
-    );
-    assert_eq!(
-        covered, all,
-        "the seeds decoded a pin outside CanonicalType::ALL, which the selector cannot produce"
+        "no committed seed pins {missing:?}; a new entry in CanonicalType::ALL needs a new seed \
+         under crates/trawl-core/fuzz/seeds/parse_emit/ that pins a field to it, or the fuzzer \
+         and this fixture both stop exercising the type"
     );
 }
 
