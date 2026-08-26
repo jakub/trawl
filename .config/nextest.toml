@@ -7,11 +7,12 @@
 # cannot override the postgres command line), which is
 # `common::CI_MAX_CONNECTIONS`.
 #
-# Worst case, by name:
-#   PER_TEST_CONNECTION_CEILING (8) * max-threads (8) = 64
-#   64 + headroom (20: admin/transient connections, store-only sqlx pools)
-#   = 84 <= CI_MAX_CONNECTIONS (100)
-# Both consts live in crates/trawl-server/tests/common/mod.rs and
+# Worst case, by shape (the shape table lives in connection_budget.rs):
+#   WORST_TEST_CONNECTION_CEILING (10: a full server plus a test-side app
+#   pool, http_api's schedule cases) * max-threads (8) = 80
+#   80 + derived headroom (15: superuser reserve + per-thread admin
+#   transients + sqlx master churn) = 95 <= CI_MAX_CONNECTIONS (100)
+# The consts live in crates/trawl-server/tests/common/mod.rs and
 # connection_budget.rs fails the build if this arithmetic stops holding.
 #
 # Why 8: the retired `server-integration` group capped full-server tests at
@@ -45,6 +46,12 @@ filter = '''
   | (package(fleet-admin) & kind(test))
 '''
 test-group = 'postgres'
+# A hung pg test must become a NAMED failure before anything upstream (the
+# soak runner's heartbeat, a CI job timeout) kills the process without a
+# log line. 60s marks slow (the heaviest repin tests run ~55s in a loaded
+# CI), 5 periods = a 5-minute hard cap. Termination is not a retry: the
+# test fails, once, by name.
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.default.overrides]]
 # Both tests assert wall-clock windows (executor reclaim via TEST_QUERY_DELAY_MS;
