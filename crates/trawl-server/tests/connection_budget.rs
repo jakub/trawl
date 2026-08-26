@@ -16,8 +16,9 @@
 //! widest.
 //!
 //! No tokio, no postgres, no fixture server: it reads a handful of consts
-//! and a TOML line. It lives in the `postgres` nextest group anyway, because it shares
-//! the fixture module and the admission guard derives membership from that.
+//! and a TOML line. It lives in the `postgres` nextest group anyway,
+//! because it shares the fixture module and the admission guard derives
+//! membership from that.
 
 mod common;
 
@@ -30,7 +31,7 @@ const NEXTEST_CONFIG: &str = include_str!("../../../.config/nextest.toml");
 ///
 /// Three named parts, none of them slack for its own sake:
 ///
-/// * [`SUPERUSER_RESERVED`] is postgres' own `superuser_reserved_connections`,
+/// * `SUPERUSER_RESERVED` is postgres' own `superuser_reserved_connections`,
 ///   which is subtracted from `max_connections` for ordinary roles. CI
 ///   connects as the superuser and would not pay it; a developer running
 ///   the same suite against the dev cluster as `fleet` does.
@@ -38,7 +39,7 @@ const NEXTEST_CONFIG: &str = include_str!("../../../.config/nextest.toml");
 ///   They live for one statement, so charging them to every shape would
 ///   double count, but with the group full each concurrent test may hold
 ///   one.
-/// * [`SQLX_MASTER_CHURN`] covers sqlx's process-global master pool, which
+/// * `SQLX_MASTER_CHURN` covers sqlx's process-global master pool, which
 ///   creates and drops the per-test database. It closes each connection on
 ///   release and only runs during setup and teardown, when the test's own
 ///   shape is not yet at its peak.
