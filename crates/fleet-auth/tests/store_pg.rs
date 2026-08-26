@@ -990,6 +990,27 @@ async fn connect_malformed_url_errors() {
     assert!(matches!(err, AuthError::Database(_)), "got: {err:?}");
 }
 
+#[tokio::test]
+async fn connect_unreachable_endpoint_errors() {
+    // `KeyStore::connect` doesn't expose `PgPoolOptions` for a shorter
+    // acquire timeout, and sqlx's default (30s) is what a real dead-backend
+    // connect attempt pays — measured directly against a closed loopback
+    // port before writing this test. Bound the test itself with an outer
+    // timeout instead of waiting the full 30s: either outcome (the connect
+    // future resolving to an error, or the outer timeout firing first) is
+    // proof the pool never reaches Ok on an endpoint nothing is listening
+    // on.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local_addr").port();
+    drop(listener); // nothing listens on `port` from here on
+
+    let url = format!("postgres://fleet:fleet@127.0.0.1:{port}/fleet_test");
+    // connect error or bounded-wait timeout: both are "not reachable".
+    if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(3), KeyStore::connect(&url)).await {
+        panic!("connect must not succeed against an unreachable endpoint");
+    }
+}
+
 // One sync sanity test to confirm imports compile without DB.
 #[test]
 fn validation_reexported_works() {
