@@ -154,9 +154,8 @@ async fn guard_advisory_lock(mut conn: PgConnection, lost_tx: watch::Sender<bool
 impl StorageState {
     /// Connect to the trawl app-state database and prepare it for use.
     ///
-    /// Boot order is load-bearing: connect pool → take the session advisory
-    /// lock (before migrate: the lock exists to prevent two instances
-    /// racing boot-time migration) → run migrations → open the stores.
+    /// Builds the pool, then hands it to [`Self::from_pool`], which owns the
+    /// load-bearing part of the boot order.
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
         let pool = PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
@@ -169,6 +168,19 @@ impl StorageState {
             .await
             .map_err(StoreError::Unavailable)?;
 
+        Self::from_pool(pool, database_url).await
+    }
+
+    /// Prepare an already-built pool for use: advisory lock, migrate, open
+    /// the stores.
+    ///
+    /// The `database_url` is still required because the sole-writer advisory
+    /// lock lives on its own raw [`PgConnection`], not on a pooled one.
+    ///
+    /// Boot order is load-bearing here, not in the caller: take the session
+    /// advisory lock BEFORE migrate — the lock exists to prevent two
+    /// instances racing boot-time migration.
+    pub async fn from_pool(pool: PgPool, database_url: &str) -> Result<Self, StoreError> {
         // Sole-writer enforcement on a dedicated session connection (pool
         // connections can be recycled, which would silently drop the lock).
         let mut lock_conn = PgConnection::connect(database_url)

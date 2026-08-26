@@ -149,6 +149,22 @@ pub struct AuthState {
 }
 
 impl AuthState {
+    /// Wrap an already-connected keystore. No I/O: the eager connect + ping
+    /// that proves the backend live belongs to the caller.
+    ///
+    /// trawld only ever runs `require_bearer_only`: it verifies bearer tokens
+    /// and never touches session cookies, so it carries just the keystore —
+    /// no fabricated session key/config (see [`AuthState::bearer_state`]).
+    #[must_use]
+    pub fn from_key_store(key_store: fleet_auth::KeyStore) -> Self {
+        let bearer_state = fleet_auth::BearerState::new(key_store.clone());
+        Self {
+            key_store,
+            bearer_state,
+            auth_ping: Arc::new(PingCache::new(None)),
+        }
+    }
+
     /// Liveness ping against the fleet keystore, memoised to protect the pool.
     ///
     /// The result is cached for [`Self::PING_CACHE_TTL`]; within a window every
@@ -524,16 +540,7 @@ async fn build_auth_state(config: &Config) -> Result<AuthState, crate::error::Se
         ))
     })?;
 
-    // trawld only ever runs require_bearer_only: it verifies bearer tokens and
-    // never touches session cookies, so it carries just the keystore — no
-    // fabricated session key/config (see AuthState::bearer_state).
-    let bearer_state = fleet_auth::BearerState::new(key_store.clone());
-
-    Ok(AuthState {
-        key_store,
-        bearer_state,
-        auth_ping: Arc::new(PingCache::new(None)),
-    })
+    Ok(AuthState::from_key_store(key_store))
 }
 
 /// Build [`StorageState`]: connect the dedicated `trawl` app-state database,
@@ -569,7 +576,6 @@ impl AppState {
     /// database (both eagerly — trawld fails fast at startup when either
     /// backend is unreachable; the app-state boot also takes the sole-writer
     /// advisory lock and runs migrations).
-    #[allow(clippy::too_many_lines)] // linear assembly, clearer unsplit
     pub async fn from_config(
         config: &Config,
         metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
@@ -578,6 +584,21 @@ impl AppState {
         let auth = build_auth_state(config).await?;
         let storage = build_storage_state(config).await?;
 
+        Self::from_parts(config, metrics_handle, derivation, auth, storage).await
+    }
+
+    /// Assemble app state over already-connected backends.
+    ///
+    /// Still async: it awaits the catalog pin load that hydrates the
+    /// in-process pin cache.
+    #[allow(clippy::too_many_lines)] // linear assembly, clearer unsplit
+    pub async fn from_parts(
+        config: &Config,
+        metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+        derivation: Arc<crate::ingest::producer::Derivation>,
+        auth: AuthState,
+        storage: StorageState,
+    ) -> Result<(Self, HttpConfig), crate::error::ServerError> {
         // Hydrate the in-process pin cache from the migrated catalog so the
         // first query already sees the pins (zero postgres I/O per query).
         let field_catalog = Arc::new(crate::catalog::FieldCatalog::new());
