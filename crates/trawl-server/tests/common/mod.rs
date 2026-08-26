@@ -767,16 +767,19 @@ pub fn ensure_test_cert() -> (PathBuf, PathBuf) {
 /// so no print of it can leak one. The admin DSN the activity snapshot
 /// connects with is read from the environment at print time and never
 /// echoed.
-pub struct FixtureFacts {
+/// Private on purpose: the panic path is the only consumer, and a `pub`
+/// field here is a field a test could overwrite with a DSN, which is
+/// exactly the leak the struct exists to avoid.
+struct FixtureFacts {
     /// Name (not DSN) of the app-state database.
-    pub app_db: String,
+    app_db: String,
     /// Name (not DSN) of the fleet-keystore database.
-    pub fleet_db: String,
+    fleet_db: String,
     /// `host:port` the server bound.
-    pub bound_addr: String,
-    pub fleet_pool_max: u32,
-    pub app_pool_max: u32,
-    pub per_test_connection_ceiling: u32,
+    bound_addr: String,
+    fleet_pool_max: u32,
+    app_pool_max: u32,
+    per_test_connection_ceiling: u32,
 }
 
 impl FixtureFacts {
@@ -902,7 +905,7 @@ pub struct TestServer {
     /// starting" from "already dead" (see [`wait_for_ready`]).
     pub serve_task: tokio::task::JoinHandle<()>,
     /// Printed by the drop guard when the test panics.
-    pub facts: FixtureFacts,
+    facts: FixtureFacts,
 }
 
 /// On a PANICKING unwind only, print the fixture's facts and a census of
@@ -991,25 +994,54 @@ pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
     store
 }
 
-/// Poll the health endpoint until the server is ready (up to 1s).
+/// Poll the health endpoint until the server answers, under ONE overall
+/// deadline.
 ///
-/// Two properties the pre-listener fixture did not need. First, the poll
-/// times out each request after 500ms: the fixture binds the socket before
-/// the serve task runs, so a connection that nothing is accepting yet sits
-/// in the kernel backlog instead of being refused, and a request against it
-/// would hang past any poll budget. Second, a serve task that has already
-/// finished means the server will never answer — TLS setup failed, or the
-/// accept loop returned — so report that instead of spending the full
-/// second and then blaming readiness.
+/// Three properties the pre-listener fixture did not need. First, the
+/// fixture binds the socket before the serve task runs, so a connection
+/// nothing is accepting yet sits in the kernel backlog instead of being
+/// refused: an attempt that hangs must be cut off, or the poll never
+/// advances. Second, a serve task that has already finished means the
+/// server will never answer (TLS setup failed, or the accept loop
+/// returned), so report that instead of spending the whole budget and then
+/// blaming readiness. Third, the budget is the WALL CLOCK, not a count of
+/// attempts: 100 attempts of up to 500ms each plus sleeps is 51 seconds of
+/// worst case behind a doc comment that says "1s".
+///
+/// [`READY_TIMEOUT`] is 10 seconds because this fixture boots a real
+/// trawld: two migrations and the boot conformance pass run before
+/// `serve_with_listener` accepts anything, and on a loaded CI runner that
+/// is seconds, not milliseconds. It is a ceiling on a hang, not a target;
+/// a healthy fixture answers on the first or second attempt.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Upper bound on ONE readiness attempt, further clamped by whatever is
+/// left of [`READY_TIMEOUT`].
+const READY_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>) {
     let poll_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_millis(500))
+        .timeout(READY_ATTEMPT_TIMEOUT)
         .build()
         .unwrap();
     let health_url = format!("https://{addr}/api/v1/health");
-    for _ in 0..100 {
-        if poll_client.get(&health_url).send().await.is_ok() {
+    let started = std::time::Instant::now();
+    let mut attempts = 0_u32;
+    loop {
+        let Some(remaining) = READY_TIMEOUT.checked_sub(started.elapsed()) else {
+            panic!(
+                "test server on {addr} was not ready within {READY_TIMEOUT:?} \
+                 ({attempts} attempts)"
+            );
+        };
+        attempts += 1;
+        let attempt = tokio::time::timeout(
+            remaining.min(READY_ATTEMPT_TIMEOUT),
+            poll_client.get(&health_url).send(),
+        )
+        .await;
+        if matches!(attempt, Ok(Ok(_))) {
             return;
         }
         assert!(
@@ -1018,7 +1050,6 @@ pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("test server failed to become ready within 1s");
 }
 
 /// Set up a test server with custom rate limiting for rate limit tests.
