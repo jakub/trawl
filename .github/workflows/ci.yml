@@ -427,6 +427,22 @@ jobs:
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # cargo-fuzz
         with:
           tool: cargo-fuzz@0.13.2
+      # The fuzz package carries its OWN Cargo.lock (it is workspace-
+      # `exclude`d), and that lockfile had gone stale: it still pinned
+      # chumsky 0.12 while the workspace moved to 0.13, so nobody had built
+      # these targets since the bump. Assert it resolves unchanged before
+      # fuzzing, or a fresh runner silently fuzzes a different dependency
+      # tree than the one committed. `cargo fuzz run` has no `--locked`
+      # passthrough (verified against 0.13.2 `--help`), so the check is a
+      # preflight rather than a flag.
+      - name: Assert the fuzz lockfile is current
+        working-directory: crates/trawl-core
+        env:
+          RUSTFLAGS: ""
+        run: >-
+          cargo +nightly-2026-08-24 metadata --manifest-path fuzz/Cargo.toml
+          --locked --format-version 1 > /dev/null
+
       - name: Fuzz parse_emit
         working-directory: crates/trawl-core
         env:
