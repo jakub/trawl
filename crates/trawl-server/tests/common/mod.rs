@@ -478,15 +478,15 @@ pub async fn terminate_backends(url: &str) {
     .expect("terminate app-database backends");
 }
 
+/// Serializes [`publish_dir_once`] within one test process.
+static PUBLISH_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
 /// Publish a directory exactly once, atomically, for every test process
-/// that races to build it.
+/// and every test thread that races to build it.
 ///
 /// If `dest` exists, there is nothing to do. Otherwise `build` fills a
-/// sibling staging directory (`{dest}.staging.{pid}`, a sibling so the
-/// rename stays on one filesystem) and one `rename` publishes it whole.
-/// A rival that got there first makes the rename fail with ENOTEMPTY or
-/// EEXIST; the loser deletes its staging tree and, seeing `dest` in
-/// place, calls it a success.
+/// sibling staging directory (a sibling so the rename stays on one
+/// filesystem) and one `rename` publishes it whole.
 ///
 /// The old shape published each FILE with its own rename and then decided
 /// "already built?" by testing ONE of them (ADR-0021 ruling 5). A reader
@@ -494,6 +494,19 @@ pub async fn terminate_backends(url: &str) {
 /// nginx parquet without the postgres one, and failed on a fixture that
 /// was merely half-published. One rename per directory removes that
 /// window: a consumer sees either no directory or a complete one.
+///
+/// Two races, two guards. ACROSS processes the rename decides: the loser
+/// gets `EEXIST`/`ENOTEMPTY` and adopts the winner's tree, but only after
+/// checking that every entry it staged is present under `dest`. A rename
+/// that failed for any other reason, or a `dest` that is missing something
+/// we built, is an error, never a silent pass. WITHIN one process (plain
+/// `cargo test` runs many tests per binary in one process, on many
+/// threads) the staging path itself was the hazard: it was named after the
+/// pid alone, so two threads shared it and one deleted the other's
+/// half-built tree. The staging name now carries a per-call nonce, and one
+/// process-wide mutex serializes publication so the second thread finds
+/// `dest` already in place instead of building a rival copy. No caller ever
+/// removes a staging path but its own.
 fn publish_dir_once(
     dest: &std::path::Path,
     build: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
@@ -501,29 +514,133 @@ fn publish_dir_once(
     if dest.exists() {
         return Ok(());
     }
+
+    // A panicking publisher leaves the lock poisoned but the filesystem
+    // consistent (staging trees are private and `dest` only ever appears
+    // whole), so the next caller may proceed.
+    let _serialized = PUBLISH_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A sibling thread may have published while we waited for the lock.
+    if dest.exists() {
+        return Ok(());
+    }
+
     let staging = dest.with_file_name(format!(
         "{}.staging.{}",
         dest.file_name()
             .and_then(std::ffi::OsStr::to_str)
             .expect("fixture destination has a UTF-8 file name"),
-        std::process::id()
+        staging_nonce()
     ));
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging)?;
+    // `create_dir`, not `create_dir_all`: this path is ours alone, so an
+    // existing one is a surprise worth failing on rather than a tree to
+    // wipe.
+    std::fs::create_dir(&staging)?;
     if let Err(e) = build(&staging) {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
+
+    let staged_entries = dir_entry_names(&staging)?;
     match std::fs::rename(&staging, dest) {
         Ok(()) => Ok(()),
         Err(e) => {
+            let rival_won = matches!(
+                e.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
+            );
+            let adopted = rival_won && published_tree_is_complete(dest, &staged_entries);
             let _ = std::fs::remove_dir_all(&staging);
-            if dest.exists() { Ok(()) } else { Err(e) }
+            if adopted { Ok(()) } else { Err(e) }
         }
     }
+}
+
+/// A staging-directory suffix no other caller can pick: the pid separates
+/// processes, the counter separates threads and repeat calls in one
+/// process, and the random tail separates us from a crashed predecessor
+/// whose pid the OS has since handed back.
+fn staging_nonce() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}.{n}.{}", std::process::id(), random_db_suffix())
+}
+
+/// Sorted top-level entry names of a directory.
+fn dir_entry_names(dir: &std::path::Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    let mut names = std::fs::read_dir(dir)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    names.sort();
+    Ok(names)
+}
+
+/// Whether the tree a rival published carries at least everything we
+/// staged. Losing the rename only counts as success when it did.
+fn published_tree_is_complete(dest: &std::path::Path, staged: &[std::ffi::OsString]) -> bool {
+    let Ok(published) = dir_entry_names(dest) else {
+        return false;
+    };
+    staged.iter().all(|name| published.contains(name))
+}
+
+#[test]
+fn publish_dir_once_has_one_winner_under_thread_contention() {
+    // The regression guard for the same-process race: under plain `cargo
+    // test` many tests share one process, so two threads can reach an
+    // unpublished fixture at the same instant. Exactly one may build, and
+    // every caller must return to a COMPLETE tree. The old pid-only
+    // staging name let the second thread delete the first one's half-built
+    // directory and publish the remains.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dest = tmp.path().join("fixture-v1");
+    let builds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let files = ["a.txt", "b.txt", "c.txt"];
+
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let dest = dest.clone();
+            let builds = std::sync::Arc::clone(&builds);
+            scope.spawn(move || {
+                publish_dir_once(&dest, |staging| {
+                    builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    for name in files {
+                        // Sleep between files: a build that is instantaneous
+                        // would not expose a rival deleting it mid-flight.
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        std::fs::write(staging.join(name), name)?;
+                    }
+                    Ok(())
+                })
+                .expect("every racing caller must succeed");
+            });
+        }
+    });
+
+    assert_eq!(
+        builds.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one thread may build the fixture"
+    );
+    for name in files {
+        let content = std::fs::read_to_string(dest.join(name))
+            .unwrap_or_else(|e| panic!("published tree must carry {name}: {e}"));
+        assert_eq!(content, name);
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .expect("read tempdir")
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|name| name != "fixture-v1")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staging directories must not survive publication: {leftovers:?}"
+    );
 }
 
 /// Root of the shared, published fixture directories.

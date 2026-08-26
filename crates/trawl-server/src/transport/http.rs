@@ -310,6 +310,11 @@ pub async fn serve(
 /// consulted on this path, it is informational only, and the address logged
 /// at startup is the listener's own `local_addr`. That is the point — a
 /// caller binding port 0 to get a free port keeps the socket it tested.
+///
+/// This entry exists for callers that must own the bound socket, which today
+/// means the test fixture; production binds through [`serve`]. A caller that
+/// adopts a listener therefore decides where that socket is bound, and
+/// nothing on this path checks that decision against `config.http_addr`.
 pub async fn serve_with_listener(
     listener: std::net::TcpListener,
     state: AppState,
