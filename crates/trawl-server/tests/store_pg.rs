@@ -1250,7 +1250,10 @@ async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
 /// the real boot path (advisory lock before migrate).
 #[sqlx::test(migrations = false)]
 async fn boot_migrates_fresh_database(pool: PgPool) {
-    let url = common::create_app_database(&pool).await;
+    // The mint opens its own admin connection; the harness pool is here only
+    // for the DATABASE_URL it proves is set.
+    let _ = pool;
+    let url = common::create_app_database().await;
     let storage = StorageState::connect(&url).await.expect("first boot");
 
     // Schema is live: a store call succeeds.
@@ -1262,7 +1265,10 @@ async fn boot_migrates_fresh_database(pool: PgPool) {
 /// first instance released its advisory lock).
 #[sqlx::test(migrations = false)]
 async fn boot_is_idempotent_after_shutdown(pool: PgPool) {
-    let url = common::create_app_database(&pool).await;
+    // The mint opens its own admin connection; the harness pool is here only
+    // for the DATABASE_URL it proves is set.
+    let _ = pool;
+    let url = common::create_app_database().await;
     {
         let storage = StorageState::connect(&url).await.expect("first boot");
         storage.saved.create(1, "boot", "q").await.unwrap();
@@ -1293,7 +1299,10 @@ async fn boot_is_idempotent_after_shutdown(pool: PgPool) {
 /// lock with a descriptive error.
 #[sqlx::test(migrations = false)]
 async fn boot_second_live_instance_fails_on_advisory_lock(pool: PgPool) {
-    let url = common::create_app_database(&pool).await;
+    // The mint opens its own admin connection; the harness pool is here only
+    // for the DATABASE_URL it proves is set.
+    let _ = pool;
+    let url = common::create_app_database().await;
     let _first = StorageState::connect(&url).await.expect("first boot");
 
     let err = StorageState::connect(&url)
@@ -1329,7 +1338,10 @@ async fn boot_unreachable_database_fails_descriptively(pool: PgPool) {
 async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement(pool: PgPool) {
     use std::time::Duration;
 
-    let url = common::create_app_database(&pool).await;
+    // The mint opens its own admin connection; the harness pool is here only
+    // for the DATABASE_URL it proves is set.
+    let _ = pool;
+    let url = common::create_app_database().await;
     let first = StorageState::connect(&url).await.expect("first boot");
 
     let mut lost = first.lock_lost();
