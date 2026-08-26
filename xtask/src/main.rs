@@ -14,8 +14,11 @@
 //! - `ingest-fuzz` — emit deterministic, Vector-compatible NDJSON corpora
 //!   for the ingest canonicalizer and field-catalog pin/conform boundary,
 //!   per producer profile (`--profile http|syslog|trawld`).
-//! - `e2e` — the real-browser Playwright suite in
-//!   `crates/trawl-web-ui/e2e/`: trunk-build the SPA, `npm ci` the
+//! - `pg-admission-guard` — prove every pg-touching test runs inside the
+//!   `postgres` nextest group, so the workspace cannot outgrow postgres'
+//!   `max_connections` (ADR-0021 ruling 4, see `pg_admission`).
+//! - `e2e` — the real-browser Playwright suite (issue #118,
+//!   `crates/trawl-web-ui/e2e/`): trunk-build the SPA, `npm ci` the
 //!   suite's own devDependency, install the chromium browser, then run
 //!   the suite against the zero-npm-dep stub server in `e2e/harness/`.
 //!
@@ -23,6 +26,7 @@
 
 mod design_cards;
 mod ingest_fuzz;
+mod pg_admission;
 
 use std::fs;
 use std::io::Write;
@@ -95,7 +99,15 @@ enum Cmd {
         #[arg(long, default_value_t = 100)]
         events: usize,
     },
-    /// Run the real-browser Playwright suite.
+    /// Check that every pg-touching test binary runs inside the
+    /// `postgres` nextest group. Arguments after `--` are forwarded to
+    /// `cargo nextest list` (CI passes its feature selection).
+    PgAdmissionGuard {
+        /// Extra arguments for the `cargo nextest list` invocation.
+        #[arg(last = true)]
+        nextest_args: Vec<String>,
+    },
+    /// Run the real-browser Playwright suite (issue #118).
     E2e {
         /// Skip the `trunk build` step — reuse whatever's already in
         /// `crates/trawl-web-ui/dist/`. Fails loudly at server startup
@@ -163,6 +175,9 @@ fn main() -> ExitCode {
             env,
             mutation_events: events,
         }),
+        Cmd::PgAdmissionGuard { nextest_args } => {
+            pg_admission::run(&workspace_root(), &nextest_args)
+        }
         Cmd::E2e {
             skip_build,
             release,

@@ -75,8 +75,9 @@ jobs:
     # Connection budget: nextest is process-per-test and sqlx pools are
     # process-local, so unbounded parallelism can exceed the server's
     # max_connections (default 100 — GH service containers can't override
-    # the postgres command line). The `pg` nextest group in
-    # .config/nextest.toml bounds pg-heavy test parallelism instead.
+    # the postgres command line). The `postgres` nextest group in
+    # .config/nextest.toml bounds pg-heavy test parallelism instead, and
+    # the pg-admission-guard step below proves nothing escaped it.
     name: test
     runs-on: k8s-big
     services:
@@ -131,6 +132,19 @@ jobs:
           # shared service container. The #[sqlx::test] harness hardwires
           # DATABASE_URL.
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Membership in the `postgres` group is hand-written in
+      # .config/nextest.toml; this recomputes it from the sources and fails
+      # if a pg-touching test runs outside the group. It runs after the
+      # suite on purpose: the test binaries are already built, so the guard
+      # only pays for `cargo nextest list`. Same feature selection as the
+      # run above, because a feature can compile a pg test file out.
+      - name: Guard the postgres admission group
+        run: >-
+          cargo xtask pg-admission-guard --
+          --no-default-features
+          --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
+        env:
+          DUCKDB_DOWNLOAD_LIB: "1"
       - name: Smoke-test downloaded DuckDB development launcher
         run: |
           cargo build -p trawl-server --no-default-features
