@@ -83,6 +83,9 @@ async fn reconcile_inner(
     registered_manifests: &BTreeMap<App, AppManifest>,
     state: &ScopedState,
 ) -> Result<DeveloperKey> {
+    // reconcile_inner is the named pool owner for the Fleet development
+    // identity reconciliation step (ADR-0021 ruling 3).
+    #[allow(clippy::disallowed_methods)]
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(Duration::from_secs(5))

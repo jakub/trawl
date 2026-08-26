@@ -1883,7 +1883,7 @@ async fn trigger_run_rejects_when_max_runs_reached() {
 
     // Seed a run directly so the schedule is already at its max_runs=1 cap;
     // count(*) >= max_runs short-circuits the claim before the insert.
-    let store = ScheduleStore::new(sqlx::PgPool::connect(&server.app_db_url).await.unwrap());
+    let store = ScheduleStore::new(common::app_pool(&server.app_db_url).await);
     let seeded = store
         .claim_run(schedule.id, saved.id, "* | head 3", None)
         .await
@@ -1929,7 +1929,7 @@ async fn trigger_run_rejects_when_already_running() {
 
     // Seed an in-progress run directly, avoiding a race with the background
     // task the happy-path trigger spawns.
-    let store = ScheduleStore::new(sqlx::PgPool::connect(&server.app_db_url).await.unwrap());
+    let store = ScheduleStore::new(common::app_pool(&server.app_db_url).await);
     let seeded = store
         .claim_run(schedule.id, saved.id, "* | head 3", None)
         .await

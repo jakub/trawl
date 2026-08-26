@@ -332,6 +332,9 @@ async fn pin_write_failure_retains_wal_and_writes_nothing() {
 
     // A catalog whose store points at an unreachable postgres: pins cannot
     // become durable, so the batch must not be written.
+    // Deliberately unreachable: this pool exists to simulate a dead
+    // catalog store, not to reach a fixture database (ADR-0021 ruling 3).
+    #[allow(clippy::disallowed_methods)]
     let dead_pool = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(Duration::from_millis(200))
         .connect_lazy("postgres://nobody@127.0.0.1:1/nowhere")

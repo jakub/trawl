@@ -157,6 +157,9 @@ impl StorageState {
     /// Builds the pool, then hands it to [`Self::from_pool`], which owns the
     /// load-bearing part of the boot order.
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
+        // StorageState::connect is the named production pool owner for
+        // trawld's app-state database (ADR-0021 ruling 3).
+        #[allow(clippy::disallowed_methods)]
         let pool = PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
             // Boot fails fast on an unreachable database instead of

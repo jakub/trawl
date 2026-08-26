@@ -7,4 +7,12 @@
 # the build instead of silently reopening the hole.
 disallowed-methods = [
     { path = "chumsky::Parser::padded", reason = "use parser::comment::Spaced::spaced — .padded() skips whitespace only, so comments would not work there (ADR-0014 ruling 4)" },
+    { path = "sqlx_core::pool::options::PoolOptions::connect", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
+    { path = "sqlx_core::pool::options::PoolOptions::connect_with", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
+    { path = "sqlx_core::pool::options::PoolOptions::connect_lazy", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
+    { path = "sqlx_core::pool::options::PoolOptions::connect_lazy_with", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
+    { path = "sqlx_core::pool::Pool::connect", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
+    { path = "sqlx_core::pool::Pool::connect_with", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
+    { path = "sqlx_core::pool::Pool::connect_lazy", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
+    { path = "sqlx_core::pool::Pool::connect_lazy_with", reason = "raw pool construction is banned outside the one owner per process (fixture_pool in tests, the named production pool owners) — see ADR-0021 ruling 3" },
 ]
