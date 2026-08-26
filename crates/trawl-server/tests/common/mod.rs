@@ -4,14 +4,20 @@
 
 //! Shared harness for trawld's pg-backed end-to-end tests.
 //!
-//! Each test runs under `#[sqlx::test(migrations = false)]`: the sqlx
-//! harness (driven by `DATABASE_URL` — unset means a loud failure, never a
-//! skip) hands the test a fresh ephemeral database, which we use as the
-//! fleet database (running `fleet_auth::MIGRATOR` on it explicitly). The
-//! trawl app-state database is a sibling database created empty by
-//! [`create_app_database`] and migrated by trawld's real boot path
-//! (`StorageState::connect`: pool → advisory lock → migrate), so every
-//! server test exercises boot-time migration.
+//! A full-server fixture owns every resource it hands the server (ADR-0021
+//! rulings 1-3). It mints BOTH databases itself — fleet keystore and trawl
+//! app state — from `DATABASE_URL`, builds one sized pool on each, and
+//! passes those pools in through `AppState::from_parts`. Nothing here runs
+//! under `#[sqlx::test]`: that macro's teardown closes the pool under a
+//! 10-second timeout and then drops the database regardless, while the
+//! server's detached tasks (collector, scheduler, compaction) still hold
+//! connections. `#[sqlx::test]` survives only where the handed pool is the
+//! sole connection holder — the store-level suites.
+//!
+//! The app database is still migrated by trawld's REAL boot path
+//! (`StorageState::from_pool`: advisory lock → migrate), so every server
+//! test exercises boot-time migration; the fixture runs
+//! `fleet_auth::MIGRATOR` on the fleet database itself.
 //!
 //! The two schemas must live in two databases: sqlx hardwires one
 //! `_sqlx_migrations` table per database and both migration sets would
@@ -153,19 +159,19 @@ pub fn test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
         .clone()
 }
 
-/// Find an available port by binding to :0 and reading back the assigned port.
-pub fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
-    listener.local_addr().unwrap().port()
-}
-
-/// The base admin DSN the sqlx test harness runs on.
+/// The base admin DSN every fixture database is minted from.
 ///
-/// `#[sqlx::test]` hardwires `DATABASE_URL`; it is guaranteed set by the
-/// time a test body runs (the harness panics loudly otherwise).
+/// Read straight from the environment, because the full-server fixture no
+/// longer runs under `#[sqlx::test]` and so has no harness reading it on
+/// the fixture's behalf. An unset variable panics loudly and fails the
+/// test: a pg-backed suite that silently skips is a suite that passes
+/// while proving nothing.
 pub fn admin_database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set for #[sqlx::test] (the harness enforces this)")
+    std::env::var("DATABASE_URL").expect(
+        "DATABASE_URL must be set for the pg-backed suites \
+         (e.g. postgres://fleet:fleet@localhost:5433/fleet_test); \
+         these tests fail rather than skip",
+    )
 }
 
 /// Replace the database path of a postgres URL, preserving any query string.
@@ -194,7 +200,9 @@ fn random_db_suffix() -> String {
         .collect()
 }
 
-/// DSN of the sqlx-provided per-test database (used as the fleet database).
+/// DSN of a pool's own database, rebuilt against the admin DSN — for the
+/// `#[sqlx::test]` suites, which need a second connection to the database
+/// the macro handed them.
 pub fn fleet_database_url(pool: &PgPool) -> String {
     let opts = pool.connect_options();
     let db = opts.get_database().expect("test pool has a database");
@@ -288,12 +296,7 @@ async fn create_test_database(prefix: &str) -> String {
 
 /// Create an EMPTY sibling database for the trawl app-state store and
 /// return its DSN. trawld's real boot path migrates it (AC5).
-///
-/// `pool` is vestigial: the mint opens its own admin connection. It stays
-/// on the signature only because the call sites live in test binaries this
-/// milestone does not own; M3 drops both.
-pub async fn create_app_database(pool: &PgPool) -> String {
-    let _ = pool;
+pub async fn create_app_database() -> String {
     create_test_database(APP_DB_PREFIX).await
 }
 
@@ -614,6 +617,9 @@ pub struct TestServer {
     /// The server's shared state — e.g. to reach the hot buffer when a test
     /// drives compaction directly against the server's WAL/data dirs.
     pub state: AppState,
+    /// The serve task, retained so the readiness poll can tell "still
+    /// starting" from "already dead" (see [`wait_for_ready`]).
+    pub serve_task: tokio::task::JoinHandle<()>,
 }
 
 impl TestServer {
@@ -676,9 +682,10 @@ pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String
     )
 }
 
-/// Migrate the sqlx-provided database with the fleet schema, seed the test
-/// roles, and return a keystore on it.
-/// (`migrations = false` hands us a bare database.)
+/// Migrate a bare database with the FLEET schema, seed the converted-shape
+/// roles, and return a keystore on it. Both callers hand it an empty
+/// database: the fixture its own mint, the store-level suites their
+/// `#[sqlx::test(migrations = false)]` one.
 pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
     fleet_auth::MIGRATOR
         .run(pool)
@@ -690,9 +697,19 @@ pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
 }
 
 /// Poll the health endpoint until the server is ready (up to 1s).
-pub async fn wait_for_ready(addr: &str) {
+///
+/// Two properties the pre-listener fixture did not need. First, the poll
+/// times out each request after 500ms: the fixture binds the socket before
+/// the serve task runs, so a connection that nothing is accepting yet sits
+/// in the kernel backlog instead of being refused, and a request against it
+/// would hang past any poll budget. Second, a serve task that has already
+/// finished means the server will never answer — TLS setup failed, or the
+/// accept loop returned — so report that instead of spending the full
+/// second and then blaming readiness.
+pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>) {
     let poll_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_millis(500))
         .build()
         .unwrap();
     let health_url = format!("https://{addr}/api/v1/health");
@@ -700,15 +717,19 @@ pub async fn wait_for_ready(addr: &str) {
         if poll_client.get(&health_url).send().await.is_ok() {
             return;
         }
+        assert!(
+            !serve_task.is_finished(),
+            "the serve task exited before the server answered on {addr}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("test server failed to become ready within 1s");
 }
 
 /// Set up a test server with custom rate limiting for rate limit tests.
-pub async fn setup_with_rate_limit(pool: PgPool, rate_limit: RateLimitConfig) -> TestServer {
+pub async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
-    let server = setup_in_dir(pool, tmp.path(), rate_limit).await;
+    let server = setup_in_dir(tmp.path(), rate_limit).await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
@@ -716,12 +737,8 @@ pub async fn setup_with_rate_limit(pool: PgPool, rate_limit: RateLimitConfig) ->
 
 /// Set up a test server whose WAL lives under the given directory (which
 /// must outlive the server), querying the shared parquet fixtures.
-pub async fn setup_in_dir(
-    pool: PgPool,
-    dir: &std::path::Path,
-    rate_limit: RateLimitConfig,
-) -> TestServer {
-    setup_in_dir_with_data(pool, dir, ensure_fixtures(), rate_limit).await
+pub async fn setup_in_dir(dir: &std::path::Path, rate_limit: RateLimitConfig) -> TestServer {
+    setup_in_dir_with_data(dir, ensure_fixtures(), rate_limit).await
 }
 
 /// The derivation policy, resolved the way `main` resolves it.
@@ -741,17 +758,22 @@ fn resolve_derivation(
 /// Like [`setup_in_dir`], but with an explicit cold-data glob — for tests
 /// that compact into a per-test data directory instead of the shared
 /// fixtures.
+#[allow(clippy::too_many_lines)] // linear assembly: two databases, two pools, one config
 pub async fn setup_in_dir_with_data(
-    pool: PgPool,
     dir: &std::path::Path,
     data_path: String,
     rate_limit: RateLimitConfig,
 ) -> TestServer {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let store = fleet_keystore(&pool).await;
-    let fleet_db_url = fleet_database_url(&pool);
-    let app_db_url = create_app_database(&pool).await;
+    // Both databases are the fixture's own (ADR-0021 ruling 2): the server's
+    // detached tasks outlive any test-macro teardown, so nothing may drop a
+    // database out from under them mid-test.
+    let fleet_db_url = create_fleet_database().await;
+    let app_db_url = create_app_database().await;
+
+    let fleet = fleet_pool(&fleet_db_url).await;
+    let store = fleet_keystore(&fleet).await;
 
     let (analyst_token, admin_token, reader_token, ingest_token) = mint_role_keys(&store).await;
     let schema_admin = store
@@ -776,8 +798,14 @@ pub async fn setup_in_dir_with_data(
         .unwrap();
 
     let (cert_path, key_path) = ensure_test_cert();
-    let port = free_port();
-    let addr = format!("127.0.0.1:{port}");
+    // ADR-0021 ruling 1: the port is owned from bind to serve. The fixture
+    // holds this listener until `serve_with_listener` adopts it, so nothing
+    // can take the port in between.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port for the server");
+    let addr = listener
+        .local_addr()
+        .expect("listener local_addr")
+        .to_string();
 
     let config = Config {
         server: ServerConfig {
@@ -825,10 +853,23 @@ pub async fn setup_in_dir_with_data(
         },
     };
 
-    let (state, http_config) =
-        AppState::from_config(&config, test_metrics_handle(), resolve_derivation(&config))
+    // ADR-0021 ruling 3: the server receives pools the fixture built and
+    // sized; only production connects for itself. The app store still boots
+    // through the real path (advisory lock, then migrate).
+    let auth = trawl_server::state::AuthState::from_key_store(KeyStore::from_pool(fleet.clone()));
+    let storage =
+        trawl_server::store::StorageState::from_pool(app_pool(&app_db_url).await, &app_db_url)
             .await
-            .expect("failed to create app state");
+            .expect("boot the app-state database");
+    let (state, http_config) = AppState::from_parts(
+        &config,
+        test_metrics_handle(),
+        resolve_derivation(&config),
+        auth,
+        storage,
+    )
+    .await
+    .expect("failed to create app state");
 
     boot_conformance_pass(&state, &config).await;
 
@@ -842,7 +883,7 @@ pub async fn setup_in_dir_with_data(
         false,
     );
 
-    serve_and_wait(&state, &config, http_config, &addr).await;
+    let serve_task = serve_and_wait(listener, &state, &config, http_config, &addr).await;
 
     TestServer {
         url: format!("https://{addr}"),
@@ -852,25 +893,29 @@ pub async fn setup_in_dir_with_data(
         ingest_token,
         schema_admin_token: schema_admin.plaintext_token.to_string(),
         coastwatch_only_token: coastwatch_only.plaintext_token.to_string(),
-        fleet_pool: pool,
+        fleet_pool: fleet,
         fleet_db_url,
         app_db_url,
         state,
+        serve_task,
     }
 }
 
-/// Spawn the HTTPS server task and wait for it to answer on `addr`.
+/// Spawn the HTTPS server task over the fixture's listener and wait for it
+/// to answer on `addr`. Returns the task handle so the caller can keep it.
 async fn serve_and_wait(
+    listener: TcpListener,
     state: &AppState,
     config: &Config,
     http_config: trawl_server::state::HttpConfig,
     addr: &str,
-) {
+) -> tokio::task::JoinHandle<()> {
     let server_config = config.server.clone();
     let state_dir = config.state_dir();
     let spawned_state = state.clone();
-    tokio::spawn(async move {
-        http::serve(
+    let task = tokio::spawn(async move {
+        http::serve_with_listener(
+            listener,
             spawned_state,
             &http_config,
             &server_config,
@@ -880,7 +925,8 @@ async fn serve_and_wait(
         .await
         .unwrap();
     });
-    wait_for_ready(addr).await;
+    wait_for_ready(addr, &task).await;
+    task
 }
 
 /// Boot conformance pass, same as trawld's `main()` does in production
@@ -900,8 +946,7 @@ async fn boot_conformance_pass(state: &trawl_server::state::AppState, config: &C
 
 /// Set up a test server with fixtures and return a `TestServer` handle.
 ///
-/// `pool` is the `#[sqlx::test(migrations = false)]`-provided per-test
-/// database; it becomes the fleet keystore database.
-pub async fn setup(pool: PgPool) -> TestServer {
-    setup_with_rate_limit(pool, RateLimitConfig::default()).await
+/// The fixture mints both databases; the caller supplies nothing.
+pub async fn setup() -> TestServer {
+    setup_with_rate_limit(RateLimitConfig::default()).await
 }
