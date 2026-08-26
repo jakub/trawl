@@ -21,7 +21,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{ensure_fixtures, roles, setup};
+use common::{roles, seed_data_root, setup};
 use fleet_auth::{KeyStore, PrincipalKind};
 use parking_lot::Mutex;
 use sqlx::PgPool;
@@ -680,8 +680,11 @@ async fn scheduler_runs_after(
         tokio::time::sleep(Duration::from_millis(pre_sleep_ms)).await;
     }
 
-    // Real parquet fixtures so a permitted run actually succeeds.
-    let data_glob = ensure_fixtures();
+    // Real parquet fixtures so a permitted run actually succeeds. The
+    // root is this test's own copy: the scheduler WRITES report output
+    // under `scheduled/`, which no other test may see.
+    let data_dir = tempfile::tempdir().expect("scheduler data root");
+    let data_glob = seed_data_root(data_dir.path());
     let base_dir = data_glob.trim_end_matches("/**/*.parquet").to_owned();
     let exec_pool = trawl_server::pool::ExecutorPool::new(base_dir, 1, 1000, None);
 

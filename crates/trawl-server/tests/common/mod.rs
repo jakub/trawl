@@ -478,42 +478,83 @@ pub async fn terminate_backends(url: &str) {
     .expect("terminate app-database backends");
 }
 
-/// Generate test parquet fixtures using `DuckDB`.
+/// Publish a directory exactly once, atomically, for every test process
+/// that races to build it.
 ///
-/// Writes fixtures to a stable path under `CARGO_MANIFEST_DIR` so all
-/// nextest processes share the same files. Uses PID-unique temp files
-/// and atomic rename for race-free coordination.
-pub fn ensure_fixtures() -> String {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+/// If `dest` exists, there is nothing to do. Otherwise `build` fills a
+/// sibling staging directory (`{dest}.staging.{pid}`, a sibling so the
+/// rename stays on one filesystem) and one `rename` publishes it whole.
+/// A rival that got there first makes the rename fail with ENOTEMPTY or
+/// EEXIST; the loser deletes its staging tree and, seeing `dest` in
+/// place, calls it a success.
+///
+/// The old shape published each FILE with its own rename and then decided
+/// "already built?" by testing ONE of them (ADR-0021 ruling 5). A reader
+/// arriving between the two renames saw the cert without the key, or the
+/// nginx parquet without the postgres one, and failed on a fixture that
+/// was merely half-published. One rename per directory removes that
+/// window: a consumer sees either no directory or a complete one.
+fn publish_dir_once(
+    dest: &std::path::Path,
+    build: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if dest.exists() {
+        return Ok(());
+    }
+    let staging = dest.with_file_name(format!(
+        "{}.staging.{}",
+        dest.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("fixture destination has a UTF-8 file name"),
+        std::process::id()
+    ));
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+    if let Err(e) = build(&staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    match std::fs::rename(&staging, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            if dest.exists() { Ok(()) } else { Err(e) }
+        }
+    }
+}
+
+/// Root of the shared, published fixture directories.
+fn fixture_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("parquet");
-    // The ADR-0009 on-disk layout the query planner prunes over:
-    // `{data}/{env}/{date}/{HH}/{service}.parquet`. Fixtures live there
-    // because that is the only shape the server ever writes — a flat data
-    // root is only reachable through a whole-root `**` glob, which the
-    // planner deliberately does not emit (it would swallow `scheduled/`).
-    let hour_dir = dir.join("prod").join("2024-01-15").join("10");
-    let nginx_path = hour_dir.join("nginx.parquet");
+}
 
-    // Remove stale scheduled-run results from prior test invocations.
-    let scheduled_dir = dir.join("scheduled");
-    if scheduled_dir.exists() {
-        let _ = std::fs::remove_dir_all(&scheduled_dir);
-    }
-    // The returned `**` glob reaches the fixture root as well, so a flat
-    // `nginx.parquet`/`postgres.parquet` sitting there would be read
-    // alongside the partitioned copies. Clear both names.
-    for legacy in ["nginx.parquet", "postgres.parquet"] {
-        let _ = std::fs::remove_file(dir.join(legacy));
-    }
+/// Publish the parquet seed tree once and return its root.
+///
+/// The directory name carries a version. Change the seed data and bump
+/// `-v1`: a stale tree from an older checkout is then simply a directory
+/// nobody looks at, instead of a half-recognised fixture some test has to
+/// detect and delete.
+///
+/// The tree is READ-ONLY to tests. Each test copies it into its own data
+/// root ([`seed_data_root`]), so nothing writes here.
+fn published_parquet_root() -> PathBuf {
+    let dest = fixture_root().join("parquet-v1");
+    publish_dir_once(&dest, |staging| {
+        // The ADR-0009 on-disk layout the query planner prunes over:
+        // `{data}/{env}/{date}/{HH}/{service}.parquet`. Fixtures live
+        // there because that is the only shape the server ever writes — a
+        // flat data root is only reachable through a whole-root `**`
+        // glob, which the planner deliberately no longer emits (it would
+        // swallow `scheduled/`).
+        let hour_dir = staging.join("prod").join("2024-01-15").join("10");
+        std::fs::create_dir_all(&hour_dir)?;
 
-    if !nginx_path.exists() {
-        std::fs::create_dir_all(&hour_dir).unwrap();
-        let suffix = format!("_{}", std::process::id());
-
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-
+        let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
         conn.execute_batch(
             "CREATE TABLE logs (
                 _time TIMESTAMP,
@@ -528,75 +569,77 @@ pub fn ensure_fixtures() -> String {
                 message VARCHAR
             )",
         )
-        .unwrap();
-
+        .expect("create fixture table");
         conn.execute_batch(
             "INSERT INTO logs VALUES
             ('2024-01-15 10:00:00', '2024-01-15 10:00:10', 'raw0', NULL, 'prod', 'nginx', 'web01', 9, 'info', 'request ok'),
             ('2024-01-15 10:00:01', '2024-01-15 10:00:11', 'raw1', NULL, 'prod', 'nginx', 'web01', 17, 'error', 'upstream timeout'),
             ('2024-01-15 10:00:02', '2024-01-15 10:00:12', 'raw2', NULL, 'prod', 'postgres', 'db01', 9, 'info', 'checkpoint complete')",
         )
-        .unwrap();
+        .expect("insert fixture rows");
 
-        // Write per-service parquet files to match compaction naming convention.
-        let nginx_tmp = hour_dir.join(format!("nginx{suffix}.parquet"));
-        let postgres_tmp = hour_dir.join(format!("postgres{suffix}.parquet"));
-
-        conn.execute_batch(&format!(
-            "COPY (SELECT * FROM logs WHERE service = 'nginx') TO '{}' (FORMAT PARQUET)",
-            nginx_tmp.display()
-        ))
-        .unwrap();
-        conn.execute_batch(&format!(
-            "COPY (SELECT * FROM logs WHERE service = 'postgres') TO '{}' (FORMAT PARQUET)",
-            postgres_tmp.display()
-        ))
-        .unwrap();
-
-        // Atomic rename — loser's rename fails harmlessly if winner already placed the file.
-        let _ = std::fs::rename(&nginx_tmp, nginx_path);
-        let _ = std::fs::rename(&postgres_tmp, hour_dir.join("postgres.parquet"));
-        // Clean up if we lost the race.
-        let _ = std::fs::remove_file(&nginx_tmp);
-        let _ = std::fs::remove_file(&postgres_tmp);
-    }
-
-    format!("{}/**/*.parquet", dir.display())
+        for service in ["nginx", "postgres"] {
+            let path = hour_dir.join(format!("{service}.parquet"));
+            conn.execute_batch(&format!(
+                "COPY (SELECT * FROM logs WHERE service = '{service}') TO '{}' (FORMAT PARQUET)",
+                path.display()
+            ))
+            .expect("write fixture parquet");
+        }
+        Ok(())
+    })
+    .expect("publish the shared parquet fixture tree");
+    dest
 }
 
-/// Return a shared self-signed cert/key pair, generating on first call.
+/// Copy a directory tree recursively.
+fn copy_tree(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Seed a PRIVATE data root under `dir` from the published parquet tree
+/// and return the glob that reads it.
 ///
-/// Uses the same PID-unique temp + atomic rename pattern as fixtures
-/// for race-free coordination across nextest processes.
+/// Every test gets its own copy because the data root is WRITABLE: the
+/// scheduler drops report output under `scheduled/`, and repin stages
+/// siblings of it. Sharing one root meant tests deleting each other's
+/// `scheduled/` directory to stay deterministic (ADR-0021 ruling 7).
+/// A private root removes both the wipe and the cross-test coupling.
+///
+/// The seed is COPIED, not hardlinked: `dir` is a tempdir on /tmp, which
+/// is a tmpfs here, so a link across from the repo's filesystem is EXDEV.
+pub fn seed_data_root(dir: &std::path::Path) -> String {
+    let data = dir.join("data");
+    copy_tree(&published_parquet_root(), &data).expect("seed the private data root");
+    format!("{}/**/*.parquet", data.display())
+}
+
+/// Return a shared self-signed cert/key pair, published on first call.
+///
+/// Both files are staged and published by ONE rename, so a reader never
+/// sees the cert without its key.
 pub fn ensure_test_cert() -> (PathBuf, PathBuf) {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("tls");
-    let cert_path = dir.join("cert.pem");
-    let key_path = dir.join("key.pem");
-
-    if !cert_path.exists() {
-        std::fs::create_dir_all(&dir).unwrap();
-        let suffix = format!("_{}", std::process::id());
-
+    let dir = fixture_root().join("tls-v1");
+    publish_dir_once(&dir, |staging| {
         let san = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
         let rcgen::CertifiedKey { cert, signing_key } =
-            rcgen::generate_simple_self_signed(san).unwrap();
-
-        let cert_tmp = dir.join(format!("cert{suffix}.pem"));
-        let key_tmp = dir.join(format!("key{suffix}.pem"));
-        std::fs::write(&cert_tmp, cert.pem()).unwrap();
-        std::fs::write(&key_tmp, signing_key.serialize_pem()).unwrap();
-
-        let _ = std::fs::rename(&cert_tmp, &cert_path);
-        let _ = std::fs::rename(&key_tmp, &key_path);
-        // Clean up if we lost the race.
-        let _ = std::fs::remove_file(&cert_tmp);
-        let _ = std::fs::remove_file(&key_tmp);
-    }
-
-    (cert_path, key_path)
+            rcgen::generate_simple_self_signed(san).expect("generate self-signed pair");
+        std::fs::write(staging.join("cert.pem"), cert.pem())?;
+        std::fs::write(staging.join("key.pem"), signing_key.serialize_pem())?;
+        Ok(())
+    })
+    .expect("publish the shared TLS fixture pair");
+    (dir.join("cert.pem"), dir.join("key.pem"))
 }
 
 /// Handle to a running test server, with one minted token per seeded role.
@@ -735,10 +778,13 @@ pub async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
     server
 }
 
-/// Set up a test server whose WAL lives under the given directory (which
-/// must outlive the server), querying the shared parquet fixtures.
+/// Set up a test server whose WAL and data root both live under the given
+/// directory (which must outlive the server). The data root is this
+/// test's own copy of the published parquet seed. Scheduled report
+/// output and repin staging therefore land where no other test can see
+/// them.
 pub async fn setup_in_dir(dir: &std::path::Path, rate_limit: RateLimitConfig) -> TestServer {
-    setup_in_dir_with_data(dir, ensure_fixtures(), rate_limit).await
+    setup_in_dir_with_data(dir, seed_data_root(dir), rate_limit).await
 }
 
 /// The derivation policy, resolved the way `main` resolves it.
