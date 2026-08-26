@@ -201,25 +201,109 @@ pub fn fleet_database_url(pool: &PgPool) -> String {
     swap_database(&admin_database_url(), db)
 }
 
-/// Create an empty sibling database for the trawl app-state store and
-/// return its DSN. trawld's real boot path migrates it.
-pub async fn create_app_database(pool: &PgPool) -> String {
-    sweep_stale_app_databases(pool).await;
-    // The run marker + owner pid are encoded in the name so future runs can
-    // tell an abandoned database from a live sibling's (see the sweep).
+/// Prefix of the app-state databases this fixture mints.
+const APP_DB_PREFIX: &str = "trawl_app_test";
+
+/// Prefix of the fleet-keystore databases this fixture mints (ADR-0021
+/// ruling 2: a full-server fixture outlives `#[sqlx::test]`'s teardown, so
+/// it mints the fleet database itself instead of borrowing the harness's).
+const FLEET_DB_PREFIX: &str = "trawl_fleet_test";
+
+/// Every prefix the sweeper is allowed to drop. A prefix that mints must
+/// appear here or its leftovers accumulate forever.
+const SWEPT_PREFIXES: [&str; 2] = [APP_DB_PREFIX, FLEET_DB_PREFIX];
+
+/// Fleet-keystore pool size for one fixture server.
+pub const FLEET_POOL_MAX: u32 = 3;
+
+/// App-store pool size for one fixture server.
+pub const APP_POOL_MAX: u32 = 3;
+
+/// The advisory-lock session the sweeper holds while it elects itself.
+pub const LOCK_CONNECTIONS: u32 = 1;
+
+/// The short-lived admin connection a mint or a kill opens and closes.
+pub const ADMIN_TRANSIENT: u32 = 1;
+
+/// Worst-case postgres connections one test may hold at once: 3 fleet +
+/// 3 app + 1 advisory-lock session + 1 transient admin connection. The
+/// nextest group width is derived from this against
+/// [`CI_MAX_CONNECTIONS`] (ADR-0021 ruling 4).
+pub const PER_TEST_CONNECTION_CEILING: u32 =
+    FLEET_POOL_MAX + APP_POOL_MAX + LOCK_CONNECTIONS + ADMIN_TRANSIENT;
+
+/// `max_connections` of the postgres CI runs against.
+pub const CI_MAX_CONNECTIONS: u32 = 100;
+
+/// The one sanctioned pool constructor for test code.
+///
+/// Every fixture pool is built here with an explicit ceiling, so the
+/// per-test connection budget is a property of this file rather than of
+/// whichever test last copied a `PgPoolOptions` chain. The `allow` below
+/// is the single enforcement point: once the pool constructors land in
+/// clippy's `disallowed_methods` for test code, this is the only site
+/// that opts out.
+pub async fn fixture_pool(dsn: &str, max_connections: u32) -> PgPool {
+    #[allow(clippy::disallowed_methods)]
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect(dsn)
+        .await
+        .expect("fixture pool connect");
+    pool
+}
+
+/// A fleet-keystore pool sized by [`FLEET_POOL_MAX`].
+pub async fn fleet_pool(dsn: &str) -> PgPool {
+    fixture_pool(dsn, FLEET_POOL_MAX).await
+}
+
+/// An app-store pool sized by [`APP_POOL_MAX`].
+pub async fn app_pool(dsn: &str) -> PgPool {
+    fixture_pool(dsn, APP_POOL_MAX).await
+}
+
+/// Create an EMPTY database under `prefix` and return its DSN.
+///
+/// The run marker and owner pid are encoded in the name so a future run
+/// can tell an abandoned database from a live sibling's (see the sweep),
+/// which is why every mint goes through this one formatter.
+async fn create_test_database(prefix: &str) -> String {
+    sweep_stale_test_databases().await;
     let name = format!(
-        "trawl_app_test_{}_{}_{}",
+        "{prefix}_{}_{}_{}",
         run_marker(),
         std::process::id(),
         random_db_suffix()
     );
-    pool.execute(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
+    let mut admin = PgConnection::connect(&admin_database_url())
         .await
-        .expect("CREATE DATABASE for app store — does the role have CREATEDB?");
+        .expect("connect to admin DB to mint a test database");
+    admin
+        .execute(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
+        .await
+        .expect("CREATE DATABASE for a test database — does the role have CREATEDB?");
     swap_database(&admin_database_url(), &name)
 }
 
-/// A marker shared by every test process of this nextest run (nextest
+/// Create an EMPTY sibling database for the trawl app-state store and
+/// return its DSN. trawld's real boot path migrates it (AC5).
+///
+/// `pool` is vestigial: the mint opens its own admin connection. It stays
+/// on the signature only because the call sites live in test binaries this
+/// milestone does not own; M3 drops both.
+pub async fn create_app_database(pool: &PgPool) -> String {
+    let _ = pool;
+    create_test_database(APP_DB_PREFIX).await
+}
+
+/// Create an EMPTY database for a fixture-owned fleet keystore and return
+/// its DSN. The caller runs `fleet_auth::MIGRATOR` on it.
+pub async fn create_fleet_database() -> String {
+    create_test_database(FLEET_DB_PREFIX).await
+}
+
+/// A marker shared by every test process of THIS nextest run (nextest
 /// exposes `NEXTEST_RUN_ID`; plain `cargo test` shares one process, so the
 /// pid suffices as fallback). Only alphanumerics survive, for db-name
 /// safety.
@@ -232,10 +316,10 @@ fn run_marker() -> String {
         .collect()
 }
 
-/// Parse `(run_marker, pid)` out of a `trawl_app_test_{run}_{pid}_{rand}`
-/// name. Names from other schemes yield `None` and are left alone.
-fn owner_of(datname: &str) -> Option<(String, u32)> {
-    let mut parts = datname.strip_prefix("trawl_app_test_")?.split('_');
+/// Parse `(run_marker, pid)` out of a `{prefix}_{run}_{pid}_{rand}` name.
+/// Names from other schemes yield `None` and are left alone.
+fn owner_of(datname: &str, prefix: &str) -> Option<(String, u32)> {
+    let mut parts = datname.strip_prefix(prefix)?.strip_prefix('_')?.split('_');
     let marker = parts.next()?.to_owned();
     let pid = parts.next()?.parse().ok()?;
     Some((marker, pid))
@@ -252,18 +336,19 @@ fn pid_alive(pid: u32) -> bool {
         .map_or(true, |s| s.success())
 }
 
-/// Best-effort sweep of sibling app databases leaked by earlier runs.
+/// Best-effort sweep of test databases leaked by earlier runs, over every
+/// prefix in [`SWEPT_PREFIXES`].
 ///
 /// The server's pools stay open until process exit, so a test cannot drop
-/// its own app database; instead each run garbage-collects its
-/// predecessors'. A database is only dropped when both guards agree it is
-/// abandoned: (a) it belongs to a different nextest run — same-run
-/// siblings are structurally never touched, even in the window between
-/// their CREATE and the server's first connection — and (b) the owner pid
-/// encoded in its name is no longer alive. A single advisory lock elects
-/// one sweeper at a time, and DROP without FORCE is a final safety net
-/// (live connections make it error harmlessly).
-async fn sweep_stale_app_databases(pool: &PgPool) {
+/// its OWN databases; instead each run garbage-collects its predecessors'.
+/// A database is only dropped when BOTH guards agree it is abandoned: (a)
+/// it belongs to a DIFFERENT nextest run — same-run siblings are
+/// structurally never touched, even in the window between their CREATE and
+/// the server's first connection — and (b) the owner pid encoded in its
+/// name is no longer alive. A single advisory lock elects one sweeper at a
+/// time, and DROP without FORCE is a final safety net (live connections
+/// make it error harmlessly). One lock, one pass, one LIKE per prefix.
+async fn sweep_stale_test_databases() {
     use sqlx::Row as _;
 
     let Ok(mut admin) = PgConnection::connect(&admin_database_url()).await else {
@@ -280,17 +365,20 @@ async fn sweep_stale_app_databases(pool: &PgPool) {
         return;
     }
 
-    if let Ok(rows) =
-        sqlx::query("SELECT datname FROM pg_database WHERE datname LIKE 'trawl_app_test_%'")
+    let marker = run_marker();
+    for prefix in SWEPT_PREFIXES {
+        let Ok(rows) = sqlx::query("SELECT datname FROM pg_database WHERE datname LIKE $1")
+            .bind(format!("{prefix}_%"))
             .fetch_all(&mut admin)
             .await
-    {
-        let marker = run_marker();
+        else {
+            continue;
+        };
         for row in rows {
             let Ok(name): Result<String, _> = row.try_get("datname") else {
                 continue;
             };
-            let Some((owner_marker, owner_pid)) = owner_of(&name) else {
+            let Some((owner_marker, owner_pid)) = owner_of(&name, prefix) else {
                 continue;
             };
             if owner_marker == marker || pid_alive(owner_pid) {
@@ -306,25 +394,36 @@ async fn sweep_stale_app_databases(pool: &PgPool) {
     let _ = sqlx::query("SELECT pg_advisory_unlock(741_852_963)")
         .execute(&mut admin)
         .await;
-    let _ = pool; // sweep uses its own admin connection
 }
 
 #[test]
 fn sweep_guards_parse_own_database_name() {
     // The sweeper's abandoned-db detection must round-trip the naming
-    // scheme `create_app_database` uses: a parse mismatch here silently
-    // turns the sweeper into a live-sibling killer, which surfaces as
-    // transient 'database does not exist' boot failures.
-    let name = format!(
-        "trawl_app_test_{}_{}_{}",
+    // scheme `create_test_database` uses, for EVERY prefix it mints under
+    // — a parse mismatch here silently turns the sweeper into a
+    // live-sibling killer (it did once: the guard-bypassing bug behind
+    // transient 'database does not exist' boot failures).
+    for prefix in SWEPT_PREFIXES {
+        let name = format!(
+            "{prefix}_{}_{}_{}",
+            run_marker(),
+            std::process::id(),
+            "abcdefghijkl"
+        );
+        let (marker, pid) = owner_of(&name, prefix).expect("own name must parse");
+        assert_eq!(marker, run_marker());
+        assert_eq!(pid, std::process::id());
+        assert!(pid_alive(pid), "our own pid is alive");
+    }
+    // A name minted under one prefix must not parse as another's: the
+    // sweeper reads each LIKE result under the prefix that matched it.
+    let app = format!(
+        "{APP_DB_PREFIX}_{}_{}_abcdefghijkl",
         run_marker(),
-        std::process::id(),
-        "abcdefghijkl"
+        std::process::id()
     );
-    let (marker, pid) = owner_of(&name).expect("own name must parse");
-    assert_eq!(marker, run_marker());
-    assert_eq!(pid, std::process::id());
-    assert!(pid_alive(pid), "our own pid is alive");
+    assert!(owner_of(&app, FLEET_DB_PREFIX).is_none());
+    assert!(owner_of("someone_elses_database", APP_DB_PREFIX).is_none());
 }
 
 /// Forcibly drop a database by DSN, terminating live connections —
