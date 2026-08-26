@@ -18,25 +18,25 @@ use fleet_auth::{KeyStore, PrincipalKind};
 use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
 
-#[sqlx::test(migrations = false)]
-async fn health_returns_ok(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn health_returns_ok() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, "unused").unwrap();
     let health = client.health().await.unwrap();
     assert_eq!(health.status, trawl_api::HealthStatus::Ok);
 }
 
-#[sqlx::test(migrations = false)]
-async fn query_returns_results(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn query_returns_results() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client.query_paginated("*", None, None).await.unwrap();
     assert_eq!(result.result.row_count(), 3);
 }
 
-#[sqlx::test(migrations = false)]
-async fn query_with_filter(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn query_with_filter() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client
         .query_paginated("service=nginx", None, None)
@@ -45,9 +45,9 @@ async fn query_with_filter(pool: sqlx::PgPool) {
     assert_eq!(result.result.row_count(), 2);
 }
 
-#[sqlx::test(migrations = false)]
-async fn query_with_stats_pipeline(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn query_with_stats_pipeline() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client
         .query_paginated("* | stats count() by service", None, None)
@@ -57,9 +57,9 @@ async fn query_with_stats_pipeline(pool: sqlx::PgPool) {
     assert_eq!(result.result.row_count(), 2);
 }
 
-#[sqlx::test(migrations = false)]
-async fn query_rejects_missing_auth(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn query_rejects_missing_auth() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, "").unwrap();
 
     let result = client.query_paginated("*", None, None).await;
@@ -73,9 +73,9 @@ async fn query_rejects_missing_auth(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn query_rejects_invalid_token(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn query_rejects_invalid_token() {
+    let server = setup().await;
     let client =
         HttpClient::new_insecure(&server.url, "flt_ZZZZZZZZ_totally_fake_token_here1234").unwrap();
 
@@ -90,9 +90,9 @@ async fn query_rejects_invalid_token(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn query_rejects_bad_dsl(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn query_rejects_bad_dsl() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = client.query_paginated("| | | broken {{{", None, None).await;
@@ -166,8 +166,9 @@ mod lifecycle_capture {
 ///
 /// One test, four sentinels: the capture layer is a global subscriber, and
 /// only the first installer in a process wins.
-#[sqlx::test(migrations = false)]
-async fn query_export_and_stream_telemetry_carry_no_user_content(pool: sqlx::PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+async fn query_export_and_stream_telemetry_carry_no_user_content() {
     use lifecycle_capture::Capture;
     use tracing_subscriber::prelude::*;
 
@@ -189,7 +190,7 @@ async fn query_export_and_stream_telemetry_carry_no_user_content(pool: sqlx::PgP
     // Global (not thread-local) — the server runs on other tokio workers.
     tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
 
-    let server = setup(pool).await;
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // The sentinel is a bare-text search term: valid DSL, matches nothing.
@@ -397,9 +398,9 @@ async fn query_export_and_stream_telemetry_carry_no_user_content(pool: sqlx::PgP
 /// are legitimately aged out of the default listing. `?all=true` is the
 /// window-lifted view this test wants (the windowing itself is covered by
 /// `catalog_surface::aged_out_field_windowed_away_unless_all`).
-#[sqlx::test(migrations = false)]
-async fn schema_returns_columns(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_returns_columns() {
+    let server = setup().await;
 
     let schema: trawl_api::SchemaResponse = raw_client()
         .get(format!("{}/api/v1/schema?all=true", server.url))
@@ -453,9 +454,9 @@ async fn schema_returns_columns(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test(migrations = false)]
-async fn schema_columns_come_from_the_catalog_not_describe(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_columns_come_from_the_catalog_not_describe() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // Pin a field that exists in no parquet file anywhere: a DESCRIBE sweep
@@ -482,9 +483,9 @@ async fn schema_columns_come_from_the_catalog_not_describe(pool: sqlx::PgPool) {
     assert_eq!(col.data_type, "BIGINT");
 }
 
-#[sqlx::test(migrations = false)]
-async fn schema_caching_works(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_caching_works() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let first = client.schema().await.unwrap();
@@ -496,9 +497,9 @@ async fn schema_caching_works(pool: sqlx::PgPool) {
 
 // -- queries endpoint tests --------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn queries_shows_history(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn queries_shows_history() {
+    let server = setup().await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
@@ -514,9 +515,9 @@ async fn queries_shows_history(pool: sqlx::PgPool) {
     assert!(!queries.recent[0].timed_out);
 }
 
-#[sqlx::test(migrations = false)]
-async fn queries_accessible_by_analyst_and_reader(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn queries_accessible_by_analyst_and_reader() {
+    let server = setup().await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
@@ -525,9 +526,9 @@ async fn queries_accessible_by_analyst_and_reader(pool: sqlx::PgPool) {
     reader.queries().await.unwrap();
 }
 
-#[sqlx::test(migrations = false)]
-async fn queries_rejects_ingest_role(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn queries_rejects_ingest_role() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let result = client.queries().await;
@@ -551,9 +552,9 @@ fn raw_client() -> reqwest::Client {
         .unwrap()
 }
 
-#[sqlx::test(migrations = false)]
-async fn ingest_accepts_ndjson(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_accepts_ndjson() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let records = vec![
@@ -573,9 +574,10 @@ async fn ingest_accepts_ndjson(pool: sqlx::PgPool) {
 /// the severity vocabulary riding `_severity`, which nothing can shadow.
 /// The game server's `level:"gold"` keeps its column and gets no
 /// `_severity` at all.
-#[sqlx::test(migrations = false)]
-async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+async fn vector_shaped_ingest_is_queryable() {
+    let server = setup().await;
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
     let query = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
@@ -749,15 +751,15 @@ async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
 /// The forgery half matters as much as the stamp: a sender that puts
 /// `_producer` on the wire must find it under the bare `producer`
 /// remainder, with the real column still naming the door.
-#[sqlx::test(migrations = false)]
-async fn producer_is_stamped_stored_and_queryable_per_door(pool: sqlx::PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn producer_is_stamped_stored_and_queryable_per_door() {
     use std::collections::HashMap;
 
     use indexmap::IndexMap;
     use trawl_server::ingest::pipeline::ServiceBatch;
     use trawl_server::syslog::convert::SyslogDoor;
 
-    let server = setup(pool).await;
+    let server = setup().await;
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
     let query = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
@@ -855,9 +857,9 @@ async fn producer_is_stamped_stored_and_queryable_per_door(pool: sqlx::PgPool) {
 
 /// An event with an unlisted env is rejected per-event with a typed
 /// message; the sibling with no env lands under `default_env`.
-#[sqlx::test(migrations = false)]
-async fn ingest_unlisted_env_rejected_per_event(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_unlisted_env_rejected_per_event() {
+    let server = setup().await;
     let client = raw_client();
 
     let body = "{\"service\":\"env-svc\",\"env\":\"nope\",\"message\":\"bad\"}\n\
@@ -883,9 +885,9 @@ async fn ingest_unlisted_env_rejected_per_event(pool: sqlx::PgPool) {
 
 /// Repairs surface as `trawl_ingest_repairs_total{code, service}` on the
 /// unauthenticated /metrics endpoint.
-#[sqlx::test(migrations = false)]
-async fn ingest_repairs_exposed_on_metrics(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_repairs_exposed_on_metrics() {
+    let server = setup().await;
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let records = vec![serde_json::json!({
@@ -920,9 +922,9 @@ async fn ingest_repairs_exposed_on_metrics(pool: sqlx::PgPool) {
 /// `trawl_severity_unmapped_total{service}` on /metrics — one increment per
 /// event whose source mapped to nothing, and no series at all for a sender
 /// whose source mapped fine (ADR-0013 §2).
-#[sqlx::test(migrations = false)]
-async fn unmapped_severity_exposed_on_metrics(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn unmapped_severity_exposed_on_metrics() {
+    let server = setup().await;
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let records = vec![
@@ -959,9 +961,9 @@ async fn unmapped_severity_exposed_on_metrics(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test(migrations = false)]
-async fn ingest_rejects_missing_auth(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_rejects_missing_auth() {
+    let server = setup().await;
     let client = raw_client();
 
     let resp = client
@@ -975,9 +977,9 @@ async fn ingest_rejects_missing_auth(pool: sqlx::PgPool) {
     assert_eq!(resp.status(), 401);
 }
 
-#[sqlx::test(migrations = false)]
-async fn ingest_rejects_analyst_role(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_rejects_analyst_role() {
+    let server = setup().await;
     let client = raw_client();
 
     let resp = client
@@ -992,9 +994,9 @@ async fn ingest_rejects_analyst_role(pool: sqlx::PgPool) {
     assert_eq!(resp.status(), 401);
 }
 
-#[sqlx::test(migrations = false)]
-async fn ingest_partial_success(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_partial_success() {
+    let server = setup().await;
     let client = raw_client();
 
     // 3 ndjson events: good, bad json, good
@@ -1017,9 +1019,9 @@ async fn ingest_partial_success(pool: sqlx::PgPool) {
     assert_eq!(body.errors[0].index, 1);
 }
 
-#[sqlx::test(migrations = false)]
-async fn ingest_all_rejected_per_event(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_all_rejected_per_event() {
+    let server = setup().await;
     let client = raw_client();
 
     // All 3 events are bad (no service field)
@@ -1044,15 +1046,12 @@ async fn ingest_all_rejected_per_event(pool: sqlx::PgPool) {
 
 // -- rate limit tests --------------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn rate_limit_returns_429(pool: sqlx::PgPool) {
-    let server = setup_with_rate_limit(
-        pool,
-        RateLimitConfig {
-            default_rpm: 2, // burst of 2
-            ..RateLimitConfig::default()
-        },
-    )
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_returns_429() {
+    let server = setup_with_rate_limit(RateLimitConfig {
+        default_rpm: 2, // burst of 2
+        ..RateLimitConfig::default()
+    })
     .await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
@@ -1077,16 +1076,13 @@ async fn rate_limit_returns_429(pool: sqlx::PgPool) {
 /// two route classes hold separate bucket maps. Without the split, one number
 /// has to serve both, and sizing it for vector hands every interactive key the
 /// same budget (the loosening this test exists to catch).
-#[sqlx::test(migrations = false)]
-async fn ingest_rpm_is_independent_of_the_interactive_ceiling(pool: sqlx::PgPool) {
-    let server = setup_with_rate_limit(
-        pool,
-        RateLimitConfig {
-            default_rpm: 1,
-            ingest_rpm: 10,
-            ..RateLimitConfig::default()
-        },
-    )
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_rpm_is_independent_of_the_interactive_ceiling() {
+    let server = setup_with_rate_limit(RateLimitConfig {
+        default_rpm: 1,
+        ingest_rpm: 10,
+        ..RateLimitConfig::default()
+    })
     .await;
     let raw = raw_client();
 
@@ -1116,19 +1112,16 @@ async fn ingest_rpm_is_independent_of_the_interactive_ceiling(pool: sqlx::PgPool
     }
 }
 
-/// Two keys holding the same role get independent buckets: the limiter keys
-/// on the keystore id, not on any shared role bucket. Exhausting key A's
-/// quota 429s A while key B still gets 200. (Role here is test-side policy
-/// vocabulary only; the limiter never sees it.)
-#[sqlx::test(migrations = false)]
-async fn rate_limit_isolates_keys_with_same_role(pool: sqlx::PgPool) {
-    let server = setup_with_rate_limit(
-        pool,
-        RateLimitConfig {
-            default_rpm: 2, // burst of 2 per key
-            ..RateLimitConfig::default()
-        },
-    )
+/// AC1 (ADR-0006 slice 0): two keys holding the SAME role get independent
+/// buckets — the limiter keys on the keystore id, not on any shared role
+/// bucket. Exhausting key A's quota 429s A while key B still gets 200.
+/// (Role here is test-side policy vocabulary only; the limiter never sees it.)
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_isolates_keys_with_same_role() {
+    let server = setup_with_rate_limit(RateLimitConfig {
+        default_rpm: 2, // burst of 2 per key
+        ..RateLimitConfig::default()
+    })
     .await;
 
     // Two analyst keys with distinct keystore ids.
@@ -1181,16 +1174,13 @@ async fn rate_limit_isolates_keys_with_same_role(pool: sqlx::PgPool) {
 /// the limiter (axum resolves `body: Bytes` first), so an ungated ingest bucket
 /// would widen every reader/analyst key's throughput on the heaviest endpoint
 /// to the shipper ceiling. A reader must stay on `default_rpm`.
-#[sqlx::test(migrations = false)]
-async fn ingest_ceiling_does_not_apply_to_keys_without_ingest_permission(pool: sqlx::PgPool) {
-    let server = setup_with_rate_limit(
-        pool,
-        RateLimitConfig {
-            default_rpm: 1,
-            ingest_rpm: 10,
-            ..RateLimitConfig::default()
-        },
-    )
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_ceiling_does_not_apply_to_keys_without_ingest_permission() {
+    let server = setup_with_rate_limit(RateLimitConfig {
+        default_rpm: 1,
+        ingest_rpm: 10,
+        ..RateLimitConfig::default()
+    })
     .await;
     let raw = raw_client();
 
@@ -1227,9 +1217,9 @@ async fn ingest_ceiling_does_not_apply_to_keys_without_ingest_permission(pool: s
 
 // ── endpoint tests (cancellation, validation, pagination, stats, field values) ──
 
-#[sqlx::test(migrations = false)]
-async fn cancel_query_by_admin(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_query_by_admin() {
+    let server = setup().await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
@@ -1250,9 +1240,9 @@ async fn cancel_query_by_admin(pool: sqlx::PgPool) {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), slow_query).await;
 }
 
-#[sqlx::test(migrations = false)]
-async fn cancel_query_nonexistent_returns_false(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_query_nonexistent_returns_false() {
+    let server = setup().await;
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let resp = admin.cancel_query(9999).await.unwrap();
@@ -1260,9 +1250,9 @@ async fn cancel_query_nonexistent_returns_false(pool: sqlx::PgPool) {
     assert_eq!(resp.query_id, 9999);
 }
 
-#[sqlx::test(migrations = false)]
-async fn cancel_query_by_analyst_for_nonexistent(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_query_by_analyst_for_nonexistent() {
+    let server = setup().await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // Analyst gets "cannot cancel" for non-existent queries — no information
@@ -1271,9 +1261,9 @@ async fn cancel_query_by_analyst_for_nonexistent(pool: sqlx::PgPool) {
     assert!(result.is_err());
 }
 
-#[sqlx::test(migrations = false)]
-async fn cancel_query_rejects_ingest_role(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_query_rejects_ingest_role() {
+    let server = setup().await;
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
 
     let result = ingest.cancel_query(1).await;
@@ -1292,20 +1282,23 @@ async fn cancel_query_rejects_ingest_role(pool: sqlx::PgPool) {
 /// key B cannot cancel key A's in-flight query, while owner A passes the gate
 /// and actually interrupts the query.
 ///
-/// The query has to be genuinely *active*: a completed one has no tracked
-/// owner under either scheme, so only a live entry tells id-matching and
-/// name-matching apart. The pool's `TEST_QUERY_DELAY_MS` hook (the crate's
-/// `test-support` feature) holds it in flight deterministically, instead of
-/// betting on dataset size against a fast CI runner.
-#[sqlx::test(migrations = false)]
-async fn cancel_query_isolated_by_key_id_not_name(pool: sqlx::PgPool) {
+/// A revert to name-matching would let B (same name) through, so this test
+/// guards that regression. It needs a genuinely *active* query — a completed
+/// one has no tracked owner under either scheme, so only a live entry can tell
+/// id-matching from name-matching apart.
+///
+/// The pool's `TEST_QUERY_DELAY_MS` hook (via the crate's `test-support`
+/// feature) holds the query in-flight deterministically — no dataset-size
+/// timing bets against fast CI runners.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_query_isolated_by_key_id_not_name() {
     // Permissive rate limits: the observe/cancel polls below run in a tight
     // window and must not trip the per-minute buckets.
     let permissive = RateLimitConfig {
         default_rpm: 1_000_000,
         ..RateLimitConfig::default()
     };
-    let server = setup_with_rate_limit(pool, permissive).await;
+    let server = setup_with_rate_limit(permissive).await;
 
     // Hold every pool query open long enough to observe and cancel it.
     // nextest runs each test in its own process, so the global is private
@@ -1402,9 +1395,9 @@ async fn cancel_query_isolated_by_key_id_not_name(pool: sqlx::PgPool) {
     let _ = slow.await;
 }
 
-#[sqlx::test(migrations = false)]
-async fn validate_query_valid(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_query_valid() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client
@@ -1415,9 +1408,9 @@ async fn validate_query_valid(pool: sqlx::PgPool) {
     assert!(resp.errors.is_empty());
 }
 
-#[sqlx::test(migrations = false)]
-async fn validate_query_syntax_error(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_query_syntax_error() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client
@@ -1428,9 +1421,9 @@ async fn validate_query_syntax_error(pool: sqlx::PgPool) {
     assert!(!resp.errors.is_empty());
 }
 
-#[sqlx::test(migrations = false)]
-async fn validate_query_unknown_function(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_query_unknown_function() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client.validate("* | stats unknown_func()").await.unwrap();
@@ -1438,9 +1431,9 @@ async fn validate_query_unknown_function(pool: sqlx::PgPool) {
     assert!(resp.errors.iter().any(|e| e.message.contains("unknown")));
 }
 
-#[sqlx::test(migrations = false)]
-async fn query_pagination_limit_offset(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn query_pagination_limit_offset() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     // The fixture holds 3 rows.
@@ -1451,9 +1444,9 @@ async fn query_pagination_limit_offset(pool: sqlx::PgPool) {
     assert_eq!(resp.result.row_count(), 2);
 }
 
-#[sqlx::test(migrations = false)]
-async fn query_pagination_offset_beyond_results(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn query_pagination_offset_beyond_results() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client
@@ -1465,9 +1458,9 @@ async fn query_pagination_offset_beyond_results(pool: sqlx::PgPool) {
     assert_eq!(resp.result.row_count(), 0);
 }
 
-#[sqlx::test(migrations = false)]
-async fn query_pagination_defaults(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn query_pagination_defaults() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client.query_paginated("*", None, None).await.unwrap();
@@ -1475,18 +1468,18 @@ async fn query_pagination_defaults(pool: sqlx::PgPool) {
     assert_eq!(resp.pagination.returned, 3);
 }
 
-#[sqlx::test(migrations = false)]
-async fn stats_endpoint_admin_only(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_endpoint_admin_only() {
+    let server = setup().await;
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let stats = admin.stats().await.unwrap();
     assert!(stats.pool_capacity > 0);
 }
 
-#[sqlx::test(migrations = false)]
-async fn stats_endpoint_analyst_forbidden(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn stats_endpoint_analyst_forbidden() {
+    let server = setup().await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = analyst.stats().await;
@@ -1497,9 +1490,9 @@ async fn stats_endpoint_analyst_forbidden(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn dashboard_rejects_analyst(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_rejects_analyst() {
+    let server = setup().await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = analyst.dashboard().await;
@@ -1510,12 +1503,12 @@ async fn dashboard_rejects_analyst(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn dashboard_becomes_available_once_collector_ticks(pool: sqlx::PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_becomes_available_once_collector_ticks() {
     // The harness spawns the snapshot collector (same as trawld's main());
     // before its first tick the endpoint is 503 (snapshot is None), after
     // it the snapshot serves. Poll briefly.
-    let server = setup(pool).await;
+    let server = setup().await;
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1537,9 +1530,9 @@ async fn dashboard_becomes_available_once_collector_ticks(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn dashboard_stream_rejects_analyst(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_stream_rejects_analyst() {
+    let server = setup().await;
     let client = raw_client();
 
     let resp = client
@@ -1552,9 +1545,9 @@ async fn dashboard_stream_rejects_analyst(pool: sqlx::PgPool) {
     assert_eq!(resp.status(), 401);
 }
 
-#[sqlx::test(migrations = false)]
-async fn dashboard_stream_emits_stats_event(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_stream_emits_stats_event() {
+    let server = setup().await;
     let client = raw_client();
 
     let resp = client
@@ -1602,9 +1595,9 @@ async fn dashboard_stream_emits_stats_event(pool: sqlx::PgPool) {
     assert!(snapshot.pool_capacity > 0);
 }
 
-#[sqlx::test(migrations = false)]
-async fn whoami_admin_has_server_manage(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn whoami_admin_has_server_manage() {
+    let server = setup().await;
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
     let resp = admin.whoami().await.unwrap();
@@ -1624,9 +1617,9 @@ async fn whoami_admin_has_server_manage(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test(migrations = false)]
-async fn whoami_reader_lacks_server_manage(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn whoami_reader_lacks_server_manage() {
+    let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     let resp = reader.whoami().await.unwrap();
@@ -1635,21 +1628,22 @@ async fn whoami_reader_lacks_server_manage(pool: sqlx::PgPool) {
     assert!(resp.permissions.contains(&"query".to_owned()));
 }
 
-#[sqlx::test(migrations = false)]
-async fn whoami_rejects_missing_auth(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn whoami_rejects_missing_auth() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, "invalid-token").unwrap();
 
     let result = client.whoami().await;
     assert!(result.is_err());
 }
 
-#[sqlx::test(migrations = false)]
-async fn whoami_no_trawl_grant_is_403(pool: sqlx::PgPool) {
-    // The mandatory trawl policy layer rejects a foreign-app-only key on every
-    // authenticated route, /whoami included: a grantless key must not learn its
-    // cross-app assignments here.
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn whoami_no_trawl_grant_is_403() {
+    // Policy change with the fleet-auth cutover (ADR-0004): a foreign-app-only
+    // key is rejected by the mandatory trawl policy layer on EVERY
+    // authenticated route — including /whoami, which previously leaked
+    // cross-app assignments to grantless keys.
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.coastwatch_only_token).unwrap();
 
     let result = client.whoami().await;
@@ -1659,9 +1653,9 @@ async fn whoami_no_trawl_grant_is_403(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn field_values_endpoint(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn field_values_endpoint() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client.field_values("service", Some(5), None).await.unwrap();
@@ -1670,9 +1664,9 @@ async fn field_values_endpoint(pool: sqlx::PgPool) {
     assert!(resp.values.iter().any(|v| v == "nginx"));
 }
 
-#[sqlx::test(migrations = false)]
-async fn field_values_cached(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn field_values_cached() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp1 = client.field_values("service", None, None).await.unwrap();
@@ -1682,9 +1676,9 @@ async fn field_values_cached(pool: sqlx::PgPool) {
     assert!(resp2.cached);
 }
 
-#[sqlx::test(migrations = false)]
-async fn field_values_invalid_field_name(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn field_values_invalid_field_name() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let result = client.field_values("bad;name", None, None).await;
@@ -1697,9 +1691,9 @@ async fn field_values_invalid_field_name(pool: sqlx::PgPool) {
 
 // -- request ID tests --------------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn response_includes_ulid_request_id(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn response_includes_ulid_request_id() {
+    let server = setup().await;
     let client = raw_client();
 
     let resp = client
@@ -1732,17 +1726,17 @@ fn assert_401<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) 
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn validate_rejects_reader(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_rejects_reader() {
+    let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.validate("* | head 1").await);
 }
 
-#[sqlx::test(migrations = false)]
-async fn saved_queries_reject_reader(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_queries_reject_reader() {
+    let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.list_saved().await);
@@ -1751,9 +1745,9 @@ async fn saved_queries_reject_reader(pool: sqlx::PgPool) {
     assert_401(reader.delete_saved(1).await);
 }
 
-#[sqlx::test(migrations = false)]
-async fn export_rejects_reader(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn export_rejects_reader() {
+    let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(
@@ -1763,9 +1757,9 @@ async fn export_rejects_reader(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test(migrations = false)]
-async fn reader_can_query_and_view_history(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn reader_can_query_and_view_history() {
+    let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     let resp = reader
@@ -1782,9 +1776,9 @@ async fn reader_can_query_and_view_history(pool: sqlx::PgPool) {
 // Runs stats endpoint
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn runs_stats_empty(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_stats_empty() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let stats = client.runs_stats().await.unwrap();
@@ -1795,9 +1789,9 @@ async fn runs_stats_empty(pool: sqlx::PgPool) {
     assert_eq!(stats.avg_duration_ms, None);
 }
 
-#[sqlx::test(migrations = false)]
-async fn runs_stats_rejects_reader(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_stats_rejects_reader() {
+    let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.runs_stats().await);
@@ -1807,9 +1801,9 @@ async fn runs_stats_rejects_reader(pool: sqlx::PgPool) {
 // Trigger run endpoint
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn trigger_run_requires_schedule(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn trigger_run_requires_schedule() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let saved = client
@@ -1829,9 +1823,9 @@ async fn trigger_run_requires_schedule(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn trigger_run_starts_execution(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn trigger_run_starts_execution() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let saved = client
@@ -1863,19 +1857,19 @@ async fn trigger_run_starts_execution(pool: sqlx::PgPool) {
     assert!(stats.avg_duration_ms.is_some());
 }
 
-#[sqlx::test(migrations = false)]
-async fn trigger_run_rejects_reader(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn trigger_run_rejects_reader() {
+    let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
     assert_401(reader.trigger_run(1).await);
 }
 
-#[sqlx::test(migrations = false)]
-async fn trigger_run_rejects_when_max_runs_reached(pool: sqlx::PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn trigger_run_rejects_when_max_runs_reached() {
     use trawl_server::store::schedule::{RunClaim, ScheduleStore};
 
-    let server = setup(pool).await;
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let saved = client
@@ -1916,11 +1910,11 @@ async fn trigger_run_rejects_when_max_runs_reached(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn trigger_run_rejects_when_already_running(pool: sqlx::PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn trigger_run_rejects_when_already_running() {
     use trawl_server::store::schedule::{RunClaim, ScheduleStore};
 
-    let server = setup(pool).await;
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let saved = client
@@ -1966,9 +1960,9 @@ async fn trigger_run_rejects_when_already_running(pool: sqlx::PgPool) {
 // Rename net (update with name)
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn rename_saved_query(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn rename_saved_query() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let saved = client.create_saved("old-name", "* | head 1").await.unwrap();
@@ -1985,9 +1979,9 @@ async fn rename_saved_query(pool: sqlx::PgPool) {
     assert!(!list.queries.iter().any(|q| q.name == "old-name"));
 }
 
-#[sqlx::test(migrations = false)]
-async fn rename_to_duplicate_fails(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn rename_to_duplicate_fails() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     client
@@ -2017,9 +2011,9 @@ async fn rename_to_duplicate_fails(pool: sqlx::PgPool) {
 // List all runs endpoint
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn list_all_runs_paginated(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_runs_paginated() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
     let resp = client.list_all_runs(Some(10), None).await.unwrap();
@@ -2031,13 +2025,14 @@ async fn list_all_runs_paginated(pool: sqlx::PgPool) {
 // repin surface
 // ---------------------------------------------------------------------------
 
-/// `SchemaWrite` gates the trigger: the admin role holds no `schema_write`
-/// and is refused, while the schema-admin role — which deliberately lacks
-/// `server_manage` — may trigger. The status route is `SchemaRead`, so a
-/// read-only key sees state without being offered the trigger.
-#[sqlx::test(migrations = false)]
-async fn repin_permission_matrix(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+/// `SchemaWrite` gates the trigger: even the admin role (frozen conversion
+/// bundle, no `schema_write`) is refused, while the schema-admin role —
+/// which deliberately lacks `server_manage` — may trigger. The status
+/// surface is `SchemaRead` (read-only surfaces show state without
+/// offering the trigger).
+#[tokio::test(flavor = "multi_thread")]
+async fn repin_permission_matrix() {
+    let server = setup().await;
 
     // Admin: the broadest standing role, server_manage included, and still
     // no schema_write.
@@ -2097,9 +2092,9 @@ async fn repin_permission_matrix(pool: sqlx::PgPool) {
 
 /// Contract-typed fields, unknown target types and unpinned fields refuse
 /// with 400 before any job row exists — validation is side-effect-free.
-#[sqlx::test(migrations = false)]
-async fn repin_validation_refusals_are_side_effect_free(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn repin_validation_refusals_are_side_effect_free() {
+    let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
 
     for (field, to) in [
@@ -2190,12 +2185,13 @@ fn sse_payloads_ignores_a_half_arrived_frame() {
 /// event on the pass-through lane and one per emitted snapshot on the
 /// aggregate lane, which no in-process test of the door can observe.
 /// The clock here is the real one, so the assertions are the ones a real
-/// clock can carry: reads that must be equal. Under per-read or per-row
-/// sampling they would differ by the microseconds it takes to evaluate
-/// the next stage, which is why equality is the discriminating direction.
-#[sqlx::test(migrations = false)]
-async fn sse_freezes_now_per_event_and_per_snapshot(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+/// clock can carry: reads that must be EQUAL. Under any per-read or
+/// per-row sampling they would differ by the microseconds it takes to
+/// evaluate the next stage, which is why equality is the discriminating
+/// direction.
+#[tokio::test(flavor = "multi_thread")]
+async fn sse_freezes_now_per_event_and_per_snapshot() {
+    let server = setup().await;
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
     let raw = raw_client();
 
