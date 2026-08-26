@@ -27,7 +27,7 @@ services:
       POSTGRES_DB: fleet_test
     # max_connections raised well past stock 100: process-per-test sqlx pools
     # (8 conns each) at full pre-push parallelism can exceed the default —
-    # see the budget math in .config/nextest.toml's pg test-group comment.
+    # see the budget math in .config/nextest.toml's postgres test-group comment.
     command: -c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=300
     tmpfs:
       - /var/lib/postgresql
