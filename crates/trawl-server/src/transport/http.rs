@@ -245,24 +245,12 @@ async fn connection_gauge_middleware(request: Request, next: middleware::Next) -
     response
 }
 
-#[allow(clippy::too_many_lines)] // accept loop + shutdown drain are cohesive
-/// Start the HTTPS server with graceful shutdown.
-///
-/// Binds a TCP listener, wraps connections in TLS via `tokio-rustls`,
-/// and serves each connection through hyper + axum. On shutdown signal,
-/// stops accepting new connections and drains in-flight requests up to
-/// `shutdown_drain_secs`.
-pub async fn serve(
-    state: AppState,
-    http: &HttpConfig,
+/// Build the TLS acceptor for a serve path, warning when the certificate was
+/// auto-generated.
+fn build_tls_acceptor(
     config: &ServerConfig,
     state_dir: &Path,
-    external_shutdown: Option<Arc<tokio::sync::Notify>>,
-) -> Result<(), crate::error::ServerError> {
-    let drain_secs = http.shutdown_drain_secs;
-    let addr = &config.http_addr;
-
-    // Build TLS config (loads or auto-generates cert).
+) -> Result<TlsAcceptor, crate::error::ServerError> {
     let (tls_config, self_signed) = tls::build_server_config(
         config.tls_cert_path.as_deref(),
         config.tls_key_path.as_deref(),
@@ -277,15 +265,103 @@ pub async fn serve(
         );
     }
 
-    let tls_acceptor = TlsAcceptor::from(tls_config);
-    let pool = state.query.pool.clone();
-    let app = router(state, http);
+    Ok(TlsAcceptor::from(tls_config))
+}
+
+/// Start the HTTPS server with graceful shutdown.
+///
+/// Binds a TCP listener, wraps connections in TLS via `tokio-rustls`,
+/// and serves each connection through hyper + axum. On shutdown signal,
+/// stops accepting new connections and drains in-flight requests up to
+/// `shutdown_drain_secs`.
+pub async fn serve(
+    state: AppState,
+    http: &HttpConfig,
+    config: &ServerConfig,
+    state_dir: &Path,
+    external_shutdown: Option<Arc<tokio::sync::Notify>>,
+) -> Result<(), crate::error::ServerError> {
+    let addr = &config.http_addr;
+
+    // Build TLS config (loads or auto-generates cert).
+    let tls_acceptor = build_tls_acceptor(config, state_dir)?;
 
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| crate::error::ServerError::Internal(format!("failed to bind {addr}: {e}")))?;
 
     tracing::info!(event_type = "lifecycle", addr = %addr, "HTTPS server listening");
+
+    accept_loop(
+        listener,
+        tls_acceptor,
+        state,
+        http,
+        config,
+        external_shutdown,
+    )
+    .await
+}
+
+/// Serve over a listener the caller already bound.
+///
+/// Same TLS setup, accept loop and shutdown drain as [`serve`]. The one
+/// difference is where the socket comes from: `config.http_addr` is NOT
+/// consulted on this path, it is informational only, and the address logged
+/// at startup is the listener's own `local_addr`. That is the point — a
+/// caller binding port 0 to get a free port keeps the socket it tested.
+pub async fn serve_with_listener(
+    listener: std::net::TcpListener,
+    state: AppState,
+    http: &HttpConfig,
+    config: &ServerConfig,
+    state_dir: &Path,
+    external_shutdown: Option<Arc<tokio::sync::Notify>>,
+) -> Result<(), crate::error::ServerError> {
+    let tls_acceptor = build_tls_acceptor(config, state_dir)?;
+
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| crate::error::ServerError::Internal(format!("listener local_addr: {e}")))?;
+
+    // A std listener is blocking by default, and tokio does not change that
+    // for us. Registering a blocking socket with the reactor turns the accept
+    // loop into a 100%-CPU spin, so set nonblocking here rather than trusting
+    // every caller to remember.
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| crate::error::ServerError::Internal(format!("set_nonblocking failed: {e}")))?;
+    let listener = TcpListener::from_std(listener).map_err(|e| {
+        crate::error::ServerError::Internal(format!("failed to adopt listener: {e}"))
+    })?;
+
+    tracing::info!(event_type = "lifecycle", addr = %local_addr, "HTTPS server listening");
+
+    accept_loop(
+        listener,
+        tls_acceptor,
+        state,
+        http,
+        config,
+        external_shutdown,
+    )
+    .await
+}
+
+/// The shared tail of both serve paths: cert hot-reload, the TLS accept loop,
+/// and the graceful shutdown drain.
+#[allow(clippy::too_many_lines)] // accept loop + shutdown drain are cohesive
+async fn accept_loop(
+    listener: TcpListener,
+    tls_acceptor: TlsAcceptor,
+    state: AppState,
+    http: &HttpConfig,
+    config: &ServerConfig,
+    external_shutdown: Option<Arc<tokio::sync::Notify>>,
+) -> Result<(), crate::error::ServerError> {
+    let drain_secs = http.shutdown_drain_secs;
+    let pool = state.query.pool.clone();
+    let app = router(state, http);
 
     // Watch channel for cert hot-reload. The accept loop reads the latest
     // acceptor from the receiver before each TLS handshake.
