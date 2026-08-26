@@ -16,8 +16,11 @@
 //!
 //! 1. DERIVATION, from `cargo metadata` plus a line scan of each target's
 //!    sources. A target is pg-touching if it carries an `#[sqlx::test]`
-//!    attribute, or if it pulls in a `common` module that opens postgres
-//!    pools (`fixture_pool`).
+//!    attribute, if it pulls in a `common` module that opens postgres pools
+//!    (`fixture_pool`), or if an integration test file names one of the
+//!    connection-opening APIs itself (`KeyStore::connect`, `PgPool`, and
+//!    friends). That third class is what catches a plain `#[tokio::test]`
+//!    that dials postgres by hand, carrying neither marker.
 //! 2. MEMBERSHIP, from nextest itself: `cargo nextest list -E
 //!    'group(postgres)'`. cargo-nextest 0.9.143 supports `group()` as a
 //!    filterset predicate, so the authority on "is this test in the group"
@@ -27,12 +30,21 @@
 //!    `test(/regex/)`, precedence) in the guard — a second implementation
 //!    to disagree with the first.
 //!
-//! The match is per TEST NAME where the evidence gives names (an
-//! `#[sqlx::test]` attribute names the function beneath it), and per BINARY
-//! where it does not (a fixture-driven binary has no marker attribute). The
-//! name granularity is what lets the group filter narrow trawl-server's
-//! library target to `from_saved::` and `scheduler::` instead of dragging
-//! ~600 pure unit tests under an 8-thread cap.
+//! The match is per TEST NAME only when EVERY finding for the target names
+//! tests (an `#[sqlx::test]` attribute names the function beneath it). Any
+//! target-level finding — the fixture module, a connection-opening API —
+//! dominates: the whole binary must be in the group, and the check is that
+//! every non-ignored testcase nextest listed for it carries
+//! `filter-match.status == "matches"`. Dominance matters because a target
+//! can carry both kinds of evidence (`trawl-server::auth_pg` has named
+//! `#[sqlx::test]` cases AND the fixture module), and checking only the
+//! named ones would let a narrowed group filter admit two tests out of
+//! twenty-six while the other twenty-four boot a whole server unbounded.
+//!
+//! Name granularity survives for the targets that only ever name tests: it
+//! is what lets the group filter narrow trawl-server's library target to
+//! `from_saved::` and `scheduler::` instead of dragging ~600 pure unit
+//! tests under an 8-thread cap.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -49,6 +61,22 @@ const GROUP: &str = "postgres";
 /// (fleet-ui and trawl-engine both have a non-pg one).
 const FIXTURE_MARKER: &str = "fn fixture_pool";
 
+/// Connection-opening APIs. An integration test naming one of these opens
+/// a postgres connection of its own, whatever attribute sits above it — a
+/// plain `#[tokio::test]` calling `KeyStore::connect` is exactly the escape
+/// the two marker-based classes miss. Scanned in integration test sources
+/// ONLY: a package's `src/` tree is production code, where `PgPool` appears
+/// in every store module, and charging that to the package's unit-test
+/// binary would drag ~600 connectionless tests into the group.
+const CONNECTION_APIS: &[&str] = &[
+    "PgConnection::connect",
+    "KeyStore::connect",
+    "StorageState::connect",
+    "connect_lazy",
+    "PgPool",
+    "fixture_pool",
+];
+
 /// Why one target is pg-touching, in a form a failure message can print.
 struct Evidence {
     /// File and line the finding came from.
@@ -64,6 +92,12 @@ struct Derived {
 }
 
 impl Derived {
+    /// Does any finding describe the TARGET rather than named tests? Such a
+    /// finding dominates: the whole binary has to be in the group.
+    fn has_target_evidence(&self) -> bool {
+        self.evidence.iter().any(|e| e.tests.is_empty())
+    }
+
     /// Every test name the evidence pins, across all findings.
     fn named_tests(&self) -> BTreeSet<&str> {
         self.evidence
@@ -111,34 +145,8 @@ pub fn run(root: &Path, nextest_args: &[String]) -> ExitCode {
 
     let mut failures = Vec::new();
     for target in &derived {
-        let in_group = grouped.get(&target.binary_id);
-        let named = target.named_tests();
-        if named.is_empty() {
-            // No attribute to name a test: the whole binary drives the pg
-            // fixture, so the whole binary belongs in the group.
-            if in_group.is_none_or(BTreeSet::is_empty) {
-                failures.push(format!(
-                    "  {} is not in the `{GROUP}` group\n    evidence: {}",
-                    target.binary_id,
-                    target.sites()
-                ));
-            }
-            continue;
-        }
-        let empty = BTreeSet::new();
-        let in_group = in_group.unwrap_or(&empty);
-        let missing: Vec<&str> = named
-            .into_iter()
-            .filter(|name| !in_group.iter().any(|test| test_is(test, name)))
-            .collect();
-        if !missing.is_empty() {
-            failures.push(format!(
-                "  {} runs {} `#[sqlx::test]` case(s) outside the `{GROUP}` group: {}\n    evidence: {}",
-                target.binary_id,
-                missing.len(),
-                missing.join(", "),
-                target.sites()
-            ));
+        if let Some(failure) = check(target, grouped.get(&target.binary_id)) {
+            failures.push(failure);
         }
     }
 
@@ -155,6 +163,81 @@ pub fn run(root: &Path, nextest_args: &[String]) -> ExitCode {
         failures.join("\n")
     );
     ExitCode::FAILURE
+}
+
+/// One binary as nextest listed it: every non-ignored testcase, and the
+/// subset the `group(postgres)` filterset matched.
+#[derive(Default)]
+struct Suite {
+    all: BTreeSet<String>,
+    matched: BTreeSet<String>,
+}
+
+/// How many escaped test names a failure message prints before it stops.
+const NAMES_SHOWN: usize = 5;
+
+/// Check one derived target against its nextest listing. `None` is a pass.
+fn check(target: &Derived, suite: Option<&Suite>) -> Option<String> {
+    if target.has_target_evidence() {
+        // The whole binary drives postgres, so the whole binary belongs in
+        // the group. Nothing here consults the named tests: target-level
+        // evidence dominates.
+        let Some(suite) = suite.filter(|s| !s.all.is_empty()) else {
+            return Some(format!(
+                "  {} is not in the `{GROUP}` group\n    evidence: {}",
+                target.binary_id,
+                target.sites()
+            ));
+        };
+        let outside: Vec<&str> = suite
+            .all
+            .iter()
+            .filter(|name| !suite.matched.contains(*name))
+            .map(String::as_str)
+            .collect();
+        if outside.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "  {} is pg-touching as a whole binary, but {} of its {} test(s) resolve outside the `{GROUP}` group: {}\n    evidence: {}",
+            target.binary_id,
+            outside.len(),
+            suite.all.len(),
+            name_list(&outside),
+            target.sites()
+        ));
+    }
+
+    let default = Suite::default();
+    let matched = &suite.unwrap_or(&default).matched;
+    let missing: Vec<&str> = target
+        .named_tests()
+        .into_iter()
+        .filter(|name| !matched.iter().any(|test| test_is(test, name)))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "  {} runs {} `#[sqlx::test]` case(s) outside the `{GROUP}` group: {}\n    evidence: {}",
+        target.binary_id,
+        missing.len(),
+        name_list(&missing),
+        target.sites()
+    ))
+}
+
+/// Test names for a failure message, truncated so a whole 600-test binary
+/// does not bury the sentence that explains it.
+fn name_list(names: &[&str]) -> String {
+    if names.len() <= NAMES_SHOWN {
+        return names.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        names[..NAMES_SHOWN].join(", "),
+        names.len() - NAMES_SHOWN
+    )
 }
 
 /// Does a nextest test id name this function? Ids carry the module path
@@ -202,7 +285,7 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
             let src = PathBuf::from(target["src_path"].as_str().unwrap_or_default());
             if kinds.contains(&"test") {
                 let sources = integration_sources(&src);
-                let evidence = scan(&sources, root);
+                let evidence = scan(&sources, root, Scope::Integration);
                 if !evidence.is_empty() {
                     derived.push(Derived {
                         binary_id: format!("{package_name}::{name}"),
@@ -225,7 +308,7 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
             }
             sources.sort();
             sources.dedup();
-            let evidence = scan(&sources, root);
+            let evidence = scan(&sources, root, Scope::UnitTree);
             if !evidence.is_empty() {
                 derived.push(Derived {
                     binary_id,
@@ -282,8 +365,16 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Which tree the sources come from. The connection-API class applies to
+/// integration test files only (see [`CONNECTION_APIS`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Integration,
+    UnitTree,
+}
+
 /// Scan a target's sources for pg evidence.
-fn scan(sources: &[PathBuf], root: &Path) -> Vec<Evidence> {
+fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
     let mut evidence = Vec::new();
     for source in sources {
         let Ok(text) = fs::read_to_string(source) else {
@@ -308,8 +399,35 @@ fn scan(sources: &[PathBuf], root: &Path) -> Vec<Evidence> {
                 tests: Vec::new(),
             });
         }
+
+        // The raw-connection side: no attribute, no fixture, just a test
+        // that dials postgres itself.
+        if scope == Scope::Integration
+            && let Some((line, api)) = connection_api_site(&text)
+        {
+            evidence.push(Evidence {
+                site: format!("{shown}:{line} {api}"),
+                tests: Vec::new(),
+            });
+        }
     }
     evidence
+}
+
+/// The first line naming a connection-opening API, with the API it named.
+///
+/// Comments are cut first, for the same reason `sqlx_test_names` drops
+/// them: the fixture module explains `fixture_pool` in prose, and prose is
+/// not a connection. Cutting at `//` also truncates a string literal that
+/// contains one (a URL), which can only lose a detection, never invent one.
+fn connection_api_site(text: &str) -> Option<(usize, &'static str)> {
+    text.lines().enumerate().find_map(|(index, raw)| {
+        let code = raw.split("//").next().unwrap_or_default();
+        CONNECTION_APIS
+            .iter()
+            .find(|api| code.contains(**api))
+            .map(|api| (index + 1, *api))
+    })
 }
 
 /// Line numbers and function names of every `#[sqlx::test]` attribute.
@@ -362,11 +480,9 @@ fn function_name(line: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// Ask nextest which tests are in the group: binary id → test names.
-fn group_membership(
-    root: &Path,
-    extra: &[String],
-) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+/// Ask nextest what it would run: binary id → its testcases and which of
+/// them the group filterset matched.
+fn group_membership(root: &Path, extra: &[String]) -> Result<BTreeMap<String, Suite>, String> {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.args([
         "nextest",
@@ -401,19 +517,23 @@ fn group_membership(
         // `--message-format json` lists EVERY test case and marks each
         // with its filter verdict, so a filtered listing is a listing with
         // mismatches in it, not a shorter listing. Reading the keys alone
-        // makes every binary look like a group member.
-        let names: BTreeSet<String> = suite["testcases"]
-            .as_object()
-            .map(|cases| {
-                cases
-                    .iter()
-                    .filter(|(_, case)| case["filter-match"]["status"] == "matches")
-                    .map(|(name, _)| name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !names.is_empty() {
-            membership.insert(binary_id.to_string(), names);
+        // makes every binary look like a group member — and reading only
+        // the matches loses the denominator a whole-binary target needs.
+        // Ignored tests never run, so they are not in either set.
+        let mut parsed = Suite::default();
+        if let Some(cases) = suite["testcases"].as_object() {
+            for (name, case) in cases {
+                if case["ignored"].as_bool().unwrap_or(false) {
+                    continue;
+                }
+                parsed.all.insert(name.clone());
+                if case["filter-match"]["status"] == "matches" {
+                    parsed.matched.insert(name.clone());
+                }
+            }
+        }
+        if !parsed.all.is_empty() {
+            membership.insert(binary_id.to_string(), parsed);
         }
     }
     Ok(membership)
@@ -453,6 +573,99 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0], (1, "roles_are_data".to_string()));
         assert_eq!(found[1], (3, "nested".to_string()));
+    }
+
+    /// Same trick for the connection APIs: writing `KeyStore::connect(`
+    /// literally here would make the guard's own source pg-touching if the
+    /// scan is ever pointed at a `src/` tree.
+    fn call(receiver: &str, method: &str) -> String {
+        format!("{receiver}{}{method}(", "::")
+    }
+
+    fn suite(all: &[&str], matched: &[&str]) -> Suite {
+        Suite {
+            all: all.iter().map(|s| (*s).to_string()).collect(),
+            matched: matched.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    fn target(evidence: Vec<Evidence>) -> Derived {
+        Derived {
+            binary_id: "trawl-server::auth_pg".to_string(),
+            evidence,
+        }
+    }
+
+    fn fixture_evidence() -> Evidence {
+        Evidence {
+            site: "tests/common/mod.rs (postgres fixture module)".to_string(),
+            tests: Vec::new(),
+        }
+    }
+
+    fn named_evidence(names: &[&str]) -> Evidence {
+        Evidence {
+            site: "tests/auth_pg.rs:12 attribute".to_string(),
+            tests: names.iter().map(|n| (*n).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn target_evidence_dominates_the_named_tests_beside_it() {
+        // auth_pg's shape: named `#[sqlx::test]` cases AND the fixture
+        // module. A narrowed filter that matches only the named ones leaves
+        // the rest of the binary booting servers unbounded.
+        let mixed = target(vec![
+            fixture_evidence(),
+            named_evidence(&["ac1_key_roundtrip", "ac3_admin_cannot_ingest"]),
+        ]);
+        let narrowed = suite(
+            &["ac1_key_roundtrip", "ac3_admin_cannot_ingest", "ac7_reload"],
+            &["ac1_key_roundtrip", "ac3_admin_cannot_ingest"],
+        );
+        let failure = check(&mixed, Some(&narrowed)).expect("the third test escaped the group");
+        assert!(failure.contains("1 of its 3 test(s)"), "{failure}");
+        assert!(failure.contains("ac7_reload"), "{failure}");
+
+        // Same evidence, whole binary in the group: a pass.
+        let whole = suite(
+            &["ac1_key_roundtrip", "ac3_admin_cannot_ingest", "ac7_reload"],
+            &["ac1_key_roundtrip", "ac3_admin_cannot_ingest", "ac7_reload"],
+        );
+        assert!(check(&mixed, Some(&whole)).is_none());
+    }
+
+    #[test]
+    fn a_named_only_target_is_still_checked_per_test() {
+        let lib = target(vec![named_evidence(&["run_all", "resolve_one"])]);
+        let listing = suite(
+            &["from_saved::tests::run_all", "unrelated::unit_test"],
+            &["from_saved::tests::run_all"],
+        );
+        let failure = check(&lib, Some(&listing)).expect("resolve_one is outside the group");
+        assert!(failure.contains("resolve_one"), "{failure}");
+        assert!(!failure.contains("unrelated"), "{failure}");
+    }
+
+    #[test]
+    fn a_raw_connection_call_is_evidence_but_prose_is_not() {
+        let code = format!(
+            "#[tokio::test]\nasync fn boots() {{\n    let ks = {}\"...\").await;\n}}\n",
+            call("KeyStore", "connect")
+        );
+        assert_eq!(
+            connection_api_site(&code).map(|(_, api)| api),
+            Some("KeyStore::connect")
+        );
+
+        let prose = format!(
+            "// the fixture calls {}dsn) for us, so this test never touches a pool\n/// see {} above\nfn pure() {{}}\n",
+            call("KeyStore", "connect"),
+            call("PgConnection", "connect"),
+        );
+        assert!(connection_api_site(&prose).is_none());
+
+        assert!(connection_api_site("fn pure() -> u8 { 1 }\n").is_none());
     }
 
     #[test]
