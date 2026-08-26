@@ -1,28 +1,50 @@
-# Test-group bounds.
+# Postgres admission: ONE group, one width (ADR-0021 ruling 4).
 #
-# server-integration: each http_api/hot_query test boots a full trawld (TLS
-# listener, duckdb executor pool, two postgres pools), so parallelism is
-# bounded for memory AND postgres connections.
+# Every pg-touching test binary in the workspace runs here. nextest is
+# process-per-test and sqlx pools are process-local, so without a bound the
+# workspace can open more connections than the postgres server allows. The
+# CI service container runs the stock max_connections of 100 (GH Actions
+# cannot override the postgres command line), which is
+# `common::CI_MAX_CONNECTIONS`.
 #
-# pg: every other pg-backed test binary (fleet-auth, fleet-admin,
-# trawl-server's auth_pg/store_pg). nextest is process-per-test and sqlx
-# pools are process-local, so unbounded parallelism can exceed the postgres
-# server's max_connections (the CI service container runs the stock limit
-# of 100 — GH Actions can't override the postgres command line).
+# Worst case, by name:
+#   PER_TEST_CONNECTION_CEILING (8) * max-threads (8) = 64
+#   64 + headroom (20: admin/transient connections, store-only sqlx pools)
+#   = 84 <= CI_MAX_CONNECTIONS (100)
+# Both consts live in crates/trawl-server/tests/common/mod.rs and
+# connection_budget.rs fails the build if this arithmetic stops holding.
+#
+# Why 8: the retired `server-integration` group capped full-server tests at
+# 4, and duckdb memory per booted trawld is the practical floor, not
+# postgres. The conductor ruling is to start at 8, let the pg soak workflow
+# validate it, and raise it here in one line if the soak stays green.
+#
+# Membership is derived, not trusted: `cargo xtask pg-admission-guard`
+# recomputes the pg-touching set from the sources and fails if one of them
+# resolves outside this group. connection_budget is in the group only
+# because it shares the fixture module (it opens no connection at all);
+# a one-test binary costs nothing here.
 
-[test-groups.server-integration]
-max-threads = 4
-
-[test-groups.pg]
+[test-groups.postgres]
 max-threads = 8
 
 [[profile.default.overrides]]
-filter = 'binary(http_api) | binary(hot_query) | binary(timestamp_repair)'
-test-group = 'server-integration'
-
-[[profile.default.overrides]]
-filter = 'binary(auth_pg) | binary(store_pg) | (package(fleet-auth) & kind(test)) | (package(fleet-admin) & kind(test))'
-test-group = 'pg'
+# The pg-touching set. trawl-server's LIBRARY tests are in it too — the
+# retired config missed them entirely, so `from_saved`'s and `scheduler`'s
+# `#[sqlx::test]` cases ran unbounded — but only those two modules: the
+# other ~600 lib unit tests open no connection and capping them would
+# serialize a suite that has no reason to be serial.
+filter = '''
+  (package(trawl-server) & kind(lib)
+    & (test(/^from_saved::/) | test(/^scheduler::/)))
+  | (package(trawl-server) & (binary(auth_pg) | binary(catalog_surface)
+    | binary(connection_budget) | binary(field_catalog) | binary(hot_query)
+    | binary(http_api) | binary(repin) | binary(store_pg)
+    | binary(timestamp_repair)))
+  | (package(fleet-auth) & kind(test))
+  | (package(fleet-admin) & kind(test))
+'''
+test-group = 'postgres'
 
 [[profile.default.overrides]]
 # Both tests assert wall-clock windows (executor reclaim via TEST_QUERY_DELAY_MS;
