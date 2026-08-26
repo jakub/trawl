@@ -132,7 +132,7 @@ impl Harness {
     }
 }
 
-async fn harness(pool: sqlx::PgPool) -> Harness {
+async fn harness() -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
     let wal_dir = root.join("wal");
@@ -140,7 +140,7 @@ async fn harness(pool: sqlx::PgPool) -> Harness {
     std::fs::create_dir_all(&data_dir).unwrap();
     let data_glob = format!("{}/**/*.parquet", data_dir.display());
 
-    let server = setup_in_dir_with_data(pool, &root, data_glob, RateLimitConfig::default()).await;
+    let server = setup_in_dir_with_data(&root, data_glob, RateLimitConfig::default()).await;
     // Leak the tempdir so it survives the server (cleaned up by OS).
     std::mem::forget(tmp);
 
@@ -190,9 +190,9 @@ fn event(service: &str, extra: &serde_json::Value) -> serde_json::Value {
 
 /// Acceptance: an ingested field lands in `/api/v1/schema` with its pinned
 /// type, and the query path agrees with the advertised type.
-#[sqlx::test(migrations = false)]
-async fn ingested_field_lands_in_schema_with_pinned_type(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ingested_field_lands_in_schema_with_pinned_type() {
+    let h = harness().await;
     ingest_and_compact(&h, &[event("nginx", &json!({"duration": 42}))]).await;
 
     let (status, schema) = h.get(&h.server.analyst_token, "/schema").await;
@@ -218,9 +218,9 @@ async fn ingested_field_lands_in_schema_with_pinned_type(pool: sqlx::PgPool) {
 }
 
 /// Acceptance: `?service=` returns only that service's fields.
-#[sqlx::test(migrations = false)]
-async fn schema_service_param_scopes_fields(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_service_param_scopes_fields() {
+    let h = harness().await;
     ingest_and_compact(&h, &[event("svc-a", &json!({"alpha_field": 1}))]).await;
     ingest_and_compact(&h, &[event("svc-b", &json!({"beta_field": 2}))]).await;
 
@@ -248,9 +248,9 @@ async fn schema_service_param_scopes_fields(pool: sqlx::PgPool) {
 /// while `?service=` is served fresh. The two must not share a slot — a
 /// scoped request must neither be answered from the unscoped cache nor
 /// poison it for the next unscoped caller.
-#[sqlx::test(migrations = false)]
-async fn schema_service_scope_bypasses_the_unscoped_cache(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_service_scope_bypasses_the_unscoped_cache() {
+    let h = harness().await;
     ingest_and_compact(&h, &[event("svc-a", &json!({"alpha_field": 1}))]).await;
     ingest_and_compact(&h, &[event("svc-b", &json!({"beta_field": 2}))]).await;
 
@@ -283,9 +283,9 @@ async fn schema_service_scope_bypasses_the_unscoped_cache(pool: sqlx::PgPool) {
 
 /// Acceptance: a field whose last observation predates the retention window
 /// is absent from `/schema` by default and present with `?all=true`.
-#[sqlx::test(migrations = false)]
-async fn aged_out_field_windowed_away_unless_all(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn aged_out_field_windowed_away_unless_all() {
+    let h = harness().await;
     ingest_and_compact(&h, &[event("nginx", &json!({"old_field": 7}))]).await;
 
     // Age the observation past the default 90-day retention window.
@@ -319,12 +319,13 @@ async fn aged_out_field_windowed_away_unless_all(pool: sqlx::PgPool) {
     );
 }
 
-/// A field that has been conflicting only briefly carries no verdict at
-/// all: no key on the wire, not a null one. Volume alone must not badge an
-/// install where a shipper had one bad afternoon.
-#[sqlx::test(migrations = false)]
-async fn a_freshly_conflicting_field_carries_no_verdict(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// A conflicting field that has not been conflicting for LONG carries no
+/// verdict at all — not a null one, no key: an install where a shipper had
+/// one bad afternoon must read exactly as it did before the analyzer
+/// shipped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_freshly_conflicting_field_carries_no_verdict() {
+    let h = harness().await;
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     for _ in 0..4 {
         ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "N/A"}))]).await;
@@ -348,9 +349,9 @@ async fn a_freshly_conflicting_field_carries_no_verdict(pool: sqlx::PgPool) {
 /// Acceptance: a pin that has been shelving values for over a day carries
 /// the verdict on both read routes, and the evidence rows carry the misfit
 /// samples the CLI and SPA render.
-#[sqlx::test(migrations = false)]
-async fn a_degraded_field_carries_the_verdict_and_its_samples(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn a_degraded_field_carries_the_verdict_and_its_samples() {
+    let h = harness().await;
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     for value in ["N/A", "pending", "N/A"] {
         ingest_and_compact(&h, &[event("svc-b", &json!({"duration": value}))]).await;
@@ -428,9 +429,9 @@ async fn a_degraded_field_carries_the_verdict_and_its_samples(pool: sqlx::PgPool
 /// incomplete-results notice, including when it projects the field away,
 /// while a query that binds none carries no key at all, and the gauge
 /// reflects the count after a refresh pass.
-#[sqlx::test(migrations = false)]
-async fn a_query_binding_a_degraded_field_is_stamped(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_binding_a_degraded_field_is_stamped() {
+    let h = harness().await;
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     for value in ["N/A", "pending", "N/A"] {
         ingest_and_compact(&h, &[event("svc-b", &json!({"duration": value}))]).await;
@@ -507,9 +508,9 @@ async fn a_query_binding_a_degraded_field_is_stamped(pool: sqlx::PgPool) {
 /// This is the false-positive case the wire field exists to prevent: the
 /// client-side join a SPA could otherwise do (`columns` ∩ degraded set)
 /// would badge both services here, and only one of them has anything to fix.
-#[sqlx::test(migrations = false)]
-async fn schema_services_badges_only_the_service_that_conflicted(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_services_badges_only_the_service_that_conflicted() {
+    let h = harness().await;
     // svc-a pins duration BIGINT and never disagrees with it again; svc-b
     // sends strings under that pin, which the conform shelves.
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
@@ -629,9 +630,9 @@ async fn schema_services_badges_only_the_service_that_conflicted(pool: sqlx::PgP
 /// Acceptance: a type conflict surfaces on `/schema/conflicts`, the field
 /// detail lists both services, and the nulled original stays findable via
 /// `_raw` search.
-#[sqlx::test(migrations = false)]
-async fn conflict_evidence_surfaces_on_the_read_routes(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn conflict_evidence_surfaces_on_the_read_routes() {
+    let h = harness().await;
     // svc-a pins duration BIGINT; svc-b disagrees with a string.
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "N/A"}))]).await;
@@ -708,9 +709,9 @@ async fn conflict_evidence_surfaces_on_the_read_routes(pool: sqlx::PgPool) {
 }
 
 /// The fields listing carries aggregates, fill stats, and a clamped limit.
-#[sqlx::test(migrations = false)]
-async fn fields_listing_carries_aggregates_and_truncation(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn fields_listing_carries_aggregates_and_truncation() {
+    let h = harness().await;
     ingest_and_compact(&h, &[event("nginx", &json!({"duration": 42}))]).await;
 
     let (status, body) = h.get(&h.server.analyst_token, "/schema/fields").await;
@@ -748,9 +749,9 @@ async fn fields_listing_carries_aggregates_and_truncation(pool: sqlx::PgPool) {
 
 /// The detail route ASCII-folds `?name=` (mirroring ingest's fold) and
 /// 404s for a field the catalog has never pinned.
-#[sqlx::test(migrations = false)]
-async fn field_detail_folds_name_and_404s_unpinned(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn field_detail_folds_name_and_404s_unpinned() {
+    let h = harness().await;
     ingest_and_compact(&h, &[event("nginx", &json!({"duration": 42}))]).await;
 
     let (status, body) = h
@@ -775,9 +776,9 @@ async fn field_detail_folds_name_and_404s_unpinned(pool: sqlx::PgPool) {
 /// `field_services` rows are ever-observed, cost no pin slot, and their
 /// service axis is client-chosen — so a common envelope field's history is
 /// the one part of the catalog a sender can grow without limit.
-#[sqlx::test(migrations = false)]
-async fn field_detail_pages_a_large_service_history(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn field_detail_pages_a_large_service_history() {
+    let h = harness().await;
     ingest_and_compact(&h, &[event("nginx", &json!({"duration": 42}))]).await;
 
     // 1100 services carrying `duration`, none of which spent a pin slot.
@@ -872,11 +873,12 @@ async fn field_detail_pages_a_large_service_history(pool: sqlx::PgPool) {
 /// shared driver renderer. The CLI's own unit tests cover the converters
 /// from synthetic structs; only this test proves the client actually asks
 /// the server the question the flags describe.
-#[sqlx::test(migrations = false)]
-async fn read_commands_render_populated_output(pool: sqlx::PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+async fn read_commands_render_populated_output() {
     use trawl_cli::cli::{ConnectionParams, OutputFormat};
 
-    let h = harness(pool).await;
+    let h = harness().await;
     // svc-a pins `duration` and `latency` BIGINT; svc-b's strings disagree,
     // so the catalog carries two pins, two service observations each, and a
     // conflict per field — two, so `--field` has something to exclude.
@@ -1027,9 +1029,9 @@ fn ndjson_field_names(out: &[u8]) -> Vec<String> {
 /// All three read routes gate on `schema_read`: a key without it is denied
 /// (401 insufficient-permissions per the handler convention; a key with no
 /// trawl grant at all is the 403 case), the reader key passes.
-#[sqlx::test(migrations = false)]
-async fn catalog_routes_require_schema_read(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn catalog_routes_require_schema_read() {
+    let h = harness().await;
     ingest_and_compact(&h, &[event("nginx", &json!({"duration": 42}))]).await;
 
     for path in [

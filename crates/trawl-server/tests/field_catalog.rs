@@ -76,7 +76,7 @@ struct Harness {
     query: HttpClient,
 }
 
-async fn harness(pool: sqlx::PgPool) -> Harness {
+async fn harness() -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
     let wal_dir = root.join("wal");
@@ -84,7 +84,7 @@ async fn harness(pool: sqlx::PgPool) -> Harness {
     std::fs::create_dir_all(&data_dir).unwrap();
     let data_glob = format!("{}/**/*.parquet", data_dir.display());
 
-    let server = setup_in_dir_with_data(pool, &root, data_glob, RateLimitConfig::default()).await;
+    let server = setup_in_dir_with_data(&root, data_glob, RateLimitConfig::default()).await;
     // Leak the tempdir so it survives the server (cleaned up by OS).
     std::mem::forget(tmp);
 
@@ -99,11 +99,12 @@ async fn harness(pool: sqlx::PgPool) -> Harness {
     }
 }
 
-/// A cold/cold type conflict returns all history, not hot-only; the
-/// conflict is recorded and attributed; the counter is on /metrics.
-#[sqlx::test(migrations = false)]
-async fn cold_cold_conflict_returns_full_history_with_attribution(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// Acceptance: a cold/cold type conflict returns ALL history, not
+/// hot-only; the conflict is recorded and attributed; the counter is on
+/// /metrics.
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_cold_conflict_returns_full_history_with_attribution() {
+    let h = harness().await;
 
     // Service A: duration is an integer. Compacted first, so it pins BIGINT.
     let a_events: Vec<serde_json::Value> = (0..3)
@@ -211,11 +212,12 @@ async fn cold_cold_conflict_returns_full_history_with_attribution(pool: sqlx::Pg
     );
 }
 
-/// Acceptance: a nested-object field keeps its batch-mates' columns, and
-/// the nested value stays reachable via `json_extract_string`.
-#[sqlx::test(migrations = false)]
-async fn nested_object_keeps_batchmates_and_stays_reachable(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// Acceptance: a nested-object field no longer drops its batch-mates'
+/// columns, and the nested value stays reachable via
+/// `json_extract_string`.
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_object_keeps_batchmates_and_stays_reachable() {
+    let h = harness().await;
 
     let events = vec![
         json!({
@@ -271,9 +273,9 @@ async fn nested_object_keeps_batchmates_and_stays_reachable(pool: sqlx::PgPool) 
 
 /// Acceptance: an all-null first batch defers the pin; a later typed batch
 /// pins it, and a query across both reads cleanly.
-#[sqlx::test(migrations = false)]
-async fn all_null_first_batch_defers_then_pins(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn all_null_first_batch_defers_then_pins() {
+    let h = harness().await;
 
     let first = json!({
         "service": "svc-defer", "env": "prod", "host": "h",
@@ -317,9 +319,9 @@ async fn all_null_first_batch_defers_then_pins(pool: sqlx::PgPool) {
 
 /// Acceptance: a pin write failure means no parquet is written and the WAL
 /// is retained for retry — never an unconformant file.
-#[sqlx::test(migrations = false)]
-async fn pin_write_failure_retains_wal_and_writes_nothing(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn pin_write_failure_retains_wal_and_writes_nothing() {
+    let h = harness().await;
 
     let event = json!({
         "service": "svc-pinfail", "env": "prod", "host": "h",
@@ -377,14 +379,15 @@ async fn pin_write_failure_retains_wal_and_writes_nothing(pool: sqlx::PgPool) {
     assert!(!walkdir_parquet(&h.data_dir).is_empty());
 }
 
-/// A hot-side conflict, an uncompacted event disagreeing with an existing
-/// pin, is nulled on the hot branch of the union while the full cold
-/// history stays visible. End-to-end proof of the `HotSnapshot` pin
-/// plumbing: the outcome is never hot-only and never an error, because the
-/// pin conformance resolves the conflict in one execution.
-#[sqlx::test(migrations = false)]
-async fn hot_conflicting_event_is_nulled_and_cold_history_survives(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// Acceptance: a HOT-side conflict — an uncompacted event disagreeing with
+/// an existing pin — is nulled on the hot branch of the union while the
+/// full cold history stays visible. The end-to-end proof of the
+/// `HotSnapshot` pin plumbing: the outcome is never hot-only (the cold rows
+/// ARE present) and never a loud error (the pin conformance resolves the
+/// conflict in one execution).
+#[tokio::test(flavor = "multi_thread")]
+async fn hot_conflicting_event_is_nulled_and_cold_history_survives() {
+    let h = harness().await;
 
     // Seed the pin: three integer durations, compacted → duration pins
     // BIGINT and the parquet history exists.
@@ -459,14 +462,17 @@ async fn hot_conflicting_event_is_nulled_and_cold_history_survives(pool: sqlx::P
     );
 }
 
-/// Two services shipping `Dur` and `dur` land one spelling, one pin, one
-/// column, because ingest folds field names at the door. Without that
-/// fold each file would conform to its own pin and
-/// `read_parquet(union_by_name)` would merge them back into one column, a
-/// `Conversion` error on every spanning query.
-#[sqlx::test(migrations = false)]
-async fn case_variant_field_names_fold_to_one_column_across_services(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// End-to-end regression for the case-variant blockers: two services
+/// shipping `Dur` and `dur` used to pin independently (case-sensitive
+/// catalog keys), each file conformed to its own pin, and
+/// `read_parquet(union_by_name)` folded them into one column — a hard
+/// `Conversion` error on every spanning query; the in-loop mitigation then
+/// degraded the pin to VARCHAR, permanently breaking numeric comparisons.
+/// With ingest-time folding there is ONE spelling, one pin, one column,
+/// and numeric predicates keep working across services.
+#[tokio::test(flavor = "multi_thread")]
+async fn case_variant_field_names_fold_to_one_column_across_services() {
+    let h = harness().await;
 
     // svc-a ships `Dur` (uppercase), numeric. Compacted first: pins `dur`.
     let a_events: Vec<serde_json::Value> = (0..3)
@@ -561,9 +567,9 @@ async fn case_variant_field_names_fold_to_one_column_across_services(pool: sqlx:
 /// Acceptance: `field_services` is ever-observed — compaction advances
 /// `last_seen`, and retention deleting a date directory leaves the rows in
 /// place (documented semantics, not a leak).
-#[sqlx::test(migrations = false)]
-async fn field_services_is_ever_observed(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn field_services_is_ever_observed() {
+    let h = harness().await;
 
     let ev = |i: u32| {
         json!({
@@ -1603,8 +1609,8 @@ mod boot {
     /// Wiring: server boot itself runs the conformance pass — pins land in
     /// the process cache and one query returns the full corrected corpus,
     /// without this test ever calling `ensure_conformance`.
-    #[sqlx::test(migrations = false)]
-    async fn server_boot_runs_the_conformance_pass(pool: sqlx::PgPool) {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_boot_runs_the_conformance_pass() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let data_dir = root.join("data");
@@ -1612,7 +1618,6 @@ mod boot {
         let data_glob = format!("{}/**/*.parquet", data_dir.display());
 
         let server = crate::common::setup_in_dir_with_data(
-            pool,
             &root,
             data_glob,
             trawl_server::config::RateLimitConfig::default(),
@@ -1642,13 +1647,13 @@ mod boot {
     }
 }
 
-/// Comparisons against a VARCHAR-pinned field follow the pin over HTTP
-/// (ADR-0011), with the hot buffer both populated and drained: the drained
-/// case rides the cold-only `run_query` branch, the populated one the hot
-/// side of the union.
-#[sqlx::test(migrations = false)]
-async fn pinned_varchar_comparisons_behave_over_http(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// ADR-0011 slice A acceptance: comparisons against a VARCHAR-pinned
+/// field follow the pin over HTTP — with the hot buffer populated AND
+/// drained (the drained case exercises the formerly pin-blind cold-only
+/// `run_query` branch).
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_varchar_comparisons_behave_over_http() {
+    let h = harness().await;
 
     // Mixed numeric-looking and word statuses (all strings) — the ladder
     // pins VARCHAR at first compaction.
@@ -1783,13 +1788,14 @@ async fn read_until(resp: &mut reqwest::Response, needle: &str) -> String {
     buf
 }
 
-/// The live tail receives the pins: a string "404" event matches
-/// `status>=400` on the SSE stream, and the equality rule is discriminably
-/// live, since `status!=200` must match "accepted" (a pin-blind numeric
-/// coercion would drop it) while still excluding every spelling of 200.
-#[sqlx::test(migrations = false)]
-async fn sse_stream_applies_varchar_pin(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// ADR-0011 slice A acceptance: live tail receives the pins. A string
+/// "404" event matches `status>=400` on the SSE stream, and the
+/// equality rule is discriminably live — `status!=200` must match
+/// "accepted" (the pin-blind numeric coercion drops it) while still
+/// excluding every spelling of 200.
+#[tokio::test(flavor = "multi_thread")]
+async fn sse_stream_applies_varchar_pin() {
+    let h = harness().await;
 
     // Seed the VARCHAR pin.
     let seed: Vec<serde_json::Value> = ["200", "404", "accepted"]
