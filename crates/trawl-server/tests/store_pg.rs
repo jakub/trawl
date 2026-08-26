@@ -9,8 +9,14 @@
 //! boot path: advisory lock, migration, idempotency, failure modes.
 //!
 //! Plain `#[sqlx::test]` auto-applies `crates/trawl-server/migrations/` to
-//! each per-test database; boot tests use `migrations = false` plus a
-//! sibling database driven through `StorageState::connect` (the real path).
+//! each per-test database. The boot tests take no harness pool at all:
+//! they mint their own database and drive it through `StorageState`, so
+//! `#[sqlx::test]` would only mint a second database nobody opens and
+//! charge its 5-connection pool to the admission budget for the duration
+//! (`common::BOOT_CONNECTION_CEILING`). They keep the real boot path:
+//! `from_pool` is where the advisory lock and the migration live, and the
+//! pool it is handed is `common::app_pool`, sized like the fixture's
+//! rather than trawld's production 8.
 
 mod common;
 
@@ -1246,15 +1252,24 @@ async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
 // boot: advisory lock + migration
 // ---------------------------------------------------------------------------
 
-/// Fresh empty database + `StorageState::connect` applies the schema via
-/// the real boot path (advisory lock before migrate).
-#[sqlx::test(migrations = false)]
-async fn boot_migrates_fresh_database(pool: PgPool) {
-    // The mint opens its own admin connection; the harness pool is here only
-    // for the DATABASE_URL it proves is set.
-    let _ = pool;
+/// Boot one `StorageState` on `url` through the real boot path.
+///
+/// `StorageState::from_pool` is that path: it takes the advisory lock on
+/// its own session, then migrates. The only thing `StorageState::connect`
+/// adds is the pool, and its production ceiling of 8 connections is more
+/// than these tests hold at once (two live instances) has any use for. The
+/// constructor itself stays under test in
+/// `boot_unreachable_database_fails_descriptively`.
+async fn boot(url: &str) -> Result<StorageState, StoreError> {
+    StorageState::from_pool(common::app_pool(url).await, url).await
+}
+
+/// Fresh empty database + the real boot path applies the schema
+/// (advisory lock BEFORE migrate).
+#[tokio::test]
+async fn boot_migrates_fresh_database() {
     let url = common::create_app_database().await;
-    let storage = StorageState::connect(&url).await.expect("first boot");
+    let storage = boot(&url).await.expect("first boot");
 
     // Schema is live: a store call succeeds.
     storage.saved.create(1, "boot", "q").await.unwrap();
@@ -1263,14 +1278,11 @@ async fn boot_migrates_fresh_database(pool: PgPool) {
 
 /// A second boot against an already-migrated database is a no-op (after the
 /// first instance released its advisory lock).
-#[sqlx::test(migrations = false)]
-async fn boot_is_idempotent_after_shutdown(pool: PgPool) {
-    // The mint opens its own admin connection; the harness pool is here only
-    // for the DATABASE_URL it proves is set.
-    let _ = pool;
+#[tokio::test]
+async fn boot_is_idempotent_after_shutdown() {
     let url = common::create_app_database().await;
     {
-        let storage = StorageState::connect(&url).await.expect("first boot");
+        let storage = boot(&url).await.expect("first boot");
         storage.saved.create(1, "boot", "q").await.unwrap();
         drop(storage);
     }
@@ -1279,7 +1291,7 @@ async fn boot_is_idempotent_after_shutdown(pool: PgPool) {
     // that is asynchronous, so retry briefly.
     let mut last_err = None;
     for _ in 0..50 {
-        match StorageState::connect(&url).await {
+        match boot(&url).await {
             Ok(storage) => {
                 // Data survived; migration did not re-run destructively.
                 let survived = storage.saved.get_by_name(1, "boot").await.unwrap();
@@ -1297,15 +1309,12 @@ async fn boot_is_idempotent_after_shutdown(pool: PgPool) {
 
 /// A second live instance on the same DSN fails startup on the advisory
 /// lock with a descriptive error.
-#[sqlx::test(migrations = false)]
-async fn boot_second_live_instance_fails_on_advisory_lock(pool: PgPool) {
-    // The mint opens its own admin connection; the harness pool is here only
-    // for the DATABASE_URL it proves is set.
-    let _ = pool;
+#[tokio::test]
+async fn boot_second_live_instance_fails_on_advisory_lock() {
     let url = common::create_app_database().await;
-    let _first = StorageState::connect(&url).await.expect("first boot");
+    let _first = boot(&url).await.expect("first boot");
 
-    let err = StorageState::connect(&url)
+    let err = boot(&url)
         .await
         .expect_err("second live instance must fail");
     assert!(matches!(err, StoreError::LockHeld), "got: {err:?}");
@@ -1316,9 +1325,11 @@ async fn boot_second_live_instance_fails_on_advisory_lock(pool: PgPool) {
 }
 
 /// An unreachable storage database is a descriptive startup failure.
-#[sqlx::test(migrations = false)]
-async fn boot_unreachable_database_fails_descriptively(pool: PgPool) {
-    let _ = pool; // harness provides the env; the DSN below is dead on purpose
+#[tokio::test]
+async fn boot_unreachable_database_fails_descriptively() {
+    // The one boot case that must keep `StorageState::connect`: what it
+    // proves is that trawld's OWN pool constructor fails fast and
+    // descriptively. The DSN is dead, so the pool never opens a connection.
     let err = StorageState::connect("postgres://trawl:nope@127.0.0.1:1/trawl")
         .await
         .expect_err("dead DSN must fail");
@@ -1334,15 +1345,12 @@ async fn boot_unreachable_database_fails_descriptively(pool: PgPool) {
 /// signal (and report unhealthy on `/health`), and a *replacement* instance
 /// must then be able to acquire the freed lock — proving the original can no
 /// longer be trusted as sole writer.
-#[sqlx::test(migrations = false)]
-async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement(pool: PgPool) {
+#[tokio::test]
+async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement() {
     use std::time::Duration;
 
-    // The mint opens its own admin connection; the harness pool is here only
-    // for the DATABASE_URL it proves is set.
-    let _ = pool;
     let url = common::create_app_database().await;
-    let first = StorageState::connect(&url).await.expect("first boot");
+    let first = boot(&url).await.expect("first boot");
 
     let mut lost = first.lock_lost();
     assert!(!*lost.borrow_and_update(), "lock is healthy at boot");
@@ -1350,7 +1358,7 @@ async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement(pool: PgPool
 
     // While the lock is held, a replacement cannot start.
     assert!(
-        matches!(StorageState::connect(&url).await, Err(StoreError::LockHeld)),
+        matches!(boot(&url).await, Err(StoreError::LockHeld)),
         "second live instance must be locked out while the lock is held"
     );
 
@@ -1374,7 +1382,7 @@ async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement(pool: PgPool
     // postgres has finished releasing the terminated session's lock.
     let mut last_err = None;
     for _ in 0..50 {
-        match StorageState::connect(&url).await {
+        match boot(&url).await {
             Ok(_replacement) => return,
             Err(e) => {
                 last_err = Some(e);

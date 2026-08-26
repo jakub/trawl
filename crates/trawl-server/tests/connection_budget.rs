@@ -5,13 +5,18 @@
 //! The postgres admission budget, checked at compile-and-run time.
 //!
 //! `.config/nextest.toml` bounds every pg-touching binary with one group
-//! width. That width, the per-test connection ceiling in `common`, and the
-//! CI server's `max_connections` are three numbers that must keep agreeing;
-//! nothing else notices when one of them moves. This test is the arithmetic
-//! written down once.
+//! width. That width, the per-shape connection ceilings in `common`, and
+//! the CI server's `max_connections` are numbers that must keep agreeing;
+//! nothing else notices when one of them moves. This test is the
+//! arithmetic written down once.
 //!
-//! No tokio, no postgres, no fixture server: it reads two consts and a TOML
-//! line. It lives in the `postgres` nextest group anyway, because it shares
+//! It multiplies the WIDEST shape, not an average and not the full-server
+//! one: the group admits whatever mix of shapes nextest happens to
+//! schedule, so the only safe assumption is that every slot holds the
+//! widest.
+//!
+//! No tokio, no postgres, no fixture server: it reads a handful of consts
+//! and a TOML line. It lives in the `postgres` nextest group anyway, because it shares
 //! the fixture module and the admission guard derives membership from that.
 
 mod common;
@@ -21,10 +26,30 @@ mod common;
 /// loudly instead of the test passing over an empty string.
 const NEXTEST_CONFIG: &str = include_str!("../../../.config/nextest.toml");
 
-/// Connections that are NOT charged to a test's own ceiling: the sweeper's
-/// admin session, transient `dropdb`/`createdb` connections, and the
-/// store-only suites' `#[sqlx::test]` pools. Slack, deliberately generous.
-const HEADROOM: u32 = 20;
+/// Connections the run needs that no single test shape holds.
+///
+/// Three named parts, none of them slack for its own sake:
+///
+/// * [`SUPERUSER_RESERVED`] is postgres' own `superuser_reserved_connections`,
+///   which is subtracted from `max_connections` for ordinary roles. CI
+///   connects as the superuser and would not pay it; a developer running
+///   the same suite against the dev cluster as `fleet` does.
+/// * `ADMIN_TRANSIENT * max-threads` covers the mint/sweep/kill sessions.
+///   They live for one statement, so charging them to every shape would
+///   double count, but with the group full each concurrent test may hold
+///   one.
+/// * [`SQLX_MASTER_CHURN`] covers sqlx's process-global master pool, which
+///   creates and drops the per-test database. It closes each connection on
+///   release and only runs during setup and teardown, when the test's own
+///   shape is not yet at its peak.
+fn headroom(max_threads: u32) -> u32 {
+    /// `superuser_reserved_connections`, the postgres default.
+    const SUPERUSER_RESERVED: u32 = 3;
+    /// Concurrent setup/teardown windows in sqlx's master pool.
+    const SQLX_MASTER_CHURN: u32 = 4;
+
+    SUPERUSER_RESERVED + common::ADMIN_TRANSIENT * max_threads + SQLX_MASTER_CHURN
+}
 
 /// `max-threads` of the `[test-groups.postgres]` table.
 fn postgres_group_max_threads() -> u32 {
@@ -49,16 +74,43 @@ fn postgres_group_max_threads() -> u32 {
 #[test]
 fn postgres_group_width_fits_the_connection_budget() {
     let max_threads = postgres_group_max_threads();
-    let worst_case = common::PER_TEST_CONNECTION_CEILING * max_threads + HEADROOM;
+    let headroom = headroom(max_threads);
+    let worst_case = common::WORST_TEST_CONNECTION_CEILING * max_threads + headroom;
     assert!(
         worst_case <= common::CI_MAX_CONNECTIONS,
-        "postgres group is oversubscribed: PER_TEST_CONNECTION_CEILING ({}) \
-         * max-threads ({max_threads}) + headroom ({HEADROOM}) = {worst_case} \
-         > CI_MAX_CONNECTIONS ({}). Lower max-threads in .config/nextest.toml \
-         or shrink the fixture pools.",
-        common::PER_TEST_CONNECTION_CEILING,
+        "postgres group is oversubscribed: WORST_TEST_CONNECTION_CEILING ({}) \
+         * max-threads ({max_threads}) + headroom ({headroom}) = {worst_case} \
+         > CI_MAX_CONNECTIONS ({}). Shape ceilings: full server {}, \
+         full server + direct store pool {}, sqlx store test {}, boot {}. \
+         Lower max-threads in .config/nextest.toml, or shrink whichever \
+         shape is widest.",
+        common::WORST_TEST_CONNECTION_CEILING,
         common::CI_MAX_CONNECTIONS,
+        common::FULL_SERVER_CONNECTION_CEILING,
+        common::DIRECT_STORE_CONNECTION_CEILING,
+        common::SQLX_STORE_CONNECTION_CEILING,
+        common::BOOT_CONNECTION_CEILING,
     );
+}
+
+#[test]
+fn the_worst_shape_is_the_widest_shape() {
+    // `WORST_TEST_CONNECTION_CEILING` is a const `max` over the shapes; a
+    // new shape added to `common` without being folded into it would leave
+    // the budget quietly under-counting.
+    for (name, ceiling) in [
+        ("full server", common::FULL_SERVER_CONNECTION_CEILING),
+        ("direct store", common::DIRECT_STORE_CONNECTION_CEILING),
+        ("sqlx store test", common::SQLX_STORE_CONNECTION_CEILING),
+        ("boot", common::BOOT_CONNECTION_CEILING),
+    ] {
+        assert!(
+            ceiling <= common::WORST_TEST_CONNECTION_CEILING,
+            "the {name} shape ({ceiling}) is wider than \
+             WORST_TEST_CONNECTION_CEILING ({})",
+            common::WORST_TEST_CONNECTION_CEILING,
+        );
+    }
 }
 
 #[test]

@@ -227,18 +227,68 @@ pub const FLEET_POOL_MAX: u32 = 3;
 /// App-store pool size for one fixture server.
 pub const APP_POOL_MAX: u32 = 3;
 
-/// The advisory-lock session the sweeper holds while it elects itself.
+/// Ceiling of the pool `#[sqlx::test]` hands a test.
+///
+/// Not ours to choose: sqlx builds it at `max_connections(5)`
+/// (`sqlx-postgres/src/testing/mod.rs`). It is charged in full to every
+/// shape that keeps the macro, because a test is free to drive five
+/// queries at once through it.
+pub const SQLX_TEST_POOL_MAX: u32 = 5;
+
+/// The advisory-lock session one `StorageState` holds for its lifetime.
 pub const LOCK_CONNECTIONS: u32 = 1;
 
-/// The short-lived admin connection a mint or a kill opens and closes.
+/// The short-lived admin connection a mint, a sweep or a kill opens and
+/// closes. Charged to the RUN (see `connection_budget`'s headroom), not to
+/// a shape: it exists for one statement, not for the test.
 pub const ADMIN_TRANSIENT: u32 = 1;
 
-/// Worst-case postgres connections one test may hold at once: 3 fleet +
-/// 3 app + 1 advisory-lock session + 1 transient admin connection. The
-/// nextest group width is derived from this against
-/// [`CI_MAX_CONNECTIONS`] (ADR-0021 ruling 4).
-pub const PER_TEST_CONNECTION_CEILING: u32 =
-    FLEET_POOL_MAX + APP_POOL_MAX + LOCK_CONNECTIONS + ADMIN_TRANSIENT;
+// -- per-shape ceilings ----------------------------------------------------
+//
+// A shape is charged what a test HOLDS for its duration: every live pool at
+// its `max_connections`, plus every raw connection it keeps open. The
+// nextest group width is derived from the WORST of them against
+// [`CI_MAX_CONNECTIONS`] (ADR-0021 ruling 4).
+//
+// One shape is deliberately absent: fleet-auth's `connect_and_ping_via_url`
+// builds a PRODUCTION keystore pool (`KeyStore::connect`, ceiling 8) beside
+// its harness pool, which by pool-ceiling arithmetic would be 13. That test
+// is the one place the production constructor itself is under test, it
+// issues one query at a time and closes the pool before returning, so it
+// holds at most three connections. Read it before trusting this note.
+
+/// A full-server fixture: fleet pool + app pool + the app store's
+/// advisory-lock session.
+pub const FULL_SERVER_CONNECTION_CEILING: u32 = FLEET_POOL_MAX + APP_POOL_MAX + LOCK_CONNECTIONS;
+
+/// A full-server fixture whose TEST also opens its own pool on the server's
+/// app database, to drive a store directly (`http_api`'s schedule cases).
+pub const DIRECT_STORE_CONNECTION_CEILING: u32 = FULL_SERVER_CONNECTION_CEILING + APP_POOL_MAX;
+
+/// A store-level `#[sqlx::test]` that keeps the harness pool AND boots one
+/// `StorageState` of its own on a fixture-minted database (`auth_pg`'s
+/// `ac6_*` scheduler cases).
+pub const SQLX_STORE_CONNECTION_CEILING: u32 = SQLX_TEST_POOL_MAX + APP_POOL_MAX + LOCK_CONNECTIONS;
+
+/// A boot test holding TWO live `StorageState`s at once (the original and
+/// its replacement, in the advisory-lock cases). These tests take no
+/// harness pool at all.
+pub const BOOT_CONNECTION_CEILING: u32 = 2 * (APP_POOL_MAX + LOCK_CONNECTIONS);
+
+/// The widest shape in the postgres admission group. `connection_budget`
+/// multiplies THIS by the group width.
+pub const WORST_TEST_CONNECTION_CEILING: u32 = max_u32(
+    max_u32(
+        FULL_SERVER_CONNECTION_CEILING,
+        DIRECT_STORE_CONNECTION_CEILING,
+    ),
+    max_u32(SQLX_STORE_CONNECTION_CEILING, BOOT_CONNECTION_CEILING),
+);
+
+/// `u32::max` is not const-callable in this MSRV path; this is.
+const fn max_u32(a: u32, b: u32) -> u32 {
+    if a > b { a } else { b }
+}
 
 /// `max_connections` of the postgres CI runs against.
 pub const CI_MAX_CONNECTIONS: u32 = 100;
@@ -779,7 +829,7 @@ struct FixtureFacts {
     bound_addr: String,
     fleet_pool_max: u32,
     app_pool_max: u32,
-    per_test_connection_ceiling: u32,
+    worst_connection_ceiling: u32,
 }
 
 impl FixtureFacts {
@@ -790,7 +840,7 @@ impl FixtureFacts {
             bound_addr: bound_addr.to_owned(),
             fleet_pool_max: FLEET_POOL_MAX,
             app_pool_max: APP_POOL_MAX,
-            per_test_connection_ceiling: PER_TEST_CONNECTION_CEILING,
+            worst_connection_ceiling: WORST_TEST_CONNECTION_CEILING,
         }
     }
 
@@ -802,8 +852,8 @@ impl FixtureFacts {
         eprintln!("  fleet database: {}", self.fleet_db);
         eprintln!("  bound addr:     {}", self.bound_addr);
         eprintln!(
-            "  pool ceilings:  fleet={} app={} per-test={}",
-            self.fleet_pool_max, self.app_pool_max, self.per_test_connection_ceiling
+            "  pool ceilings:  fleet={} app={} worst-shape={}",
+            self.fleet_pool_max, self.app_pool_max, self.worst_connection_ceiling
         );
         print_pg_activity(vec![self.app_db.clone(), self.fleet_db.clone()]);
     }

@@ -655,11 +655,20 @@ async fn scheduler_runs_after(
         .await
         .unwrap();
 
-    // Dedicated app-state database, migrated via the real boot path.
+    // Dedicated app-state database, migrated via the real boot path
+    // (`from_pool` is where the advisory lock and the migration live;
+    // `connect` only adds the pool). The pool is the fixture's, sized by
+    // `APP_POOL_MAX`: `StorageState::connect` would build trawld's
+    // PRODUCTION pool of 8 on top of the 5 this test already holds from
+    // `#[sqlx::test]`, which is most of a per-test connection budget spent
+    // on a scheduler that runs one query.
     let app_db_url = common::create_app_database().await;
-    let storage = trawl_server::store::StorageState::connect(&app_db_url)
-        .await
-        .expect("boot app storage");
+    let storage = trawl_server::store::StorageState::from_pool(
+        common::app_pool(&app_db_url).await,
+        &app_db_url,
+    )
+    .await
+    .expect("boot app storage");
 
     let saved = storage
         .saved
@@ -880,9 +889,11 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
 
     // Out-of-process mutation: a second connection to the same database
     // (what fleet-admin does).
-    let second = KeyStore::connect(&common::fleet_database_url(&pool))
-        .await
-        .unwrap();
+    // A SECOND pool on the same database, sized by the fixture rather than
+    // by `KeyStore::connect`'s production ceiling of 8: what the test needs
+    // is a connection the audit poller does not own, not a daemon's worth
+    // of them.
+    let second = KeyStore::from_pool(common::fleet_pool(&common::fleet_database_url(&pool)).await);
     let created = second
         .create_key(
             "made-by-fleet-admin",
