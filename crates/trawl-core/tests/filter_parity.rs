@@ -2610,14 +2610,14 @@ fn assert_let_parity_hot_only(
 
 /// The pins a generated case draws from — the whole `CanonicalType`
 /// vocabulary, because a repin can land on any of them.
-const GENERATIVE_PINS: [CanonicalType; 6] = [
-    CanonicalType::BigInt,
-    CanonicalType::Boolean,
-    CanonicalType::Double,
-    CanonicalType::Timestamp,
-    CanonicalType::Varchar,
-    CanonicalType::Severity,
-];
+///
+/// Defined AS [`CanonicalType::ALL`] instead of relisting it. The relisted
+/// form held all six types and compiled fine, which is exactly the problem:
+/// a seventh entry in `ALL` would have left it at six with nothing turning
+/// red. (Its order had drifted from `ALL`'s too.) Both call sites below —
+/// the draw and the coverage assertion — now grow with the vocabulary on
+/// their own.
+const GENERATIVE_PINS: [CanonicalType; CanonicalType::ALL.len()] = CanonicalType::ALL;
 
 /// Wire values a generated event can carry under `pin`: shapes the
 /// round-trip guard KEEPS (spelled unlike the wire, so the two lanes must

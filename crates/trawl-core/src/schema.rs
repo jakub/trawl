@@ -208,6 +208,80 @@ pub enum CanonicalType {
 }
 
 impl CanonicalType {
+    /// Every variant, once, in declaration order. The ONE hand-written
+    /// enumeration of the vocabulary in production code.
+    ///
+    /// Two consumers read it. The fuzz pin selector in `crate::fuzz_input`
+    /// maps a selector byte onto a pin by indexing here, so the ladder's
+    /// length is the modulus and no fuzz code hardcodes a count. The
+    /// PREPARE fixture in trawl-engine asserts that its committed cases
+    /// pin every entry LISTED HERE — a real guarantee, and a different one
+    /// from "every variant is listed here", which nothing checks.
+    ///
+    /// A variant added to the enum must be added here too, and nothing
+    /// mechanically proves it was. Stable Rust cannot count a plain enum's
+    /// variants, so every guard downstream reads `ALL` and inherits its
+    /// blind spot: a seventh variant left out is invisible to all of them.
+    /// Probed at #114, not assumed — a seventh variant with an `index` arm
+    /// and no `ALL` entry leaves the slot-walk test below and the engine
+    /// fixture both green.
+    ///
+    /// What the codebase offers instead is a SIGNPOST: `index` below is an
+    /// exhaustive match on this screen, so the build stops with the author
+    /// already looking at the list they have to edit. A `macro_rules!`
+    /// declaring the enum and `ALL` together would close the gap outright.
+    /// Weighed at #114 and rejected: it needs per-variant `#[$meta]`
+    /// passthrough plus a variant-counting trick, and `ALL`'s array TYPE is
+    /// load-bearing (`GENERATIVE_PINS` in `filter_parity.rs` is declared
+    /// `[CanonicalType; CanonicalType::ALL.len()]`).
+    ///
+    /// One test elsewhere names all six variants and is NOT a competing
+    /// list: `repin_targets_are_the_catalog_vocabulary_severity_included`
+    /// in `trawl-server/src/repin/engine.rs` tables case-insensitive
+    /// SPELLINGS to check what `from_catalog` parses, so it is about that
+    /// function's input, not about the vocabulary's extent. Leave it be.
+    pub const ALL: [Self; 6] = [
+        Self::Boolean,
+        Self::BigInt,
+        Self::Double,
+        Self::Timestamp,
+        Self::Varchar,
+        Self::Severity,
+    ];
+
+    /// This variant's slot in [`Self::ALL`].
+    ///
+    /// A signpost, not reflection. The match has no wildcard arm, so a new
+    /// variant fails to COMPILE here, a few lines from `ALL`, with this
+    /// comment telling the author to add it to `ALL` as well. Putting the
+    /// author in the right file next to the right list is the whole of
+    /// what it buys, and no test can do that job.
+    ///
+    /// It does not make `ALL`'s completeness checkable. Every guard
+    /// downstream — the slot walk in
+    /// `canonical_type_all_is_ordered_and_duplicate_free`, the fuzz pin
+    /// selector, the trawl-engine PREPARE fixture's coverage assertion —
+    /// reads `ALL`, so a variant missing from `ALL` is a variant none of
+    /// them can see. Adding the arm here and forgetting `ALL` is a green
+    /// suite; that was probed at #114.
+    ///
+    /// Test-only: nothing in production wants the inverse of `ALL`, and a
+    /// `pub`/`pub(crate)` version unused outside tests is either dead code
+    /// or public API nobody calls. The pre-commit hook runs clippy with
+    /// `--all-targets`, so the compile error lands before the commit
+    /// rather than in CI.
+    #[cfg(test)]
+    const fn index(self) -> usize {
+        match self {
+            Self::Boolean => 0,
+            Self::BigInt => 1,
+            Self::Double => 2,
+            Self::Timestamp => 3,
+            Self::Varchar => 4,
+            Self::Severity => 5,
+        }
+    }
+
     /// The PHYSICAL `DuckDB` type spelling — what a cast, a `DESCRIBE`
     /// comparison, a repin rewrite and the hot branch's `REPLACE` all
     /// name. NOT injective: `SEVERITY` is a `BIGINT` on disk.
@@ -534,20 +608,47 @@ mod tests {
     /// canonical type, `SEVERITY` included.
     #[test]
     fn canonical_type_catalog_spellings_round_trip() {
-        for ty in [
-            CanonicalType::Boolean,
-            CanonicalType::BigInt,
-            CanonicalType::Double,
-            CanonicalType::Timestamp,
-            CanonicalType::Varchar,
-            CanonicalType::Severity,
-        ] {
+        for ty in CanonicalType::ALL {
             assert_eq!(CanonicalType::from_catalog(ty.as_catalog()), Some(ty));
         }
         assert_eq!(CanonicalType::BigInt.as_catalog(), "BIGINT");
         assert_eq!(CanonicalType::Severity.as_catalog(), "SEVERITY");
         assert_eq!(CanonicalType::from_catalog("JSON"), None);
         assert_eq!(CanonicalType::from_catalog("bigint"), None);
+    }
+
+    /// `ALL` is what the fuzz pin selector indexes and what the trawl-engine
+    /// PREPARE fixture walks, so a duplicate entry would quietly bias the
+    /// selector (two byte values landing on one pin), and an entry in the
+    /// wrong slot would make `index` disagree with the list it describes.
+    ///
+    /// It does NOT prove `ALL` lists every variant, and the name no longer
+    /// says it does. The length line is a tripwire for edits to `ALL`
+    /// itself: delete an entry and it reddens. It cannot notice an entry
+    /// that was never added, because `ALL` is a `[Self; 6]` and a seventh
+    /// variant nobody listed leaves the length at 6 (probed at #114, with
+    /// the engine fixture green beside it). `index` — the exhaustive match
+    /// beside `ALL` — is what stops the build in front of the list.
+    #[test]
+    fn canonical_type_all_is_ordered_and_duplicate_free() {
+        assert_eq!(
+            CanonicalType::ALL.len(),
+            6,
+            "an entry left CanonicalType::ALL; every entry also needs a \
+             PREPARE fixture case, which is what the engine's coverage \
+             assertion checks"
+        );
+        for (slot, ty) in CanonicalType::ALL.into_iter().enumerate() {
+            assert_eq!(ty.index(), slot, "{ty:?} sits in the wrong ALL slot");
+        }
+        let unique: std::collections::BTreeSet<CanonicalType> =
+            CanonicalType::ALL.into_iter().collect();
+        assert_eq!(
+            unique.len(),
+            CanonicalType::ALL.len(),
+            "duplicate entry in CanonicalType::ALL would bias the fuzz pin \
+             selector and skew the trawl-engine fixture's coverage"
+        );
     }
 
     /// The PHYSICAL spelling is what casts and DDL use, and it is

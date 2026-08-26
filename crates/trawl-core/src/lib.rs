@@ -40,6 +40,10 @@ pub mod field_refs;
 /// In-memory event filter compiled from the search stage.
 pub mod filter;
 
+/// The `parse_emit` fuzz wire encoding and its pin-derivation rule,
+/// shared by the fuzz target and the trawl-engine PREPARE fixture.
+pub mod fuzz_input;
+
 /// The shared in-memory pin-aware comparison core (ADR-0011 slice A′):
 /// one evaluator behind both the search-stage matcher and the pipeline
 /// expression evaluator.

@@ -734,16 +734,14 @@ mod tests {
     /// every pin — the delegation is what makes "live conform is `OTel`" a
     /// fact about call sites rather than a second expression to keep in
     /// step (issue #79).
+    ///
+    /// Iterates [`CanonicalType::ALL`] rather than listing the variants: a
+    /// seventh canonical type joins this test the moment it joins `ALL`,
+    /// where a hand-written list would keep compiling and keep covering
+    /// six.
     #[test]
     fn guarded_cast_is_the_otel_reading_of_every_pin() {
-        for pin in [
-            CanonicalType::Boolean,
-            CanonicalType::BigInt,
-            CanonicalType::Double,
-            CanonicalType::Timestamp,
-            CanonicalType::Varchar,
-            CanonicalType::Severity,
-        ] {
+        for pin in CanonicalType::ALL {
             assert_eq!(
                 guarded_cast("t", pin),
                 guarded_cast_in("t", pin, crate::severity::Dialect::Otel),

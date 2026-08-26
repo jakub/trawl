@@ -147,6 +147,11 @@ pub enum EmitError {
         func_name: String,
         format: String,
     },
+    /// A literal the ADR-0011 pin rule table refuses under the field's
+    /// catalog pin. Reads as an unsupported operation, and carries the
+    /// typed cause so a caller can classify the refusal without reading
+    /// its prose (see the [`From`] impl below).
+    Comparison(crate::compare::CompareError),
 }
 
 impl fmt::Display for EmitError {
@@ -163,6 +168,7 @@ impl fmt::Display for EmitError {
             Self::UnsupportedOperation { message } => {
                 write!(f, "unsupported operation: {message}")
             }
+            Self::Comparison(err) => write!(f, "unsupported operation: {err}"),
             Self::InvalidFormat { func_name, format } => {
                 write!(f, "{func_name}(): invalid format string {format:?}")
             }
@@ -176,11 +182,19 @@ impl std::error::Error for EmitError {}
 /// is an unsupported operation to every emitter caller — one conversion,
 /// so the search stage, the pipeline emitter, the live filter and the
 /// stream compiler all report the same sentence.
+///
+/// The SENTENCE is unchanged: [`EmitError::Comparison`] renders through
+/// the same `unsupported operation: {…}` arm the stringified form used to
+/// take, so no user-facing text, snapshot or wire message moves. What
+/// changed is that the cause survives as a TYPE instead of as prose. The
+/// pin-aware fuzz target (issue #114) has to decide whether an emitter
+/// refusal is a legitimate outcome for the pin map it invented — an
+/// `_severity` pin plus a literal naming no ladder point is expected, a
+/// panic never is — and that verdict must not be a substring test against
+/// an error message anyone is free to reword.
 impl From<crate::compare::CompareError> for EmitError {
     fn from(err: crate::compare::CompareError) -> Self {
-        Self::UnsupportedOperation {
-            message: err.to_string(),
-        }
+        Self::Comparison(err)
     }
 }
 
@@ -338,13 +352,42 @@ fn emit_with_raw_fallback(
     let (mut emitted, referenced_raw) = emit_from_state(query, make_state()?)?;
     if referenced_raw {
         let (raw_free, _) = emit_from_state(query, make_state()?.without_raw_column())?;
-        debug_assert_eq!(
-            raw_free.params, emitted.params,
-            "raw-free pass must keep the parameter list identical"
+        debug_assert!(
+            params_are_identical(&raw_free.params, &emitted.params),
+            "raw-free pass must keep the parameter list identical\n  raw-free: {:?}\n  first:    {:?}",
+            raw_free.params,
+            emitted.params
         );
         emitted.raw_free_sql = Some(raw_free.sql);
     }
     Ok(emitted)
+}
+
+/// Are these two bound parameter lists the SAME list, slot for slot?
+///
+/// Deliberately not `PartialEq` on the values. `SqlValue::Float` wraps an
+/// `f64`, so `==` asks IEEE 754, which says a NaN is equal to nothing at
+/// all, itself included. A NaN in the list is an ordinary value here: the
+/// DSL admits `nan` as a filter literal, and ADR-0011 gives it a reading
+/// (no numeric reading, so UNKNOWN rather than false) instead of rejecting
+/// it, so `hello a=nan` binds one and the check above reported a list as
+/// different from itself.
+///
+/// Comparing `f64::to_bits` asks the question an identity check means: did
+/// the second pass push the same bytes in the same order. It also stops
+/// `0.0` and `-0.0` reading as one value, which is the right answer here
+/// too — [`crate::eval::duckdb_double_to_string`] keeps the sign, so the
+/// two are not interchangeable downstream.
+///
+/// `SqlValue`'s own `PartialEq` is left alone on purpose. It is derived,
+/// public and used widely; bending global equality to satisfy one internal
+/// assertion would change comparisons nobody here has read.
+fn params_are_identical(left: &[SqlValue], right: &[SqlValue]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(a, b)| match (a, b) {
+            (SqlValue::Float(a), SqlValue::Float(b)) => a.to_bits() == b.to_bits(),
+            _ => a == b,
+        })
 }
 
 /// Emit one pass. Returns the query and whether text search referenced the
@@ -2947,5 +2990,110 @@ mod tests {
                 SqlValue::Int(3),
             ]
         );
+    }
+
+    /// A refused pinned comparison keeps its cause as a TYPE and renders
+    /// the sentence it always rendered.
+    ///
+    /// Both halves matter and they pull in opposite directions. The type
+    /// is what the pin-aware fuzz target classifies on (issue #114): a
+    /// `SEVERITY` pin plus a literal naming no ladder point is a
+    /// legitimate outcome, so the target must recognize it without
+    /// matching prose. The TEXT is what users, snapshots and the wire
+    /// already see, so the `unsupported operation: ` prefix stays exactly
+    /// where the stringifying `From` impl used to put it.
+    #[test]
+    fn a_refused_pinned_comparison_keeps_its_type_and_its_sentence() {
+        let query = parser::parse("_severity=nosuchlevel").expect("parse should succeed");
+        let mut pins = crate::schema::FieldTypes::new();
+        pins.insert("_severity", crate::schema::CanonicalType::Severity);
+        let err = emit_with_pins(&query, SRC, &pins, anchor()).expect_err("the token is unknown");
+
+        let EmitError::Comparison(
+            cause @ crate::compare::CompareError::UnknownSeverityToken { token },
+        ) = &err
+        else {
+            panic!("expected a typed comparison refusal, got {err:?}");
+        };
+        assert_eq!(token, "nosuchlevel");
+
+        // The WHOLE rendering, composed from the typed cause. This was a
+        // `starts_with` against a prefix, which is no guard at all for a
+        // test whose only job is that the sentence has not moved: appending
+        // ` [comparison refusal]` to the `Display` impl would have sailed
+        // straight through it.
+        assert_eq!(err.to_string(), format!("unsupported operation: {cause}"));
+    }
+
+    /// A NaN parameter is an ordinary value, and the raw-free identity
+    /// check must not read it as a difference.
+    ///
+    /// `hello` is a bare term, so text search binds `_raw` and arms the
+    /// second, raw-free pass. `nan` is a filter literal the pin-blind
+    /// coercion parses as a float, so both passes push a NaN in the same
+    /// slot. Before [`params_are_identical`] this panicked inside
+    /// `emit_with_raw_fallback`, with both halves of the message printing
+    /// the same list, because `assert_eq!` over an `f64` asks IEEE 754 and
+    /// IEEE 754 says a NaN equals nothing at all. Found by the `parse_emit`
+    /// fuzz target (issue #114) and older than it: the assertion landed in
+    /// `367aff46`.
+    #[test]
+    fn a_nan_parameter_keeps_the_raw_free_parameter_lists_identical() {
+        let query = parser::parse("hello a=nan").expect("parse should succeed");
+        let emitted = emit(&query, SRC, anchor()).expect("emit should succeed");
+
+        assert!(
+            emitted.raw_free_sql.is_some(),
+            "a bare term must bind `_raw` and arm the raw-free pass, or this \
+             test no longer reaches the assertion it guards"
+        );
+        let nan_params = emitted
+            .params
+            .iter()
+            .filter(|p| matches!(p, SqlValue::Float(f) if f.is_nan()))
+            .count();
+        assert_eq!(
+            nan_params, 1,
+            "expected the `nan` literal to bind as a NaN parameter, got {:?}",
+            emitted.params
+        );
+
+        // The invariant the emitter asserts, stated here where a release
+        // build still checks it: `debug_assert` is compiled out with
+        // debug assertions off, so this test would otherwise prove
+        // nothing there.
+        assert!(params_are_identical(&emitted.params, &emitted.params));
+    }
+
+    /// The three readings `PartialEq` gets wrong for an identity check,
+    /// and the one it gets right.
+    #[test]
+    fn parameter_identity_reads_bits_not_ieee_equality() {
+        let nan = vec![SqlValue::Float(f64::NAN)];
+        assert!(
+            nan != nan,
+            "IEEE 754 equality is the thing being worked around"
+        );
+        assert!(params_are_identical(&nan, &nan));
+
+        // A signed zero is a different value, not a different reading of
+        // one: `eval::duckdb_double_to_string` keeps the sign.
+        let plus = vec![SqlValue::Float(0.0)];
+        let minus = vec![SqlValue::Float(-0.0)];
+        assert_eq!(plus, minus, "IEEE 754 equality conflates the signed zeros");
+        assert!(!params_are_identical(&plus, &minus));
+
+        // Everything else still answers exactly as `PartialEq` does.
+        let left = vec![SqlValue::String("a".to_owned()), SqlValue::Int(1)];
+        assert!(params_are_identical(&left, &left.clone()));
+        assert!(!params_are_identical(&left, &left[..1]));
+        assert!(!params_are_identical(
+            &left,
+            &[SqlValue::Int(1), SqlValue::Int(1)]
+        ));
+        assert!(!params_are_identical(
+            &[SqlValue::Float(1.0)],
+            &[SqlValue::Int(1)]
+        ));
     }
 }

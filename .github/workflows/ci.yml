@@ -345,3 +345,162 @@ jobs:
           name: e2e-traces
           path: crates/trawl-web-ui/e2e/test-results/
           retention-days: 7
+
+  fuzz-smoke:
+    name: pin-aware fuzz smoke (parse_emit)
+    # A bounded gating run of the pin-aware parse/emit fuzz target: parse
+    # arbitrary DSL, invent a catalog pin for every name
+    # `field_refs::referenced_fields` reports out of the parsed query, emit
+    # SQL under those pins, and assert the differential oracle in the
+    # target. (Not every field the query binds: bare-word search terms and
+    # time bounds are excluded there, and those envelope fields have fixed
+    # production types, so there is no pin to vary.)
+    # It links no DuckDB and needs no postgres, so ten minutes is generous
+    # (the measured run is ~25s of build plus ~10s of fuzzing).
+    #
+    # The build target is pinned explicitly below, and that flag is
+    # load-bearing. `cargo fuzz` does NOT default `--target` to the host
+    # triple: it defaults to the triple cargo-fuzz ITSELF was compiled for,
+    # baked in at its own build time via
+    # `current_platform::CURRENT_PLATFORM`. The only Linux artifact the
+    # cargo-fuzz 0.13.2 release publishes is
+    # `cargo-fuzz-0.13.2-x86_64-unknown-linux-musl.tar.gz`, so
+    # install-action hands every Linux runner, glibc or not, a musl-static
+    # binary that then builds the fuzz target for musl. That fails twice
+    # over: AddressSanitizer cannot instrument a statically linked libc
+    # ("sanitizer is incompatible with statically linked libc"), and no
+    # musl std is installed to link against anyway. A dev machine whose
+    # cargo-fuzz came from `cargo install` is built against glibc and
+    # defaults to gnu, which is why this only ever showed up in CI.
+    # `--target x86_64-unknown-linux-gnu` makes the build independent of
+    # how the tool was packaged.
+    #
+    # This is also the one job here NOT on the self-hosted runners, and
+    # that is deliberate rather than accidental. Nothing is known to be
+    # wrong with k8s-small: the failure above describes the BUILD target
+    # and says nothing about that image, and the host triple there was
+    # never measured. But every step of this job is demonstrated working on
+    # `ubuntu-latest`, so it stays where the evidence is.
+    #
+    # `ubuntu-latest` rather than a pinned image, unlike the nightly below.
+    # The toolchain inputs are pinned already — the ASan runtime ships
+    # inside the pinned nightly, install-action pins cargo-fuzz — but the
+    # image's own glibc, C toolchain and linker are not, and this job does
+    # depend on all three. Needing a glibc runner is the reason it is here
+    # at all. So the claim is only the one that was tested: every step of
+    # this job is demonstrated working on `ubuntu-latest` today, and the
+    # explicit `--target` removes the dependency on how cargo-fuzz was
+    # PACKAGED, not the dependency on the image shipping a glibc toolchain.
+    # The image is left unpinned knowingly, and a future image change could
+    # in principle need attention here. docs.yml already runs on
+    # `ubuntu-latest`, so this follows the repo instead of inventing a
+    # third runner convention.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # This job executes code the PR controls: a fuzz target running mutated
+    # input through PR-authored code, and every build script in the
+    # dependency tree, which runs at build time. Read-only token, and no
+    # credentials persisted into .git/config for that code to read.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      # Pinned by DATE. cargo-fuzz needs a nightly compiler (-Zsanitizer),
+      # and a floating `nightly` is the one input that can redden a merge
+      # gate with no code change in the PR: a compiler published overnight
+      # can add a lint, change a codegen flag or break libfuzzer-sys, and
+      # the failure lands on whoever opens a PR that morning. Bump this
+      # line deliberately, on its own, so the bump is what gets reviewed.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+        with:
+          toolchain: nightly-2026-08-24
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Its own key and its own workspace: a different compiler, a
+          # different RUSTFLAGS (see below) and a different target dir than
+          # every stable job here, so sharing a key would make the two sides
+          # evict each other's artifacts on every run.
+          shared-key: fuzz-smoke
+          workspaces: crates/trawl-core/fuzz
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # cargo-fuzz
+        with:
+          tool: cargo-fuzz@0.13.2
+      # The fuzz package carries its OWN Cargo.lock (it is workspace-
+      # `exclude`d), and that lockfile had gone stale: it still pinned
+      # chumsky 0.12 while the workspace moved to 0.13, so nobody had built
+      # these targets since the bump. Assert it resolves unchanged before
+      # fuzzing, or a fresh runner silently fuzzes a different dependency
+      # tree than the one committed. `cargo fuzz run` has no `--locked`
+      # passthrough (verified against 0.13.2 `--help`), so the check is a
+      # preflight rather than a flag.
+      - name: Assert the fuzz lockfile is current
+        working-directory: crates/trawl-core
+        env:
+          RUSTFLAGS: ""
+        run: >-
+          cargo +nightly-2026-08-24 metadata --manifest-path fuzz/Cargo.toml
+          --locked --format-version 1 > /dev/null
+
+      - name: Fuzz parse_emit
+        working-directory: crates/trawl-core
+        env:
+          # RUSTFLAGS is overridden, and this is not cosmetic. The
+          # workflow-level `RUSTFLAGS: -D warnings` is inherited by every
+          # job, cargo-fuzz APPENDS its sanitizer flags to whatever it
+          # inherits, and nightly 1.100 deprecates
+          # `AtomicU64::fetch_update` (renamed `try_update`), which
+          # crates/trawl-core/src/stream.rs uses. So the inherited flag
+          # turns that warning into an error and the fuzz build dies before
+          # a single input runs. Renaming the method is NOT the fix:
+          # `try_update` does not exist on stable 1.98, so adopting it would
+          # break every other job in this file. The deprecation is
+          # unresolvable until the MSRV moves, and until then this job
+          # compiles trawl-core without `-D warnings`. The stable clippy job
+          # is what actually gates warnings.
+          RUSTFLAGS: ""
+        run: |
+          # A writable scratch corpus FIRST, the committed inputs after:
+          # libFuzzer writes new coverage-increasing units into the first
+          # directory only, so the committed seeds and the parse corpus stay
+          # read-only and CI never produces a dirty tree.
+          mkdir -p "$RUNNER_TEMP/corpus"
+          # -runs counts corpus REPLAY first: libFuzzer loads every
+          # committed input under the paths below before it mutates
+          # anything, and prints the total as `#N INITED`. That N is the
+          # floor, and the job log is where to read it — a count written
+          # down here rots the next time someone commits a seed. Any -runs
+          # under it is a load test wearing a fuzzing costume: the job
+          # exits 0 having explored nothing new. When this was last
+          # measured the line read `#3849 INITED` and 25000 left ~21k
+          # mutation runs (628 new coverage units, ~3100 exec/s, ~8s).
+          # Raise -runs freely; never lower it below the `#N INITED` the
+          # log reports, or the job stops fuzzing without ever going red.
+          #
+          # -seed=114 is deliberate. libFuzzer's mutation sequence is a pure
+          # function of (seed, binary, corpus), so a gating job stays
+          # reproducible: a new crash means THIS PR made a previously
+          # explored path panic, rather than the job being a lottery that
+          # reddens an unrelated PR and goes green on re-run.
+          #
+          # The input paths are relative to THIS step's working directory,
+          # crates/trawl-core: cargo-fuzz does not chdir into fuzz/ before
+          # exec'ing the target, so `seeds/parse_emit` would resolve to
+          # nothing and libFuzzer exits 1 with "No such file or directory"
+          # (verified, not assumed).
+          cargo +nightly-2026-08-24 fuzz run parse_emit \
+            --target x86_64-unknown-linux-gnu \
+            "$RUNNER_TEMP/corpus" fuzz/seeds/parse_emit fuzz/corpus/parse \
+            -- -runs=25000 -seed=114 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -print_final_stats=1
+      # A crash must arrive with the input that reproduces it, because the
+      # bytes are the whole bug report. `if: failure()` only, so this never
+      # affects job status; the job fails on the fuzzer's nonzero exit and
+      # on nothing else.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: fuzz-parse-emit-artifacts
+          path: crates/trawl-core/fuzz/artifacts/
+          retention-days: 7
+          if-no-files-found: ignore
