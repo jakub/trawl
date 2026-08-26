@@ -992,24 +992,63 @@ async fn connect_malformed_url_errors() {
 
 #[tokio::test]
 async fn connect_unreachable_endpoint_errors() {
-    // `KeyStore::connect` doesn't expose `PgPoolOptions` for a shorter
-    // acquire timeout, and sqlx's default (30s) is what a real dead-backend
-    // connect attempt pays — measured directly against a closed loopback
-    // port before writing this test. Bound the test itself with an outer
-    // timeout instead of waiting the full 30s: either outcome (the connect
-    // future resolving to an error, or the outer timeout firing first) is
-    // proof the pool never reaches Ok on an endpoint nothing is listening
-    // on.
+    // The endpoint must be unreachable in a way sqlx does NOT retry.
+    // `PoolInner::connect` treats ECONNREFUSED as "the database is still
+    // starting" and backs off until the acquire deadline, which
+    // `KeyStore::connect` leaves at sqlx's default 30 seconds. So a dropped
+    // port would make this test either slow or, worse, a pass by timeout:
+    // the previous shape wrote `if let Ok(Ok(_)) = timeout(3s, ...)`, under
+    // which Err(Elapsed) — a hang, the regression this test exists to catch
+    // — sailed through as success.
+    //
+    // A listener we OWN for the whole test, accepting and immediately
+    // closing, gives the postgres startup handshake an EOF instead. That is
+    // not a retryable connect error, so the pool gives up at once, and
+    // nothing can take the port from under us mid-test.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().expect("local_addr").port();
-    drop(listener); // nothing listens on `port` from here on
+    let closing = std::thread::spawn(move || {
+        // One accept per connect attempt; the stream drops at the end of
+        // each iteration, which closes it. The loop ends when the test
+        // drops the listener half by returning (accept then errors).
+        while let Ok((stream, _)) = listener.accept() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    });
 
     let url = format!("postgres://fleet:fleet@127.0.0.1:{port}/fleet_test");
-    // connect error or bounded-wait timeout: both are "not reachable".
-    if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(3), KeyStore::connect(&url)).await {
-        panic!("connect must not succeed against an unreachable endpoint");
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(BOUNDED_CONNECT, KeyStore::connect(&url)).await;
+    let elapsed = started.elapsed();
+
+    match outcome {
+        Ok(Err(e)) => {
+            assert!(
+                matches!(e, AuthError::Database(_)),
+                "unreachable endpoint must surface as a database error: {e:?}"
+            );
+        }
+        Ok(Ok(_)) => panic!("connect must not succeed against an unreachable endpoint"),
+        Err(tokio::time::error::Elapsed { .. }) => panic!(
+            "KeyStore::connect did not fail within {BOUNDED_CONNECT:?} against a \
+             socket that closes every connection. Either the pool started \
+             retrying an error it used to give up on, or connect grew an \
+             unbounded wait: trawld boots through this call, so a hang here \
+             is a daemon that never starts and never says why"
+        ),
     }
+    assert!(
+        elapsed < BOUNDED_CONNECT,
+        "connect took {elapsed:?}, at the {BOUNDED_CONNECT:?} bound"
+    );
+
+    drop(closing); // the accept loop exits when the process does
 }
+
+/// How long an unreachable-endpoint connect may take before we call it a
+/// hang. A closed socket answers in milliseconds; two seconds is slack for
+/// a loaded runner, not a budget the healthy path spends.
+const BOUNDED_CONNECT: Duration = Duration::from_secs(2);
 
 // One sync sanity test to confirm imports compile without DB.
 #[test]
