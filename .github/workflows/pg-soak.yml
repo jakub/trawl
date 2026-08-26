@@ -1,0 +1,80 @@
+name: pg soak
+
+# Flake hunting for the pg-backed suites (ADR-0021). One run executes the
+# whole workspace twice, once per feature configuration, exactly as CI's
+# `test` job does. Evidence is gathered by pushing a soak branch repeatedly
+# and reading the run history, so nothing here counts attempts.
+on:
+  workflow_dispatch:
+  push:
+    branches: ['soak/**']
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  suite:
+    name: ${{ matrix.suite }}
+    runs-on: k8s-big
+    strategy:
+      # Both suites always run: a flake in one says nothing about the other,
+      # and cancelling the survivor halves the evidence.
+      fail-fast: false
+      matrix:
+        include:
+          - suite: default-features
+            features: ""
+          - suite: no-default-features
+            features: >-
+              --no-default-features
+              --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=2s
+          --health-timeout=3s
+          --health-retries=15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: soak-${{ matrix.suite }}
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
+      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
+      - name: Apply fleet-auth schema migrations
+        run: cargo run -p fleet-admin -- migrate
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # `--retries 0` on the command line overrides every retry setting in
+      # .config/nextest.toml, including its two named per-test overrides. A
+      # soak that retries measures the retry, not the flake.
+      - run: cargo nextest run --workspace ${{ matrix.features }} --retries 0
+        env:
+          DUCKDB_DOWNLOAD_LIB: "1"
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      - name: Record suite outcome
+        if: always()
+        run: echo "${{ matrix.suite }} -> ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+
+  summary:
+    name: soak summary
+    runs-on: k8s-small
+    needs: [suite]
+    if: always()
+    steps:
+      - name: Report
+        run: |
+          echo "suite matrix result: ${{ needs.suite.result }}"
+          echo "per-suite outcomes are in this run's job summary"
+          test "${{ needs.suite.result }}" = "success"

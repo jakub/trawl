@@ -429,14 +429,18 @@ fn sweep_guards_parse_own_database_name() {
     assert!(owner_of("someone_elses_database", APP_DB_PREFIX).is_none());
 }
 
+/// The database name a DSN points at.
+fn database_name(url: &str) -> &str {
+    url.rsplit('/')
+        .next()
+        .and_then(|last| last.split('?').next())
+        .expect("database name in url")
+}
+
 /// Forcibly drop a database by DSN, terminating live connections —
 /// simulates a backend dying under a running server.
 pub async fn kill_database(url: &str) {
-    let name = url
-        .rsplit('/')
-        .next()
-        .and_then(|last| last.split('?').next())
-        .expect("database name in url");
+    let name = database_name(url);
     let mut admin = PgConnection::connect(&admin_database_url())
         .await
         .expect("connect to admin DB");
@@ -458,11 +462,7 @@ pub async fn kill_database(url: &str) {
 /// hazard), but the raw lock connection cannot, so its session-held
 /// advisory lock is released.
 pub async fn terminate_backends(url: &str) {
-    let name = url
-        .rsplit('/')
-        .next()
-        .and_then(|last| last.split('?').next())
-        .expect("database name in url");
+    let name = database_name(url);
     let mut admin = PgConnection::connect(&admin_database_url())
         .await
         .expect("connect to admin DB");
@@ -642,7 +642,128 @@ pub fn ensure_test_cert() -> (PathBuf, PathBuf) {
     (dir.join("cert.pem"), dir.join("key.pem"))
 }
 
-/// Handle to a running test server, with one minted token per seeded role.
+/// What a failing test needs to know about its own fixture (ADR-0021
+/// ruling 8): which two databases it minted, which port it bound, and the
+/// connection ceilings it was sized against.
+///
+/// Names and numbers ONLY. There is no DSN and no token in this struct,
+/// so no print of it can leak one. The admin DSN the activity snapshot
+/// connects with is read from the environment at print time and never
+/// echoed.
+pub struct FixtureFacts {
+    /// Name (not DSN) of the app-state database.
+    pub app_db: String,
+    /// Name (not DSN) of the fleet-keystore database.
+    pub fleet_db: String,
+    /// `host:port` the server bound.
+    pub bound_addr: String,
+    pub fleet_pool_max: u32,
+    pub app_pool_max: u32,
+    pub per_test_connection_ceiling: u32,
+}
+
+impl FixtureFacts {
+    fn new(app_db_url: &str, fleet_db_url: &str, bound_addr: &str) -> Self {
+        Self {
+            app_db: database_name(app_db_url).to_owned(),
+            fleet_db: database_name(fleet_db_url).to_owned(),
+            bound_addr: bound_addr.to_owned(),
+            fleet_pool_max: FLEET_POOL_MAX,
+            app_pool_max: APP_POOL_MAX,
+            per_test_connection_ceiling: PER_TEST_CONNECTION_CEILING,
+        }
+    }
+
+    /// Print the facts, then whatever postgres is willing to say about
+    /// the backends on those two databases.
+    fn report(&self) {
+        eprintln!("--- fixture facts ---");
+        eprintln!("  app database:   {}", self.app_db);
+        eprintln!("  fleet database: {}", self.fleet_db);
+        eprintln!("  bound addr:     {}", self.bound_addr);
+        eprintln!(
+            "  pool ceilings:  fleet={} app={} per-test={}",
+            self.fleet_pool_max, self.app_pool_max, self.per_test_connection_ceiling
+        );
+        print_pg_activity(vec![self.app_db.clone(), self.fleet_db.clone()]);
+    }
+}
+
+/// Print a `pg_stat_activity` census of this test's two databases.
+///
+/// Grouped counts only: datname, `backend_type`, state and the wait
+/// event. No `usename`, `client_addr`, `application_name` or `query`: a
+/// diagnostic that dumps SQL text or connection identities into CI logs
+/// is a leak, and the grouped counts are what distinguish "pool
+/// exhausted" from "everyone is waiting on one lock".
+///
+/// `Drop` cannot await, and `Handle::block_on` panics when called from a
+/// runtime worker thread, so the work happens on a fresh std thread with
+/// its own current-thread runtime. The join is capped at 2 seconds: a
+/// wedged postgres must not turn one failing test into a hung run. Any
+/// failure prints a CLASS and nothing else.
+fn print_pg_activity(databases: Vec<String>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt.block_on(collect_pg_activity(&databases)),
+            Err(_) => Err("runtime"),
+        };
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(Ok(lines)) => {
+            eprintln!("--- pg_stat_activity ---");
+            if lines.is_empty() {
+                eprintln!("  (no backends on either database)");
+            }
+            for line in lines {
+                eprintln!("  {line}");
+            }
+        }
+        Ok(Err(class)) => eprintln!("diagnostics unavailable: {class}"),
+        Err(_) => eprintln!("diagnostics unavailable: timeout"),
+    }
+}
+
+async fn collect_pg_activity(databases: &[String]) -> Result<Vec<String>, &'static str> {
+    use sqlx::Row as _;
+
+    let Ok(dsn) = std::env::var("DATABASE_URL") else {
+        return Err("no DATABASE_URL");
+    };
+    let mut admin = PgConnection::connect(&dsn).await.map_err(|_| "connect")?;
+    let rows = sqlx::query(
+        "SELECT datname, backend_type, state, wait_event_type, wait_event, count(*) AS n \
+         FROM pg_stat_activity WHERE datname = ANY($1) \
+         GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3",
+    )
+    .bind(databases)
+    .fetch_all(&mut admin)
+    .await
+    .map_err(|_| "query")?;
+
+    let unset = |v: Option<String>| v.unwrap_or_else(|| "-".to_owned());
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let n: i64 = row.try_get("n").unwrap_or(-1);
+            format!(
+                "{} {} state={} wait={}/{} count={n}",
+                unset(row.try_get("datname").ok().flatten()),
+                unset(row.try_get("backend_type").ok().flatten()),
+                unset(row.try_get("state").ok().flatten()),
+                unset(row.try_get("wait_event_type").ok().flatten()),
+                unset(row.try_get("wait_event").ok().flatten()),
+            )
+        })
+        .collect())
+}
+
+/// Test server handle with analyst, admin, and ingest tokens.
 pub struct TestServer {
     pub url: String,
     pub analyst_token: String,
@@ -663,6 +784,20 @@ pub struct TestServer {
     /// The serve task, retained so the readiness poll can tell "still
     /// starting" from "already dead" (see [`wait_for_ready`]).
     pub serve_task: tokio::task::JoinHandle<()>,
+    /// Printed by the drop guard when the test panics.
+    pub facts: FixtureFacts,
+}
+
+/// On a PANICKING unwind only, print the fixture's facts and a census of
+/// its postgres backends. A passing test prints nothing: the guard exists
+/// so a CI failure carries the state that explains it, not so every run
+/// grows a diagnostics tail.
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.facts.report();
+        }
+    }
 }
 
 impl TestServer {
@@ -932,6 +1067,7 @@ pub async fn setup_in_dir_with_data(
     let serve_task = serve_and_wait(listener, &state, &config, http_config, &addr).await;
 
     TestServer {
+        facts: FixtureFacts::new(&app_db_url, &fleet_db_url, &addr),
         url: format!("https://{addr}"),
         analyst_token,
         admin_token,
