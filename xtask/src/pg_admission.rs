@@ -386,7 +386,7 @@ enum Scope {
 
 /// Scan a target's sources for pg evidence.
 fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
-    let parsed: Vec<(PathBuf, FileFacts)> = sources
+    let mut parsed: Vec<(PathBuf, FileFacts)> = sources
         .iter()
         .filter_map(|source| {
             fs::read_to_string(source)
@@ -395,10 +395,37 @@ fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
         })
         .collect();
 
+    // Out-of-line test modules. `#[cfg(test)] mod pg_tests;` puts the test
+    // code in ANOTHER file, and that file carries no `#[cfg(test)]` of its
+    // own, so a span scan of it finds nothing. The whole child file is test
+    // code, so it is scanned whole, and its tests are named under the
+    // module its parent declared.
+    let mut whole_file: BTreeMap<PathBuf, String> = BTreeMap::new();
+    if scope == Scope::UnitTree {
+        for (path, facts) in &parsed {
+            for decl in &facts.cfg_test_mods {
+                for child in mod_decl_files(path, decl) {
+                    whole_file.insert(child, decl.name.clone());
+                }
+            }
+        }
+        let known: BTreeSet<PathBuf> = parsed.iter().map(|(path, _)| path.clone()).collect();
+        for child in whole_file.keys() {
+            if !known.contains(child)
+                && let Ok(text) = fs::read_to_string(child)
+            {
+                parsed.push((child.clone(), file_facts(&text)));
+            }
+        }
+        parsed.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+
     let mut evidence = Vec::new();
     for (source, facts) in &parsed {
         let shown = source.strip_prefix(root).unwrap_or(source).display();
-        let tests = sqlx_tests(facts);
+        let prefix = whole_file.get(source).map(String::as_str);
+
+        let tests = sqlx_tests(facts, prefix);
         if let Some((line, _)) = tests.first() {
             evidence.push(Evidence {
                 site: format!("{shown}:{line} #[sqlx::test]"),
@@ -417,21 +444,22 @@ fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
         }
 
         // The raw-connection side: no attribute, no fixture, just a test
-        // that dials postgres itself. An integration file is all test code;
-        // a `src/` file is production code, where only the `#[cfg(test)]`
-        // bodies count.
-        //
-        // Residual: an out-of-line test module (`#[cfg(test)] mod tests;`)
-        // puts the test code in a file that carries no `#[cfg(test)]` of
-        // its own, so no span of it is scanned at all.
-        if scope == Scope::Integration {
-            // An integration target's finding is target-level on purpose:
-            // nothing there says WHICH tests the connection belongs to, so
-            // the whole binary is charged.
+        // that dials postgres itself. An integration file is all test code
+        // and so is an out-of-line test module's file; a `src/` file is
+        // production code, where only the `#[cfg(test)]` bodies count.
+        if scope == Scope::Integration || prefix.is_some() {
+            // An integration target's finding stays target-level on
+            // purpose: nothing there says WHICH tests the connection
+            // belongs to, so the whole binary is charged.
+            let tests = if scope == Scope::Integration {
+                Vec::new()
+            } else {
+                test_names(facts, prefix, None)
+            };
             if let Some((line, api)) = connection_site(facts, 1, usize::MAX) {
                 evidence.push(Evidence {
                     site: format!("{shown}:{line} {api}"),
-                    tests: Vec::new(),
+                    tests,
                 });
             }
         } else {
@@ -439,13 +467,56 @@ fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
                 if let Some((line, api)) = connection_site(facts, span.0, span.1) {
                     evidence.push(Evidence {
                         site: format!("{shown}:{line} {api}"),
-                        tests: test_names(facts, Some(*span)),
+                        tests: test_names(facts, None, Some(*span)),
                     });
                 }
             }
         }
     }
     evidence
+}
+
+/// The file(s) an out-of-line `mod name;` can live in, as rustc resolves
+/// them: `dir/name.rs` and `dir/name/mod.rs`, where `dir` is the declaring
+/// file's own directory for `mod.rs`/`lib.rs`/`main.rs` and its `dir/stem/`
+/// subdirectory otherwise. Both candidates are returned when both exist —
+/// that is a compile error in the crate, and scanning both is the
+/// conservative answer.
+///
+/// An explicit `#[path = "..."]` wins and resolves against the declaring
+/// file's directory, which is what rustc does for a module declared at the
+/// TOP level of that file. A `#[path]` on a module nested inside an inline
+/// `mod` block resolves against a further subdirectory; that case is a
+/// residual, and it under-collects (the file is simply not found) rather
+/// than pointing the scan at the wrong file.
+fn mod_decl_files(parent: &Path, decl: &ModDecl) -> Vec<PathBuf> {
+    let Some(dir) = parent.parent() else {
+        return Vec::new();
+    };
+    if let Some(path) = &decl.path {
+        let child = dir.join(path);
+        return if child.is_file() {
+            vec![child]
+        } else {
+            Vec::new()
+        };
+    }
+    let stem = parent
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let dir = if matches!(stem, "mod" | "lib" | "main") {
+        dir.to_path_buf()
+    } else {
+        dir.join(stem)
+    };
+    [
+        dir.join(format!("{}.rs", decl.name)),
+        dir.join(&decl.name).join("mod.rs"),
+    ]
+    .into_iter()
+    .filter(|candidate| candidate.is_file())
+    .collect()
 }
 
 /// Line numbers and names of every non-ignored `#[sqlx::test]` in a file.
@@ -455,12 +526,12 @@ fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
 /// name collected here that nextest never lists reads as a test that
 /// escaped the group and fails the guard over a test that never runs. The
 /// two sides must agree on what counts as a test.
-fn sqlx_tests(facts: &FileFacts) -> Vec<(usize, String)> {
+fn sqlx_tests(facts: &FileFacts, prefix: Option<&str>) -> Vec<(usize, String)> {
     facts
         .fns
         .iter()
         .filter(|item| item.is_sqlx_test && !item.ignored)
-        .map(|item| (item.line, item.name.clone()))
+        .map(|item| (item.line, qualify(prefix, &item.name)))
         .collect()
 }
 
@@ -469,14 +540,20 @@ fn sqlx_tests(facts: &FileFacts) -> Vec<(usize, String)> {
 /// Helper `fn`s are left out — they are not test ids, and asking nextest
 /// about one would fail the guard on a name that can never be in the group.
 /// Ignored ones are left out for the same reason `sqlx_tests` drops them.
-fn test_names(facts: &FileFacts, span: Option<Span>) -> Vec<String> {
+fn test_names(facts: &FileFacts, prefix: Option<&str>, span: Option<Span>) -> Vec<String> {
     facts
         .fns
         .iter()
         .filter(|item| item.is_test && !item.ignored)
         .filter(|item| span.is_none_or(|(start, end)| item.line >= start && item.line <= end))
-        .map(|item| item.name.clone())
+        .map(|item| qualify(prefix, &item.name))
         .collect()
+}
+
+/// Prefix a derived name with the module its file was declared as, when the
+/// file IS a module (an out-of-line `#[cfg(test)] mod pg_tests;`).
+fn qualify(prefix: Option<&str>, name: &str) -> String {
+    prefix.map_or_else(|| name.to_string(), |module| format!("{module}::{name}"))
 }
 
 /// The first line in the inclusive range `[start, end]` naming a
@@ -518,6 +595,13 @@ struct FnItem {
     ignored: bool,
 }
 
+/// An out-of-line `#[cfg(test)] mod name;` declaration.
+struct ModDecl {
+    name: String,
+    /// The `#[path = "..."]` override, when one is written.
+    path: Option<String>,
+}
+
 /// Inclusive 1-based line range.
 type Span = (usize, usize);
 
@@ -528,6 +612,9 @@ struct Attr {
     path: String,
     /// The arguments, BLANKED — a string literal's contents are spaces.
     args: String,
+    /// The same arguments as WRITTEN, for the one attribute whose value has
+    /// to be read back (`#[path = "child.rs"]`).
+    raw_args: String,
 }
 
 /// Everything the guard reads out of one source file.
@@ -537,6 +624,7 @@ struct FileFacts {
     code: String,
     fns: Vec<FnItem>,
     cfg_test_spans: Vec<Span>,
+    cfg_test_mods: Vec<ModDecl>,
 }
 
 /// Read one source file with a single item-bounded pass over its blanked
@@ -563,6 +651,7 @@ struct FileFacts {
 fn file_facts(text: &str) -> FileFacts {
     let code = blank_comments_and_literals(text);
     let mut lexer = ItemLexer {
+        raw: text,
         bytes: code.as_bytes(),
         i: 0,
         line: 1,
@@ -573,13 +662,15 @@ fn file_facts(text: &str) -> FileFacts {
         pending_cfg: None,
         fns: Vec::new(),
         spans: Vec::new(),
+        decls: Vec::new(),
     };
     lexer.run();
-    let (fns, spans) = (lexer.fns, lexer.spans);
+    let (fns, spans, decls) = (lexer.fns, lexer.spans, lexer.decls);
     FileFacts {
         code,
         fns,
         cfg_test_spans: spans,
+        cfg_test_mods: decls,
     }
 }
 
@@ -587,7 +678,10 @@ fn file_facts(text: &str) -> FileFacts {
 /// `mod` — and treats everything else as "some item that takes the pending
 /// attribute block".
 struct ItemLexer<'a> {
-    /// The blanked text, as long as the file it came from.
+    /// The file as written. Only `#[path = "..."]` reads it, because
+    /// blanking eats the very string it needs.
+    raw: &'a str,
+    /// The blanked text, the same length as `raw`.
     bytes: &'a [u8],
     i: usize,
     /// 1-based line of `i`.
@@ -605,6 +699,7 @@ struct ItemLexer<'a> {
     pending_cfg: Option<usize>,
     fns: Vec<FnItem>,
     spans: Vec<Span>,
+    decls: Vec<ModDecl>,
 }
 
 impl ItemLexer<'_> {
@@ -730,6 +825,11 @@ impl ItemLexer<'_> {
                 .filter(|c| !c.is_whitespace())
                 .collect(),
             args: inner[split..].to_string(),
+            raw_args: self
+                .raw
+                .get(from + split..to)
+                .unwrap_or_default()
+                .to_string(),
         }
     }
 
@@ -812,17 +912,28 @@ impl ItemLexer<'_> {
         let (attr_line, attrs) = self.pending.take().unwrap_or((line, Vec::new()));
         let cfg_test = attrs.iter().any(is_cfg_test);
         self.skip_trivia();
-        if self.peek() == Some(b'{') {
-            self.bump();
-            if cfg_test {
-                self.open_cfg.push((attr_line, self.depth));
+        match self.peek() {
+            Some(b'{') => {
+                self.bump();
+                if cfg_test {
+                    self.open_cfg.push((attr_line, self.depth));
+                }
+                self.mods.push((name, self.depth));
+                self.depth += 1;
             }
-            self.mods.push((name, self.depth));
-            self.depth += 1;
+            Some(b';') => {
+                self.bump();
+                if cfg_test {
+                    self.decls.push(ModDecl {
+                        name,
+                        path: path_attr(&attrs),
+                    });
+                }
+            }
+            _ => {}
         }
     }
 
-    /// A function's name under the inline modules enclosing it.
     fn qualified(&self, name: &str) -> String {
         let mut out = String::new();
         for (module, _) in &self.mods {
@@ -859,6 +970,15 @@ fn has_ident(text: &str, word: &str) -> bool {
 
 fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// The `#[path = "child.rs"]` value, read from the attribute AS WRITTEN
+/// (blanking eats the string it names).
+fn path_attr(attrs: &[Attr]) -> Option<String> {
+    let attr = attrs.iter().find(|attr| attr.path == "path")?;
+    let start = attr.raw_args.find('"')? + 1;
+    let end = attr.raw_args[start..].find('"')? + start;
+    Some(attr.raw_args[start..end].to_string())
 }
 
 /// Replace comment and literal CONTENT with spaces, keeping every byte
@@ -1049,9 +1169,9 @@ mod tests {
         format!("#[{}::test{args}]", "sqlx")
     }
 
-    /// Every `#[sqlx::test]` a file declares.
+    /// Every `#[sqlx::test]` a file declares, unqualified.
     fn sqlx_names(text: &str) -> Vec<(usize, String)> {
-        sqlx_tests(&file_facts(text))
+        sqlx_tests(&file_facts(text), None)
     }
 
     /// The span half of `scan`, as one call: the first connection each
@@ -1063,7 +1183,7 @@ mod tests {
             .iter()
             .filter_map(|span| {
                 connection_site(&facts, span.0, span.1)
-                    .map(|(line, api)| (line, api, test_names(&facts, Some(*span))))
+                    .map(|(line, api)| (line, api, test_names(&facts, None, Some(*span))))
             })
             .collect()
     }
@@ -1373,6 +1493,107 @@ mod tests {
             "store::pure_tests::connects",
             "pg_tests::connects"
         ));
+    }
+
+    /// A scratch directory that removes itself. The out-of-line module
+    /// class resolves a declaration to a FILE, so it needs real ones.
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!("pg-admission-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        Scratch(dir)
+    }
+
+    fn write(path: &Path, text: &str) {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).expect("scratch subdir");
+        }
+        fs::write(path, text).expect("scratch file");
+    }
+
+    /// `#[cfg(test)] mod pg_tests;` puts the tests in another file, and
+    /// that file carries no `#[cfg(test)]` of its own — so a span scan of
+    /// it finds nothing at all and the connection is invisible. The child
+    /// is all test code, so it is scanned whole, under the module name its
+    /// parent gave it.
+    #[test]
+    fn an_out_of_line_cfg_test_module_is_scanned_whole() {
+        let dir = scratch("out-of-line");
+        let root = &dir.0;
+        let parent = root.join("src").join("store.rs");
+        let child = root.join("src").join("store").join("pg_tests.rs");
+        write(
+            &parent,
+            "pub struct Store;\n\n#[cfg(test)]\nmod pg_tests;\n",
+        );
+        write(
+            &child,
+            &format!(
+                "#[tokio::test]\nasync fn connects() {{\n    let s = {}\"...\").await;\n}}\n\n#[tokio::test]\n#[ignore]\nasync fn shelved() {{}}\n",
+                call("StorageState", "connect"),
+            ),
+        );
+
+        let evidence = scan(&[parent, child], root, Scope::UnitTree);
+        assert_eq!(
+            evidence.len(),
+            1,
+            "{:?}",
+            evidence.iter().map(|e| &e.site).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            evidence[0].site,
+            "src/store/pg_tests.rs:3 StorageState::connect"
+        );
+        assert_eq!(evidence[0].tests, vec!["pg_tests::connects".to_string()]);
+    }
+
+    /// The `mod.rs` form of the same thing, and a `#[path]` override. The
+    /// child is discovered from the declaration, so it does not have to be
+    /// in the source list at all.
+    #[test]
+    fn an_out_of_line_module_resolves_mod_rs_and_path_overrides() {
+        let dir = scratch("out-of-line-paths");
+        let root = &dir.0;
+        let lib = root.join("src").join("lib.rs");
+        write(
+            &lib,
+            "#[cfg(test)]\nmod pg_tests;\n\n#[cfg(test)]\n#[path = \"elsewhere/other.rs\"]\nmod other;\n",
+        );
+        write(
+            &root.join("src").join("pg_tests").join("mod.rs"),
+            &format!(
+                "#[tokio::test]\nasync fn connects() {{\n    let s = {}\"...\").await;\n}}\n",
+                call("StorageState", "connect"),
+            ),
+        );
+        write(
+            &root.join("src").join("elsewhere").join("other.rs"),
+            &format!(
+                "#[tokio::test]\nasync fn also_connects() {{\n    let s = {}\"...\").await;\n}}\n",
+                call("KeyStore", "connect"),
+            ),
+        );
+
+        let evidence = scan(&[lib], root, Scope::UnitTree);
+        let sites: Vec<&str> = evidence.iter().map(|e| e.site.as_str()).collect();
+        assert_eq!(
+            sites,
+            vec![
+                "src/elsewhere/other.rs:3 KeyStore::connect",
+                "src/pg_tests/mod.rs:3 StorageState::connect",
+            ]
+        );
+        assert_eq!(evidence[0].tests, vec!["other::also_connects".to_string()]);
+        assert_eq!(evidence[1].tests, vec!["pg_tests::connects".to_string()]);
     }
 
     /// Blanking has to be byte-for-byte length preserving and newline
