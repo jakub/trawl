@@ -184,14 +184,20 @@ impl StorageState {
     /// processes locking two different databases both believe they are the
     /// sole writer.
     ///
-    /// The contract that makes it airtight is on the CALLER: the pool's
-    /// connect target must not be reconfigured while this call runs.
-    /// `Pool::set_connect_options` changes future connections only, so a
-    /// caller that repointed the pool between the lock acquisition here and
-    /// the migration below would still split the two across databases.
-    /// Every in-repo caller hands over a pool it just built and then drops
-    /// its own handle, and no runtime check is worth adding for a shape
-    /// nothing writes.
+    /// The contract that makes it airtight is on the CALLER, and it runs
+    /// for the LIFETIME of the returned [`StorageState`], not just for the
+    /// duration of this call: the pool's connect target must never be
+    /// reconfigured. A sqlx 0.9 `Pool` clone shares one `Arc`, so
+    /// `set_connect_options` on a clone the caller kept repoints every
+    /// connection the stores open from then on, while the detached lock
+    /// session below stays on the old database. The result is a process
+    /// holding the sole-writer lock on one database and writing to
+    /// another. Repointing mid-call splits the lock from the migration the
+    /// same way.
+    ///
+    /// Every in-repo caller MOVES a pool it just built into this function
+    /// and keeps no clone of its own, so no runtime check is worth adding
+    /// for a shape nothing writes.
     ///
     /// The connection is then detached ([`sqlx::pool::PoolConnection::detach`]):
     /// it leaves pool management entirely and is never recycled, so the
