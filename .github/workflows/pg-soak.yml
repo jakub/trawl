@@ -62,9 +62,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
           toolchain: 1.98.0
+      # Read ci.yml's own warm cache, never write it. The soak's former
+      # private per-suite keys were never SAVED for the heavy suite --
+      # rust-cache saves in its post step, and a cold full-workspace
+      # compile OOMed the pod before post ever ran -- so every attempt
+      # rebuilt from scratch and died in the build, not the tests. CI's
+      # `test` job compiles both feature configs under this one key on
+      # every push, so reading it makes the soak build incremental: the
+      # exact memory shape the pool survives daily. save-if false keeps
+      # ten soak runs from churning the key CI maintains.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: soak-${{ matrix.suite }}
+          shared-key: test
+          save-if: false
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
       - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       - name: Apply fleet-auth schema migrations
