@@ -272,14 +272,13 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
         let package_name = package["name"].as_str().unwrap_or_default();
         let targets = package["targets"].as_array().map_or(&[][..], Vec::as_slice);
 
-        // The unit-test half: a package's `src/` tree is ONE module tree
-        // shared by its lib and its bins, so it is scanned once and charged
-        // to the binary nextest actually runs those tests in — the lib
-        // target when there is one, else the package's first bin. Charging
-        // it per target would blame `trawl-server::bin/trawld` for tests
-        // that only ever run in `trawl-server`'s lib binary.
-        let mut unit_id = None;
-        let mut unit_src = None;
+        // The unit-test half. A package's `src/` tree is NOT one binary:
+        // nextest runs `src/lib.rs`'s tests in `pkg` and each
+        // `src/bin/tool.rs`'s in `pkg::bin/tool`, so scanning the whole
+        // tree and charging it to the lib let a bin's pg test be satisfied
+        // by a same-named lib test that was in the group.
+        let mut lib_src = None;
+        let mut bins = Vec::new();
         for target in targets {
             if !target["test"].as_bool().unwrap_or(false) {
                 continue;
@@ -297,16 +296,13 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
                     });
                 }
             } else if kinds.contains(&"lib") {
-                unit_id = Some(package_name.to_string());
-                unit_src = Some(src);
-            } else if unit_id.is_none() {
-                // nextest ids a bin's unit tests `pkg::bin/name`.
-                unit_id = Some(format!("{package_name}::bin/{name}"));
-                unit_src = Some(src);
+                lib_src = Some(src);
+            } else {
+                bins.push((name.to_string(), src));
             }
         }
-        if let (Some(binary_id), Some(src)) = (unit_id, unit_src) {
-            let files = unit_files(&src)?;
+
+        let mut charge = |binary_id: String, files: Vec<(SourceFile, FileFacts)>| {
             let evidence = scan(&files, root, Scope::UnitTree);
             if !evidence.is_empty() {
                 derived.push(Derived {
@@ -314,6 +310,31 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
                     evidence,
                 });
             }
+        };
+
+        if let Some(src) = &lib_src {
+            // `src/bin/` is nobody's lib module. Sweeping it into the lib
+            // scan is what made a bin's test look like a lib test.
+            let bin_dir = src.parent().map(|dir| dir.join("bin"));
+            let files = unit_files(src, src.parent(), bin_dir.as_deref())?;
+            charge(package_name.to_string(), files);
+        }
+        for (name, src) in bins {
+            // A bin under `src/bin/` owns `src/bin/<stem>/` and nothing
+            // else. A bin at `src/main.rs` shares the directory with the
+            // lib, so only the modules it actually declares are its own —
+            // a module BOTH roots declare is scanned into both targets,
+            // which over-collects loudly rather than dropping it.
+            let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            let net = match src.parent() {
+                Some(dir) if dir.ends_with("bin") => Some(dir.join(stem)),
+                // No lib: the bin IS the package's unit-test target, so
+                // the whole `src/` tree is its safety net.
+                dir if lib_src.is_none() => dir.map(Path::to_path_buf),
+                _ => None,
+            };
+            let files = unit_files(&src, net.as_deref(), None)?;
+            charge(format!("{package_name}::bin/{name}"), files);
         }
     }
     derived.sort_by(|a, b| a.binary_id.cmp(&b.binary_id));
@@ -321,15 +342,20 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
 }
 
 /// Every file of a unit-test tree: the module walk from the crate root,
-/// plus any other `.rs` under the source root the walk never reached.
+/// plus any other `.rs` under `net_root` the walk never reached, minus
+/// anything under `exclude`.
 ///
 /// The walk is the authority on module paths; the leftovers are a safety
 /// net. A file no `mod` declaration reaches does not compile into the
 /// binary at all, so including it can only cost a false failure — loud,
 /// and preferable to trusting the walk to be complete.
-fn unit_files(src: &Path) -> Result<Vec<(SourceFile, FileFacts)>, String> {
+fn unit_files(
+    src: &Path,
+    net_root: Option<&Path>,
+    exclude: Option<&Path>,
+) -> Result<Vec<(SourceFile, FileFacts)>, String> {
     let mut files = module_tree(src, false)?;
-    let Some(source_root) = src.parent() else {
+    let Some(source_root) = net_root else {
         return Ok(files);
     };
     let mut all = Vec::new();
@@ -338,7 +364,7 @@ fn unit_files(src: &Path) -> Result<Vec<(SourceFile, FileFacts)>, String> {
     all.dedup();
     let seen: BTreeSet<PathBuf> = files.iter().map(|(file, _)| file.path.clone()).collect();
     for path in all {
-        if seen.contains(&path) {
+        if seen.contains(&path) || exclude.is_some_and(|dir| path.starts_with(dir)) {
             continue;
         }
         let text = fs::read_to_string(&path)
@@ -1810,6 +1836,13 @@ mod tests {
         Scratch(dir)
     }
 
+    fn derived_sites(derived: &[Derived]) -> Vec<String> {
+        derived
+            .iter()
+            .map(|d| format!("{}: {}", d.binary_id, d.sites()))
+            .collect()
+    }
+
     fn sites(evidence: &[Evidence]) -> Vec<&str> {
         evidence.iter().map(|e| e.site.as_str()).collect()
     }
@@ -1845,7 +1878,7 @@ mod tests {
         );
 
         write(&root.join("src").join("lib.rs"), "mod store;\n");
-        let files = unit_files(&root.join("src").join("lib.rs")).expect("module tree");
+        let files = unit_files(&root.join("src").join("lib.rs"), None, None).expect("module tree");
         let evidence = scan(&files, root, Scope::UnitTree);
         assert_eq!(
             evidence.len(),
@@ -1891,7 +1924,7 @@ mod tests {
             ),
         );
 
-        let files = unit_files(&lib).expect("module tree");
+        let files = unit_files(&lib, None, None).expect("module tree");
         let evidence = scan(&files, root, Scope::UnitTree);
         let sites: Vec<&str> = evidence.iter().map(|e| e.site.as_str()).collect();
         assert_eq!(
@@ -1925,7 +1958,7 @@ mod tests {
             "#[cfg(test)]\nmod tests {\n    #[tokio::test]\n    async fn connects() {}\n}\n",
         );
 
-        let files = unit_files(&src.join("lib.rs")).expect("module tree");
+        let files = unit_files(&src.join("lib.rs"), None, None).expect("module tree");
         let evidence = scan(&files, root, Scope::UnitTree);
         assert_eq!(evidence.len(), 1, "{:?}", sites(&evidence));
         assert_eq!(evidence[0].tests, vec!["a::tests::connects".to_string()]);
@@ -1982,7 +2015,7 @@ mod tests {
             ),
         );
 
-        let files = unit_files(&src.join("lib.rs")).expect("module tree");
+        let files = unit_files(&src.join("lib.rs"), None, None).expect("module tree");
         let evidence = scan(&files, root, Scope::UnitTree);
         assert_eq!(
             sites(&evidence),
@@ -2005,6 +2038,46 @@ mod tests {
             panic!("nowhere resolves to no file")
         };
         assert!(error.contains("mod nowhere;"), "{error}");
+    }
+
+    /// A bin's unit tests run in `pkg::bin/tool`, not in the lib binary.
+    /// Scanning all of `src/` and charging it to the lib let a pg test in
+    /// `src/bin/tool.rs` be satisfied by a same-named lib test that WAS in
+    /// the group. This one goes through `derive`, so `cargo metadata` gets
+    /// the last word on which target owns which file.
+    #[test]
+    fn a_bins_pg_test_is_charged_to_the_bin_not_the_lib() {
+        let dir = scratch("bin-partition");
+        let root = &dir.0;
+        write(
+            &root.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        );
+        // The lib carries a same-named test that never opens a pool.
+        write(
+            &root.join("src").join("lib.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn connects() {}\n}\n",
+        );
+        write(
+            &root.join("src").join("bin").join("tool.rs"),
+            &format!(
+                "fn main() {{}}\n\n#[cfg(test)]\nmod tests {{\n    #[tokio::test]\n    async fn connects() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+                call("KeyStore", "connect"),
+            ),
+        );
+
+        let derived = derive(root).expect("cargo metadata");
+        let ids: Vec<&str> = derived.iter().map(|d| d.binary_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["probe::bin/tool"],
+            "{:?}",
+            derived_sites(&derived)
+        );
+        assert_eq!(
+            derived[0].named_tests().into_iter().collect::<Vec<_>>(),
+            vec!["tests::connects"]
+        );
     }
 
     /// Blanking has to be byte-for-byte length preserving and newline
