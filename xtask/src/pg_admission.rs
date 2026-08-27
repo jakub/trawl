@@ -79,10 +79,19 @@
 //! * A `#[cfg(test)]` region nested inside another one yields two spans
 //!   over the same code, so one connection can be reported twice. Two
 //!   findings for one call site, never zero.
-//! * An item whose signature ends in a brace that is not a body — a
-//!   `#[cfg(test)] const X: Foo = Foo { .. };`, a `use a::{b, c};` — opens
-//!   a span over that brace. The span is wrong but LARGER than the item,
-//!   which can only add findings.
+//! * An attributed item that ends at a `;` with no body spans its own
+//!   whole extent, first attribute line through the semicolon. That is
+//!   what covers a `#[cfg(test)] static POOL: LazyLock<PgPool> =
+//!   LazyLock::new(|| { .. });`, whose connection lives in a closure the
+//!   signature walk consumes as a group. It over-collects for an item with
+//!   nothing in it, `#[cfg(test)] use x;`, which is harmless.
+//! * A brace at the item's own depth that is not a body is still read as
+//!   one, so a `use a::{b, c};` opens a span ending at that brace's `}`
+//!   rather than at the semicolon. The span covers the item's own text and
+//!   stops there: it neither loses a line of the item nor reaches into the
+//!   next one. An initializer brace is not misread at all, since a `=` at
+//!   the item's own depth switches the walk to skipping brace groups
+//!   whole.
 //! * Token spacing inside an attribute is not read: `# [test]` is invisible
 //!   to the lexer. `cargo fmt` rejects that spelling at the pre-commit
 //!   hook and in CI, so the shape cannot reach a merge.
@@ -878,6 +887,17 @@ struct ItemLexer<'a> {
     decls: Vec<ModDecl>,
 }
 
+/// How [`ItemLexer::skip_to_body`] left an attributed item.
+enum ItemHead {
+    /// A body brace was found and consumed. The item's extent is the block
+    /// that now follows, and the main loop's depth bookkeeping closes it.
+    Body,
+    /// The item ended at a `;` with no body, on the line reported here.
+    Bodyless(usize),
+    /// The enclosing block closed first, or the file ended mid-item.
+    None,
+}
+
 impl ItemLexer<'_> {
     fn run(&mut self) {
         loop {
@@ -1079,16 +1099,29 @@ impl ItemLexer<'_> {
     /// even when it was a const-generic argument (`fn f() -> Foo<{ 1 }>`).
     fn take_pending(&mut self, line: usize) -> (usize, Vec<Attr>) {
         let (attr_line, attrs) = self.pending.take().unwrap_or((line, Vec::new()));
-        if attrs.iter().any(is_cfg_test) && self.skip_to_body() {
-            self.open_cfg.push((attr_line, self.depth));
-            self.depth += 1;
+        if attrs.iter().any(is_cfg_test) {
+            match self.skip_to_body() {
+                ItemHead::Body => {
+                    self.open_cfg.push((attr_line, self.depth));
+                    self.depth += 1;
+                }
+                // No body to bound the span with, so the item's own extent
+                // is the span: first attribute line through the semicolon.
+                // A `#[cfg(test)] static POOL: LazyLock<PgPool> =
+                // LazyLock::new(|| { .. connect_lazy .. });` has its whole
+                // connection inside a closure the signature walk consumed
+                // as a group, and reporting no span at all made that pool
+                // invisible.
+                ItemHead::Bodyless(end) => self.spans.push((attr_line, end)),
+                ItemHead::None => {}
+            }
         }
         (attr_line, attrs)
     }
 
-    /// Walk an item's signature to its body brace, consuming it. `false`
-    /// means the item has no body (`#[cfg(test)] use x;`, a trait method
-    /// declaration) or the file ended mid-item.
+    /// Walk an item's signature to its body brace, consuming it. An item
+    /// that ends at a `;` instead reports the line that semicolon sits on,
+    /// which is where its extent stops.
     ///
     /// `(`/`[` depth is what keeps a signature comma or semicolon from
     /// reading as the end of the item. Angle depth is what keeps a
@@ -1098,16 +1131,24 @@ impl ItemLexer<'_> {
     /// Angle tracking is deliberately crude — `->` and `=>` are stepped
     /// over so their `>` does not close a bracket that never opened, and
     /// `>>` closes two. A signature-level `<` that is not a generic opener
-    /// does not occur in Rust, so nothing else is tracked. The residual
-    /// runs toward over-collection: a `{` this walk misreads as a body
-    /// opens a LARGER span than the item, which can only add findings.
-    fn skip_to_body(&mut self) -> bool {
+    /// does not occur in Rust, so nothing else is tracked.
+    ///
+    /// A `=` at group and angle depth 0 says the rest of the item is an
+    /// INITIALIZER, so every brace after it is an expression brace and is
+    /// skipped as a balanced group rather than read as a body. No item
+    /// with a real body carries such a `=` first: an `impl`, `struct`,
+    /// `trait` or `fn` head has none, and an associated type's `=` sits at
+    /// angle depth 1 (`Iterator<Item = u8>`). Without the rule an
+    /// initializer like `= if c { a } else { connect_lazy(..) };` had its
+    /// span closed at the first `}`, leaving the second arm uncovered.
+    fn skip_to_body(&mut self) -> ItemHead {
         let mut group = 0usize;
         let mut angle = 0usize;
+        let mut initializer = false;
         loop {
             self.skip_trivia();
             let Some(byte) = self.peek() else {
-                return false;
+                return ItemHead::None;
             };
             match byte {
                 b'(' | b'[' => {
@@ -1119,22 +1160,29 @@ impl ItemLexer<'_> {
                     self.bump();
                 }
                 b'{' => {
-                    if group > 0 || angle > 0 {
+                    if group > 0 || angle > 0 || initializer {
                         self.group(b'{', b'}');
                     } else {
                         self.bump();
-                        return true;
+                        return ItemHead::Body;
                     }
                 }
                 // The enclosing block ended before this item did. Leave the
                 // brace for the main loop, which owns the depth bookkeeping.
-                b'}' => return false,
+                b'}' => return ItemHead::None,
                 b';' if group == 0 => {
+                    let line = self.line;
                     self.bump();
-                    return false;
+                    return ItemHead::Bodyless(line);
                 }
                 b'-' | b'=' if self.bytes.get(self.i + 1) == Some(&b'>') => {
                     self.bump();
+                    self.bump();
+                }
+                b'=' => {
+                    if group == 0 && angle == 0 {
+                        initializer = true;
+                    }
                     self.bump();
                 }
                 b'<' => {
@@ -1873,6 +1921,45 @@ mod tests {
         assert_eq!(sites.len(), 1, "{sites:?}");
         assert_eq!((sites[0].0, sites[0].1), (8, "StorageState::connect"));
         assert_eq!(sites[0].2, vec!["pg_tests::boots".to_string()]);
+    }
+
+    /// A `LazyLock` pool is a bodyless item, and its whole connection sits
+    /// inside a closure the signature walk consumes as a balanced group.
+    /// The walk used to reach the terminating `;` and report no span at
+    /// all, so the pool was invisible: a test that acquires from it names
+    /// no connection API of its own, and nothing else in the file does
+    /// either.
+    #[test]
+    fn a_lazy_static_pool_is_covered_by_its_own_span() {
+        let pool = format!("Pg{}", "Pool");
+        let lazy = format!("connect{}", "_lazy");
+        let text = format!(
+            "#[cfg(test)]\nstatic POOL: LazyLock<{pool}> = LazyLock::new(|| {{\n    {lazy}(\"postgres://x\")\n}});\n",
+        );
+        let facts = file_facts(&text);
+        // Attribute line through the semicolon, and no further.
+        assert_eq!(facts.cfg_test_spans, vec![(1, 4)]);
+        let span = facts.cfg_test_spans[0];
+        // The type on line 2 names `PgPool`, so ask the span about the
+        // initializer line specifically.
+        assert_eq!(
+            connection_site(&facts, 3, span.1),
+            Some((3, "connect_lazy"))
+        );
+    }
+
+    /// An initializer can open more than one brace group at the item's own
+    /// depth. Reading the first one as a body closed the span at its `}`,
+    /// so the second arm fell outside every span.
+    #[test]
+    fn an_initializer_with_two_brace_groups_is_covered_whole() {
+        let lazy = format!("connect{}", "_lazy");
+        let text = format!(
+            "#[cfg(test)]\nstatic POOL: Lazy = if stubbed() {{\n    stub()\n}} else {{\n    {lazy}(\"postgres://x\")\n}};\n",
+        );
+        let facts = file_facts(&text);
+        assert_eq!(facts.cfg_test_spans, vec![(1, 6)]);
+        assert_eq!(cfg_test_sites(&text), vec![(5, "connect_lazy", Vec::new())]);
     }
 
     /// `#[cfg(feature = "test")]` is not `#[cfg(test)]`. The argument text
