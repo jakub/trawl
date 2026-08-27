@@ -105,7 +105,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: test
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
+      # nextest is pinned by VERSION, not just by the action sha: the action
+      # manifest at this sha ships 0.9.132, whose filterset grammar predates
+      # the `group()` predicate pg-admission-guard queries with -- the guard
+      # step failed on every run while local 0.9.143 parsed it fine. Pin the
+      # version the local gates validate.
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
+        with:
+          tool: nextest@0.9.143
       - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       # Explicit migration step: run the operational `fleet-admin migrate`
       # command against the service container. Spells out AC10's migration
@@ -294,7 +301,7 @@ jobs:
           shared-key: trawl-web-tests
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
         with:
-          tool: nextest
+          tool: nextest@0.9.143
       - run: cargo nextest run -p trawl-web
 
   trawl-web-release:
