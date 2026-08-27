@@ -505,8 +505,12 @@ fn module_tree(root_file: &Path, all_test: bool) -> Result<Vec<(SourceFile, File
         // twice, and nextest names the tests once per mounting, so a
         // path-only key scans the file once and derives only whichever
         // mounting came off the stack first. The other mounting's names are
-        // then never checked against the group.
-        if !seen.insert((file.path.clone(), file.prefix.clone())) {
+        // then never checked against the group. Test scope is part of the
+        // identity too: cfg-alternated mountings share a path AND a name
+        // (`#[cfg(test)] mod shared;` beside `#[cfg(feature = "x")] mod
+        // shared;`), and a key without `all_test` lets whichever mounting
+        // pops last discard the test-scoped scan of the other.
+        if !seen.insert((file.path.clone(), file.prefix.clone(), file.all_test)) {
             continue;
         }
         let text = fs::read_to_string(&file.path)
@@ -542,7 +546,9 @@ fn module_tree(root_file: &Path, all_test: bool) -> Result<Vec<(SourceFile, File
         }
         out.push((file, facts));
     }
-    out.sort_by(|a, b| (&a.0.path, &a.0.prefix).cmp(&(&b.0.path, &b.0.prefix)));
+    out.sort_by(|a, b| {
+        (&a.0.path, &a.0.prefix, a.0.all_test).cmp(&(&b.0.path, &b.0.prefix, b.0.all_test))
+    });
     Ok(out)
 }
 
@@ -2233,6 +2239,35 @@ mod tests {
                 "alias_b::connects".to_string()
             ]
         );
+    }
+
+    /// One file, one module name, two cfg-alternated mountings. Only one
+    /// exists per build, but the walk follows both declarations, and a
+    /// dedup key without the test scope lets the non-test mounting (popped
+    /// last off the LIFO) discard the `#[cfg(test)]` one -- the whole-file
+    /// scan that would have seen the connection never runs.
+    #[test]
+    fn a_cfg_alternated_mounting_keeps_the_test_scoped_scan() {
+        let dir = scratch("cfg-alternated");
+        let root = &dir.0;
+        let src = root.join("src");
+        write(
+            &src.join("lib.rs"),
+            "#[cfg(test)]\n#[path = \"shared.rs\"]\nmod shared;\n\n#[cfg(feature = \"prod\")]\n#[path = \"shared.rs\"]\nmod shared;\n",
+        );
+        write(
+            &src.join("shared.rs"),
+            &format!(
+                "#[tokio::test]\nasync fn escapes() {{\n    let s = {}\"...\").await;\n}}\n",
+                call("KeyStore", "connect"),
+            ),
+        );
+
+        let files = unit_files(&src.join("lib.rs"), None, None).expect("module tree");
+        let evidence = scan(&files, root, Scope::UnitTree);
+        assert_eq!(sites(&evidence), vec!["src/shared.rs:3 KeyStore::connect"]);
+        let derived: Vec<String> = evidence.iter().flat_map(|e| e.tests.clone()).collect();
+        assert_eq!(derived, vec!["shared::escapes".to_string()]);
     }
 
     /// A declaration the walk cannot resolve is the shape a pg test hides
