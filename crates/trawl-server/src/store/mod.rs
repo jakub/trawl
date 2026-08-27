@@ -30,8 +30,8 @@ pub mod status;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sqlx::PgPool;
 use sqlx::postgres::{PgConnection, PgPoolOptions};
-use sqlx::{Connection as _, PgPool};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -171,24 +171,37 @@ impl StorageState {
             .await
             .map_err(StoreError::Unavailable)?;
 
-        Self::from_pool(pool, database_url).await
+        Self::from_pool(pool).await
     }
 
     /// Prepare an already-built pool for use: advisory lock, migrate, open
     /// the stores.
     ///
-    /// The `database_url` is still required because the sole-writer advisory
-    /// lock lives on its own raw [`PgConnection`], not on a pooled one.
+    /// The pool is the only input, and that is the whole point: the
+    /// sole-writer lock is taken on a connection acquired from THIS pool,
+    /// so the lock and the writes it guards are on the same database by
+    /// construction. A second parameter naming a DSN could disagree with
+    /// the pool, and two processes locking two different databases both
+    /// believe they are the sole writer.
+    ///
+    /// The connection is then detached ([`sqlx::pool::PoolConnection::detach`]):
+    /// it leaves pool management entirely and is never recycled, so the
+    /// session-scoped `pg_advisory_lock` cannot be released underneath us
+    /// by a pooled connection going back on the idle list. The pool refills
+    /// the slot on demand, so the process ceiling is `max_connections` plus
+    /// this one dedicated session.
     ///
     /// Boot order is load-bearing here, not in the caller: take the session
     /// advisory lock BEFORE migrate — the lock exists to prevent two
     /// instances racing boot-time migration.
-    pub async fn from_pool(pool: PgPool, database_url: &str) -> Result<Self, StoreError> {
-        // Sole-writer enforcement on a dedicated session connection (pool
-        // connections can be recycled, which would silently drop the lock).
-        let mut lock_conn = PgConnection::connect(database_url)
+    pub async fn from_pool(pool: PgPool) -> Result<Self, StoreError> {
+        // Sole-writer enforcement on a dedicated session connection, minted
+        // from the pool and detached so nothing can recycle it.
+        let mut lock_conn: PgConnection = pool
+            .acquire()
             .await
-            .map_err(StoreError::Unavailable)?;
+            .map_err(StoreError::Unavailable)?
+            .detach();
         let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(ADVISORY_LOCK_KEY)
             .fetch_one(&mut lock_conn)

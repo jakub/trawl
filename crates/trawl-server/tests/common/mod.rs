@@ -236,6 +236,10 @@ pub const APP_POOL_MAX: u32 = 3;
 pub const SQLX_TEST_POOL_MAX: u32 = 5;
 
 /// The advisory-lock session one `StorageState` holds for its lifetime.
+///
+/// Charged on top of the app pool's own ceiling: the store acquires it from
+/// that pool and then detaches it, so the pool refills the slot and the
+/// process holds `APP_POOL_MAX` plus this one.
 pub const LOCK_CONNECTIONS: u32 = 1;
 
 /// The short-lived admin connection a mint, a sweep or a kill opens and
@@ -1236,10 +1240,9 @@ pub async fn setup_in_dir_with_data(
     // sized; only production connects for itself. The app store still boots
     // through the real path (advisory lock, then migrate).
     let auth = trawl_server::state::AuthState::from_key_store(KeyStore::from_pool(fleet.clone()));
-    let storage =
-        trawl_server::store::StorageState::from_pool(app_pool(&app_db_url).await, &app_db_url)
-            .await
-            .expect("boot the app-state database");
+    let storage = trawl_server::store::StorageState::from_pool(app_pool(&app_db_url).await)
+        .await
+        .expect("boot the app-state database");
     let (state, http_config) = AppState::from_parts(
         &config,
         test_metrics_handle(),

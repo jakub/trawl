@@ -663,12 +663,9 @@ async fn scheduler_runs_after(
     // `#[sqlx::test]`, which is most of a per-test connection budget spent
     // on a scheduler that runs one query.
     let app_db_url = common::create_app_database().await;
-    let storage = trawl_server::store::StorageState::from_pool(
-        common::app_pool(&app_db_url).await,
-        &app_db_url,
-    )
-    .await
-    .expect("boot app storage");
+    let storage = trawl_server::store::StorageState::from_pool(common::app_pool(&app_db_url).await)
+        .await
+        .expect("boot app storage");
 
     let saved = storage
         .saved

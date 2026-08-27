@@ -1261,7 +1261,7 @@ async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
 /// constructor itself stays under test in
 /// `boot_unreachable_database_fails_descriptively`.
 async fn boot(url: &str) -> Result<StorageState, StoreError> {
-    StorageState::from_pool(common::app_pool(url).await, url).await
+    StorageState::from_pool(common::app_pool(url).await).await
 }
 
 /// Fresh empty database + the real boot path applies the schema
@@ -1322,6 +1322,33 @@ async fn boot_second_live_instance_fails_on_advisory_lock() {
         err.to_string().contains("advisory lock"),
         "error must name the advisory lock: {err}"
     );
+}
+
+/// The lock session is detached, so it never occupies a pool slot.
+///
+/// `from_pool` acquires the advisory-lock connection from the pool it was
+/// handed — that is what makes the lock and the writes it guards provably
+/// the same database — and then detaches it. A connection merely held
+/// checked out would spend a slot for the process lifetime: on a pool of
+/// one, the migration that runs right after would wait for a connection
+/// that never comes back. Boot completing here, and the pool answering a
+/// query afterwards, is the evidence that detach happened.
+#[tokio::test]
+async fn boot_lock_session_does_not_hold_a_pool_slot() {
+    let url = common::create_app_database().await;
+    let pool = common::fixture_pool(&url, 1).await;
+
+    let storage = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        StorageState::from_pool(pool),
+    )
+    .await
+    .expect("boot must not wait on a pool slot the lock session took")
+    .expect("boot on a single-connection pool");
+
+    // The pool refilled the detached slot: ordinary store traffic flows.
+    storage.ping().await.unwrap();
+    storage.saved.create(1, "detached", "q").await.unwrap();
 }
 
 /// An unreachable storage database is a descriptive startup failure.
