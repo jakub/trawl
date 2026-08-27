@@ -245,10 +245,16 @@ fn name_list(names: &[&str]) -> String {
     )
 }
 
-/// Does a nextest test id name this function? Ids carry the module path
-/// (`from_saved::tests::name`), so match the last segment.
-fn test_is(test_id: &str, fn_name: &str) -> bool {
-    test_id == fn_name || test_id.rsplit("::").next() == Some(fn_name)
+/// Does a nextest test id name this derived test?
+///
+/// An id carries the full module path (`from_saved::pg_tests::run_all`)
+/// while a derived name carries only the nesting the lexer could see inside
+/// the file (`pg_tests::run_all`), so the match is on a whole trailing run
+/// of path segments. Matching the LEAF alone was unsound: a pg-touching
+/// `pg_tests::connects` outside the group was masked by an unrelated
+/// `pure_tests::connects` inside it.
+fn test_is(test_id: &str, derived: &str) -> bool {
+    test_id == derived || test_id.ends_with(&format!("::{derived}"))
 }
 
 /// Derive the pg-touching targets from `cargo metadata` and the sources.
@@ -501,6 +507,9 @@ struct FnItem {
     /// Real 1-based line of the first attribute in the block, or of the
     /// signature itself when the function carries no attributes.
     line: usize,
+    /// The enclosing inline `mod` names joined onto the function's own
+    /// (`pg_tests::resolve_all`). The file's path from the crate root is
+    /// NOT part of it; [`test_is`] matches by trailing segments.
     name: String,
     /// Does the block carry an attribute whose last path segment is `test`
     /// (`#[test]`, `#[tokio::test]`, `#[sqlx::test]`)?
@@ -558,6 +567,7 @@ fn file_facts(text: &str) -> FileFacts {
         i: 0,
         line: 1,
         depth: 0,
+        mods: Vec::new(),
         open_cfg: Vec::new(),
         pending: None,
         pending_cfg: None,
@@ -583,6 +593,8 @@ struct ItemLexer<'a> {
     /// 1-based line of `i`.
     line: usize,
     depth: usize,
+    /// Enclosing inline `mod` names, each with the depth its body opened at.
+    mods: Vec<(String, usize)>,
     /// Open `#[cfg(test)]` bodies: start line, and the depth each opened at.
     open_cfg: Vec<(usize, usize)>,
     /// The attribute block being accumulated: the line it started on, and
@@ -725,6 +737,13 @@ impl ItemLexer<'_> {
         self.pending = None;
         self.pending_cfg = None;
         self.depth = self.depth.saturating_sub(1);
+        while self
+            .mods
+            .last()
+            .is_some_and(|(_, depth)| *depth >= self.depth)
+        {
+            self.mods.pop();
+        }
         while let Some(&(start, depth)) = self.open_cfg.last() {
             if depth < self.depth {
                 break;
@@ -780,7 +799,7 @@ impl ItemLexer<'_> {
         let Some(name) = name else { return };
         self.fns.push(FnItem {
             line: attr_line,
-            name,
+            name: self.qualified(&name),
             is_test: attrs.iter().any(is_test_attr),
             is_sqlx_test: attrs.iter().any(|attr| attr.path == "sqlx::test"),
             ignored: attrs.iter().any(|attr| attr.path == "ignore"),
@@ -789,7 +808,7 @@ impl ItemLexer<'_> {
 
     fn module(&mut self, line: usize) {
         self.skip_trivia();
-        self.ident();
+        let name = self.ident().unwrap_or_default();
         let (attr_line, attrs) = self.pending.take().unwrap_or((line, Vec::new()));
         let cfg_test = attrs.iter().any(is_cfg_test);
         self.skip_trivia();
@@ -798,8 +817,20 @@ impl ItemLexer<'_> {
             if cfg_test {
                 self.open_cfg.push((attr_line, self.depth));
             }
+            self.mods.push((name, self.depth));
             self.depth += 1;
         }
+    }
+
+    /// A function's name under the inline modules enclosing it.
+    fn qualified(&self, name: &str) -> String {
+        let mut out = String::new();
+        for (module, _) in &self.mods {
+            out.push_str(module);
+            out.push_str("::");
+        }
+        out.push_str(name);
+        out
     }
 }
 
@@ -1242,6 +1273,8 @@ mod tests {
 
     /// The escape this class exists for: a plain `#[tokio::test]` under
     /// `src/`, inside the crate's own test module, dialing postgres itself.
+    /// The name it reports carries the module, because a leaf name is
+    /// ambiguous across modules (see [`test_is`]).
     #[test]
     fn a_connection_inside_a_cfg_test_module_is_evidence() {
         let text = format!(
@@ -1252,7 +1285,7 @@ mod tests {
         let sites = cfg_test_sites(&text);
         assert_eq!(sites.len(), 1);
         assert_eq!((sites[0].0, sites[0].1), (10, "StorageState::connect"));
-        assert_eq!(sites[0].2, vec!["boots".to_string()]);
+        assert_eq!(sites[0].2, vec!["pg_tests::boots".to_string()]);
     }
 
     /// One `#[cfg(test)]` region per file was the old rule (`find_map`), so
@@ -1266,7 +1299,7 @@ mod tests {
         let sites = cfg_test_sites(&text);
         assert_eq!(sites.len(), 1, "{sites:?}");
         assert_eq!((sites[0].0, sites[0].1), (11, "StorageState::connect"));
-        assert_eq!(sites[0].2, vec!["boots".to_string()]);
+        assert_eq!(sites[0].2, vec!["pg_tests::boots".to_string()]);
     }
 
     /// An ignored test inside a connecting span is not named evidence
@@ -1280,7 +1313,7 @@ mod tests {
         );
         let sites = cfg_test_sites(&text);
         assert_eq!(sites.len(), 1);
-        assert_eq!(sites[0].2, vec!["live".to_string()]);
+        assert_eq!(sites[0].2, vec!["pg_tests::live".to_string()]);
     }
 
     /// Braces nested inside the test module, and a string literal carrying
@@ -1294,7 +1327,7 @@ mod tests {
         let sites = cfg_test_sites(&text);
         assert_eq!((sites[0].0, sites[0].1), (9, "StorageState::connect"));
         // `helper` carries no test attribute, so it is not a name to check.
-        assert_eq!(sites[0].2, vec!["boots".to_string()]);
+        assert_eq!(sites[0].2, vec!["tests::boots".to_string()]);
 
         // The same call AFTER the module closes is production code again.
         let outside = format!(
@@ -1329,10 +1362,17 @@ mod tests {
     }
 
     #[test]
-    fn a_test_id_matches_by_its_last_segment() {
+    fn a_test_id_matches_by_a_whole_trailing_path() {
         assert!(test_is("from_saved::tests::run_all", "run_all"));
         assert!(test_is("run_all", "run_all"));
         assert!(!test_is("from_saved::tests::run_all_but_one", "run_all"));
+        // The whole point of qualifying: a leaf match would let an
+        // in-group `pure_tests::connects` mask an out-of-group one.
+        assert!(test_is("store::pg_tests::connects", "pg_tests::connects"));
+        assert!(!test_is(
+            "store::pure_tests::connects",
+            "pg_tests::connects"
+        ));
     }
 
     /// Blanking has to be byte-for-byte length preserving and newline
