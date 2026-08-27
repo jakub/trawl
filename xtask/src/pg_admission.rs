@@ -469,6 +469,13 @@ struct SourceFile {
 ///   own directory instead of `foo/`. Nested inside an inline `mod`, it
 ///   goes back to the nesting rule.
 ///
+/// A file already visited is skipped, but the key is the pair (path,
+/// module prefix), not the path. One file can be mounted under two module
+/// names, `#[path = "shared.rs"] mod a;` beside `#[path = "shared.rs"] mod
+/// b;`, and rustc compiles its tests twice, once under each name. Keying on
+/// the path alone scanned the text once and derived only one of the two
+/// name sets.
+///
 /// A declaration that resolves to no file on disk is a hard error naming
 /// the module. Skipping it silently is the one outcome this guard may not
 /// have: the file it could not find is exactly where a pg test would hide.
@@ -484,7 +491,13 @@ fn module_tree(root_file: &Path, all_test: bool) -> Result<Vec<(SourceFile, File
         true,
     )];
     while let Some((file, is_root)) = queue.pop() {
-        if !seen.insert(file.path.clone()) {
+        // Keyed on the module identity, not the file alone. `#[path =
+        // "shared.rs"]` on two `mod` declarations compiles the same text
+        // twice, and nextest names the tests once per mounting, so a
+        // path-only key scans the file once and derives only whichever
+        // mounting came off the stack first. The other mounting's names are
+        // then never checked against the group.
+        if !seen.insert((file.path.clone(), file.prefix.clone())) {
             continue;
         }
         let text = fs::read_to_string(&file.path)
@@ -520,7 +533,7 @@ fn module_tree(root_file: &Path, all_test: bool) -> Result<Vec<(SourceFile, File
         }
         out.push((file, facts));
     }
-    out.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+    out.sort_by(|a, b| (&a.0.path, &a.0.prefix).cmp(&(&b.0.path, &b.0.prefix)));
     Ok(out)
 }
 
@@ -2092,6 +2105,46 @@ mod tests {
         assert_eq!(
             evidence[0].tests,
             vec!["outer::pg_tests::connects".to_string()]
+        );
+    }
+
+    /// One file, two `#[path]` mountings. rustc compiles the text twice
+    /// and nextest lists `alias_a::connects` and `alias_b::connects`, so
+    /// deriving only one of them leaves the other unchecked: the group
+    /// filter can hold the derived name while the alias runs outside it.
+    #[test]
+    fn a_file_mounted_under_two_module_names_derives_both() {
+        let dir = scratch("path-alias");
+        let root = &dir.0;
+        let src = root.join("src");
+        write(
+            &src.join("lib.rs"),
+            "#[cfg(test)]\n#[path = \"shared.rs\"]\nmod alias_a;\n\n#[cfg(test)]\n#[path = \"shared.rs\"]\nmod alias_b;\n",
+        );
+        write(
+            &src.join("shared.rs"),
+            &format!(
+                "#[tokio::test]\nasync fn connects() {{\n    let s = {}\"...\").await;\n}}\n",
+                call("KeyStore", "connect"),
+            ),
+        );
+
+        let files = unit_files(&src.join("lib.rs"), None, None).expect("module tree");
+        let evidence = scan(&files, root, Scope::UnitTree);
+        assert_eq!(
+            sites(&evidence),
+            vec![
+                "src/shared.rs:3 KeyStore::connect",
+                "src/shared.rs:3 KeyStore::connect"
+            ]
+        );
+        let derived: Vec<String> = evidence.iter().flat_map(|e| e.tests.clone()).collect();
+        assert_eq!(
+            derived,
+            vec![
+                "alias_a::connects".to_string(),
+                "alias_b::connects".to_string()
+            ]
         );
     }
 
