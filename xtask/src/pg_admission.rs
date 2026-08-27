@@ -47,6 +47,51 @@
 //! is what lets the group filter narrow trawl-server's library target to
 //! `from_saved::` and `scheduler::` instead of dragging ~600 pure unit
 //! tests under an 8-thread cap.
+//!
+//! # What this guard defends against, and what it does not
+//!
+//! It is a CI tripwire for an ACCIDENTAL escape: a reasonable author adds
+//! a test that opens a postgres connection, the code passes `cargo fmt`
+//! and compiles in the feature set CI builds with, and nobody remembers to
+//! extend the group override. That is the whole threat model. It is NOT a
+//! security boundary. Anyone editing the workspace can also edit
+//! `.config/nextest.toml`, or write a test whose connection this lexer
+//! cannot see, and no amount of static reading closes that.
+//!
+//! The fail direction is fixed, and every judgement call below follows it:
+//!
+//! * Uncertain whether something is a pg test? Collect it. A test named
+//!   here that nextest never lists fails the guard by name, and a human
+//!   reads the sentence.
+//! * Uncertain which target owns a file? Charge it to both. Two loud
+//!   failures beat one silent pass.
+//! * A SILENT FALSE GREEN is the only defect class this module treats as a
+//!   bug. A false failure is noise; a pass over a live escape is the thing
+//!   the group exists to prevent.
+//!
+//! Accepted residuals, each of them loud or over-collecting:
+//!
+//! * CONDITIONAL COMPILATION is not statically resolvable. The guard does
+//!   not know which cfgs CI compiled under, so a `cfg_attr`-wrapped
+//!   `sqlx::test` counts as one, a `cfg_attr`-wrapped `ignore` does not
+//!   ignore, and a `#[cfg(not(test))]` region is scanned like any other
+//!   attributed item. All three over-collect.
+//! * A `#[cfg(test)]` region nested inside another one yields two spans
+//!   over the same code, so one connection can be reported twice. Two
+//!   findings for one call site, never zero.
+//! * An item whose signature ends in a brace that is not a body — a
+//!   `#[cfg(test)] const X: Foo = Foo { .. };`, a `use a::{b, c};` — opens
+//!   a span over that brace. The span is wrong but LARGER than the item,
+//!   which can only add findings.
+//! * Token spacing inside an attribute is not read: `# [test]` is invisible
+//!   to the lexer. `cargo fmt` rejects that spelling at the pre-commit
+//!   hook and in CI, so the shape cannot reach a merge.
+//! * Raw identifiers lex whole (`r#mod` is one token), but nothing else
+//!   about raw keywords is modelled. A raw keyword used where the lexer
+//!   expects a real one is unsupported.
+//!
+//! A future review that finds a new hole should adjudicate it against this
+//! section: does it produce a silent pass, or only noise?
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -697,8 +742,9 @@ struct FnItem {
     /// signature itself when the function carries no attributes.
     line: usize,
     /// The enclosing inline `mod` names joined onto the function's own
-    /// (`pg_tests::resolve_all`). The file's path from the crate root is
-    /// NOT part of it; [`test_is`] matches by trailing segments.
+    /// (`pg_tests::resolve_all`). The file's own path from the crate root
+    /// is added later, by [`SourceFile::prefix`], which is what makes the
+    /// full name comparable to a nextest id.
     name: String,
     /// Does the block carry an attribute whose last path segment is `test`
     /// (`#[test]`, `#[tokio::test]`, `#[sqlx::test]`)?
@@ -950,10 +996,7 @@ impl ItemLexer<'_> {
         let inner = self.slice(from, to);
         let split = inner.find(['(', '=']).unwrap_or(inner.len());
         Attr {
-            path: inner[..split]
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect(),
+            path: despace(&inner[..split]),
             args: inner[split..].to_string(),
             raw_args: self
                 .raw
@@ -1108,7 +1151,13 @@ impl ItemLexer<'_> {
             line: attr_line,
             name: self.qualified(&name),
             is_test: attrs.iter().any(is_test_attr),
-            is_sqlx_test: attrs.iter().any(|attr| attr.path == "sqlx::test"),
+            is_sqlx_test: attrs.iter().any(is_sqlx_test),
+            // `#[ignore]` and nothing else. A `#[cfg_attr(slow, ignore)]`
+            // is ignored under some cfgs and not others, and no static
+            // reading can say which one CI compiled, so the test is KEPT:
+            // a name nextest never lists fails the guard loudly, while a
+            // name dropped here is a pg test running outside the group
+            // with nobody to say so.
             ignored: attrs.iter().any(|attr| attr.path == "ignore"),
         });
     }
@@ -1160,6 +1209,25 @@ impl ItemLexer<'_> {
 /// final path segment is exactly `test`.
 fn is_test_attr(attr: &Attr) -> bool {
     attr.path.rsplit("::").next() == Some("test")
+}
+
+/// Does this attribute install the sqlx test harness, which builds a
+/// postgres pool for the function beneath it?
+///
+/// Written directly, or wrapped in a `cfg_attr` at any depth. Textual
+/// containment is enough on purpose: the guard cannot know which cfgs CI
+/// compiled under, so it treats a conditional `sqlx::test` as a real one.
+/// That over-collects when the cfg is off, and over-collecting names a
+/// test nextest may not list, which fails the guard loudly. The reverse
+/// reading would be a pg pool nobody counted.
+fn is_sqlx_test(attr: &Attr) -> bool {
+    attr.path == "sqlx::test" || despace(&attr.args).contains("sqlx::test")
+}
+
+/// The text with every whitespace byte removed, so `sqlx :: test` reads
+/// the same as `sqlx::test`.
+fn despace(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// `#[cfg(test)]`, and only a bare `test` predicate: the arguments are read
@@ -1630,7 +1698,7 @@ mod tests {
     /// The escape this class exists for: a plain `#[tokio::test]` under
     /// `src/`, inside the crate's own test module, dialing postgres itself.
     /// The name it reports carries the module, because a leaf name is
-    /// ambiguous across modules (see [`test_is`]).
+    /// ambiguous across modules.
     #[test]
     fn a_connection_inside_a_cfg_test_module_is_evidence() {
         let text = format!(
@@ -2078,6 +2146,41 @@ mod tests {
             derived[0].named_tests().into_iter().collect::<Vec<_>>(),
             vec!["tests::connects"]
         );
+    }
+
+    /// A `cfg_attr`-wrapped `sqlx::test` builds a postgres pool whenever
+    /// its cfg holds, and the guard cannot know whether CI compiled with
+    /// it. Reading it as a real one over-collects; reading it as no
+    /// attribute at all is a pool nobody counted.
+    #[test]
+    fn a_cfg_attr_wrapped_sqlx_test_still_counts() {
+        for wrapper in [
+            "#[cfg_attr(feature = \"pg\", {a})]",
+            "#[cfg_attr(all(unix, feature = \"pg\"), cfg_attr(test, {a}))]",
+            "#[cfg_attr(feature = \"pg\", sqlx :: test)]",
+        ] {
+            let text = format!(
+                "{}\nasync fn live(pool: PgPool) {{}}\n",
+                wrapper.replace("{a}", "sqlx::test"),
+            );
+            assert_eq!(
+                sqlx_names(&text),
+                vec![(1, "live".to_string())],
+                "{wrapper}"
+            );
+        }
+    }
+
+    /// A `cfg_attr`-wrapped `ignore` runs under some cfgs and not others,
+    /// so the test is kept. Dropping it would take a real pg test out of
+    /// the derived set on a guess.
+    #[test]
+    fn a_cfg_attr_wrapped_ignore_does_not_drop_the_test() {
+        let text = format!(
+            "{}\n#[cfg_attr(slow, ignore)]\nasync fn live(pool: PgPool) {{}}\n",
+            attr(""),
+        );
+        assert_eq!(sqlx_names(&text), vec![(1, "live".to_string())]);
     }
 
     /// Blanking has to be byte-for-byte length preserving and newline
