@@ -659,7 +659,6 @@ fn file_facts(text: &str) -> FileFacts {
         mods: Vec::new(),
         open_cfg: Vec::new(),
         pending: None,
-        pending_cfg: None,
         fns: Vec::new(),
         spans: Vec::new(),
         decls: Vec::new(),
@@ -694,9 +693,6 @@ struct ItemLexer<'a> {
     /// The attribute block being accumulated: the line it started on, and
     /// the attributes in it.
     pending: Option<(usize, Vec<Attr>)>,
-    /// A `cfg(test)` block already taken by an item whose braced body has
-    /// not opened yet.
-    pending_cfg: Option<usize>,
     fns: Vec<FnItem>,
     spans: Vec<Span>,
     decls: Vec<ModDecl>,
@@ -711,19 +707,16 @@ impl ItemLexer<'_> {
                 b'#' => self.attribute(),
                 b'{' => {
                     self.pending = None;
-                    if let Some(start) = self.pending_cfg.take() {
-                        self.open_cfg.push((start, self.depth));
-                    }
                     self.depth += 1;
                     self.bump();
                 }
                 b'}' => self.close_block(),
-                b';' | b',' => {
-                    self.pending = None;
-                    self.pending_cfg = None;
-                    self.bump();
-                }
                 b'_' | b'a'..=b'z' | b'A'..=b'Z' => self.word(),
+                // Anything else ends the attribute block without taking
+                // it. A `cfg(test)` one is already spent by then: the item
+                // that took it walked its own signature to its body (see
+                // [`ItemLexer::take_pending`]), so a separator here can no
+                // longer clear a span that has not opened yet.
                 _ => {
                     self.pending = None;
                     self.bump();
@@ -750,8 +743,24 @@ impl ItemLexer<'_> {
         }
     }
 
+    /// One identifier, raw ones (`r#type`) read whole.
+    ///
+    /// The `r#` prefix is part of the token: `r#fn` is a name, not the `fn`
+    /// keyword, and lexing it as `r` followed by `#` would hand the `#` to
+    /// [`ItemLexer::attribute`]. A raw STRING cannot be confused with one,
+    /// because blanking already turned `r#"..."#` into spaces.
     fn ident(&mut self) -> Option<String> {
         let start = self.i;
+        if self.peek() == Some(b'r')
+            && self.bytes.get(self.i + 1) == Some(&b'#')
+            && self
+                .bytes
+                .get(self.i + 2)
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        {
+            self.bump();
+            self.bump();
+        }
         while self
             .peek()
             .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -835,7 +844,6 @@ impl ItemLexer<'_> {
 
     fn close_block(&mut self) {
         self.pending = None;
-        self.pending_cfg = None;
         self.depth = self.depth.saturating_sub(1);
         while self
             .mods
@@ -882,14 +890,92 @@ impl ItemLexer<'_> {
         }
     }
 
-    /// Take the pending attribute block, remembering a `cfg(test)` in it so
-    /// the item's braced body becomes a span.
+    /// Take the pending attribute block and, when it carries `#[cfg(test)]`,
+    /// open a span over the attributed item's BODY.
+    ///
+    /// The cursor sits inside the item's signature here (just past `fn
+    /// name`, past `impl`, past `use`), so the body has to be found by
+    /// walking that signature. Letting the main loop do it lost spans two
+    /// ways, both of them silent: a comma or semicolon anywhere in the
+    /// signature (`fn helper(_: u8, _: u8)`, `fn f(x: [u8; 4])`) cleared
+    /// the remembered `cfg(test)`, and the first `{` was taken as the body
+    /// even when it was a const-generic argument (`fn f() -> Foo<{ 1 }>`).
     fn take_pending(&mut self, line: usize) -> (usize, Vec<Attr>) {
         let (attr_line, attrs) = self.pending.take().unwrap_or((line, Vec::new()));
-        if attrs.iter().any(is_cfg_test) {
-            self.pending_cfg = Some(attr_line);
+        if attrs.iter().any(is_cfg_test) && self.skip_to_body() {
+            self.open_cfg.push((attr_line, self.depth));
+            self.depth += 1;
         }
         (attr_line, attrs)
+    }
+
+    /// Walk an item's signature to its body brace, consuming it. `false`
+    /// means the item has no body (`#[cfg(test)] use x;`, a trait method
+    /// declaration) or the file ended mid-item.
+    ///
+    /// `(`/`[` depth is what keeps a signature comma or semicolon from
+    /// reading as the end of the item. Angle depth is what keeps a
+    /// const-generic brace from reading as the body: at angle depth > 0 a
+    /// `{` is an argument and is skipped as a balanced group.
+    ///
+    /// Angle tracking is deliberately crude — `->` and `=>` are stepped
+    /// over so their `>` does not close a bracket that never opened, and
+    /// `>>` closes two. A signature-level `<` that is not a generic opener
+    /// does not occur in Rust, so nothing else is tracked. The residual
+    /// runs toward over-collection: a `{` this walk misreads as a body
+    /// opens a LARGER span than the item, which can only add findings.
+    fn skip_to_body(&mut self) -> bool {
+        let mut group = 0usize;
+        let mut angle = 0usize;
+        loop {
+            self.skip_trivia();
+            let Some(byte) = self.peek() else {
+                return false;
+            };
+            match byte {
+                b'(' | b'[' => {
+                    group += 1;
+                    self.bump();
+                }
+                b')' | b']' => {
+                    group = group.saturating_sub(1);
+                    self.bump();
+                }
+                b'{' => {
+                    if group > 0 || angle > 0 {
+                        self.group(b'{', b'}');
+                    } else {
+                        self.bump();
+                        return true;
+                    }
+                }
+                // The enclosing block ended before this item did. Leave the
+                // brace for the main loop, which owns the depth bookkeeping.
+                b'}' => return false,
+                b';' if group == 0 => {
+                    self.bump();
+                    return false;
+                }
+                b'-' | b'=' if self.bytes.get(self.i + 1) == Some(&b'>') => {
+                    self.bump();
+                    self.bump();
+                }
+                b'<' => {
+                    angle += 1;
+                    self.bump();
+                }
+                b'>' => {
+                    self.bump();
+                    if angle >= 2 && self.peek() == Some(b'>') {
+                        angle -= 2;
+                        self.bump();
+                    } else {
+                        angle = angle.saturating_sub(1);
+                    }
+                }
+                _ => self.bump(),
+            }
+        }
     }
 
     fn function(&mut self, line: usize) {
@@ -1486,6 +1572,76 @@ mod tests {
         assert_eq!((sites[0].0, sites[0].1), (3, "KeyStore::connect"));
         // No test attribute inside: the finding is target-level.
         assert!(sites[0].2.is_empty());
+    }
+
+    /// A comma in the attributed item's OWN signature used to clear the
+    /// remembered `#[cfg(test)]`, so the body never opened a span and a
+    /// helper that dials postgres was invisible. Any signature separator
+    /// does it: a comma between parameters, a `;` inside an array type.
+    #[test]
+    fn a_signature_separator_does_not_lose_the_cfg_test_span() {
+        for signature in [
+            "async fn helper(_: u8, _: u8)",
+            "async fn helper(_: [u8; 4])",
+            "async fn helper<A, B>(_: A, _: B)",
+            "async fn helper(_: (u8, u8)) -> Result<Store, Error>",
+        ] {
+            let text = format!(
+                "#[cfg(test)]\n{signature} {{\n    let s = {}\"...\").await;\n}}\n",
+                call("KeyStore", "connect"),
+            );
+            let sites = cfg_test_sites(&text);
+            assert_eq!(sites.len(), 1, "{signature}: {sites:?}");
+            assert_eq!(
+                (sites[0].0, sites[0].1),
+                (3, "KeyStore::connect"),
+                "{signature}"
+            );
+        }
+    }
+
+    /// A const-generic argument in the return type is a `{` that is not the
+    /// body. Taking it as one ended the span before the real body, so the
+    /// connection below it was outside every span.
+    #[test]
+    fn a_const_generic_brace_is_not_the_body() {
+        let text = format!(
+            "#[cfg(test)]\nasync fn helper() -> Fixed<{{ 1 + 1 }}> {{\n    let s = {}\"...\").await;\n    Fixed\n}}\n",
+            call("KeyStore", "connect"),
+        );
+        let sites = cfg_test_sites(&text);
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!((sites[0].0, sites[0].1), (3, "KeyStore::connect"));
+    }
+
+    /// A raw identifier is one token. Lexing `r#mod` as `r` then `#` fed
+    /// the `#` to the attribute reader and left a bare `mod` keyword behind
+    /// it, so the module never opened a span and the connection inside was
+    /// invisible.
+    #[test]
+    fn a_raw_identifier_module_name_still_opens_a_span() {
+        let text = format!(
+            "#[cfg(test)]\nmod r#mod {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+            call("StorageState", "connect"),
+        );
+        let sites = cfg_test_sites(&text);
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!((sites[0].0, sites[0].1), (5, "StorageState::connect"));
+        assert_eq!(sites[0].2, vec!["r#mod::boots".to_string()]);
+    }
+
+    /// A bodyless `#[cfg(test)]` item ends at its own `;`. It must not
+    /// swallow the span of the module that follows it.
+    #[test]
+    fn a_bodyless_cfg_test_item_does_not_eat_the_next_span() {
+        let text = format!(
+            "#[cfg(test)]\nuse std::sync::Arc;\n\n#[cfg(test)]\nmod pg_tests {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+            call("StorageState", "connect"),
+        );
+        let sites = cfg_test_sites(&text);
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!((sites[0].0, sites[0].1), (8, "StorageState::connect"));
+        assert_eq!(sites[0].2, vec!["pg_tests::boots".to_string()]);
     }
 
     /// `#[cfg(feature = "test")]` is not `#[cfg(test)]`. The argument text
