@@ -17,10 +17,12 @@
 //! 1. DERIVATION, from `cargo metadata` plus a line scan of each target's
 //!    sources. A target is pg-touching if it carries an `#[sqlx::test]`
 //!    attribute, if it pulls in a `common` module that opens postgres pools
-//!    (`fixture_pool`), or if an integration test file names one of the
-//!    connection-opening APIs itself (`KeyStore::connect`, `PgPool`, and
-//!    friends). That third class is what catches a plain `#[tokio::test]`
-//!    that dials postgres by hand, carrying neither marker.
+//!    (`fixture_pool`), or if test code names one of the connection-opening
+//!    APIs itself (`KeyStore::connect`, `PgPool`, and friends). That third
+//!    class is what catches a plain `#[tokio::test]` that dials postgres by
+//!    hand, carrying neither marker. It reads a whole integration test
+//!    file, but only the `#[cfg(test)]` regions of a `src/` tree, where the
+//!    surrounding production code is where those APIs are defined.
 //! 2. MEMBERSHIP, from nextest itself: `cargo nextest list -E
 //!    'group(postgres)'`. cargo-nextest 0.9.143 supports `group()` as a
 //!    filterset predicate, so the authority on "is this test in the group"
@@ -61,13 +63,16 @@ const GROUP: &str = "postgres";
 /// (fleet-ui and trawl-engine both have a non-pg one).
 const FIXTURE_MARKER: &str = "fn fixture_pool";
 
-/// Connection-opening APIs. An integration test naming one of these opens
-/// a postgres connection of its own, whatever attribute sits above it — a
-/// plain `#[tokio::test]` calling `KeyStore::connect` is exactly the escape
-/// the two marker-based classes miss. Scanned in integration test sources
-/// ONLY: a package's `src/` tree is production code, where `PgPool` appears
-/// in every store module, and charging that to the package's unit-test
-/// binary would drag ~600 connectionless tests into the group.
+/// Connection-opening APIs. A test naming one of these opens a postgres
+/// connection of its own, whatever attribute sits above it — a plain
+/// `#[tokio::test]` calling `KeyStore::connect` is exactly the escape the
+/// two marker-based classes miss.
+///
+/// Where they are scanned differs by tree. An integration test file is all
+/// test code, so the whole file counts. A package's `src/` tree is
+/// production code, where `PgPool` appears in every store module and
+/// `StorageState::connect` is DEFINED, so only `#[cfg(test)]` regions count
+/// there (see [`cfg_test_connection_site`]).
 const CONNECTION_APIS: &[&str] = &[
     "PgConnection::connect",
     "KeyStore::connect",
@@ -219,7 +224,7 @@ fn check(target: &Derived, suite: Option<&Suite>) -> Option<String> {
         return None;
     }
     Some(format!(
-        "  {} runs {} `#[sqlx::test]` case(s) outside the `{GROUP}` group: {}\n    evidence: {}",
+        "  {} runs {} pg-touching case(s) outside the `{GROUP}` group: {}\n    evidence: {}",
         target.binary_id,
         missing.len(),
         name_list(&missing),
@@ -402,13 +407,23 @@ fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
 
         // The raw-connection side: no attribute, no fixture, just a test
         // that dials postgres itself.
-        if scope == Scope::Integration
-            && let Some((line, api)) = connection_api_site(&text)
-        {
-            evidence.push(Evidence {
-                site: format!("{shown}:{line} {api}"),
-                tests: Vec::new(),
-            });
+        match scope {
+            Scope::Integration => {
+                if let Some((line, api)) = connection_api_site(&text) {
+                    evidence.push(Evidence {
+                        site: format!("{shown}:{line} {api}"),
+                        tests: Vec::new(),
+                    });
+                }
+            }
+            Scope::UnitTree => {
+                if let Some((line, api, tests)) = cfg_test_connection_site(&text) {
+                    evidence.push(Evidence {
+                        site: format!("{shown}:{line} {api}"),
+                        tests,
+                    });
+                }
+            }
         }
     }
     evidence
@@ -428,6 +443,245 @@ fn connection_api_site(text: &str) -> Option<(usize, &'static str)> {
             .find(|api| code.contains(**api))
             .map(|api| (index + 1, *api))
     })
+}
+
+/// The first connection-opening API called inside a `#[cfg(test)]` region,
+/// with the test functions that region declares.
+///
+/// A `src/` tree is production code: `StorageState::connect` is DEFINED
+/// there, and every store module names `PgPool` in a signature, so scanning
+/// the whole file would put ~600 connectionless unit tests in the group.
+/// Scanning nothing is the other failure, and it is the one that lets a
+/// plain `#[tokio::test]` under `src/` dial postgres outside the group. The
+/// middle is the test code itself: everything under a `#[cfg(test)]`
+/// attribute, which is where a unit test that opens a connection lives.
+///
+/// The names keep the finding NAME-granular, like the `#[sqlx::test]`
+/// class: the connection lives in one test module, not in all 600 unit
+/// tests of the binary that module compiles into. A region that opens a
+/// connection and declares no test of its own returns no names, which makes
+/// the finding target-level and drags the whole binary in — the
+/// conservative answer for test-only code nothing in the region names.
+///
+/// Comments and literal contents are blanked first (see
+/// [`blank_comments_and_literals`]) so a `}` inside a string cannot end the
+/// region early and prose about `fixture_pool` is not a connection. Line
+/// numbers are the file's real ones: blanking preserves every newline.
+fn cfg_test_connection_site(text: &str) -> Option<(usize, &'static str, Vec<String>)> {
+    let code = blank_comments_and_literals(text);
+    let lines: Vec<&str> = code.lines().collect();
+    cfg_test_spans(&lines).into_iter().find_map(|(start, end)| {
+        let (line, api) = (start..=end).find_map(|index| {
+            CONNECTION_APIS
+                .iter()
+                .find(|api| lines[index].contains(**api))
+                .map(|api| (index + 1, *api))
+        })?;
+        Some((line, api, test_fn_names(&lines[start..=end])))
+    })
+}
+
+/// Names of the test functions declared in one span: every `fn` under an
+/// attribute whose last path segment is `test` (`#[test]`, `#[tokio::test]`,
+/// `#[sqlx::test(migrations = false)]`). Helper `fn`s are left out — they
+/// are not test ids, and asking nextest about one would fail the guard on a
+/// name that can never be in the group.
+fn test_fn_names(lines: &[&str]) -> Vec<String> {
+    let mut names = Vec::new();
+    for (index, raw) in lines.iter().enumerate() {
+        if !is_test_attribute(raw.trim()) {
+            continue;
+        }
+        if let Some(name) = lines[index + 1..]
+            .iter()
+            .map(|l| l.trim())
+            .find_map(function_name)
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// `#[test]`, `#[tokio::test]`, `#[sqlx::test(...)]` — an attribute whose
+/// final path segment is exactly `test`.
+fn is_test_attribute(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("#[") else {
+        return false;
+    };
+    let path: &str = rest.split(['(', ']']).next().unwrap_or_default().trim();
+    path.rsplit("::").next() == Some("test")
+}
+
+/// Inclusive line ranges (0-based) of every `#[cfg(test)]` item.
+///
+/// The attribute is followed by the item it guards, and the item's body is
+/// taken by brace matching from its first `{`. That covers `mod tests { }`
+/// and a `#[cfg(test)]` on a single `fn` alike, since both are one braced
+/// body. A brace-less item (`#[cfg(test)] mod tests;`, the out-of-line
+/// module form) closes with `;` before any `{` and yields no span — the
+/// separate file it names is scanned on its own, and its own tests carry
+/// no `#[cfg(test)]` inside, which is the one residual here: a unit test
+/// living in a file that is ITSELF `#[cfg(test)]`-gated from its parent is
+/// invisible to this scan. Nothing in the workspace is written that way,
+/// and the `#[sqlx::test]` and fixture classes still cover such a file.
+fn cfg_test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if !lines[index].contains("#[cfg(test)]") {
+            index += 1;
+            continue;
+        }
+        match braced_body_end(lines, index) {
+            Some(end) => {
+                spans.push((index, end));
+                index = end + 1;
+            }
+            None => index += 1,
+        }
+    }
+    spans
+}
+
+/// Line of the `}` closing the first `{` at or after `start`, or `None`
+/// when the item has no braced body.
+///
+/// Three ways to have none, all of them real: a `;` ends the item before
+/// any `{` (`#[cfg(test)] mod tests;`), the ENCLOSING block closes first
+/// (an attribute written inside a function body), or the braces never
+/// balance to the end of the file. All three yield no span rather than
+/// swallowing the rest of the file.
+fn braced_body_end(lines: &[&str], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, line) in lines[start..].iter().enumerate() {
+        for c in line.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' | ';' if depth == 0 => return None,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(start + offset);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Replace comment and literal CONTENT with spaces, keeping every byte
+/// position and newline. Handles `//`, `/* */` (nested, as rustc does),
+/// `"..."`, `r"..."`/`r#"..."#` and `'a'`.
+///
+/// Blanking rather than deleting is what keeps the reported line numbers
+/// honest, and it is what stops a `}` inside a string literal from closing
+/// a `#[cfg(test)] mod` twenty lines early.
+fn blank_comments_and_literals(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(' ');
+                i += 1;
+            }
+        } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+            }
+        } else if b == b'r' && matches!(bytes.get(i + 1), Some(b'"' | b'#')) {
+            let hashes = bytes[i + 1..].iter().take_while(|c| **c == b'#').count();
+            if bytes.get(i + 1 + hashes) == Some(&b'"') {
+                out.push_str(&" ".repeat(2 + hashes));
+                i += 2 + hashes;
+                let terminator: Vec<u8> = std::iter::once(b'"')
+                    .chain(std::iter::repeat_n(b'#', hashes))
+                    .collect();
+                while i < bytes.len() && !bytes[i..].starts_with(&terminator) {
+                    out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                out.push_str(&" ".repeat(terminator.len().min(bytes.len() - i)));
+                i += terminator.len();
+            } else {
+                out.push('r');
+                i += 1;
+            }
+        } else if b == b'"' {
+            out.push(' ');
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    out.push_str("  ");
+                    i += 2;
+                    continue;
+                }
+                out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            if i < bytes.len() {
+                out.push(' ');
+                i += 1;
+            }
+        } else if b == b'\'' && is_char_literal(&bytes[i..]) {
+            let end = char_literal_len(&bytes[i..]);
+            out.push_str(&" ".repeat(end));
+            i += end;
+        } else {
+            out.push(text[i..].chars().next().unwrap_or(' '));
+            i += text[i..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    out
+}
+
+/// Is this `'` opening a char literal rather than a lifetime (`'a`)?
+fn is_char_literal(rest: &[u8]) -> bool {
+    char_literal_len(rest) > 0
+}
+
+/// Byte length of the char literal at `rest`, or 0 when it is not one.
+fn char_literal_len(rest: &[u8]) -> usize {
+    if rest.first() != Some(&b'\'') {
+        return 0;
+    }
+    if rest.get(1) == Some(&b'\\') {
+        // Escapes are at most `\u{10FFFF}`; find the closing quote.
+        return rest[2..]
+            .iter()
+            .position(|c| *c == b'\'')
+            .map_or(0, |p| p + 3);
+    }
+    // A single character then a quote — anything else is a lifetime.
+    let len = std::str::from_utf8(rest)
+        .ok()
+        .and_then(|s| s[1..].chars().next())
+        .map_or(0, char::len_utf8);
+    if len > 0 && rest.get(1 + len) == Some(&b'\'') {
+        1 + len + 1
+    } else {
+        0
+    }
 }
 
 /// Line numbers and function names of every `#[sqlx::test]` attribute.
@@ -666,6 +920,65 @@ mod tests {
         assert!(connection_api_site(&prose).is_none());
 
         assert!(connection_api_site("fn pure() -> u8 { 1 }\n").is_none());
+    }
+
+    /// Production `src/` code that opens a pool is not test evidence: the
+    /// definition sites would flag every store module in the workspace.
+    #[test]
+    fn production_code_outside_cfg_test_is_not_evidence() {
+        let text = format!(
+            "pub async fn connect(url: &str) -> Store {{\n    let pool = {}url).await;\n    Store {{ pool }}\n}}\n",
+            call("PgPoolOptions", "new")
+        );
+        assert!(cfg_test_connection_site(&text).is_none());
+    }
+
+    /// The escape this class exists for: a plain `#[tokio::test]` under
+    /// `src/`, inside the crate's own test module, dialing postgres itself.
+    #[test]
+    fn a_connection_inside_a_cfg_test_module_is_evidence() {
+        let text = format!(
+            "pub async fn connect(url: &str) -> Store {{\n    let pool = {}url).await;\n    Store {{ pool }}\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+            call("PgPoolOptions", "new"),
+            call("StorageState", "connect"),
+        );
+        let (line, api, tests) = cfg_test_connection_site(&text).expect("the test dials postgres");
+        assert_eq!((line, api), (10, "StorageState::connect"));
+        assert_eq!(tests, vec!["boots".to_string()]);
+    }
+
+    /// Braces nested inside the test module, and a string literal carrying
+    /// an unbalanced `}`. Neither may end the region before the call.
+    #[test]
+    fn nested_braces_and_a_brace_in_a_string_do_not_end_the_region() {
+        let text = format!(
+            "#[cfg(test)]\nmod tests {{\n    fn helper() {{\n        let s = \"}}}}}} not code\";\n    }}\n\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n\nfn after() {{}}\n",
+            call("StorageState", "connect"),
+        );
+        let (line, api, tests) = cfg_test_connection_site(&text).expect("the test dials postgres");
+        assert_eq!((line, api), (9, "StorageState::connect"));
+        // `helper` carries no test attribute, so it is not a name to check.
+        assert_eq!(tests, vec!["boots".to_string()]);
+
+        // The same call AFTER the module closes is production code again.
+        let outside = format!(
+            "#[cfg(test)]\nmod tests {{\n    fn helper() {{}}\n}}\n\nasync fn boot() {{\n    let s = {}\"...\").await;\n}}\n",
+            call("StorageState", "connect"),
+        );
+        assert!(cfg_test_connection_site(&outside).is_none());
+    }
+
+    /// `#[cfg(test)]` on a single fn is one braced body like a module.
+    #[test]
+    fn a_cfg_test_fn_is_scanned_like_a_cfg_test_mod() {
+        let text = format!(
+            "#[cfg(test)]\nasync fn helper() {{\n    let s = {}\"...\").await;\n}}\n",
+            call("KeyStore", "connect"),
+        );
+        let (line, api, tests) = cfg_test_connection_site(&text).expect("cfg(test) fn is scanned");
+        assert_eq!((line, api), (3, "KeyStore::connect"));
+        // No test attribute inside: the finding is target-level.
+        assert!(tests.is_empty());
     }
 
     #[test]
