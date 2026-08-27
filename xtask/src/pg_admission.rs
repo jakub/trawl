@@ -1422,6 +1422,24 @@ mod tests {
         assert_eq!(sites[0].2, vec!["pg_tests::boots".to_string()]);
     }
 
+    /// Two connecting regions in one file, both reported. The old
+    /// `find_map` stopped at the first, so a second test module could dial
+    /// postgres unseen behind a module that already had a finding.
+    #[test]
+    fn two_connecting_spans_are_two_findings() {
+        let text = format!(
+            "#[cfg(test)]\nmod first_tests {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n\n#[cfg(test)]\nmod second_tests {{\n    #[tokio::test]\n    async fn dials() {{\n        let k = {}\"...\").await;\n    }}\n}}\n",
+            call("StorageState", "connect"),
+            call("KeyStore", "connect"),
+        );
+        let sites = cfg_test_sites(&text);
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        assert_eq!((sites[0].0, sites[0].1), (5, "StorageState::connect"));
+        assert_eq!(sites[0].2, vec!["first_tests::boots".to_string()]);
+        assert_eq!((sites[1].0, sites[1].1), (13, "KeyStore::connect"));
+        assert_eq!(sites[1].2, vec!["second_tests::dials".to_string()]);
+    }
+
     /// An ignored test inside a connecting span is not named evidence
     /// either: nextest lists no such case, so the guard would fail on a
     /// name that can never be in the group.
