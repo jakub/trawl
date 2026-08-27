@@ -693,6 +693,12 @@ fn char_literal_len(rest: &[u8]) -> usize {
 /// enough here because the attribute is only ever written at the start of
 /// its own line; a `/* */` block hiding one would be a false positive, and
 /// a false positive only over-groups.
+///
+/// An `#[ignore]`d test is skipped, and it has to be: `group_membership`
+/// drops ignored cases from both the `all` and the `matched` side, so a
+/// name collected here that nextest never lists reads as a test that
+/// escaped the group and fails the guard over a test that never runs. The
+/// two sides must agree on what counts as a test.
 fn sqlx_test_names(text: &str) -> Vec<(usize, String)> {
     let mut found = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
@@ -701,16 +707,48 @@ fn sqlx_test_names(text: &str) -> Vec<(usize, String)> {
         if line.starts_with("//") || !is_sqlx_test_attribute(line) {
             continue;
         }
-        // The attribute names the test beneath it; skip any further
-        // attributes stacked between the two.
-        let name = lines[index + 1..]
+        // Attributes above the `#[sqlx::test]`, contiguous with it.
+        if lines[..index]
             .iter()
+            .rev()
             .map(|l| l.trim())
-            .find_map(function_name)
-            .unwrap_or_else(|| "<unnamed>".to_string());
-        found.push((index + 1, name));
+            .take_while(|l| l.starts_with("#["))
+            .any(is_ignore_attribute)
+        {
+            continue;
+        }
+        // The attribute names the test beneath it; skip any further
+        // attributes stacked between the two, and drop the test if one of
+        // them is `#[ignore]`.
+        let below = lines[index + 1..].iter().map(|l| l.trim());
+        let mut ignored = false;
+        let mut name = None;
+        for line in below {
+            if let Some(found_name) = function_name(line) {
+                name = Some(found_name);
+                break;
+            }
+            ignored |= is_ignore_attribute(line);
+        }
+        if ignored {
+            continue;
+        }
+        found.push((index + 1, name.unwrap_or_else(|| "<unnamed>".to_string())));
     }
     found
+}
+
+/// `#[ignore]` / `#[ignore = "reason"]`.
+fn is_ignore_attribute(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("#[") else {
+        return false;
+    };
+    let path = rest
+        .split(['(', '=', ']'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    path == "ignore"
 }
 
 /// `#[sqlx::test]` / `#[sqlx::test(migrations = false)]`, tolerating the
@@ -827,6 +865,19 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0], (1, "roles_are_data".to_string()));
         assert_eq!(found[1], (3, "nested".to_string()));
+    }
+
+    /// An ignored test never runs, so `group_membership` leaves it out of
+    /// both its sets. Collecting it here would fail the guard on a name
+    /// nextest never lists.
+    #[test]
+    fn an_ignored_sqlx_test_is_not_collected() {
+        let text = format!(
+            "{a}\n#[ignore = \"needs a live cluster\"]\nasync fn skipped(pool: PgPool) {{}}\n\n#[ignore]\n{a}\nasync fn also_skipped(pool: PgPool) {{}}\n\n{a}\nasync fn runs(pool: PgPool) {{}}\n",
+            a = attr("")
+        );
+        let found = sqlx_test_names(&text);
+        assert_eq!(found, vec![(9, "runs".to_string())]);
     }
 
     /// Same trick for the connection APIs: writing `KeyStore::connect(`
