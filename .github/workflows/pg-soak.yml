@@ -26,6 +26,14 @@ jobs:
       # Both suites always run: a flake in one says nothing about the other,
       # and cancelling the survivor halves the evidence.
       fail-fast: false
+      # ... but one at a time. Unlike ci.yml's single sequential `test` job,
+      # a matrix schedules both suites concurrently, and two full workspace
+      # builds + two postgres containers co-scheduled on the k8s-big pool
+      # OOM the heavier runner pod ~15min in (step stuck in_progress, no
+      # logs uploaded, "lost communication"). Every such death so far --
+      # the 10 concurrent attempts and the first serial one -- was this,
+      # not a test failure.
+      max-parallel: 1
       matrix:
         include:
           - suite: default-features
