@@ -86,13 +86,23 @@ jobs:
       # `--retries 0` on the command line overrides every retry setting in
       # .config/nextest.toml, including its two named per-test overrides. A
       # soak that retries measures the retry, not the flake.
-      # CARGO_BUILD_JOBS bounds the COMPILE, which is what actually killed
-      # every soak attempt so far: CI's test job never builds the
-      # default-features workspace (its cache holds no-default artifacts
-      # only), so this step is the first-ever cold default build on the
-      # pool, and at full rustc parallelism its link peak OOMs the runner
-      # pod ~16min in -- before one test runs. Slower, bounded, alive.
-      - run: cargo nextest run --workspace ${{ matrix.features }} --retries 0
+      # Build and run are SEPARATE steps so the step boundary says which
+      # phase kills the pod, and the completed step's logs upload. History:
+      # unbounded cold build died ~16min (rustc parallelism); with
+      # CARGO_BUILD_JOBS=4 the death moved to ~29min -- still before any
+      # per-test output survived. CI's test job never builds the
+      # default-features workspace (no-default only), so the heavy suite
+      # is always a cold build here. --test-threads 4 bounds the run
+      # phase: default features boot real trawld+duckdb per integration
+      # test, and only the pg group is capped by nextest.toml -- the rest
+      # ran at full parallelism.
+      - name: Build test binaries
+        run: cargo nextest run --workspace ${{ matrix.features }} --no-run
+        env:
+          CARGO_BUILD_JOBS: "4"
+          DUCKDB_DOWNLOAD_LIB: "1"
+      - name: Run suites
+        run: cargo nextest run --workspace ${{ matrix.features }} --retries 0 --test-threads 4
         env:
           CARGO_BUILD_JOBS: "4"
           DUCKDB_DOWNLOAD_LIB: "1"
