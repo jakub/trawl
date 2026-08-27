@@ -179,10 +179,19 @@ impl StorageState {
     ///
     /// The pool is the only input, and that is the whole point: the
     /// sole-writer lock is taken on a connection acquired from THIS pool,
-    /// so the lock and the writes it guards are on the same database by
-    /// construction. A second parameter naming a DSN could disagree with
-    /// the pool, and two processes locking two different databases both
-    /// believe they are the sole writer.
+    /// so nothing here can name a different database than the writes do. A
+    /// second parameter naming a DSN could disagree with the pool, and two
+    /// processes locking two different databases both believe they are the
+    /// sole writer.
+    ///
+    /// The contract that makes it airtight is on the CALLER: the pool's
+    /// connect target must not be reconfigured while this call runs.
+    /// `Pool::set_connect_options` changes future connections only, so a
+    /// caller that repointed the pool between the lock acquisition here and
+    /// the migration below would still split the two across databases.
+    /// Every in-repo caller hands over a pool it just built and then drops
+    /// its own handle, and no runtime check is worth adding for a shape
+    /// nothing writes.
     ///
     /// The connection is then detached ([`sqlx::pool::PoolConnection::detach`]):
     /// it leaves pool management entirely and is never recycled, so the
