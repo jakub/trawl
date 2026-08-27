@@ -215,10 +215,15 @@ fn check(target: &Derived, suite: Option<&Suite>) -> Option<String> {
 
     let default = Suite::default();
     let matched = &suite.unwrap_or(&default).matched;
+    // Exact, not a trailing-segment match. Every derived name is rooted at
+    // the target's crate root (see [`module_tree`]), so it is spelled the
+    // way nextest spells it. Suffix matching let an in-group
+    // `b::tests::connects` satisfy an out-of-group `a::tests::connects`,
+    // and the guard reported a pass while the pg test ran unbounded.
     let missing: Vec<&str> = target
         .named_tests()
         .into_iter()
-        .filter(|name| !matched.iter().any(|test| test_is(test, name)))
+        .filter(|name| !matched.contains(*name))
         .collect();
     if missing.is_empty() {
         return None;
@@ -243,18 +248,6 @@ fn name_list(names: &[&str]) -> String {
         names[..NAMES_SHOWN].join(", "),
         names.len() - NAMES_SHOWN
     )
-}
-
-/// Does a nextest test id name this derived test?
-///
-/// An id carries the full module path (`from_saved::pg_tests::run_all`)
-/// while a derived name carries only the nesting the lexer could see inside
-/// the file (`pg_tests::run_all`), so the match is on a whole trailing run
-/// of path segments. Matching the LEAF alone was unsound: a pg-touching
-/// `pg_tests::connects` outside the group was masked by an unrelated
-/// `pure_tests::connects` inside it.
-fn test_is(test_id: &str, derived: &str) -> bool {
-    test_id == derived || test_id.ends_with(&format!("::{derived}"))
 }
 
 /// Derive the pg-touching targets from `cargo metadata` and the sources.
@@ -295,8 +288,8 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
             let name = target["name"].as_str().unwrap_or_default();
             let src = PathBuf::from(target["src_path"].as_str().unwrap_or_default());
             if kinds.contains(&"test") {
-                let sources = integration_sources(&src);
-                let evidence = scan(&sources, root, Scope::Integration);
+                let files = module_tree(&src, true)?;
+                let evidence = scan(&files, root, Scope::Integration);
                 if !evidence.is_empty() {
                     derived.push(Derived {
                         binary_id: format!("{package_name}::{name}"),
@@ -313,13 +306,8 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
             }
         }
         if let (Some(binary_id), Some(src)) = (unit_id, unit_src) {
-            let mut sources = Vec::new();
-            if let Some(dir) = src.parent() {
-                collect_rs(dir, &mut sources);
-            }
-            sources.sort();
-            sources.dedup();
-            let evidence = scan(&sources, root, Scope::UnitTree);
+            let files = unit_files(&src)?;
+            let evidence = scan(&files, root, Scope::UnitTree);
             if !evidence.is_empty() {
                 derived.push(Derived {
                     binary_id,
@@ -332,6 +320,43 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
     Ok(derived)
 }
 
+/// Every file of a unit-test tree: the module walk from the crate root,
+/// plus any other `.rs` under the source root the walk never reached.
+///
+/// The walk is the authority on module paths; the leftovers are a safety
+/// net. A file no `mod` declaration reaches does not compile into the
+/// binary at all, so including it can only cost a false failure — loud,
+/// and preferable to trusting the walk to be complete.
+fn unit_files(src: &Path) -> Result<Vec<(SourceFile, FileFacts)>, String> {
+    let mut files = module_tree(src, false)?;
+    let Some(source_root) = src.parent() else {
+        return Ok(files);
+    };
+    let mut all = Vec::new();
+    collect_rs(source_root, &mut all);
+    all.sort();
+    all.dedup();
+    let seen: BTreeSet<PathBuf> = files.iter().map(|(file, _)| file.path.clone()).collect();
+    for path in all {
+        if seen.contains(&path) {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let facts = file_facts(&text);
+        files.push((
+            SourceFile {
+                prefix: path_prefix(source_root, &path),
+                path,
+                all_test: false,
+            },
+            facts,
+        ));
+    }
+    files.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+    Ok(files)
+}
+
 fn target_kinds(target: &Value) -> Vec<&str> {
     target["kind"]
         .as_array()
@@ -341,25 +366,164 @@ fn target_kinds(target: &Value) -> Vec<&str> {
         .collect()
 }
 
-/// The source files one integration test target's evidence may live in:
-/// the test file itself plus, when it declares `mod common;`, that module.
-fn integration_sources(src: &Path) -> Vec<PathBuf> {
-    let mut sources = vec![src.to_path_buf()];
-    if let Some(dir) = src.parent()
-        && fs::read_to_string(src).is_ok_and(|text| declares_common(&text))
-    {
-        let common = dir.join("common").join("mod.rs");
-        if common.is_file() {
-            sources.push(common);
-        }
-    }
-    sources
+/// One source file of a target, with the module path its contents live
+/// under.
+struct SourceFile {
+    path: PathBuf,
+    /// Module path from the crate root, `::`-terminated (`store::pg_tests::`),
+    /// empty for the root file itself. This is what makes a derived test
+    /// name spelled the way nextest spells it.
+    prefix: String,
+    /// Is the whole file test code? True for every file of an integration
+    /// target, and for a `src/` file reached through a `#[cfg(test)] mod`
+    /// declaration.
+    all_test: bool,
 }
 
-fn declares_common(text: &str) -> bool {
-    text.lines()
-        .map(str::trim)
-        .any(|line| line == "mod common;" || line == "pub mod common;")
+/// Walk a target's module tree from its root file, following every
+/// out-of-line `mod x;` declaration.
+///
+/// Following only `mod common;` was a silent hole: a `tests/root.rs` that
+/// declared `mod cases;` put its postgres tests in a file the guard never
+/// opened. Resolution follows rustc's rules, each one probed against rustc
+/// rather than assumed:
+///
+/// * Children of the crate root file, and of a `mod.rs`, resolve in that
+///   file's own directory. A `tests/root.rs` declaring `mod cases;` wants
+///   `tests/cases.rs`, NOT `tests/root/cases.rs`.
+/// * Children of any other file `foo.rs` resolve in `foo/`.
+/// * An inline `mod outer { mod inner; }` adds `outer/` to that directory.
+/// * `#[path = "..."]` resolves in the same directory, with ONE quirk: at
+///   the TOP level of a non-root `foo.rs` it resolves against the file's
+///   own directory instead of `foo/`. Nested inside an inline `mod`, it
+///   goes back to the nesting rule.
+///
+/// A declaration that resolves to no file on disk is a hard error naming
+/// the module. Skipping it silently is the one outcome this guard may not
+/// have: the file it could not find is exactly where a pg test would hide.
+fn module_tree(root_file: &Path, all_test: bool) -> Result<Vec<(SourceFile, FileFacts)>, String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut queue = vec![(
+        SourceFile {
+            path: root_file.to_path_buf(),
+            prefix: String::new(),
+            all_test,
+        },
+        true,
+    )];
+    while let Some((file, is_root)) = queue.pop() {
+        if !seen.insert(file.path.clone()) {
+            continue;
+        }
+        let text = fs::read_to_string(&file.path)
+            .map_err(|e| format!("cannot read {}: {e}", file.path.display()))?;
+        let facts = file_facts(&text);
+        for decl in &facts.mods {
+            let children = resolve_mod(&file.path, is_root, decl);
+            if children.is_empty() {
+                return Err(format!(
+                    "{} declares `mod {};` and no file resolves it. \
+                     The guard cannot scan what it cannot find.",
+                    file.path.display(),
+                    decl.name
+                ));
+            }
+            let mut prefix = file.prefix.clone();
+            for module in &decl.chain {
+                prefix.push_str(module);
+                prefix.push_str("::");
+            }
+            prefix.push_str(&decl.name);
+            prefix.push_str("::");
+            for path in children {
+                queue.push((
+                    SourceFile {
+                        path,
+                        prefix: prefix.clone(),
+                        all_test: file.all_test || decl.cfg_test,
+                    },
+                    false,
+                ));
+            }
+        }
+        out.push((file, facts));
+    }
+    out.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+    Ok(out)
+}
+
+/// The file(s) an out-of-line `mod name;` can live in. Both candidates are
+/// returned when both exist — that is a compile error in the crate, and
+/// scanning both is the conservative answer.
+fn resolve_mod(parent: &Path, is_root: bool, decl: &ModDecl) -> Vec<PathBuf> {
+    let own_dir = parent.parent().unwrap_or(Path::new("")).to_path_buf();
+    let mut dir = if decl.path.is_some() && decl.chain.is_empty() {
+        own_dir
+    } else {
+        child_dir(parent, is_root)
+    };
+    for module in &decl.chain {
+        dir = dir.join(module);
+    }
+    if let Some(path) = &decl.path {
+        let child = dir.join(path);
+        return if child.is_file() {
+            vec![child]
+        } else {
+            Vec::new()
+        };
+    }
+    [
+        dir.join(format!("{}.rs", decl.name)),
+        dir.join(&decl.name).join("mod.rs"),
+    ]
+    .into_iter()
+    .filter(|candidate| candidate.is_file())
+    .collect()
+}
+
+/// The directory a file's out-of-line children resolve in, before inline
+/// `mod` nesting is applied.
+fn child_dir(file: &Path, is_root: bool) -> PathBuf {
+    let dir = file.parent().unwrap_or(Path::new(""));
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    if is_root || stem == "mod" {
+        dir.to_path_buf()
+    } else {
+        dir.join(stem)
+    }
+}
+
+/// The module prefix a file's PATH implies, for a `src/` file the module
+/// walk never reached: `src/foo.rs` is `foo::`, `src/foo/bar.rs` is
+/// `foo::bar::`, `src/foo/mod.rs` is `foo::`, the root file is empty.
+///
+/// This is the safety net under [`module_tree`], not a substitute for it:
+/// it cannot see `#[path]` or inline nesting. A file it names wrongly costs
+/// a false failure, which is loud. A file left out costs a silent escape,
+/// which is the one thing the guard may not do.
+fn path_prefix(source_root: &Path, file: &Path) -> String {
+    let Ok(rest) = file.strip_prefix(source_root) else {
+        return String::new();
+    };
+    let mut prefix = String::new();
+    for component in rest.parent().into_iter().flat_map(Path::components) {
+        prefix.push_str(&component.as_os_str().to_string_lossy());
+        prefix.push_str("::");
+    }
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    if !matches!(stem, "mod" | "lib" | "main") {
+        prefix.push_str(stem);
+        prefix.push_str("::");
+    }
+    prefix
 }
 
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -385,45 +549,15 @@ enum Scope {
 }
 
 /// Scan a target's sources for pg evidence.
-fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
-    let mut parsed: Vec<(PathBuf, FileFacts)> = sources
-        .iter()
-        .filter_map(|source| {
-            fs::read_to_string(source)
-                .ok()
-                .map(|text| (source.clone(), file_facts(&text)))
-        })
-        .collect();
-
-    // Out-of-line test modules. `#[cfg(test)] mod pg_tests;` puts the test
-    // code in ANOTHER file, and that file carries no `#[cfg(test)]` of its
-    // own, so a span scan of it finds nothing. The whole child file is test
-    // code, so it is scanned whole, and its tests are named under the
-    // module its parent declared.
-    let mut whole_file: BTreeMap<PathBuf, String> = BTreeMap::new();
-    if scope == Scope::UnitTree {
-        for (path, facts) in &parsed {
-            for decl in &facts.cfg_test_mods {
-                for child in mod_decl_files(path, decl) {
-                    whole_file.insert(child, decl.name.clone());
-                }
-            }
-        }
-        let known: BTreeSet<PathBuf> = parsed.iter().map(|(path, _)| path.clone()).collect();
-        for child in whole_file.keys() {
-            if !known.contains(child)
-                && let Ok(text) = fs::read_to_string(child)
-            {
-                parsed.push((child.clone(), file_facts(&text)));
-            }
-        }
-        parsed.sort_by(|a, b| a.0.cmp(&b.0));
-    }
-
+fn scan(files: &[(SourceFile, FileFacts)], root: &Path, scope: Scope) -> Vec<Evidence> {
     let mut evidence = Vec::new();
-    for (source, facts) in &parsed {
-        let shown = source.strip_prefix(root).unwrap_or(source).display();
-        let prefix = whole_file.get(source).map(String::as_str);
+    for (source, facts) in files {
+        let shown = source
+            .path
+            .strip_prefix(root)
+            .unwrap_or(&source.path)
+            .display();
+        let prefix = source.prefix.as_str();
 
         let tests = sqlx_tests(facts, prefix);
         if let Some((line, _)) = tests.first() {
@@ -434,9 +568,10 @@ fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
         }
 
         // The fixture side: this file IS the pg harness (it defines the
-        // pool constructor), and `integration_sources` only handed it over
-        // because the target declares `mod common;`.
-        if facts.code.contains(FIXTURE_MARKER) && source.ends_with(Path::new("common/mod.rs")) {
+        // pool constructor), and the module walk only reached it because
+        // the target declares `mod common;`.
+        if facts.code.contains(FIXTURE_MARKER) && source.path.ends_with(Path::new("common/mod.rs"))
+        {
             evidence.push(Evidence {
                 site: format!("{shown} (postgres fixture module)"),
                 tests: Vec::new(),
@@ -447,7 +582,7 @@ fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
         // that dials postgres itself. An integration file is all test code
         // and so is an out-of-line test module's file; a `src/` file is
         // production code, where only the `#[cfg(test)]` bodies count.
-        if scope == Scope::Integration || prefix.is_some() {
+        if source.all_test {
             // An integration target's finding stays target-level on
             // purpose: nothing there says WHICH tests the connection
             // belongs to, so the whole binary is charged.
@@ -467,56 +602,13 @@ fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
                 if let Some((line, api)) = connection_site(facts, span.0, span.1) {
                     evidence.push(Evidence {
                         site: format!("{shown}:{line} {api}"),
-                        tests: test_names(facts, None, Some(*span)),
+                        tests: test_names(facts, prefix, Some(*span)),
                     });
                 }
             }
         }
     }
     evidence
-}
-
-/// The file(s) an out-of-line `mod name;` can live in, as rustc resolves
-/// them: `dir/name.rs` and `dir/name/mod.rs`, where `dir` is the declaring
-/// file's own directory for `mod.rs`/`lib.rs`/`main.rs` and its `dir/stem/`
-/// subdirectory otherwise. Both candidates are returned when both exist —
-/// that is a compile error in the crate, and scanning both is the
-/// conservative answer.
-///
-/// An explicit `#[path = "..."]` wins and resolves against the declaring
-/// file's directory, which is what rustc does for a module declared at the
-/// TOP level of that file. A `#[path]` on a module nested inside an inline
-/// `mod` block resolves against a further subdirectory; that case is a
-/// residual, and it under-collects (the file is simply not found) rather
-/// than pointing the scan at the wrong file.
-fn mod_decl_files(parent: &Path, decl: &ModDecl) -> Vec<PathBuf> {
-    let Some(dir) = parent.parent() else {
-        return Vec::new();
-    };
-    if let Some(path) = &decl.path {
-        let child = dir.join(path);
-        return if child.is_file() {
-            vec![child]
-        } else {
-            Vec::new()
-        };
-    }
-    let stem = parent
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    let dir = if matches!(stem, "mod" | "lib" | "main") {
-        dir.to_path_buf()
-    } else {
-        dir.join(stem)
-    };
-    [
-        dir.join(format!("{}.rs", decl.name)),
-        dir.join(&decl.name).join("mod.rs"),
-    ]
-    .into_iter()
-    .filter(|candidate| candidate.is_file())
-    .collect()
 }
 
 /// Line numbers and names of every non-ignored `#[sqlx::test]` in a file.
@@ -526,12 +618,12 @@ fn mod_decl_files(parent: &Path, decl: &ModDecl) -> Vec<PathBuf> {
 /// name collected here that nextest never lists reads as a test that
 /// escaped the group and fails the guard over a test that never runs. The
 /// two sides must agree on what counts as a test.
-fn sqlx_tests(facts: &FileFacts, prefix: Option<&str>) -> Vec<(usize, String)> {
+fn sqlx_tests(facts: &FileFacts, prefix: &str) -> Vec<(usize, String)> {
     facts
         .fns
         .iter()
         .filter(|item| item.is_sqlx_test && !item.ignored)
-        .map(|item| (item.line, qualify(prefix, &item.name)))
+        .map(|item| (item.line, format!("{prefix}{}", item.name)))
         .collect()
 }
 
@@ -540,20 +632,14 @@ fn sqlx_tests(facts: &FileFacts, prefix: Option<&str>) -> Vec<(usize, String)> {
 /// Helper `fn`s are left out — they are not test ids, and asking nextest
 /// about one would fail the guard on a name that can never be in the group.
 /// Ignored ones are left out for the same reason `sqlx_tests` drops them.
-fn test_names(facts: &FileFacts, prefix: Option<&str>, span: Option<Span>) -> Vec<String> {
+fn test_names(facts: &FileFacts, prefix: &str, span: Option<Span>) -> Vec<String> {
     facts
         .fns
         .iter()
         .filter(|item| item.is_test && !item.ignored)
         .filter(|item| span.is_none_or(|(start, end)| item.line >= start && item.line <= end))
-        .map(|item| qualify(prefix, &item.name))
+        .map(|item| format!("{prefix}{}", item.name))
         .collect()
-}
-
-/// Prefix a derived name with the module its file was declared as, when the
-/// file IS a module (an out-of-line `#[cfg(test)] mod pg_tests;`).
-fn qualify(prefix: Option<&str>, name: &str) -> String {
-    prefix.map_or_else(|| name.to_string(), |module| format!("{module}::{name}"))
 }
 
 /// The first line in the inclusive range `[start, end]` naming a
@@ -595,11 +681,19 @@ struct FnItem {
     ignored: bool,
 }
 
-/// An out-of-line `#[cfg(test)] mod name;` declaration.
+/// An out-of-line `mod name;` declaration.
 struct ModDecl {
     name: String,
     /// The `#[path = "..."]` override, when one is written.
     path: Option<String>,
+    /// The inline `mod` names it is nested inside, outermost first. They
+    /// are part of both the module path and the directory the child file
+    /// resolves in.
+    chain: Vec<String>,
+    /// Is the declared module test-only? True for its own `#[cfg(test)]`
+    /// and for a declaration sitting anywhere inside a `#[cfg(test)]`
+    /// region, which inherits the gate without carrying the attribute.
+    cfg_test: bool,
 }
 
 /// Inclusive 1-based line range.
@@ -624,7 +718,8 @@ struct FileFacts {
     code: String,
     fns: Vec<FnItem>,
     cfg_test_spans: Vec<Span>,
-    cfg_test_mods: Vec<ModDecl>,
+    /// Every out-of-line `mod name;` in the file, test-only or not.
+    mods: Vec<ModDecl>,
 }
 
 /// Read one source file with a single item-bounded pass over its blanked
@@ -669,7 +764,7 @@ fn file_facts(text: &str) -> FileFacts {
         code,
         fns,
         cfg_test_spans: spans,
-        cfg_test_mods: decls,
+        mods: decls,
     }
 }
 
@@ -1009,12 +1104,16 @@ impl ItemLexer<'_> {
             }
             Some(b';') => {
                 self.bump();
-                if cfg_test {
-                    self.decls.push(ModDecl {
-                        name,
-                        path: path_attr(&attrs),
-                    });
-                }
+                self.decls.push(ModDecl {
+                    name,
+                    path: path_attr(&attrs),
+                    chain: self.mods.iter().map(|(name, _)| name.clone()).collect(),
+                    // An open `#[cfg(test)]` region above the declaration
+                    // gates it just as its own attribute would, and a
+                    // declaration inside `#[cfg(test)] mod outer { .. }`
+                    // carries no attribute of its own.
+                    cfg_test: cfg_test || !self.open_cfg.is_empty(),
+                });
             }
             _ => {}
         }
@@ -1257,7 +1356,7 @@ mod tests {
 
     /// Every `#[sqlx::test]` a file declares, unqualified.
     fn sqlx_names(text: &str) -> Vec<(usize, String)> {
-        sqlx_tests(&file_facts(text), None)
+        sqlx_tests(&file_facts(text), "")
     }
 
     /// The span half of `scan`, as one call: the first connection each
@@ -1269,7 +1368,7 @@ mod tests {
             .iter()
             .filter_map(|span| {
                 connection_site(&facts, span.0, span.1)
-                    .map(|(line, api)| (line, api, test_names(&facts, None, Some(*span))))
+                    .map(|(line, api)| (line, api, test_names(&facts, "", Some(*span))))
             })
             .collect()
     }
@@ -1433,7 +1532,10 @@ mod tests {
 
     #[test]
     fn a_named_only_target_is_still_checked_per_test() {
-        let lib = target(vec![named_evidence(&["run_all", "resolve_one"])]);
+        let lib = target(vec![named_evidence(&[
+            "from_saved::tests::run_all",
+            "from_saved::tests::resolve_one",
+        ])]);
         let listing = suite(
             &["from_saved::tests::run_all", "unrelated::unit_test"],
             &["from_saved::tests::run_all"],
@@ -1441,6 +1543,28 @@ mod tests {
         let failure = check(&lib, Some(&listing)).expect("resolve_one is outside the group");
         assert!(failure.contains("resolve_one"), "{failure}");
         assert!(!failure.contains("unrelated"), "{failure}");
+    }
+
+    /// The masking escape, end to end through `check`: two files declare
+    /// the same `tests::connects`, only one of them opens a pool. A
+    /// trailing-segment match let the grouped one satisfy the ungrouped
+    /// one and the guard reported a pass.
+    #[test]
+    fn a_same_named_test_in_another_module_does_not_satisfy_this_one() {
+        let masked = target(vec![named_evidence(&["a::tests::connects"])]);
+        let listing = suite(
+            &["a::tests::connects", "b::tests::connects"],
+            &["b::tests::connects"],
+        );
+        let failure = check(&masked, Some(&listing)).expect("a::tests::connects escaped");
+        assert!(failure.contains("a::tests::connects"), "{failure}");
+
+        // The right one in the group is a pass.
+        let listing = suite(
+            &["a::tests::connects", "b::tests::connects"],
+            &["a::tests::connects"],
+        );
+        assert!(check(&masked, Some(&listing)).is_none());
     }
 
     #[test]
@@ -1655,18 +1779,18 @@ mod tests {
         assert!(cfg_test_sites(&text).is_empty());
     }
 
+    /// The path a file sits at is the module path its tests are named
+    /// under, and that is what makes an exact match possible.
     #[test]
-    fn a_test_id_matches_by_a_whole_trailing_path() {
-        assert!(test_is("from_saved::tests::run_all", "run_all"));
-        assert!(test_is("run_all", "run_all"));
-        assert!(!test_is("from_saved::tests::run_all_but_one", "run_all"));
-        // The whole point of qualifying: a leaf match would let an
-        // in-group `pure_tests::connects` mask an out-of-group one.
-        assert!(test_is("store::pg_tests::connects", "pg_tests::connects"));
-        assert!(!test_is(
-            "store::pure_tests::connects",
-            "pg_tests::connects"
-        ));
+    fn a_files_path_gives_its_module_prefix() {
+        let src = Path::new("/w/src");
+        assert_eq!(path_prefix(src, Path::new("/w/src/lib.rs")), "");
+        assert_eq!(path_prefix(src, Path::new("/w/src/foo.rs")), "foo::");
+        assert_eq!(path_prefix(src, Path::new("/w/src/foo/mod.rs")), "foo::");
+        assert_eq!(
+            path_prefix(src, Path::new("/w/src/foo/bar.rs")),
+            "foo::bar::"
+        );
     }
 
     /// A scratch directory that removes itself. The out-of-line module
@@ -1684,6 +1808,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
         Scratch(dir)
+    }
+
+    fn sites(evidence: &[Evidence]) -> Vec<&str> {
+        evidence.iter().map(|e| e.site.as_str()).collect()
     }
 
     fn write(path: &Path, text: &str) {
@@ -1716,7 +1844,9 @@ mod tests {
             ),
         );
 
-        let evidence = scan(&[parent, child], root, Scope::UnitTree);
+        write(&root.join("src").join("lib.rs"), "mod store;\n");
+        let files = unit_files(&root.join("src").join("lib.rs")).expect("module tree");
+        let evidence = scan(&files, root, Scope::UnitTree);
         assert_eq!(
             evidence.len(),
             1,
@@ -1727,7 +1857,11 @@ mod tests {
             evidence[0].site,
             "src/store/pg_tests.rs:3 StorageState::connect"
         );
-        assert_eq!(evidence[0].tests, vec!["pg_tests::connects".to_string()]);
+        assert_eq!(
+            evidence[0].tests,
+            vec!["store::pg_tests::connects".to_string()]
+        );
+        let _ = (parent, child);
     }
 
     /// The `mod.rs` form of the same thing, and a `#[path]` override. The
@@ -1757,7 +1891,8 @@ mod tests {
             ),
         );
 
-        let evidence = scan(&[lib], root, Scope::UnitTree);
+        let files = unit_files(&lib).expect("module tree");
+        let evidence = scan(&files, root, Scope::UnitTree);
         let sites: Vec<&str> = evidence.iter().map(|e| e.site.as_str()).collect();
         assert_eq!(
             sites,
@@ -1768,6 +1903,108 @@ mod tests {
         );
         assert_eq!(evidence[0].tests, vec!["other::also_connects".to_string()]);
         assert_eq!(evidence[1].tests, vec!["pg_tests::connects".to_string()]);
+    }
+
+    /// Two files, the same `tests::connects`, only one of them opening a
+    /// pool. The derived names have to differ, or the grouped one satisfies
+    /// the ungrouped one and the guard passes over a live escape.
+    #[test]
+    fn same_named_tests_in_two_files_derive_two_different_names() {
+        let dir = scratch("same-name");
+        let root = &dir.0;
+        let src = root.join("src");
+        write(&src.join("lib.rs"), "mod a;\nmod b;\n");
+        let body = |api: &str| {
+            format!(
+                "#[cfg(test)]\nmod tests {{\n    #[tokio::test]\n    async fn connects() {{\n        let s = {api}\"...\").await;\n    }}\n}}\n",
+            )
+        };
+        write(&src.join("a.rs"), &body(&call("StorageState", "connect")));
+        write(
+            &src.join("b.rs"),
+            "#[cfg(test)]\nmod tests {\n    #[tokio::test]\n    async fn connects() {}\n}\n",
+        );
+
+        let files = unit_files(&src.join("lib.rs")).expect("module tree");
+        let evidence = scan(&files, root, Scope::UnitTree);
+        assert_eq!(evidence.len(), 1, "{:?}", sites(&evidence));
+        assert_eq!(evidence[0].tests, vec!["a::tests::connects".to_string()]);
+    }
+
+    /// An integration root declaring anything other than `mod common;` used
+    /// to be invisible: only the root file and a literal `mod common;` were
+    /// ever opened, so a postgres test one module down never existed.
+    #[test]
+    fn an_integration_root_follows_every_module_it_declares() {
+        let dir = scratch("integration-mods");
+        let root = &dir.0;
+        let tests = root.join("tests");
+        write(&tests.join("root.rs"), "mod cases;\nmod common;\n");
+        write(
+            &tests.join("cases.rs"),
+            &format!(
+                "#[tokio::test]\nasync fn connects() {{\n    let s = {}\"...\").await;\n}}\n",
+                call("KeyStore", "connect"),
+            ),
+        );
+        write(&tests.join("common").join("mod.rs"), "pub fn helper() {}\n");
+
+        let files = module_tree(&tests.join("root.rs"), true).expect("module tree");
+        // rustc resolves a crate root's children in the root file's own
+        // directory, probed: `tests/cases.rs`, not `tests/root/cases.rs`.
+        let paths: Vec<&Path> = files.iter().map(|(f, _)| f.path.as_path()).collect();
+        assert!(
+            paths.iter().any(|path| path.ends_with("cases.rs")),
+            "{paths:?}"
+        );
+        let evidence = scan(&files, root, Scope::Integration);
+        assert_eq!(sites(&evidence), vec!["tests/cases.rs:3 KeyStore::connect"]);
+    }
+
+    /// An out-of-line module declared INSIDE an inline `#[cfg(test)] mod`
+    /// carries no attribute of its own, and its file sits one directory
+    /// deeper. Both halves have to be right or the child is either skipped
+    /// as production code or looked for in the wrong place.
+    #[test]
+    fn an_out_of_line_module_inside_an_inline_test_mod_is_followed() {
+        let dir = scratch("nested-decl");
+        let root = &dir.0;
+        let src = root.join("src");
+        write(
+            &src.join("lib.rs"),
+            "#[cfg(test)]\nmod outer {\n    mod pg_tests;\n}\n",
+        );
+        write(
+            &src.join("outer").join("pg_tests.rs"),
+            &format!(
+                "#[tokio::test]\nasync fn connects() {{\n    let s = {}\"...\").await;\n}}\n",
+                call("KeyStore", "connect"),
+            ),
+        );
+
+        let files = unit_files(&src.join("lib.rs")).expect("module tree");
+        let evidence = scan(&files, root, Scope::UnitTree);
+        assert_eq!(
+            sites(&evidence),
+            vec!["src/outer/pg_tests.rs:3 KeyStore::connect"]
+        );
+        assert_eq!(
+            evidence[0].tests,
+            vec!["outer::pg_tests::connects".to_string()]
+        );
+    }
+
+    /// A declaration the walk cannot resolve is the shape a pg test hides
+    /// behind, so it fails the guard by name rather than being skipped.
+    #[test]
+    fn an_unresolvable_module_declaration_is_a_loud_error() {
+        let dir = scratch("unresolvable");
+        let root = &dir.0;
+        write(&root.join("src").join("lib.rs"), "mod nowhere;\n");
+        let Err(error) = module_tree(&root.join("src").join("lib.rs"), false) else {
+            panic!("nowhere resolves to no file")
+        };
+        assert!(error.contains("mod nowhere;"), "{error}");
     }
 
     /// Blanking has to be byte-for-byte length preserving and newline
