@@ -14,8 +14,8 @@
 //!
 //! Two independent sides, on purpose:
 //!
-//! 1. DERIVATION, from `cargo metadata` plus a line scan of each target's
-//!    sources. A target is pg-touching if it carries an `#[sqlx::test]`
+//! 1. DERIVATION, from `cargo metadata` plus one item-bounded lexer pass
+//!    over each target's sources (see [`file_facts`]). A target is pg-touching if it carries an `#[sqlx::test]`
 //!    attribute, if it pulls in a `common` module that opens postgres pools
 //!    (`fixture_pool`), or if test code names one of the connection-opening
 //!    APIs itself (`KeyStore::connect`, `PgPool`, and friends). That third
@@ -380,14 +380,19 @@ enum Scope {
 
 /// Scan a target's sources for pg evidence.
 fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
-    let mut evidence = Vec::new();
-    for source in sources {
-        let Ok(text) = fs::read_to_string(source) else {
-            continue;
-        };
-        let shown = source.strip_prefix(root).unwrap_or(source).display();
+    let parsed: Vec<(PathBuf, FileFacts)> = sources
+        .iter()
+        .filter_map(|source| {
+            fs::read_to_string(source)
+                .ok()
+                .map(|text| (source.clone(), file_facts(&text)))
+        })
+        .collect();
 
-        let tests = sqlx_test_names(&text);
+    let mut evidence = Vec::new();
+    for (source, facts) in &parsed {
+        let shown = source.strip_prefix(root).unwrap_or(source).display();
+        let tests = sqlx_tests(facts);
         if let Some((line, _)) = tests.first() {
             evidence.push(Evidence {
                 site: format!("{shown}:{line} #[sqlx::test]"),
@@ -398,7 +403,7 @@ fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
         // The fixture side: this file IS the pg harness (it defines the
         // pool constructor), and `integration_sources` only handed it over
         // because the target declares `mod common;`.
-        if text.contains(FIXTURE_MARKER) && source.ends_with(Path::new("common/mod.rs")) {
+        if facts.code.contains(FIXTURE_MARKER) && source.ends_with(Path::new("common/mod.rs")) {
             evidence.push(Evidence {
                 site: format!("{shown} (postgres fixture module)"),
                 tests: Vec::new(),
@@ -406,21 +411,29 @@ fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
         }
 
         // The raw-connection side: no attribute, no fixture, just a test
-        // that dials postgres itself.
-        match scope {
-            Scope::Integration => {
-                if let Some((line, api)) = connection_api_site(&text) {
-                    evidence.push(Evidence {
-                        site: format!("{shown}:{line} {api}"),
-                        tests: Vec::new(),
-                    });
-                }
+        // that dials postgres itself. An integration file is all test code;
+        // a `src/` file is production code, where only the `#[cfg(test)]`
+        // bodies count.
+        //
+        // Residual: an out-of-line test module (`#[cfg(test)] mod tests;`)
+        // puts the test code in a file that carries no `#[cfg(test)]` of
+        // its own, so no span of it is scanned at all.
+        if scope == Scope::Integration {
+            // An integration target's finding is target-level on purpose:
+            // nothing there says WHICH tests the connection belongs to, so
+            // the whole binary is charged.
+            if let Some((line, api)) = connection_site(facts, 1, usize::MAX) {
+                evidence.push(Evidence {
+                    site: format!("{shown}:{line} {api}"),
+                    tests: Vec::new(),
+                });
             }
-            Scope::UnitTree => {
-                if let Some((line, api, tests)) = cfg_test_connection_site(&text) {
+        } else {
+            for span in &facts.cfg_test_spans {
+                if let Some((line, api)) = connection_site(facts, span.0, span.1) {
                     evidence.push(Evidence {
                         site: format!("{shown}:{line} {api}"),
-                        tests,
+                        tests: test_names(facts, Some(*span)),
                     });
                 }
             }
@@ -429,147 +442,392 @@ fn scan(sources: &[PathBuf], root: &Path, scope: Scope) -> Vec<Evidence> {
     evidence
 }
 
-/// The first line naming a connection-opening API, with the API it named.
+/// Line numbers and names of every non-ignored `#[sqlx::test]` in a file.
 ///
-/// Comments are cut first, for the same reason `sqlx_test_names` drops
-/// them: the fixture module explains `fixture_pool` in prose, and prose is
-/// not a connection. Cutting at `//` also truncates a string literal that
-/// contains one (a URL), which can only lose a detection, never invent one.
-fn connection_api_site(text: &str) -> Option<(usize, &'static str)> {
-    text.lines().enumerate().find_map(|(index, raw)| {
-        let code = raw.split("//").next().unwrap_or_default();
-        CONNECTION_APIS
-            .iter()
-            .find(|api| code.contains(**api))
-            .map(|api| (index + 1, *api))
-    })
+/// An `#[ignore]`d test is skipped, and it has to be: `group_membership`
+/// drops ignored cases from both the `all` and the `matched` side, so a
+/// name collected here that nextest never lists reads as a test that
+/// escaped the group and fails the guard over a test that never runs. The
+/// two sides must agree on what counts as a test.
+fn sqlx_tests(facts: &FileFacts) -> Vec<(usize, String)> {
+    facts
+        .fns
+        .iter()
+        .filter(|item| item.is_sqlx_test && !item.ignored)
+        .map(|item| (item.line, item.name.clone()))
+        .collect()
 }
 
-/// The first connection-opening API called inside a `#[cfg(test)]` region,
-/// with the test functions that region declares.
+/// Names of the non-ignored test functions of a file, or of one span of it.
 ///
-/// A `src/` tree is production code: `StorageState::connect` is DEFINED
-/// there, and every store module names `PgPool` in a signature, so scanning
-/// the whole file would put ~600 connectionless unit tests in the group.
-/// Scanning nothing is the other failure, and it is the one that lets a
-/// plain `#[tokio::test]` under `src/` dial postgres outside the group. The
-/// middle is the test code itself: everything under a `#[cfg(test)]`
-/// attribute, which is where a unit test that opens a connection lives.
+/// Helper `fn`s are left out — they are not test ids, and asking nextest
+/// about one would fail the guard on a name that can never be in the group.
+/// Ignored ones are left out for the same reason `sqlx_tests` drops them.
+fn test_names(facts: &FileFacts, span: Option<Span>) -> Vec<String> {
+    facts
+        .fns
+        .iter()
+        .filter(|item| item.is_test && !item.ignored)
+        .filter(|item| span.is_none_or(|(start, end)| item.line >= start && item.line <= end))
+        .map(|item| item.name.clone())
+        .collect()
+}
+
+/// The first line in the inclusive range `[start, end]` naming a
+/// connection-opening API, with the API it named.
 ///
-/// The names keep the finding NAME-granular, like the `#[sqlx::test]`
-/// class: the connection lives in one test module, not in all 600 unit
-/// tests of the binary that module compiles into. A region that opens a
-/// connection and declares no test of its own returns no names, which makes
-/// the finding target-level and drags the whole binary in — the
-/// conservative answer for test-only code nothing in the region names.
-///
-/// Comments and literal contents are blanked first (see
-/// [`blank_comments_and_literals`]) so a `}` inside a string cannot end the
-/// region early and prose about `fixture_pool` is not a connection. Line
-/// numbers are the file's real ones: blanking preserves every newline.
-fn cfg_test_connection_site(text: &str) -> Option<(usize, &'static str, Vec<String>)> {
-    let code = blank_comments_and_literals(text);
-    let lines: Vec<&str> = code.lines().collect();
-    cfg_test_spans(&lines).into_iter().find_map(|(start, end)| {
-        let (line, api) = (start..=end).find_map(|index| {
+/// Reads the blanked text, so prose about `fixture_pool` is not a
+/// connection and a DSN inside a string literal is not one either. Losing a
+/// detection that way is impossible: a call is code, and code survives
+/// blanking intact.
+fn connection_site(facts: &FileFacts, start: usize, end: usize) -> Option<(usize, &'static str)> {
+    facts
+        .code
+        .lines()
+        .enumerate()
+        .map(|(index, line)| (index + 1, line))
+        .filter(|(number, _)| *number >= start && *number <= end)
+        .find_map(|(number, line)| {
             CONNECTION_APIS
                 .iter()
-                .find(|api| lines[index].contains(**api))
-                .map(|api| (index + 1, *api))
-        })?;
-        Some((line, api, test_fn_names(&lines[start..=end])))
-    })
+                .find(|api| line.contains(**api))
+                .map(|api| (number, *api))
+        })
 }
 
-/// Names of the test functions declared in one span: every `fn` under an
-/// attribute whose last path segment is `test` (`#[test]`, `#[tokio::test]`,
-/// `#[sqlx::test(migrations = false)]`). Helper `fn`s are left out — they
-/// are not test ids, and asking nextest about one would fail the guard on a
-/// name that can never be in the group.
-fn test_fn_names(lines: &[&str]) -> Vec<String> {
-    let mut names = Vec::new();
-    for (index, raw) in lines.iter().enumerate() {
-        if !is_test_attribute(raw.trim()) {
-            continue;
-        }
-        if let Some(name) = lines[index + 1..]
-            .iter()
-            .map(|l| l.trim())
-            .find_map(function_name)
-        {
-            names.push(name);
+/// One `fn` item, with the facts derived from the attribute block rustc
+/// attaches to it.
+struct FnItem {
+    /// Real 1-based line of the first attribute in the block, or of the
+    /// signature itself when the function carries no attributes.
+    line: usize,
+    name: String,
+    /// Does the block carry an attribute whose last path segment is `test`
+    /// (`#[test]`, `#[tokio::test]`, `#[sqlx::test]`)?
+    is_test: bool,
+    is_sqlx_test: bool,
+    ignored: bool,
+}
+
+/// Inclusive 1-based line range.
+type Span = (usize, usize);
+
+/// One attribute, as the lexer read it.
+struct Attr {
+    /// The path before any arguments, whitespace removed: `cfg`, `ignore`,
+    /// `sqlx::test`.
+    path: String,
+    /// The arguments, BLANKED — a string literal's contents are spaces.
+    args: String,
+}
+
+/// Everything the guard reads out of one source file.
+struct FileFacts {
+    /// The comment- and literal-blanked text: byte for byte as long as the
+    /// original, with every newline in place.
+    code: String,
+    fns: Vec<FnItem>,
+    cfg_test_spans: Vec<Span>,
+}
+
+/// Read one source file with a single item-bounded pass over its blanked
+/// text.
+///
+/// Every per-test fact the guard uses — is this a test, what is it called,
+/// is it `#[ignore]`d — comes from here, because deriving them from
+/// adjacent lines gets all three wrong in ways that matter:
+///
+/// * An `#[ignore]` written inside a `/* */` block comment is not an
+///   attribute. Blanking turns it into spaces before the lexer sees it, so
+///   it cannot be read as one.
+/// * An attribute block belongs to the NEXT ITEM and stops there. A scan
+///   that walks downward until it finds a `fn` reads the `#[ignore]` of the
+///   next test as this one's.
+/// * Blank lines, doc comments and multi-line attributes between the block
+///   and its item change nothing. Probed with rustc: `#[test]`, a blank
+///   line, `/// doc`, a blank line, `#[ignore]`, a blank line, then `fn
+///   t()` compiles to one IGNORED test. So the block accumulates across all
+///   of them and is discarded only when some other item takes it.
+///
+/// Line numbers stay the file's real ones: blanking preserves every byte
+/// position and newline.
+fn file_facts(text: &str) -> FileFacts {
+    let code = blank_comments_and_literals(text);
+    let mut lexer = ItemLexer {
+        bytes: code.as_bytes(),
+        i: 0,
+        line: 1,
+        depth: 0,
+        open_cfg: Vec::new(),
+        pending: None,
+        pending_cfg: None,
+        fns: Vec::new(),
+        spans: Vec::new(),
+    };
+    lexer.run();
+    let (fns, spans) = (lexer.fns, lexer.spans);
+    FileFacts {
+        code,
+        fns,
+        cfg_test_spans: spans,
+    }
+}
+
+/// The item lexer. It knows four things — attributes, braces, `fn` and
+/// `mod` — and treats everything else as "some item that takes the pending
+/// attribute block".
+struct ItemLexer<'a> {
+    /// The blanked text, as long as the file it came from.
+    bytes: &'a [u8],
+    i: usize,
+    /// 1-based line of `i`.
+    line: usize,
+    depth: usize,
+    /// Open `#[cfg(test)]` bodies: start line, and the depth each opened at.
+    open_cfg: Vec<(usize, usize)>,
+    /// The attribute block being accumulated: the line it started on, and
+    /// the attributes in it.
+    pending: Option<(usize, Vec<Attr>)>,
+    /// A `cfg(test)` block already taken by an item whose braced body has
+    /// not opened yet.
+    pending_cfg: Option<usize>,
+    fns: Vec<FnItem>,
+    spans: Vec<Span>,
+}
+
+impl ItemLexer<'_> {
+    fn run(&mut self) {
+        loop {
+            self.skip_trivia();
+            let Some(byte) = self.peek() else { break };
+            match byte {
+                b'#' => self.attribute(),
+                b'{' => {
+                    self.pending = None;
+                    if let Some(start) = self.pending_cfg.take() {
+                        self.open_cfg.push((start, self.depth));
+                    }
+                    self.depth += 1;
+                    self.bump();
+                }
+                b'}' => self.close_block(),
+                b';' | b',' => {
+                    self.pending = None;
+                    self.pending_cfg = None;
+                    self.bump();
+                }
+                b'_' | b'a'..=b'z' | b'A'..=b'Z' => self.word(),
+                _ => {
+                    self.pending = None;
+                    self.bump();
+                }
+            }
         }
     }
-    names
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.i).copied()
+    }
+
+    fn bump(&mut self) {
+        if self.peek() == Some(b'\n') {
+            self.line += 1;
+        }
+        self.i += 1;
+    }
+
+    /// Comments are already spaces, so trivia is whitespace.
+    fn skip_trivia(&mut self) {
+        while self.peek().is_some_and(|b| b.is_ascii_whitespace()) {
+            self.bump();
+        }
+    }
+
+    fn ident(&mut self) -> Option<String> {
+        let start = self.i;
+        while self
+            .peek()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            self.bump();
+        }
+        (self.i > start).then(|| self.slice(start, self.i).to_string())
+    }
+
+    fn slice(&self, from: usize, to: usize) -> &str {
+        std::str::from_utf8(self.bytes.get(from..to).unwrap_or_default()).unwrap_or_default()
+    }
+
+    /// Consume a balanced group and return the byte range INSIDE it. The
+    /// cursor must be on `open`; it ends past the matching `close`.
+    fn group(&mut self, open: u8, close: u8) -> (usize, usize) {
+        self.bump();
+        let start = self.i;
+        let mut depth = 1usize;
+        while let Some(byte) = self.peek() {
+            if byte == open {
+                depth += 1;
+            } else if byte == close {
+                depth -= 1;
+                if depth == 0 {
+                    let end = self.i;
+                    self.bump();
+                    return (start, end);
+                }
+            }
+            self.bump();
+        }
+        (start, self.i)
+    }
+
+    fn attribute(&mut self) {
+        let line = self.line;
+        let at = self.i;
+        self.bump();
+        let inner = self.peek() == Some(b'!');
+        if inner {
+            self.bump();
+        }
+        if self.peek() != Some(b'[') {
+            // Not an attribute. Rust has no other `#`, but a blanked byte
+            // could leave one behind; step over it and drop the block.
+            self.i = at;
+            self.line = line;
+            self.bump();
+            self.pending = None;
+            return;
+        }
+        let (from, to) = self.group(b'[', b']');
+        if inner {
+            // `#![...]` belongs to the ENCLOSING item, not the next one.
+            return;
+        }
+        let attr = self.parse_attr(from, to);
+        self.pending
+            .get_or_insert_with(|| (line, Vec::new()))
+            .1
+            .push(attr);
+    }
+
+    fn parse_attr(&self, from: usize, to: usize) -> Attr {
+        let inner = self.slice(from, to);
+        let split = inner.find(['(', '=']).unwrap_or(inner.len());
+        Attr {
+            path: inner[..split]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect(),
+            args: inner[split..].to_string(),
+        }
+    }
+
+    fn close_block(&mut self) {
+        self.pending = None;
+        self.pending_cfg = None;
+        self.depth = self.depth.saturating_sub(1);
+        while let Some(&(start, depth)) = self.open_cfg.last() {
+            if depth < self.depth {
+                break;
+            }
+            self.open_cfg.pop();
+            self.spans.push((start, self.line));
+        }
+        self.bump();
+    }
+
+    fn word(&mut self) {
+        let line = self.line;
+        let Some(word) = self.ident() else {
+            self.bump();
+            return;
+        };
+        match word.as_str() {
+            // Visibility and function modifiers do NOT take the attribute
+            // block: `#[sqlx::test] pub(crate) async fn live()` is one item,
+            // and the block is the `fn`'s.
+            "pub" => {
+                self.skip_trivia();
+                if self.peek() == Some(b'(') {
+                    self.group(b'(', b')');
+                }
+            }
+            "async" | "const" | "unsafe" | "extern" | "default" => {}
+            "fn" => self.function(line),
+            "mod" => self.module(line),
+            // Any other item or expression takes the block. A `cfg(test)`
+            // one still opens a span when its body does, which is what
+            // covers shapes like `#[cfg(test)] impl Fixture { .. }`.
+            _ => {
+                self.take_pending(line);
+            }
+        }
+    }
+
+    /// Take the pending attribute block, remembering a `cfg(test)` in it so
+    /// the item's braced body becomes a span.
+    fn take_pending(&mut self, line: usize) -> (usize, Vec<Attr>) {
+        let (attr_line, attrs) = self.pending.take().unwrap_or((line, Vec::new()));
+        if attrs.iter().any(is_cfg_test) {
+            self.pending_cfg = Some(attr_line);
+        }
+        (attr_line, attrs)
+    }
+
+    fn function(&mut self, line: usize) {
+        self.skip_trivia();
+        let name = self.ident();
+        let (attr_line, attrs) = self.take_pending(line);
+        let Some(name) = name else { return };
+        self.fns.push(FnItem {
+            line: attr_line,
+            name,
+            is_test: attrs.iter().any(is_test_attr),
+            is_sqlx_test: attrs.iter().any(|attr| attr.path == "sqlx::test"),
+            ignored: attrs.iter().any(|attr| attr.path == "ignore"),
+        });
+    }
+
+    fn module(&mut self, line: usize) {
+        self.skip_trivia();
+        self.ident();
+        let (attr_line, attrs) = self.pending.take().unwrap_or((line, Vec::new()));
+        let cfg_test = attrs.iter().any(is_cfg_test);
+        self.skip_trivia();
+        if self.peek() == Some(b'{') {
+            self.bump();
+            if cfg_test {
+                self.open_cfg.push((attr_line, self.depth));
+            }
+            self.depth += 1;
+        }
+    }
 }
 
 /// `#[test]`, `#[tokio::test]`, `#[sqlx::test(...)]` — an attribute whose
 /// final path segment is exactly `test`.
-fn is_test_attribute(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("#[") else {
-        return false;
-    };
-    let path: &str = rest.split(['(', ']']).next().unwrap_or_default().trim();
-    path.rsplit("::").next() == Some("test")
+fn is_test_attr(attr: &Attr) -> bool {
+    attr.path.rsplit("::").next() == Some("test")
 }
 
-/// Inclusive line ranges (0-based) of every `#[cfg(test)]` item.
-///
-/// The attribute is followed by the item it guards, and the item's body is
-/// taken by brace matching from its first `{`. That covers `mod tests { }`
-/// and a `#[cfg(test)]` on a single `fn` alike, since both are one braced
-/// body. A brace-less item (`#[cfg(test)] mod tests;`, the out-of-line
-/// module form) closes with `;` before any `{` and yields no span — the
-/// separate file it names is scanned on its own, and its own tests carry
-/// no `#[cfg(test)]` inside, which is the one residual here: a unit test
-/// living in a file that is ITSELF `#[cfg(test)]`-gated from its parent is
-/// invisible to this scan. Nothing in the workspace is written that way,
-/// and the `#[sqlx::test]` and fixture classes still cover such a file.
-fn cfg_test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        if !lines[index].contains("#[cfg(test)]") {
-            index += 1;
-            continue;
-        }
-        match braced_body_end(lines, index) {
-            Some(end) => {
-                spans.push((index, end));
-                index = end + 1;
-            }
-            None => index += 1,
-        }
-    }
-    spans
+/// `#[cfg(test)]`, and only a bare `test` predicate: the arguments are read
+/// from the BLANKED text, so `#[cfg(feature = "test")]` has no `test` token
+/// left in it to find.
+fn is_cfg_test(attr: &Attr) -> bool {
+    attr.path == "cfg" && has_ident(&attr.args, "test")
 }
 
-/// Line of the `}` closing the first `{` at or after `start`, or `None`
-/// when the item has no braced body.
-///
-/// Three ways to have none, all of them real: a `;` ends the item before
-/// any `{` (`#[cfg(test)] mod tests;`), the ENCLOSING block closes first
-/// (an attribute written inside a function body), or the braces never
-/// balance to the end of the file. All three yield no span rather than
-/// swallowing the rest of the file.
-fn braced_body_end(lines: &[&str], start: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (offset, line) in lines[start..].iter().enumerate() {
-        for c in line.chars() {
-            match c {
-                '{' => depth += 1,
-                '}' | ';' if depth == 0 => return None,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(start + offset);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    None
+/// Does `text` contain `word` as a whole identifier?
+fn has_ident(text: &str, word: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.match_indices(word).any(|(at, _)| {
+        let before = at.checked_sub(1).map(|i| bytes[i]);
+        let after = bytes.get(at + word.len()).copied();
+        !before.is_some_and(is_ident_byte) && !after.is_some_and(is_ident_byte)
+    })
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// Replace comment and literal CONTENT with spaces, keeping every byte
@@ -632,7 +890,12 @@ fn blank_comments_and_literals(text: &str) -> String {
             i += 1;
             while i < bytes.len() && bytes[i] != b'"' {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    out.push_str("  ");
+                    // A `\` before a newline is a line-continuation escape.
+                    // Blanking the newline away with it would shift every
+                    // later line number by one, so the escaped byte is
+                    // blanked only when it is not a newline.
+                    out.push(' ');
+                    out.push(if bytes[i + 1] == b'\n' { '\n' } else { ' ' });
                     i += 2;
                     continue;
                 }
@@ -682,94 +945,6 @@ fn char_literal_len(rest: &[u8]) -> usize {
     } else {
         0
     }
-}
-
-/// Line numbers and function names of every `#[sqlx::test]` attribute.
-///
-/// Comment lines are dropped first. A bare substring search would find the
-/// PROSE: `crates/trawl-config/src/lib.rs` explains in a `//` comment that
-/// `DATABASE_URL` is ceded to `#[sqlx::test]`, and trawl-server's store
-/// modules say the same in doc comments. Dropping `//`-leading lines is
-/// enough here because the attribute is only ever written at the start of
-/// its own line; a `/* */` block hiding one would be a false positive, and
-/// a false positive only over-groups.
-///
-/// An `#[ignore]`d test is skipped, and it has to be: `group_membership`
-/// drops ignored cases from both the `all` and the `matched` side, so a
-/// name collected here that nextest never lists reads as a test that
-/// escaped the group and fails the guard over a test that never runs. The
-/// two sides must agree on what counts as a test.
-fn sqlx_test_names(text: &str) -> Vec<(usize, String)> {
-    let mut found = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
-    for (index, raw) in lines.iter().enumerate() {
-        let line = raw.trim();
-        if line.starts_with("//") || !is_sqlx_test_attribute(line) {
-            continue;
-        }
-        // Attributes above the `#[sqlx::test]`, contiguous with it.
-        if lines[..index]
-            .iter()
-            .rev()
-            .map(|l| l.trim())
-            .take_while(|l| l.starts_with("#["))
-            .any(is_ignore_attribute)
-        {
-            continue;
-        }
-        // The attribute names the test beneath it; skip any further
-        // attributes stacked between the two, and drop the test if one of
-        // them is `#[ignore]`.
-        let below = lines[index + 1..].iter().map(|l| l.trim());
-        let mut ignored = false;
-        let mut name = None;
-        for line in below {
-            if let Some(found_name) = function_name(line) {
-                name = Some(found_name);
-                break;
-            }
-            ignored |= is_ignore_attribute(line);
-        }
-        if ignored {
-            continue;
-        }
-        found.push((index + 1, name.unwrap_or_else(|| "<unnamed>".to_string())));
-    }
-    found
-}
-
-/// `#[ignore]` / `#[ignore = "reason"]`.
-fn is_ignore_attribute(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("#[") else {
-        return false;
-    };
-    let path = rest
-        .split(['(', '=', ']'])
-        .next()
-        .unwrap_or_default()
-        .trim();
-    path == "ignore"
-}
-
-/// `#[sqlx::test]` / `#[sqlx::test(migrations = false)]`, tolerating the
-/// whitespace rustfmt would never write but a human might.
-fn is_sqlx_test_attribute(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("#[") else {
-        return false;
-    };
-    rest.trim_start().starts_with("sqlx::test")
-}
-
-/// `async fn name(` / `fn name(` → `name`.
-fn function_name(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("pub ").unwrap_or(line).trim_start();
-    let rest = rest.strip_prefix("async ").unwrap_or(rest).trim_start();
-    let rest = rest.strip_prefix("fn ")?;
-    let name: String = rest
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    (!name.is_empty()).then_some(name)
 }
 
 /// Ask nextest what it would run: binary id → its testcases and which of
@@ -837,11 +1012,29 @@ mod tests {
 
     /// The guard scans this very file, so the fixtures below assemble the
     /// attribute at run time instead of writing it at the start of a line.
-    /// A line scan cannot tell an attribute from a string literal that
-    /// looks like one; keeping the literal out of column zero is cheaper
-    /// than teaching the scanner Rust's lexical grammar.
+    /// Blanking makes a literal that looks like an attribute harmless, but
+    /// an attribute written in column zero here would be a real one.
     fn attr(args: &str) -> String {
         format!("#[{}::test{args}]", "sqlx")
+    }
+
+    /// Every `#[sqlx::test]` a file declares.
+    fn sqlx_names(text: &str) -> Vec<(usize, String)> {
+        sqlx_tests(&file_facts(text))
+    }
+
+    /// The span half of `scan`, as one call: the first connection each
+    /// `#[cfg(test)]` span opens, with the tests that span declares.
+    fn cfg_test_sites(text: &str) -> Vec<(usize, &'static str, Vec<String>)> {
+        let facts = file_facts(text);
+        facts
+            .cfg_test_spans
+            .iter()
+            .filter_map(|span| {
+                connection_site(&facts, span.0, span.1)
+                    .map(|(line, api)| (line, api, test_names(&facts, Some(*span))))
+            })
+            .collect()
     }
 
     #[test]
@@ -851,7 +1044,7 @@ mod tests {
             "// DATABASE_URL is ceded to the sqlx test harness ({a}\n    /// tests use `{a}`-migrated pools directly).\n",
             a = attr("")
         );
-        assert!(sqlx_test_names(&text).is_empty());
+        assert!(sqlx_names(&text).is_empty());
     }
 
     #[test]
@@ -861,7 +1054,7 @@ mod tests {
             attr("(migrations = false)"),
             attr("")
         );
-        let found = sqlx_test_names(&text);
+        let found = sqlx_names(&text);
         assert_eq!(found.len(), 2);
         assert_eq!(found[0], (1, "roles_are_data".to_string()));
         assert_eq!(found[1], (3, "nested".to_string()));
@@ -876,8 +1069,69 @@ mod tests {
             "{a}\n#[ignore = \"needs a live cluster\"]\nasync fn skipped(pool: PgPool) {{}}\n\n#[ignore]\n{a}\nasync fn also_skipped(pool: PgPool) {{}}\n\n{a}\nasync fn runs(pool: PgPool) {{}}\n",
             a = attr("")
         );
-        let found = sqlx_test_names(&text);
+        let found = sqlx_names(&text);
         assert_eq!(found, vec![(9, "runs".to_string())]);
+    }
+
+    /// An `#[ignore]` inside a block comment is prose, and prose does not
+    /// ignore a test. The lexer reads the BLANKED text, where the whole
+    /// comment is spaces, so the live test below it stays collected.
+    #[test]
+    fn an_ignore_inside_a_block_comment_is_not_an_attribute() {
+        let text = format!(
+            "{a}\n/* the shelved variant was\n#[ignore]\nuntil the fixture landed */\nasync fn live(pool: PgPool) {{}}\n",
+            a = attr("")
+        );
+        assert_eq!(sqlx_names(&text), vec![(1, "live".to_string())]);
+    }
+
+    /// The block ends at the item it attributes. Reading downward "until a
+    /// fn appears" walked past `live`'s signature and charged it with the
+    /// NEXT test's `#[ignore]`, dropping a live pg test from the derived
+    /// set. `pub(crate) async fn` is the shape that made the old scan miss
+    /// the signature in the first place.
+    #[test]
+    fn the_attribute_block_stops_at_the_fn_it_attributes() {
+        let text = format!(
+            "{a}\npub(crate) async fn live(pool: PgPool) {{}}\n\n#[test]\n#[ignore]\nfn offline() {{}}\n",
+            a = attr("")
+        );
+        assert_eq!(sqlx_names(&text), vec![(1, "live".to_string())]);
+    }
+
+    /// Visibility and modifier spellings the old `strip_prefix("pub ")`
+    /// scan could not read.
+    #[test]
+    fn every_visibility_and_modifier_ordering_names_its_fn() {
+        for signature in [
+            "pub(crate) async fn probe(pool: PgPool) {}",
+            "pub(super) async fn probe(pool: PgPool) {}",
+            "pub(in crate::store) async fn probe(pool: PgPool) {}",
+            "pub async unsafe fn probe(pool: PgPool) {}",
+            "const fn probe() {}",
+            "pub  (  crate  )  fn probe() {}",
+        ] {
+            let text = format!("{}\n{signature}\n", attr(""));
+            assert_eq!(
+                sqlx_names(&text),
+                vec![(1, "probe".to_string())],
+                "{signature}"
+            );
+        }
+    }
+
+    /// rustc attaches an attribute across blank lines, doc comments and
+    /// other attributes; probed with rustc, which reports exactly one
+    /// IGNORED test for this shape. The reverse line scan stopped at the
+    /// first line that was not an attribute, so the `#[ignore]` above the
+    /// doc comment was invisible and an ignored test was collected.
+    #[test]
+    fn an_attribute_block_carries_across_blank_lines_and_docs() {
+        let text = format!(
+            "#[ignore]\n\n/// why it is shelved\n\n#[allow(\n    dead_code\n)]\n\n{}\nasync fn shelved(pool: PgPool) {{}}\n",
+            attr("")
+        );
+        assert!(sqlx_names(&text).is_empty(), "{:?}", sqlx_names(&text));
     }
 
     /// Same trick for the connection APIs: writing `KeyStore::connect(`
@@ -958,19 +1212,21 @@ mod tests {
             "#[tokio::test]\nasync fn boots() {{\n    let ks = {}\"...\").await;\n}}\n",
             call("KeyStore", "connect")
         );
+        let facts = file_facts(&code);
         assert_eq!(
-            connection_api_site(&code).map(|(_, api)| api),
+            connection_site(&facts, 1, usize::MAX).map(|(_, api)| api),
             Some("KeyStore::connect")
         );
 
         let prose = format!(
-            "// the fixture calls {}dsn) for us, so this test never touches a pool\n/// see {} above\nfn pure() {{}}\n",
+            "// the fixture calls {}dsn) for us, so this test never touches a pool\n/// see {} above\n/* or {} */\nfn pure() {{}}\n",
             call("KeyStore", "connect"),
             call("PgConnection", "connect"),
+            call("StorageState", "connect"),
         );
-        assert!(connection_api_site(&prose).is_none());
+        assert!(connection_site(&file_facts(&prose), 1, usize::MAX).is_none());
 
-        assert!(connection_api_site("fn pure() -> u8 { 1 }\n").is_none());
+        assert!(connection_site(&file_facts("fn pure() -> u8 { 1 }\n"), 1, usize::MAX).is_none());
     }
 
     /// Production `src/` code that opens a pool is not test evidence: the
@@ -981,7 +1237,7 @@ mod tests {
             "pub async fn connect(url: &str) -> Store {{\n    let pool = {}url).await;\n    Store {{ pool }}\n}}\n",
             call("PgPoolOptions", "new")
         );
-        assert!(cfg_test_connection_site(&text).is_none());
+        assert!(cfg_test_sites(&text).is_empty());
     }
 
     /// The escape this class exists for: a plain `#[tokio::test]` under
@@ -989,13 +1245,42 @@ mod tests {
     #[test]
     fn a_connection_inside_a_cfg_test_module_is_evidence() {
         let text = format!(
-            "pub async fn connect(url: &str) -> Store {{\n    let pool = {}url).await;\n    Store {{ pool }}\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+            "pub async fn connect(url: &str) -> Store {{\n    let pool = {}url).await;\n    Store {{ pool }}\n}}\n\n#[cfg(test)]\nmod pg_tests {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
             call("PgPoolOptions", "new"),
             call("StorageState", "connect"),
         );
-        let (line, api, tests) = cfg_test_connection_site(&text).expect("the test dials postgres");
-        assert_eq!((line, api), (10, "StorageState::connect"));
-        assert_eq!(tests, vec!["boots".to_string()]);
+        let sites = cfg_test_sites(&text);
+        assert_eq!(sites.len(), 1);
+        assert_eq!((sites[0].0, sites[0].1), (10, "StorageState::connect"));
+        assert_eq!(sites[0].2, vec!["boots".to_string()]);
+    }
+
+    /// One `#[cfg(test)]` region per file was the old rule (`find_map`), so
+    /// a second test module in the same file opened connections unseen.
+    #[test]
+    fn every_cfg_test_span_is_scanned() {
+        let text = format!(
+            "#[cfg(test)]\nmod pure_tests {{\n    #[test]\n    fn arithmetic() {{}}\n}}\n\n#[cfg(test)]\nmod pg_tests {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+            call("StorageState", "connect"),
+        );
+        let sites = cfg_test_sites(&text);
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!((sites[0].0, sites[0].1), (11, "StorageState::connect"));
+        assert_eq!(sites[0].2, vec!["boots".to_string()]);
+    }
+
+    /// An ignored test inside a connecting span is not named evidence
+    /// either: nextest lists no such case, so the guard would fail on a
+    /// name that can never be in the group.
+    #[test]
+    fn an_ignored_test_in_a_connecting_span_is_not_named() {
+        let text = format!(
+            "#[cfg(test)]\nmod pg_tests {{\n    #[tokio::test]\n    #[ignore]\n    async fn shelved() {{\n        let s = {}\"...\").await;\n    }}\n\n    #[tokio::test]\n    async fn live() {{}}\n}}\n",
+            call("StorageState", "connect"),
+        );
+        let sites = cfg_test_sites(&text);
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].2, vec!["live".to_string()]);
     }
 
     /// Braces nested inside the test module, and a string literal carrying
@@ -1006,17 +1291,17 @@ mod tests {
             "#[cfg(test)]\nmod tests {{\n    fn helper() {{\n        let s = \"}}}}}} not code\";\n    }}\n\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n\nfn after() {{}}\n",
             call("StorageState", "connect"),
         );
-        let (line, api, tests) = cfg_test_connection_site(&text).expect("the test dials postgres");
-        assert_eq!((line, api), (9, "StorageState::connect"));
+        let sites = cfg_test_sites(&text);
+        assert_eq!((sites[0].0, sites[0].1), (9, "StorageState::connect"));
         // `helper` carries no test attribute, so it is not a name to check.
-        assert_eq!(tests, vec!["boots".to_string()]);
+        assert_eq!(sites[0].2, vec!["boots".to_string()]);
 
         // The same call AFTER the module closes is production code again.
         let outside = format!(
             "#[cfg(test)]\nmod tests {{\n    fn helper() {{}}\n}}\n\nasync fn boot() {{\n    let s = {}\"...\").await;\n}}\n",
             call("StorageState", "connect"),
         );
-        assert!(cfg_test_connection_site(&outside).is_none());
+        assert!(cfg_test_sites(&outside).is_empty());
     }
 
     /// `#[cfg(test)]` on a single fn is one braced body like a module.
@@ -1026,10 +1311,21 @@ mod tests {
             "#[cfg(test)]\nasync fn helper() {{\n    let s = {}\"...\").await;\n}}\n",
             call("KeyStore", "connect"),
         );
-        let (line, api, tests) = cfg_test_connection_site(&text).expect("cfg(test) fn is scanned");
-        assert_eq!((line, api), (3, "KeyStore::connect"));
+        let sites = cfg_test_sites(&text);
+        assert_eq!((sites[0].0, sites[0].1), (3, "KeyStore::connect"));
         // No test attribute inside: the finding is target-level.
-        assert!(tests.is_empty());
+        assert!(sites[0].2.is_empty());
+    }
+
+    /// `#[cfg(feature = "test")]` is not `#[cfg(test)]`. The argument text
+    /// is read blanked, so the string has no `test` token left in it.
+    #[test]
+    fn a_feature_named_test_does_not_open_a_span() {
+        let text = format!(
+            "#[cfg(feature = \"test\")]\nmod helpers {{\n    async fn boot() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+            call("StorageState", "connect"),
+        );
+        assert!(cfg_test_sites(&text).is_empty());
     }
 
     #[test]
@@ -1037,5 +1333,29 @@ mod tests {
         assert!(test_is("from_saved::tests::run_all", "run_all"));
         assert!(test_is("run_all", "run_all"));
         assert!(!test_is("from_saved::tests::run_all_but_one", "run_all"));
+    }
+
+    /// Blanking has to be byte-for-byte length preserving and newline
+    /// exact, because every reported line number and every `#[path]` read
+    /// out of the raw text depends on the two texts lining up. A `\`
+    /// before a newline inside a string used to eat the newline, and every
+    /// line after it was reported one too low.
+    #[test]
+    fn blanking_preserves_length_and_line_numbers() {
+        let text = "let s = \"a \\\n    b\";\nlet t = \"ünïcødé\";\nlet r = r#\"raw \" }\"#;\nlet c = '}';\n// tail ü\n";
+        let blanked = blank_comments_and_literals(text);
+        assert_eq!(blanked.len(), text.len());
+        assert_eq!(blanked.lines().count(), text.lines().count());
+        for (index, (before, after)) in text.lines().zip(blanked.lines()).enumerate() {
+            assert_eq!(before.len(), after.len(), "line {}", index + 1);
+        }
+
+        // The line number a continuation escape used to shift.
+        let code = format!(
+            "fn a() {{\n    let msg = \"one \\\n        two\";\n}}\n\n#[cfg(test)]\nmod pg_tests {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+            call("StorageState", "connect"),
+        );
+        let sites = cfg_test_sites(&code);
+        assert_eq!((sites[0].0, sites[0].1), (10, "StorageState::connect"));
     }
 }
