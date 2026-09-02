@@ -102,22 +102,44 @@
 //!   about raw keywords is modelled. A raw keyword used where the lexer
 //!   expects a real one is unsupported.
 //!
-//! Eight further shapes are SILENT: each one can hide a connection with
-//! nothing printed. All eight stay open, because each needs a spelling
-//! nobody in this workspace writes by accident, and reading them buys
-//! nothing against an author who wants the connection unseen. That is the
-//! "NOT a security boundary" sentence above, spent:
+//! Eight further shapes can hide a connection outright, or name the test
+//! that opens one wrongly. All eight stay open, because each needs a
+//! spelling nobody in this workspace writes by accident, and reading them
+//! buys nothing against an author who wants the connection unseen. That is
+//! the "NOT a security boundary" sentence above, spent.
 //!
-//! * `#[cfg(test)] include!("cases.rs");` contributes no test names and no
-//!   evidence from the included file. The walk follows `mod` declarations,
-//!   and no crate here includes Rust source at all.
-//! * An identifier starting with a non-ASCII character (`async fn 東京`) is
-//!   not lexed as a word, so such a fn is never named and such an inline
-//!   `mod` never opens a span. Every identifier in this workspace is ASCII.
+//! Which of the two it costs depends on the tree. Under `src/`,
+//! [`unit_files`] sweeps in every `.rs` file the module walk never reached,
+//! so a file the walk misses is usually SCANNED anyway, under the module
+//! prefix its PATH implies. Where that is not the prefix rustc gave the
+//! file, the derived name is one nextest never lists and the guard fails
+//! loudly. An integration target has no sweep. `tests/` is the module walk
+//! and nothing else, so a file the walk misses there is a file nobody
+//! reads.
+//!
+//! * An `include!("cases.rs")` edge is invisible to the module walk, which
+//!   follows `mod` declarations and nothing else. In a `src/` tree the
+//!   sweep opens the file anyway, under the prefix its path implies rather
+//!   than the module the `include!` put it in, so the derived name fails
+//!   the guard on a test nextest never lists. In an integration target
+//!   nothing opens it at all. No crate here includes Rust source.
+//! * An identifier starting with a non-ASCII character is not lexed as a
+//!   word. On a FN that is loud rather than silent: the attribute block is
+//!   taken before the name is read, so `#[tokio::test] async fn 東京()`
+//!   still opens a span over its body, the connection inside is collected,
+//!   and a finding naming no test charges the whole binary. On an inline
+//!   `mod 東京 { .. }` the name stops [`ItemLexer::module`] before the body
+//!   brace, so a `#[cfg(test)]` above it opens nothing. A test fn inside
+//!   still spans its own body and is collected, under a name missing the
+//!   module, which fails loudly. A connection anywhere ELSE in that module,
+//!   a helper fn or a `LazyLock` pool a test acquires from, is production
+//!   code as far as the guard can see, and that is the silent half. Every
+//!   identifier in this workspace is ASCII.
 //! * A `#[cfg_attr(target_os = "linux", path = "linux.rs")] mod m;` path
 //!   override is not read. The guard probes `m.rs` and `m/mod.rs`, so it
 //!   scans the wrong file when one of them exists and fails loudly when
-//!   neither does. No crate here has a per-target module file.
+//!   neither does. Under `src/` the sweep still opens the real file, under
+//!   a path-derived prefix. No crate here has a per-target module file.
 //! * A `#[cfg(test)]` macro INVOCATION (`db_test!();`) is a bodyless item,
 //!   so its span is its own line and the tests it expands to are neither
 //!   named nor scanned. Reading inside one means running macro expansion.
@@ -129,8 +151,10 @@
 //!   argument and opens nothing by hand.
 //! * `#[cfg(test)] if probe() { .. } else { .. }` as an attributed
 //!   STATEMENT spans the first arm only, so a connection in the `else` arm
-//!   is outside every span. An attribute on an `if` is exotic; the same
-//!   attribute on an ITEM is covered, initializer arms included.
+//!   falls outside it. It bites in production code alone: written inside a
+//!   test fn or a `#[cfg(test)]` region, the enclosing span already covers
+//!   both arms. An attribute on an `if` is exotic; the same attribute on an
+//!   ITEM is covered, initializer arms included.
 //! * In `skip_to_body`, a `>>` at angle depth 1 is consumed as two generic
 //!   closers, one more than the signature opened, so a `{` further along
 //!   can be taken for the body and the span ends in the wrong place. The
@@ -2168,6 +2192,71 @@ mod tests {
             call("StorageState", "connect"),
         );
         assert!(cfg_test_sites(&text).is_empty());
+    }
+
+    /// A non-ASCII fn name never lexes, so the guard cannot name the test.
+    /// The connection is still COLLECTED: the attribute block is taken
+    /// before the name is read, so the body opens a span, and a finding that
+    /// names no test charges the whole binary. Loud, which is the accepted
+    /// direction.
+    #[test]
+    fn a_non_ascii_test_fn_is_collected_without_a_name() {
+        let text = format!(
+            "#[tokio::test]\nasync fn \u{6771}\u{4eac}() {{\n    let s = {}\"...\").await;\n}}\n",
+            call("StorageState", "connect"),
+        );
+        let facts = file_facts(&text);
+        assert!(facts.fns.is_empty(), "the name is not lexable");
+        assert_eq!(facts.test_fn_spans, vec![(1, 4)]);
+        assert_eq!(
+            connection_site(&facts, 1, 4),
+            Some((3, "StorageState::connect"))
+        );
+        assert!(
+            test_names(&facts, "", Some((1, 4))).is_empty(),
+            "no name to charge, so the finding is target-level"
+        );
+    }
+
+    /// The other half of the same residual, and this one IS silent: a
+    /// non-ASCII module name stops `module` before it can see the body
+    /// brace, so the `#[cfg(test)]` above it opens nothing and the
+    /// connection inside reads as production code. Pinned so a later fix
+    /// has to come here and delete this test.
+    #[test]
+    fn a_non_ascii_module_name_opens_no_span() {
+        let text = format!(
+            "#[cfg(test)]\nmod \u{6771}\u{4eac} {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+            call("StorageState", "connect"),
+        );
+        let facts = file_facts(&text);
+        assert!(
+            facts.cfg_test_spans.is_empty(),
+            "{:?}",
+            facts.cfg_test_spans
+        );
+        // The inner `#[tokio::test]` fn is still a span of its own, so the
+        // connection is collected even here. What the module name costs is
+        // the `#[cfg(test)]` region, and the qualification of the name.
+        assert_eq!(facts.test_fn_spans, vec![(3, 6)]);
+        assert_eq!(
+            facts
+                .fns
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["boots"]
+        );
+
+        // The silent half: a connection in that module that sits outside a
+        // test fn body is in no span at all, so nothing collects it.
+        let helper = format!(
+            "#[cfg(test)]\nmod \u{6771}\u{4eac} {{\n    async fn helper() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+            call("StorageState", "connect"),
+        );
+        let facts = file_facts(&helper);
+        assert!(facts.cfg_test_spans.is_empty());
+        assert!(facts.test_fn_spans.is_empty());
     }
 
     /// The path a file sits at is the module path its tests are named
