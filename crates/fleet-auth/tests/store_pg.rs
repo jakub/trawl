@@ -1007,12 +1007,18 @@ async fn connect_unreachable_endpoint_errors() {
     // nothing can take the port from under us mid-test.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().expect("local_addr").port();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_in_thread = std::sync::Arc::clone(&stop);
     let closing = std::thread::spawn(move || {
         // One accept per connect attempt; the stream drops at the end of
-        // each iteration, which closes it. The loop ends when the test
-        // drops the listener half by returning (accept then errors).
+        // each iteration, which closes it. The listener lives in this
+        // thread, so the loop ends when the test sets `stop` and makes
+        // one final connection to unblock `accept`.
         while let Ok((stream, _)) = listener.accept() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
+            if stop_in_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
         }
     });
 
@@ -1042,7 +1048,9 @@ async fn connect_unreachable_endpoint_errors() {
         "connect took {elapsed:?}, at the {BOUNDED_CONNECT:?} bound"
     );
 
-    drop(closing); // the accept loop exits when the process does
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port)); // unblock accept
+    let _ = closing.join();
 }
 
 /// How long an unreachable-endpoint connect may take before we call it a
