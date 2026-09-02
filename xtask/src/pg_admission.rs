@@ -21,8 +21,10 @@
 //!    APIs itself (`KeyStore::connect`, `PgPool`, and friends). That third
 //!    class is what catches a plain `#[tokio::test]` that dials postgres by
 //!    hand, carrying neither marker. It reads a whole integration test
-//!    file, but only the `#[cfg(test)]` regions of a `src/` tree, where the
-//!    surrounding production code is where those APIs are defined.
+//!    file, but only the TEST REGIONS of a `src/` tree, where the
+//!    surrounding production code is where those APIs are defined: the body
+//!    of a `#[cfg(test)]` item, and the body of any fn carrying a test
+//!    attribute.
 //! 2. MEMBERSHIP, from nextest itself: `cargo nextest list -E
 //!    'group(postgres)'`. cargo-nextest 0.9.143 supports `group()` as a
 //!    filterset predicate, so the authority on "is this test in the group"
@@ -73,9 +75,10 @@
 //!
 //! * CONDITIONAL COMPILATION is not statically resolvable. The guard does
 //!   not know which cfgs CI compiled under, so a `cfg_attr`-wrapped
-//!   `sqlx::test` counts as one, a `cfg_attr`-wrapped `ignore` does not
+//!   `sqlx::test` counts as one, a `cfg_attr` whose expansion contains
+//!   `cfg(test)` opens a test span, a `cfg_attr`-wrapped `ignore` does not
 //!   ignore, and a `#[cfg(not(test))]` region is scanned like any other
-//!   attributed item. All three over-collect.
+//!   attributed item. All of them over-collect.
 //! * A `#[cfg(test)]` region nested inside another one yields two spans
 //!   over the same code, so one connection can be reported twice. Two
 //!   findings for one call site, never zero.
@@ -125,8 +128,9 @@ const FIXTURE_MARKER: &str = "fn fixture_pool";
 /// Where they are scanned differs by tree. An integration test file is all
 /// test code, so the whole file counts. A package's `src/` tree is
 /// production code, where `PgPool` appears in every store module and
-/// `StorageState::connect` is DEFINED, so only `#[cfg(test)]` regions count
-/// there (see [`cfg_test_connection_site`]).
+/// `StorageState::connect` is DEFINED, so only the test regions count
+/// there: the body of a `#[cfg(test)]` item, and the body of a fn carrying
+/// a test attribute (see [`scan`]).
 const CONNECTION_APIS: &[&str] = &[
     "PgConnection::connect",
     "KeyStore::connect",
@@ -631,7 +635,11 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // `symlink_metadata`, not `is_dir()`: a directory symlink pointing at
+        // one of its own ancestors stays a directory forever, and the walk
+        // recursed into it until the OS refused a deeper path. A symlinked
+        // `.rs` FILE is still collected, below.
+        if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
             collect_rs(&path, out);
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
@@ -697,7 +705,11 @@ fn scan(files: &[(SourceFile, FileFacts)], root: &Path, scope: Scope) -> Vec<Evi
                 });
             }
         } else {
-            for span in &facts.cfg_test_spans {
+            // A test fn's own body counts too. Without it a `#[test]` or
+            // `#[tokio::test]` written at a `src/` file's top level, under
+            // no `#[cfg(test)]` at all, had its connection read as
+            // production code and nothing was collected.
+            for span in facts.cfg_test_spans.iter().chain(&facts.test_fn_spans) {
                 if let Some((line, api)) = connection_site(facts, span.0, span.1) {
                     evidence.push(Evidence {
                         site: format!("{shown}:{line} {api}"),
@@ -818,6 +830,11 @@ struct FileFacts {
     code: String,
     fns: Vec<FnItem>,
     cfg_test_spans: Vec<Span>,
+    /// Bodies of fns carrying a test attribute, minus the ones a
+    /// `#[cfg(test)]` span already covers. Keeping the covered ones would
+    /// report one connection twice for the ordinary `#[cfg(test)] mod tests`
+    /// shape.
+    test_fn_spans: Vec<Span>,
     /// Every out-of-line `mod name;` in the file, test-only or not.
     mods: Vec<ModDecl>,
 }
@@ -852,18 +869,29 @@ fn file_facts(text: &str) -> FileFacts {
         line: 1,
         depth: 0,
         mods: Vec::new(),
-        open_cfg: Vec::new(),
+        open_spans: Vec::new(),
         pending: None,
         fns: Vec::new(),
         spans: Vec::new(),
+        test_fn_spans: Vec::new(),
         decls: Vec::new(),
     };
     lexer.run();
     let (fns, spans, decls) = (lexer.fns, lexer.spans, lexer.decls);
+    let test_fn_spans = lexer
+        .test_fn_spans
+        .into_iter()
+        .filter(|(start, end)| {
+            !spans
+                .iter()
+                .any(|(outer, close)| outer <= start && end <= close)
+        })
+        .collect();
     FileFacts {
         code,
         fns,
         cfg_test_spans: spans,
+        test_fn_spans,
         mods: decls,
     }
 }
@@ -883,14 +911,25 @@ struct ItemLexer<'a> {
     depth: usize,
     /// Enclosing inline `mod` names, each with the depth its body opened at.
     mods: Vec<(String, usize)>,
-    /// Open `#[cfg(test)]` bodies: start line, and the depth each opened at.
-    open_cfg: Vec<(usize, usize)>,
+    /// Open test regions: the line each started on, the depth it opened at,
+    /// and the list it closes into.
+    open_spans: Vec<(usize, usize, SpanKind)>,
     /// The attribute block being accumulated: the line it started on, and
     /// the attributes in it.
     pending: Option<(usize, Vec<Attr>)>,
     fns: Vec<FnItem>,
     spans: Vec<Span>,
+    test_fn_spans: Vec<Span>,
     decls: Vec<ModDecl>,
+}
+
+/// Which list a closed span belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpanKind {
+    /// A `#[cfg(test)]` item's body.
+    CfgTest,
+    /// The body of a fn carrying a test attribute.
+    TestFn,
 }
 
 /// How [`ItemLexer::skip_to_body`] left an attributed item.
@@ -1021,7 +1060,17 @@ impl ItemLexer<'_> {
         }
         let (from, to) = self.group(b'[', b']');
         if inner {
-            // `#![...]` belongs to the ENCLOSING item, not the next one.
+            // `#![...]` belongs to the ENCLOSING item, not the next one, so
+            // it never joins the pending block. A `#![cfg(test)]` at the top
+            // of an inline `mod m { .. }` is how that module says its whole
+            // body is test code, and the cursor is already inside that body:
+            // open the span here, at the depth the body was entered on.
+            // Without it the module was scanned as production code and every
+            // connection in it was invisible.
+            if self.depth > 0 && is_cfg_test(&self.parse_attr(from, to)) {
+                self.open_spans
+                    .push((line, self.depth - 1, SpanKind::CfgTest));
+            }
             return;
         }
         let attr = self.parse_attr(from, to);
@@ -1055,12 +1104,12 @@ impl ItemLexer<'_> {
         {
             self.mods.pop();
         }
-        while let Some(&(start, depth)) = self.open_cfg.last() {
+        while let Some(&(start, depth, kind)) = self.open_spans.last() {
             if depth < self.depth {
                 break;
             }
-            self.open_cfg.pop();
-            self.spans.push((start, self.line));
+            self.open_spans.pop();
+            self.record_span(kind, (start, self.line));
         }
         self.bump();
     }
@@ -1093,8 +1142,8 @@ impl ItemLexer<'_> {
         }
     }
 
-    /// Take the pending attribute block and, when it carries `#[cfg(test)]`,
-    /// open a span over the attributed item's BODY.
+    /// Take the pending attribute block and, when it carries `#[cfg(test)]`
+    /// or a test attribute, open a span over the attributed item's BODY.
     ///
     /// The cursor sits inside the item's signature here (just past `fn
     /// name`, past `impl`, past `use`), so the body has to be found by
@@ -1105,10 +1154,19 @@ impl ItemLexer<'_> {
     /// even when it was a const-generic argument (`fn f() -> Foo<{ 1 }>`).
     fn take_pending(&mut self, line: usize) -> (usize, Vec<Attr>) {
         let (attr_line, attrs) = self.pending.take().unwrap_or((line, Vec::new()));
-        if attrs.iter().any(is_cfg_test) {
+        // A test fn's body is test code wherever it is written, `#[cfg(test)]`
+        // above it or not, so it opens a span of its own kind.
+        let kind = if attrs.iter().any(is_cfg_test) {
+            Some(SpanKind::CfgTest)
+        } else if attrs.iter().any(is_test_attr) {
+            Some(SpanKind::TestFn)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
             match self.skip_to_body() {
                 ItemHead::Body => {
-                    self.open_cfg.push((attr_line, self.depth));
+                    self.open_spans.push((attr_line, self.depth, kind));
                     self.depth += 1;
                 }
                 // No body to bound the span with, so the item's own extent
@@ -1118,11 +1176,19 @@ impl ItemLexer<'_> {
                 // connection inside a closure the signature walk consumed
                 // as a group, and reporting no span at all made that pool
                 // invisible.
-                ItemHead::Bodyless(end) => self.spans.push((attr_line, end)),
+                ItemHead::Bodyless(end) => self.record_span(kind, (attr_line, end)),
                 ItemHead::None => {}
             }
         }
         (attr_line, attrs)
+    }
+
+    /// File one closed span under the list its kind names.
+    fn record_span(&mut self, kind: SpanKind, span: Span) {
+        match kind {
+            SpanKind::CfgTest => self.spans.push(span),
+            SpanKind::TestFn => self.test_fn_spans.push(span),
+        }
     }
 
     /// Walk an item's signature to its body brace, consuming it. An item
@@ -1239,7 +1305,8 @@ impl ItemLexer<'_> {
             Some(b'{') => {
                 self.bump();
                 if cfg_test {
-                    self.open_cfg.push((attr_line, self.depth));
+                    self.open_spans
+                        .push((attr_line, self.depth, SpanKind::CfgTest));
                 }
                 self.mods.push((name, self.depth));
                 self.depth += 1;
@@ -1250,11 +1317,11 @@ impl ItemLexer<'_> {
                     name,
                     path: path_attr(&attrs),
                     chain: self.mods.iter().map(|(name, _)| name.clone()).collect(),
-                    // An open `#[cfg(test)]` region above the declaration
-                    // gates it just as its own attribute would, and a
-                    // declaration inside `#[cfg(test)] mod outer { .. }`
-                    // carries no attribute of its own.
-                    cfg_test: cfg_test || !self.open_cfg.is_empty(),
+                    // An open test region above the declaration gates it
+                    // just as its own attribute would, and a declaration
+                    // inside `#[cfg(test)] mod outer { .. }` carries no
+                    // attribute of its own.
+                    cfg_test: cfg_test || !self.open_spans.is_empty(),
                 });
             }
             _ => {}
@@ -1300,8 +1367,18 @@ fn despace(text: &str) -> String {
 /// `#[cfg(test)]`, and only a bare `test` predicate: the arguments are read
 /// from the BLANKED text, so `#[cfg(feature = "test")]` has no `test` token
 /// left in it to find.
+///
+/// A `cfg_attr` whose expansion contains `cfg(test)` counts as one, for the
+/// same reason [`is_sqlx_test`] reads a wrapped `sqlx::test`: the guard
+/// cannot know which cfgs CI compiled under, and the item is test code
+/// whenever the predicate holds. Reading it as production code is a
+/// connection nobody scanned. `#[cfg_attr(test, ignore)]` is untouched by
+/// this: its expansion is `ignore`, not `cfg(test)`.
 fn is_cfg_test(attr: &Attr) -> bool {
-    attr.path == "cfg" && has_ident(&attr.args, "test")
+    if attr.path == "cfg" {
+        return has_ident(&attr.args, "test");
+    }
+    attr.path == "cfg_attr" && despace(&attr.args).contains("cfg(test)")
 }
 
 /// Does `text` contain `word` as a whole identifier?
@@ -1979,6 +2056,55 @@ mod tests {
         assert!(cfg_test_sites(&text).is_empty());
     }
 
+    /// An inline module can gate itself from the INSIDE. The attribute is
+    /// an inner one, so it never joins the pending block, and the module was
+    /// read as production code with every connection in it invisible.
+    #[test]
+    fn an_inner_cfg_test_attribute_opens_the_module_body_as_a_span() {
+        let text = format!(
+            "mod pg_tests {{\n    #![cfg(test)]\n\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n\nasync fn after() {{\n    let s = {}\"...\").await;\n}}\n",
+            call("StorageState", "connect"),
+            call("KeyStore", "connect"),
+        );
+        let sites = cfg_test_sites(&text);
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert_eq!((sites[0].0, sites[0].1), (6, "StorageState::connect"));
+        assert_eq!(sites[0].2, vec!["pg_tests::boots".to_string()]);
+    }
+
+    /// A `cfg_attr` that expands to `cfg(test)` gates its item as a written
+    /// `#[cfg(test)]` does whenever the predicate holds, and the guard cannot
+    /// know whether CI compiled with it. Over-collecting is the fail
+    /// direction; reading it as production code was a connection nobody
+    /// scanned.
+    #[test]
+    fn a_cfg_attr_expanding_to_cfg_test_opens_a_span() {
+        for wrapper in [
+            "#[cfg_attr(feature = \"pg\", cfg(test))]",
+            "#[cfg_attr(unix, cfg_attr(feature = \"pg\", cfg(test)))]",
+        ] {
+            let text = format!(
+                "{wrapper}\nmod pg_tests {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+                call("StorageState", "connect"),
+            );
+            let sites = cfg_test_sites(&text);
+            assert_eq!(sites.len(), 1, "{wrapper}: {sites:?}");
+            assert_eq!(
+                (sites[0].0, sites[0].1),
+                (5, "StorageState::connect"),
+                "{wrapper}"
+            );
+        }
+
+        // `#[cfg_attr(test, ignore)]` expands to `ignore`, not to
+        // `cfg(test)`, so it gates nothing and opens no span.
+        let text = format!(
+            "#[cfg_attr(test, ignore)]\nasync fn helper() {{\n    let s = {}\"...\").await;\n}}\n",
+            call("StorageState", "connect"),
+        );
+        assert!(cfg_test_sites(&text).is_empty());
+    }
+
     /// The path a file sits at is the module path its tests are named
     /// under, and that is what makes an exact match possible.
     #[test]
@@ -2265,9 +2391,18 @@ mod tests {
 
         let files = unit_files(&src.join("lib.rs"), None, None).expect("module tree");
         let evidence = scan(&files, root, Scope::UnitTree);
-        assert_eq!(sites(&evidence), vec!["src/shared.rs:3 KeyStore::connect"]);
+        // One call site, two findings: the test-scoped mounting is scanned
+        // whole, and the production-scoped one now reports the test fn's own
+        // body as a span. Twice is the fail direction; zero is not.
+        assert_eq!(
+            sites(&evidence),
+            vec![
+                "src/shared.rs:3 KeyStore::connect",
+                "src/shared.rs:3 KeyStore::connect"
+            ]
+        );
         let derived: Vec<String> = evidence.iter().flat_map(|e| e.tests.clone()).collect();
-        assert_eq!(derived, vec!["shared::escapes".to_string()]);
+        assert_eq!(derived, vec!["shared::escapes".to_string(); 2]);
     }
 
     /// A declaration the walk cannot resolve is the shape a pg test hides
@@ -2380,5 +2515,68 @@ mod tests {
         );
         let sites = cfg_test_sites(&code);
         assert_eq!((sites[0].0, sites[0].1), (10, "StorageState::connect"));
+    }
+
+    /// A test fn at a `src/` file's top level sits inside no `#[cfg(test)]`
+    /// region at all, so the span scan found nothing and the connection was
+    /// read as production code. Its own body is the span.
+    #[test]
+    fn a_test_fn_outside_any_cfg_test_region_is_scanned() {
+        for marker in ["#[test]", "#[tokio::test]", "#[::tokio::test]", &attr("")] {
+            let text = format!(
+                "{marker}\nasync fn boots() {{\n    let s = {}\"...\").await;\n}}\n",
+                call("StorageState", "connect"),
+            );
+            let facts = file_facts(&text);
+            assert!(facts.cfg_test_spans.is_empty(), "{marker}");
+            assert_eq!(facts.test_fn_spans, vec![(1, 4)], "{marker}");
+        }
+
+        let dir = scratch("root-test-fn");
+        let root = &dir.0;
+        let src = root.join("src");
+        write(
+            &src.join("lib.rs"),
+            &format!(
+                "pub struct Store;\n\n#[tokio::test]\nasync fn boots() {{\n    let s = {}\"...\").await;\n}}\n",
+                call("StorageState", "connect"),
+            ),
+        );
+        let files = unit_files(&src.join("lib.rs"), None, None).expect("module tree");
+        let evidence = scan(&files, root, Scope::UnitTree);
+        assert_eq!(sites(&evidence), vec!["src/lib.rs:5 StorageState::connect"]);
+        assert_eq!(evidence[0].tests, vec!["boots".to_string()]);
+    }
+
+    /// The ordinary shape stays ONE finding: a test fn body inside a
+    /// `#[cfg(test)]` region is already covered by that region's span, and
+    /// reporting it twice would print the same connection twice.
+    #[test]
+    fn a_test_fn_inside_a_cfg_test_region_is_not_a_second_span() {
+        let text = format!(
+            "#[cfg(test)]\nmod pg_tests {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
+            call("StorageState", "connect"),
+        );
+        let facts = file_facts(&text);
+        assert_eq!(facts.cfg_test_spans, vec![(1, 7)]);
+        assert!(facts.test_fn_spans.is_empty(), "{:?}", facts.test_fn_spans);
+    }
+
+    /// A directory symlink pointing at one of its own ancestors keeps
+    /// `is_dir()` true forever, so the safety-net walk recursed into it once
+    /// per path component the OS still allowed, collecting the same files
+    /// hundreds of times on the way.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_symlink_is_not_walked() {
+        let dir = scratch("symlink-loop");
+        let root = &dir.0;
+        let src = root.join("src");
+        write(&src.join("lib.rs"), "pub struct Store;\n");
+        std::os::unix::fs::symlink(&src, src.join("loop")).expect("symlink");
+
+        let mut found = Vec::new();
+        collect_rs(&src, &mut found);
+        assert_eq!(found, vec![src.join("lib.rs")]);
     }
 }
