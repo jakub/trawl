@@ -83,12 +83,10 @@ fn forward_sse_response(
     auth: &Auth,
     upstream_resp: reqwest::Response,
 ) -> Result<Response, ProxyError> {
-    // Mirror the upstream status verbatim. The previous implementation
-    // routed non-2xx through `ProxyError::Upstream`, whose `IntoResponse`
-    // collapses everything that isn't 401/403 into 502 — so trawld's
-    // 400 (invalid DSL) or 429 (stream-concurrency limit) would surface
-    // as a vague "upstream error" to the browser. The generic
-    // `proxy::forward` gets this right; we match its behavior here.
+    // Mirror the upstream status verbatim, as `proxy::forward` does.
+    // Routing non-2xx through `ProxyError::Upstream` would collapse
+    // everything but 401/403 into 502, hiding trawld's 400 (invalid DSL)
+    // and 429 (stream-concurrency limit) behind a vague "upstream error".
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let upstream_ct = upstream_resp
@@ -98,13 +96,13 @@ fn forward_sse_response(
         .map(str::to_owned);
     let byte_stream = upstream_resp.bytes_stream();
 
-    // Cap the stream at `session.exp`. Without this, a browser that opens
-    // `/api/v1/stream` moments before expiry would keep receiving events
-    // indefinitely after the cookie becomes unusable for any other
-    // request — the extractor checks expiry once at handler entry, but
-    // `Body::from_stream` otherwise has no deadline. Dropping the
-    // upstream stream also cleanly closes the TCP connection via
-    // reqwest's drop handling.
+    // Cap the stream: a cookie session ends at its `exp`, a bearer client
+    // at the configured session TTL. Without a deadline a browser that
+    // opens `/api/v1/stream` moments before expiry keeps receiving events
+    // long after the cookie stops working for any other request, since the
+    // extractor checks expiry once at handler entry and `Body::from_stream`
+    // has no deadline of its own. Dropping the upstream stream also closes
+    // the TCP connection via reqwest's drop handling.
     let ttl = match auth {
         Auth::Session(s) => remaining_ttl(s.exp(), chrono::Utc::now().timestamp()),
         Auth::Bearer(_) => Duration::from_secs(state.session_ttl_secs()),
@@ -131,9 +129,9 @@ fn forward_sse_response(
         .header("X-Accel-Buffering", "no");
 
     // The SSE path shares the proxy-wide 401/403 cookie rule; see
-    // `clear_cookie_for_proxied_response`. (Today it never clears — an
+    // `clear_cookie_for_proxied_response`. It never clears, so an
     // EventSource reconnect keeps 401ing until the SPA's next `/me` poll
-    // drops the dead cookie, the permission-aware place to make that call.)
+    // drops the dead cookie, which is the permission-aware place to decide.
     if let Some(clear) = clear_cookie_for_proxied_response(status, auth) {
         builder = builder.header(header::SET_COOKIE, clear);
     }
@@ -296,12 +294,10 @@ mod tests {
 
     #[tokio::test]
     async fn stream_upstream_401_with_session_preserves_cookie() {
-        // trawld's 401 on the SSE path is just as ambiguous as on any other
-        // proxied route — it covers both a dead key and a live key lacking
-        // the `stream` permission. Clearing on it would sign valid users out
-        // of the whole fleet on a routine authz denial, so the stream path
-        // must NOT touch the shared cookie. `auth::me` (permission-free
-        // /whoami) remains the sole authority for the cookie lifecycle.
+        // trawld's 401 here is as ambiguous as on any other proxied route:
+        // a dead key and a live key lacking the `stream` permission look
+        // alike, so the stream path must not touch the shared cookie
+        // either. `auth::me` owns the cookie lifecycle.
         let upstream = MockServer::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);

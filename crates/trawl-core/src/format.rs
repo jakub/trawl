@@ -190,19 +190,19 @@ fn escape_quoted(text: &str) -> String {
 ///
 /// The complement of `primitives::bare_value`, plus `"` which ends the
 /// quoted form — and, because a value position re-lexes more than that one
-/// production, three shapes whose BARE rendering would parse back as
+/// production, three shapes whose bare rendering would parse back as
 /// something else:
 ///
-/// - a `#`, which the grammar refuses INSIDE an unquoted token
+/// - a `#`, which the grammar refuses inside an unquoted token
 ///   (ADR-0014 ruling 2), so `host="a#b"` rendered bare would come back a
-///   parse error rather than the same AST. `//` is deliberately NOT in
-///   this set any more: with the second opener dropped (ruling 3) a value
-///   carries it freely, and quoting it would be a stale mirror of a
-///   deleted rule — the drift ADR-0014 exists to retire;
-/// - the regex shape `/…/`, which `search::filter_value` tries FIRST, so
+///   parse error rather than the same AST. `//` is deliberately not in
+///   this set: `#` is the only comment opener (ruling 3), so a value
+///   carries slashes freely and quoting them would change nothing but the
+///   spelling;
+/// - the regex shape `/…/`, which `search::filter_value` tries first, so
 ///   an exact match would come back a pattern (`host="/foo/"`);
 /// - a glob character, which the same production auto-detects and which
-///   then OVERRIDES the written operator, so `host!="a*b"` would come back
+///   then overrides the written operator, so `host!="a*b"` would come back
 ///   a glob and lose its negation. A value the AST already marks
 ///   [`FilterOp::Glob`] is exempt — there the wildcards are the point, and
 ///   quoting them would turn the glob into an exact match instead.
@@ -225,7 +225,7 @@ fn needs_quoting(s: &str, op: FilterOp) -> bool {
 /// pipe or end of input after it — which is exactly what follows a value
 /// in formatted output, so the shape alone decides.
 ///
-/// A value with an INNER slash (`/foo/bar/`) fails that production and
+/// A value with an inner slash (`/foo/bar/`) fails that production and
 /// stays bare: the rule quotes what would change meaning and nothing more.
 fn is_regex_shaped(s: &str) -> bool {
     let Some(body) = s.strip_prefix('/').and_then(|rest| rest.strip_suffix('/')) else {
@@ -493,7 +493,6 @@ fn format_expr(expr: &Expr, parent_prec: u8, ctx: ExprContext, out: &mut String)
             }
             format_expr(&lhs.node, prec, ExprContext::Normal, out);
             let _ = write!(out, " {op} ");
-            // RHS context: if this is `matches`, the RHS is a regex literal
             let rhs_ctx = if *op == BinaryOp::Matches {
                 ExprContext::MatchesRhs
             } else {
@@ -627,9 +626,9 @@ mod tests {
     }
 
     /// The invariant the whole formatter rests on: format → reparse
-    /// yields the SAME AST, for every literal value shape. Idempotence
+    /// yields the same AST, for every literal value shape. Idempotence
     /// alone does not prove it — a value that re-lexes as a different
-    /// OPERATOR reformats to itself while meaning something else — so
+    /// operator reformats to itself while meaning something else — so
     /// this compares the parsed token, which carries no spans.
     #[test]
     fn a_formatted_filter_value_reparses_to_the_same_ast() {
@@ -646,13 +645,12 @@ mod tests {
             r##"host="#lead""##,
             r#"host="trail#""#,
             r#"* | where message == "a#b""#,
-            // …while `//` is ordinary data now (ruling 3) and must NOT
-            // pick up stale quoting
+            // …while `//` is ordinary data (ruling 3) and must stay bare
             "host=a//b",
             "url=https://example.com/x",
             "path=/api//v1",
             "url=//cdn.example.com/x",
-            // LIST elements re-lex one at a time, so each carries its own
+            // list elements re-lex one at a time, so each carries its own
             // quoting decision
             r#"status=200,"a#b",301"#,
             r#"host="a#b","c d""#,
@@ -664,7 +662,7 @@ mod tests {
             r#"host="trail*""#,
             r#"host!="a*b""#,
             r#"host>="/foo/""#,
-            // …and the ones that must STAY as they are: a real glob, a
+            // …and the ones that must stay as they are: a real glob, a
             // real regex, and values whose specials round-trip bare
             "path=/api/*",
             "message=/error.*/",
@@ -706,8 +704,7 @@ mod tests {
             ("path=/api/*", "path=/api/*"),
             ("host=a-b.c", "host=a-b.c"),
             ("host=200", "host=200"),
-            // `//` is data: quoting it would be a stale mirror of a
-            // deleted rule (ADR-0014 ruling 3)
+            // `//` is ordinary data (ADR-0014 ruling 3), so it stays bare
             ("host=a//b", "host=a//b"),
             ("url=https://example.com/x", "url=https://example.com/x"),
             ("path=/api//v1", "path=/api//v1"),
@@ -1058,7 +1055,7 @@ mod tests {
 
     #[test]
     fn expr_minimal_parens() {
-        // a + b * c should NOT have parens (mul binds tighter)
+        // a + b * c needs no parens: mul binds tighter
         insta::assert_snapshot!(
             fmt("* | let x = a + b * c"),
             @r"
@@ -1070,7 +1067,7 @@ mod tests {
 
     #[test]
     fn expr_needed_parens() {
-        // (a + b) * c NEEDS parens
+        // (a + b) * c needs parens
         insta::assert_snapshot!(
             fmt("* | let x = (a + b) * c"),
             @r"

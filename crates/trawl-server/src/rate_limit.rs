@@ -8,8 +8,8 @@
 //! id (`VerifiedKey.id`). The ceiling is resolved per request (ADR-0006):
 //!
 //! - When any of the key's roles set `rate_rpm`, the key's effective RPM is
-//!   the MAX across its roles and OVERRIDES the route class's config
-//!   default — the two are never max'd or summed together.
+//!   the max across its roles and replaces the route class's config
+//!   default. The two are never max'd or summed together.
 //! - Otherwise the route class default applies: interactive API routes use
 //!   `default_rpm`, `/api/v1/ingest` uses `ingest_rpm`.
 //!
@@ -17,8 +17,8 @@
 //! come from a single map: each route class holds a `DashMap` of limiters
 //! indexed by effective RPM, buckets still keyed solely by key id. The maps
 //! are bounded by the number of distinct `rate_rpm` values operators define
-//! (plus the class default) — a handful at fleet scale — and buckets by the
-//! keystore's key count, the same bounds slice 0 had.
+//! (plus the class default), a handful at fleet scale, and buckets by the
+//! keystore's key count.
 //!
 //! A `default_rpm`/`ingest_rpm` of 0 disables limiting for keys on the
 //! class default. A role-set override can never be 0 (the schema CHECKs
@@ -27,8 +27,9 @@
 //! The ingest ceiling is additionally gated on [`Permission::Ingest`]: the
 //! handler's own permission check runs downstream of this middleware (axum
 //! resolves every extractor, including the 16 MB `body: Bytes`, before the
-//! handler body runs), so without the gate ANY trawl-granted key — reader
-//! included — would ride the shipper-sized bucket on the heaviest endpoint.
+//! handler body runs), so without the gate any trawl-granted key, reader
+//! keys included, would ride the shipper-sized bucket on the heaviest
+//! endpoint.
 //! Keys that cannot ingest stay on the interactive class, the same maps the
 //! query routes use. This is route-class eligibility, not per-role
 //! bucketing.
@@ -167,8 +168,8 @@ impl RateLimitState {
 
 /// Axum middleware that enforces per-key rate limits.
 ///
-/// Must run AFTER the auth middleware (needs [`VerifiedKey`] in extensions)
-/// and INSIDE the mandatory `require_trawl_grant` policy layer — grantless
+/// Must run after the auth middleware (needs [`VerifiedKey`] in extensions)
+/// and inside the mandatory `require_trawl_grant` policy layer: grantless
 /// keys 403 before ever reaching this middleware (pinned by the
 /// `ac3_grantless_key_never_reaches_rate_limiter` integration test), so no
 /// bypass branch is needed here. Returns 429 when the rate limit is exceeded.
@@ -244,10 +245,9 @@ mod tests {
         );
     }
 
-    /// AC5 core: a role `rate_rpm` OVERRIDES the class default — it is never
-    /// max'd with it. That cuts both ways: an override larger than the
-    /// default raises the ceiling, an override smaller than the default
-    /// lowers it.
+    /// A role `rate_rpm` replaces the class default and is never max'd with
+    /// it. That cuts both ways: an override larger than the default raises
+    /// the ceiling, an override smaller than the default lowers it.
     #[test]
     fn role_override_replaces_the_class_default_in_both_directions() {
         let state = RateLimitState::interactive(&config_with_rpm(5));
@@ -263,7 +263,7 @@ mod tests {
         );
     }
 
-    /// An override even beats a DISABLED class default: `rate_rpm` on the
+    /// An override even beats a disabled class default: `rate_rpm` on the
     /// role re-enables limiting for that key.
     #[test]
     fn role_override_applies_even_when_default_disabled() {
@@ -272,8 +272,8 @@ mod tests {
         assert_eq!(spend(&limiter, 9, 10), 3);
     }
 
-    /// Two keys resolving the same effective RPM share a limiter MAP (one
-    /// quota) but never a bucket — spending one key's budget leaves the
+    /// Two keys resolving the same effective RPM share a limiter map (one
+    /// quota) but never a bucket: spending one key's budget leaves the
     /// other untouched.
     #[test]
     fn same_effective_rpm_shares_map_not_buckets() {
@@ -316,7 +316,7 @@ mod tests {
     }
 
     /// A key whose roles set `rate_rpm` gets that one effective number in
-    /// EACH class it touches, spent separately per class (ADR-0006).
+    /// each class it touches, spent separately per class (ADR-0006).
     #[test]
     fn override_applies_per_class_with_separate_budgets() {
         let config = RateLimitConfig {
@@ -340,7 +340,7 @@ mod tests {
     }
 
     /// The shipper-sized ceiling is earned by `Permission::Ingest`, not by
-    /// reaching the route: the handler rejects permissionless keys only AFTER
+    /// reaching the route: the handler rejects permissionless keys only after
     /// this middleware, so an ungated ingest class would hand every reader key
     /// the shipper budget on the heaviest endpoint.
     #[test]
@@ -387,8 +387,8 @@ mod tests {
             "key A should be limited"
         );
 
-        // Key id 2 still has its own independent quota — the AC1 core:
-        // exhausting one key never starves another, role or no role.
+        // Key id 2 still has its own independent quota: exhausting one key
+        // never starves another, role or no role.
         let key_b: i64 = 2;
         assert!(
             limiter.check_key(&key_b).is_ok(),

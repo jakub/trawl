@@ -17,18 +17,17 @@ use crate::tui::highlight::Highlighter;
 use crate::tui::state::{Focus, WrapMap};
 
 /// Render the editor pane.
-#[allow(clippy::too_many_lines)] // Editor rendering is inherently complex
+#[allow(clippy::too_many_lines)] // Block chrome, wrap map, overlay inputs and scrollbar
 pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let theme = &app.theme;
 
-    // Determine border style.
     let border_style = if app.focus == Focus::Editor {
         Style::default().fg(theme.border_focused)
     } else {
         Style::default().fg(theme.border_unfocused)
     };
 
-    // Theme-derived style values for helper functions.
+    // Copied out before the mutable tab borrow below, then passed to the build helpers.
     let selection_bg = theme.surface_highlight;
     let error_fg = theme.status_error;
     let ghost_style = Style::new()
@@ -38,7 +37,6 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         .fg(theme.text_muted)
         .add_modifier(Modifier::DIM);
 
-    // Add [LIVE] indicator if streaming.
     let title = if app.live_mode {
         " Query Editor [LIVE] "
     } else {
@@ -51,30 +49,24 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
-    // Compute visible area inside the block (minus borders + padding).
-    // Borders: 1 top + 1 bottom = 2 rows, 1 left + 1 right = 2 cols
-    // Padding: 1 left + 1 right = 2 cols (horizontal only)
+    // Visible area inside the block. Borders cost 2 rows and 2 cols; horizontal
+    // padding another 2 cols.
     let visible_rows = area.height.saturating_sub(2) as usize;
-    let visible_cols = area.width.saturating_sub(4) as usize; // 2 border + 2 padding
+    let visible_cols = area.width.saturating_sub(4) as usize;
 
-    // Update the wrap map with the current viewport width.
     let tab = app.active_tab_mut();
     tab.editor.update_wrap_map(visible_cols);
 
-    // Ensure cursor is visible within viewport (wrap-aware).
     tab.editor.ensure_cursor_visible(visible_rows, visible_cols);
 
     let tab = app.active_tab();
     let scroll_row = tab.editor.scroll_row; // in visual-line units when wrapping
     let selection = tab.editor.selection_range();
 
-    // Create highlighter with schema information.
     let highlighter = Highlighter::new(app.schema_cache.as_ref(), &app.theme.syntax);
 
-    // Convert validation error byte spans to (row, col_start, col_end) tuples.
     let error_regions = compute_error_regions(&tab.editor.lines, &tab.validation_errors);
 
-    // Ghost text info: cursor position and ghost text (if any).
     let cursor_row = tab.editor.cursor.0;
     let cursor_col = tab.editor.cursor.1;
     let ghost_text = tab.ghost.as_ref().map(|g| g.ghost_text.clone());
@@ -98,8 +90,8 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
             indent_style,
         )
     } else {
-        // Fallback: no wrap map (shouldn't happen for multi-line editors,
-        // but handles the edge case gracefully).
+        // Only a single-line editor skips the wrap map, so the tab editor never
+        // reaches this branch.
         build_unwrapped_lines(
             &tab.editor.lines,
             scroll_row,
@@ -119,7 +111,6 @@ pub fn render(app: &mut App, frame: &mut Frame<'_>, area: Rect) {
     let paragraph = Paragraph::new(visual_lines).block(block);
     frame.render_widget(paragraph, area);
 
-    // Render vertical scrollbar when content exceeds visible area.
     let total_visual = tab
         .editor
         .wrap_map
@@ -182,17 +173,14 @@ fn build_wrapped_lines(
             continue;
         }
 
-        // Highlight the full logical line.
         let mut styled_line = highlighter.highlight_line(line);
 
-        // Apply error overlay.
         for &(err_row, err_col_start, err_col_end) in error_regions {
             if err_row == logical_row {
                 styled_line = apply_error_style(styled_line, err_col_start, err_col_end, error_fg);
             }
         }
 
-        // Apply selection overlay.
         if let Some(((sel_start_row, sel_start_col), (sel_end_row, sel_end_col))) = selection
             && logical_row >= sel_start_row
             && logical_row <= sel_end_row
@@ -216,7 +204,6 @@ fn build_wrapped_lines(
             styled_line = splice_ghost_text(styled_line, cursor_col, ghost, ghost_style);
         }
 
-        // Split the styled line at wrap breaks.
         let visual_lines = split_line_at_wraps(
             styled_line,
             breaks,
@@ -240,7 +227,7 @@ fn build_wrapped_lines(
     result
 }
 
-/// Fallback: build visual lines without wrapping (original behavior).
+/// Build visual lines without wrapping, for the no-wrap-map fallback.
 #[allow(clippy::too_many_arguments)]
 fn build_unwrapped_lines(
     lines: &[String],
@@ -316,8 +303,6 @@ fn split_line_at_wraps(
         return vec![line];
     }
 
-    // Collect all spans into a flat (char_offset, style, text) stream
-    // so we can split them at arbitrary char boundaries.
     let mut visual_lines = Vec::with_capacity(breaks.len());
     let spans = line.spans;
 
@@ -422,7 +407,6 @@ fn apply_selection_style(
             let rel_start = sel_start.saturating_sub(col);
             let rel_end = sel_end.saturating_sub(col).min(span_chars);
 
-            // Convert char offsets to byte offsets for slicing
             let byte_start = char_to_byte(&text, rel_start);
             let byte_end = char_to_byte(&text, rel_end);
 
@@ -445,6 +429,9 @@ fn apply_selection_style(
 }
 
 /// Convert a char offset to a byte offset within a string.
+///
+/// A char offset past the end yields `s.len()`, which is how callers slice
+/// through to the end of a span.
 fn char_to_byte(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
@@ -460,7 +447,6 @@ fn compute_error_regions(
         return Vec::new();
     }
 
-    // Build a byte-offset-to-(row, char_col) mapping.
     let mut regions = Vec::new();
     for error in errors {
         let span_start = error.span.start;
@@ -470,16 +456,13 @@ fn compute_error_regions(
         let mut byte_offset = 0;
         for (row, line) in lines.iter().enumerate() {
             let line_byte_start = byte_offset;
-            // +1 for the newline character (except last line)
             let line_byte_end = byte_offset + line.len();
 
-            // Check if this line overlaps with the error span.
             if line_byte_end > span_start && line_byte_start < span_end {
-                // Compute char-column range within this line.
+                // Char-column range of the overlap within this line.
                 let byte_start_in_line = span_start.saturating_sub(line_byte_start);
                 let byte_end_in_line = (span_end - line_byte_start).min(line.len());
 
-                // Convert byte offsets to char offsets.
                 let col_start = line[..byte_start_in_line].chars().count();
                 let col_end = line[..byte_end_in_line].chars().count();
 

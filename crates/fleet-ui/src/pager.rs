@@ -3,20 +3,17 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<Pager/>` — table footer with summary + optional prev/next
-//! controls (issue #31).
+//! controls.
 //!
-//! Unifies trawl's two footer families — `.results-footer` (results
-//! table) and `.tbl-foot` (history/runs/nets/drawer, literally
-//! commented "mirror of .results-footer") — onto the `.results-footer`
-//! look (ADR-0003). Three shapes:
+//! The one table-footer look in the fleet, `.results-footer`
+//! (ADR-0003). Three shapes:
 //!
 //! - **summary-only** — pass just `summary` (nets' "N nets" count row);
 //!   no pagination semantics are invented for unpaginated tables.
 //! - **prev/next** — pass `on_prev`/`on_next` (+ `can_prev`/`can_next`)
 //!   to render the compact pager buttons.
-//! - **custom trailing slot** — `children` render on the right (the
-//!   cursor-based "load more" button of the intel pages this was
-//!   extracted from, retired in #112).
+//! - **custom trailing slot** — `children` render after the summary,
+//!   e.g. a cursor-based `LoadMore` button.
 
 use leptos::prelude::*;
 

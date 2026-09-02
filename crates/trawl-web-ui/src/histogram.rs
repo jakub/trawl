@@ -11,9 +11,9 @@
 //!   evenly-spaced buckets between the observed min/max timestamp.
 //!   Each bucket returns `(ok_count, err_count)`.
 //! - [`align_buckets`] — the service drawer's ingest chart. Lays rows
-//!   that are ALREADY aggregated server-side (`timechart span=1h`) onto
-//!   a fixed grid, so gaps in the data render as gaps instead of
-//!   collapsing the chart to one bar per returned row.
+//!   the server already aggregated (`timechart span=1h`) onto a fixed
+//!   grid, so gaps in the data render as gaps instead of collapsing the
+//!   chart to one bar per returned row.
 //!
 //! The histogram component is intentionally tolerant: callers pass
 //! whatever timestamps they can extract (parsed `_time` strings,
@@ -79,10 +79,10 @@ pub struct Slot {
 /// grid of `n` slots of `slot_ms` each, ending at the slot holding the
 /// newest row. Gaps come back as zero-count slots.
 ///
-/// The chart this feeds gives every slot equal width, so without the
-/// fill a service that only ingested during two hours of the last
-/// twenty-four rendered as two half-width bars — visually
-/// indistinguishable from "two evenly-spaced periods".
+/// uPlot sizes bars from the spacing of the x values it is handed and
+/// ends its axis just past the last one, so two populated hours out of
+/// twenty-four arrive as two wide bars on an axis that stops at the
+/// later of them. The zero slots are what make idle time read as idle.
 ///
 /// Anchoring on the newest row rather than wall-clock now is
 /// deliberate: `_time` arrives pre-shifted into trawld's configured
@@ -239,8 +239,8 @@ mod tests {
 
     #[test]
     fn align_always_returns_a_full_grid() {
-        // The regression this whole helper exists for: two populated
-        // hours must render as 24 slots, not 2 bars.
+        // The reason this helper exists: two populated hours must render
+        // as 24 slots, not 2 bars.
         let rows = [(100 * HOUR, 5), (103 * HOUR, 7)];
         let out = align_buckets(&rows, HOUR, 24);
         assert_eq!(out.len(), 24);

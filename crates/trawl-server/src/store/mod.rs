@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Postgres app-state store: query history, saved queries, schedules, and
-//! report runs (ADR-0004 slice 3).
+//! Postgres app-state store: query history, saved queries, schedules,
+//! report runs, the field catalog, and repin jobs (ADR-0004).
 //!
 //! trawld owns the dedicated `trawl` database outright: it takes a session
 //! advisory lock at boot (sole-writer enforcement), then auto-migrates via
@@ -91,7 +91,7 @@ impl Drop for LockGuard {
     }
 }
 
-/// App-state storage: one shared pool, three store facades, and the guard
+/// App-state storage: one shared pool, five store facades, and the guard
 /// holding the sole-writer advisory lock. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct StorageState {
@@ -105,11 +105,10 @@ pub struct StorageState {
     pub saved: SavedQueryStore,
     /// Schedules + report runs store.
     pub schedule: ScheduleStore,
-    /// Field catalog: type pins, per-service observations, conflicts
-    /// (ADR-0009 slice 2).
+    /// Field catalog: type pins, per-service observations, conflicts.
     pub catalog: CatalogStore,
-    /// Repin jobs (ADR-0011 slice B): the persisted one-at-a-time
-    /// operator-triggered field repin.
+    /// Repin jobs: the persisted one-at-a-time operator-triggered field
+    /// repin.
     pub repin: RepinStore,
     /// Guard task owning the dedicated session connection that holds
     /// `pg_advisory_lock`. Lives exactly as long as the state; its `Drop`
@@ -156,7 +155,7 @@ impl StorageState {
     /// Connect to the trawl app-state database and prepare it for use.
     ///
     /// Boot order is load-bearing: connect pool → take the session advisory
-    /// lock (BEFORE migrate — the lock exists to prevent two instances
+    /// lock (before migrate: the lock exists to prevent two instances
     /// racing boot-time migration) → run migrations → open the stores.
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
         let pool = PgPoolOptions::new()

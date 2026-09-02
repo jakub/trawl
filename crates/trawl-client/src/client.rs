@@ -179,14 +179,15 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Fetch active and recent queries from the daemon (admin only).
+    /// Fetch active and recent queries from the daemon (needs `query`).
     pub async fn queries(&self) -> Result<QueriesResponse, ClientError> {
         let url = self.endpoint("/api/v1/queries");
         let req = self.client.get(&url);
         self.send_authenticated(req).await
     }
 
-    /// Cancel a running query by ID (admin or owner only).
+    /// Cancel a running query by ID: `server_manage` cancels any query,
+    /// `query_cancel` only the ones this key started.
     pub async fn cancel_query(&self, query_id: u64) -> Result<CancelResponse, ClientError> {
         let url = self.endpoint(&format!("/api/v1/queries/{query_id}"));
         let req = self.client.delete(&url);
@@ -196,7 +197,7 @@ impl HttpClient {
     /// Validate a DSL query without executing it.
     ///
     /// Checks syntax and semantic rules (function names, arity, regex patterns)
-    /// but does NOT validate field existence.
+    /// but not field existence.
     pub async fn validate(&self, dsl: &str) -> Result<ValidationResponse, ClientError> {
         let url = self.endpoint("/api/v1/validate");
         let body = ValidateRequest { query: dsl };
@@ -367,7 +368,7 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Fetch server stats (admin only).
+    /// Fetch server stats (needs `server_manage`).
     pub async fn stats(&self) -> Result<StatsResponse, ClientError> {
         let url = self.endpoint("/api/v1/stats");
         let req = self.client.get(&url);
@@ -381,7 +382,7 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Fetch the full dashboard snapshot (admin only).
+    /// Fetch the full dashboard snapshot (needs `server_manage`).
     pub async fn dashboard(&self) -> Result<DashboardSnapshot, ClientError> {
         let url = self.endpoint("/api/v1/dashboard");
         let req = self.client.get(&url);
@@ -463,7 +464,7 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Trigger a repin (`POST /api/v1/schema/repin`, ADR-0011 slice B).
+    /// Trigger a repin (`POST /api/v1/schema/repin`).
     ///
     /// The HTTP status carries the verdict, so this returns a three-way
     /// outcome instead of flattening 409-with-plan into an opaque error:
@@ -498,7 +499,7 @@ impl HttpClient {
 
         let status = resp.status().as_u16();
         if status == 409 {
-            // Two 409 shapes: a refused-needs-force PLAN (RepinResponse
+            // Two 409 shapes: a refused-needs-force plan (a RepinResponse
             // body) and the already-running error envelope.
             let bytes = resp
                 .bytes()

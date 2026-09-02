@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Native contract tests for the self-hosted Geist assets (issue #119).
+//! Native contract tests for the self-hosted Geist assets.
 
 use sha2::{Digest as _, Sha256};
 

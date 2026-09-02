@@ -14,7 +14,7 @@ use super::tone::{Tone, badge_class};
 /// markings, claim relationships, run outcomes, …).
 ///
 /// The API is deliberately tone-only: apps map their domain kinds onto
-/// [`Tone`] at the call site, and there is NO color/style passthrough
+/// [`Tone`] at the call site, and there is no color/style passthrough
 /// prop (ADR-0003). A mis-fitting palette is a cheap in-place API
 /// change under lockstep versioning.
 #[component]

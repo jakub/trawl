@@ -2,28 +2,27 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The per-env swap (ADR-0011 slice B) — idempotent and forward-only, so
-//! the live cutover and boot recovery are ONE function.
+//! The per-env swap: idempotent and forward-only, so the live cutover and
+//! boot recovery are one function.
 //!
-//! An ADR-0011 amendment records why this is a per-env swap under
-//! exclusion rather than the ADR's literal whole-root rename: the WAL
-//! lives inside the data root by default, so a root swap would strand it
-//! (or force WAL-writer gating plus grafting), and the M1 probes proved a
-//! mixed corpus does not even error — it silently promotes — so atomicity
-//! comes from the exclusion primitives either way. The swap itself is two
-//! renames per env dir; `wal/`, `scheduled/`, `EPOCH`, `CATALOG` and the
-//! `REPIN` marker never move.
+//! It is a per-env swap under exclusion rather than the whole-root rename
+//! ADR-0011 describes, because the WAL lives inside the data root by
+//! default and a root swap would strand it (or force WAL-writer gating plus
+//! grafting). Atomicity comes from the exclusion primitives either way:
+//! probes showed a mixed-type corpus does not error, it silently promotes.
+//! The swap itself is two renames per env dir; `wal/`, `scheduled/`,
+//! `EPOCH`, `CATALOG` and the `REPIN` marker never move.
 
 use std::path::{Path, PathBuf};
 
 /// Move every env dir the shadow generation carries into place:
 /// `data/{env}` → `aside/{env}`, then `shadow/{env}` → `data/{env}`.
 ///
-/// Idempotent per env — a crash between the two renames resumes exactly
+/// Idempotent per env: a crash between the two renames resumes exactly
 /// where it stopped (the set-aside is skipped precisely because the live
-/// dir is already gone) — tolerant of an absent shadow root (a crash
-/// after the last env moved) and of a LEFTOVER aside from an earlier
-/// job's failed sweep, which is parked beside rather than refused (see
+/// dir is already gone). Tolerant of an absent shadow root (a crash after
+/// the last env moved) and of a leftover aside from an earlier job's failed
+/// sweep, which is parked beside rather than refused (see
 /// [`free_aside_slot`]). Callers hold the exclusion guards (live cutover)
 /// or run before anything can query (boot recovery).
 pub(crate) fn swap_envs(data_dir: &Path, shadow: &Path, aside: &Path) -> Result<(), String> {
@@ -89,14 +88,13 @@ pub(crate) fn swap_envs(data_dir: &Path, shadow: &Path, aside: &Path) -> Result<
 /// directory makes that directory unrenameable (`EBUSY`).
 /// [`check_staging_filesystem`](crate::repin::marker::check_staging_filesystem)
 /// refuses a job that would meet either, but a marker written before the
-/// volume was mounted (or by an older build) still replays here at
-/// every boot, where the bare `Invalid cross-device link` / `Device or
-/// resource busy` says nothing about why the node will not start or what
-/// to do about it. Nothing has moved when the `EXDEV` fires — every rename
-/// fails alike — so the corpus stands at its pre-repin generation; the
-/// `EBUSY` is per env, so envs without a nested mount may already serve
-/// the new generation and finishing the swap (not undoing it) is the way
-/// out.
+/// volume was mounted still replays here at every boot, where the bare
+/// `Invalid cross-device link` / `Device or resource busy` says nothing
+/// about why the node will not start or what to do about it. Nothing has
+/// moved when the `EXDEV` fires (every rename fails alike), so the corpus
+/// stands at its pre-repin generation; the `EBUSY` is per env, so envs
+/// without a nested mount may already serve the new generation and
+/// finishing the swap, not undoing it, is the way out.
 fn cross_device_hint(e: &std::io::Error) -> &'static str {
     match e.kind() {
         std::io::ErrorKind::CrossesDevices => {
@@ -122,9 +120,9 @@ fn cross_device_hint(e: &std::io::Error) -> &'static str {
 
 /// The slot this env's outgoing generation is parked in: `aside/{env}`
 /// normally, and `aside/{env}.{n}` when that name is already taken by a
-/// LEFTOVER aside — a previous job's outgoing generation whose sweep
-/// failed (the sweep is best-effort; a failure keeps the marker and warns,
-/// but nothing removes the root before the next job runs).
+/// leftover aside, a previous job's outgoing generation whose sweep failed
+/// (the sweep is best-effort; a failure keeps the marker and warns, but
+/// nothing removes the root before the next job runs).
 ///
 /// Parking rather than refusing is the only safe answer past the cutover
 /// marker: this runs both under the live exclusion guards, where an error
@@ -183,19 +181,18 @@ pub(crate) fn sweep_dir(path: &Path, what: &'static str) -> bool {
     }
 }
 
-/// Clear the shadow root and hand back an EMPTY one for a build to fill.
+/// Clear the shadow root and hand back an empty one for a build to fill.
 ///
 /// This is the one sweep that is not best-effort. Elsewhere a surviving
 /// staging root only costs disk, because nothing writes into it again;
-/// here `create_dir_all` succeeds on the survivor and the build layers
-/// its generation onto whatever it holds. Nothing downstream repairs
-/// that: a pass only retires shadow entries whose source it has seen in
-/// THIS job's `BuildState` (empty on pass 0), so a survivor's files —
-/// conformed to an earlier job's pin, or copied from live data that
-/// retention has since deleted — ride [`swap_envs`] into the live corpus
-/// as a resurrected, mixed-type generation. Refuse the build instead and
-/// leave the root for the operator (the marker replay retries the
-/// sweep).
+/// here `create_dir_all` succeeds on the survivor and the build layers its
+/// generation onto whatever it holds. Nothing downstream repairs that: a
+/// pass only retires shadow entries whose source it has seen in this job's
+/// `BuildState` (empty on pass 0), so a survivor's files, conformed to an
+/// earlier job's pin or copied from live data that retention has since
+/// deleted, ride [`swap_envs`] into the live corpus as a resurrected,
+/// mixed-type generation. Refuse the build instead and leave the root for
+/// the operator (the marker replay retries the sweep).
 pub(crate) fn prepare_shadow_root(data_dir: &Path) -> Result<PathBuf, String> {
     let shadow = crate::repin::marker::shadow_root(data_dir);
     if !sweep_dir(&shadow, "stale shadow") {
@@ -210,21 +207,20 @@ pub(crate) fn prepare_shadow_root(data_dir: &Path) -> Result<PathBuf, String> {
     Ok(shadow)
 }
 
-/// Sweep BOTH staging roots for a job that ends before any swap — the
-/// live abandon path and the boot replay of a `building` marker — and
-/// report whether both are gone (the signal marker removal is gated on).
+/// Sweep both staging roots for a job that ends before any swap (the live
+/// abandon path and the boot replay of a `building` marker) and report
+/// whether both are gone; marker removal is gated on that answer.
 ///
-/// Such a job made no aside of its own, so anything under the aside root
-/// is an EARLIER job's outgoing generation whose best-effort sweep
-/// failed. It is superseded data by construction (an aside exists only
-/// past a cutover, and the swap is forward-only: the corpus already
-/// serves the generation that replaced it), and the marker standing right
-/// now is the LAST license to delete it — a marker-less aside is never
-/// removed ([`crate::repin::recover::recover_filesystem`] leaves it for
-/// an operator). Sweeping only the shadow and then dropping the marker is
-/// what strands it forever, with retention suppressed the whole time
-/// because [`crate::retention`] treats either staging root as a repin in
-/// flight.
+/// Such a job made no aside of its own, so anything under the aside root is
+/// an earlier job's outgoing generation whose best-effort sweep failed. It
+/// is superseded data by construction (an aside exists only past a cutover,
+/// and the swap is forward-only: the corpus already serves the generation
+/// that replaced it), and the marker standing right now is the last license
+/// to delete it, since a marker-less aside is never removed
+/// ([`crate::repin::recover::recover_filesystem`] leaves it for an
+/// operator). Sweeping only the shadow and then dropping the marker is what
+/// strands it forever, with retention suppressed the whole time because
+/// [`crate::retention`] treats either staging root as a repin in flight.
 pub(crate) fn sweep_pre_swap_staging(data_dir: &Path) -> bool {
     // Not `&&`: a shadow that survives must not skip the aside sweep.
     let shadow_swept = sweep_dir(
@@ -238,12 +234,12 @@ pub(crate) fn sweep_pre_swap_staging(data_dir: &Path) -> bool {
     shadow_swept && aside_swept
 }
 
-/// Sweep both staging roots for a job that has ALREADY cut over — the
-/// outgoing generation in the aside and whatever the swap left of the
-/// shadow — then drop the marker if both are gone.
+/// Sweep both staging roots for a job that has already cut over (the
+/// outgoing generation in the aside, and whatever the swap left of the
+/// shadow), then drop the marker if both are gone.
 ///
 /// Returns nothing, and that is the contract: past the point of no return
-/// the corpus IS the new generation and `finish_cutover` has flipped the
+/// the corpus is the new generation and `finish_cutover` has flipped the
 /// pin, so nothing here may be reported as a failure of the job. A
 /// staging root or a marker that will not delete is leftover disk — the
 /// marker deliberately stands so the next boot replays `phase=cleanup`
@@ -279,7 +275,7 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
-    /// The pre-swap sweep takes BOTH roots, and an undeletable shadow does
+    /// The pre-swap sweep takes both roots, and an undeletable shadow does
     /// not short-circuit the aside sweep — a leftover aside would then keep
     /// suppressing retention with no marker left to license its removal.
     #[cfg(unix)]
@@ -348,7 +344,7 @@ mod tests {
         );
     }
 
-    /// A shadow root that survives its sweep REFUSES the next build rather
+    /// A shadow root that survives its sweep refuses the next build rather
     /// than letting it layer on top: nothing retires the survivor's files
     /// (a pass only retires sources it has seen in its own state), so the
     /// swap would publish an earlier job's generation into the live corpus.

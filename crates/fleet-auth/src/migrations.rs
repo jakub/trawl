@@ -4,15 +4,10 @@
 
 //! Embedded sqlx migrations.
 //!
-//! The migration filename carries the full `20260515000001` version prefix so
-//! `sqlx::migrate!()` derives the SAME version the retired hand-built
-//! `LazyLock<Migrator>` used — already-migrated fleet databases validate
-//! cleanly (version + checksum match; the checksum covers only the SQL).
-//!
-//! History: until ADR-0004 slice 3 this was a hand-built `LazyLock<Migrator>`
-//! because the workspace's rusqlite (`links = "sqlite3"`, via the now-deleted
-//! trawl-auth crate) collided with sqlx-macros' optional sqlx-sqlite at
-//! resolve time (issue #12). The collision died with the crate.
+//! sqlx identifies an applied migration by the version number in its filename
+//! and stores a checksum over its SQL. Renumber a shipped file or edit its SQL
+//! and every already-migrated fleet database fails validation on the next run
+//! (`VersionMissing` / `VersionMismatch`); add a new file instead.
 
 /// Embedded schema migrations applied to the fleet database.
 ///
@@ -27,7 +22,6 @@ mod tests {
 
     #[test]
     fn migrator_exposes_every_migration() {
-        // Smoke test that the Migrator builds and the SQL embeds are non-empty.
         let migrations: Vec<_> = MIGRATOR.iter().collect();
         assert_eq!(migrations.len(), 3);
         assert_eq!(migrations[0].version, 20_260_515_000_001);
@@ -40,7 +34,7 @@ mod tests {
                 .as_str()
                 .contains("DROP TABLE api_key_role_assignment")
         );
-        // ADR-0011 slice B: schema_write registered, never granted.
+        // schema_write is registered in the vocabulary, never granted.
         assert_eq!(migrations[2].version, 20_260_812_000_001);
         let registry = migrations[2].sql.as_str();
         assert!(registry.contains("'schema_write'"));

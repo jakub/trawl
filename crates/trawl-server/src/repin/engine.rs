@@ -2,26 +2,26 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The repin job lifecycle (ADR-0011 slice B): validation → claim → scan
-//! → (dry-run report | force gate | background build) → additive catch-up
-//! → exclusion-guarded cutover → sweep.
+//! The repin job lifecycle: validation → claim → scan → (dry-run report |
+//! force gate | background build) → additive catch-up → exclusion-guarded
+//! cutover → sweep.
 //!
-//! Every job — dry or real — runs the same scan with the same expressions
-//! the rewrite writes; "mandatory dry run" and the force gate are one code
-//! path. The gate is then re-asked of the FINISHED shadow under the
-//! cutover exclusion, because the scan describes a corpus that ingest and
-//! compaction keep changing underneath the build: a file written after
-//! the scan can carry values the new pin cannot read, and only the
-//! shadow's own accounting can be what the omitted force flag governs.
+//! Every job, dry or real, runs the same scan with the same expressions the
+//! rewrite writes; "mandatory dry run" and the force gate are one code path.
+//! The gate is then re-asked of the finished shadow under the cutover
+//! exclusion, because the scan describes a corpus that ingest and compaction
+//! keep changing underneath the build: a file written after the scan can
+//! carry values the new pin cannot read, and only the shadow's own
+//! accounting can be what the omitted force flag governs.
 //!
-//! The build stages the new generation in a SIBLING shadow root
+//! The build stages the new generation in a sibling shadow root
 //! (`marker.rs` explains why it cannot live inside the data root), the
 //! catch-up loop folds in files compaction writes meanwhile (additive by
 //! construction: the rollup is paused for the whole job), and the cutover
-//! holds BOTH exclusion primitives — the corpus gate against compaction
-//! and pool exclusivity against every parquet-reading query lane — across
-//! the final increment, the per-env swap and the pin flip. The M1 probes
-//! are why this is not optional: a mixed-type corpus does not error, it
+//! holds both exclusion primitives, the corpus gate against compaction and
+//! pool exclusivity against every parquet-reading query lane, across the
+//! final increment, the per-env swap and the pin flip. That exclusion is
+//! not optional: probes showed a mixed-type corpus does not error, it
 //! silently promotes.
 
 use std::collections::{BTreeMap, HashMap};
@@ -66,8 +66,8 @@ const FLIP_ATTEMPTS: u32 = 3;
 /// in [`RepinEngine::finish`] are exhausted (a real store outage).
 const FINISH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The terminal-outcome counter, incremented ONLY once the terminal write
-/// has actually landed — see [`RepinEngine::finish`].
+/// The terminal-outcome counter, incremented only once the terminal write
+/// has actually landed (see [`RepinEngine::finish`]).
 fn count_outcome(status: RepinJobStatus) {
     metrics::counter!(
         crate::metrics::CATALOG_REPIN_JOBS_TOTAL,
@@ -81,20 +81,20 @@ fn count_outcome(status: RepinJobStatus) {
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_FILE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Test-only per-file delay in the SCAN (`plan::scan`), so integration
+/// Test-only per-file delay in the scan (`plan::scan`), so integration
 /// tests can walk away from a request while the scan is still running.
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_SCAN_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Test-only BARRIER on the build's first pass, arming a
-/// happened-before ordering a delay alone cannot give: pass 0 takes its
-/// source snapshot, publishes [`TEST_SNAPSHOT_TAKEN`], and then waits for
+/// Test-only barrier on the build's first pass, arming a happened-before
+/// ordering a delay alone cannot give: pass 0 takes its source snapshot,
+/// publishes [`TEST_SNAPSHOT_TAKEN`], and then waits for
 /// [`TEST_RELEASE_BUILD`].
 ///
-/// A test that ingests while the build merely runs SLOWLY proves nothing
+/// A test that ingests while the build merely runs slowly proves nothing
 /// about catch-up: pass 0's own snapshot may already have seen the new
 /// file, and the assertion would hold even if catch-up passes read the
-/// wrong dialect. With the barrier the file provably lands AFTER the
+/// wrong dialect. With the barrier the file provably lands after the
 /// snapshot, so only a catch-up pass can carry it into the shadow.
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_BARRIER_FIRST_PASS: std::sync::atomic::AtomicBool =
@@ -110,23 +110,23 @@ pub static TEST_SNAPSHOT_TAKEN: std::sync::atomic::AtomicBool =
 pub static TEST_RELEASE_BUILD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Test-only HOLD at the first published progress, pinning the one state a
+/// Test-only hold at the first published progress, pinning the one state a
 /// mid-job observer needs: the job row `running`, the running gauge up, and
-/// `files_done` already ≥ 1 — with no exclusion primitive held, so queries
+/// `files_done` already ≥ 1, with no exclusion primitive held, so queries
 /// and ingest still work exactly as they do mid-build.
 ///
-/// Progress is published per PASS, not per file, so the window where
-/// "running AND `files_done` ≥ 1" holds opens only when pass 0 finishes and
+/// Progress is published per pass, not per file, so the window where
+/// "running and `files_done` ≥ 1" holds opens only when pass 0 finishes and
 /// closes when the job terminalizes. A polling observer can miss it
-/// entirely — or find the job already terminal on its first read — which is
-/// timing, not behaviour. Holding the job at that point makes the
-/// observation an ORDERING instead of a race: the state is pinned until the
+/// entirely, or find the job already terminal on its first read, which is
+/// timing rather than behaviour. Holding the job at that point makes the
+/// observation an ordering instead of a race: the state is pinned until the
 /// test that wants to see it says so.
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_HOLD_AFTER_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Set by the build once it is HOLDING at published progress.
+/// Set by the build once it is holding at published progress.
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_PROGRESS_PUBLISHED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -162,7 +162,6 @@ pub struct RepinEngine {
 }
 
 impl RepinEngine {
-    /// Assemble the engine.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -197,7 +196,7 @@ impl RepinEngine {
     /// without force), or start the background rewrite.
     ///
     /// Refusals are side-effect-free on the corpus; every claim leaves a
-    /// job row (the dry-run report IS the row).
+    /// job row (the dry-run report is the row).
     #[allow(clippy::too_many_arguments)] // one flag bundle per request field
     pub async fn start(
         self: &Arc<Self>,
@@ -211,10 +210,10 @@ impl RepinEngine {
         let field = field.to_ascii_lowercase();
         let to = parse_target(to)?;
         let dialect = resolve_dialect(to, dialect)?;
-        // A PREDICATE, not the envelope list: the whole `_` prefix is
-        // trawl's (`schema::is_contract_typed`), so a contract slot added
-        // later is refused the day it exists rather than the day somebody
-        // remembers this check.
+        // A predicate, not a list of envelope names: the whole `_` prefix
+        // is trawl's (`schema::is_contract_typed`), so a contract slot
+        // added later is refused the day it exists rather than the day
+        // somebody remembers this check.
         if trawl_core::schema::is_contract_typed(&field) {
             return Err(ServerError::BadRequest(format!(
                 "{field:?} is a declared envelope field — its type is part \
@@ -261,21 +260,22 @@ impl RepinEngine {
             "repin job claimed; scanning the corpus"
         );
 
-        // Everything past the claim runs in a DETACHED task, never in the
-        // caller's future. The scan is a full-corpus DuckDB pass — minutes
-        // on a real archive, well past `trawl-client`'s two-minute
-        // timeout and any proxy's — and axum drops the handler future the
-        // moment the connection goes away. Cancelled between the claim and
-        // the terminal transition, the unique running slot would be
-        // stranded until a daemon restart (only boot reconciliation ever
-        // clears it), 409ing every later repin and reporting a phantom
-        // running job. Detached, the ladder always terminalizes; a caller
-        // that walked away merely loses the response and reads the verdict
-        // from `/schema/repin/status`.
-        // The reading rule, built ONCE here because this is the only place
-        // that knows the OLD pin (see `RepinReading`). Everything downstream
-        // — scan, rewrite, both force gates — reads it rather than
-        // re-deriving a dialect from the target.
+        // Everything past the claim runs in a detached task, never in the
+        // caller's future. The scan is a full-corpus DuckDB pass, minutes on
+        // a real archive, well past `trawl-client`'s two-minute timeout and
+        // any proxy's, and axum drops the handler future the moment the
+        // connection goes away. Cancelled between the claim and the terminal
+        // transition, the unique running slot would be stranded until a
+        // daemon restart (only boot reconciliation ever clears it), 409ing
+        // every later repin and reporting a phantom running job. Detached,
+        // the ladder always terminalizes; a caller that walked away merely
+        // loses the response and reads the verdict from
+        // `/schema/repin/status`.
+        //
+        // The reading rule is built once here because this is the only place
+        // that knows the old pin (see `RepinReading`). Everything downstream
+        // (scan, rewrite, both force gates) reads it rather than re-deriving
+        // a dialect from the target.
         let reading = RepinReading::new(from, to, dialect.unwrap_or_default());
         let engine = Arc::clone(self);
         let decided = tokio::spawn(async move {
@@ -374,10 +374,11 @@ impl RepinEngine {
             self.finish(job_id, RepinJobStatus::Succeeded, None).await;
             return Ok(StartOutcome::DryRun(self.job(job_id).await?));
         }
-        // The SCAN gate. Same decision as the finished-shadow gate below,
-        // one function — the plan rides back as the 409 body, and the reason
-        // rides with it: a refusal over ambiguity with zero projected nulls
-        // is otherwise a plan an operator cannot read the verdict off.
+        // The scan gate: the same decision as the finished-shadow gate
+        // below, one function. The plan rides back as the 409 body and the
+        // reason rides with it, because a refusal over ambiguity with zero
+        // projected nulls is otherwise a plan an operator cannot read the
+        // verdict off.
         if let Some(reason) = force_refusal(
             reading.written.pin,
             Some(reading.written.raw),
@@ -390,9 +391,9 @@ impl RepinEngine {
             return Ok(StartOutcome::Refused(self.job(job_id).await?));
         }
 
-        // Free-space pre-flight: the job holds the affected bytes TWICE
+        // Free-space pre-flight: the job holds the affected bytes twice
         // until the aside sweep, and retention is suppressed for its whole
-        // life — it must not create pressure retention cannot relieve.
+        // life, so it must not create pressure retention cannot relieve.
         // A post-claim failure must terminalize the claimed job: the
         // running slot is unique, so an early return would 409 every
         // later repin until a restart reconciles the orphan.
@@ -444,14 +445,14 @@ impl RepinEngine {
             .map_err(|e| format!("repin scan task panicked: {e}"))?
     }
 
-    /// Is anything still WRITING this field? The newest observation inside
+    /// Is anything still writing this field? The newest observation inside
     /// [`crate::repin::LIVENESS_WINDOW`], with one service behind it.
     ///
-    /// One indexed row (`field_services (field, …)`, ordered `last_seen`
-    /// DESC — the read the schema surface already pages through), so no new
+    /// One indexed row (`field_services (field, …)` ordered `last_seen`
+    /// DESC, the read the schema surface already pages through), so no new
     /// store method and no scan. Best-effort by design: liveness is
-    /// ADVISORY, and a repin must not fail because an observation table was
-    /// briefly unreadable — a warning that cannot be produced is a missing
+    /// advisory, and a repin must not fail because an observation table was
+    /// briefly unreadable. A warning that cannot be produced is a missing
     /// warning, not a missing repin.
     async fn field_liveness(&self, field: &str) -> Option<(chrono::DateTime<chrono::Utc>, String)> {
         let (rows, _) = self
@@ -485,16 +486,16 @@ impl RepinEngine {
     ///
     /// The `repin_jobs_one_running` slot is unique, so a `running` row
     /// whose terminal write is lost would 409 every later repin until a
-    /// restart's boot reconciliation — a wedge the daemon must not carry
+    /// restart's boot reconciliation, a wedge the daemon must not carry
     /// while it lives. A blip gets bounded fast retries (the catalog
     /// bookkeeping cadence); a real outage hands the write to a detached
     /// slow loop that retries until it lands. While the store is down no
     /// new claim can succeed either, so the slot is honestly busy rather
     /// than wedged, and it frees within one tick of the store returning.
     /// A daemon that dies with the loop still trying falls back to boot
-    /// reconciliation, as before. The outcome counter increments only
-    /// when the write lands: a row still `running` must not be metered
-    /// as a terminal outcome.
+    /// reconciliation. The outcome counter increments only when the write
+    /// lands: a row still `running` must not be metered as a terminal
+    /// outcome.
     async fn finish(&self, job_id: i64, status: RepinJobStatus, error: Option<&str>) {
         const FAST_ATTEMPTS: u32 = 3;
         for attempt in 1..=FAST_ATTEMPTS {
@@ -619,8 +620,8 @@ impl RepinEngine {
             "repin job abandoned before any visible change; corpus untouched"
         );
         // The marker is what licenses the next boot to delete the staging
-        // roots — BOTH of them, since a leftover aside from an earlier
-        // job's failed sweep outlives its own marker (see
+        // roots, both of them, since a leftover aside from an earlier job's
+        // failed sweep outlives its own marker (see
         // `sweep_pre_swap_staging`). Removing the marker over a failed
         // sweep strands whichever root survived, which suppresses
         // retention forever. Keep it and let the replay retry.
@@ -668,10 +669,10 @@ impl RepinEngine {
         };
         write_marker(&self.data_dir, &marker).map_err(JobAbort::Failed)?;
 
-        // A shadow root that outlived an earlier job's sweep is NOT a
-        // disk-only problem here: building into it would publish that
-        // job's files — and rows retention has since deleted — into the
-        // live corpus at the swap. Refuse rather than layer.
+        // A shadow root that outlived an earlier job's sweep is not a
+        // disk-only problem here: building into it would publish that job's
+        // files into the live corpus at the swap, including rows retention
+        // has since deleted. Refuse rather than layer.
         let data_dir = self.data_dir.clone();
         let shadow = on_blocking_pool("shadow prepare", move || prepare_shadow_root(&data_dir))
             .await
@@ -730,7 +731,7 @@ impl RepinEngine {
             )));
         }
 
-        // The narrow pause: exclusive against compaction batches AND every
+        // The narrow pause: exclusive against compaction batches and every
         // parquet-reading query lane, bounded.
         let corpus_gate = self.coordinator.cutover_guard().await;
         let pool_guard = match self.pool.exclusive(CUTOVER_DRAIN_TIMEOUT).await {
@@ -761,13 +762,13 @@ impl RepinEngine {
             .map_err(JobAbort::Failed)?;
         self.publish_progress(job_id, &state).await;
 
-        // The AUTHORITATIVE loss gate. The pre-build scan only describes
+        // The authoritative loss gate. The pre-build scan only describes
         // the corpus as it stood before the build; ingest and compaction
-        // run for the whole job, so a file written after the scan can
-        // carry values the new pin cannot read. Deciding on the finished
-        // shadow's OWN accounting is the only check the operator's
-        // omitted force flag can actually govern — and it is safe to
-        // refuse here because nothing visible has moved yet.
+        // run for the whole job, so a file written after the scan can carry
+        // values the new pin cannot read. Deciding on the finished shadow's
+        // own accounting is the only check the operator's omitted force
+        // flag can actually govern, and it is safe to refuse here because
+        // nothing visible has moved yet.
         let totals = state.totals();
         if let Some(reason) = force_refusal(
             reading.written.pin,
@@ -810,7 +811,7 @@ impl RepinEngine {
 
         // The pin flip, transactional with the job's completion. Postgres
         // trouble here gets bounded retries, then the same forward-only
-        // exit: the corpus already IS the new generation.
+        // exit: the corpus already is the new generation.
         let mut flipped_ok = false;
         for attempt in 1..=FLIP_ATTEMPTS {
             match self.store.finish_cutover(job_id, field, to).await {
@@ -858,12 +859,12 @@ impl RepinEngine {
         self.record_outcome(job_id, field, from, to, &state).await;
 
         // Sweep: disk-only from here, and infallible by type. A failed
-        // sweep of EITHER staging root keeps the marker so the boot replay
-        // retries it — a leftover root suppresses retention until it is
-        // gone — but nothing past the point of no return may be reported
-        // as a failure of the JOB: the corpus is the new generation and
-        // the pin is flipped, so an undeletable marker is leftover disk,
-        // not a repin that "left the corpus untouched".
+        // sweep of either staging root keeps the marker so the boot replay
+        // retries it, since a leftover root suppresses retention until it
+        // is gone. But nothing past the point of no return may be reported
+        // as a failure of the job: the corpus is the new generation and the
+        // pin is flipped, so an undeletable marker is leftover disk, not a
+        // repin that "left the corpus untouched".
         let data_dir = self.data_dir.clone();
         if let Err(msg) = on_blocking_pool("post-swap sweep", move || {
             finish_post_swap_staging(&data_dir);
@@ -955,10 +956,10 @@ impl RepinEngine {
             .map(|(service, rows_nulled)| FieldConflict {
                 field: field.to_owned(),
                 service,
-                // The CATALOG spelling: evidence a repin authors must name
+                // The catalog spelling: evidence a repin authors must name
                 // the pin the values were stored under, and `as_duckdb` is
-                // not injective — a SEVERITY source would indict itself as
-                // BIGINT, a pin the field never had.
+                // not injective, so a SEVERITY source would indict itself
+                // as BIGINT, a pin the field never had.
                 observed_type: from.as_catalog().to_owned(),
                 expected_type: to,
                 rows_nulled,
@@ -983,9 +984,9 @@ impl RepinEngine {
 
 /// Run one whole-corpus filesystem step on the blocking pool.
 ///
-/// These steps are proportional to the SIZE OF THE ARCHIVE, not to the
+/// These steps are proportional to the size of the archive, not to the
 /// repin: the staging pre-flight lstats every file under every env dir,
-/// and each sweep is a `remove_dir_all` over a whole corpus generation —
+/// and each sweep is a `remove_dir_all` over a whole corpus generation,
 /// tens of seconds to minutes on a multi-hundred-thousand-file archive.
 /// Called inline from an async fn, each parks a tokio worker thread for
 /// that whole time and degrades unrelated request handling, which is the
@@ -1040,7 +1041,7 @@ impl BuildState {
         self.results.values().filter(|t| t.rewritten).count() as u64
     }
 
-    /// The shadow's tallies over its CURRENT contents — a caught-up
+    /// The shadow's tallies over its current contents: a caught-up
     /// replacement supersedes its earlier tally, so totals never
     /// double-count a reprocessed file.
     fn totals(&self) -> BuildTotals {
@@ -1086,7 +1087,7 @@ fn run_pass_blocking(
     let sources = snapshot_env_files(data_dir)?;
 
     // Test-only happened-before edge: this snapshot is taken, and nothing
-    // moves until the test has written the file it wants a CATCH-UP pass to
+    // moves until the test has written the file it wants a catch-up pass to
     // carry. Bounded so a mis-driven test fails rather than hangs.
     #[cfg(any(test, feature = "test-support"))]
     if TEST_BARRIER_FIRST_PASS.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -1149,25 +1150,16 @@ fn run_pass_blocking(
     Ok(changed)
 }
 
-/// Resolve a requested repin target to a canonical type.
+/// Whether this repin must be refused for want of an explicit force flag.
 ///
-/// The parse is through `CanonicalType::from_catalog` — the CATALOG
-/// spelling, the injective one — so `SEVERITY` is admitted (issue #79).
-/// It is a target an operator can only reach by naming it: inference still
-/// cannot mint it (`DESCRIBE` never says SEVERITY, so
-/// `normalize_duckdb_type` can never yield it), and the seed remains the
-/// only other installer. What used to make the physical door the gate —
-/// "severity is not an operator decision" — is exactly what this slice
-/// reverses.
-/// The force decision, asked by all THREE askers — the pre-build scan
-/// gate, the finished-shadow gate, and the wire (`requires_force` on every
-/// job row a client reads) — so a dry run can never report a verdict the
-/// executing request would not reach. `Some(reason)` means the job needs an
-/// explicit force flag it does not have; the reason is the row's `error`
-/// text, and a caller may wrap it in its own context, which is the only
-/// thing the askers say differently.
+/// One decision with three askers: the pre-build scan gate, the
+/// finished-shadow gate, and the wire (`requires_force` on every job row a
+/// client reads), so a dry run can never report a verdict the executing
+/// request would not reach. `Some(reason)` is the text stored as the job
+/// row's `error`, and a caller may wrap it in its own context, which is the
+/// only thing the askers say differently.
 ///
-/// Takes the PIN and the asserted dialect rather than a `RepinTarget`,
+/// Takes the pin and the asserted dialect rather than a `RepinTarget`,
 /// because the wire asker reads a stored job row: `RepinTarget` is the
 /// engine's to construct (it alone knows the old pin), and re-deriving one
 /// from a row would be exactly the second opinion this function exists to
@@ -1175,16 +1167,16 @@ fn run_pass_blocking(
 ///
 /// Two reasons, both about a value the operator has not knowingly accepted:
 ///
-/// 1. LOSS — values the new pin cannot read at all. Unchanged behaviour;
-/// 2. AMBIGUITY — numerals that read as a different severity in each
-///    dialect (the 1-7 overlap). Only under the `OTel` reading, because
-///    asserting syslog IS the statement about provenance the ambiguity is
-///    waiting for (issue #79, AC4). An explicit `dialect=otel` does NOT
-///    suppress it: the refusal is about the values, not about how the
-///    request was spelled, and force is the one escape.
+/// 1. loss: values the new pin cannot read at all;
+/// 2. ambiguity: numerals that read as a different severity in each dialect
+///    (the 1-7 overlap). Only under the `OTel` reading, because asserting
+///    syslog is itself the statement about provenance the ambiguity is
+///    waiting for. An explicit `dialect=otel` does not suppress it: the
+///    refusal is about the values, not about how the request was spelled,
+///    and force is the one escape.
 ///
-/// The COUNT is taken whatever the dialect — the report says what is there
-/// — and only the gate is conditional.
+/// The count is taken whatever the dialect, since the report says what is
+/// there; only the gate is conditional.
 pub(crate) fn force_refusal(
     pin: CanonicalType,
     dialect: Option<trawl_core::severity::Dialect>,
@@ -1218,15 +1210,15 @@ pub(crate) fn force_refusal(
     None
 }
 
-/// Resolve the asserted numeral dialect for a target (issue #79).
+/// Resolve the asserted numeral dialect for a target.
 ///
-/// A `SEVERITY` target always ends up with one — `otel` when the request
-/// says nothing, because that is what every other lane reads and a repin
-/// that changed the ladder by omission would be the silent mistranslation
-/// this whole feature exists to make deliberate.
+/// A `SEVERITY` target always ends up with one: `otel` when the request says
+/// nothing, because that is what every other lane reads and a repin that
+/// changed the ladder by omission would be the silent mistranslation this
+/// whole feature exists to make deliberate.
 ///
-/// Any OTHER target with a dialect is a 400, not an ignored field: the
-/// dialect only reaches the SEVERITY rung, so accepting it elsewhere would
+/// Any other target with a dialect is a 400, not an ignored field: the
+/// dialect only reaches the `SEVERITY` rung, so accepting it elsewhere would
 /// tell an operator their assertion was honoured when nothing read it.
 fn resolve_dialect(
     to: CanonicalType,
@@ -1254,6 +1246,13 @@ fn resolve_dialect(
     }
 }
 
+/// Resolve a requested repin target to a canonical type.
+///
+/// The parse is through `CanonicalType::from_catalog`, the catalog spelling
+/// and the injective one, so `SEVERITY` is admitted. It is a target an
+/// operator can only reach by naming it: inference cannot mint it
+/// (`DESCRIBE` never says `SEVERITY`, so `normalize_duckdb_type` can never
+/// yield it), and the envelope seed is the only other installer.
 fn parse_target(to: &str) -> Result<CanonicalType, ServerError> {
     CanonicalType::from_catalog(&to.to_ascii_uppercase()).ok_or_else(|| {
         ServerError::BadRequest(format!(
@@ -1267,11 +1266,11 @@ fn parse_target(to: &str) -> Result<CanonicalType, ServerError> {
 mod tests {
     use super::*;
 
-    /// The target vocabulary is the CATALOG's — the injective spelling —
-    /// so `SEVERITY` is a target an operator can name (issue #79) and
-    /// stays DISTINCT from the `BIGINT` it shares a physical type with:
-    /// the two mean different things to every comparison rule, and a parse
-    /// that collapsed them would repin a field to a pin nobody asked for.
+    /// The target vocabulary is the catalog's, the injective spelling, so
+    /// `SEVERITY` is a target an operator can name and stays distinct from
+    /// the `BIGINT` it shares a physical type with: the two mean different
+    /// things to every comparison rule, and a parse that collapsed them
+    /// would repin a field to a pin nobody asked for.
     #[test]
     fn repin_targets_are_the_catalog_vocabulary_severity_included() {
         for (spelling, expected) in [
@@ -1302,11 +1301,11 @@ mod tests {
         }
     }
 
-    /// The force gate is ONE decision asked at two moments (the pre-build
+    /// The force gate is one decision asked at two moments (the pre-build
     /// scan and the finished shadow), so the two can only refuse for the
-    /// same reasons: loss always, ambiguity only under the `OTel` reading —
-    /// asserting syslog IS the provenance statement the ambiguity waits for
-    /// — and `--force` is the single escape from either.
+    /// same reasons: loss always, ambiguity only under the `OTel` reading
+    /// (asserting syslog is itself the provenance statement the ambiguity
+    /// waits for), and `--force` is the single escape from either.
     #[test]
     fn the_force_gate_refuses_loss_always_and_ambiguity_under_otel_only() {
         use trawl_core::severity::Dialect;
@@ -1337,9 +1336,8 @@ mod tests {
             force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, true),
             None
         );
-        // A row with no recorded dialect at all (a legacy job, or one whose
-        // scope CHECK predates this slice) reads as the OTel default — the
-        // gate must not go silent because a column is NULL.
+        // A row with no recorded dialect at all reads as the OTel default:
+        // the gate must not go silent because a column is NULL.
         assert!(force_refusal(SEVERITY, None, 0, 2, false).is_some());
 
         // Nothing to refuse, and a non-severity target has no ambiguity
@@ -1351,17 +1349,17 @@ mod tests {
         );
         assert_eq!(force_refusal(VARCHAR, None, 0, 5, false), None);
 
-        // Loss is reported FIRST: it is the older and larger hazard, and a
-        // plan carrying both needs one force flag, not a ladder of them.
+        // Loss is reported first: it is the larger hazard, and a plan
+        // carrying both needs one force flag, not a ladder of them.
         let both = force_refusal(SEVERITY, Some(Dialect::Otel), 1, 1, false).unwrap();
         assert!(both.contains("cannot be read as SEVERITY"), "{both}");
     }
 
-    /// The dialect is a SEVERITY-only assertion: a severity target defaults
-    /// to `otel` (what every other lane reads), an unknown token names the
-    /// vocabulary, and a dialect on any other target is refused rather than
-    /// ignored — an ignored assertion is one an operator believes was
-    /// honoured.
+    /// The dialect is a `SEVERITY`-only assertion: a severity target
+    /// defaults to `otel` (what every other lane reads), an unknown token
+    /// names the vocabulary, and a dialect on any other target is refused
+    /// rather than ignored, because an ignored assertion is one an operator
+    /// believes was honoured.
     #[test]
     fn the_dialect_is_resolved_for_severity_targets_only() {
         use trawl_core::severity::Dialect;
@@ -1406,12 +1404,11 @@ mod tests {
         }
     }
 
-    /// The FIELD side of admission: `start` gates on
-    /// `schema::is_contract_typed`, so every contract slot — the sealed `_`
+    /// The field side of admission: `start` gates on
+    /// `schema::is_contract_typed`, so every contract slot (the sealed `_`
     /// namespace whole, present and future, plus the four sender-asserted
-    /// bare names — is refused before a job is ever claimed, while ordinary
-    /// sender vocabulary (including the names that used to be envelope
-    /// slots) is repinnable.
+    /// bare names) is refused before a job is ever claimed, while ordinary
+    /// sender vocabulary is repinnable.
     #[test]
     fn contract_typed_fields_are_not_repin_subjects() {
         for refused in [

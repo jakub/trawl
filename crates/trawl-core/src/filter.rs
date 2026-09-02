@@ -10,7 +10,7 @@
 //!
 //! Key invariant: `filter.matches_at(event, ctx)` must agree with
 //! running the emitted SQL against `DuckDB` for every
-//! `(event, search_stage)` pair — under the SAME `now()` anchor, since
+//! `(event, search_stage)` pair — under the same `now()` anchor, since
 //! `last=` is clock-relative and both lanes read the instant the caller
 //! hands them (ADR-0017 §3).
 //!
@@ -104,22 +104,22 @@ struct TextMatcher {
 impl CompiledFilter {
     /// Compile a filter from a parsed search stage.
     ///
-    /// `pins` is the field catalog's full pin snapshot (ADR-0011 slice A):
+    /// `pins` is the field catalog's full pin snapshot (ADR-0011):
     /// comparisons against pinned fields follow the same rule table the
     /// SQL emitter's `emit_with_pins` applies — batch/live parity is part
     /// of the contract. Pass an empty set where no catalog exists
-    /// (embedded mode, plain unit tests); every comparison then stays
-    /// literal-driven, exactly as before.
+    /// (embedded mode, plain unit tests); every comparison is then
+    /// literal-driven.
     ///
     /// Regex and glob patterns are compiled eagerly. Invalid patterns
     /// are silently skipped (they would also fail at SQL execution time).
     ///
     /// # Errors
     ///
-    /// Returns the SQL emitter's error when the search stage contains a
-    /// `level` filter the emitter rejects (unknown severity token, glob
-    /// or regex). Such a filter has no in-memory meaning: compiling it to
-    /// a match-nothing predicate would turn a typo into a silently empty
+    /// Returns the same error the SQL emitter raises when a `SEVERITY`-pinned
+    /// field is compared against a literal outside the ladder vocabulary.
+    /// Such a filter has no in-memory meaning: compiling it to a
+    /// match-nothing predicate would turn a typo into a silently empty
     /// live stream while the same query errors on `/api/v1/query`.
     pub fn compile(search: &SearchStage, pins: &FieldTypes) -> Result<Self, EmitError> {
         let time_filter = search.time_filter.as_ref().map(|tf| TimeMatcher {
@@ -155,13 +155,10 @@ impl CompiledFilter {
     /// a `now()` reader like any other and takes its instant from the
     /// caller's [`EvalContext`] — never from a clock of its own
     /// (ADR-0017 §3). In the live lane that context is the event's own,
-    /// which is what makes the window this filter applies and the
-    /// `now()` a later `| where` reads ONE instant; there is no second
-    /// door that samples per batch, because a bus batch is an upstream
-    /// client's POST size and not a boundary a query author can see.
-    ///
-    /// This is the whole reason the convenience `matches(event)` is
-    /// gone: it hid a clock read behind a call that looked pure.
+    /// so the window this filter applies and the `now()` a later
+    /// `| where` reads are one instant; there is no second door that
+    /// samples per batch, because a bus batch is an upstream client's
+    /// POST size and not a boundary a query author can see.
     pub fn matches_at(&self, event: &serde_json::Map<String, Value>, ctx: &EvalContext) -> bool {
         // Check time filter first (global, not per-group).
         if let Some(tf) = &self.time_filter
@@ -222,19 +219,19 @@ fn compile_token(
 ) -> Result<Option<TokenMatcher>, EmitError> {
     Ok(match token {
         SearchToken::FieldFilter(ff) => {
-            // The catalog pin typing this comparison (ADR-0011 slice A);
-            // the lookup folds through `catalog_key`, same as the emitter.
+            // The catalog pin typing this comparison (ADR-0011); the
+            // lookup folds through `catalog_key`, same as the emitter.
             let pin = pins.pin_for(&ff.field);
-            // Glob/regex match ONE canonical text per pin, resolved by the
+            // Glob/regex match one canonical text per pin, resolved by the
             // shared rule table: plain stringification mirrors the SQL
             // side's bare column only where there is no pin to conform to
             // (unpinned, VARCHAR), and every typed pin renders the value's
-            // own cast reading — RFC 3339 microseconds for TIMESTAMP,
-            // `DuckDB`'s DOUBLE text for DOUBLE, the conformed integer for
-            // BIGINT, lowercase `true`/`false` for BOOLEAN — so a pattern
-            // cannot mean one thing live and another in batch. All four
-            // are corroborated by execution probes in
-            // trawl-engine/tests/duckdb_probe.rs, not assumed.
+            // own conformed reading — RFC 3339 microseconds for TIMESTAMP,
+            // DuckDB's DOUBLE text for DOUBLE, the conformed integer for
+            // BIGINT, lowercase `true`/`false` for BOOLEAN, the ladder
+            // token for SEVERITY — so a pattern cannot mean one thing live
+            // and another in batch. Each is corroborated by execution
+            // probes in trawl-engine/tests/duckdb_probe.rs, not assumed.
             let form = compare::pattern_form(pin);
             let predicate = match (&ff.op, &ff.value) {
                 (FilterOp::Glob, FilterValue::Literal(pattern)) => {
@@ -271,16 +268,15 @@ fn compile_token(
                 },
             };
             Some(TokenMatcher::Field(FieldMatcher {
-                // The event key is the SAME `catalog_key` the pin lookup
-                // used: `timestamp`/`@timestamp` alias the physical `_time`
-                // key (matching the SQL emitter's quote_field mapping), and
-                // the ASCII fold mirrors DuckDB binding `"Status"` to the
-                // real `status` column. Ingest folds every incoming field
-                // name, so an exact lookup on the folded spelling is the
-                // one that finds the value — without the fold a mixed-case
-                // reference would read every event as a NULL column, which
-                // `!=` reports as a match (`OR col IS NULL`): live tail
-                // would stream everything while `/query` returned nothing.
+                // The event key is the same `catalog_key` the pin lookup
+                // used: an ASCII fold and nothing else, mirroring DuckDB
+                // binding `"Status"` to the real `status` column. Ingest
+                // folds every incoming field name, so an exact lookup on
+                // the folded spelling is the one that finds the value —
+                // without the fold a mixed-case reference would read every
+                // event as a NULL column, which `!=` reports as a match
+                // (`OR col IS NULL`): live tail would stream everything
+                // while `/query` returned nothing.
                 field: crate::schema::catalog_key(&ff.field),
                 predicate,
             }))
@@ -385,7 +381,7 @@ impl FieldMatcher {
             // — except `!=`, whose emitted form carries `OR col IS NULL`
             // and is therefore TRUE. Decided here, before coercion, so
             // every coercion class agrees with the SQL on nulls
-            // (stringifying null to "" made ordered comparisons diverge).
+            // (stringifying null to "" diverges on ordered comparisons).
             return match &self.predicate {
                 FieldPredicate::Compare {
                     op: CompareOp::Ne, ..
@@ -649,7 +645,7 @@ mod tests {
     /// The fixed instant these tests evaluate at.
     ///
     /// Nothing here samples a clock: a filter's window is measured
-    /// against the context it is HANDED (ADR-0017 §3), so a test that
+    /// against the context it is handed (ADR-0017 §3), so a test that
     /// read `Utc::now()` would be racing the wall clock between event
     /// construction and evaluation for no gain.
     fn fixed_now() -> chrono::DateTime<chrono::Utc> {
@@ -668,7 +664,7 @@ mod tests {
         filter.matches_at(&event, &EvalContext::at(fixed_now()))
     }
 
-    /// Helper: like `matches_event`, with catalog pins (ADR-0011 slice A).
+    /// Helper: like `matches_event`, with catalog pins (ADR-0011).
     fn matches_event_pinned(
         dsl: &str,
         event_json: &str,
@@ -857,7 +853,7 @@ mod tests {
         ));
     }
 
-    // ── pin-aware comparisons (ADR-0011 slice A) ──────────────────────
+    // ── pin-aware comparisons (ADR-0011) ─────────────────────────────
 
     use crate::schema::CanonicalType as CT;
 
@@ -872,7 +868,7 @@ mod tests {
             r#"{"status": "200"}"#,
             VARCHAR_STATUS
         ));
-        // A wire NUMBER matches on the numeric arm, which is the arm that
+        // A wire number matches on the numeric arm, which is the arm that
         // survives `read_json` widening the column: the same event stores
         // "200" beside integers and "200.0" beside a fractional sibling,
         // and batch answers TRUE either way (executed in
@@ -887,8 +883,7 @@ mod tests {
             r#"{"status": 200.0}"#,
             VARCHAR_STATUS
         ));
-        // Other spellings of the same number are the same number to
-        // `TRY_CAST` — as they were before pins existed.
+        // Other spellings of the same number share its decimal reading.
         assert!(matches_event_pinned(
             "status=200",
             r#"{"status": "0200"}"#,
@@ -1001,7 +996,8 @@ mod tests {
 
     #[test]
     fn pinned_varchar_ordered_numeric_matches_numeric_text() {
-        // "404"/"500" are numeric under TRY_CAST(DOUBLE) semantics.
+        // "404"/"500" have a DECIMAL(38,6) reading, so both sides compare
+        // numerically.
         assert!(matches_event_pinned(
             "status>=400",
             r#"{"status": "404"}"#,
@@ -1017,8 +1013,8 @@ mod tests {
             r#"{"status": "200"}"#,
             VARCHAR_STATUS
         ));
-        // Non-numeric values are NULL under TRY_CAST — never a match,
-        // never an error.
+        // Values with no reading are NULL — never a match, never an
+        // error.
         assert!(!matches_event_pinned(
             "status>=400",
             r#"{"status": "accepted"}"#,
@@ -1029,7 +1025,7 @@ mod tests {
             r#"{"status": null}"#,
             VARCHAR_STATUS
         ));
-        // DOUBLE domain uniformly: "1.5" sits between 1 and 2.
+        // The reading is exact, not integral: "1.5" sits between 1 and 2.
         assert!(matches_event_pinned(
             "dur>1",
             r#"{"dur": "1.5"}"#,
@@ -1078,10 +1074,10 @@ mod tests {
     #[test]
     fn pinned_lookup_is_case_folded() {
         // Both halves fold, over an event whose key is spelled the way
-        // ingest actually writes it (lowercase). The EVENT lookup: DuckDB
+        // ingest actually writes it (lowercase). The event lookup: DuckDB
         // binds `"Status"` to the real `status` column, so a mixed-case
         // reference must read the value, not an absent key — and `!=` over
-        // an absent key is a MATCH (`OR col IS NULL`), so a fold miss here
+        // an absent key matches (`OR col IS NULL`), so a fold miss here
         // streams every event live while `/query` returns none.
         assert!(matches_event_pinned(
             "Status=200",
@@ -1093,7 +1089,7 @@ mod tests {
             r#"{"status": "200"}"#,
             VARCHAR_STATUS
         ));
-        // The PIN lookup: "accepted" has no numeric reading, so only the
+        // The pin lookup: "accepted" has no numeric reading, so only the
         // VARCHAR pin's text arm can answer `!=` at all — a fold miss
         // falls back to the unpinned Int coercion, which answers FALSE.
         assert!(matches_event_pinned(
@@ -1297,9 +1293,9 @@ mod tests {
 
     // ── the severity vocabulary rides the pin, not the name ───────────
 
-    /// `level` is ordinary sender vocabulary now (ADR-0013 §6): every
-    /// shape that used to be an emit error compiles, and matches the
-    /// sender's own column.
+    /// `level` is ordinary sender vocabulary (ADR-0013 §6): every shape
+    /// compiles in both lanes and matches the sender's own column, with
+    /// no severity meaning attached to the name.
     #[test]
     fn level_is_an_ordinary_field() {
         for dsl in [
@@ -1338,7 +1334,7 @@ mod tests {
         assert!(matches("_severity=error2", r#"{"_severity": 18}"#));
         assert!(!matches("_severity=error2", r#"{"_severity": 17}"#));
 
-        // An unknown value refuses in BOTH lanes, with one sentence.
+        // An unknown value refuses in both lanes, with one sentence.
         let query = parser::parse("_severity=spicy").expect("parse should succeed");
         let emit_error = crate::emitter::emit_with_pins(
             &query,
@@ -1592,7 +1588,7 @@ mod tests {
         // Under that instant → matches (30 min < 1 hour).
         assert!(filter.matches_at(&event, &EvalContext::at(now)));
 
-        // Under an instant 3 hours earlier the event is in the FUTURE,
+        // Under an instant 3 hours earlier the event is in the future,
         // which the window admits.
         let old_now = now - chrono::Duration::hours(3);
         assert!(filter.matches_at(&event, &EvalContext::at(old_now)));

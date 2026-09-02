@@ -183,8 +183,8 @@ enum RolesAction {
     },
 }
 
-/// CLI-side mirror of [`PrincipalKind`] — `clap` requires the type to live
-/// in the binary crate to derive `ValueEnum`.
+/// CLI-side mirror of [`PrincipalKind`] — deriving `ValueEnum` on the
+/// original would pull `clap` into `fleet-auth`, which does not depend on it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum CliKind {
     Human,

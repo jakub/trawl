@@ -31,8 +31,7 @@ use super::variant::{Size, Variant, btn_class};
 ///
 /// `stop_propagation` stops the click from bubbling before `on_click`
 /// runs — for buttons nested inside clickable rows (results-table quick
-/// actions, lineage entries) where the raw markup called
-/// `e.stop_propagation()` by hand.
+/// actions, lineage entries).
 #[component]
 pub fn Btn(
     variant: Variant,

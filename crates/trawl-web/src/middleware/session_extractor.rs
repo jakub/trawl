@@ -46,8 +46,8 @@ impl Session {
 impl FromRequestParts<AppState> for Session {
     type Rejection = ProxyError;
 
-    // Not `async fn`: nothing here awaits (clippy::unused_async_trait_impl),
-    // the trait merely demands a future, so hand back a ready one.
+    // Not `async fn`: nothing here awaits, and the trait asks only for a
+    // future, so hand back a ready one.
     fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
@@ -177,8 +177,8 @@ mod tests {
 
     #[test]
     fn find_cookie_ignores_legacy_trawl_session() {
-        // Browsers may keep sending the dead trawl_session cookie until it
-        // expires at TTL — it must never be picked up as a fleet_session.
+        // A neighbouring cookie whose name merely resembles the one asked
+        // for must not satisfy the lookup: find_cookie matches whole names.
         assert_eq!(
             find_cookie("trawl_session=old; fleet_session=new", "fleet_session"),
             Some("new")

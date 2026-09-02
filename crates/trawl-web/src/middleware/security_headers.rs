@@ -13,7 +13,6 @@
 use axum::http::{HeaderName, HeaderValue, header};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-/// Alias for the concrete `SetResponseHeaderLayer` type we use throughout.
 pub type HeaderLayer = SetResponseHeaderLayer<HeaderValue>;
 
 /// Content Security Policy string applied to every response.
@@ -23,8 +22,8 @@ pub type HeaderLayer = SetResponseHeaderLayer<HeaderValue>;
 ///   from same origin; `wasm-unsafe-eval` is mandatory for
 ///   `WebAssembly.instantiate`; `unsafe-inline` is required because
 ///   Trunk bootstraps the wasm via an injected `<script type="module">`
-///   block, and so does the codemirror/uplot `<link data-trunk>` glue
-///   when it ends up inline. A future hardening pass can switch to a
+///   block (the vendored codemirror/uplot bundles load by URL and need
+///   only `'self'`). A future hardening pass can switch to a
 ///   nonce-per-response scheme (Trunk supports `data-integrity`), but
 ///   for v1 behind same-origin auth the trade-off is acceptable.
 /// - `style-src 'self' 'unsafe-inline'`: inline style attributes are used by
@@ -44,10 +43,8 @@ pub const CSP: &str = "default-src 'self'; \
     img-src 'self' data:; \
     frame-ancestors 'none'";
 
-/// Build a `tower_http::Layer` chain that injects security headers.
-///
-/// Returns a tuple of layers so the caller composes them onto its router
-/// however it likes.
+/// Build the security-header layers, one per header, for the caller to
+/// compose onto its router.
 #[must_use]
 pub fn layers() -> (
     HeaderLayer,

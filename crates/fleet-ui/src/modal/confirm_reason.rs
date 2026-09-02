@@ -6,11 +6,10 @@
 //! reason textarea (audit-trail actions: invalidate, retract,
 //! quarantine-resolve).
 //!
-//! Promoted from trawl-web-ui in issue #28 with one API change:
-//! `confirm_variant: Variant` replaces the original `danger: bool`,
-//! matching the convention [`ConfirmModal`](super::ConfirmModal)
-//! established. Confirm stays disabled until the reason is non-blank;
-//! `on_confirm` receives the entered reason.
+//! `confirm_variant: Variant` follows the
+//! [`ConfirmModal`](super::ConfirmModal) convention. Confirm stays
+//! disabled until the reason is non-blank; `on_confirm` receives the
+//! entered reason.
 
 use leptos::prelude::*;
 

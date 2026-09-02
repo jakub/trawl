@@ -7,18 +7,18 @@
 //! Each test runs under `#[sqlx::test(migrations = false)]`: the sqlx
 //! harness (driven by `DATABASE_URL` — unset means a loud failure, never a
 //! skip) hands the test a fresh ephemeral database, which we use as the
-//! FLEET database (running `fleet_auth::MIGRATOR` on it explicitly). The
+//! fleet database (running `fleet_auth::MIGRATOR` on it explicitly). The
 //! trawl app-state database is a sibling database created empty by
-//! [`create_app_database`] and migrated by trawld's REAL boot path
+//! [`create_app_database`] and migrated by trawld's real boot path
 //! (`StorageState::connect`: pool → advisory lock → migrate), so every
 //! server test exercises boot-time migration.
 //!
-//! The two schemas must live in two databases: sqlx 0.8 hardwires one
+//! The two schemas must live in two databases: sqlx hardwires one
 //! `_sqlx_migrations` table per database and both migration sets would
 //! collide in it. Two databases also match the production shape.
 //!
 //! Sibling databases are best-effort leftovers: nextest is process-per-test
-//! and the server's pools stay open until process exit, so we don't DROP
+//! and the server's pools stay open until process exit, so we don't drop
 //! them (a throwaway CI container makes leaks acceptable; local dev reuses
 //! names prefixed `trawl_app_test_` for easy bulk cleanup).
 
@@ -41,9 +41,9 @@ pub fn trawl_perms(perms: &[&str]) -> Vec<RolePermission> {
         .collect()
 }
 
-/// Seed the four converted-shape trawl roles (the exact permission sets the
-/// conversion migration freezes — the legacy compile-time tables minus the
-/// dead `key_manage`) plus a coastwatch-only role for grantless-key tests.
+/// Seed the four trawl roles whose permission sets the production migration
+/// freezes (so the `/whoami` goldens are the real wire shape), the
+/// schema-admin role, and a coastwatch-only role for grantless-key tests.
 pub async fn seed_trawl_roles(store: &KeyStore) {
     store
         .create_role(
@@ -90,10 +90,10 @@ pub async fn seed_trawl_roles(store: &KeyStore) {
         .create_role("trawl-ingest", None, &trawl_perms(&["ingest"]))
         .await
         .expect("seed trawl-ingest");
-    // Beyond the four frozen conversion bundles: the ADR-0011 slice-B
-    // schema-admin shape — schema_write WITHOUT server_manage, which is
-    // the whole point of the separate permission. No pre-existing role
-    // carries schema_write (the migration registers, never grants).
+    // The schema-admin shape: schema_write without server_manage, which is
+    // the whole point of the separate permission. The fleet migration
+    // registers schema_write and grants it to no role, so a test that needs
+    // it seeds this one.
     store
         .create_role(
             "trawl-schema-admin",
@@ -128,17 +128,16 @@ use trawl_server::transport::http;
 
 /// Create a `PrometheusHandle` for test contexts.
 ///
-/// The prometheus recorder is PROCESS-global: `metrics::counter!` always
+/// The prometheus recorder is process-global: `metrics::counter!` always
 /// records into whichever recorder was installed first, regardless of
 /// which handle a given server renders `/metrics` from. Under nextest
 /// (process-per-test) that is always the test's own; under plain
 /// `cargo test` every test in the binary shares one process, so a second
 /// server's freshly-built recorder would never see the counters the
 /// handlers emit — its `/metrics` renders empty and any assertion on it
-/// fails only under `cargo test`. Runner-independence therefore requires
-/// every harness server in the process to render the SAME handle: the
-/// first call installs the global recorder and caches its handle, and
-/// every later call clones it.
+/// fails only under `cargo test`. Every harness server in the process
+/// therefore renders the same handle: the first call installs the global
+/// recorder and caches its handle, and every later call clones it.
 pub fn test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
     static HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
         std::sync::OnceLock::new();
@@ -195,15 +194,15 @@ fn random_db_suffix() -> String {
         .collect()
 }
 
-/// DSN of the sqlx-provided per-test database (used as the FLEET database).
+/// DSN of the sqlx-provided per-test database (used as the fleet database).
 pub fn fleet_database_url(pool: &PgPool) -> String {
     let opts = pool.connect_options();
     let db = opts.get_database().expect("test pool has a database");
     swap_database(&admin_database_url(), db)
 }
 
-/// Create an EMPTY sibling database for the trawl app-state store and
-/// return its DSN. trawld's real boot path migrates it (AC5).
+/// Create an empty sibling database for the trawl app-state store and
+/// return its DSN. trawld's real boot path migrates it.
 pub async fn create_app_database(pool: &PgPool) -> String {
     sweep_stale_app_databases(pool).await;
     // The run marker + owner pid are encoded in the name so future runs can
@@ -220,7 +219,7 @@ pub async fn create_app_database(pool: &PgPool) -> String {
     swap_database(&admin_database_url(), &name)
 }
 
-/// A marker shared by every test process of THIS nextest run (nextest
+/// A marker shared by every test process of this nextest run (nextest
 /// exposes `NEXTEST_RUN_ID`; plain `cargo test` shares one process, so the
 /// pid suffices as fallback). Only alphanumerics survive, for db-name
 /// safety.
@@ -256,9 +255,9 @@ fn pid_alive(pid: u32) -> bool {
 /// Best-effort sweep of sibling app databases leaked by earlier runs.
 ///
 /// The server's pools stay open until process exit, so a test cannot drop
-/// its OWN app database; instead each run garbage-collects its
-/// predecessors'. A database is only dropped when BOTH guards agree it is
-/// abandoned: (a) it belongs to a DIFFERENT nextest run — same-run
+/// its own app database; instead each run garbage-collects its
+/// predecessors'. A database is only dropped when both guards agree it is
+/// abandoned: (a) it belongs to a different nextest run — same-run
 /// siblings are structurally never touched, even in the window between
 /// their CREATE and the server's first connection — and (b) the owner pid
 /// encoded in its name is no longer alive. A single advisory lock elects
@@ -313,10 +312,9 @@ async fn sweep_stale_app_databases(pool: &PgPool) {
 #[test]
 fn sweep_guards_parse_own_database_name() {
     // The sweeper's abandoned-db detection must round-trip the naming
-    // scheme `create_app_database` uses — a parse mismatch here silently
-    // turns the sweeper into a live-sibling killer (it did once: the
-    // guard-bypassing bug behind transient 'database does not exist' boot
-    // failures).
+    // scheme `create_app_database` uses: a parse mismatch here silently
+    // turns the sweeper into a live-sibling killer, which surfaces as
+    // transient 'database does not exist' boot failures.
     let name = format!(
         "trawl_app_test_{}_{}_{}",
         run_marker(),
@@ -392,7 +390,7 @@ pub fn ensure_fixtures() -> String {
     // `{data}/{env}/{date}/{HH}/{service}.parquet`. Fixtures live there
     // because that is the only shape the server ever writes — a flat data
     // root is only reachable through a whole-root `**` glob, which the
-    // planner deliberately no longer emits (it would swallow `scheduled/`).
+    // planner deliberately does not emit (it would swallow `scheduled/`).
     let hour_dir = dir.join("prod").join("2024-01-15").join("10");
     let nginx_path = hour_dir.join("nginx.parquet");
 
@@ -401,7 +399,9 @@ pub fn ensure_fixtures() -> String {
     if scheduled_dir.exists() {
         let _ = std::fs::remove_dir_all(&scheduled_dir);
     }
-    // Remove pre-ADR-0009 flat fixtures left by an older checkout.
+    // The returned `**` glob reaches the fixture root as well, so a flat
+    // `nginx.parquet`/`postgres.parquet` sitting there would be read
+    // alongside the partitioned copies. Clear both names.
     for legacy in ["nginx.parquet", "postgres.parquet"] {
         let _ = std::fs::remove_file(dir.join(legacy));
     }
@@ -497,7 +497,7 @@ pub fn ensure_test_cert() -> (PathBuf, PathBuf) {
     (cert_path, key_path)
 }
 
-/// Test server handle with analyst, admin, and ingest tokens.
+/// Handle to a running test server, with one minted token per seeded role.
 pub struct TestServer {
     pub url: String,
     pub analyst_token: String,
@@ -506,7 +506,7 @@ pub struct TestServer {
     pub ingest_token: String,
     pub schema_admin_token: String,
     pub coastwatch_only_token: String,
-    /// Pool on the per-test FLEET database (mint/revoke keys mid-test).
+    /// Pool on the per-test fleet database (mint/revoke keys mid-test).
     pub fleet_pool: PgPool,
     /// DSN of the fleet database (kill it to simulate auth-backend loss).
     pub fleet_db_url: String,
@@ -577,8 +577,8 @@ pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String
     )
 }
 
-/// Migrate the sqlx-provided database with the FLEET schema, seed the
-/// converted-shape roles, and return a keystore on it.
+/// Migrate the sqlx-provided database with the fleet schema, seed the test
+/// roles, and return a keystore on it.
 /// (`migrations = false` hands us a bare database.)
 pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
     fleet_auth::MIGRATOR

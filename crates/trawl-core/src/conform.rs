@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The ONE expression that binds a pinned column to its catalog type
+//! The one expression that binds a pinned column to its catalog type
 //! (ADR-0009 slice 2, ADR-0011).
 //!
 //! Two lanes conform the same value, and both build their SQL here:
@@ -81,13 +81,13 @@ pub const SESSION_TIME_ZONE_SQL: &str = "SET TimeZone='UTC'";
 ///
 /// `DECIMAL(38,6)` because it is EXACT over every `i64` and far past it
 /// (magnitudes below 10^32), where a DOUBLE comparison goes blind above
-/// 2^53 and silently equates neighbours: `id=1737000000123456789` matched
-/// three distinct stored ids, and `id!=9007199254740993` suppressed the
-/// genuinely different `9007199254740992` — snowflake ids and nanosecond
-/// epochs are exactly that shape. The costs are stated where they bite
-/// ([`crate::compare`]'s module doc): fractions quantize at 10^-6, and a
-/// magnitude at or above 10^32 — like `nan` and `inf` — has no reading at
-/// all, which is a NULL, never a false match.
+/// 2^53 and silently equates neighbours: `id=1737000000123456789` would
+/// match three distinct stored ids, and `id!=9007199254740993` would
+/// suppress the genuinely different `9007199254740992` — snowflake ids
+/// and nanosecond epochs are exactly that shape. The costs are stated
+/// where they bite ([`crate::compare`]'s module doc): fractions quantize
+/// at 10^-6, and a magnitude at or above 10^32 — like `nan` and `inf` —
+/// has no reading at all, which is a NULL, never a false match.
 pub const DECIMAL_COMPARISON_SPACE: &str = "DECIMAL(38,6)";
 
 /// `expr`'s reading in [`DECIMAL_COMPARISON_SPACE`] — NULL for a text the
@@ -114,18 +114,19 @@ pub fn decimal_reading(expr: &str) -> String {
 /// `json_extract_string` can read back. All probed by execution.
 ///
 /// The hot lane has no choice — the emitter has no `DESCRIBE` — and
-/// compaction, which does, must not use it: this rendering is NOT
-/// `CAST(x AS VARCHAR)`'s (a DOUBLE `1e20` is `100000000000000000000.0`
-/// here and `1e+20` there), and under the VARCHAR pin [`guarded_cast`] is
-/// the IDENTITY, so the text form is the stored value itself. Two
-/// spellings there are two corpora: `note=/^1e/` matched while the event
-/// was hot and stopped matching minutes later, when the compactor ran.
+/// compaction, which does, must not reach for `CAST(x AS VARCHAR)`
+/// instead: the two renderings differ (a DOUBLE `1e20` is
+/// `100000000000000000000.0` here and `1e+20` there), and under the
+/// VARCHAR pin [`guarded_cast`] is the identity, so the text form is the
+/// stored value itself. Two spellings there are two corpora, where
+/// `note=/^1e/` matches while the event is hot and stops matching minutes
+/// later, once the compactor has run.
 #[must_use]
 pub fn untyped_text(quoted: &str) -> String {
     format!("json_extract_string(to_json({quoted}), '$')")
 }
 
-/// [`guarded_cast_in`] under the `OTel` dialect — the reading every LIVE
+/// [`guarded_cast_in`] under the `OTel` dialect — the reading every live
 /// conform lane wants.
 ///
 /// The dialect governs the SEVERITY rung alone, and every lane that
@@ -134,9 +135,9 @@ pub fn untyped_text(quoted: &str) -> String {
 /// syslog PRI numeral at its own door (the syslog profile's fixed
 /// derivation source, ADR-0013 slice 2), so what reaches a stored column
 /// is a ladder position, not a wire dialect. "Live conform is `OTel`" is
-/// therefore a fact about these CALL SITES, not a property of the builder
-/// — the repin engine (issue #79) is the one caller that asserts
-/// otherwise, and it says so per arm through [`RepinTarget`].
+/// therefore a fact about these call sites, not a property of the builder
+/// — the repin engine is the one caller that asserts otherwise, and it
+/// says so per arm through [`RepinTarget`].
 #[must_use]
 pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
     guarded_cast_in(text, pin, Dialect::Otel)
@@ -157,20 +158,20 @@ pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
 /// `trawl-engine/tests/duckdb_probe.rs`:
 ///
 /// - `BIGINT` compares the cast against the text re-parsed in
-///   [`DECIMAL_COMPARISON_SPACE`] — an EXACT integer space across the whole BIGINT
-///   range, where a DOUBLE-space comparison goes blind above 2^53 (both
-///   sides collapse to the same double, so `1735689600123456710.7`
-///   conformed to `…711` with no conflict). It keeps every representation
-///   drift (`'4.0'` → 4, `'0404'` → 404, `'1e3'` → 1000, `' 200'` → 200,
-///   `'200_000'` → 200000, `2^53 ± 1` exact, `i64::MAX`) and refuses every
-///   value change (`'1.5'`, `'nan'`, `''`, `u64::MAX`). Texts outside
-///   `DECIMAL`'s syntax are refused even where `BIGINT` reads them —
-///   `'0x10'` is 16 to the cast and NULL to the guard — which is the
-///   guard doing its job: hex is a spelling `DuckDB` will never write
-///   back. Residual tolerance: a fraction below `DECIMAL(38,6)`'s
-///   half-microstep (`'4.0000001'`) quantizes to the integer and is
-///   absorbed as representation drift; `'4.0000005'` rounds away and is
-///   refused;
+///   [`DECIMAL_COMPARISON_SPACE`] — an exact integer space across the
+///   whole BIGINT range, where a DOUBLE-space comparison goes blind above
+///   2^53 (both sides collapse to the same double, so
+///   `1735689600123456710.7` would conform to `…711` with no conflict). It
+///   keeps every representation drift (`'4.0'` → 4, `'0404'` → 404,
+///   `'1e3'` → 1000, `' 200'` → 200, `'200_000'` → 200000, `2^53 ± 1`
+///   exact, `i64::MAX`) and refuses every value change (`'1.5'`, `'nan'`,
+///   `''`, `u64::MAX`). Texts outside `DECIMAL`'s syntax are refused even
+///   where `BIGINT` reads them — `'0x10'` is 16 to the cast and NULL to
+///   the guard — which is the guard doing its job: hex is a spelling
+///   `DuckDB` will never write back. Residual tolerance: a fraction below
+///   `DECIMAL(38,6)`'s half-microstep (`'4.0000001'`) quantizes to the
+///   integer and is absorbed as representation drift; `'4.0000005'` rounds
+///   away and is refused;
 /// - `DOUBLE` is the bare cast. Over a text source the round trip is the
 ///   identity — the guard would compare `TRY_CAST(text AS DOUBLE)` with
 ///   itself — and DOUBLE-space comparison is deliberately
@@ -181,9 +182,9 @@ pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
 ///   reason, and it parses through `TIMESTAMPTZ` so an offset in the text
 ///   is applied and a zoneless text reads as UTC — the semantics ingest
 ///   already ratified for `_time` (ADR-0008). `TRY_CAST(text AS TIMESTAMP)`
-///   alone is a WALL-CLOCK parse that IGNORES the offset, which made
-///   `09:00:00+05:30` store `09:00` here and `03:30` through `read_json`'s
-///   own inference. Requires [`SESSION_TIME_ZONE_SQL`];
+///   alone is a WALL-CLOCK parse that IGNORES the offset, so
+///   `09:00:00+05:30` would store `09:00` here and `03:30` through
+///   `read_json`'s own inference. Requires [`SESSION_TIME_ZONE_SQL`];
 /// - `BOOLEAN` compares strict text, so only the values `DuckDB` renders
 ///   back conform: `'true'`/`'false'` and nothing else. `'TRUE'`, `'t'`,
 ///   `'yes'` and `'1'` are all inside the CAST's vocabulary and all fail
@@ -273,12 +274,12 @@ fn trimmed_sql(expr: &str) -> String {
 /// an INTEGER-typed conform would make the hot branch disagree with the
 /// parquet side and throw the union.
 ///
-/// `text_expr` appears FIVE times in the result — the ASCII gate, the
-/// token lookup, the digits guard, and the cast's two halves — which is
-/// free for a column
-/// (`DuckDB` evaluates the common subexpression once) but wrong for an
-/// expression carrying bound `?` parameters, since the emitter pushes one
-/// value per call and not per occurrence. A caller whose subject can
+/// `text_expr` lands in the result up to five times — the ASCII gate, the
+/// `lower()` fold, the digits guard, and the `OTel` numeric arm's two
+/// halves of the cast (the syslog arm names it once) — which is free for a
+/// column (`DuckDB` evaluates the common subexpression once) but wrong for
+/// an expression carrying bound `?` parameters, since the emitter pushes
+/// one value per call and not per occurrence. A caller whose subject can
 /// carry parameters takes [`severity_reading_sql_bind_once`] instead.
 #[must_use]
 pub fn severity_reading_sql(text_expr: &str, dialect: crate::severity::Dialect) -> String {
@@ -432,9 +433,9 @@ pub fn raw_extract(raw_quoted: &str, field: &str) -> String {
     )
 }
 
-/// Whether `text_expr` reads as a DIFFERENT severity in each dialect —
-/// the SQL mirror of [`crate::severity::dialect_ambiguous`], and the
-/// building block the repin's ambiguity count is derived from (issue #79).
+/// Whether `text_expr` reads as a different severity in each dialect —
+/// the SQL mirror of [`crate::severity::dialect_ambiguous`], and what the
+/// repin's ambiguity count is derived from.
 ///
 /// `A IS NOT NULL AND B IS NOT NULL AND A <> B` over the two readings, so
 /// a value with only ONE reading is FALSE rather than NULL: an unreadable
@@ -442,9 +443,9 @@ pub fn raw_extract(raw_quoted: &str, field: &str) -> String {
 /// a value both dialects claim differently is a silent mistranslation
 /// waiting on an operator's assertion.
 ///
-/// `text_expr` lands in the result many times over (both readings name it
-/// five times each), which is free for a column and wrong for an
-/// expression carrying bound `?` parameters — the same constraint
+/// `text_expr` lands in the result nine times over (five in the `OTel`
+/// reading, four in the syslog one), which is free for a column and wrong
+/// for an expression carrying bound `?` parameters — the same constraint
 /// [`severity_reading_sql`] documents.
 #[must_use]
 pub fn severity_dialect_ambiguous_sql(text_expr: &str) -> String {
@@ -453,8 +454,8 @@ pub fn severity_dialect_ambiguous_sql(text_expr: &str) -> String {
     format!("({otel} IS NOT NULL AND {syslog} IS NOT NULL AND {otel} <> {syslog})")
 }
 
-/// The pin a repin rewrites TO, with the dialect each ARM reads its
-/// numerals in (issue #79).
+/// The pin a repin rewrites to, with the dialect each arm reads its
+/// numerals in.
 ///
 /// Two arms read text under a repin ([`resurrection_expr`]), and they do
 /// not have the same provenance, so they cannot share one dialect:
@@ -606,8 +607,8 @@ mod tests {
     }
 
     /// The two shapes are one reading: the bind-once form names its
-    /// subject EXACTLY once (a subject carrying `?` is pushed once), the
-    /// repeated form four times (free for a column, and measurably faster
+    /// subject exactly once (a subject carrying `?` is pushed once), the
+    /// repeated form five times (free for a column, and measurably faster
     /// — the reason the conform rung does not pay the lambda).
     #[test]
     fn severity_reading_sql_shapes_differ_only_in_where_the_subject_lands() {
@@ -730,10 +731,10 @@ mod tests {
         assert_eq!(typed.matches("DECIMAL(38,6)").count(), 4);
     }
 
-    /// `guarded_cast` IS `guarded_cast_in` at `OTel`, byte for byte, for
+    /// `guarded_cast` is `guarded_cast_in` at `OTel`, byte for byte, for
     /// every pin — the delegation is what makes "live conform is `OTel`" a
     /// fact about call sites rather than a second expression to keep in
-    /// step (issue #79).
+    /// step.
     ///
     /// Iterates [`CanonicalType::ALL`] rather than listing the variants: a
     /// seventh canonical type joins this test the moment it joins `ALL`,

@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The one text-level scan over a DSL query that can change an ANSWER
+//! The one text-level scan over a DSL query that can change an answer
 //! (ADR-0014 ruling 5).
 //!
 //! The web UI's date-range popover rewrites a span this walk picks — where
@@ -11,15 +11,15 @@
 //! It lives here, beside the grammar it approximates, rather than in the
 //! consumer.
 //!
-//! This is NOT the parser and never will be: it runs on partial,
+//! This is not the parser and never will be: it runs on partial,
 //! mid-typing input the grammar would reject outright, so it is a
-//! deliberate approximation with its rules stated. The grammar remains
-//! the authority on what a query MEANS; this only decides where to splice
+//! deliberate approximation with its rules stated. The grammar is the
+//! authority on what a query means; this only decides where to splice
 //! text.
 
 use crate::parser::comment::{is_layout, opens_comment_after};
 
-/// Walk `input`'s bytes, calling `hit` only for bytes that sit OUTSIDE a
+/// Walk `input`'s bytes, calling `hit` only for bytes that sit outside a
 /// delimited span — a double-quoted string, a `/`-delimited regex
 /// literal, a backtick-quoted field name (ADR-0013 ruling 7), or a
 /// comment (ADR-0014). Returns the index of the first byte `hit`
@@ -31,16 +31,16 @@ use crate::parser::comment::{is_layout, opens_comment_after};
 ///
 /// Four rules are worth stating outright:
 ///
-/// * **A backslash escapes only INSIDE a quoted string or a regex body.**
+/// * **A backslash escapes only inside a quoted string or a regex body.**
 ///   The grammar has no escape in an unquoted position — a bare `\` is
-///   ordinary text — so honouring one outside a delimited span made
-///   `foo\" last=1h"` read the `last=` as grammar while the parser reads
-///   it as the contents of a quoted phrase. Backticks have no backslash
+///   ordinary text — so honouring one outside a delimited span would read
+///   the `last=` in `foo\" last=1h"` as grammar while the parser reads it
+///   as the contents of a quoted phrase. Backticks have no backslash
 ///   escape either: their only escape is a doubled backtick, which this
 ///   walk sees as a close immediately followed by a re-open, so no inner
 ///   byte leaks out as bare.
 /// * **`'` is not a delimiter.** The DSL has no single-quoted string, so
-///   treating one as an opener made an apostrophe (`message=it's`)
+///   treating one as an opener would let an apostrophe (`message=it's`)
 ///   swallow the rest of the query.
 /// * **A `/` opens a regex only at a token boundary** — start of input,
 ///   or after whitespace or one of the bytes a value may follow
@@ -52,7 +52,7 @@ use crate::parser::comment::{is_layout, opens_comment_after};
 ///   neither consumer scans.
 /// * **A `#` opens a comment only after ASCII whitespace or at the start
 ///   of input** — the same structural boundary the grammar uses, tested
-///   through the grammar's OWN predicate
+///   through the grammar's own predicate
 ///   (`parser::comment::opens_comment_after`) rather than a copy that
 ///   could drift. ASCII and not Unicode because the unquoted token
 ///   charsets end on ASCII whitespace: `message="x"\u{a0}# last=1h` is a
@@ -63,9 +63,8 @@ use crate::parser::comment::{is_layout, opens_comment_after};
 ///
 /// On unterminated input — a quote or regex the user has not closed yet —
 /// the open span runs to end of input and nothing after it is offered.
-/// That is the existing fail-shape and is deliberate: mid-typing, the
-/// safest reading of an unclosed quote is that everything after it is
-/// still inside it.
+/// That fail-shape is deliberate: mid-typing, the safest reading of an
+/// unclosed quote is that everything after it is still inside it.
 pub fn scan_outside_quotes<F>(input: &str, mut hit: F) -> Option<usize>
 where
     F: FnMut(usize, u8) -> bool,
@@ -73,7 +72,7 @@ where
     walk(input, &mut hit).0
 }
 
-/// Whether `input` ENDS inside an open comment — the walk's terminal
+/// Whether `input` ends inside an open comment — the walk's terminal
 /// state, which decides whether text appended to it would land in prose.
 ///
 /// The web UI's date-range merge asks this before it joins a rewritten
@@ -147,7 +146,7 @@ where
     (None, span)
 }
 
-/// Whether the byte at `i` sits where the GRAMMAR admits a comment: the
+/// Whether the byte at `i` sits where the grammar admits a comment: the
 /// beginning of the input, or directly after an ASCII whitespace
 /// character — asked of `parser::comment`'s own predicate, the one both
 /// `ws`/`leading_ws` and this walk go through. Deliberately narrower than
@@ -157,7 +156,7 @@ fn at_layout_boundary(input: &str, i: usize) -> bool {
     opens_comment_after(input[..i].chars().next_back())
 }
 
-/// Whether the byte at `i` sits where a new VALUE could START: the
+/// Whether the byte at `i` sits where a new value could start: the
 /// beginning of the input, after whitespace, or after one of the bytes a
 /// value or a regex may directly follow.
 fn at_boundary(input: &str, i: usize) -> bool {
@@ -181,7 +180,7 @@ mod tests {
         scan_outside_quotes(&lower, |i, _| bytes[i..].starts_with(b"last=")).is_some()
     }
 
-    /// A `//` in a value is ordinary data now (ADR-0014 ruling 3), so the
+    /// A `//` in a value is ordinary data (ADR-0014 ruling 3), so the
     /// slashes must not open a phantom regex that hides the clause the
     /// date-range popover is looking for.
     #[test]
@@ -217,14 +216,14 @@ mod tests {
         assert!(!has_last("service=x # last=1h"));
         assert!(has_last("service=x # note\nlast=1h"));
         assert_eq!(first_pipe("service=x # | stats count()"), None);
-        // …and a `#` INSIDE a token is not a comment (ADR-0014 ruling 2).
+        // …and a `#` inside a token is not a comment (ADR-0014 ruling 2).
         assert!(has_last("color=#ff0000 last=1h"));
     }
 
     /// The grammar has no escape outside a delimited span, so a bare
-    /// backslash must not hide the quote that follows it — the walk read
-    /// `foo\"` as an escaped quote and offered the `last=` inside the
-    /// PHRASE the parser sees.
+    /// backslash must not hide the quote that follows it: reading `foo\"`
+    /// as an escaped quote would offer a `last=` that the parser sees
+    /// inside a quoted phrase.
     #[test]
     fn a_backslash_escapes_only_inside_a_delimited_span() {
         assert!(!has_last(r#"foo\" last=1h""#));
@@ -271,8 +270,8 @@ mod tests {
         assert_eq!(first_pipe("`a|b`=1 | stats count()"), Some(8));
     }
 
-    /// An unterminated span runs to end of input — the existing
-    /// fail-shape for partial, mid-typing text.
+    /// An unterminated span runs to end of input, the fail-shape for
+    /// partial, mid-typing text.
     #[test]
     fn an_unterminated_span_runs_to_end_of_input() {
         assert_eq!(first_pipe(r#"message="a | stats"#), None);

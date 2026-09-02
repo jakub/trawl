@@ -67,7 +67,6 @@ impl App {
                 ghost.cursor_offset,
             );
             self.tab.mark_editor_dirty();
-            // Recompute ghost for the new editor state.
             self.update_ghost_text();
         }
     }
@@ -75,7 +74,6 @@ impl App {
     /// Handle key events when editor is focused.
     #[allow(clippy::too_many_lines)] // Inherently large key dispatch
     pub(crate) fn handle_editor_key(&mut self, key: event::KeyEvent) {
-        // Debug: log the key event to see what we're receiving
         tracing::debug!(
             "editor key: modifiers={:?}, code={:?}",
             key.modifiers,
@@ -96,37 +94,32 @@ impl App {
                 self.tab.ghost = None;
                 self.tab.editor.clear_selection();
             }
-            // Execute query: F5
             (KeyModifiers::NONE, KeyCode::F(5)) => {
                 tracing::info!("executing query with F5");
                 self.execute_query();
             }
-            // Execute query: Ctrl+Enter
             (_, KeyCode::Enter) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 tracing::info!("executing query with ctrl+enter");
                 self.execute_query();
             }
-            // Execute query: Shift+Enter (or iTerm2's Ctrl+J)
+            // Ctrl+J is here because iTerm2 sends it for Shift+Enter.
             (KeyModifiers::SHIFT, KeyCode::Enter) | (KeyModifiers::CONTROL, KeyCode::Char('j')) => {
                 tracing::info!("executing query with shift+enter");
                 self.execute_query();
             }
-            // Clear editor: Ctrl+L
             (KeyModifiers::CONTROL, KeyCode::Char('l')) => {
                 self.active_tab_mut().clear();
                 self.active_tab_mut().mark_editor_dirty();
             }
-            // Format query: Ctrl+F
             (KeyModifiers::CONTROL, KeyCode::Char('f')) => {
                 self.format_editor_query();
             }
-            // Readline: Ctrl+A → line start
+            // Readline conventions: Ctrl+A/Ctrl+E jump to line start/end.
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => {
                 let editor = &mut self.active_tab_mut().editor;
                 editor.clear_selection();
                 editor.move_to_line_start();
             }
-            // Readline: Ctrl+E → line end
             (KeyModifiers::CONTROL, KeyCode::Char('e')) => {
                 let editor = &mut self.active_tab_mut().editor;
                 editor.clear_selection();
@@ -189,7 +182,6 @@ impl App {
                 editor.start_selection();
                 editor.move_to_line_end();
             }
-            // Undo: Ctrl+Z
             (KeyModifiers::CONTROL, KeyCode::Char('z')) => {
                 self.active_tab_mut().editor.undo();
                 self.active_tab_mut().mark_editor_dirty();
@@ -221,7 +213,6 @@ impl App {
                     self.active_tab_mut().mark_editor_dirty();
                 }
             }
-            // Clipboard: Ctrl+V (paste)
             (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
                 if let Some(text) = clipboard_get() {
                     let tab = self.active_tab_mut();
@@ -240,17 +231,14 @@ impl App {
                 self.active_tab_mut().editor.delete_word_after();
                 self.active_tab_mut().mark_editor_dirty();
             }
-            // Kill to line start: Ctrl+U
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
                 self.active_tab_mut().editor.delete_to_line_start();
                 self.active_tab_mut().mark_editor_dirty();
             }
-            // Kill to line end: Ctrl+K
             (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
                 self.active_tab_mut().editor.delete_to_line_end();
                 self.active_tab_mut().mark_editor_dirty();
             }
-            // Handle text editing.
             _ => {
                 let tab = self.active_tab_mut();
                 let editor = &mut tab.editor;

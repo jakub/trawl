@@ -2,19 +2,19 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The Atmosphere knobs site (jakub/coastwatch#308, point 6).
+//! The Atmosphere knobs site.
 //!
-//! Every tunable of the shader backdrop lives HERE and only here —
-//! palette arrays, shader selection, motion and texture knobs — so
-//! post-merge aesthetic iteration touches exactly one file. The look
-//! shipped by this issue is an explicit placeholder.
+//! Every tunable of the shader backdrop lives here and only here:
+//! palette arrays, shader selection, motion and texture knobs, so
+//! aesthetic iteration touches exactly one file. The current look is
+//! an explicit placeholder.
 //!
 //! Palettes are Rust-owned hex mirrors of the Mira Blue ramp rather
 //! than `getComputedStyle` reads: the stylesheet's tokens are
 //! `oklch()`/`color-mix()` expressions the vendored
 //! `getShaderColorFromString` cannot parse, and resolve-at-mount
 //! plumbing would freeze the first theme anyway. The two `--accent`
-//! anchors are the ONLY literal-hex blue tokens in fleet-ui.css and
+//! anchors are the only literal-hex blue tokens in fleet-ui.css and
 //! are machine-pinned by `tests/atmosphere_palette_parity.rs`; the
 //! surrounding mesh stops are hand-approximated from the `oklch`
 //! bg/panel ramp (documented, not machine-pinned).
@@ -35,7 +35,7 @@ pub const LIGHT_COLORS: [&str; 5] = ["#fafafa", "#e9eff6", "#c8d9ea", "#7ea6cc",
 /// literals (#5a9fd4 / #8fb8dc).
 pub const DARK_COLORS: [&str; 5] = ["#0a0a0a", "#12202e", "#1d3a57", "#5a9fd4", "#8fb8dc"];
 
-/// Slow drift — the issue asks for ~0.1–0.2.
+/// Slow drift; the intended range is 0.1 to 0.2.
 pub const SPEED: f64 = 0.15;
 
 /// Organic noise distortion (0..=1).

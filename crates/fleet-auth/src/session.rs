@@ -289,9 +289,9 @@ impl SessionKey {
     /// [`KEY_LEN`].
     pub fn from_base64(s: &str) -> Result<Self, SessionError> {
         let trimmed = s.trim();
-        // Try url-safe first (the historical canonical form), fall back
-        // through the other three. All four decoders are constant-time and
-        // reject non-alphabet bytes, so the cascade is safe.
+        // Try url-safe first (what `to_base64url` emits), fall back through
+        // the other three. All four decoders are constant-time and reject
+        // non-alphabet bytes, so the cascade is safe.
         let decoded = Base64UrlUnpadded::decode_vec(trimmed)
             .or_else(|_| Base64Url::decode_vec(trimmed))
             .or_else(|_| Base64Unpadded::decode_vec(trimmed))
@@ -338,14 +338,12 @@ impl std::fmt::Debug for SessionKey {
 
 /// Absolute unix-second expiry timestamp.
 ///
-/// Newtype around the raw second count so callers can't accidentally mix
-/// seconds with milliseconds — the `coastwatch-web` consumer is the
-/// second to use this module and one stray `.timestamp_millis()` would
-/// produce sessions that live 1000× too long without any compile-time
-/// or runtime signal.
+/// Newtype around the raw second count so callers can't mix seconds with
+/// milliseconds. One stray `.timestamp_millis()` would produce sessions
+/// that live 1000× too long with no compile-time or runtime signal.
 ///
-/// `#[serde(transparent)]` keeps the on-the-wire shape a bare integer
-/// so existing encrypted cookies still decrypt unchanged.
+/// `#[serde(transparent)]` keeps the newtype invisible on the wire, so the
+/// cookie payload's `exp` stays a bare integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionExpiry(i64);
@@ -383,10 +381,10 @@ impl SessionExpiry {
 
 /// Plaintext payload stored inside an encrypted session cookie.
 ///
-/// App-agnostic per ADR-0030: `role` is *not* in the payload — each app
-/// resolves its role from the [`VerifiedKey`] returned by
-/// `KeyStore::verify_key` at request time. `name` stays so the UI can render
-/// the user's name on first paint without a verify round-trip.
+/// App-agnostic per ADR-0030: authorization is not in the payload. Each app
+/// resolves roles and permissions from the [`VerifiedKey`] returned by
+/// `KeyStore::verify_key` at request time. `name` is here so the UI can
+/// render the user's name on first paint without a verify round-trip.
 ///
 /// `token` is the bearer token that middleware re-verifies against
 /// `KeyStore::verify_key`. Wrapped in [`Zeroizing`] so it's cleared on drop.
@@ -725,9 +723,9 @@ pub fn build_session_cookie_header(
 /// Build a `Set-Cookie` header value that clears the named cookie.
 ///
 /// Attributes (`HttpOnly`, `SameSite`, `Path`, optional `Secure`, optional
-/// `Domain`) MUST match what the original `Set-Cookie` had — browsers reject
-/// clear directives that don't match the issued attributes. `Max-Age=0`
-/// signals immediate deletion.
+/// `Domain`) must match what the original `Set-Cookie` had, because browsers
+/// reject clear directives that don't match the issued attributes.
+/// `Max-Age=0` signals immediate deletion.
 #[must_use]
 pub fn build_clear_cookie_header(
     name: &str,
@@ -816,8 +814,8 @@ pub fn decrypt(key: &SessionKey, cookie_value: &str) -> Result<SessionPayload, S
     Ok(payload)
 }
 
-/// Present-only Origin validation for login/logout endpoints (ADR-0004
-/// slice 2).
+/// Present-only Origin validation for state-changing auth endpoints
+/// (ADR-0004).
 ///
 /// The shared `fleet_session` cookie makes logout forgeable cross-site: a
 /// forged POST to any fleet app's logout endpoint would clear the cookie
@@ -833,21 +831,21 @@ pub fn decrypt(key: &SessionKey, cookie_value: &str) -> Result<SessionPayload, S
 ///   fail closed.
 /// - Anything else → reject.
 ///
-/// Sharing a parent-domain cookie is **not** an origin allowlist: a
-/// sibling fleet app (`evil.fleet.example` posting to
-/// `trawl.fleet.example/logout`) is a *different* origin and must be
-/// rejected even though both sit under the cookie's `shared_domain`.
-/// Otherwise any compromised sibling — or attacker-hosted content on one —
-/// could auto-submit a form POST that clears `fleet_session` fleet-wide.
-/// So origin validation is strictly same-host; the shared domain governs
-/// only the cookie's `Domain=` attribute, never who may hit auth endpoints.
+/// Sharing a parent-domain cookie is not an origin allowlist. A sibling
+/// fleet app (`evil.fleet.example` posting to
+/// `trawl.fleet.example/logout`) is a different origin and is rejected
+/// even though both sit under the cookie's `Domain=`; otherwise a
+/// compromised sibling, or attacker-hosted content on one, could
+/// auto-submit a form POST that clears `fleet_session` fleet-wide.
+/// `Domain=` decides where the browser sends the cookie, never who may call
+/// these endpoints.
 ///
-/// Pure string parsing — no request types — so both fleet-auth's own
+/// Pure string parsing, no request types, so both fleet-auth's own
 /// handlers and thin proxies that only take the `session` feature call
-/// the literally-same function instead of growing diverged copies.
+/// the same function instead of growing diverged copies.
 ///
 /// Note: the exact-host arm trusts the request `Host` header. A reverse
-/// proxy in front MUST forward the original `Host` or legitimate
+/// proxy in front must forward the original `Host` or legitimate
 /// same-origin requests will be rejected.
 #[must_use]
 pub fn origin_allowed(origin: Option<&str>, host: Option<&str>) -> bool {
@@ -877,10 +875,9 @@ pub struct OriginRejected;
 /// Callers pass the raw `Origin`/`Host` header values (already `Option<&str>`)
 /// rather than a request type, so this stays usable from both fleet-auth's
 /// own axum handlers and thin proxies that take only the `session` feature.
-/// On rejection it emits the shared `tracing::warn!` — the log fields and
-/// message live in **one** place so they can't drift between call sites — and
-/// returns [`OriginRejected`]. `handler` labels the endpoint (`"login"` /
-/// `"logout"`) in the log line.
+/// On rejection it emits the shared `tracing::warn!`, so the log fields and
+/// message can't drift between call sites, and returns [`OriginRejected`].
+/// `handler` labels the calling endpoint in that log line (e.g. `"login"`).
 ///
 /// # Errors
 ///
@@ -1176,9 +1173,6 @@ mod tests {
 
     #[test]
     fn session_expiry_serde_is_bare_integer() {
-        // #[serde(transparent)] keeps the wire format a bare i64, so
-        // SessionPayload JSON shape stays back-compatible with cookies
-        // written by earlier builds.
         let expiry = SessionExpiry::from_unix_seconds(1_700_000_000);
         let json = serde_json::to_string(&expiry).unwrap();
         assert_eq!(json, "1700000000");
@@ -1188,9 +1182,9 @@ mod tests {
 
     #[test]
     fn payload_serde_drops_no_fields() {
-        // SessionPayload has only {token, name, exp} — no `role`.
-        // If a future change adds a field, the JSON shape changes and this
-        // test prompts a deliberate decision about cookie back-compat.
+        // A field without a serde default changes the JSON shape and stops
+        // every already-issued cookie from parsing, so make that a
+        // deliberate decision.
         let payload = sample_payload();
         let json = serde_json::to_value(&payload).unwrap();
         let obj = json.as_object().expect("payload serialises as object");
@@ -1284,10 +1278,9 @@ mod tests {
 
     #[test]
     fn session_cookie_header_includes_domain_when_set() {
-        // `.fleet.home.lan` (legacy leading dot) and `fleet.home.lan` are
-        // semantically identical per RFC 6265; the `cookie` crate normalises
-        // both to the dotless form. Either input is acceptable; we assert on
-        // the normalised emit.
+        // `.fleet.home.lan` and `fleet.home.lan` are semantically identical
+        // per RFC 6265; the `cookie` crate normalises both to the dotless
+        // form. Either input is acceptable; we assert on the normalised emit.
         let header = build_session_cookie_header(
             "fleet_session",
             "abc".to_string(),
@@ -1501,13 +1494,12 @@ mod tests {
 
     #[test]
     fn sibling_under_shared_domain_is_rejected() {
-        // A parent-domain cookie is NOT an origin allowlist: a sibling
-        // fleet app posting to trawl's auth endpoints is a *different*
-        // origin and must be rejected, even though both live under the
-        // same `shared_domain`. Otherwise a compromised (or
+        // A parent-domain cookie is not an origin allowlist: origin
+        // validation stays strictly same-host, so a sibling fleet app
+        // posting to trawl's auth endpoints is rejected even though both
+        // live under the same cookie domain. Otherwise a compromised (or
         // attacker-hosted) sibling could forge a logout that clears
-        // `fleet_session` fleet-wide. This is the ADR-0004-slice-2
-        // regression: origin validation stays strictly same-host.
+        // `fleet_session` fleet-wide.
         assert!(!origin_allowed(
             Some("https://evil.fleet.lab.ktle.net"),
             Some("trawl.fleet.lab.ktle.net")

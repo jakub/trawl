@@ -5,15 +5,15 @@
 //! Hot buffer: batch-keyed in-memory event store for query freshness.
 //!
 //! Events land here via synchronous insertion during ingest/telemetry.
-//! The buffer makes fresh events visible to ALL queries by providing
+//! The buffer makes fresh events visible to every query by providing
 //! a temporary ndjson file that the executor can `UNION ALL BY NAME`
 //! with the parquet source.
 //!
 //! Events stay in the hot buffer until compaction writes parquet and
 //! calls [`drain`](HotBuffer::drain). During the brief window between
-//! parquet write and drain, events may appear in both sources — this
-//! is acceptable (transient overcount). Invisible events (missing from
-//! both sources) are not acceptable.
+//! parquet write and drain, events may appear in both sources; that
+//! transient overcount is acceptable, while invisible events (missing
+//! from both sources) are not.
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -47,13 +47,13 @@ pub struct HotBufferConfig {
 ///
 /// `field_types` is the catalog's pins intersected with the key set the
 /// snapshot's events actually carry, computed fresh on every
-/// [`HotBuffer::snapshot`] call — never cached per generation. Compaction
-/// makes pins durable and refreshes the in-process cache strictly BEFORE
-/// the atomic rename publishes the conformant parquet, but the hot drain
-/// that bumps the buffer generation happens AFTER the rename; a
-/// generation-cached pin set would be stale in that window and the union
-/// would hard-error. Intersecting with the observed keys also guarantees the
-/// emitter's `REPLACE` never names a column absent from the snapshot.
+/// [`HotBuffer::snapshot`] call, never cached per generation. Compaction
+/// makes pins durable and refreshes the in-process cache before the atomic
+/// rename publishes the conformant parquet, but the hot drain that bumps the
+/// buffer generation happens after that rename; a generation-cached pin set
+/// would be stale in between and the union would hard-error. Intersecting
+/// with the observed keys also guarantees the emitter's `REPLACE` never names
+/// a column absent from the snapshot.
 #[derive(Debug, Clone)]
 pub struct HotSnapshot {
     /// The ndjson snapshot file (shared across concurrent queries).
@@ -83,7 +83,8 @@ struct CachedSnapshot {
 /// Batch-keyed in-memory event store.
 ///
 /// Uses an `IndexMap` for insertion-order iteration (oldest-first
-/// FIFO eviction) keyed by batch ID (WAL filename stem).
+/// FIFO eviction) keyed by batch id (`{env}/{WAL filename stem}`, the
+/// shape compaction derives to drain what it just wrote).
 pub struct HotBuffer {
     batches: RwLock<IndexMap<Arc<str>, Arc<IngestBatch>>>,
     total_events: AtomicUsize,
@@ -204,7 +205,7 @@ impl HotBuffer {
     /// buffer share a single snapshot file (1 disk write instead of N).
     /// The `Arc` ensures the temp file stays alive until all queries using it finish.
     ///
-    /// The FILE is cached per generation; the PIN INTERSECTION is not — see
+    /// The file is cached per generation; the pin intersection is not — see
     /// [`HotSnapshot`] for why a generation-cached pin set would be stale in
     /// the compaction rename-to-drain window. The intersect is O(observed
     /// keys) over an in-process map, negligible next to the query itself.
@@ -246,10 +247,10 @@ impl HotBuffer {
     }
 
     /// The pins that apply to one snapshot: the catalog intersected with
-    /// the keys the file carries. An exact-name lookup on both sides —
-    /// every producer ASCII-folds field names before they can reach
-    /// [`HotBuffer::insert`], so key set and catalog agree on one spelling
-    /// per `DuckDB` identifier (see [`Self::insert`]).
+    /// the keys the file carries. An exact-name lookup on both sides:
+    /// `ingest::envelope::canonicalize` folds every field name before it can
+    /// reach [`HotBuffer::insert`], so key set and catalog agree on one
+    /// spelling per `DuckDB` identifier.
     fn pins_for(&self, keys: &[String]) -> trawl_core::schema::FieldTypes {
         self.field_catalog
             .intersect(keys.iter().map(String::as_str))
@@ -261,15 +262,13 @@ impl HotBuffer {
     /// Events are written schema-pioneers-first (see [`survey_schema`]) so
     /// that the reader can rely on `DuckDB`'s cheap default schema sample.
     ///
-    /// The key set is ASCII-lowercase by construction — no case merging is
-    /// needed here (the former `CaseMerge` rewrite is deliberately gone):
-    /// [`HotBuffer::insert`]'s production callers are exactly
+    /// The key set is ASCII-lowercase by construction, so no case merging
+    /// happens here: [`HotBuffer::insert`]'s production callers are exactly
     /// `PipelineWriter::publish` and telemetry's flush, and every event
-    /// reaching either has its field names folded at the producer's own
-    /// door (HTTP ingest in `envelope::canonicalize`, the syslog listener
-    /// at SD-key construction, telemetry in its `JsonVisitor`). Test-only
-    /// direct constructors that insert unfolded keys get the loud
-    /// behaviour: an unnameable `x_1` twin column, not a silent merge.
+    /// reaching either was canonicalized in `ingest::envelope::canonicalize`,
+    /// the one door that folds field names. Test-only constructors that
+    /// insert unfolded keys get the loud behaviour: an unnameable `x_1` twin
+    /// column, not a silent merge.
     fn build_snapshot(&self) -> Option<(tempfile::NamedTempFile, Vec<String>)> {
         let map = self.batches.read();
         if map.is_empty() {
@@ -290,12 +289,12 @@ impl HotBuffer {
             .chain((0..events.len()).filter(|&i| !pioneer[i]));
         for (batch_id, event) in order.map(|i| events[i]) {
             // Events are written verbatim: ingest canonicalization already
-            // stringified top-level object/array values (ADR-0009 slice 2),
-            // so every value here is a scalar.
+            // stringified top-level object/array values (ADR-0009), so every
+            // value here is a scalar.
             //
-            // Serialization failure here is very unlikely (we parsed it
-            // successfully during ingest), but log and skip rather than
-            // poisoning the entire snapshot.
+            // Serialization failure is very unlikely (the event parsed during
+            // ingest), but log and skip rather than poisoning the whole
+            // snapshot.
             match serde_json::to_writer(&mut tmpfile, event) {
                 Ok(()) => {
                     if let Err(e) = tmpfile.write_all(b"\n") {
@@ -353,26 +352,26 @@ impl HotBuffer {
 /// full observed key set.
 ///
 /// `DuckDB`'s `read_json` auto-detection infers the schema from a bounded
-/// prefix of the file (~20480 records) and then hard-errors — `unknown key`
-/// — on any later record carrying a key outside it. `_repairs` is
-/// sparse by construction (only repaired events carry it, ADR-0008) and the
-/// buffer holds up to `max_events` (100k by default), so one repaired event
-/// past the prefix used to break every query touching the hot buffer.
+/// prefix of the file (~20480 records) and then hard-errors (`unknown key`)
+/// on any later record carrying a key outside it. `_repairs` is sparse by
+/// construction (only repaired events carry it, ADR-0008) and the buffer
+/// holds up to `max_events` (100k by default), so a single repaired event
+/// past the prefix would break every query touching the hot buffer.
 ///
-/// Making the reader detect over the whole file (`sample_size=-1`) cures
-/// that at the cost of re-parsing the entire snapshot on every query and SSE
-/// poll: ~2.7x the read (+135ms measured on a full 100k-event / 100 MiB
-/// buffer, ~1s at half a million records), growing with the configured
-/// buffer size. Writing the pioneers first instead puts the complete key set inside the
-/// detection prefix for the price of one pass over the buffer, and does it
-/// with the events' real values: an always-emitted null placeholder column
-/// would be inferred as JSON, so `_repairs` would come back quoted
-/// and numeric fields would stop being numbers.
+/// Detecting over the whole file (`sample_size=-1`) also cures that, but
+/// costs a re-parse of the entire snapshot on every query and SSE poll:
+/// ~2.7x the read (+135ms measured on a full 100k-event / 100 MiB buffer,
+/// ~1s at half a million records), growing with the configured buffer size.
+/// Writing the pioneers first puts the complete key set inside the detection
+/// prefix for the price of one pass over the buffer, and does it with the
+/// events' real values: an always-emitted null placeholder column would be
+/// inferred as JSON, so `_repairs` would come back quoted and numeric fields
+/// would stop being numbers.
 ///
 /// A homogeneous buffer has exactly one pioneer (the first event), so the
 /// snapshot order is unchanged in the common case.
 ///
-/// The key set falls out of the same pass for free — its seen-set IS the
+/// The key set falls out of the same pass for free: the seen-set is the
 /// union of every event's keys. The caller intersects catalog pins against
 /// it, so the emitter's `REPLACE` can never name an absent column.
 fn survey_schema<'a>(events: impl Iterator<Item = &'a Event>) -> (Vec<bool>, Vec<String>) {
@@ -452,7 +451,8 @@ mod tests {
     }
 
     /// Build `n` plain events plus one carrying the sparse `_repairs`
-    /// key, with the sparse one last — the shape that used to break queries.
+    /// key, with the sparse one last — the order a prefix-sampled read
+    /// fails on unless the writer hoists the pioneer.
     fn events_with_trailing_sparse_key(n: usize) -> Vec<Event> {
         let mut events: Vec<Event> = (0..n)
             .map(|i| {
@@ -602,7 +602,7 @@ mod tests {
     fn snapshot_field_types_is_pins_intersect_observed_keys() {
         // The snapshot's pin set is the catalog intersected with the keys
         // the buffered events actually carry: a pin on a field no event has
-        // must NOT reach the emitter (REPLACE on an absent column throws),
+        // must not reach the emitter (REPLACE on an absent column throws),
         // and an observed key without a pin contributes nothing.
         use trawl_core::schema::CanonicalType;
 
@@ -643,12 +643,12 @@ mod tests {
 
     #[test]
     fn snapshot_reflects_new_pins_at_same_generation() {
-        // Compaction makes pins durable and refreshes the cache BEFORE the
+        // Compaction makes pins durable and refreshes the cache before the
         // atomic rename publishes the conformant parquet, but the hot drain
-        // that bumps the generation happens AFTER. A generation-cached pin
-        // set would be stale in that window — a hard union error once the
-        // coerced retry is gone. Pins must therefore be intersected on
-        // EVERY snapshot() call, even a cache hit.
+        // that bumps the generation happens after it. A generation-cached pin
+        // set would be stale in that window, and nothing retries a failed
+        // union, so a stale set is a hard error. Pins are therefore
+        // intersected on every snapshot() call, cache hit included.
         use trawl_core::schema::CanonicalType;
 
         let catalog = Arc::new(crate::catalog::FieldCatalog::new());

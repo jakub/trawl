@@ -105,8 +105,8 @@ impl SavedQueryStore {
     }
 
     /// List saved queries with schedule + latest-run + run-count details in
-    /// a single statement (the `1 + 3n` per-item lookup loop the sqlite port
-    /// would have shipped is replaced by lateral joins).
+    /// a single statement: the lateral joins keep it one round trip whatever
+    /// the item count, instead of three follow-up lookups per saved query.
     pub async fn list_with_details(
         &self,
         key_id: i64,
@@ -270,13 +270,13 @@ impl SavedQueryStore {
     }
 
     /// Delete a saved query, collecting the parquet result paths of its runs
-    /// in the SAME transaction as the delete.
+    /// in the same transaction as the delete.
     ///
     /// Lock order (shared with [`super::ScheduleStore::claim_run`]): the parent
     /// row first, then its `report_runs`. Locking the parent `FOR UPDATE` blocks
     /// a concurrent run INSERT (which needs a `FOR KEY SHARE` on the same row via
     /// the FK), so no new run can slip in after we collect paths. Locking every
-    /// run row — NOT just those with a non-null `result_path` — forces a
+    /// run row, not just those with a non-null `result_path`, forces a
     /// concurrent `finish_run` to either commit its path before us (we collect it
     /// here) or block until our cascade deletes its row (it then updates zero rows
     /// and the caller unlinks the file it wrote). Filtering on

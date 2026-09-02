@@ -25,18 +25,16 @@ enum Quoted {
 }
 
 impl Quoted {
-    /// Advance the quote state across ONE character of emitted SQL.
+    /// Advance the quote state across one character of emitted SQL.
     ///
-    /// `peek` is the character that FOLLOWS `ch`. Returns `true` when the
-    /// pair is a doubled delimiter (`''`, `""`) — one ESCAPED character
+    /// `peek` is the character that follows `ch`. Returns `true` when the
+    /// pair is a doubled delimiter (`''`, `""`) — one escaped character
     /// inside its own literal, never a close — which the caller must emit
     /// whole and step past; `DuckDB` has no backslash escape in either
     /// form, so there is nothing else to track.
     ///
-    /// This is the ONE transition rule both finalization scans read.
-    /// Param inlining and CTE indentation have to agree byte for byte
-    /// about where a literal ends: two hand-written SQL-quoting scanners
-    /// drifting apart is exactly the bug the multiline-literal fix was.
+    /// Param inlining and CTE indentation read this one transition rule,
+    /// so the two scans cannot disagree about where a literal ends.
     fn advance(&mut self, ch: char, peek: Option<char>) -> bool {
         let kind = match ch {
             '\'' => Quoted::String,
@@ -55,7 +53,9 @@ impl Quoted {
     }
 }
 
-/// `DuckDB` PIVOT specification — set when `pivot` is the terminal stage.
+/// `DuckDB` PIVOT specification, set by a `pivot` stage. A non-terminal
+/// one is flushed to a CTE before the following stage; a terminal one is
+/// rendered by `finalize`.
 pub(crate) struct PivotSpec {
     pub agg_sql: String,
     pub on_field: String,
@@ -73,7 +73,7 @@ pub(crate) enum FlushCondition {
     IfModifiedOrLimited,
     /// Flush if modified OR if there is a pending ORDER BY or LIMIT.
     ///
-    /// What an AGGREGATING stage needs: SQL applies both clauses AFTER
+    /// What an aggregating stage needs: SQL applies both clauses after
     /// the aggregation, so leaving either on the same SELECT would make
     /// `head 2 | stats count()` count the whole input and then limit a
     /// one-row result. Flushing puts them in the CTE the aggregate reads,
@@ -99,7 +99,7 @@ pub(crate) struct EmitterState {
     pub(crate) has_projection: bool,
     /// Persistent flag: set when any stage defines a complete output column set
     /// (table/fields, stats, top, rare, timechart, pivot). Unlike `has_aggregation`
-    /// and `has_projection`, this is NOT reset on CTE flush — it tracks whether
+    /// and `has_projection`, this is not reset on CTE flush — it tracks whether
     /// the pipeline as a whole produced an explicit schema.
     pub(crate) had_explicit_columns: bool,
     /// The time filter from the search stage, used by `timechart` auto-bucketing.
@@ -113,15 +113,15 @@ pub(crate) struct EmitterState {
     params: Vec<SqlValue>,
     /// How text search binds `_raw` in this pass (see [`RawBinding`]).
     raw_binding: RawBinding,
-    /// The pin scope typing comparisons at the CURRENT point of emission
-    /// (ADR-0011 slices A/A′): seeded with the full catalog snapshot by
-    /// [`Self::with_compare_pins`] — during search emission the scope IS
+    /// The pin scope typing comparisons at the current point of emission
+    /// (ADR-0011): seeded with the full catalog snapshot by
+    /// [`Self::with_compare_pins`] — during search emission the scope is
     /// the root — and advanced per pipe stage by
     /// [`Self::advance_pin_scope`], so a `where` after a `rename` or a
     /// computed `let` resolves against the schema actually in force.
     /// Distinct from the hot-branch conformance pins passed to
-    /// [`Self::with_hot_source`] — empty for pin-blind emission
-    /// (embedded mode, [`super::emit`]).
+    /// [`Self::with_hot_source`]. The scope stays empty for pin-blind
+    /// emission (embedded mode, [`super::emit`]).
     pin_scope: crate::pin_scope::PinScope,
     /// The statement's `now()` instant (ADR-0017 §3), handed in by the
     /// caller and never sampled here. Every source shape funnels through
@@ -129,10 +129,10 @@ pub(crate) struct EmitterState {
     /// to acquire an anchor and no way for it to acquire two.
     anchor: crate::context::EvalContext,
     /// How many of [`Self::params`] are already inside a CTE — i.e. how
-    /// many render BEFORE anything the current level emits.
+    /// many render before anything the current level emits.
     ///
-    /// The remainder were pushed at the CURRENT level, where the only
-    /// parameter-bearing clause is the WHERE, which renders AFTER the
+    /// The remainder were pushed at the current level, where the only
+    /// parameter-bearing clause is the WHERE, which renders after the
     /// SELECT list. That difference is the whole input to
     /// [`Self::emit_ordered_select`].
     flushed_params: usize,
@@ -168,7 +168,6 @@ pub fn validate_source_path(source: &str) -> Result<(), super::EmitError> {
             message: format!("source path contains invalid characters: {source}"),
         });
     }
-    // reject path traversal via .. components
     if source.split('/').any(|component| component == "..") {
         return Err(super::EmitError::UnsupportedOperation {
             message: format!("source path contains path traversal: {source}"),
@@ -205,7 +204,8 @@ fn validate_source_list(source: &str) -> Result<(), super::EmitError> {
 
 /// Build a `DuckDB` reader expression from a source path.
 ///
-/// Handles three source formats:
+/// Handles four source formats:
+/// - Subquery: `(SELECT …)` → passed through verbatim
 /// - List: `['path1', 'path2']` → `read_parquet([...], union_by_name=true)`
 /// - JSON/ndjson file: `*.json` or `*.ndjson` → `read_json(...)`
 /// - Parquet glob: everything else → `read_parquet('...', union_by_name=true)`
@@ -265,7 +265,7 @@ fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
 }
 
 /// Conform expression for one pinned field on the hot branch, applied
-/// UNTYPED — the emitter has no `DESCRIBE`, so the expression must be valid
+/// untyped — the emitter has no `DESCRIBE`, so the expression must be valid
 /// whatever type `read_json` inferred for the column.
 ///
 /// Text first, then the guarded cast, exactly as compaction conforms the
@@ -273,7 +273,7 @@ fn hot_reader(hot: &str) -> Result<String, super::EmitError> {
 /// query reads is the one the corpus will durably hold, so a result cannot
 /// flip when the compactor runs. Both halves matter — the text form pins
 /// the cast domain to VARCHAR whatever `read_json` inferred from the rest
-/// of the snapshot, and the guard refuses a cast that would ALTER the value
+/// of the snapshot, and the guard refuses a cast that would alter the value
 /// (`'1.5'` is not 2, `'TRUE'` is not `true`) instead of silently
 /// rewriting it.
 ///
@@ -288,16 +288,12 @@ fn conform_untyped(quoted: &str, pin: crate::schema::CanonicalType) -> String {
 /// `TRY_CAST`s — a second entry for the same identifier would be
 /// `Parser Error: Duplicate entry`.
 ///
-/// The comparison is exact (on the alias-mapped, quoted name): pins reach
-/// the emitter from the server's folded catalog — field names are
-/// ASCII-lowercased at ingest, at boot seeding, and in compaction's
-/// proposals — so one `DuckDB` identifier has exactly one pin spelling and
-/// there is nothing left to fold at emit time. The former runtime
-/// case-folding (collapsing `Status`+`status` pins, degrading disagreeing
-/// variants to VARCHAR) is deliberately gone with the unfolded catalog
-/// that produced such pin sets; the duplicate-entry hazard is now
-/// prevented by construction, and the timestamp skip is the one remaining
-/// identifier-level dedupe.
+/// The comparison is exact (on the quoted name): pins reach the emitter
+/// from the server's folded catalog — field names are ASCII-lowercased at
+/// ingest, at boot seeding, and in compaction's proposals — so one
+/// `DuckDB` identifier has exactly one pin spelling and there is nothing
+/// left to fold at emit time. The timestamp skip is therefore the only
+/// identifier-level dedupe this list needs.
 ///
 /// Returned in pin order (`FieldTypes` iterates sorted), so the emitted
 /// SQL stays deterministic.
@@ -351,28 +347,25 @@ impl EmitterState {
 
     /// Construct with a composite source that unions parquet with hot buffer ndjson.
     ///
-    /// The hot source is read via `read_json` with explicit format parameters
-    /// (`field_appearance_threshold=0` prevents `DuckDB` from collapsing
-    /// heterogeneous-schema events into a single MAP column) and a
-    /// `REPLACE` list that conforms the hot branch to the catalog:
+    /// The hot source is read via [`hot_reader`] under a `REPLACE` list
+    /// that conforms the hot branch to the catalog:
     ///
     /// - both envelope TIMESTAMP columns get their unconditional `TRY_CAST`s
-    ///   (ADR-0008 — survives empty `pins`, so catalog-less callers keep the
-    ///   timestamp guarantee; ingest already canonicalized them to UTC, so
-    ///   they need none of the zone-aware rung's work), and
+    ///   (ADR-0008 — survives empty `hot_pins`, so catalog-less callers keep
+    ///   the timestamp guarantee; ingest already canonicalized them to UTC,
+    ///   so they need none of the zone-aware rung's work), and
     /// - every pinned field (excluding the timestamp columns, already
-    ///   handled) gets its [`conform_untyped`] expression — the same
-    ///   text-first guarded cast compaction writes with — so a hot value
+    ///   handled) gets its [`conform_untyped`] expression, so a hot value
     ///   that disagrees with the write-time pin degrades to NULL instead of
     ///   throwing the union.
     ///
-    /// One `REPLACE` entry per identifier is guaranteed by construction —
+    /// One `REPLACE` entry per identifier is guaranteed by construction:
     /// pin names are ASCII-folded before they ever reach the catalog, and
     /// [`conformable_pins`] skips the timestamp columns' identifiers.
     ///
     /// The cold branch is deliberately plain: parquet is write-time
-    /// conformant (ADR-0009 slice 2), and a defensive cold cast would mask
-    /// a real invariant breach.
+    /// conformant (ADR-0009), and a defensive cold cast would mask a real
+    /// invariant breach.
     pub(crate) fn with_hot_source(
         primary: &str,
         hot: &str,
@@ -390,7 +383,7 @@ impl EmitterState {
         Ok(Self::with_source(composite, anchor))
     }
 
-    /// Construct with the hot-buffer ndjson as the SOLE source, carrying the
+    /// Construct with the hot-buffer ndjson as the sole source, carrying the
     /// same `REPLACE` conformance the union's hot branch gets.
     ///
     /// The executor reads hot-only whenever there is provably no cold data to
@@ -401,7 +394,7 @@ impl EmitterState {
     /// the conformed hot+cold union and the SSE filter compare the text
     /// `'200'` and reject it. Sharing one `REPLACE` list with
     /// [`Self::with_hot_source`] keeps a result from flipping the moment the
-    /// first parquet lands (ADR-0011 slice A).
+    /// first parquet lands (ADR-0011).
     pub(crate) fn with_hot_only_source(
         hot: &str,
         hot_pins: &crate::schema::FieldTypes,
@@ -415,7 +408,7 @@ impl EmitterState {
         ))
     }
 
-    /// The ONE constructor: every source shape ends here, so the anchor
+    /// The one constructor: every source shape ends here, so the anchor
     /// is a required argument of building any emission at all.
     fn with_source(source: String, anchor: crate::context::EvalContext) -> Self {
         Self {
@@ -448,29 +441,29 @@ impl EmitterState {
         self.anchor
     }
 
-    /// Attach the comparison pin set (ADR-0011 slice A). Builder-style so
+    /// Attach the comparison pin set (ADR-0011). Builder-style so
     /// the `emit*` entry points can funnel through one constructor per
     /// source shape.
     ///
     /// The clone is a refcount bump, not a map copy ([`crate::schema::FieldTypes`]
     /// shares its entries behind an `Arc`): every emission takes one, the
-    /// raw-free fallback takes a second, and the executor's pruned-retry /
-    /// hot-only ladder can re-emit a third time for one logical query.
+    /// raw-free pass takes a second, and the executor's hot-only fallback
+    /// re-emits both again for one logical query.
     pub(crate) fn with_compare_pins(mut self, pins: &crate::schema::FieldTypes) -> Self {
         self.pin_scope = crate::pin_scope::PinScope::root(pins);
         self
     }
 
     /// The pin typing a comparison against `dsl_name` at the current point
-    /// of emission, looked up through [`crate::schema::catalog_key`]
-    /// (alias resolution + ASCII fold).
+    /// of emission, looked up through [`crate::schema::catalog_key`] (an
+    /// ASCII fold — the DSL has no aliases).
     pub(crate) fn compare_pin(&self, dsl_name: &str) -> Option<crate::schema::CanonicalType> {
         self.pin_scope.pin_for(dsl_name)
     }
 
-    /// Advance the pin scope over one processed pipe stage (ADR-0011
-    /// slice A′) — called AFTER the stage's own expressions were emitted,
-    /// so they resolved against the incoming schema.
+    /// Advance the pin scope over one processed pipe stage (ADR-0011) —
+    /// called after the stage's own expressions were emitted, so they
+    /// resolved against the incoming schema.
     pub(crate) fn advance_pin_scope(&mut self, stage: &crate::ast::PipeStage) {
         self.pin_scope.advance(stage);
     }
@@ -540,7 +533,6 @@ impl EmitterState {
         outcome.map(|()| collected)
     }
 
-    /// Conditionally flush the current state to a CTE based on the given condition.
     pub(crate) fn flush_if(&mut self, condition: FlushCondition) {
         let should_flush = match condition {
             FlushCondition::IfModified => self.has_aggregation || self.has_projection,
@@ -588,31 +580,30 @@ impl EmitterState {
         self.flushed_params = self.params.len();
     }
 
-    /// Emit SELECT-list expressions that MAY push parameters, keeping the
+    /// Emit SELECT-list expressions that may push parameters, keeping the
     /// parameter list aligned with the placeholders in the rendered SQL.
     ///
-    /// `DuckDB` binds `?` POSITIONALLY, so the parameter list has to run
+    /// `DuckDB` binds `?` positionally, so the parameter list has to run
     /// in the order the placeholders appear in the text. A built SELECT
     /// renders `SELECT … FROM … WHERE …`, but the emitter walks the
-    /// SEARCH stage first: a parameter the search predicate pushed sits
-    /// FIRST in the list while its placeholder sits LAST in the
+    /// search stage first: a parameter the search predicate pushed sits
+    /// first in the list while its placeholder sits last in the
     /// statement. So the moment an aggregating stage pushes a parameter
     /// of its own into the SELECT list, the two lists disagree and the
     /// predicate's value is fed to the SELECT's placeholder — a
-    /// conversion error when the types clash, and a SILENT value swap
+    /// conversion error when the types clash, and a silent value swap
     /// when they don't (an `earliest=` bound against `now()`'s anchor).
     ///
-    /// `let`/`extract`/`eventstats` prevent this by flushing to a CTE
-    /// UNCONDITIONALLY: a CTE renders before the outer SELECT, which
-    /// restores the order. An aggregating stage cannot pay that
-    /// unconditionally — most aggregates push nothing, and wrapping every
-    /// `stats count() by host` in a CTE would be a pointless nesting on
-    /// the commonest query in the language. So the decision is taken from
-    /// what the emission ACTUALLY DID — the parameter list grew — never
-    /// from what its expressions are called.
+    /// `let`/`extract`/`eventstats` avoid that by flushing to a CTE
+    /// unconditionally, since a CTE renders before the outer SELECT. An
+    /// aggregating stage cannot pay that: most aggregates push nothing,
+    /// and wrapping every `stats count() by host` in a CTE would nest the
+    /// commonest query in the language for nothing. So the decision comes
+    /// from what the emission did — the parameter list grew — never from
+    /// what its expressions are called.
     ///
     /// `build` therefore runs at most twice, and the first run is
-    /// discarded WHOLE. That is sound because the only state a SELECT
+    /// discarded whole. That is sound because the only state a SELECT
     /// expression emission can touch is the parameter list (it quotes
     /// fields, translates calls and pushes literals; it binds no `_raw`
     /// and appends no WHERE clause), so truncating the parameters undoes
@@ -648,7 +639,6 @@ impl EmitterState {
     fn build_select(&self) -> String {
         let mut sql = String::new();
 
-        // SELECT
         if self.select.is_empty() {
             sql.push_str("SELECT *");
         } else {
@@ -656,7 +646,6 @@ impl EmitterState {
             sql.push_str(&self.select.join(", "));
         }
 
-        // FROM
         sql.push_str("\nFROM ");
         sql.push_str(&self.source);
 
@@ -666,25 +655,21 @@ impl EmitterState {
             sql.push_str(sample);
         }
 
-        // WHERE
         if !self.where_clauses.is_empty() {
             sql.push_str("\nWHERE ");
             sql.push_str(&self.where_clauses.join(" AND "));
         }
 
-        // GROUP BY
         if !self.group_by.is_empty() {
             sql.push_str("\nGROUP BY ");
             sql.push_str(&self.group_by.join(", "));
         }
 
-        // ORDER BY
         if !self.order_by.is_empty() {
             sql.push_str("\nORDER BY ");
             sql.push_str(&self.order_by.join(", "));
         }
 
-        // LIMIT
         if let Some(limit) = self.limit {
             let _ = write!(sql, "\nLIMIT {limit}");
         }
@@ -701,7 +686,6 @@ impl EmitterState {
         });
     }
 
-    /// Whether the state currently has a pending pivot.
     pub(crate) fn has_pivot(&self) -> bool {
         self.pivot.is_some()
     }
@@ -714,12 +698,12 @@ impl EmitterState {
     /// then clear the param list. Subsequent stages can add fresh `?`
     /// params as normal.
     ///
-    /// Clearing the list also RESETS [`Self::flushed_params`]: that
+    /// Clearing the list also resets [`Self::flushed_params`]: that
     /// counter answers "how many parameters render before anything this
     /// level emits", and after inlining the answer is none — there are no
-    /// parameters at all. Leaving it stale made
+    /// parameters at all. A stale count lets
     /// [`Self::emit_ordered_select`] read a post-pivot parameter count
-    /// that had merely climbed back to the old value as "this level has
+    /// that has merely climbed back to the old value as "this level has
     /// pushed nothing", and skip the flush it exists to perform.
     pub(crate) fn flush_pivot_to_cte(&mut self) -> Result<(), super::EmitError> {
         let Some(pivot) = self.pivot.take() else {
@@ -742,9 +726,9 @@ impl EmitterState {
             Self::inline_params_counted(&pivot_sql, &self.params, param_idx);
 
         // Every accumulated parameter must have found a placeholder: the
-        // list is about to be DROPPED, so one left behind is a `?` that
+        // list is about to be dropped, so one left behind is a `?` that
         // survives into SQL nothing will ever bind — or that silently
-        // takes the NEXT stage's value. Two integers to check, and
+        // takes the next stage's value. Two integers to check, and
         // undiagnosable downstream, so it is a real error rather than a
         // debug assertion.
         if consumed != self.params.len() {
@@ -814,9 +798,9 @@ impl EmitterState {
         if self.pivot.is_some() {
             let (inlined, consumed) = Self::inline_params_counted(&sql, &self.params, 0);
             // The same refusal [`Self::flush_pivot_to_cte`] makes, for
-            // the same reason: the parameter list is DROPPED on the next
+            // the same reason: the parameter list is dropped on the next
             // line, so one left behind is a `?` nothing will ever bind.
-            // A terminal pivot inlines the WHOLE statement at once, so
+            // A terminal pivot inlines the whole statement at once, so
             // the count is over every placeholder in it.
             if consumed != self.params.len() {
                 return Err(super::EmitError::UnsupportedOperation {
@@ -884,17 +868,17 @@ impl EmitterState {
     /// Returns the inlined SQL and the next param index (for chaining across
     /// multiple SQL fragments).
     ///
-    /// The scan is QUOTE-AWARE, and has to be: a `?` inside a SQL string
-    /// literal or a quoted identifier is DATA, not a placeholder. The
-    /// emitter now authors both — `sev()`'s digits guard carries the
-    /// regex `'[+-]?[0-9]+'`, and a field name is a client-chosen key
-    /// that since backticks (ADR-0013 ruling 7) may contain ANY
-    /// character, `?` included — so a naive scan spliced the next user
-    /// literal into the middle of the regex (`'[+-]'m1'[0-9]+'`, a
-    /// parser error) and shifted every later parameter by one. Doubled
-    /// quotes (`''`, `""`) are escapes INSIDE their literal, never a
-    /// close; `DuckDB` has no backslash escape in either form, so there
-    /// is nothing else to track.
+    /// The scan is quote-aware, and has to be: a `?` inside a SQL string
+    /// literal or a quoted identifier is data, not a placeholder. The
+    /// emitter authors both — `sev()`'s digits guard carries the regex
+    /// `'[+-]?[0-9]+'`, and a backticked field name is a client-chosen
+    /// key that may contain any character, `?` included (ADR-0013 ruling
+    /// 7) — so a quote-blind scan splices the next user literal into the
+    /// middle of the regex (`'[+-]'m1'[0-9]+'`, a parser error) and
+    /// shifts every later parameter by one. Doubled quotes (`''`, `""`)
+    /// are escapes inside their literal, never a close; `DuckDB` has no
+    /// backslash escape in either form, so there is nothing else to
+    /// track.
     fn inline_params_counted(sql: &str, params: &[SqlValue], start_idx: usize) -> (String, usize) {
         let mut result = String::with_capacity(sql.len());
         let mut param_idx = start_idx;
@@ -925,8 +909,8 @@ impl EmitterState {
                     SqlValue::Bool(b) => {
                         result.push_str(if *b { "TRUE" } else { "FALSE" });
                     }
-                    // The typed literal form of the bound parameter —
-                    // ONE rendering shared with `SqlValue`'s `Display`,
+                    // The typed literal form of the bound parameter, one
+                    // rendering shared with `SqlValue`'s `Display`,
                     // because PIVOT (which cannot take parameters) must
                     // read the very instant the parameterized lanes bind.
                     SqlValue::Timestamp(at) => {
@@ -960,8 +944,8 @@ mod tests {
     use super::*;
 
     /// The inlining scan is quote-aware: a `?` inside a string literal or
-    /// a quoted identifier is DATA. `sev()`'s digits guard put the first
-    /// one in emitter-authored SQL, and the naive scan spliced the next
+    /// a quoted identifier is data. `sev()`'s digits guard puts one in
+    /// emitter-authored SQL, so a quote-blind scan would splice the next
     /// user literal into the middle of it — a parser error, and every
     /// later parameter shifted by one.
     #[test]
@@ -981,7 +965,7 @@ mod tests {
         assert_eq!(used, 2, "only the two real placeholders were consumed");
     }
 
-    /// A doubled quote is an ESCAPE inside its own literal, never a
+    /// A doubled quote is an escape inside its own literal, never a
     /// close: `'it''s ?'` stays one literal, and the `?` after it is the
     /// placeholder.
     #[test]

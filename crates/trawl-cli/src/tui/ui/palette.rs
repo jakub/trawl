@@ -37,7 +37,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     let theme = &app.theme;
     let area = centered_rect(65, 75, frame.area());
 
-    // Clear the area under the popup.
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -52,7 +51,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Split inner area: input line (1), separator (1), item list (rest).
     let chunks = Layout::vertical([
         Constraint::Length(1), // input
         Constraint::Length(1), // separator
@@ -96,7 +94,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     // Detect column mode: input contains a dot.
     let column_mode_service = input.find('.').map(|pos| &input[..pos]);
 
-    // Build display lines from filtered items.
     let list_width = list_area.width as usize;
     let display = build_display_lines(
         input,
@@ -107,12 +104,11 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
         list_width,
     );
 
-    // Compute scroll offset based on selected item position.
-    // We need to find the line index of the selected item.
+    // Headers and detail lines mean display lines outnumber items, so scroll is
+    // computed from the selected item's line index, not its item index.
     let selected_line_idx = find_selected_line(&display, selected);
     let scroll_offset = compute_scroll(selected_line_idx, visible_height, display.len());
 
-    // Render visible lines, highlighting the selected item.
     let visible_lines: Vec<Line<'_>> = display
         .iter()
         .skip(scroll_offset)
@@ -130,7 +126,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
 
     frame.render_widget(Paragraph::new(visible_lines), list_area);
 
-    // Scrollbar (if content exceeds visible height).
     if display.len() > visible_height {
         let mut scrollbar_state = ScrollbarState::new(display.len().saturating_sub(visible_height))
             .position(scroll_offset);
@@ -161,7 +156,8 @@ fn build_display_lines<'a>(
     let mut lines = Vec::new();
     let is_filtered = !input.is_empty();
 
-    // In column mode with no matches, show a "no matching service" or "no columns" message.
+    // Column mode reports "No matching service" for both misses: an unknown service
+    // prefix, and a known service whose after-dot column filter matched nothing.
     if filtered.is_empty() {
         let msg = if column_mode_service.is_some() {
             "  No matching service"
@@ -281,7 +277,6 @@ fn render_item_line<'a>(
     let mut spans = Vec::new();
     let indent = 2; // "  " prefix
 
-    // Selection indicator (populated by the caller via styling).
     spans.push(Span::raw("  "));
 
     // Label with match highlighting.
@@ -292,7 +287,6 @@ fn render_item_line<'a>(
             Style::default().fg(theme.text_primary),
         ));
     } else {
-        // Build spans with highlighted matched characters.
         for (i, ch) in item.label.chars().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
             let is_match = match_positions.contains(&(i as u32));
@@ -335,7 +329,6 @@ fn render_item_line<'a>(
 
 /// Render a detail line (indented, dimmed).
 fn render_detail_line<'a>(detail: &'a str, theme: &Theme) -> Line<'a> {
-    // Truncate long detail text.
     let max_len = 60;
     let display = if detail.len() > max_len {
         format!("    {}…", &detail[..max_len])

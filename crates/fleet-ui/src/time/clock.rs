@@ -3,11 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The single shared "now" tick every relative timestamp subscribes
-//! to (issue #33 D4). One module-level signal, advanced by ONE 30s
-//! interval installed once via [`install`] (the
-//! [`theme::install`](crate::theme) pattern) — never per-instance
-//! timers, so a page of 200 [`When`](super::when::When) labels costs
-//! one timer and re-renders in one batch.
+//! to. One module-level signal, advanced by one 30s interval installed
+//! once via [`install`] (the [`theme::install`](crate::theme)
+//! pattern), never per-instance timers: a page of 200
+//! [`When`](super::when::When) labels costs one timer and re-renders
+//! in one batch.
 
 use std::cell::RefCell;
 

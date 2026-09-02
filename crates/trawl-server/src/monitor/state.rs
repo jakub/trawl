@@ -186,7 +186,7 @@ impl RateTracker {
     }
 }
 
-/// Holds references to `AppState` fields plus cached values that don't change.
+/// The `AppState` handle plus the values the dashboard carries between ticks.
 #[derive(Debug)]
 pub struct MonitorState {
     state: AppState,
@@ -205,7 +205,6 @@ pub struct MonitorState {
 }
 
 impl MonitorState {
-    /// Create a new monitor state from an `AppState` and server config values.
     pub fn new(
         state: AppState,
         listen_addr: String,
@@ -380,9 +379,8 @@ impl MonitorState {
     }
 }
 
-/// Create a `MonitorState` from `AppState` and config values.
-///
-/// Convenience wrapper that extracts the relevant config fields.
+/// Convenience wrapper over [`MonitorState::new`] that takes `listen_addr`
+/// by reference.
 pub fn from_app_state(
     state: AppState,
     listen_addr: &str,

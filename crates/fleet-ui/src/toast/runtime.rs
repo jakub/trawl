@@ -8,10 +8,9 @@
 //! launched per push. Border-left color encodes the kind — the class
 //! mapping lives on [`ToastKind::as_class`] so it's testable natively.
 //!
-//! The title+detail wrapper is `toast-body`, NOT `body`: `.body` is a
-//! reserved Shell chrome class (the rail+main row), and its
-//! `display: flex` leaked into toasts when they shared the name,
-//! flattening title and detail onto one line.
+//! The title+detail wrapper is `toast-body`, not `body`: `.body` is a
+//! reserved Shell chrome class (the rail+main row) whose `display: flex`
+//! would flatten a toast's title and detail onto one line.
 
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
@@ -24,14 +23,14 @@ use super::stack::ToastStack;
 ///
 /// # Ownership contract
 ///
-/// In an app composed around [`Shell`](crate::shell::Shell), the Shell
-/// owns the bus: it calls `ToastBus::new()`, `provide_context`s it,
-/// and mounts the single `<Toasts/>` host. Everything rendered inside
-/// the Shell (router `<Outlet/>` content, footer, modals) pushes via
-/// `expect_context::<ToastBus>()`. Do NOT construct a second bus or
-/// mount a second `<Toasts/>` inside a Shell — that produces two
-/// competing toast stacks. Only screens rendered outside a Shell need
-/// their own `ToastBus::new()` + `<Toasts bus=bus/>` pair.
+/// [`Shell`](crate::shell::Shell) owns the bus: it calls
+/// `ToastBus::new()`, `provide_context`s it, and mounts the single
+/// `<Toasts/>` host. Everything rendered inside the Shell (router
+/// `<Outlet/>` content, footer, modals) pushes via
+/// `expect_context::<ToastBus>()`; a second bus or a second
+/// `<Toasts/>` inside a Shell means two competing stacks. Only screens
+/// rendered outside a Shell need their own `ToastBus::new()` +
+/// `<Toasts bus=bus/>` pair.
 #[derive(Debug, Clone, Copy)]
 pub struct ToastBus {
     stack: RwSignal<ToastStack>,

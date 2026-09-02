@@ -4,7 +4,7 @@
 
 //! `<Modal/>` — the dialog primitive every fleet modal composes.
 //!
-//! Owns the machinery each app modal used to copy-paste:
+//! Owns the machinery every dialog needs:
 //!
 //! - **Scrim + panel frame** — `modal-scrim > modal[.modal-sm]` with the
 //!   `m-hd` (icon chip / title / close) header, `m-body` (children) and
@@ -14,10 +14,10 @@
 //!   string-matching), so clicks and drag-selections inside the panel
 //!   never dismiss.
 //! - **Window-level Escape** — bound to `window` rather than the scrim
-//!   so it fires regardless of focus (the scrim-bound `on:keydown` the
-//!   trawl modals shipped only dispatched once focus was inside the
-//!   dialog subtree; on a freshly-opened modal Esc was a no-op). Gated
-//!   on [`overlay`](crate::overlay) topmost-layer arbitration so a modal
+//!   so it fires regardless of focus; a scrim-bound `on:keydown` only
+//!   dispatches once focus is inside the dialog subtree, which leaves
+//!   Esc dead on a freshly-opened modal. Gated on
+//!   [`overlay`](crate::overlay) topmost-layer arbitration so a modal
 //!   opened over a live drawer takes Escape without the drawer also
 //!   closing.
 //! - **Window-level Cmd/Ctrl+Enter** — opt-in via `on_submit`, for
@@ -65,7 +65,7 @@ pub fn Modal(
     //
     // FocusPolicy::Trap earns the aria-modal="true" below: initial focus
     // lands inside the panel, Tab/Shift+Tab cycle within it, and focus
-    // restores to the opener on close (issue #33 D2).
+    // restores to the opener on close.
     let layer =
         crate::overlay::use_overlay_layer_with(crate::overlay::FocusPolicy::Trap, move || {
             panel_ref.get().map(web_sys::Element::from)

@@ -4,13 +4,10 @@
 
 //! Pure badge tone. No `leptos`, no `web_sys` — builds on every target
 //! so the per-tone CSS-class fragment is exercised by native unit
-//! tests (mirrors [`crate::button::variant`]). Originally extracted by
-//! issue #31 from trawl's 22 `class="intel-badge"
-//! style="background:…;color:…"` call sites (that surface was retired in
-//! #112; coastwatch carries the pattern on); apps map their domain kinds
-//! (story state, TLP marking, claim relationship, …) onto this closed
-//! tone set at the call site — there is deliberately NO color/style
-//! passthrough prop (ADR-0003 hard decision, human call 2026-07-10).
+//! tests (mirrors [`crate::button::variant`]). Apps map their domain
+//! kinds (story state, TLP marking, claim relationship, …) onto this
+//! closed tone set at the call site; there is deliberately no
+//! color/style passthrough prop (ADR-0003).
 
 /// Semantic tone. Maps onto the `.bdg.{tone}` classes shipped in
 /// `styles/fleet-ui.css`, drawing on the fleet color tokens
@@ -42,8 +39,8 @@ impl Tone {
 }
 
 /// Compose the full `class` attribute rendered by `<Badge>`. The base
-/// class is `bdg`, NOT `badge` — fleet-ui.css already owns a
-/// `.rail .it .badge` rule (the rail count chip), and a top-level
+/// class is `bdg`, not `badge`, because fleet-ui.css already owns a
+/// `.rail .it .badge` rule (the rail count chip) and a top-level
 /// `.badge` rule would leak `display` / `text-transform` /
 /// `letter-spacing` into that chip through the cascade.
 #[must_use]

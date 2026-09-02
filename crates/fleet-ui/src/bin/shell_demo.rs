@@ -17,11 +17,11 @@
 //! cargo build -p fleet-ui --bin shell_demo --target wasm32-unknown-unknown
 //! ```
 //!
-//! For a live rendered preview — the way AC5's "toasts fire via context"
-//! is actually observed — the crate ships `index.html` + `Trunk.toml`
-//! next to `Cargo.toml`, so `cd crates/fleet-ui && trunk serve` renders
-//! it with the real fleet-ui CSS. No backend or auth required: a success
-//! and an error toast fire on mount, and buttons re-fire on demand.
+//! For a live rendered preview the crate ships `index.html` +
+//! `Trunk.toml` next to `Cargo.toml`, so `cd crates/fleet-ui && trunk
+//! serve` renders it with the real fleet-ui CSS. No backend or auth
+//! required: a success and an error toast fire on mount, and buttons
+//! re-fire on demand.
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
@@ -46,7 +46,9 @@ use leptos_router::path;
 
 /// The shader backdrop, behind fleet-ui's default-off `atmosphere`
 /// feature — `index.html` turns it on via `data-cargo-features`, so
-/// the trunk-served workbench (the evidence venue) always paints it.
+/// the trunk-served workbench paints it. The xtask design-cards pages
+/// are static HTML with no WebGL context, so the workbench is the only
+/// fleet-ui venue that shows the backdrop.
 ///
 /// The feature-off arm is not dead weight: it is the shape every
 /// non-mounting consumer compiles, and it is what `cargo check -p
@@ -84,8 +86,6 @@ fn rail_items() -> Vec<RailItem> {
             label: "Alerts".into(),
             icon: Icon::Alert,
             path: "/alerts".into(),
-            // Count chip — the slot coastwatch previously smuggled into
-            // the label text ("Editions (N)").
             badge: Some(3),
         },
     ]
@@ -128,10 +128,8 @@ fn modes() -> Vec<ModeTab> {
 /// Stands in for a page/modal rendered inside `Shell`: it reaches the
 /// Shell-owned [`ToastBus`] via `expect_context` (never constructing its
 /// own bus or `<Toasts/>` host) and fires both a success and an error
-/// toast. This is the "toasts fire via context" contract in miniature —
-/// verifiable with `trunk serve` alone, no backend or auth required. One
-/// of each fires on mount so a fresh load is self-evident; the buttons
-/// re-fire on demand.
+/// toast, verifiable with `trunk serve` alone. One of each fires on
+/// mount so a fresh load is self-evident; the buttons re-fire on demand.
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn ToastProbe() -> impl IntoView {
@@ -166,10 +164,10 @@ fn ToastProbe() -> impl IntoView {
     }
 }
 
-/// Mounts the issue-#28 Drawer + Tabs from a non-trawl consumer: a
-/// standalone workspace-style strip with a count chip, and a drawer
-/// composing the drawer-style strip, title/actions slots, and body
-/// panes switched by the active tab.
+/// Mounts the Drawer + Tabs from a non-trawl consumer: a standalone
+/// workspace-style strip with a count chip, and a drawer composing the
+/// drawer-style strip, title/actions slots, and body panes switched by
+/// the active tab.
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn DrawerProbe() -> impl IntoView {
@@ -218,9 +216,9 @@ fn DrawerProbe() -> impl IntoView {
     }
 }
 
-/// Mounts the issue-#28 modal family from a non-trawl consumer: the
-/// `Modal` shell with icon/footer/Cmd-Ctrl+Enter, and the promoted
-/// `ConfirmWithReasonModal`. Also exercises the `Btn` size axis.
+/// Mounts the modal family from a non-trawl consumer: the `Modal`
+/// shell with icon/footer/Cmd-Ctrl+Enter, and `ConfirmWithReasonModal`.
+/// Also exercises the `Btn` size axis.
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn ModalProbe() -> impl IntoView {
@@ -293,10 +291,9 @@ fn DemoApp() -> impl IntoView {
     // initialized". This mirrors trawl-web-ui's `App`, which likewise
     // calls `fleet_ui::install` in its body.
     let prefs = install("fleet-ui-demo:prefs");
-    // …and, like trawl-web-ui's App, the prefs must be PROVIDED as
+    // …and, like trawl-web-ui's App, the prefs must be provided as
     // context: TopBar's theme toggle reaches them via
-    // `use_context::<UiPrefs>()` and silently no-ops without this
-    // (the demo previously discarded `_prefs` — a latent bug).
+    // `use_context::<UiPrefs>()` and silently no-ops without this.
     provide_context(prefs);
 
     let rail_items_sig = Signal::derive(rail_items);
@@ -314,10 +311,6 @@ fn DemoApp() -> impl IntoView {
         <Router>
             <Routes fallback=|| view! { <p>"…"</p> }>
                 <Route path=path!("/login") view=move || view! {
-                    // The shader backdrop composed under the login card
-                    // — the coastwatch#308 target arrangement, and the
-                    // trunk-served evidence venue for ACs 3–6 (the
-                    // static design-cards workbench cannot host WebGL).
                     {backdrop(prefs.theme())}
                     <Login
                         brand="demo"
@@ -337,9 +330,9 @@ fn DemoApp() -> impl IntoView {
                         user=user
                         app_links=app_links_sig
                         on_logout=Callback::new(|()| {})
-                        // footer is #[prop(optional)] now — a footer-less app
-                        // simply omits it. The demo passes one to exercise the
-                        // slot (and the `auto` grid row sizing).
+                        // footer is #[prop(optional)]: a footer-less app simply
+                        // omits it. The demo passes one to exercise the slot
+                        // (and the `auto` grid row sizing).
                         footer=Box::new(|| view! {
                             <div class="statusbar">"demo footer"</div>
                         }.into_any())
@@ -352,7 +345,7 @@ fn DemoApp() -> impl IntoView {
                     >
                         // Child rendered inside Shell — reaches the
                         // Shell-owned ToastBus via expect_context and fires
-                        // success + error toasts (AC5's context contract).
+                        // success + error toasts.
                         <ToastProbe/>
                         // Hidden export sentinel — proves Icon is in scope
                         // without re-mounting TopBar/Rail (which Shell
@@ -361,11 +354,11 @@ fn DemoApp() -> impl IntoView {
                     </Shell>
                 }/>
             </Routes>
-            // Always-visible theme toggle, OUTSIDE <Routes> so it stays
+            // Always-visible theme toggle, outside <Routes> so it stays
             // mounted on /login too (the real Shell's TopBar toggle only
-            // exists on shell routes). This is what lets AC-4 — a live
-            // re-color of the SAME mounted canvas, no remount — be
-            // driven and captured while /login is on screen.
+            // exists on shell routes). That is what lets a theme flip
+            // re-color the mounted backdrop canvas in place, without a
+            // remount, while /login is on screen.
             <button
                 class="btn"
                 style="position:fixed;right:12px;bottom:12px;z-index:10"

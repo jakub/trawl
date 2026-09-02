@@ -2,39 +2,39 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The repin operation marker and staging-root layout (ADR-0011 slice B).
+//! The repin operation marker and staging-root layout (ADR-0011).
 //!
 //! `data/REPIN` is a small JSON document naming the job, the field, the
 //! two types and the current phase. It is written via the shared
 //! staged-write idiom ([`crate::epoch::publish_marker_staged`]: temp name
-//! → fsync → atomic rename → dir fsync) BEFORE any
-//! visible change and removed as the job's final act, so boot recovery
-//! reads exactly one file to know whether — and where — a repin died.
+//! → fsync → atomic rename → dir fsync) before any visible change and
+//! removed as the job's final act, so boot recovery reads exactly one
+//! file to know whether — and where — a repin died.
 //!
-//! The shadow and aside roots are SIBLINGS of the data root
-//! (`data.repin-next/`, `data.repin-aside/`), the epoch set-aside pattern
-//! — NOT dot-directories inside it: `DuckDB`'s recursive glob descends
-//! into dot-directories (probed by execution in
+//! The shadow and aside roots are siblings of the data root
+//! (`data.repin-next/`, `data.repin-aside/`), the epoch set-aside pattern,
+//! rather than dot-directories inside it: `DuckDB`'s recursive glob
+//! descends into dot-directories (probed by execution in
 //! `trawl-engine/tests/duckdb_probe.rs`), so an in-root shadow would be
 //! unioned into every fallback-glob query as duplicate rows. A sibling is
 //! invisible to every data-root glob and walk by construction and moves
 //! nothing that must not move — `wal/`, `scheduled/`, `EPOCH` and
 //! `CATALOG` never leave the data root.
 //!
-//! Being a sibling puts the staging on the PARENT's filesystem, which is
+//! Being a sibling puts the staging on the parent's filesystem, which is
 //! the data root's own for the shipped packaging (the volume is mounted
 //! at `/var/lib/trawl`, data at `/var/lib/trawl/data`) but not when an
-//! operator mounts a volume AT the data dir (`[data] path = "/mnt/logs"`)
-//! — and then no hardlink and no rename can cross. Nor is the root the
+//! operator mounts a volume at the data dir (`[data] path = "/mnt/logs"`)
+//! — and then no hardlink and no rename can cross. The root is not the
 //! only place a mount can sit: everything the engine touches lives
 //! arbitrarily deep under it (the shadow build hardlinks
 //! `{env}/{date}/{HH}/{service}.parquet`, the swap renames `{env}`), so a
-//! volume mounted at ANY env/date/hour subtree — tiered storage, a
+//! volume mounted at any env/date/hour subtree — tiered storage, a
 //! plausible archive layout — breaks the same two halves. That is not a
 //! survivable discovery mid-cutover (the swap is forward-only past the
 //! marker, so an `EXDEV`/`EBUSY` there costs the process and every
 //! subsequent boot replays it), so [`check_staging_filesystem`] proves
-//! the WHOLE env subtree is one filesystem BEFORE a job is allowed to
+//! the whole env subtree is one filesystem before a job is allowed to
 //! build anything.
 
 use std::path::{Path, PathBuf};
@@ -67,24 +67,23 @@ pub enum RepinPhase {
 
 /// The `data/REPIN` document.
 ///
-/// Dialect-free BY DESIGN (issue #79): a repin to `SEVERITY` may assert
-/// that the corpus's numerals are syslog PRI, but no replay path ever
-/// re-runs a cast — a `building` marker abandons the shadow (the values
-/// were never written), and a `cutover`/`cleanup` marker only completes
-/// renames over files the job already wrote. The dialect lives on the job
-/// ROW, where the report needs it; putting it here would imply a recovery
-/// that could re-read wire text, which is exactly what forward-only
-/// recovery does not do.
+/// Dialect-free by design: a repin to `SEVERITY` may assert that the
+/// corpus's numerals are syslog PRI, but no replay path ever re-runs a
+/// cast — a `building` marker abandons the shadow (the values were never
+/// written), and a `cutover`/`cleanup` marker only completes renames over
+/// files the job already wrote. The dialect lives on the job row, where
+/// the report needs it; putting it here would imply a recovery that could
+/// re-read wire text, which forward-only recovery does not do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepinMarker {
     /// The `repin_jobs` row this marker belongs to.
     pub job_id: i64,
     /// The repinned field (catalog key, folded).
     pub field: String,
-    /// The pin at claim time (CATALOG spelling — `SEVERITY` is not
+    /// The pin at claim time (catalog spelling — `SEVERITY` is not
     /// `BIGINT`, and boot recovery parses this back).
     pub from_type: String,
-    /// The target pin (CATALOG spelling, as written by
+    /// The target pin (catalog spelling, as written by
     /// `CanonicalType::as_catalog`).
     pub to_type: String,
     /// Where the job is.
@@ -116,8 +115,8 @@ pub fn marker_path(data_dir: &Path) -> PathBuf {
     data_dir.join(REPIN_MARKER)
 }
 
-/// Prove the staging siblings will land on the data root's OWN filesystem
-/// AND that the whole env subtree the engine moves lives on that same
+/// Prove the staging siblings will land on the data root's own filesystem
+/// and that the whole env subtree the engine moves lives on that same
 /// filesystem — i.e. that neither the data root nor anything nested under
 /// an env directory is a mount point.
 ///
@@ -125,11 +124,11 @@ pub fn marker_path(data_dir: &Path) -> PathBuf {
 /// and its siblings, neither of which crosses a filesystem. Discovering
 /// that mid-job is only ever bad: a hardlink `EXDEV` fails the build
 /// (clean, but late), and a corpus where nothing needed hardlinking builds
-/// fine and then meets the SAME failure in the forward-only swap, where
+/// fine and then meets the same failure in the forward-only swap, where
 /// the only safe answer is to exit the process — after which every boot
 /// replays the marker into the identical failure and refuses to start. A
 /// nested mount fails identically and even more opaquely: renaming a
-/// directory that CONTAINS a mount point is `EBUSY`, not `EXDEV`. One
+/// directory that contains a mount point is `EBUSY`, not `EXDEV`. One
 /// stat walk up front turns all of that into a refusal that changes
 /// nothing.
 pub fn check_staging_filesystem(data_dir: &Path) -> Result<(), String> {
@@ -316,7 +315,7 @@ mod tests {
         read_marker(tmp.path()).expect_err("corruption must surface");
     }
 
-    /// The staging roots are SIBLINGS of the data root — outside every
+    /// The staging roots are siblings of the data root — outside every
     /// data-root glob and walk (see the module doc for the probe that
     /// forced this).
     #[test]
@@ -349,7 +348,7 @@ mod tests {
         check_staging_filesystem(&data).expect("one filesystem for the whole corpus");
     }
 
-    /// A volume mounted at an env/date/hour SUBTREE breaks both halves of
+    /// A volume mounted at an env/date/hour subtree breaks both halves of
     /// the engine exactly as a mount at the root does — the shadow build
     /// hardlinks out of it (EXDEV) and the cutover renames the env
     /// directory containing it (EBUSY, past the point of no return) — so
@@ -380,7 +379,7 @@ mod tests {
         assert!(err.contains("EBUSY"), "{err}");
     }
 
-    /// A bind-mounted FILE is the same defect one level down: the shadow
+    /// A bind-mounted file is the same defect one level down: the shadow
     /// build hardlinks it, so a different device is EXDEV all the same.
     #[cfg(unix)]
     #[test]
@@ -403,7 +402,7 @@ mod tests {
         assert!(err.contains(&file.display().to_string()), "{err}");
     }
 
-    /// Only what the engine MOVES is in scope: `wal/` and `scheduled/`
+    /// Only what the engine moves is in scope: `wal/` and `scheduled/`
     /// never leave the data root, so a volume mounted there is not this
     /// job's business and must not refuse it.
     #[cfg(unix)]
@@ -439,7 +438,7 @@ mod tests {
         std::os::unix::fs::MetadataExt::ino(meta)
     }
 
-    /// A data root that is itself a mount point is refused BEFORE anything
+    /// A data root that is itself a mount point is refused before anything
     /// is built — the shape `[data] path = "/mnt/logs"` creates, and the
     /// one the forward-only cutover cannot survive. `/proc` is a real
     /// mount under `/` on every Linux box, so this is a genuine

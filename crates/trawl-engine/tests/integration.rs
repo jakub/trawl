@@ -79,9 +79,7 @@ fn field_filter_severity_number() {
 fn text_search_ilike() {
     let (exec, glob) = setup();
     let result = exec.run_query_max("error", &glob).unwrap();
-    // matches messages containing "error": nginx 500 ("internal server error"),
-    // nginx 502 ("bad gateway" — no "error"), sshd ("Connection refused" — no "error")
-    // only the 500 message contains the word "error"
+    // only the nginx 500 message ("internal server error") carries the word
     assert!(result.row_count() >= 1);
 }
 
@@ -237,7 +235,7 @@ fn time_filter_large_window() {
     assert_eq!(result.row_count(), 13);
 }
 
-// -- Phase 7: Extended DSL stages --
+// -- extended DSL stages --
 
 #[test]
 fn top_by_service() {
@@ -509,12 +507,12 @@ fn pivot_on_service() {
     assert!(result.columns.len() >= 4); // at least nginx, sshd, systemd, kernel
 }
 
-/// The PIVOT lane INLINES every parameter (`DuckDB` cannot parameterize
-/// a PIVOT), and `sev()` is the first emitter-authored SQL carrying a `?`
-/// inside a string literal — its digits guard, `'[+-]?[0-9]+'`. A naive
-/// scan spliced the next user literal into the middle of that regex and
-/// shifted every later parameter by one; this runs the whole shape
-/// end to end, so the SQL has to actually parse and answer.
+/// The PIVOT lane inlines every parameter (`DuckDB` cannot parameterize a
+/// PIVOT), and `sev()` emits a `?` inside a string literal: its digits
+/// guard, `'[+-]?[0-9]+'`. An inliner that scans for `?` without skipping
+/// string literals splices the next user literal into the middle of that
+/// regex and shifts every later parameter by one, so this runs the whole
+/// shape end to end and the SQL has to actually parse and answer.
 #[test]
 fn pivot_over_sev_keeps_the_digits_guard_intact() {
     let (exec, glob) = setup();
@@ -525,26 +523,27 @@ fn pivot_over_sev_keeps_the_digits_guard_intact() {
         )
         .expect("pivot over sev() must emit parseable SQL");
     assert_eq!(result.row_count(), 1);
-    // Exactly ONE nginx row carries that message and it is a `warn`, so
-    // the pivot has exactly one dynamic column: the ladder NUMBER, which
-    // is what the column holds. A parameter spliced into the regex — or
-    // shifted past it — would either fail to parse or let the other
+    // Exactly one nginx row carries that message and it is a `warn`, so
+    // the pivot has exactly one dynamic column: the ladder number, which
+    // is what the column holds. A parameter spliced into the regex, or
+    // shifted past it, would either fail to parse or let the other
     // severities through as extra columns.
     let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["13"], "unexpected pivot columns");
 }
 
-/// An AGGREGATION position is still a call: its per-position literal
-/// rules apply there too. `stats sev(level, "syslog")` bound the dialect
-/// as a parameter before, then handed `translate_function` a literal `?`
-/// and errored with `dialect "?" is not in the allowed set`.
+/// An aggregation position is still a call, so the per-position literal
+/// rules apply there too: binding the dialect of
+/// `stats sev(severity, "syslog")` as a parameter would hand
+/// `translate_function` a literal `?` and error with
+/// `dialect "?" is not in the allowed set`.
 #[test]
 fn sev_in_an_aggregation_position_keeps_its_dialect() {
     let (exec, glob) = setup();
     // The fixture's `severity` column carries OTel numbers; read as
-    // SYSLOG, 9 (info) is out of the 0-7 range and 17 has no reading
-    // either — so a syslog reading of this corpus is all NULL, while the
-    // OTel one is the ladder itself. Both must EMIT.
+    // syslog, 9 (info) is out of the 0-7 range and 17 has no reading
+    // either, so a syslog reading of this corpus is all NULL while the
+    // OTel one is the ladder itself. Both must emit.
     let syslog = exec
         .run_query_max(r#"* | stats max(sev(severity, "syslog")) as m"#, &glob)
         .expect(r#"stats sev(x, "syslog") must emit"#);
@@ -1060,7 +1059,7 @@ fn write_pin_conflict_corpus(cold_dir: &std::path::Path, hot: &std::path::Path) 
 /// Write a one-row cold parquet whose `meta` is a STRUCT next to a hot
 /// ndjson whose `meta` is a plain string — a FOREIGN nonconformant corpus:
 /// server-written parquet can never hold a STRUCT (write-time conformance,
-/// ADR-0009 slice 2), so no catalog pin exists for it.
+/// ADR-0009), so no catalog pin exists for it.
 fn write_foreign_struct_corpus(cold_dir: &std::path::Path, hot: &std::path::Path) {
     use duckdb::Connection;
     let conn = Connection::open_in_memory().unwrap();
@@ -1085,11 +1084,10 @@ fn duration_bigint_pins() -> FieldTypes {
     pins
 }
 
-/// Assert the pin-conflict result: BOTH rows present from ONE execution of
-/// the pin-conformed union — the cold value still a BIGINT integer, the
-/// nonconforming hot value degraded to NULL. The deleted coerced retry
-/// would instead have stringified BOTH sides to VARCHAR ("410"/"n/a"), so
-/// any String in the duration column proves a second, coercing execution.
+/// Assert the pin-conflict result: both rows present from one execution of
+/// the pin-conformed union, the cold value still a BIGINT integer and the
+/// nonconforming hot value degraded to NULL. A String in the duration
+/// column would mean a second, stringifying execution ran.
 fn assert_pin_conflict_rows(columns: &[trawl_engine::value::Column], rows: &[Vec<Value>]) {
     let dur = columns
         .iter()
@@ -1115,8 +1113,8 @@ fn assert_pin_conflict_rows(columns: &[trawl_engine::value::Column], rows: &[Vec
 fn hot_pin_conflict_nulls_hot_value_keeps_both_rows() {
     // Cold parquet has `duration` as BIGINT (write-time conformant); the hot
     // snapshot carries "n/a" for it. Under the BIGINT pin the emitter
-    // TRY_CASTs the hot branch, so ONE execution returns both rows with the
-    // hot value NULL — no retry, no VARCHAR coercion, cold data intact.
+    // TRY_CASTs the hot branch, so one execution returns both rows with the
+    // hot value NULL: no second pass, no VARCHAR coercion, cold data intact.
     let dir = tempfile::tempdir().unwrap();
     let hot = dir.path().join("hot.ndjson");
     write_pin_conflict_corpus(dir.path(), &hot);
@@ -1138,22 +1136,19 @@ fn hot_pin_conflict_nulls_hot_value_keeps_both_rows() {
     assert_pin_conflict_rows(&result.columns, &result.rows);
 }
 
-// NOTE: the former `hot_case_variant_pins_do_not_wedge_the_union` test is
-// deliberately gone with the emitter's runtime case-folding it exercised:
-// field names are ASCII-folded at every producer's own door (HTTP ingest
-// canonicalization, the syslog listener's SD-key construction, telemetry's
-// JsonVisitor) and again at the catalog's entry points (boot seeding,
-// compaction proposals), so a `FieldTypes` carrying two spellings of one
-// DuckDB identifier cannot be produced by the wired system — the
-// end-to-end proofs live in trawl-server's
-// `case_variant_field_names_fold_to_one_column_across_services` and
-// `syslog_mixed_case_sd_param_lands_folded_and_pins_folded`.
+// NOTE: no case-variant pin test lives here. Field names are ASCII-folded
+// at `envelope::canonicalize`, the one door every producer enters, and
+// again at the catalog's entry points (boot seeding, compaction proposals),
+// so a `FieldTypes` carrying two spellings of one DuckDB identifier cannot
+// be produced by the wired system. The end-to-end proofs live in
+// trawl-server's `case_variant_field_names_fold_to_one_column_across_services`
+// and `syslog_mixed_case_sd_param_lands_folded_and_pins_folded`.
 
 #[test]
 fn hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
-    // Same pinned conflict behind the LIST source shape the server emits,
-    // with one element pointing at an hour dir holding no file. The pruned
-    // retry (which survives — it only lost its conflict branch) must carry
+    // Same pinned conflict behind the list source shape the server emits,
+    // with one element pointing at an hour dir holding no file. Resolution
+    // narrows the list before the read, and the narrowed source must carry
     // the pins too.
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
@@ -1187,8 +1182,8 @@ fn hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
 #[test]
 fn export_parquet_hot_pin_conflict_nulls_hot_value() {
     // The export lane of the pinned conflict: both rows land in the exported
-    // parquet, with `duration` still BIGINT (a VARCHAR column would mean the
-    // deleted coercion ran).
+    // parquet, with `duration` still BIGINT (a VARCHAR column would mean a
+    // second, coercing execution ran).
     use duckdb::Connection;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1232,7 +1227,8 @@ fn export_parquet_hot_pin_conflict_nulls_hot_value() {
 
 #[test]
 fn export_parquet_hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
-    // Export lane crossed with the pruned-list source shape.
+    // Export lane crossed with the list source shape whose second element
+    // reaches no file.
     use duckdb::Connection;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1279,9 +1275,9 @@ fn export_parquet_hot_pin_conflict_nulls_hot_value_for_a_pruned_list_source() {
 fn foreign_nonconformant_corpus_errors_loudly() {
     // A STRUCT-typed parquet column can only come from foreign parquet
     // dropped into the data root (the boot pass conforms everything else),
-    // so no pin exists and the union hard-errors. The old behavior —
-    // silently degrading to a coerced or hot-only result — hid the breach;
-    // the honest contract is a loud error the operator can act on.
+    // so no pin exists and the union hard-errors. Degrading to a coerced or
+    // hot-only result would hide the breach; the contract is a loud error
+    // the operator can act on.
     let dir = tempfile::tempdir().unwrap();
     let hot = dir.path().join("hot.ndjson");
     write_foreign_struct_corpus(dir.path(), &hot);
@@ -1307,9 +1303,10 @@ fn foreign_nonconformant_corpus_errors_loudly() {
 
 #[test]
 fn foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_source() {
-    // Same foreign corpus behind the pruned-list shape: the conflict only
-    // surfaces on the pruned (first real) read, which must also error loudly
-    // rather than fall back hot-only past existing cold files.
+    // Same foreign corpus behind a list source one of whose elements
+    // reaches no file: the conflict surfaces on the narrowed read, which
+    // must also error loudly rather than fall back hot-only past existing
+    // cold files.
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
     let empty = dir.path().join("empty");
@@ -1374,7 +1371,8 @@ fn export_parquet_foreign_nonconformant_corpus_errors_loudly() {
 
 #[test]
 fn export_parquet_foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_source() {
-    // Export lane crossed with the pruned-list source shape.
+    // Export lane crossed with the list source shape whose second element
+    // reaches no file.
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
     let empty = dir.path().join("empty");
@@ -1410,10 +1408,10 @@ fn export_parquet_foreign_nonconformant_corpus_errors_loudly_for_a_pruned_list_s
 #[test]
 fn hot_cold_malformed_timestamp_keeps_cold_data() {
     // A malformed timestamp in the hot buffer must not throw the hot+cold
-    // union (ADR-0008: the partition key is never hard-CAST). Pre-fix this
-    // raised a Conversion Error that was misread as a schema conflict and
-    // silently degraded the query to hot-only — dropping the entire parquet
-    // history. With TRY_CAST on the union's hot side, both rows survive.
+    // union (ADR-0008: the partition key is never hard-CAST). With TRY_CAST
+    // on the union's hot side both rows survive; a hard cast raises a
+    // Conversion error that reads as a schema conflict and drops the entire
+    // parquet history.
     use duckdb::Connection;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1538,7 +1536,7 @@ fn hot_sparse_repair_column_survives_inside_the_sample_window() {
     }
 }
 
-// ── pin-aware comparisons survive every lane (ADR-0011 slice A) ────────
+// ── pin-aware comparisons survive every lane (ADR-0011) ────────────────
 
 /// Cold parquet with a VARCHAR `status` column holding mixed
 /// numeric-looking and word values — the write-time-conformant shape a
@@ -1563,10 +1561,10 @@ fn status_varchar_pins() -> FieldTypes {
 
 #[test]
 fn pinned_comparison_applies_on_cold_only_run_query() {
-    // The formerly pin-blind branch (pool cold path): run_query itself
-    // must consult the pins. `status=200` binds text and matches only the
-    // stored "200"; `status>=400` TRY_CASTs and excludes "accepted"
-    // without erroring (pin-blind emission Conversion-errors here).
+    // The cold-only branch (pool cold path): run_query itself must consult
+    // the pins. `status=200` binds text and matches only the stored "200";
+    // `status>=400` TRY_CASTs and excludes "accepted" without erroring
+    // (pin-blind emission Conversion-errors here).
     let dir = tempfile::tempdir().unwrap();
     write_varchar_status_parquet(dir.path());
     let exec = Executor::new().unwrap();
@@ -1586,9 +1584,10 @@ fn pinned_comparison_applies_on_cold_only_run_query() {
 
 #[test]
 fn pinned_comparison_survives_pruned_list_source() {
-    // One list element points at an hour dir holding no file; the pruned
-    // retry must carry the same comparison pins — a pin dropped on retry
-    // turns `status>=400` into a Conversion error over 'accepted'.
+    // One list element points at an hour dir holding no file, so resolution
+    // narrows the list before the read. The narrowed source must carry the
+    // same comparison pins: a pin dropped there turns `status>=400` into a
+    // Conversion error over 'accepted'.
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
     let empty = dir.path().join("empty");
@@ -1661,7 +1660,7 @@ fn pinned_comparison_survives_hot_only_fallback() {
 
 #[test]
 fn pinned_comparison_survives_export_retry() {
-    // The export lane: pruned-list retry with comparison pins carried.
+    // The export lane: a narrowed list source with comparison pins carried.
     use duckdb::Connection;
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full");
@@ -1765,7 +1764,7 @@ fn hot_only_fallback_conforms_hot_columns_to_the_pin() {
     // the moment a fractional sibling shares its batch. So the equality
     // rule carries the value's numeric reading and `status=200.0` matches
     // the stored '200', exactly as the SSE matcher answers for the same
-    // wire value (ADR-0011 slice A, `trawl-core/tests/filter_parity.rs`).
+    // wire value (ADR-0011, `trawl-core/tests/filter_parity.rs`).
     let decimal = exec
         .run_query_with_hot(
             "status=200.0",
@@ -1845,7 +1844,7 @@ fn export_hot_only_fallback_conforms_hot_columns_to_the_pin() {
     );
 }
 
-// ── pinned rust_stages tail (ADR-0011 slice A′) ───────────────────────
+// ── pinned rust_stages tail (ADR-0011) ────────────────────────────────
 
 /// A source with a VARCHAR `status` column and kv-free messages, plus the
 /// VARCHAR pin for it.
@@ -2041,9 +2040,9 @@ fn extract_kv_tail_rename_keeps_the_display_zone() {
     );
 }
 
-/// The reviewer's repro: `let t2 = _time` copies the value verbatim, so
-/// both columns must show the SAME rendering in the caller's zone — never
-/// one local and one UTC side by side.
+/// `let t2 = _time` copies the value verbatim, so both columns must show
+/// the same rendering in the caller's zone, never one local and one UTC
+/// side by side.
 #[test]
 fn extract_kv_tail_alias_copy_keeps_the_display_zone() {
     let (exec, src, ft, _dir) = setup_pinned_time();
@@ -2104,25 +2103,24 @@ fn extract_kv_tail_computed_value_stays_as_rendered() {
     );
 }
 
-// ── parameter ordering across an aggregate SELECT list (#106) ─────────
+// ── parameter ordering across an aggregate SELECT list ────────────────
 //
-// `DuckDB` binds `?` POSITIONALLY, so the parameter list has to run in
-// the order the placeholders appear in the rendered SQL. A built SELECT
-// renders `SELECT … FROM … WHERE …`, but the emitter walks the SEARCH
-// stage first — so a parameter the search predicate pushed sits FIRST in
-// the list while its placeholder sits LAST in the text. Any parameter an
-// aggregating stage pushes into the SELECT list therefore collides with
-// it: the predicate's value is fed to the SELECT's placeholder.
+// `DuckDB` binds `?` positionally, so the parameter list has to run in the
+// order the placeholders appear in the rendered SQL. A built SELECT renders
+// `SELECT … FROM … WHERE …`, but the emitter walks the search stage first,
+// so a parameter the search predicate pushed sits first in the list while
+// its placeholder sits last in the text. Any parameter an aggregating stage
+// pushes into the SELECT list therefore collides with it: the predicate's
+// value is fed to the SELECT's placeholder. Flushing to a CTE is what keeps
+// them apart, because a CTE renders before the outer SELECT.
 //
-// `let`/`extract`/`eventstats` avoid this by flushing to a CTE (a CTE
-// renders BEFORE the outer SELECT, restoring the order); `stats` and
-// `timechart` did not. The failure is worst when the two values happen to
-// be type-compatible — a timestamp-shaped window bound against `now()`'s
-// TIMESTAMP anchor — because then nothing errors and the query answers
-// the wrong values in both places.
+// The failure is worst when the two values happen to be type-compatible, a
+// timestamp-shaped window bound against `now()`'s TIMESTAMP anchor, because
+// then nothing errors and the query answers the wrong values in both
+// places.
 //
 // These execute against real `DuckDB` rather than asserting on SQL text:
-// the bug IS the binding, and only the engine can show it.
+// the defect is the binding, and only the engine can show it.
 
 /// The anchor these emit under, so an assertion can name the exact
 /// instant `now()` has to answer.
@@ -2171,7 +2169,7 @@ fn text_cell(result: &QueryResult, row: usize, name: &str) -> String {
 }
 
 /// (a) The loud half: a plain filter's value cannot be cast to a
-/// TIMESTAMP, so the swap took the whole query down.
+/// TIMESTAMP, so a swap takes the whole query down.
 #[test]
 fn an_aggregate_now_binds_after_the_search_predicate() {
     let (exec, glob) = setup();
@@ -2182,7 +2180,7 @@ fn an_aggregate_now_binds_after_the_search_predicate() {
 }
 
 /// (b) The silent half: a timestamp-shaped window bound and the anchor
-/// are type-compatible, so the swapped query SUCCEEDS and answers the
+/// are type-compatible, so a swapped query succeeds and answers the
 /// window bound as `max(now())` while filtering on the anchor.
 #[test]
 fn a_time_window_bound_cannot_swap_with_an_aggregate_now() {
@@ -2223,8 +2221,8 @@ fn a_timechart_aggregate_now_binds_after_the_search_predicate() {
 }
 
 /// (d) The `_raw`-free twin pushes the same parameters in the same order,
-/// so the realignment has to reach BOTH passes — asserted over a source
-/// that HAS `_raw` (the first pass runs) and one that does not (the retry
+/// so the realignment has to reach both passes: asserted over a source
+/// that has `_raw` (the first pass runs) and one that does not (the retry
 /// runs).
 #[test]
 fn a_bare_text_search_keeps_aggregate_params_aligned_in_both_raw_variants() {
@@ -2240,11 +2238,10 @@ fn a_bare_text_search_keeps_aggregate_params_aligned_in_both_raw_variants() {
     assert_eq!(text_cell(&raw_free, 0, "n"), ANCHOR_TEXT);
 }
 
-/// The bug is not `now()`'s: ANY parameter an aggregate argument pushes
-/// hits it. This shape — an integer literal inside an aggregate — has
-/// been mis-binding since long before the anchor existed, and is the
-/// reason the fix keys on "the emission pushed a parameter" rather than
-/// on the anchor.
+/// The trap is not `now()`'s: any parameter an aggregate argument pushes
+/// hits it, which is why the guard keys on "the emission pushed a
+/// parameter" rather than on the anchor. Here the parameter is an integer
+/// literal inside an aggregate.
 #[test]
 fn an_aggregate_literal_argument_binds_after_the_search_predicate() {
     let (exec, glob) = setup();
@@ -2258,15 +2255,15 @@ fn an_aggregate_literal_argument_binds_after_the_search_predicate() {
     assert_eq!(text_cell(&result, 0, "m"), "POS");
 }
 
-// ── the same guard after a PIVOT (#106, review F1) ────────────────────
+// ── the same guard after a PIVOT ──────────────────────────────────────
 //
-// `DuckDB` cannot parameterize PIVOT, so `flush_pivot_to_cte` INLINES
-// every accumulated placeholder and empties the parameter list. The
-// ordering guard's "has this level pushed anything yet" reading is a
-// comparison against how many parameters are already inside a CTE, and
-// that count was not reset by the inlining — so once the post-pivot
-// parameter count climbed back to the stale value, the guard read
-// "nothing pushed here" and skipped the flush it exists to perform.
+// `DuckDB` cannot parameterize PIVOT, so `flush_pivot_to_cte` inlines every
+// accumulated placeholder and empties the parameter list. The ordering
+// guard reads "has this level pushed anything yet" as a comparison against
+// how many parameters are already inside a CTE, so the inlining must reset
+// that count: left stale, the guard reads "nothing pushed here" as soon as
+// the post-pivot count climbs back to it and skips the flush it exists to
+// perform.
 
 /// The pivot's own output columns, so a `where` downstream has something
 /// real to bind: `host` plus one column per status value.
@@ -2332,19 +2329,19 @@ fn a_timechart_aggregate_after_a_pivot_binds_after_the_predicate() {
     }
 }
 
-// ── an aggregating stage's PLACEMENT (#106, review F3) ────────────────
+// ── an aggregating stage's placement ──────────────────────────────────
 //
-// `stats`/`timechart` flushed only `IfModified`, so a pending LIMIT or
-// ORDER BY stayed on the SAME SELECT as the aggregation — where SQL
-// applies both AFTER it. `head 2 | stats count()` therefore counted the
-// whole input and then limited a one-row result.
+// SQL applies a LIMIT and an ORDER BY after the aggregation on the same
+// SELECT, so a pending one has to be flushed to a CTE first or
+// `head 2 | stats count()` counts the whole input and then limits a
+// one-row result.
 //
-// The ordering guard (#106) made that WORSE by making it depend on a
-// SIBLING: `stats count() as c` answered the un-limited count while
-// `stats count() as c, max(now()) as n` answered the limited one, because
-// the second pushed a parameter and got flushed. Placement must not key
-// off parameter accounting, so an aggregating stage now flushes whenever
-// a LIMIT or ORDER BY is pending, and both spellings agree.
+// Placement must also not key off parameter accounting, or the answer
+// depends on a sibling: `stats count() as c` would give the un-limited
+// count while `stats count() as c, max(now()) as n` gives the limited one,
+// because only the second pushes a parameter. An aggregating stage
+// therefore flushes whenever a LIMIT or ORDER BY is pending, and both
+// spellings agree.
 
 /// `head` before `stats` limits the INPUT to the aggregation.
 #[test]
@@ -2418,19 +2415,18 @@ fn a_limit_before_timechart_applies_before_the_aggregation() {
     );
 }
 
-// ── `top`/`rare` place the same way (#106, review F3 extended) ────────
+// ── `top`/`rare` place the same way ───────────────────────────────────
 //
 // `top`/`rare` desugar to `stats count() by field | sort count | limit N`
-// through `process_frequency`, which flushed only `IfModified` — so a
-// pending LIMIT or ORDER BY was absorbed into the AGGREGATION's own
-// SELECT. `head 2 | top 3 host` therefore counted all six matching rows
-// and then kept two GROUPS, which is a different question from the one
-// the pipeline asks.
+// through `process_frequency`, so they take the same placement rule. A
+// pending LIMIT absorbed into the aggregation's own SELECT would make
+// `head 2 | top 3 host` count all six matching rows and then keep two
+// groups, which is a different question from the one the pipeline asks.
 
-/// Every `count` a frequency stage produced, summed — the rows the
-/// aggregation actually SAW. Deliberately order-independent: `head` with
-/// no sort takes whichever rows the scan yields, so the identity of the
-/// survivors is not the assertion, their NUMBER is.
+/// Every `count` a frequency stage produced, summed: the rows the
+/// aggregation actually saw. Deliberately order-independent, because
+/// `head` with no sort takes whichever rows the scan yields, so the
+/// assertion is the number of survivors and not their identity.
 fn counted_rows(result: &QueryResult) -> i64 {
     integer_column(result, "count").iter().sum()
 }
@@ -2482,13 +2478,13 @@ fn a_pending_sort_orders_the_frequency_stages_input() {
     assert_eq!(integer_column(&result, "count"), vec![2]);
 }
 
-// ── a pivot follows a pivot (#106, review round 4 finding 1) ──────────
+// ── a pivot follows a pivot ───────────────────────────────────────────
 //
-// A pending pivot is flushed to a CTE before any following stage — and
-// that used to EXCLUDE another pivot. `process_pivot` opens with an
-// ordinary `flush_to_cte`, whose `build_select` does not render the
-// pending `PIVOT`, and then overwrites the spec: the first pivot was
-// silently dropped and the second ran over PRE-pivot input.
+// A pending pivot is flushed to a CTE before any following stage,
+// including another pivot. `process_pivot` opens with an ordinary
+// `flush_to_cte`, whose `build_select` does not render a pending `PIVOT`,
+// and then overwrites the spec, so without the pivot-aware flush the first
+// pivot is silently dropped and the second runs over pre-pivot input.
 
 /// The second pivot reads the FIRST one's dynamic output columns.
 ///
@@ -2527,12 +2523,10 @@ fn a_second_pivot_reads_the_first_pivots_output() {
     }
 }
 
-/// A column the FIRST pivot consumed into dynamic columns is gone, and
-/// naming it is a loud error rather than a quietly different answer.
-///
-/// Before the fix this query "succeeded", returning the second pivot
-/// alone computed over pre-pivot rows — `sum(status)` per status per
-/// host, with the first pivot's `count()` nowhere in the result.
+/// A column the first pivot consumed into dynamic columns is gone, and
+/// naming it is a loud error rather than a quietly different answer: a
+/// dropped first pivot would let this "succeed", returning `sum(status)`
+/// per status per host with the first pivot's `count()` nowhere in it.
 #[test]
 fn a_second_pivot_cannot_see_a_column_the_first_consumed() {
     let (exec, glob) = setup();
@@ -2548,8 +2542,8 @@ fn a_second_pivot_cannot_see_a_column_the_first_consumed() {
     );
 }
 
-/// A TERMINAL pivot is still never flushed by the loop — no stage
-/// follows it, so `finalize` renders it, inlining every parameter.
+/// A terminal pivot is never flushed by the loop: no stage follows it, so
+/// `finalize` renders it, inlining every parameter.
 #[test]
 fn a_terminal_pivot_is_unchanged() {
     let (exec, glob) = setup();

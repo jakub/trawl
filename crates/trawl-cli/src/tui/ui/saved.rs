@@ -2,7 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Saved queries overlay (legacy, replaced by `sidebar.rs` inline renderer).
+//! Saved-queries overlay, unreferenced.
+//!
+//! The Saved tab draws its list inline through `panels.rs` instead.
 #![allow(dead_code, unused_imports)]
 
 use ratatui::Frame;
@@ -13,7 +15,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use crate::tui::App;
 
-/// Render the saved queries sidebar.
+/// Render the saved-queries overlay.
 pub fn render(app: &App, frame: &mut Frame<'_>) {
     let theme = &app.theme;
     let area = centered_rect(80, 80, frame.area());
@@ -35,7 +37,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             return;
         }
 
-        // Build list of saved queries
         let items: Vec<ListItem<'_>> = saved
             .queries
             .iter()
@@ -83,7 +84,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
 
         frame.render_stateful_widget(list, area, &mut list_state);
     } else {
-        // Saved queries not loaded
         let text = Line::from("Saved queries not available");
         let paragraph = Paragraph::new(text)
             .block(block)

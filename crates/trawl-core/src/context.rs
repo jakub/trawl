@@ -2,17 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The evaluation context: the ONE instant a unit of output reads
+//! The evaluation context: the one instant a unit of output reads
 //! `now()` at (ADR-0017 §3).
 //!
 //! `now()` is one instant per unit of output, not one per call site. In
-//! BATCH that unit is the logical query: the instant is captured here, in
+//! batch that unit is the logical query: the instant is captured here, in
 //! Rust, and travels as a bound TIMESTAMP parameter into the SQL prefix
 //! and as an [`EvalContext`] into the `rust_stages` tail behind
 //! `extract kv`, so a `let` and a `where` in one statement cannot see
 //! different clocks and the SQL and the tail agree by construction. (In
-//! the LIVE lane the unit is one event, or one emitted aggregate
-//! snapshot; the same type carries it.)
+//! the live lane the unit is one event, or one emitted aggregate
+//! snapshot: `stream::SnapshotContext` is a newtype over this one, so the
+//! two boundaries cannot be passed for each other.)
 //!
 //! # Why the truncation lives here
 //!

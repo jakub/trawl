@@ -4,9 +4,8 @@
 
 //! Pure sparkline point/scale math. No `leptos`, no `web_sys` — builds
 //! on every target so the degenerate-input and scaling behaviour is
-//! exercised by native unit tests (extracted from trawl-web-ui's
-//! `sparkline.rs` in issue #31; the SVG assembly stays in the wasm-only
-//! [`component`](super::component)).
+//! exercised by native unit tests. The SVG assembly stays in the
+//! wasm-only [`component`](super::component).
 
 /// The two SVG point lists a sparkline renders: `line` for the
 /// `<polyline>` stroke, `fill` for the closed `<polygon>` area under it.

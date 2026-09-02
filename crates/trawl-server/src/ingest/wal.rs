@@ -4,12 +4,9 @@
 
 //! Write-ahead log for crash-safe event ingestion.
 //!
-//! Each ingest request writes events to a WAL file durably: write to
-//! `.tmp`, fsync the data, rename to `.ndjson`, then fsync the parent
-//! directory. The fsync *before* the rename is what prevents a hard kill
-//! from leaving a full-length but NUL-filled file (unflushed blocks read
-//! back as zeros) — an unparseable poison pill that would later wedge
-//! compaction. The compaction task converts these to parquet.
+//! Ingest writes one WAL file per `(env, service)` batch; compaction later
+//! converts those files to parquet. [`WalWriter::write`] carries the
+//! durability sequence and the reason for each step.
 
 use std::fs::File;
 use std::io::Write;
@@ -23,17 +20,14 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
-    /// Create a new writer targeting the given WAL directory.
     pub fn new(wal_dir: PathBuf) -> Self {
         Self { wal_dir }
     }
 
-    /// Ensure the WAL directory exists.
     pub fn ensure_dir(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.wal_dir)
     }
 
-    /// The WAL directory path.
     pub fn dir(&self) -> &Path {
         &self.wal_dir
     }
@@ -48,11 +42,9 @@ impl WalWriter {
     /// that head-of-line-blocks compaction. The parent-directory fsync makes
     /// the rename entry durable so a crash can't lose the just-acked batch.
     ///
-    /// Returns the final path of the WAL file on success.
-    ///
     /// Files land in `wal_dir/{env}/` (lazily created), named
     /// `{service}_{unix_millis}_{4_hex}.ndjson` with the service name
-    /// VERBATIM — path encoding is injective by validation (ADR-0009):
+    /// verbatim — path encoding is injective by validation (ADR-0009):
     /// both `env` and `service` were validated at ingest, so `api.v2`
     /// and `api_v2` are distinct files and pruning stays exact.
     pub fn write(&self, env: &str, service: &str, events: &[u8]) -> std::io::Result<PathBuf> {
@@ -70,13 +62,11 @@ impl WalWriter {
         std::fs::rename(&tmp_path, &final_path)?;
 
         // fsync the directory entry so the rename is durable, not just the
-        // file's data — the canonical "make a rename crash-safe" step.
-        //
-        // Best-effort: the data fsync above already made the bytes durable and
-        // the rename has published the file (the compactor WILL consume it), so
-        // a dir-fsync failure here only weakens crash-survival of the rename
-        // entry. It must NOT fail an otherwise-successful, already-visible write
-        // — that would falsely reject the batch and risk a duplicate on retry.
+        // file's data. Best-effort: the data fsync above already made the
+        // bytes durable and the rename has published the file to the
+        // compactor, so a failure here only weakens crash-survival of the
+        // rename entry. Failing an already-visible write would reject the
+        // batch and risk a duplicate on retry.
         if let Err(e) = File::open(&env_dir).and_then(|d| d.sync_all()) {
             tracing::warn!(
                 event_type = "wal_dir_fsync_failed",
@@ -132,8 +122,9 @@ mod tests {
 
     #[test]
     fn filename_carries_service_verbatim() {
-        // api.v2 and api_v2 must be DISTINCT files (injective paths,
-        // ADR-0009) — the old sanitizer collapsed them.
+        // api.v2 and api_v2 must be distinct files: path encoding is
+        // injective by validation, with no sanitizer to collapse them
+        // (ADR-0009).
         let dotted = WalWriter::generate_filename("api.v2").unwrap();
         let underscored = WalWriter::generate_filename("api_v2").unwrap();
         assert!(dotted.starts_with("api.v2_"), "got {dotted}");

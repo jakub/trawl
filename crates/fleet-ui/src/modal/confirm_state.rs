@@ -4,10 +4,10 @@
 
 //! Pure confirm-dialog state. No `leptos`, no `web_sys` — builds on
 //! every target (the [`theme::prefs`](crate::theme::prefs) template) so
-//! the open/close lifecycle is exercised by native unit tests
-//! (issue #31). Replaces the `RwSignal<Option<(id, name)>>` plumbing
-//! each trawl page hand-rolled around [`ConfirmModal`](super::confirm):
-//! a page stores `RwSignal<ConfirmState<T>>`, a "delete" action calls
+//! the open/close lifecycle is exercised by native unit tests. It
+//! stands in for a per-page `RwSignal<Option<(id, name)>>` around
+//! [`ConfirmModal`](super::confirm): a page stores
+//! `RwSignal<ConfirmState<T>>`, a "delete" action calls
 //! [`ConfirmState::request`], the modal renders while
 //! [`ConfirmState::is_open`], and confirm/cancel call
 //! [`ConfirmState::take`] / [`ConfirmState::cancel`]. The `ConfirmModal`

@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `trawl schema` subcommands: catalog read commands (#51).
+//! `trawl schema` subcommands: the field catalog's read commands plus repin.
 //!
 //! `fields`/`field`/`conflicts` hit the server's catalog routes and render
 //! through the generic driver formatter ([`crate::cli::render_driver_results`]).
@@ -20,7 +20,7 @@ use crate::cli::{ConnectionParams, OutputFormat, render_driver_results};
 /// Parse a `--last` window like `30m`, `2h`, `7d`, `1w` into seconds.
 pub fn parse_last(input: &str) -> Result<u64, CliError> {
     let input = input.trim();
-    // Split off the last CHAR, not the last byte: `split_at` panics off a
+    // Split off the last char, not the last byte: `split_at` panics off a
     // char boundary, and the unit position is exactly where a multi-byte
     // char lands (`--last 7µ` must be a usage error, not a crash).
     let (num, unit) = match input.char_indices().next_back() {
@@ -324,11 +324,12 @@ pub async fn run_field<W: Write>(
 /// The case file for a degraded pin: the analyzer's facts, the values the
 /// pin is shelving, and the one command that fixes it.
 ///
-/// Facts only, phrased here rather than stored (ADR-0011 slice C ruling 5).
-/// "rows shelved" is the LIFETIME total from the durable aggregates, which
-/// is a different number from the `rows_nulled` column in the conflict table
-/// below it — that one sums only the evidence rows still inside the
-/// per-field recency window — so the two are labelled apart on purpose.
+/// The wire carries structured facts, never stored prose (ADR-0011), so the
+/// words are written here. "rows shelved" is the lifetime total from the
+/// durable aggregates, a different number from the `rows_nulled` column in
+/// the conflict table below it, which sums only the evidence rows still
+/// inside the per-field recency window, so the two are labelled apart on
+/// purpose.
 fn render_verdict<W: Write>(
     out: &mut W,
     human: bool,
@@ -336,8 +337,8 @@ fn render_verdict<W: Write>(
     v: &trawl_client::DegradedVerdict,
 ) -> Result<(), CliError> {
     // A field name is a client-chosen JSON key that ingest polices for
-    // length and case ONLY: a name carrying `;` and a shell command, or a
-    // bidi override, is legal — and the last line here is written to be
+    // length and case only: a name carrying `;` and a shell command, or a
+    // bidi override, is legal, and the last line here is written to be
     // pasted into a shell. Every rendering of the name is neutralised.
     let shown = trawl_core::sanitize::sanitize_display_text(field);
     label(out, human, "\ndegraded pin:")?;
@@ -357,12 +358,12 @@ fn render_verdict<W: Write>(
     }
     label(out, human, &format!("  suggested:      {}", v.suggested_to))?;
 
-    // The remedy line is printed ONLY for a name a command line can carry
+    // The remedy line is printed only for a name a command line can carry
     // as itself. Two ways it cannot, both reachable because ingest polices
     // field names for length and case and nothing else:
     //
     // - it does not survive the neutralisation above, so the sanitised
-    //   spelling is a DIFFERENT string — pasted, it would repin some other
+    //   spelling is a different string; pasted, it would repin some other
     //   field, or nothing, or (with enough bad luck) a real field whose name
     //   genuinely contains U+FFFD;
     // - it starts with `-`, so the argument parser reads it as a flag
@@ -603,7 +604,7 @@ mod tests {
         );
     }
 
-    /// A name the sanitiser CHANGES cannot be named by a command: the
+    /// A name the sanitiser changes cannot be named by a command: the
     /// printed spelling is a different string, and repinning the wrong
     /// field rewrites the wrong corpus. The verdict facts still render.
     #[test]
@@ -631,7 +632,7 @@ mod tests {
         );
     }
 
-    /// A DASH-leading name is printable and shell-quotable but still cannot
+    /// A dash-leading name is printable and shell-quotable but still cannot
     /// be a command argument: the parser reads `'-x'` as a flag, quotes and
     /// all (`unexpected argument '-x' found`). It takes the same note
     /// branch, rather than an offered command that does not run.
@@ -711,7 +712,7 @@ mod tests {
     }
 
     /// Embedded mode: `fields --data` DESCRIBEs local parquet with no
-    /// server and no postgres (the retained-DESCRIBE acceptance evidence).
+    /// server and no postgres.
     #[test]
     fn describe_data_lists_local_parquet_columns() {
         let dir = tempfile::tempdir().unwrap();
@@ -746,7 +747,7 @@ mod tests {
     }
 }
 
-// -- repin (ADR-0011 slice B) -------------------------------------------------
+// -- repin --------------------------------------------------------------------
 
 /// The `trawl schema repin` flag bundle.
 #[derive(Debug, Clone, Copy)]
@@ -767,16 +768,16 @@ pub struct RepinFlags {
 /// One repin job → generic key/value (columns, rows) for the driver
 /// formatter — the job is a single record, so it renders as one row.
 ///
-/// EVERY fact rides the ROW — dialect, ambiguity, samples, liveness, the
-/// force verdict and its reason — because a scripted caller reading
+/// Every fact rides the row (dialect, ambiguity, samples, liveness, the
+/// force verdict and its reason), because a scripted caller reading
 /// `-f json` or `-f csv` must not have to parse the prose the case file
-/// writes for a human (issue #79). `requires_force` is NULL, not `false`,
-/// while the scan has yet to record a plan: absent is "not known yet".
+/// writes for a human. `requires_force` is null rather than `false` while
+/// the scan has yet to record a plan: absent is "not known yet".
 ///
-/// The samples are an ARRAY in JSON and a joined string everywhere else:
-/// a spreadsheet's formula-injection rule fires on a cell's FIRST
+/// The samples are an array in JSON and a joined string everywhere else.
+/// A spreadsheet's formula-injection rule fires on a cell's first
 /// character, so a joined cell puts the first sample there where
-/// `csv_escape_string`'s `'` prefix can neutralise it — inside a rendered
+/// `csv_escape_string`'s `'` prefix can neutralise it; inside a rendered
 /// JSON array it would sit behind a `[` and be invisible to that rule.
 pub fn repin_job_to_rows(
     job: &trawl_client::RepinJobResponse,
@@ -850,16 +851,15 @@ pub fn repin_job_to_rows(
     (columns, rows)
 }
 
-/// The repin report's case file: the evidence a plan's NUMBERS cannot carry
-/// — what the new pin cannot read, whether the corpus is dialect-ambiguous,
-/// whether anything is still WRITING the field, and why force is required
-/// (issue #79).
+/// The repin report's case file: the evidence a plan's numbers cannot
+/// carry. What the new pin cannot read, whether the corpus is
+/// dialect-ambiguous, whether anything is still writing the field, and why
+/// force is required.
 ///
-/// Facts from the job row, phrased here (the ADR-0011 slice C ruling: the
-/// server ships facts, the consumer writes the words). Every value is
-/// sender-chosen text and every one of them goes through display
-/// sanitisation — samples are attacker text by definition, and this lands in
-/// a terminal.
+/// Facts from the job row, phrased here (ADR-0011: the server ships facts,
+/// the consumer writes the words). Every value is sender-chosen text and
+/// goes through display sanitisation, because samples are attacker text by
+/// definition and this lands in a terminal.
 fn render_repin_case_file<W: Write>(
     out: &mut W,
     human: bool,
@@ -905,10 +905,10 @@ fn render_repin_case_file<W: Write>(
         )?;
     }
 
-    // Ruling 8: the operator has to be told that a repin translates HISTORY
-    // only. A live sender keeps arriving in the INGEST-time reading, so a
-    // syslog rewrite leaves a discontinuity at the cutover instant, and the
-    // fix for the live half is config, not another repin.
+    // A repin translates history only: a live sender keeps arriving in the
+    // ingest-time reading, so a syslog rewrite leaves a discontinuity at the
+    // cutover instant, and the fix for the live half is config, not another
+    // repin (ADR-0013 ruling 10).
     if let Some(live) = &job.liveness {
         let service = trawl_core::sanitize::sanitize_display_text(&live.service);
         label(
@@ -955,7 +955,7 @@ fn render_repin_case_file<W: Write>(
 /// `trawl schema repin <field> --to <type>`.
 ///
 /// An executing repin rewrites the archive, so it confirms interactively —
-/// and off a TTY it REFUSES without `--yes` rather than assuming (a piped
+/// and off a TTY it refuses without `--yes` rather than assuming (a piped
 /// or scripted invocation must state its intent). Dry runs never prompt.
 pub async fn run_repin(
     out: &mut impl Write,
@@ -1016,7 +1016,7 @@ pub async fn run_repin(
     if flags.wait && job.status == "running" {
         job = wait_for_terminal(&client, job).await?;
     }
-    // Computed AFTER the wait: a started job can still refuse at the
+    // Computed after the wait: a started job can still refuse at the
     // cutover gate when data ingested after the scan turns out to be
     // unreadable under the new type.
     let refused = job.status == "refused_needs_force";
@@ -1026,7 +1026,7 @@ pub async fn run_repin(
     }
     let (columns, rows) = repin_job_to_rows(&job, format);
     render_driver_results(&columns, &rows, format, out)?;
-    // The case file goes to stdout for a human and to STDERR for a machine
+    // The case file goes to stdout for a human and to stderr for a machine
     // format (`label`), so a piped `-f json` stays one parseable record while
     // the operator still reads the evidence.
     render_repin_case_file(out, format == OutputFormat::Table, &job)?;
@@ -1149,14 +1149,14 @@ mod repin_tests {
         assert_eq!(parsed["projected_nulls"], 0);
     }
 
-    /// AC9: the operator-facing transcript of a `--dry-run` over the
-    /// acceptance corpus, rendered by the real CLI path.
+    /// The operator-facing transcript of a `--dry-run`, rendered by the real
+    /// CLI path.
     ///
     /// The numbers are the ones the server produces in
     /// `trawl-server/tests/repin.rs::repin_to_severity_dry_run_matches_the_executed_rewrite`
     /// (five rows carrying, one unreadable `gold`, one dialect-ambiguous
-    /// `3`), so this pins what an operator actually READS when the plan says
-    /// the executing request would refuse.
+    /// `3`), so this pins what an operator reads when the plan says the
+    /// executing request would refuse.
     #[test]
     fn the_dry_run_transcript_shows_the_plan_the_evidence_and_the_verdict() {
         let job = trawl_client::RepinJobResponse {
@@ -1202,8 +1202,8 @@ mod repin_tests {
         render_repin_case_file(&mut out, true, &job).unwrap();
         let text = String::from_utf8(out).unwrap();
 
-        // Printed so the run can be pasted into a PR body verbatim
-        // (`cargo nextest run --no-capture`).
+        // Printed, not just asserted: the transcript as a whole is what an
+        // operator reads, and `--no-capture` shows it.
         println!("{text}");
 
         for expected in [
@@ -1219,11 +1219,11 @@ mod repin_tests {
         }
     }
 
-    /// The case file is the evidence a plan's NUMBERS cannot carry: the
+    /// The case file is the evidence a plan's numbers cannot carry: the
     /// asserted dialect, the ambiguous rows, the values the pin cannot read,
-    /// the force verdict — and, for a field something is still WRITING, the
-    /// discontinuity warning (issue #79, ruling 8): a repin translates
-    /// history, while live events keep taking the ingest-time reading.
+    /// the force verdict, and, for a field something is still writing, the
+    /// discontinuity warning. A repin translates history, while live events
+    /// keep taking the ingest-time reading.
     #[test]
     fn the_repin_case_file_states_the_evidence_and_the_discontinuity() {
         let mut job = sample_job();
@@ -1263,13 +1263,12 @@ mod repin_tests {
         assert!(String::from_utf8(out).unwrap().is_empty());
     }
 
-    /// The ROW carries every fact, in every machine format: a scripted
-    /// caller must never have to parse the case file's prose (issue #79
-    /// review). CSV joins the samples into ONE cell (", "-separated) so the
-    /// first sample's first character is the cell's first character — where
-    /// the formula-injection prefix actually fires; rendered as a JSON
-    /// array, a hostile sample would hide behind the `[`.  JSON keeps the
-    /// real array.
+    /// The row carries every fact, in every machine format: a scripted
+    /// caller must never have to parse the case file's prose. CSV joins the
+    /// samples into one cell (", "-separated) so the first sample's first
+    /// character is the cell's first character, where the formula-injection
+    /// prefix fires; rendered as a JSON array, a hostile sample would hide
+    /// behind the `[`. JSON keeps the real array.
     #[test]
     fn the_repin_row_carries_the_evidence_in_every_machine_format() {
         let mut job = sample_job();
@@ -1311,7 +1310,7 @@ mod repin_tests {
         let table = render(OutputFormat::Table);
         assert!(table.contains("otel") && table.contains("nginx"), "{table}");
 
-        // A sample whose FIRST character is a formula trigger lands at the
+        // A sample whose first character is a formula trigger lands at the
         // start of the joined cell, where the CSV escaping neutralises it.
         let mut hostile = job.clone();
         hostile.unmapped_samples = vec!["=cmd()".into(), "gold".into()];
@@ -1321,7 +1320,7 @@ mod repin_tests {
         let csv = String::from_utf8(out).unwrap();
         assert!(csv.contains("'=cmd()"), "formula prefix missing: {csv}");
 
-        // A job whose scan has not recorded a plan reports NO verdict —
+        // A job whose scan has not recorded a plan reports no verdict —
         // never `false`, which would read as "safe to execute".
         let mut running = sample_job();
         running.status = "running".into();
@@ -1340,7 +1339,7 @@ mod repin_tests {
         assert!(!text.contains("requires --force"), "{text}");
     }
 
-    /// An executing repin off a TTY refuses without `--yes` BEFORE any
+    /// An executing repin off a TTY refuses without `--yes` before any
     /// network access — the connection params here are deliberately
     /// unusable, so reaching the client would fail differently.
     #[tokio::test]
@@ -1374,7 +1373,7 @@ mod repin_tests {
         assert!(out.is_empty(), "nothing rendered before the refusal");
     }
 
-    /// `--dialect` is a SEVERITY-only assertion, refused here before any
+    /// `--dialect` is a severity-only assertion, refused here before any
     /// network access — the server refuses it too, but this one is a typo
     /// an operator can fix without spending a job claim. A severity target
     /// carries it through (the refusal below is the `--yes` gate, i.e. the

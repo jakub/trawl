@@ -25,18 +25,17 @@ use crate::value::{Column, QueryResult};
 
 /// Apply Rust pipeline stages to a SQL result set.
 ///
-/// Converts the columnar `QueryResult` into JSON events, compiles a
+/// Converts the columnar `QueryResult` into typed pipeline rows, compiles a
 /// stream plan from the given stages, runs it, and converts back.
 ///
 /// `pins` is the pin scope stamped at the kv split
-/// (`EmittedQuery::rust_stage_pins`, ADR-0011 slice A′), so the tail's
-/// `where`/`let` evaluate under the same interpretation the SQL prefix
-/// used. Sort stages are partitioned out below without walking the scope
-/// — they pass it through unchanged.
+/// (`EmittedQuery::rust_stage_pins`), so the tail's `where`/`let` evaluate
+/// under the same interpretation the SQL prefix used. Sort stages are
+/// partitioned out below without walking the scope; they pass it through
+/// unchanged.
 ///
-/// `anchor` is the STATEMENT's `now()` instant
-/// (`EmittedQuery::anchor`, ADR-0017 §3). The batch rule dominates the
-/// whole tail: EVERY row — pre-stage, accumulator feed, snapshot,
+/// `anchor` is the statement's `now()` instant (`EmittedQuery::anchor`,
+/// ADR-0017 §3). Every row — pre-stage, accumulator feed, snapshot,
 /// post-stage — evaluates under this one instant, because the tail is
 /// part of one unit of output with the SQL prefix that bound it. Nothing
 /// here samples a clock.
@@ -105,16 +104,14 @@ fn rows_to_events(result: &QueryResult) -> Vec<Row> {
         .collect()
 }
 
-/// A result cell as a pipeline cell — the DIRECT bridge, variant for
-/// variant.
+/// A result cell as a pipeline cell — a direct bridge, variant for variant.
 ///
-/// It used to route through `serde_json`, which has no spelling for a
-/// non-finite double and turned one into NULL on the way IN: a SQL
-/// prefix computing `1.0/0` handed the `extract kv` tail a null, so the
-/// tail counted, compared and printed something the same query without
-/// the kv split never saw. Both directions are exhaustive with no `_`
-/// arm, so a new variant on either side is a compile error rather than a
-/// silent NULL.
+/// Deliberately not a `serde_json` hop: JSON has no spelling for a
+/// non-finite double, so a SQL prefix computing `1.0/0` would hand the
+/// `extract kv` tail a null and the tail would count, compare and print
+/// something the same query without the kv split never sees. Both
+/// directions are exhaustive with no `_` arm, so a new variant on either
+/// side is a compile error rather than a silent NULL.
 fn cell_to_eval(cell: &crate::value::Value) -> EvalValue {
     match cell {
         crate::value::Value::Null => EvalValue::Null,
@@ -128,24 +125,23 @@ fn cell_to_eval(cell: &crate::value::Value) -> EvalValue {
 
 /// A pipeline cell as a result cell.
 ///
-/// A non-finite double SURVIVES as `Value::Float`; the ONE place it
-/// becomes `null` is `trawl_api::value`'s serializer, at the wire, which
-/// is also where the batch path has always nulled it. Adding a second
-/// nulling site here is exactly the bug this bridge removes.
+/// A non-finite double survives as `Value::Float`; the one place it becomes
+/// `null` is `trawl_api::value`'s serializer, at the wire, which is where
+/// the all-SQL path nulls it too. Nulling it here as well would make the kv
+/// tail disagree with the same query without the split.
 ///
-/// A `Timestamp` becomes the STRING `executor::extract_value` renders,
-/// deliberately: the display-offset shift runs AFTER the tail and
-/// re-parses that text, so a cell retyped here would silently stop
-/// shifting (ADR-0011's unshifted-when-tail contract).
+/// A `Timestamp` becomes the string `executor::extract_value` renders,
+/// deliberately: the display-offset shift runs after the tail and re-parses
+/// that text, so a cell retyped here would silently stop shifting.
 fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
     match cell {
         EvalValue::Null => crate::value::Value::Null,
         EvalValue::Bool(b) => crate::value::Value::Boolean(*b),
         EvalValue::Int(i) => crate::value::Value::Integer(*i),
         // `crate::value::Value::Integer` is signed, so a number above
-        // `i64::MAX` degrades to the double the JSON hop degraded it to.
-        // Unreachable from this bridge in practice — a result cell has no
-        // unsigned shape to arrive as — but stated rather than assumed.
+        // `i64::MAX` degrades to a double. Unreachable from this bridge in
+        // practice — a result cell has no unsigned shape to arrive as — but
+        // stated rather than assumed.
         #[allow(clippy::cast_precision_loss)]
         EvalValue::UInt(u) => crate::value::Value::Float(*u as f64),
         EvalValue::Float(f) => crate::value::Value::Float(*f),
@@ -155,7 +151,7 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
     }
 }
 
-/// Convert JSON events back to a columnar `QueryResult`.
+/// Convert pipeline rows back to a columnar `QueryResult`.
 ///
 /// Discovers the column set across all events (preserving insertion order)
 /// and fills missing keys with NULL.
@@ -220,20 +216,19 @@ fn apply_aggregate(
             match stream::apply_stage(stage, &mut event, anchor) {
                 StageResult::Pass => {}
                 StageResult::Filtered => continue 'event,
-                // `Done` ends the INPUT, not just this event's stage
-                // run. It used to break only the inner loop, which then
-                // fed the very event an exhausted `limit` had just
-                // refused — and went on to the next one, so
-                // `extract kv | limit 1 | stats count()` counted every
-                // row. Exhaustion is sticky, so no later event could be
-                // admitted either; stopping here is the same row set,
-                // read once. It is also what the post-stage loop below
-                // has always done with `Done`.
+                // `Done` ends the input, not just this event's stage
+                // run: breaking only the inner loop would feed the
+                // accumulator the very event an exhausted `limit` just
+                // refused, and then every event after it, so
+                // `extract kv | limit 1 | stats count()` would count
+                // every row. Exhaustion is sticky, so no later event
+                // could be admitted anyway. Same rule as the post-stage
+                // loop below.
                 StageResult::Done => break 'event,
             }
         }
-        // The BATCH rule: one statement anchor for every row, the
-        // pre-stages and the accumulator feed alike (ADR-0017 §3).
+        // One statement anchor for every row, the pre-stages and the
+        // accumulator feed alike (ADR-0017 §3).
         aggregation.feed_event(&event, anchor);
     }
 
@@ -285,11 +280,11 @@ fn apply_sorts(mut events: Vec<Row>, sort_stages: &[Spanned<PipeStage>]) -> Vec<
 
 /// Compare two optional cells for sorting purposes.
 ///
-/// NULLs sort last. Two numbers compare numerically, through the one
-/// probed DOUBLE order (`compare::double_total_cmp`) rather than
-/// `partial_cmp(…).unwrap_or(Equal)`, which left a NaN wherever arrival
-/// order happened to put it. Everything else compares as the text the
-/// cell shows (`row::cell_text`, the same renderer the live lane groups
+/// NULLs sort last. Two numbers compare numerically, through the probed
+/// DOUBLE order (`compare::double_total_cmp`) rather than
+/// `partial_cmp(…).unwrap_or(Equal)`, which would leave a NaN wherever
+/// arrival order happened to put it. Everything else compares as the text
+/// the cell shows (`row::cell_text`, the same renderer the live lane groups
 /// by).
 fn compare_cells(a: Option<&EvalValue>, b: Option<&EvalValue>) -> std::cmp::Ordering {
     match (a, b) {
@@ -307,8 +302,6 @@ fn compare_cells(a: Option<&EvalValue>, b: Option<&EvalValue>) -> std::cmp::Orde
     }
 }
 
-/// The numeric reading a sort takes — numbers only, exactly as the JSON
-/// form read only `Value::Number`.
 #[allow(clippy::cast_precision_loss)]
 fn numeric_cell(cell: &EvalValue) -> Option<f64> {
     match cell {
@@ -340,9 +333,9 @@ mod tests {
         }
     }
 
-    /// The bridge is an identity on every cell shape a result can hold —
-    /// specials included, which is the whole point: the JSON hop this
-    /// replaced turned `inf` and `NaN` into NULL on the way in.
+    /// The bridge is an identity on every cell shape a result can hold,
+    /// specials included: a JSON hop would turn `inf` and `NaN` into NULL
+    /// on the way in.
     #[test]
     fn the_bridge_round_trips_every_cell_shape() {
         let cells = [
@@ -370,7 +363,7 @@ mod tests {
             let round_tripped = eval_to_cell(&cell_to_eval(&cell));
             match (&cell, &round_tripped) {
                 // NaN is never equal to itself, so the pair is compared
-                // BITWISE — sign bit included, since DuckDB renders it.
+                // bitwise — sign bit included, since DuckDB renders it.
                 (crate::value::Value::Float(a), crate::value::Value::Float(b)) => {
                     assert_eq!(a.to_bits(), b.to_bits(), "{cell:?}");
                 }
@@ -379,8 +372,8 @@ mod tests {
         }
     }
 
-    /// A `Timestamp` cell — the one shape with no result-side twin —
-    /// lands as the STRING the shift machinery re-parses after the tail.
+    /// A `Timestamp` cell — the one shape with no result-side twin — lands
+    /// as the string the shift machinery re-parses after the tail.
     #[test]
     fn a_timestamp_cell_leaves_the_bridge_as_text() {
         let ts = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
@@ -391,7 +384,7 @@ mod tests {
             eval_to_cell(&EvalValue::Timestamp(trawl_core::compare::Instant::At(ts))),
             crate::value::Value::String("2026-01-15 09:00:00".into())
         );
-        // An infinity crosses as its WORD — a text the display-offset
+        // An infinity crosses as its word — a text the display-offset
         // shift leaves alone (it re-parses only its own rendering), so a
         // computed infinity survives a shifted run unchanged.
         assert_eq!(
@@ -481,7 +474,7 @@ mod tests {
         );
     }
 
-    /// The kv tail is the ONLY lane behind `extract kv`: a `let` sibling
+    /// The kv tail is the only lane behind `extract kv`: a `let` sibling
     /// reference naming no column of the pre-stage row binds the sibling's
     /// value here exactly as `DuckDB`'s lateral column alias does in the
     /// SQL lane, so `| extract kv | let ms = 1000, total = ms * 2` cannot

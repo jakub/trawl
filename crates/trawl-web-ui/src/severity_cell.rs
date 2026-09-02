@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Severity PRESENTATION, keyed off `_severity` alone (ADR-0013 §9).
+//! Severity presentation, keyed off `_severity` alone (ADR-0013 §9).
 //!
 //! Data-in / data-out, and ungated, so the two decisions that are easy to
 //! get subtly wrong are table-testable natively rather than only in a
@@ -12,11 +12,11 @@
 //! Two rules, both load-bearing:
 //!
 //! - **`_severity` only.** A bare `severity` column is ordinary sender
-//!   data now, and the `severity_text` fallback died with the column, so
-//!   coloring one would be trawl assigning meaning to a bare name.
-//! - **display, never the wire.** Results DISPLAY the token (`17` →
-//!   `error`), because that is the vocabulary the query language uses —
-//!   but json/csv/SSE keep the NUMBER, so arithmetic consumers are
+//!   data, so coloring one would be trawl assigning meaning to a bare
+//!   name.
+//! - **display, never the wire.** Results display the token (`17` →
+//!   `error`), because that is the vocabulary the query language uses,
+//!   while json/csv/SSE keep the number, so arithmetic consumers are
 //!   untouched. Rendering is presentation, and only presentation.
 //!
 //! The token text comes from `trawl_core::severity::otel_name`, the same
@@ -28,7 +28,7 @@
 use trawl_api::value::Value;
 
 /// Which result column presentation reads severity from: `_severity`,
-/// and nothing else (ADR-0013 §9).
+/// and nothing else.
 ///
 /// Both SPA call sites — the results table's cell rendering and the
 /// histogram's error bars — go through this one lookup, so "reads
@@ -41,15 +41,14 @@ pub fn severity_column<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<u
         .position(|name| name == trawl_core::schema::SEVERITY)
 }
 
-/// Which result columns render as severity TOKENS: `_severity`, plus the
-/// columns the response DECLARED (`sev()` output — ADR-0013 slice 2,
-/// ruling 9).
+/// Which result columns render as severity tokens: `_severity`, plus the
+/// columns the response declared (`sev()` output, ADR-0013 ruling 9).
 ///
 /// The membership rule is `trawl_core::severity::renders_as_severity`,
 /// the one every renderer asks; only the index collection is local.
-/// Distinct from [`severity_column`], which stays `_severity`-ONLY
+/// Distinct from [`severity_column`], which stays `_severity`-only
 /// because the histogram's error bucketing is a statement about the
-/// EVENT's severity, not about any column a query happened to compute.
+/// event's severity, not about any column a query happened to compute.
 #[must_use]
 pub fn severity_columns<'a>(
     names: impl IntoIterator<Item = &'a str>,
@@ -67,12 +66,12 @@ pub fn severity_columns<'a>(
 ///
 /// The column is BIGINT on the wire; a string is tolerated only because
 /// a hot-buffer row can carry the JSON shape before conformance renders
-/// it. Both shapes read through the ONE kernel
-/// (`trawl_core::severity::reading_*`, ADR-0013 slice 2 ruling 9), so a
-/// cell displays exactly the number ingest would have derived and
-/// `sev()` would compute — no surface has its own severity vocabulary.
-/// Every other shape (a float, a bool, an array) names no rung and has
-/// no reading, exactly as the kernel says.
+/// it. Both shapes read through the one kernel
+/// (`trawl_core::severity::reading_*`, ADR-0013 ruling 9), so a cell
+/// displays exactly the number ingest would have derived and `sev()`
+/// would compute — no surface has its own severity vocabulary. Every
+/// other shape (a float, a bool, an array) names no rung and has no
+/// reading, exactly as the kernel says.
 #[must_use]
 pub fn severity_number(v: &Value) -> Option<u8> {
     use trawl_core::severity::Dialect;
@@ -104,7 +103,7 @@ pub fn severity_class(v: &Value) -> &'static str {
     }
 }
 
-/// Whether a row sits at or above the `OTel` ERROR band (17), read off
+/// Whether a row sits at or above the `OTel` error band (17), read off
 /// `_severity` alone.
 #[must_use]
 pub fn row_is_error(row: &[Value], severity_idx: Option<usize>) -> bool {
@@ -118,8 +117,8 @@ pub fn row_is_error(row: &[Value], severity_idx: Option<usize>) -> bool {
 mod tests {
     use super::*;
 
-    /// Results DISPLAY the token, never the number (ADR-0013 §6) — and
-    /// the rendering is INJECTIVE, so `error2` is not shown as `error`.
+    /// Results display the token, never the number (ADR-0013 §6), and the
+    /// rendering is injective, so `error2` is not shown as `error`.
     #[test]
     fn a_severity_cell_renders_its_otel_short_name() {
         assert_eq!(severity_display(&Value::Integer(17)), "error");
@@ -132,7 +131,7 @@ mod tests {
         assert_eq!(severity_display(&Value::Null), "NULL");
     }
 
-    /// Coloring is by BAND, over the same reading.
+    /// Coloring is by band, over the same reading.
     #[test]
     fn a_severity_cell_colors_by_band() {
         assert_eq!(severity_class(&Value::Integer(17)), "lvl lvl-error");
@@ -146,9 +145,9 @@ mod tests {
     }
 
     /// A hot-buffer row can still carry the JSON shape before conformance
-    /// renders it, so a string reads through the same ladder — the ONE
-    /// kernel, so a numeric string and a padded token read here exactly
-    /// as they read at ingest and under `sev()`.
+    /// renders it, so a string reads through the same ladder: one kernel,
+    /// so a numeric string and a padded token read here exactly as they
+    /// read at ingest and under `sev()`.
     #[test]
     fn a_string_severity_reads_through_the_same_ladder() {
         assert_eq!(severity_number(&Value::String("error".into())), Some(17));
@@ -164,8 +163,8 @@ mod tests {
         assert_eq!(severity_display(&Value::String("17".into())), "error");
     }
 
-    /// The INTEGER shape — what the wire actually carries — is unchanged
-    /// by the delegation: the ladder guard is the kernel's own.
+    /// The integer shape is what the wire actually carries, and its
+    /// ladder guard is the kernel's own.
     #[test]
     fn an_integer_severity_reads_the_ladder_and_nothing_else() {
         for n in 1..=24i64 {
@@ -185,7 +184,7 @@ mod tests {
         assert_eq!(severity_number(&Value::Null), None);
     }
 
-    /// Cell rendering reads `_severity` AND whatever the response
+    /// Cell rendering reads `_severity` and whatever the response
     /// declared — a `sev()` output renders its token like any other
     /// severity column, and an undeclared bare name renders as data.
     #[test]
@@ -204,15 +203,15 @@ mod tests {
         );
     }
 
-    /// The COLUMN both SPA surfaces read is `_severity` and nothing
-    /// else: a bare `severity` is ordinary sender data now, and
-    /// `severity_text` is gone — neither may be mistaken for the slot.
+    /// The column both SPA surfaces read is `_severity` and nothing
+    /// else: a bare `severity`, or a sender's own `severity_text`, is
+    /// ordinary data and may not be mistaken for the slot.
     #[test]
     fn presentation_binds_the_derived_column_alone() {
         let cols = ["_time", "severity_text", "severity", "_severity", "message"];
         assert_eq!(severity_column(cols), Some(3));
 
-        // Same row set WITHOUT the derived slot: no column, so nothing
+        // Same row set without the derived slot: no column, so nothing
         // is colored and no bar is painted red.
         assert_eq!(
             severity_column(["_time", "severity_text", "severity", "message"]),
@@ -222,7 +221,7 @@ mod tests {
         assert_eq!(severity_column(std::iter::empty()), None);
     }
 
-    /// Bucketing reads `_severity` ONLY: a bare `severity` column is
+    /// Bucketing reads `_severity` only: a bare `severity` column is
     /// ordinary sender data and colors nothing.
     #[test]
     fn error_bucketing_keys_off_the_derived_slot_alone() {

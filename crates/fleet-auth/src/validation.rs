@@ -76,9 +76,11 @@ pub fn validate_app_namespace(app: &str) -> Result<(), AuthError> {
 
 /// Validate a role name.
 ///
-/// Rules: lowercase ascii + digits + underscore + hyphen, length 1..=64 —
-/// the hyphen is required by the converted legacy names (`trawl-admin`,
-/// `coastwatch-analyst`, …). Mirrors the `roles_name_format` CHECK.
+/// Rules: lowercase ascii + digits + underscore + hyphen, length 1..=64.
+/// The hyphen is the one charset difference from app namespaces and
+/// permission strings, which reject it: role names are `<app>-<role>`
+/// (`trawl-admin`, `coastwatch-analyst`). Mirrors the `roles_name_format`
+/// CHECK.
 pub fn validate_role_name(role: &str) -> Result<(), AuthError> {
     validate_identifier(
         role,

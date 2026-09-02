@@ -73,8 +73,8 @@ pub fn spawn_snapshot_collector(
         loop {
             interval.tick().await;
 
-            // The enabled-schedule count lives in postgres now; the async
-            // collector loop owns that (store) access and pushes the value
+            // The enabled-schedule count lives in postgres; this async
+            // collector loop owns that store access and pushes the value
             // into the sync MonitorState. One indexed COUNT(*) per second
             // on a tiny table is negligible, and per-tick refresh keeps the
             // dashboard (and its tests) current.
@@ -126,7 +126,6 @@ pub async fn run(app_state: AppState, refresh_ms: u64, shutdown: Arc<Notify>) ->
                         let is_quit = matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
                             || matches!(key.code, KeyCode::Char('q'));
                         if is_quit {
-                            // Signal the HTTP server to shut down.
                             shutdown.notify_waiters();
                             return Ok(());
                         }

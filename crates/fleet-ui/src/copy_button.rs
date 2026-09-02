@@ -2,9 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<CopyButton/>` — click-to-copy wired to the toast system (issue
-//! #33 D6). Unifies trawl's two hand-rolled copies (results-table raw
-//! event, editor share URL); coastwatch wants the same affordance.
+//! `<CopyButton/>` — click-to-copy wired to the toast system.
 //!
 //! The trigger is a secondary [`Btn`](crate::button::Btn) by default;
 //! passing `class` renders a bare `<span class=…>` instead — for
@@ -16,11 +14,10 @@
 //!
 //! The "which toast fires" decision lives in the pure [`copy_toast`]
 //! function so the click → toast outcome is a native `nextest` fact
-//! (see this module's tests) rather than something only eyeballed in a
-//! browser — mirroring [`crate::toast::stack`], where the toast *stack*
-//! transitions are likewise unit-tested off-target. The wasm component
-//! below is just the DOM glue that runs the async clipboard write and
-//! pushes the pure decision onto the bus.
+//! (see this module's tests), mirroring [`crate::toast::stack`], where
+//! the toast *stack* transitions are likewise unit-tested off-target.
+//! The wasm component below is the DOM glue that runs the async
+//! clipboard write and pushes the pure decision onto the bus.
 
 use crate::toast::ToastKind;
 
@@ -111,9 +108,8 @@ mod tests {
     use super::copy_toast;
     use crate::toast::{ToastKind, ToastStack};
 
-    /// The runtime toast-fires proof for D6, off-target: a successful
-    /// copy pushes exactly one `Success`/"Copied" toast onto the bus's
-    /// stack, carrying the app's success detail line.
+    /// A successful copy pushes exactly one `Success`/"Copied" toast
+    /// onto the bus's stack, carrying the app's success detail line.
     #[test]
     fn copy_success_fires_a_copied_toast() {
         let (kind, title, detail) = copy_toast(Ok(()), Some("share URL copied".into()));

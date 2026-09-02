@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pg-backed auth integration matrix for the fleet-auth cutover
-//! (ADR-0004 slice 1, issue #36 acceptance criteria).
+//! Pg-backed auth integration matrix over the fleet-auth keystore
+//! (ADR-0004).
 //!
 //! - AC1: fleet-minted key round-trip (create → whoami → revoke → 401)
 //! - AC3: route matrix (public probes, per-role denials, grantless 403
@@ -13,13 +13,8 @@
 //!   503 pg-down without backend detail)
 //! - AC6: scheduler skips revoked / expired / grant-stripped keys
 //! - AC8: audit poller sees out-of-process key mutations
-//!
-//! The slice-1 AC7 quarantine tests (legacy auth.db with colliding ids)
-//! were deleted in ADR-0004 slice 3: the transitional sqlite store and its
-//! quarantine apparatus no longer exist — the stores live in a dedicated
-//! postgres database keyed by fleet ids from day one.
 //! - SSE: revoked-before-connect → 401 (handshake-only auth is accepted
-//!   policy for this slice)
+//!   policy)
 
 mod common;
 
@@ -288,9 +283,9 @@ async fn ac3_grantless_key_never_reaches_rate_limiter(pool: PgPool) {
     }
 }
 
-/// Roles-as-data addition to the grantless matrix: a key whose role EXISTS
-/// but resolves zero permissions anywhere is still 403 on every
-/// authenticated route — holding a role is not capability, permissions are.
+/// A key whose role exists but resolves zero permissions anywhere is still
+/// 403 on every authenticated route: holding a role is not capability,
+/// permissions are.
 #[sqlx::test(migrations = false)]
 async fn ac3_zero_permission_role_key_403_everywhere(pool: PgPool) {
     let server = setup(pool).await;
@@ -390,7 +385,7 @@ async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class(pool: PgPool) {
         "role rate_rpm=2 must cap /query despite the huge class default: {statuses:?}"
     );
 
-    // Ingest class: its OWN budget of 2 — the interactive spend above must
+    // Ingest class: its own budget of 2 — the interactive spend above must
     // not have consumed it.
     let client = raw_client();
     let mut ingest_statuses = Vec::new();
@@ -425,9 +420,7 @@ async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class(pool: PgPool) {
 async fn ac4_whoami_golden_json_per_role(pool: PgPool) {
     let server = setup(pool).await;
 
-    // The converted roles resolve exactly the permission sets the legacy
-    // compile-time tables granted — minus the dead `key_manage`, which the
-    // conversion never carries and no handler ever checked.
+    // The frozen permission set each seeded role resolves to.
     let cases = [
         (
             &server.admin_token,
@@ -646,7 +639,7 @@ async fn ac5_envelope_pg_down_503_without_backend_detail(pool: PgPool) {
 // ---------------------------------------------------------------------------
 
 /// Drive the real scheduler over pg schedule state and a pg keystore,
-/// applying `mutate` to the owning key BEFORE the scheduler polls.
+/// applying `mutate` to the owning key before the scheduler polls.
 /// Returns the number of runs recorded after ~2.5s of 1s polling.
 ///
 /// `key_ttl`/`pre_sleep_ms` support the expiry case (expiry can't be set
@@ -807,9 +800,9 @@ async fn ac6_scheduler_skips_analyst_downgraded_to_ingest(pool: PgPool) {
     assert_downgrade_stops_schedules(pool, "trawl-ingest").await;
 }
 
-/// Roles-as-data variant of the downgrade: the key keeps its role, but the
-/// ROLE loses `saved_query`. The scheduler's Query-AND-SavedQuery gate must
-/// observe the mutation on its next liveness poll.
+/// The key keeps its role; the role itself loses `saved_query`. The
+/// scheduler's Query-AND-SavedQuery gate must observe the mutation on its
+/// next liveness poll.
 #[sqlx::test(migrations = false)]
 async fn ac6_scheduler_stops_when_role_loses_saved_query_permission(pool: PgPool) {
     let runs = scheduler_runs_after(
@@ -888,7 +881,7 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
     // Let the initial snapshot land before mutating.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Out-of-process mutation: a SECOND connection to the same database
+    // Out-of-process mutation: a second connection to the same database
     // (what fleet-admin does).
     let second = KeyStore::connect(&common::fleet_database_url(&pool))
         .await
@@ -999,7 +992,7 @@ async fn sse_stream_rejects_revoked_key_at_handshake(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// AC9 (slice 3): storage-loss observability + redacted store errors
+// AC9: storage-loss observability + redacted store errors
 // ---------------------------------------------------------------------------
 
 /// Killing the app-state database under a running server degrades /health

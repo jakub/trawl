@@ -2,10 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! "Did you mean?" suggestions via Levenshtein distance.
+//! "Did you mean?" suggestions, and the DSL field-name renderer.
 //!
-//! Provides typo correction for pipe stage names and function names,
-//! enabling contextual hints in parse error messages.
+//! Levenshtein typo correction for pipe stage and function names, behind
+//! the contextual hints in parse errors, plus [`quote_dsl_field`] — the
+//! one renderer every surface that offers a field name goes through, so a
+//! name trawl prints is a name trawl can parse back.
 
 /// All recognized pipe stage keywords.
 pub const KNOWN_PIPE_STAGES: &[&str] = &[
@@ -104,9 +106,8 @@ pub const KNOWN_FUNCTIONS: &[&str] = &[
 /// unconditionally, before any field filter (`last=2h`, `earliest="…"`,
 /// `latest="…"`).
 ///
-/// ADR-0013 ruling 7 corrects §6 here — the set is THREE, not one. A
-/// field of one of these names is reachable only through backticks, so
-/// [`quote_dsl_field`] always quotes them.
+/// A field of one of these names is reachable only through backticks, so
+/// [`quote_dsl_field`] always quotes them (ADR-0013 ruling 7).
 pub const GRAMMAR_KEYWORDS: &[&str] = &["last", "earliest", "latest"];
 
 /// The words an EXPRESSION position reads before it tries a field
@@ -114,7 +115,7 @@ pub const GRAMMAR_KEYWORDS: &[&str] = &["last", "earliest", "latest"];
 /// words (`and`/`or`/`not`/`in`/`matches`/`like`/`ilike`).
 ///
 /// Bare, these do not name a column inside `| where` / `| let`: a field
-/// called `true` renders as the boolean literal — a SILENT change of
+/// called `true` renders as the boolean literal — a silent change of
 /// meaning — and one called `not` turns the surrounding text into a
 /// parse error. A rendered name must be pasteable in every field
 /// position, so [`quote_dsl_field`] backticks the whole set, exactly as
@@ -185,7 +186,8 @@ pub fn quote_dsl_field(name: &str) -> Option<String> {
 
 /// Compute the Levenshtein edit distance between two strings.
 ///
-/// Uses a standard two-row dynamic programming approach — O(min(a,b)) space.
+/// Two rows rather than the full matrix, so the working space is
+/// proportional to `b` alone.
 pub fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
@@ -283,10 +285,9 @@ mod tests {
         assert_eq!(quote_dsl_field("trailing.").as_deref(), Some("`trailing.`"));
     }
 
-    /// The closed keyword set is THREE (ADR-0013 ruling 7 corrects §6),
-    /// and the rule is uniform: a rendered name is pasteable in every
-    /// position, so these are always quoted even where a bare spelling
-    /// would happen to parse.
+    /// The closed keyword set is three, and the rule is uniform: a
+    /// rendered name is pasteable in every position, so these are always
+    /// quoted even where a bare spelling would happen to parse.
     #[test]
     fn the_three_grammar_keywords_are_always_quoted() {
         assert_eq!(GRAMMAR_KEYWORDS, ["last", "earliest", "latest"]);
@@ -456,8 +457,8 @@ mod tests {
     /// and the shapes only backticks can express.
     ///
     /// The keyword half is written out here rather than read from
-    /// [`GRAMMAR_KEYWORDS`]/[`SEARCH_KEYWORDS`]/[`EXPRESSION_KEYWORDS`] ON
-    /// PURPOSE — drawing the corpus from the constants under test would
+    /// [`GRAMMAR_KEYWORDS`]/[`SEARCH_KEYWORDS`]/[`EXPRESSION_KEYWORDS`] on
+    /// purpose: drawing the corpus from the constants under test would
     /// make dropping a keyword invisible, since the name would leave the
     /// corpus with it. This list comes from grepping `keyword(...)` and
     /// `just("...=")` out of the grammar.
@@ -695,10 +696,12 @@ mod tests {
     }
 
     /// The half a forgotten keyword breaks: when the helper renders a name
-    /// BARE, the bare spelling must mean that name in every position.
-    /// `true` and `by` are good identifiers that never reach `field_ref`,
-    /// which is why `quote_dsl_field` backticks them even though
-    /// [`is_bare_field_name`] calls them lexable.
+    /// bare, the bare spelling must mean that name in every position.
+    /// `true` and `last` are good identifiers that some position reads as
+    /// something else first — the boolean literal inside `| where`, the
+    /// time keyword in the search stage — which is why `quote_dsl_field`
+    /// backticks them even though [`is_bare_field_name`] calls them
+    /// lexable.
     #[test]
     fn a_bare_rendering_means_that_name_in_every_position() {
         for original in adversarial_names() {

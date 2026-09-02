@@ -42,14 +42,13 @@ enum TokenType {
 
 /// Syntax highlighter for DSL queries.
 pub struct Highlighter<'a> {
-    /// Known field names from schema (for validation).
+    /// Known field names from the schema; unknown ones get a different colour.
     fields: Vec<std::string::String>,
     /// Syntax colors from the active theme.
     colors: &'a SyntaxColors,
 }
 
 impl<'a> Highlighter<'a> {
-    /// Create a new highlighter with schema information and theme colors.
     pub fn new(schema: Option<&SchemaResponse>, colors: &'a SyntaxColors) -> Self {
         let fields = schema
             .map(|s| s.columns.iter().map(|c| c.name.clone()).collect())
@@ -62,8 +61,6 @@ impl<'a> Highlighter<'a> {
     pub fn highlight_line(&self, text: &str) -> Line<'static> {
         let mut tokens = Self::tokenize(text);
 
-        // Post-tokenization: fix FilterKey detection.
-        // If token[i] is Field and token[i+1] is ":" operator, reclassify as FilterKey.
         Self::fix_filter_keys(&mut tokens);
 
         let colors = self.colors;
@@ -123,33 +120,30 @@ impl<'a> Highlighter<'a> {
 
     /// Tokenize a line into (`TokenType`, text) pairs.
     ///
-    /// **Display only, never correctness.** This is a colouring walk over
-    /// text the user is still typing, not a reading of the query: it has
-    /// no backtick awareness and no comment case, and it must never be
-    /// consulted for what a query MEANS. `trawl_core::parser` is the
-    /// authority on that, and `trawl_core::parser::scan` is the one
-    /// text-level walk allowed to change an answer (ADR-0014 ruling 5).
-    /// Unifying this walk with either needs a partial-input policy for an
-    /// unterminated token at the cursor, which is its own design problem.
+    /// Display only, never correctness. This is a colouring walk over text the user
+    /// is still typing, not a reading of the query: it has no backtick awareness, and
+    /// nothing may consult it for what a query means. `trawl_core::parser` is the
+    /// authority on that, and `trawl_core::parser::scan` is the one text-level walk
+    /// allowed to change an answer (ADR-0014 ruling 5). Unifying this walk with either
+    /// needs a partial-input policy for an unterminated token at the cursor, which is
+    /// its own design problem.
     #[allow(clippy::too_many_lines)]
     fn tokenize(text: &str) -> Vec<(TokenType, std::string::String)> {
         let mut tokens = Vec::new();
         let mut chars = text.chars().peekable();
         let mut current = std::string::String::new();
-        // Whether the cursor sits where the GRAMMAR admits a comment:
-        // start of line, or directly after whitespace. `current.is_empty()`
-        // is NOT that test — after `color=` it is empty too, and colouring
-        // `#ff0000` as a comment told the user prose where the parser
-        // reports an error (ADR-0014 ruling 2).
+        // Whether the cursor sits where the grammar admits a comment: start of line,
+        // or directly after whitespace. `current.is_empty()` is not that test. After
+        // `color=` it is empty too, and colouring `#ff0000` as a comment would show
+        // the user prose where the parser reports an error (ADR-0014 ruling 2).
         let mut at_layout_boundary = true;
 
         while let Some(ch) = chars.next() {
             let boundary = at_layout_boundary;
             at_layout_boundary = false;
 
-            // Comment: `#` to end of line (ADR-0014 — `//` is not an
-            // opener any more, and colouring it as one falsely dimmed
-            // every URL in a query).
+            // Comment: `#` to end of line, and only `#` (ADR-0014). Treating `//`
+            // as an opener would dim every URL in a query.
             if ch == '#' && boundary {
                 let mut comment = std::string::String::from('#');
                 for c in chars.by_ref() {
@@ -280,7 +274,6 @@ impl<'a> Highlighter<'a> {
             current.push(ch);
         }
 
-        // Push final token if any
         if !current.is_empty() {
             tokens.push((Self::classify_word(&current), current));
         }
@@ -288,7 +281,6 @@ impl<'a> Highlighter<'a> {
         tokens
     }
 
-    /// Classify a word into a token type.
     fn classify_word(word: &str) -> TokenType {
         let lower = word.to_lowercase();
 
@@ -319,7 +311,6 @@ impl<'a> Highlighter<'a> {
         TokenType::Field
     }
 
-    /// Check if a word is a known function name.
     fn is_function_name(word: &str) -> bool {
         matches!(
             word,
@@ -395,7 +386,7 @@ mod tests {
         assert_eq!(comment_text("count(),# x"), None, "after a delimiter");
     }
 
-    /// `//` is not an opener since ADR-0014 ruling 3, so a URL keeps its
+    /// `//` is not a comment opener (ADR-0014 ruling 3), so a URL keeps its
     /// ordinary colouring.
     #[test]
     fn slashes_are_not_a_comment() {

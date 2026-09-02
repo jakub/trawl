@@ -2,33 +2,24 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The *component* half of issue #28's C5 ("zero visual change") contract.
+//! Every class hook a fleet-ui component emits, paired with the CSS rule
+//! that styles it.
 //!
-//! `css_chrome_parity` proves every relocated chrome rule still lives
-//! byte-for-byte in `fleet-ui.css`, and `css_move_invariant` proves the
-//! design tokens those rules reference are untouched — so a class hook,
-//! *if emitted*, paints exactly as it did pre-migration. That is the
-//! **necessary** leg. It is not **sufficient**: those tests never observe
-//! that the migrated fleet-ui primitives actually *emit* the class hooks
-//! their CSS styles. A primitive renamed to `class="modal-overlay"` would
-//! leave the byte-identical `.modal-scrim` rule green while silently
-//! dropping every pixel it painted — a C5 regression invisible to compile,
-//! to clippy, and to the CSS parity tests.
+//! `css_chrome_parity` proves each chrome rule still lives byte-for-byte
+//! in `fleet-ui.css` and `css_move_invariant` proves its design tokens are
+//! untouched, so a hook that *is* emitted paints as intended. Neither
+//! observes whether the component still emits it: a primitive renamed to
+//! `class="modal-overlay"` leaves the byte-identical `.modal-scrim` rule
+//! green while dropping every pixel it painted, invisible to compile, to
+//! clippy, and to the CSS tests.
 //!
-//! The reviewer's residual C5 gap is that the pixel-level claim rests on a
-//! before/after screenshot grid that needs a live server + browser + open
-//! PR — unobservable from `cargo nextest`. fleet-ui compiles leptos only
-//! under `cfg(target_arch = "wasm32")` (natively it is just `serde_json`),
-//! so no native test can *render* these components. What a native test
-//! *can* do — the same `include_str!`-and-scan trick `css_chrome_parity`
-//! uses on the stylesheet — is read each primitive's source and assert the
-//! class hooks are present in the emitted markup. Pairing every hook with
-//! the CSS rule it must match closes the loop: pre-migration markup used
-//! class X, the byte-identical rule for X still ships (CSS test), and the
-//! fleet-ui component still emits X (this test) => the surface renders
-//! identically. That is C5 machine-checked to the maximum degree
-//! observable without a renderer; the screenshot grid remains the PR-time
-//! deliverable for the truly-rendered residual.
+//! fleet-ui compiles leptos only under `cfg(target_arch = "wasm32")`
+//! (natively it is `serde_json` + `chrono`), so no native test can *render*
+//! these components. Instead each primitive's source is read with
+//! `include_str!` and scanned for its hooks, the same trick
+//! `css_chrome_parity` uses on the stylesheet. Rule ships plus hook
+//! emitted is as close to "renders identically" as a native test gets;
+//! the screenshot grid stays the PR-time deliverable for the rest.
 
 const MODAL_SHELL: &str = include_str!("../src/modal/shell.rs");
 const CONFIRM_REASON: &str = include_str!("../src/modal/confirm_reason.rs");
@@ -36,8 +27,8 @@ const DRAWER: &str = include_str!("../src/drawer.rs");
 const TABS: &str = include_str!("../src/tabs.rs");
 const ERROR_BANNER: &str = include_str!("../src/error_banner.rs");
 
-// Issue #31 small widgets. Their tone/class *composition* is pinned by
-// native unit tests in the pure layers (badge::tone, status_dot::tone,
+// Small widgets. Their tone/class *composition* is pinned by native
+// unit tests in the pure layers (badge::tone, status_dot::tone,
 // segmented::class); these source scans pin the base class hooks the
 // wasm components emit.
 const BADGE: &str = include_str!("../src/badge/component.rs");
@@ -77,8 +68,8 @@ fn emits(src: &str, hook: &str, styled_by: &str) {
 #[test]
 fn modal_shell_emits_the_hooks_its_css_styles() {
     // `.modal-scrim > .modal[.modal-sm] > .m-hd(.ic/.t/.x) / .m-body / .m-ft`
-    // — the frame slice A moved into fleet-ui.css and css_chrome_parity's
-    // `modal_family_classes_shipped_with_crate` pins.
+    // — the frame `modal_family_classes_shipped_with_crate` pins in
+    // css_chrome_parity.
     emits(MODAL_SHELL, r#"class="modal-scrim""#, ".modal-scrim");
     // narrow => `modal modal-sm`, else `modal`; both selectors are styled.
     emits(MODAL_SHELL, r#""modal modal-sm""#, ".modal-sm");
@@ -91,8 +82,8 @@ fn modal_shell_emits_the_hooks_its_css_styles() {
 
 #[test]
 fn confirm_reason_emits_field_and_reason_input() {
-    // Promoted ConfirmWithReasonModal: `.m-field` wrapper (via Field's
-    // class override) + `.reason-input` textarea, both pinned in the CSS
+    // ConfirmWithReasonModal: `.m-field` wrapper (via Field's class
+    // override) + `.reason-input` textarea, both pinned in the CSS
     // parity test's `modal_family_classes_shipped_with_crate`.
     emits(CONFIRM_REASON, r#"class="m-field""#, ".modal .m-field");
     emits(CONFIRM_REASON, r#"class="reason-input""#, ".reason-input");
@@ -115,7 +106,7 @@ fn drawer_emits_the_sd_shell_hooks_its_css_styles() {
 #[test]
 fn tabs_emits_both_strip_families_with_distinct_active_idioms() {
     // Workspace family: `.tabs > div.t.active > span.c`. The active
-    // modifier MUST be `active` (weight-500 `.tabs .t.active`) and the
+    // modifier must be `active` (weight-500 `.tabs .t.active`) and the
     // count chip `.c` — both pinned in the CSS test.
     emits(TABS, r#"class="tabs""#, ".tabs");
     emits(TABS, r#"class="t""#, ".tabs .t");
@@ -123,7 +114,7 @@ fn tabs_emits_both_strip_families_with_distinct_active_idioms() {
     emits(TABS, r#"class="c""#, ".tabs .t .c");
 
     // Drawer family: `.sd-tabs > span.tb.on`. The active modifier here is
-    // `on` (weight-600 `.sd-tabs .tb.on`) — a DIFFERENT idiom from the
+    // `on` (weight-600 `.sd-tabs .tb.on`) — a different idiom from the
     // workspace `active`. `tab_strip_families_stay_distinct` pins the two
     // weights apart on the CSS side; pin the two active-class idioms apart
     // on the emission side so a "unify the tab strips" refactor can't
@@ -173,9 +164,9 @@ fn sparkline_emits_the_spark_class() {
 fn loaded_emits_the_tri_state_hint_hooks() {
     emits(LOADED, r#"class="load-hint""#, ".load-hint");
     emits(LOADED, r#"class="load-hint error""#, ".load-hint.error");
-    // Issue #33 D5: the Missing arm renders on the NEUTRAL hint tone
-    // (a missing resource is not a failure — no `.error` modifier),
-    // with the subtitle hook for the explanatory second line.
+    // The Missing arm renders on the neutral hint tone (a missing
+    // resource is not a failure — no `.error` modifier), with the
+    // subtitle hook for the explanatory second line.
     emits(LOADED, "missing_copy(label)", ".load-hint");
     emits(LOADED, r#"class="load-sub""#, ".load-hint .load-sub");
     assert!(
@@ -194,7 +185,7 @@ fn segmented_emits_one_strip_family_with_a_single_active_treatment() {
     emits(SEGMENTED_CLASS, r#"String::from("seg")"#, ".seg");
     emits(SEGMENTED, r#"class="seg-opt""#, ".seg .seg-opt");
     emits(SEGMENTED, "class:on", ".seg .seg-opt.on");
-    // ADR-0003: ONE accent-wash active treatment. The size axis must not
+    // ADR-0003: one accent-wash active treatment. The size axis must not
     // grow its own active rule — exactly one `.seg-opt.on` declaration
     // ships in the stylesheet.
     let active_rules = FLEET_CSS.matches(".seg-opt.on").count();
@@ -239,8 +230,8 @@ fn actions_menu_emits_its_hooks_and_registers_with_the_overlay_stack() {
         r#""item danger""#,
         ".actions-menu .item.danger",
     );
-    // C5: the open panel must arbitrate Escape through the overlay
-    // stack (topmost-only), like Modal and Drawer.
+    // The open panel arbitrates Escape through the overlay stack
+    // (topmost-only), like Modal and Drawer.
     assert!(
         ACTIONS_MENU.contains("use_overlay_layer()") && ACTIONS_MENU.contains("is_topmost()"),
         "ActionsMenu's open panel must register an overlay layer and \
@@ -252,10 +243,10 @@ fn actions_menu_emits_its_hooks_and_registers_with_the_overlay_stack() {
 
 #[test]
 fn modal_family_traps_focus_and_keeps_aria_modal() {
-    // Issue #33 D2: the modal family renders aria-modal="true" and now
-    // EARNS it — the shell registers FocusPolicy::Trap with the overlay
-    // stack (initial focus, Tab/Shift+Tab cycle, restore-to-opener) and
-    // hands the glue its panel element with a tabindex="-1" fallback.
+    // The modal family renders aria-modal="true" and earns it: the shell
+    // registers FocusPolicy::Trap with the overlay stack (initial focus,
+    // Tab/Shift+Tab cycle, restore-to-opener) and hands the glue its
+    // panel element with a tabindex="-1" fallback.
     assert!(
         MODAL_SHELL.contains(r#"aria-modal="true""#),
         "the modal shell must keep aria-modal=\"true\" — it traps focus, \
@@ -276,11 +267,10 @@ fn modal_family_traps_focus_and_keeps_aria_modal() {
 
 #[test]
 fn drawer_is_an_honest_non_modal_dialog() {
-    // Issue #33 D2: the drawer is non-modal BY DESIGN (background stays
-    // interactive; modal-over-live-drawer is a supported stack), so it
-    // must NOT claim aria-modal. It keeps role="dialog" and registers
-    // FocusPolicy::Capture (initial focus + restore, no trap). This is
-    // the slice's single sanctioned semantic markup delta.
+    // The drawer is non-modal by design (background stays interactive;
+    // modal-over-live-drawer is a supported stack), so it must not claim
+    // aria-modal. It keeps role="dialog" and registers
+    // FocusPolicy::Capture (initial focus + restore, no trap).
     assert!(
         DRAWER.contains(r#"role="dialog""#),
         "the drawer keeps role=\"dialog\""
@@ -309,8 +299,8 @@ fn drawer_is_an_honest_non_modal_dialog() {
 
 #[test]
 fn icon_ships_the_slice_d_glyphs_and_the_crate_doc_is_honest() {
-    // Issue #33 D8: Document / Upload / Copy join the closed enum, each
-    // with an icon_body arm in house style.
+    // Document / Upload / Copy belong to the closed enum, each with an
+    // icon_body arm in house style.
     for glyph in ["Document", "Upload", "Copy"] {
         assert!(
             ICON.contains(&format!("    {glyph},\n"))
@@ -318,8 +308,8 @@ fn icon_ships_the_slice_d_glyphs_and_the_crate_doc_is_honest() {
             "Icon::{glyph} must exist as a variant with an icon_body arm"
         );
     }
-    // The lib.rs crate doc claimed "four typed components" while
-    // exporting ~25 — describe the surface by category, never by count.
+    // The lib.rs crate doc must describe its exports by category, never
+    // by count: a hard-coded number rots the next time one lands.
     assert!(
         !LIB.contains("four typed components"),
         "lib.rs crate doc must not hard-code a component count (doc rot)"
@@ -328,10 +318,10 @@ fn icon_ships_the_slice_d_glyphs_and_the_crate_doc_is_honest() {
 
 #[test]
 fn drawer_and_tabs_meta_is_reactive() {
-    // Issue #33 D7: `meta` is a reactive optional (MaybeProp) on both
-    // Tabs and the Drawer that forwards to it — live counts must tick.
-    // Static Strings still convert via `into`, so call sites with
-    // snapshot copy compile unchanged.
+    // `meta` is a reactive optional (MaybeProp) on both Tabs and the
+    // Drawer that forwards to it — live counts must tick. Static Strings
+    // still convert via `into`, so call sites with snapshot copy compile
+    // unchanged.
     assert!(
         TABS.contains("MaybeProp<String>"),
         "Tabs meta must be a reactive MaybeProp<String>"
@@ -345,9 +335,9 @@ fn drawer_and_tabs_meta_is_reactive() {
 
 #[test]
 fn copy_button_reports_through_the_shared_toast_bus() {
-    // Issue #33 D6: one click-to-copy component, wired to the Shell's
-    // ToastBus (never a second bus), with the canonical "Copied" /
-    // "Copy failed" toast titles.
+    // One click-to-copy component, wired to the Shell's ToastBus (never
+    // a second bus), with the canonical "Copied" / "Copy failed" toast
+    // titles.
     assert!(
         COPY_BUTTON.contains("expect_context::<ToastBus>()"),
         "CopyButton must resolve the Shell-owned ToastBus from context"
@@ -366,10 +356,10 @@ fn copy_button_reports_through_the_shared_toast_bus() {
 
 #[test]
 fn load_more_emits_its_hooks_and_the_canonical_busy_label() {
-    // Issue #33 D3: cursor-driven list footer. The three terminal
-    // states (button / end-of-list / empty) are pinned natively in
-    // load_more::phase tests; these pin the class hooks and that the
-    // busy label is the CANONICAL loading copy, not a bespoke string.
+    // Cursor-driven list footer. The three terminal states (button /
+    // end-of-list / empty) are pinned natively in load_more::phase
+    // tests; these pin the class hooks and that the busy label is the
+    // canonical loading copy, not a bespoke string.
     emits(LOAD_MORE, r#"class="load-more""#, ".load-more");
     emits(
         LOAD_MORE,
@@ -385,9 +375,9 @@ fn load_more_emits_its_hooks_and_the_canonical_busy_label() {
 
 #[test]
 fn when_renders_both_modes_off_the_shared_clock() {
-    // Issue #33 D4: <When> renders relative (time_ago buckets) and
-    // absolute ("%Y-%m-%d %H:%M UTC" — explicit zone marker) modes,
-    // always with the full RFC 3339 form in the title attr.
+    // <When> renders relative (time_ago buckets) and absolute
+    // ("%Y-%m-%d %H:%M UTC" — explicit zone marker) modes, always with
+    // the full RFC 3339 form in the title attr.
     emits(WHEN, r#"class="when""#, ".when");
     assert!(
         WHEN.contains("title=") && WHEN.contains("to_rfc3339"),
@@ -398,8 +388,8 @@ fn when_renders_both_modes_off_the_shared_clock() {
         "absolute mode renders \"%Y-%m-%d %H:%M UTC\" — nothing else in \
          the app signals timezone, the explicit marker is the point"
     );
-    // Exactly ONE shared tick drives every instance: <When> subscribes
-    // to clock::now_ms and must never own a timer of its own.
+    // One shared tick drives every instance: <When> subscribes to
+    // clock::now_ms and must never own a timer of its own.
     assert!(
         WHEN.contains("clock::now_ms") && !WHEN.contains("Interval"),
         "<When> must subscribe to the shared clock tick, never a \
@@ -414,11 +404,11 @@ fn when_renders_both_modes_off_the_shared_clock() {
 
 #[test]
 fn error_banner_emits_error_class_with_alert_role() {
-    // ErrorBanner paints via `.error-banner` — renamed from the moved
-    // bare `.error`, whose selector leaked banner padding onto every
-    // element using `error` as a state token (`.status-dot.error`,
-    // `.load-hint.error`). Pin both — the class so it paints, the role
-    // so the sanctioned a11y delta isn't silently dropped.
+    // ErrorBanner paints via `.error-banner`, not a bare `.error`: that
+    // selector would leak banner padding onto every element using
+    // `error` as a state token (`.status-dot.error`, `.load-hint.error`).
+    // Pin both — the class so it paints, the role so the sanctioned a11y
+    // delta isn't silently dropped.
     emits(ERROR_BANNER, r#"class="error-banner""#, ".error-banner");
     assert!(
         ERROR_BANNER.contains(r#"role="alert""#),
@@ -429,9 +419,9 @@ fn error_banner_emits_error_class_with_alert_role() {
 
 #[test]
 fn atmosphere_emits_its_hook_and_is_hidden_from_the_accessibility_tree() {
-    // jakub/coastwatch#308: the shader backdrop mounts into
-    // `.atmosphere` — the fixed full-viewport layer whose CSS paints
-    // the var(--bg) fallback floor (the AC-6 degradation surface).
+    // The shader backdrop mounts into `.atmosphere`, the fixed
+    // full-viewport layer whose CSS paints the var(--bg) fallback floor
+    // for browsers without WebGL.
     emits(ATMOSPHERE, r#"class="atmosphere""#, ".atmosphere");
     // Pure decoration: never in the accessibility tree.
     assert!(
@@ -443,8 +433,8 @@ fn atmosphere_emits_its_hook_and_is_hidden_from_the_accessibility_tree() {
 
 #[test]
 fn atmosphere_disposes_its_shader_mount_on_cleanup() {
-    // The chart.rs lifecycle idiom: leaked ShaderMounts keep a rAF loop
-    // + WebGL context alive per route transition (the AC-3 leak class).
+    // A leaked ShaderHandle keeps a rAF loop + WebGL context alive for
+    // the life of the page, one per route transition.
     assert!(
         ATMOSPHERE.contains("on_cleanup") && ATMOSPHERE.contains("dispose"),
         "Atmosphere must dispose its ShaderHandle in on_cleanup — \

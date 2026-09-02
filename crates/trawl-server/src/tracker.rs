@@ -34,7 +34,7 @@ pub struct ActiveQuery {
     pub key_id: i64,
     /// Authenticated user name (display only).
     pub user: String,
-    /// User's role.
+    /// Comma-joined role names of the submitting key (display only).
     pub role: String,
     /// The DSL query string.
     pub query: String,
@@ -63,7 +63,6 @@ impl QueryTracker {
         Self::with_capacity(DEFAULT_MAX_HISTORY)
     }
 
-    /// Create a new tracker with a custom history capacity.
     pub fn with_capacity(max_history: usize) -> Self {
         Self {
             active: DashMap::new(),

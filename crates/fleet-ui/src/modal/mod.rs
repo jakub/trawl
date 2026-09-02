@@ -2,21 +2,19 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Modal dialog family (issue #28, confirm-state helper issue #31).
+//! Modal dialog family.
 //!
 //! - [`shell`] — the `<Modal/>` primitive: scrim + panel + header/body/
 //!   footer slots, window-level Escape / Cmd-Ctrl+Enter, NodeRef-based
 //!   outside-click dismissal. Every dialog in the fleet composes it.
-//! - [`confirm`] — `<ConfirmModal/>`, the confirm/cancel dialog
-//!   (unchanged public API, now built on the shell).
+//! - [`confirm`] — `<ConfirmModal/>`, the confirm/cancel dialog built
+//!   on the shell.
 //! - [`confirm_reason`] — `<ConfirmWithReasonModal/>`, confirm plus a
-//!   required reason textarea (promoted from trawl-web-ui; coastwatch's
-//!   quarantine-resolve and derivation-retract flows are the next
-//!   consumers).
+//!   required reason textarea.
 //! - [`confirm_state`] — the pure [`ConfirmState`] open/close payload
-//!   state each page used to hand-roll as `RwSignal<Option<T>>`. Builds
-//!   on every target so the lifecycle is natively unit-tested; the
-//!   components above stay wasm-only.
+//!   state, replacing a per-page `RwSignal<Option<T>>`. Builds on every
+//!   target so the lifecycle is natively unit-tested; the components
+//!   above stay wasm-only.
 
 pub mod confirm_state;
 

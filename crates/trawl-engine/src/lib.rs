@@ -14,15 +14,10 @@ pub mod parquet_stats;
 pub mod post_process;
 pub mod timezone;
 
-// Value types live in trawl-api (the wire types crate); re-exported here
-// so that existing `trawl_engine::value::*` imports across the workspace
-// continue to work without changes.
 pub use trawl_api::value;
 
-// The conversion-error classifier reports "a cast failed", NOT "the schemas
-// conflict" — the two are indistinguishable from the error alone (ADR-0008).
-// No production path classifies conversion errors any more (the read-time
-// cast-to-`VARCHAR` fallbacks are deleted, ADR-0009 slice 2); it stays
-// exported because the ADR-evidence tests pin the `DuckDB` behaviour the
-// no-classifier design rests on.
+// Nothing on the read path classifies conversion errors; the classifier
+// exists for the ADR-evidence tests, which reach it as
+// `executor::is_conversion_error`. See its own doc comment for why the
+// classification is unusable in production.
 pub use executor::is_conversion_error;

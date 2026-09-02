@@ -2,11 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! End-to-end tests for the field catalog (ADR-0009 slice 2): write-time
-//! type conformance kills both silent data-loss paths — the cold/cold
+//! End-to-end tests for the field catalog (ADR-0009): write-time type
+//! conformance closes two silent data-loss paths, the cold/cold
 //! whole-history drop and the nested-key whole-batch column drop.
 //!
-//! Modeled on `timestamp_repair.rs`: ingest through the real handler,
+//! Shaped like `timestamp_repair.rs`: ingest through the real handler,
 //! compact through the real compaction path (with the catalog context the
 //! daemon wires), query through the real API.
 
@@ -99,14 +99,13 @@ async fn harness(pool: sqlx::PgPool) -> Harness {
     }
 }
 
-/// Acceptance: a cold/cold type conflict returns ALL history, not
-/// hot-only; the conflict is recorded and attributed; the counter is on
-/// /metrics.
+/// A cold/cold type conflict returns all history, not hot-only; the
+/// conflict is recorded and attributed; the counter is on /metrics.
 #[sqlx::test(migrations = false)]
 async fn cold_cold_conflict_returns_full_history_with_attribution(pool: sqlx::PgPool) {
     let h = harness(pool).await;
 
-    // Service A: duration is an integer. Compacted FIRST, so it pins BIGINT.
+    // Service A: duration is an integer. Compacted first, so it pins BIGINT.
     let a_events: Vec<serde_json::Value> = (0..3)
         .map(|i| {
             json!({
@@ -136,8 +135,8 @@ async fn cold_cold_conflict_returns_full_history_with_attribution(pool: sqlx::Pg
 
     // Both services' history is on disk; the hot buffer is drained. A
     // cross-service query over the conflicted field must return service
-    // A's parquet rows — never degrade to hot-only (which here would be
-    // zero rows with HTTP 200: the exact defect).
+    // A's parquet rows, never degrade to hot-only: that would be zero rows
+    // under an HTTP 200.
     let result = h
         .query
         .query_paginated("last=1h | where duration > 1000", None, None)
@@ -212,9 +211,8 @@ async fn cold_cold_conflict_returns_full_history_with_attribution(pool: sqlx::Pg
     );
 }
 
-/// Acceptance: a nested-object field no longer drops its batch-mates'
-/// columns, and the nested value stays reachable via
-/// `json_extract_string`.
+/// Acceptance: a nested-object field keeps its batch-mates' columns, and
+/// the nested value stays reachable via `json_extract_string`.
 #[sqlx::test(migrations = false)]
 async fn nested_object_keeps_batchmates_and_stays_reachable(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -236,9 +234,8 @@ async fn nested_object_keeps_batchmates_and_stays_reachable(pool: sqlx::PgPool) 
     assert_eq!(resp.accepted, 2);
     compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
 
-    // Every custom column landed in parquet — nothing was dropped for the
-    // batch (the old ten-column fallback would have kept only the
-    // envelope).
+    // Every custom column landed in parquet: a nested value costs its own
+    // column at most, never its batch-mates'.
     let result = h
         .query
         .query_paginated("service=svc-k8s last=1h", None, None)
@@ -318,7 +315,7 @@ async fn all_null_first_batch_defers_then_pins(pool: sqlx::PgPool) {
     assert!(values.contains(&Value::Null), "deferred rows read as NULL");
 }
 
-/// Acceptance: a pin write failure means NO parquet is written and the WAL
+/// Acceptance: a pin write failure means no parquet is written and the WAL
 /// is retained for retry — never an unconformant file.
 #[sqlx::test(migrations = false)]
 async fn pin_write_failure_retains_wal_and_writes_nothing(pool: sqlx::PgPool) {
@@ -380,12 +377,11 @@ async fn pin_write_failure_retains_wal_and_writes_nothing(pool: sqlx::PgPool) {
     assert!(!walkdir_parquet(&h.data_dir).is_empty());
 }
 
-/// Acceptance: a HOT-side conflict — an uncompacted event disagreeing with
-/// an existing pin — is nulled on the hot branch of the union while the
-/// full cold history stays visible. The end-to-end proof of the
-/// `HotSnapshot` pin plumbing: the outcome is never hot-only (the cold rows
-/// ARE present) and never a loud error (the pin conformance resolves the
-/// conflict in one execution).
+/// A hot-side conflict, an uncompacted event disagreeing with an existing
+/// pin, is nulled on the hot branch of the union while the full cold
+/// history stays visible. End-to-end proof of the `HotSnapshot` pin
+/// plumbing: the outcome is never hot-only and never an error, because the
+/// pin conformance resolves the conflict in one execution.
 #[sqlx::test(migrations = false)]
 async fn hot_conflicting_event_is_nulled_and_cold_history_survives(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -426,7 +422,7 @@ async fn hot_conflicting_event_is_nulled_and_cold_history_survives(pool: sqlx::P
 
     // The union succeeds in one execution: all four rows, the hot value
     // NULL, the cold values still integers. A hot-only fallback would show
-    // 1 row; the deleted coerced retry would show strings.
+    // 1 row.
     let result = h
         .query
         .query_paginated("service=svc-hot last=1h", None, None)
@@ -463,14 +459,11 @@ async fn hot_conflicting_event_is_nulled_and_cold_history_survives(pool: sqlx::P
     );
 }
 
-/// End-to-end regression for the case-variant blockers: two services
-/// shipping `Dur` and `dur` used to pin independently (case-sensitive
-/// catalog keys), each file conformed to its own pin, and
-/// `read_parquet(union_by_name)` folded them into one column — a hard
-/// `Conversion` error on every spanning query; the in-loop mitigation then
-/// degraded the pin to VARCHAR, permanently breaking numeric comparisons.
-/// With ingest-time folding there is ONE spelling, one pin, one column,
-/// and numeric predicates keep working across services.
+/// Two services shipping `Dur` and `dur` land one spelling, one pin, one
+/// column, because ingest folds field names at the door. Without that
+/// fold each file would conform to its own pin and
+/// `read_parquet(union_by_name)` would merge them back into one column, a
+/// `Conversion` error on every spanning query.
 #[sqlx::test(migrations = false)]
 async fn case_variant_field_names_fold_to_one_column_across_services(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -507,7 +500,7 @@ async fn case_variant_field_names_fold_to_one_column_across_services(pool: sqlx:
     );
     compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
 
-    // ONE pin, under the folded spelling.
+    // One pin, under the folded spelling.
     assert_eq!(
         h.server.state.query.field_catalog.get("dur"),
         Some(trawl_core::schema::CanonicalType::BigInt),
@@ -519,8 +512,8 @@ async fn case_variant_field_names_fold_to_one_column_across_services(pool: sqlx:
         "no mixed-case pin may exist"
     );
 
-    // A spanning query returns ALL rows — no Conversion error, no
-    // hot-only degrade, and ONE column in the result.
+    // A spanning query returns all rows: no Conversion error, no hot-only
+    // degrade, one column in the result.
     let all = h
         .query
         .query_paginated("last=1h", None, None)
@@ -538,8 +531,7 @@ async fn case_variant_field_names_fold_to_one_column_across_services(pool: sqlx:
         all.result.columns
     );
 
-    // Numeric comparison works across services — the VARCHAR degrade that
-    // used to break this is gone.
+    // Numeric comparison binds across services, under the one pin.
     let big = h
         .query
         .query_paginated("last=1h | where dur > 1000", None, None)
@@ -637,7 +629,6 @@ async fn field_services_is_ever_observed(pool: sqlx::PgPool) {
     );
 }
 
-/// Recursively find parquet files.
 fn walkdir_parquet(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -654,7 +645,7 @@ fn walkdir_parquet(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// boot conformance pass (ADR-0009 slice 2, section 2b)
+// boot conformance pass (ADR-0009)
 // ---------------------------------------------------------------------------
 
 mod boot {
@@ -763,7 +754,7 @@ mod boot {
     }
 
     /// A standing file whose `_time` is VARCHAR text no parser can read must
-    /// NOT be rewritten to a NULL partition key: a NULL sorts first and falls
+    /// not be rewritten to a NULL partition key: a NULL sorts first and falls
     /// outside every `last=Xh` filter, so the row would survive the conform
     /// and become permanently unqueryable by time (ADR-0008). The rewrite
     /// substitutes the file's own partition instant, exactly as compaction
@@ -823,7 +814,7 @@ mod boot {
         );
     }
 
-    /// The vote weighs rows that CARRY the field, not the file's row count:
+    /// The vote weighs rows that carry the field, not the file's row count:
     /// a mostly-NULL `duration` in a big file holds no values to describe, so
     /// it must not win the pin and `TRY_CAST` the small file's real values away.
     #[sqlx::test]
@@ -888,11 +879,10 @@ mod boot {
             .collect()
     }
 
-    /// Parquet written before ingest folded field names can carry
-    /// mixed-case column names. The boot pass folds when seeding — `Dur`
-    /// and `dur` form ONE folded group, most-rows-wins inside it — and the
-    /// rewrite renames columns to the folded form, so the corpus comes out
-    /// with one spelling, one pin, and a clean cross-file union.
+    /// Parquet trawl did not write can carry mixed-case column names. The
+    /// boot pass folds when seeding, so `Dur` and `dur` form one group with
+    /// most-rows-wins inside it, and the rewrite renames columns to the
+    /// folded form: one spelling, one pin, a clean cross-file union.
     #[sqlx::test]
     async fn mixed_case_columns_fold_to_one_pin_and_are_renamed(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
@@ -922,7 +912,7 @@ mod boot {
             "the majority file is renamed, the minority file is cast"
         );
 
-        // ONE pin, under the folded name, decided by most rows in the group.
+        // One pin, under the folded name, decided by most rows in the group.
         assert_eq!(
             cache.get("dur"),
             Some(trawl_core::schema::CanonicalType::BigInt),
@@ -930,7 +920,7 @@ mod boot {
         );
         assert_eq!(cache.get("Dur"), None, "no mixed-case pin may exist");
 
-        // Both files store the FOLDED spelling at the pinned type.
+        // Both files store the folded spelling at the pinned type.
         for file in [&majority, &minority] {
             let names = column_names(file);
             assert!(
@@ -1007,12 +997,12 @@ mod boot {
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
     }
 
-    /// `_severity` is SEVERITY-pinned and in every parquet trawl writes, and
-    /// its conform is a domain guard rather than a pass-through — so without
-    /// a data-decided skip, a re-armed pass (identity mismatch, or the
-    /// `clear_conformed` inside a repin cutover) would rewrite the ENTIRE
-    /// archive in place on every re-arm. An in-ladder corpus must be
-    /// untouched.
+    /// `_severity` is SEVERITY-pinned and sits in every parquet trawl
+    /// writes, and its conform is a domain guard rather than a pass-through.
+    /// Without a data-decided skip, a re-armed pass (identity mismatch, or
+    /// the `clear_conformed` inside a repin cutover) would rewrite the
+    /// entire archive in place on every re-arm; an in-ladder corpus must
+    /// come out untouched.
     #[sqlx::test]
     async fn a_rerun_over_an_in_ladder_severity_corpus_rewrites_nothing(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1044,7 +1034,7 @@ mod boot {
         assert_eq!(mtime(&file), before, "no file touched");
     }
 
-    /// Crash-mid-pass: the marker is published LAST, so a crash after the
+    /// Crash-mid-pass: the marker is published last, so a crash after the
     /// rewrites but before the marker leaves a conformant corpus with no
     /// marker. The re-run must be restartable — rewrite nothing (everything
     /// already conforms) and republish the marker.
@@ -1080,14 +1070,12 @@ mod boot {
         );
     }
 
-    /// The upgrade path: migration 0002 creates `field_services` EMPTY, and
-    /// only live compaction ever wrote it — so a corpus that predates the
-    /// catalog gets pins (and rewrites) but no observations, and the filters
-    /// those rows are authoritative for silently answer wrong: `?service=`
-    /// returns nothing for a service whose data all predates the upgrade,
-    /// and its pins sit outside the `last_seen` window forever (a
-    /// never-observed pin is always shown, by design). The boot pass must
-    /// backfill from the files it adopted.
+    /// Only live compaction writes `field_services`, so a corpus adopted
+    /// from disk would carry pins but no observations, and the reads those
+    /// rows are authoritative for answer wrong: `?service=` returns nothing
+    /// for a service that has sent nothing since, and its pins never enter
+    /// the `last_seen` window (a never-observed pin is always shown, by
+    /// design). The boot pass backfills from the files it adopts.
     #[sqlx::test]
     async fn boot_pass_backfills_observations_for_a_pre_catalog_corpus(pool: sqlx::PgPool) {
         use trawl_server::store::FieldListFilter;
@@ -1146,8 +1134,8 @@ mod boot {
         assert_eq!(obs[0].first_seen.to_rfc3339(), "2026-08-01T10:00:00+00:00");
         assert_eq!(obs[0].last_seen.to_rfc3339(), "2026-08-01T10:00:00+00:00");
 
-        // So the `last_seen` window can age the corpus out at all — before
-        // the backfill these pins were unwindowable.
+        // The observations are what let the `last_seen` window age the
+        // corpus out at all.
         let (windowed, _) = store
             .list_fields(&FieldListFilter {
                 service: None,
@@ -1189,13 +1177,12 @@ mod boot {
         assert_eq!(again[0].last_seen, obs[0].last_seen);
     }
 
-    /// The upgrade the backfill exists for, exactly as it arrives: a node
-    /// that conformed under the PREVIOUS slice carries `conformed_at` set
-    /// and `data/CATALOG` naming this catalog, but an empty `field_services`
-    /// — and nothing will ever refill it, because no live batch re-sends a
-    /// standing corpus. Gating the backfill on the conformance marker alone
-    /// would short-circuit the pass on precisely those installs, so the
-    /// backfill carries its own flag and an unset one re-arms the pass.
+    /// A node can be conformed (`conformed_at` set, `data/CATALOG` naming
+    /// this catalog) and still hold an empty `field_services`, and no live
+    /// batch re-sends a standing corpus to refill it. Gating the backfill on
+    /// the conformance marker alone would skip the pass on exactly those
+    /// installs, so the backfill carries its own flag and an unset one
+    /// re-arms the pass.
     #[sqlx::test]
     async fn backfill_reruns_on_a_corpus_conformed_before_the_backfill_existed(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1213,8 +1200,8 @@ mod boot {
             .await
             .expect("boot pass runs");
 
-        // Rewind to the state the previous slice leaves behind: conformed,
-        // marker published, pins seeded — observations never taken.
+        // The state to reproduce: conformed, marker published, pins seeded,
+        // observations never taken.
         sqlx::query("DELETE FROM field_services")
             .execute(&pool)
             .await
@@ -1257,7 +1244,7 @@ mod boot {
     }
 
     /// A live tick's accumulated `row_count` must survive a later backfill
-    /// that sees a retention-shrunk corpus: the backfill takes the MAX, it
+    /// that sees a retention-shrunk corpus: the backfill takes the max, it
     /// never rewrites a count downward.
     #[sqlx::test]
     async fn backfill_never_clobbers_a_live_count_downward(pool: sqlx::PgPool) {
@@ -1336,13 +1323,13 @@ mod boot {
         );
     }
 
-    /// A READABLE parquet in a foreign layout is still not trawl's file.
+    /// A readable parquet in a foreign layout is still not trawl's file.
     /// The rewrite is in place, lossy and irreversible (no backup, no
-    /// dry-run, no opt-in), so the boot pass must decide "mine" from the
-    /// PATH, before it opens anything: an operator's own parquet dropped
-    /// under the data root is left byte-identical, never votes on a pin, and
-    /// — like every other skip — withholds completion so the next boot
-    /// re-runs rather than declaring the corpus proven.
+    /// dry-run, no opt-in), so the boot pass decides "mine" from the path,
+    /// before it opens anything: an operator's own parquet dropped under the
+    /// data root is left byte-identical, never votes on a pin, and, like
+    /// every other skip, withholds completion so the next boot re-runs
+    /// rather than declaring the corpus proven.
     #[sqlx::test]
     async fn foreign_layout_files_are_never_rewritten(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1655,10 +1642,10 @@ mod boot {
     }
 }
 
-/// ADR-0011 slice A acceptance: comparisons against a VARCHAR-pinned
-/// field follow the pin over HTTP — with the hot buffer populated AND
-/// drained (the drained case exercises the formerly pin-blind cold-only
-/// `run_query` branch).
+/// Comparisons against a VARCHAR-pinned field follow the pin over HTTP
+/// (ADR-0011), with the hot buffer both populated and drained: the drained
+/// case rides the cold-only `run_query` branch, the populated one the hot
+/// side of the union.
 #[sqlx::test(migrations = false)]
 async fn pinned_varchar_comparisons_behave_over_http(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -1731,7 +1718,7 @@ async fn pinned_varchar_comparisons_behave_over_http(pool: sqlx::PgPool) {
         "cold '404' plus hot '500'"
     );
 
-    // Wire NUMBERS under the same VARCHAR pin. `read_json` types the
+    // Wire numbers under the same VARCHAR pin. `read_json` types the
     // column from the whole batch, so the fractional sibling widens it to
     // DOUBLE and `200` is stored as the text "200.0" — durably, once
     // compaction writes the parquet. The equality rule carries the
@@ -1796,11 +1783,10 @@ async fn read_until(resp: &mut reqwest::Response, needle: &str) -> String {
     buf
 }
 
-/// ADR-0011 slice A acceptance: live tail receives the pins. A string
-/// "404" event matches `status>=400` on the SSE stream, and the
-/// equality rule is discriminably live — `status!=200` must match
-/// "accepted" (the pin-blind numeric coercion drops it) while still
-/// excluding every spelling of 200.
+/// The live tail receives the pins: a string "404" event matches
+/// `status>=400` on the SSE stream, and the equality rule is discriminably
+/// live, since `status!=200` must match "accepted" (a pin-blind numeric
+/// coercion would drop it) while still excluding every spelling of 200.
 #[sqlx::test(migrations = false)]
 async fn sse_stream_applies_varchar_pin(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -1855,10 +1841,10 @@ async fn sse_stream_applies_varchar_pin(pool: sqlx::PgPool) {
     drop(stream);
 
     // Equality rule live, discriminably: `status!=200` must return
-    // "accepted" — the pin-blind numeric coercion cannot read it and
-    // answers no-match — while both spellings of 200 stay excluded, the
-    // text one through the text arm and "200.00" through the numeric
-    // reading that keeps batch and live agreeing about a widened column.
+    // "accepted", which a pin-blind numeric coercion cannot read and would
+    // answer no-match for, while both spellings of 200 stay excluded: the
+    // text one through the text arm, "200.00" through the numeric reading
+    // that keeps batch and live agreeing about a widened column.
     let mut stream = raw
         .get(format!("{}/api/v1/stream", h.server.url))
         .query(&[("query", "service=sse-svc status!=200")])

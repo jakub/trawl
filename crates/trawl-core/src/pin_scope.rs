@@ -2,27 +2,26 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The compile-time pin scope walk (ADR-0011 slice A′).
+//! The compile-time pin scope walk (ADR-0011).
 //!
-//! Which catalog pin applies to a field reference depends on WHERE in the
+//! Which catalog pin applies to a field reference depends on where in the
 //! pipeline the reference sits: `rename status as st | where st>400` must
 //! stay pin-aware under the new name, `let status=<expr> | where
-//! status>400` must NOT apply the original pin to a derived value, and
+//! status>400` must not apply the original pin to a derived value, and
 //! `stats count() by status | where status=…` keeps the group-by key's
 //! pin. [`PinScope`] carries the catalog snapshot through the pipeline,
 //! advancing per stage; the SQL emitter and the stream compiler consume
-//! the SAME walk, so which pin applies at each stage is identical in both
+//! the same walk, so which pin applies at each stage is identical in both
 //! lanes by construction.
 
 use crate::ast::{AggExpr, Expr, LiteralValue, PipeStage, Spanned};
 use crate::schema::{CanonicalType, FieldTypes, catalog_key};
 
-/// What a pin-aware comparison is comparing — the ONE classifier all
-/// three lanes bind through (ADR-0011 slice A′, widened by ADR-0013 slice
-/// 2 ruling 9).
+/// What a pin-aware comparison is comparing — the one classifier all
+/// three lanes bind through (ADR-0011, ADR-0013 ruling 9).
 ///
 /// Subjects widen; the rule table does not. A subject here is either a
-/// bare pinned field reference or a call that DECLARES its result type
+/// bare pinned field reference or a call that declares its result type
 /// ([`crate::emitter::function_result_pin`]) over a bare field reference —
 /// nothing else, because "which pin types this comparison" has to be
 /// decidable from the AST alone in the emitter, the stream compiler and
@@ -70,9 +69,8 @@ impl PinScope {
     }
 
     /// The pin typing a comparison against `dsl_name` at this point in the
-    /// pipeline, looked up through [`catalog_key`] (alias resolution +
-    /// ASCII fold) — the same lookup the emitter and the live matcher
-    /// share.
+    /// pipeline, looked up through [`catalog_key`]'s ASCII fold — the same
+    /// lookup the emitter and the live matcher share.
     #[must_use]
     pub fn pin_for(&self, dsl_name: &str) -> Option<CanonicalType> {
         self.pins.pin_for(dsl_name)
@@ -87,9 +85,9 @@ impl PinScope {
     ///
     /// 1. a bare field reference the scope pins;
     /// 2. a call whose name declares a result pin
-    ///    ([`crate::emitter::function_result_pin`]) over a BARE field
+    ///    ([`crate::emitter::function_result_pin`]) over a bare field
     ///    reference, with every further argument a string literal (the
-    ///    dialect). Its pin is the FUNCTION's declaration, so it holds
+    ///    dialect). Its pin is the function's declaration, so it holds
     ///    even under [`Self::unpinned`] — `sev()` is how a corpus with no
     ///    catalog gets a severity comparison at all.
     ///
@@ -125,22 +123,22 @@ impl PinScope {
         }
     }
 
-    /// Advance the scope over one pipe stage: the scope BEFORE the call
+    /// Advance the scope over one pipe stage: the scope before the call
     /// types that stage's own expressions; after it, the scope describes
     /// the stage's output schema.
     ///
     /// The match is exhaustive on purpose — a new stage variant must state
     /// its scope rule here or fail to compile, never silently keep a wrong
-    /// pin. The rules (issue #66 / ADR-0011 slice A′ prep rulings):
+    /// pin. The rules:
     ///
     /// - `rename` remaps the pin from the old name to the new one (and an
     ///   unpinned source scrubs any pin the target name held). All
-    ///   sources resolve against the PRE-stage scope — the SQL aliases
+    ///   sources resolve against the pre-stage scope — the SQL aliases
     ///   them off the pre-stage row, so `rename a as b, b as c` gives
     ///   `b` the original `a` and `c` the original `b`.
     /// - `table`/`fields` restrict to the named columns; `drop` removes.
-    /// - `let` resolves ALL assignments' pins against the PRE-stage scope.
-    ///   A bare field-ref alias copies the source's pin to the target; any
+    /// - `let` resolves every assignment's pin against the pre-stage
+    ///   scope. A bare field-ref alias copies the source's pin; any
     ///   other expression kills the target's pin (the value is derived).
     ///   The pins stay parallel even where the VALUES do not: the SQL
     ///   desugars to one projection (`COLUMNS(c -> c NOT IN …)`) in which
@@ -155,11 +153,10 @@ impl PinScope {
     /// - `eventstats` keeps its inputs (non-reducing) and kills only the
     ///   aggregate output columns.
     /// - `extract <regex>` kills the capture-group names it (re)writes;
-    ///   `extract kv` passes the scope through — the acceptance contract
-    ///   makes the kv tail pin-aware, and the residual (a kv key
-    ///   shadowing a pinned name takes that pin's reading) is accepted
-    ///   and documented, identical in both lanes because both consume
-    ///   this walk.
+    ///   `extract kv` passes the scope through, which is what makes the kv
+    ///   tail pin-aware. The residual — a kv key shadowing a pinned name
+    ///   takes that pin's reading — is accepted, and identical in both
+    ///   lanes because both consume this walk.
     /// - `from saved` reads someone else's output: the scope clears.
     /// - selection/ordering stages pass the scope through.
     pub fn advance(&mut self, stage: &PipeStage) {
@@ -178,7 +175,7 @@ impl PinScope {
             }
             PipeStage::Rename(r) => {
                 // Parallel, like `let`: every source resolves against the
-                // PRE-stage scope, because the SQL aliases every source
+                // pre-stage scope, because the SQL aliases every source
                 // off the pre-stage row (`* EXCLUDE (sources), src AS
                 // tgt, …`). In a chain (`rename a as b, b as c`) the row
                 // gives `b` the original `a` and `c` the original `b`;
@@ -201,14 +198,14 @@ impl PinScope {
             }
             PipeStage::Let(l) => {
                 // Two passes so every source pin resolves against the
-                // PRE-stage scope (parallel SELECT semantics, see above).
+                // pre-stage scope (parallel SELECT semantics, see above).
                 let resolved: Vec<(String, Option<CanonicalType>)> = l
                     .assignments
                     .iter()
                     .map(|(target, expr)| {
                         let pin = match &expr.node {
                             Expr::FieldRef(source) => self.pin_for(source),
-                            // A call that DECLARES its result type hands
+                            // A call that declares its result type hands
                             // that type to the target (ADR-0013 ruling
                             // 9): `let s = sev(level) | where s >=
                             // "error"` is the same comparison as the
@@ -255,8 +252,7 @@ impl PinScope {
             }
             PipeStage::Pivot(p) => {
                 // The pivoted value columns are dynamic; only the group-by
-                // keys survive with their identity (issue #66 mechanism
-                // text: aggregation stages keep group-by keys).
+                // keys survive with their identity.
                 self.restrict_to_names(p.by.iter().map(String::as_str));
             }
             PipeStage::EventStats(es) => self.remove_agg_outputs(&es.aggregations),
@@ -278,11 +274,14 @@ impl PinScope {
         }
     }
 
-    /// The names this scope pins `SEVERITY`, EXCLUDING the envelope's own
-    /// `_severity` — sorted, so the wire order is stable.
+    /// The names this scope pins `SEVERITY`, excluding the envelope's own
+    /// `_severity`.
+    ///
+    /// [`FieldTypes`] iterates a `BTreeMap`, so the list comes out in key
+    /// order and the wire order is stable.
     ///
     /// `_severity` is left out because every renderer already keys off
-    /// that NAME (ADR-0013 §6): carrying it here would make two rules for
+    /// that name (ADR-0013 §6): carrying it here would make two rules for
     /// one column, and the name-keyed one has to stay for the surfaces
     /// that never see a pipeline (a raw result, a saved run).
     fn severity_columns(&self) -> Vec<String> {
@@ -314,9 +313,9 @@ impl PinScope {
 
 /// The result columns a query hands back that hold `SeverityNumber`s and
 /// are NOT the envelope's `_severity` — the rendering channel for
-/// `sev()`'s output (ADR-0013 slice 2, ruling 9).
+/// `sev()`'s output (ADR-0013 ruling 9).
 ///
-/// The SAME walk the emitter and the stream compiler consume, run to the
+/// The same walk the emitter and the stream compiler consume, run to the
 /// end of the pipeline: whatever the final scope pins `SEVERITY` is what
 /// the rows carry, so `| let s = sev(level) | stats count() by s` names
 /// `s` and `| let s = sev(level) | stats count()` names nothing. A name
@@ -647,7 +646,7 @@ mod tests {
         assert_eq!(scope.pin_for("status"), None);
     }
 
-    // ── the pin-declaring subject (ADR-0013 slice 2, ruling 9) ───────
+    // ── the pin-declaring subject (ADR-0013 ruling 9) ────────────────
 
     /// A call whose name declares a result pin hands it to the `let`
     /// target — and it does so under an UNPINNED scope, because the

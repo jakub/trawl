@@ -13,7 +13,7 @@ use trawl_engine::value::{Column, QueryResult, Value};
 
 /// Cached layout areas from the last render frame, used for mouse hit-testing.
 ///
-/// Updated every frame (~100ms) so always fresh after resize.
+/// Rewritten by every draw, so a resize cannot leave hit-testing on a stale layout.
 #[derive(Debug, Clone, Default)]
 pub struct LayoutAreas {
     /// Tab bar row at the top.
@@ -88,7 +88,6 @@ impl ResultsSearch {
                 }
             }
         }
-        // Clamp current_match
         if self.current_match >= self.matches.len() {
             self.current_match = 0;
         }
@@ -208,7 +207,7 @@ impl ColumnConfig {
         }
     }
 
-    /// Hide the selected column and advance cursor to the next visible one.
+    /// Hide the selected column, moving the cursor to the first visible column.
     pub fn hide_selected(&mut self) {
         if let Some(idx) = self.selected
             && self.visible_count() > 1
@@ -216,7 +215,6 @@ impl ColumnConfig {
             if let Some(entry) = self.columns.get_mut(idx) {
                 entry.hidden = true;
             }
-            // Advance cursor to next visible column.
             let order = self.display_order();
             self.selected = order.into_iter().next();
         }
@@ -342,15 +340,15 @@ impl DashboardState {
     }
 }
 
-/// Schema browser state — replaces the old per-service profiling approach.
+/// Schema browser state.
 ///
-/// Populated from a single `schema_services()` API call at startup.
-/// The tree is fully navigable immediately — no async loading per service.
+/// Populated from a single `schema_services()` API call at startup, so the
+/// tree is fully navigable immediately with no per-service async loading.
 #[derive(Debug, Clone)]
 pub struct SchemaBrowser {
     /// Per-service schema from the API response.
     pub services: Vec<trawl_api::ServiceSchema>,
-    /// Fields present in ≥80% of services (computed client-side).
+    /// Well-known fields plus anything in more than 80% of services (computed client-side).
     pub common_fields: Vec<CommonField>,
     /// Which services are expanded (by name).
     pub expanded: HashSet<String>,
@@ -381,7 +379,7 @@ impl SchemaBrowser {
 
 /// A field present across many services (shown once at tree top).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Stats fields used in phase 6 rendering rewrite
+#[allow(dead_code)]
 pub struct CommonField {
     /// Field name.
     pub name: String,
@@ -401,7 +399,7 @@ pub struct CommonField {
 
 /// What is selected in the detail pane (right side).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Used in phase 6 rendering rewrite
+#[allow(dead_code)] // Unused: ui::schema resolves selection with its own local enum
 pub enum DetailSelection {
     /// Nothing selected.
     None,
@@ -415,16 +413,16 @@ pub enum DetailSelection {
     ServiceField { service: String, field: String },
 }
 
-/// Well-known fields that are always in the common set (the ADR-0013
-/// envelope's leading order; kept in sync with
-/// `trawl_api::value::WELL_KNOWN_LOG_FIELDS` — a test asserts parity).
+/// Envelope fields exempt from the frequency threshold, in leading display order.
+///
+/// Mirrors `trawl_api::value::WELL_KNOWN_LOG_FIELDS`; a test asserts parity.
 const WELL_KNOWN_FIELDS: &[&str] = &["_time", "env", "service", "host", "_severity", "message"];
 
 /// Compute common fields from the service list.
 ///
-/// A field is "common" if it's in the well-known set OR appears in ≥80%
-/// of services. Well-known fields come first, then threshold-promoted
-/// fields alphabetically.
+/// A field is "common" if some service reports it and it is either well-known
+/// or present in more than 80% of services. Well-known fields come first, then
+/// threshold-promoted fields alphabetically.
 pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<CommonField> {
     use std::collections::HashMap;
 
@@ -509,8 +507,8 @@ pub struct SavedDetailState {
     pub total_runs: usize,
     /// Currently selected run in the list.
     pub run_selected: usize,
-    /// Scroll offset for the run list (used by rendering).
-    #[allow(dead_code)] // Consumed by render code via `compute_center_offset`
+    /// Scroll offset for the run list.
+    #[allow(dead_code)] // The run list renderer centers on `run_selected` instead
     pub run_scroll: usize,
     /// Loaded result data for viewing a specific run.
     pub result: Option<trawl_api::value::QueryResult>,
@@ -605,7 +603,8 @@ pub enum Popup {
         selected: usize,
         /// Vertical scroll offset in the item list.
         scroll: usize,
-        /// Full catalog of palette items (built on open).
+        /// Items for the current input: the full catalog, or one service's
+        /// columns once the input contains a dot.
         items: Vec<super::palette::PaletteItem>,
         /// Filtered + scored results (recomputed on input change).
         filtered: Vec<super::palette::FilteredItem>,
@@ -800,7 +799,7 @@ impl WrapMap {
             remaining -= num_visual;
         }
 
-        // Past the end — return last line, last col.
+        // Past the end of the map, so fall back to the start of the last logical line.
         let last_row = self.line_breaks.len().saturating_sub(1);
         (last_row, 0)
     }
@@ -1708,12 +1707,10 @@ impl LiveBuffer {
                 offset: 0,
                 returned,
             },
-            // A live buffer rendered as a response carries no notice: the
-            // SSE lane is deliberately outside the stamp (ADR-0011 slice C1).
+            // The SSE lane carries no incomplete-results notice (ADR-0011 slice C1).
             degraded_fields: Vec::new(),
-            // …and outside the severity-rendering channel for the same
-            // reason: the stream carries numbers, and a live tail's
-            // columns are whatever the events happened to bring.
+            // …and no severity token rendering: the stream carries numbers,
+            // and a live tail's columns are whatever the events bring.
             severity_columns: Vec::new(),
         }
     }
@@ -2061,13 +2058,9 @@ mod tests {
     fn editor_word_boundary_left_with_symbols() {
         let mut editor = SimpleEditor::new();
         editor.lines = vec!["foo_bar::baz".to_owned()];
-        // From end (col 12) — skips "baz", skips "::", lands at start of "foo_bar"? No.
-        // Actually: col 12, skip non-word (none at 11, 'z' is word), skip word "baz" → col 9
-        // Wait: col 12: chars[11] = 'z' (word), so skip word first? No, the algorithm is:
-        // skip non-word first, then word. If at word char, skip nothing then skip word.
-        // Let me trace: c=12, chars[11]='z' word → skip non-word: nothing. skip word: z,a,b → c=9
+        // From col 12: no non-word chars to skip, then skip "baz" → col 9.
         assert_eq!(editor.find_word_boundary_left(0, 12), (0, 9));
-        // From col 9: chars[8]=':' not word → skip non-word: ::, c=7. skip word: r,a,b,_,o,o,f → c=0
+        // From col 9: skip "::" → col 7, then skip "foo_bar" → col 0.
         assert_eq!(editor.find_word_boundary_left(0, 9), (0, 0));
     }
 

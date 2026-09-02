@@ -8,19 +8,16 @@
 //! because the consumer expects the `width`/`height` attributes to be
 //! present for layout).
 //!
-//! Adding a 17th glyph is a one-line enum change plus a match arm. No
-//! escape hatch by design — ADR-0030 wants the fleet to share visual
-//! DNA, not let consumers smuggle arbitrary SVGs into the design system.
+//! Adding a glyph is a one-line enum change plus a match arm. There is
+//! no escape hatch by design: ADR-0030 keeps the fleet on one closed
+//! icon set rather than letting consumers pass arbitrary SVGs in.
 
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
 
 /// Every icon shipped by fleet-ui. Used by the rail, the topbar, the
-/// modal family, and app content. Variant order: shared chrome first,
-/// then rail glyphs in the original order they appeared in
-/// trawl-web-ui's `RailIcon` enum, then the glyphs absorbed from
-/// trawl's per-file icon components in the issue-#28 sweep (Download,
-/// Pin, Calendar, Bolt).
+/// modal family, and app content. Variants are grouped by where they
+/// are used: shared chrome, rail, then app content.
 ///
 /// The enum itself is a pure `&'static` descriptor that builds on every
 /// target (like [`crate::theme::prefs`] and [`crate::toast::kinds`]) so
@@ -45,17 +42,13 @@ pub enum Icon {
     User,
     Chart,
     Question,
-    // issue-#28 sweep (paths copied verbatim from trawl's per-file
-    // icon components)
+    // app content
     Download,
     Pin,
     Calendar,
-    /// Service card/drawer "Tail" bolt (round joins). Distinct from the
-    /// rail's [`Icon::Zap`] — trawl shipped two different bolt glyphs
-    /// pre-migration, and both shapes are preserved verbatim.
+    /// Service card/drawer "Tail" bolt (round joins). A different shape
+    /// from the rail's [`Icon::Zap`], kept separate on purpose.
     Bolt,
-    // issue-#33 additions (no in-repo SVG to lift — authored fresh to
-    // house style: 16×16 viewBox, currentColor, stroke 1.4–1.5)
     Document,
     Upload,
     Copy,

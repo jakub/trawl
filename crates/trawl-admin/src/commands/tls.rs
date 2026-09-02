@@ -25,7 +25,7 @@ pub fn generate(output_dir: &Path, extra_san: &[String]) -> Result<(), String> {
         subject_alt_names.join(", ")
     );
 
-    // Explicit ECDSA P-256 key + 2-year validity for auditability.
+    // ECDSA P-256 (rcgen's default) with the 2-year validity set below.
     let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("key generation failed: {e}"))?;
 
     let mut params = rcgen::CertificateParams::new(subject_alt_names)

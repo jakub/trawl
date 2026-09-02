@@ -54,8 +54,8 @@ impl Executor {
     /// The cloned connection benefits from `DuckDB`'s internal metadata
     /// caching (parquet file stats, column statistics) accumulated by
     /// other connections to the same database. A clone shares the
-    /// DATABASE, not the session: settings are NOT inherited — it starts
-    /// from the process default — so the clone is configured in its own
+    /// database, not the session: settings are not inherited, it starts
+    /// from the process default, so the clone is configured in its own
     /// right (`a_cloned_connection_starts_from_the_process_default_not_the_parent`
     /// in `trawl-engine/tests/duckdb_probe.rs`).
     pub fn try_clone(&self) -> Result<Self, EngineError> {
@@ -64,10 +64,10 @@ impl Executor {
         Ok(Self { conn })
     }
 
-    /// Pin the settings a query's ANSWER depends on — currently the session
+    /// Pin the settings a query's answer depends on: currently the session
     /// time zone, which must be UTC on every connection.
     ///
-    /// The bundled `DuckDB` links ICU and defaults `TimeZone` to the HOST
+    /// The bundled `DuckDB` links ICU and defaults `TimeZone` to the host
     /// zone (probed with the clone behaviour above), and two things read
     /// it: the hot branch's TIMESTAMP conform
     /// (`trawl_core::conform`, which parses through `TIMESTAMPTZ` so an
@@ -96,10 +96,10 @@ impl Executor {
     /// Full pipeline: parse DSL, emit SQL, execute.
     ///
     /// `pins` is the field catalog's full pin snapshot typing the
-    /// search-stage comparisons (ADR-0011 slice A). Every caller decides:
-    /// the server passes its catalog snapshot; embedded mode passes an
-    /// explicit `FieldTypes::new()`, making its documented pin-blindness
-    /// visible at the call site.
+    /// search-stage comparisons (ADR-0011). Every caller decides: the
+    /// server passes its catalog snapshot; embedded mode passes an
+    /// explicit `FieldTypes::new()`, making its pin-blindness visible at
+    /// the call site.
     ///
     /// `utc_offset_secs` is applied to all timestamp values at format time.
     /// Pass `0` for UTC display.
@@ -157,7 +157,7 @@ impl Executor {
     /// answering "no files" is a race, not an empty window (ADR-0008).
     /// `hot_pins` conforms the hot branch (pins ∩ snapshot keys); `pins`
     /// is the full catalog snapshot typing the comparisons — one
-    /// interpretation per query (ADR-0011 slice A).
+    /// interpretation per query (ADR-0011).
     #[allow(clippy::too_many_arguments)]
     pub fn run_query_with_hot(
         &self,
@@ -178,12 +178,11 @@ impl Executor {
 
         // A hot value disagreeing with a catalog pin is already conformed on
         // the union's hot branch by the emitter (TRY_CAST to NULL), and
-        // parquet is write-time conformant — so a type conflict surviving to
+        // parquet is write-time conformant, so a type conflict surviving to
         // here means a nonconformant corpus (foreign parquet dropped in
-        // post-boot, restore against a stale catalog) and falls through to
-        // the outcome policy below as a loud error whenever cold files
-        // exist. The read-time coerced retry that used to paper over it is
-        // deleted (ADR-0009 slice 2).
+        // post-boot, restore against a stale catalog). There is no read-time
+        // coerced retry: it falls through to the outcome policy below as a
+        // loud error whenever cold files exist (ADR-0009).
 
         // Classify the outcome, then route on the pure `cold_action`
         // decision so the outcome policy stays unit-testable and identical
@@ -194,18 +193,18 @@ impl Executor {
             HotLane::Present,
         ) {
             ColdAction::HotOnly => {
-                // Hot-only keeps BOTH halves of the interpretation: the same
+                // Hot-only keeps both halves of the interpretation: the same
                 // comparison pins, and the same hot-column conformance the
                 // union's hot branch applies. Reading the raw ndjson would
                 // let `read_json`'s inference type the columns, so
                 // `status=200.0` over a VARCHAR-pinned field would match a
                 // hot numeric `200` here and stop matching the moment a
                 // parquet file appeared.
-                // The anchor is INHERITED, never re-captured: this is
-                // the same logical query reading a narrower source, so a
-                // second clock read would let the fallback answer a
-                // `now()` comparison differently from the union attempt
-                // it replaces (ADR-0017 §3).
+                // The anchor is inherited, never re-captured: this is the
+                // same logical query reading a narrower source, so a second
+                // clock read would let the fallback answer a `now()`
+                // comparison differently from the union attempt it replaces
+                // (ADR-0017 §3).
                 let hot_emitted =
                     emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)?;
                 match self.execute_emitted_tracked(&hot_emitted, max_rows, sql_offset) {
@@ -346,12 +345,12 @@ impl Executor {
     /// The one door onto [`resolve_list_source`], binding its matcher to this
     /// connection's files.
     ///
-    /// The matcher is SPLIT by element shape, for cost: a `glob()` round trip
+    /// The matcher is split by element shape, for cost: a `glob()` round trip
     /// through `DuckDB` costs roughly a millisecond, and a service-pinned
-    /// window is ALL literals (`.../{HH}/nginx.parquet`, one element per
-    /// hour), so a 30-day query paid ~700ms just to resolve. A literal element
-    /// — no `*`, `?` or `[` — is therefore answered by a single
-    /// [`std::fs::metadata`] call instead. Patterns still go through `glob()`.
+    /// window is all literals (`.../{HH}/nginx.parquet`, one element per
+    /// hour), so a 30-day query would pay ~700ms just to resolve. A literal
+    /// element — no `*`, `?` or `[` — is answered by a single
+    /// [`std::fs::metadata`] call instead. Patterns go through `glob()`.
     ///
     /// The two halves must agree on what "matches" means, because both feed
     /// the same no-silent-cold-drop verdict; `fs_matcher_agrees_with_duckdb_glob_on_literals`
@@ -372,15 +371,15 @@ impl Executor {
     ///
     /// Consulted only where the outcome policy's verdict actually depends on
     /// it: a hot-only read — or an empty success — is permitted exactly when
-    /// there is no cold data it could
-    /// hide. A list source already carries its evidence from resolution, so
-    /// this costs nothing and, crucially, never re-globs: a file that matched
-    /// at resolution and vanished before the read must surface as
-    /// [`EngineError::ColdDataUnread`], not be silently re-resolved away. A
-    /// plain glob was never resolved (there is nothing to narrow), so it is
-    /// globbed lazily, here and only here. [`Executor::glob_has_match`] errs
-    /// on the side of "matches", so an unexpected failure surfaces as an
-    /// error rather than degrading to hot-only success.
+    /// there is no cold data it could hide. A list source already carries its
+    /// evidence from resolution, so this costs nothing and never re-globs: a
+    /// file that matched at resolution and vanished before the read must
+    /// surface as [`EngineError::ColdDataUnread`], not be silently
+    /// re-resolved away. A plain glob was never resolved (there is nothing to
+    /// narrow), so it is globbed lazily, here and only here.
+    /// [`Executor::glob_has_match`] errs on the side of "matches", so an
+    /// unexpected failure surfaces as an error rather than degrading to
+    /// hot-only success.
     fn cold_presence(&self, resolved: &ResolvedSource) -> ColdPresence {
         match resolved.evidence {
             ListEvidence::NotAList => {
@@ -424,7 +423,7 @@ impl Executor {
     }
 
     /// Describe the schema without reading row data — embedded mode's schema
-    /// introspection (`trawl schema fields --data`, `trawl query --data`).
+    /// introspection (`trawl schema fields --data`).
     ///
     /// A single `DESCRIBE` over `read_parquet(union_by_name=true)`: `DuckDB`
     /// resolves it without reading rows, and its result is exactly the schema
@@ -433,14 +432,12 @@ impl Executor {
     /// type, and union-able scalar drift (`BIGINT`-vs-`DOUBLE`) reports the
     /// reconciled type.
     ///
-    /// Errors PROPAGATE. The read-time reconcilers that used to degrade an
-    /// irreconcilable cross-file mix to `VARCHAR` via per-file describes are
-    /// deleted (ADR-0009 slice 2): every trawl-written file conforms to the
-    /// field catalog at
-    /// write time, so a union conflict can only mean foreign/nonconformant
-    /// parquet — and that errors loudly instead of being papered over. The
-    /// server's `/api/v1/schema` no longer calls this at all (it reads the
-    /// catalog); embedded mode over the user's own parquet is the sole caller.
+    /// Errors propagate rather than degrading an irreconcilable cross-file
+    /// mix to `VARCHAR`: every trawl-written file conforms to the field
+    /// catalog at write time, so a union conflict can only mean
+    /// foreign/nonconformant parquet (ADR-0009). The server's
+    /// `/api/v1/schema` reads the catalog instead, so embedded mode over the
+    /// user's own parquet is the sole caller.
     pub fn describe_schema(&self, source: &str) -> Result<SchemaResult, EngineError> {
         // Validate source path before interpolation — DuckDB doesn't truly
         // parameterize table-valued function arguments.
@@ -458,7 +455,6 @@ impl Executor {
             columns.push(SchemaColumn { name, data_type });
         }
 
-        // Count matching files.
         let file_count: i64 =
             self.conn
                 .query_row("SELECT count(*)::BIGINT FROM glob(?)", [source], |row| {
@@ -487,7 +483,6 @@ impl Executor {
         field: &str,
         limit: usize,
     ) -> Result<Vec<String>, EngineError> {
-        // Validate field name to prevent SQL injection.
         if !field
             .chars()
             .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
@@ -533,7 +528,7 @@ impl Executor {
     /// (e.g. `extract kv`) since those can't be expressed as pure SQL.
     ///
     /// `max_rows` is a two-mode parameter: a row cap, or `usize::MAX` —
-    /// the caller-facing sentinel for an UNBOUNDED export, which emits no
+    /// the caller-facing sentinel for an unbounded export, which emits no
     /// LIMIT at all. Any cap above `DuckDB`'s INT64 LIMIT domain reads as
     /// the sentinel too, since a larger literal is a conversion error.
     /// Both halves are the one decision `export_row_limit` takes, on the
@@ -561,7 +556,7 @@ impl Executor {
             HotLane::Absent,
         ) {
             // Discarding `outcome`'s error text is safe by construction:
-            // `classify_export_outcome` maps ONLY `is_no_files_error` errors
+            // `classify_export_outcome` maps only `is_no_files_error` errors
             // to `NoColumns` (every other `Database` error classifies
             // `Recoverable` and propagates verbatim), so the error dropped
             // here is always the known "no files match" message — which says
@@ -582,7 +577,7 @@ impl Executor {
     /// (ADR-0008).
     ///
     /// `max_rows` is a two-mode parameter: a row cap, or `usize::MAX` —
-    /// the caller-facing sentinel for an UNBOUNDED export, which emits no
+    /// the caller-facing sentinel for an unbounded export, which emits no
     /// LIMIT at all. Any cap above `DuckDB`'s INT64 LIMIT domain reads as
     /// the sentinel too, since a larger literal is a conversion error.
     /// Both halves are the one decision `export_row_limit` takes, on the
@@ -613,7 +608,7 @@ impl Executor {
                 // Hot-only, conformed like the union's hot branch — an
                 // export must not write JSON-inferred types where the
                 // hot+cold lane would have written the catalog's.
-                // The anchor is INHERITED, never re-captured: this is
+                // The anchor is inherited, never re-captured: this is
                 // the same logical query reading a narrower source, so a
                 // second clock read would let the fallback answer a
                 // `now()` comparison differently from the union attempt
@@ -663,7 +658,7 @@ impl Executor {
         })?;
 
         // Create temp table from query results. Which shape the staging
-        // SELECT takes is ONE decision, `export_row_limit`, read off the
+        // SELECT takes is one decision, `export_row_limit`, read off the
         // caller's `usize` before any narrowing conversion.
         let create_sql = match export_row_limit(max_rows) {
             Some(max_rows) => format!(
@@ -702,7 +697,6 @@ impl Executor {
         let copy_sql =
             format!("COPY __trawl_export TO '{safe_path}' (FORMAT PARQUET, COMPRESSION SNAPPY)");
         if let Err(e) = self.conn.execute_batch(&copy_sql) {
-            // Clean up temp table and partial file on error.
             cleanup(&self.conn);
             let _ = std::fs::remove_file(output_path);
             return Err(e.into());
@@ -836,9 +830,11 @@ fn value_to_json(v: &Value) -> serde_json::Value {
     }
 }
 
-/// `DuckDB` error substring for "no matching files" — verified against `DuckDB` 1.4.x.
+/// `DuckDB`'s "no matching files" message. Matched as text, so a `DuckDB`
+/// upgrade has to re-check it; the outcome-policy tests below provoke the
+/// real error against the bundled build.
 const DUCKDB_NO_FILES_MSG: &str = "No files found that match the pattern";
-/// `DuckDB` error prefix for binder errors — verified against `DuckDB` 1.4.x.
+/// `DuckDB`'s binder-error class prefix, matched as text for the same reason.
 const DUCKDB_BINDER_ERROR_MSG: &str = "Binder Error";
 
 /// Check if a `DuckDB` error is the "No files found" error from `read_parquet()`
@@ -924,12 +920,11 @@ fn error_class(msg: &str) -> Option<&str> {
 /// `read_parquet(union_by_name)` per-file remap path (pinned by
 /// `conflicting_kind_mixes_all_carry_the_conversion_class`).
 ///
-/// NOTE: since ADR-0009 slice 2 NO production path classifies conversion
-/// errors any more — the read-time cast-to-`VARCHAR` fallbacks that consumed
-/// this classifier are deleted, because write-time catalog conformance makes
-/// a surviving `Conversion` error mean a nonconformant corpus, which errors
-/// loudly. The function is retained because the ADR-evidence tests below pin
-/// the `DuckDB` behaviour the no-classifier design rests on.
+/// No production path classifies conversion errors: write-time catalog
+/// conformance makes a surviving `Conversion` error mean a nonconformant
+/// corpus, which errors loudly (ADR-0009). The function is retained because
+/// the ADR-evidence tests below pin the `DuckDB` behaviour that design rests
+/// on.
 ///
 /// It is a *necessary but not sufficient* condition for a union type
 /// conflict: a genuine data-conversion error (`CAST('abc' AS INTEGER)`)
@@ -937,7 +932,7 @@ fn error_class(msg: &str) -> Option<&str> {
 /// two either — both shapes say a value "can't be cast to the destination
 /// type" and both name a "source column".
 ///
-/// Deliberately does NOT match corruption ("too small to be a Parquet
+/// Deliberately does not match corruption ("too small to be a Parquet
 /// file") or missing-column binder errors: those are handled by quarantine
 /// and the benign-binder carve-out respectively.
 pub fn is_conversion_error(e: &duckdb::Error) -> bool {
@@ -959,17 +954,16 @@ enum HotColdOutcome {
     /// resolved source can also have raced a file move, so this is an
     /// observation, not proof: it still needs a cold-file presence check.
     NoColumns,
-    /// A user error the hot lanes answer with the established empty-result
-    /// UX rather than a failure. What lands here differs by lane: the query
-    /// lanes send only a binder error about a missing column (querying a
-    /// nonexistent field), while the export lanes ALSO send
-    /// [`EngineError::Emit`] refusals (a `rust_stages` pipeline, a non-UTF-8
-    /// output path) — main's behavior, kept deliberately. The consequence on
-    /// export is that a `HotOnly` verdict retries emit-refused queries
-    /// hot-only: a binder-shaped failure can genuinely be rescued by a hot
-    /// snapshot that carries the column, while an emitter refusal fails
-    /// identically on the retry — futile, harmless, and identical to what
-    /// main did.
+    /// A user error the hot lanes answer with the empty-result UX rather
+    /// than a failure. What lands here differs by lane: the query lanes send
+    /// only a binder error about a missing column (querying a nonexistent
+    /// field), while the export lanes also send [`EngineError::Emit`]
+    /// refusals (a `rust_stages` pipeline, a non-UTF-8 output path). The
+    /// consequence on export is that a `HotOnly` verdict retries
+    /// emit-refused queries hot-only: a binder-shaped failure can genuinely
+    /// be rescued by a hot snapshot that carries the column, while an
+    /// emitter refusal fails identically on the retry — futile but
+    /// harmless.
     BenignBinder,
     /// Any other database failure — hot-only is only provably safe when a
     /// cold-file presence check says no cold files exist.
@@ -1005,7 +999,7 @@ enum ColdAction {
     ColdDataUnread,
 }
 
-/// Decide the next step for a classified outcome — the ONE outcome policy,
+/// Decide the next step for a classified outcome — the one outcome policy,
 /// consulted by all four entry points (ADR-0008).
 ///
 /// | outcome          | hot=P, cold=P      | hot=P, cold=A | hot=A, cold=P      | hot=A, cold=A |
@@ -1107,14 +1101,14 @@ fn classify_export_outcome(outcome: &Result<(), EngineError>) -> HotColdOutcome 
 /// The LIMIT an export's staging SELECT carries, decided from the caller's
 /// `max_rows`.
 ///
-/// `None` is the UNBOUNDED shape — no LIMIT clause at all — and it is the
+/// `None` is the unbounded shape — no LIMIT clause at all — and it is the
 /// answer for two disjoint reasons. `usize::MAX` is the caller-facing
 /// sentinel for an unbounded export; and `DuckDB`'s LIMIT domain is INT64,
 /// so every `usize` above `i64::MAX` is a Conversion Error rather than a
 /// bigger cap, which the sentinel is not the only way to reach
 /// (`max_export_rows` is operator-set).
 ///
-/// The sentinel is tested on the `usize` BEFORE the conversion, because the
+/// The sentinel is tested on the `usize` before the conversion, because the
 /// conversion alone only recognises it where `usize` is wider than `i64`:
 /// on a 32-bit target `usize::MAX` is `4_294_967_295` and converts cleanly,
 /// which would silently turn the documented unbounded export into a real
@@ -1152,11 +1146,11 @@ enum ColdPresence {
 /// A source argument resolved against the filesystem — once, before the
 /// read, on every lane (ADR-0008).
 ///
-/// `read_parquet` rejects a whole list source when a SINGLE element matches
+/// `read_parquet` rejects a whole list source when a single element matches
 /// nothing, and the server emits one glob per hour in range, so a
 /// sparse-traffic service routinely gets elements pointing at hour
 /// directories holding no file of its own. Resolution narrows the list to
-/// the elements that reach a file BEFORE the read, rather than retrying
+/// the elements that reach a file before the read, rather than retrying
 /// after one failed — and the evidence it gathers on the way is what the
 /// outcome policy later reads instead of globbing again.
 pub(crate) struct ResolvedSource {
@@ -1171,7 +1165,7 @@ pub(crate) struct ResolvedSource {
 impl ResolvedSource {
     /// Emit the cold-only read over this source.
     ///
-    /// The crate's ONE call to [`emitter::emit_with_pins`]: every lane that
+    /// The crate's only call to [`emitter::emit_with_pins`]: every lane that
     /// reads parquet reads a source that has been resolved.
     fn emit_cold(
         &self,
@@ -1184,7 +1178,7 @@ impl ResolvedSource {
 
     /// Emit the hot+cold union read over this source.
     ///
-    /// The crate's ONE call to [`emitter::emit_with_hot_source`], for the
+    /// The crate's only call to [`emitter::emit_with_hot_source`], for the
     /// same reason as [`Self::emit_cold`]. (`emit_hot_only` stays a free
     /// call — it reads no cold source at all.)
     fn emit_union(
@@ -1205,15 +1199,15 @@ fn has_glob_meta(element: &str) -> bool {
     element.contains(['*', '?', '['])
 }
 
-/// Whether a LITERAL path (no glob metacharacters) is a file `read_parquet`
+/// Whether a literal path (no glob metacharacters) is a file `read_parquet`
 /// could open — the filesystem twin of [`Executor::glob_has_match`].
 ///
-/// `metadata` FOLLOWS symlinks, which is what `glob()` does too: a symlink to
+/// `metadata` follows symlinks, which is what `glob()` does too: a symlink to
 /// a real file matches, a broken one does not. A directory named like a
 /// parquet file is not a file, and `glob()` on a literal path does not match
 /// one either (probed, not assumed).
 ///
-/// A metadata error that is NOT `NotFound` (a permission or IO fault) RETAINS
+/// A metadata error that is not `NotFound` (a permission or IO fault) retains
 /// the element: the element must reach `read_parquet` and fail loudly there,
 /// never be dropped into a silently narrower answer.
 fn literal_path_is_file(path: &str) -> bool {
@@ -1224,13 +1218,13 @@ fn literal_path_is_file(path: &str) -> bool {
     }
 }
 
-/// Resolve `source` against a file matcher — the ONE owner of list-source
+/// Resolve `source` against a file matcher — the one owner of list-source
 /// resolution semantics.
 ///
 /// The matcher is injected so the semantics are unit-testable without a live
 /// `DuckDB` connection; [`Executor::resolve_source`] binds it to `glob()`.
 ///
-/// List elements are retained VERBATIM in their original order, duplicates
+/// List elements are retained verbatim in their original order, duplicates
 /// included, and never expanded to concrete filenames: the narrowed source
 /// must reach exactly the data the original reached, and a glob expanded at
 /// resolution time would freeze a file list that compaction is still
@@ -1334,9 +1328,9 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
                 SqlValue::Float(f) => Box::new(*f),
                 SqlValue::Bool(b) => Box::new(*b),
                 // The statement's `now()` anchor (ADR-0017 §3). Bound as
-                // MICROSECONDS because that is `DuckDB`'s TIMESTAMP
+                // microseconds because that is `DuckDB`'s TIMESTAMP
                 // domain and the anchor is truncated to it at capture, so
-                // the bound value is exact — never rounded at the wire.
+                // the bound value is exact, never rounded at the wire.
                 SqlValue::Timestamp(at) => Box::new(duckdb::types::Value::Timestamp(
                     duckdb::types::TimeUnit::Microsecond,
                     at.and_utc().timestamp_micros(),
@@ -1348,8 +1342,10 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
 
 /// Extract a `Value` from a duckdb row at the given column index.
 ///
-/// Uses `ValueRef` for type-safe dispatch. Temporal types fall back to
-/// string extraction so duckdb handles its own formatting.
+/// Uses `ValueRef` for type-safe dispatch. Temporal values render through
+/// this module's own formatters ([`format_timestamp`], [`format_date`],
+/// [`format_time`]) rather than `DuckDB`'s, because the display offset has
+/// to be applied while the value is still an integer count.
 ///
 /// `utc_offset_secs` is applied to timestamp values before civil time
 /// formatting. Pass `0` for UTC.
@@ -1408,11 +1404,10 @@ fn convert_duckdb_value(v: duckdb::types::Value) -> Value {
     }
 }
 
-/// Convert a timestamp value to an ISO 8601 string.
-///
-/// `DuckDB` stores timestamps as integer offsets from the Unix epoch.
-/// The `TimeUnit` indicates the resolution.
 /// Convert a temporal value to microseconds based on its `TimeUnit`.
+///
+/// `DuckDB` stores temporal values as integer offsets from the Unix epoch;
+/// the `TimeUnit` gives the resolution.
 const fn to_micros(unit: TimeUnit, val: i64) -> i64 {
     match unit {
         TimeUnit::Second => val * 1_000_000,
@@ -1463,12 +1458,12 @@ fn format_timestamp(unit: TimeUnit, val: i64, utc_offset_secs: i32) -> String {
     }
 }
 
-/// The offset the SQL result is RENDERED with, given the display offset
+/// The offset the SQL result is rendered with, given the display offset
 /// the caller asked for.
 ///
 /// Zero whenever a Rust tail follows, because that tail is a second
 /// evaluator, not a printer: its `| where`/`| let` are pin-aware
-/// (ADR-0011 slice A′) and read a TIMESTAMP cell through
+/// (ADR-0011) and read a TIMESTAMP cell through
 /// `compare::conformed_timestamp`, which takes a zoneless text as UTC. A
 /// display-shifted rendering handed to it would compare local wall-clock
 /// text against a UTC instant and skew every timestamp comparison by the
@@ -1487,14 +1482,13 @@ fn sql_render_offset(emitted: &EmittedQuery, utc_offset_secs: i32) -> i32 {
 /// Follow the SQL result's TIMESTAMP columns through the Rust tail's own
 /// rename/alias lineage.
 ///
-/// The tail re-uses the pin-scope walk ([`PinScope::advance`], ADR-0011
-/// slice A′) with a scope holding exactly the tracked columns: a
-/// `rename`d timestamp column carries its tracking to the new name, a
-/// bare-alias `let t2 = _time` copies it, and a computed value or
-/// aggregate output — the tail's own, no longer the stored rendering —
-/// is killed by the walk and stays as the tail rendered it. Both display
-/// lineage and comparison pins follow the SAME stage rules, so they can
-/// never disagree about which column is "still `_time`".
+/// The tail re-uses the pin-scope walk ([`PinScope::advance`]) with a scope
+/// holding exactly the tracked columns: a `rename`d timestamp column carries
+/// its tracking to the new name, a bare-alias `let t2 = _time` copies it,
+/// and a computed value or aggregate output — the tail's own, no longer the
+/// stored rendering — is killed by the walk and stays as the tail rendered
+/// it. Display lineage and comparison pins follow the same stage rules, so
+/// they can never disagree about which column is "still `_time`".
 fn tail_timestamp_scope(timestamp_columns: &[String], stages: &[Spanned<PipeStage>]) -> PinScope {
     let mut seed = FieldTypes::new();
     for name in timestamp_columns {
@@ -1729,10 +1723,10 @@ mod tests {
         // message body can tell a value that cannot be converted from a
         // schema that cannot be reconciled. Both are `Conversion`-class, and
         // on the bundled 1.5.5 both bodies name a "source column" and talk
-        // about casting to a "destination type". This is exactly why the
-        // read path no longer classifies conflicts at all (ADR-0009 slice 2
-        // deleted the coerced retry): the catalog enforces conformance at
-        // write time and any surviving Conversion error is loud.
+        // about casting to a "destination type". That is why the read path
+        // does not classify conflicts at all: the catalog enforces
+        // conformance at write time and any surviving Conversion error is
+        // loud.
         let data = data_conversion_error();
         assert_eq!(
             error_class(&data.to_string()),
@@ -1747,9 +1741,9 @@ mod tests {
     fn conflicting_kind_mixes_all_carry_the_conversion_class() {
         // Compaction's rollup and merge fallbacks trigger on the conversion
         // class alone (there is no second source to describe until the
-        // fallback runs), so the class must cover every cross-file mix the
-        // old "remap"/"type mismatch" substrings used to catch. Pin the full
-        // kind matrix on both the read_parquet and UNION ALL BY NAME paths.
+        // fallback runs), so the class must cover every cross-file mix. Pin
+        // the full kind matrix on both the read_parquet and UNION ALL BY
+        // NAME paths.
         let mixes = [
             ("{'a': 1}", "'plain'"),
             ("{'a': 1}", "[1, 2]"),
@@ -1797,17 +1791,16 @@ mod tests {
     #[test]
     fn irreconcilable_drift_describes_raw_and_errors_loudly_at_read() {
         // `meta` is a STRUCT in file A and a VARCHAR in file B — an
-        // irreconcilable cross-file mix a real query cannot read. Post-catalog
-        // (ADR-0009 slice 2) every trawl-written file conforms at write time,
-        // so this shape can only be foreign/nonconformant parquet.
+        // irreconcilable cross-file mix a real query cannot read. Every
+        // trawl-written file conforms at write time (ADR-0009), so this shape
+        // can only be foreign/nonconformant parquet.
         //
         // Execution-verified on the bundled DuckDB 1.5.5: DESCRIBE never
-        // reads rows, so it resolves the union to the complex side WITHOUT
+        // reads rows, so it resolves the union to the complex side without
         // erroring — the describe reports what is in the footers, raw. The
-        // read-time reconciler that used to degrade the column to VARCHAR is
-        // deleted, so the QUERY over the same glob now errors loudly instead
-        // of silently succeeding with a coerced VARCHAR column. Pin both
-        // halves: describe succeeds (raw), query errors (loud).
+        // query over the same glob errors loudly rather than coercing the
+        // column to VARCHAR. Pin both halves: describe succeeds (raw), query
+        // errors (loud).
         let dir = tempfile::tempdir().unwrap();
         let setup = Connection::open_in_memory().unwrap();
         write_meta_parquet(&setup, &dir.path().join("a.parquet"), "{'a': 1}");
@@ -1843,11 +1836,10 @@ mod tests {
     fn describe_schema_keeps_union_able_struct_drift() {
         // `meta` is `STRUCT(x INTEGER)` in file A and `STRUCT(y INTEGER)` in
         // file B — realistic per-batch JSON inference on sparse nested objects.
-        // `read_parquet(union_by_name=true)` MERGES these to
+        // `read_parquet(union_by_name=true)` merges these to
         // `STRUCT(x INTEGER, y INTEGER)` and a real query reads them fine, so
-        // describe_schema must report the merged STRUCT, NOT collapse to
-        // VARCHAR (which would make /api/v1/schema lie about a column queries
-        // return as a STRUCT — the inverse of the drift S1 set out to prevent).
+        // describe_schema must report the merged STRUCT, not collapse to
+        // VARCHAR, which would report a type no query returns.
         let dir = tempfile::tempdir().unwrap();
         let setup = Connection::open_in_memory().unwrap();
         write_meta_parquet(&setup, &dir.path().join("a.parquet"), "{'x': 1}");
@@ -1883,11 +1875,11 @@ mod tests {
         );
     }
 
-    /// The `_raw`-free retry re-runs the SAME emission with one SQL
-    /// string swapped, so it inherits the statement's anchor by
-    /// construction. Verified rather than assumed: the retry builds its
-    /// query with struct update syntax, and a future field added by hand
-    /// instead could quietly re-sample.
+    /// The `_raw`-free retry re-runs the same emission with one SQL string
+    /// swapped, so it inherits the statement's anchor by construction.
+    /// Verified rather than assumed: the retry builds its query with struct
+    /// update syntax, and a future field added by hand instead could quietly
+    /// re-sample.
     #[test]
     fn the_raw_free_retry_inherits_the_anchor() {
         let anchor = EvalContext::at(
@@ -1923,9 +1915,8 @@ mod tests {
     #[test]
     fn run_query_with_hot_returns_hot_on_cold_start() {
         // Cold start: the parquet source matches zero files, so the union
-        // raises a "no files" error (NOT a type conflict). The hot-only
-        // fallback must return the hot row without erroring and WITHOUT
-        // logging a cold-drop (type_conflict is false here).
+        // raises a "no files" error, not a type conflict. The hot-only
+        // fallback must return the hot row without erroring.
         let dir = tempfile::tempdir().unwrap();
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
@@ -1963,10 +1954,10 @@ mod tests {
         // produce this Conversion class, see conversion_error_class below).
         let dir = tempfile::tempdir().unwrap();
 
-        // On the bundled 1.5.5 the per-file remap variant is ALSO a
-        // Conversion-class error ("failed to cast column ..."), not the
-        // legacy Binder "Struct remap" string — which is why the classifier
-        // needs no Binder arm at all.
+        // On the bundled 1.5.5 the per-file remap variant is also a
+        // Conversion-class error ("failed to cast column ..."), not a Binder
+        // "Struct remap" one, which is why the classifier needs no Binder
+        // arm at all.
         let remap_msg = read_parquet_remap_error(dir.path()).to_string();
         assert_eq!(
             error_class(&remap_msg),
@@ -1999,8 +1990,10 @@ mod tests {
     /// The four ADR-0008 trigger variants under a hard CAST all produce a
     /// `Conversion Error`-class message — the evidence (verified by execution
     /// against the bundled crate) behind the classifier keying off the class
-    /// token. Post-fix these variants never reach a hard CAST, but the
-    /// assertion pins the `DuckDB` behavior the design relies on.
+    /// token. No ingest or read lane hard-CASTs a `_time` value — the hot
+    /// branch `TRY_CAST`s it and compaction resolves it through `COALESCE` —
+    /// so this pins `DuckDB` behaviour the design relies on, not a live code
+    /// path.
     #[test]
     fn trigger_variants_produce_conversion_class_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -2042,10 +2035,8 @@ mod tests {
         // The whole outcome policy, cell by cell (ADR-0008). Two invariants
         // read off it: a hot-only read happens exactly where it cannot hide
         // cold data, and an empty answer is returned only when the source
-        // provably reaches no files. The `hot=Present` columns are the
-        // behaviour the hot+cold lanes have always had; the `hot=Absent`
-        // ones extend the same gate to `run_query`/`export_parquet`, which
-        // used to have none.
+        // provably reaches no files. The `hot=Absent` column is the same gate
+        // applied to `run_query`/`export_parquet`.
         use ColdAction::{ColdDataUnread as Unread, HotOnly, ReturnOutcome as Return};
         use ColdPresence::{Absent as ColdAbsent, Present as ColdPresent};
         use HotColdOutcome::{BenignBinder, Columns, Fatal, NoColumns, Recoverable};
@@ -2200,8 +2191,8 @@ mod tests {
     #[test]
     fn missing_column_with_cold_files_returns_empty_not_error() {
         // A query on a nonexistent field with cold files present keeps the
-        // current empty-result UX (the BenignBinder carve-out): the binder
-        // error is a user error, not a cold-data drop.
+        // empty-result UX (the BenignBinder carve-out): the binder error is
+        // a user error, not a cold-data drop.
         let dir = tempfile::tempdir().unwrap();
         let setup = Connection::open_in_memory().unwrap();
         write_meta_parquet(&setup, &dir.path().join("cold.parquet"), "'plain'");
@@ -2277,7 +2268,7 @@ mod tests {
 
         let missing = dir.path().join("missing.parquet");
 
-        // A DIRECTORY named like a parquet file: not something `read_parquet`
+        // A directory named like a parquet file: not something `read_parquet`
         // can open as an element.
         let dir_named_parquet = dir.path().join("dir.parquet");
         std::fs::create_dir(&dir_named_parquet).unwrap();
@@ -2313,9 +2304,10 @@ mod tests {
 
     #[test]
     fn literal_path_is_file_retains_on_a_non_notfound_error() {
-        // Fail toward RETAINING the element: an unreadable path must reach
+        // Fail toward retaining the element: an unreadable path must reach
         // `read_parquet` and error loudly, never vanish from the list. A
-        // component that is a FILE makes the lookup ENOTDIR, not ENOENT.
+        // path component that is a file makes the lookup ENOTDIR, not
+        // ENOENT.
         let dir = tempfile::tempdir().unwrap();
         let setup = Connection::open_in_memory().unwrap();
         let file = dir.path().join("present.parquet");
@@ -2422,7 +2414,7 @@ mod tests {
 
     #[test]
     fn resolve_list_source_preserves_order_and_duplicates() {
-        // Elements are kept VERBATIM, in the original order, duplicates
+        // Elements are kept verbatim, in the original order, duplicates
         // included: the narrowed source must reach exactly what the original
         // reached, and never a set of concrete filenames.
         let source = "['/z/*.parquet', '/a/*.parquet', '/z/*.parquet', '/m/*.parquet']";
@@ -2474,7 +2466,7 @@ mod tests {
         // (created by other services) holding no file of its own. DuckDB
         // raises "No files found that match the pattern" for such an element
         // even when a sibling element has data, and `execute_emitted` maps
-        // that to an empty result — so an empty result must NOT be read as
+        // that to an empty result — so an empty result must not be read as
         // "cold start". The cold rows that do exist must still come back.
         let dir = tempfile::tempdir().unwrap();
         let full_hour = dir.path().join("10");
@@ -2518,10 +2510,10 @@ mod tests {
     #[test]
     fn partial_list_source_miss_keeps_cold_rows_without_a_hot_buffer() {
         // The same shape as `partial_list_source_miss_keeps_cold_rows`, one
-        // lane over: `run_query` had NEITHER the prune retry nor the outcome
-        // gate, so `service=X last=Nh` against an idle install answered 200
-        // with zero rows for as long as any hour in range belonged to another
-        // service. Resolution is a source property now, so it does not.
+        // lane over: with no hot buffer to rescue it, resolution alone has to
+        // keep the cold row. Regression guard: `service=X last=Nh` against an
+        // idle install must not answer 200 with zero rows because some hour in
+        // range belongs to another service.
         let dir = tempfile::tempdir().unwrap();
         let full_hour = dir.path().join("10");
         let empty_hour = dir.path().join("11");
@@ -2549,8 +2541,8 @@ mod tests {
 
     #[test]
     fn export_without_hot_keeps_cold_rows_on_partial_list_miss() {
-        // `export_parquet` surfaced DuckDB's "no files" error raw, so the
-        // same everyday shape was a 500 on the export lane.
+        // The export lane surfaces DuckDB's "no files" error raw, so without
+        // resolution narrowing the list this everyday shape would be a 500.
         let dir = tempfile::tempdir().unwrap();
         let full_hour = dir.path().join("10");
         let empty_hour = dir.path().join("11");
@@ -2586,9 +2578,9 @@ mod tests {
     #[test]
     fn empty_window_without_a_hot_buffer_is_an_empty_success() {
         // The one shape where an empty answer is the truth: the list reaches
-        // no file at all. Widening the gate to `run_query` must not turn a
-        // genuinely empty window into an error — that would make every query
-        // over a quiet time range fail.
+        // no file at all. The gate must not turn a genuinely empty window
+        // into an error — that would fail every query over a quiet time
+        // range.
         let dir = tempfile::tempdir().unwrap();
         let hour = dir.path().join("10");
         std::fs::create_dir_all(&hour).unwrap();
@@ -2605,7 +2597,7 @@ mod tests {
     fn export_without_hot_stays_loud_for_an_empty_window() {
         // An export has no empty answer to write, so the raw "no files" error
         // stands where the query lane returns zero rows. Deliberate, and
-        // pinned so the gate's widening does not quietly convert it.
+        // pinned so the gate does not quietly convert it.
         let dir = tempfile::tempdir().unwrap();
         let hour = dir.path().join("10");
         std::fs::create_dir_all(&hour).unwrap();
@@ -2622,12 +2614,12 @@ mod tests {
 
     #[test]
     fn no_files_outcome_with_cold_data_errors_instead_of_empty_success() {
-        // A "no files" read error with cold parquet on disk must NOT surface
+        // A "no files" read error with cold parquet on disk must not surface
         // as the substituted empty success: that would silently drop the
         // entire cold history (ADR-0008). Provoked here the same way it
         // happens in production — the hot snapshot path matches no file while
-        // a sibling cold element still does — so the prune retry cannot
-        // rescue it and the outcome policy is the last line of defense.
+        // a sibling cold element still does — so narrowing cannot rescue it
+        // and the outcome policy is the last line of defence.
         let dir = tempfile::tempdir().unwrap();
         let hour = dir.path().join("10");
         std::fs::create_dir_all(&hour).unwrap();
@@ -2704,8 +2696,9 @@ mod tests {
         // sibling hour directory that exists (other services compacted there)
         // without a file of its own. DuckDB rejects the whole list, and the
         // hot-only arm cannot rescue it because the matching sibling makes
-        // cold files "present" — so without the prune retry this 500s. Both
-        // the cold row and the hot row must land in the exported parquet.
+        // cold files "present" — narrowing the list before the read is what
+        // keeps this from 500ing. Both the cold row and the hot row must land
+        // in the exported parquet.
         let dir = tempfile::tempdir().unwrap();
         let full_hour = dir.path().join("10");
         let empty_hour = dir.path().join("11");
@@ -2794,13 +2787,13 @@ mod tests {
     /// The export lane's LIMIT shape is decided on the caller's `usize`,
     /// so the unbounded contract holds at every pointer width.
     ///
-    /// This asserts the DECISION, not an execution, and that is what makes
-    /// it target-independent: `usize::MAX` here IS the target's sentinel,
+    /// This asserts the decision, not an execution, which is what makes it
+    /// target-independent: `usize::MAX` here is the target's sentinel,
     /// whatever its width.
     ///
     /// Deciding by conversion alone — `i64::try_from` with the error arm
-    /// standing in for "unbounded" — passes on a 64-bit target and FAILS
-    /// on a 32-bit one, where `usize::MAX` is `4_294_967_295` and converts
+    /// standing in for "unbounded" — passes on a 64-bit target and fails on
+    /// a 32-bit one, where `usize::MAX` is `4_294_967_295` and converts
     /// cleanly into a real `LIMIT`.
     #[test]
     fn export_row_limit_sentinel_is_target_independent() {
@@ -2823,7 +2816,7 @@ mod tests {
             assert_eq!(export_row_limit(top), Some(i64::MAX));
         }
 
-        // Out of the INT64 domain but NOT the sentinel (`max_export_rows`
+        // Out of the INT64 domain but not the sentinel (`max_export_rows`
         // is operator-set). Only reachable where `usize` is wider than
         // `i64`'s positive range.
         if let Ok(above) = usize::try_from(1_u128 << 63) {

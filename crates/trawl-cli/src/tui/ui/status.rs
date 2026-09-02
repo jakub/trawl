@@ -43,7 +43,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         spans.push(status_span);
     }
 
-    // Live mode indicator
     if app.live_mode {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -54,7 +53,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ));
     }
 
-    // Focus indicator
     let focus_text = match app.focus {
         Focus::Editor => " [editor] ",
         Focus::Results => " [results] ",
@@ -62,17 +60,13 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     };
     spans.push(Span::raw(focus_text));
 
-    // Context-sensitive hints (responsive)
     let hints = get_context_hints(app, width);
 
-    // Calculate left side length for padding
     let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
 
-    // Calculate padding
     #[allow(clippy::cast_possible_truncation)] // Terminal width is always < u16::MAX
     let padding_len = area.width.saturating_sub((left_len + hints.len()) as u16) as usize;
 
-    // Add padding and hints
     spans.push(Span::raw(" ".repeat(padding_len)));
     spans.push(Span::styled(hints, Style::default().fg(theme.text_muted)));
 
@@ -83,7 +77,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
 /// Generate context-sensitive keybinding hints (responsive to terminal width).
 fn get_context_hints(app: &App, width: usize) -> String {
-    // Panel tab hints
     if app.focus == Focus::Panel {
         if app.main_tab == MainTab::Schema
             && app.panel.schema.as_ref().is_some_and(|s| s.filter_active)
@@ -125,7 +118,6 @@ fn get_context_hints(app: &App, width: usize) -> String {
         };
     }
 
-    // Live mode hints
     if app.live_mode {
         return if width >= 75 {
             "F9: stop live tail | F1: help | Ctrl+Q: quit".to_owned()
@@ -136,7 +128,6 @@ fn get_context_hints(app: &App, width: usize) -> String {
         };
     }
 
-    // Results search mode hints
     if let Some(ref search) = app.results_search {
         return if search.input_active {
             if width >= 55 {
@@ -151,7 +142,6 @@ fn get_context_hints(app: &App, width: usize) -> String {
         };
     }
 
-    // Focus-specific hints
     match app.focus {
         Focus::Editor => {
             if width >= 75 {

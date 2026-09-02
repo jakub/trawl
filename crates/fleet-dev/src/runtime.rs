@@ -106,9 +106,9 @@ pub fn render(
 
     let token = developer_key.token.expose().as_bytes();
     if token.is_empty() {
-        // `windows(0)` panics, and an empty key would make the leak check
-        // below vacuously pass. Both are unreachable today; neither should be
-        // a surprise if a key source ever regresses.
+        // `windows(0)` panics, so an empty token would crash the leak check
+        // below instead of running it. No key source produces one today; the
+        // guard keeps a regression from landing as a panic.
         return Err(Error::InvalidArgument(
             "internal error: developer API key is empty".to_owned(),
         ));
@@ -453,8 +453,8 @@ mod tests {
 
     #[test]
     fn an_empty_developer_key_is_refused_rather_than_panicking() {
-        // `windows(0)` panics, and an empty needle would make the leak check
-        // vacuously pass.
+        // No key source produces an empty token, but `windows(0)` would panic
+        // if one did.
         let plan = DevelopmentPlan {
             schema: 1,
             exposure: crate::cli::Exposure::Localhost,
@@ -520,8 +520,8 @@ no_redirect = true
         render_trunk_config(&output, &ui, &topology).unwrap();
         let rendered: toml::Value =
             toml::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
-        // Trunk's serve-mode nonce CSP blocks the app's own stylesheets
-        // (#301 follow-up), so the generated config must always disable it…
+        // Trunk's serve-mode nonce CSP blocks the app's own stylesheets, so
+        // the generated config must always disable it…
         assert_eq!(rendered["build"]["create_nonce"].as_bool(), Some(false));
         // …while the app's source Trunk.toml keeps the release-build nonce
         // pipeline untouched.

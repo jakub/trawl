@@ -13,10 +13,9 @@
 //! Producer failure paths are therefore metrics only (plus rate-limited
 //! stderr at the producer, outside these modules).
 //!
-//! This is a source-level assertion rather than a runtime one because the
-//! failure mode is unbounded recursion: a test that PROVOKES it would be
-//! the outage. Reviewing a diff is exactly when the invariant is at risk,
-//! so the guard belongs where a diff trips it.
+//! This is a source-level assertion rather than a runtime one: the failure
+//! mode is unbounded recursion, so a test that provoked it would be the
+//! outage.
 
 /// The modules the invariant covers: the door, the profile types it
 /// reaches on every event, and the metric label helpers the per-event
@@ -38,11 +37,11 @@ const GUARDED: [(&str, &str); 3] = [
 /// tests may log freely — they run under no telemetry layer.
 const TEST_MODULE_MARKER: &str = "#[cfg(test)]";
 
-/// Strip whole-line comments, so the invariant is about CALLS and not
-/// about prose (both modules DOCUMENT the rule, naming `tracing` to do
-/// so). Deliberately strict about the rest: a trailing `// tracing`
-/// comment would fail this test, which is a cheap false positive next to
-/// the alternative of parsing Rust.
+/// Strip whole-line comments, so the invariant is about calls and not
+/// about prose (the two ingest modules state the rule in their headers,
+/// which takes naming `tracing`). Deliberately strict about the rest: a
+/// trailing `// tracing` comment fails this test, a cheap false positive
+/// next to the alternative of parsing Rust.
 fn code_only(source: &str) -> String {
     source
         .lines()

@@ -25,8 +25,8 @@ use crate::parser::primitives::{
 /// Parse an aggregation expression like `count()`, `avg(duration)`,
 /// or `count() as total`.
 fn agg_expr<'src>() -> impl Parser<'src, ParserInput<'src>, AggExpr, ParserExtra<'src>> + Clone {
-    // The function head takes the UNQUOTED production — a function name
-    // is not a field name (ADR-0013 §7).
+    // The function head takes the unquoted production, because a function
+    // name is not a field name (ADR-0013 §7).
     plain_name()
         .then_ignore(just('(').spaced())
         .then(expr().separated_by(just(',').spaced()).collect::<Vec<_>>())
@@ -259,12 +259,12 @@ fn drop_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         .labelled("drop stage")
 }
 
-/// A field name the pipeline WRITES: a `let`/`eval` target, a `rename`
+/// A field name the pipeline writes: a `let`/`eval` target, a `rename`
 /// target, or an explicit aggregate alias (`stats`/`eventstats`/
 /// `timechart`/`pivot` all mint their output column through `as`).
-/// Trawl's `_` namespace is sealed at both doors (ADR-0013 §5) —
-/// ingest strips the prefix off an incoming key, so a name the DSL minted
-/// there would be a column ingest can never carry.
+/// Trawl's `_` namespace is sealed at both doors (ADR-0013 §5): ingest
+/// strips the prefix off an incoming key, so a name the DSL minted there
+/// would be a column ingest can never carry.
 fn assignment_target<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     field_name().try_map(|name, span| {
@@ -1219,8 +1219,8 @@ mod tests {
 
     // ── backtick escape (ADR-0013 ruling 7) ─────────────────────────────
 
-    /// Backticks are accepted in EVERY field-name position — a partial
-    /// rollout recreates "the name you type isn't always reachable".
+    /// Backticks are accepted in every field-name position: a gap in the
+    /// coverage would mean the name you type is not always reachable.
     #[test]
     fn backticks_are_accepted_in_every_field_position() {
         let cases: &[(&str, &str)] = &[
@@ -1261,8 +1261,8 @@ mod tests {
         }
     }
 
-    /// Quoting is not an escape from policy: `is_reserved_name` still
-    /// refuses every WRITE position (ADR-0013 §5).
+    /// Quoting is not an escape from policy: `is_reserved_name` refuses
+    /// every write position (ADR-0013 §5).
     #[test]
     fn backticks_do_not_unseal_the_reserved_namespace() {
         for dsl in [
@@ -1279,8 +1279,8 @@ mod tests {
         }
     }
 
-    /// Function names are not fields and take no backticks — the
-    /// aggregate head parses through the UNQUOTED production.
+    /// Function names are not fields and take no backticks: the
+    /// aggregate head parses through the unquoted production.
     #[test]
     fn aggregate_function_names_take_no_backticks() {
         assert!(pipeline().parse("| stats `count`()").into_result().is_err());

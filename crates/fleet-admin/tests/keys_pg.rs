@@ -28,7 +28,7 @@ fn names(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_owned()).collect()
 }
 
-/// Seed the converted-shape roles the key tests hand out.
+/// Seed the roles the key tests hand out.
 async fn seed_roles(store: &KeyStore) {
     store
         .create_role(

@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Per-file processing for the shadow build (ADR-0011 slice B): source
+//! Per-file processing for the shadow build (ADR-0011): source
 //! enumeration/signatures, the affectedness decision, and the two ways a
 //! file lands in the shadow generation — a hardlink (unaffected, foreign,
 //! or non-parquet) or a `ConformPlan` rewrite (affected).
@@ -30,22 +30,22 @@ pub(crate) struct FileSig {
     mtime: Option<std::time::SystemTime>,
 }
 
-/// Enumerate every FILE under the env directories of `data_dir` (all
+/// Enumerate every file under the env directories of `data_dir` (all
 /// files, not just parquet — `.corrupt` quarantines and other evidence
 /// must ride the swap too), keyed by data-root-relative path.
 ///
-/// Only VALID env directories are covered: the per-env swap moves exactly
+/// Only valid env directories are covered: the per-env swap moves exactly
 /// these, so `wal/`, `scheduled/`, the markers, and any non-env top-level
 /// entry stay in the live root untouched.
 ///
-/// `*.tmp` is the ONE exclusion: a staging file belongs to the writer
+/// `*.tmp` is the one exclusion: a staging file belongs to the writer
 /// holding it open (compaction's `{service}.parquet.tmp`, this module's
 /// own), is never evidence, and hardlinking one into the shadow would
 /// make a second name for an inode a live writer is about to rewrite.
 /// Anything left behind is an orphan compaction's own stale-tmp sweep
 /// reclaims.
 ///
-/// A SYMLINK anywhere under an env directory aborts the walk. trawl never
+/// A symlink anywhere under an env directory aborts the walk. trawl never
 /// writes one, so it is an operator's own layout (a date partition or a
 /// large service file parked on another volume), and the shadow cannot
 /// carry it: the entry is neither a file nor a directory to `lstat`, and
@@ -125,15 +125,15 @@ pub(crate) struct ProcessTally {
     pub(crate) nulled: u64,
     /// Values recovered from `_raw` into the column.
     pub(crate) resurrected: u64,
-    /// Rows the new pin reads DIFFERENTLY in each dialect — the values only
-    /// the operator's assertion can settle (issue #79).
+    /// Rows the new pin reads differently in each dialect — the values only
+    /// the operator's assertion can settle.
     pub(crate) ambiguous: u64,
     /// The service the file belongs to (layout files only) — conflict
     /// evidence for a forced lossy repin is attributed per service.
     pub(crate) service: Option<String>,
 }
 
-/// Process ONE source file into the shadow root: an affected layout
+/// Process one source file into the shadow root: an affected layout
 /// parquet is rewritten through [`ConformPolicy::Repin`]; everything else
 /// — unaffected parquet, foreign parquet, non-parquet evidence — is
 /// hardlinked verbatim (the shadow is a sibling of the data root, and
@@ -143,7 +143,7 @@ pub(crate) struct ProcessTally {
 /// Idempotent per file: a pre-existing shadow entry (an earlier catch-up
 /// pass's output for a since-replaced source) is removed first.
 ///
-/// `precounted` is the scan's own tally for THIS byte-identical file (see
+/// `precounted` is the scan's own tally for this byte-identical file (see
 /// [`crate::repin::plan::ScanTallies`]); supplying it skips the aggregate
 /// recount, and supplying a stale one would misreport the rewrite, so the
 /// caller owns the signature check.
@@ -197,13 +197,13 @@ pub(crate) fn process_file(
 
 /// Decide affectedness: a file is rewritten only when it is (a) at a path
 /// trawl itself wrote ([`layout_path`] — the same ownership gate as the
-/// boot pass; a foreign file is NEVER rewritten however it parses) and
+/// boot pass; a foreign file is never rewritten however it parses) and
 /// (b) a readable parquet whose schema carries the target column under
 /// its folded name.
 ///
-/// THE affectedness decision — the scan (`repin::plan`) asks this same
-/// function, so the dry run's file set is the rewrite's file set by
-/// construction rather than by two predicates agreeing.
+/// The scan (`repin::plan`) asks this same function, so the dry run's file
+/// set is the rewrite's file set by construction rather than by two
+/// predicates agreeing.
 pub(crate) fn affected_schema(
     conn: &duckdb::Connection,
     data_dir: &Path,
@@ -227,7 +227,7 @@ pub(crate) fn affected_schema(
     Ok(carries.then_some((schema, layout)))
 }
 
-/// Rewrite one affected file into the shadow: tally with the SAME
+/// Rewrite one affected file into the shadow: tally with the same
 /// expressions the write uses, then `COPY` through the
 /// [`ConformPolicy::Repin`] plan, staged `.tmp` → fsync → rename.
 #[allow(clippy::too_many_arguments)]
@@ -245,7 +245,7 @@ fn rewrite_affected(
     let safe = src.to_string_lossy().replace('\'', "''");
     let source = format!("read_parquet('{safe}')");
     // The tally is a full aggregate scan of the file, and the mandatory
-    // pre-build scan just ran the IDENTICAL SQL over it. Reuse that
+    // pre-build scan just ran the identical SQL over it. Reuse that
     // reading when the source has not changed a byte since — the numbers
     // are equal by construction, not by approximation.
     let counts = match precounted {
@@ -293,10 +293,10 @@ fn rewrite_affected(
 
 /// Where a rewrite stages its output before the rename onto `dst`.
 ///
-/// Deliberately NOT `{service}.parquet.tmp` — that is byte-for-byte the
+/// Deliberately not `{service}.parquet.tmp` — that is byte-for-byte the
 /// path hourly compaction stages at, and `DuckDB`'s `COPY` opens its target
 /// `O_CREAT|O_TRUNC` without unlinking first, so a shadow entry that is a
-/// hardlink to a live staging file would be truncated and rewritten IN
+/// hardlink to a live staging file would be truncated and rewritten inside
 /// the live data root. The pid keeps two processes sharing a shadow root
 /// (a would-be operator mistake) off each other's staging file, and the
 /// `.tmp` extension keeps a crash leftover inert and inside compaction's
@@ -306,7 +306,7 @@ fn staging_path(dst: &Path) -> PathBuf {
 }
 
 /// The per-file numbers the plan reports and the rewrite achieves,
-/// computed with the SAME expressions the rewrite writes
+/// computed with the same expressions the rewrite writes
 /// (`repin_count_exprs` — see `ingest::compaction::repin_target_expr`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RepinEffect {
@@ -320,7 +320,7 @@ pub(crate) struct RepinEffect {
     pub(crate) resurrected: u64,
     /// Rows whose reading differs between the two dialects. Counted on
     /// every scan whatever the job asserted — the count is evidence; what
-    /// the assertion governs is the force GATE.
+    /// the assertion governs is the force gate.
     pub(crate) ambiguous: u64,
 }
 
@@ -336,15 +336,15 @@ pub(crate) fn count_repin_effect(
     Ok(effect)
 }
 
-/// Count what the repin would do to one affected source AND sample the
-/// values it cannot read — in ONE statement (issue #79).
+/// Count what the repin would do to one affected source and sample the
+/// values it cannot read, in one statement.
 ///
 /// One statement because the numbers and the evidence must describe the
 /// same read of the same file: compaction can replace a file between two
 /// statements, and a report whose counts came from one generation and whose
 /// samples came from another describes a corpus that never existed.
 ///
-/// Sampling is BEST-EFFORT, exactly as the conform's own evidence capture
+/// Sampling is best-effort, exactly as the conform's own evidence capture
 /// is: a sampling failure re-runs the plain count and returns no samples
 /// rather than failing the scan. A repin an operator cannot run because the
 /// optional evidence column errored is a worse outcome than a report
@@ -481,7 +481,7 @@ mod tests {
         assert!(err.contains("nginx.parquet"), "{err}");
         assert!(err.contains("symlink"), "{err}");
 
-        // A symlinked DIRECTORY is refused on the same terms: recursing
+        // A symlinked directory is refused on the same terms: recursing
         // through it would hardlink its contents onto the data root's own
         // filesystem and the cutover would then unlink the link.
         std::fs::remove_file(hour.join("nginx.parquet")).unwrap();

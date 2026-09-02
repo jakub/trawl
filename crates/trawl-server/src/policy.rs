@@ -4,7 +4,7 @@
 
 //! Trawl's app-side authorization policy over fleet-auth principals.
 //!
-//! fleet-auth's [`require_bearer`] deliberately authenticates keys from ANY
+//! fleet-auth's [`require_bearer`] deliberately authenticates keys from any
 //! fleet app — it authenticates, it does not authorise. This module is the
 //! mandatory policy layer behind it (ADR-0004, reshaped by ADR-0006):
 //!
@@ -15,7 +15,7 @@
 //! - [`TrawlAuthz`]: extension trait giving [`fleet_auth::VerifiedKey`] the
 //!   `has_permission()` surface every handler checks.
 //! - [`require_trawl_grant`]: middleware that 403s keys resolving zero
-//!   recognized trawl permissions BEFORE anything else (rate limiter,
+//!   recognized trawl permissions before anything else (rate limiter,
 //!   `/whoami`) sees them, and stamps [`TrawlPolicyApplied`] on every
 //!   response it passes so the envelope normalizer can tell trawl-shaped
 //!   bodies apart.
@@ -40,24 +40,21 @@ use crate::error::ServerError;
 
 /// Discrete permissions trawl's handlers check.
 ///
-/// The `Role` enum and its compile-time role → permission tables died with
-/// ADR-0006: roles are data-defined bundles of these strings in the fleet
-/// keystore. The dead `KeyManage` variant died with them (no handler ever
-/// checked it).
+/// A variant exists here because a handler checks it; a role is a keystore
+/// row bundling these strings (ADR-0006).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Permission {
     /// Execute search queries, view history, list running queries.
     Query,
     /// Read schema and field catalog.
     ///
-    /// Since ADR-0011 slice C1 this grants more than names, types and
-    /// counts: `/schema/field` and `/schema/conflicts` carry the misfit
-    /// SAMPLES compaction captured — up to five values per conflict row, 256
-    /// bytes each, of raw client-supplied event data — and a degraded
-    /// field's verdict repeats a bounded set of them. Reading event VALUES
-    /// used to require [`Self::Query`]. A role built as query-less
-    /// schema-admin is therefore a deliberate choice about who may see
-    /// fragments of event content, not only its shape.
+    /// This grants more than names, types and counts: `/schema/field` and
+    /// `/schema/conflicts` carry the misfit samples compaction captured —
+    /// up to five values per conflict row, 256 bytes each, of raw
+    /// client-supplied event data — and a degraded field's verdict repeats
+    /// a bounded set of them. A role built as query-less schema-admin is
+    /// therefore a deliberate choice about who may see fragments of event
+    /// content, not only its shape.
     SchemaRead,
     /// Validate DSL syntax without executing.
     Validate,
@@ -73,7 +70,7 @@ pub enum Permission {
     ServerManage,
     /// Write events via the ingest endpoint.
     Ingest,
-    /// Mutate the field catalog — the repin trigger (ADR-0011 slice B).
+    /// Mutate the field catalog — the repin trigger (ADR-0011).
     /// Separate from [`Self::ServerManage`] so a schema-admin role can
     /// exist without server administration, and read-only surfaces can
     /// show repin state without offering the trigger.
@@ -137,17 +134,16 @@ impl Permission {
 
 /// Trawl-side authorization surface over a fleet-auth [`VerifiedKey`].
 ///
-/// Handler call sites keep the exact shape they had under the role era:
-/// `verified.has_permission(Permission::Export)`.
+/// Handlers gate on it as `verified.has_permission(Permission::Export)`.
 pub trait TrawlAuthz {
     /// Check whether this key's resolved trawl-namespace permission union
     /// grants `perm`.
     fn has_permission(&self, perm: Permission) -> bool;
 
-    /// Whether the key resolves at least one RECOGNIZED trawl permission —
+    /// Whether the key resolves at least one recognized trawl permission —
     /// the "may enter trawl at all" question. A key whose roles carry only
     /// strings trawl doesn't recognize has nothing usable here (fail
-    /// closed), exactly like the old unknown-role case.
+    /// closed).
     fn has_any_trawl_permission(&self) -> bool;
 
     /// The key's recognized trawl permissions in canonical
@@ -211,12 +207,12 @@ pub struct TrawlPolicyApplied;
 /// with an opaque 403 — before the rate limiter, `/whoami`, or any handler
 /// sees them.
 ///
-/// Must run AFTER `fleet_auth::require_bearer_only` (needs [`VerifiedKey`] in
-/// request extensions). Mounted on BOTH authenticated sub-routers (`/api/v1`
+/// Must run after `fleet_auth::require_bearer_only` (needs [`VerifiedKey`] in
+/// request extensions). Mounted on both authenticated sub-routers (`/api/v1`
 /// tree and `/ingest`), so it is a mandatory layer, not a per-handler
 /// convention.
 ///
-/// Because it sits outside the limiter, the rejection is UNMETERED: it is
+/// Because it sits outside the limiter, the rejection is unmetered: it is
 /// counted (`trawl_auth_failures_total{reason="no_trawl_grant"}` — a closed
 /// label set) and logged on [`crate::telemetry::UNMETERED_POLICY_TARGET`],
 /// which the WAL layer refuses. A valid fleet key with zero trawl
@@ -261,14 +257,13 @@ fn mark(mut resp: Response) -> Response {
 
 /// Count one rejected request against `trawl_auth_failures_total{reason}`.
 ///
-/// This is the ONLY in-product signal for a failed authentication. The
-/// events behind a 401/503 come from fleet-auth's bearer shell, and the
-/// one behind a grantless 403 from [`require_trawl_grant`] — all of it
-/// decided outside the rate limiter, so
-/// [`crate::telemetry::UNMETERED_TARGETS`] keeps them off the WAL: a flood
-/// nothing meters must not become durable corpus growth. A counter has no
-/// such problem: `reason` is a
-/// closed, code-defined set, so the series count is fixed however hard the
+/// This is the only in-product signal for a failed authentication. The
+/// events behind a 401/503 come from fleet-auth's bearer shell, and the one
+/// behind a grantless 403 from [`require_trawl_grant`] — all decided
+/// outside the rate limiter, so [`crate::telemetry::UNMETERED_TARGETS`]
+/// keeps them off the WAL: a flood nothing meters must not become durable
+/// corpus growth. A counter has no such problem, because `reason` is a
+/// closed, code-defined set: the series count is fixed however hard the
 /// endpoint is hammered, and credential stuffing, token brute force or a
 /// revoked key still in use stay alarmable on `/metrics`.
 fn count_auth_failure(reason: &'static str) {
@@ -276,9 +271,9 @@ fn count_auth_failure(reason: &'static str) {
 }
 
 /// Axum middleware: keep trawl's [`trawl_api::ErrorResponse`] envelope at the
-/// trust boundary (ADR-0004 AC5).
+/// trust boundary (ADR-0004).
 ///
-/// Mounted directly OUTSIDE `fleet_auth::require_bearer_only`. Responses that
+/// Mounted directly outside `fleet_auth::require_bearer_only`. Responses that
 /// carry the [`TrawlPolicyApplied`] marker passed authn and are already
 /// trawl-shaped; anything else with an auth-relevant status was
 /// short-circuited by the bearer shell (fleet-auth's flat
@@ -412,8 +407,8 @@ mod tests {
 
     #[test]
     fn authz_unrecognized_strings_dropped_fail_closed() {
-        // AC2: unknown permission strings in a role are ignored — the
-        // recognized remainder survives, the unknown advertises nothing.
+        // Unknown permission strings in a role are ignored: the recognized
+        // remainder survives, the unknown advertises nothing.
         let key = key_with(vec![role(
             "future",
             &[
@@ -512,12 +507,12 @@ mod tests {
         assert_eq!(json["error"]["code"], "forbidden");
     }
 
-    /// The grantless 403 is decided OUTSIDE the rate limiter (mounted that
+    /// The grantless 403 is decided outside the rate limiter (mounted that
     /// way on purpose — see `require_trawl_grant`), so its event must be
     /// stdout-only: a valid fleet key resolving zero trawl permissions is a
     /// supported thing to hold, and a persisted event would let its holder
     /// grow the corpus one durable record per request, unmetered. Drives the
-    /// REAL middleware through the REAL WAL filter.
+    /// real middleware through the real WAL filter.
     #[tokio::test]
     async fn grantless_403_event_is_logged_but_never_persisted() {
         use std::sync::{Arc, Mutex};

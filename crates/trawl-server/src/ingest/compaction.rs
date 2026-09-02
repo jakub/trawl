@@ -25,8 +25,8 @@ use crate::repin::RepinCoordinator;
 use crate::state::CompactionStats;
 use crate::store::{FieldConflict, MAX_CONFLICT_SAMPLE_BYTES, MAX_CONFLICT_SAMPLES, PinProposal};
 
-/// Default compaction chunk size, used when config is not threaded
-/// through (e.g. in direct `compact_once` calls from tests).
+/// Chunk size for tests that call a compaction entry point directly, with
+/// no config to thread through.
 #[cfg(test)]
 const DEFAULT_CHUNK_SIZE: usize = 500;
 
@@ -34,7 +34,7 @@ const DEFAULT_CHUNK_SIZE: usize = 500;
 ///
 /// Runs every `interval` seconds, scanning `wal_dir` for `.ndjson` files
 /// whose mtime is older than `interval`. Groups by service and writes
-/// parquet to `data_dir/{date}/{hour}/{service}.parquet`.
+/// parquet to `data_dir/{env}/{date}/{HH}/{service}.parquet`.
 ///
 /// Stops when `shutdown_rx` receives a signal.
 #[allow(clippy::too_many_arguments)] // internal API, config struct is overkill here
@@ -72,7 +72,7 @@ pub fn spawn_compaction(
                             if let Some(ref stats) = compaction_stats {
                                 stats.total_runs.fetch_add(1, Ordering::Relaxed);
                                 // compact_once returns the combined data-loss
-                                // tally: best-effort daily-rollup failures PLUS
+                                // tally: best-effort daily-rollup failures plus
                                 // WAL files quarantined this cycle. Surface it
                                 // on the dashboard counter, not just in logs.
                                 if data_loss > 0 {
@@ -111,8 +111,8 @@ pub fn spawn_compaction(
 /// Public for integration tests only — not part of the external API.
 /// Called internally by [`spawn_compaction`].
 ///
-/// `catalog` carries the field-catalog store + pin cache (ADR-0009 slice
-/// 2). `None` (tests, embedded-style callers) conforms each batch against
+/// `catalog` carries the field-catalog store + pin cache (ADR-0009).
+/// `None` (tests, embedded-style callers) conforms each batch against
 /// the envelope seed plus its own local pins, without persistence.
 #[allow(clippy::too_many_arguments)] // internal API, config struct is overkill here
 pub async fn compact_once(
@@ -139,15 +139,14 @@ pub async fn compact_once(
     .await
 }
 
-/// [`compact_once`] with the repin interlocks (ADR-0011 slice B) attached:
-/// each service batch's pin-snapshot → conform → publish phase runs under
-/// the coordinator's corpus-gate READ guard (so no batch can straddle a
-/// repin cutover), and the file-RELOCATING daily rollup is suppressed for
-/// as long as the coordinator holds a rollup pause (so the shadow build's
-/// catch-up diff stays additive) — suppressed BEFORE it starts by the
-/// pause, and mid-pass by the same corpus gate, which every relocating
-/// unit takes so a pass already running when the job began can neither
-/// straddle the cutover nor continue past it. WAL→parquet draining itself is never
+/// [`compact_once`] with the repin interlocks attached (ADR-0011): each
+/// service batch's pin-snapshot → conform → publish phase runs under the
+/// coordinator's corpus-gate read guard, so no batch can straddle a repin
+/// cutover, and the file-relocating daily rollup is suppressed for as long
+/// as the coordinator holds a rollup pause, so the shadow build's catch-up
+/// diff stays additive. The pause stops a pass that has not begun; the
+/// corpus gate, which every relocating unit takes, stops a pass already in
+/// flight from continuing past the cutover. WAL→parquet draining is never
 /// suppressed — it only waits out the seconds the cutover holds the write
 /// guard.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
@@ -177,7 +176,6 @@ pub async fn compact_once_coordinated(
 
     // Env is the outermost storage dimension (ADR-0009): WAL lives in
     // `wal_dir/{env}/` and parquet in `data_dir/{env}/{date}/{HH}/`.
-    // The per-env inner algorithm is unchanged.
     //
     // The root listing is fallible on purpose: an unreadable WAL root is not
     // an empty WAL root. Swallowing it would iterate nothing and report a
@@ -257,11 +255,11 @@ pub async fn compact_once_coordinated(
                         .await;
                 drop(corpus_guard);
 
-                // Fold the quarantine count UNCONDITIONALLY — quarantining
-                // renames the corrupt file to `.corrupt`, so a retry can't
-                // re-see (and re-count) it. If an `Err` result dropped the
-                // tally, those data-loss quarantines would never reach the
-                // dashboard counter. Mirrors the rollup RollupOutcome handling.
+                // Folded unconditionally: quarantining renames the corrupt
+                // file to `.corrupt`, so a retry can't re-see (and re-count)
+                // it — dropping the tally on an `Err` result would keep those
+                // data-loss quarantines off the dashboard counter. Mirrors the
+                // rollup's `RollupOutcome` handling.
                 wal_quarantined += outcome.quarantined;
 
                 match outcome.result {
@@ -675,12 +673,12 @@ fn recover_rollup_markers(day_dir: &Path) -> Result<(), String> {
                     retire_merged_hourly(f)?;
                 }
             } else {
-                // Crash MID-COPY left a truncated .tmp. Promoting it would
+                // A crash mid-COPY left a truncated .tmp. Promoting it would
                 // persist an unreadable parquet under the canonical name
-                // (the origin of "too small to be a Parquet file" errors).
-                // Quarantine it and KEEP the hourly files so the next tick
+                // ("too small to be a Parquet file" on every later read).
+                // Quarantine it and keep the hourly files so the next tick
                 // re-rolls them from scratch. A failed quarantine propagates
-                // as `Err` BEFORE the marker delete, so recovery retries it.
+                // as `Err` before the marker delete, so recovery retries it.
                 tracing::warn!(
                     event_type = "rollup_recovery",
                     compact_service = %service,
@@ -757,7 +755,7 @@ pub(crate) fn is_valid_parquet(path: &Path) -> bool {
 /// unreadable file is likewise rejected — `read_json` can't read it either,
 /// so quarantining beats wedging.
 ///
-/// This deliberately does NOT fully JSON-parse each line: that would
+/// This deliberately does not fully JSON-parse each line: that would
 /// re-implement `read_json` and reject merely-malformed-but-textual data, a
 /// different (and rarer) class than the crash debris this guards against.
 fn is_valid_ndjson(path: &Path) -> bool {
@@ -776,7 +774,7 @@ fn is_valid_ndjson(path: &Path) -> bool {
 /// exhaustion is a hard error so it surfaces rather than silently rotating.
 const MAX_QUARANTINE_ATTEMPTS: u32 = 1000;
 
-/// Pick — and RESERVE — a free quarantine name for `path`.
+/// Pick, and reserve, a free quarantine name for `path`.
 ///
 /// The first candidate is the bare `<path>.corrupt`; subsequent ones append a
 /// counter (`<path>.corrupt.1`, `.corrupt.2`, …). A candidate is claimed by
@@ -785,7 +783,7 @@ const MAX_QUARANTINE_ATTEMPTS: u32 = 1000;
 /// was already there.
 ///
 /// Scope, stated honestly: the reservation makes no-clobber hold between
-/// COOPERATING IN-PROCESS quarantiners — every quarantine in trawl funnels
+/// cooperating in-process quarantiners — every quarantine in trawl funnels
 /// through `quarantine_file`, so that is the whole population. External
 /// mutation of the trawl-owned data root (another process planting or renaming
 /// files under it) is outside the threat model; the workspace forbids `unsafe`,
@@ -832,7 +830,7 @@ fn quarantine_target(path: &Path) -> Result<PathBuf, String> {
 /// which makes it inert: it no longer matches the `*.parquet`/`*.tmp` globs
 /// the rollup scans, nor the `*.ndjson` glob WAL compaction scans.
 ///
-/// The destination is RESERVED first (`quarantine_target`) rather than renamed
+/// The destination is reserved first (`quarantine_target`) rather than renamed
 /// onto blind: `std::fs::rename` silently replaces an existing destination, so
 /// a second corruption of a recurring path (`{env}/{date}/{HH}/{service}` is
 /// stable across ticks) would destroy the first forensic artifact. A taken name
@@ -843,7 +841,7 @@ fn quarantine_target(path: &Path) -> Result<PathBuf, String> {
 /// rollup quarantine (`rollup_quarantine`) from a WAL-compaction one
 /// (`compaction_quarantine`).
 ///
-/// A failed rename is a HARD error: the bad file still matches the scan glob
+/// A failed rename is a hard error: the bad file still matches the scan glob
 /// and would re-wedge on every tick forever, so callers must surface (and
 /// count) the failure rather than swallow it. The reservation is removed on
 /// that path so a failure leaves no empty `.corrupt` debris behind.
@@ -901,13 +899,13 @@ fn quarantine_file(path: &Path, service: &str, event_type: &str) -> Result<PathB
 /// later rollup (which would duplicate its rows — the merge path has no
 /// dedup by design, since two identical log lines are distinct events).
 ///
-/// A MISSING source is success: the goal — "this file is no longer present as
+/// A missing source is success: the goal — "this file is no longer present as
 /// a re-mergeable hourly" — is already satisfied if it's gone. This keeps the
 /// op idempotent so a recovery pass that replays a marker after a partial
 /// cleanup loop (some hourlies already deleted) doesn't wedge on a phantom.
 /// A failed rename whose source vanished from under us (lost a delete race) is
 /// likewise fine; only a genuine non-`NotFound` rename failure is a hard error,
-/// because then the file still matches `*.parquet` and WOULD be re-merged.
+/// because then the file still matches `*.parquet` and would be re-merged.
 fn retire_merged_hourly(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => return Ok(()),
@@ -1023,7 +1021,7 @@ fn rollup_day_inner(
             all_files.push(f.clone());
             merged_hourly.push(f.clone());
         } else {
-            // A failed quarantine is a HARD error — the bad file still
+            // A failed quarantine is a hard error — the bad file still
             // matches `*.parquet` and would wedge the rollup forever.
             quarantine_file(f, service, "rollup_quarantine")?;
             *quarantined += 1;
@@ -1039,7 +1037,7 @@ fn rollup_day_inner(
     }
 
     // Every input was corrupt and has been quarantined — nothing readable
-    // to merge, and nothing left to retry. This is DATA LOSS: a whole
+    // to merge, and nothing left to retry. This is data loss: a whole
     // service/day produced no daily file. Surface it distinctly at error
     // level (the partial-corrupt path only logs a cheerful rollup_complete)
     // and report the quarantine count so it lands on the dashboard counter.
@@ -1055,9 +1053,9 @@ fn rollup_day_inner(
         return Ok(());
     }
 
-    // Path provenance: service is sanitized to [A-Za-z0-9_-] at ingest
-    // (ingest service charset validation) and data_dir is operator-trusted,
-    // so direct interpolation cannot inject. No quote-escaping needed.
+    // Path provenance: ingest validates every service name against
+    // [A-Za-z0-9._-] (no quote, no space, no leading dot) and data_dir is
+    // operator-trusted, so direct interpolation cannot inject.
     let file_list_sql = all_files
         .iter()
         .map(|f| format!("'{}'", f.to_string_lossy()))
@@ -1066,11 +1064,11 @@ fn rollup_day_inner(
     let tmp_path = day_dir.join(format!("{service}.parquet.tmp"));
 
     // Read, merge, sort by timestamp, and write to tmp file. Every hourly
-    // file is write-time conformant to the field catalog (ADR-0009 slice 2),
-    // so `union_by_name` cannot hit a type conflict on trawl-written files —
-    // a conversion-class failure here means foreign parquet in the tree and
+    // file is write-time conformant to the field catalog (ADR-0009), so
+    // `union_by_name` cannot hit a type conflict on trawl-written files — a
+    // conversion-class failure here means foreign parquet in the tree, and
     // errors loudly (inputs retained, retried next tick) rather than being
-    // silently rewritten by the deleted VARCHAR-cast fallback.
+    // silently rewritten by a VARCHAR cast.
     let fast = conn.execute_batch(&format!(
         "COPY (\
              SELECT * FROM read_parquet([{file_list_sql}], union_by_name=true) \
@@ -1080,7 +1078,7 @@ fn rollup_day_inner(
         tmp_path.to_string_lossy(),
     ));
     if let Err(e) = fast {
-        // S2: a file that passed `is_valid_parquet`'s magic-byte sniff but
+        // A file that passed `is_valid_parquet`'s magic-byte sniff but
         // fails `read_parquet` — corrupt middle, or a schema the catalog
         // invariant says trawl cannot have written. No amount of retrying
         // repairs either — surface it distinctly at error level so the rare
@@ -1095,7 +1093,7 @@ fn rollup_day_inner(
         return Err(format!("rollup COPY failed: {e}"));
     }
 
-    // Write marker BEFORE rename so recovery knows which hourlies to clean up.
+    // Write the marker before the rename so recovery knows which hourlies to clean up.
     write_rollup_marker(day_dir, service, &merged_hourly)?;
 
     // Atomic rename.
@@ -1147,20 +1145,20 @@ struct CompactOutcome {
 }
 
 /// Compact a batch of WAL files for a single service into parquet,
-/// enforcing the write-time invariant (ADR-0009 slice 2): A PARQUET FILE
-/// IS NEVER WRITTEN BEFORE ITS COLUMNS' PINS ARE DURABLE IN POSTGRES.
+/// enforcing the write-time invariant (ADR-0009): a parquet file is never
+/// written before its columns' pins are durable in postgres.
 ///
 /// Four phases:
 /// 1. blocking — read the WAL into `wal_batch`, `DESCRIBE` it, and derive
 ///    pin proposals for unpinned columns (candidate ladder over values).
-/// 2. async — `pin_missing` the proposals; the AUTHORITATIVE pins come
+/// 2. async — `pin_missing` the proposals; the authoritative pins come
 ///    back and are folded into the in-process cache (skipped entirely when
 ///    the batch proposes nothing — the common case). A store failure is `Err`:
 ///    the WAL is retained and retried next tick — never an unconformant
 ///    parquet write.
 /// 3. blocking — conform `wal_batch` to the pins (`TRY_CAST` on mismatch,
 ///    drop deferred all-null unpinned columns), then merge/sort/COPY/
-///    atomic-rename exactly as before.
+///    atomic-rename.
 /// 4. async, best-effort — record `field_conflicts`, touch
 ///    `field_services`, bump metrics. A failure here warns and moves on
 ///    (the data is already durable and conformant).
@@ -1281,16 +1279,17 @@ async fn compact_service_batch(
 /// `known` is the cache snapshot phase 1 proposed against, and the two
 /// together cover every column of the batch by construction: `propose_pins`
 /// emits a proposal for exactly the columns `known` did not already pin, and
-/// `pin_missing` returns the AUTHORITATIVE pin for each proposal (a racing
-/// batch's pin, not ours, when it got there first). Pins are add-only until
-/// #53, so a `known` entry cannot have gone stale meanwhile.
+/// `pin_missing` returns the authoritative pin for each proposal (a racing
+/// batch's pin, not ours, when it got there first). Only a repin cutover
+/// retypes a standing pin, and it holds the corpus gate against this whole
+/// batch, so a `known` entry cannot go stale meanwhile.
 ///
-/// Deliberately NOT a `load_pins` + `replace` per batch. A pin row exists
+/// Deliberately not a `load_pins` + `replace` per batch. A pin row exists
 /// for every distinct JSON key ever ingested, so reloading it per chunk per
 /// service per tick is O(catalog) work whose size a noisy or hostile sender
 /// picks — up to [`crate::store::MAX_PINNED_FIELDS`], which is what keeps
-/// that "up to" a number at all. The common case (nothing new to pin) now
-/// costs no postgres round trip at all.
+/// that "up to" a number at all. The common case (nothing new to pin) costs
+/// no postgres round trip at all.
 async fn resolve_pins_durable(
     cat: &CatalogContext,
     mut known: HashMap<String, CanonicalType>,
@@ -1379,7 +1378,7 @@ const BOOKKEEPING_BUDGET: Duration = Duration::from_secs(2);
 ///
 /// Both writes are safe to repeat after a failure: `touch_services` is an
 /// upsert and `record_conflicts` commits atomically. The one case a retry
-/// can double is a LOST ACK (postgres committed, the answer never arrived),
+/// can double is a lost ack (postgres committed, the answer never arrived),
 /// which over-counts a `row_count` that is already an approximation or
 /// re-appends conflict evidence the per-field trim bounds anyway — both
 /// strictly better than the gap the retry exists to prevent.
@@ -1418,7 +1417,7 @@ where
 /// Catalog bookkeeping after a successful conformant write: conflict rows
 /// and per-service field observations. Retried under a shared budget, then
 /// warned — the parquet is already durable and conformant, so retrying the
-/// BATCH for a bookkeeping error would duplicate data.
+/// batch for a bookkeeping error would duplicate data.
 async fn record_batch_bookkeeping(cat: &CatalogContext, service: &str, report: &WriteReport) {
     let store = &cat.store;
     let conflicts = &report.conflicts;
@@ -1486,7 +1485,7 @@ fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
 /// Complex-typed columns cannot arise here: ingest canonicalization
 /// stringifies top-level object/array values before the WAL is written, and
 /// the conform phase pins every column to a canonical scalar type before
-/// the parquet write (ADR-0009 slice 2).
+/// the parquet write (ADR-0009).
 fn read_wal_to_table(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
@@ -1540,21 +1539,21 @@ fn read_wal_to_table(
 /// field cannot trip the "Duplicate name" fallback, and excluded from
 /// `wal_batch` so it never reaches parquet.
 ///
-/// The name is reserved, not unreachable: ingest strips it from incoming
-/// events (`fill_defaults`) so no client can plant it, and pre-fix WAL that
-/// already carries it drains losslessly through a renamed provenance column
-/// (see [`build_wal_batch`]) instead of wedging forever.
+/// The name is reserved, not unreachable: ingest's reserved-prefix strip
+/// (`envelope::canonicalize`) stops a client planting it, and a WAL file
+/// that carries it anyway drains losslessly through a renamed provenance
+/// column (see [`build_wal_batch`]) instead of wedging forever.
 pub(super) const WAL_FILE_COL: &str = "_trawl_wal_file";
 
 /// SQL expression producing a never-NULL TIMESTAMP `column` for a WAL row
 /// (ADR-0008: the partition key is never hard-CAST).
 ///
-/// Three arms: `TRY_CAST` the raw value (always succeeds on post-fix data,
-/// which ingest canonicalizes); else recover the ingest instant from the
-/// row's own WAL filename (`{service}_{unix_millis}_{4_hex}`), which drains
-/// pre-fix wedged WAL with no operator step; else the compaction instant —
-/// a NULL partition key would sort first and fall outside every `last=Xh`
-/// filter, a silent failure of its own.
+/// Three arms: `TRY_CAST` the raw value (always succeeds on the values
+/// ingest canonicalized); else recover the ingest instant from the row's
+/// own WAL filename (`{service}_{unix_millis}_{4_hex}`), which drains a
+/// hand-written or damaged file with no operator step; else the compaction
+/// instant — a NULL partition key would sort first and fall outside every
+/// `last=Xh` filter, a silent failure of its own.
 fn repair_expr(prov_col: &str, column: &str) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.6f");
     format!(
@@ -1583,38 +1582,39 @@ fn timestamp_repair_list(prov_col: &str) -> String {
 /// The nested-key collision shape: keys inside a nested object that
 /// collide (case-insensitively) when `DuckDB` builds the auto-detected
 /// STRUCT at `maximum_depth=2`. Verified by execution: only reachable via
-/// nested values, which ingest stringifies since ADR-0009 slice 2 — so
-/// this fires only on legacy/hand-written WAL, and the depth-1 retry
-/// ([`build_wal_batch`]) drains it losslessly.
+/// nested values, which ingest stringifies (ADR-0009) — so this fires only
+/// on hand-written WAL, and the depth-1 retry ([`build_wal_batch`]) drains
+/// it losslessly.
 fn is_duplicate_name(e: &duckdb::Error) -> bool {
     e.to_string().contains("Duplicate name")
 }
 
 /// The collision shape specific to the `filename=` option: the data itself
 /// carries a column named like the synthetic provenance column
-/// ([`WAL_FILE_COL`]). Ingest strips that key now, but WAL written before
-/// it did would otherwise fail this read on every tick forever — resolved
-/// losslessly by retrying under a renamed provenance column.
+/// ([`WAL_FILE_COL`]). Ingest strips that key, so only a hand-written WAL
+/// file reaches this — and it would fail the read on every tick forever,
+/// which is why the retry under a renamed provenance column exists.
 fn is_filename_collision(e: &duckdb::Error) -> bool {
     e.to_string().contains("adds column")
 }
 
 /// Build the `wal_batch` table from a multi-file `read_json`.
 ///
-/// A lossless ladder — the explicit ten-column fallback (which dropped
-/// every custom column for the batch) is DELETED (ADR-0009 slice 2):
+/// A lossless ladder — no rung drops a column. The simpler recovery, falling
+/// back to a fixed envelope-column list, is wrong: it loses every custom
+/// column for the whole batch.
 ///
 /// 1. Auto-detection (`maximum_depth=2`) with [`WAL_FILE_COL`] as the
 ///    provenance column.
-/// 2. On a `filename=` collision ([`is_filename_collision`] — legacy WAL
-///    written before ingest reserved the key), the same auto-detect read under
+/// 2. On a `filename=` collision ([`is_filename_collision`] — a WAL file
+///    carrying the reserved key itself), the same auto-detect read under
 ///    a randomized provenance name. Lossless: every user field survives, and
 ///    the row's literal `_trawl_wal_file` value lands in parquet as ordinary
 ///    data — it never feeds [`repair_expr`].
 /// 3. On a nested-key collision ([`is_duplicate_name`] — only reachable
-///    from legacy pre-stringification WAL), the same read at
-///    `maximum_depth=1`: every top-level field arrives as an opaque JSON
-///    column and the catalog conform step types it via the lattice. No
+///    from WAL whose nested values ingest never stringified), the same
+///    read at `maximum_depth=1`: every top-level field arrives as an opaque
+///    JSON column and the catalog conform step types it via the lattice. No
 ///    column is ever dropped.
 ///
 /// Any other read error is returned so the caller can isolate the offending
@@ -1622,12 +1622,11 @@ fn is_filename_collision(e: &duckdb::Error) -> bool {
 /// [`repair_expr`].
 ///
 /// `sample_size=-1` (schema detection over every row, not `DuckDB`'s default
-/// ~20480-row prefix) is what keeps `_repairs` alive: it is sparse
-/// by construction — only repaired events carry it — so on any WAL file
-/// bigger than the sample it fell outside the inferred schema and
-/// `union_by_name` dropped it with no error at all, losing the evidence
-/// ADR-0008 promises to preserve. Any other sparse user field was equally
-/// exposed.
+/// ~20480-row prefix) is what keeps a sparse column alive: `_repairs` rides
+/// only on repaired events, so on a WAL file bigger than the sample it would
+/// fall outside the inferred schema and `union_by_name` would drop it with no
+/// error at all, losing the evidence ADR-0008 promises to preserve. Any
+/// sparse user field is equally exposed.
 fn build_wal_batch(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
@@ -1671,7 +1670,7 @@ fn build_wal_batch(
     match read_with_depth_ladder(WAL_FILE_COL) {
         Ok(()) => Ok(()),
         Err(e) if is_filename_collision(&e) => {
-            // Randomized so legacy data cannot collide with it too.
+            // Randomized so the data itself cannot collide with it too.
             let alt = format!("{WAL_FILE_COL}_{:08x}", rand::random::<u32>());
             tracing::warn!(
                 event_type = "compaction_provenance_rename",
@@ -1692,7 +1691,7 @@ fn build_wal_batch(
 /// Returns `Err` only if the file is genuinely unparseable — the
 /// malformed-but-textual corruption the byte sniff can't catch. A full
 /// `count(*)` scan forces every record to parse, so a malformed line anywhere
-/// in the file surfaces. A "Duplicate name" collision is NOT corruption —
+/// in the file surfaces. A "Duplicate name" collision is not corruption —
 /// [`build_wal_batch`]'s depth-1 rung drains it — so a colliding file is
 /// re-probed at `maximum_depth=1` and only quarantined when both depths
 /// fail.
@@ -1749,7 +1748,8 @@ pub(crate) fn describe_source(
 
 /// Escape a `DuckDB` identifier: wrap in double-quotes, doubling any
 /// embedded double-quotes. Column names come from ingested JSON keys
-/// (user-controlled), so this prevents SQL injection in the fallback path.
+/// (user-controlled), so every generated statement naming one must go
+/// through this.
 pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -1757,14 +1757,14 @@ pub(crate) fn quote_ident(name: &str) -> String {
 /// Merge `wal_batch` with an existing parquet file via `UNION ALL BY NAME`.
 ///
 /// The batch is conformed to the catalog pins before this runs, and every
-/// trawl-written parquet file is write-time conformant too (ADR-0009 slice
-/// 2), so the direct union cannot conflict on trawl's own files. A failure
-/// here therefore means the existing file violates the invariant — foreign
+/// trawl-written parquet file is write-time conformant too (ADR-0009), so
+/// the direct union cannot conflict on trawl's own files. A failure here
+/// therefore means the existing file violates the invariant — foreign
 /// parquet dropped into the tree, or a restore against a stale catalog —
 /// and is surfaced as `catalog_invariant_violation`: the batch errors, the
-/// WAL files are retained, and the tick retries. The cast-and-retry
-/// fallback that used to rewrite both sides silently is deliberately gone
-/// and must not be rebuilt.
+/// WAL files are retained, and the tick retries. Do not add a cast-and-retry
+/// fallback: rewriting both sides silently hides exactly the nonconformant
+/// corpus this error exists to report.
 fn merge_with_existing(
     conn: &duckdb::Connection,
     canonical_path: &Path,
@@ -1809,13 +1809,13 @@ struct PreparedBatch {
 
 /// Outcome of a conformant write, carried to the bookkeeping phase.
 struct WriteReport {
-    /// Rows THIS batch contributed. Deliberately NOT the merged file's
+    /// Rows this batch contributed, deliberately not the merged file's
     /// total: `field_services.row_count` accumulates this value, so a
     /// whole-file count would re-add every earlier batch on every tick.
     batch_rows: u64,
     /// Conform casts that constitute recordable conflicts.
     conflicts: Vec<FieldConflict>,
-    /// Fields this batch actually WROTE (for `field_services`) — the
+    /// Fields this batch actually wrote (for `field_services`) — the
     /// post-conform column set, so deferred-pin columns dropped by
     /// [`conform_wal_batch`] are not claimed as observed.
     observed_fields: Vec<String>,
@@ -1944,8 +1944,8 @@ fn propose_pins(
     //
     // Names are ASCII-case-folded for both the lookup and the proposal: the
     // catalog holds folded names only (ingest folds at canonicalization),
-    // and a legacy mixed-case WAL column must pin — and be conformed — under
-    // the same key its data will be stored as.
+    // and a mixed-case WAL column must pin — and be conformed — under the
+    // same key its data will be stored as.
     let mut candidates: Vec<(String, Option<CanonicalType>)> = Vec::new();
     let mut ladder_cols: Vec<&ColInfo> = Vec::new();
     for col in schema {
@@ -1995,10 +1995,10 @@ fn propose_pins(
 /// width.
 ///
 /// Both extremes are pathological on a wide batch (measured by execution
-/// against the bundled `DuckDB` 1.5.5, 10k columns × 50 rows): one query PER
+/// against the bundled `DuckDB` 1.5.5, 10k columns × 50 rows): one query per
 /// column is superlinear because every query re-binds the whole table (27s,
-/// and ~n^1.4 in the column count), while ONE query over every column blows
-/// aggregate memory (a 40k-column batch OOMs outright) and is roughly
+/// and ~n^1.4 in the column count), while a single query over every column
+/// blows aggregate memory (a 40k-column batch OOMs outright) and is roughly
 /// quadratic well before that (the 2-aggregate tally shape: 1k cols 0.68s,
 /// 5k 10.6s, 10k 38.5s). Chunking is flat in both: 10k ladder columns take
 /// ~1.4s and 40k ~7.9s at this width, and the peak is bounded by the chunk,
@@ -2006,7 +2006,7 @@ fn propose_pins(
 /// in the middle.
 pub(crate) const AGG_CHUNK_COLS: usize = 256;
 
-/// How many CONFLICTED columns one batch captures misfit samples for
+/// How many conflicted columns one batch captures misfit samples for
 /// ([`ConformPlan::capture_samples`]).
 ///
 /// One chunk's worth, for the reason above — but the bound bites far
@@ -2020,12 +2020,12 @@ const MAX_SAMPLED_CONFLICT_COLUMNS: usize = AGG_CHUNK_COLS;
 /// How many distinct raw values the capture pulls per column before Rust
 /// sanitises them ([`sanitize_sample`]) and re-deduplicates.
 ///
-/// `DISTINCT` runs in `DuckDB`, on the RAW text, but the values that are
-/// STORED are the sanitised, byte-capped ones — and both transforms can
+/// `DISTINCT` runs in `DuckDB`, on the raw text, but the values that are
+/// stored are the sanitised, byte-capped ones — and both transforms can
 /// collapse two distinct misfits into one (`a\x01b` and `a\x02b` both
 /// become `a\u{FFFD}b`; two long values can share their first 256 bytes).
 /// Pulling a small multiple of the budget keeps the slots fillable when
-/// that happens. Residual, accepted: a column whose misfits differ ONLY in
+/// that happens. Residual, accepted: a column whose misfits differ only in
 /// collapsing positions still yields fewer than [`MAX_CONFLICT_SAMPLES`] —
 /// the samples are evidence of shape, and re-querying for more would cost a
 /// second pass over the batch to distinguish values an operator cannot see
@@ -2103,20 +2103,20 @@ fn run_pin_ladders(
 /// ([`trawl_core::conform::untyped_text`]) under the same guard
 /// ([`trawl_core::conform::guarded_cast`]), because a value that reads one
 /// way while it is hot and another once it compacts is a query whose answer
-/// changes with a background timer. The `DESCRIBE`d type decides ONLY
+/// changes with a background timer. The `DESCRIBE`d type decides only
 /// whether the column already is its pin — never how it is read, which is
 /// what makes the reading independent of what `read_json` inferred for the
 /// batch (see [`trawl_core::conform`] for the two rules and their
 /// execution evidence).
 ///
-/// Choosing the text form per observed type — which compaction could and
-/// the emitter cannot — is exactly what made the lanes disagree: under a
-/// VARCHAR pin the guard is the identity, so the text form IS the stored
-/// value, and `TRY_CAST(col AS VARCHAR)` spells a DOUBLE `1e20` as
-/// `1e+20` where `to_json` spells it `100000000000000000000.0`. Same
-/// value, two corpora, and `note=/^1e/` flipped when the compactor ran.
+/// Never choose the text form per observed type, which compaction could do
+/// and the emitter cannot: under a VARCHAR pin the guard is the identity, so
+/// the text form is the stored value, and `TRY_CAST(col AS VARCHAR)` spells a
+/// DOUBLE `1e20` as `1e+20` where `to_json` spells it
+/// `100000000000000000000.0`. Same value, two corpora, and a `note=/^1e/`
+/// query that flips when the compactor runs.
 pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Option<String> {
-    // The pass-through is valid only where the conform is the IDENTITY
+    // The pass-through is valid only where the conform is the identity
     // over values already of the physical type. SEVERITY is the one pin
     // where it is not: its domain is the 1-24 ladder, not "any BIGINT",
     // so a numeral outside it must still be nulled out here or the corpus
@@ -2131,13 +2131,13 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
     ))
 }
 
-/// Everything a repin needs to READ one column: the target the rewrite
+/// Everything a repin needs to read one column: the target the rewrite
 /// writes with, and the two wire-dialect readings whose disagreement is
-/// ambiguity (issue #79).
+/// ambiguity (ADR-0013).
 ///
-/// Built ONCE per job, by the engine, because the engine is the only place
-/// that knows the OLD pin — and the old pin is what decides whether the
-/// STORED column holds wire text at all. A stored `SEVERITY` column holds
+/// Built once per job, by the engine, because the engine is the only place
+/// that knows the old pin — and the old pin is what decides whether the
+/// stored column holds wire text at all. A stored `SEVERITY` column holds
 /// canonical `OTel` ladder positions, so its arm is dialect-free in every
 /// variant; a stored VARCHAR holds whatever the sender wrote, so its arm
 /// flips with the assertion exactly as the `_raw` arm does. Deriving that
@@ -2147,7 +2147,7 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
 pub(crate) struct RepinReading {
     /// What the rewrite writes and the plan counts with.
     pub(crate) written: RepinTarget,
-    /// Whether the STORED column's own text is SENDER text (the old pin was
+    /// Whether the stored column's own text is sender text (the old pin was
     /// not `SEVERITY`), and therefore a wire position the dialect reaches.
     stored_is_wire: bool,
 }
@@ -2170,7 +2170,7 @@ impl RepinReading {
         }
     }
 
-    /// The `OTel`-and-syslog readings of the SAME columns, or `None` where
+    /// The `OTel`-and-syslog readings of the same columns, or `None` where
     /// the two are textually identical — every target but `SEVERITY`, whose
     /// numeric arm is the one dialect-sensitive rung. `None` is what makes
     /// the ambiguity count a constant `0` rather than a pair of full
@@ -2192,7 +2192,7 @@ impl RepinReading {
     }
 }
 
-/// The repin target column's expression, in the ONE place both consumers
+/// The repin target column's expression, in the one place both consumers
 /// read it from: [`ConformPlan::build`] under [`ConformPolicy::Repin`]
 /// (the rewrite) and the repin scan's dry-run counting
 /// (`crate::repin::plan`) — the plan predicts with the same SQL the
@@ -2213,7 +2213,7 @@ pub(crate) fn repin_target_expr(
         )
     } else {
         // No `_raw` to resurrect from, so the stored arm is the whole
-        // reading — and it is the STORED arm's dialect that reads it.
+        // reading, under the stored arm's own dialect.
         trawl_core::conform::guarded_cast_in(
             &trawl_core::conform::untyped_text(quoted),
             target.pin,
@@ -2233,7 +2233,7 @@ pub(crate) struct RepinCountExprs {
     pub(crate) kept: String,
     /// Shelved (`NULL`-stored) values `_raw` gives back.
     pub(crate) resurrectable: String,
-    /// Rows whose reading DIFFERS between the two dialects — the values
+    /// Rows whose reading differs between the two dialects — the values
     /// only provenance can settle.
     pub(crate) ambiguous: String,
 }
@@ -2258,12 +2258,12 @@ pub(crate) fn repin_count_exprs(
     } else {
         "0".to_owned()
     };
-    // Ambiguity is DERIVED from the whole target expression rather than
+    // Ambiguity is derived from the whole target expression rather than
     // spelled out over the syslog domain a second time: a row is ambiguous
     // when both wire dialects have a reading for it and they disagree. Over
-    // the FULL expression this covers the resurrection arm for free (a raw
+    // the full expression this covers the resurrection arm for free (a raw
     // numeral recovering into a shelved column is just as ambiguous), and it
-    // keeps one-dialect values OUT — those are visible loss the
+    // keeps one-dialect values out — those are visible loss the
     // `projected_nulls` count already reports, not silent mistranslation.
     let ambiguous = match reading.variants() {
         None => "0".to_owned(),
@@ -2319,8 +2319,8 @@ fn guard_partition_key(
 pub(crate) enum ConformPolicy {
     /// A freshly-read WAL batch (compaction). `_time`/`_ingested` pass
     /// through untouched — the ADR-0008 repair ladder already made them
-    /// TIMESTAMP and they must never be re-cast — and a column with NO pin
-    /// is DROPPED: `union_by_name` reads an absent column as NULL, and
+    /// TIMESTAMP and they must never be re-cast — and a column with no pin
+    /// is dropped: `union_by_name` reads an absent column as NULL, and
     /// writing typed NULLs would let a silent field pre-empt its own real
     /// type. Unpinned means either a deferred pin (all-null column) or a
     /// denied one (unstorable name, or the catalog at
@@ -2328,14 +2328,14 @@ pub(crate) enum ConformPolicy {
     /// `_raw`.
     WalBatch,
     /// A standing parquet file (boot conformance pass). Every column is
-    /// conformed, `_time` included — a legacy file whose timestamp column
-    /// is mistyped is exactly what that pass exists to fix — and a column
+    /// conformed, `_time` included — a file whose timestamp column is
+    /// mistyped is exactly what that pass exists to fix — and a column
     /// with no pin is kept verbatim (pins cover every scanned field, so
     /// this is unreachable in practice).
     ///
     /// `time_fallback` is the last arm of the TIMESTAMP-pinned envelope
     /// columns' conform, exactly as [`repair_expr`] is for WAL: a value the
-    /// `TRY_CAST` cannot read must NOT be written as NULL, because a NULL
+    /// `TRY_CAST` cannot read must not be written as NULL, because a NULL
     /// partition key sorts first and falls outside every `last=Xh` filter
     /// — the row would survive the rewrite yet become permanently
     /// unqueryable by time (ADR-0008). The boot pass has no WAL filename to
@@ -2345,15 +2345,15 @@ pub(crate) enum ConformPolicy {
     StandingFile {
         time_fallback: chrono::DateTime<chrono::Utc>,
     },
-    /// A repin rewrite over an affected standing file (ADR-0011 slice B):
+    /// A repin rewrite over an affected standing file (ADR-0011):
     /// [`ConformPolicy::StandingFile`] in every rule but one — the column
-    /// whose FOLDED name is `resurrect_field` routes through
-    /// [`trawl_core::conform::resurrection_expr`] UNCONDITIONALLY, even
+    /// whose folded name is `resurrect_field` routes through
+    /// [`trawl_core::conform::resurrection_expr`] unconditionally, even
     /// when its physical type already matches the pin (the forced
     /// resurrection-only pass, `to == current`, exists precisely to
     /// rewrite a column the ordinary conform would call a noop). The pin
     /// map handed in is the live one with the target entry flipped to the
-    /// NEW type, so every other column takes the pass-through arm — a
+    /// new type, so every other column takes the pass-through arm — a
     /// conformant corpus casts nothing else.
     ///
     /// Defensive residual: a file with no `_raw` column (impossible for
@@ -2366,8 +2366,8 @@ pub(crate) enum ConformPolicy {
         resurrect_field: String,
         /// Same role as [`ConformPolicy::StandingFile::time_fallback`].
         time_fallback: chrono::DateTime<chrono::Utc>,
-        /// The per-arm reading rule for the target column (issue #79):
-        /// which dialect each arm reads NUMERALS in. Structurally scoped —
+        /// The per-arm reading rule for the target column (ADR-0013):
+        /// which dialect each arm reads numerals in. Structurally scoped —
         /// only the `repin_target` arm of [`ConformPlan::build`] can reach
         /// it, so ordinary compaction and the boot pass stay on the `OTel`
         /// reading no matter what a job asserted.
@@ -2377,14 +2377,14 @@ pub(crate) enum ConformPolicy {
 
 /// One column the plan will `TRY_CAST`.
 struct CastEntry {
-    /// The FOLDED (catalog-key) name — conflict evidence is attributed to
-    /// the field as the catalog knows it, not to a legacy spelling.
+    /// The folded (catalog-key) name — conflict evidence is attributed to
+    /// the field as the catalog knows it, not to the stored spelling.
     name: String,
     dtype: String,
     pin: CanonicalType,
     expr: String,
-    /// The column is ALREADY of its pin's physical type, so the cast can
-    /// only null values outside the pin's DOMAIN — it can never change a
+    /// The column is already of its pin's physical type, so the cast can
+    /// only null values outside the pin's domain — it can never change a
     /// conforming one. Today that is exactly the SEVERITY ladder guard
     /// (see [`conform_expr`]); every other pin passes such a column
     /// through. A plan whose only work is guard-only casts is the identity
@@ -2403,16 +2403,15 @@ struct CastEntry {
 /// differ in where the rows come from ([`ConformPlan::tally_conflicts`]'s
 /// `source`) and how the result is applied.
 ///
-/// Column names are ASCII-case-folded on the OUTPUT side: pins are keyed by
+/// Column names are ASCII-case-folded on the output side: pins are keyed by
 /// the folded name (ingest folds every field name at canonicalization), so
-/// the lookup folds too, and a column whose stored spelling still carries
-/// uppercase (parquet written before the fold shipped) is RENAMED to the
-/// folded form as part of the conform — a rename with no cast still counts
-/// as a rewrite ([`Self::is_noop`]).
+/// the lookup folds too, and a column whose stored spelling carries uppercase
+/// is renamed to the folded form as part of the conform — a rename with no
+/// cast still counts as a rewrite ([`Self::is_noop`]).
 pub(crate) struct ConformPlan {
     /// Per-column SELECT expressions, in schema order.
     pub(crate) select_list: Vec<String>,
-    /// The RETAINED column names (folded) — the post-conform column set,
+    /// The retained column names (folded) — the post-conform column set,
     /// so bookkeeping can never claim a service carried a field no parquet
     /// file holds.
     pub(crate) retained: Vec<String>,
@@ -2450,7 +2449,7 @@ impl ConformPlan {
                 plan.keep(col, &folded, quoted);
                 continue;
             }
-            // The one arm that may read a job's ASSERTED dialect, and it
+            // The one arm that may read a job's asserted dialect, and it
             // carries that reading with it — nothing else in this loop can
             // reach the target.
             let repin_target = match policy {
@@ -2535,7 +2534,7 @@ impl ConformPlan {
         self.casts.is_empty() && self.dropped.is_empty() && self.renamed == 0
     }
 
-    /// Whether the plan's ONLY work is domain guards over columns already
+    /// Whether the plan's only work is domain guards over columns already
     /// of their pin's physical type ([`CastEntry::guard_only`]).
     ///
     /// Such a plan rewrites nothing unless the source actually holds a
@@ -2560,18 +2559,18 @@ impl ConformPlan {
     }
 
     /// Tally what each cast would null over `source` (a FROM-clause source
-    /// expression) — necessarily BEFORE the plan is applied, since applying
+    /// expression) — necessarily before the plan is applied, since applying
     /// it destroys the pre-cast values. Runs in aggregate passes of at most
     /// [`AGG_CHUNK_COLS`] cast columns for the same reason the pin ladder
     /// does: the width is client-chosen, and 2 aggregates × 10k columns in
     /// one statement is quadratic (38.5s at 10k, vs ~1.4s chunked).
     ///
-    /// A conflict is one row per cast column the conform actually NULLED.
+    /// A conflict is one row per cast column the conform actually nulled.
     /// A cast that nulls nothing lost no data, whatever the two type names
     /// say: an all-null pinned column (a batch with no `_repairs`), a JSON
     /// source that converts fully, and a VARCHAR-pinned field whose batch
     /// happened to carry only numbers are all honest convergence. Recording
-    /// those would append a row per (field, service) to the APPEND-ONLY
+    /// those would append a row per (field, service) to the append-only
     /// `field_conflicts` on every compaction tick, forever, for a sender
     /// that is losing nothing — noise that outgrows the evidence.
     ///
@@ -2622,9 +2621,9 @@ impl ConformPlan {
         // feeds. `list(DISTINCT …)` accumulates every distinct misfit before
         // the slice caps it and DuckDB does not spill it, so a column with
         // pathological misfit cardinality can OOM the capture on a batch
-        // whose TALLY (two scalar aggregates) just succeeded. Propagating
+        // whose tally (two scalar aggregates) just succeeded. Propagating
         // that would fail the whole conform: the WAL is retained, the next
-        // tick retries a LARGER batch, and ingestion ratchets itself to a
+        // tick retries a larger batch, and ingestion tightens itself to a
         // stop — while the boot lane would skip the file and withhold the
         // marker forever. Evidence is worth less than the data it describes.
         let mut samples = match self.capture_samples(conn, source, &lossy) {
@@ -2633,7 +2632,7 @@ impl ConformPlan {
                 metrics::counter!(crate::metrics::CATALOG_SAMPLE_CAPTURE_FAILURES_TOTAL)
                     .increment(1);
                 // The error text can name a column, like every other DuckDB
-                // error this module logs; it can never carry a VALUE — the
+                // error this module logs; it can never carry a value — the
                 // capture expression embeds no literals, the misfits are
                 // data.
                 tracing::warn!(
@@ -2668,17 +2667,17 @@ impl ConformPlan {
     /// the values whose guarded cast reads NULL while the stored value does
     /// not, which is exactly what the conform is about to shelve.
     ///
-    /// Only the columns that ACTUALLY conflicted are sampled, and never more
+    /// Only the columns that actually conflicted are sampled, and never more
     /// than [`MAX_SAMPLED_CONFLICT_COLUMNS`] of them in one pass:
     /// `list(DISTINCT …)` accumulates every distinct misfit before the slice
     /// caps it, so the cost is paid per sampled column, and a healthy install
     /// pays nothing at all (no conflicts, no query). Which columns win the
-    /// cap is decided by NAME rather than by schema position, so a wide
+    /// cap is decided by name rather than by schema position, so a wide
     /// conflicting batch samples the same fields whatever order the source
     /// happens to `DESCRIBE` in.
     ///
     /// Values are sanitised and byte-capped in Rust ([`sanitize_sample`]):
-    /// `left()` inside the aggregate counts CHARACTERS (probed in
+    /// `left()` inside the aggregate counts characters (probed in
     /// `trawl-engine/tests/duckdb_probe.rs`), so it bounds what `DuckDB`
     /// accumulates, never what the store is promised. Samples are attacker
     /// text end to end — they are never logged, at any level.
@@ -2731,7 +2730,7 @@ impl ConformPlan {
 /// [`MAX_CONFLICT_SAMPLES`] once they are sanitised.
 ///
 /// The predicate is the definition of a shelved value — a stored value the
-/// guarded cast cannot read — written against the SAME `cast.expr` the
+/// guarded cast cannot read — written against the same `cast.expr` the
 /// tally counts with, so the samples can only ever be values the conflict
 /// row is counting.
 fn sample_expr(cast: &CastEntry) -> String {
@@ -2740,23 +2739,23 @@ fn sample_expr(cast: &CastEntry) -> String {
     distinct_misfit_samples_sql(&quoted, &text, &cast.expr)
 }
 
-/// The conform's own misfit-sampling aggregate (ADR-0011 slice C1): up to
-/// [`SAMPLE_CANDIDATES`] DISTINCT values the cast nulls, as one JSON array
-/// of strings, from which [`decode_misfit_samples`] keeps at most
+/// The conform's own misfit-sampling aggregate (ADR-0011): up to
+/// [`SAMPLE_CANDIDATES`] DISTINCT values the cast nulls, as one JSON array of
+/// strings, from which [`decode_misfit_samples`] keeps at most
 /// [`MAX_CONFLICT_SAMPLES`].
 ///
 /// `list(DISTINCT …)` accumulates every distinct misfit before the slice
-/// caps it, which is safe HERE and only here: the source is one WAL batch,
+/// caps it, which is safe here and only here: the source is one WAL batch,
 /// already bounded by the compactor's own batch limits. The repin scan runs
-/// the same question over a whole CORPUS, where the distinct count is
+/// the same question over a whole corpus, where the distinct count is
 /// unbounded, so it takes [`bounded_misfit_samples_sql`] instead — a
 /// deliberate second spelling, not a drift.
 ///
-/// `left()` counts CHARACTERS (probed), so it bounds what `DuckDB`
+/// `left()` counts characters (probed), so it bounds what `DuckDB`
 /// accumulates and never what the store is promised — the byte cap is
 /// [`sanitize_sample`]'s, in Rust, after the control-character
 /// substitution. `array_slice` takes twice [`MAX_CONFLICT_SAMPLES`]
-/// candidates because sanitising can COLLAPSE two distinct raw values into
+/// candidates because sanitising can collapse two distinct raw values into
 /// one sample.
 fn distinct_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> String {
     format!(
@@ -2767,9 +2766,9 @@ fn distinct_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> S
 }
 
 /// The repin scan's misfit-sampling aggregate: at most
-/// [`MAX_CONFLICT_SAMPLES`] of the values a column CARRIES whose reading
-/// through `target_expr` is NULL, as one JSON array of strings — bounded BY
-/// CONSTRUCTION over a corpus of any size (issue #79).
+/// [`MAX_CONFLICT_SAMPLES`] of the values a column carries whose reading
+/// through `target_expr` is NULL, as one JSON array of strings — bounded by
+/// construction over a corpus of any size.
 ///
 /// `approx_top_k` is a fixed-size sketch: its memory is a function of `k`,
 /// never of the distinct cardinality. That is the whole reason it is here
@@ -2780,13 +2779,13 @@ fn distinct_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> S
 /// been writing free text into). A report that cannot be produced for the
 /// worst corpus is a report for the cases that did not need it.
 ///
-/// What changes with the sketch is WHICH samples: the most FREQUENT
+/// What changes with the sketch is which samples: the most frequent
 /// misfits rather than the first distinct ones, approximately ordered. For
 /// an advisory "here is what this pin cannot read" that is at least as
 /// useful, and every value in the list is an exact value the corpus holds
 /// — the approximation is in the ranking, never in the strings.
 ///
-/// It rides the SAME statement as the counts (`count_repin_effect`), so
+/// It rides the same statement as the counts (`count_repin_effect`), so
 /// the samples and the numbers describe one read of one file: two
 /// statements could straddle a compaction that replaced the file underneath
 /// them and report evidence from a corpus that never existed.
@@ -2798,12 +2797,12 @@ pub(crate) fn bounded_misfit_samples_sql(quoted: &str, text: &str, target_expr: 
     )
 }
 
-/// Decode one misfit-sample cell — from EITHER sampling aggregate — into at most
-/// [`MAX_CONFLICT_SAMPLES`] sanitised, distinct samples in first-seen
+/// Decode one misfit-sample cell — from either sampling aggregate — into at
+/// most [`MAX_CONFLICT_SAMPLES`] sanitised, distinct samples in first-seen
 /// order.
 ///
-/// Distinct AFTER both transforms: SQL's `DISTINCT` ran over the raw text,
-/// and what is promised — and stored — is distinct SAMPLES. A capture over
+/// Distinct after both transforms: SQL's `DISTINCT` ran over the raw text,
+/// and what is promised — and stored — is distinct samples. A capture over
 /// zero matching rows is SQL NULL rather than `[]` (probed), which is not
 /// an error.
 pub(crate) fn decode_misfit_samples(rendered: Option<&str>) -> Result<Vec<String>, String> {
@@ -2828,12 +2827,12 @@ pub(crate) fn decode_misfit_samples(rendered: Option<&str>) -> Result<Vec<String
 /// format characters become U+FFFD ([`trawl_core::sanitize`]) and the result
 /// is cut to [`MAX_CONFLICT_SAMPLE_BYTES`] on a `char` boundary.
 ///
-/// Sanitising at CAPTURE rather than at each read is the point: the value is
+/// Sanitising at capture rather than at each read is the point: the value is
 /// whatever bytes a client sent, and it goes on to a postgres row, a JSON
-/// body, an operator's terminal and (slice C2) a browser — one door is
-/// auditable, four are not. Order matters, too: U+FFFD is three bytes where
-/// most of what it replaces is one, so the byte cap is applied AFTER the
-/// substitution or it is not a cap.
+/// body, an operator's terminal and a browser — one door is auditable, four
+/// are not. Order matters, too: U+FFFD is three bytes where most of what it
+/// replaces is one, so the byte cap is applied after the substitution or it
+/// is not a cap.
 pub(crate) fn sanitize_sample(value: &str) -> String {
     let mut cleaned = trawl_core::sanitize::sanitize_display_text(value);
     if cleaned.len() > MAX_CONFLICT_SAMPLE_BYTES {
@@ -2847,9 +2846,9 @@ pub(crate) fn sanitize_sample(value: &str) -> String {
 }
 
 /// Blocking phase 3: conform `wal_batch` to the authoritative pins, then
-/// write parquet exactly as before (canonical `{service}.parquet` per
-/// hour-directory, merge with the existing file when present, `.tmp` +
-/// atomic `rename()` for crash safety).
+/// write parquet: canonical `{service}.parquet` per hour-directory, merged
+/// with the existing file when present, `.tmp` + atomic `rename()` for
+/// crash safety.
 fn conform_and_write(
     prep: PreparedBatch,
     pins: &HashMap<String, CanonicalType>,
@@ -2870,7 +2869,7 @@ fn conform_and_write(
         .filter(|n| !n.starts_with(WAL_FILE_COL))
         .collect();
     // Counted before the merge: `merged` holds the whole hour file, and
-    // accumulating THAT into `field_services.row_count` would re-add every
+    // accumulating that into `field_services.row_count` would re-add every
     // previously-compacted row on every tick.
     let batch_rows = count_rows(&conn, "wal_batch")?;
 
@@ -2963,7 +2962,7 @@ fn conform_and_write(
 /// Conform `wal_batch` to the pins in place, per [`ConformPolicy::WalBatch`].
 ///
 /// Returns the recordable conflicts (see [`ConformPlan::tally_conflicts`])
-/// and the RETAINED column names.
+/// and the retained column names.
 fn conform_wal_batch(
     conn: &duckdb::Connection,
     schema: &[ColInfo],
@@ -2975,7 +2974,7 @@ fn conform_wal_batch(
         return Err("conform produced an empty column list".to_owned());
     }
 
-    // Tallied BEFORE the table is replaced.
+    // Tallied before the table is replaced.
     let conflicts = plan.tally_conflicts(conn, "wal_batch", service)?;
 
     if !plan.dropped.is_empty() {
@@ -3035,9 +3034,9 @@ fn compact_service_blocking(
 /// Remove stale `.parquet.tmp` files left by interrupted compaction or
 /// rollup runs.
 ///
-/// Checks both `data_dir/{date}/{hour}/` (hourly compaction) and
-/// `data_dir/{date}/` (daily rollup) for `.tmp` files older than
-/// `max_age`. These are inert (don't match `*.parquet` globs) but
+/// `data_dir` is one env root (`data/{env}`): checks both `{date}/{HH}/`
+/// (hourly compaction) and `{date}/` (daily rollup) for `.tmp` files older
+/// than `max_age`. These are inert (don't match `*.parquet` globs) but
 /// should be cleaned up to avoid disk waste.
 fn cleanup_stale_tmp_files(data_dir: &Path, max_age: Duration) {
     let Ok(days) = std::fs::read_dir(data_dir) else {
@@ -3173,7 +3172,7 @@ fn extract_service_from_filename(filename: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The pass-through shortcut is a claim about the CONFORM, not about
+    /// The pass-through shortcut is a claim about the conform, not about
     /// the physical type: it holds only where a column already of that
     /// type needs nothing done to it.
     ///
@@ -3323,7 +3322,7 @@ mod tests {
     }
 
     /// `field_services.row_count` is accumulated by `touch_services`, so
-    /// the report must carry THIS batch's rows — the merged file's total
+    /// the report must carry this batch's rows — the merged file's total
     /// would re-add every earlier batch on every tick. And the observed
     /// fields must be the post-conform set: a deferred-pin column is
     /// dropped from the parquet, so claiming it as observed is a lie.
@@ -3603,11 +3602,10 @@ mod tests {
 
     #[test]
     fn compact_merges_despite_type_conflict() {
-        // Simulates the k8s containerID scenario: first batch carries
-        // `container_id` as a JSON object, second as a plain string. The
-        // cast-fallback that used to rescue this is deleted (ADR-0009 slice
-        // 2) — instead the conform pipeline pins the column VARCHAR at the
-        // FIRST write, so the second batch merges with no conflict at all.
+        // The k8s containerID scenario: first batch carries `container_id`
+        // as a JSON object, second as a plain string. The conform pipeline
+        // pins the column VARCHAR at the first write, so the second batch
+        // merges with no conflict at all — no cast fallback involved.
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         let data_dir = tmp.path().join("data");
@@ -3622,7 +3620,6 @@ mod tests {
         let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"kubelet","message":"running","container_id":"def456"}"#;
         let f2 = write_wal_file(&wal_dir, "kubelet", &[r2]);
 
-        // This would previously fail with a type mismatch error.
         compact_service_blocking(&[f2], &data_dir, "kubelet", "2GB").unwrap();
 
         let parquet_files = find_files_by_ext(&data_dir, "parquet");
@@ -3663,9 +3660,9 @@ mod tests {
 
     #[test]
     fn compaction_coerces_complex_fields_to_varchar() {
-        // Root-cause fix: an object-valued field must be written as VARCHAR
-        // so hourly files never disagree on its physical type. Scalars keep
-        // their inferred types.
+        // An object-valued field must be written as VARCHAR so hourly files
+        // never disagree on its physical type. Scalars keep their inferred
+        // types.
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         let data_dir = tmp.path().join("data");
@@ -3807,7 +3804,7 @@ mod tests {
         assert!(!plan.is_guard_only(), "the case-fold rename is real work");
     }
 
-    /// Only a cast that NULLED something is conflict evidence.
+    /// Only a cast that nulled something is conflict evidence.
     /// `field_conflicts` is append-only and compaction ticks every few
     /// seconds, so recording a lossless conform (here: a VARCHAR-pinned
     /// field whose batch happened to carry only numbers) would append a row
@@ -3885,7 +3882,7 @@ mod tests {
 
     /// The evidence a conflict row carries beyond its counts: which values
     /// the pin is actually costing. Distinct, capped, and only ever values
-    /// the cast NULLED — a lossless column's convergence is not evidence.
+    /// the cast nulled — a lossless column's convergence is not evidence.
     #[test]
     fn conflict_samples_are_the_distinct_nulled_values_capped_at_five() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -3927,7 +3924,7 @@ mod tests {
     /// A misfit value is client text of client-chosen length and content, so
     /// the sample is cut to a byte budget and stripped of control characters
     /// at capture — before it reaches postgres, a response body or a
-    /// terminal. The substitution runs FIRST (U+FFFD is three bytes where the
+    /// terminal. The substitution runs first (U+FFFD is three bytes where the
     /// character it replaces is one), and the cut lands on a `char` boundary.
     #[test]
     fn conflict_samples_are_control_sanitised_then_byte_capped() {
@@ -3979,7 +3976,7 @@ mod tests {
         assert_eq!(lengths, vec![5, 15, 255, 256]);
     }
 
-    /// `DISTINCT` runs in `DuckDB` over the RAW values, but what is stored
+    /// `DISTINCT` runs in `DuckDB` over the raw values, but what is stored
     /// is the sanitised, byte-capped form — and two raw misfits can collapse
     /// into one of those. The stored set is deduplicated after both
     /// transforms, so "at most five DISTINCT samples" describes the samples
@@ -4017,14 +4014,14 @@ mod tests {
         );
     }
 
-    /// A capture that fails must cost the SAMPLES, never the batch.
+    /// A capture that fails must cost the samples, never the batch.
     ///
     /// The failure is real, not mocked: `list(DISTINCT …)` accumulates every
     /// distinct misfit and `DuckDB` does not spill it, so a memory limit the
     /// two scalar tally aggregates fit inside comfortably is one the capture
     /// exhausts. Propagating it would fail the conform, retain the WAL, and
     /// have the next tick retry a bigger batch — an ingestion stall that
-    /// ratchets itself tighter.
+    /// tightens itself with every retry.
     #[test]
     fn a_failed_sample_capture_still_records_the_conflict() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -4033,14 +4030,14 @@ mod tests {
              SELECT 'v' || repeat('x', 200) || i::VARCHAR AS v FROM range(200000) s(i)",
         )
         .unwrap();
-        // Applied AFTER the fixture: the settings are for the queries under
+        // Applied after the fixture: the settings are for the queries under
         // test. The margin is deliberately an order of magnitude wide — the
         // tally's two scalar aggregates need single-digit MB whatever the
         // row count, while the capture must hold ~40MB of distinct values —
         // so the outcome does not turn on how loaded the machine is. One
         // thread for the same reason.
         conn.execute_batch("SET threads=1").unwrap();
-        // No spilling: an over-limit query must FAIL, which is the
+        // No spilling: an over-limit query must fail, which is the
         // production shape (a compactor that silently offloads 40MB of
         // sample candidates to disk is its own problem) and keeps the test
         // off DuckDB's temp-file path.
@@ -4069,7 +4066,7 @@ mod tests {
         );
     }
 
-    /// A batch that conflicts on nothing runs no sample query at ALL — the
+    /// A batch that conflicts on nothing runs no sample query at all — the
     /// capture is a second aggregate pass over client-width data, and a
     /// healthy install must not pay it every tick.
     ///
@@ -4085,7 +4082,7 @@ mod tests {
         // Distinct 200-byte values: enough that `list(DISTINCT …)` cannot
         // fit inside the limit, while the two scalar tally aggregates fit
         // inside it with an order of magnitude to spare (so the outcome
-        // does not turn on machine load). Settings are applied AFTER the
+        // does not turn on machine load). Settings are applied after the
         // fixture: they are for the queries under test, not their setup.
         let capture_ran = |projection: &str, pin: CanonicalType| {
             let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -4141,7 +4138,7 @@ mod tests {
     /// At the sampled-column cap the evidence degrades, never the tally: a
     /// batch conflicting on more columns than one capture pass may cover
     /// still records every conflict, and only the columns past the cap lose
-    /// their samples. Which columns those are is decided by NAME, so a wide
+    /// their samples. Which columns those are is decided by name, so a wide
     /// batch samples the same fields whatever order it describes in.
     #[test]
     fn the_sampled_column_cap_drops_samples_not_conflicts() {
@@ -4279,12 +4276,11 @@ mod tests {
         assert_eq!(nn, 20, "the out-of-range outlier nulls");
     }
 
-    /// The lossless-cast fix's headline case: 19 fractional values + one
-    /// string infer JSON, and under bare `count(TRY_CAST(...))` scoring the
-    /// BIGINT rung counted `1.5 → 2` as success (19/20 ≥ 90%) — pinning
-    /// BIGINT and silently rounding every value on write, with no
-    /// `field_conflicts` row. Round-trip scoring fails the BIGINT rung
-    /// (rounding is not lossless) and pins DOUBLE.
+    /// 19 fractional values plus one string infer JSON. Bare
+    /// `count(TRY_CAST(...))` scoring would count `1.5 → 2` as a BIGINT
+    /// success (19/20 ≥ 90%), pinning BIGINT and rounding every value on
+    /// write with no `field_conflicts` row; round-trip scoring fails that
+    /// rung because rounding is not lossless, so the batch pins DOUBLE.
     #[test]
     fn pin_ladder_fractional_majority_pins_double_not_bigint() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4317,7 +4313,7 @@ mod tests {
         );
     }
 
-    /// The >2^53 boundary, where a wire number's FRACTION stops being a
+    /// The >2^53 boundary, where a wire number's fraction stops being a
     /// fraction: above 2^53 the gap between adjacent doubles exceeds 1, so
     /// `read_json` parses `1735689600123456710.7` into an integer-valued
     /// double before any conform expression exists to see it. The text
@@ -4326,14 +4322,12 @@ mod tests {
     /// batch still pins BIGINT bit-exactly (JSON keeps integer tokens
     /// integral, so nothing rounds it at all).
     ///
-    /// This is the one outcome the ADR-0009 guard used to answer
-    /// differently, and the difference was an artefact: it compared the
-    /// DOUBLE column's own BIGINT cast (`…768`, the double's exact value)
-    /// against the column's 17-significant-digit rendering (`…800`) and
-    /// refused the pin over the gap between two spellings of ONE double.
-    /// Text-first (ADR-0011) takes both sides from one text, so the
-    /// artefact is gone — and it cost determinism, since a `read_json`
-    /// class that rendered the same double differently answered
+    /// Text-first scoring (ADR-0011) takes both sides of the guard from one
+    /// text, which is what makes this deterministic. Comparing the DOUBLE
+    /// column's own BIGINT cast (`…768`, the double's exact value) against
+    /// the column's 17-significant-digit rendering (`…800`) would refuse the
+    /// pin over the gap between two spellings of one double, and answer
+    /// differently for any `read_json` class that renders that double
     /// differently. Below 2^53 nothing moves: a real fraction survives
     /// into the text and is still refused
     /// ([`Self::pin_ladder_fractional_majority_pins_double_not_bigint`]),
@@ -4437,9 +4431,9 @@ mod tests {
         );
     }
 
-    /// With lossless scoring the Boolean rung is reachable: under the old
-    /// counting, `TRY_CAST(true AS BIGINT)` = 1 scored a boolean batch ≥90%
-    /// on the BIGINT rung first, so no batch could ever pin BOOLEAN.
+    /// Lossless scoring is what makes the BOOLEAN rung reachable at all:
+    /// plain counting scores a boolean batch ≥90% on the earlier BIGINT rung
+    /// (`TRY_CAST(true AS BIGINT)` = 1), so BIGINT would always win first.
     #[test]
     fn pin_ladder_boolean_majority_pins_boolean() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4465,10 +4459,10 @@ mod tests {
     }
 
     /// The catalog holds ASCII-folded names only, so the conform plan must
-    /// fold a legacy mixed-case column onto its pin — a type-matching
-    /// column still gets a RENAME (a rewrite, not a no-op), and a cast
-    /// column lands under the folded alias with its conflict evidence
-    /// attributed to the catalog key.
+    /// fold a mixed-case column onto its pin — a type-matching column still
+    /// gets a rename (a rewrite, not a no-op), and a cast column lands under
+    /// the folded alias with its conflict evidence attributed to the catalog
+    /// key.
     #[test]
     fn conform_plan_folds_mixed_case_columns_onto_their_pins() {
         let schema = vec![
@@ -4505,17 +4499,17 @@ mod tests {
             plan.select_list[1]
         );
 
-        // WalBatch: an unpinned mixed-case column is judged by its FOLDED
+        // WalBatch: an unpinned mixed-case column is judged by its folded
         // name — pinned under `dur`, so it is conformed, not dropped.
         let wal_plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         assert!(wal_plan.dropped.is_empty(), "{:?}", wal_plan.dropped);
         assert_eq!(wal_plan.retained, vec!["dur", "note"]);
     }
 
-    /// The repin policy (ADR-0011 slice B): the target column routes
-    /// through the resurrection expression — stored guarded reading first,
-    /// then the `_raw` re-extraction — while every already-conformant
-    /// column passes through untouched.
+    /// The repin policy (ADR-0011): the target column routes through the
+    /// resurrection expression — stored guarded reading first, then the
+    /// `_raw` re-extraction — while every already-conformant column passes
+    /// through untouched.
     #[test]
     fn repin_policy_routes_the_target_through_resurrection() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -4653,11 +4647,11 @@ mod tests {
         );
     }
 
-    /// TWO sampling aggregates, one promise (issue #79). The conform's own
-    /// evidence accumulates every distinct misfit and slices — safe over a
-    /// bounded WAL batch — while the repin scan reads a whole corpus and
-    /// takes a fixed-size sketch instead, because the distinct count there
-    /// is a sender's free text and nothing bounds it. What they SHARE is
+    /// Two sampling aggregates, one promise. The conform's own evidence
+    /// accumulates every distinct misfit and slices — safe over a bounded
+    /// WAL batch — while the repin scan reads a whole corpus and takes a
+    /// fixed-size sketch instead, because the distinct count there is a
+    /// sender's free text and nothing bounds it. What they share is
     /// what a sample is: the same subject (a value the column carries whose
     /// reading is NULL), the same character cap, and the same
     /// sanitise-then-cap-then-dedup decode.
@@ -4704,7 +4698,7 @@ mod tests {
         assert!(!bounded.contains("list(DISTINCT"), "{bounded}");
     }
 
-    /// The bounded aggregate, EXECUTED against the shape that broke the
+    /// The bounded aggregate, executed against the shape that exhausts the
     /// unbounded one: a column whose every value is a distinct misfit. The
     /// scan must survive and return at most five samples, all of them real
     /// values from the corpus.
@@ -4749,9 +4743,9 @@ mod tests {
     }
 
     /// Decoding caps, sanitises and de-duplicates in that order: `left()`
-    /// bounds what `DuckDB` accumulates in CHARACTERS, the byte cap and the
+    /// bounds what `DuckDB` accumulates in characters, the byte cap and the
     /// control-character substitution happen in Rust, and DISTINCT is
-    /// re-applied AFTER both because sanitising can collapse two raw values
+    /// re-applied after both because sanitising can collapse two raw values
     /// into one sample.
     #[test]
     fn decoding_samples_caps_sanitises_then_dedups() {
@@ -4769,11 +4763,11 @@ mod tests {
         assert!(decode_misfit_samples(Some("not json")).is_err());
     }
 
-    /// The counting expressions over a SEVERITY target, EXECUTED (issue
-    /// #79): a sender's `level` column repinned onto the ladder. Tokens map
-    /// dialect-free, `gold` maps nowhere, and the numeral `3` maps under
-    /// BOTH dialects to different rungs — which is the whole ambiguity
-    /// notion, counted whatever the job asserted.
+    /// The counting expressions over a SEVERITY target, executed: a sender's
+    /// `level` column repinned onto the ladder. Tokens map dialect-free,
+    /// `gold` maps nowhere, and the numeral `3` maps under both dialects to
+    /// different rungs — which is the whole ambiguity notion, counted
+    /// whatever the job asserted.
     #[test]
     fn repin_counts_over_a_severity_target_separate_loss_from_ambiguity() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -4814,7 +4808,7 @@ mod tests {
         assert_eq!(count(Dialect::Syslog), (5, 4, 1));
 
         // The values themselves, to prove the dialect actually changes what
-        // the rewrite would WRITE.
+        // the rewrite would write.
         let read = |dialect| {
             let reading =
                 RepinReading::new(CanonicalType::Varchar, CanonicalType::Severity, dialect);
@@ -4844,7 +4838,7 @@ mod tests {
     /// dialect-free: the values are canonical ladder positions, and
     /// re-reading a stored `3` as syslog would silently corrupt it to 17.
     /// Only the `_raw` arm — the sender's own wire text — takes the
-    /// assertion (issue #79, ruling 1).
+    /// assertion (ADR-0013).
     #[test]
     fn a_severity_source_keeps_its_stored_arm_dialect_free() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -4892,7 +4886,7 @@ mod tests {
     }
 
     /// Conform-time lossless guarantee: a batch disagreeing with an
-    /// existing typed pin must NULL (and tally) every value the cast would
+    /// existing typed pin must null (and tally) every value the cast would
     /// alter — never write a silently rounded one. Numeric-space tolerance
     /// keeps genuinely lossless drift (`4.0 → 4`).
     #[test]
@@ -4948,7 +4942,7 @@ mod tests {
     }
 
     /// A batch wider than one ladder chunk must pin every column to the type
-    /// its OWN values support: the ladder runs in batched aggregate passes,
+    /// its own values support: the ladder runs in batched aggregate passes,
     /// so a slot-mapping slip would silently hand a column its neighbour's
     /// verdict. Alternating verdicts across the chunk boundary catch that.
     #[test]
@@ -5004,7 +4998,7 @@ mod tests {
         std::fs::create_dir_all(&wal_dir).unwrap();
 
         // Batch 1: `maybe` is all-null and unpinned → the column must be
-        // ABSENT from the file (union_by_name reads absent as NULL; typed
+        // absent from the file (union_by_name reads absent as NULL; typed
         // NULLs would pre-empt the field's real type).
         let r1 = record_with("maybe", "null", 0);
         let f1 = write_wal_file(&wal_dir, "svc", &[r1.as_str()]);
@@ -5046,7 +5040,7 @@ mod tests {
 
     #[test]
     fn nested_object_keeps_batchmates_columns_and_stays_reachable() {
-        // Legacy WAL shape (pre-stringification): a nested object infers
+        // A nested object (hand-written WAL — ingest stringifies) infers
         // STRUCT at depth 2 and must conform to VARCHAR JSON text without
         // dropping any batch-mate's custom column.
         let tmp = tempfile::tempdir().unwrap();
@@ -5084,10 +5078,10 @@ mod tests {
 
     #[test]
     fn duplicate_name_collision_drains_at_depth_1_keeping_all_columns() {
-        // Case-colliding keys INSIDE a nested object are the one shape that
+        // Case-colliding keys inside a nested object are the one shape that
         // still raises "Duplicate name" at depth 2 (verified by execution).
         // The depth-1 retry reads every top-level field as JSON and the
-        // conform step types them — no ten-column fallback, no column drop.
+        // conform step types them — no column is dropped.
         let tmp = tempfile::tempdir().unwrap();
         let (wal_dir, data_dir) = (tmp.path().join("wal"), tmp.path().join("data"));
         std::fs::create_dir_all(&wal_dir).unwrap();
@@ -5126,7 +5120,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(50));
 
-        // Create a fresh .tmp file that should NOT be removed.
+        // Create a fresh .tmp file that must not be removed.
         let fresh = hour_dir.join("postgres.parquet.tmp");
         std::fs::write(&fresh, b"fresh").unwrap();
 
@@ -5324,12 +5318,11 @@ mod tests {
     #[test]
     fn rollup_of_nonconformant_hourlies_errors_loudly_and_retains_inputs() {
         // Hour 01 carries `offset` as a STRUCT, hour 02 as a plain string —
-        // a mix write-time conformance can no longer produce, so it can only
-        // mean foreign parquet dropped into the tree. The VARCHAR-cast
-        // fallback that used to rewrite both sides silently is deleted
-        // (ADR-0009 slice 2): the rollup must fail loudly and RETAIN the
-        // hourly inputs for the operator (retried next tick), never
-        // half-produce a daily file.
+        // a mix write-time conformance cannot produce, so it can only mean
+        // foreign parquet dropped into the tree (ADR-0009). The rollup must
+        // fail loudly and retain the hourly inputs for the operator (retried
+        // next tick), never half-produce a daily file and never rewrite both
+        // sides with a silent VARCHAR cast.
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
@@ -5360,9 +5353,9 @@ mod tests {
         // The canonical hourly file already holds `container_id` as a STRUCT
         // (foreign parquet — the conform pipeline always writes VARCHAR for
         // it). Merging a conformant WAL batch into it hits a union type
-        // conflict; the deleted cast-and-retry must NOT be rebuilt: the
-        // batch errors (logged as catalog_invariant_violation), the WAL file
-        // survives for the next tick, and the existing file is untouched.
+        // conflict, and there is no cast-and-retry: the batch errors (logged
+        // as catalog_invariant_violation), the WAL file survives for the next
+        // tick, and the existing file is untouched.
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         let data_dir = tmp.path().join("data");
@@ -5469,11 +5462,11 @@ mod tests {
         );
     }
 
-    /// The repin job's rollup interlock (ADR-0011 slice B): while the
-    /// coordinator holds a rollup pause, a compaction tick drains WAL but
-    /// never relocates hourly files into dailies — the shadow build's
-    /// catch-up diff must stay additive. Dropping the pause resumes
-    /// consolidation on the next tick.
+    /// The repin job's rollup interlock (ADR-0011): while the coordinator
+    /// holds a rollup pause, a compaction tick drains WAL but never
+    /// relocates hourly files into dailies — the shadow build's catch-up
+    /// diff must stay additive. Dropping the pause resumes consolidation on
+    /// the next tick.
     #[tokio::test]
     async fn rollup_is_suppressed_while_a_repin_pause_is_held() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5531,13 +5524,12 @@ mod tests {
         );
     }
 
-    /// The other half of that interlock (ADR-0011 slice B): a rollup pass
-    /// that was ALREADY RUNNING when the job started. The pause flag alone
-    /// only stops a pass that has not begun — a pass in flight would keep
-    /// relocating files straight through `swap_envs` and republish
-    /// pre-repin types into the new generation. So every relocating unit
-    /// takes the corpus gate: the cutover waits it out, and the rest of the
-    /// pass stands down.
+    /// The other half of that interlock (ADR-0011): a rollup pass that was
+    /// already running when the job started. The pause flag alone only stops
+    /// a pass that has not begun — a pass in flight would keep relocating
+    /// files straight through `swap_envs` and republish pre-repin types into
+    /// the new generation. So every relocating unit takes the corpus gate:
+    /// the cutover waits it out, and the rest of the pass stands down.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_running_rollup_pass_is_gated_by_the_cutover_and_stands_down() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5933,9 +5925,9 @@ mod tests {
 
     #[test]
     fn compact_keeps_quarantine_count_when_a_later_step_fails() {
-        // A NUL file is quarantined (count=1) and then a step AFTER the
+        // A NUL file is quarantined (count=1) and then a step after the
         // quarantine errors (output dir can't be created because data_dir is a
-        // regular file). The count must SURVIVE the Err — a naive `?` would
+        // regular file). The count must survive the Err — a naive `?` would
         // drop it, and since the file is already renamed `.corrupt` a retry
         // can't re-count it. Mirrors the rollup
         // `rollup_keeps_quarantine_count_when_merge_errors` guarantee.
@@ -5943,7 +5935,7 @@ mod tests {
         let wal_dir = tmp.path().join("wal");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // data_dir is a regular FILE, so create_dir_all of the output dir (and
+        // data_dir is a regular file, so create_dir_all of the output dir (and
         // any DuckDB write) downstream of the quarantine fails.
         let data_file = tmp.path().join("data_is_a_file");
         std::fs::write(&data_file, b"not a directory").unwrap();
@@ -6061,7 +6053,7 @@ mod tests {
 
     #[test]
     fn rollup_keeps_quarantine_count_when_merge_errors() {
-        // One input is corrupt (quarantined, count=1); a SECOND input passes the
+        // One input is corrupt (quarantined, count=1); a second input passes the
         // magic-byte sniff but is unreadable by read_parquet (valid PAR1
         // bookends, bogus footer length), so the merge COPY hard-errors. The
         // quarantine count must still ride out on the outcome: a naive
@@ -6104,7 +6096,7 @@ mod tests {
 
     #[test]
     fn recovery_discards_truncated_tmp() {
-        // Crash mid-COPY: a truncated .tmp must NOT be promoted to canonical,
+        // Crash mid-COPY: a truncated .tmp must not be promoted to canonical,
         // and the hourly files must be retained for a fresh rollup.
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
@@ -6136,7 +6128,7 @@ mod tests {
 
     #[test]
     fn compact_once_counts_quarantine_as_error() {
-        // I3 counter wiring: an all-corrupt service/day must surface its
+        // Counter wiring: an all-corrupt service/day must surface its
         // quarantine count through rollup_once → compact_once's returned u64
         // (which spawn_compaction folds into stats.total_errors).
         let tmp = tempfile::tempdir().unwrap();
@@ -6241,7 +6233,7 @@ mod tests {
 
     #[test]
     fn rollup_does_not_duplicate_rows_when_hourly_survives() {
-        // I4: simulate a delete that fails on the first rollup (the hourly is
+        // Simulate a delete that fails on the first rollup (the hourly is
         // retired aside as `.merged`), then run a second rollup over the same
         // day. The retired `.merged` file must not be re-merged, so the daily
         // row count stays put rather than doubling.
@@ -6263,7 +6255,7 @@ mod tests {
 
         // Simulate a "delete failed → retired aside" hourly that survived as
         // `.merged` (what retire_merged_hourly leaves behind on a bad delete).
-        // It must NOT be re-collected nor re-merged.
+        // It must not be re-collected nor re-merged.
         let stranded = day_dir.join("01").join("nginx.parquet.merged");
         std::fs::create_dir_all(stranded.parent().unwrap()).unwrap();
         std::fs::copy(&daily, &stranded).unwrap();
@@ -6300,7 +6292,7 @@ mod tests {
 
     #[test]
     fn recovery_keeps_marker_when_hourly_retire_fails() {
-        // I4b: canonical present, marker lists an hourly that can be neither
+        // Canonical present, marker lists an hourly that can be neither
         // deleted nor renamed aside. recover_rollup_markers must return Err
         // and leave the marker in place so the next pass retries.
         let tmp = tempfile::tempdir().unwrap();
@@ -6337,9 +6329,9 @@ mod tests {
 
     #[test]
     fn retire_merged_hourly_is_idempotent_on_missing_file() {
-        // I4c: retiring an already-gone hourly is a no-op success. The goal
+        // Retiring an already-gone hourly is a no-op success. The goal
         // ("this file is no longer a re-mergeable hourly") is already met, so a
-        // missing source must NOT propagate as Err (which would wedge recovery).
+        // missing source must not propagate as Err (which would wedge recovery).
         let tmp = tempfile::tempdir().unwrap();
         let gone = tmp.path().join("never-existed.parquet");
         assert!(!gone.exists());
@@ -6356,12 +6348,11 @@ mod tests {
 
     #[test]
     fn recovery_completes_after_partial_hourly_cleanup() {
-        // I4c regression: a crash MID-cleanup-loop deleted SOME hourlies but
-        // left the marker (it lists ALL of them). On the next recovery pass the
-        // marker is replayed verbatim — retiring an already-gone hourly must be
-        // a no-op success so recovery still retires the surviving hourly AND
-        // deletes the marker. The old code returned Err on the first phantom,
-        // short-circuiting before the marker delete → permanently wedged.
+        // A crash mid-cleanup-loop deletes some hourlies but leaves the
+        // marker, which lists all of them. The next recovery pass replays the
+        // marker verbatim, so retiring an already-gone hourly must be a no-op
+        // success: an Err on the first phantom short-circuits before the
+        // marker delete and wedges recovery permanently.
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
@@ -6376,7 +6367,7 @@ mod tests {
         let canonical = day_dir.join("nginx.parquet");
         std::fs::write(&canonical, b"consolidated").unwrap();
 
-        // Marker lists BOTH (written before the cleanup loop ran).
+        // Marker lists both (written before the cleanup loop ran).
         write_rollup_marker(
             &day_dir,
             "nginx",
@@ -6401,7 +6392,7 @@ mod tests {
             !still_present.exists() || PathBuf::from(aside).exists(),
             "the present hourly must be retired (gone or .merged)"
         );
-        // The marker MUST be removed so later compaction ticks don't replay it.
+        // The marker must be removed so later compaction ticks don't replay it.
         assert!(
             !marker.exists(),
             "marker must be removed after recovery completes"
@@ -6427,9 +6418,9 @@ mod tests {
         rows
     }
 
-    /// A hand-written legacy WAL file with a malformed timestamp (simulating
-    /// pre-fix on-disk state) compacts, and the row's timestamp comes from
-    /// the filename's unix-millis segment — draining wedged WAL on deploy.
+    /// A hand-written WAL file with a malformed timestamp compacts, and the
+    /// row's timestamp comes from the filename's unix-millis segment rather
+    /// than wedging the batch.
     #[test]
     fn compact_repairs_malformed_timestamp_from_filename() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6460,7 +6451,7 @@ mod tests {
         );
     }
 
-    /// Each row's filename fallback comes from its OWN WAL file, never a
+    /// Each row's filename fallback comes from its own WAL file, never a
     /// batch-level value: one batch spanning two files with different
     /// unix-millis values recovers two different instants.
     #[test]
@@ -6498,8 +6489,8 @@ mod tests {
         );
     }
 
-    /// All four trigger variants from the issue compact without error and
-    /// land with a non-NULL timestamp.
+    /// All four malformed-`_time` shapes compact without error and land with
+    /// a non-NULL timestamp.
     #[test]
     fn compact_repairs_all_trigger_variants() {
         let variants = [
@@ -6547,11 +6538,10 @@ mod tests {
     /// A repaired event past `DuckDB`'s default JSON sample window still
     /// reaches parquet with its `_repairs` intact.
     ///
-    /// `_repairs` is sparse by construction — only repaired events
-    /// carry it. Auto-detection over a bounded sample never saw it on a WAL
-    /// file bigger than the sample, so the preserved original was dropped
-    /// with no error at all, defeating ADR-0008's promise that the evidence
-    /// survives to the operator.
+    /// `_repairs` is sparse by construction — only repaired events carry it
+    /// — so auto-detection over a bounded sample would miss it on any WAL
+    /// file bigger than the sample and drop the column with no error at all,
+    /// defeating ADR-0008's promise that the evidence reaches the operator.
     #[test]
     fn compact_preserves_repair_column_past_the_sample_window() {
         use std::fmt::Write as _;
@@ -6895,15 +6885,14 @@ mod tests {
         );
     }
 
-    /// WAL written before ingest stripped the reserved key still drains, and
-    /// drains LOSSLESSLY: a row literally carrying `_trawl_wal_file` collides
+    /// A WAL file carrying the reserved provenance key still drains, and
+    /// drains losslessly: a row literally carrying `_trawl_wal_file` collides
     /// with the synthetic provenance column, which must route to the renamed
     /// provenance retry rather than failing the read forever (the isolation
     /// path cannot save it — `probe_ndjson` omits `filename=`, so the file
     /// parses cleanly and is kept as a survivor). Its innocent batch-mate
     /// must land too, and every user field outside the vector envelope must
-    /// survive — the whole point of the rename over the explicit-columns
-    /// fallback, which would drop them for the entire batch.
+    /// survive the rename.
     #[tokio::test]
     async fn compact_once_drains_wal_carrying_reserved_provenance_key() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6913,7 +6902,7 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
 
         // Malformed timestamp on the poison row: the repair must fall back to
-        // the file's OWN name — never to the client-controlled value.
+        // the file's own name — never to the client-controlled value.
         let poison = r#"{"_time":"not-a-date","_ingested":"not-a-date","service":"nginx","message":"poison","_trawl_wal_file":"/etc/passwd","request_id":"deadbeef"}"#;
         let innocent = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"nginx","message":"innocent","trace_id":"t1"}"#;
         std::fs::create_dir_all(wal_dir.join("prod")).unwrap();
@@ -7062,8 +7051,8 @@ mod tests {
     }
 
     /// A recurring path (`{env}/{date}/{HH}/{service}.parquet` is stable
-    /// across ticks) corrupting twice must leave TWO artifacts: `rename`
-    /// clobbers an existing destination, so the second quarantine used to
+    /// across ticks) corrupting twice must leave two artifacts: `rename`
+    /// clobbers an existing destination, so a blind second quarantine would
     /// destroy the first one's bytes.
     #[test]
     fn repeated_quarantine_keeps_every_artifact() {
@@ -7101,7 +7090,7 @@ mod tests {
         }
     }
 
-    /// E3a: a failed RESERVATION is a hard error, not a swallowed log — the
+    /// A failed reservation is a hard error, not a swallowed log — the
     /// bad file still matches the scan glob and would re-wedge every tick.
     #[test]
     #[cfg(unix)]
@@ -7137,9 +7126,9 @@ mod tests {
         assert!(bad.exists(), "original stays put when quarantine fails");
     }
 
-    /// E3b: a failed RENAME is a hard error too — and it cleans up the
-    /// reservation, so a retry re-uses the bare `.corrupt` name instead of
-    /// stepping over zero-byte debris.
+    /// A failed rename is a hard error too, and it cleans up the reservation,
+    /// so a retry re-uses the bare `.corrupt` name instead of stepping over
+    /// zero-byte debris.
     #[test]
     fn quarantine_file_signals_rename_failure() {
         let tmp = tempfile::tempdir().unwrap();

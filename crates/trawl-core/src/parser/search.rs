@@ -38,10 +38,10 @@ fn quoted_search<'src>()
 
 /// Detect whether a value contains glob characters (`*` or `?`).
 ///
-/// The ONE glob predicate: it decides the operator here, and it is what
-/// [`crate::parser::comment::hint_for`] asks before promising a quoted
-/// rewrite matches "exactly" — a hint whose claim came from a second
-/// spelling of this rule could contradict the parser that answers it.
+/// The single glob predicate: it decides the operator here, and
+/// [`crate::parser::comment::hint_for`] asks it before promising a quoted
+/// rewrite matches "exactly" — a second spelling of the rule could make a
+/// hint contradict the parser that answers it.
 pub(crate) fn has_glob_chars(s: &str) -> bool {
     s.contains('*') || s.contains('?')
 }
@@ -68,10 +68,10 @@ fn filter_value<'src>()
 
     // One element: a quoted value (`service="Activity Monitor"` — quotes
     // stripped) or a bare one. Quoted-ness rides along because it decides
-    // GLOB auto-detection: the wildcards in `host="a*b"` are data, while
+    // glob auto-detection: the wildcards in `host="a*b"` are data, while
     // the ones in `host=a*b` are the pattern.
     //
-    // Both spellings are admitted in EVERY position of a comma list, not
+    // Both spellings are admitted in every position of a comma list, not
     // just alone, so `format` can quote a list element that would
     // otherwise re-lex as something else — a `#` in one is a parse error
     // bare (ADR-0014 ruling 2), and the round trip has to survive it.
@@ -116,7 +116,6 @@ fn filter_value<'src>()
 /// commit the parser.
 fn field_filter<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
-    // lookahead: check ident + operator without consuming
     field_name()
         .then(filter_op())
         .rewind()
@@ -146,20 +145,20 @@ fn field_filter<'src>()
         .labelled("field filter")
 }
 
-/// Emit ADR-0014's diagnostics for a search-stage bare term.
+/// Emit the comment-opener diagnostics for a search-stage bare term
+/// (ADR-0014).
 ///
-/// A `#` anywhere in the term is ruling 2 — the opener is never data and
-/// never a comment inside a token. `//` at the START of a term is
-/// ruling 3's loud half: an old-style comment line must fail rather than
-/// silently become AND-ed text terms that narrow the match set to
-/// nothing. The NEGATED arm passes `negated`, which does two things: a
-/// leading `//` cannot have been meant as a comment there (nothing
-/// negates one), so `-//cdn.example.com` stays an ordinary negated term;
-/// and the `#` message is the negated one, because quoting is no escape
-/// under `-` — `-"a#b"` is a bare term spelling literal quote
-/// characters, and `NOT "a#b"` is the working form the hint offers.
+/// A `#` anywhere in the term is an error: the opener is never data and
+/// never a comment inside a token. A term starting with `//` is an error
+/// too — a comment line in that spelling must fail rather than silently
+/// become AND-ed text terms that narrow the match set to nothing. Under
+/// `-` neither rule holds as written: nothing negates a comment, so
+/// `-//cdn.example.com` stays an ordinary negated term, and the `#`
+/// message is the negated one because quoting is no escape there
+/// (`-"a#b"` is a bare term spelling literal quote characters, while
+/// `NOT "a#b"` is the working form the hint offers).
 ///
-/// The term is still produced and the diagnostics are EMITTED, so the
+/// The term is still produced and the diagnostics are emitted, so the
 /// branch succeeds structurally: chumsky ranks alternatives by how far
 /// they got, and a returned error here would lose to a worse one from a
 /// later arm. `into_result()` is still `Err`.
@@ -195,21 +194,20 @@ fn check_term<'src>(
 
 /// Parse a bare text search term, optionally negated with `-`.
 ///
-/// A backtick is a METACHARACTER here, not a word byte: it opens a quoted
+/// A backtick is a metacharacter here, not a word byte: it opens a quoted
 /// field name (ADR-0013 ruling 7), and text search is the last alternative
-/// in the leaf choice. Were it accepted anywhere in the term, a quoted name
-/// the grammar refuses — or one whose filter never reaches an operator —
-/// would not error: no alternative would match, and the query would
+/// in the leaf choice. If a term could absorb one, a quoted name the
+/// grammar refuses — or one whose filter never reaches an operator — would
+/// not error at all: no alternative would match, and the query would
 /// silently become a substring search for the literal ticks
-/// (`` service=`my service` `` for a search of the whole line). It ends the
-/// term in EVERY position, leading or mid-word, and under `-` as much as
-/// bare, so the tick is the one character no unquoted position can absorb —
+/// (`` service=`my service` `` searching the whole line). So it ends the
+/// term in every position, leading or mid-word, negated as much as bare —
 /// the same exclusion [`crate::parser::primitives::bare_value`] makes on the
-/// value side. Cost, deliberate: a bare word carrying a tick must be
+/// value side. The deliberate cost: a bare word carrying a tick must be
 /// double-quoted (`` "a`b" ``).
 ///
-/// A comment opener inside the term, and a term OPENING with the retired
-/// `//`, are parse errors ([`check_term`], ADR-0014).
+/// A comment opener inside the term, and a term opening with `//`, are
+/// parse errors ([`check_term`], ADR-0014).
 fn text_search<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     let negated = just('-')
@@ -253,7 +251,7 @@ fn text_search<'src>()
     });
 
     // Excluding the byte from both terms is not enough for the `-` case:
-    // it would leave `-` matching as a POSITIVE term of its own, so
+    // it would leave `-` matching as a positive term of its own, so
     // `` -`http-status`=500 `` would parse as a text search for `-` beside
     // an un-negated field filter — the negation silently gone, which is
     // worse than the term that matched nothing. Refusing the pair ahead of
@@ -291,8 +289,7 @@ fn search_token<'src>()
         // that's a valid token start, otherwise treat "NOT" as text search.
         let not_token = keyword("NOT")
             .then(
-                // Peek ahead: next char after whitespace must be a valid token start.
-                // This prevents "NOT |" or "NOT" at end from being parsed as negation.
+                // Keeps "NOT |" and a trailing "NOT" out of the negation arm.
                 any()
                     .filter(|c: &char| {
                         c.is_alphanumeric()
@@ -735,12 +732,12 @@ mod tests {
         }
     }
 
-    /// A backtick ends a bare word and a bare VALUE alike, in every
+    /// A backtick ends a bare word and a bare value alike, in every
     /// position: no unquoted position may absorb the one character whose
-    /// meaning is settled before the grammar runs. Each shape below used
-    /// to answer something quietly different — a substring search for the
-    /// literal ticks, or a filter narrowed to half the value the user
-    /// wrote beside a stray text term.
+    /// meaning is settled before the grammar runs. Without the refusal
+    /// each shape below answers something quietly different — a substring
+    /// search for the literal ticks, or a filter narrowed to half the
+    /// value the user wrote beside a stray text term.
     #[test]
     fn no_unquoted_position_absorbs_a_backtick() {
         for dsl in [

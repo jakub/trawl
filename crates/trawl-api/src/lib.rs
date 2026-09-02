@@ -258,7 +258,7 @@ pub struct HealthResponse {
     pub status: HealthStatus,
     /// Per-subsystem check results (`"ok"` or `"error: ..."`).
     ///
-    /// Absent in minimal responses for backward compatibility.
+    /// The daemon always fills this; optional so a body that omits it parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<HashMap<String, String>>,
     /// Server version string (e.g. `"0.1.3"`).
@@ -328,28 +328,26 @@ pub struct QueryResponse {
     pub truncated: bool,
     /// Pagination metadata.
     pub pagination: PaginationMeta,
-    /// Fields the query BOUND whose catalog pin the analyzer currently calls
-    /// degraded (ADR-0011 slice C1) — the results may be missing values that
-    /// pin shelved. Includes fields the query filtered on and projected away;
-    /// absent from the wire when empty, which is the healthy case.
+    /// Fields the query bound whose catalog pin the analyzer calls degraded
+    /// (ADR-0011): results may be missing values that pin shelved. Includes
+    /// fields the query filtered on and projected away; absent from the wire
+    /// when empty, which is the healthy case.
     ///
-    /// Bounded by one schema-refresh tick of staleness, and carried by
+    /// Stale by at most one schema-refresh tick, and carried by
     /// `/api/v1/query` only: the SSE stream keeps its compile-time snapshot
     /// semantics, and embedded `--data` mode has no catalog to consult.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded_fields: Vec<String>,
-    /// Result columns holding `OTel` `SeverityNumber`s that are NOT the
-    /// envelope's `_severity` — `sev()` output, or a column that took the
-    /// slot's pin (ADR-0013 slice 2, ruling 9).
+    /// Result columns holding `OTel` severity numbers other than the
+    /// envelope's `_severity`: `sev()` output, or a column that took the
+    /// slot's pin (ADR-0013).
     ///
-    /// Response-level and PRESENTATIONAL, exactly like `degraded_fields`
-    /// and for the same reason: a per-`Column` field would have to be
-    /// filled at ~25 construction sites, and this says nothing about the
-    /// VALUES — every format still carries the number. A renderer that
-    /// displays tokens (the CLI table, the TUI, the SPA's results grid)
-    /// reads it; json/csv/SSE ignore it, so an arithmetic consumer is
-    /// untouched. Absent from the wire when empty, which is the ordinary
-    /// case.
+    /// Response-level and presentational, like `degraded_fields`. A
+    /// per-`Column` field would have to be filled at ~25 construction sites,
+    /// and it would say nothing about the values, since every format still
+    /// carries the number. Renderers that display tokens (the CLI table, the
+    /// TUI, the SPA's results grid) read it; json/csv/SSE ignore it, so an
+    /// arithmetic consumer is untouched. Absent from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub severity_columns: Vec<String>,
 }
@@ -398,7 +396,7 @@ pub struct ActiveQuerySnapshot {
     /// Authenticated user name.
     pub user: String,
     /// The key's role names, comma-joined and sorted (`"none"` when the
-    /// key holds no roles). Wire field name kept from the one-role era.
+    /// key holds no roles).
     pub role: String,
     /// The DSL query string.
     pub query: String,
@@ -500,10 +498,10 @@ impl std::str::FromStr for PrincipalKind {
 /// resolved trawl permission set.
 ///
 /// `roles` carries the names of every data-defined role the key holds
-/// (display/audit; roles are cross-app bundles and are NOT app-scoped —
-/// ADR-0006). `permissions` is the server-resolved permission union for
-/// THIS server's app namespace (`"trawl"`), in canonical order; only
-/// permissions this server recognizes appear.
+/// (display/audit; roles are cross-app bundles, not app-scoped, ADR-0006).
+/// `permissions` is the server-resolved permission union for this server's
+/// app namespace (`"trawl"`), in canonical order; only permissions this
+/// server recognizes appear.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoAmIResponse {
     /// Key prefix (stable 8-char fingerprint). Intended as an immutable
@@ -516,7 +514,7 @@ pub struct WhoAmIResponse {
     pub kind: PrincipalKind,
     /// Names of every role attached to this key, sorted.
     pub roles: Vec<String>,
-    /// Recognized trawl permissions resolved for this key on THIS server
+    /// Recognized trawl permissions resolved for this key on this server
     /// (e.g. `"query"`, `"server_manage"`), in canonical order. Empty when
     /// the key holds no recognized trawl permission.
     pub permissions: Vec<String>,
@@ -699,12 +697,11 @@ pub struct ServiceSchema {
     /// Per-day event counts for sparkline rendering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub daily_event_counts: Vec<DailyCount>,
-    /// Fields this service has ACTUALLY conflicted on and which the analyzer
-    /// currently calls degraded (ADR-0011 slice C2). Stamped from the
-    /// schema-refresh tick's in-process snapshot (one-tick staleness, shared
-    /// with the query notice). NOT a client-computable join: carrying a
-    /// degraded field's COLUMN is not evidence that this service is what
-    /// degraded it.
+    /// Fields this service has itself conflicted on and which the analyzer
+    /// calls degraded (ADR-0011). Stamped from the schema-refresh tick's
+    /// in-process snapshot, so it is stale by at most one tick, like the
+    /// query notice. A client cannot compute it: carrying a degraded field's
+    /// column is not evidence that this service is what degraded it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded_fields: Vec<String>,
 }
@@ -740,7 +737,7 @@ pub struct DailyCount {
     pub count: u64,
 }
 
-// -- field catalog (schema-health surfaces, #51) ------------------------------
+// -- field catalog (schema-health surfaces) -----------------------------------
 
 /// Response from `GET /api/v1/schema/fields` — the pinned-field listing
 /// with aggregated observation and conflict evidence.
@@ -781,20 +778,20 @@ pub struct CatalogFieldSummary {
     pub last_seen: Option<String>,
     /// Conflict evidence rows currently retained.
     pub conflict_count: u64,
-    /// Total rows nulled across the retained evidence — the TRIMMED
-    /// window's sum, not a lifetime total (see [`DegradedVerdict`]).
+    /// Total rows nulled across the retained evidence: the trimmed window's
+    /// sum, not a lifetime total (see [`DegradedVerdict`]).
     pub rows_nulled: u64,
     /// The analyzer's verdict, present only when the pin is degraded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<DegradedVerdict>,
 }
 
-/// The analyzer's verdict on a degraded field (ADR-0011 slice C1): the pin
-/// has been shelving values for long enough, and in enough volume, that an
-/// operator should decide whether to repin it.
+/// The analyzer's verdict on a degraded field (ADR-0011): the pin has been
+/// shelving values for long enough, and in enough volume, that an operator
+/// should decide whether to repin it.
 ///
-/// Structured FACTS only — the consumer writes the words. A stored sentence
-/// would fix the phrasing of every current and future surface (CLI table,
+/// Structured facts only, so the consumer writes the words. A stored sentence
+/// would fix the phrasing of every present and future surface (CLI table,
 /// SPA drawer, an eventual auto-repin's decision record) at the moment the
 /// evidence was recorded.
 ///
@@ -807,12 +804,12 @@ pub struct CatalogFieldSummary {
 pub struct DegradedVerdict {
     /// Earliest conflict evidence for the field (ISO 8601 UTC).
     pub since: String,
-    /// Distinct services in the evidence. DISPLAYED, never a gate.
+    /// Distinct services in the evidence. Displayed, never a gate.
     pub services: u64,
     /// Distinct conflict episodes across every service.
     pub episodes: u64,
-    /// Lifetime rows the pin has nulled — durable, and therefore usually
-    /// LARGER than the sibling `rows_nulled` fields, which sum only the
+    /// Lifetime rows the pin has nulled: durable, and therefore usually
+    /// larger than the sibling `rows_nulled` fields, which sum only the
     /// evidence rows still inside the per-field recency window.
     pub rows_shelved: u64,
     /// A bounded sample of the values that were shelved, newest evidence
@@ -837,7 +834,7 @@ pub struct CatalogFieldResponse {
     pub pinned_from: Option<String>,
     /// When the pin was written (ISO 8601 UTC).
     pub pinned_at: String,
-    /// One PAGE of per-service observations, most recent first. The service
+    /// One page of per-service observations, most recent first. The service
     /// axis is client-chosen and never pruned, so the detail never carries
     /// the whole history — page with `services_cursor`.
     pub services: Vec<CatalogFieldServiceRow>,
@@ -889,16 +886,15 @@ pub struct CatalogConflictRow {
     pub expected_type: String,
     /// Rows whose value the cast nulled (recoverable from `_raw`).
     pub rows_nulled: u64,
-    /// A bounded sample of the values this cast nulled. Empty for evidence
-    /// recorded before the capture shipped, and for the repin rewrite,
-    /// which counts its nulls without materialising them.
+    /// A bounded sample of the values this cast nulled. Empty for the repin
+    /// rewrite, which counts its nulls without materialising them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub samples: Vec<String>,
     /// When the conflict was recorded (ISO 8601 UTC).
     pub at: String,
 }
 
-// -- repin (ADR-0011 slice B) ------------------------------------------------
+// -- repin (ADR-0011) --------------------------------------------------------
 
 /// Request body for `POST /api/v1/schema/repin`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -908,11 +904,11 @@ pub struct RepinRequest {
     /// Target catalog type (`BIGINT`, `DOUBLE`, `TIMESTAMP`, `BOOLEAN`,
     /// `VARCHAR`, `SEVERITY`; case-insensitive).
     pub to: String,
-    /// Which dialect the corpus's NUMERALS are read in for a `SEVERITY`
+    /// Which dialect the corpus's numerals are read in for a `SEVERITY`
     /// target: `otel` (default) or `syslog`. The two ladders overlap over
     /// 1-7 with opposite meanings, so no value-shape rule can tell them
-    /// apart — the operator asserts provenance. A dialect with any other
-    /// target is a 400: it would be silently ignored otherwise.
+    /// apart; the operator asserts provenance. A dialect with any other
+    /// target is a 400, since it would be silently ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialect: Option<String>,
     /// Scan and report only — no mutation.
@@ -969,13 +965,13 @@ pub struct RepinJobResponse {
     pub rows_nulled: u64,
     /// Outcome: values resurrected from `_raw`.
     pub rows_resurrected: u64,
-    /// The asserted numeral dialect — present exactly for a `SEVERITY`
-    /// target. Absent on a legacy job and on every other target: a
-    /// backfilled `otel` would report an assertion nobody made.
+    /// The asserted numeral dialect, present exactly for a `SEVERITY`
+    /// target. Absent on every other target: a backfilled `otel` would
+    /// report an assertion nobody made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialect: Option<String>,
-    /// Rows whose numeral reads as a DIFFERENT severity in each dialect
-    /// (the 1-7 overlap) — the values only provenance can settle. Counted
+    /// Rows whose numeral reads as a different severity in each dialect
+    /// (the 1-7 overlap): only provenance can settle them. Counted
     /// whatever the dialect; what the dialect governs is the force gate.
     #[serde(default)]
     pub ambiguous_numerals: u64,
@@ -984,23 +980,21 @@ pub struct RepinJobResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmapped_samples: Vec<String>,
     /// Scan-time liveness, when something is still writing the field.
-    /// PRESENCE is the verdict — the consumer writes the words.
+    /// Presence is the verdict; the consumer writes the words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liveness: Option<RepinLiveness>,
-    /// Whether an EXECUTING request with this job's flags would be refused
-    /// for want of a force flag (issue #79).
+    /// Whether an executing request with this job's flags would be refused
+    /// for want of a force flag.
     ///
-    /// A dry run succeeds by design, so without this a plan carrying loss or
-    /// dialect ambiguity read as a clean 200 and the operator learned about
-    /// the refusal only from the request that was supposed to do the work.
-    /// The server computes it from THIS row's numbers through the same
-    /// decision the two live gates ask, so a dry run cannot promise an
-    /// outcome the execution would not reach.
+    /// A dry run succeeds by design, so a plan carrying loss or dialect
+    /// ambiguity has to say so here, or the operator meets the refusal only
+    /// on the request meant to do the work. The server computes it from this
+    /// row's numbers through the same decision the two live gates ask, so a
+    /// dry run cannot promise an outcome the execution would not reach.
     ///
-    /// ABSENT until the scan has recorded its plan — a claimed job's counts
+    /// Absent until the scan has recorded its plan: a claimed job's counts
     /// are zeros meaning "not measured yet", and answering `false` there
-    /// would promise a clean run for a job that is about to refuse. Absent
-    /// on legacy rows for the same reason.
+    /// would promise a clean run for a job that is about to refuse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_force: Option<bool>,
     /// Why force is required, in the words the refusal itself uses. Present
@@ -1009,11 +1003,11 @@ pub struct RepinJobResponse {
     pub requires_force_reason: Option<String>,
 }
 
-/// Evidence that a repin's subject is still being WRITTEN (issue #79).
+/// Evidence that a repin's subject is still being written.
 ///
-/// A repin translates HISTORY. A field a live sender still feeds keeps
+/// A repin translates history. A field a live sender still feeds keeps
 /// arriving in the ingest-time reading, so a syslog-dialect rewrite leaves
-/// a discontinuity at the cutover instant — the fix for the live half is
+/// a discontinuity at the cutover instant; the fix for the live half is
 /// `[ingest] severity_from`, not another repin. Facts only, presence being
 /// the verdict (the `Option<DegradedVerdict>` shape).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1027,7 +1021,7 @@ pub struct RepinLiveness {
 /// Response body for `POST /api/v1/schema/repin`. The HTTP status carries
 /// the verdict: 200 = dry-run report, 202 = rewrite started, 409 = lossy
 /// without force (the job is terminal `refused_needs_force` and this body
-/// IS the plan the refusal is based on).
+/// is the plan the refusal is based on).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepinResponse {
     /// The job row.
@@ -1258,9 +1252,8 @@ pub struct IngestEventError {
 
 /// Response from the ingest endpoint.
 ///
-/// When all events are valid, `rejected` and `errors` are omitted from
-/// the JSON response for backward compatibility.  New clients should
-/// use `#[serde(default)]` on these fields.
+/// When every event is valid, `rejected` and `errors` are omitted from the
+/// JSON body, so a decoder has to default them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestResponse {
     /// Number of records accepted and written to the WAL.
@@ -1373,9 +1366,8 @@ mod tests {
         assert_eq!(verdict.suggested_to, "VARCHAR");
     }
 
-    /// A healthy field carries no `verdict` KEY and no `samples` key at all
-    /// — the bytes an existing client sees are unchanged, and "absent" is
-    /// the only encoding of "not degraded".
+    /// A healthy field carries no `verdict` key and no `samples` key at all:
+    /// absent is the only encoding of "not degraded".
     #[test]
     fn a_healthy_field_serialises_without_the_new_keys() {
         let resp = CatalogFieldsResponse {
@@ -1399,7 +1391,7 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("verdict"), "{json}");
 
-        // And an old body without the key still deserialises.
+        // A body without the key still deserialises.
         let old = r#"{"fields":[{"name":"duration","type":"BIGINT",
             "pinned_at":"2026-08-01T10:00:00Z","service_count":1,"row_count":5,
             "conflict_count":0,"rows_nulled":0}],
@@ -1428,9 +1420,9 @@ mod tests {
         assert!(rt.truncated);
     }
 
-    /// The `/api/v1/schema/services` wire shape is the TUI and SPA contract
-    /// for the #51 cutover: types now come from the catalog, but the JSON
-    /// keys must stay byte-identical. Golden-pin every key.
+    /// The `/api/v1/schema/services` wire shape is the TUI and SPA contract:
+    /// types come from the catalog, and the JSON keys are fixed. Golden-pin
+    /// every key.
     #[test]
     fn service_schema_wire_keys_are_pinned() {
         let resp = ServiceSchemaResponse {
@@ -1454,8 +1446,8 @@ mod tests {
                     date: "2026-01-01".into(),
                     count: 1,
                 }],
-                // Empty is the healthy install, and the pinned key set below
-                // is what proves it stays OFF the wire there (ADR-0011 C2).
+                // Empty is the healthy install; the pinned key set below is
+                // what proves it stays off the wire there.
                 degraded_fields: Vec::new(),
             }],
             cached: true,
@@ -1464,7 +1456,7 @@ mod tests {
         };
         let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
 
-        // serde_json::Value sorts object keys, so pin the sorted key SETS —
+        // serde_json::Value sorts object keys, so pin the sorted key sets:
         // key names are the wire contract, their order is not.
         let top: Vec<&str> = json
             .as_object()
@@ -1720,7 +1712,7 @@ mod tests {
 
     #[test]
     fn ingest_response_backward_compat_deserialize() {
-        // Old servers return only {"accepted": N} — new clients must handle this.
+        // A body carrying only {"accepted": N} still parses.
         let json = r#"{"accepted": 5}"#;
         let resp: IngestResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.accepted, 5);
@@ -1776,7 +1768,7 @@ mod tests {
 
     #[test]
     fn health_response_without_checks_deserializes() {
-        // Backward compat: old responses without `checks` field still parse.
+        // A response without the `checks` field still parses.
         let json = r#"{"status":"ok"}"#;
         let resp: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.status, HealthStatus::Ok);
@@ -1803,7 +1795,7 @@ mod tests {
 
     #[test]
     fn whoami_multi_role_roundtrip() {
-        // Roles are cross-app bundles: ALL role names travel, unfiltered;
+        // Roles are cross-app bundles: every role name travels, unfiltered;
         // permissions stay trawl-scoped.
         let resp = WhoAmIResponse {
             prefix: "abcd1234".into(),
@@ -1882,11 +1874,9 @@ mod tests {
         assert_eq!(rt.hot_buffer_events, Some(42));
     }
 
-    /// Wire compatibility for the ADR-0011 slice C2 addition: a client or a
-    /// server that predates `degraded_fields` must be indistinguishable from
-    /// a healthy one. Absent on the way in reads as "nothing degraded";
-    /// empty on the way out never reaches the wire at all, so the healthy
-    /// response is byte-identical to the C1 one.
+    /// A body with no `degraded_fields` key is indistinguishable from a
+    /// healthy one: absent on the way in reads as "nothing degraded", and
+    /// empty on the way out never reaches the wire at all.
     #[test]
     fn service_schema_degraded_fields_defaults_and_omits() {
         let legacy = serde_json::json!({

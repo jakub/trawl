@@ -62,7 +62,9 @@ fn ensure_fixture(dir: &Path, filename: &str, format: &str) {
 fn generate_to(path: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::open_in_memory()?;
 
-    // The ADR-0009 event envelope plus per-service user fields.
+    // The envelope minus `_severity`/`_producer`, plus per-service sender
+    // fields. `severity` and `severity_text` are ordinary sender vocabulary
+    // here, not the derived `_severity` slot.
     conn.execute_batch(
         "CREATE TABLE logs (
             _time TIMESTAMP,

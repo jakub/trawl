@@ -122,7 +122,7 @@ fn render_filter_bar(filter: &str, active: bool, theme: &Theme, frame: &mut Fram
 }
 
 // ---------------------------------------------------------------------------
-// Schema tree view (placeholder — phase 6 rewrites this properly)
+// Schema tree view
 // ---------------------------------------------------------------------------
 
 /// A node in the flattened schema tree (computed at render time).
@@ -587,14 +587,12 @@ fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect
         .queries
         .iter()
         .map(|entry| {
-            // Show schedule indicator and last run status if the query has a schedule.
             let mut suffixes = Vec::new();
             if let Some(ref sched) = entry.schedule {
                 suffixes.push(Span::styled(
                     format!(" [{}]", sched.interval),
                     Style::default().fg(theme.text_accent),
                 ));
-                // Show last run status icon
                 if let Some(ref last_run) = sched.last_run {
                     let (icon, color) = match last_run.status.as_str() {
                         "success" => (" \u{2713}", theme.status_success),
@@ -795,7 +793,6 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
     let header_p = Paragraph::new(lines);
     frame.render_widget(header_p, header_area);
 
-    // Render run items as a List widget.
     let run_items: Vec<ListItem<'_>> = detail
         .runs
         .iter()
@@ -873,7 +870,6 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
         return;
     };
 
-    // Get the run summary for the title.
     let run_info = detail.runs.get(detail.run_selected);
     let title_str = if let Some(run) = run_info {
         let time_str = format_relative_time(&run.started_at);
@@ -899,7 +895,8 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
 
     // -- column headers --
     let col_names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
-    // Compute column widths: max of header width and first few data rows.
+    // Widths sample the header and the first 100 rows, so a wider value further down
+    // renders truncated.
     let col_widths: Vec<usize> = col_names
         .iter()
         .enumerate()

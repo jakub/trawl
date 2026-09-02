@@ -4,8 +4,9 @@
 
 //! AST type definitions for the trawl query language.
 //!
-//! These types represent the parsed structure of a trawl DSL query.
-//! The AST is the contract between the parser and the SQL emitter.
+//! These types are the contract between the parser and every consumer of a
+//! parsed query: the SQL emitter, the in-memory filter and stream compiler,
+//! and the DSL formatter.
 
 use std::fmt;
 use std::ops::Range;
@@ -86,7 +87,7 @@ impl Query {
 /// The implicit search stage — OR-separated groups of AND-joined tokens.
 ///
 /// `a b OR c d` → groups: `[[a, b], [c, d]]`
-/// Queries without OR have a single group (backward-compatible).
+/// A query without OR has a single group.
 ///
 /// Time filters are hoisted out of groups and applied globally — a query
 /// like `service=nginx last=2h OR service=postgres` applies the time
@@ -578,7 +579,6 @@ pub enum Expr {
     },
 }
 
-/// Binary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     // arithmetic
@@ -626,7 +626,6 @@ impl fmt::Display for BinaryOp {
     }
 }
 
-/// Unary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Not,
@@ -642,19 +641,18 @@ impl fmt::Display for UnaryOp {
     }
 }
 
-/// A float literal: the parsed value together with the SOURCE TEXT it was
+/// A float literal: the parsed value together with the source text it was
 /// written as.
 ///
 /// The text is not decoration. A pipeline comparison against a VARCHAR pin
-/// binds the literal's TEXT into `DECIMAL(38,6)` — ADR-0011 ruling #6: the
-/// literal never round-trips through `f64`, because `f64` is lossy the
-/// moment a literal needs more than 53 bits. `9007199254740993.0` parses as
-/// `9007199254740992`, so rendering the parsed double back would compare
-/// against the ADJACENT identifier, and the same query written
-/// `"9007199254740993.0"` — a string literal, carried verbatim — would
-/// answer differently, contradicting the documented quote-insensitivity of
-/// pipeline comparisons. Keeping the token means the pipeline binds exactly
-/// what the search stage binds for the same text.
+/// binds the literal's text into `DECIMAL(38,6)` instead of round-tripping
+/// through `f64` (ADR-0011 ruling #6), which is lossy the moment a literal
+/// needs more than 53 bits: `9007199254740993.0` parses as `9007199254740992`,
+/// so rendering the parsed double back would compare against the adjacent
+/// identifier, and the same query written `"9007199254740993.0"` — a string
+/// literal, carried verbatim — would answer differently, contradicting the
+/// quote-insensitivity of pipeline comparisons. Keeping the token means the
+/// pipeline binds exactly what the search stage binds for the same text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FloatLiteral {
     value: f64,

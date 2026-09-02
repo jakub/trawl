@@ -4,9 +4,9 @@
 
 //! trawl-client: shared client library for communicating with trawld.
 //!
-//! Used by trawl-cli (CLI and TUI modes). Handles connection
-//! management, authentication, query submission, and result streaming
-//! across all supported transports.
+//! Used by `trawl-cli` (CLI and TUI modes) and by the server's own
+//! integration tests. Wraps the daemon's HTTP API: bearer authentication,
+//! query submission, catalog reads, ingest, export, and SSE streaming.
 
 pub mod client;
 pub mod error;

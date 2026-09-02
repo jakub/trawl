@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Postgres-backed integration tests for [`fleet_auth::login`] and
-//! [`fleet_auth::logout`] (ADR-0030, issue coastwatch#34).
+//! [`fleet_auth::logout`] (ADR-0030).
 
 #![cfg(feature = "axum")]
 
@@ -40,8 +40,8 @@ fn session_state(store: KeyStore, app_namespace: &str) -> (SessionState, Arc<Ses
     (state, session_key)
 }
 
-/// Seed the converted-shape `trawl-analyst` role and return its name as
-/// the role list every test key is created with.
+/// Seed the `trawl-analyst` role and return its name as the role list every
+/// test key is created with.
 async fn trawl_role(store: &KeyStore) -> Vec<String> {
     store
         .create_role(
@@ -253,7 +253,7 @@ async fn login_no_grant_returns_403_no_cookie(pool: sqlx::PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// origin validation (default-on, ADR-0004 slice 2)
+// origin validation (default-on, ADR-0004)
 // ---------------------------------------------------------------------------
 
 fn login_request_with_origin(api_key: &str, origin: &str, host: &str) -> Request<Body> {
@@ -388,10 +388,9 @@ async fn login_rejects_sibling_under_shared_domain(pool: sqlx::PgPool) {
     let app = router_with_state(state);
 
     // Origin is a sibling app under the shared cookie domain. A
-    // parent-domain cookie is NOT an origin allowlist: origin
-    // validation stays strictly same-host, so a compromised sibling
-    // can't forge auth requests against trawl's endpoints (ADR-0004
-    // slice 2, commit a527ccbf).
+    // parent-domain cookie is not an origin allowlist: origin validation
+    // stays strictly same-host, so a compromised sibling can't forge auth
+    // requests against trawl's endpoints (ADR-0004).
     let response = app
         .oneshot(login_request_with_origin(
             &created.plaintext_token,

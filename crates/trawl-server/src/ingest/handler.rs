@@ -85,7 +85,7 @@ struct ParsedEvents {
     /// Per-`(code, service)` repair counts (ADR-0009): accepted events the
     /// server modified, feeding `trawl_ingest_repairs_total{code,service}`.
     repairs: IndexMap<(&'static str, String), u64>,
-    /// Per-service count of accepted events that carried a severity SOURCE
+    /// Per-service count of accepted events that carried a severity source
     /// mapping to nothing on the `OTel` ladder (ADR-0013 §2). Not a
     /// repair — nothing sender-visible was touched — so it rides its own
     /// counter, `trawl_severity_unmapped_total{service}`.
@@ -135,8 +135,8 @@ impl ParsedEvents {
         }
     }
 
-    /// Total repaired-event... repairs applied (a single event may carry
-    /// several codes; this counts code applications, for the log line).
+    /// Total repair codes applied, for the log line. One event may carry
+    /// several codes, so this is not an event count.
     fn total_repairs(&self) -> u64 {
         self.repairs.values().sum()
     }
@@ -248,7 +248,6 @@ pub async fn ingest(
 /// Write one WAL file per `(env, service)` group. Partial failures are
 /// reported as per-event errors — successful groups are durable. Failed
 /// groups are removed from `parsed.batches` so they are never published.
-///
 fn write_wal_batches(
     wal_writer: &crate::ingest::wal::WalWriter,
     parsed: &mut ParsedEvents,
@@ -284,7 +283,6 @@ fn write_wal_batches(
         }
     }
 
-    // Remove failed service groups from batches so we don't publish them.
     for key in &wal_failures {
         parsed.batches.shift_remove(key);
     }
@@ -417,7 +415,6 @@ fn finalize_ingest(
     }
 }
 
-/// Check if the request body is gzip-encoded.
 fn is_gzip(headers: &HeaderMap) -> bool {
     headers
         .get("content-encoding")
@@ -669,7 +666,7 @@ mod tests {
 
     #[test]
     fn parse_json_array_derives_severity() {
-        // `level` is OBSERVED, never consumed: the source stays as the
+        // `level` is observed, never consumed: the source stays as the
         // sender's own column and `_severity` is derived beside it.
         let data = br#"[{"service":"nginx","level":"error"},{"service":"nginx","level":"warn"}]"#;
         let parsed = parse(data).unwrap();
@@ -709,7 +706,7 @@ mod tests {
         );
     }
 
-    // --- batch-level errors (still Err, unchanged) ---
+    // --- batch-level errors ---
 
     #[test]
     fn parse_empty_json_array_rejected() {
@@ -776,7 +773,8 @@ mod tests {
 
     #[test]
     fn parse_rejects_space_in_service() {
-        // Spaces died with the verbatim-filename cutover (ADR-0009).
+        // The service name is written to the path verbatim (ADR-0009), so
+        // the charset excludes spaces.
         let data = br#"{"service":"Activity Monitor","message":"nope"}"#;
         let parsed = parse(data).unwrap();
         assert!(parsed.batches.is_empty());
@@ -937,7 +935,7 @@ mod tests {
     // DuckDB's `read_json` is a recursive-descent parser: JSON nested past
     // ~500 levels overflows the (2 MB) `spawn_blocking` stack and the C++
     // frames can leap the guard page into a raw SIGSEGV. `maximum_depth=2`
-    // does NOT protect against this — that param caps schema-inference
+    // does not protect against this — that param caps schema-inference
     // flattening, not parse recursion. What actually keeps adversarially-deep
     // JSON away from `read_json` is that ingest re-serializes every event
     // through `serde_json`, whose default recursion limit (128) rejects it at
@@ -1012,7 +1010,7 @@ mod tests {
         let data = br#"{"service":"test","timestamp":"2025-12-31T12:00:00Z","host":"myhost","message":"hello"}"#;
         let parsed = parse(data).unwrap();
         let event = &batch_maps(&parsed, "prod", "test")[0];
-        // The `timestamp` source is READ for `_time` and STORED verbatim
+        // The `timestamp` source is read for `_time` and stored verbatim
         // as the sender's own column (ADR-0013 §2).
         assert_eq!(event["_time"], "2025-12-31T12:00:00.000000Z");
         assert_eq!(event["timestamp"], "2025-12-31T12:00:00Z");
@@ -1061,8 +1059,9 @@ mod tests {
 
     /// A client-supplied `_trawl_wal_file` never reaches the WAL: compaction
     /// projects that name as its synthetic provenance column, so a row
-    /// carrying it makes `read_json` fail to bind and wedges the service's
-    /// whole WAL. The event itself is still accepted.
+    /// carrying it collides with `read_json`'s `filename=` option and costs
+    /// the batch a retry under a renamed provenance column. The event
+    /// itself is still accepted.
     #[test]
     fn reserved_wal_file_key_stripped_from_events() {
         let data = br#"{"service":"test","timestamp":"2025-12-31T12:00:00Z","_trawl_wal_file":"x","keep":"me"}"#;
@@ -1112,7 +1111,6 @@ mod tests {
         assert_eq!(parsed.batches.len(), 3);
         assert_eq!(total_accepted(&parsed), 4);
         assert!(parsed.errors.is_empty());
-        // nginx gets 2 events, redis and postgres each get 1.
         assert_eq!(batch_maps(&parsed, "prod", "nginx").len(), 2);
         assert_eq!(batch_maps(&parsed, "prod", "redis").len(), 1);
         assert_eq!(batch_maps(&parsed, "prod", "postgres").len(), 1);

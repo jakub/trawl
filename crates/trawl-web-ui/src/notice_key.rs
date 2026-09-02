@@ -2,10 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The incomplete-results notice's dismissal identity (ADR-0011 slice
-//! C2).
+//! The incomplete-results notice's dismissal identity.
 //!
-//! A dismissal has to survive PAGING the same result — the query and the
+//! A dismissal has to survive paging the same result — the query and the
 //! degraded set are unchanged, only the offset moved — and has to lapse
 //! the moment either half changes, so a new query, or the same query
 //! after a repin retired one of the fields, gets the notice back.

@@ -2,30 +2,30 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The repin TRIGGER's pure logic (ADR-0011 slice C2): the target
-//! ladder, the 409 double-shape decode, and the poll decision.
+//! The repin trigger's pure logic: the target ladder, the 409
+//! double-shape decode, and the poll decision.
 //!
 //! Everything here is data-in / data-out so the parts that are easy to
 //! get subtly wrong are table-testable natively, off the browser:
 //!
-//! - [`classify_conflict`] — `POST /schema/repin` answers 409 with TWO
+//! - [`classify_conflict`] — `POST /schema/repin` answers 409 with two
 //!   different bodies (the refusal plan, and the error envelope for a
-//!   slot held elsewhere). They are told apart by DECODING, never by the
+//!   slot held elsewhere). They are told apart by decoding, never by the
 //!   status code, and never by sniffing error text.
-//! - [`poll_decide`] — the status route is INSTALL-WIDE (synthesis R4:
-//!   no `?id=`), so every read has to be matched against the job id the
+//! - [`poll_decide`] — the status route is install-wide (there is no
+//!   `?id=`), so every read has to be matched against the job id the
 //!   case file holds. A different id, or no job at all, means the
 //!   one-running slot moved on and our job's record is gone from the
 //!   route: stop, keep what we last saw, say so.
-//! - [`recovery_verdict`] — a real run whose RESPONSE was lost either
+//! - [`recovery_verdict`] — a real run whose response was lost either
 //!   claimed a job or did not, and the client cannot tell which. The
-//!   route only ever gets to say YES (a job it can PROVE is ours), and
+//!   route only ever gets to say yes (a job it can prove is ours), and
 //!   the absence of that proof is [`Unproven`], never "it never ran".
 //! - [`slot_check`] — whether the install-wide one-running slot is free
 //!   right now, which is the only thing that unwedges a modal parked on
 //!   someone else's job.
 //!
-//! All three decisions read ONE reduction of a status response
+//! All three decisions read one reduction of a status response
 //! ([`StatusProbe`]), so they cannot disagree about what a read said.
 //!
 //! The ladder rungs are [`trawl_core::schema::CanonicalType`] values
@@ -44,7 +44,7 @@ use trawl_core::schema::CanonicalType;
 use crate::repin_hint::{repin_is_running, repin_is_terminal};
 
 /// How often the case file re-reads `/schema/repin/status` while it
-/// tracks a running job (synthesis R10: one immediate read, then this).
+/// tracks a running job. One immediate read comes first, then this.
 pub const REPIN_POLL_MS: u32 = 3_000;
 
 /// Consecutive failed status reads tolerated before polling stops and
@@ -54,10 +54,10 @@ pub const MAX_POLL_ERRORS: u32 = 3;
 
 /// The candidate ladder this SPA offers, in the engine's own order.
 ///
-/// The engine admits SIX targets since issue #79 — these five PHYSICAL
-/// rungs plus `SEVERITY`. `SEVERITY` is left out DELIBERATELY, not
-/// forgotten: putting a field on the severity ladder means asserting which
-/// dialect its numerals are in (`otel` counts up, `syslog` counts down and
+/// The engine admits six targets: these five physical rungs plus
+/// `SEVERITY`. `SEVERITY` is left out deliberately, not forgotten:
+/// putting a field on the severity ladder means asserting which dialect
+/// its numerals are in (`otel` counts up, `syslog` counts down and
 /// inverts), and that assertion is an operator decision about a sender's
 /// provenance which no modal should be making on their behalf. It is
 /// reachable through `trawl schema repin --to severity --dialect …` and
@@ -71,9 +71,9 @@ pub const REPIN_LADDER: [CanonicalType; 5] = [
 ];
 
 /// The rungs the modal offers for a field pinned `current`: every rung
-/// EXCEPT the one it already has (synthesis R9 — `to == current` is the
+/// except the one it already has. `to == current` is the
 /// resurrection-only pass, which stays a CLI decision because its only
-/// effect is re-extracting shelved values under the same pin).
+/// effect is re-extracting shelved values under the same pin.
 ///
 /// An unrecognised `current` (a catalog spelling this build doesn't
 /// know) offers the whole ladder rather than nothing.
@@ -107,7 +107,7 @@ pub fn default_target(current: &str, suggested: &str) -> CanonicalType {
 #[derive(Debug, Clone)]
 pub enum ConflictBody {
     /// The body decoded as a repin job: the scan projected values the
-    /// new pin cannot keep and no force flag was passed. The body IS the
+    /// new pin cannot keep and no force flag was passed. The body is the
     /// plan the refusal is based on — boxed because a job row dwarfs the
     /// other variant.
     Plan(Box<RepinJobResponse>),
@@ -124,7 +124,7 @@ pub const REPIN_BUSY_FALLBACK: &str = "another repin already holds the one-runni
 /// Decide which of the two 409 bodies arrived.
 ///
 /// Order matters only for clarity: the two shapes are disjoint by
-/// REQUIRED field (`job` vs `error`), so neither can decode as the
+/// required field (`job` vs `error`), so neither can decode as the
 /// other — which is why this is a decode and not a heuristic.
 #[must_use]
 pub fn classify_conflict(body: &str) -> ConflictBody {
@@ -179,8 +179,8 @@ pub enum StatusProbe {
     /// row this install had is gone.
     NoJob,
     /// The read failed (network, or the store behind the route). It said
-    /// NOTHING; every decision has to treat it as an absence of
-    /// information, never as an absence of a job.
+    /// nothing at all, so every decision has to treat it as an absence
+    /// of information, never as an absence of a job.
     Failed,
 }
 
@@ -203,7 +203,7 @@ pub enum PollAction {
 
 /// Decide what one status read means for the job the case file tracks.
 ///
-/// `consecutive_errors` COUNTS the tick being decided, so the first
+/// `consecutive_errors` counts the tick being decided, so the first
 /// failure arrives as 1.
 #[must_use]
 pub fn poll_decide(tracked_id: i64, consecutive_errors: u32, probe: &StatusProbe) -> PollAction {
@@ -215,7 +215,7 @@ pub fn poll_decide(tracked_id: i64, consecutive_errors: u32, probe: &StatusProbe
                 PollAction::Track
             }
         }
-        // The route is install-wide: a different id is a DIFFERENT job,
+        // The route is install-wide: a different id is a different job,
         // never a later view of ours, and `job: null` cannot be ours
         // either. Both mean our record is unreachable from here.
         StatusProbe::Job(_) | StatusProbe::NoJob => PollAction::Lost,
@@ -229,14 +229,14 @@ pub fn poll_decide(tracked_id: i64, consecutive_errors: u32, probe: &StatusProbe
     }
 }
 
-/// Whether a failed REAL run's HTTP status PROVES nothing was claimed.
+/// Whether a failed real run's HTTP status proves nothing was claimed.
 ///
-/// The server claims the one-running `repin_jobs` row BEFORE it answers,
+/// The server claims the one-running `repin_jobs` row before it answers,
 /// so only a status decided before that claim can be read as "nothing
 /// started". Every 4xx is one: 400 is request validation, 401/403 is
 /// authorization, 404 is a field the catalog does not hold, and the 409s
 /// are decoded elsewhere as a refusal or a held slot. A 5xx can land
-/// AFTER the claim — the rewrite may be running right now — and a
+/// after the claim — the rewrite may be running right now — and a
 /// transport or decode failure carries no status at all, so both stay
 /// indeterminate and must never be reported as "provably not running".
 #[must_use]
@@ -244,7 +244,7 @@ pub fn is_pre_claim_failure(status: Option<u16>) -> bool {
     matches!(status, Some(400..=499))
 }
 
-/// The real run whose RESPONSE was lost, and the one fact that can make
+/// The real run whose response was lost, and the one fact that can make
 /// its outcome provable.
 #[derive(Debug, Clone)]
 pub struct LostRun {
@@ -254,7 +254,7 @@ pub struct LostRun {
     pub to: String,
     /// The force flag the request carried.
     pub force: bool,
-    /// The newest job id KNOWN to exist BEFORE the request went out —
+    /// The newest job id known to exist before the request went out —
     /// the plan's own row, since every dry run writes one. The request's
     /// job, if it claimed one at all, is strictly newer than this.
     /// `None` means nothing about the request's outcome can be proven.
@@ -264,7 +264,7 @@ pub struct LostRun {
 /// What a recovery probe settled about a [`LostRun`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
-    /// The probed job is PROVABLY the run that was issued: adopt it.
+    /// The probed job is provably the run that was issued: adopt it.
     Adopt,
     /// Nothing was proven. The run may be rewriting the corpus right
     /// now, so this can never license a second one.
@@ -286,12 +286,12 @@ pub enum Unproven {
     Unmatched,
 }
 
-/// Whether a probed job is PROVABLY the lost run's own job.
+/// Whether a probed job is provably the lost run's own job.
 ///
 /// Every clause is necessary, and the id ordering is what makes the rest
 /// mean anything: the status route is install-wide and answers about the
 /// running job if there is one, else the newest — so a job matching
-/// field, target and force could equally be the PREVIOUS repin of the
+/// field, target and force could equally be the previous repin of the
 /// same field with the same target, days old. Only an id strictly newer
 /// than a row that existed before the request went out can have been
 /// created by that request.
@@ -354,8 +354,8 @@ pub enum SlotCheck {
 /// Whether the one-running slot is free right now.
 ///
 /// A dry run holds the slot exactly like a rewrite does (its scan is a
-/// full-corpus pass), so the question is only ever whether SOMETHING is
-/// running — never what kind of job it is.
+/// full-corpus pass), so the question is only ever whether something is
+/// running, never what kind of job it is.
 #[must_use]
 pub fn slot_check(probe: &StatusProbe) -> SlotCheck {
     match probe {
@@ -371,20 +371,20 @@ thread_local! {
     /// Repin job ids that have already raised a toast, for the life of
     /// the page.
     ///
-    /// GLOBAL on purpose, and the one piece of state in this module. The
-    /// field case file is a component that is REBUILT whenever the
-    /// `?field=` it mounts from changes, so navigating A → B → A leaves
-    /// the third instance with no memory of what the first announced:
-    /// per-instance bookkeeping would toast one job's completion twice.
-    /// A `thread_local` rather than a lock because the SPA is
+    /// Global on purpose, and the one piece of state in this module. The
+    /// field case file is a component rebuilt whenever the `?field=` it
+    /// mounts from changes, so navigating A → B → A leaves the third
+    /// instance with no memory of what the first announced: per-instance
+    /// bookkeeping would toast one job's completion twice. A
+    /// `thread_local` rather than a lock because the SPA is
     /// single-threaded wasm, and unbounded only in the sense that it
     /// holds one `i64` per job an operator watched finish in one page
     /// load.
     static TOASTED_JOBS: RefCell<HashSet<i64>> = RefCell::new(HashSet::new());
 }
 
-/// Claim the ONE toast for `job_id`: true exactly once per id per page
-/// load, whichever component instance asks first.
+/// Claim the single toast for `job_id`: true exactly once per id per
+/// page load, whichever component instance asks first.
 pub fn claim_toast(job_id: i64) -> bool {
     TOASTED_JOBS.with_borrow_mut(|seen| seen.insert(job_id))
 }
@@ -518,8 +518,8 @@ mod tests {
             let tick = StatusProbe::Job(probed(42, status));
             assert_eq!(poll_decide(42, 0, &tick), PollAction::Settle, "{status}");
         }
-        // An unknown future status is terminal (synthesis R5), so
-        // polling stops rather than spinning forever.
+        // An unknown future status is terminal, so polling stops rather
+        // than spinning forever.
         let unknown = StatusProbe::Job(probed(42, "quiesced"));
         assert_eq!(poll_decide(42, 0, &unknown), PollAction::Settle);
     }
@@ -528,7 +528,7 @@ mod tests {
     fn another_id_or_no_job_loses_the_trail() {
         let other = StatusProbe::Job(probed(43, "running"));
         assert_eq!(poll_decide(42, 0, &other), PollAction::Lost);
-        // Even a TERMINAL row for another id: the install-wide route
+        // Even a terminal row for another id: the install-wide route
         // never speaks about our job again once the slot moves on.
         let other_done = StatusProbe::Job(probed(43, "succeeded"));
         assert_eq!(poll_decide(42, 0, &other_done), PollAction::Lost);
@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(spoil(|j| j.dry_run = true), unmatched);
         // A forced job when we sent no force: a different request.
         assert_eq!(spoil(|j| j.force = true), unmatched);
-        // The bound's own row, and anything older: created BEFORE the
+        // The bound's own row, and anything older: created before the
         // request, so the request cannot have created it.
         assert_eq!(spoil(|j| j.id = 41), unmatched);
         assert_eq!(spoil(|j| j.id = 7), unmatched);
@@ -670,7 +670,7 @@ mod tests {
         for status in [400_u16, 401, 403, 404, 422, 429, 499] {
             assert!(is_pre_claim_failure(Some(status)), "{status}");
         }
-        // A 5xx can be answered AFTER the row was claimed, so the job
+        // A 5xx can be answered after the row was claimed, so the job
         // may be rewriting the corpus right now.
         for status in [500_u16, 502, 503, 504] {
             assert!(!is_pre_claim_failure(Some(status)), "{status}");

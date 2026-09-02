@@ -4,8 +4,9 @@
 
 //! trawl-server: the trawld daemon.
 //!
-//! Multi-transport server (HTTP via axum, Unix socket, TCP+TLS) that
-//! authenticates clients, executes queries, and streams results.
+//! HTTPS server (axum over `tokio-rustls`) that authenticates clients,
+//! ingests events, executes queries and streams results, alongside a
+//! syslog listener and the compaction, retention and scheduler jobs.
 
 pub mod audit;
 pub mod bus;

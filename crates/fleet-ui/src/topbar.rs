@@ -5,10 +5,10 @@
 //! `<TopBar/>` — generic application chrome.
 //!
 //! brand · mode tabs · spacer · command-palette stub · notif iconbtn ·
-//! user-menu dropdown. Theme toggle reads from the
-//! `UiPrefs` context provided by `fleet_ui::install()`. The bar knows
-//! nothing about auth, /me, or app-specific endpoints — `on_logout`
-//! is a callback the consumer wires to its own logout flow.
+//! app links · user-menu dropdown. The theme toggle reads the
+//! `UiPrefs` context the consumer provides from `fleet_ui::install()`.
+//! The bar knows nothing about auth, `/me`, or app-specific endpoints:
+//! `on_logout` is a callback the consumer wires to its own logout flow.
 
 use leptos::prelude::*;
 use leptos_router::components::A;

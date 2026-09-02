@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Property tests: [`CompiledFilter::matches`] must agree with `DuckDB` SQL
+//! Property tests: [`CompiledFilter::matches_at`] must agree with `DuckDB` SQL
 //! for every `(search_stage, event)` pair.
 //!
 //! Generates random DSL search strings and JSON events, then verifies
@@ -355,7 +355,7 @@ fn filter_matches_sql_parity() {
             skipped += 1;
             continue;
         };
-        // ONE anchor for both lanes (ADR-0017 §3): `last=` is
+        // One anchor for both lanes (ADR-0017 §3): `last=` is
         // clock-relative, so a second capture would let the matcher and
         // the SQL disagree about the window rather than about the
         // property under test.
@@ -375,13 +375,11 @@ fn filter_matches_sql_parity() {
         tmp.flush().unwrap();
         let tmp_path = tmp.path().to_str().expect("temp path is valid UTF-8");
 
-        // Emit SQL.
         let Ok(emitted) = emitter::emit(&query, tmp_path, anchor) else {
             skipped += 1;
             continue;
         };
 
-        // DuckDB SQL result.
         let sql_result = sql_matches_where(&conn, &emitted, r#""_parity_target" = TRUE"#);
 
         assert_eq!(
@@ -551,18 +549,18 @@ fn severity_band_parity_exhaustive() {
         "_severity!=info",
         "_severity=error,fatal",
         "_severity=trace,notice",
-        // Issue #82: the whole list collapses into ONE membership test
-        // over ladder points, so a list naming the same band twice, or a
-        // band beside a point inside it, must still be exactly that set.
+        // The whole list collapses into one membership test over ladder
+        // points, so a list naming the same band twice, or a band beside
+        // a point inside it, must still be exactly that set.
         "_severity=warn,17",
         "_severity=error,err,error2",
         "_severity=warn,99",
         "_severity!=warn,error",
-        // Review finding A: out-of-ladder points collapse to ONE
-        // representative in the render, because a SEVERITY subject is
-        // 1-24 or NULL. These cells run over every stored number AND the
-        // NULL — which is exactly where a naive constant-FALSE collapse
-        // would diverge from the live matcher (NULL must stay UNKNOWN).
+        // Out-of-ladder points collapse to one representative in the
+        // render, because a SEVERITY subject is 1-24 or NULL. These cells
+        // run over every stored number and the NULL, which is where a
+        // naive constant-FALSE collapse would diverge from the live
+        // matcher (NULL must stay UNKNOWN).
         "_severity=99,101,250",
         "_severity=-5,99",
         "_severity=error,99,101,250",
@@ -579,8 +577,8 @@ fn severity_band_parity_exhaustive() {
     }
 }
 
-/// Issue #91: search-stage `f!=a,b` is `f!=a AND f!=b`, including
-/// scalar `!=`'s NULL widening, in both lanes.
+/// Search-stage `f!=a,b` is `f!=a AND f!=b`, including scalar `!=`'s
+/// NULL widening, in both lanes.
 #[test]
 fn search_stage_ne_over_a_list_is_compositional_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
@@ -698,7 +696,7 @@ fn sparse_text_containment_is_total_in_both_lanes() {
 
 /// The pipeline `where _severity …` stage means the same thing to the SQL
 /// emitter and to the streaming evaluator, for every severity number and
-/// NULL — the same rule table the search stage binds, with the STRICT
+/// NULL — the same rule table the search stage binds, with the strict
 /// null policy (ADR-0011 slice A′).
 #[test]
 fn where_severity_band_parity_exhaustive() {
@@ -720,23 +718,22 @@ fn where_severity_band_parity_exhaustive() {
         "* | where _severity == \"error\" and status == 500",
         "* | where not (_severity == \"error\")",
         "* | where _severity in (\"warn\", \"error\")",
-        // Review finding A, in the STRICT lane where `!=` really negates:
-        // an all-out-of-ladder set must answer FALSE for every stored
-        // number and UNKNOWN for the absent one, and its negation must be
-        // TRUE / UNKNOWN respectively — which is what keeps the one
-        // representative (rather than dropping the points) necessary.
+        // The strict lane, where `!=` really negates: an all-out-of-ladder
+        // set must answer FALSE for every stored number and UNKNOWN for
+        // the absent one, and its negation TRUE / UNKNOWN respectively —
+        // which is what makes the one representative (rather than dropping
+        // the points) necessary.
         "* | where _severity in (99, 101, 250)",
         "* | where _severity in (\"error\", 99, 101, 250)",
         "* | where _severity != 99",
         "* | where not (_severity in (99, 101))",
-        // ADJACENT REPRESENTATIVE EXTENSION, the subtlest collapse case:
-        // the out-of-ladder 0 sits beside the TRACE band, so the render
-        // widens to `BETWEEN 0 AND 4` rather than emitting 0 separately.
-        // That is only sound because no stored severity is ever 0 — and
-        // the NEGATION is where an unsound widening would show, since it
-        // would start excluding a row the exact per-point semantics keep.
-        // Exhaustive over every stored 1-24 and the absent column, both
-        // lanes.
+        // The subtlest collapse case: the out-of-ladder 0 sits beside the
+        // TRACE band, so the render widens to `BETWEEN 0 AND 4` rather
+        // than emitting 0 separately. That is sound only because no stored
+        // severity is ever 0, and the negation is where an unsound
+        // widening would show — it would exclude a row the exact per-point
+        // semantics keep. Exhaustive over every stored 1-24 and the absent
+        // column, both lanes.
         "* | where _severity in (0, \"trace\")",
         "* | where not (_severity in (0, \"trace\"))",
         "* | where not (_severity in (0, 25))",
@@ -816,7 +813,7 @@ fn time_filter_parity_on_time_column() {
 
 // ── Pinned parity (ADR-0011 slice A) ──────────────────────────────────
 
-/// Execute emitted SQL strictly: ANY `DuckDB` error fails the test. The
+/// Execute emitted SQL strictly: any `DuckDB` error fails the test. The
 /// pinned rules exist precisely so a comparison against a pinned column
 /// can never throw — an unexpected error here is a broken rule, never a
 /// "no match".
@@ -862,7 +859,7 @@ fn pinned(entries: &[(&str, CanonicalType)]) -> FieldTypes {
 /// invariant every real cold file satisfies — so the null case goes
 /// through a parquet COPY harness that types the column explicitly.
 ///
-/// An ABSENT key takes that same parquet path, because in batch it IS the
+/// An absent key takes that same parquet path, because in batch it is the
 /// null case: a file whose rows never carried the field still reads the
 /// pinned column as NULL. Absent is the dominant shape on the event bus
 /// (the canonicalizer only fills envelope fields), so the two must answer
@@ -870,10 +867,11 @@ fn pinned(entries: &[(&str, CanonicalType)]) -> FieldTypes {
 /// event.
 ///
 /// Returns the answer the two engines agreed on, because agreement is not
-/// always the whole property: the DOUBLE comparison space ADR-0011 ruling
-/// #6 replaced collapsed every id above 2^53 in the SQL and in the matcher
-/// IDENTICALLY, so a parity assertion alone watched both sides agree on
-/// the wrong row. A caller that knows what the answer must BE says so.
+/// always the whole property: a comparison space both lanes share can be
+/// wrong in both at once (a DOUBLE space collapses every id above 2^53 —
+/// ADR-0011 ruling #6), and a parity assertion alone would watch them
+/// agree on the wrong row. A caller that knows what the answer must be
+/// says so.
 fn assert_pinned_parity(
     conn: &Connection,
     dsl: &str,
@@ -930,7 +928,7 @@ fn assert_pinned_parity(
 /// triple over a source whose `status` column is written by an explicit
 /// SQL expression.
 ///
-/// The wire shape and the stored shape are NOT the same thing once a pin
+/// The wire shape and the stored shape are not the same thing once a pin
 /// exists: a wire `200` and a wire `"200"` both conform to the DOUBLE
 /// `200.0`, and no `read_json` inference reproduces that. So the stored
 /// value is spelled out — exactly the column compaction wrote — while the
@@ -988,12 +986,12 @@ fn absent_status_event() -> Map<String, Value> {
 
 /// The ADR-0013 deterministic matrix: a SEVERITY-pinned `status` over
 /// stored ladder numbers × the whole token vocabulary × every operator
-/// class, with the EXPECTED answer stated so a matching pair of wrong
+/// class, with the expected answer stated so a matching pair of wrong
 /// lanes cannot pass.
 ///
 /// `status` rather than `_severity` on purpose: the harness's one pinned
 /// column is what makes the stored value spellable, and the rule table
-/// binds by the PIN, never by the name.
+/// binds by the pin, never by the name.
 #[test]
 fn pinned_severity_matrix_parity() {
     let conn = Connection::open_in_memory().unwrap();
@@ -1008,11 +1006,11 @@ fn pinned_severity_matrix_parity() {
         ("status=error", 20, true),
         ("status=error", 16, false),
         ("status=error", 21, false),
-        // The aliases the ADR-0009 token table carries.
+        // The alternate spellings the band token table carries.
         ("status=err", 18, true),
         ("status=WARN", 13, true),
         ("status=warning", 16, true),
-        // An OTel exact short name is ONE number.
+        // An OTel exact short name is one number.
         ("status=error2", 18, true),
         ("status=error2", 17, false),
         ("status=warn4", 16, true),
@@ -1031,7 +1029,7 @@ fn pinned_severity_matrix_parity() {
         // An IN list ORs the bands.
         ("status=warn,error", 14, true),
         ("status=warn,error", 21, false),
-        // Glob and regex match the CANONICAL token text, so a band's
+        // Glob and regex match the canonical token text, so a band's
         // prefix glob is exactly its four rungs.
         ("status=warn*", 13, true),
         ("status=warn*", 16, true),
@@ -1064,7 +1062,7 @@ fn pinned_severity_matrix_parity() {
         assert_eq!(got, expected, "{dsl} over an out-of-ladder value");
     }
 
-    // An unknown token is an ERROR in BOTH lanes, with the same sentence.
+    // An unknown token is an error in both lanes, with the same sentence.
     let query = parser::parse("status=spicy").expect("dsl parses");
     let filter_err = CompiledFilter::compile(&query.search, &ft).expect_err("filter refuses");
     let emit_err = emitter::emit_with_pins(
@@ -1081,7 +1079,7 @@ fn pinned_severity_matrix_parity() {
     );
 }
 
-/// The slice-A deterministic matrix: a VARCHAR-pinned `status` over
+/// The deterministic matrix for a VARCHAR pin: `status` over
 /// string-stored values (the physical column `read_json` infers is
 /// VARCHAR, matching the pin) × every operator class × numeric and
 /// non-numeric literals. Unexpected `DuckDB` errors fail the test.
@@ -1103,10 +1101,9 @@ fn pinned_varchar_matrix_parity() {
         Value::String("0404".into()),
         Value::String("+5".into()),
         Value::String("1e3".into()),
-        // Numbers to Rust's parser with NO reading in the comparison
-        // space: 'nan' and 'inf' used to order above every literal in
-        // DuckDB's total DOUBLE ordering, and now match nothing at all —
-        // on both sides (ADR-0011 ruling #6).
+        // Numbers to Rust's parser with no reading in the comparison
+        // space (ADR-0011 ruling #6): ordered comparisons over them are
+        // UNKNOWN on both sides, while equality still has its text arm.
         Value::String("nan".into()),
         Value::String("inf".into()),
         Value::String("-inf".into()),
@@ -1126,7 +1123,7 @@ fn pinned_varchar_matrix_parity() {
         "status=200,accepted",
         "status=accepted",
         "status!=accepted",
-        // ordered, numeric literal (TRY_CAST DOUBLE rule)
+        // ordered, numeric literal (both sides read in DECIMAL(38,6))
         "status>400",
         "status>=400",
         "status<400",
@@ -1134,12 +1131,14 @@ fn pinned_varchar_matrix_parity() {
         "status>=0",
         "status>1",
         "status<2",
-        // ordered, non-numeric literal (lexical rule, unchanged)
+        // ordered, non-numeric literal (lexical rule)
         "status>accepted",
         "status<accepted",
         // numeric literals with no reading in the comparison space: the
-        // numeric RULE still applies (never the lexical one), and its
-        // right-hand cast is NULL, so every row is UNKNOWN on both sides.
+        // numeric rule still applies (never the lexical one), and the
+        // literal's own cast is NULL. An ordered comparison is then
+        // UNKNOWN for every row, while equality falls to its text arm —
+        // `status=nan` matches the stored text `nan`.
         "status>nan",
         "status<inf",
         "status>=1e40",
@@ -1149,7 +1148,7 @@ fn pinned_varchar_matrix_parity() {
         "status=9007199254740993",
         "status!=9007199254740993",
         "status>9007199254740992",
-        // glob / regex (unchanged under the VARCHAR pin)
+        // glob / regex over the stored text
         "status=2*",
         "status=/2.*/",
         // NOT over each class: a TRY_CAST miss and a NULL column are
@@ -1189,7 +1188,7 @@ fn pinned_bigint_pattern_parity() {
         "status=2*",
         "status=/4.*/",
         "status=/^40.$/",
-        // non-pattern ops stay native under a typed pin
+        // non-pattern ops compare in the column's own type
         "status=404",
         "status>=400",
         "status!=200",
@@ -1211,7 +1210,7 @@ fn pinned_bigint_pattern_parity() {
 
 /// DOUBLE-pinned patterns: the column is DOUBLE whatever the wire number
 /// looked like, so the pattern text is `DuckDB`'s DOUBLE rendering
-/// (`200.0`, `1e-07`, `1.2345678901234568e+17`) on BOTH sides — a matcher
+/// (`200.0`, `1e-07`, `1.2345678901234568e+17`) on both sides — a matcher
 /// that stringified the wire value would answer `status=/^200$/` TRUE
 /// where the batch query answers FALSE.
 ///
@@ -1237,7 +1236,7 @@ fn pinned_double_pattern_parity() {
         r"NOT status=/^200\.0$/",
         "NOT status=2*",
     ];
-    // Non-pattern ops stay native under a typed pin, unchanged.
+    // Non-pattern ops compare in the column's own type.
     let natives = [
         "status=200",
         "status>=400",
@@ -1292,13 +1291,13 @@ fn pinned_double_pattern_parity() {
 }
 
 /// The IEEE specials under a DOUBLE pin: a live filter compares them in
-/// `DuckDB`'s TOTAL order, not Rust's.
+/// `DuckDB`'s total order, not Rust's.
 ///
 /// Every NaN equals every other NaN whatever its sign and outranks `inf`,
-/// so `metric=nan` MATCHES a stored NaN — the answer the matcher's own
-/// IEEE `==` used to get wrong while the batch query returned the row.
-/// The expected answers are stated, not merely agreed on: two lanes
-/// sharing one wrong comparator would pass a bare parity assertion.
+/// so `status=nan` matches a stored NaN where a matcher comparing through
+/// Rust's IEEE `==` would not. The expected answers are stated, not merely
+/// agreed on: two lanes sharing one wrong comparator would pass a bare
+/// parity assertion.
 ///
 /// The column is spelled out rather than inferred, because a wire `"nan"`
 /// and a wire `"-nan"` both conform to a DOUBLE the round-trip guard
@@ -1355,9 +1354,9 @@ fn pinned_double_special_value_parity() {
     }
 
     // A NULL column is UNKNOWN, not false: nothing matches it — except
-    // the search stage's `!=`, which is the one TOTAL comparison (it
-    // widens with `OR col IS NULL`, ADR-0011), and `NOT status=nan`,
-    // which does NOT, because `NOT (NULL)` is NULL.
+    // the search stage's `!=`, the one total comparison (it widens with
+    // `OR col IS NULL`, ADR-0011). `NOT status=nan` does not widen,
+    // because `NOT (NULL)` is NULL.
     for event in [status_event(&Value::Null), absent_status_event()] {
         for dsl in dsls {
             let widened = dsl.contains("!=");
@@ -1370,12 +1369,12 @@ fn pinned_double_special_value_parity() {
     }
 }
 
-/// A mixed-case DSL reference names ONE column on both sides: `DuckDB`
+/// A mixed-case DSL reference names one column on both sides: `DuckDB`
 /// folds `"Status"` onto the physical `status`, and ingest folds every
 /// incoming field name, so the matcher must read the same folded key.
 ///
-/// Absent-key `!=` is a MATCH (`OR col IS NULL`), so a matcher that reads
-/// `Status` verbatim sees a NULL column on EVERY event and fires on all of
+/// Absent-key `!=` is a match (`OR col IS NULL`), so a matcher that reads
+/// `Status` verbatim sees a NULL column on every event and fires on all of
 /// them while the batch query returns only the real non-matching rows —
 /// which is why this runs against `DuckDB` rather than asserting a shape.
 #[test]
@@ -1412,26 +1411,25 @@ fn mixed_case_field_reference_parity() {
 /// Patterns over a TIMESTAMP-pinned column: batch renders the canonical
 /// RFC 3339 microsecond text through `strftime`, the live matcher renders
 /// the same text from the wire value, so a pattern anchored on the
-/// separator, the zone suffix or the fraction means ONE thing.
+/// separator, the zone suffix or the fraction means one thing.
 ///
 /// A value with no timestamp reading is NULL on disk and UNKNOWN in
 /// memory, including under `NOT`.
 ///
 /// The parquet is written through [`trawl_core::conform::guarded_cast`]
-/// itself — what compaction and the hot `REPLACE` both emit — so this is
+/// itself, what compaction and the hot `REPLACE` both emit, so this is
 /// end-to-end evidence for ADR-0011 ruling #1 rather than a re-statement
-/// of the mirror: a zone-bearing value is stored as the UTC instant, and
-/// `…T09:00:00+05:30` therefore matches `/T03:30/` on BOTH sides and
-/// `/T09:/` on neither. That rung parses through `TIMESTAMPTZ`, so the
-/// writing session is pinned to UTC exactly as every conforming
-/// connection is.
+/// of the mirror: a zone-bearing value is stored as the UTC instant, so
+/// `…T09:00:00+05:30` matches `/T03:30/` on both sides and `/T09:/` on
+/// neither. That rung parses through `TIMESTAMPTZ`, so the writing session
+/// is pinned to UTC exactly as every conforming connection is.
 ///
 /// The value list is the shapes ADR-0011 ruling #4 turned up by
-/// execution — `epoch`, a trailing zone NAME, hour-24 rollover, and the
-/// seconds-less `T09:00+00:00` that used to fire live while batch stored
-/// NULL — beside the ordinary ones. The exhaustive text matrix lives in
-/// `trawl-engine/tests/duckdb_probe.rs`; this test proves the same
-/// agreement survives the whole pipeline (pin → emit → parquet → GLOB).
+/// execution — `epoch`, a trailing zone name, hour-24 rollover, and a
+/// seconds-less `T09:00+00:00` — beside the ordinary ones. The exhaustive
+/// text matrix lives in `trawl-engine/tests/duckdb_probe.rs`; this test
+/// proves the same agreement survives the whole pipeline
+/// (pin → emit → parquet → GLOB).
 #[test]
 fn pinned_timestamp_pattern_parity() {
     let conn = Connection::open_in_memory().unwrap();
@@ -1446,12 +1444,12 @@ fn pinned_timestamp_pattern_parity() {
         // Shapes a custom TIMESTAMP-pinned field can carry.
         Value::String("2026-01-15 09:00:00".into()),
         Value::String("2026-01-15".into()),
-        // Zone-bearing: the offset is APPLIED, so the stored hour moves.
+        // Zone-bearing: the offset is applied, so the stored hour moves.
         Value::String("2026-01-15T09:00:00+05:30".into()),
         Value::String("2026-01-15T09:00:00-08:00".into()),
         Value::String("2026-01-15T09:00:00+0530".into()),
         Value::String("2026-01-15T09:00:00+02".into()),
-        // The ruling #4 shapes.
+        // The shapes ADR-0011 ruling #4 turned up.
         Value::String("epoch".into()),
         Value::String("2026-01-15 09:00:00 UTC".into()),
         Value::String("2026-01-15 24:00:00".into()),
@@ -1524,7 +1522,7 @@ fn pinned_timestamp_pattern_parity() {
     }
 }
 
-/// Hot+cold union with BOTH pin sets: the cold branch reads one event,
+/// Hot+cold union with both pin sets: the cold branch reads one event,
 /// the hot branch another (conformed via the REPLACE list), and the
 /// pin-aware comparison must agree with the in-memory filter over the
 /// pair — SQL matches iff the filter matches either event.
@@ -1602,7 +1600,7 @@ fn pinned_hot_cold_union_parity() {
 /// very bytes the matcher reads, so no stored column has to be spelled out
 /// by hand.
 ///
-/// The returned temp file must outlive the SQL run: it IS the source.
+/// The returned temp file must outlive the SQL run: it is the source.
 fn emit_hot_only_over(
     query: &trawl_core::ast::Query,
     event: &Map<String, Value>,
@@ -1622,7 +1620,7 @@ fn emit_hot_only_over(
 
     // hot_pins = pins ∩ the snapshot's keys: the REPLACE list must never
     // name a column the snapshot does not carry — and the key set is the
-    // SNAPSHOT's, not one row's, exactly as `HotBuffer::snapshot` computes
+    // snapshot's, not one row's, exactly as `HotBuffer::snapshot` computes
     // it. A row that skipped a field still reads the conformed column its
     // neighbours put there.
     let mut hot_pins = FieldTypes::new();
@@ -1641,11 +1639,11 @@ fn emit_hot_only_over(
 ///
 /// The hot-only lane is the SSE filter's own corpus: the same event the
 /// matcher sees, read back through the `REPLACE` conformance
-/// (`TRY_CAST(col AS <pin>)`) the executor applies on a cold start. So the
-/// wire value is not spelled out here the way
-/// [`assert_pinned_parity_over_column`] spells the stored column — the
-/// point is precisely that the emitter conforms the SAME bytes the matcher
-/// reads, and the two must still answer alike.
+/// ([`trawl_core::conform::guarded_cast`] over the column's text form)
+/// the executor applies on a cold start. So the wire value is not spelled
+/// out here the way [`assert_pinned_parity_over_column`] spells the stored
+/// column — the point is precisely that the emitter conforms the same
+/// bytes the matcher reads, and the two must still answer alike.
 fn assert_hot_only_parity(
     conn: &Connection,
     dsl: &str,
@@ -1655,10 +1653,10 @@ fn assert_hot_only_parity(
     assert_hot_only_parity_beside(conn, dsl, event, ft, &[]);
 }
 
-/// [`assert_hot_only_parity`] with SIBLING events sharing the snapshot.
+/// [`assert_hot_only_parity`] with sibling events sharing the snapshot.
 ///
 /// The siblings are not incidental: `read_json` types each column from the
-/// whole file, so a sibling decides how the event under test is SPELLED
+/// whole file, so a sibling decides how the event under test is spelled
 /// once it is read back (a fractional `status` widens the column to DOUBLE
 /// and stores `200` as `"200.0"`). Only the target row is asked about —
 /// it is the one whose `message` is `hello`, and the row filter sits
@@ -1699,16 +1697,16 @@ const VARCHAR_EQ_DSLS: [&str; 10] = [
     "NOT status=200,301",
 ];
 
-/// A VARCHAR pin does NOT mean the stored text is the wire text.
+/// A VARCHAR pin does not mean the stored text is the wire text.
 /// `read_json` types each column from the whole batch, so one fractional
-/// sibling makes a wire `200` read back as `"200.0"` — and compaction's
-/// `TRY_CAST(col AS VARCHAR)` writes exactly that spelling to parquet, so
-/// the widening is durable, not hot-only.
+/// sibling makes a wire `200` read back as `"200.0"`, and compaction
+/// writes exactly that spelling to parquet (the VARCHAR rung's guarded
+/// cast is the identity over the column's text form), so the widening is
+/// durable, not hot-only.
 ///
 /// Exact-text equality is therefore unmirrorable: the live matcher only
 /// ever sees the wire `200`. Both sides carry the value's numeric reading
-/// beside its text, and this is the execution evidence — the same batch
-/// the reviewer's probe used, answered identically on both sides.
+/// beside its text, and this is the execution evidence for that rule.
 #[test]
 fn pinned_varchar_eq_survives_read_json_widening() {
     let conn = Connection::open_in_memory().unwrap();
@@ -1747,7 +1745,8 @@ fn pinned_varchar_eq_over_conformed_number_spellings() {
     let ft = pinned(&[("status", CanonicalType::Varchar)]);
     // (wire value, the text conformance stored for it)
     let cases = [
-        // DOUBLE inference: the reported case.
+        // DOUBLE inference: a wire integer that shared a batch with a
+        // fraction.
         (Value::from(200), "'200.0'"),
         (Value::from(200.0), "'200.0'"),
         // BIGINT inference: same value, plain spelling.
@@ -1779,17 +1778,16 @@ const COLLIDING_IDS: [&str; 5] = [
     "9007199254740993",
 ];
 
-/// Numeric comparison against a VARCHAR-pinned field is EXACT past 2^53 —
-/// asserted against the ANSWER, not merely against agreement.
+/// Numeric comparison against a VARCHAR-pinned field is exact past 2^53,
+/// asserted against the answer rather than against agreement alone.
 ///
-/// This is the one place a parity assertion could not have done the job.
-/// The old `TRY_CAST(col AS DOUBLE)` arm bound the literal as an `f64` and
-/// compared in double space; the live matcher mirrored it faithfully, so
-/// both engines returned `1737000000123456788` and `…790` for
-/// `status=1737000000123456789` and both suppressed `9007199254740992`
-/// for `status!=9007199254740993`. Perfect parity, wrong rows. Snowflake
-/// ids and nanosecond epochs land in VARCHAR-pinned fields exactly like
-/// this, and the resulting query is silently, plausibly wrong.
+/// This is the one place a parity assertion could not do the job. Compare
+/// in double space and the literal binds as an `f64`; a live matcher
+/// mirroring that faithfully agrees with the query while both return
+/// `1737000000123456788` and `…790` for `status=1737000000123456789`, and
+/// both suppress `9007199254740992` for `status!=9007199254740993`.
+/// Perfect parity, wrong rows — and snowflake ids and nanosecond epochs
+/// land in VARCHAR-pinned fields exactly like this.
 ///
 /// So each case states the truth an operator would expect — the value is
 /// the id or it isn't — and the helper still asserts the two engines agree
@@ -1844,20 +1842,20 @@ fn pinned_varchar_numeric_comparison_is_exact_above_2_pow_53() {
     }
 }
 
-/// COMPARISONS under a typed pin, over the hot-only lane — the same
+/// Comparisons under a typed pin, over the hot-only lane — the same
 /// event read by the matcher and by the query, which is the strictest
 /// form of the batch/live contract.
 ///
-/// The gap this closes: the pattern rules conformed the wire value and
-/// the comparison rules did not, so every value the round-trip guard
-/// nulls out answered one way live and another in batch. A wire `1.5`
-/// under a BIGINT pin is NULL in both batch lanes — `duration>1` is
-/// UNKNOWN there and was TRUE here — and `"TRUE"` under a BOOLEAN pin
-/// made `NOT flag=true` fire on a stream while `/query` returned nothing.
+/// Both lanes conform the wire value before comparing, so every value the
+/// round-trip guard nulls out answers alike: a wire `1.5` under a BIGINT
+/// pin is the NULL both batch lanes hold, making `status>1` UNKNOWN rather
+/// than TRUE, and a wire `"TRUE"` under a BOOLEAN pin is NULL too, so a
+/// matcher reading the wire text would fire `NOT status=true` on a stream
+/// while `/query` returns nothing.
 ///
 /// Literals a typed column cannot be compared against at all (a word
 /// against a numeric pin) are deliberately absent: `DuckDB` answers those
-/// with a conversion ERROR, so there is no row set to agree with.
+/// with a conversion error, so there is no row set to agree with.
 #[test]
 #[allow(clippy::too_many_lines)] // one matrix, kept in one place to stay readable
 fn pinned_typed_comparison_parity() {
@@ -1891,14 +1889,14 @@ fn pinned_typed_comparison_parity() {
                 Value::from("accepted"),
                 Value::from(true),
                 Value::Null,
-                // …and values that DO conform, spelled unlike the wire.
+                // …and values that do conform, spelled unlike the wire.
                 Value::from("0404"),
                 Value::from(" 200"),
                 Value::from("2"),
                 Value::from(404),
                 Value::from(2),
-                // Integral above 2^53, where the deleted `f64` cast rung
-                // read nothing.
+                // Integral above 2^53, where an `f64` cast rung would read
+                // nothing.
                 Value::from("9007199254740993.0"),
             ],
         ),
@@ -1975,7 +1973,7 @@ fn pinned_typed_comparison_parity() {
     ];
     // A string sibling fixes the snapshot's inference at VARCHAR/JSON, so
     // the conform reads the text the wire carried rather than whatever
-    // `read_json` would have parsed a lone value into — the conform is
+    // `read_json` would parse a lone value into: the conform is
     // text-first, but the reader in front of it is not.
     let mut sibling = status_event(&Value::from("sentinel"));
     sibling.insert("message".into(), Value::from("sibling"));
@@ -1997,14 +1995,14 @@ fn pinned_typed_comparison_parity() {
 }
 
 /// Patterns over the hot-only lane, where the matcher and the query read
-/// the SAME event — the strictest form of the batch/live contract, and the
+/// the same event — the strictest form of the batch/live contract, and the
 /// one that catches a pattern text taken from the wire instead of from the
 /// conformed value.
 ///
-/// Every case here diverged before the typed pattern texts landed: the
-/// matcher globbed `accepted` / `0404` / `TRUE` / `1.50` while the query
-/// globbed the conformed `NULL` / `404` / `true` / `1.5`, so a live tail
-/// fired on events the equivalent `/api/v1/query` dropped.
+/// Every case is one where the two texts differ: `accepted` / `0404` /
+/// `TRUE` / `1.50` on the wire against the conformed `NULL` / `404` /
+/// `true` / `1.5`. A matcher globbing the wire text fires on events the
+/// equivalent `/api/v1/query` drops.
 #[test]
 fn pinned_hot_only_pattern_parity() {
     let conn = Connection::open_in_memory().unwrap();
@@ -2026,9 +2024,9 @@ fn pinned_hot_only_pattern_parity() {
     ];
     // (pin, wire value the matcher AND the query both read)
     let cases = [
-        // The reported BIGINT divergences: a non-numeric text conforms to
-        // NULL, a leading-zero text conforms to a differently-spelled
-        // integer, and the control (a wire integer) must keep matching.
+        // BIGINT: a non-numeric text conforms to NULL, a leading-zero text
+        // conforms to a differently-spelled integer, and the control (a
+        // wire integer) must keep matching.
         (CanonicalType::BigInt, Value::from("accepted")),
         (CanonicalType::BigInt, Value::from("0404")),
         (CanonicalType::BigInt, Value::from(404)),
@@ -2096,17 +2094,17 @@ fn eval_truth(v: &trawl_core::eval::EvalValue) -> Option<bool> {
 
 /// Assert the streaming `where` evaluator and SQL agree on one
 /// `| where` (dsl, event, pins) triple, and return the three-valued eval
-/// answer so callers can pin what it must BE (agreement alone would let
-/// both lanes be wrong together — the ruling-#6 lesson).
+/// answer so callers can pin what it must be (agreement alone would let
+/// both lanes be wrong together — ADR-0011 ruling #6).
 ///
-/// Pins are threaded through BOTH lanes — [`trawl_core::pin_scope::PinScope::root`]
+/// Pins are threaded through both lanes — [`trawl_core::pin_scope::PinScope::root`]
 /// for the evaluator, [`emitter::emit_with_pins`] for the SQL — so an
-/// EMPTY catalog is the pin-blind lane (byte-identical to what
-/// [`emitter::emit`] emits), and a populated one is slice A′.
+/// empty catalog is the pin-blind lane (byte-identical to what
+/// [`emitter::emit`] emits), and a populated one is the pin-aware lane.
 ///
 /// Same source strategy as [`assert_pinned_parity`]: ndjson when the wire
 /// shape already infers the pin's physical type, a typed-NULL parquet for
-/// the null/absent case. A wire shape that does NOT infer its pin belongs
+/// the null/absent case. A wire shape that does not infer its pin belongs
 /// on the hot-only lane ([`assert_where_parity_hot_only`]), where the
 /// emitter conforms the bytes itself.
 fn assert_where_parity(
@@ -2222,7 +2220,7 @@ fn assert_where_parity_over_column(
 }
 
 /// Assert the pinned `| let x = <cmp>` SELECT-list value agrees between the
-/// lanes and IS `expected` — TRUE/FALSE/NULL as a stored value, not a row
+/// lanes and is `expected` — TRUE/FALSE/NULL as a stored value, not a row
 /// filter, so UNKNOWN is directly observable in batch too.
 fn assert_pinned_let_parity(
     conn: &Connection,
@@ -2295,9 +2293,9 @@ fn let_value(conn: &Connection, emitted: &EmittedQuery, row_filter: &str) -> Opt
         })
 }
 
-/// The slice-A′ deterministic matrix: pin-aware `| where` over the same
-/// value × operator grid the search stage runs, strict SQL (an error is a
-/// broken rule, never a "no match").
+/// The deterministic matrix for pin-aware `| where`: the same value ×
+/// operator grid the search stage runs, strict SQL (an error is a broken
+/// rule, never a "no match").
 #[test]
 fn pinned_where_varchar_matrix_parity() {
     let conn = Connection::open_in_memory().unwrap();
@@ -2349,8 +2347,8 @@ fn pinned_where_varchar_matrix_parity() {
     }
 }
 
-/// Expected values pinned, not just agreement (the ruling-#6 lesson):
-/// the headline slice-A′ answers over a VARCHAR pin.
+/// Expected values pinned, not just agreement (ADR-0011 ruling #6): the
+/// headline pin-aware `| where` answers over a VARCHAR pin.
 #[test]
 fn pinned_where_expected_answers() {
     let conn = Connection::open_in_memory().unwrap();
@@ -2379,7 +2377,7 @@ fn pinned_where_expected_answers() {
     );
 
     // Strict `!=` NULL policy: absent/null is UNKNOWN (the search stage's
-    // widening does NOT apply in the pipeline).
+    // widening does not apply in the pipeline).
     assert_eq!(
         assert_where_parity(
             &conn,
@@ -2444,7 +2442,7 @@ fn pinned_where_expected_answers() {
 
 /// TIMESTAMP pin: the conform is zone-aware, so an offset-bearing wire
 /// value compares (and pattern-matches) at its UTC instant, while a query
-/// literal parses wall-clock (offset ignored) — both probed in slice A.
+/// literal parses wall-clock (offset ignored). Both probed by execution.
 #[test]
 fn pinned_where_timestamp_offset_instant() {
     let conn = Connection::open_in_memory().unwrap();
@@ -2524,12 +2522,12 @@ fn pinned_let_matrix_with_expected_values() {
 
 // ── Generative pinned where/let parity (ADR-0011 slice A′) ────────────
 
-/// [`assert_where_parity`] over the HOT-ONLY lane: the evaluator and the
-/// query read the SAME bytes, the emitter conforming them exactly as
+/// [`assert_where_parity`] over the hot-only lane: the evaluator and the
+/// query read the same bytes, the emitter conforming them exactly as
 /// compaction will.
 ///
 /// This is the lane every wire shape can take. The cold lane needs the
-/// stored column to already BE the pin's physical type, which a wire value
+/// stored column to already be the pin's physical type, which a wire value
 /// only infers when it happens to look like its pin (a JSON string under a
 /// VARCHAR pin); here the `REPLACE` conformance derives it, so a wire
 /// `"1.5"` under a BIGINT pin is the NULL both batch lanes hold.
@@ -2545,7 +2543,7 @@ fn assert_where_parity_hot_only(
 ) -> Option<bool> {
     let (query, condition) = where_condition(dsl);
     let scope = trawl_core::pin_scope::PinScope::root(ft);
-    // ONE anchor for both lanes (ADR-0017 §3).
+    // One anchor for both lanes (ADR-0017 §3).
     let anchor = trawl_core::context::EvalContext::capture();
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
         &condition,
@@ -2568,7 +2566,7 @@ fn assert_where_parity_hot_only(
 }
 
 /// The `| let` mirror of [`assert_where_parity_hot_only`]: the same
-/// comparison as a STORED value, so the lanes are compared three-valued —
+/// comparison as a stored value, so the lanes are compared three-valued —
 /// FALSE and UNKNOWN are one row set to a `where`, two values here.
 fn assert_let_parity_hot_only(
     conn: &Connection,
@@ -2588,7 +2586,7 @@ fn assert_let_parity_hot_only(
         })
         .expect("dsl has a let stage");
     let scope = trawl_core::pin_scope::PinScope::root(ft);
-    // ONE anchor for both lanes (ADR-0017 §3).
+    // One anchor for both lanes (ADR-0017 §3).
     let anchor = trawl_core::context::EvalContext::capture();
     let eval_result = eval_truth(&trawl_core::eval::eval_expr_with_pins(
         &assignment,
@@ -2611,17 +2609,14 @@ fn assert_let_parity_hot_only(
 /// The pins a generated case draws from — the whole `CanonicalType`
 /// vocabulary, because a repin can land on any of them.
 ///
-/// Defined AS [`CanonicalType::ALL`] instead of relisting it. The relisted
-/// form held all six types and compiled fine, which is exactly the problem:
-/// a seventh entry in `ALL` would have left it at six with nothing turning
-/// red. (Its order had drifted from `ALL`'s too.) Both call sites below —
-/// the draw and the coverage assertion — now grow with the vocabulary on
-/// their own.
+/// Defined as [`CanonicalType::ALL`] rather than relisted: a relisted form
+/// still compiles when the vocabulary grows, silently leaving both call
+/// sites below (the draw and the coverage assertion) one pin short.
 const GENERATIVE_PINS: [CanonicalType; CanonicalType::ALL.len()] = CanonicalType::ALL;
 
 /// Wire values a generated event can carry under `pin`: shapes the
-/// round-trip guard KEEPS (spelled unlike the wire, so the two lanes must
-/// each derive the stored reading), shapes it NULLS, and JSON null.
+/// round-trip guard keeps (spelled unlike the wire, so the two lanes must
+/// each derive the stored reading), shapes it nulls, and JSON null.
 fn wire_pool(pin: CanonicalType) -> Vec<Value> {
     match pin {
         CanonicalType::BigInt => vec![
@@ -2655,7 +2650,7 @@ fn wire_pool(pin: CanonicalType) -> Vec<Value> {
             Value::from(true),
             // Both NaN spellings survive the pin's round-trip guard, so
             // both are values the corpus really holds — and they compare
-            // in DuckDB's TOTAL order, not Rust's IEEE one.
+            // in DuckDB's total order, not Rust's IEEE one.
             Value::from("nan"),
             Value::from("-nan"),
             Value::Null,
@@ -2701,15 +2696,15 @@ fn wire_pool(pin: CanonicalType) -> Vec<Value> {
 /// Literals a generated comparison against `pin` can carry.
 ///
 /// Type-appropriate on purpose, exactly as the deterministic matrix is: a
-/// word against a numeric pin is a `DuckDB` conversion ERROR, so there is
+/// word against a numeric pin is a `DuckDB` conversion error, so there is
 /// no row set for the evaluator to agree with. The VARCHAR pin is the
 /// exception — its rules are the ones that take a literal of either shape.
 fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
     match pin {
         CanonicalType::BigInt => &["1", "2", "404", "1.5", "-1", "9007199254740992"],
         CanonicalType::Boolean => &["true", "false"],
-        // The NaN literal is QUOTED: a bare `nan` in an expression
-        // position is a FIELD reference, and the quoted spelling binds
+        // The NaN literal is quoted: a bare `nan` in an expression
+        // position is a field reference, and the quoted spelling binds
         // through the same content coercion the search stage applies.
         CanonicalType::Double => &["0", "1.5", "-1.5", "200", "404", "\"nan\""],
         CanonicalType::Timestamp => &[
@@ -2724,7 +2719,7 @@ fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
             "9007199254740993",
             // The parser hands a negative literal over as a unary
             // negation, not a signed literal — a shape the pinned door
-            // has to fold, and the one the pools originally missed.
+            // has to fold before it can bind.
             "-400",
             "-1.5",
             "\"-400\"",
@@ -2741,13 +2736,13 @@ fn literal_pool(pin: CanonicalType) -> &'static [&'static str] {
 /// Literals a generated `in (…)` list draws from — [`literal_pool`],
 /// except that the BIGINT pin drops its fractional literal.
 ///
-/// `DuckDB` widens a MIXED integer/fraction `IN` list to DOUBLE, and
+/// `DuckDB` widens a mixed integer/fraction `IN` list to DOUBLE, and
 /// DOUBLE is blind above 2^53: `status IN (1.5, 9007199254740992)` matches
 /// a stored `9007199254740993` in batch and nowhere else. That is the
-/// ruling-#6 pathology in the LITERAL list, and it is not slice A′'s — the
-/// search stage emits the same list from `status=1.5,9007199254740992` and
-/// diverges identically, so this generator stays off a shipped rule
-/// instead of re-litigating it here.
+/// ADR-0011 ruling #6 pathology in the literal list, and it belongs to the
+/// search stage too (`status=1.5,9007199254740992` emits the same list and
+/// diverges identically), so this generator stays off it rather than
+/// re-litigating it here.
 fn in_list_pool(pin: CanonicalType) -> &'static [&'static str] {
     match pin {
         CanonicalType::BigInt => &["1", "2", "404", "-1", "9007199254740992"],
@@ -2756,7 +2751,7 @@ fn in_list_pool(pin: CanonicalType) -> &'static [&'static str] {
 }
 
 /// Patterns are text-shaped whatever the pin is: each typed pin renders
-/// its CONFORMED value's canonical text on both sides.
+/// its conformed value's canonical text on both sides.
 const GENERATIVE_REGEXES: [&str; 6] = ["^2", "4", "acc", "true", "^40", "0"];
 const GENERATIVE_GLOBS: [&str; 5] = ["2%", "%0%", "true", "acc%", "%.%"];
 
@@ -2771,7 +2766,7 @@ fn random_comparison(rng: &mut Rng, pin: CanonicalType) -> String {
             rng.pick(&GENERATIVE_ORDERED_OPS),
             rng.pick(lits)
         ),
-        // Literal on the LEFT: the rule table has to bind the same way
+        // Literal on the left: the rule table has to bind the same way
         // whichever side the field sits on.
         2 => format!(
             "{} {} status",
@@ -2803,12 +2798,12 @@ fn random_condition(rng: &mut Rng, pin: CanonicalType) -> String {
 /// Generative batch/live parity for the pinned pipeline: random DSL ×
 /// random events × random pins, both stages, both lanes.
 ///
-/// The deterministic matrices above pin what each answer must BE; this one
+/// The deterministic matrices above pin what each answer must be; this one
 /// covers the combinations nobody enumerated — a `NOT` over a reversed
 /// comparison whose literal has no reading, an `in` list against a value
 /// the guard nulled, a pattern over a pin whose canonical text is not the
-/// wire text — and it is the test that would have caught slice A′ shipping
-/// pin-blind for any one operator, pin or connective.
+/// wire text — and it is the test that catches one operator, pin or
+/// connective staying pin-blind.
 ///
 /// `| where` is checked as a row set and `| let` as a stored value, so
 /// UNKNOWN is observed directly rather than through "no row": a lane that
@@ -2822,7 +2817,7 @@ fn pinned_where_let_parity_generative() {
 
     // Every snapshot carries a string sibling, exactly as
     // `pinned_typed_comparison_parity` does: the conform is text-first but
-    // the READER in front of it is not, and a lone value lets `read_json`
+    // the reader in front of it is not, and a lone value lets `read_json`
     // retype the column before the conform sees it (a single-row snapshot
     // holding `"infinity"` infers DATE and stores 1900-01-01). That is a
     // snapshot-inference property, not a comparison rule; pinning the
@@ -2853,7 +2848,7 @@ fn pinned_where_let_parity_generative() {
         event.insert("_ingested".into(), Value::from("2026-01-01T12:00:01Z"));
 
         // The sibling also keeps the column present for the absent case:
-        // a snapshot in which NO row carries `status` has no such column
+        // a snapshot in which no row carries `status` has no such column
         // for either lane to read (the executor's missing-column policy
         // answers that, not the comparison rules), while a sibling makes
         // it the NULL a real corpus holds for a row that skipped it.

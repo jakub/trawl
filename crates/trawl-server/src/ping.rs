@@ -13,12 +13,12 @@
 
 use std::time::{Duration, Instant};
 
-/// A cached liveness-ping outcome with an expiry timestamp.
+/// A liveness-ping outcome and the instant it was taken; the caller's `ttl`
+/// decides when it has expired.
 #[derive(Debug, Clone)]
 pub struct CachedPing {
     /// Ping outcome: `Ok(())` on success, `Err(msg)` on failure/timeout.
     result: Result<(), String>,
-    /// When this ping was performed.
     checked_at: Instant,
 }
 

@@ -32,7 +32,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     for (idx, (tab, label, shortcut)) in tabs.iter().enumerate() {
         let is_active = *tab == app.main_tab;
 
-        // For the Query tab, show the status indicator.
         let label_text = if *tab == MainTab::Query {
             let indicator = match &app.tab.status {
                 TabStatus::Idle => "",
@@ -64,7 +63,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
         spans.push(Span::styled(label_text, style));
 
-        // Separator between tabs
         if idx < tabs.len() - 1 {
             spans.push(Span::raw(" "));
         }
@@ -73,8 +71,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line).style(Style::default().bg(theme.surface));
 
-    // Render only on the first row; the rest of the area is a spacer that
-    // inherits the terminal's default background.
+    // Paint the first row only. The spacer row below it keeps the surface
+    // fill `ui::render` lays over the whole frame.
     let tab_row = Rect { height: 1, ..area };
     frame.render_widget(paragraph, tab_row);
 }

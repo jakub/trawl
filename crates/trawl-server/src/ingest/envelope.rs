@@ -10,18 +10,16 @@
 //! would guess.** Every repair is recorded as a [`RepairCode`] in the
 //! event's `_repairs` column and counted per `(code, service)`.
 //!
-//! Three producers feed events through here as PROFILES (ADR-0013 slice 2,
-//! ruling 2): the HTTP ingest handler, the syslog listener, and internal
-//! telemetry (`service:trawld`). A profile asserts the identity it can
-//! prove and contributes fixed derivation sources
-//! ([`crate::ingest::producer`]); it bypasses no gate here, and the door
-//! is the one place `_repairs` is assembled — producers CONTRIBUTE codes,
-//! they never assemble.
+//! Three producers feed events through here as profiles (ADR-0013): the
+//! HTTP ingest handler, the syslog listener, and internal telemetry
+//! (`service:trawld`). A profile asserts the identity it can prove and
+//! contributes fixed derivation sources ([`crate::ingest::producer`]); it
+//! bypasses no gate here. Producers contribute repair codes, but this door
+//! is the only place `_repairs` is assembled.
 //!
 //! This module never calls `tracing`. Telemetry's own events pass through
 //! it on their way to the WAL, so a log line emitted from inside would be
-//! an ingestion loop (ruling 4) — pinned by
-//! `tests/canonicalize_no_tracing.rs`.
+//! an ingestion loop; pinned by `tests/canonicalize_no_tracing.rs`.
 
 use std::fmt;
 
@@ -45,46 +43,45 @@ pub enum RepairCode {
     TimeOutOfRange,
     /// a value exceeded the length cap (`_raw`).
     FieldTruncated,
-    /// a field NAME arrived in trawl's `_` namespace and is not a slot the
-    /// sender may propose (ADR-0013 §5). The leading underscore RUN was
+    /// a field name arrived in trawl's `_` namespace and is not a slot the
+    /// sender may propose (ADR-0013 §5). The leading underscore run was
     /// stripped and the value stored under the bare remainder
     /// (`_HOSTNAME` → `hostname`, `__name__` → `name__`); a name with no
     /// remainder at all (`_`, `___`) was dropped. Nothing is lost either
     /// way — `_raw` carries the original name and value.
     ReservedPrefix,
-    /// stripping a reserved prefix produced a name the SAME event already
+    /// stripping a reserved prefix produced a name the same event already
     /// carries bare, so the prefixed loser was dropped (the case-collision
     /// precedent). Its value stays findable in `_raw`.
     ReservedPrefixCollision,
-    /// a field's NAME exceeded [`trawl_core::schema::MAX_FIELD_NAME_BYTES`];
+    /// a field's name exceeded [`trawl_core::schema::MAX_FIELD_NAME_BYTES`];
     /// the field was dropped (its value stays findable in `_raw`).
     FieldNameTooLong,
-    /// a field's NAME carried ASCII uppercase and was folded to lowercase —
+    /// a field's name carried ASCII uppercase and was folded to lowercase —
     /// `DuckDB` identifiers are ASCII case-insensitive, so the lowercase
     /// form is the one spelling every downstream layer (catalog, parquet,
     /// hot snapshot) agrees on. The original spelling stays in `_raw`.
     FieldNameCaseFolded,
-    /// two field NAMES in one event differed only in ASCII case — one
+    /// two field names in one event differed only in ASCII case — one
     /// column as far as `DuckDB` is concerned — so the losing key was
     /// dropped (its value stays findable in `_raw`). The exact-lowercase
     /// spelling wins when present; otherwise the ASCII-lexicographically
     /// first variant does.
     FieldNameCaseCollision,
-    /// a payload key named a slot the PRODUCER asserts (`env`, `service`,
-    /// `host`, `message`) and carried a different value, so the
-    /// assertion won (ADR-0013 slice 2, ruling 2). Identity is protected
-    /// by precedence, not by a namespace — telemetry's own fields are
-    /// ordinary sender vocabulary — and the displaced value stays
-    /// findable in `_raw`. An IDENTICAL value is not a collision and
-    /// earns no code, and neither is a JSON `null` — an explicit null is
-    /// absence, not a competing claim.
+    /// a payload key named a slot the producer asserts (`env`, `service`,
+    /// `host`, `message`) and carried a different value, so the assertion
+    /// won (ADR-0013). Identity is protected by precedence, not by a
+    /// namespace: telemetry's own fields are ordinary sender vocabulary,
+    /// and the displaced value stays findable in `_raw`. An identical
+    /// value is not a collision and earns no code, and neither is a JSON
+    /// `null`, which is absence rather than a competing claim.
     ProducerAsserted,
     /// the producer had no honest `host` to assert, so the event was kept
-    /// with `host` ABSENT (ADR-0013 slice 2, ruling 4). Reached by a
-    /// hostname-less syslog frame behind a trusted relay and by a failed
-    /// hostname lookup for trawld: absent-but-honest beats both the
-    /// peer-fill lie and dropping the event. The HTTP door never gets
-    /// here — an HTTP sender can be rejected and resend.
+    /// with `host` absent (ADR-0013). Reached by a hostname-less syslog
+    /// frame behind a trusted relay and by a failed hostname lookup for
+    /// trawld: absent but honest beats both the peer-fill lie and dropping
+    /// the event. The HTTP door never gets here, since an HTTP sender can
+    /// be rejected and resend.
     HostOmitted,
     /// the producer could not derive a usable `service` from the frame
     /// and fell back to its profile's configured default (a syslog
@@ -186,8 +183,8 @@ impl fmt::Display for RejectReason {
 
 /// Per-event context the canonicalizer needs: arrival instant, which door
 /// the event came in at, the env allowlist, and the derivation policy.
-/// Threaded in deliberately — this is `validate`'s first config-dependent
-/// check, and globals would hide it.
+/// Threaded through every call rather than read from a global, so the
+/// config a canonicalization depends on is visible at the call site.
 #[derive(Debug)]
 pub struct EnvelopeContext<'a> {
     /// RFC 3339 UTC arrival time at microsecond precision — stamped as
@@ -201,13 +198,12 @@ pub struct EnvelopeContext<'a> {
     /// for a profile producer, which asserts a boot-validated env.
     pub default_env: &'a str,
     /// Which door this event arrived at, with whatever that door asserts
-    /// (ADR-0013 slice 2, ruling 2). The HTTP variant carries the peer
-    /// identity that used to sit on this struct — it is evidence for a
-    /// fill, not an assertion, and only that door has it.
+    /// (ADR-0013). Only the HTTP variant carries a peer identity, and it
+    /// is evidence for a fill rather than an assertion.
     pub producer: Producer<'a>,
-    /// The boot-resolved, per-profile `_severity`/`_time` source lists
-    /// (ruling 5). Borrowed, because one resolved policy serves every
-    /// event on every door for the life of the process.
+    /// The boot-resolved, per-profile `_severity`/`_time` source lists.
+    /// Borrowed, because one resolved policy serves every event on every
+    /// door for the life of the process.
     pub derivation: &'a Derivation,
 }
 
@@ -220,16 +216,16 @@ pub struct Canonical {
     /// Path segment 2 (validated against the service charset).
     pub service: String,
     /// The full event object, envelope fields canonicalized. Optional
-    /// envelope fields are OMITTED when absent, never written as JSON
+    /// envelope fields are omitted when absent, never written as JSON
     /// null — `DuckDB` infers JSON for an all-null column (ADR-0009).
     pub obj: Map<String, Value>,
     /// Repair codes applied, in application order (also joined into the
     /// object's `_repairs`).
     pub repairs: Vec<RepairCode>,
-    /// The event carried a severity SOURCE that mapped to nothing on the
+    /// The event carried a severity source that mapped to nothing on the
     /// `OTel` ladder, so `_severity` was omitted (ADR-0013 §2).
     ///
-    /// NOT a repair: derivation into the `_` namespace is an annotation,
+    /// Not a repair: derivation into the `_` namespace is an annotation,
     /// and nothing sender-visible was touched — the source column is
     /// stored verbatim. The ops signal is a metrics counter instead.
     pub severity_unmapped: bool,
@@ -251,9 +247,8 @@ const OUT_OF_RANGE_FUTURE_DAYS: i64 = 1;
 ///
 /// `chrono::DateTime::parse_from_rfc3339` only accepts the extended offset
 /// spelling (`+05:30`), but the ISO 8601 *basic* spelling (`+0530`, `+05`) is
-/// what Java's default logging encoders and Go's `-0700` layouts emit, and the
-/// hard `CAST` this path replaced accepted it. `%#z` is chrono's parse-only
-/// offset that takes `+HH`, `+HHMM` and `+HH:MM` alike.
+/// what Java's default logging encoders and Go's `-0700` layouts emit. `%#z`
+/// is chrono's parse-only offset that takes `+HH`, `+HHMM` and `+HH:MM` alike.
 const OFFSET_TIMESTAMP_FORMATS: [&str; 6] = [
     "%Y-%m-%dT%H:%M:%S%.f%#z",
     "%Y-%m-%d %H:%M:%S%.f%#z",
@@ -281,8 +276,7 @@ const NAIVE_TIMESTAMP_FORMATS: [&str; 6] = [
 /// Date-only formats, read as midnight UTC.
 const DATE_ONLY_TIMESTAMP_FORMATS: [&str; 2] = ["%Y-%m-%d", "%Y/%m/%d"];
 
-/// Parse a time value per the ADR-0008 grammar (moved verbatim from the
-/// pre-cutover handler, never narrowed).
+/// Parse a time value per the ADR-0008 grammar.
 ///
 /// A value is valid iff it is a JSON string that — after trimming
 /// surrounding whitespace — chrono parses as RFC 3339, as one of
@@ -360,7 +354,7 @@ const fn json_type_name(v: &Value) -> &'static str {
 /// length cap, charset-clean, and not a dot-name (`.`, `..`, dot-leading).
 ///
 /// Path encoding is injective by validation (ADR-0009): the on-disk name
-/// IS the value, so the constraints here are the whole safety argument.
+/// is the value, so the constraints here are the whole safety argument.
 fn validate_service(obj: &Map<String, Value>) -> Result<String, (String, RejectReason)> {
     let v = obj.get("service").ok_or_else(|| {
         (
@@ -449,29 +443,29 @@ fn resolve_env(
     }
 }
 
-/// Derive `_severity` from the event's own fields — READ-ONLY.
+/// Derive `_severity` from the event's own fields, reading and never
+/// consuming them.
 ///
-/// First MAPPABLE source wins, over the source list THIS profile reads
-/// (ADR-0013 slice 2, ruling 5): the configured `[ingest] severity_from`
-/// chain, with the profile's fixed sources prepended. Every source stays
-/// exactly where it is, so `{"service":"game","level":"gold"}` keeps a
-/// queryable `level="gold"` column and simply gets no `_severity`
-/// (ADR-0013 §2). Returns whether a source EXISTED and none mapped, which
-/// is the ops counter's input — not a repair, because nothing
-/// sender-visible was touched.
+/// The first mappable source wins, over the list this profile reads
+/// (ADR-0013 §2): the configured `[ingest] severity_from` chain with the
+/// profile's fixed sources prepended. Every source stays exactly where it
+/// is, so `{"service":"game","level":"gold"}` keeps a queryable
+/// `level="gold"` column and simply gets no `_severity`. Returns whether a
+/// source existed and none mapped, which is the ops counter's input. That
+/// is not a repair, because nothing sender-visible was touched.
 ///
-/// Each source carries its own dialect, and the value goes through the
-/// ONE reader (ruling 9): a WORD maps through the ADR-0009 token table
-/// (`error` → 17) or the `OTel` exact short names (`error2` → 18), and a
-/// NUMERIC maps as that source's dialect says — `OTel` 1-24 by default,
-/// so `3` is trace, and syslog's inverted 0-7 only where the source's
-/// provenance was declared. The ranges overlap completely, so no
-/// value-shape rule could tell the dialects apart; the config (and the
-/// syslog profile's fixed source) is where provenance is asserted.
+/// Each source carries its own dialect and every value goes through
+/// `trawl_core::severity`. A word maps through the token table (`error` →
+/// 17) or the `OTel` exact short names (`error2` → 18); a number maps as
+/// that source's dialect says, `OTel` 1-24 by default (so `3` is trace),
+/// and syslog's inverted 0-7 only where the source declares it. The two
+/// numeric ranges overlap, so no value-shape rule could tell the dialects
+/// apart; provenance is asserted in config, or by the syslog profile's
+/// fixed source, and never guessed.
 ///
-/// Reading through the kernel is also what keeps ingest and `sev()`
-/// honest: the number a query computes from a raw `level` is the number
-/// derivation would have stored for it.
+/// Ingest and the `sev()` query function read through that same code, so
+/// the number a query computes from a raw `level` is the number derivation
+/// would have stored for it.
 fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -> bool {
     let mut saw_source = false;
     for source in sources {
@@ -487,27 +481,27 @@ fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -
     saw_source
 }
 
-/// Stamp what the PRODUCER asserts over the payload, returning whether any
-/// payload value was displaced (ADR-0013 slice 2, ruling 2).
+/// Stamp what the producer asserts over the payload, returning whether any
+/// payload value was displaced (ADR-0013).
 ///
 /// Runs after the reserved-prefix strip and before the validators, so a
 /// stripped `_service` has already landed on its bare slot and the
-/// assertion overrides that too — and so `validate_service`/`resolve_env`
-/// run on the ASSERTED values, giving the profile doors exactly the
+/// assertion overrides that too, and so `validate_service`/`resolve_env`
+/// run on the asserted values, giving the profile doors exactly the
 /// checks the HTTP door gets.
 ///
-/// Identity is protected by PRECEDENCE, not by a namespace: telemetry's
+/// Identity is protected by precedence, not by a namespace: telemetry's
 /// `service` field is ordinary sender vocabulary that happens to collide,
-/// and it loses. An IDENTICAL value is not a collision — the sender
-/// agreed with the profile, and confessing a repair for that would put a
-/// code on every well-formed syslog frame.
+/// and it loses. An identical value is not a collision, because the sender
+/// agreed with the profile and a repair code for that would land on every
+/// well-formed syslog frame.
 ///
 /// The two `None`s mean different things, deliberately:
-/// - `host: None` is an assertion of ABSENCE (the producer knows it has
-///   no honest hostname), so any payload `host` is displaced and the slot
-///   is left empty for the caller to confess as `host.omitted` — a
-///   payload `host: null` displaces nothing, being absence itself;
-/// - `message: None` is NO assertion at all (the payload IS the message,
+/// - `host: None` asserts absence (the producer knows it has no honest
+///   hostname), so any payload `host` is displaced and the slot is left
+///   empty for the caller to confess as `host.omitted`. A payload
+///   `host: null` displaces nothing, being absence itself;
+/// - `message: None` asserts nothing at all (the payload is the message,
 ///   as for telemetry), so whatever the payload carries stands.
 fn apply_assertions(out: &mut Map<String, Value>, asserted: &Asserted<'_>) -> bool {
     let mut displaced = claim_slot(out, trawl_core::schema::ENV, Some(asserted.env));
@@ -520,16 +514,16 @@ fn apply_assertions(out: &mut Map<String, Value>, asserted: &Asserted<'_>) -> bo
 }
 
 /// Claim one asserted slot. `Some` stamps the value, `None` empties the
-/// slot. Returns whether a DIFFERENT payload value was displaced.
+/// slot. Returns whether a different payload value was displaced.
 ///
-/// A JSON `null` counts as ABSENCE, everywhere the collision is judged:
+/// A JSON `null` counts as absence everywhere the collision is judged:
 /// `{"host": null}` asserts nothing, so it displaces nothing and earns no
-/// `field.producer_asserted`. It is still REMOVED — an optional envelope
-/// field is omitted, never written as JSON null (`DuckDB` infers JSON for
-/// an all-null column, ADR-0009) — and the whole payload stays in `_raw`
-/// either way. The alternative would put a repair code on every sender
-/// whose serializer emits explicit nulls for unset fields, which is most
-/// of them.
+/// `field.producer_asserted`. It is still removed, because an optional
+/// envelope field is omitted rather than written as JSON null (`DuckDB`
+/// infers JSON for an all-null column, ADR-0009), and the whole payload
+/// stays in `_raw` either way. The alternative would put a repair code on
+/// every sender whose serializer emits explicit nulls for unset fields,
+/// which is most of them.
 fn claim_slot(out: &mut Map<String, Value>, key: &str, value: Option<&str>) -> bool {
     match value {
         Some(value) => {
@@ -545,17 +539,18 @@ fn claim_slot(out: &mut Map<String, Value>, key: &str, value: Option<&str>) -> b
     }
 }
 
-/// Stringify top-level object/array values to their JSON text (ADR-0009
-/// slice 2): with nothing left to flatten, a `read_json` "Duplicate name"
-/// collision is structurally impossible, so compaction never has to choose
-/// between draining a batch and keeping its columns.
+/// Stringify top-level object/array values to their JSON text (ADR-0009):
+/// with nothing left to flatten, a `read_json` "Duplicate name" collision
+/// is structurally impossible, so compaction never has to choose between
+/// draining a batch and keeping its columns.
 ///
-/// Runs AFTER the `_raw` capture (the nesting stays findable there) and
-/// AFTER the reserved-key strip (a forged object `_raw` must strip as
-/// meta, not be laundered into a string). This is a canonicalization like
-/// RFC 3339 time reformatting, NOT a repair — a code firing on every k8s
-/// event would destroy `_repairs`'s NULL-dominance. Reach nested values
-/// with `json_extract_string(k8s, '$.pod')`.
+/// Runs after the `_raw` capture (the nesting stays findable there) and
+/// after the reserved-prefix strip (a forged object `_raw` must strip like
+/// any other reserved name rather than be laundered into a string). This
+/// is a canonicalization like RFC 3339 time reformatting, not a repair: a
+/// code firing on every k8s event would fill `_repairs` on most of the
+/// corpus, and its value is that it is almost always null. Reach nested
+/// values with `json_extract_string(k8s, '$.pod')`.
 fn stringify_nested_values(out: &mut Map<String, Value>) {
     for value in out.values_mut() {
         if value.is_object() || value.is_array() {
@@ -576,23 +571,22 @@ struct PrefixStrip {
     collided: bool,
 }
 
-/// Whether this profile lets the PAYLOAD propose `_raw`.
+/// Whether this profile lets the payload propose `_raw`.
 ///
 /// `_raw` is the re-extraction lifeline, and what makes it one differs by
 /// door. A remote sender (HTTP) or a transport frame (syslog) has an
-/// original form trawl never saw — the collector's pre-parse line, the
-/// wire datagram — so a string `_raw` it supplies IS the most original
-/// form available and is honoured verbatim.
+/// original form trawl never saw, the collector's pre-parse line or the
+/// wire datagram, so a string `_raw` it supplies is the most original form
+/// available and is honoured verbatim.
 ///
-/// Trawld's own telemetry has no such thing: the payload IS the original,
-/// and a tracing field literally named `_raw` is ordinary application
-/// vocabulary that would otherwise SHADOW the lifeline — the pre-repair
-/// serialization is what carries the values assertions and collisions
-/// displace, so letting a field claim the slot would make "a displaced
-/// value stays findable in `_raw`" false on exactly the door whose
-/// identity slots are asserted hardest. Non-proposable therefore means
-/// the standard reserved-prefix strip applies: the payload key lands on
-/// bare `raw`, value intact, and the door writes the serialization.
+/// Trawld's own telemetry has no such thing: the payload is the original,
+/// and a tracing field named `_raw` is ordinary application vocabulary
+/// that would shadow the lifeline. The pre-repair serialization carries
+/// the values assertions and collisions displace, so letting a field claim
+/// the slot would make "a displaced value stays findable in `_raw`" false
+/// on exactly the door that asserts identity hardest. Non-proposable
+/// means the standard reserved-prefix strip applies: the payload key lands
+/// on bare `raw`, value intact, and the door writes the serialization.
 const fn raw_is_proposable(kind: producer::ProducerKind) -> bool {
     match kind {
         producer::ProducerKind::Http | producer::ProducerKind::Syslog => true,
@@ -600,11 +594,11 @@ const fn raw_is_proposable(kind: producer::ProducerKind) -> bool {
     }
 }
 
-/// Whether a `_`-prefixed key is one the SENDER may propose.
+/// Whether a `_`-prefixed key is one the sender may propose.
 ///
 /// At most two slots (ADR-0013 §3): `_time`, always — it is the event
 /// time proposal, canonicalized downstream — and `_raw`, when the value
-/// is a string AND this door admits a proposal at all
+/// is a string and this door admits a proposal at all
 /// ([`raw_is_proposable`]). Everything else in the namespace is trawl's:
 /// server-stamped (`_ingested`, `_repairs`), derivation-only
 /// (`_severity`), internal (`_trawl_wal_file`), or a slot that does not
@@ -615,19 +609,17 @@ fn is_proposable(key: &str, value: &Value, raw_proposable: bool) -> bool {
 }
 
 /// Seal the `_` namespace at the ingest door (ADR-0013 §5): a
-/// non-proposable `_x` has its leading underscore RUN stripped and its
+/// non-proposable `_x` has its leading underscore run stripped and its
 /// value stored under the bare remainder.
 ///
-/// ONE rule replaces four hand-written ones — the reserved-client-fields
-/// list, the non-string-`_raw` special case, the silent `_trawl_wal_file`
-/// removal, and the forged-`_severity` question — and it answers the
-/// journald/prometheus collision (`_HOSTNAME` → `hostname`,
-/// `_SYSTEMD_UNIT` → `systemd_unit`, `__name__` → `name__`) while keeping
-/// #60's core promise: every accepted field stays structurally queryable.
+/// One rule covers every shape, including the journald/prometheus names
+/// (`_HOSTNAME` → `hostname`, `_SYSTEMD_UNIT` → `systemd_unit`,
+/// `__name__` → `name__`), and it keeps the promise that every accepted
+/// field stays structurally queryable.
 ///
 /// Three sub-cases, all deterministic:
 ///
-/// - the bare remainder is EMPTY (`_`, `___`): there is no name to store
+/// - the bare remainder is empty (`_`, `___`): there is no name to store
 ///   under, so the field is dropped — its value is still in `_raw`;
 /// - the bare name already exists in this event: the prefixed loser is
 ///   dropped (`field.reserved_prefix_collision`), the same tiebreak the
@@ -675,20 +667,20 @@ struct FoldedNames {
 /// ASCII-lowercase every field name, dropping the losers of any resulting
 /// collision.
 ///
-/// `DuckDB` identifiers are ASCII case-INSENSITIVE while JSON keys are not,
-/// so `Dur` and `dur` — or `_Time` and `_time` — name ONE column
-/// downstream, while every layer that keys on the exact string (the
-/// postgres field catalog, the envelope's own alias/reserved handling, the
-/// hot snapshot's key set) would treat them as two. Folding at the door
-/// means exactly one code path ever sees one spelling: a client `_Time`
-/// becomes the `_time` wire input, `_Ingested` strips as server-owned meta,
-/// `Service` validates as `service`, and a custom `Dur` pins and stores as
-/// `dur`. Per-character ASCII lowercase is precisely `DuckDB`'s identifier
+/// `DuckDB` identifiers are ASCII case-insensitive while JSON keys are not,
+/// so `Dur` and `dur`, or `_Time` and `_time`, name one column downstream,
+/// while every layer that keys on the exact string (the postgres field
+/// catalog, the envelope's own reserved-name handling, the hot snapshot's
+/// key set) would treat them as two. Folding at the door means exactly one
+/// code path ever sees one spelling: a client `_Time` becomes the `_time`
+/// wire input, `_Ingested` strips to bare `ingested`, `Service` validates
+/// as `service`, and a custom `Dur` pins and stores as `dur`.
+/// Per-character ASCII lowercase is precisely `DuckDB`'s identifier
 /// equivalence: `CAFÉ` folds to `cafÉ` (its class's canonical form) while
-/// `café` — a DIFFERENT `DuckDB` identifier — is untouched (probed in
+/// the distinct identifier `café` is untouched (probed in
 /// `trawl-engine/tests/duckdb_probe.rs`).
 ///
-/// In-event collisions after folding keep ONE value, deterministically: the
+/// In-event collisions after folding keep one value, deterministically: the
 /// exact (already-lowercase) spelling wins when the event carries it;
 /// otherwise the ASCII-lexicographically first variant does
 /// (`serde_json::Map` iterates sorted, so "first in map order" is exactly
@@ -725,11 +717,11 @@ fn fold_field_names(obj: &Map<String, Value>) -> FoldedNames {
     }
 }
 
-/// Drop every field whose NAME cannot be a field-catalog key, returning
+/// Drop every field whose name cannot be a field-catalog key, returning
 /// whether any were dropped (the `field.name_too_long` repair).
 ///
 /// This is the only seam that sees a client-chosen key before it becomes a
-/// column. Compaction pins every dynamic column in postgres BEFORE writing
+/// column. Compaction pins every dynamic column in postgres before writing
 /// the parquet that carries it, and an over-long name overflows the btree
 /// key behind `field_types.field`: the insert errors, the batch is retained
 /// for retry, and the same WAL re-fails on every tick — permanently, for
@@ -751,7 +743,7 @@ fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
     !unstorable.is_empty()
 }
 
-/// Decide what to do about `host`, per door (ADR-0013 slice 2, ruling 3).
+/// Decide what to do about `host`, per door (ADR-0013).
 ///
 /// Returns whether the event arrived without one and, if so, the peer
 /// address to fill it from.
@@ -759,9 +751,9 @@ fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
 /// Only the HTTP door has a peer to fill from or to refuse behind: an
 /// HTTP sender can be rejected and resend, so trawl holds out for an
 /// honest answer rather than stamping a relay's address as the origin. A
-/// profile producer cannot reject to anyone, so its absent host is kept
-/// ABSENT and confessed as `host.omitted` by the caller —
-/// absent-but-honest beats both the peer-fill lie and dropping the event.
+/// profile producer cannot reject to anyone, so its absent host stays
+/// absent and the caller confesses `host.omitted`: absent but honest beats
+/// both the peer-fill lie and dropping the event.
 fn decide_host<'a>(
     out: &Map<String, Value>,
     producer: &Producer<'a>,
@@ -788,19 +780,19 @@ fn decide_host<'a>(
     Ok((host_missing, peer_fill))
 }
 
-/// Derive `_time` from the first PRESENT source in this profile's
+/// Derive `_time` from the first present source in this profile's
 /// `time_from` list, returning the canonical RFC 3339 UTC-microsecond
 /// text and the repair it earned, if any (ADR-0013 §2, ADR-0008 grammar).
 ///
-/// Derivation observes, it never consumes. Only `_time` itself is removed
-/// — it is the proposal slot, and the canonical value replaces it;
+/// Derivation observes, it never consumes. Only `_time` itself is removed,
+/// being the proposal slot the canonical value replaces;
 /// `timestamp`/`@timestamp`, and the syslog profile's own
 /// `syslog_timestamp`, stay as ordinary columns.
 ///
-/// First PRESENT, not first PARSEABLE: an unparseable value claims the
+/// First present, not first parseable: an unparseable value claims the
 /// derivation and falls to arrival time rather than reaching past itself
 /// to a lower-precedence source, so what `_time` holds is always
-/// explicable from ONE input.
+/// explicable from one input.
 fn derive_time(
     out: &mut Map<String, Value>,
     ctx: &EnvelopeContext<'_>,
@@ -833,43 +825,42 @@ fn derive_time(
 /// Canonicalize one parsed event object into the declared envelope.
 ///
 /// Field order of operations is load-bearing:
-/// 0. Field-name ASCII case-fold ([`fold_field_names`]) — BEFORE anything
-///    that keys on a name (service validation, reserved-key strip, wire
-///    aliases, stringification), so one code path sees one spelling.
-///    Recorded as `field.name_case_folded` / `field.name_case_collision`
-///    only when it changed something.
-/// 1. `_raw` capture — before reserved-key stripping and every repair, so
-///    the server's own fills never appear inside "what arrived" (the
-///    serialization fallback uses the PRE-fold object, so dropped and
-///    folded spellings stay findable). Whether the payload may PROPOSE
-///    `_raw` is per-profile ([`raw_is_proposable`]): trawld's own door
-///    never lets a field claim the lifeline.
+/// 0. Field-name ASCII case-fold ([`fold_field_names`]), before anything
+///    that keys on a name (service validation, reserved-prefix strip,
+///    stringification), so one code path sees one spelling. Recorded as
+///    `field.name_case_folded` / `field.name_case_collision` only when it
+///    changed something.
+/// 1. `_raw` capture, before the strip and every repair, so the server's
+///    own fills never appear inside "what arrived" (the serialization
+///    fallback uses the pre-fold object, so dropped and folded spellings
+///    stay findable). Whether the payload may propose `_raw` is
+///    per-profile ([`raw_is_proposable`]): trawld's own door never lets a
+///    field claim the lifeline.
 /// 2. Reserved-prefix strip ([`strip_reserved_prefixes`],
 ///    `field.reserved_prefix` / `field.reserved_prefix_collision`).
 ///    2.5. Producer assertions ([`apply_assertions`],
-///    `field.producer_asserted`) — AFTER the strip, so a stripped
+///    `field.producer_asserted`), after the strip, so a stripped
 ///    `_service` has already landed on its bare slot and the profile
-///    overrides that too, and BEFORE the validators, so an asserted
+///    overrides that too, and before the validators, so an asserted
 ///    `service`/`env` faces exactly the checks an HTTP sender's does.
 ///    The HTTP door asserts nothing and skips this.
-/// 3. `service` validation (reject path), `env` and `host` resolution —
-///    AFTER the strip, because a stripped `_service`/`_env`/`_host` lands
+/// 3. `service` validation (reject path), `env` and `host` resolution,
+///    after the strip, because a stripped `_service`/`_env`/`_host` lands
 ///    on exactly the bare slot these read, the same way a stripped
 ///    `_severity` lands where derivation reads it (ADR-0013 §5). Resolving
 ///    first would let step 6 overwrite the stripped value and then confess
-///    `env.defaulted`/`host.from_peer` about a sender that DID assert one.
+///    `env.defaulted`/`host.from_peer` about a sender that did assert one.
 ///    Over-long field-name drop (`field.name_too_long`) follows.
-/// 4. `_time` derived from the first PRESENT source in THIS profile's
+/// 4. `_time` derived from the first present source in this profile's
 ///    `time_from` list, ADR-0008 grammar,
 ///    `time.from_ingest`/`time.out_of_range`. Only `_time` is consumed.
 /// 5. `_ingested` stamp.
 /// 6. `env` default-or-reject, `host` peer-fill / relay-reject / omit.
-/// 7. `_severity` derived from the first MAPPABLE source in THIS profile's
-///    `severity_from` list, READ-ONLY: every source stays where it is, and
+/// 7. `_severity` derived from the first mappable source in this profile's
+///    `severity_from` list, read-only: every source stays where it is, and
 ///    no mappable one means no key and no repair.
-///    7.5. `_producer` stamp — after the strip, so an incoming
-///    `_producer` has already become a bare `producer` and the column is
-///    unforgeable.
+///    7.5. `_producer` stamp, after the strip, so an incoming `_producer`
+///    has already become a bare `producer` and the column is unforgeable.
 /// 8. `_repairs` assembly (omitted when clean).
 pub fn canonicalize(
     obj: &Map<String, Value>,
@@ -879,14 +870,12 @@ pub fn canonicalize(
     let fold = fold_field_names(obj);
     let folded_obj = fold.obj;
 
-    // 1. Capture `_raw` before anything is stripped or repaired: on a door
-    // that admits the proposal ([`raw_is_proposable`]) a client-supplied
-    // string `_raw` (a collector preserving its pre-parse line, under any
-    // spelling of the name) is kept verbatim; otherwise the canonical
-    // pre-repair serialization of the parsed object — the PRE-fold
-    // original, so folded-away spellings stay findable — is the most
-    // original form available (wire-exact bytes do not exist — events
-    // arrive inside JSON arrays and the WAL re-serializes anyway).
+    // 1. Capture `_raw` before anything is stripped or repaired. On a door
+    // that admits the proposal a client-supplied string `_raw` is kept
+    // verbatim; otherwise the pre-repair serialization of the pre-fold
+    // object is the most original form available, since wire-exact bytes
+    // do not exist (events arrive inside JSON arrays and the WAL
+    // re-serializes anyway).
     let raw_proposable = raw_is_proposable(ctx.producer.kind());
     let raw_string = match folded_obj.get(trawl_core::schema::RAW) {
         Some(Value::String(s)) if raw_proposable => s.clone(),
@@ -906,7 +895,7 @@ pub fn canonicalize(
         }
     };
 
-    // 2.5. What the PRODUCER asserts wins over what the payload carries.
+    // 2.5. What the producer asserts wins over what the payload carries.
     // The codes the producer itself contributed lead `_repairs`: they
     // describe what happened to the event before it reached this door.
     if let Some(asserted) = ctx.producer.asserted() {
@@ -918,7 +907,7 @@ pub fn canonicalize(
         }
     }
 
-    // 3. Identity, read from the POST-strip, POST-assertion event: a
+    // 3. Identity, read from the post-strip, post-assertion event: a
     // `_host`/`_env`/`_service` has landed on its bare slot by now, so it
     // is ordinary sender-asserted data and the fills below cannot
     // overwrite it (nor claim in `_repairs` that the sender asserted
@@ -974,15 +963,14 @@ pub fn canonicalize(
         push_repair(&mut repairs, RepairCode::HostOmitted);
     }
 
-    // 7. `_severity` derivation — READ-ONLY: every source stays where it
-    // is, and an event with no mappable one simply has no `_severity`.
+    // 7. `_severity` derivation is read-only: every source stays where
+    // it is, and an event with no mappable one simply has no `_severity`.
     let severity_unmapped =
         derive_severity(&mut out, ctx.derivation.severity_from(ctx.producer.kind()));
 
-    // 7.5. Provenance becomes data (ADR-0013 slice 2, ruling 6). Stamped
-    // from the profile, never from the payload: an incoming `_producer`
-    // was stripped to a bare `producer` back at step 2, so the column
-    // cannot be forged.
+    // 7.5. Provenance becomes data (ADR-0013). Stamped from the profile,
+    // never from the payload: an incoming `_producer` was stripped to a
+    // bare `producer` back at step 2, so the column cannot be forged.
     out.insert(
         trawl_core::schema::PRODUCER.into(),
         json!(ctx.producer.kind().as_str()),
@@ -1026,17 +1014,16 @@ mod tests {
     const ARRIVAL: &str = "2026-01-01T00:00:00.000000Z";
 
     /// The default derivation policy, shared by every test that does not
-    /// configure its own. Leaked so a test can hold `&Derivation` for the
-    /// life of a borrowed context without threading an owner through
-    /// every helper.
+    /// configure its own. Held in a `OnceLock` so a test can borrow it for
+    /// the life of a context without threading an owner through every
+    /// helper.
     fn default_derivation() -> &'static Derivation {
         static DEFAULTS: std::sync::OnceLock<Derivation> = std::sync::OnceLock::new();
         DEFAULTS.get_or_init(Derivation::defaults)
     }
 
-    /// The HTTP door with the packaged derivation policy — what the whole
-    /// pre-slice-2 matrix below assumes, so the profile reshape shows up
-    /// as a change to this ONE helper and nothing else.
+    /// The HTTP door with the packaged derivation policy, which is what
+    /// every test below assumes unless it builds its own context.
     fn ctx_with(envs: &[String], relay: bool) -> EnvelopeContext<'_> {
         EnvelopeContext {
             arrival: ARRIVAL,
@@ -1077,7 +1064,7 @@ mod tests {
         c.repairs.iter().map(|r| r.as_str()).collect()
     }
 
-    // --- the declared schema, enforced (acceptance criterion 1) ---
+    // --- the declared schema, enforced ---
 
     #[test]
     fn fully_specified_event_is_clean() {
@@ -1122,13 +1109,13 @@ mod tests {
         assert!(codes(&c).contains(&"host.from_peer"));
     }
 
-    // --- nested-value stringification (ADR-0009 slice 2) ---
+    // --- nested-value stringification (ADR-0009) ---
 
     #[test]
     fn object_values_are_stringified_to_json_text() {
-        // Killing the duplicate-name class structurally: with nothing to
-        // flatten, `read_json` can never raise a "Duplicate name" collision
-        // and the explicit-columns fallback is deleted rather than fixed.
+        // With nothing left to flatten, `read_json` can never raise a
+        // "Duplicate name" collision, so compaction needs no fallback that
+        // trades a batch's custom columns for draining it.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z",
@@ -1159,9 +1146,9 @@ mod tests {
 
     #[test]
     fn stringification_is_canonicalization_not_a_repair() {
-        // NO RepairCode: this is a canonicalization like RFC 3339
-        // reformatting — a code firing on every k8s event would destroy the
-        // NULL-dominance of `_repairs`.
+        // No repair code: this is a canonicalization like RFC 3339
+        // reformatting, and a code firing on every k8s event would leave
+        // `_repairs` almost never null.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
                 "_time":"2025-12-31T23:00:00Z","k8s":{"pod":"x"}}"#,
@@ -1189,7 +1176,7 @@ mod tests {
 
     #[test]
     fn raw_preserves_the_original_nesting() {
-        // `_raw` is captured BEFORE stringification, so the original
+        // `_raw` is captured before stringification, so the original
         // structure stays findable there.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
@@ -1225,7 +1212,7 @@ mod tests {
         assert!(msg.contains("service"));
     }
 
-    // --- service type-specific rejection (acceptance criterion 2) ---
+    // --- service type-specific rejection ---
 
     #[test]
     fn service_object_rejects_with_type_reason() {
@@ -1279,7 +1266,7 @@ mod tests {
         assert_eq!(c.service, "api.v2");
     }
 
-    // --- host behind a trusted relay (acceptance criterion 3) ---
+    // --- host behind a trusted relay ---
 
     #[test]
     fn missing_host_behind_trusted_relay_rejects() {
@@ -1309,7 +1296,7 @@ mod tests {
         assert!(c.repairs.is_empty());
     }
 
-    // --- env allowlist (acceptance criterion: unknown env hard-rejects) ---
+    // --- env allowlist: an unknown env hard-rejects ---
 
     #[test]
     fn unlisted_env_rejects() {
@@ -1397,9 +1384,9 @@ mod tests {
 
     // --- `_severity` derivation: observe, never consume (ADR-0013 §2) ---
 
-    /// The #60 canonical example, verbatim: a game server whose `level`
-    /// means loot tier keeps a queryable `level` column, gets no
-    /// `_severity`, and is repaired in no way at all.
+    /// The canonical example: a game server whose `level` means loot tier
+    /// keeps a queryable `level` column, gets no `_severity`, and is
+    /// repaired in no way at all.
     #[test]
     fn a_bare_level_that_is_not_a_severity_survives_untouched() {
         let c = canon(r#"{"service":"game","level":"gold"}"#);
@@ -1412,7 +1399,7 @@ mod tests {
             c.severity_unmapped,
             "a source existed and mapped to nothing — the ops counter's input"
         );
-        // `env`/`host`/`_time` are filled, which IS confessed; nothing
+        // `env`/`host`/`_time` are filled, which is confessed; nothing
         // about the severity derivation is.
         assert!(
             !codes(&c).iter().any(|code| code.starts_with("severity")),
@@ -1422,7 +1409,7 @@ mod tests {
     }
 
     /// The other worked example: an OTel-native sender's `severity: 3`
-    /// stays verbatim AND derives `_severity = 3` — trace on the `OTel`
+    /// stays verbatim and derives `_severity = 3` — trace on the `OTel`
     /// ladder, never syslog's err. Both truths coexist.
     #[test]
     fn a_numeric_severity_is_stored_verbatim_and_derived_as_otel() {
@@ -1436,9 +1423,9 @@ mod tests {
         assert!(!c.severity_unmapped);
     }
 
-    /// The numeric dialect matrix (ADR-0013 §4 + the #60 acceptance
-    /// list): words map through the token table, numerics map strictly as
-    /// `OTel` 1-24, and everything else has no reading.
+    /// The numeric dialect matrix (ADR-0013 §4): words map through the
+    /// token table, numerics map strictly as `OTel` 1-24, and everything
+    /// else has no reading.
     #[test]
     fn severity_numeric_dialect_matrix() {
         for (input, expected) in [
@@ -1466,13 +1453,13 @@ mod tests {
                 expected.is_none(),
                 "the counter fires exactly when a source mapped to nothing: {input}"
             );
-            // Whatever the reading, the SOURCE is never touched.
+            // Whatever the reading, the source is never touched.
             assert!(c.obj.contains_key("severity"), "source kept: {input}");
         }
     }
 
     /// Source precedence is `severity` → `severity_text` → `level`, first
-    /// MAPPABLE wins — and every source stays where it is.
+    /// mappable wins, and every source stays where it is.
     #[test]
     fn severity_source_precedence_is_first_mappable() {
         let cases: &[(&str, Option<i64>)] = &[
@@ -1547,7 +1534,8 @@ mod tests {
 
     // --- the sealed `_` namespace at the ingest door (ADR-0013 §5) ---
 
-    /// One rule, every case the four hand-written ones used to cover.
+    /// One rule, every shape: journald names, a forged server slot, and
+    /// the internal provenance key alike.
     #[test]
     fn reserved_prefixes_strip_to_the_bare_remainder() {
         let c = canon(
@@ -1568,7 +1556,7 @@ mod tests {
         assert!(codes(&c).contains(&"field.reserved_prefix"));
     }
 
-    /// The strip runs BEFORE identity resolution, so a stripped
+    /// The strip runs before identity resolution, so a stripped
     /// `_host`/`_env`/`_service` is sender-asserted data the server's own
     /// fills can neither overwrite nor misreport in `_repairs`.
     #[test]
@@ -1604,7 +1592,7 @@ mod tests {
         let (_, reason) = reject(r#"{"service":"s","host":"h","_env":"nope"}"#);
         assert!(matches!(reason, RejectReason::EnvNotAllowed), "{reason:?}");
 
-        // `_service` is the same rule — it lands bare and IS the service.
+        // `_service` is the same rule: it lands bare and is the service.
         let c = canon(r#"{"_service":"other","message":"m"}"#);
         assert_eq!(c.service, "other");
         assert_eq!(c.obj["service"], "other");
@@ -1627,7 +1615,7 @@ mod tests {
         }
     }
 
-    /// The bare name already present in the SAME event wins; the
+    /// The bare name already present in the same event wins; the
     /// prefixed loser is dropped, deterministically.
     #[test]
     fn a_prefixed_name_loses_to_the_bare_one_it_would_shadow() {
@@ -1644,7 +1632,7 @@ mod tests {
         assert!(codes(&c).contains(&"field.reserved_prefix_collision"));
     }
 
-    /// `_time` and a string `_raw` are the two slots a sender MAY
+    /// `_time` and a string `_raw` are the two slots a sender may
     /// propose, so neither strips.
     #[test]
     fn the_two_proposable_slots_are_not_stripped() {
@@ -1663,8 +1651,8 @@ mod tests {
         );
     }
 
-    /// A NON-string `_raw` is not a proposal, so it takes the standard
-    /// strip and lands bare — the special case is gone.
+    /// A non-string `_raw` is not a proposal, so it takes the standard
+    /// strip and lands bare.
     #[test]
     fn a_non_string_raw_strips_like_any_other_reserved_name() {
         let c = canon(r#"{"service":"s","_raw":{"a":1},"keep":"me"}"#);
@@ -1678,7 +1666,7 @@ mod tests {
 
     // --- time derivation: observe, never consume (ADR-0013 §2) ---
 
-    /// `timestamp`/`@timestamp` are read for the derivation AND stored
+    /// `timestamp`/`@timestamp` are read for the derivation and stored
     /// verbatim as ordinary columns; only `_time` — the proposal slot —
     /// is consumed.
     #[test]
@@ -1695,7 +1683,7 @@ mod tests {
         assert_eq!(c.obj["@timestamp"], "2025-06-01T12:00:00Z");
     }
 
-    /// First PRESENT claims the derivation: an unparseable `_time` falls
+    /// First present claims the derivation: an unparseable `_time` falls
     /// to arrival time rather than reaching past itself to a
     /// lower-precedence source.
     #[test]
@@ -1706,7 +1694,7 @@ mod tests {
         assert_eq!(c.obj["timestamp"], "2025-06-01T12:00:00Z", "still stored");
     }
 
-    // --- _raw (acceptance criteria: pre-defaults capture, client honour) ---    // --- _raw (acceptance criteria: pre-defaults capture, client honour) ---
+    // --- _raw: pre-defaults capture, client honour ---
 
     #[test]
     fn raw_captured_before_host_fill() {
@@ -1819,7 +1807,7 @@ mod tests {
 
     #[test]
     fn exact_envelope_keys_cannot_be_shadowed_by_case_variants() {
-        // A case-variant of an envelope column names the SAME DuckDB
+        // A case-variant of an envelope column names the same DuckDB
         // column; when the exact spelling is present too, the exact one
         // wins and the variant's value is dropped — anything else would let
         // a sender holding `ingest` forge `_time`/`service`/`host`/etc.
@@ -1855,7 +1843,7 @@ mod tests {
 
     #[test]
     fn lone_case_variant_envelope_keys_fold_and_are_consumed_canonically() {
-        // With no exact counterpart, a case-variant IS the field: `_Time`
+        // With no exact counterpart, a case-variant is the field: `_Time`
         // becomes the `_time` wire input, `Message` becomes `message`,
         // `SEVERITY` joins the severity chain — one code path, one spelling.
         let c = canon(
@@ -1933,7 +1921,7 @@ mod tests {
     fn folding_is_ascii_only_and_lowercase_names_are_untouched() {
         // Per-character ASCII lowercase is exactly DuckDB's identifier
         // equivalence: `CAFÉ` folds to `cafÉ` (same DuckDB identifier),
-        // which stays DISTINCT from an all-lowercase `café`. Names with no
+        // which stays distinct from an all-lowercase `café`. Names with no
         // ASCII uppercase are untouched and record nothing.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
@@ -1960,7 +1948,7 @@ mod tests {
 
     #[test]
     fn folded_severity_inputs_join_the_derivation_chain() {
-        // `Severity` IS `severity` and `LEVEL` IS `level` — one spelling
+        // `Severity` is `severity` and `LEVEL` is `level`: one spelling
         // reaches the derivation, and both sources are stored verbatim.
         let c = canon(
             r#"{"service":"s","env":"prod","host":"h",
@@ -1995,7 +1983,7 @@ mod tests {
         assert!(codes(&c).contains(&"field.name_case_folded"));
     }
 
-    // --- _time grammar (the ADR-0008 corpus, moved verbatim) ---
+    // --- _time grammar (the ADR-0008 corpus) ---
 
     #[test]
     fn time_valid_values_canonicalized() {
@@ -2071,7 +2059,6 @@ mod tests {
                 codes(&c).contains(&"time.from_ingest"),
                 "malformed input {input} must be flagged"
             );
-            // The original is findable in _raw.
         }
     }
 
@@ -2135,10 +2122,10 @@ mod tests {
         assert!(repairs.contains(','));
     }
 
-    // --- producer profiles (ADR-0013 slice 2, rulings 2/3/4/6) ---
+    // --- producer profiles (ADR-0013) ---
     //
-    // The matrix above is the HTTP door and is UNCHANGED by the profile
-    // reshape — only `ctx_with` moved. These cover what the profiles add.
+    // The matrix above covers the HTTP door; these cover what a profile
+    // door adds on top of it.
 
     /// A profile context: asserted identity plus the packaged derivation.
     fn profile_ctx<'a>(
@@ -2181,9 +2168,8 @@ mod tests {
 
     #[test]
     fn every_door_stamps_its_own_producer() {
-        // Provenance becomes data (ruling 6). One spelling, and it is the
-        // one `ProducerKind` publishes — a query and a metric label can
-        // never disagree about what to call a door.
+        // One spelling, the one `ProducerKind` publishes, so a query and
+        // a metric label can never disagree about what to call a door.
         let http = canon(r#"{"service":"s","env":"prod","host":"h"}"#);
         assert_eq!(http.obj["_producer"], "http");
 
@@ -2216,7 +2202,7 @@ mod tests {
         assert!(codes(&c).contains(&"field.reserved_prefix"));
 
         // Same rule on a profile door, and the assertion order holds:
-        // the strip runs BEFORE the stamp, so the two never race.
+        // the strip runs before the stamp, so the two never race.
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(r#"{"_PRODUCER":"http","msg":"x"}"#, Producer::Syslog(a));
         assert_eq!(c.obj["_producer"], "syslog");
@@ -2225,9 +2211,9 @@ mod tests {
 
     #[test]
     fn a_profile_assertion_beats_a_colliding_payload_key() {
-        // Ruling 2/3: telemetry's own `service`/`host` fields are ordinary
-        // sender vocabulary — no `trawld_` prefix — and identity is
-        // protected by PRECEDENCE. The displaced values stay in `_raw`.
+        // Telemetry's own `service`/`host` fields are ordinary sender
+        // vocabulary, with no `trawld_` prefix: identity is protected by
+        // precedence. The displaced values stay in `_raw`.
         let a = asserted("prod", "trawld", Some("box"), None, &[]);
         let c = canon_profile(
             r#"{"service":"nginx","host":"web01","env":"lab","message":"boom"}"#,
@@ -2238,7 +2224,7 @@ mod tests {
         assert_eq!(c.obj["host"], "box");
         assert_eq!(c.env, "prod");
         assert_eq!(c.obj["env"], "prod");
-        // `message: None` is NO assertion — the payload IS the message.
+        // `message: None` asserts nothing: the payload is the message.
         assert_eq!(c.obj["message"], "boom");
         assert!(codes(&c).contains(&"field.producer_asserted"));
         let raw = c.obj["_raw"].as_str().unwrap();
@@ -2252,8 +2238,8 @@ mod tests {
 
     #[test]
     fn an_identical_payload_value_is_not_a_collision() {
-        // A code on every well-formed frame would destroy `_repairs`'s
-        // NULL-dominance, and nothing was displaced: the sender agreed.
+        // A code on every well-formed frame would leave `_repairs` almost
+        // never null, and nothing was displaced: the sender agreed.
         let a = asserted("prod", "unifi", Some("gw"), Some("link down"), &[]);
         let c = canon_profile(
             r#"{"service":"unifi","host":"gw","env":"prod","message":"link down",
@@ -2266,12 +2252,11 @@ mod tests {
 
     #[test]
     fn trawld_never_lets_a_payload_field_claim_the_raw_lifeline() {
-        // `_raw` proposability is per-profile. HTTP and syslog have an
-        // original form trawl never saw, so a string `_raw` they supply
-        // IS it. Trawld's payload IS the original, so a tracing field
-        // named `_raw` is ordinary vocabulary — and letting it claim the
-        // slot would make "a displaced value stays findable in `_raw`"
-        // false on exactly the door that asserts identity hardest.
+        // `_raw` proposability is per-profile: HTTP and syslog have an
+        // original form trawl never saw, while trawld's payload is that
+        // original. Letting a tracing field claim the slot would make "a
+        // displaced value stays findable in `_raw`" false on the door that
+        // asserts identity hardest.
         let a = asserted("prod", "trawld", Some("box"), None, &[]);
         let c = canon_profile(
             r#"{"_raw":"a tracing field, not a wire line","service":"nginx","message":"boom"}"#,
@@ -2291,8 +2276,8 @@ mod tests {
             assert!(codes(&c).contains(&code), "missing {code}: {:?}", codes(&c));
         }
 
-        // The other two doors keep today's rule: a string `_raw` is the
-        // sender's own pre-parse line (or the listener's frame) verbatim.
+        // On the other two doors a string `_raw` is the sender's own
+        // pre-parse line (or the listener's frame) verbatim.
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(r#"{"_raw":"<13>the frame","msg":"x"}"#, Producer::Syslog(a));
         assert_eq!(c.obj["_raw"], "<13>the frame");
@@ -2306,7 +2291,7 @@ mod tests {
         // An explicit null is what most serializers emit for an unset
         // field. Reading it as a competing claim would put
         // `field.producer_asserted` on a huge share of well-formed
-        // events, so null counts as ABSENCE in the collision judgement —
+        // events, so null counts as absence in the collision judgement,
         // and is still removed, because an optional envelope field is
         // omitted, never written as JSON null (ADR-0009).
         let a = asserted("prod", "unifi", None, None, &[]);
@@ -2320,7 +2305,7 @@ mod tests {
         );
         assert_eq!(codes(&c), vec!["host.omitted"]);
 
-        // Same rule on a slot the profile DOES assert.
+        // Same rule on a slot the profile does assert.
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(
             r#"{"host":null,"service":null,"msg":"x","_time":"2025-12-31T23:00:00Z"}"#,
@@ -2337,9 +2322,8 @@ mod tests {
 
     #[test]
     fn a_profile_with_no_honest_host_keeps_the_event_and_omits_it() {
-        // Ruling 4: absent-but-honest beats both the peer-fill lie and
-        // dropping the event — a hostname-less frame behind a trusted
-        // relay still lands.
+        // Absent but honest beats both the peer-fill lie and dropping the
+        // event, so a hostname-less frame behind a trusted relay lands.
         let a = asserted("prod", "unifi", None, None, &[]);
         let c = canon_profile(
             r#"{"msg":"x","_time":"2025-12-31T23:00:00Z"}"#,
@@ -2367,7 +2351,7 @@ mod tests {
     #[test]
     fn producer_contributed_codes_lead_the_repairs_list() {
         // Producers contribute codes; only the door assembles `_repairs`.
-        // The producer's own codes describe what happened BEFORE the door,
+        // The producer's own codes describe what happened before the door,
         // so they come first.
         let a = asserted(
             "prod",
@@ -2386,9 +2370,9 @@ mod tests {
 
     #[test]
     fn a_profile_never_defaults_its_env() {
-        // Ruling 2: env comes from boot-validated config, so
-        // `env.defaulted` is structurally unreachable on a profile door —
-        // even when the payload carries no env at all.
+        // Env comes from boot-validated config, so `env.defaulted` is
+        // structurally unreachable on a profile door, even when the payload
+        // carries no env at all.
         let a = asserted("lab", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(
             r#"{"msg":"x","_time":"2025-12-31T23:00:00Z"}"#,
@@ -2400,8 +2384,8 @@ mod tests {
 
     #[test]
     fn a_profile_faces_every_universal_gate() {
-        // AC2: no profile bypasses the fold, the strip, the name-length
-        // drop, the nested stringify or the `_raw` cap.
+        // No profile bypasses the fold, the strip, the name-length drop,
+        // the nested stringify or the `_raw` cap.
         let long = "k".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1);
         let payload = format!(
             r#"{{"_HOSTNAME":"box","Dur":12,"nest":{{"a":1}},"{long}":"x",
@@ -2445,13 +2429,13 @@ mod tests {
         assert_eq!(reason, RejectReason::InvalidChars);
     }
 
-    // --- per-profile derivation (ADR-0013 slice 2, rulings 1/5) ---
+    // --- per-profile derivation (ADR-0013) ---
 
     #[test]
     fn the_syslog_profile_derives_severity_from_its_own_artifact() {
-        // Ruling 1: the listener writes no `_severity`. It publishes the
-        // raw 0-7 numeral and the profile's FIXED source inverts it —
-        // syslog 3 (err) is OTel 17, not OTel 3 (trace2).
+        // The listener writes no `_severity`. It publishes the raw 0-7
+        // numeral and the profile's fixed source inverts it: syslog 3 (err)
+        // is OTel 17, not OTel 3 (trace3).
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
         let c = canon_profile(r#"{"syslog_severity":3}"#, Producer::Syslog(a));
         assert_eq!(c.obj["_severity"], 17);
@@ -2479,7 +2463,7 @@ mod tests {
             "derivation observes; the artifact stays"
         );
 
-        // An OMITTED artifact (no frame timestamp, or an unparseable one)
+        // An omitted artifact (no frame timestamp, or an unparseable one)
         // falls through the configured chain honestly — no listener-side
         // `now()` substitution can hide behind it.
         let a = asserted("prod", "unifi", Some("gw"), None, &[]);
@@ -2490,8 +2474,8 @@ mod tests {
 
     #[test]
     fn a_syslog_over_http_forwarder_inverts_through_the_configured_dialect() {
-        // AC5: the native listener and a collector forwarding syslog over
-        // HTTP reach the SAME mechanism. Configure the artifact as a
+        // The native listener and a collector forwarding syslog over HTTP
+        // reach the same mechanism: configure the artifact as a
         // syslog-dialect source and the HTTP door inverts it too.
         let derivation = Derivation::resolve(&trawl_config::IngestConfig {
             severity_from: vec![

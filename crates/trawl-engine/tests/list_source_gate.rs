@@ -5,16 +5,15 @@
 //! List-source resolution and the no-silent-cold-drop gate, across all four
 //! read lanes (ADR-0008).
 //!
-//! `read_parquet` rejects a whole list source when a SINGLE element matches
-//! nothing, and the server emits one glob per hour in the query's range — so
+//! `read_parquet` rejects a whole list source when a single element matches
+//! nothing, and the server emits one glob per hour in the query's range, so
 //! the everyday `service=X last=Nh` shape routinely carries elements pointing
 //! at hour directories another service owns. Every lane must answer the same
 //! way: resolve the source before the read, and never turn a read that could
 //! not reach existing files into an empty success.
 //!
-//! The three shapes below run against all four entry points, because before
-//! this each lane had its own opinion: two carried a post-failure prune retry
-//! and a presence gate, the other two carried neither.
+//! The three shapes below run against all four entry points, because a
+//! per-lane opinion is exactly what makes a query and its export disagree.
 //!
 //! # The one shape that is not end-to-end here
 //!
@@ -196,9 +195,9 @@ fn run(lane: Lane, corpus: &Corpus, source: &str, hot: &Path) -> Result<usize, E
 #[test]
 fn partial_list_miss_keeps_the_cold_rows_on_every_lane() {
     // Hour 10 holds the queried service's file; hour 11 exists because
-    // another service compacted into it. DuckDB rejects the whole list, and
-    // before this the cold row was silently dropped on the query lanes and
-    // 500'd on the export ones.
+    // another service compacted into it. DuckDB rejects the whole list, so
+    // without resolution the cold row is silently dropped on the query lanes
+    // and 500s on the export ones.
     for lane in LANES {
         let corpus = Corpus::new();
         corpus.hour("10", Some("svc.parquet"));
@@ -221,7 +220,7 @@ fn partial_list_miss_keeps_the_cold_rows_on_every_lane() {
 fn an_all_missing_list_is_an_empty_window_not_a_failure() {
     // No parquet anywhere: the hour directories exist (another env's
     // services, a retention sweep that just ran) but hold nothing. This is
-    // the ONE shape where an empty answer is the truth.
+    // the one shape where an empty answer is the truth.
     for lane in LANES {
         let corpus = Corpus::new();
         corpus.hour("10", None);

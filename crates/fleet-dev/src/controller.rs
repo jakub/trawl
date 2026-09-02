@@ -173,8 +173,9 @@ async fn prepare_launch(
         }
     });
     let docker_owned = AtomicBool::new(false);
-    // An aborted child surfaces as `Error::CommandLimit`, so the ordinary error
-    // path below performs the owned-Docker cleanup.
+    // An aborted child surfaces as `Error::CommandLimit`, so an interrupt needs
+    // no cleanup of its own. Whichever error path catches it already stops a
+    // Docker database this run started.
     let result = prepare_launch_inner(runner, profile, selection, state_root, &docker_owned).await;
     watcher.abort();
     result

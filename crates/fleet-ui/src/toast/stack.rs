@@ -4,7 +4,7 @@
 
 //! Pure toast-stack state machine. No `leptos`, no `web_sys`, no I/O —
 //! builds on every target so the "a success toast and an error toast
-//! are now live" outcome (AC5) is enforced by `cargo nextest run
+//! are now live" outcome is enforced by `cargo nextest run
 //! --workspace`, not just eyeballed in a browser.
 //!
 //! [`runtime`](super::runtime) wraps a [`ToastStack`] in a reactive
@@ -104,9 +104,9 @@ impl ToastStack {
 mod tests {
     use super::*;
 
-    /// AC5 in miniature, no browser required: pushing a success then an
-    /// error leaves exactly those two toasts live, in order, with the
-    /// kinds the app asked for.
+    /// No browser required: pushing a success then an error leaves
+    /// exactly those two toasts live, in order, with the kinds the app
+    /// asked for.
     #[test]
     fn success_then_error_are_both_live() {
         let mut stack = ToastStack::new();

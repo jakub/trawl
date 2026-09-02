@@ -2,14 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Projection-name collisions are ONE check, stated the SAME way in both
+//! Projection-name collisions are one check, stated the same way in both
 //! lanes (ADR-0013 ruling 8).
 //!
 //! A projecting stage's output schema has to be deterministic: two
 //! columns of one name is a query whose answer depends on which producer
 //! the engine happens to bind. The SQL lane refuses it in
-//! `emitter::validate_pipeline`; the stream lane — which never runs that
-//! — refuses it in `stream::compile_stream_plan`. Both read the one
+//! `emitter::validate_pipeline`; the stream lane, which never runs that,
+//! refuses it in `stream::compile_stream_plan`. Both read the one
 //! function, so the sentence a user sees cannot drift between batch and
 //! live.
 
@@ -69,7 +69,7 @@ const COLLISIONS: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
-/// Shapes that must keep working — the check is about DUPLICATE output
+/// Shapes that must keep working: the check is about duplicate output
 /// names, not about names that merely look alike.
 const CLEAN: &[&str] = &[
     "* | stats count() by host",
@@ -156,10 +156,10 @@ fn eventstats_without_an_alias_is_refused_in_both_lanes() {
     assert_eq!(stream_err, message);
 }
 
-/// The collision check runs BEFORE the stream lane's own
+/// The collision check runs before the stream lane's own
 /// unsupported-stage refusals, so a `pivot`/`eventstats` collision gets
 /// the shared semantic answer rather than "not supported in streaming
-/// mode" — the sentence is about the query, not about the transport.
+/// mode": the sentence is about the query, not about the transport.
 #[test]
 fn the_shared_check_precedes_the_stream_lanes_own_refusals() {
     for dsl in [
@@ -190,8 +190,8 @@ fn clean_projections_stay_clean_in_both_lanes() {
             );
         }
         assert!(validate_pipeline(&pipeline).is_ok(), "{dsl}: SQL lane");
-        // The stream lane may still refuse the STAGE (pivot, eventstats,
-        // sort) — but never for a projection collision.
+        // The stream lane may still refuse the stage (pivot, eventstats,
+        // sort), but never for a projection collision.
         if let Err(err) = compile_stream_plan(&pipeline, &PinScope::unpinned()) {
             let text = err.to_string();
             assert!(

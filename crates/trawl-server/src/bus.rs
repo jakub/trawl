@@ -7,10 +7,6 @@
 //! The bus sits between the ingest handler and downstream consumers
 //! (hot buffer, live streaming). It uses `tokio::sync::broadcast` for
 //! lock-free fanout to multiple subscribers.
-//!
-//! The trait boundary (`EventBus` / `EventSubscriber`) exists to keep the
-//! door open for future multi-node backends (NATS, Redis Streams) without
-//! requiring any consumer changes.
 
 use std::sync::Arc;
 
@@ -27,7 +23,6 @@ use std::sync::Arc;
 pub struct IngestBatch {
     /// WAL filename stem — unique identifier for this batch.
     pub batch_id: Arc<str>,
-    /// Service name for these events.
     pub service: Arc<str>,
     /// Parsed event objects ready for in-memory filtering.
     pub events: Vec<serde_json::Map<String, serde_json::Value>>,
@@ -130,7 +125,6 @@ impl EventSubscriber for LocalSubscriber {
     }
 }
 
-/// Default event bus channel capacity.
 pub const DEFAULT_EVENT_BUS_CAPACITY: usize = 4096;
 
 #[cfg(test)]

@@ -222,12 +222,10 @@ impl Config {
     /// 1. `direct_token` (from `--token` flag / `TRAWL_TOKEN` env)
     /// 2. Inline token from config (post-profile overlay)
     pub fn load_token(&self, direct_token: Option<&str>) -> Result<String, ConfigError> {
-        // Direct token takes precedence (--token flag or TRAWL_TOKEN env).
         if let Some(token) = direct_token {
             return Ok(token.trim().to_owned());
         }
 
-        // Fall back to inline config token.
         if let Some(ref token) = self.server.token {
             return Ok(token.trim().to_owned());
         }

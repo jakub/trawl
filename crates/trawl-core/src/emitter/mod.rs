@@ -45,15 +45,15 @@ pub struct EmittedQuery {
     /// The executor runs the SQL prefix, then applies these stages
     /// to the result set using the streaming engine.
     pub rust_stages: Vec<Spanned<PipeStage>>,
-    /// The pin scope in force at the kv split point (ADR-0011 slice A′):
-    /// the interpretation [`rust_stages`](Self::rust_stages) must be
-    /// evaluated under, carried so the batch tail's `where`/`let` use the
-    /// SAME pins the SQL prefix used — including every rename/let/stats
-    /// scope change before the split. Empty for pin-blind emission.
+    /// The pin scope in force at the kv split point: the interpretation
+    /// [`rust_stages`](Self::rust_stages) must be evaluated under, so the
+    /// batch tail's `where`/`let` bind the same pins the SQL prefix did,
+    /// including every rename/let/stats scope change before the split.
+    /// Empty for pin-blind emission.
     pub rust_stage_pins: crate::pin_scope::PinScope,
     /// Whether the executor should reorder result columns to put well-known
-    /// fields first. `true` when the pipeline has no explicit column selection
-    /// or aggregation — i.e. the column set comes from `SELECT *`.
+    /// fields first. `true` when no stage defined a complete output column
+    /// set (table/fields, stats, top, rare, timechart, pivot).
     pub needs_column_reorder: bool,
     /// The same query with text search's `_raw` side bound to a typed NULL
     /// instead of the column — `Some` only when a text search referenced
@@ -69,13 +69,13 @@ pub struct EmittedQuery {
     pub raw_free_sql: Option<String>,
     /// The instant this statement's `now()` reads (ADR-0017 §3).
     ///
-    /// Captured ONCE per logical query by the caller and stamped here, so
-    /// every reader of this emission shares one clock: the SQL prefix
+    /// The caller captures it once per logical query and stamps it here,
+    /// so every reader of this emission shares one clock: the SQL prefix
     /// binds it as a TIMESTAMP parameter, and the `rust_stages` tail
-    /// behind `extract kv` evaluates under the SAME anchor
+    /// behind `extract kv` evaluates under the same anchor
     /// ([`crate::context::EvalContext`]). A re-emission of the same
-    /// logical query — the executor's hot-only fallback — INHERITS this
-    /// value rather than sampling a second one.
+    /// logical query, such as the executor's hot-only fallback, inherits
+    /// this value rather than sampling a second one.
     pub anchor: crate::context::EvalContext,
 }
 
@@ -93,23 +93,23 @@ pub enum SqlValue {
     Timestamp(chrono::NaiveDateTime),
 }
 
-/// The TIMESTAMP literal text a bound [`SqlValue::Timestamp`] denotes —
-/// the ONE rendering, shared by [`fmt::Display`] and the PIVOT lane's
+/// The TIMESTAMP literal text a bound [`SqlValue::Timestamp`] denotes.
+///
+/// The one rendering, shared by [`fmt::Display`] and the PIVOT lane's
 /// parameter inlining, so the inlined form and the bound form can never
 /// name different instants.
 ///
 /// Typed (`TIMESTAMP '…'`) so the literal has a type wherever it lands,
-/// and FIXED six-digit microseconds so no value renders with a precision
+/// and fixed six-digit microseconds so no value renders at a precision
 /// `DuckDB`'s domain does not hold. Trailing zeros are kept: `DuckDB`
 /// parses `…:00.000000` and `…:00` to the same instant, and a fixed width
 /// is one rule instead of two.
 ///
-/// The leading `+` chrono puts on a year outside `0..=9999` is STRIPPED:
+/// The leading `+` chrono puts on a year outside `0..=9999` is stripped:
 /// `DuckDB`'s timestamp parser accepts a leading `-` but not a leading
-/// `+`, so `+10000-01-01` is a conversion error where the SAME instant
-/// bound as a parameter is fine — the two renderings of one anchor
-/// disagreeing at the edge of the domain. A production clock never gets
-/// there, but [`crate::context::EvalContext::at`] is public. Probed in
+/// `+`, so `+10000-01-01` is a conversion error where the same instant
+/// bound as a parameter is fine. A production clock never gets there, but
+/// [`crate::context::EvalContext::at`] is public. Probed in
 /// `trawl-engine/tests/duckdb_probe.rs`.
 fn timestamp_literal(at: chrono::NaiveDateTime) -> String {
     let rendered = at.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
@@ -179,19 +179,16 @@ impl fmt::Display for EmitError {
 impl std::error::Error for EmitError {}
 
 /// A literal the pin rule table refuses (`crate::compare::CompareError`)
-/// is an unsupported operation to every emitter caller — one conversion,
-/// so the search stage, the pipeline emitter, the live filter and the
-/// stream compiler all report the same sentence.
+/// is an unsupported operation to every emitter caller: one conversion, so
+/// the search stage, the pipeline emitter, the live filter and the stream
+/// compiler all report the same sentence.
 ///
-/// The SENTENCE is unchanged: [`EmitError::Comparison`] renders through
-/// the same `unsupported operation: {…}` arm the stringified form used to
-/// take, so no user-facing text, snapshot or wire message moves. What
-/// changed is that the cause survives as a TYPE instead of as prose. The
-/// pin-aware fuzz target (issue #114) has to decide whether an emitter
-/// refusal is a legitimate outcome for the pin map it invented — an
-/// `_severity` pin plus a literal naming no ladder point is expected, a
-/// panic never is — and that verdict must not be a substring test against
-/// an error message anyone is free to reword.
+/// The cause travels as a type rather than as prose, because the pin-aware
+/// fuzz target has to decide whether an emitter refusal is a legitimate
+/// outcome for the pin map it invented (a `SEVERITY` pin plus a literal
+/// naming no ladder point is expected, a panic never is), and that verdict
+/// must not be a substring test against an error message anyone is free to
+/// reword.
 impl From<crate::compare::CompareError> for EmitError {
     fn from(err: crate::compare::CompareError) -> Self {
         Self::Comparison(err)
@@ -228,14 +225,14 @@ impl EmitError {
 ///
 /// `source` is the parquet glob path, e.g. `"/data/**/*.parquet"`.
 ///
-/// Deliberately PIN-BLIND: comparisons stay literal-driven (ADR-0011 slice
-/// A's documented embedded-mode behavior). This is the door for embedded
-/// `--data` queries, the fuzz target and the snapshot tests; every
-/// catalog-backed caller goes through [`emit_with_pins`] or
-/// [`emit_with_hot_source`].
+/// Deliberately pin-blind: comparisons stay literal-driven, which is the
+/// same answer a catalog-backed caller gets by passing an empty pin set,
+/// as embedded `--data` does (ADR-0011). The fuzz target and the crate's
+/// own tests enter here; the execution lanes go through [`emit_with_pins`],
+/// [`emit_with_hot_source`] or [`emit_hot_only`].
 ///
 /// `anchor` is the statement's `now()` instant (ADR-0017 §3): capture it
-/// ONCE per logical query, at the head of the operation, and pass the
+/// once per logical query, at the head of the operation, and pass the
 /// same value to every emission that operation performs.
 pub fn emit(
     query: &Query,
@@ -245,20 +242,22 @@ pub fn emit(
     emit_with_raw_fallback(query, || EmitterState::new(source, anchor))
 }
 
-/// Emit SQL with the field catalog's pins typing the search-stage
-/// comparisons (ADR-0011 slice A).
+/// Emit SQL with the field catalog's pins typing the comparisons, in the
+/// search stage and in the pipeline alike (ADR-0011).
 ///
-/// `pins` is the FULL catalog snapshot (not intersected with any hot key
-/// set): a VARCHAR-pinned field compares as text under `=`/`!=`/IN,
+/// `pins` is the full catalog snapshot, not intersected with any hot key
+/// set: a VARCHAR-pinned field compares as text under `=`/`!=`/IN,
 /// numerically in [`crate::conform::DECIMAL_COMPARISON_SPACE`] for
 /// ordered numeric literals (both sides cast, so the literal never
-/// round-trips through `f64`), and typed pins glob/regex through
-/// `CAST(col AS VARCHAR)`. A typed pin's COMPARISONS emit exactly what the
-/// unpinned path emits — the column on disk already is the pinned type —
-/// and travel to the live matcher, which has to conform the wire value
-/// before it can answer the same question ([`crate::filter`]). See
-/// [`crate::compare`] for the rule table. Empty `pins` emits exactly what
-/// [`emit`] emits.
+/// round-trips through `f64`), and typed pins glob/regex against the
+/// stored value's canonical text: `CAST(col AS VARCHAR)` for `BIGINT`,
+/// `DOUBLE` and `BOOLEAN`, `strftime` for `TIMESTAMP`, the ladder's short
+/// names for `SEVERITY`. A typed pin's comparisons emit exactly what the
+/// unpinned path emits, the column on disk already being the pinned type;
+/// the pin still travels to the live matcher, which has to conform the
+/// wire value before it can answer the same question ([`crate::filter`]).
+/// See [`crate::compare`] for the rule table. Empty `pins` emits exactly
+/// what [`emit`] emits.
 pub fn emit_with_pins(
     query: &Query,
     source: &str,
@@ -275,19 +274,18 @@ pub fn emit_with_pins(
 /// Produces a `UNION ALL BY NAME` composite source so that fresh events
 /// in the hot buffer are visible alongside compacted parquet data.
 ///
-/// Two pin sets, two roles, never conflated (ADR-0011 slice A):
+/// Two pin sets, two roles, never conflated (ADR-0011):
 ///
-/// - `hot_pins` — the catalog's pins intersected with the snapshot's
-///   observed keys: each pinned field is conformed on the HOT branch only,
+/// - `hot_pins`: the catalog's pins intersected with the snapshot's
+///   observed keys. Each pinned field is conformed on the hot branch only,
 ///   through the same text-first guarded cast compaction writes with
 ///   ([`crate::conform`]), so a hot value disagreeing with the write-time
-///   pin degrades to NULL instead of throwing the union — and one that
-///   agrees reads exactly as it will once compacted. An intersected set,
-///   because the `REPLACE` list must never name a column absent from the
-///   snapshot.
-/// - `pins` — the FULL catalog snapshot typing the search-stage
-///   comparisons (see [`emit_with_pins`]). Full, because a cold-only
-///   field's comparison semantics must not depend on ingest timing.
+///   pin degrades to NULL instead of throwing the union, and one that
+///   agrees reads exactly as it will once compacted. Intersected, because
+///   the `REPLACE` list must never name a column absent from the snapshot.
+/// - `pins`: the full catalog snapshot typing the comparisons (see
+///   [`emit_with_pins`]). Full, because a cold-only field's comparison
+///   semantics must not depend on ingest timing.
 ///
 /// Empty sets (embedded mode, catalog-less buffer) leave the union plain
 /// apart from the unconditional envelope timestamp `TRY_CAST`s (ADR-0008)
@@ -308,21 +306,22 @@ pub fn emit_with_hot_source(
     })
 }
 
-/// Emit SQL reading ONLY the hot-buffer ndjson, conformed exactly as the
-/// union's hot branch is (ADR-0011 slice A).
+/// Emit SQL reading only the hot-buffer ndjson, conformed exactly as the
+/// union's hot branch is (ADR-0011).
 ///
 /// Same two pin sets, same two roles as [`emit_with_hot_source`]:
 /// `hot_pins` (intersected with the snapshot's keys) conforms the hot
 /// columns, `pins` (the full catalog snapshot) types the comparisons. This
-/// is the executor's cold-start lane — reading the raw ndjson through
+/// is the executor's cold-start lane; reading the raw ndjson through
 /// [`emit_with_pins`] instead would let `read_json`'s inference, not the
 /// catalog, decide a hot column's type, so a query's answer would change
 /// the moment the first parquet file landed.
-/// The `anchor` is the ORIGINAL emission's
-/// ([`EmittedQuery::anchor`]), never a fresh capture: this lane re-emits
-/// one logical query against a narrower source, so re-sampling the clock
-/// here would make the fallback answer a `now()` comparison differently
-/// from the union attempt it replaces.
+///
+/// The `anchor` is the original emission's ([`EmittedQuery::anchor`]),
+/// never a fresh capture: this lane re-emits one logical query against a
+/// narrower source, so re-sampling the clock here would make the fallback
+/// answer a `now()` comparison differently from the union attempt it
+/// replaces.
 pub fn emit_hot_only(
     query: &Query,
     hot_source: &str,
@@ -363,21 +362,20 @@ fn emit_with_raw_fallback(
     Ok(emitted)
 }
 
-/// Are these two bound parameter lists the SAME list, slot for slot?
+/// Are these two bound parameter lists the same list, slot for slot?
 ///
 /// Deliberately not `PartialEq` on the values. `SqlValue::Float` wraps an
 /// `f64`, so `==` asks IEEE 754, which says a NaN is equal to nothing at
 /// all, itself included. A NaN in the list is an ordinary value here: the
-/// DSL admits `nan` as a filter literal, and ADR-0011 gives it a reading
-/// (no numeric reading, so UNKNOWN rather than false) instead of rejecting
-/// it, so `hello a=nan` binds one and the check above reported a list as
-/// different from itself.
+/// DSL admits `nan` as a filter literal, and ADR-0011 gives it no numeric
+/// reading (UNKNOWN rather than false) instead of rejecting it, so
+/// `hello a=nan` binds one in both passes.
 ///
 /// Comparing `f64::to_bits` asks the question an identity check means: did
 /// the second pass push the same bytes in the same order. It also stops
 /// `0.0` and `-0.0` reading as one value, which is the right answer here
-/// too — [`crate::eval::duckdb_double_to_string`] keeps the sign, so the
-/// two are not interchangeable downstream.
+/// too, since [`crate::eval::duckdb_double_to_string`] keeps the sign and
+/// the two are not interchangeable downstream.
 ///
 /// `SqlValue`'s own `PartialEq` is left alone on purpose. It is derived,
 /// public and used widely; bending global equality to satisfy one internal
@@ -398,7 +396,6 @@ fn emit_from_state(
 ) -> Result<(EmittedQuery, bool), EmitError> {
     validate::validate_pipeline(&query.pipeline)?;
 
-    // `from saved` cannot be combined with search-stage filters.
     if query.from_saved_stage().is_some() && !query.has_empty_search() {
         return Err(EmitError::UnsupportedOperation {
             message: "'from saved' cannot be combined with search filters".to_string(),
@@ -411,10 +408,10 @@ fn emit_from_state(
     let mut rust_stage_pins = crate::pin_scope::PinScope::unpinned();
 
     for (i, stage) in query.pipeline.iter().enumerate() {
-        // Check if this stage is a kv extraction — can't be expressed as SQL.
-        // Collect it and all remaining stages into rust_stages, stamping
-        // the pin scope in force at the split so the batch tail evaluates
-        // under the same interpretation the SQL prefix used (slice A′).
+        // A kv extraction mints dynamic columns, so it cannot be expressed
+        // as SQL: it and every remaining stage become rust_stages, stamped
+        // with the pin scope in force at the split so the batch tail
+        // evaluates under the interpretation the SQL prefix used.
         if matches!(
             stage.node,
             PipeStage::Extract(crate::ast::ExtractStage {
@@ -427,24 +424,20 @@ fn emit_from_state(
             break;
         }
 
-        // A pending pivot is flushed to a CTE before ANY following
-        // stage, so that stage reads the pivot's dynamic output columns.
+        // A pending pivot is flushed to a CTE before any following stage,
+        // so that stage reads the pivot's dynamic output columns.
         //
-        // Including another PIVOT. The exception that used to sit here
-        // (`&& !matches!(stage.node, PipeStage::Pivot(_))`) dates from
-        // the commit that lifted the pivot-must-be-terminal restriction
-        // and predates any pivot-of-pivot case: `process_pivot` opens
-        // with an ORDINARY `flush_to_cte`, whose `build_select` does not
-        // render `self.pivot`, and then OVERWRITES the pending spec —
-        // so skipping the flush silently dropped the first pivot and ran
-        // the second over pre-pivot input. A pivot that is TERMINAL is
-        // still never flushed here (no stage follows it); `finalize`
-        // renders it.
+        // That includes a second pivot: `process_pivot` opens with an
+        // ordinary `flush_to_cte`, whose `build_select` does not render
+        // `self.pivot`, and then overwrites the pending spec, so skipping
+        // the flush would drop the first pivot and run the second over
+        // pre-pivot input. A terminal pivot is never flushed here (no
+        // stage follows it); `finalize` renders it.
         if state.has_pivot() {
             state.flush_pivot_to_cte()?;
         }
         pipeline::process_stage(&stage.node, &mut state)?;
-        // AFTER the stage: its own expressions resolve against the
+        // After the stage: its own expressions resolve against the
         // incoming schema; the next stage sees this one's output scope.
         state.advance_pin_scope(&stage.node);
     }
@@ -479,7 +472,7 @@ mod tests {
 
     /// The instant emitter tests emit under.
     ///
-    /// FIXED, not captured: `now()` binds the anchor as a parameter
+    /// Fixed rather than captured: `now()` binds the anchor as a parameter
     /// (ADR-0017 §3), so a snapshot of a query carrying one would
     /// otherwise change on every run.
     fn anchor() -> crate::context::EvalContext {
@@ -640,9 +633,9 @@ mod tests {
     // zero DSL aliases (ADR-0013 §6)
     // -----------------------------------------------------------------------
 
-    /// `level` is ordinary sender vocabulary now — one name, one column,
-    /// in every position that used to reject it. The severity band
-    /// vocabulary lives on `_severity`, which nothing can shadow.
+    /// `level` is ordinary sender vocabulary: one name, one column, in
+    /// every field position. The severity band vocabulary lives on
+    /// `_severity`, which nothing can shadow.
     #[test]
     fn level_is_an_ordinary_field_in_every_position() {
         for dsl in [
@@ -673,8 +666,7 @@ mod tests {
         }
     }
 
-    /// `level=gold` — the #60 canonical example — filters the sender's
-    /// own column, verbatim.
+    /// `level=gold` filters the sender's own column, verbatim.
     #[test]
     fn search_level_is_a_plain_field_filter() {
         assert_snapshot!(emit_dsl("level=gold"));
@@ -685,7 +677,7 @@ mod tests {
         assert_snapshot!(emit_dsl(r#"* | where level == "error""#));
     }
 
-    /// The pipeline may not MINT a reserved name (ADR-0013 §5): the same
+    /// The pipeline may not mint a reserved name (ADR-0013 §5): the same
     /// predicate ingest strips by.
     #[test]
     fn reserved_names_cannot_be_minted_by_the_pipeline() {
@@ -710,8 +702,8 @@ mod tests {
     // the physical `_time` column (ADR-0013: no aliases resolve onto it)
     // -----------------------------------------------------------------------
 
-    /// `timestamp` and `@timestamp` are ORDINARY sender field names —
-    /// each names the column it spells, and only `_time` is `_time`.
+    /// `timestamp` and `@timestamp` are ordinary sender field names: each
+    /// names the column it spells, and only `_time` is `_time`.
     #[test]
     fn time_alias_spellings_name_their_own_columns() {
         assert!(emit_dsl("* | sort _time").contains("\"_time\""));
@@ -1116,7 +1108,7 @@ mod tests {
     /// The overwriting wildcard folds ASCII and nothing else, exactly as
     /// `DuckDB` binds identifiers: a backtickable non-ASCII target must
     /// not exclude a differently-cased non-ASCII column the query never
-    /// named (`lower()` on both sides used to delete it silently).
+    /// named (folding both sides with `lower()` deletes it silently).
     #[test]
     fn let_wildcard_folds_ascii_only() {
         let sql = emit_dsl("* | let `Ü` = 1, `HOST` = 2");
@@ -1259,12 +1251,12 @@ mod tests {
         ));
     }
 
-    /// `pivot` inlines every `?` because `DuckDB` cannot bind a PIVOT —
-    /// and a backticked name may now contain a `?` of its own (ADR-0013
-    /// ruling 7). Only a placeholder OUTSIDE a quoted region may be
-    /// spliced: splicing into the identifier or the COLUMNS lambda string
-    /// would corrupt the name AND shift every later binding, spilling the
-    /// user's value into the statement with only `'` escaped.
+    /// `pivot` inlines every `?` because `DuckDB` cannot bind a PIVOT, and
+    /// a backticked name may contain a `?` of its own (ADR-0013 ruling 7).
+    /// Only a placeholder outside a quoted region may be spliced: splicing
+    /// into the identifier or the COLUMNS lambda string would corrupt the
+    /// name and shift every later binding, spilling the user's value into
+    /// the statement with only `'` escaped.
     #[test]
     fn pivot_inlining_never_splices_into_a_quoted_region() {
         let query = parser::parse(r#"* | let `a?b` = "v" | pivot count() on status"#)
@@ -1751,8 +1743,7 @@ mod tests {
 
     #[test]
     fn hot_source_empty_pins_is_plain_union_with_timestamp_casts() {
-        // Empty pins (embedded mode, catalog-less buffer) must emit exactly
-        // the shape the coerced path emits for zero coercions: plain cold
+        // Empty pins (embedded mode, catalog-less buffer): plain cold
         // select, hot side with only the two timestamp TRY_CASTs.
         let query = parser::parse("service=nginx").unwrap();
         let sql = emit_with_hot_source(
@@ -1784,7 +1775,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // pin-aware comparisons (ADR-0011 slice A)
+    // pin-aware comparisons (ADR-0011)
     // -----------------------------------------------------------------------
 
     fn pins(entries: &[(&str, crate::schema::CanonicalType)]) -> crate::schema::FieldTypes {
@@ -1819,10 +1810,6 @@ mod tests {
 
     use crate::schema::CanonicalType as CT;
 
-    /// A numeric literal binds BOTH the text and its numeric reading: the
-    /// stored text of a number is `read_json`'s inference rendered
-    /// (`"200.0"`), so exact text alone would be a batch miss where the
-    /// live matcher — which only sees the wire `200` — hits.
     // --- the SEVERITY pin (ADR-0013): tokens ride the rule table ---
 
     #[test]
@@ -1845,9 +1832,9 @@ mod tests {
         assert_snapshot!(emit_dsl_with_pins("_severity!=info", &SEVERITY_PIN));
     }
 
-    /// A whole severity list is ONE membership test over the ladder
-    /// points its bands cover — the subject written once, however many
-    /// bands the list names (issue #82).
+    /// A whole severity list is one membership test over the ladder points
+    /// its bands cover: the subject is written once, however many bands
+    /// the list names.
     #[test]
     fn pinned_severity_in_list_binds_the_subject_once() {
         assert_snapshot!(emit_dsl_with_pins("_severity=warn,error", &SEVERITY_PIN));
@@ -1868,8 +1855,8 @@ mod tests {
         assert_snapshot!(emit_dsl_with_pins("_severity=/^err/", &SEVERITY_PIN));
     }
 
-    /// The pipeline lane binds the same rule with the STRICT null policy:
-    /// `!=` keeps plain SQL null propagation (ADR-0011 slice A′).
+    /// The pipeline lane binds the same rule with the strict null policy:
+    /// `!=` keeps plain SQL null propagation (ADR-0011).
     #[test]
     fn pinned_severity_where_eq_band() {
         assert_snapshot!(emit_dsl_with_pins(
@@ -1907,6 +1894,10 @@ mod tests {
         ));
     }
 
+    /// A numeric literal binds both the text and its numeric reading: the
+    /// stored text of a number is `read_json`'s inference rendered
+    /// (`"200.0"`), so exact text alone would be a batch miss where the
+    /// live matcher, which only sees the wire `200`, hits.
     #[test]
     fn pinned_varchar_eq_numeric_binds_text_and_reading() {
         assert_snapshot!(emit_dsl_with_pins("status=200", &[("status", CT::Varchar)]));
@@ -1956,10 +1947,10 @@ mod tests {
         ));
     }
 
-    /// The ordered rung casts BOTH sides into the one comparison space:
-    /// binding the literal as a number would put it back on the `f64`
-    /// path that made every id above 2^53 equal to its neighbours
-    /// (ADR-0011 ruling #6).
+    /// The ordered rung casts both sides into the one comparison space:
+    /// binding the literal as a number would compare through `f64`, which
+    /// makes every id above 2^53 equal to its neighbours (ADR-0011 ruling
+    /// #6).
     #[test]
     fn pinned_varchar_ordered_numeric_compares_in_decimal_space() {
         assert_snapshot!(emit_dsl_with_pins(
@@ -2037,12 +2028,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // pin-aware pipeline comparisons (ADR-0011 slice A′)
+    // pin-aware pipeline comparisons (ADR-0011)
     // -----------------------------------------------------------------------
 
     /// `| where` over a VARCHAR pin compares ordered-numeric in the one
-    /// DECIMAL space — the Conversion error the pin-blind emission raised
-    /// becomes an answer.
+    /// DECIMAL space, where a pin-blind emission raises a Conversion
+    /// error instead.
     #[test]
     fn pinned_where_varchar_ordered_numeric_compares_in_decimal_space() {
         assert_snapshot!(emit_dsl_with_pins(
@@ -2061,9 +2052,9 @@ mod tests {
         ));
     }
 
-    /// The pipeline `!=` keeps plain SQL null propagation: NO
-    /// `OR field IS NULL` widening — a repin must not change
-    /// missing-field semantics (`NullPolicy::Strict`).
+    /// The pipeline `!=` keeps plain SQL null propagation, with no
+    /// `OR field IS NULL` widening: a repin must not change missing-field
+    /// semantics (`NullPolicy::Strict`).
     #[test]
     fn pinned_where_varchar_ne_keeps_strict_null_policy() {
         assert_snapshot!(emit_dsl_with_pins(
@@ -2255,8 +2246,8 @@ mod tests {
     }
 
     /// Minimality is a tested invariant: outside the changed cells of the
-    /// ADR-0011 slice A table, pinned emission is byte-identical to
-    /// unpinned emission — a repin changes no other query's meaning.
+    /// ADR-0011 rule table, pinned emission is byte-identical to unpinned
+    /// emission, so a repin changes no other query's meaning.
     #[test]
     fn pinned_emission_is_byte_identical_outside_the_changed_cells() {
         use crate::ast::FilterOp;
@@ -2323,10 +2314,10 @@ mod tests {
         }
     }
 
-    /// The same minimality invariant over the PIPELINE lane (slice A′):
-    /// outside the changed cells — VARCHAR pin × numeric literal for
-    /// comparisons, typed pins for patterns — a `| where` emits
-    /// byte-identical SQL under pins.
+    /// The same minimality invariant over the pipeline lane: outside the
+    /// changed cells (VARCHAR pin × numeric literal for comparisons,
+    /// typed pins for patterns) a `| where` emits byte-identical SQL
+    /// under pins.
     #[test]
     fn pinned_pipeline_emission_is_byte_identical_outside_the_changed_cells() {
         let pin_states: [Option<CT>; 6] = [
@@ -2463,16 +2454,14 @@ mod tests {
         assert_eq!(emit_dsl(r#"* | let s = sev(level, "OTel")"#), otel);
     }
 
-    /// Issue #82: a severity predicate names its subject once PER
-    /// CONTIGUOUS RANGE — which is once outright for every natural query,
-    /// because a band, a run of bands and a band-plus-adjacent-point all
-    /// merge into ONE range.
+    /// A severity predicate names its subject once per contiguous range,
+    /// which is once outright for every natural query: a band, a run of
+    /// bands and a band-plus-adjacent-point all merge into one range.
     ///
-    /// The counting rule is the whole point of the merge: the pre-#82
-    /// rendering wrote the subject once per BAND (six copies for the six
-    /// base bands), and the subject is over a kilobyte of `sev()` SQL.
+    /// Counting matters because the subject can be over a kilobyte of
+    /// `sev()` SQL, so one copy per band would multiply the statement.
     ///
-    /// That `sev()` substring is derived from the ONE builder that emits it
+    /// That `sev()` substring is derived from the builder that emits it
     /// (`conform::severity_reading_sql_bind_once` over
     /// `conform::untyped_text`), never hand-typed: a substring that drifts
     /// from the emitter would pass this test while asserting nothing.
@@ -2548,11 +2537,11 @@ mod tests {
         assert_eq!(sql.matches(sev_subject.as_str()).count(), 2, "{sql}");
     }
 
-    /// Review finding A: out-of-ladder points cannot amplify the render.
+    /// Out-of-ladder points cannot amplify the render.
     ///
     /// A `SEVERITY` subject evaluates to 1-24 or NULL, so every point
-    /// outside that range is unmatchable and they are all interchangeable
-    /// — the renderer keeps exactly ONE. Without the collapse each
+    /// outside that range is unmatchable and they are all interchangeable:
+    /// the renderer keeps exactly one. Without the collapse each
     /// non-adjacent literal would be its own run carrying its own ~1.2 KB
     /// copy of a `sev()` subject, which the 64 KB query-text cap does not
     /// bound.
@@ -2581,7 +2570,7 @@ mod tests {
             "{adjacent}"
         );
         assert_eq!(adjacent.matches(column).count(), 1, "{adjacent}");
-        // THE AMPLIFICATION GUARD: a long alternating in/out list renders
+        // The amplification guard: a long alternating in/out list renders
         // at most 13 subjects — 12 possible in-ladder runs plus the one
         // representative — however many literals it names.
         let mut list: Vec<String> = Vec::new();
@@ -2600,8 +2589,8 @@ mod tests {
             sql.matches(column).count(),
             list.len()
         );
-        // The same bound over the EXPENSIVE subject, which is the case the
-        // finding is about.
+        // The same bound over the expensive subject, where amplification
+        // would actually cost bytes: a `sev()` call, not a bare column.
         let sev_subject = crate::conform::severity_reading_sql_bind_once(
             &crate::conform::untyped_text(r#""level""#),
             crate::severity::Dialect::Otel,
@@ -2615,17 +2604,16 @@ mod tests {
         );
     }
 
-    /// Issue #82, AC3: the severity set is INLINED, so it binds nothing
-    /// between a subject's parameters and whatever follows.
+    /// The severity set is inlined, so it binds nothing between a
+    /// subject's parameters and whatever follows.
     ///
-    /// The set is a SINGLE run here on purpose (review finding B). A
-    /// multi-run set repeats the subject, so a subject carrying `?`
-    /// placeholders would emit more placeholders than parameters were
-    /// pushed — that shape is out of contract, documented at
-    /// `severity_ranges_sql`, and structurally unreachable (see
-    /// [`severity_subjects_never_push_parameters`]). Asserting positions
-    /// over a repeated subject would document a contract the renderer
-    /// does not hold.
+    /// The set is a single run here on purpose. A multi-run set repeats
+    /// the subject, so a subject carrying `?` placeholders would emit more
+    /// placeholders than parameters were pushed: that shape is out of
+    /// contract, documented at `severity_ranges_sql`, and structurally
+    /// unreachable (see [`severity_subjects_never_push_parameters`]).
+    /// Asserting positions over a repeated subject would document a
+    /// contract the renderer does not hold.
     #[test]
     fn a_severity_set_pushes_no_parameters_and_preserves_positions() {
         let mut state = EmitterState::new("/data/**/*.parquet", anchor()).expect("source");
@@ -2658,24 +2646,24 @@ mod tests {
         );
     }
 
-    /// The real regression guard behind AC3 (review finding B): NO subject
-    /// the pin scope admits can push a bound parameter, so the multi-run
-    /// repetition can never desynchronize placeholders from parameters.
+    /// No subject the pin scope admits can push a bound parameter, so the
+    /// multi-run repetition can never desynchronize placeholders from
+    /// parameters.
     ///
-    /// `PinScope::subject_pin` admits exactly two shapes — a bare pinned
-    /// field, and a pin-declaring call over a bare field whose remaining
-    /// arguments are string literals — and `sev()`'s dialect is inlined as
-    /// TEXT (`functions::literal_text_positions`) rather than bound. This
+    /// `PinScope::subject_pin` admits exactly two shapes, a bare pinned
+    /// field and a pin-declaring call over a bare field whose remaining
+    /// arguments are string literals, and `sev()`'s dialect is inlined as
+    /// text (`functions::literal_text_positions`) rather than bound. This
     /// asserts that end to end: a severity predicate emits no parameters
     /// at all, in the search stage and in both operand orders of the
-    /// pipeline, for single-run AND multi-run sets.
+    /// pipeline, for single-run and multi-run sets.
     ///
-    /// The last block ties the guard to the TABLE rather than to the one
-    /// name `sev`: every `KNOWN_FUNCTIONS` entry that declares a SEVERITY
-    /// result is admitted by `subject_pin`, so a future Severity-returning
-    /// function joins this test automatically — and if its argument shape
-    /// makes the probe DSL unemittable, the panic names the obligation
-    /// instead of silently covering nothing.
+    /// The last block ties the guard to the function table rather than to
+    /// the one name `sev`: every `KNOWN_FUNCTIONS` entry that declares a
+    /// `SEVERITY` result is admitted by `subject_pin`, so a future
+    /// severity-returning function joins this test automatically, and if
+    /// its argument shape makes the probe DSL unemittable, the panic names
+    /// the obligation instead of silently covering nothing.
     #[test]
     fn severity_subjects_never_push_parameters() {
         for dsl in [
@@ -2863,13 +2851,13 @@ mod tests {
         assert_eq!(value.to_string(), "TIMESTAMP '2026-02-03 04:05:06.789012'");
     }
 
-    /// A year outside `0..=9999` renders UNSIGNED (#106, review F5).
+    /// A year outside `0..=9999` renders unsigned.
     ///
-    /// chrono writes `+10000-01-01`, which `DuckDB`'s parser refuses
-    /// while accepting the same year unsigned and a negative year signed
-    /// — so the sign would make the inlined PIVOT literal fail for an
-    /// instant the bound parameter handles. Executed against the engine
-    /// in `trawl-engine/tests/duckdb_probe.rs`.
+    /// chrono writes `+10000-01-01`, which `DuckDB`'s parser refuses while
+    /// accepting the same year unsigned and a negative year signed, so the
+    /// sign would make the inlined PIVOT literal fail for an instant the
+    /// bound parameter handles. Executed against the engine in
+    /// `trawl-engine/tests/duckdb_probe.rs`.
     #[test]
     fn a_year_outside_four_digits_renders_without_a_plus() {
         let at = |year: i32| {
@@ -2973,9 +2961,9 @@ mod tests {
         );
     }
 
-    /// The bug the guard fixes is not the anchor's: an ordinary literal
-    /// inside an aggregate argument has always pushed a parameter into
-    /// the SELECT list, and mis-bound the same way.
+    /// The guard is not about the anchor: any literal inside an aggregate
+    /// argument pushes a parameter into the SELECT list, and mis-binds
+    /// without the same flush.
     #[test]
     fn an_aggregate_literal_argument_takes_the_same_guard() {
         let query =
@@ -2992,16 +2980,15 @@ mod tests {
         );
     }
 
-    /// A refused pinned comparison keeps its cause as a TYPE and renders
-    /// the sentence it always rendered.
+    /// A refused pinned comparison keeps its cause as a type and renders
+    /// the same sentence every other unsupported operation renders.
     ///
     /// Both halves matter and they pull in opposite directions. The type
-    /// is what the pin-aware fuzz target classifies on (issue #114): a
-    /// `SEVERITY` pin plus a literal naming no ladder point is a
-    /// legitimate outcome, so the target must recognize it without
-    /// matching prose. The TEXT is what users, snapshots and the wire
-    /// already see, so the `unsupported operation: ` prefix stays exactly
-    /// where the stringifying `From` impl used to put it.
+    /// is what the pin-aware fuzz target classifies on: a `SEVERITY` pin
+    /// plus a literal naming no ladder point is a legitimate outcome, so
+    /// the target must recognize it without matching prose. The text is
+    /// what users, snapshots and the wire see, so the
+    /// `unsupported operation: ` prefix has to stay where it is.
     #[test]
     fn a_refused_pinned_comparison_keeps_its_type_and_its_sentence() {
         let query = parser::parse("_severity=nosuchlevel").expect("parse should succeed");
@@ -3017,11 +3004,11 @@ mod tests {
         };
         assert_eq!(token, "nosuchlevel");
 
-        // The WHOLE rendering, composed from the typed cause. This was a
-        // `starts_with` against a prefix, which is no guard at all for a
-        // test whose only job is that the sentence has not moved: appending
-        // ` [comparison refusal]` to the `Display` impl would have sailed
-        // straight through it.
+        // The whole rendering, composed from the typed cause. A
+        // `starts_with` against the prefix would be no guard at all for a
+        // test whose only job is that the sentence has not moved:
+        // appending ` [comparison refusal]` to the `Display` impl would
+        // sail straight through it.
         assert_eq!(err.to_string(), format!("unsupported operation: {cause}"));
     }
 
@@ -3031,12 +3018,9 @@ mod tests {
     /// `hello` is a bare term, so text search binds `_raw` and arms the
     /// second, raw-free pass. `nan` is a filter literal the pin-blind
     /// coercion parses as a float, so both passes push a NaN in the same
-    /// slot. Before [`params_are_identical`] this panicked inside
-    /// `emit_with_raw_fallback`, with both halves of the message printing
-    /// the same list, because `assert_eq!` over an `f64` asks IEEE 754 and
-    /// IEEE 754 says a NaN equals nothing at all. Found by the `parse_emit`
-    /// fuzz target (issue #114) and older than it: the assertion landed in
-    /// `367aff46`.
+    /// slot, and an `assert_eq!` over the two lists would fail on a pair
+    /// of identical lists: IEEE 754 says a NaN equals nothing at all.
+    /// [`params_are_identical`] compares bits instead.
     #[test]
     fn a_nan_parameter_keeps_the_raw_free_parameter_lists_identical() {
         let query = parser::parse("hello a=nan").expect("parse should succeed");

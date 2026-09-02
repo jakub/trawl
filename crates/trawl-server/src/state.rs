@@ -45,9 +45,9 @@ pub struct AppState {
     /// Latest dashboard snapshot, updated every ~1s by the snapshot collector.
     /// Available even when the terminal monitor is disabled (systemd, `--no-monitor`).
     pub dashboard_snapshot: Arc<Mutex<Option<DashboardSnapshot>>>,
-    /// The repin engine (ADR-0011 slice B). `Some` exactly when ingest is
-    /// enabled: a query-only node owns nothing under the data root, so
-    /// `POST /api/v1/schema/repin` answers 503 there.
+    /// The repin engine. `Some` exactly when ingest is enabled: a query-only
+    /// node owns nothing under the data root, so `POST /api/v1/schema/repin`
+    /// answers 503 there.
     pub repin: Option<Arc<crate::repin::RepinEngine>>,
 }
 
@@ -80,14 +80,14 @@ pub struct QueryState {
     /// Uses `Mutex` (not `RwLock`) to prevent thundering herd: only one
     /// request refreshes the cache while others wait on the lock.
     pub schema_cache: Arc<tokio::sync::Mutex<Option<CachedCorpusFacts>>>,
-    /// Cached UNSCOPED `/api/v1/schema` column set (a catalog SELECT that
+    /// Cached unscoped `/api/v1/schema` column set (a catalog SELECT that
     /// aggregates every service's observations), under the same TTL and the
-    /// same thundering-herd discipline as the corpus facts. Two slots —
-    /// windowed at `usize::from(windowed)` — because there are exactly two
-    /// unscoped request shapes (`?all=true` lifts the retention window) and
-    /// each entry must survive requests of the OTHER shape: this cache is
+    /// same thundering-herd discipline as the corpus facts. Two slots,
+    /// indexed by whether the retention window applied, because there are
+    /// exactly two unscoped request shapes (`?all=true` lifts the window) and
+    /// each entry must survive requests of the other shape: this cache is
     /// the only bound on the whole-table aggregate behind it (migration
-    /// 0003), and a single shared slot let alternating `/schema` /
+    /// 0003), so one shared slot would let alternating `/schema` and
     /// `/schema?all=true` traffic evict each other into a 100% miss rate,
     /// every miss running the aggregate while holding the mutex.
     pub schema_columns_cache: Arc<tokio::sync::Mutex<[Option<CachedSchemaColumns>; 2]>>,
@@ -98,12 +98,12 @@ pub struct QueryState {
     /// Pre-computed per-service schema from background refresh job.
     /// Uses `parking_lot::Mutex` (like `dashboard_snapshot`) for fast reads.
     pub service_schema_cache: Arc<Mutex<Option<CachedServiceSchema>>>,
-    /// In-process field-catalog pin cache (ADR-0009 slice 2): hydrated at
-    /// boot from `field_types`, refreshed by compaction after every
-    /// `pin_missing` — the query path never touches postgres for pins.
+    /// In-process field-catalog pin cache: hydrated at boot from
+    /// `field_types`, refreshed by compaction after every `pin_missing`, so
+    /// the query path never touches postgres for pins.
     pub field_catalog: Arc<crate::catalog::FieldCatalog>,
-    /// What the analyzer currently calls degraded (ADR-0011 slices C1/C2),
-    /// reloaded on the schema-refresh tick.
+    /// What the analyzer currently calls degraded, reloaded on the
+    /// schema-refresh tick.
     ///
     /// Two request paths stamp from it — `QueryResponse.degraded_fields`
     /// (the notice) and `ServiceSchema.degraded_fields` (the badge) — and
@@ -126,18 +126,18 @@ pub struct QueryState {
 }
 
 /// Authentication state: the fleet keystore and its bearer middleware state.
-/// (The app-state stores moved to [`StorageState`] in ADR-0004 slice 3 —
-/// they are app state, not auth.)
+/// The app-state stores live in [`StorageState`]; they are app state, not
+/// auth.
 #[derive(Debug, Clone)]
 pub struct AuthState {
     /// Fleet-auth Postgres keystore. Cheap to clone (Arc-backed pool +
     /// verification cache live inside).
     pub key_store: fleet_auth::KeyStore,
     /// State for `fleet_auth::require_bearer_only`. trawld never reads session
-    /// cookies (that's trawl-web's job in slice 2), so it holds a
-    /// keystore-only [`fleet_auth::BearerState`] with no session key/cookie
-    /// config at all — the type forbids ever mounting `require_session`
-    /// against a meaningless key.
+    /// cookies (that is trawl-web's job), so it holds a keystore-only
+    /// [`fleet_auth::BearerState`] with no session key/cookie config at all:
+    /// the type forbids ever mounting `require_session` against a
+    /// meaningless key.
     pub bearer_state: fleet_auth::BearerState,
     /// Memoised keystore liveness ping, shared by every `/health` probe.
     ///
@@ -214,26 +214,26 @@ pub struct IngestState {
     /// a warn-skipped entry would fail open into host repair.
     pub trusted_relays: Arc<[crate::syslog::CidrEntry]>,
     /// The boot-resolved per-profile `_severity`/`_time` source lists
-    /// (ADR-0013 slice 2, ruling 5).
+    /// (ADR-0013).
     ///
     /// Resolved in `main`, before the tracing subscriber, and handed in:
     /// the telemetry layer needs the same policy and is built earlier
     /// still, so resolving it here would mean two resolutions of one
-    /// config — the shape that lets two doors disagree. Boot-fatal
-    /// there, on the `trusted_relays` precedent: a source list that
-    /// silently never matches is worse than a refusal to start.
+    /// config, the shape that lets two doors disagree. Boot-fatal there,
+    /// like `trusted_relays`: a source list that silently never matches is
+    /// worse than a refusal to start.
     pub derivation: Arc<crate::ingest::producer::Derivation>,
-    /// Repin ↔ compaction interlock (ADR-0011 slice B). `Some` exactly when
-    /// ingest is enabled — a query-only node runs no compaction and refuses
-    /// repin requests outright.
+    /// Repin/compaction interlock. `Some` exactly when ingest is enabled:
+    /// a query-only node runs no compaction and refuses repin requests
+    /// outright.
     pub repin_coordinator: Option<Arc<crate::repin::RepinCoordinator>>,
 }
 
 /// Parse `[ingest] trusted_relays` CIDRs, boot-fatally.
 ///
-/// Deliberately NOT the syslog `parse_cidrs` warn-skip: a skipped relay
-/// CIDR would fail open — host-less events from that relay would be
-/// peer-repaired where the operator configured a reject.
+/// Deliberately not the syslog `parse_cidrs` warn-skip: a skipped relay
+/// CIDR would fail open, peer-repairing host-less events from that relay
+/// where the operator configured a reject.
 fn parse_trusted_relays(
     cidrs: &[String],
 ) -> Result<Arc<[crate::syslog::CidrEntry]>, crate::error::ServerError> {
@@ -308,10 +308,10 @@ pub struct CompactionStats {
     pub last_run_epoch_secs: AtomicU64,
     /// Total successful compaction cycles.
     pub total_runs: AtomicU64,
-    /// Total compaction failures: failed WAL-compaction cycles PLUS
+    /// Total compaction failures: failed WAL-compaction cycles plus
     /// per-service daily-rollup failures and quarantined-input data-loss
-    /// counts (so this can exceed `total_runs` — it is a failure/data-loss
-    /// tally, not a cycle count).
+    /// counts. It can exceed `total_runs`, being a failure/data-loss tally
+    /// rather than a cycle count.
     pub total_errors: AtomicU64,
 }
 
@@ -379,12 +379,12 @@ pub struct CachedCorpusFacts {
 
 /// A cached `/api/v1/schema` column set, with an expiry timestamp.
 ///
-/// Only the UNSCOPED listing is cached. `?service=` is client-chosen and
+/// Only the unscoped listing is cached. `?service=` is client-chosen and
 /// unbounded, so keying a map on it would be an unbounded cache — and the
 /// scoped listing is already bounded by the pin cap through the
 /// `field_services (service, field)` index (migration 0003), while the
 /// unscoped one aggregates every service's observations and is what the
-/// autocomplete polls. The windowed/unwindowed shape lives in WHICH slot
+/// autocomplete polls. The windowed/unwindowed shape lives in which slot
 /// of `schema_columns_cache` holds the entry, not in the entry itself.
 #[derive(Debug, Clone)]
 pub struct CachedSchemaColumns {
@@ -400,14 +400,14 @@ pub struct CachedSchemaColumns {
 }
 
 impl CachedSchemaColumns {
-    /// The ONE freshness rule for this cache: an entry serves iff it is
-    /// inside the TTL AND was built under the catalog's current repin
-    /// generation. Callers must not re-check `cached_at` themselves — a
-    /// second rule is exactly how the endpoint came to serve a retyped
-    /// field's OLD type for up to a TTL after a repin cutover.
+    /// The single freshness rule for this cache: an entry serves iff it is
+    /// inside the TTL and was built under the catalog's current repin
+    /// generation. Callers must not re-check `cached_at` themselves; a
+    /// second rule lets the endpoint serve a retyped field's old type for
+    /// up to a TTL after a repin cutover.
     ///
-    /// Accepted residual: the cutover is two-phase — the transactional
-    /// postgres flip, then [`crate::catalog::FieldCatalog::repin`] — and a
+    /// Accepted residual: the cutover is two-phase (the transactional
+    /// postgres flip, then [`crate::catalog::FieldCatalog::repin`]), so a
     /// read landing between them still sees the old generation. That window
     /// is microseconds, and postgres-first is load-bearing for boot-replay
     /// crash consistency, so it is inherent rather than fixed here. What
@@ -438,15 +438,15 @@ pub struct CachedServiceSchema {
 }
 
 /// One generation of the degraded-field picture: the fields the analyzer
-/// indicts, plus which senders' data indicted them (ADR-0011 slices C1/C2).
+/// indicts, plus which senders' data indicted them.
 ///
 /// Built and swapped as a whole by
-/// [`crate::schema_refresh::refresh_degraded_fields`] and read nowhere else
-/// — both halves come from one pair of postgres reads inside one
+/// [`crate::schema_refresh::refresh_degraded_fields`], the only writer.
+/// Both halves come from one pair of postgres reads inside one
 /// `REPEATABLE READ` transaction, so the badge can never name a field the
 /// notice does not, nor the reverse.
 ///
-/// `by_service` is keyed BY `fields` at construction (a pair naming a field
+/// `by_service` is keyed by `fields` at construction (a pair naming a field
 /// outside the set is dropped), which is the invariant that makes the two
 /// halves one fact rather than two caches that agree by luck.
 #[derive(Debug, Default)]
@@ -454,12 +454,12 @@ pub struct DegradedSnapshot {
     /// Every degraded field, install-wide — the set the query notice's
     /// membership test runs against.
     pub fields: BTreeSet<String>,
-    /// Service → the degraded fields THAT service actually conflicted on.
+    /// Service to the degraded fields that service actually conflicted on.
     ///
     /// Private: the only sanctioned read is [`Self::services_of`]. A caller
-    /// holding the map could join it the wrong way round — badging every
-    /// service that merely CARRIES a degraded column — which is precisely
-    /// the false positive this whole snapshot exists to prevent.
+    /// holding the map could join it the wrong way round, badging every
+    /// service that merely carries a degraded column, which is the false
+    /// positive this snapshot exists to prevent.
     by_service: BTreeMap<String, Vec<String>>,
 }
 
@@ -624,9 +624,9 @@ impl AppState {
                     config.server.max_result_rows,
                     hot_buffer.clone(),
                 )
-                // Comparison typing (ADR-0011 slice A): the pool snapshots
-                // the full pin set per query. The catalog is constructed
-                // unconditionally above, so query-only nodes are covered.
+                // Comparison typing: the pool snapshots the full pin set per
+                // query. The catalog is constructed unconditionally above,
+                // so query-only nodes are covered.
                 .with_field_catalog(Arc::clone(&field_catalog)),
                 timeout_secs: config.server.timeout_secs,
                 tracker: Arc::new(QueryTracker::with_capacity(config.server.max_query_history)),
@@ -736,7 +736,7 @@ mod tests {
     }
 
     /// Both halves of the one freshness rule, in one place: an entry serves
-    /// only while it is young AND was built under the pin generation the
+    /// only while it is young and was built under the pin generation the
     /// reader holds.
     #[test]
     fn cached_columns_serve_only_inside_the_ttl_and_generation() {
@@ -759,10 +759,10 @@ mod tests {
     }
 
     /// The construction invariant the whole snapshot rests on: `by_service`
-    /// is keyed BY `fields`, so no service can ever be badged for a field
+    /// is keyed by `fields`, so no service can ever be badged for a field
     /// the notice does not also call degraded. A pair naming a field outside
-    /// the set — what a repin clearing evidence between the two reads
-    /// produces — is dropped, not trusted.
+    /// the set, which is what a repin clearing evidence between the two
+    /// reads produces, is dropped rather than trusted.
     #[test]
     fn by_service_never_names_a_field_outside_the_set() {
         let snapshot = DegradedSnapshot::new(
@@ -791,7 +791,7 @@ mod tests {
 
     /// Per-service lists are sorted and deduplicated: `field_conflict_stats`
     /// is keyed on `(field, service)` so duplicates cannot arise today, but
-    /// the badge's ORDER is a rendered wire fact and must not depend on the
+    /// the badge's order is a rendered wire fact and must not depend on the
     /// row order postgres happened to return.
     #[test]
     fn services_of_is_sorted_and_deduplicated() {

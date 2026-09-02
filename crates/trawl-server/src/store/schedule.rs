@@ -4,8 +4,7 @@
 
 //! Postgres-backed storage for scheduled queries and report runs.
 //!
-//! Concurrency is redesigned for postgres rather than ported from sqlite
-//! (whose stores were atomic by accident of a process-wide mutex):
+//! Concurrency rests on the database, not on a process-wide lock:
 //!
 //! - the no-concurrent-run guard is the partial unique index
 //!   `report_runs_one_running`; [`ScheduleStore::claim_run`] maps the named
@@ -46,7 +45,7 @@ pub struct Schedule {
     pub updated_at: DateTime<Utc>,
 }
 
-/// A single report run (legacy result blob fetched separately via
+/// A single report run (the result blob is fetched separately via
 /// [`ScheduleStore::get_run_result`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportRun {
@@ -76,8 +75,7 @@ pub enum RunClaim {
 }
 
 /// Outcome of [`ScheduleStore::finish_run`], naming the file-cleanup obligation
-/// the caller inherits (so match arms are self-documenting rather than
-/// depending on prose to decode a bare `bool`).
+/// the caller inherits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishOutcome {
     /// The run row was updated; any result file it points at must be kept.
@@ -104,7 +102,7 @@ pub enum FlipOutcome {
     NotRunning,
 }
 
-/// Parse a duration string (same syntax as the DSL `last:` filter) into seconds.
+/// Parse a duration string (same syntax as the DSL `last=` filter) into seconds.
 ///
 /// Supported units: `s`, `m`, `h`, `d`, `w`. Minimum interval is 60 seconds.
 pub fn parse_interval(s: &str) -> Result<u64, StoreError> {
@@ -371,12 +369,12 @@ impl ScheduleStore {
     }
 
     /// Delete a schedule by its saved query id, collecting the parquet paths
-    /// of its runs in the SAME transaction (cascade wipes the rows).
+    /// of its runs in the same transaction (cascade wipes the rows).
     ///
     /// Lock order matches [`Self::claim_run`]: the schedule row first (`FOR
     /// UPDATE`, which also blocks a concurrent run INSERT via its FK `FOR KEY
-    /// SHARE`), then every one of its `report_runs`. Locking all run rows — not
-    /// just those with a non-null `result_path` — forces a concurrent
+    /// SHARE`), then every one of its `report_runs`. Locking all run rows, not
+    /// just those with a non-null `result_path`, forces a concurrent
     /// `finish_run` to either commit its path before us (collected here) or
     /// block until our cascade deletes its row (it then updates zero rows and
     /// the caller unlinks the file). Filtering on `result_path IS NOT NULL`
@@ -649,7 +647,7 @@ impl ScheduleStore {
     /// clearing `row_count`/`result_data`/`result_path` and permanently
     /// orphaning the parquet file the row pointed at. Guarding on
     /// `status = 'running'` makes completion a state transition: the flip lands
-    /// only if the success did NOT commit.
+    /// only if the success did not commit.
     ///
     /// Returns [`FlipOutcome::FlippedToError`] when a running row was flipped
     /// (the earlier success never committed, so any parquet the caller wrote is
@@ -735,7 +733,8 @@ impl ScheduleStore {
         Ok(row.as_ref().map(row_to_report_run).transpose()?)
     }
 
-    /// Get the legacy compressed result blob for a run. Checks ownership.
+    /// Get the zstd-compressed result blob for a run, non-null only when the
+    /// parquet write failed and the scheduler fell back to it. Checks ownership.
     pub async fn get_run_result(
         &self,
         run_id: i64,
@@ -840,8 +839,8 @@ impl ScheduleStore {
     }
 
     /// Delete old runs for retention. Keeps at most `max_per_schedule` runs
-    /// per schedule and deletes runs older than `max_age_days` — both
-    /// deletions and the path collection happen in ONE transaction.
+    /// per schedule and deletes runs older than `max_age_days`; both
+    /// deletions and the path collection happen in one transaction.
     ///
     /// Returns `(count_deleted, result_paths)`; the caller unlinks the
     /// parquet files.
@@ -915,8 +914,8 @@ impl ScheduleStore {
         Ok(usize::try_from(count).unwrap_or_default())
     }
 
-    /// List runs across ALL saved queries for a user, paginated.
-    /// Returns `(ReportRun, net_name)` pairs, most recent first.
+    /// List runs across every saved query for a user, paginated. Each run is
+    /// paired with its saved query's name, most recent first.
     pub async fn list_all_runs(
         &self,
         key_id: i64,

@@ -234,10 +234,10 @@ fn parse_serve_status(bytes: &[u8]) -> Result<Vec<ServeMapping>> {
         mappings.iter().filter_map(mapping_port).collect();
     if let Some(tcp) = document.get("TCP").and_then(Value::as_object) {
         for (port_key, value) in tcp {
-            // Keys are bare (`"8445"`) today, but the `:port` and `host:port`
-            // forms must not silently drop an occupant: this conflict check is
-            // the only thing standing between `setup` and clobbering an
-            // unrelated Serve handler. Fall back to the *trimmed* key.
+            // Serve reports bare keys (`"8445"`), but `:port` and `host:port`
+            // are also valid and an unparsed key would silently drop the
+            // occupant. This check is all that stops `setup` from clobbering an
+            // unrelated Serve handler.
             let trimmed = port_key.trim_start_matches(':');
             let port = trimmed
                 .rsplit_once(':')

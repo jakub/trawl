@@ -4,22 +4,17 @@
 
 //! The typed row the pipeline stages pass between them.
 //!
-//! Stages used to hand each other `serde_json::Map<String, Value>`, so
-//! every computed value crossed a JSON boundary once per stage — and JSON
-//! has no spelling for a non-finite double, so `serde_json::Number::
-//! from_f64` turned one into NULL. `* | let x = 0/0 | where x == x` kept
-//! the row in batch (`NaN = NaN` is TRUE in `DuckDB`, ADR-0011) and
-//! dropped it live, for no reason a query author could see.
+//! A row carries [`crate::eval::EvalValue`] cells end to end, and JSON
+//! appears only at the wire, through the two doors here. Crossing a JSON
+//! boundary once per stage would lose every non-finite double — JSON has
+//! no spelling for one, so `serde_json::Number::from_f64` yields NULL — and
+//! `* | let x = 0/0 | where x == x` would keep the row in batch
+//! (`NaN = NaN` is TRUE in `DuckDB`, ADR-0011) while dropping it live, for
+//! no reason a query author could see. On the wire a non-finite still
+//! serializes as `null`, matching what `trawl-api`'s `serialize_f64` sends
+//! on the batch path, but that happens once, at the edge.
 //!
-//! A row now carries [`crate::eval::EvalValue`] cells end to end and JSON
-//! appears only at the WIRE, through the two doors here. The wire
-//! behaviour is unchanged: a non-finite still serializes as `null`,
-//! because that is what both lanes have always sent (`trawl-api`'s
-//! `serialize_f64` does the same for the batch path) — the difference is
-//! that it now happens ONCE, at the edge, instead of at every stage
-//! boundary.
-//!
-//! [`Row`] is a type ALIAS for the same `BTreeMap` `serde_json::Map` is
+//! [`Row`] is a type alias for the same `BTreeMap` `serde_json::Map` is
 //! (this workspace does not enable serde_json's `preserve_order`, checked
 //! in `Cargo.lock`: no `indexmap` dependency), so key ordering — and with
 //! it SSE frame bytes and result-column order — is preserved by
@@ -39,17 +34,16 @@ use crate::eval::EvalValue;
 /// they impose is the ordering the JSON map already had.
 pub type Row = BTreeMap<String, EvalValue>;
 
-/// The ONE JSON → row door: the event bus's wire JSON, or a batch result
+/// The one JSON → row door: the event bus's wire JSON, or a batch result
 /// cell, read into typed cells.
 ///
-/// Per-cell reading is `EvalValue::from(&Value)` by IDENTITY. A JSON
+/// Per-cell reading is `EvalValue::from(&Value)` by identity. A JSON
 /// integer above `i64::MAX` becomes `UInt`, keeping its exact digits
 /// through the row (identity, egress, keys, `pin_read`) and widening to
-/// `Float` only when a numeric expression reads it — exactly the value
-/// the pre-typed-row evaluator computed, while the wire keeps the exact
-/// integer the pre-typed-row pass-through carried. A
-/// JSON object cannot appear here: ingest stringifies nested values
-/// before they reach the bus (`envelope::canonicalize`).
+/// `Float` only when a numeric expression reads it, so the wire hands back
+/// the exact integer it was given. A JSON object cannot appear here:
+/// ingest stringifies nested values before they reach the bus
+/// (`envelope::canonicalize`).
 #[must_use]
 pub fn from_json(event: &Map<String, Value>) -> Row {
     event
@@ -58,13 +52,13 @@ pub fn from_json(event: &Map<String, Value>) -> Row {
         .collect()
 }
 
-/// The ONE row → JSON door: the SSE wire, and the batch bridge's
+/// The one row → JSON door: the SSE wire, and the batch bridge's
 /// compatibility path.
 ///
 /// This is the live lane's single nulling site — `Float(inf)` has no JSON
 /// spelling and serializes as `null` — and it is deliberately never
-/// called from a stage. A stage that needed JSON would be re-introducing
-/// the boundary this module exists to remove.
+/// called from a stage. A stage that needed JSON would re-introduce the
+/// per-stage boundary this module exists to avoid.
 #[must_use]
 pub fn to_json(row: Row) -> Map<String, Value> {
     row.into_iter()
@@ -72,7 +66,7 @@ pub fn to_json(row: Row) -> Map<String, Value> {
         .collect()
 }
 
-/// The TEXT a cell contributes to an identity or a display: group-by
+/// The text a cell contributes to an identity or a display: group-by
 /// keys, `dedup <field>` keys, `top`/`rare` values, `dc`/`values`
 /// members, and the group columns a snapshot row displays.
 ///
@@ -83,15 +77,14 @@ pub fn to_json(row: Row) -> Map<String, Value> {
 /// `DuckDB`'s own `CAST(… AS VARCHAR)`), which has two visible
 /// consequences:
 ///
-/// - `-0.0` is normalized to `0.0`, so it groups WITH positive zero —
+/// - `-0.0` is normalized to `0.0`, so it groups with positive zero —
 ///   the two compare equal ([`compare::double_total_cmp`]), and a key
 ///   that split them would contradict the comparison;
-/// - a NaN renders `nan` (not JSON `null`), so all NaNs land in ONE
+/// - a NaN renders `nan` (not JSON `null`), so all NaNs land in one
 ///   group, which is what `DuckDB`'s `NaN = NaN` does.
 ///
-/// A JSON `null` cell renders `"null"`, as the JSON `Display` it replaces
-/// did; an ABSENT field is the caller's empty string, not this
-/// function's.
+/// A JSON `null` cell renders `null`; an absent field is the caller's
+/// empty string, not this function's.
 ///
 /// Public because the batch tail sorts through it too
 /// (`trawl-engine`'s `post_process`), and a second renderer there would
@@ -102,26 +95,25 @@ pub fn cell_text(cell: &EvalValue) -> String {
         EvalValue::Null => "null".to_owned(),
         EvalValue::Bool(b) => b.to_string(),
         EvalValue::Int(n) => n.to_string(),
-        // EXACT digits, never the double it computes as: a group key and
+        // Exact digits, never the double it computes as: a group key and
         // a `dedup` key are identities, and two ids one apart must not
         // collapse into one.
         EvalValue::UInt(n) => n.to_string(),
         EvalValue::Float(f) => {
             let text = compare::canonical_double_text(*f);
-            // The identity path normalizes what the ORDER ties: the two
+            // The identity path normalizes what the order ties: the two
             // zeros compare equal and so do the two NaN signs
-            // ([`compare::double_total_cmp`]), so each pair is ONE key
-            // and one group — a signed key would split a group `DuckDB`
-            // does not split, make `dc()` say two and let `dedup` keep
-            // both rows.
+            // (`compare::double_total_cmp`), so each pair is one key and
+            // one group — a signed key would split a group `DuckDB` does
+            // not split, make `dc()` say two and let `dedup` keep both
+            // rows.
             //
-            // The scalar CAST domain keeps its sign:
+            // The scalar cast domain keeps its sign:
             // `duckdb_double_to_string` (hence `tostring()`, `concat()`
-            // and the DOUBLE pin's glob text) still renders `-0.0` and
-            // `-nan`, because that is the text the engine prints for
-            // one. Same parked caveat both times: `DuckDB` DISPLAYS
-            // whichever representative row it kept, so a group key it
-            // prints may carry a sign this one does not.
+            // and the DOUBLE pin's glob text) renders `-0.0` and `-nan`,
+            // because that is the text the engine prints. Caveat, parked:
+            // `DuckDB` displays whichever representative row it kept, so a
+            // group key it prints may carry a sign this one does not.
             match text.as_str() {
                 "-0.0" => "0.0".to_owned(),
                 "-nan" => "nan".to_owned(),
@@ -129,34 +121,31 @@ pub fn cell_text(cell: &EvalValue) -> String {
             }
         }
         EvalValue::Str(s) => s.clone(),
-        // The instant's own cast text, NOT the JSON string it becomes on
-        // the wire: rendering it through the wire door wrapped it in QUOTE
-        // characters, which then landed inside a group key (`stats count()
-        // by t` emitted `"2026-01-15 09:00:00"` live against
-        // `2026-01-15 09:00:00` in batch) and split a `Timestamp` cell
-        // from a `Str` cell holding the same text. An infinity renders as
-        // its word, so `Timestamp(Infinity)` and `Str("infinity")` share
-        // one identity under the `s:` tag — which is the rule this cell
-        // has always followed, since on the wire it WAS a JSON string.
+        // The instant's own cast text, not the JSON string it becomes on
+        // the wire: the wire door would wrap it in quote characters, which
+        // land inside a group key (`stats count() by t` giving
+        // `"2026-01-15 09:00:00"` live against `2026-01-15 09:00:00` in
+        // batch) and split a `Timestamp` cell from a `Str` cell holding
+        // the same text. An infinity renders as its word, so
+        // `Timestamp(Infinity)` and `Str("infinity")` share one identity
+        // under the `s:` tag — the rule the wire imposes, where this cell
+        // is a JSON string.
         EvalValue::Timestamp(instant) => instant.cast_text(),
-        // A list stays JSON text, as it has always been (`values()`
-        // produces a string array).
+        // A list stays JSON text (`values()` produces a string array).
         EvalValue::Array(_) => Value::from(cell.clone()).to_string(),
     }
 }
 
-/// The identity of a cell inside a WHOLE-ROW `dedup` key.
+/// The identity of a cell inside a whole-row `dedup` key.
 ///
-/// Whole-row dedup used to format each cell through JSON `Display`, which
-/// tells a string from a number by its QUOTES: `"1"` and `1` are
-/// different keys. Typed cells have no quotes, so the kind is tagged
-/// explicitly and the equivalence classes survive the retyping. The key
-/// BYTES are new (they are internal to a live dedup's memory), the
-/// classes are not — except for the two float rulings [`cell_text`]
-/// documents.
+/// Typed cells carry no quotes, so the kind is tagged explicitly: a string
+/// `1` and an integer `1` stay different keys, as they are on the wire
+/// where JSON quotes one and not the other. The key bytes are internal to
+/// a live dedup's memory; what matters is the equivalence classes, which
+/// follow [`cell_text`] — the two float rulings included.
 ///
-/// A `Timestamp` tags as a string because that is what it was on the
-/// wire: a JSON string in `DuckDB`'s timestamp text.
+/// A `Timestamp` tags as a string because that is what it is on the wire:
+/// a JSON string in `DuckDB`'s timestamp text.
 pub(crate) fn cell_key(cell: &EvalValue) -> String {
     let tag = match cell {
         EvalValue::Null => 'n',
@@ -168,13 +157,12 @@ pub(crate) fn cell_key(cell: &EvalValue) -> String {
     format!("{tag}:{}", cell_text(cell))
 }
 
-/// A `u64` counter as a cell: an integer while it fits, and the
-/// unsigned cell past that — which is what the JSON row carried, digits
-/// intact.
+/// A `u64` counter as a cell: an integer while it fits, and the unsigned
+/// cell past that, digits intact.
 ///
 /// `count()`, `count(field)` and `dc()` all produce one. No stream
 /// reaches the second arm (it would need `i64::MAX` events), but the
-/// counter IS a `u64` and this is the reading that does not invent a
+/// counter is a `u64` and this is the reading that does not invent a
 /// rounding.
 pub(crate) fn count_value(n: u64) -> EvalValue {
     i64::try_from(n).map_or(EvalValue::UInt(n), EvalValue::Int)
@@ -237,8 +225,8 @@ mod tests {
 
     #[test]
     fn cell_key_tags_the_kind_json_quoting_used_to_carry() {
-        // A string `1` and an integer `1` were different dedup keys when
-        // the key was JSON text (`"1"` vs `1`); they still are.
+        // A string `1` and an integer `1` are different dedup keys, as
+        // they are on the wire (`"1"` vs `1`).
         assert_ne!(
             cell_key(&EvalValue::Str("1".into())),
             cell_key(&EvalValue::Int(1))
@@ -279,8 +267,8 @@ mod tests {
     }
 
     /// A number above `i64::MAX` keeps its digits through both doors and
-    /// in every identity — the JSON row did, and a rounded double makes
-    /// `dedup`, `stats … by` and `dc()` merge ids that differ.
+    /// in every identity: a rounded double would make `dedup`,
+    /// `stats … by` and `dc()` merge ids that differ.
     #[test]
     fn an_unsigned_number_keeps_its_digits() {
         let event = json!({ "request_id": u64::MAX, "near": u64::MAX - 1 });

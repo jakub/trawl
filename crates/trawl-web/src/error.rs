@@ -16,34 +16,33 @@ use serde_json::json;
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
     /// Request didn't carry a valid session cookie, or the cookie was
-    /// missing/tampered. Does NOT clear any cookie — if the browser
-    /// sent no cookie there's nothing to clear, and if the cookie was
-    /// tampered we don't want to tell the attacker their attempt was
-    /// noticed by sending a specific response.
+    /// missing/tampered. Clears no cookie: if the browser sent none there
+    /// is nothing to clear, and a distinct response to a tampered cookie
+    /// would confirm to a prober that it was recognized.
     #[error("unauthorized")]
     Unauthorized,
 
     /// The session is dead: the cookie's `exp` is in the past, or upstream
     /// trawld rejected the session's key with 401 (revoked/expired
-    /// fleet-wide). This path DOES clear the cookie so the browser stops
+    /// fleet-wide). This path does clear the cookie so the browser stops
     /// sending a token it can't redeem. Carries the pre-built, validated
-    /// clear header from `AppState::build_clear_cookie()` so the attributes
-    /// are guaranteed to match issuance (browsers reject mismatched clears)
-    /// and the `Set-Cookie` can never silently vanish on a parse failure.
+    /// clear header from `AppState::build_clear_cookie` so the attributes
+    /// match issuance (browsers ignore mismatched clears) and the
+    /// `Set-Cookie` can't silently vanish on a parse failure.
     #[error("session expired")]
     ExpiredSession { clear_cookie: HeaderValue },
 
     /// A browser sent a cross-origin request to a state-changing auth
     /// endpoint (login/logout). With the shared `fleet_session` cookie a
     /// forged logout would sign the user out of every fleet app, so the
-    /// Origin header is validated by default (ADR-0004 slice 2).
+    /// `Origin` header is validated by default (ADR-0004).
     #[error("cross-origin request rejected")]
     OriginMismatch,
 
     /// Upstream trawld returned a non-2xx status when the proxy called it.
-    /// NOTE: 403 deliberately maps to 403 with NO cookie mutation — the
-    /// key is valid but lacks a trawl grant; clearing the shared cookie
-    /// would log the user out of sibling apps where they DO have access.
+    /// A 403 maps to 403 with no cookie mutation: the key is valid but
+    /// lacks a trawl grant, and clearing the shared cookie would log the
+    /// user out of sibling apps where they do have access.
     #[error("upstream returned {0}")]
     Upstream(StatusCode),
 
@@ -85,10 +84,9 @@ impl IntoResponse for ProxyError {
             Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "service unavailable"),
         };
 
-        // Severity per variant — blanket `debug!` used to hide network
-        // and upstream errors at the default `info` log level, which
-        // made prod outages invisible until someone turned debug
-        // logging on.
+        // Severity per variant: network and upstream failures are outage
+        // signal and must be visible at the default `info` level, while
+        // routine client errors stay at debug.
         match &self {
             Self::Unauthorized | Self::ExpiredSession { .. } | Self::BadRequest(_) => {
                 tracing::debug!(error = %self, "proxy error (expected)");
@@ -107,11 +105,8 @@ impl IntoResponse for ProxyError {
             }
         }
 
-        // For the expired-session path, attach Set-Cookie: Max-Age=0 so
-        // the browser stops sending the dead cookie on every subsequent
-        // request. Other 401 paths (missing/tampered) skip this: there
-        // may be no cookie to clear, and we don't want to confirm to a
-        // probing attacker that their tampered cookie was recognized.
+        // Only the expired-session path clears the cookie; see the
+        // variant docs for why the other 401s stay silent.
         if let Self::ExpiredSession { clear_cookie } = &self {
             let body = axum::Json(json!({ "error": message }));
             let mut headers = HeaderMap::new();

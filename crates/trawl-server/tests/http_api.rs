@@ -106,7 +106,7 @@ async fn query_rejects_bad_dsl(pool: sqlx::PgPool) {
     }
 }
 
-// -- query lifecycle telemetry (issue #56 F5) --------------------------------
+// -- query lifecycle telemetry -----------------------------------------------
 
 mod lifecycle_capture {
     use std::collections::BTreeMap;
@@ -164,7 +164,7 @@ mod lifecycle_capture {
 /// user's own tokens). The details survive only as DEBUG-level
 /// `query_text` / `query_error_text` events `trawl_server=info` never stores.
 ///
-/// One test, four sentinels: the capture layer is a GLOBAL subscriber, and
+/// One test, four sentinels: the capture layer is a global subscriber, and
 /// only the first installer in a process wins.
 #[sqlx::test(migrations = false)]
 async fn query_export_and_stream_telemetry_carry_no_user_content(pool: sqlx::PgPool) {
@@ -232,7 +232,7 @@ async fn query_export_and_stream_telemetry_carry_no_user_content(pool: sqlx::PgP
         "query_start carries query_len"
     );
 
-    // The raw text IS available — as a separate DEBUG-only event.
+    // The raw text is available, as a separate DEBUG-only event.
     let query_text = debug_capture
         .events()
         .into_iter()
@@ -255,7 +255,7 @@ async fn query_export_and_stream_telemetry_carry_no_user_content(pool: sqlx::PgP
         "query_text is keyed on query_id"
     );
 
-    // -- a FAILING query --------------------------------------------------
+    // -- a failing query --------------------------------------------------
     //
     // The emitter rejects an unknown function by quoting its name, so an
     // error message in default telemetry republishes whatever was typed.
@@ -365,7 +365,7 @@ async fn query_export_and_stream_telemetry_carry_no_user_content(pool: sqlx::PgP
         }
     }
 
-    // Every one of them IS recoverable at DEBUG, keyed on query_id.
+    // Every one of them is recoverable at DEBUG, keyed on query_id.
     let debug_events = debug_capture.events();
     for (sentinel, event_type) in [
         ("zz_failure_needle", "query_error_text"),
@@ -394,7 +394,7 @@ async fn query_export_and_stream_telemetry_carry_no_user_content(pool: sqlx::PgP
 /// The fixture corpus is dated 2024-01-15 — years outside the default
 /// 90-day retention window — and the boot conformance pass backfills
 /// `field_services` from the partition directories it adopted, so its fields
-/// are legitimately aged out of the DEFAULT listing. `?all=true` is the
+/// are legitimately aged out of the default listing. `?all=true` is the
 /// window-lifted view this test wants (the windowing itself is covered by
 /// `catalog_surface::aged_out_field_windowed_away_unless_all`).
 #[sqlx::test(migrations = false)]
@@ -412,7 +412,7 @@ async fn schema_returns_columns(pool: sqlx::PgPool) {
         .unwrap();
     assert!(!schema.columns.is_empty());
 
-    // Our test fixture has these exact columns.
+    // The fixture corpus carries these columns.
     let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"_time"), "missing _time column");
     assert!(names.contains(&"_ingested"), "missing _ingested column");
@@ -458,10 +458,9 @@ async fn schema_columns_come_from_the_catalog_not_describe(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // Pin a field that exists in NO parquet file anywhere: a DESCRIBE sweep
+    // Pin a field that exists in no parquet file anywhere: a DESCRIBE sweep
     // could never see it, so its presence in the response proves the columns
-    // are a catalog SELECT. (The DESCRIBE code path itself is deleted —
-    // Pool::describe_schema no longer exists — this pins the behaviour.)
+    // come from a catalog SELECT.
     server
         .state
         .storage
@@ -521,7 +520,7 @@ async fn queries_accessible_by_analyst_and_reader(pool: sqlx::PgPool) {
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
-    // Both analyst and reader can list running queries (loosened from admin-only).
+    // Both analyst and reader can list running queries.
     analyst.queries().await.unwrap();
     reader.queries().await.unwrap();
 }
@@ -569,10 +568,10 @@ async fn ingest_accepts_ndjson(pool: sqlx::PgPool) {
 /// The ADR-0013 worked examples, end to end.
 ///
 /// A vector-shaped payload (`timestamp` + `level`) lands as the declared
-/// ten-field envelope: `_time` derived AND `timestamp` stored verbatim,
-/// `_severity` derived AND `level` stored verbatim, `_raw` populated —
-/// and the severity vocabulary rides `_severity`, which nothing can
-/// shadow. The game server's `level:"gold"` keeps its column and gets no
+/// ten-field envelope: `_time` derived and `timestamp` stored verbatim,
+/// `_severity` derived and `level` stored verbatim, `_raw` populated, with
+/// the severity vocabulary riding `_severity`, which nothing can shadow.
+/// The game server's `level:"gold"` keeps its column and gets no
 /// `_severity` at all.
 #[sqlx::test(migrations = false)]
 async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
@@ -586,11 +585,11 @@ async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
             "timestamp": now, "message": "boom"}),
         serde_json::json!({"service": "vec-svc", "host": "web01", "level": "info",
             "timestamp": now, "message": "fine"}),
-        // The #60 canonical example: `level` means loot tier here.
+        // `level` means loot tier here, not severity.
         serde_json::json!({"service": "vec-svc", "host": "web01", "level": "gold",
             "timestamp": now, "message": "dropped"}),
-        // The elastic spelling, which is now an ordinary column whose
-        // DuckDB identifier needs quoting everywhere it appears.
+        // The elastic spelling: an ordinary column whose DuckDB
+        // identifier needs quoting everywhere it appears.
         serde_json::json!({"service": "vec-svc", "host": "web01",
             "@timestamp": now, "message": "elastic"}),
     ];
@@ -704,9 +703,9 @@ async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
         "the error must name the vocabulary: {body}"
     );
 
-    // …and `level` is ORDINARY sender vocabulary now (ADR-0013 §6): the
-    // shapes the alias used to refuse — grouping on it, an IN-list in
-    // `where` — are plain field usage in both lanes, batch and live.
+    // …and `level` is ordinary sender vocabulary (ADR-0013 §6): grouping
+    // on it and naming it in a `where` IN-list are plain field usage, in
+    // both lanes, batch and live.
     for query_text in [
         "service=vec-svc last=1h | stats count() by level",
         r#"service=vec-svc last=1h | where level in ("error", "fatal")"#,
@@ -735,17 +734,17 @@ async fn vector_shaped_ingest_is_queryable(pool: sqlx::PgPool) {
     }
 }
 
-/// Provenance is data (ADR-0013 slice 2, ruling 6), end to end.
+/// Provenance is data (ADR-0013 ruling 6), end to end.
 ///
 /// `_producer` has to survive the whole journey to be worth anything: the
 /// door stamps it, the WAL and hot buffer carry it, the catalog types it,
-/// and the DSL filters on it. Two of the three doors are exercised here
-/// against ONE running server — the HTTP handler through the real
-/// endpoint, and the syslog door through `SyslogDoor::admit` into the
-/// server's own pipeline (there is no in-process harness that speaks
-/// UDP/TCP frames to a live listener, and the frame parser is not what
-/// this test is about). The trawld door's stamp is covered where its
-/// events are built, in `telemetry`'s own tests.
+/// and the DSL filters on it. Two of the three doors run against one
+/// server here — the HTTP handler through the real endpoint, and the
+/// syslog door through `SyslogDoor::admit` into the server's own pipeline
+/// (no in-process harness speaks UDP/TCP frames to a live listener, and
+/// the frame parser is not what this test is about). The trawld door's
+/// stamp is covered where its events are built, in `telemetry`'s own
+/// tests.
 ///
 /// The forgery half matters as much as the stamp: a sender that puts
 /// `_producer` on the wire must find it under the bare `producer`
@@ -774,7 +773,7 @@ async fn producer_is_stamped_stored_and_queryable_per_door(pool: sqlx::PgPool) {
     ];
     assert_eq!(ingest.ingest(&records).await.unwrap().accepted, 3);
 
-    // The syslog door, with the server's OWN boot-resolved policy, into
+    // The syslog door, with the server's own boot-resolved policy, into
     // the server's own pipeline — the same route `spawn_syslog` takes.
     let door = SyslogDoor {
         envs: Arc::clone(&server.state.ingest.envs),
@@ -1117,10 +1116,10 @@ async fn ingest_rpm_is_independent_of_the_interactive_ceiling(pool: sqlx::PgPool
     }
 }
 
-/// AC1 (ADR-0006 slice 0): two keys holding the SAME role get independent
-/// buckets — the limiter keys on the keystore id, not on any shared role
-/// bucket. Exhausting key A's quota 429s A while key B still gets 200.
-/// (Role here is test-side policy vocabulary only; the limiter never sees it.)
+/// Two keys holding the same role get independent buckets: the limiter keys
+/// on the keystore id, not on any shared role bucket. Exhausting key A's
+/// quota 429s A while key B still gets 200. (Role here is test-side policy
+/// vocabulary only; the limiter never sees it.)
 #[sqlx::test(migrations = false)]
 async fn rate_limit_isolates_keys_with_same_role(pool: sqlx::PgPool) {
     let server = setup_with_rate_limit(
@@ -1226,7 +1225,7 @@ async fn ingest_ceiling_does_not_apply_to_keys_without_ingest_permission(pool: s
     }
 }
 
-// ── new endpoint tests (cancellation, validation, pagination, stats, field values) ──
+// ── endpoint tests (cancellation, validation, pagination, stats, field values) ──
 
 #[sqlx::test(migrations = false)]
 async fn cancel_query_by_admin(pool: sqlx::PgPool) {
@@ -1234,23 +1233,20 @@ async fn cancel_query_by_admin(pool: sqlx::PgPool) {
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
-    // Spawn a slow query in the background.
     let analyst_clone = analyst.clone();
     let slow_query = tokio::spawn(async move {
-        // This query will take a while (timechart with small span).
         let _ = analyst_clone
             .query_paginated("* | timechart span=1s count()", None, None)
             .await;
     });
 
-    // Give it a moment to start.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Admin cancels query ID 1 (first query).
-    // May or may not catch it depending on timing — just verify the endpoint works.
+    // Cancelling id 1 is a timing guess: the fixture is too small to keep a
+    // query in flight, so this asserts the endpoint answers, not that it
+    // caught anything.
     let _cancel_resp = admin.cancel_query(1).await.unwrap();
 
-    // Wait for the spawned task to finish.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), slow_query).await;
 }
 
@@ -1296,14 +1292,11 @@ async fn cancel_query_rejects_ingest_role(pool: sqlx::PgPool) {
 /// key B cannot cancel key A's in-flight query, while owner A passes the gate
 /// and actually interrupts the query.
 ///
-/// A revert to name-matching would let B (same name) through, so this test
-/// guards that regression. It needs a genuinely *active* query — a completed
-/// one has no tracked owner under either scheme, so only a live entry can tell
-/// id-matching from name-matching apart.
-///
-/// The pool's `TEST_QUERY_DELAY_MS` hook (via the crate's `test-support`
-/// feature) holds the query in-flight deterministically — no dataset-size
-/// timing bets against fast CI runners.
+/// The query has to be genuinely *active*: a completed one has no tracked
+/// owner under either scheme, so only a live entry tells id-matching and
+/// name-matching apart. The pool's `TEST_QUERY_DELAY_MS` hook (the crate's
+/// `test-support` feature) holds it in flight deterministically, instead of
+/// betting on dataset size against a fast CI runner.
 #[sqlx::test(migrations = false)]
 async fn cancel_query_isolated_by_key_id_not_name(pool: sqlx::PgPool) {
     // Permissive rate limits: the observe/cancel polls below run in a tight
@@ -1319,7 +1312,7 @@ async fn cancel_query_isolated_by_key_id_not_name(pool: sqlx::PgPool) {
     // to this test; reset at the end regardless.
     trawl_server::pool::TEST_QUERY_DELAY_MS.store(3_000, Ordering::Relaxed);
 
-    // Two analyst keys with the SAME display name but distinct keystore ids.
+    // Two analyst keys with the same display name but distinct keystore ids.
     let store = KeyStore::from_pool(server.fleet_pool.clone());
     let key_a = store
         .create_key(
@@ -1382,7 +1375,7 @@ async fn cancel_query_isolated_by_key_id_not_name(pool: sqlx::PgPool) {
         other => panic!("expected 401 for non-owner cancel, got: {other:?}"),
     }
 
-    // Owner A passes the ownership gate AND interrupts the tracked query:
+    // Owner A passes the ownership gate and interrupts the tracked query:
     // `cancelled == true` proves the tracker id and the pool's interrupt-map
     // id are the same id space. The interrupt handle is registered by the
     // pool task shortly after the tracker entry appears, so retry briefly.
@@ -1450,7 +1443,7 @@ async fn query_pagination_limit_offset(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // We have 3 rows total. Request 2 rows starting at offset 1.
+    // The fixture holds 3 rows.
     let resp = client.query_paginated("*", Some(2), Some(1)).await.unwrap();
     assert_eq!(resp.pagination.limit, 2);
     assert_eq!(resp.pagination.offset, 1);
@@ -1477,7 +1470,6 @@ async fn query_pagination_defaults(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // No limit/offset specified — defaults should apply.
     let resp = client.query_paginated("*", None, None).await.unwrap();
     assert_eq!(resp.pagination.offset, 0);
     assert_eq!(resp.pagination.returned, 3);
@@ -1654,10 +1646,9 @@ async fn whoami_rejects_missing_auth(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn whoami_no_trawl_grant_is_403(pool: sqlx::PgPool) {
-    // Policy change with the fleet-auth cutover (ADR-0004): a foreign-app-only
-    // key is rejected by the mandatory trawl policy layer on EVERY
-    // authenticated route — including /whoami, which previously leaked
-    // cross-app assignments to grantless keys.
+    // The mandatory trawl policy layer rejects a foreign-app-only key on every
+    // authenticated route, /whoami included: a grantless key must not learn its
+    // cross-app assignments here.
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.coastwatch_only_token).unwrap();
 
@@ -1684,11 +1675,9 @@ async fn field_values_cached(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // First request should populate cache.
     let resp1 = client.field_values("service", None, None).await.unwrap();
     assert!(!resp1.cached);
 
-    // Second request should hit cache.
     let resp2 = client.field_values("service", None, None).await.unwrap();
     assert!(resp2.cached);
 }
@@ -1733,7 +1722,6 @@ async fn response_includes_ulid_request_id(pool: sqlx::PgPool) {
 
 // -- reader role restriction tests -------------------------------------------
 
-/// Helper to assert a client call returns HTTP 401.
 fn assert_401<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) {
     let err = result.expect_err("expected 401 but got success");
     match err {
@@ -1780,17 +1768,13 @@ async fn reader_can_query_and_view_history(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
-    // Reader can execute queries.
     let resp = reader
         .query_paginated("* | head 1", None, None)
         .await
         .unwrap();
     assert!(!resp.result.columns.is_empty());
 
-    // Reader can view schema.
     reader.schema().await.unwrap();
-
-    // Reader can view history.
     reader.history(Some(10), None).await.unwrap();
 }
 
@@ -1828,13 +1812,11 @@ async fn trigger_run_requires_schedule(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // Create a net without a schedule.
     let saved = client
         .create_saved("trigger-test", "* | head 5")
         .await
         .unwrap();
 
-    // Triggering should fail with 400 (no schedule attached).
     let err = client
         .trigger_run(saved.id)
         .await
@@ -1852,7 +1834,6 @@ async fn trigger_run_starts_execution(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // Create net + attach schedule.
     let saved = client
         .create_saved("trigger-exec", "* | head 3")
         .await
@@ -1862,7 +1843,6 @@ async fn trigger_run_starts_execution(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    // Trigger the run.
     let summary = client.trigger_run(saved.id).await.unwrap();
     assert_eq!(summary.status, "running");
     assert_eq!(summary.query, "* | head 3");
@@ -1870,7 +1850,6 @@ async fn trigger_run_starts_execution(pool: sqlx::PgPool) {
     // Wait briefly for execution to complete (test fixtures are tiny).
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Verify the run completed.
     let runs = client
         .list_report_runs(saved.id, Some(10), None)
         .await
@@ -1878,7 +1857,6 @@ async fn trigger_run_starts_execution(pool: sqlx::PgPool) {
     assert_eq!(runs.runs.len(), 1);
     assert_eq!(runs.runs[0].status, "success");
 
-    // Stats should reflect the completed run.
     let stats = client.runs_stats().await.unwrap();
     assert_eq!(stats.total_runs, 1);
     assert_eq!(stats.success_count, 1);
@@ -1921,7 +1899,6 @@ async fn trigger_run_rejects_when_max_runs_reached(pool: sqlx::PgPool) {
         "seeding the cap must start a run, got {seeded:?}"
     );
 
-    // Triggering again exceeds the cap -> 400 "max runs reached".
     let err = client
         .trigger_run(saved.id)
         .await
@@ -1968,7 +1945,6 @@ async fn trigger_run_rejects_when_already_running(pool: sqlx::PgPool) {
         "seeding an in-progress run must start it, got {seeded:?}"
     );
 
-    // Triggering while a run is in progress -> 400 "already in progress".
     let err = client
         .trigger_run(saved.id)
         .await
@@ -1997,7 +1973,6 @@ async fn rename_saved_query(pool: sqlx::PgPool) {
 
     let saved = client.create_saved("old-name", "* | head 1").await.unwrap();
 
-    // Rename it.
     let updated = client
         .update_saved_with_name(saved.id, "* | head 1", Some("new-name"))
         .await
@@ -2005,7 +1980,6 @@ async fn rename_saved_query(pool: sqlx::PgPool) {
     assert_eq!(updated.name, "new-name");
     assert_eq!(updated.query, "* | head 1");
 
-    // Verify via list.
     let list = client.list_saved().await.unwrap();
     assert!(list.queries.iter().any(|q| q.name == "new-name"));
     assert!(!list.queries.iter().any(|q| q.name == "old-name"));
@@ -2025,8 +1999,8 @@ async fn rename_to_duplicate_fails(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    // Try to rename `other` to the taken name. Conflicts are 409 since the
-    // pg cutover (ADR-0004 StoreError -> HTTP table).
+    // Try to rename `other` to the taken name. A name conflict is a 409
+    // (ADR-0004's StoreError -> HTTP table).
     let err = client
         .update_saved_with_name(other.id, "* | head 2", Some("taken-name"))
         .await
@@ -2048,26 +2022,25 @@ async fn list_all_runs_paginated(pool: sqlx::PgPool) {
     let server = setup(pool).await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // Empty initially.
     let resp = client.list_all_runs(Some(10), None).await.unwrap();
     assert_eq!(resp.total, 0);
     assert!(resp.runs.is_empty());
 }
 
 // ---------------------------------------------------------------------------
-// repin surface (ADR-0011 slice B)
+// repin surface
 // ---------------------------------------------------------------------------
 
-/// `SchemaWrite` gates the trigger: even the admin role (frozen conversion
-/// bundle, no `schema_write`) is refused, while the schema-admin role —
-/// which deliberately lacks `server_manage` — may trigger. The status
-/// surface is `SchemaRead` (read-only surfaces show state without
-/// offering the trigger).
+/// `SchemaWrite` gates the trigger: the admin role holds no `schema_write`
+/// and is refused, while the schema-admin role — which deliberately lacks
+/// `server_manage` — may trigger. The status route is `SchemaRead`, so a
+/// read-only key sees state without being offered the trigger.
 #[sqlx::test(migrations = false)]
 async fn repin_permission_matrix(pool: sqlx::PgPool) {
     let server = setup(pool).await;
 
-    // Admin: full legacy bundle, but NOT schema_write.
+    // Admin: the broadest standing role, server_manage included, and still
+    // no schema_write.
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
     let err = admin
         .schema_repin("status", "VARCHAR", None, true, false)
@@ -2085,8 +2058,8 @@ async fn repin_permission_matrix(pool: sqlx::PgPool) {
         resp.permissions
     );
 
-    // Schema-admin: may trigger (an unpinned field is a 400 — the request
-    // was AUTHORIZED and then refused on the merits, with no side effect).
+    // Schema-admin: may trigger (an unpinned field is a 400 — authorized,
+    // then refused on the merits, with no side effect).
     let schema_admin = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
     let err = schema_admin
         .schema_repin("never_pinned_field", "VARCHAR", None, true, false)
@@ -2134,9 +2107,9 @@ async fn repin_validation_refusals_are_side_effect_free(pool: sqlx::PgPool) {
         ("_time", "VARCHAR"),     // envelope metadata
         ("service", "BIGINT"),    // sender-asserted, still contract-typed
         ("status", "UUID"),       // not a catalog type
-        // SEVERITY is an admissible target since #79, so this row is
-        // refused for the OTHER reason a repin can be: nothing has pinned
-        // `status` on this server, so there is nothing to repin.
+        // SEVERITY is an admissible target, so this row is refused for the
+        // other reason a repin can be: nothing has pinned `status` on this
+        // server, so there is nothing to repin.
         ("status", "SEVERITY"),
     ] {
         let err = client
@@ -2162,7 +2135,7 @@ async fn read_sse_until(resp: &mut reqwest::Response, needle: &str) -> String {
         loop {
             let chunk = resp.chunk().await.unwrap().expect("stream ended early");
             bytes.extend_from_slice(&chunk);
-            // The WHOLE buffer is re-read each time rather than appended
+            // The whole buffer is re-read each time rather than appended
             // as text: a chunk can split a UTF-8 codepoint, and starting
             // from the front heals it on the next chunk.
             let text = String::from_utf8_lossy(&bytes);
@@ -2186,10 +2159,10 @@ async fn read_sse_until(resp: &mut reqwest::Response, needle: &str) -> String {
     })
 }
 
-/// Every `data:` payload in the COMPLETE frames of an SSE buffer.
+/// Every `data:` payload in the complete frames of an SSE buffer.
 ///
 /// The read stops at a frame terminator, but the bytes after it can be
-/// the first half of the NEXT frame — so the buffer is cut at its last
+/// the first half of the next frame, so the buffer is cut at its last
 /// terminator and the remainder is dropped rather than parsed.
 fn sse_payloads(buf: &str) -> Vec<serde_json::Value> {
     let complete = buf.rfind("\n\n").map_or("", |end| &buf[..end + 2]);
@@ -2210,17 +2183,16 @@ fn sse_payloads_ignores_a_half_arrived_frame() {
     assert_eq!(payloads[0]["a"], 1);
 }
 
-/// ADR-0017 §3 through the REAL SSE loop, on a live server.
+/// ADR-0017 §3 through the real SSE loop, on a live server.
 ///
 /// The fake-clock cases in `trawl-core`'s `live_sampling` pin the rule;
-/// this pins the WIRING — that `stream_query` samples one instant per
+/// this pins the wiring, that `stream_query` samples one instant per
 /// event on the pass-through lane and one per emitted snapshot on the
 /// aggregate lane, which no in-process test of the door can observe.
 /// The clock here is the real one, so the assertions are the ones a real
-/// clock can carry: reads that must be EQUAL. Under any per-read or
-/// per-row sampling they would differ by the microseconds it takes to
-/// evaluate the next stage, which is why equality is the discriminating
-/// direction.
+/// clock can carry: reads that must be equal. Under per-read or per-row
+/// sampling they would differ by the microseconds it takes to evaluate
+/// the next stage, which is why equality is the discriminating direction.
 #[sqlx::test(migrations = false)]
 async fn sse_freezes_now_per_event_and_per_snapshot(pool: sqlx::PgPool) {
     let server = setup(pool).await;

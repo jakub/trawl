@@ -5,10 +5,10 @@
 //! The `extract kv` batch tail against real `DuckDB`: what the SQL prefix
 //! computes is what the tail receives.
 //!
-//! The tail used to reach the Rust stages through `serde_json`, which has
-//! no spelling for a non-finite double — so a prefix computing `1.0/0`
-//! handed the tail a NULL, and the SAME query without the kv split
-//! answered differently. These tests run both shapes of each query
+//! Non-finite doubles are where that can break. `serde_json` has no
+//! spelling for one, so a bridge that carried rows to the tail as JSON
+//! would turn a prefix's `1.0/0` into a NULL and the same query without
+//! the kv split would answer differently. These tests run both shapes of each query
 //! against one another rather than against a hand-written expectation, so
 //! agreement is the assertion.
 
@@ -18,7 +18,7 @@ use trawl_core::schema::{CanonicalType, FieldTypes};
 use trawl_engine::executor::Executor;
 use trawl_engine::value::{QueryResult, Value};
 
-/// One ndjson row, written where `read_json` can reach it.
+/// The ndjson rows, written where `read_json` can reach them.
 fn source(rows: &[&str]) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.ndjson");
@@ -222,8 +222,8 @@ fn a_tail_computed_infinity_survives_a_shifted_run() {
 /// (d) A DOUBLE-pinned infinity answers a tail's `| where d > 1` the way
 /// the batch lane does.
 ///
-/// The pinned read used to project a non-finite as JSON null — UNKNOWN,
-/// so the row vanished — while the SQL lane compared it happily. The
+/// A pinned read that projected a non-finite as JSON null would make it
+/// UNKNOWN and drop the row, while the SQL lane compares it happily. The
 /// column is written as a real DOUBLE, which is what a conformed corpus
 /// holds (both `inf` spellings survive the pin's round-trip guard).
 #[test]
@@ -276,7 +276,7 @@ fn a_double_pinned_infinity_compares_in_the_tail() {
     );
 }
 
-// ── the now() anchor across the kv split (ADR-0017 §3, #106) ──────────
+// ── the now() anchor across the kv split (ADR-0017 §3) ────────────────
 
 /// One row of real parquet, written by `DuckDB` itself — the shape the
 /// production cold lane reads.
@@ -293,7 +293,7 @@ fn parquet_source() -> (tempfile::TempDir, String) {
     (dir, path.display().to_string())
 }
 
-/// AC1: the SQL prefix and the `rust_stages` tail read ONE instant.
+/// The SQL prefix and the `rust_stages` tail read one instant.
 ///
 /// `now()` appears three times in one statement across the kv split —
 /// twice in the SQL prefix (a `let` and a `where`) and once in the tail.
@@ -369,11 +369,10 @@ fn the_cold_start_fallback_keeps_the_statements_anchor() {
 /// A `limit` among the kv tail's PRE-stages caps what reaches the
 /// aggregation, exactly as the same query without the split does.
 ///
-/// The tail's aggregate arm used to treat `StageResult::Done` as "stop
-/// running stages for THIS event" — it broke the inner stage loop and
-/// then fed the very event an exhausted `limit` had just refused, and
-/// went on to the next one. `extract kv | limit 1 | stats count()`
-/// counted every row.
+/// Reading `StageResult::Done` as "stop running stages for this event"
+/// would break only the inner stage loop, then feed the aggregation the
+/// very event an exhausted `limit` just refused, so
+/// `extract kv | limit 1 | stats count()` would count every row.
 #[test]
 fn a_pre_stage_limit_caps_what_the_kv_tail_aggregates() {
     let (_dir, glob) = source(&[
@@ -406,10 +405,9 @@ fn a_pre_stage_limit_caps_what_the_kv_tail_aggregates() {
 /// The batch tail's POST-aggregation `limit` is unaffected by the live
 /// lane's per-snapshot re-arming.
 ///
-/// This lane emits ONE snapshot from a freshly compiled plan, so its
-/// counter is armed once and spent once — the same answer before and
-/// after the live rule changed, and the same answer the query gives
-/// without the kv split.
+/// This lane emits one snapshot from a freshly compiled plan, so its
+/// counter is armed once and spent once, giving the same answer the query
+/// gives without the kv split.
 #[test]
 fn a_post_stage_limit_caps_the_kv_tails_one_snapshot() {
     let (_dir, glob) = source(&[

@@ -28,8 +28,8 @@ pub enum StatusKind {
     Hauling,
     /// Live SSE stream open.
     Live,
-    /// Last query errored — wired in a follow-up commit; rendering
-    /// switches the status dot to red.
+    /// Last query errored; the status dot turns red. Nothing constructs
+    /// it yet, hence the allow below.
     #[allow(dead_code)]
     Error,
 }

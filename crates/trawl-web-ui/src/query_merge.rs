@@ -139,10 +139,10 @@ pub fn effective_query(base_q: &str, filters: &[Filter], range: &RangeSpec) -> S
     };
 
     match tail {
-        // A search half that ENDS inside an open comment cannot be joined
+        // A search half that ends inside an open comment cannot be joined
         // on one line: the `|` and everything after it would be comment
-        // text, and the result still PARSES — as a query with no
-        // pipeline. A newline closes the comment and nothing else moves.
+        // text, and the result still parses, as a query with no pipeline.
+        // A newline closes the comment and nothing else moves.
         Some(t) if ends_inside_comment(&new_search) => {
             format!("{new_search}\n| {}", t.trim_start_matches('|').trim())
         }
@@ -164,7 +164,7 @@ fn split_search_stage(input: &str) -> (&str, Option<&str>) {
 /// Heuristic: does the search stage already carry a `last=<units>` clause?
 /// Word-boundary check to avoid matching `loglast=` or similar. Case-insensitive.
 ///
-/// A backticked `` `last` `` is a FIELD, not the grammar keyword, so the
+/// A backticked `` `last` `` is a field, not the grammar keyword, so the
 /// walk skips quoted spans entirely — otherwise the UI would read the
 /// field as an existing time clause and silently drop the range.
 fn search_has_last_clause(search: &str) -> bool {
@@ -199,7 +199,7 @@ fn format_filter(f: &Filter) -> Option<String> {
 fn format_absolute_range(from: &str, to: &str) -> String {
     // _time>="<from>" _time<="<to>" — DSL parses these as implicit-AND
     // comparison clauses in the search stage. The canonical column by
-    // name: the DSL has zero aliases since ADR-0013 §6, so `@timestamp`
+    // name: the DSL has zero aliases (ADR-0013 §6), so `@timestamp`
     // would name an ordinary sender field most events never carry.
     let mut out = String::new();
     if !from.is_empty() {
@@ -429,13 +429,13 @@ mod tests {
     }
 
     /// A search half that ends inside an open comment gets its pipeline
-    /// back on a NEW LINE. Joined on one line the `|` and every stage
-    /// after it would be comment text — and the result would still parse,
+    /// back on a new line. Joined on one line the `|` and every stage
+    /// after it would be comment text, and the result would still parse,
     /// as a query with no pipeline at all.
     #[test]
     fn a_pipeline_is_not_swallowed_by_an_open_comment() {
-        // the split trims the newline that used to close the comment, so
-        // the rejoin has to put one back
+        // the split trims the newline that closed the comment, so the
+        // rejoin has to put one back
         assert_eq!(
             effective_query("service=x # note\n| stats count()", &[], &quick("15m")),
             "last=15m service=x # note\n| stats count()"
@@ -445,7 +445,7 @@ mod tests {
             effective_query("service=x | stats count()", &[], &quick("15m")),
             "last=15m service=x | stats count()"
         );
-        // …and a comment CLOSED by its own newline needs none either
+        // …and a comment closed by its own newline needs none either
         assert_eq!(
             effective_query(
                 "service=x # note\nhost=y | stats count()",
@@ -458,8 +458,9 @@ mod tests {
 
     /// The scan and the grammar answer the same question: a `\` outside a
     /// quoted span does not escape, and a comment opens only after ASCII
-    /// whitespace. The escape shape used to hide the base query's own
-    /// `last=`, which injected a SECOND time bound.
+    /// whitespace. Disagreeing either hides the base query's own `last=`
+    /// and injects a second time bound, or reads a phantom one and drops
+    /// the popover's range.
     #[test]
     fn the_scan_agrees_with_the_grammar_on_escapes_and_whitespace() {
         // `last=1h` lives inside the quoted phrase — not a time clause,
@@ -468,7 +469,7 @@ mod tests {
             effective_query(r#"foo\" last=1h""#, &[], &quick("15m")),
             r#"last=15m foo\" last=1h""#
         );
-        // a no-break space does NOT open a comment — the token charsets
+        // a no-break space does not open a comment — the token charsets
         // end on ASCII whitespace, so the grammar refuses this `#` rather
         // than reading prose after it, and the `last=1h` is a real clause
         assert_eq!(

@@ -2,20 +2,20 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The declared event envelope (ADR-0009, reshaped by ADR-0013): field
-//! names and the sealed namespace predicate.
+//! The declared event envelope (ADR-0013): field names and the sealed
+//! namespace predicate.
 //!
-//! The derivation source lists are NOT here: they became `[ingest]`
-//! config (ADR-0013 slice 2, ruling 5), resolved boot-fatally by the
-//! server and threaded to the one canonicalizer.
+//! The derivation source lists live in `[ingest]` config, not here: the
+//! server resolves them boot-fatally and threads them to the one
+//! canonicalizer.
 //!
-//! Namespace rule, one sentence: **underscore-prefixed names are trawl's
-//! contract slots** — trawl guarantees their semantics, the sender may
-//! propose some (`_time`, `_raw`), trawl derives the rest — and **bare
-//! names are sender vocabulary trawl never assigns meaning to**. The
-//! `_` prefix is sealed as a PREDICATE ([`is_reserved_name`]), not an
-//! enumerated list, so the envelope can grow without a corpus already
-//! holding a client's colliding key.
+//! Namespace rule, one sentence: underscore-prefixed names are trawl's
+//! contract slots (trawl guarantees their semantics, the sender may
+//! propose `_time` and `_raw`, trawl derives the rest) and bare names are
+//! sender vocabulary trawl never assigns meaning to. The `_` prefix is
+//! sealed as a predicate ([`is_reserved_name`]) rather than an enumerated
+//! list, so the envelope can grow without colliding with a key a corpus
+//! already holds.
 
 use std::fmt;
 
@@ -35,25 +35,25 @@ pub const SERVICE: &str = "service";
 pub const HOST: &str = "host";
 /// The derived `OTel` `SeverityNumber` 1-24 (SEVERITY over BIGINT).
 ///
-/// DERIVATION-ONLY (ADR-0013 §3): it is a verdict, not a proposal, so an
-/// incoming `_severity` takes the standard reserved-prefix strip and
-/// lands as a bare `severity` — which derivation then reads.
+/// Derivation-only (ADR-0013 §3): it is a verdict, not a proposal, so an
+/// incoming `_severity` takes the reserved-prefix strip and lands as a
+/// bare `severity`, which derivation then reads.
 pub const SEVERITY: &str = "_severity";
 /// The important part of the line (VARCHAR, by convention).
 pub const MESSAGE: &str = "message";
 /// Which door the event entered through (VARCHAR, required;
 /// server-stamped, closed vocabulary `http` | `syslog` | `trawld`).
 ///
-/// Provenance is data (ADR-0013 slice 2, ruling 6): "which events came
-/// over syslog" and "why is this severity inverted" are queries, not
-/// archaeology through the config that was live at the time. The sender
-/// cannot forge it — an incoming `_producer` takes the standard
-/// reserved-prefix strip and lands as a bare `producer`.
+/// Provenance is data (ADR-0013): "which events came over syslog" and
+/// "why is this severity inverted" are queries, not archaeology through
+/// the config that was live at the time. The sender cannot forge it — an
+/// incoming `_producer` takes the reserved-prefix strip and lands as a
+/// bare `producer`.
 pub const PRODUCER: &str = "_producer";
 
 /// Envelope columns stored as TIMESTAMP on disk. Every seam that casts the
-/// hot (ndjson VARCHAR) side to match parquet must cover ALL of these —
-/// a second TIMESTAMP column left VARCHAR on the hot side trips the
+/// hot (ndjson VARCHAR) side to match parquet must cover all of these: a
+/// second TIMESTAMP column left VARCHAR on the hot side trips the
 /// union-conflict path on every query with a non-empty hot buffer.
 pub const TIMESTAMP_COLUMNS: &[&str] = &[TIME, INGESTED];
 
@@ -83,40 +83,37 @@ pub const TRAILING_LOG_FIELDS: &[&str] = &[RAW, INGESTED, REPAIRS, PRODUCER];
 
 /// Whether a name belongs to trawl's contract namespace (ADR-0013 §1).
 ///
-/// The ENTIRE `_` prefix is sealed — a predicate, not an enumerated list
-/// — so the envelope can grow without a corpus already holding a client's
-/// colliding key. Both doors enforce it from here: ingest strips the
-/// prefix off an incoming `_x` and stores the value under the bare
-/// remainder, and the pipeline refuses to MINT one (`let _foo`,
-/// `rename x as _foo`, `extract (?P<_foo>…)`).
+/// Both doors enforce the seal from here: ingest strips the prefix off an
+/// incoming `_x` and stores the value under the bare remainder, and the
+/// pipeline refuses to mint one (`let _foo`, `rename x as _foo`,
+/// `extract (?P<_foo>…)`).
 #[must_use]
 pub fn is_reserved_name(name: &str) -> bool {
     name.starts_with('_')
 }
 
-/// The envelope fields the SENDER asserts (ADR-0013 §1): bare names, but
+/// The envelope fields the sender asserts (ADR-0013 §1): bare names, but
 /// declared slots all the same — trawl mirrors `env`/`service` into the
 /// storage path, peer-fills `host`, and every result surface leads with
 /// `message`.
 ///
-/// Bare because the sender is the authority on those VALUES; declared
-/// because their TYPE is part of the event contract, which is what
+/// Bare because the sender is the authority on those values; declared
+/// because their type is part of the event contract, which is what
 /// [`is_contract_typed`] answers — the one public predicate over this
 /// list, so no caller can grow a second opinion about the envelope by
 /// reading the names directly.
 const SENDER_ASSERTED_ENVELOPE: &[&str] = &[ENV, SERVICE, HOST, MESSAGE];
 
-/// Whether a field's TYPE is trawl's to declare rather than an operator's
-/// to change (issue #79).
+/// Whether a field's type is trawl's to declare rather than an operator's
+/// to change, which is what refuses a repin of an envelope field.
 ///
-/// The union of the two namespaces the envelope spans: everything under the
-/// sealed `_` prefix ([`is_reserved_name`], which covers every trawl-owned
-/// slot present AND future) plus the four sender-asserted bare names
-/// ([`SENDER_ASSERTED_ENVELOPE`]). A repin retypes ONE field's corpus, and
-/// these are exactly the fields whose type the rest of the system reasons
-/// from — the partition path, the peer fill, the severity ladder — so the
-/// refusal is a predicate over the contract rather than a list of names
-/// somewhere else that has to be kept in step with the envelope.
+/// The union of the two namespaces the envelope spans: everything under
+/// the sealed `_` prefix ([`is_reserved_name`], covering future slots as
+/// well as present ones) plus the four sender-asserted bare names
+/// (`SENDER_ASSERTED_ENVELOPE`). These are the fields the rest of the
+/// system reasons from — the partition path, the peer fill, the severity
+/// ladder — so the refusal is a predicate over the contract rather than a
+/// separate list of names to keep in step with the envelope.
 #[must_use]
 pub fn is_contract_typed(name: &str) -> bool {
     is_reserved_name(name) || SENDER_ASSERTED_ENVELOPE.contains(&name)
@@ -174,22 +171,24 @@ pub fn catalog_key(dsl_name: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Field-catalog type vocabulary (ADR-0009 slice 2)
+// Field-catalog type vocabulary (ADR-0009)
 // ---------------------------------------------------------------------------
 //
-// The catalog pins every dynamic field to exactly one of five canonical
-// storage types. This vocabulary is pure data — no I/O, no store coupling —
-// and lives here because the SQL emitter needs the pins to conform the hot
+// The catalog pins every dynamic field to exactly one canonical storage
+// type. This vocabulary is pure data — no I/O, no store coupling — and
+// lives here because the SQL emitter needs the pins to conform the hot
 // (JSON snapshot) side of the hot+cold union to the parquet side at emit
 // time, with no read-time reconciliation left to do.
 
 /// The canonical storage types a field can be pinned to.
 ///
-/// Five are physical types; [`Self::Severity`] is a SEMANTIC type over the
-/// physical `BIGINT` (ADR-0013): the pin is what gives `_severity` its
-/// token vocabulary in the ADR-0011 comparison rule table, and it is
-/// reachable only from the declared envelope seed — `DESCRIBE` never says
-/// `SEVERITY`, so inference cannot mint it.
+/// Five are physical types; [`Self::Severity`] is a semantic type over the
+/// physical `BIGINT` (ADR-0013): the pin is what gives a column its token
+/// vocabulary in the ADR-0011 comparison rule table. `DESCRIBE` never says
+/// `SEVERITY`, so inference cannot mint it — it arrives either from the
+/// catalog spelling (the envelope seed, `repin --to severity`) or from
+/// `sev()`, which declares it as its result pin whatever the catalog
+/// holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CanonicalType {
     /// `BOOLEAN` on disk.
@@ -203,43 +202,38 @@ pub enum CanonicalType {
     /// `VARCHAR` on disk — the honest fallback for everything else.
     Varchar,
     /// The `OTel` `SeverityNumber` ladder, `BIGINT` on disk and bounded to
-    /// 1-24 by its conform rung (ADR-0013). Only `_severity` carries it.
+    /// 1-24 by its conform rung (ADR-0013). The catalog seeds it on
+    /// `_severity`; any other field takes it only from an operator's repin.
     Severity,
 }
 
 impl CanonicalType {
-    /// Every variant, once, in declaration order. The ONE hand-written
+    /// Every variant, once, in declaration order — the one hand-written
     /// enumeration of the vocabulary in production code.
     ///
-    /// Two consumers read it. The fuzz pin selector in `crate::fuzz_input`
-    /// maps a selector byte onto a pin by indexing here, so the ladder's
-    /// length is the modulus and no fuzz code hardcodes a count. The
-    /// PREPARE fixture in trawl-engine asserts that its committed cases
-    /// pin every entry LISTED HERE — a real guarantee, and a different one
-    /// from "every variant is listed here", which nothing checks.
+    /// Consumers derive from it rather than relisting: the fuzz pin
+    /// selector in `crate::fuzz_input` maps a selector byte onto a pin by
+    /// indexing here, so its modulus comes from `ALL.len()`, and the
+    /// `PREPARE` fixture in trawl-engine demands a committed seed for every
+    /// entry listed here.
     ///
-    /// A variant added to the enum must be added here too, and nothing
-    /// mechanically proves it was. Stable Rust cannot count a plain enum's
-    /// variants, so every guard downstream reads `ALL` and inherits its
-    /// blind spot: a seventh variant left out is invisible to all of them.
-    /// Probed at #114, not assumed — a seventh variant with an `index` arm
-    /// and no `ALL` entry leaves the slot-walk test below and the engine
-    /// fixture both green.
+    /// Nothing mechanically proves a new variant was added here. Stable
+    /// Rust cannot count a plain enum's variants, so every guard
+    /// downstream reads `ALL` and inherits its blind spot: a seventh
+    /// variant left out is invisible to all of them, tests included.
+    /// `index` below is the mitigation — an exhaustive match on this
+    /// screen, so the build stops with the author already looking at the
+    /// list they have to edit. A `macro_rules!` declaring the enum and
+    /// `ALL` together would close the gap outright, but it needs
+    /// per-variant `#[$meta]` passthrough plus a variant-counting trick,
+    /// and `ALL`'s array type is load-bearing: `GENERATIVE_PINS` in
+    /// `filter_parity.rs` is declared
+    /// `[CanonicalType; CanonicalType::ALL.len()]`.
     ///
-    /// What the codebase offers instead is a SIGNPOST: `index` below is an
-    /// exhaustive match on this screen, so the build stops with the author
-    /// already looking at the list they have to edit. A `macro_rules!`
-    /// declaring the enum and `ALL` together would close the gap outright.
-    /// Weighed at #114 and rejected: it needs per-variant `#[$meta]`
-    /// passthrough plus a variant-counting trick, and `ALL`'s array TYPE is
-    /// load-bearing (`GENERATIVE_PINS` in `filter_parity.rs` is declared
-    /// `[CanonicalType; CanonicalType::ALL.len()]`).
-    ///
-    /// One test elsewhere names all six variants and is NOT a competing
-    /// list: `repin_targets_are_the_catalog_vocabulary_severity_included`
-    /// in `trawl-server/src/repin/engine.rs` tables case-insensitive
-    /// SPELLINGS to check what `from_catalog` parses, so it is about that
-    /// function's input, not about the vocabulary's extent. Leave it be.
+    /// `repin_targets_are_the_catalog_vocabulary_severity_included` in
+    /// `trawl-server/src/repin/engine.rs` names all six variants and is not
+    /// a competing list: it tables case-insensitive spellings to check what
+    /// [`Self::from_catalog`] parses.
     pub const ALL: [Self; 6] = [
         Self::Boolean,
         Self::BigInt,
@@ -251,25 +245,16 @@ impl CanonicalType {
 
     /// This variant's slot in [`Self::ALL`].
     ///
-    /// A signpost, not reflection. The match has no wildcard arm, so a new
-    /// variant fails to COMPILE here, a few lines from `ALL`, with this
-    /// comment telling the author to add it to `ALL` as well. Putting the
-    /// author in the right file next to the right list is the whole of
-    /// what it buys, and no test can do that job.
+    /// A signpost, not reflection: the match has no wildcard arm, so a new
+    /// variant fails to compile here, a few lines from `ALL`, and the
+    /// author is already looking at the list they must edit. It does not
+    /// make `ALL`'s completeness checkable — adding the arm here and
+    /// forgetting `ALL` leaves every downstream guard green, since they
+    /// all read `ALL`.
     ///
-    /// It does not make `ALL`'s completeness checkable. Every guard
-    /// downstream — the slot walk in
-    /// `canonical_type_all_is_ordered_and_duplicate_free`, the fuzz pin
-    /// selector, the trawl-engine PREPARE fixture's coverage assertion —
-    /// reads `ALL`, so a variant missing from `ALL` is a variant none of
-    /// them can see. Adding the arm here and forgetting `ALL` is a green
-    /// suite; that was probed at #114.
-    ///
-    /// Test-only: nothing in production wants the inverse of `ALL`, and a
-    /// `pub`/`pub(crate)` version unused outside tests is either dead code
-    /// or public API nobody calls. The pre-commit hook runs clippy with
-    /// `--all-targets`, so the compile error lands before the commit
-    /// rather than in CI.
+    /// Test-only because nothing in production wants the inverse of `ALL`,
+    /// and the pre-commit hook runs clippy with `--all-targets`, so the
+    /// compile error lands before the commit rather than in CI.
     #[cfg(test)]
     const fn index(self) -> usize {
         match self {
@@ -282,9 +267,9 @@ impl CanonicalType {
         }
     }
 
-    /// The PHYSICAL `DuckDB` type spelling — what a cast, a `DESCRIBE`
+    /// The physical `DuckDB` type spelling — what a cast, a `DESCRIBE`
     /// comparison, a repin rewrite and the hot branch's `REPLACE` all
-    /// name. NOT injective: `SEVERITY` is a `BIGINT` on disk.
+    /// name. Not injective: `SEVERITY` is a `BIGINT` on disk.
     #[must_use]
     pub const fn as_duckdb(self) -> &'static str {
         match self {
@@ -296,14 +281,13 @@ impl CanonicalType {
         }
     }
 
-    /// Parse a PHYSICAL spelling back into the enum. EXACT match only.
+    /// Parse a physical spelling back into the enum. Exact match only.
     ///
     /// `BIGINT` resolves to [`Self::BigInt`] and nothing resolves to
     /// [`Self::Severity`] — the semantic pin has no physical spelling of
-    /// its own, so INFERENCE can never mint it (`DESCRIBE` reports the
+    /// its own, so inference can never mint it (`DESCRIBE` reports the
     /// physical type, and [`normalize_duckdb_type`] goes through this
-    /// door). An OPERATOR can now name it: `repin --to severity` parses
-    /// through [`Self::from_catalog`] (issue #79).
+    /// door). An operator names it through [`Self::from_catalog`] instead.
     #[must_use]
     pub fn from_duckdb(s: &str) -> Option<Self> {
         match s {
@@ -316,7 +300,7 @@ impl CanonicalType {
         }
     }
 
-    /// The CATALOG spelling: what postgres stores in `field_types` and
+    /// The catalog spelling: what postgres stores in `field_types` and
     /// what every schema wire surface carries. Injective, so a pin can be
     /// read back exactly as it was written.
     #[must_use]
@@ -327,15 +311,12 @@ impl CanonicalType {
         }
     }
 
-    /// Parse the catalog's stored spelling back into the enum. EXACT match
+    /// Parse the catalog's stored spelling back into the enum. Exact match
     /// only — the catalog is written by code, so any other spelling is
     /// corruption and must surface, not be guessed at.
     ///
-    /// This is also the REPIN admission door (issue #79), which retracts
-    /// migration 0010's header claim that `repin --to severity` "parses
-    /// through the physical door": it parses here now, and `SEVERITY` is a
-    /// target an operator can name. What 0010 was really protecting still
-    /// holds — inference cannot mint the pin, because
+    /// This is also the repin admission door, so `SEVERITY` is a target an
+    /// operator can name. Inference still cannot mint that pin, because
     /// [`normalize_duckdb_type`] goes through [`Self::from_duckdb`].
     #[must_use]
     pub fn from_catalog(s: &str) -> Option<Self> {
@@ -381,7 +362,7 @@ pub const LADDER: [CanonicalType; 4] = [
 pub const LADDER_SUCCESS_THRESHOLD: f64 = 0.9;
 
 /// Normalize a `DuckDB` type name (as reported by `DESCRIBE`) into the
-/// canonical lattice (ADR-0009 slice 2).
+/// canonical lattice (ADR-0009).
 ///
 /// Complex kinds (`STRUCT`/`MAP`/`LIST`/`UNION`) cannot occur on the write
 /// path once ingest stringifies nested values, so they normalize to
@@ -423,13 +404,14 @@ pub const ENVELOPE_TYPES: &[(&str, CanonicalType)] = &[
 ];
 
 /// An ordered field → canonical-type map, as threaded from the server's
-/// pin cache into the emitter (pins ∩ hot-snapshot keys). Ordered so the
+/// pin cache into the emitter and the in-memory matcher. Ordered so the
 /// emitted SQL is deterministic.
 ///
 /// The map is shared behind an `Arc` and written copy-on-write: a pin set
-/// is built once and then read many times — the emitter carries one per
-/// pass, and a single logical query can re-emit up to three times on the
-/// pruned-retry / hot-only-fallback ladder. With the catalog bounded at
+/// is built once and then read many times — the emitter takes one per
+/// pass, and one logical query runs up to four passes: the union emission
+/// and its `_raw`-free variant, then that pair again if the executor falls
+/// back to the hot-only lane. With the catalog bounded at
 /// `MAX_PINNED_FIELDS` (10 000 install-wide) a deep copy per clone is a
 /// real per-query cost; `clone` here is a refcount bump instead. Mutation
 /// stays available (`insert` through [`std::sync::Arc::make_mut`]) and
@@ -459,16 +441,17 @@ impl FieldTypes {
         self.entries.iter().map(|(f, t)| (f.as_str(), *t))
     }
 
-    /// Look up a field's pinned type.
+    /// Look up a field's pinned type by exact catalog key; a DSL field
+    /// reference goes through [`Self::pin_for`] to be folded first.
     #[must_use]
     pub fn get(&self, field: &str) -> Option<CanonicalType> {
         self.entries.get(field).copied()
     }
 
-    /// Look up the pin for a DSL field reference, through [`catalog_key`]
-    /// (alias resolution + ASCII fold). The emitter's and the in-memory
-    /// filter's shared pin lookup — both must agree on which pin a query
-    /// token names (ADR-0011 slice A).
+    /// Look up the pin for a DSL field reference, through [`catalog_key`]'s
+    /// ASCII fold. The emitter's and the in-memory filter's shared pin
+    /// lookup — both must agree on which pin a query token names
+    /// (ADR-0011).
     #[must_use]
     pub fn pin_for(&self, dsl_name: &str) -> Option<CanonicalType> {
         self.get(&catalog_key(dsl_name))
@@ -495,13 +478,11 @@ impl FieldTypes {
         std::sync::Arc::make_mut(&mut self.entries).retain(|k, _| keep.contains(k));
     }
 
-    /// Whether the map holds no pins.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Number of pinned fields.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -542,7 +523,7 @@ mod tests {
         }
     }
 
-    /// The contract-typed predicate must cover the WHOLE declared envelope,
+    /// The contract-typed predicate must cover the whole declared envelope,
     /// whichever namespace a slot lives in — it is what refuses a repin of
     /// a field whose type the event contract fixes, and a slot added to
     /// `ENVELOPE_TYPES` without a matching name here would become
@@ -559,8 +540,8 @@ mod tests {
                 "{name} must be a declared envelope field"
             );
         }
-        // Sender vocabulary is the operator's to repin, including the names
-        // that used to be envelope slots (ADR-0013 §7).
+        // Sender vocabulary is the operator's to repin, `level` and
+        // `severity` included (ADR-0013 §7).
         for name in [
             "level",
             "severity",
@@ -601,9 +582,9 @@ mod tests {
         }
     }
 
-    // --- the field-catalog type vocabulary (ADR-0009 slice 2) ---
+    // --- the field-catalog type vocabulary (ADR-0009) ---
 
-    /// The CATALOG spelling is the injective one — it is what postgres
+    /// The catalog spelling is the injective one — it is what postgres
     /// stores and what the wire carries, so it must round-trip for every
     /// canonical type, `SEVERITY` included.
     #[test]
@@ -618,17 +599,16 @@ mod tests {
     }
 
     /// `ALL` is what the fuzz pin selector indexes and what the trawl-engine
-    /// PREPARE fixture walks, so a duplicate entry would quietly bias the
+    /// `PREPARE` fixture walks, so a duplicate entry would quietly bias the
     /// selector (two byte values landing on one pin), and an entry in the
     /// wrong slot would make `index` disagree with the list it describes.
     ///
-    /// It does NOT prove `ALL` lists every variant, and the name no longer
-    /// says it does. The length line is a tripwire for edits to `ALL`
-    /// itself: delete an entry and it reddens. It cannot notice an entry
-    /// that was never added, because `ALL` is a `[Self; 6]` and a seventh
-    /// variant nobody listed leaves the length at 6 (probed at #114, with
-    /// the engine fixture green beside it). `index` — the exhaustive match
-    /// beside `ALL` — is what stops the build in front of the list.
+    /// It does not prove `ALL` lists every variant. The length line is a
+    /// tripwire for edits to `ALL` itself: delete an entry and it reddens.
+    /// It cannot notice an entry that was never added, because `ALL` is a
+    /// `[Self; 6]` and a seventh variant nobody listed leaves the length at
+    /// 6. `index` — the exhaustive match beside `ALL` — is what stops the
+    /// build in front of the list.
     #[test]
     fn canonical_type_all_is_ordered_and_duplicate_free() {
         assert_eq!(
@@ -651,12 +631,11 @@ mod tests {
         );
     }
 
-    /// The PHYSICAL spelling is what casts and DDL use, and it is
-    /// deliberately NOT injective: `SEVERITY` is a BIGINT on disk, so
-    /// `from_duckdb` — the inverse of the physical spelling — cannot
-    /// name it. That is what keeps INFERENCE from minting the pin;
-    /// admission for an operator's `--to severity` goes through
-    /// `from_catalog` instead (issue #79).
+    /// The physical spelling is what casts and DDL use, and it is
+    /// deliberately not injective: `SEVERITY` is a BIGINT on disk, so
+    /// `from_duckdb` — the inverse of the physical spelling — cannot name
+    /// it. That is what keeps inference from minting the pin; an
+    /// operator's `--to severity` is admitted by `from_catalog` instead.
     #[test]
     fn severity_is_physically_bigint_and_unreachable_by_physical_parse() {
         assert_eq!(CanonicalType::Severity.as_duckdb(), "BIGINT");
@@ -668,7 +647,7 @@ mod tests {
     }
 
     /// `DESCRIBE` never reports SEVERITY, so inference can never pin it —
-    /// only the declared seed can.
+    /// only the catalog door can, by seed or by an operator's repin.
     #[test]
     fn inference_can_never_pin_severity() {
         for t in [
@@ -761,10 +740,9 @@ mod tests {
         );
     }
 
-    /// The envelope is TEN fields (ADR-0013 §1 as amended by slice 2's
-    /// ruling 6): six trawl-owned under the `_` namespace and four
-    /// sender-asserted bare ones. `severity_text` is gone outright, and
-    /// `severity` left the envelope to become ordinary sender data.
+    /// The envelope is ten fields (ADR-0013 §1): six trawl-owned under the
+    /// `_` namespace and four sender-asserted bare ones. A bare `severity`
+    /// is ordinary sender data, and `severity_text` is not a field at all.
     #[test]
     fn envelope_types_cover_the_declared_ten() {
         let fields: Vec<&str> = ENVELOPE_TYPES.iter().map(|(f, _)| *f).collect();
@@ -803,7 +781,7 @@ mod tests {
 
     #[test]
     fn catalog_key_only_folds_ascii() {
-        // ZERO aliases (ADR-0013 §6): `timestamp` is an ordinary sender
+        // No aliases (ADR-0013 §6): `timestamp` is an ordinary sender
         // field, not another spelling of `_time`.
         assert_eq!(catalog_key("timestamp"), "timestamp");
         assert_eq!(catalog_key("@timestamp"), "@timestamp");
@@ -877,8 +855,8 @@ mod tests {
         let mut ft = FieldTypes::new();
         ft.insert("status", CanonicalType::Varchar);
         let shared = ft.clone();
-        // The emitter clones a pin set per pass (up to three passes per
-        // logical query); that must not deep-copy the catalog.
+        // The emitter clones a pin set per pass, and one logical query
+        // runs up to four passes; that must not deep-copy the catalog.
         assert!(std::sync::Arc::ptr_eq(&ft.entries, &shared.entries));
 
         // ... and a write through one handle must not reach the other.

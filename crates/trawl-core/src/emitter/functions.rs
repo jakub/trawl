@@ -11,8 +11,9 @@ pub(crate) use crate::parser::suggest::KNOWN_FUNCTIONS;
 
 /// Validate that a function name is known and argument count is correct.
 ///
-/// Single source of truth for arity — used by both pre-emission
-/// validation (`validate.rs`) and translation (`translate_function`).
+/// Single source of truth for arity: read by pre-emission validation
+/// (`validate.rs`), by the argument walk (`emit_call_args`) and by the
+/// stream compiler (`stream::validate_expr`).
 pub(crate) fn validate_function_arity(name: &str, argc: usize) -> Result<(), EmitError> {
     if !KNOWN_FUNCTIONS.contains(&name) {
         return Err(EmitError::UnknownFunction {
@@ -88,12 +89,12 @@ pub const DATE_PART_UNITS: &[&str] = &[
 /// Arg positions (0-indexed) that must be string literals drawn from a
 /// closed vocabulary — date/time unit names, and `sev()`'s dialect.
 ///
-/// Returns `(arg_index, allowlist)` pairs. The `emit_expr` `FunctionCall` arm
-/// calls `validate_unit_literal` for each returned pair, and so does
-/// `stream::validate_expr` — which is the whole point of the table: the
-/// SSE lane and the `extract kv` batch tail never run `translate_function`,
-/// so a vocabulary they cannot honour has to be refused from the shared
-/// table or it would 400 in batch and silently null live.
+/// Returns `(arg_index, allowlist)` pairs. `emit_call_args` calls
+/// `validate_unit_literal` for each returned pair, and so does
+/// `stream::validate_expr`, which is the point of the table: the SSE lane
+/// and the `extract kv` batch tail never run `translate_function`, so a
+/// vocabulary they cannot honour has to be refused from the shared table
+/// or it would 400 in batch and silently null live.
 pub(crate) fn unit_literal_positions(name: &str) -> &'static [(usize, &'static [&'static str])] {
     match name {
         "date_part" => &[(0, DATE_PART_UNITS)],
@@ -104,12 +105,13 @@ pub(crate) fn unit_literal_positions(name: &str) -> &'static [(usize, &'static [
 }
 
 /// Arg positions (0-indexed) whose string literal must reach
-/// [`translate_function`] as its own TEXT rather than as a bound `?`
+/// [`translate_function`] as its own text rather than as a bound `?`
 /// parameter.
 ///
-/// `sev()`'s dialect is not an operand — it SELECTS which reading
-/// expression is emitted ([`crate::conform::severity_reading_sql`]), so
-/// the translation has to see the token itself. Same precedent as
+/// `sev()`'s dialect is not an operand: it selects which reading
+/// expression is emitted
+/// ([`crate::conform::severity_reading_sql_bind_once`]), so the
+/// translation has to see the token itself. Same precedent as
 /// [`literal_int_positions`], which inlines `split()`'s index because the
 /// emitted SQL indexes a list with it.
 pub(crate) fn literal_text_positions(name: &str) -> &'static [usize] {
@@ -122,12 +124,12 @@ pub(crate) fn literal_text_positions(name: &str) -> &'static [usize] {
 /// Arg positions (0-indexed) whose value is read through `to_json`
 /// ([`crate::conform::untyped_text`]) rather than used as an operand.
 ///
-/// `DuckDB` types a prepared statement's parameters by INFERENCE from
-/// where they sit, and `to_json(?)` gives it nothing to infer from — the
-/// statement fails to prepare. A bare LITERAL at such a position therefore
-/// carries its own type (`CAST(? AS BIGINT)`), which is exactly the type
-/// the parameter binds anyway, so the reading is unchanged. Non-literals
-/// are columns and expressions, which type themselves.
+/// `DuckDB` infers a prepared statement's parameter types from where they
+/// sit, and `to_json(?)` gives it nothing to infer from, so the statement
+/// fails to prepare. A bare literal at such a position therefore carries
+/// its own type (`CAST(? AS BIGINT)`), which is exactly the type the
+/// parameter binds anyway, so the reading is unchanged. Non-literals are
+/// columns and expressions, which type themselves.
 pub(crate) fn json_read_positions(name: &str) -> &'static [usize] {
     match name {
         "sev" => &[0],
@@ -135,7 +137,7 @@ pub(crate) fn json_read_positions(name: &str) -> &'static [usize] {
     }
 }
 
-/// What one closed-vocabulary argument is CALLED in its error message.
+/// What one closed-vocabulary argument is called in its error message.
 ///
 /// The mechanism is shared with the date/time units, the noun is not: a
 /// `sev()` second argument is a dialect, and telling an operator their
@@ -149,9 +151,10 @@ fn literal_noun(func_name: &str) -> &'static str {
 
 /// Arg position (0-indexed) of a `strftime`/`strptime` format string, if any.
 ///
-/// When the arg at this index is a string literal, both the batch (`emit_expr`)
-/// and streaming (`stream::validate_expr_formats`) paths run it through
-/// `validate_format_literal` so an invalid code is rejected identically.
+/// When the arg at this index is a string literal, both the batch
+/// (`emit_call_args`) and streaming (`stream::validate_expr`) paths run it
+/// through `validate_format_literal` so an invalid code is rejected
+/// identically.
 pub(crate) fn format_literal_position(name: &str) -> Option<usize> {
     match name {
         // DSL arg order: strftime(ts, fmt), strptime(str, fmt) — fmt is index 1.
@@ -167,7 +170,7 @@ pub(crate) fn format_literal_position(name: &str) -> Option<usize> {
 /// in directly rather than re-derived). `unit_literal` is `Some(value)` when the
 /// arg at `arg_idx` is a string literal, or `None` when it is a computed
 /// expression. Rejects non-literals and unknown units; this check runs in
-/// **both** the batch and streaming paths so an unsupported unit can never error
+/// both the batch and streaming paths so an unsupported unit can never error
 /// in batch while silently nulling in live tail.
 pub(crate) fn validate_unit_literal(
     func_name: &str,
@@ -195,7 +198,7 @@ pub(crate) fn validate_unit_literal(
     Ok(())
 }
 
-/// Validate a `strftime`/`strptime` format-string **literal**.
+/// Validate a `strftime`/`strptime` format-string literal.
 ///
 /// chrono is the canonical format authority for both the batch (`DuckDB`) and
 /// streaming (eval) paths. An invalid code (e.g. `%Q`) or a trailing `%`
@@ -204,8 +207,8 @@ pub(crate) fn validate_unit_literal(
 /// erroring-in-batch / silently-nulling-in-stream. The same `Item::Error`
 /// detection is used by the defensive runtime guard in `eval::eval_strftime`.
 ///
-/// Only call this for string-literal format args — a non-literal (field ref)
-/// can't be checked up front and keeps its pre-existing runtime behaviour.
+/// Only call this for string-literal format args: a non-literal (field ref)
+/// can't be checked up front and keeps its runtime behaviour (eval nulls).
 pub(crate) fn validate_format_literal(func_name: &str, fmt: &str) -> Result<(), EmitError> {
     if chrono::format::StrftimeItems::new(fmt)
         .any(|item| matches!(item, chrono::format::Item::Error))
@@ -220,9 +223,9 @@ pub(crate) fn validate_format_literal(func_name: &str, fmt: &str) -> Result<(), 
 
 /// Translate a DSL function call to `DuckDB` SQL.
 ///
-/// `state` is here for ONE arm: `now()` binds the statement's anchor as a
+/// `state` is here for one arm: `now()` binds the statement's anchor as a
 /// parameter (ADR-0017 §3). Nothing else in this function may push a
-/// parameter — see the arm's own note.
+/// parameter; see the arm's own note.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn translate_function(
     name: &str,
@@ -286,19 +289,19 @@ pub(crate) fn translate_function(
                 format!("ROUND({}, {})", a[0], a[1])
             }
         }),
-        // ADR-0017 §3: `now()` is ONE instant per unit of output. The
+        // `now()` is one instant per unit of output (ADR-0017 §3): the
         // instant is captured in Rust at the head of the query and bound
         // here as a TIMESTAMP parameter, so the SQL prefix and the
         // `rust_stages` tail behind `extract kv` read the same value by
-        // construction — and so the result has a settled TYPE, instead of
-        // the naive-vs-TIMESTAMPTZ split a bare `now()` produced.
+        // construction.
         //
         // The explicit `CAST(? AS TIMESTAMP)` is not decoration: an
         // unadorned placeholder leaves the result type to the driver's
         // parameter inference, so `typeof(now())` would depend on it.
+        // SQL's own `now()` is no way out either: it is TIMESTAMPTZ.
         //
-        // ONLY the zero-arg `now` may push a parameter in this function.
-        // A pushing arm WITH arguments would push after its arguments'
+        // Only the zero-arg `now` may push a parameter in this function.
+        // A pushing arm with arguments would push after its arguments'
         // own placeholders were rendered by `emit_call_args`, putting the
         // parameter list out of order with the `?`s in the SQL.
         //
@@ -314,11 +317,11 @@ pub(crate) fn translate_function(
         }
         "typeof" => require_one_arg(name, args, |a| format!("TYPEOF({a})")),
         "tonumber" => require_one_arg(name, args, |a| format!("TRY_CAST({a} AS DOUBLE)")),
-        // The ladder function (ADR-0013 slice 2, ruling 9): the ONE
-        // reading kernel, in SQL. Its argument goes through
-        // `untyped_text` because `sev(x)` must read a column of ANY
-        // physical type — a VARCHAR `level`, a BIGINT one, a foreign
-        // parquet's JSON — exactly as the conform rung reads its own.
+        // The ladder function (ADR-0013 ruling 9): the one reading
+        // kernel, in SQL. Its argument goes through `untyped_text`
+        // because `sev(x)` must read a column of any physical type (a
+        // VARCHAR `level`, a BIGINT one, a foreign parquet's JSON),
+        // exactly as the conform rung reads its own.
         "sev" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(EmitError::InvalidAggregation {
@@ -327,17 +330,18 @@ pub(crate) fn translate_function(
             }
             let dialect = match args.get(1) {
                 // The token arrives verbatim (`literal_text_positions`),
-                // and it is re-validated here because `translate_function`
-                // is reachable from callers that never ran the arg walk.
+                // and is re-validated here because this is the door that
+                // reads it: `translate_function` is callable without the
+                // arg walk.
                 Some(token) => {
                     validate_unit_literal(name, 1, crate::severity::DIALECT_TOKENS, Some(token))?;
                     // Never `unwrap_or_default()`: the validator folds
                     // with `to_lowercase` (Unicode) and `from_token`
                     // with `to_ascii_lowercase`, so a token the two ever
                     // disagreed about would silently degrade syslog to
-                    // OTel — WRONG readings (1-7 are valid in both
-                    // dialects), not absent ones. Refuse instead, with
-                    // the vocabulary.
+                    // OTel, giving wrong readings rather than absent ones
+                    // (1-7 are valid in both dialects). Refuse instead,
+                    // with the vocabulary.
                     crate::severity::Dialect::from_token(token).ok_or_else(|| {
                         EmitError::UnsupportedOperation {
                             message: format!(
@@ -386,11 +390,11 @@ pub(crate) fn translate_function(
         }),
         // strftime: emit in DSL order (timestamp, format). DuckDB's STRFTIME is
         // overloaded and accepts (timestamp, format) directly, so no swap is
-        // needed. The previous text-swap (`a[1], a[0]`) desynchronized the `?`
-        // placeholders from emit_expr's DSL-order param push: whenever the
-        // timestamp arg itself produced bound params (e.g. a nested strptime
-        // with literal args), the placeholders bound positionally to the wrong
-        // values and the call misbound.
+        // needed. A text-level swap would also desynchronize the `?`
+        // placeholders from emit_call_args' DSL-order param push: whenever the
+        // timestamp arg itself produces bound params (e.g. a nested strptime
+        // with literal args), the placeholders would bind positionally to the
+        // wrong values.
         "strftime" => require_n_args(name, args, 2, |a| format!("STRFTIME({}, {})", a[0], a[1])),
         // TRY_STRPTIME (not STRPTIME) so an unparseable input yields NULL, not a
         // whole-query error — matching the streaming eval path, which nulls.
@@ -440,21 +444,20 @@ pub(crate) fn translate_function(
     }
 }
 
-/// The canonical type a function DECLARES its result to be — the one
-/// table that lets a call be a pinned comparison subject (ADR-0013 slice
-/// 2, ruling 9).
+/// The canonical type a function declares its result to be: the one table
+/// that lets a call be a pinned comparison subject (ADR-0013 ruling 9).
 ///
-/// ONE entry, and the narrowness is the design. ADR-0011 slice A′ excluded
-/// function-wrapped subjects on DECIDABILITY: nothing tells the binder
-/// what `lower(status)` is, so it stays literal-driven. A DECLARED result
-/// pin restores that decidability for exactly the functions that have one
-/// — `sev()` answers a `SeverityNumber` whatever it is handed — so
-/// `| where sev(level) >= "error"` binds through the same rule table
-/// `_severity` does, equality takes the BAND (a plain-BIGINT `sev()` would
-/// compile `== "error"` to `== 17` and silently miss `error2`-`error4`),
-/// and the result renders as tokens.
+/// One entry, and the narrowness is the design. A function-wrapped
+/// subject is otherwise excluded on decidability, since nothing tells the
+/// binder what `lower(status)` is. A declared result pin restores that
+/// decidability for exactly the functions that have one: `sev()` answers
+/// a `SeverityNumber` whatever it is handed, so `| where sev(level) >=
+/// "error"` binds through the same rule table `_severity` does, equality
+/// takes the band (a plain-BIGINT `sev()` would compile `== "error"` to
+/// `== 17` and silently miss `error2`-`error4`), and the result renders
+/// as tokens.
 ///
-/// The declaration is the FUNCTION's, never the catalog's: it holds under
+/// The declaration is the function's, never the catalog's: it holds under
 /// [`crate::pin_scope::PinScope::unpinned`] too, which is what makes
 /// `sev()` the escape hatch for a corpus trawl did not write (embedded
 /// `--data` over foreign parquet).
@@ -466,7 +469,6 @@ pub fn function_result_pin(name: &str) -> Option<crate::schema::CanonicalType> {
     }
 }
 
-/// Check whether a function name refers to an aggregate function.
 pub fn is_aggregate_function(name: &str) -> bool {
     matches!(
         name,
@@ -493,8 +495,8 @@ pub fn is_aggregate_function(name: &str) -> bool {
 /// The quoted SQL identifier an un-aliased aggregation projects.
 ///
 /// `count()` → `"count"`, `avg(duration)` → `"avg_duration"`. A thin
-/// wrapper over [`crate::projection::agg_output_name`], the ONE
-/// derivation the stream compiler and the pin-scope walk read too — the
+/// wrapper over [`crate::projection::agg_output_name`], the one
+/// derivation the stream compiler and the pin-scope walk read too, so the
 /// collision check counts with the names this writes.
 pub(crate) fn default_agg_alias(agg: &crate::ast::AggExpr) -> String {
     quote_field(&crate::projection::agg_output_name(agg))
@@ -562,7 +564,7 @@ mod tests {
         strs.iter().map(|s| (*s).to_string()).collect()
     }
 
-    /// A FIXED anchor: nothing in this crate's `src/` may self-serve an
+    /// A fixed anchor: nothing in this crate's `src/` may self-serve an
     /// evaluation context (`tests/now_anchor_contract.rs`), and a test
     /// that samples its own clock cannot prove per-unit freezing.
     fn anchor() -> crate::context::EvalContext {
@@ -826,8 +828,8 @@ mod tests {
         );
     }
 
-    /// `now()` is the statement ANCHOR, bound as a TIMESTAMP parameter
-    /// under an explicit cast — never `DuckDB`'s own clock (ADR-0017 §3).
+    /// `now()` is the statement anchor, bound as a TIMESTAMP parameter
+    /// under an explicit cast, never `DuckDB`'s own clock (ADR-0017 §3).
     #[test]
     fn translate_now_binds_the_anchor_under_an_explicit_cast() {
         let mut st = state();
@@ -869,9 +871,9 @@ mod tests {
 
     #[test]
     fn translate_strftime_dsl_order() {
-        // DSL (ts, fmt) emits in the same order — STRFTIME is overloaded in
-        // DuckDB so no swap is needed, and emitting in DSL order keeps the `?`
-        // placeholders aligned with emit_expr's DSL-order param push.
+        // DSL (ts, fmt) emits in the same order: STRFTIME is overloaded in
+        // DuckDB so no swap is needed, and DSL order keeps the `?`
+        // placeholders aligned with emit_call_args' param push.
         assert_eq!(
             translate_function("strftime", &args(&["ts", "fmt"]), &mut state()).unwrap(),
             "STRFTIME(ts, fmt)"
@@ -1087,7 +1089,7 @@ mod tests {
 
     #[test]
     fn date_trunc_rejects_dow_not_in_allowlist() {
-        // dow is in DATE_PART_UNITS but NOT in DATE_UNITS (date_trunc allowlist)
+        // dow is in DATE_PART_UNITS but not in DATE_UNITS (date_trunc allowlist)
         let err = validate_unit_literal("date_trunc", 0, DATE_UNITS, Some("dow")).unwrap_err();
         assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
     }
@@ -1206,12 +1208,9 @@ mod tests {
 
     // ── sev() dialect resolution ────────────────────────────────────────
 
-    /// The translation NEVER defaults a dialect it cannot parse. The
-    /// validator folds with `to_lowercase` (Unicode) and `from_token`
-    /// with `to_ascii_lowercase`, so a token they ever disagreed about
-    /// would otherwise degrade syslog to `OTel` silently — and 1-7 are
-    /// valid readings in BOTH dialects, so that is a WRONG number, not a
-    /// missing one.
+    /// The translation never defaults a dialect it cannot parse: 1-7 are
+    /// valid readings in both dialects, so degrading syslog to `OTel`
+    /// would give a wrong number rather than a missing one.
     #[test]
     fn sev_refuses_a_dialect_it_cannot_parse_rather_than_defaulting() {
         let otel = translate_function(

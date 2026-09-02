@@ -12,21 +12,21 @@
 //! `None` here. Colors are plain `#rrggbb` strings; the wrapper does
 //! the vec4 conversion.
 //!
-//! MODULE RESOLUTION (ADR-0012): the leading `/` in `module =
+//! Module resolution (ADR-0012): the leading `/` in `module =
 //! "/vendor/paper-shaders.js"` makes it a path-shaped specifier, which
-//! wasm-bindgen reads as a LOCAL JS SNIPPET — resolved at COMPILE TIME
+//! wasm-bindgen reads as a local JS snippet, resolved at compile time
 //! against this crate's root (`crates/fleet-ui/vendor/paper-shaders.js`),
 //! inlined into the wasm custom section, and re-emitted beside the
 //! generated shim under `snippets/fleet-ui-<hash>/vendor/`, which the
 //! shim imports by relative path. It is never fetched from a dist-root
 //! URL, so consumers owe nothing beyond the dependency itself: no
 //! `copy-file` directive, no path bookkeeping. A missing or renamed
-//! vendor file is a build failure, not a runtime 404 — the only thing
+//! vendor file is a build failure, not a runtime 404, so the only thing
 //! left worth pinning is that the path and the committed filename
 //! agree, which `tests/atmosphere_vendor_contract.rs` does.
 //!
 //! The flip side, and why this module sits behind the default-off
-//! `atmosphere` feature: snippet emission keys off LINKING the extern
+//! `atmosphere` feature: snippet emission keys off linking the extern
 //! block, not off calling it. An unconditional extern block here plants
 //! the 142 KB bundle in the dist of every fleet-ui consumer and gets it
 //! `modulepreload`ed from their `index.html`, even one whose glue

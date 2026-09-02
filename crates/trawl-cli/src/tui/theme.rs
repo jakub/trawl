@@ -104,7 +104,7 @@ pub struct SyntaxColors {
     pub regex: Color,
     /// Negated terms (`-word`).
     pub negated: Color,
-    /// Comments (`// ...`).
+    /// Comments (`# ...` to end of line).
     pub comment: Color,
 }
 
@@ -121,7 +121,8 @@ const fn rgb(hex: u32) -> Color {
     )
 }
 
-/// Dark theme — the default. Maps 1:1 to the original hardcoded colors.
+/// Dark theme — the default. Built entirely from named ANSI colors, so it
+/// follows the terminal's own palette instead of fixed RGB.
 pub fn dark() -> Theme {
     Theme {
         name: "dark".to_owned(),

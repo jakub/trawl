@@ -2,10 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<SearchInput/>` — icon-adorned filter input (issue #31).
+//! `<SearchInput/>` — icon-adorned filter input.
 //!
-//! The `.inp-wrap` toolbar filter every list page hand-rolled
-//! (history/nets/runs/schema). Deliberately a SIBLING of
+//! The `.inp-wrap` toolbar filter of the list pages
+//! (history/nets/runs/schema). Deliberately a sibling of
 //! [`Field`](crate::field::Field), not a Field mode: Field is a
 //! label+input+helper cluster; this has no caption at all.
 

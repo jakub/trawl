@@ -2,15 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Atmosphere palette ↔ stylesheet parity (jakub/coastwatch#308).
+//! Atmosphere palette ↔ stylesheet parity.
 //!
 //! The shader palettes live in Rust (`atmosphere::palette`) because
 //! `getShaderColorFromString` cannot parse the `oklch()`/`color-mix()`
-//! tokens the Mira Blue stylesheet uses — the palettes MIRROR the CSS
-//! by necessity instead of reading it. Mirrors drift, so this test
-//! pins the two literal-hex anchors the palettes are seeded from (the
-//! only literal-hex blue tokens in fleet-ui.css: `--accent` per theme)
-//! and asserts the `.atmosphere` CSS fallback floor stays `var()`-only —
+//! tokens the Mira Blue stylesheet uses, so the palettes mirror the CSS
+//! instead of reading it. Mirrors drift, so this test pins the two
+//! literal-hex anchors the palettes are seeded from (the only
+//! literal-hex blue tokens in fleet-ui.css: `--accent` per theme) and
+//! asserts the `.atmosphere` CSS fallback floor stays `var()`-only —
 //! the floor must re-theme through the token system, never through a
 //! second hard-coded color that could drift from `--bg`.
 
@@ -86,7 +86,7 @@ fn atmosphere_css_floor_is_var_only() {
 #[test]
 fn atmosphere_geometry_is_pinned() {
     // The layering contract every consumer composes against: fixed
-    // full-viewport, painted BELOW normal flow, and transparent to
+    // full-viewport, painted below normal flow, and transparent to
     // input. Losing any one of these silently breaks the backdrop —
     // content stops scrolling over it, it occludes clicks, or it paints
     // above the login card.
@@ -142,12 +142,12 @@ fn html_rules(css: &str) -> Vec<String> {
 
 #[test]
 fn html_selector_declares_no_background() {
-    // The .login-shell background removal (css_chrome_parity) depends on
-    // an invariant nothing else states: `body`'s `background: var(--bg)`
-    // PROPAGATES to the canvas only while `html` declares no background
-    // of its own. A future `html { background: … }` would silently
-    // re-occlude nothing but ALSO stop body's floor from reaching the
-    // viewport behind the z-index:-1 canvas. Scan every html-selector
+    // `.login-shell` declares no background (css_chrome_parity), which
+    // leans on an invariant nothing else states: `body`'s
+    // `background: var(--bg)` propagates to the viewport canvas only
+    // while `html` declares no background of its own. An
+    // `html { background: … }` rule would cut that propagation and the
+    // backdrop's degradation floor with it, so scan every html-selector
     // rule body for a background declaration.
     let html_rules = html_rules(FLEET_CSS);
     // Vacuous-pass guard: fleet-ui.css declares `html, body { … }` and the

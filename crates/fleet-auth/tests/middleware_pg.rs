@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Postgres-backed integration tests for `require_session` and
-//! `require_bearer` middleware (ADR-0030, issue coastwatch#34).
+//! `require_bearer` middleware (ADR-0030).
 //!
 //! Builds a real `axum::Router` with the middleware layered on, fires
 //! requests via `tower::ServiceExt::oneshot`, and asserts both response
@@ -82,8 +82,8 @@ fn issue_session_cookie(session_key: &SessionKey, token: &str, ttl_secs: i64) ->
     encrypt(session_key, &payload).expect("encrypt cookie")
 }
 
-/// Seed the converted-shape `trawl-analyst` role and return its name as the
-/// role list every test key is created with.
+/// Seed the `trawl-analyst` role and return its name as the role list every
+/// test key is created with.
 async fn trawl_role(store: &KeyStore) -> Vec<String> {
     store
         .create_role(
@@ -219,7 +219,6 @@ async fn session_tampered_cookie_returns_401(pool: sqlx::PgPool) {
 
     let (state, session_key) = session_state(store, "trawl");
     let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
-    // Flip a single character somewhere in the middle of the base64 body.
     let mut bytes = cookie_value.into_bytes();
     let mid = bytes.len() / 2;
     bytes[mid] = if bytes[mid] == b'A' { b'B' } else { b'A' };
@@ -289,7 +288,7 @@ async fn session_grant_revoked_during_session_returns_403(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
     let roles = trawl_role(&store).await;
 
-    // Key remains active, but its ONLY role is unassigned after the
+    // Key remains active, but its only role is unassigned after the
     // cookie was issued. The next request must take the no-permission
     // 403 path, proving middleware re-resolves roles from the DB on
     // each request rather than trusting cached state.
@@ -468,8 +467,8 @@ async fn bearer_does_not_enforce_namespace(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
     let roles = trawl_role(&store).await;
 
-    // A key with NO permission in "coastwatch" still passes bearer
-    // middleware configured for "coastwatch" — per ADR-0030 cross-app
+    // A key with no permission in "coastwatch" still passes bearer
+    // middleware configured for "coastwatch": per ADR-0030 cross-app
     // service principals must be allowed past, and each app gates further
     // with its own permission guard.
     let created = store
@@ -498,20 +497,18 @@ async fn bearer_does_not_enforce_namespace(pool: sqlx::PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// build-time sanity: SessionState rejects invalid config at construction
+// build-time sanity: the builder rejects invalid config before construction
 // ---------------------------------------------------------------------------
 
 #[sqlx::test]
 async fn session_state_rejects_invalid_config(pool: sqlx::PgPool) {
     let _store = KeyStore::from_pool(pool);
 
-    // After the I4 lockdown, external code can't construct an
-    // invalid SessionConfig — `#[non_exhaustive]` and `pub(crate)`
-    // fields force every external value through
-    // `SessionConfig::builder().build()`, which validates first.
-    // Verify the builder itself rejects an empty cookie name so the
-    // chokepoint that previously sat in SessionState::new is still
-    // observable to consumers.
+    // External code can't construct an invalid SessionConfig:
+    // `#[non_exhaustive]` and `pub(crate)` fields force every external
+    // value through `SessionConfig::builder().build()`, which validates
+    // first. So the reachable check is the builder's, and this asserts it
+    // rejects an empty cookie name.
     let err = SessionConfig::builder()
         .cookie_name("")
         .app_namespace("trawl")

@@ -2,9 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Drawer/>` — right-slide detail inspector (issue #28), extracted
-//! from the `sd-*` convention trawl's service and net drawers
-//! copy-pasted.
+//! `<Drawer/>` — right-slide detail inspector over the `sd-*` classes.
 //!
 //! Owns the shell: scrim (outside-click dismissal via `NodeRef`
 //! identity), the sliding `aside` panel, the header row (title slot +
@@ -13,15 +11,15 @@
 //! scrolling body. Pane content, tab-switching state, and the title's
 //! inner markup stay app-owned.
 //!
-//! **Escape** is bound at window level, so it fires regardless of
-//! focus (the scrim-bound `on:keydown` the trawl drawers shipped only
-//! dispatched once focus entered the drawer subtree — on a
-//! freshly-opened drawer Esc was a no-op). It is gated on
+//! **Escape** is bound at window level so it fires regardless of
+//! focus; a scrim-bound `on:keydown` only dispatches once focus has
+//! entered the drawer subtree, which leaves Esc dead on a
+//! freshly-opened drawer. It is gated on
 //! [`overlay`](crate::overlay) topmost-layer arbitration so a drawer
 //! sitting beneath an open modal ignores Escape (the modal owns it).
 //! `on_escape` overrides the default close behaviour for drawers that
-//! need a pre-close step — trawl's net drawer cancels an in-flight
-//! inline rename first.
+//! need a pre-close step, such as cancelling an in-flight inline
+//! rename.
 
 use leptos::ev;
 use leptos::html::{Aside, Div};
@@ -46,12 +44,10 @@ pub fn Drawer(
     on_close: Callback<()>,
     #[prop(optional, into)] on_escape: Option<Callback<()>>,
     #[prop(into, optional)] meta: MaybeProp<String>,
-    /// Close-glyph size in px. Exists because trawl's drawers drifted
-    /// pre-migration: the service drawer's close X was 12px, the net
-    /// drawer's 14px, and the zero-visual-change contract preserves
-    /// both (the 2px delta is pixel-visible in the stroke tips).
-    /// Unifying on one size is deliberate visual work for a future
-    /// slice, not a migration side effect.
+    /// Close-glyph size in px. A prop because the sizes in use differ
+    /// (trawl's drawers pass 12, the default is 14) and the 2px delta
+    /// is pixel-visible in the stroke tips; picking one size for the
+    /// fleet is deliberate visual work, not a default to flip.
     #[prop(default = 14)]
     close_size: u16,
     title: Children,
@@ -65,13 +61,13 @@ pub fn Drawer(
     // registers an on_cleanup hook internally; the returned handle is
     // discarded intentionally. The topmost-layer guard (see
     // crate::overlay) makes a background drawer ignore Escape while a
-    // modal is stacked over it — otherwise one Escape closed both.
+    // modal is stacked over it, so one Escape doesn't close both.
     //
     // FocusPolicy::Capture: the drawer takes initial focus on open and
     // restores the opener on close, but never Tab-traps — it is
     // non-modal by design (the background stays interactive, and a
     // modal may stack over a live drawer), which is also why the aside
-    // below renders role="dialog" WITHOUT aria-modal (issue #33 D2).
+    // below renders role="dialog" without aria-modal.
     let layer =
         crate::overlay::use_overlay_layer_with(crate::overlay::FocusPolicy::Capture, move || {
             panel_ref.get().map(web_sys::Element::from)

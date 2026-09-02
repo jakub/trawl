@@ -2,13 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Postgres store tests for trawl-server's app-state stores (ADR-0004
-//! slice 3).
+//! Postgres store tests for trawl-server's app-state stores.
 //!
-//! Ports every behaviour the retired trawl-auth sqlite unit tests pinned
-//! (AC2), adds the pg-specific concurrency guarantees the sqlite stores got
-//! for free from their process-wide mutex (AC3), and exercises the boot
-//! path — advisory lock, migration, idempotency, failure modes (AC5).
+//! Covers per-store behaviour, the concurrency guarantees postgres has to
+//! make on its own (nothing serialises these calls in-process), and the
+//! boot path: advisory lock, migration, idempotency, failure modes.
 //!
 //! Plain `#[sqlx::test]` auto-applies `crates/trawl-server/migrations/` to
 //! each per-test database; boot tests use `migrations = false` plus a
@@ -35,7 +33,7 @@ fn schedules(pool: &PgPool) -> ScheduleStore {
 }
 
 // ---------------------------------------------------------------------------
-// history (AC2)
+// history
 // ---------------------------------------------------------------------------
 
 #[sqlx::test]
@@ -178,7 +176,7 @@ async fn history_status_check_is_backstop(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// saved queries (AC2)
+// saved queries
 // ---------------------------------------------------------------------------
 
 #[sqlx::test]
@@ -335,7 +333,7 @@ async fn saved_get_by_name(pool: PgPool) {
 }
 
 /// The bulk-join list carries schedule + latest run + run count per item in
-/// ONE statement (AC4's bounded-query-count contract).
+/// a single statement, so the query count does not grow with the list.
 #[sqlx::test]
 async fn saved_list_with_details_bulk_join(pool: PgPool) {
     let saved_store = saved(&pool);
@@ -385,7 +383,7 @@ async fn saved_list_with_details_bulk_join(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// schedules + runs (AC2)
+// schedules + runs
 // ---------------------------------------------------------------------------
 
 async fn seed_saved(pool: &PgPool, key_id: i64, name: &str) -> i64 {
@@ -454,8 +452,8 @@ async fn schedule_for_missing_saved_query_is_not_found(pool: PgPool) {
 
 #[sqlx::test]
 async fn schedule_rejects_sub_minute_interval(pool: PgPool) {
-    // The store enforces the 60s minimum on both create and update paths,
-    // not just in the handler's parse_interval.
+    // The 60s minimum is enforced on both the create and update paths, not
+    // only where `parse_interval` reads the request string.
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
 
@@ -546,7 +544,7 @@ async fn schedule_user_isolation(pool: PgPool) {
     );
 }
 
-/// Full cascade chain: deleting the saved query wipes its schedule AND its
+/// Full cascade chain: deleting the saved query wipes its schedule and its
 /// runs, and the delete transaction reports the parquet paths to unlink.
 #[sqlx::test]
 async fn cascade_on_saved_query_delete(pool: PgPool) {
@@ -613,7 +611,7 @@ async fn schedule_delete_collects_run_paths(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// run lifecycle (AC2)
+// run lifecycle
 // ---------------------------------------------------------------------------
 
 #[sqlx::test]
@@ -897,7 +895,7 @@ async fn delete_old_runs_retention_and_paths(pool: PgPool) {
             .unwrap();
     }
 
-    // Age cutoff 30 days AND keep at most 1 per schedule.
+    // Age cutoff 30 days, and keep at most 1 per schedule.
     let (deleted, mut paths) = store.delete_old_runs(30, 1).await.unwrap();
     assert_eq!(deleted, 3, "two aged out + one excess");
     paths.sort();
@@ -966,8 +964,8 @@ async fn successful_run_selectors(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// concurrency (AC3) — the load-bearing new coverage: sqlite's atomicity was
-// an accident of the process-wide mutex, pg must prove it.
+// concurrency: nothing serialises these calls in-process, so every
+// atomicity claim has to be a postgres one.
 // ---------------------------------------------------------------------------
 
 /// Two connections racing `claim_run` on one schedule: exactly one claims
@@ -1066,9 +1064,9 @@ async fn finish_run_after_cascade_delete_reports_orphan(pool: PgPool) {
 }
 
 /// `fail_run_if_running` is the ambiguous-commit recovery guard: it flips a
-/// still-`running` row to `error`, but must NEVER clobber a run whose success
-/// already committed. Regression for the finding where an unconditional retry
-/// destroyed a committed result and orphaned its parquet file.
+/// still-`running` row to `error`, and must leave a run whose success already
+/// committed alone. An unconditional retry would destroy the committed result
+/// and orphan its parquet file.
 #[sqlx::test]
 async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
     let saved_store = saved(&pool);
@@ -1134,16 +1132,15 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
     );
 }
 
-/// Barrier-driven regression: a scheduler's `finish_run` landing its parquet
-/// path while `SavedQueryStore::delete` is mid-flight must never orphan the
-/// file. A blocker transaction pins the interleaving to the exact window the
-/// finding describes — `finish_run` commits its path after `delete` collected
-/// paths but before its cascade wipes the row. The fix locks the parent and
-/// every run row first, so `delete` either collects the path or the run row
-/// survives long enough for `finish_run` to report the orphan. Invariant:
-/// `delete` returns the path iff `finish_run` succeeded — exactly one side owns
-/// cleanup. The pre-fix code returns an empty set while `finish_run` reports
-/// success, leaking the file, and trips this assertion.
+/// A scheduler's `finish_run` landing its parquet path while
+/// `SavedQueryStore::delete` is mid-flight must not orphan the file.
+///
+/// A blocker transaction pins the interleaving to the dangerous window, where
+/// `finish_run` commits its path after `delete` has collected paths but before
+/// its cascade wipes the row. `delete` locks the parent and every run row
+/// first, so it either collects the path or the run row survives long enough
+/// for `finish_run` to report the orphan. The invariant: `delete` returns the
+/// path iff `finish_run` succeeded, so exactly one side owns the cleanup.
 #[sqlx::test]
 async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     const PATH: &str = "scheduled/race/run.parquet";
@@ -1156,9 +1153,8 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
         .unwrap();
     let rid = seed_run(&sched_store, sched.id, sq.id, "q").await;
 
-    // Hold the parent row so `delete` stalls at the spot the race needs: the
-    // fixed code blocks on its parent `FOR UPDATE`; the pre-fix code blocks on
-    // its cascade `DELETE` — after it already read an empty path set.
+    // Hold the parent row so `delete` stalls on its parent `FOR UPDATE`, the
+    // spot the race needs.
     let mut blocker = pool.begin().await.unwrap();
     sqlx::query_scalar::<_, i64>("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
         .bind(sq.id)
@@ -1170,8 +1166,8 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     let sq_id = sq.id;
     let delete_task = tokio::spawn(async move { delete_store.delete(sq_id, 1).await });
 
-    // Let `delete` reach its blocking point (so the pre-fix path read has
-    // already run) before the scheduler commits its result path.
+    // Let `delete` reach its blocking point before the scheduler commits its
+    // result path.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
     let finished = sched_store
@@ -1195,10 +1191,10 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
 }
 
-/// Same barrier-driven race for `ScheduleStore::delete_schedule`: the blocker
-/// holds the schedule row, `finish_run` commits its path mid-delete, and the
-/// fix guarantees `delete_schedule` collects it (rather than cascading it away
-/// while `finish_run` believed it persisted).
+/// The same race for `ScheduleStore::delete_schedule`: the blocker holds the
+/// schedule row, `finish_run` commits its path mid-delete, and
+/// `delete_schedule` must collect that path rather than cascade it away while
+/// `finish_run` believes it persisted.
 #[sqlx::test]
 async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
     const PATH: &str = "scheduled/race/sched.parquet";
@@ -1247,11 +1243,11 @@ async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// boot: advisory lock + migration (AC5)
+// boot: advisory lock + migration
 // ---------------------------------------------------------------------------
 
 /// Fresh empty database + `StorageState::connect` applies the schema via
-/// the real boot path (advisory lock BEFORE migrate).
+/// the real boot path (advisory lock before migrate).
 #[sqlx::test(migrations = false)]
 async fn boot_migrates_fresh_database(pool: PgPool) {
     let url = common::create_app_database(&pool).await;
@@ -1293,7 +1289,7 @@ async fn boot_is_idempotent_after_shutdown(pool: PgPool) {
     panic!("second boot never succeeded: {last_err:?}");
 }
 
-/// A second LIVE instance on the same DSN fails startup on the advisory
+/// A second live instance on the same DSN fails startup on the advisory
 /// lock with a descriptive error.
 #[sqlx::test(migrations = false)]
 async fn boot_second_live_instance_fails_on_advisory_lock(pool: PgPool) {
@@ -1321,7 +1317,7 @@ async fn boot_unreachable_database_fails_descriptively(pool: PgPool) {
 }
 
 /// Losing the lock-holding session must be detected, and must free the lock
-/// for a replacement — the split-brain guard from the [high] review finding.
+/// for a replacement: the guard against two live instances writing at once.
 ///
 /// Terminating every backend on the app database kills the dedicated
 /// advisory-lock connection (postgres releases the session lock) while the
@@ -1378,7 +1374,7 @@ async fn lock_loss_is_detected_and_frees_the_lock_for_a_replacement(pool: PgPool
 }
 
 // ---------------------------------------------------------------------------
-// field catalog (ADR-0009 slice 2)
+// field catalog
 // ---------------------------------------------------------------------------
 
 mod catalog {
@@ -1400,8 +1396,7 @@ mod catalog {
 
     #[sqlx::test]
     async fn migration_seed_matches_envelope_types(pool: PgPool) {
-        // The declared schema is the catalog's first citizen: the migration
-        // seed must mirror trawl-core's ENVELOPE_TYPES exactly.
+        // The migration seed must mirror trawl-core's ENVELOPE_TYPES exactly.
         let pins = catalog(&pool).load_pins().await.unwrap();
         for (field, ty) in ENVELOPE_TYPES {
             let pinned = pins.iter().find(|(f, _)| f == field);
@@ -1416,9 +1411,9 @@ mod catalog {
             ENVELOPE_TYPES.len(),
             "a fresh catalog holds exactly the declared envelope"
         );
-        // The ADR-0013 reshape, spelled out: `_severity` is pinned
-        // SEVERITY (the semantic type, persisted under its own catalog
-        // spelling) and the pre-cutover names are gone from the seed.
+        // `_severity` is pinned SEVERITY, the semantic type persisted under
+        // its own catalog spelling, and no `severity`/`severity_text` row is
+        // seeded: those are ordinary sender vocabulary.
         assert_eq!(
             pins.iter().find(|(f, _)| f == "_severity").map(|(_, t)| *t),
             Some(CanonicalType::Severity)
@@ -1429,18 +1424,18 @@ mod catalog {
                 "{gone} left the envelope (ADR-0013 §1)"
             );
         }
-        // Slice 2's tenth field (ruling 6): server-stamped provenance,
-        // seeded VARCHAR by migration 0011 so the closed vocabulary
-        // (`http` | `syslog` | `trawld`) is never typed by inference.
+        // `_producer` is server-stamped provenance, seeded VARCHAR by
+        // migration 0011 so its closed vocabulary (http | syslog | trawld)
+        // is never typed by inference.
         assert_eq!(
             pins.iter().find(|(f, _)| f == "_producer").map(|(_, t)| *t),
             Some(CanonicalType::Varchar)
         );
     }
 
-    /// Migration 0010's DELETE is SCOPED to the rows migration 0002
-    /// declared: a SENDER's own `severity` pin is ordinary data and must
-    /// survive the reshape, along with its observations and evidence.
+    /// Migration 0010's DELETE is scoped to the rows migration 0002
+    /// declared: a sender's own `severity` pin is ordinary data and survives
+    /// the reshape, along with its observations and evidence.
     #[sqlx::test]
     async fn the_seed_reshape_leaves_a_senders_own_severity_pin_standing(pool: PgPool) {
         let store = catalog(&pool);
@@ -1490,15 +1485,15 @@ mod catalog {
         [services, conflicts, stats]
     }
 
-    /// The declared envelope AS OF migration 0010, written out.
+    /// The declared envelope as of migration 0010, written out.
     ///
     /// A migration-boundary assertion has to name the envelope of its own
-    /// moment. Deriving it from today's `ENVELOPE_TYPES` — even minus the
-    /// fields added since — keeps the frozen past coupled to the living
-    /// present: a RETYPED envelope field would silently rewrite what this
-    /// test claims 0010 produced, and every later growth would need
-    /// another subtraction here. sqlx migrations are immutable once
-    /// merged, so this list is too.
+    /// moment. Deriving it from today's `ENVELOPE_TYPES`, even minus the
+    /// fields added since, couples the frozen past to the living present:
+    /// retyping an envelope field would silently rewrite what this test
+    /// claims 0010 produced, and every later addition would need another
+    /// subtraction here. sqlx migrations are immutable once merged, so this
+    /// list is too.
     const ENVELOPE_AT_0010: &[(&str, CanonicalType)] = &[
         ("_time", CanonicalType::Timestamp),
         ("_ingested", CanonicalType::Timestamp),
@@ -1515,22 +1510,21 @@ mod catalog {
         ENVELOPE_AT_0010.iter()
     }
 
-    /// Migration 0010 applied over a REAL pre-cutover catalog.
+    /// Migration 0010 applied over a real pre-cutover catalog.
     ///
     /// The reshape test above starts from the already-migrated schema and
     /// replays one of 0010's statements by hand, which can only speak for
-    /// forward behaviour. This one builds the state a live install actually
-    /// upgrades FROM — migrations 0001-0009, the declared `severity`/
-    /// `severity_text` seed with observations and conflict evidence, a
-    /// SENDER-owned `_severity` pin from the era when `_` was an ordinary
-    /// character, an unrelated sender field, and a stamped `conformed_at` —
-    /// and then applies 0010 over it. sqlx migrations are immutable once
-    /// merged, so this is the only window in which the conditional DELETEs
-    /// can be proven to scope correctly; a pin slot is spent permanently,
-    /// and the corpus a mis-scoped DELETE unstores is standing data.
+    /// forward behaviour. This one builds the state a live install upgrades
+    /// from (migrations 0001-0009, the declared `severity`/`severity_text`
+    /// seed with observations and conflict evidence, a sender-owned
+    /// `_severity` pin from before the `_` prefix was sealed, an unrelated
+    /// sender field, a stamped `conformed_at`) and then applies 0010 over it.
+    /// sqlx migrations are immutable once merged, so this is the only window
+    /// in which the conditional DELETEs can be proven to scope correctly, and
+    /// the corpus a mis-scoped DELETE unstores is standing data.
     #[sqlx::test(migrations = false)]
     async fn applying_0010_over_a_0009_catalog_reshapes_only_the_declared_rows(pool: PgPool) {
-        // The crate's real migration set — the same files
+        // The crate's real migration set, the same files
         // `StorageState::connect` runs, so neither half can drift.
         static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
         MIGRATIONS
@@ -1594,14 +1588,10 @@ mod catalog {
             .await
             .expect("apply 0010 over the pre-cutover catalog");
 
-        // The pin table: exactly the new declared envelope plus the
+        // The pin table: exactly the envelope 0010 declares (nine fields;
+        // `_producer` is 0011's, proven in the sibling test below) plus the
         // bystander. `load_pins` parsing at all proves the widened CHECK
         // constraint and `CanonicalType::from_catalog` agree on SEVERITY.
-        //
-        // "The envelope" here is the one 0010 declares — NINE fields.
-        // `_producer` is slice 2's tenth (migration 0011, proven in the
-        // sibling test below), so a migration boundary this test asserts
-        // at cannot borrow it from today's `ENVELOPE_TYPES`.
         let pins = catalog(&pool).load_pins().await.unwrap();
         for (field, ty) in envelope_at_0010() {
             assert_eq!(
@@ -1624,7 +1614,7 @@ mod catalog {
             envelope_at_0010().count() + 1,
             "the reshape leaves the declared envelope plus the sender's own pin: {pins:?}"
         );
-        // `_severity` is REPLACED, not merely present: the sender's VARCHAR
+        // `_severity` is replaced, not merely present: the sender's VARCHAR
         // pin is gone and the row is the declared seed's.
         let pinned_from: Option<String> =
             sqlx::query_scalar("SELECT pinned_from FROM field_types WHERE field = '_severity'")
@@ -1655,7 +1645,7 @@ mod catalog {
             "an unrelated field's evidence survives the reshape"
         );
 
-        // Re-armed for epoch 3's fresh data root — and nothing else in
+        // Re-armed for epoch 3's fresh data root, and nothing else in
         // `catalog_state` is disturbed (a set-aside root has no standing
         // corpus to backfill observations from).
         let (conformed, backfilled): (
@@ -1672,16 +1662,15 @@ mod catalog {
         );
     }
 
-    /// Migration 0011 (`_producer`, ADR-0013 slice 2 ruling 6) applied over
-    /// a catalog that already carries a SENDER-owned `_producer` pin.
+    /// Migration 0011 (`_producer`) applied over a catalog that already
+    /// carries a sender-owned `_producer` pin.
     ///
-    /// Such a pin can only date from before slice 1 sealed the `_` prefix,
-    /// which is exactly the catalog a live install replays 0010 and 0011
-    /// over in one boot. 0011's DELETEs claim the name unconditionally —
-    /// the column is server-stamped, so typing it by an old sender's data
-    /// would misread a closed vocabulary — and this is the only window in
-    /// which that scoping can be proven, since a merged migration is
-    /// immutable.
+    /// Such a pin can only date from before the `_` prefix was sealed, which
+    /// is exactly the catalog a live install replays 0010 and 0011 over in one
+    /// boot. 0011's DELETEs claim the name unconditionally, because the column
+    /// is server-stamped and typing it from an old sender's data would misread
+    /// a closed vocabulary. A merged migration is immutable, so this is the
+    /// only window in which that scoping can be proven.
     #[sqlx::test(migrations = false)]
     async fn applying_0011_claims_producer_and_leaves_sender_pins_alone(pool: PgPool) {
         static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -1747,7 +1736,7 @@ mod catalog {
             "the ten declared fields plus the sender's own pin: {pins:?}"
         );
 
-        // `_producer` is REPLACED, not merely present: the sender's BIGINT
+        // `_producer` is replaced, not merely present: the sender's BIGINT
         // pin is gone, the row is the declared seed's, and the evidence
         // describing the retired pin goes with it.
         let pinned_from: Option<String> =
@@ -1774,8 +1763,8 @@ mod catalog {
         );
     }
 
-    /// `_producer` is a NEW column on a corpus that never held one, so
-    /// 0011 must NOT re-arm the boot conformance pass: `UNION ALL BY NAME`
+    /// `_producer` is a new column on a corpus that never held one, so
+    /// 0011 must not re-arm the boot conformance pass: `UNION ALL BY NAME`
     /// tolerates a column absent from older parquet, and a spurious
     /// re-arm would make every upgrading node re-walk its whole archive.
     #[sqlx::test(migrations = false)]
@@ -1815,7 +1804,7 @@ mod catalog {
             .unwrap();
         assert_eq!(pins.get("duration"), Some(&CanonicalType::BigInt));
 
-        // A later batch proposing a different type does NOT repin — the
+        // A later batch proposing a different type does not repin; the
         // authoritative pin comes back instead.
         let pins = store
             .pin_missing(&[proposal("duration", CanonicalType::Varchar)])
@@ -1831,7 +1820,7 @@ mod catalog {
     #[sqlx::test]
     async fn pin_missing_race_converges_on_one_pin(pool: PgPool) {
         // Two concurrent proposals for the same unpinned field with
-        // different types: both callers must come back with the SAME
+        // different types: both callers must come back with the same
         // authoritative pin (INSERT ... ON CONFLICT DO NOTHING + re-read).
         let a = catalog(&pool);
         let b = catalog(&pool);
@@ -1900,13 +1889,13 @@ mod catalog {
 
     #[sqlx::test]
     async fn pin_missing_caps_catalog_cardinality(pool: PgPool) {
-        // Field names are client-chosen JSON keys and a pin is permanent
-        // (add-only until #53, and retention never reconciles the catalog),
-        // so an uncapped catalog is an unbounded postgres table AND an
-        // unbounded in-process cache that a sender embedding identifiers in
-        // its keys grows for free. Only the free slots under the cap are
-        // filled; the surplus stays unpinned, which is what makes the
-        // conform step drop the column with its values still in `_raw`.
+        // Field names are client-chosen JSON keys and the ingest path never
+        // reclaims a pin (retention does not reconcile the catalog), so an
+        // uncapped catalog is an unbounded postgres table and an unbounded
+        // in-process cache that a sender embedding identifiers in its keys
+        // grows for free. Only the free slots under the cap are filled; the
+        // surplus stays unpinned, which is what makes the conform step drop
+        // the column with its values still in `_raw`.
         let seeded = i64::try_from(ENVELOPE_TYPES.len()).unwrap();
         let store = catalog(&pool).with_pin_cap(seeded + 2);
 
@@ -1946,8 +1935,8 @@ mod catalog {
             "the catalog never exceeds the cap"
         );
 
-        // A later batch against a full catalog pins nothing new — but must
-        // still resolve the pins that DO exist, or every known column of
+        // A later batch against a full catalog pins nothing new, but must
+        // still resolve the pins that do exist, or every known column of
         // every batch would start being dropped once the cap is reached.
         let pins = store
             .pin_missing(&[
@@ -1971,13 +1960,12 @@ mod catalog {
 
     #[sqlx::test]
     async fn one_batch_cannot_consume_the_catalog_but_the_boot_seed_can(pool: PgPool) {
-        // A pin slot is spent PERMANENTLY (add-only until #53) and denial is
-        // silent in the data — the column is simply absent from every later
-        // parquet file. First-come-first-served therefore meant one ingest
-        // request carrying enough junk keys could permanently unstore every
-        // future field on the install, from every service. The ingest path
-        // takes at most half the free slots, so the tail always survives a
-        // burst.
+        // A pin slot is spent permanently on the ingest path and denial is
+        // silent in the data: the column is simply absent from every later
+        // parquet file. Under first-come-first-served, one ingest request
+        // carrying enough junk keys would unstore every future field on the
+        // install, from every service, so a batch takes at most half the free
+        // slots and the tail survives a burst.
         let seeded = i64::try_from(ENVELOPE_TYPES.len()).unwrap();
         let store = catalog(&pool).with_pin_cap(seeded + 8);
 
@@ -2001,7 +1989,7 @@ mod catalog {
         );
 
         // The boot conformance pass is exempt: its proposals describe
-        // columns already ON DISK, so a denied pin there deletes standing
+        // columns already on disk, so a denied pin there deletes standing
         // data rather than declining to add a column.
         let pins = store.pin_missing_unrationed(&burst).await.unwrap();
         assert_eq!(
@@ -2082,10 +2070,9 @@ mod catalog {
 
     #[sqlx::test]
     async fn touch_services_is_ever_observed_no_eviction(pool: PgPool) {
-        // The acceptance criterion: `field_services` rows are ever-observed.
-        // No window, no eviction — a service observed once stays observed,
-        // however many other services later carry the field. Consumers
-        // window on `last_seen`.
+        // `field_services` rows are ever-observed: no window, no eviction, so
+        // a service observed once stays observed however many other services
+        // later carry the field. Consumers window on `last_seen`.
         let store = catalog(&pool);
         let fields = vec!["duration".to_owned()];
 
@@ -2269,7 +2256,7 @@ mod catalog {
         );
     }
 
-    /// The verdict's evidence read is bounded PER FIELD, not per page: one
+    /// The verdict's evidence read is bounded per field, not per page: one
     /// degraded field cannot spend the whole budget and leave the rest of
     /// the page verdictless, and a page of degraded fields cannot pull the
     /// whole evidence table into one response.
@@ -2359,19 +2346,18 @@ mod catalog {
         assert!(span, "the span is the evidence, and it only widens");
     }
 
-    /// The degraded generation's two reads share ONE postgres snapshot.
+    /// The degraded generation's two reads share one postgres snapshot.
     ///
     /// Both halves read `field_conflict_stats`, and a repin's evidence clear
-    /// deletes from it. As two pool reads (READ COMMITTED, a fresh snapshot
-    /// per statement) a clear landing between them publishes a generation
-    /// with a degraded field and no service attributed to it: the query
-    /// notice stands while every badge vanishes, for a whole refresh
+    /// deletes from it. As two pool reads (READ COMMITTED gives a fresh
+    /// snapshot per statement) a clear landing between them would publish a
+    /// generation with a degraded field and no service attributed to it: the
+    /// query notice stands while every badge vanishes, for a whole refresh
     /// interval.
     ///
-    /// The isolation level is only observable by interleaving a COMMITTED
+    /// The isolation level is only observable by interleaving a committed
     /// delete from a second connection, so the test drives the two
-    /// transaction-scoped reads itself — the seam
-    /// `CatalogStore::degraded_snapshot` composes.
+    /// transaction-scoped reads `CatalogStore::degraded_snapshot` composes.
     #[sqlx::test]
     async fn degraded_snapshot_reads_survive_a_concurrent_evidence_clear(pool: PgPool) {
         let store = catalog(&pool);
@@ -2447,8 +2433,8 @@ mod catalog {
         );
         tx.commit().await.unwrap();
 
-        // And the next generation is empty on BOTH halves: the fix keeps the
-        // reads together, it does not keep evidence alive.
+        // And the next generation is empty on both halves: keeping the reads
+        // together does not keep evidence alive.
         let (degraded, pairs) = store.degraded_snapshot(&visible).await.unwrap();
         assert!(
             degraded.is_empty(),
@@ -2457,7 +2443,7 @@ mod catalog {
         assert!(pairs.is_empty(), "and nothing is attributed to it");
     }
 
-    /// `first_at` only ever moves EARLIER — the property the whole degraded
+    /// `first_at` only ever moves earlier, the property the whole degraded
     /// gate rests on.
     ///
     /// The gate is `last_at - first_at >= 24h`. If a later episode restamped
@@ -2503,7 +2489,7 @@ mod catalog {
     }
 
     /// The boot conformance pass accumulates conflicts across every file it
-    /// rewrites, so ONE call routinely carries many rows for the same
+    /// rewrites, so one call routinely carries many rows for the same
     /// `(field, service)`. Postgres refuses to let one `ON CONFLICT DO
     /// UPDATE` touch a row twice, so the upsert aggregates in the statement.
     #[sqlx::test]
@@ -2591,7 +2577,7 @@ mod catalog {
         // A field pinned BIGINT that keeps receiving strings appends a row
         // every compaction tick, forever, while its information content
         // stays constant — so the evidence is a rolling window, trimmed per
-        // FIELD (service names are client-chosen too, so a per-service
+        // field (service names are client-chosen too, so a per-service
         // window would only move the unbounded axis).
         let store = catalog(&pool).with_conflict_cap(3);
         let conflict = |service: &str, nulled: u64| FieldConflict {
@@ -2662,7 +2648,7 @@ mod catalog {
         );
     }
 
-    // -- catalog read model (#51) -------------------------------------------
+    // -- catalog read model -------------------------------------------------
 
     /// Age a `(field, service)` observation into the past by `days`.
     async fn age_observation(pool: &PgPool, field: &str, service: &str, days: i64) {
@@ -2777,7 +2763,7 @@ mod catalog {
         assert_eq!(duration.conflict_count, 0, "evidence not requested");
         assert_eq!(duration.rows_nulled, 0, "evidence not requested");
 
-        // The same filter WITH the evidence sees it — proving the zeroes
+        // The same filter with the evidence sees it, proving the zeroes
         // above are the skip, not a missing conflict row.
         let (rows, _) = store
             .list_fields(&trawl_server::store::FieldListFilter::default())
@@ -3094,7 +3080,7 @@ mod catalog {
 }
 
 // ---------------------------------------------------------------------------
-// repin jobs (ADR-0011 slice B, issue #53)
+// repin jobs
 // ---------------------------------------------------------------------------
 
 mod repin_store {
@@ -3158,8 +3144,8 @@ mod repin_store {
         .expect("a terminal job frees the one-running slot");
     }
 
-    /// Two CONCURRENT claims: exactly one wins, the loser sees the domain
-    /// error (the pg-native replacement for a process mutex).
+    /// Two concurrent claims: exactly one wins, and the loser sees the
+    /// domain error rather than a raw pg violation.
     #[sqlx::test]
     async fn concurrent_claims_admit_exactly_one(pool: PgPool) {
         let s1 = store(&pool);
@@ -3190,7 +3176,7 @@ mod repin_store {
         assert!(matches!(loser, Err(StoreError::RepinAlreadyRunning)));
     }
 
-    /// The cutover flip is ONE transaction: the pin's stored type and the
+    /// The cutover flip is one transaction: the pin's stored type and the
     /// job's completion move together, and re-running it (crash recovery's
     /// idempotent redo) changes nothing.
     #[sqlx::test]
@@ -3296,10 +3282,10 @@ mod repin_store {
         );
     }
 
-    /// A replay of an ALREADY-succeeded cutover must not clear evidence.
+    /// A replay of an already-succeeded cutover must not clear evidence.
     ///
-    /// A forced lossy repin records its own conflict evidence — describing
-    /// the NEW pin — after the flip commits. Boot recovery replays
+    /// A forced lossy repin records its own conflict evidence, describing
+    /// the new pin, after the flip commits. Boot recovery replays
     /// `finish_cutover` whenever the marker outlived the cleanup window, and
     /// an unconditional clear would delete exactly that evidence, which
     /// nothing writes again.
@@ -3474,17 +3460,17 @@ mod repin_store {
         assert_eq!(dry.unmapped_samples, vec!["gold", "platinum"]);
         assert!(dry.field_last_seen.is_some(), "liveness rides the plan");
         assert_eq!(dry.field_last_service.as_deref(), Some("nginx"));
-        // Nothing asserted a dialect, so the row reports none — never a
-        // backfilled `otel` (issue #79).
+        // Nothing asserted a dialect, so the row reports none, never a
+        // backfilled `otel`.
         assert_eq!(dry.dialect, None);
     }
 
-    /// The SEVERITY target and its dialect (issue #79, migration 0012):
-    /// both type CHECKs admit the catalog spelling — a repin AWAY from a
-    /// severity pin claims a job whose FROM type is SEVERITY — and the
-    /// dialect is stored exactly for a severity target, scope-CHECKed on
-    /// both sides so a row can never carry an assertion nothing read (or
-    /// omit one the rewrite needed).
+    /// The SEVERITY target and its dialect (migration 0012): both type
+    /// CHECKs admit the catalog spelling, so a repin away from a severity pin
+    /// claims a job whose `from_type` is SEVERITY, and the dialect is stored
+    /// exactly for a severity target. The scope CHECK runs both ways, so a
+    /// row can never carry an assertion nothing read, nor omit one the
+    /// rewrite needed.
     #[sqlx::test]
     async fn a_severity_repin_stores_its_asserted_dialect(pool: PgPool) {
         use trawl_core::severity::Dialect;
@@ -3509,8 +3495,8 @@ mod repin_store {
         assert_eq!(job.dialect.as_deref(), Some("syslog"));
         s.finish(id, RepinJobStatus::Succeeded, None).await.unwrap();
 
-        // And back OFF the severity pin: 0007's from_type CHECK would have
-        // refused this row.
+        // And back off the severity pin, which 0012's widened `from_type`
+        // CHECK admits.
         let back = s
             .claim(RepinClaim {
                 field: "level",

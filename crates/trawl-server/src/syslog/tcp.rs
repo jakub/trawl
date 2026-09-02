@@ -59,7 +59,6 @@ pub async fn run_tcp_listener(
                 let (stream, src_addr) = result?;
                 let source_ip = super::canonical_peer(src_addr.ip());
 
-                // Check CIDR allowlist
                 if !super::is_allowed(&cidrs, source_ip) {
                     tracing::trace!(
                         event_type = "syslog_tcp_rejected",
@@ -69,7 +68,6 @@ pub async fn run_tcp_listener(
                     continue;
                 }
 
-                // Try to acquire a connection permit
                 let Ok(permit) = semaphore.clone().try_acquire_owned() else {
                     tracing::warn!(
                         event_type = "syslog_tcp_limit_reached",
@@ -112,7 +110,7 @@ pub async fn run_tcp_listener(
                     if let Some(ref s) = conn_stats {
                         s.tcp_connections.fetch_sub(1, Ordering::Relaxed);
                     }
-                    drop(permit); // Release the connection permit
+                    drop(permit);
                 });
             }
         }
@@ -180,9 +178,9 @@ async fn handle_tcp_connection(
 
         // The one door: parse, then canonicalize under the syslog
         // profile. A refusal is counted as a profile reject and the frame
-        // is dropped — a TCP sender has no reply channel to be told on —
-        // but it still SPENDS the connection's event budget, so a client
-        // that somehow provokes refusals cannot hold a permit forever.
+        // dropped (a TCP sender has no reply channel to be told on), but it
+        // still spends the connection's event budget, so a client that
+        // somehow provokes refusals cannot hold a permit forever.
         if let Some(event) =
             door.admit(&line, source_ip, source_service_map, default_service, "tcp")
         {
@@ -313,10 +311,10 @@ async fn drain_to_newline(
 async fn read_octet_counted_or_line(
     reader: &mut BufReader<tokio::net::TcpStream>,
 ) -> Result<Option<String>, std::io::Error> {
-    // Read until space or newline to get the potential length prefix
+    // Read one byte at a time up to the space or newline that ends the
+    // potential length prefix.
     let mut prefix = String::new();
 
-    // Read characters one at a time to find the separator
     loop {
         let buf = reader.fill_buf().await?;
         if buf.is_empty() {
@@ -374,7 +372,6 @@ async fn read_octet_counted_or_line(
         ));
     }
 
-    // Read exactly `length` bytes
     let mut msg_buf = vec![0u8; length];
     reader.read_exact(&mut msg_buf).await?;
 

@@ -2,20 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<ActionsMenu/>` — `⋯` overflow menu for table rows (issue #31).
+//! `<ActionsMenu/>` — `⋯` overflow menu for table rows.
 //!
-//! Owns its trigger button (`.btn-icon`), its open/close state, and —
-//! the ADR-0003-sanctioned behaviour improvement over the hand-rolled
-//! nets-page menu — its dismissal: the open panel registers with the
+//! Owns its trigger button (`.btn-icon`), its open/close state, and its
+//! dismissal: the open panel registers with the
 //! [`overlay`](crate::overlay) arbitration stack, so window-level
 //! Escape closes it only while it is the topmost overlay, and a
 //! window-level `mousedown` outside the trigger+panel wrapper closes
-//! it (outside-click). The outside-click check uses `Node::contains`
-//! on the wrapper `NodeRef` — unlike [`Modal`](crate::Modal)'s
-//! `is_same_node` scrim identity check — because the menu has interior
-//! `.item` children and no scrim, and because excluding the trigger
-//! keeps a trigger re-click a clean toggle instead of a
-//! close-then-reopen.
+//! it. The outside-click check uses `Node::contains` on the wrapper
+//! `NodeRef` rather than [`Modal`](crate::Modal)'s `is_same_node` scrim
+//! identity check, because the menu has interior `.item` children and
+//! no scrim, and because excluding the trigger keeps a trigger re-click
+//! a clean toggle instead of a close-then-reopen.
 //!
 //! Clicks on the trigger and the items stop propagation: every current
 //! call site nests the menu inside a clickable table row.

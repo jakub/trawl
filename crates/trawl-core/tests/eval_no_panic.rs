@@ -2,20 +2,20 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Property test: `eval_expr` RETURNS. That is the whole assertion.
+//! Property test: `eval_expr` returns. That is the whole assertion.
 //!
 //! The streaming evaluator runs inside an SSE subscription and inside the
 //! `rust_stages` batch tail, over values a client chose. A panic there is
 //! not a wrong answer — it unwinds a live subscription (or a query task)
 //! on one adversarial event, which is a different failure class from the
 //! divergences `scalar_parity.rs` hunts. So this test says nothing about
-//! WHICH value comes back: the value contract belongs to the parity
+//! which value comes back: the value contract belongs to the parity
 //! harness, and duplicating it here would make two owners of one rule.
 //!
-//! It matters that this runs in the DEBUG profile, where Rust's overflow
-//! checks are live: `9223372036854775807 + 1` was a debug panic and a
-//! release wrap until #105 made the integer arithmetic checked, and the
-//! only build that can observe the difference is this one.
+//! It matters that this runs in the debug profile, where Rust's overflow
+//! checks are live: unchecked integer arithmetic would make
+//! `9223372036854775807 + 1` a debug panic and a release wrap, and this
+//! is the only build that observes the difference.
 //!
 //! Two entry points, because they reach different values. The parsed-DSL
 //! path is what a user's query really is; the AST path is the only way to
@@ -112,7 +112,7 @@ const STRINGS: &[&str] = &[
     "٢٠٢٤-٠١-٠١",
     "24:00:00",
     "-9999999999-01-01",
-    // The timestamp KEYWORDS, which are instants rather than dates.
+    // The timestamp keywords, which are instants rather than dates.
     "infinity",
     "-infinity",
     "inf",
@@ -154,7 +154,7 @@ fn huge_string() -> String {
 /// `round`'s precision, `substr`'s start and length, `split`'s index.
 const ABUSIVE_BOUNDS: &[i64] = &[i64::MIN, -1_000_000, -1, 0, 1, 1_000_000, i64::MAX];
 
-/// Documents the json door is fed — ones that PARSE (so the renderer
+/// Documents the json door is fed — ones that parse (so the renderer
 /// runs) and ones that do not (so its error path does).
 const JSON_DOCUMENTS: &[&str] = &[
     r#"{"a":1}"#,
@@ -394,9 +394,9 @@ fn compose(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
             call(name, args)
         }
         // The json door: the most parser-shaped code here — it decodes a
-        // document, walks a pointer and RENDERS what it finds, and the
+        // document, walks a pointer and renders what it finds, and the
         // renderer scans text tracking string state. The document and
-        // the path are drawn TOGETHER, because pairing them by lottery
+        // the path are drawn together, because pairing them by lottery
         // (a path against a format string, say) never reaches the
         // renderer at all.
         9 => {
@@ -444,7 +444,7 @@ fn eval_returns_for_every_composed_expression() {
     let mut rng = Rng::new(0x0105_A57C_0DE0);
     for _ in 0..4_000 {
         let expression = compose(&mut rng, 4);
-        // The ONLY assertion: control comes back. Which value it carries
+        // The only assertion: control comes back. Which value it carries
         // is `scalar_parity.rs`'s question, not this test's.
         let _answer = eval_expr(
             &expression,
@@ -548,7 +548,7 @@ fn compose_dsl(rng: &mut Rng, depth: usize) -> String {
             compose_dsl(rng, depth - 1),
             rng.pick(ABUSIVE_BOUNDS)
         ),
-        // The json door through the PARSER, document and path drawn
+        // The json door through the parser, document and path drawn
         // together so the renderer is reached rather than only its
         // error path. The document is escaped as the DSL spells a
         // string literal.
@@ -571,7 +571,7 @@ fn eval_returns_for_every_parsed_dsl_expression() {
     let mut evaluated = 0_u32;
     for _ in 0..4_000 {
         let dsl = format!("* | let x = {}", compose_dsl(&mut rng, 3));
-        // A rejected generated string is a PARSE outcome, not a panic —
+        // A rejected generated string is a parse outcome, not a panic —
         // this generator is deliberately loose about types and arities,
         // which the parser and the pipeline are entitled to refuse.
         let Ok(query) = parser::parse(&dsl) else {

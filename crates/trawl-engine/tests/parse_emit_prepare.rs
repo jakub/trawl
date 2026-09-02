@@ -437,10 +437,9 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
          prepare exercised"
     );
 
-    // Acceptance criterion 3: every entry of `CanonicalType::ALL` is
-    // pinned by some committed seed. The vocabulary is iterated, never
-    // re-listed here, so ADDING an entry to `ALL` widens what this demands
-    // without anyone editing this file.
+    // Every entry of `CanonicalType::ALL` is pinned by some committed seed.
+    // The vocabulary is iterated, never re-listed here, so adding an entry
+    // to `ALL` widens what this demands without anyone editing this file.
     //
     // What it cannot demand is a seed for a variant left OUT of `ALL`:
     // `covered` comes from `derive_field_types`, which draws its pins from
@@ -460,8 +459,8 @@ fn every_committed_seed_emits_sql_duckdb_can_prepare() {
     );
 }
 
-/// CONTROL. If this ever goes green, every other assertion in this file is
-/// worthless.
+/// CONTROL. If `DuckDB` ever prepares this statement, every other
+/// assertion in this file is worthless.
 ///
 /// It proves `DuckDB`'s binder resolves column names at PREPARE time. The
 /// whole design leans on that: nothing here executes a statement, so if
@@ -492,8 +491,9 @@ fn control_prepare_rejects_a_missing_column() {
     );
 }
 
-/// CONTROL. Green here would mean this file cannot tell "your SQL is fine"
-/// from "the file you pointed at is not there".
+/// CONTROL. A missing source that prepares cleanly would mean this file
+/// cannot tell "your SQL is fine" from "the file you pointed at is not
+/// there".
 ///
 /// Every seed's prepare names a fixture path. If a missing source prepared
 /// cleanly, a broken fixture builder would look exactly like a passing
@@ -522,9 +522,9 @@ fn control_prepare_rejects_a_missing_source_file() {
 ///
 /// The pair is the point. `abs` over the BIGINT `_severity` prepares;
 /// `abs` over the TIMESTAMP `_time` must not, and both name real columns
-/// of the same file. A green failure half would mean the binder resolves
-/// names but defers types, and every claim this file makes about
-/// conform expressions would shrink to "the column exists".
+/// of the same file. If the invalid half prepared, the binder would be
+/// resolving names but deferring types, and every claim this file makes
+/// about conform expressions would shrink to "the column exists".
 #[test]
 fn control_prepare_rejects_a_type_invalid_expression() {
     let scratch = tempfile::tempdir().expect("a scratch dir");

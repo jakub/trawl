@@ -2,30 +2,28 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Producer profiles and the derivation policy (ADR-0013 slice 2,
-//! rulings 2 and 5).
+//! Producer profiles and the derivation policy (ADR-0013).
 //!
-//! **Profiles are code, not data.** The set is closed — `http`, `syslog`,
-//! `trawld` — and a profile is chosen by the server call site that owns
-//! the transport, never by anything on the wire. A profile ASSERTS the
+//! Profiles are code, not data. The set is closed (`http`, `syslog`,
+//! `trawld`) and a profile is chosen by the server call site that owns
+//! the transport, never by anything on the wire. A profile asserts the
 //! identity it can prove (`env` from boot-validated config, `service`
 //! from the listener's own derivation or the fixed `trawld`, `host` per
-//! transport) and contributes FIXED derivation sources. It bypasses no
+//! transport) and contributes fixed derivation sources. It bypasses no
 //! universal gate: the fold, the name-length drop, the sealed-prefix
 //! strip, nested stringification, the `_raw` cap and `_repairs` assembly
 //! all belong to the one canonicalizer and apply to all three doors.
 //!
-//! **Derivation sources are data.** `_severity` and `_time` each read an
-//! ordered source list — configured globally under `[ingest]`, with each
-//! profile's fixed sources PREPENDED and not configurable. That is what
+//! Derivation sources are data. `_severity` and `_time` each read an
+//! ordered source list, configured globally under `[ingest]`, with each
+//! profile's fixed sources prepended and not configurable. That is what
 //! makes provenance-licensed syslog inversion a config fact rather than a
 //! privileged writer: the native listener and a syslog-over-HTTP
 //! forwarder reach the same dialect through the same mechanism.
 //!
 //! Nothing here calls `tracing`. The telemetry producer's own events pass
 //! through this module on their way to the WAL, so a log line emitted
-//! from inside it is an ingestion loop (ruling 4); failure paths are
-//! metrics only.
+//! from inside it is an ingestion loop; failure paths are metrics only.
 
 use trawl_config::{DerivationSourceSpec, IngestConfig};
 use trawl_core::schema::{self, MAX_FIELD_NAME_BYTES};
@@ -33,8 +31,8 @@ use trawl_core::severity::{DIALECT_TOKENS, Dialect};
 
 use crate::ingest::envelope::{RejectReason, RepairCode};
 
-/// Which door an event entered through — the `_producer` column's closed
-/// vocabulary (ADR-0013 slice 2, ruling 6).
+/// Which door an event entered through: the `_producer` column's closed
+/// vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProducerKind {
     /// `POST /api/v1/ingest`.
@@ -49,7 +47,7 @@ impl ProducerKind {
     /// Every profile, for exhaustive iteration (metric zero-init, tests).
     pub const ALL: &'static [Self] = &[Self::Http, Self::Syslog, Self::Trawld];
 
-    /// The one spelling: the `_producer` column VALUE and the metric
+    /// The one spelling: the `_producer` column value and the metric
     /// label alike, so a query and a dashboard never disagree about what
     /// to call a door.
     pub const fn as_str(self) -> &'static str {
@@ -70,11 +68,11 @@ impl ProducerKind {
     }
 }
 
-/// The syslog listener's severity artifact: the RAW PRI severity numeral,
+/// The syslog listener's severity artifact: the raw PRI severity numeral,
 /// 0-7, published as an ordinary sender-visible column.
 ///
-/// The listener does not write `_severity` (ruling 1) — it publishes what
-/// it parsed and the syslog profile's fixed source reads it back with
+/// The listener does not write `_severity`. It publishes what it parsed,
+/// and the syslog profile's fixed source reads it back with
 /// `dialect = "syslog"`, so the inversion is licensed by where the config
 /// lives rather than by a privileged writer.
 pub const SYSLOG_SEVERITY_FIELD: &str = "syslog_severity";
@@ -83,7 +81,7 @@ pub const SYSLOG_SEVERITY_FIELD: &str = "syslog_severity";
 /// column and read as the syslog profile's first `_time` source.
 pub const SYSLOG_TIMESTAMP_FIELD: &str = "syslog_timestamp";
 
-/// Maximum entries in ONE configured derivation list.
+/// Maximum entries in one configured derivation list.
 ///
 /// Derivation runs per event on the ingest hot path and scans the list
 /// until something matches, so its length is a per-event cost paid by
@@ -93,12 +91,12 @@ pub const SYSLOG_TIMESTAMP_FIELD: &str = "syslog_timestamp";
 /// operator's.
 pub const MAX_DERIVATION_SOURCES: usize = 8;
 
-/// What a profile ASSERTS about an event before the door sees it.
+/// What a profile asserts about an event before the door sees it.
 ///
-/// An assertion is not a repair (ruling 2): the producer is the authority
-/// on these values, so stamping them is ordinary identity, not a fix. A
-/// payload key that collides with one loses — `field.producer_asserted` —
-/// and its value stays findable in `_raw`.
+/// An assertion is not a repair: the producer is the authority on these
+/// values, so stamping them is ordinary identity, not a fix. A payload key
+/// that collides with one loses (`field.producer_asserted`) and its value
+/// stays findable in `_raw`.
 #[derive(Clone, Copy, Debug)]
 pub struct Asserted<'a> {
     /// Boot-validated, so `env.defaulted` can never fire for a profile
@@ -107,16 +105,16 @@ pub struct Asserted<'a> {
     pub env: &'a str,
     /// The listener's derived service, or the literal `trawld`.
     pub service: &'a str,
-    /// `None` means keep the event and OMIT `host` (`host.omitted`) —
-    /// absent-but-honest beats both the peer-fill lie and the drop
-    /// (ruling 4). The only paths there are a hostname-less frame behind
-    /// a trusted relay and a failed hostname lookup for trawld.
+    /// `None` means keep the event and omit `host` (`host.omitted`):
+    /// absent-but-honest beats both the peer-fill lie and the drop. The
+    /// only paths there are a hostname-less frame behind a trusted relay
+    /// and a failed hostname lookup for trawld.
     pub host: Option<&'a str>,
     /// The parsed message body, where the transport separates one from
-    /// its metadata (syslog's `msg.msg`); `None` when the payload IS the
+    /// its metadata (syslog's `msg.msg`); `None` when the payload is the
     /// message.
     pub message: Option<&'a str>,
-    /// Codes the PRODUCER contributed (`host.from_peer`,
+    /// Codes the producer contributed (`host.from_peer`,
     /// `service.from_profile`). Producers contribute codes; only the door
     /// assembles `_repairs`.
     pub repairs: &'a [RepairCode],
@@ -126,7 +124,7 @@ pub struct Asserted<'a> {
 #[derive(Clone, Copy, Debug)]
 pub enum Producer<'a> {
     /// The HTTP door asserts nothing: an HTTP sender owns its own
-    /// identity fields and can be REJECTED and told to resend, so the
+    /// identity fields and can be rejected and told to resend, so the
     /// peer is evidence for a fill, not an assertion.
     Http {
         /// Peer IP as a string (from the TCP connection).
@@ -162,7 +160,7 @@ impl Producer<'_> {
 }
 
 /// One resolved derivation source: a wire key and the dialect its
-/// NUMERICS read in (words always go through the one token table).
+/// numerics read in (words always go through the one token table).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
     /// The wire key to read. Already validated bare, folded and storable.
@@ -186,10 +184,10 @@ impl Source {
 /// The resolved, per-profile derivation policy: what `_severity` and
 /// `_time` read, in order, at each door.
 ///
-/// Built once at boot (boot-FATAL on a bad config — see [`Self::resolve`])
-/// and threaded to every producer, so the lists cannot drift between
-/// doors and a config change is forward-only by construction: there is no
-/// policy history, and nothing re-reads a stored event's derivation.
+/// Built once at boot (fatal on a bad config, see [`Self::resolve`]) and
+/// threaded to every producer, so the lists cannot drift between doors and
+/// a config change is forward-only by construction: there is no policy
+/// history, and nothing re-reads a stored event's derivation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Derivation {
     /// Indexed by [`ProducerKind::index`].
@@ -207,9 +205,9 @@ fn fixed_severity_sources(kind: ProducerKind) -> Vec<Source> {
             field: SYSLOG_SEVERITY_FIELD.to_owned(),
             dialect: Dialect::Syslog,
         }],
-        // Telemetry is an ordinary sender (ruling 3): its bare `level`
-        // rides the configured chain like any app's. The HTTP door has no
-        // transport evidence at all.
+        // Telemetry is an ordinary sender: its bare `level` rides the
+        // configured chain like any app's. The HTTP door has no transport
+        // evidence at all.
         ProducerKind::Http | ProducerKind::Trawld => Vec::new(),
     }
 }
@@ -218,7 +216,7 @@ fn fixed_severity_sources(kind: ProducerKind) -> Vec<Source> {
 fn fixed_time_sources(kind: ProducerKind) -> Vec<Source> {
     match kind {
         // The frame's own timestamp, published as an ordinary column. It
-        // is OMITTED when the frame carried none or an unparseable one,
+        // is omitted when the frame carried none or an unparseable one,
         // so the configured chain — and ultimately arrival time with
         // `time.from_ingest` — takes over honestly.
         ProducerKind::Syslog => vec![Source::otel(SYSLOG_TIMESTAMP_FIELD)],
@@ -242,8 +240,8 @@ fn effective(fixed: Vec<Source>, configured: &[Source]) -> Vec<Source> {
 }
 
 impl Derivation {
-    /// Resolve and VALIDATE the configured lists — boot-fatal on any
-    /// error (see [`DerivationConfigError`]).
+    /// Resolve and validate the configured lists; boot-fatal on any error
+    /// (see [`DerivationConfigError`]).
     ///
     /// Called unconditionally at boot, before and independently of
     /// `ingest.enabled`: trawld's own telemetry derives through the same
@@ -285,14 +283,14 @@ impl Derivation {
         resolved
     }
 
-    /// The `_severity` sources this profile reads, in precedence order —
-    /// first MAPPABLE wins.
+    /// The `_severity` sources this profile reads, in precedence order:
+    /// the first mappable one wins.
     pub fn severity_from(&self, kind: ProducerKind) -> &[Source] {
         &self.severity[kind.index()]
     }
 
-    /// The `_time` sources this profile reads, in precedence order —
-    /// first PRESENT wins.
+    /// The `_time` sources this profile reads, in precedence order: the
+    /// first present one wins.
     pub fn time_from(&self, kind: ProducerKind) -> &[Source] {
         &self.time[kind.index()]
     }
@@ -349,7 +347,7 @@ fn echo(name: &str) -> String {
 /// offending entry — the operator must not have to guess which of eight
 /// sources trawld disliked.
 ///
-/// All of these are BOOT-FATAL. A derivation list that silently never
+/// All of these are boot-fatal. A derivation list that silently never
 /// matches is the sharpest footgun in this design (`severity_from =
 /// ["_severity"]` would derive nothing, forever, quietly), so the answer
 /// is refusing to start rather than a warning nobody reads.
@@ -451,10 +449,9 @@ pub enum DerivationConfigError {
 
 /// Validate one configured list and resolve it to [`Source`]s.
 ///
-/// The rules, in the order they are applied (ADR-0013 slice 2, ruling 5):
-/// list length, then per entry — non-empty, storable length, already
-/// ASCII-folded, namespace, dialect — then list-wide duplicates, then
-/// `time_from`'s `_time` requirement.
+/// The rules, in the order they are applied: list length, then per entry
+/// (non-empty, storable length, already ASCII-folded, namespace, dialect),
+/// then list-wide duplicates, then `time_from`'s `_time` requirement.
 fn check_list(
     list: DerivationList,
     specs: &[DerivationSourceSpec],
@@ -495,11 +492,10 @@ fn check_list(
                 folded: echo(&folded),
             });
         }
-        // `_time` in `time_from` is the ONE reserved name any derivation
-        // list may read: it is the event-time PROPOSAL slot, so reading
+        // `_time` in `time_from` is the one reserved name any derivation
+        // list may read: it is the event-time proposal slot, so reading
         // it is the whole point. Everything else in the namespace would
-        // silently never match — the sharpest footgun in this design,
-        // which is why it refuses to boot rather than warn.
+        // silently never match, which is why it refuses to boot.
         let time_proposal = list == DerivationList::TimeFrom && name == schema::TIME;
         if schema::is_reserved_name(name) && !time_proposal {
             return Err(match list {
@@ -580,12 +576,12 @@ fn finish_entry(
     Ok(())
 }
 
-/// Count an event a profile producer had to DROP.
+/// Count an event a profile producer had to drop.
 ///
-/// Only the salvage profiles reach here (ruling 4): syslog and telemetry
-/// have no one to reject to, so a drop means the server refused its own
-/// assertion — a bug, not a sender's mistake. The HTTP door keeps its
-/// per-event rejection and its own counter.
+/// Only the salvage profiles reach here: syslog and telemetry have no one
+/// to reject to, so a drop means the server refused its own assertion — a
+/// bug, not a sender's mistake. The HTTP door keeps its per-event
+/// rejection and its own counter.
 pub fn count_profile_reject(kind: ProducerKind, reason: RejectReason) {
     metrics::counter!(
         crate::metrics::INGEST_PROFILE_REJECT_TOTAL,
@@ -595,7 +591,7 @@ pub fn count_profile_reject(kind: ProducerKind, reason: RejectReason) {
     .increment(1);
 }
 
-/// Count ONE accepted event's outcome: the repairs the door applied and
+/// Count one accepted event's outcome: the repairs the door applied and
 /// whether a severity source went unmapped.
 ///
 /// The per-event form of the HTTP door's per-request aggregation. HTTP
@@ -625,8 +621,8 @@ pub fn count_event_outcome(canonical: &crate::ingest::envelope::Canonical) {
 
 /// Publish the whole closed label matrix at zero.
 ///
-/// An ABSENT increment on a present series is what proves the salvage
-/// profiles are rejection-free; an absent SERIES proves nothing, because
+/// An absent increment on a present series is what proves the salvage
+/// profiles are rejection-free; an absent series proves nothing, because
 /// a scrape cannot tell "never happened" from "never wired up". Called
 /// once at boot, right after the recorder is installed and described.
 pub fn init_profile_reject_metrics() {
@@ -684,7 +680,7 @@ mod tests {
         sources.iter().map(|s| s.field.as_str()).collect()
     }
 
-    // --- the profile vocabulary (ruling 6) ------------------------------
+    // --- the profile vocabulary -----------------------------------------
 
     #[test]
     fn producer_kind_spellings_are_unique_and_round_trip() {
@@ -739,7 +735,7 @@ mod tests {
         );
     }
 
-    // --- the fixed source tables (ruling 1) -----------------------------
+    // --- the fixed source tables ----------------------------------------
 
     #[test]
     fn syslog_fixed_sources_lead_and_carry_their_dialect() {
@@ -749,8 +745,8 @@ mod tests {
             fields(severity),
             vec!["syslog_severity", "severity", "severity_text", "level"]
         );
-        // The whole point of ruling 1: provenance licenses the inversion,
-        // and it does so HERE, not in a privileged writer.
+        // Provenance licenses the inversion, and it does so here rather
+        // than in a privileged writer.
         assert_eq!(severity[0].dialect, Dialect::Syslog);
         assert!(
             severity[1..].iter().all(|s| s.dialect == Dialect::Otel),
@@ -810,7 +806,7 @@ mod tests {
         assert_eq!(http[0].dialect, Dialect::Otel);
     }
 
-    // --- the packaging contract (ruling 5) ------------------------------
+    // --- the packaging contract -----------------------------------------
 
     #[test]
     fn defaults_match_resolving_the_default_config() {
@@ -874,9 +870,9 @@ mod tests {
         Derivation::resolve(&with_time(bare(&time))).expect("the bound itself is allowed");
     }
 
-    // --- the boot-fatal validation table (ruling 5) ---------------------
+    // --- the boot-fatal validation table --------------------------------
     //
-    // One case per rule. Every message must NAME the offending entry, so
+    // One case per rule. Every message must name the offending entry, so
     // an operator reading a failed boot knows which of eight sources to
     // go fix — asserting only "it errored" would let a message that says
     // nothing useful pass.
@@ -910,7 +906,7 @@ mod tests {
             (
                 "more entries than the bound",
                 with_severity(bare(&nine)),
-                // Naming the first entry PAST the bound turns "nine is
+                // Naming the first entry past the bound turns "nine is
                 // more than eight" into a line the operator can delete.
                 vec![
                     "severity_from".into(),
@@ -990,15 +986,15 @@ mod tests {
         );
     }
 
-    // --- the rejection-free invariant's evidence (ruling 4) -------------
+    // --- the rejection-free invariant's evidence ------------------------
 
     #[test]
     fn the_reject_matrix_renders_at_zero_before_anything_rejects() {
-        // AC3's evidence shape: the salvage profiles prove they are
-        // rejection-free by an absent INCREMENT on a PRESENT series. A
-        // series that only appears on the first drop cannot distinguish
-        // "never happened" from "never wired up", so boot publishes the
-        // whole closed matrix at zero and this pins that it renders.
+        // The salvage profiles prove they are rejection-free by an absent
+        // increment on a present series. A series that only appears on the
+        // first drop cannot distinguish "never happened" from "never wired
+        // up", so boot publishes the whole closed matrix at zero and this
+        // pins that it renders.
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, init_profile_reject_metrics);

@@ -2,22 +2,21 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<DegradedNotice/>` — the incomplete-results notice (ADR-0011 slice
-//! C2), the SPA's rendering of `QueryResponse.degraded_fields`.
+//! `<DegradedNotice/>` — the incomplete-results notice, the SPA's
+//! rendering of `QueryResponse.degraded_fields` (ADR-0011).
 //!
-//! Everything here is a fact about ONE execution. The fields are the
+//! Everything here is a fact about one execution. The fields are the
 //! ones the server said that query bound; nothing is re-derived from the
 //! DSL, and no catalog state is consulted afterwards — a repin that
 //! retires a badge does not edit a notice already on screen, because the
-//! results under it were still produced by the old pin. The next query
-//! is the next answer.
+//! results under it were still produced by the old pin.
 //!
 //! Nothing renders when the list is empty, which is the ordinary case,
-//! and nothing renders for the live tail: SSE carries no notice (a named
-//! C1 residual), so the search page hands this component an empty list
-//! in live mode rather than the last snapshot's.
+//! and nothing renders for the live tail: SSE carries no notice, so the
+//! search page hands this component an empty list in live mode rather
+//! than the last snapshot's.
 //!
-//! Field names are client-chosen text: they are rendered in leptos TEXT
+//! Field names are client-chosen text: they render in leptos text
 //! positions through `sanitize_display_text`, while the exact original
 //! spelling is what gets percent-encoded into the case-file link.
 
@@ -42,9 +41,9 @@ pub fn DegradedNotice(
     fields: Signal<Vec<String>>,
 ) -> impl IntoView {
     // The case file is `schema_read`-gated, so without it the link would
-    // be a 403 dressed as a remedy (synthesis R8). The names still show:
-    // knowing WHICH field is incomplete is the useful half, and it needs
-    // no permission the query itself did not.
+    // be a 403 dressed as a remedy. The names still show: knowing which
+    // field is incomplete is the useful half, and it needs no permission
+    // the query itself did not.
     let me = use_context::<RwSignal<Option<api::MeResponse>>>();
     let can_link = Signal::derive(move || {
         me.and_then(|me| me.get())
@@ -61,7 +60,7 @@ pub fn DegradedNotice(
     let showing = Signal::derive(move || key.with(|k| k.is_some() && *k != dismissed.get()));
 
     view! {
-        // The live region OUTLIVES the notice inside it: a region that
+        // The live region outlives the notice inside it: a region that
         // mounts with its content is not reliably announced, so this
         // wrapper stays in the tree and collapses to nothing when empty.
         <div class="deg-live" aria-live="polite">

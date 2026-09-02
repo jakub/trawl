@@ -36,7 +36,7 @@ struct Cli {
 }
 
 /// Wall-clock cap on how long process exit waits for blocking-pool work
-/// that has already STARTED — chiefly the telemetry/WAL durability
+/// that has already started — chiefly the telemetry/WAL durability
 /// barriers (fsync, dir-fsync). Dropping a Tokio runtime normally waits on
 /// those forever, so a frozen volume would stall restarts and rolling
 /// deployments indefinitely; past this budget the runtime is abandoned and
@@ -71,7 +71,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = resolve_path(&cli.config);
     // Pre-tracing boundary: no subscriber exists yet, so a config failure
     // here can only surface through stderr. Name the resolved path so the
-    // operator can tell WHICH file failed (issue #56 F4).
+    // operator can tell which file failed.
     let config = Config::from_file(&config_path).map_err(|e| {
         eprintln!(
             "[trawld] failed to load configuration from {}: {e}",
@@ -85,17 +85,16 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Resolve the log filter explicitly: RUST_LOG is authoritative when
     // valid; unset or invalid installs DEFAULT_LOG_FILTER, and the invalid
-    // case warns AFTER the subscriber is up (visible because `trawld=info`
+    // case warns after the subscriber is up (visible because `trawld=info`
     // is part of the default).
     let log_filter = telemetry::resolve_log_filter(std::env::var("RUST_LOG").ok().as_deref());
 
-    // The derivation policy is resolved BEFORE the subscriber, because
-    // the telemetry layer derives through it too (ADR-0013 slice 2,
-    // ruling 5) — trawld's own `level` rides the configured
-    // `severity_from` chain like any sender's. That puts it on the same
-    // pre-tracing boundary as the config load: boot-fatal, and the
-    // diagnostic can only reach stderr. Resolved UNCONDITIONALLY, before
-    // and independently of `ingest.enabled`, for the same reason.
+    // The derivation policy is resolved before the subscriber, because the
+    // telemetry layer derives through it too (ADR-0013): trawld's own
+    // `level` rides the configured `severity_from` chain like any
+    // sender's. That puts it on the same pre-tracing boundary as the
+    // config load: boot-fatal, and the diagnostic can only reach stderr.
+    // Resolved independently of `ingest.enabled`, for the same reason.
     let derivation = Arc::new(
         trawl_server::ingest::producer::Derivation::resolve(&config.ingest).map_err(|e| {
             eprintln!("[trawld] {e} — refusing to start");
@@ -140,11 +139,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     metrics_process::Collector::default().describe();
     trawl_server::metrics::describe_metrics();
-    // Publish the salvage profiles' rejection matrix at zero. The claim
-    // "telemetry is rejection-free by construction" (ADR-0013 slice 2,
-    // ruling 4) is evidenced by an absent INCREMENT on a present series —
-    // an absent series would leave a scrape unable to tell "never
-    // happened" from "never wired up".
+    // Publish the salvage profiles' rejection matrix at zero. "Telemetry
+    // is rejection-free by construction" is evidenced by an absent
+    // increment on a present series; an absent series would leave a scrape
+    // unable to tell "never happened" from "never wired up".
     trawl_server::ingest::producer::init_profile_reject_metrics();
 
     // Spawn upkeep task to prevent histogram bucket memory bloat.
@@ -158,10 +156,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // ADR-0011 slice B, filesystem half: an interrupted repin must be
-    // finished BEFORE the epoch gate forms an opinion of the data root —
-    // a half-swapped corpus does not error, it silently promotes. One
-    // stat on the marker-less fast path.
+    // Repin recovery, filesystem half: an interrupted repin must be
+    // finished before the epoch gate forms an opinion of the data root,
+    // because a half-swapped corpus does not error, it silently promotes
+    // (ADR-0011). One stat on the marker-less fast path.
     let recovered_repin = trawl_server::repin::recover::recover_filesystem(
         &config.data.base_dir(),
         config.ingest.enabled,
@@ -238,11 +236,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // ADR-0011 slice B, postgres half: finish the recovered job row
+    // Repin recovery, postgres half: finish the recovered job row
     // (idempotent flip or failure), re-arm the conformance pass for a
     // recovered cutover, sweep the aside, reconcile orphaned running rows.
-    // Runs BEFORE the conformance pass so a cleared conformed_at re-proves
-    // the corpus in this very boot.
+    // Runs before the conformance pass so a cleared `conformed_at`
+    // re-proves the corpus in this very boot.
     trawl_server::repin::recover::reconcile_store(
         &state.storage,
         &state.query.field_catalog,
@@ -255,7 +253,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // over the standing corpus before anything reads or writes it. Only on
     // ingest-enabled nodes (a query-only node does not own the data root).
     // Fatal on failure, like the epoch gate — a data root not proven
-    // conformant must not serve queries. Per-path failures are NOT that:
+    // conformant must not serve queries. A per-path failure is not that:
     // an unreadable or foreign parquet file, or a subdirectory the walk
     // cannot enumerate, is skipped and counted inside the pass, so one bad
     // path cannot keep the daemon down.
@@ -281,7 +279,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         // answers from this catalog's pins — which describe the archive only
         // if this catalog wrote it. Check the same dual-sided marker as a
         // gate, and refuse the boot rather than advertise a schema about
-        // someone else's data. Only a marker naming ANOTHER catalog does
+        // someone else's data. Only a marker naming another catalog does
         // that: an archive with no marker (what an incomplete conformance
         // pass leaves) warns and serves, exactly as the ingest node does for
         // the same corpus.
@@ -311,11 +309,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn syslog listeners if enabled (requires ingest to be enabled).
     let syslog_handle = if config.syslog.enabled && config.ingest.enabled {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        // Everything the listeners need to reach the one door. The env
-        // allowlist, the relay CIDRs and the derivation policy all live
-        // on `IngestState` already, resolved boot-fatally there; before
-        // slice 2 none of them were threaded here, which is precisely
-        // why the listener hand-rolled its own envelope.
+        // Everything the listeners need to reach the one canonicalizer.
+        // The env allowlist, the relay CIDRs and the derivation policy all
+        // live on `IngestState`, resolved boot-fatally there.
         let door = Arc::new(trawl_server::syslog::convert::SyslogDoor {
             envs: Arc::clone(&state.ingest.envs),
             default_env: Arc::clone(&state.ingest.default_env),
@@ -489,11 +485,12 @@ async fn shutdown_task(task: Option<(JoinHandle<()>, watch::Sender<bool>)>, name
     }
 }
 
+/// A background task's join handle paired with its shutdown signal.
+type IngestHandles = (JoinHandle<()>, watch::Sender<bool>);
+
 /// Spawn the ingest pipeline tasks (compaction).
 ///
 /// Returns handles for graceful shutdown, or `None` if ingest is disabled.
-type IngestHandles = (JoinHandle<()>, watch::Sender<bool>);
-
 fn spawn_ingest_pipeline(
     config: &Config,
     state: &AppState,
@@ -505,7 +502,6 @@ fn spawn_ingest_pipeline(
 
     let wal_dir = config.wal_dir();
 
-    // Ensure the WAL directory exists at startup.
     if let Some(writer) = &state.ingest.wal_writer {
         writer
             .ensure_dir()
@@ -525,8 +521,8 @@ fn spawn_ingest_pipeline(
     );
 
     // Compaction is the only parquet writer: it pins every field's type in
-    // the catalog BEFORE writing, and conforms every batch to the pins
-    // (ADR-0009 slice 2).
+    // the catalog before writing, and conforms every batch to the pins
+    // (ADR-0009).
     let catalog = trawl_server::catalog::CatalogContext {
         store: state.storage.catalog.clone(),
         cache: state.query.field_catalog.clone(),
@@ -549,12 +545,11 @@ fn spawn_ingest_pipeline(
     Ok(Some((handle, shutdown_tx)))
 }
 
-/// Initialize the tracing subscriber.
+/// Warn about on-disk env directories missing from the current allowlist.
 ///
-/// Warn for on-disk env directories not in the current allowlist: the
-/// allowlist gates writes, not reads — removing an env stops new ingest
-/// but its directories stay queryable and age out under retention
-/// normally (ADR-0009).
+/// The allowlist gates writes, not reads: removing an env stops new ingest
+/// for it, while its directories stay queryable and age out under retention
+/// (ADR-0009).
 fn warn_unlisted_env_dirs(config: &Config) {
     let allowed = config.ingest.effective_envs();
     let Ok(entries) = std::fs::read_dir(config.data.base_dir()) else {
@@ -583,13 +578,15 @@ fn warn_unlisted_env_dirs(config: &Config) {
     }
 }
 
-/// When internal telemetry is enabled, registers a [`WalLayer`] that
-/// replaces the JSON file logger. Returns both the [`WalHandle`] (for
-/// deferred writer injection) and a [`WalLayer`] clone (sharing the same
-/// buffer) for the flush task.
+/// Initialize the tracing subscriber.
+///
+/// When internal telemetry is enabled, registers a [`WalLayer`] in place of
+/// the JSON file logger and returns both the [`WalHandle`] (for deferred
+/// writer injection) and a [`WalLayer`] clone (sharing the same buffer) for
+/// the flush task.
 ///
 /// When telemetry is disabled and `log_file` is configured, falls back
-/// to the legacy JSON file layer.
+/// to the JSON file layer.
 ///
 /// When `monitor_active` is true, the stdout `fmt::layer()` is omitted
 /// to avoid corrupting the TUI with interleaved log output.
@@ -610,7 +607,6 @@ fn init_tracing(
     let use_telemetry = config.internal_telemetry_enabled();
 
     if use_telemetry {
-        // WAL layer replaces the JSON file logger.
         let handle = WalHandle::new();
         let wal_layer = WalLayer::new_with_buffer_cap(
             handle.clone(),
@@ -635,7 +631,6 @@ fn init_tracing(
         }
         Ok(Some((handle, flush_layer)))
     } else if let Some(log_path) = &config.server.log_file {
-        // Legacy: JSON file logger.
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }

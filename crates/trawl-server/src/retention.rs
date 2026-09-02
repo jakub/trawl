@@ -14,18 +14,19 @@
 //! Today's directory is never deleted (compaction writes there actively).
 //! Both policies can be independently disabled by setting their value to 0.
 //!
-//! Disk-pressure deletion is additionally suppressed while the ADR-0009
-//! set-aside root (`data.pre-schema-v2/`) exists: it is a sibling of
-//! `data/`, so it yields no deletion candidates while still occupying the
-//! filesystem free space is measured on — deleting fresh partitions could
-//! never reclaim it.
+//! Disk-pressure deletion is additionally suppressed while any epoch
+//! set-aside root ([`crate::epoch::set_aside_paths`]) exists: a set-aside
+//! is a sibling of `data/`, so it yields no deletion candidates while
+//! still occupying the filesystem free space is measured on — deleting
+//! fresh partitions could never reclaim it. A repin in flight suppresses
+//! both sweeps (marker or either staging sibling).
 //!
 //! The field catalog's `field_services` observations are ever-observed:
 //! retention deleting a partition deliberately never reconciles them, and
-//! nothing else removes a row either (ADR-0009 slice 2 — "which services
-//! ever carried this field" is historical fact, not an index over live
-//! files). Consumers window on `last_seen`; the field axis is bounded by
-//! the pin cap ([`crate::store::MAX_PINNED_FIELDS`]).
+//! nothing else removes a row either (ADR-0009 — "which services ever
+//! carried this field" is historical fact, not an index over live files).
+//! Consumers window on `last_seen`; the field axis is bounded by the pin
+//! cap ([`crate::store::MAX_PINNED_FIELDS`]).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -105,13 +106,13 @@ fn retention_tick(
     config: &RetentionConfig,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
 ) -> Result<(), String> {
-    // ADR-0011 slice B: a repin in flight — marker, shadow sibling, or
-    // aside sibling — suppresses BOTH sweeps, not just pressure. Age
-    // deletion would remove affected files out from under the shadow
-    // build (the catch-up diff treats disappearance as an operator act,
-    // not a normal event), and pressure deletion can never reclaim the
-    // bytes the job is deliberately double-holding. The job's own
-    // free-space pre-flight is what keeps this suppression affordable.
+    // A repin in flight — marker, shadow sibling, or aside sibling —
+    // suppresses both sweeps, not just pressure (ADR-0011). Age deletion
+    // would remove affected files out from under the shadow build (the
+    // catch-up diff treats disappearance as an operator act, not a normal
+    // event), and pressure deletion can never reclaim the bytes the job is
+    // deliberately double-holding. The job's own free-space pre-flight is
+    // what keeps this suppression affordable.
     if let Some(what) = repin_in_flight(data_dir) {
         // Alertable, because "suppressed" is not always "a job is
         // running": staging whose sweep keeps failing holds this at 1
@@ -177,7 +178,8 @@ fn retention_tick(
             }
         }
 
-        // Remove deleted dirs from candidate list for phase 2.
+        // Everything past the cutoff was already attempted above, failures
+        // included, so phase 2 works on what age retention left alone.
         candidates.retain(|(date, _)| *date >= cutoff);
     }
 
@@ -211,14 +213,14 @@ fn disk_pressure_sweep(
     let mut total_bytes_freed: u64 = 0;
     let mut total_dirs_deleted: u64 = 0;
 
-    // The pre-cutover set-aside root (ADR-0009, `data.pre-schema-v2/`)
-    // is a *sibling* of `data/`: it yields no deletion candidates yet
-    // still occupies the filesystem `free_space_fn` measures. Deleting
-    // date dirs cannot reclaim it, so an unattended loop would destroy
-    // every non-today partition and remain under threshold. Refuse to
-    // delete anything under pressure while it exists, and say why.
-    // Either set-aside suppresses the sweep: an install can hold one
-    // from each epoch bump, and trawl deletes neither.
+    // An epoch set-aside root is a *sibling* of `data/`: it yields no
+    // deletion candidates yet still occupies the filesystem
+    // `free_space_fn` measures. Deleting date dirs cannot reclaim it, so
+    // an unattended loop would destroy every non-today partition and
+    // remain under threshold. Refuse to delete anything under pressure
+    // while one exists, and say why. Either set-aside suppresses the
+    // sweep: an install can hold one from each epoch bump, and trawl
+    // deletes neither.
     let set_asides = crate::epoch::set_aside_paths(data_dir);
 
     loop {
@@ -293,7 +295,7 @@ fn disk_pressure_sweep(
 /// it has appeared since the tick opened.
 ///
 /// The tick-opening check only says that no job owned the data root when
-/// the tick STARTED. A job admitted mid-tick writes its marker before it
+/// the tick started. A job admitted mid-tick writes its marker before it
 /// touches anything and keeps it until it is completely done, so re-reading
 /// it here means a `remove_dir_all` can only overlap a shadow build or a
 /// swap if that single directory removal outlives the whole job — as
@@ -693,12 +695,12 @@ mod tests {
         }
     }
 
-    /// ADR-0011 slice B: while a repin job exists on this root — marker,
-    /// shadow sibling, or aside sibling — BOTH sweeps stand down. Age
-    /// deletion would yank affected files out from under the shadow build
-    /// (the catch-up diff sees additions, not disappearances, as normal),
-    /// and pressure deletion could never reclaim the double-held bytes the
-    /// job itself is holding.
+    /// While a repin job exists on this root — marker, shadow sibling, or
+    /// aside sibling — both sweeps stand down. Age deletion would yank
+    /// affected files out from under the shadow build (the catch-up diff
+    /// sees additions, not disappearances, as normal), and pressure
+    /// deletion could never reclaim the double-held bytes the job itself
+    /// is holding.
     #[test]
     fn both_sweeps_suppressed_while_a_repin_is_in_flight() {
         let today = chrono::Utc::now().date_naive();
@@ -724,7 +726,7 @@ mod tests {
                 }
             }
 
-            // Age AND pressure both armed, both hungry.
+            // Age and pressure both armed, both hungry.
             let config = make_config(90, 1_000_000);
             retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
             assert!(
@@ -734,7 +736,7 @@ mod tests {
         }
     }
 
-    /// A job admitted MID-TICK stops the sweep too. The tick-opening check
+    /// A job admitted mid-tick stops the sweep too. The tick-opening check
     /// only speaks for the moment the tick started; a sweep that got past
     /// it would keep calling `remove_dir_all` right through the shadow
     /// build and the swap. The claim is therefore re-read before every
@@ -869,12 +871,10 @@ mod tests {
         std::fs::create_dir_all(&dir_b).unwrap();
         std::fs::write(dir_b.join("data.parquet"), b"data").unwrap();
 
-        // Make dir_a undeletable by removing it before the tick (simulates
-        // a race or permission issue — remove_dir_all on an empty dir
-        // still succeeds, so we pre-delete it to trigger an error on the
-        // second attempt if it were re-listed, but actually the simplest
-        // approach: just verify both dirs get processed).
-        // Actually, the simplest test: both are old enough, both get deleted.
+        // Both dirs are old enough, so both are processed. Nothing here
+        // actually makes a deletion fail: `remove_dir_all` succeeds on an
+        // empty dir, and a permission-denied dir needs setup the suite
+        // cannot rely on.
         let config = make_config(30, 0);
         retention_tick(tmp.path(), &config, |_| Ok(u64::MAX)).unwrap();
 

@@ -103,7 +103,7 @@ impl App {
                         });
                     }
                     Ok(StreamEvent::Row(_)) => {
-                        // Legacy variant — shouldn't appear from SSE stream.
+                        // `Row` is the columnar, non-streaming variant; SSE never sends it.
                         tracing::debug!("ignoring unexpected Row variant in live stream");
                     }
                     Ok(StreamEvent::Error(msg)) => {
@@ -167,8 +167,8 @@ impl App {
 
 /// Extract the user-specified field order from a `fields`/`table` pipe stage.
 ///
-/// Returns the mapped column names in user-specified order, or empty vec if
-/// no table stage is present (or the query fails to parse).
+/// Returns the column names verbatim, in the order the user wrote them, or an empty
+/// vec when the query has no such stage or fails to parse.
 fn extract_field_order(query: &str) -> Vec<String> {
     let Ok(ast) = trawl_core::parser::parse(query) else {
         return Vec::new();
@@ -187,9 +187,9 @@ fn extract_field_order(query: &str) -> Vec<String> {
 
 /// Apply timezone offset to timestamp-valued fields in a streaming event.
 ///
-/// Converts RFC 3339 UTC strings to the display format used by the query
-/// executor, with the configured UTC offset applied. Handles both the
-/// standard `timestamp` field and timechart's `_time` bucket field.
+/// Converts RFC 3339 UTC strings to the display format the query executor uses, with
+/// the configured UTC offset applied. Covers the envelope's `_time` and `_ingested`
+/// (`_time` doubles as timechart's bucket) plus a sender field spelled `timestamp`.
 fn apply_tz_to_event(event: &mut serde_json::Map<String, serde_json::Value>, utc_offset_secs: i32) {
     if utc_offset_secs == 0 {
         return;
@@ -207,8 +207,8 @@ mod tests {
     use super::extract_field_order;
 
     /// Zero-alias contract (ADR-0013): the live column order carries the user's
-    /// own spellings verbatim. A re-added alias mapping would make `table
-    /// timestamp` consume `_time` here while the batch lane stayed green.
+    /// own spellings verbatim. An alias mapping here would make `table
+    /// timestamp` consume `_time` while the batch lane stayed green.
     #[test]
     fn table_field_names_are_verbatim_and_distinct() {
         assert_eq!(extract_field_order("* | table _time"), vec!["_time"]);

@@ -15,11 +15,9 @@
 //! ```
 //!
 //! Login validates the submitted API key directly via
-//! `KeyStore::verify_key` (no HTTP `/whoami` hop — that lived in trawl-web's
-//! old proxy and is replaced per ADR-0030's "What happens to
-//! coastwatch-trawl-client" section). It then filters grants to the app's
-//! namespace, sets the encrypted session cookie, and 302-redirects to
-//! `SessionConfig.post_login_redirect`.
+//! `KeyStore::verify_key`, with no HTTP `/whoami` hop. It then requires at
+//! least one permission in the app's namespace, sets the encrypted session
+//! cookie, and 302-redirects to `SessionConfig.post_login_redirect`.
 //!
 //! Logout clears the session cookie with matching attributes (domain, path,
 //! `same_site`, secure) so browsers accept the directive. Returns 204.
@@ -179,8 +177,8 @@ pub async fn login(
 /// a parent domain, a forged cross-site POST to any app's logout endpoint
 /// would clear the shared cookie and sign the user out of every sibling
 /// app. Both `login` and `logout` therefore validate the `Origin` header
-/// by default via [`session::check_origin`] (ADR-0004 slice 2): a present Origin
-/// whose host doesn't match the request `Host` → 403 with NO `Set-Cookie`.
+/// by default via [`session::check_origin`] (ADR-0004): a present Origin
+/// whose host doesn't match the request `Host` → 403 with no `Set-Cookie`.
 /// Sharing a parent-domain cookie is deliberately NOT an origin allowlist —
 /// a sibling app is a different origin and is rejected. Absent Origin is
 /// allowed, so curl/scripted clients are unaffected.

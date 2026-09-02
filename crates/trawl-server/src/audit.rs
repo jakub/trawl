@@ -10,7 +10,7 @@
 //! tracing events that flow through the [`WalLayer`] into parquet, providing
 //! an audit trail even though fleet-admin has no WAL subscriber.
 //!
-//! Under ADR-0006 a role name alone says nothing durable about capability —
+//! Under ADR-0006 a role name alone says nothing durable about capability:
 //! `fleet-admin roles add-perm` mutates what a role grants without touching
 //! any key. So the snapshot covers *both* sides of the grant: each key's role
 //! set and each role's `(app, permission)` bundle plus `rate_rpm`. Every event
@@ -177,7 +177,6 @@ fn snapshot_of(keys: &[ApiKeyInfo], roles: &[Role]) -> Snapshot {
     }
 }
 
-/// Build the initial snapshot from the current keystore state.
 async fn initial_snapshot(key_store: &KeyStore) -> Result<Snapshot, String> {
     let (keys, roles) = fetch(key_store).await?;
     Ok(snapshot_of(&keys, &roles))
@@ -244,7 +243,6 @@ async fn poll_changes(key_store: &KeyStore, snapshot: &mut Snapshot) -> Result<(
     for key in &keys {
         match snapshot.keys.get(&key.id) {
             None => {
-                // New key — not in our snapshot.
                 tracing::info!(
                     event_type = "key_created",
                     key_id = key.id,
@@ -258,8 +256,8 @@ async fn poll_changes(key_store: &KeyStore, snapshot: &mut Snapshot) -> Result<(
                 );
             }
             Some(prev) if prev.active && !key.active => {
-                // Key was revoked since last poll. fleet-auth timestamps are
-                // typed DateTime<Utc>; render rfc3339 for the audit trail.
+                // fleet-auth timestamps are typed DateTime<Utc>; render
+                // rfc3339 for the audit trail.
                 let occurred_at = key
                     .revoked_at
                     .map_or_else(|| "unknown".to_owned(), |t| t.to_rfc3339());
@@ -284,7 +282,7 @@ async fn poll_changes(key_store: &KeyStore, snapshot: &mut Snapshot) -> Result<(
                     "API key roles changed (detected by audit)"
                 );
             }
-            _ => {} // No change.
+            _ => {}
         }
     }
 

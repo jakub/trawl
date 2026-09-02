@@ -27,8 +27,8 @@ pub enum ServerError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
-    /// Authenticated but not authorized for trawl (no trawl grant / unknown
-    /// trawl role). Produced by the mandatory policy middleware.
+    /// Authenticated, but the key resolves no usable trawl permission.
+    /// Produced by the mandatory policy middleware.
     #[error("forbidden: {0}")]
     Forbidden(String),
 
@@ -90,7 +90,7 @@ impl ServerError {
 
     /// Return a stable, content-free classification of this error.
     ///
-    /// SECURITY: default-filter telemetry logs this INSTEAD of any message.
+    /// SECURITY: default-filter telemetry logs this instead of any message.
     /// [`safe_message`](Self::safe_message) is safe to hand a *client* but not
     /// safe to persist: it deliberately preserves parse/emit text, and
     /// parser/emitter messages quote the user's own tokens and format strings
@@ -150,7 +150,6 @@ impl From<fleet_auth::AuthError> for ServerError {
     }
 }
 
-/// Convert a `ParseError` into a structured `ErrorDetail`.
 pub(crate) fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_api::ErrorDetail {
     trawl_api::ErrorDetail {
         message: e.message.clone(),

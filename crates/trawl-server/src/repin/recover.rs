@@ -2,15 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Boot recovery for an interrupted repin (ADR-0011 slice B) — the
-//! marker-driven decision table, split in two halves because the two
-//! resources come up at different times:
+//! Boot recovery for an interrupted repin (ADR-0011) — the marker-driven
+//! decision table, split in two halves because the two resources come up
+//! at different times:
 //!
-//! - the FILESYSTEM half runs BEFORE `ensure_current_epoch`
+//! - the filesystem half runs before `ensure_current_epoch`
 //!   (non-negotiable: a half-swapped root must be finished before the
 //!   epoch gate forms an opinion of it), needs no postgres, and is one
 //!   `stat` on the marker-less fast path;
-//! - the POSTGRES half runs after `AppState::from_config`, finishes the
+//! - the postgres half runs after `AppState::from_config`, finishes the
 //!   job row (idempotent flip or failure), re-arms the boot conformance
 //!   pass for any recovered cutover, sweeps the aside, and removes the
 //!   marker — then reconciles any orphaned `running` rows.
@@ -51,7 +51,7 @@ pub struct Recovered {
     /// What was done.
     pub action: RecoveredAction,
     /// Whether every staging sweep this half owed actually left the
-    /// staging root gone. A failed sweep KEEPS the marker (see
+    /// staging root gone. A failed sweep keeps the marker (see
     /// `reconcile_store`): the leftover root suppresses retention and
     /// would make the next cutover's forward-only swap ambiguous, so the
     /// replay must run again at the next boot rather than be forgotten.
@@ -63,9 +63,9 @@ pub struct Recovered {
 /// A query-only node (`ingest_enabled == false`) owns nothing here: a
 /// `building` marker is harmless (the live corpus was never touched —
 /// warn and serve, leaving the shadow for the owning node), but a
-/// `cutover`/`cleanup` marker means the corpus may be HALF-SWAPPED, which
-/// the M1 probes proved does not even error — it silently promotes — so
-/// the only honest answer is to refuse the boot.
+/// `cutover`/`cleanup` marker means the corpus may be half-swapped, which
+/// probes showed does not even error — mixed scalar types silently
+/// promote — so the only honest answer is to refuse the boot.
 pub fn recover_filesystem(
     data_dir: &Path,
     ingest_enabled: bool,
@@ -181,11 +181,11 @@ pub async fn reconcile_store(
                     .map_err(|e| format!("failed to fail recovered repin job: {e}"))?;
             }
             RecoveredAction::CompletedCutover | RecoveredAction::SweptCleanup => {
-                // `from_catalog`, matching what the marker WRITES
-                // (`to.as_catalog()`): the physical parse has no `SEVERITY`
-                // spelling, so a severity cutover marker failed the boot
-                // replay here — the one recovery path that must never
-                // refuse, since the corpus is already half-swapped.
+                // `from_catalog`, matching what the marker writes
+                // (`to.as_catalog()`): the physical parse (`from_duckdb`)
+                // has no `SEVERITY` spelling, so it would refuse a severity
+                // cutover marker. This path must never refuse — the corpus
+                // is already half-swapped.
                 let to = CanonicalType::from_catalog(&marker.to_type).ok_or_else(|| {
                     format!("repin marker names non-canonical type {:?}", marker.to_type)
                 })?;
@@ -205,7 +205,7 @@ pub async fn reconcile_store(
                 swept &= sweep_dir(&aside_root(data_dir), "recovered aside");
             }
         }
-        // The marker is the ONLY record that a staging root is trawl's to
+        // The marker is the only record that a staging root is trawl's to
         // delete: dropping it over a failed sweep strands the leftover
         // root forever (retention stays suppressed by its mere existence,
         // and a later cutover meets an aside beside a live env and refuses
@@ -295,7 +295,7 @@ mod tests {
         }
     }
 
-    /// A leftover aside from an EARLIER job's failed sweep is reclaimed by
+    /// A leftover aside from an earlier job's failed sweep is reclaimed by
     /// the abandoned build rather than inherited: the marker standing over
     /// it is the last one that will ever name it, and leaving it while the
     /// marker goes strands it (retention stays suppressed by its mere

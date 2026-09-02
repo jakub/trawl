@@ -27,8 +27,8 @@ pub(crate) fn emit_expr(
         Expr::Literal(lit) => Ok(emit_literal(lit, state)),
         Expr::FieldRef(name) => Ok(quote_field(name)),
         Expr::Binary { lhs, op, rhs } => {
-            // Bare field-vs-literal comparisons consult the pin scope
-            // (ADR-0011 slice A′) — same rule table as the search stage.
+            // Bare field-vs-literal comparisons bind through the pin
+            // scope, on the same rule table as the search stage.
             if let Some(clause) = try_pinned_comparison(lhs, *op, rhs, state)? {
                 return Ok(clause);
             }
@@ -46,8 +46,8 @@ pub(crate) fn emit_expr(
         }
         Expr::InList { expr: target, list } => {
             // A pinned bare-field target with an all-literal list routes
-            // each element through the equality rule (ADR-0011 slice A′),
-            // mirroring the search stage's IN list.
+            // each element through the equality rule, mirroring the
+            // search stage's IN list.
             if let Some(clause) = try_pinned_in_list(target, list, state)? {
                 return Ok(clause);
             }
@@ -61,16 +61,16 @@ pub(crate) fn emit_expr(
     }
 }
 
-/// Translate one call's ARGUMENTS, applying every per-position rule the
-/// function declares — literal ints, closed-vocabulary literals, format
+/// Translate one call's arguments, applying every per-position rule the
+/// function declares: literal ints, closed-vocabulary literals, format
 /// strings, and the literals read through `to_json`.
 ///
-/// Shared by the expression arm above and by every AGGREGATION-position
-/// call site (`emitter::pipeline`'s `stats`/`timechart`/`pivot`/
-/// `eventstats`): those emitted their arguments with a bare `emit_expr`,
-/// so `stats sev(level, "syslog")` bound the dialect as a parameter and
-/// then failed on the literal `?` it handed the translation. One
-/// argument walk, every position a call can sit in.
+/// The one argument walk for every position a call can sit in: the
+/// expression arm above and every aggregation call site
+/// (`emitter::pipeline`'s `stats`/`timechart`/`pivot`/`eventstats`).
+/// Emitting an aggregation's arguments with a bare `emit_expr` instead
+/// would bind `stats sev(level, "syslog")`'s dialect as a parameter, and
+/// the translation cannot read a `?`.
 pub(crate) fn emit_call_args(
     name: &str,
     args: &[Spanned<Expr>],
@@ -82,14 +82,13 @@ pub(crate) fn emit_call_args(
     let json_positions = json_read_positions(name);
     let fmt_position = format_literal_position(name);
     if !lit_positions.is_empty() || !unit_positions.is_empty() {
-        // Arity BEFORE vocabulary: a call carrying an argument the
-        // function does not have must say so, rather than
-        // complaining about a literal at a position that is not a
-        // literal position at all. Scoped to the functions with
-        // literal positions because only they inspect an argument
-        // before `translate_function`'s own arity guard runs — and
-        // for those the table's message is the guard's, word for
-        // word.
+        // Arity before vocabulary: a call carrying an argument the
+        // function does not have must say so, rather than complaining
+        // about a literal at a position that is not a literal position
+        // at all. Scoped to the functions with literal positions
+        // because only they inspect an argument before
+        // `translate_function`'s own arity guard runs, and for those
+        // the table's message is the guard's, word for word.
         validate_function_arity(name, args.len())?;
     }
     let translated_args: Vec<String> = args
@@ -112,11 +111,11 @@ pub(crate) fn emit_call_args(
                 };
                 validate_unit_literal(name, i, allowlist, raw)?;
                 if text_positions.contains(&i) {
-                    // The token CHOOSES the emitted expression
+                    // The token chooses the emitted expression
                     // (`sev()`'s dialect), so it is never a bound
-                    // parameter: `translate_function` has to read
-                    // it. Folded here, once, so both the SQL and
-                    // the eval lane see one spelling.
+                    // parameter: `translate_function` has to read it.
+                    // Case-folded here, so the vocabulary check and the
+                    // dialect parse downstream read one spelling.
                     Ok(raw
                         .expect("a non-literal was refused above")
                         .to_ascii_lowercase())
@@ -137,7 +136,7 @@ pub(crate) fn emit_call_args(
                     // codes at emit time when it is a string literal, so
                     // batch and streaming fail identically. A non-literal
                     // (field ref) can't be checked here and keeps its
-                    // pre-existing runtime behaviour.
+                    // runtime behaviour (eval nulls).
                     if let Expr::Literal(LiteralValue::String(s)) = &a.node {
                         validate_format_literal(name, s)?;
                     }
@@ -174,19 +173,18 @@ fn flip_filter_op(op: FilterOp) -> FilterOp {
     }
 }
 
-/// A bare literal, as the rule table's door wants it — the AST value, not
+/// A bare literal, as the rule table's door wants it: the AST value, not
 /// a re-rendered one, so a float literal keeps its source token (ADR-0011
 /// ruling #6, [`crate::ast::FloatLiteral`]).
 ///
-/// A NEGATIVE numeric literal reaches the parser as `Unary{Neg, Literal}`,
-/// never as a signed `Literal`, so the sign is folded back in here — into
-/// the `i64` and into the float's SOURCE TOKEN alike, keeping the DECIMAL
-/// binding exact. Without the fold every negative literal would fall
-/// through to pin-blind emission and raise exactly the VARCHAR-pin binder
-/// error slice A′ removes, while its quoted spelling (`> "-400"`, a plain
-/// `Literal`) bound pin-aware — two spellings of one number disagreeing.
-/// Only `Int`/`Float` fold: `-"400"` and `-true` are arithmetic on a
-/// non-number and keep their generic emission.
+/// A negative numeric literal leaves the parser as `Unary{Neg, Literal}`,
+/// never as a signed `Literal`, so the sign is folded back in here, into
+/// the `i64` and into the float's source token alike, keeping the DECIMAL
+/// binding exact. Without the fold a bare `> -400` would emit pin-blind
+/// while its quoted spelling `> "-400"` (a plain `Literal`) bound
+/// pin-aware: two spellings of one number disagreeing. Only `Int`/`Float`
+/// fold; `-"400"` and `-true` are arithmetic on a non-number and keep
+/// their generic emission.
 fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
     match expr {
         Expr::Literal(lit) => Some(Cow::Borrowed(lit)),
@@ -209,21 +207,22 @@ fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
 }
 
 /// Detect a pinned-subject-vs-literal comparison and emit it through the
-/// shared rule table (ADR-0011 slice A′, widened by ADR-0013 ruling 9).
-/// The subject is whatever [`PinScope::subject_pin`] recognizes — a bare
-/// pinned field, or a pin-DECLARING call over one (`sev(level)`) — and
-/// every other shape returns `None`, falling through to generic,
-/// literal-driven emission, structurally: field-vs-field, an ordinary
-/// function wrapper, arithmetic, `== null`, unpinned fields, and any form
-/// the rule table leaves native.
+/// shared rule table (ADR-0011, ADR-0013 ruling 9).
+///
+/// The subject is whatever [`crate::pin_scope::PinScope::subject_pin`]
+/// recognizes: a bare pinned field, or a pin-declaring call over one
+/// (`sev(level)`). Every other shape returns `None` and falls through to
+/// generic, literal-driven emission, structurally: field-vs-field, an
+/// ordinary function wrapper, arithmetic, `== null`, unpinned fields, and
+/// any form the rule table leaves native.
 ///
 /// Both operand orders are accepted for the comparison operators
 /// (`400 < status` is `status > 400`); for the pattern operators
-/// (`matches`/LIKE/ILIKE) only the LEFT operand is a subject — the right
-/// operand is the pattern, not a comparison target.
+/// (`matches`/LIKE/ILIKE) only the left operand is a subject, since the
+/// right one is the pattern rather than a comparison target.
 ///
 /// NULL policy is [`NullPolicy::Strict`]: plain SQL null propagation,
-/// exactly what the pin-blind `where` answers — the search stage's
+/// exactly what a pin-blind `where` answers. The search stage's
 /// `OR field IS NULL` widening for `!=` deliberately does not apply here,
 /// or a repin would change missing-field semantics.
 fn try_pinned_comparison(
@@ -232,7 +231,7 @@ fn try_pinned_comparison(
     rhs: &Spanned<Expr>,
     state: &mut EmitterState,
 ) -> Result<Option<String>, EmitError> {
-    // Pattern operators: the subject is the LEFT operand only.
+    // Pattern operators: the subject is the left operand only.
     if matches!(op, BinaryOp::Matches | BinaryOp::Like | BinaryOp::ILike) {
         let Some((subject, pin)) = state.pin_scope().subject_pin(lhs) else {
             return Ok(None);
@@ -241,11 +240,11 @@ fn try_pinned_comparison(
             return Ok(None);
         };
         if compare::pattern_form(Some(pin)) == PatternForm::Native {
-            // The column is already text — generic emission is
-            // byte-identical, so keep it on the generic path.
+            // The column is already text, so generic emission is
+            // byte-identical: keep it on the generic path.
             return Ok(None);
         }
-        // The subject's SQL is built BEFORE the pattern's parameter, so
+        // The subject's SQL is built before the pattern's parameter, so
         // any placeholder inside it keeps its positional order.
         let target = pattern_target(&subject_sql(&subject, state)?, Some(pin));
         let placeholder = state.push_param(SqlValue::String(pattern.clone()));
@@ -278,7 +277,7 @@ fn try_pinned_comparison(
     };
     if matches!(form, CompareForm::Native(_)) {
         // The rule table leaves the shape literal-driven (VARCHAR pin,
-        // ordered non-numeric literal) — generic emission is the rule.
+        // ordered non-numeric literal): generic emission is the rule.
         return Ok(None);
     }
     // Subject first, again for parameter order.
@@ -295,7 +294,7 @@ fn try_pinned_comparison(
 
 /// Detect `field in (literal, …)` over a pinned field and emit each
 /// element through the equality rule, mirroring the search stage's IN
-/// list (ADR-0011 slice A′).
+/// list.
 fn try_pinned_in_list(
     target: &Spanned<Expr>,
     list: &[Spanned<Expr>],
@@ -315,8 +314,8 @@ fn try_pinned_in_list(
         forms.push(form);
     }
     // Subject first, for parameter order: `in_list_sql` pushes one
-    // parameter per element — except the all-SEVERITY arm, which renders
-    // inlined ladder points and pushes none (issue #82).
+    // parameter per element, except the all-SEVERITY arm, which renders
+    // inlined ladder points and pushes none.
     let subject = subject_sql(&subject, state)?;
     let clause = in_list_sql(&subject, forms, state);
     Ok(Some(if clause.starts_with('(') {
@@ -329,9 +328,9 @@ fn try_pinned_in_list(
 /// The SQL a pinned subject compares as: the quoted column, or the
 /// translated call.
 ///
-/// A pin-declaring call is emitted by the ordinary function path — it is
-/// the same SQL `| let s = sev(level)` would project — so the comparison
-/// and the projection can never read one value two ways.
+/// A pin-declaring call is emitted by the ordinary function path, so it
+/// is the same SQL `| let s = sev(level)` would project and the
+/// comparison and the projection cannot read one value two ways.
 fn subject_sql(
     subject: &crate::pin_scope::PinnedSubject<'_>,
     state: &mut EmitterState,
@@ -342,10 +341,10 @@ fn subject_sql(
     }
 }
 
-/// A literal bound as a parameter that carries its OWN type.
+/// A literal bound as a parameter that carries its own type.
 ///
 /// For the positions read through `to_json`
-/// ([`super::functions::json_read_positions`]) — `DuckDB` infers a
+/// ([`super::functions::json_read_positions`]): `DuckDB` infers a
 /// parameter's type from its surroundings, and `to_json(?)` offers none,
 /// so the statement fails to prepare. The cast names exactly the type the
 /// value binds as, so nothing about the reading changes; a NULL takes

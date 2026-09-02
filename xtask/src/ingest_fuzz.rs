@@ -7,18 +7,17 @@
 //! Vector's `file` source can decode it, and an HTTP test can post the same
 //! bytes directly as `application/x-ndjson`.
 //!
-//! Since ADR-0013 slice 2 there are three producer PROFILES behind one
-//! canonicalizer, so `--profile` selects which door's payload shape the
-//! `mutate` corpus imitates: `http` emits wire events exactly as a sender
-//! posts them, while `syslog` and `trawld` emit the payload MAPS their
-//! doors hand `envelope::canonicalize` — the `syslog_*`/`sd_*` parse
-//! artifacts and the tracing-visitor fields respectively. Those two are
-//! still ordinary NDJSON, so they replay over HTTP the way a
-//! syslog-over-HTTP forwarder's batch does; the in-process proof that
-//! each shape survives its OWN door is
-//! `crates/trawl-server/tests/profile_fuzz.rs`, which generates its own
-//! corpus deliberately — this command's job is a wire artifact, that
-//! test's job is the function.
+//! Three producer profiles sit behind one canonicalizer, so `--profile`
+//! selects which door's payload shape the `mutate` corpus imitates:
+//! `http` emits wire events exactly as a sender posts them, while
+//! `syslog` and `trawld` emit the payload maps their doors hand
+//! `envelope::canonicalize` (the `syslog_*`/`sd_*` parse artifacts and
+//! the tracing-visitor fields respectively). Those two are still
+//! ordinary NDJSON, so they replay over HTTP the way a syslog-over-HTTP
+//! forwarder's batch does. The in-process proof that each shape survives
+//! its own door is `crates/trawl-server/tests/profile_fuzz.rs`, which
+//! generates its own corpus deliberately: this command's job is a wire
+//! artifact, that test's job is the function.
 
 use std::io::{self, BufWriter, Write as _};
 use std::process::ExitCode;
@@ -39,26 +38,25 @@ pub enum Phase {
     Conflicts,
     /// Seeded accepted events covering scalar boundaries, nested values,
     /// hostile-but-storable names, casing, repair paths, and the whole
-    /// ADR-0013 derivation surface: severity source PRECEDENCE, the
-    /// numeric dialect domain, the time sources (read AND stored), and
-    /// every branch of the sealed `_`-prefix strip — including the empty
+    /// derivation surface of ADR-0013: severity source precedence, the
+    /// numeric dialect domain, the time sources (read and stored), and
+    /// every branch of the sealed `_`-prefix strip, including the empty
     /// remainder, the bare-name collision, and a forged `_severity`.
     ///
     /// The invariant this phase exists to break: every accepted field
-    /// stays queryable under SOME name. Nothing is consumed, and the one
-    /// strip rule either renames or (with no remainder) drops into
-    /// `_raw`.
+    /// stays queryable under some name. Nothing is consumed, and the
+    /// strip rule either renames the field or, with no remainder, drops
+    /// it with the value still in `_raw`.
     #[default]
     Mutate,
     /// Valid JSON objects that trawl should reject at envelope validation.
     Rejects,
 }
 
-/// Which producer PROFILE the `mutate` corpus is shaped for (ADR-0013
-/// slice 2, ruling 2).
+/// Which producer profile the `mutate` corpus is shaped for.
 ///
 /// The profiles share one canonicalizer, so what differs is only the
-/// payload a door hands it — which is exactly what a corpus can imitate.
+/// payload a door hands it, which is exactly what a corpus can imitate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum Profile {
     /// Wire events as an HTTP sender posts them: the door asserts nothing
@@ -217,7 +215,7 @@ fn base_event(config: &Config, names: &Names, phase: &str, seq: usize) -> Map<St
     event.insert("env".into(), json!(config.env));
     event.insert("service".into(), json!(names.service(phase)));
     event.insert("host".into(), json!("fuzz-host"));
-    // A severity SOURCE, stored verbatim: derivation reads it and leaves
+    // A severity source, stored verbatim: derivation reads it and leaves
     // it exactly where it is (ADR-0013 §2).
     event.insert("severity".into(), json!("info"));
     event.insert(
@@ -379,7 +377,7 @@ fn mutation_events(config: &Config, names: &Names) -> Vec<Value> {
                     json!({"outer": {"inner": seq}, "list": [null, true, seq]}),
                 );
             }
-            // Source PRECEDENCE: `severity` → `severity_text` → `level`,
+            // Source precedence: `severity` → `severity_text` → `level`,
             // first mappable wins, and every one of them lands as its own
             // column whatever the derivation decides.
             if seq % 7 == 0 {
@@ -405,15 +403,15 @@ fn mutation_events(config: &Config, names: &Names) -> Vec<Value> {
         .collect()
 }
 
-/// The gates EVERY door applies, probed on a deterministic cadence so no
+/// The gates every door applies, probed on a deterministic cadence so no
 /// seed can miss a branch: the sealed `_` prefix (ADR-0013 §5) in each of
-/// its shapes — server-stamped slots, the internal provenance key, a
+/// its shapes (server-stamped slots, the internal provenance key, a
 /// journald-shaped name, an empty remainder, the bare-name collision, a
-/// forged verdict, a forged provenance stamp — plus the name-length cap
+/// forged verdict, a forged provenance stamp), plus the name-length cap
 /// and a non-string `_raw`.
 ///
-/// One function for all three profiles on purpose: the universal gates
-/// are the thing slice 2 unified, so a corpus that probed them per-door
+/// One function for all three profiles on purpose: these gates are the
+/// canonicalizer's, not a door's, so a corpus that probed them per-door
 /// could drift about what "adversarial" even means.
 fn universal_gate_probes(event: &mut Map<String, Value>, names: &Names, seq: usize) {
     if seq.is_multiple_of(11) {
@@ -421,7 +419,7 @@ fn universal_gate_probes(event: &mut Map<String, Value>, names: &Names, seq: usi
         event.insert("_repairs".into(), json!("client-forged"));
         event.insert("_trawl_wal_file".into(), json!("client-forged"));
         // Provenance is stamped by the door, so this must strip to a bare
-        // `producer` and never reach `_producer` (ADR-0013 slice 2).
+        // `producer` and never reach `_producer`.
         event.insert("_producer".into(), json!("client-forged"));
     }
     if seq.is_multiple_of(4) {
@@ -434,7 +432,7 @@ fn universal_gate_probes(event: &mut Map<String, Value>, names: &Names, seq: usi
         event.insert(format!("_{}", names.field("collide")), json!("loser"));
     }
     // A forged verdict: derivation-only, so it strips to bare `severity`
-    // and is then READ like any other source.
+    // and is then read like any other source.
     if seq.is_multiple_of(6) {
         event.insert("_severity".into(), json!(severity_value(seq)));
     }
@@ -449,12 +447,12 @@ fn universal_gate_probes(event: &mut Map<String, Value>, names: &Names, seq: usi
     }
 }
 
-/// The payload the SYSLOG door hands the canonicalizer: the pre-parse
+/// The payload the syslog door hands the canonicalizer: the pre-parse
 /// wire line as a `_raw` proposal, the `syslog_*` parse artifacts, and
-/// the `sd_*` structured-data pairs UNFOLDED and uncapped — the listener
-/// stopped owning any of those rules in ADR-0013 slice 2.
+/// the `sd_*` structured-data pairs unfolded and uncapped. The listener
+/// owns none of those rules; the canonicalizer does.
 ///
-/// The identity fields are here too, because the profile ASSERTS them: a
+/// The identity fields are here too, because the profile asserts them: a
 /// payload key that names one is the assertion-precedence case, and
 /// including them is also what makes the corpus replayable over HTTP the
 /// way a syslog-over-HTTP forwarder's batch is.
@@ -471,8 +469,9 @@ fn syslog_payload_events(config: &Config, names: &Names) -> Vec<Value> {
             // exists to exercise (the forwarder recipe in configuration.md).
             event.remove("severity");
             // The wire frame, proposed as `_raw`. Every eleventh one is
-            // past MAX_RAW_CHARS: a 64 KB datagram is exactly the case
-            // the listener never used to cap.
+            // past the door's MAX_RAW_CHARS, the oversized-datagram case
+            // the canonicalizer truncates. The 65 536-char bound is
+            // mirrored, not imported: xtask has no trawl-server dep.
             let frame = if seq % 11 == 0 {
                 format!("<{}>1 - - - - - {}", 13 + seq % 8, "A".repeat(70_000))
             } else {
@@ -484,7 +483,7 @@ fn syslog_payload_events(config: &Config, names: &Names) -> Vec<Value> {
             };
             event.insert("_raw".into(), json!(frame));
 
-            // The severity ARTIFACT: raw 0-7, sometimes out of the
+            // The severity artifact: raw 0-7, sometimes out of the
             // dialect's domain, sometimes absent (a PRI-less frame).
             match seq % 10 {
                 8 => {}
@@ -495,7 +494,7 @@ fn syslog_payload_events(config: &Config, names: &Names) -> Vec<Value> {
                     event.insert("syslog_severity".into(), json!(n));
                 }
             }
-            // The timestamp ARTIFACT, omitted a third of the time so the
+            // The timestamp artifact, omitted a third of the time so the
             // configured chain and then arrival time take over.
             if seq % 3 != 0 {
                 event.insert("syslog_timestamp".into(), timestamp_value(seq));
@@ -505,9 +504,9 @@ fn syslog_payload_events(config: &Config, names: &Names) -> Vec<Value> {
             event.insert("syslog_msgid".into(), json!(format!("ID{seq}")));
             event.insert("syslog_source_ip".into(), json!("10.0.0.1"));
 
-            // Structured data, exactly as the listener now spells it:
-            // mixed case, `@`-bearing SD-IDs, an over-long key and a
-            // case-collision pair — all of which the DOOR resolves.
+            // Structured data, exactly as the listener spells it: mixed
+            // case, `@`-bearing SD-IDs, an over-long key and a
+            // case-collision pair, all of which the door resolves.
             event.insert(
                 "sd_exampleSDID@32473_eventID".into(),
                 json!(format!("{seq}")),
@@ -531,21 +530,20 @@ fn syslog_payload_events(config: &Config, names: &Names) -> Vec<Value> {
         .collect()
 }
 
-/// The payload the TELEMETRY layer hands the canonicalizer: ordinary
-/// sender vocabulary (ruling 3 — no `trawld_` prefix), a `_time`
-/// proposal, and the arbitrary field names trawld's own `tracing` call
-/// sites carry.
+/// The payload the telemetry layer hands the canonicalizer: ordinary
+/// sender vocabulary (no `trawld_` prefix), a `_time` proposal, and the
+/// arbitrary field names trawld's own `tracing` call sites carry.
 ///
 /// The identity collisions are the point: a tracing field named
 /// `service` must lose to the profile's assertion with a repair rather
 /// than misfile the daemon's own logs, and a >255-byte field name must
 /// be dropped rather than reach the WAL and wedge compaction for
-/// `service=trawld` (the defect this issue exists to fix).
+/// `service=trawld`.
 fn trawld_payload_events(config: &Config, names: &Names) -> Vec<Value> {
     let mut rng = StdRng::seed_from_u64(config.seed);
     let values = mutation_values();
     // Names a `tracing` field could carry, mixed case included: field
-    // names are Rust-side tokens, so `myField` is legal and the DOOR is
+    // names are Rust-side tokens, so `myField` is legal and the door is
     // what folds it.
     let tracing_fields = [
         "query_id".to_owned(),
@@ -561,7 +559,7 @@ fn trawld_payload_events(config: &Config, names: &Names) -> Vec<Value> {
         .map(|seq| {
             let mut event = Map::new();
             // What the layer always writes. `service`/`env`/`host` are
-            // NOT here — the profile asserts them — except where the
+            // not here — the profile asserts them — except where the
             // collision probe below plants one.
             event.insert("level".into(), json!(severity_value(seq)));
             event.insert("target".into(), json!("trawl_server::ingest::handler"));
@@ -813,9 +811,9 @@ mod tests {
         );
     }
 
-    /// Every profile's corpus probes the gates the ONE canonicalizer
-    /// applies to all of them (ADR-0013 slice 2) — the branch coverage
-    /// `crates/trawl-server/tests/profile_fuzz.rs` asserts the outcome of.
+    /// Every profile's corpus probes the gates the one canonicalizer
+    /// applies to all of them. `crates/trawl-server/tests/profile_fuzz.rs`
+    /// asserts what those probes produce.
     #[test]
     fn every_profile_corpus_probes_the_universal_gates() {
         for profile in [Profile::Http, Profile::Syslog, Profile::Trawld] {
@@ -859,7 +857,7 @@ mod tests {
             events.iter().any(|e| !e.contains_key("syslog_timestamp")),
             "a timestamp-less frame must appear"
         );
-        // The `_raw` cap, which the listener never used to apply.
+        // The oversized frame, past the door's MAX_RAW_CHARS.
         assert!(
             events.iter().any(|e| e["_raw"]
                 .as_str()
@@ -880,7 +878,7 @@ mod tests {
                 "the trawld corpus must collide with the asserted {slot}"
             );
         }
-        // Ordinary sender vocabulary, no `trawld_` prefix (ruling 3).
+        // Ordinary sender vocabulary, no `trawld_` prefix.
         assert!(
             events
                 .iter()

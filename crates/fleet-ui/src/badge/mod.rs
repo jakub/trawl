@@ -2,10 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Typed `<Badge tone=Tone>`, extracted by issue #31 (ADR-0003
-//! unification) from the stringly-styled `class="intel-badge"
-//! style="background:…;color:…"` pattern trawl's since-retired intel
-//! pages used (#112).
+//! Typed `<Badge tone=Tone>`, the one badge treatment (ADR-0003).
 //!
 //! Split into two layers, mirroring [`crate::button`]:
 //! - [`tone`] — the pure [`Tone`] enum and its CSS-class contract.

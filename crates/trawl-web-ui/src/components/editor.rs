@@ -5,7 +5,7 @@
 //! `<DslEditor/>` — `CodeMirror` 6 editor backed by the in-browser trawl-core
 //! DSL parser.
 //!
-//! The parser is the SAME crate the server uses, compiled to wasm. Every
+//! The parser is the same crate the server uses, compiled to wasm. Every
 //! keystroke re-parses and produces `Diagnostic` entries that codemirror
 //! renders as red squiggles. No network round-trip; zero schema drift
 //! between server and browser possible.
@@ -74,9 +74,9 @@ fn lint_document(doc: &str) -> Vec<Diagnostic> {
     }
 }
 
-/// Autocomplete: offers pipe stages if the cursor is after `|` or at SOL;
-/// otherwise offers function names. Good-enough v1 heuristic — full
-/// context-aware completion is a later commit.
+/// Autocomplete: offers pipe stages when the word being typed follows a
+/// `|`, otherwise function names. A heuristic, not a context-aware
+/// completion over the parse tree.
 ///
 /// `pos_utf16` is the cursor position in UTF-16 code units (as `CodeMirror`
 /// reports). We translate to a UTF-8 byte offset before slicing.
@@ -139,8 +139,8 @@ fn complete_at(doc: &str, pos_utf16: usize) -> Option<CompletionResult> {
     })
 }
 
-/// Convert a non-negative `f64` into `usize`, clamping at 0 on negatives
-/// (shouldn't happen for DOM cursor positions but defensive).
+/// Convert an `f64` into `usize`, clamping negatives and non-finite
+/// values to 0 (neither should reach here from a DOM cursor position).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn f64_to_usize(f: f64) -> usize {
     if f.is_sign_negative() || !f.is_finite() {
@@ -152,23 +152,20 @@ fn f64_to_usize(f: f64) -> usize {
 
 /// Bundle of everything that must outlive the editor mount.
 ///
-/// `EditorHandle` owns the `CodeMirror` view; dropping it calls `destroy`
-/// on the JS side. The four closures are installed into that JS view as
+/// `EditorHandle` is the `CodeMirror` view; this struct's `Drop` calls
+/// `destroy` on it. The four closures are installed into that JS view as
 /// callbacks, so they need to stay alive at least as long as the view.
-/// Keeping them in one struct ensures they all drop together on
-/// component cleanup — in the right order (view first, then closures).
+/// Keeping them in one struct drops them together on component cleanup,
+/// in the right order: view first, then closures.
 ///
-/// This replaces an earlier `Closure::forget()`-everywhere design that
-/// leaked the closures permanently and made re-mounting the component
-/// (which can happen if a parent re-renders) pile up unreferenceable
+/// Nothing here is `Closure::forget()`-ed: a parent re-render re-mounts
+/// this component, and forgotten closures would pile up unreferenceable
 /// JS functions in the GC roots.
 struct EditorLifecycle {
     handle: EditorHandle,
-    // The `dyn Fn` types differ per closure, so we can't store a Vec.
-    // Ordering matters for drop: the destructor runs handle FIRST,
-    // which triggers CodeMirror's internal teardown (it stops firing
-    // callbacks). Only then are the closures dropped, which in turn
-    // releases their JS-side backing functions safely.
+    // The `dyn Fn` types differ per closure, so a Vec is impossible.
+    // Field order is drop order: the handle goes first, so CodeMirror
+    // has stopped firing callbacks before the closures are released.
     _on_change: Closure<dyn Fn(String)>,
     _on_submit: Closure<dyn Fn()>,
     _lint: Closure<dyn Fn(String) -> JsValue>,
@@ -177,11 +174,10 @@ struct EditorLifecycle {
 
 impl Drop for EditorLifecycle {
     fn drop(&mut self) {
-        // Explicit `destroy()` before the closures are released by the
-        // compiler-inserted field drops. CodeMirror's destroy() removes
-        // the view from the DOM and tears down internal event listeners
-        // that reference our callbacks; running it first guarantees no
-        // callback fires on a dangling closure.
+        // Destroy the view before the field drops release the closures:
+        // CodeMirror's destroy() removes the view and tears down the
+        // listeners that reference those callbacks, so none can fire on
+        // a dangling closure.
         self.handle.destroy();
     }
 }
@@ -202,9 +198,8 @@ pub fn DslEditor(
     let node_ref = NodeRef::<leptos::html::Div>::new();
     // `StoredValue::new_local`, not `::new`: `Closure<dyn Fn...>` is
     // neither `Send` nor `Sync`, so the default `SyncStorage` rejects
-    // it. `LocalStorage` is the single-threaded (i.e. wasm-appropriate)
-    // variant. CSR apps always run on the main JS thread — `Local`
-    // semantics are a perfect fit.
+    // it. A CSR app runs on the main JS thread, so the single-threaded
+    // `LocalStorage` variant is the right one.
     let lifecycle: StoredValue<Option<EditorLifecycle>, leptos::prelude::LocalStorage> =
         StoredValue::new_local(None);
 
@@ -305,9 +300,7 @@ pub fn DslEditor(
     }
 
     on_cleanup(move || {
-        // Dropping the `EditorLifecycle` runs its `Drop` impl (which
-        // calls `destroy()`) and then drops the four closures in field
-        // order. No `.forget()` anywhere — closures are freed cleanly.
+        // Dropping the `EditorLifecycle` is what tears the view down.
         lifecycle.update_value(|v| {
             let _ = v.take();
         });

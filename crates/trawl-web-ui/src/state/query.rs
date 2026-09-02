@@ -12,8 +12,10 @@
 //!
 //! On top of `executed_q`, the URL also carries structured state that gets
 //! folded into the wire query at request time:
-//! - filters (`?f=+host=web-01,-source=auth.log`) — include/exclude clauses
-//!   driven by the facet sidebar and detail-row tag clicks.
+//! - filters (`?f=v1.<base64url>`, encoded by `crate::filter_codec`) —
+//!   include/exclude clauses driven by the facet sidebar and detail-row
+//!   tag clicks. A payload without the `v1.` prefix falls back to the
+//!   plain `+host=web-01,-source=auth.log` reader.
 //! - range (`?r=15m` or `?r=abs:<from>:<to>`) — time window from the
 //!   date-range popover.
 //!

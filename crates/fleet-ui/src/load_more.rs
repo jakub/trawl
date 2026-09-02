@@ -2,19 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<LoadMore/>` — cursor-driven list footer (issue #33 D3).
+//! `<LoadMore/>` — cursor-driven list footer.
 //!
-//! Canonizes the busy-flag load-more idiom hand-rolled by trawl's intel
-//! pages (retired in #112) and six coastwatch pages: a "load more"
+//! The one busy-flag load-more idiom for every consumer: a "load more"
 //! button while a cursor remains, the canonical `loading…` label
 //! (disabled) while a fetch is in flight, and two terminal texts —
 //! "end of list" when the cursor runs out, "nothing here yet" when the
-//! list is empty. Domain-informative copy stays a prop (`end_text` / `empty_text`);
-//! the defaults are the canonical generic strings.
+//! list is empty. Domain-informative copy stays a prop (`end_text` /
+//! `empty_text`); the defaults are the canonical generic strings.
 //!
 //! A standalone component, not a [`Pager`](crate::pager::Pager) mode —
 //! it composes into `Pager`'s trailing-children slot for footer
-//! placement, or renders bare (as trawl's story timeline did).
+//! placement, or renders bare.
 //!
 //! The phase resolution is pure ([`phase`]) and native-tested; the
 //! wasm-only [`LoadMore`] component renders it.

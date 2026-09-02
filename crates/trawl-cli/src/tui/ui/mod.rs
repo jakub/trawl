@@ -73,12 +73,12 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
 
     editor::render(app, frame, editor_area);
 
-    // Render validation hint bar if there are errors.
     if let Some(hint) = hint_area {
         editor::render_validation_hint(app, frame, hint);
     }
 
-    // Update visible row count for scroll calculations (borders + header = 4 rows overhead).
+    // Visible rows for scroll math: 2 borders plus the header row account for 3 of the 4
+    // subtracted; the 4th is left spare, matching results::render_table.
     #[allow(clippy::cast_possible_truncation)]
     let results_visible = results_area.height.saturating_sub(4) as usize;
     let search_adjust = usize::from(app.results_search.is_some());
@@ -88,7 +88,7 @@ fn render_query_layout(app: &mut App, frame: &mut Frame<'_>) {
     app.layout.column_header_ranges = results::take_header_ranges();
     status::render(app, frame, status_area);
 
-    // Render popup overlay (if any) — renders on top of everything.
+    // Popup last so it paints over everything else.
     popup::render(app, frame);
 
     // Set cursor position based on focus (adjusted for scroll offset).
@@ -149,7 +149,6 @@ fn render_dashboard_layout(app: &mut App, frame: &mut Frame<'_>) {
 
     status::render(app, frame, status_area);
 
-    // Render popup overlay (if any).
     popup::render(app, frame);
 }
 
@@ -171,7 +170,6 @@ fn render_panel_layout(app: &mut App, frame: &mut Frame<'_>) {
     panels::render(app, frame, panel);
     status::render(app, frame, status_area);
 
-    // Render popup overlay (if any).
     popup::render(app, frame);
 }
 
@@ -289,9 +287,9 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
-    /// The TUI transcript for ADR-0013 §9: a `_severity` column renders
-    /// its `OTel` token (`17` → `error`, `18` → `error2`), injectively, and
-    /// an out-of-ladder value shows itself rather than a guess.
+    /// A `_severity` column renders its `OTel` token (`17` → `error`,
+    /// `18` → `error2`), one token per number, while a sender's own `level`
+    /// column renders its text verbatim (ADR-0013 §6).
     #[test]
     fn render_with_severity_tokens() {
         let mut app = test_app();

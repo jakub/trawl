@@ -19,13 +19,11 @@ use crate::pages::search::Search;
 
 #[component]
 pub fn App() -> impl IntoView {
-    // Theme/rowstyle prefs come from fleet-ui; the storage key
-    // stays "trawl.ui" so pre-migration prefs round-trip (AC4).
     let prefs = fleet_ui::install("trawl.ui");
     provide_context(prefs);
 
-    // Shared 30s "now" tick for every <When> relative label — installed
-    // once here, never per-instance (issue #33 D4).
+    // The shared 30s "now" tick every relative label subscribes to; installed
+    // once at the root so a page of labels costs one timer, not one each.
     fleet_ui::time::clock::install();
 
     view! {

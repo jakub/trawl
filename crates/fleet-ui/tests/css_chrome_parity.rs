@@ -2,47 +2,38 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Native contract test for the chrome CSS invariants that AC3
-//! ("zero visual change") of issue #27 depends on but that no rendered
-//! test can observe.
+//! Native contract test for the chrome CSS invariants that "zero visual
+//! change" depends on but that no rendered test can observe.
 //!
-//! The migration moved trawl-web-ui's chrome onto fleet-ui and deleted
-//! the duplicated `main.css` surface. The reviewer's residual AC3 gap:
-//! the *deliberate* CSS deltas — and the compensations that keep the
-//! result eyeball-identical — were asserted in prose, not guarded.
-//! These are load-bearing and non-obvious:
+//! Each of these is load-bearing and non-obvious:
 //!
-//!   * `.rail .it` and `.topbar .mode` render as `<a>` in fleet-ui
-//!     (they were `<div>` in the pre-migration markup). Anchors default
+//!   * `.rail .it` and `.topbar .mode` render as `<a>`. Anchors default
 //!     to `text-decoration: underline`; the explicit `none` is the sole
 //!     thing keeping rail items and mode tabs from sprouting underlines.
 //!     Drop it and every nav element silently regresses — invisible to
 //!     the DOM-class contract tests.
-//!   * `.login-card .error` re-establishes the login form's 16px error
-//!     spacing via a *more specific* selector after the base `.error`
-//!     moved into fleet-ui. Lose the override and login spacing shifts.
-//!   * `.shell` grid rows became `var(--topbar-h) 1fr auto` (documented
-//!     footer-auto-sizing change) — the row that lets a footer-less app
-//!     collapse the footer to zero while trawl's statusbar sizes itself.
-//!   * The six chrome keyframes must survive the move to fleet-ui.css.
-//!   * `.login-shell` lost its `background: var(--bg)` declaration
-//!     (jakub/coastwatch#308, ADR-0012) — a DELIBERATE delta: an opaque
+//!   * `.login-card .error-banner` re-establishes the login form's 16px
+//!     error spacing via a *more specific* selector over the base
+//!     `.error-banner`. Lose the override and login spacing shifts.
+//!   * `.shell` grid rows are `var(--topbar-h) 1fr auto` — the `auto`
+//!     row lets a footer-less app collapse the footer to zero while
+//!     trawl's statusbar sizes itself.
+//!   * The six chrome keyframes ship from fleet-ui.css.
+//!   * `.login-shell` declares no background (ADR-0012): an opaque
 //!     normal-flow block paints above the `z-index: -1` `.atmosphere`
-//!     canvas and fully occluded the backdrop. Zero-visual-delta today
-//!     because `body`'s `background: var(--bg)` propagates to the
-//!     canvas (html declares none). `.login-shell` is not in the golden
-//!     fixture, so no re-capture was needed.
+//!     canvas and fully occludes the backdrop. The page floor comes
+//!     from `body`'s `background: var(--bg)` propagating to the canvas
+//!     instead (html declares none), so the pixels are unchanged.
 //!
-//! Reading the shipped stylesheet at test time turns those prose claims
-//! into a `cargo nextest` guard, mirroring the `ToastKind` / `Btn`
+//! Reading the shipped stylesheet at test time turns those claims into
+//! a `cargo nextest` guard, mirroring the `ToastKind` / `Btn`
 //! variant native contract tests.
 //!
-//! Baseline: **Mira Blue (ADR-0007, issue #47)**. The golden fixture was
-//! re-captured from the shipped CSS after the Mira Blue port (the
-//! ADR-0005-sanctioned mechanism), and the targeted `rule_body` pins
-//! below enforce the Mira control recipes — weight-500 buttons, tinted
-//! destructive, `--on-accent` text, 2px `--ring` focus, tokenized radii
-//! — so the new values are the guarded baseline, not a casualty.
+//! Baseline: Mira Blue (ADR-0007). The golden fixture is captured from
+//! the shipped CSS (the ADR-0005-sanctioned mechanism), and the targeted
+//! `rule_body` pins below enforce the Mira control recipes — weight-500
+//! buttons, tinted destructive, `--on-accent` text, 2px `--ring` focus,
+//! tokenized radii.
 
 mod common;
 
@@ -50,8 +41,8 @@ use common::rules;
 
 const CSS: &str = include_str!("../styles/fleet-ui.css");
 
-/// The pre-migration bytes of every chrome rule issue #28 relocated out
-/// of trawl-web-ui's `main.css`, captured verbatim (provenance in the
+/// The pre-migration bytes of every chrome rule relocated out of
+/// trawl-web-ui's `main.css`, captured verbatim (provenance in the
 /// fixture header). `moved_chrome_is_byte_identical_to_premigration`
 /// asserts each still lives byte-for-byte in the shipped `fleet-ui.css`.
 const PREMIGRATION_CHROME: &str = include_str!("fixtures/premigration-chrome.css");
@@ -75,15 +66,14 @@ fn rule_body(selector: &str) -> &'static str {
 
 #[test]
 fn moved_chrome_is_byte_identical_to_premigration() {
-    // C5 ("zero visual change") of issue #28 asks for a before/after pixel
-    // grid of every migrated surface in both themes — unobservable from a
-    // native test. For a *pure CSS relocation* it has an exact structural
-    // equivalent: every rule that moved must still render from byte-for-
-    // byte identical CSS, and the design tokens those rules reference are
-    // untouched by this slice (guarded by `css_move_invariant`), so both
-    // themes follow by construction. This turns the golden fixture's
-    // pre-migration bytes into that machine-checked guarantee — the
-    // exhaustive backstop behind the hand-picked delta assertions below.
+    // "Zero visual change" wants a before/after pixel grid of every
+    // surface in both themes, which a native test cannot observe. For a
+    // pure CSS relocation there is an exact structural equivalent: every
+    // moved rule must still render from byte-for-byte identical CSS, and
+    // the design tokens those rules reference are untouched (guarded by
+    // `css_move_invariant`), so both themes follow by construction. The
+    // golden fixture's bytes are that guarantee — the exhaustive backstop
+    // behind the hand-picked delta assertions below.
     let expected = rules(PREMIGRATION_CHROME);
     // Vacuous-pass guard: the fixture is the full moved set (33 rules at
     // capture). A splitter that stopped matching would pass silently.
@@ -109,7 +99,6 @@ fn moved_chrome_is_byte_identical_to_premigration() {
 
 #[test]
 fn rail_items_suppress_anchor_underline() {
-    // div -> anchor compensation: without this, every rail item underlines.
     assert!(
         rule_body(".rail .it").contains("text-decoration: none"),
         "`.rail .it` must keep `text-decoration: none` — rail items are \
@@ -128,7 +117,6 @@ fn mode_tabs_suppress_anchor_underline() {
 
 #[test]
 fn login_error_spacing_preserved() {
-    // The more-specific override that restores the pre-migration 16px gap.
     assert!(
         rule_body(".login-card .error-banner").contains("margin-bottom: 16px"),
         "`.login-card .error-banner` must keep `margin-bottom: 16px` — the \
@@ -139,14 +127,13 @@ fn login_error_spacing_preserved() {
 
 #[test]
 fn login_shell_declares_no_background() {
-    // jakub/coastwatch#308 / ADR-0012 composability: `.login-shell` is a
-    // normal-flow opaque block covering the viewport — ANY background on
-    // it paints above the `z-index: -1` `.atmosphere` canvas and fully
-    // occludes the backdrop. The page background it used to provide comes
-    // from `body { background: var(--bg) }` via root propagation instead
-    // (html declares none — pinned by atmosphere_palette_parity), so
-    // removing the declaration is zero visual delta without a backdrop
-    // and the whole point with one.
+    // ADR-0012 composability: `.login-shell` is a normal-flow opaque
+    // block covering the viewport, so any background on it paints above
+    // the `z-index: -1` `.atmosphere` canvas and fully occludes the
+    // backdrop. The page background comes from
+    // `body { background: var(--bg) }` via root propagation instead
+    // (html declares none — pinned by atmosphere_palette_parity), which
+    // looks identical without a backdrop and is the whole point with one.
     assert!(
         !rule_body(".login-shell").contains("background"),
         "`.login-shell` must not declare a background — an opaque \
@@ -157,7 +144,6 @@ fn login_shell_declares_no_background() {
 
 #[test]
 fn shell_grid_has_auto_footer_row() {
-    // Documented delta #3: topbar / body / auto footer row.
     assert!(
         rule_body(".shell").contains("grid-template-rows: var(--topbar-h) 1fr auto"),
         "`.shell` grid rows must be `var(--topbar-h) 1fr auto` — the `auto` \
@@ -167,10 +153,9 @@ fn shell_grid_has_auto_footer_row() {
 
 #[test]
 fn btn_size_classes_shipped_with_crate() {
-    // Issue #28: `<Btn size=…>` emits `btn-sm` / `btn-xs`, so the rules
-    // must ship in fleet-ui.css (every class a fleet-ui component emits
-    // exists in fleet-ui.css). Bodies pinned to the values moved verbatim
-    // from trawl's main.css.
+    // `<Btn size=…>` emits `btn-sm` / `btn-xs`, so those rules must ship
+    // in fleet-ui.css: every class a fleet-ui component emits exists in
+    // fleet-ui.css.
     let sm = rule_body(".btn-sm");
     assert!(
         sm.contains("padding: 3px 10px"),
@@ -191,9 +176,9 @@ fn btn_size_classes_shipped_with_crate() {
         xs.contains("font-size: var(--fs-small)") && xs.contains("padding: 3px 8px"),
         ".btn-xs modifier body matches the ADR-0005 baseline"
     );
-    // .btn-xs must appear AFTER the variant rules: equal specificity, and
-    // its padding/font-size must win over .btn-pri/.btn-sec/.btn-danger
-    // exactly as it did when main.css loaded after fleet-ui.css.
+    // .btn-xs must appear after the variant rules: equal specificity, so
+    // source order is what makes its padding/font-size win over
+    // .btn-pri/.btn-sec/.btn-danger.
     let xs_pos = CSS.find("\n.btn-xs {").expect(".btn-xs rule present");
     for variant in [".btn-pri {", ".btn-sec {", ".btn-danger {"] {
         let vpos = CSS
@@ -208,11 +193,10 @@ fn btn_size_classes_shipped_with_crate() {
 
 #[test]
 fn modal_family_classes_shipped_with_crate() {
-    // Issue #28 M2: the Modal shell renders the header icon chip and
-    // the promoted ConfirmWithReasonModal emits .m-field/.reason-input,
-    // so their rules move from trawl's main.css into fleet-ui.css
-    // (coastwatch consumes the reason modal next — app-side CSS would
-    // leave it unstyled there). Bodies pinned to the moved values.
+    // The Modal shell renders the header icon chip and
+    // ConfirmWithReasonModal emits .m-field/.reason-input, so their rules
+    // live in fleet-ui.css — app-side CSS would leave the reason modal
+    // unstyled in every other consumer.
     assert!(
         rule_body(".modal .m-hd .ic").contains("background: var(--accent-wash)"),
         ".modal .m-hd .ic (header icon chip) keeps the accent-wash chip"
@@ -239,10 +223,10 @@ fn modal_family_classes_shipped_with_crate() {
 
 #[test]
 fn tab_strip_families_stay_distinct() {
-    // Issue #28 M3: ONE Tabs component renders BOTH strip families —
-    // the workspace `.tabs > .t.active` (weight 500) and the drawer
-    // `.sd-tabs > .tb.on` (weight 600). Pin the weights separately so
-    // a future "simplify the CSS" pass can't silently merge them.
+    // One Tabs component renders both strip families: the workspace
+    // `.tabs > .t.active` (weight 500) and the drawer `.sd-tabs > .tb.on`
+    // (weight 600). Pin the weights separately so a future "simplify the
+    // CSS" pass can't silently merge them.
     let workspace = rule_body(".tabs .t.active");
     assert!(
         workspace.contains("font-weight: 500"),
@@ -262,9 +246,9 @@ fn tab_strip_families_stay_distinct() {
 
 #[test]
 fn drawer_shell_classes_shipped_with_crate() {
-    // Drawer owns the sd-* SHELL: scrim, panel, header, actions, close,
+    // Drawer owns the sd-* shell: scrim, panel, header, actions, close,
     // body. Content selectors (.sd-overview, .sd-card, .sf-*, .sd-ttl
-    // .name/.sub) stay app-side. Bodies pinned to the moved values.
+    // .name/.sub) stay app-side.
     assert!(
         rule_body(".sd-scrim").contains("z-index: 50"),
         ".sd-scrim moved verbatim"
@@ -295,16 +279,15 @@ fn drawer_shell_classes_shipped_with_crate() {
 
 #[test]
 fn mira_blue_button_recipes_pinned() {
-    // ADR-0007: buttons are weight 500 (was 600) — the single most
-    // visible Mira control delta. Pinned per variant so a font-weight
-    // regression on any one of them turns red.
+    // ADR-0007: buttons are weight 500, pinned per variant so a
+    // font-weight regression on any one of them turns red.
     for sel in [".btn", ".btn-pri", ".btn-danger"] {
         assert!(
             rule_body(sel).contains("font-weight: 500"),
             "`{sel}` must carry the Mira Blue weight-500 button treatment"
         );
     }
-    // Destructive is TINTED (red text on the red wash), never solid red.
+    // Destructive is tinted (red text on the red wash), never solid red.
     let danger = rule_body(".btn-danger");
     assert!(
         danger.contains("background: var(--red-wash)"),
@@ -314,7 +297,7 @@ fn mira_blue_button_recipes_pinned() {
         !danger.contains("background: var(--red)"),
         ".btn-danger must never regress to a solid red fill"
     );
-    // Tinting makes `--red` a FOREGROUND over its own wash, so the light
+    // Tinting makes `--red` a foreground over its own wash, so the light
     // tone is contrast-bound: Mira's oklch(57.7% .245) measures 3.97:1
     // there (3.31:1 on the 20% hover wash), under the 4.5:1 AA floor for
     // normal text. The shipped light tone is the measured one — re-measure
@@ -325,7 +308,7 @@ fn mira_blue_button_recipes_pinned() {
          5.06:1 hover) — a lighter tone drops the tinted destructive recipe \
          below 4.5:1"
     );
-    // Press feedback is a 1px translate; the scale press is retired.
+    // Press feedback is a 1px translate, never a scale.
     assert!(
         !CSS.contains("scale: 0.96"),
         "the scale(0.96) press is retired — Mira presses are `translate: 0 1px`"
@@ -340,15 +323,15 @@ fn mira_blue_button_recipes_pinned() {
 #[test]
 fn dark_outline_hover_is_a_backdrop_independent_lift() {
     // The shared hover fill — `color-mix(in oklab, var(--panel-3) 55%,
-    // transparent)` — is TRANSLUCENT, so what it renders depends on the
+    // transparent)` — is translucent, so what it renders depends on the
     // backdrop it composites over, while the dark resting fill is a fixed
     // white-alpha overlay. Measured in headless Chrome with the shipped
-    // CSS at the old .04 resting alpha: over `--panel` the hover landed on
-    // rgb(29) against a rgb(27) rest (a 2/255 delta — no feedback), and
-    // inside a `--panel-2` container it landed DARKER than rest, rgb(33)
+    // CSS at a .04 resting alpha: over `--panel` the hover landed on
+    // rgb(29) against a rgb(27) rest (a 2/255 delta, no feedback), and
+    // inside a `--panel-2` container it landed darker than rest, rgb(33)
     // under rgb(36) — an inverted hover. Real `--panel-2` containers hold
     // secondary buttons (`.tl-bar`, `.sd-card`), so dark mode restates
-    // BOTH ends in the overlay system: `--fill` -> `--fill-2` is the same
+    // both ends in the overlay system: `--fill` -> `--fill-2` is the same
     // step on every surface (rgb(32)->rgb(44) on `--panel`,
     // rgb(41)->rgb(52) on `--panel-2`).
     let rest = rule_body("[data-theme=\"dark\"] .btn-sec,\n[data-theme=\"dark\"] .btn-sm");
@@ -367,7 +350,7 @@ fn dark_outline_hover_is_a_backdrop_independent_lift() {
          imperceptible on `--panel` and a DIP on `--panel-2`, got:{hover}"
     );
     // The resting fill is (0,2,0), exactly `.btn-sec:hover`, so source
-    // order is the only tie-breaker: it must still be declared BEFORE the
+    // order is the only tie-breaker: it must still be declared before the
     // shared hover rules. (The dark hover pair above is (0,3,0) and wins
     // on specificity regardless of where it sits.)
     let fill = CSS
@@ -408,7 +391,7 @@ fn mira_blue_tokens_declared() {
         2,
         "--on-accent must be declared exactly once per theme block"
     );
-    // Focus is the 2px solid ring in BOTH themes (was a 3px soft glow).
+    // Focus is the 2px solid ring in both themes.
     assert_eq!(
         CSS.matches("--shadow-glow: 0 0 0 2px var(--ring)").count(),
         2,
@@ -430,15 +413,15 @@ fn mira_blue_tokens_declared() {
 
 #[test]
 fn control_fills_route_through_the_per_theme_token() {
-    // Dark `--line` is ITSELF a 10%-alpha white overlay, and
-    // `color-mix(<colour>, transparent)` MULTIPLIES alphas: a fill spelled
+    // Dark `--line` is itself a 10%-alpha white overlay, and
+    // `color-mix(<colour>, transparent)` multiplies alphas: a fill spelled
     // `color-mix(in oklab, var(--line) 20%, transparent)` renders at
     // .10 x .20 = 2% in dark mode — nothing on an oklch(18%) panel, so
     // dark inputs would ship effectively unfilled while the light theme
     // looked correct. Fills therefore read the per-theme `--fill` /
     // `--fill-2` tokens (light mixes the opaque line; dark states the
-    // overlay alpha directly), and the ONLY `--line`-against-transparent
-    // mixes left in the file are those two light declarations.
+    // overlay alpha directly), and the only `--line`-against-transparent
+    // mixes in the file are those two light declarations.
     // Declarations only — anchored on the newline + indent so prose in the
     // surrounding comments never counts.
     for token in ["\n  --fill:", "\n  --fill-2:"] {
