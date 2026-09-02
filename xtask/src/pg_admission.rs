@@ -102,6 +102,47 @@
 //!   about raw keywords is modelled. A raw keyword used where the lexer
 //!   expects a real one is unsupported.
 //!
+//! Eight further shapes are SILENT: each one can hide a connection with
+//! nothing printed. All eight stay open, because each needs a spelling
+//! nobody in this workspace writes by accident, and reading them buys
+//! nothing against an author who wants the connection unseen. That is the
+//! "NOT a security boundary" sentence above, spent:
+//!
+//! * `#[cfg(test)] include!("cases.rs");` contributes no test names and no
+//!   evidence from the included file. The walk follows `mod` declarations,
+//!   and no crate here includes Rust source at all.
+//! * An identifier starting with a non-ASCII character (`async fn 東京`) is
+//!   not lexed as a word, so such a fn is never named and such an inline
+//!   `mod` never opens a span. Every identifier in this workspace is ASCII.
+//! * A `#[cfg_attr(target_os = "linux", path = "linux.rs")] mod m;` path
+//!   override is not read. The guard probes `m.rs` and `m/mod.rs`, so it
+//!   scans the wrong file when one of them exists and fails loudly when
+//!   neither does. No crate here has a per-target module file.
+//! * A `#[cfg(test)]` macro INVOCATION (`db_test!();`) is a bodyless item,
+//!   so its span is its own line and the tests it expands to are neither
+//!   named nor scanned. Reading inside one means running macro expansion.
+//! * `#[::sqlx::test]`, with the leading `::`, is not the spelling
+//!   `is_sqlx_test` matches, so it names no test. The fn body is still
+//!   scanned (it carries a test attribute), and the injected `pool:
+//!   PgPool` argument on its signature line is evidence on its own, so
+//!   what the leading `::` actually costs is an sqlx test that takes NO
+//!   argument and opens nothing by hand.
+//! * `#[cfg(test)] if probe() { .. } else { .. }` as an attributed
+//!   STATEMENT spans the first arm only, so a connection in the `else` arm
+//!   is outside every span. An attribute on an `if` is exotic; the same
+//!   attribute on an ITEM is covered, initializer arms included.
+//! * In `skip_to_body`, a `>>` at angle depth 1 is consumed as two generic
+//!   closers, one more than the signature opened, so a `{` further along
+//!   can be taken for the body and the span ends in the wrong place. The
+//!   angle walk is textual by design (see that function's own note), and
+//!   provoking the miscount takes a right shift written at angle depth 1,
+//!   outside the braces a const-generic argument is written in, which the
+//!   walk skips whole.
+//! * `#[path = /* "decoy.rs" */ "real.rs"]` resolves to `decoy.rs`. The
+//!   `#[path]` value is the one thing read from the RAW text, comments and
+//!   all, because blanking eats the very string it names. The cost is the
+//!   wrong file scanned, or a loud failure when `decoy.rs` is not there.
+//!
 //! A future review that finds a new hole should adjudicate it against this
 //! section: does it produce a silent pass, or only noise?
 
