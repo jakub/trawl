@@ -20,7 +20,7 @@ mod imp;
 /// Keeps the crash handler installed for the lifetime of the process.
 ///
 /// Dropping it uninstalls the handler (and on Linux disconnects from the
-/// monitor), so hold it for the whole run — bind it to a `_guard` in `main`.
+/// monitor), so bind it in `main` and hold it for the whole run.
 #[derive(Debug)]
 pub struct Guard {
     // Held only for its `Drop` (which detaches the handler); never read, so the
