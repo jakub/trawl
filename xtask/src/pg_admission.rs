@@ -121,10 +121,15 @@
 //!   follows `mod` declarations and nothing else. In a `src/` tree the
 //!   sweep opens the file anyway, under the prefix its path implies rather
 //!   than the module the `include!` put it in, so the derived name fails
-//!   the guard on a test nextest never lists. Two places keep it silent:
-//!   an integration target, which has no sweep, and a file reachable only
-//!   through a directory this target excludes, `src/bin` for a library.
-//!   No crate here includes Rust source.
+//!   the guard on a test nextest never lists. Three places keep it silent:
+//!   an integration target, which has no sweep; a file reachable only
+//!   through a directory this target excludes, `src/bin` for a library;
+//!   and the test scope a file INHERITS from its inclusion site, which the
+//!   sweep cannot see. A `#[cfg(test)] mod cases { include!("cases.rs"); }`
+//!   makes all of `cases.rs` test code to rustc, but the sweep reads it as
+//!   production code, so a plain helper fn in it that opens a connection,
+//!   called from a `#[test]` beside it, is collected nowhere. No crate here
+//!   includes Rust source.
 //! * An identifier starting with a non-ASCII character is not lexed as a
 //!   word. On a FN that is loud rather than silent: the attribute block is
 //!   taken before the name is read, so `#[tokio::test] async fn 東京()`
