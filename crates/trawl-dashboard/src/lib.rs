@@ -9,7 +9,7 @@
 //! `TestBackend` + insta snapshots.
 //!
 //! Used by both the server's terminal monitor and the TUI client's admin
-//! dashboard tab. The future web UI consumes the same data as JSON.
+//! dashboard tab; the web UI reads the same [`DashboardSnapshot`] over SSE.
 
 use std::time::Duration;
 
@@ -80,7 +80,6 @@ pub fn render_dashboard(
 fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let [title_row, info_row] = vertical![==1, ==1].areas(area);
 
-    // Title bar
     let title = format!(" trawld v{} ", snapshot.version);
     let title_line = line![Span::styled(
         title,
@@ -90,7 +89,6 @@ fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
     )];
     frame.render_widget(Paragraph::new(title_line), title_row);
 
-    // Info line
     let health_style = if snapshot.healthy {
         Style::default().fg(Color::Green)
     } else {
@@ -116,8 +114,8 @@ fn render_header(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect
 
 /// Body: two-column grid with panels.
 ///
-/// Uses `Flex::Start` (the default since ratatui 0.26) for predictable
-/// top-aligned layout. `Flex::SpaceAround` could work for taller terminals.
+/// `Flex::Start` is spelled out so the panels stay top-aligned however tall
+/// the terminal is, instead of spreading into the spare rows.
 fn render_body(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let [row1_area, row2_area, row3_area, row4_area, row5_area] =
         vertical![==5, ==6, ==5, ==3, >=4]
