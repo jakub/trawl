@@ -489,7 +489,7 @@ fn unit_files(
         return Ok(files);
     };
     let mut all = Vec::new();
-    collect_rs(source_root, &mut all);
+    collect_rs(source_root, &mut all)?;
     all.sort();
     all.dedup();
     let seen: BTreeSet<PathBuf> = files.iter().map(|(file, _)| file.path.clone()).collect();
@@ -721,32 +721,57 @@ fn path_prefix(source_root: &Path, file: &Path) -> String {
 /// walked, and a file reachable two ways is collected twice, once per path.
 /// Duplicate lexical paths cost a duplicate finding at worst, which is loud;
 /// a dropped alias is a pg test nobody counted.
-fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+///
+/// A ROOT that does not exist is an empty sweep, by design: [`unit_files`]
+/// derives one sweep directory per target, and a bin whose source is a
+/// single file has none. Every other filesystem failure, at the root or
+/// below it, is an error, never an empty directory: a directory the walk
+/// cannot canonicalize or list is one whose tests nobody scans, and a
+/// silent skip is the one defect this module refuses.
+fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    match fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "pg-admission-guard: cannot stat {}: {e}",
+                dir.display()
+            ));
+        }
+        Ok(_) => {}
+    }
     let mut ancestors = Vec::new();
-    collect_rs_acyclic(dir, &mut ancestors, out);
+    collect_rs_acyclic(dir, &mut ancestors, out)
 }
 
-fn collect_rs_acyclic(dir: &Path, ancestors: &mut Vec<PathBuf>, out: &mut Vec<PathBuf>) {
-    // A directory that cannot be canonicalized cannot be read either, so
-    // stopping here loses nothing the `read_dir` below would have found.
-    let Ok(real) = fs::canonicalize(dir) else {
-        return;
-    };
+fn collect_rs_acyclic(
+    dir: &Path,
+    ancestors: &mut Vec<PathBuf>,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let real = fs::canonicalize(dir).map_err(|e| {
+        format!(
+            "pg-admission-guard: cannot canonicalize {}: {e}",
+            dir.display()
+        )
+    })?;
     if ancestors.contains(&real) {
-        return;
+        return Ok(());
     }
     ancestors.push(real);
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_rs_acyclic(&path, ancestors, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("pg-admission-guard: cannot read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("pg-admission-guard: cannot list {}: {e}", dir.display()))?
+            .path();
+        if path.is_dir() {
+            collect_rs_acyclic(&path, ancestors, out)?;
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
         }
     }
     ancestors.pop();
+    Ok(())
 }
 
 /// Which tree the sources come from. The connection-API class applies to
@@ -2750,7 +2775,7 @@ mod tests {
         std::os::unix::fs::symlink(root.join("shared"), src.join("aliased")).expect("alias link");
 
         let mut found = Vec::new();
-        collect_rs(&src, &mut found);
+        collect_rs(&src, &mut found).expect("walk");
         found.sort();
         assert_eq!(
             found,
@@ -2777,6 +2802,26 @@ mod tests {
     /// edge. Loud is not what this test is about. Evidence at all is.
     #[cfg(unix)]
     #[test]
+    fn an_unreadable_directory_fails_the_walk_instead_of_reading_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("sealed-walk");
+        let src = dir.0.join("src");
+        let sealed = src.join("sealed");
+        write(&sealed.join("cases.rs"), "");
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).expect("seal");
+        let outcome = collect_rs(&src, &mut Vec::new());
+        // Restore before asserting so the scratch directory can remove itself.
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).expect("unseal");
+        if fs::read_dir(&sealed).is_ok() && outcome.is_ok() {
+            // Root reads anything: the mode bits cannot make the directory
+            // unreadable here, so there is nothing for this test to see.
+            return;
+        }
+        let err = outcome.expect_err("an unlistable directory must fail the walk");
+        assert!(err.contains("sealed"), "error names the directory: {err}");
+    }
+
+    #[test]
     fn a_file_aliased_into_another_targets_directory_is_still_scanned() {
         let dir = scratch("alias-ownership");
         let root = &dir.0;
@@ -2798,7 +2843,7 @@ mod tests {
         // Both lexical paths, so the assertion does not depend on the order
         // `read_dir` returns `bin` and `shared` in.
         let mut found = Vec::new();
-        collect_rs(&src, &mut found);
+        collect_rs(&src, &mut found).expect("walk");
         found.sort();
         assert_eq!(
             found,
