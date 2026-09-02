@@ -77,7 +77,6 @@ pub fn reformat_rfc3339(ts: &str, utc_offset_secs: i32) -> String {
     if nanos == 0 {
         local.format("%Y-%m-%d %H:%M:%S").to_string()
     } else {
-        // Trim trailing zeros from sub-second part.
         let micros = nanos / 1_000;
         let frac = format!("{micros:06}");
         let trimmed = frac.trim_end_matches('0');

@@ -2,28 +2,28 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The issue-82 cost probe: what each severity-predicate SHAPE actually
-//! costs, executed against the bundled `DuckDB`.
+//! What each severity-predicate shape actually costs, executed against the
+//! bundled `DuckDB`.
 //!
-//! # The finding, and it is not the one issue #82 assumed
+//! # The finding, and it contradicts the text-size argument
 //!
-//! Issue #82 reasoned from SQL TEXT SIZE: a `sev()` subject is over a
-//! kilobyte, the pre-#82 rendering repeated it once per band, so collapsing
-//! the bands into one `IN` over ladder points should be the cheaper shape.
-//! The text does shrink — 5.68x for a six-band list — but the execution
-//! goes the OTHER way, by a lot: `DuckDB` evaluates a repeated `BETWEEN`
-//! subject far more cheaply than it evaluates the same subject under an
-//! `IN` list, so the `IN` rendering is 3.6x slower for six bands and 62x
-//! slower for a single band.
+//! Reasoning from SQL text size predicts the wrong winner. A `sev()`
+//! subject is over a kilobyte and the per-band rendering repeats it once
+//! per band, so collapsing the bands into one `IN` over ladder points
+//! should be cheaper. The text does shrink, 5.68x for a six-band list, but
+//! execution goes the other way by a lot. `DuckDB` evaluates a repeated
+//! `BETWEEN` subject far more cheaply than it evaluates the same subject
+//! under an `IN` list, so the `IN` rendering is 3.6x slower for six bands
+//! and 62x slower for a single band.
 //!
-//! What SHIPPED is the third shape this probe times: keep RANGES, but
-//! merge the ladder points into MINIMAL CONTIGUOUS ones. Six contiguous
-//! bands then collapse to a single `BETWEEN 1 AND 24` — the subject
-//! written once AND ~5.9x faster than the pre-#82 rendering. The `IN`
-//! shape stays in the matrix as the falsified-premise record, so a future
-//! reader who has the same idea can see it was measured and rejected.
+//! What ships is the third shape this probe times: keep ranges, but merge
+//! the ladder points into minimal contiguous ones. Six contiguous bands
+//! then collapse to a single `BETWEEN 1 AND 24`, the subject written once
+//! and ~5.9x faster than the per-band rendering. The `IN` shape stays in
+//! the matrix as the falsified-premise record, so a future reader who has
+//! the same idea can see it was measured and rejected.
 //!
-//! Not a correctness test and not run in CI — `#[ignore]`d, because a
+//! Not a correctness test and not run in CI: `#[ignore]`d, because a
 //! wall-clock ratio on a shared machine is evidence for a human reading a
 //! PR, not a gate. Run it explicitly:
 //!
@@ -31,12 +31,12 @@
 //! cargo test -p trawl-engine --test severity_set_bench --release -- --ignored --nocapture
 //! ```
 //!
-//! # Why it times SHAPES rather than two checkouts
+//! # Why it times shapes rather than two checkouts
 //!
-//! Every predicate is built here from the ONE subject builder
-//! (`conform::severity_reading_sql_bind_once`), so the pre-#82 shape (the
+//! Every predicate is built here from the one subject builder
+//! (`conform::severity_reading_sql_bind_once`), so the per-band shape (the
 //! subject repeated once per band), the shipped merged-range shape and the
-//! rejected `IN` one are measured in the SAME process, against the SAME
+//! rejected `IN` one are measured in the same process, against the same
 //! corpus, with the same engine build.
 //! Timing two git checkouts instead would compare two binaries built
 //! minutes apart, which is how a 60x "regression" that is really a
@@ -47,7 +47,7 @@
 //! equal to the hand-built merged-range ones this bench times.
 //!
 //! The corpus is 1M rows of a realistic token distribution over a VARCHAR
-//! `level` column — the shape a sender that never adopted `_severity`
+//! `level` column, the shape a sender that never adopted `_severity`
 //! actually writes.
 
 use std::time::{Duration, Instant};
@@ -85,14 +85,14 @@ fn conn() -> Connection {
     Connection::open_in_memory().expect("in-memory duckdb")
 }
 
-/// The `sev(level)` subject every shape below compares — the expensive
+/// The `sev(level)` subject every shape below compares: the expensive
 /// thing, over a kilobyte of `list_transform` SQL.
 fn subject() -> String {
     severity_reading_sql_bind_once(&untyped_text(r#""level""#), Dialect::Otel)
 }
 
-/// The pre-#82 rendering: one `BETWEEN` per band, OR'd, each carrying its
-/// OWN copy of the subject.
+/// The per-band rendering: one `BETWEEN` per band, OR'd, each carrying its
+/// own copy of the subject.
 fn ranges_sql(bands: &[(i64, i64)]) -> String {
     let subject = subject();
     bands
@@ -102,8 +102,8 @@ fn ranges_sql(bands: &[(i64, i64)]) -> String {
         .join(" OR ")
 }
 
-/// The SHIPPED post-#82 rendering: the points merged back into minimal
-/// contiguous ranges, so contiguous bands share ONE subject.
+/// The shipped rendering: the points merged back into minimal contiguous
+/// ranges, so contiguous bands share one subject.
 fn merged_sql(bands: &[(i64, i64)]) -> String {
     let subject = subject();
     let points: Vec<i64> = bands
@@ -131,8 +131,8 @@ fn merged_sql(bands: &[(i64, i64)]) -> String {
     }
 }
 
-/// The REJECTED post-#82 candidate, kept as the falsified-premise record:
-/// the subject once, every ladder point inlined into one `IN`.
+/// The rejected candidate, kept as the falsified-premise record: the
+/// subject once, every ladder point inlined into one `IN`.
 fn points_sql(bands: &[(i64, i64)]) -> String {
     let points: Vec<String> = bands
         .iter()
@@ -209,8 +209,9 @@ fn severity_predicate_shape_costs() {
     corpus(&conn, &file);
     let source = file.display().to_string();
 
-    // Three groups of three, in a fixed order the ratio loop indexes:
-    // pre-#82, the SHIPPED merged-range shape, the REJECTED `IN` one.
+    // Three groups of three, in a fixed order the ratio loop indexes: the
+    // per-band shape (labelled `before`), the shipped merged-range one
+    // (`AFTER`), the rejected `IN` one.
     let shapes = [
         ("one band  before (1x BETWEEN)", ranges_sql(&ONE_BAND)),
         ("one band  AFTER  (merged range)", merged_sql(&ONE_BAND)),
@@ -282,9 +283,9 @@ fn severity_predicate_shape_costs() {
     );
 }
 
-/// The guard that makes the bench above honest: the hand-built post-#82
-/// shapes it times are EXACTLY what the emitter produces for the
-/// equivalent DSL.
+/// The guard that makes the bench above honest: the hand-built
+/// merged-range shapes it times are exactly what the emitter produces for
+/// the equivalent DSL.
 #[test]
 fn emitted_shapes_match_the_hand_built_ones() {
     let emitted = |dsl: &str| {
@@ -297,7 +298,7 @@ fn emitted_shapes_match_the_hand_built_ones() {
         predicate.trim().to_owned()
     };
     // The pipeline arm parenthesizes its clause for composition, but does
-    // NOT double-wrap one that already arrives grouped — which is exactly
+    // not double-wrap one that already arrives grouped, which is exactly
     // the multi-range case. Expect what that rule produces.
     let composed = |bands: &[(i64, i64)]| {
         let clause = merged_sql(bands);
