@@ -21,9 +21,9 @@ pub enum OutputFormat {
     Parquet,
 }
 
-/// Which dialect a `SEVERITY` repin reads the corpus's numerals in
-/// (issue #79) — the same closed vocabulary the DSL's `sev()` and the
-/// `[ingest]` derivation config take.
+/// Which dialect a `SEVERITY` repin reads the corpus's numerals in: the
+/// same closed vocabulary the DSL's `sev()` and the `[ingest]` derivation
+/// config take.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum SeverityDialect {
     /// `OTel` `SeverityNumber`: 1-24, counting up.
@@ -92,8 +92,8 @@ pub async fn run_query(
         return run_parquet_export(query, data, conn.as_ref(), output_path).await;
     }
 
-    // Block `from saved` in embedded mode — it requires server-side
-    // auth database access to resolve saved query names to parquet paths.
+    // Block `from saved` in embedded mode: resolving a saved query's name
+    // to parquet paths needs the server's saved-query and report-run stores.
     if data.is_some()
         && let Ok(ast) = trawl_core::parser::parse(query)
         && ast.from_saved_stage().is_some()
@@ -105,10 +105,9 @@ pub async fn run_query(
 
     let (result, degraded, severity_columns) = if let Some(data) = data {
         match run_embedded_mode(data, query, timezone) {
-            // Embedded mode has no catalog, so it has no notice to carry
-            // — but `sev()` declares its own pin, so its columns still
-            // render as tokens here (that is the whole point of a
-            // FUNCTION-declared pin: it needs no catalog).
+            // Embedded mode has no catalog, so no degraded notice to
+            // carry; `sev()` declares its own pin, so its columns still
+            // render as tokens without one.
             Ok(r) => (r, Vec::new(), embedded_severity_columns(query)),
             Err(CliError::Engine(ref engine_err)) => {
                 render_engine_error(query, engine_err);
@@ -143,13 +142,12 @@ pub async fn run_query(
     )
 }
 
-/// The severity-rendering columns of an EMBEDDED query.
+/// The severity-rendering columns of an embedded query.
 ///
-/// The same walk the server runs, from a pin-blind root: embedded mode
-/// has no catalog, so only a FUNCTION-declared pin can survive it — which
-/// is exactly `sev()`, and exactly why it is declared rather than
-/// derived. An unparseable query renders nothing special; the engine
-/// reports the parse error.
+/// The same walk the server runs, from a pin-blind root: with no catalog
+/// only a function-declared pin survives it, which is exactly `sev()`. An
+/// unparseable query renders nothing special; the engine reports the parse
+/// error.
 fn embedded_severity_columns(query: &str) -> Vec<String> {
     trawl_core::parser::parse(query).map_or_else(
         |_| Vec::new(),
@@ -164,7 +162,7 @@ fn embedded_severity_columns(query: &str) -> Vec<String> {
 
 /// Write the results and their footer to the two streams.
 ///
-/// The stream split is the contract: with `-o`, the FILE is the
+/// The stream split is the contract: with `-o`, the file is the
 /// deliverable and the footer goes to `err` so it can never
 /// contaminate it; without it, results and footer share `out`.
 fn emit_results(
@@ -204,13 +202,13 @@ fn render_results(
     }
 }
 
-/// The incomplete-results footer (ADR-0011 slice C1): one line after the
-/// row count when the query bound a field whose pin is shelving values.
+/// The incomplete-results footer (ADR-0011): one line after the row count
+/// when the query bound a field whose pin is shelving values.
 ///
-/// Table output only. json/csv/parquet carry `degraded_fields` on the wire
-/// — that IS the notice for a machine — and a prose line in a machine format
-/// is a parse error waiting to happen. One sentence, no advice beyond where
-/// to look: the case file holds the evidence and the remedy.
+/// Table output only. json/csv/parquet carry `degraded_fields` on the wire,
+/// which is the notice for a machine, and a prose line inside a machine
+/// format is a parse error waiting to happen. One sentence, no advice beyond
+/// where to look: the case file holds the evidence and the remedy.
 fn write_degraded_footer(
     out: &mut impl Write,
     format: OutputFormat,
@@ -269,8 +267,8 @@ async fn run_parquet_export(
     if let Some(data) = data {
         // Embedded mode: export directly via DuckDB.
         let executor = trawl_engine::executor::Executor::new()?;
-        // Embedded mode is pin-blind by design (no catalog, ADR-0011
-        // slice A): the explicit empty set keeps that decision visible.
+        // Embedded mode is pin-blind by design (no catalog, ADR-0011):
+        // the explicit empty set keeps that decision visible.
         executor.export_parquet(
             query,
             data,
@@ -306,9 +304,9 @@ async fn run_daemon_mode(
     Ok(daemon_outcome(response))
 }
 
-/// Split a daemon response into what the printer needs: the rows and the
-/// degraded-field note (ADR-0011 slice C1), which is carried, never
-/// dropped.
+/// Split a daemon response into what the printer needs: the rows, the
+/// degraded-field note (ADR-0011) and the severity columns. Both advisory
+/// channels are carried, never dropped.
 fn daemon_outcome(
     response: trawl_client::QueryResponse,
 ) -> (QueryResult, Vec<String>, Vec<String>) {
@@ -324,9 +322,9 @@ fn run_embedded_mode(data: &str, query: &str, timezone: &str) -> Result<QueryRes
     let utc_offset_secs =
         trawl_engine::timezone::resolve_utc_offset(timezone).map_err(CliError::Usage)?;
     let executor = trawl_engine::executor::Executor::new()?;
-    // CLI has no server-side row limit — use usize::MAX. Embedded mode is
-    // pin-blind by design (no catalog, ADR-0011 slice A): the explicit
-    // empty set keeps that decision visible.
+    // CLI has no server-side row limit, hence usize::MAX. Embedded mode is
+    // pin-blind by design (no catalog, ADR-0011): the explicit empty set
+    // keeps that decision visible.
     Ok(executor.run_query(
         query,
         data,
@@ -367,10 +365,10 @@ fn render_table(
     let headers: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
     table.set_header(headers);
 
-    // A severity column DISPLAYS its OTel token (ADR-0013 §6): `17` reads
+    // A severity column displays its OTel token (ADR-0013 §6): `17` reads
     // `error`, the same vocabulary that would filter it. `_severity` by
     // name, plus whatever the response declared (a `sev()` output). Only
-    // the table renders it — json/csv keep the number, for arithmetic
+    // the table renders it; json/csv keep the number for arithmetic
     // consumers.
     let severity_cells: Vec<bool> = result
         .columns
@@ -421,8 +419,8 @@ fn render_ndjson(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     for row in &result.rows {
         let mut map = serde_json::Map::new();
         for (col, val) in result.columns.iter().zip(row.iter()) {
-            // Value's custom Serialize impl maps directly to JSON primitives,
-            // so this conversion is infallible.
+            // `Value`'s Serialize impl emits plain JSON, never a struct or
+            // a map, so this conversion has no failure mode.
             map.insert(
                 col.name.clone(),
                 serde_json::to_value(val).expect("Value serialization is infallible"),
@@ -591,7 +589,8 @@ pub fn render_engine_error(query: &str, err: &trawl_engine::error::EngineError) 
 // -- driver output formatters -------------------------------------------------
 
 /// Render driver result data (columns + JSON rows) in the requested format.
-/// Used by `trawl driver query` and `trawl driver get-results`.
+/// Used by `trawl driver query`, `trawl driver get-results` and the
+/// `trawl schema` tables.
 pub fn render_driver_results(
     columns: &[String],
     rows: &[Vec<serde_json::Value>],
@@ -698,7 +697,7 @@ fn csv_escape_json(v: &serde_json::Value) -> String {
 mod tests {
     use super::*;
 
-    /// The notice is a TABLE-only footer: a machine format carries the
+    /// The notice is a table-only footer: a machine format carries the
     /// wire field instead, and a prose line inside ndjson or CSV would
     /// corrupt it.
     #[test]
@@ -826,9 +825,9 @@ mod tests {
         assert!(render(render_csv).contains("17"));
     }
 
-    /// A DECLARED severity column — `sev()`'s output under its own alias
-    /// — renders its token in the table and its NUMBER everywhere a
-    /// machine reads (ADR-0013 slice 2, ruling 9).
+    /// A declared severity column (`sev()`'s output under its own alias)
+    /// renders its token in the table and its number everywhere a machine
+    /// reads (ADR-0013).
     #[test]
     fn a_declared_severity_column_displays_its_token_in_the_table_only() {
         let result = QueryResult {
@@ -859,7 +858,7 @@ mod tests {
         let plain = String::from_utf8(buf).unwrap();
         assert!(!plain.contains("error2"), "{plain}");
 
-        // A MIXED-CASE alias: the pin scope folds the name and the
+        // A mixed-case alias: the pin scope folds the name and the
         // result column keeps the spelling the user typed, so the match
         // folds too — `DuckDB` identifiers are case-insensitive.
         let mixed = QueryResult {
@@ -873,7 +872,7 @@ mod tests {
         let table = String::from_utf8(buf).unwrap();
         assert!(table.contains("error2"), "mixed-case alias: {table}");
 
-        // Machine formats carry the number in BOTH columns.
+        // Machine formats carry the number in both columns.
         for f in [
             render_ndjson as fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>,
             render_csv,
@@ -885,8 +884,8 @@ mod tests {
         }
     }
 
-    /// The embedded lane names the same columns the server would: the
-    /// pin is the FUNCTION's, so it survives a catalog-less root.
+    /// The embedded lane names the same columns the server would: the pin
+    /// is the function's, so it survives a catalog-less root.
     #[test]
     fn the_embedded_lane_declares_sev_columns_without_a_catalog() {
         assert_eq!(embedded_severity_columns("* | let s = sev(level)"), ["s"]);
@@ -965,8 +964,9 @@ mod tests {
     }
 
     /// Embedded parquet export is unbounded when the CLI supplies no row
-    /// limit. Exercise the public CLI lane and read the artifact back through
-    /// `DuckDB`: the old literal `LIMIT usize::MAX` failed before writing it.
+    /// limit. Exercises the public CLI lane and reads the artifact back
+    /// through `DuckDB`, since a literal `LIMIT usize::MAX` fails inside
+    /// `DuckDB` before any file is written.
     #[tokio::test]
     async fn embedded_parquet_export_without_limit_roundtrips() {
         let dir = tempfile::tempdir().unwrap();

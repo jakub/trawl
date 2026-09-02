@@ -99,7 +99,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, scroll: usize) {
         )),
     ];
 
-    // Clamp scroll to content bounds
     let max_scroll = help_text.len().saturating_sub(1);
     let clamped_scroll = scroll.min(max_scroll);
 

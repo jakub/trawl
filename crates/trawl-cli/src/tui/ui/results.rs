@@ -78,7 +78,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
         render_placeholder(app, frame, results_area);
     }
 
-    // Render search bar if active.
     if let (Some(search), Some(bar_area)) = (&app.results_search, search_area) {
         render_search_bar(frame, theme, search, bar_area);
     }
@@ -135,8 +134,9 @@ fn render_table(
     let result = &response.result;
     let config = tab.column_config.as_ref();
 
-    // Calculate visible row range first (needed for column width sampling)
-    let max_visible_rows = area.height.saturating_sub(4) as usize; // -4 for borders and header
+    // Row range comes first: column width sampling reads from it. 2 borders
+    // plus the header row account for 3 of the 4; the 4th is left spare.
+    let max_visible_rows = area.height.saturating_sub(4) as usize;
     let total_rows = result.row_count();
     let v_scroll = if total_rows <= max_visible_rows {
         0
@@ -145,28 +145,24 @@ fn render_table(
             .min(total_rows.saturating_sub(max_visible_rows))
     };
 
-    // Calculate how many columns fit on screen
     let available_width = area.width.saturating_sub(4) as usize; // borders + padding
 
-    // Compute adaptive column widths for ALL columns
+    // Widths for every column, not just the displayed ones.
     let all_widths = compute_column_widths(result, v_scroll, available_width, config);
     let total_cols = result.columns.len();
 
-    // Partition into pinned and scrollable indices
     let pinned = config.map_or_else(Vec::new, ColumnConfig::pinned_indices);
     let scrollable = config.map_or_else(
         || (0..total_cols).collect::<Vec<_>>(),
         ColumnConfig::scrollable_indices,
     );
 
-    // Check if all columns are hidden
     let visible_count = config.map_or(total_cols, ColumnConfig::visible_count);
     if visible_count == 0 {
         render_all_hidden_placeholder(app, frame, area);
         return;
     }
 
-    // Compute pinned area width (sum of pinned col widths + spacing)
     let pinned_width: usize = pinned
         .iter()
         .enumerate()
@@ -180,7 +176,7 @@ fn render_table(
         })
         .sum();
 
-    // Separator takes 2 chars (" ┃") if there are pinned columns AND scrollable columns
+    // Separator takes 2 chars (" ┃") when both regions are non-empty.
     let separator_width = if !pinned.is_empty() && !scrollable.is_empty() {
         2
     } else {
@@ -191,7 +187,6 @@ fn render_table(
         .saturating_sub(pinned_width)
         .saturating_sub(separator_width);
 
-    // Clamp h_scroll to scrollable range
     let h_scroll = tab
         .horizontal_scroll_offset
         .min(scrollable.len().saturating_sub(1));
@@ -211,7 +206,6 @@ fn render_table(
         .max(usize::from(!scrollable.is_empty()))
         .min(scrollable.len().saturating_sub(h_scroll));
 
-    // Combined display columns: pinned + visible scrollable
     let display_cols: Vec<usize> = pinned
         .iter()
         .copied()
@@ -229,7 +223,6 @@ fn render_table(
     // Column mode cursor (original index)
     let col_cursor = config.and_then(|c| c.selected);
 
-    // Build header row
     let header_cells: Vec<Cell<'_>> = display_cols
         .iter()
         .map(|&col_idx| {
@@ -261,7 +254,6 @@ fn render_table(
         (HashSet::new(), None)
     };
 
-    // Build data rows
     let selected_row = tab.selected_row;
     let data_rows: Vec<Row<'_>> = result
         .rows
@@ -280,11 +272,9 @@ fn render_table(
                         &result.columns[col_idx].name,
                         &response.severity_columns,
                     ) {
-                        // A severity column DISPLAYS its OTel token
-                        // (ADR-0013 §6): `17` reads `error`, the same
-                        // vocabulary that would filter it — `_severity`
-                        // by name, plus whatever the response declared
-                        // (a `sev()` output).
+                        // A severity cell shows its OTel token, so `17` reads
+                        // `error`, the same vocabulary that filters it
+                        // (ADR-0013 §6).
                         severity_cell_text(value)
                     } else {
                         value_to_string(value)
@@ -327,7 +317,6 @@ fn render_table(
         .map(|&col_idx| Constraint::Length(all_widths[col_idx]))
         .collect();
 
-    // Build title
     let pinned_info = if pinned_count > 0 {
         format!(", {pinned_count} pinned")
     } else {
@@ -388,7 +377,6 @@ fn render_table(
         cumulative_x += col_w;
 
         if i < total_display - 1 {
-            // Determine divider character: thick separator between pinned and scrollable
             let is_pin_boundary = i + 1 == pinned_count && pinned_count > 0;
             let divider_char = if is_pin_boundary { '┃' } else { '│' };
             let divider_x = cumulative_x + 1; // middle of 3-char gap
@@ -408,7 +396,6 @@ fn render_table(
         }
     }
 
-    // Render vertical scrollbar if needed
     if total_rows > max_visible_rows {
         let mut scrollbar_state = ScrollbarState::new(total_rows)
             .position(v_scroll)
@@ -428,7 +415,8 @@ fn render_table(
         );
     }
 
-    // Render horizontal scrollbar over scrollable columns only
+    // The pinned region never scrolls, so the horizontal bar's scale counts
+    // only the scrollable columns.
     if has_h_scrollbar {
         let mut scrollbar_state = ScrollbarState::new(scrollable.len()).position(h_scroll);
 
@@ -446,10 +434,9 @@ fn render_table(
         );
     }
 
-    // Write header ranges back to app layout for mouse click detection.
-    // SAFETY: we need &mut App here but only have &App. The caller (render())
-    // has &mut App and will copy this data out after render_table returns.
-    // Instead, we return it via a thread-local.
+    // Mouse click detection needs these ranges back on `App`, but rendering
+    // only holds `&App`. The UI dispatcher, which does hold `&mut App`,
+    // drains the thread-local via `take_header_ranges` right after this call.
     HEADER_RANGES.with(|cell| {
         *cell.borrow_mut() = header_ranges;
     });
@@ -480,8 +467,7 @@ fn render_all_hidden_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
 }
 
 std::thread_local! {
-    /// Thread-local storage for column header ranges computed during render.
-    /// Extracted by the caller after `render_table` returns.
+    /// Column header x-ranges from the last `render_table` pass.
     static HEADER_RANGES: std::cell::RefCell<Vec<(u16, u16, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -513,22 +499,16 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Build splash content lines.
     let dim = Style::default().fg(theme.text_muted);
     let client_version = trawl_core::version::PKG_VERSION;
     let server_version = app.server_version.as_deref().unwrap_or("\u{2014}");
 
-    // Layout: align all colons at a fixed column, then horizontally center
-    // the block so the colon column sits slightly left of the pane midpoint.
-    // This keeps the visual weight balanced despite varying value lengths.
-    //
-    // Label widths: "Command Palette" = 15 (longest), colon at col 15.
-    // We pad shorter labels so every ":" lands at the same offset.
+    // Pad every label out to the longest one ("Command Palette", 15 chars)
+    // so all the colons line up in one column. The block is then centered on
+    // the longest line, shifted one column left on purpose.
     let colon_col: usize = 15; // offset of ":" within each line
     let longest_line = "Command Palette: https://trawl.sh".len(); // 33 chars
     let w = inner.width as usize;
-    // Center the *colon column* in the pane, then nudge left a bit so the
-    // right-side values have room to breathe.
     let left_pad = (w.saturating_sub(longest_line)) / 2 - 1;
     let pad = " ".repeat(left_pad);
 
@@ -538,7 +518,7 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     };
 
     // "trawl" title: center it on the colon column (visually near the middle).
-    let title_pad = left_pad + colon_col.saturating_sub(3); // ~center "trawl" on colon col
+    let title_pad = left_pad + colon_col.saturating_sub(3);
     let title_line = format!("{}{}", " ".repeat(title_pad), "trawl");
 
     let content: Vec<Line<'_>> = vec![
@@ -601,7 +581,6 @@ fn render_error_display(
     let query_text = tab.editor.text();
     let mut lines: Vec<Line<'_>> = Vec::new();
 
-    // Error message header.
     lines.push(Line::from(Span::styled(
         format!("error: {message}"),
         Style::default()
@@ -659,7 +638,6 @@ fn render_error_display(
                 Span::styled(after.to_owned(), Style::default().fg(theme.text_primary)),
             ]));
 
-            // Caret line.
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::raw(" ".repeat(col_start)),
@@ -669,7 +647,6 @@ fn render_error_display(
                 ),
             ]));
 
-            // Detail message.
             lines.push(Line::from(Span::styled(
                 format!("  {}", detail.message),
                 Style::default().fg(theme.text_muted),
@@ -737,7 +714,6 @@ fn render_line_chart(
 
     let time_info = extract_time_metadata(result);
 
-    // Build title
     let title = if series.len() == 1 {
         let label = &series[0].0;
         if let Some((ref start, ref end, ref span)) = time_info {
@@ -806,7 +782,6 @@ fn render_line_chart(
         y_max = 1.0;
     }
 
-    // Build datasets
     let datasets: Vec<Dataset<'_>> = series
         .iter()
         .zip(all_points.iter())
@@ -1159,13 +1134,11 @@ fn render_series_label(
     };
 
     if area.height >= 3 {
-        // Max value at top
         frame.render_widget(
             Paragraph::new(format!("{max_val:>w$}")).style(Style::default().fg(theme.text_muted)),
             Rect { height: 1, ..area },
         );
 
-        // Min value at bottom
         frame.render_widget(
             Paragraph::new(format!("{min_val:>w$}")).style(Style::default().fg(theme.text_muted)),
             Rect {
@@ -1175,7 +1148,6 @@ fn render_series_label(
             },
         );
 
-        // Series label vertically centered
         frame.render_widget(
             Paragraph::new(format!("{display_label:>w$}")).style(Style::default().fg(series_color)),
             Rect {
@@ -1321,7 +1293,8 @@ fn render_stacked_sparklines(
 /// Compute adaptive column widths based on header + first N rows of data.
 ///
 /// Samples up to `SAMPLE_ROWS` visible rows starting from `v_scroll`, taking
-/// the max display width per column, clamped to `[MIN_COL, MAX_COL]`.
+/// the max display width per column, clamped to `MIN_COL` and to each
+/// column's equal share of `available_width` (itself capped at `MAX_COL`).
 /// Respects `width_override` from `ColumnConfig`; hidden columns get width 0.
 fn compute_column_widths(
     result: &trawl_engine::value::QueryResult,
@@ -1345,12 +1318,10 @@ fn compute_column_widths(
         .iter()
         .enumerate()
         .map(|(col_idx, col)| {
-            // Hidden columns get zero width.
             if let Some(cfg) = config {
                 if cfg.columns.get(col_idx).is_some_and(|e| e.hidden) {
                     return 0;
                 }
-                // If user set a width override, use it directly.
                 if let Some(w) = cfg.columns.get(col_idx).and_then(|e| e.width_override) {
                     return w;
                 }
@@ -1397,7 +1368,6 @@ fn extract_time_metadata(
     // Find the _time column by name (UNION ALL BY NAME can reorder columns)
     let time_col = result.columns.iter().position(|c| c.name == "_time")?;
 
-    // Get first and last time values
     let first_time = value_to_string(&result.rows[0][time_col]);
     let last_time = value_to_string(&result.rows[result.rows.len() - 1][time_col]);
 
@@ -1472,9 +1442,8 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-/// A `_severity` cell as the TUI shows it: the shared `OTel` token, or —
-/// where the ladder has no reading for it — the cell rendered the way the
-/// grid renders every other.
+/// A `_severity` cell as the TUI shows it: the shared `OTel` token, or the
+/// grid's ordinary rendering where the ladder has no reading for the value.
 fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
     crate::cli::severity_token(value).map_or_else(|| value_to_string(value), str::to_owned)
 }

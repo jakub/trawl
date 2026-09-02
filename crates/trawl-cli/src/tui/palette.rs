@@ -214,9 +214,8 @@ fn tab_items(is_admin: bool) -> Vec<PaletteItem> {
 
 /// Build the full palette item catalog from current app state.
 ///
-/// Called once each time the palette is opened (not on every keystroke).
-/// Also called to rebuild items when the palette input changes between
-/// "all categories" mode and "service columns" mode.
+/// Rebuilt on open and on every input change while the input has no dot; a
+/// dotted input switches to [`build_service_column_items`] instead.
 pub fn build_palette_items(
     is_admin: bool,
     saved: Option<&trawl_client::ListSavedResponse>,
@@ -427,7 +426,6 @@ pub fn refilter(input: &str, items: &[PaletteItem]) -> Vec<FilteredItem> {
         })
         .collect();
 
-    // Sort by score descending.
     results.sort_by_key(|b| std::cmp::Reverse(b.score));
     results
 }

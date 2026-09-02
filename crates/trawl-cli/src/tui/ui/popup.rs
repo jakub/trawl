@@ -175,7 +175,6 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
         return;
     };
 
-    // Collect non-null fields into (name, value_string) pairs.
     let total_fields = result.columns.len();
     let fields: Vec<(&str, String)> = result
         .columns
@@ -194,7 +193,6 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
         .collect();
     let visible_fields = fields.len();
 
-    // Partition into well-known (in priority order) and others (alphabetical).
     let mut well_known: Vec<(&str, &str)> = Vec::new();
     for &wk in WELL_KNOWN_LOG_FIELDS {
         if let Some((_, val)) = fields.iter().find(|(name, _)| *name == wk) {

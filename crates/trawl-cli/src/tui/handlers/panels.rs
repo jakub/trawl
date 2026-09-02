@@ -79,7 +79,6 @@ impl App {
                 if let Some(ref saved) = self.saved_cache
                     && let Some(entry) = saved.queries.get(selected)
                 {
-                    // Mark loading and fetch runs
                     self.panel.saved_detail = Some(super::super::state::SavedDetailState {
                         saved_id: entry.id,
                         runs: Vec::new(),

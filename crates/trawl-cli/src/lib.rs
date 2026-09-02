@@ -403,10 +403,10 @@ async fn run(args: Cli) -> Result<(), CliError> {
 }
 
 /// Dispatch `trawl schema <cmd>`. Connection resolution mirrors `query`,
-/// not `validate`: only `fields --data` has a serverless fallback, so for
-/// everything else a token-resolution failure IS the answer and must
-/// surface as itself — swallowing it into `Option` used to re-report a
-/// broken profile as "schema field requires a server".
+/// not `validate`: only `fields --data` has a serverless fallback, so
+/// everywhere else a token-resolution failure must surface as itself.
+/// Swallowing it into an `Option` would re-report a broken profile as
+/// "schema field requires a server".
 async fn run_schema(
     cmd: SchemaSubcommand,
     cfg: &config::Config,

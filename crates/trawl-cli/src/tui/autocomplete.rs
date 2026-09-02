@@ -30,7 +30,7 @@ pub enum CompletionContext {
     PipeStage { prefix: String },
     /// Inside `stats`/`timechart`/`eventstats` before `by` — suggest aggregate functions.
     AggFunction { prefix: String },
-    /// Inside `let`/`eval` or general expression — suggest scalar (and agg) functions.
+    /// Inside `let`/`eval` — suggest scalar functions.
     ScalarFunction { prefix: String },
     /// Field position (`by`, `sort`, `table`, `fields`, `drop`, etc.) — suggest field names.
     FieldName { prefix: String },
@@ -54,7 +54,6 @@ pub struct Completion {
     pub cursor_offset: Option<usize>,
 }
 
-/// Internal candidate from the candidate list.
 #[derive(Debug, Clone)]
 struct Candidate {
     /// Display/insert name (e.g. "stats", "count", "host").
@@ -175,14 +174,16 @@ pub fn detect_context(text: &str, cursor_byte: usize) -> CompletionContext {
                 }
             }
         }
-        // In where → could be fields or scalar functions.
+        // In where → field names either way.
         Some("where") => {
             if before_prefix.ends_with('(') {
                 CompletionContext::FieldName {
                     prefix: prefix.to_owned(),
                 }
             } else {
-                // Offer field names in where clauses (most common use).
+                // Deliberately the same as the `(` arm, unlike `let` above: a
+                // filter names a field far more often than it calls a function,
+                // so no scalar-function offer here.
                 CompletionContext::FieldName {
                     prefix: prefix.to_owned(),
                 }
@@ -292,7 +293,8 @@ fn candidates_for(context: &CompletionContext, schema_fields: &[SchemaField]) ->
     }
 }
 
-/// Case-insensitive prefix match. Returns the first alphabetical match.
+/// Case-insensitive prefix match, taking the first candidate in list order
+/// (every candidate list is built sorted).
 ///
 /// Returns `None` when the prefix exactly matches a candidate — the user
 /// has already typed a valid name, so suggesting a longer variant (e.g.
@@ -300,7 +302,6 @@ fn candidates_for(context: &CompletionContext, schema_fields: &[SchemaField]) ->
 fn prefix_match(prefix: &str, candidates: &[Candidate]) -> Option<Candidate> {
     let lower = prefix.to_lowercase();
 
-    // If the prefix is an exact match for any candidate, suppress ghost text.
     if candidates.iter().any(|c| c.name.to_lowercase() == lower) {
         return None;
     }
@@ -374,7 +375,7 @@ fn is_zero_arg_function(name: &str) -> bool {
 /// **Completion only, never correctness.** This is editor state over
 /// half-typed text — an unterminated name at the cursor is the normal
 /// case, not an error — so it is a deliberate approximation and must
-/// never be consulted for what a query MEANS. `trawl_core::parser` is the
+/// never be consulted for what a query means. `trawl_core::parser` is the
 /// authority on that, and `trawl_core::parser::scan` is the one
 /// text-level walk allowed to change an answer (ADR-0014 ruling 5).
 fn open_backtick_prefix(before: &str) -> Option<&str> {
@@ -797,10 +798,11 @@ mod tests {
         assert_eq!(c.replace_len, 5);
     }
 
-    /// A field whose name the bare production cannot spell is INSERTED
-    /// backticked (ADR-0013 ruling 7) — a suggestion trawl offers must be
-    /// a query trawl can parse. The ghost text stays the raw name: it is
-    /// the label of the column, not the text at the cursor.
+    /// A field whose name the bare production cannot spell is inserted
+    /// backticked (ADR-0013): a suggestion trawl offers must be a query
+    /// trawl can parse. The typed `x` is not a prefix of the backticked
+    /// rendering, so the ghost is the whole name rather than the untyped
+    /// suffix.
     #[test]
     fn complete_field_needing_backticks_inserts_quoted() {
         let mut schema = fields();
@@ -1008,9 +1010,6 @@ mod tests {
                 is_zero_arg: false,
             },
         ];
-        // "ab" should match "abs" (first alphabetically that starts with "ab")
-        // candidates are sorted: abs, avg — but input is pre-sorted, so first is avg then abs.
-        // Actually the vec is [avg, abs], so "a" matches "avg" first.
         let result = prefix_match("av", &candidates);
         assert_eq!(result.unwrap().name, "avg");
     }

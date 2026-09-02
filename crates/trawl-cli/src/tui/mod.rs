@@ -152,7 +152,7 @@ pub struct App {
     /// Sender for mutation operations.
     mutation_tx: mpsc::UnboundedSender<MutationResult>,
     /// Cache of sample values for (field, optional service) pairs.
-    #[allow(dead_code)] // Populated in phase 6 detail pane
+    #[allow(dead_code)] // nothing reads or writes it yet
     pub sample_values_cache: std::collections::HashMap<(String, Option<String>), Vec<String>>,
     /// Channel for receiving driver commands from the unix socket.
     driver_rx: Option<mpsc::UnboundedReceiver<DriverCommand>>,
@@ -245,12 +245,10 @@ impl App {
             handle.abort();
         }
 
-        // Update tab status to running.
         tab.status = TabStatus::Running {
             start: Instant::now(),
         };
 
-        // Spawn background task to execute query.
         let client = self.client.clone();
         let tx = self.query_tx.clone();
         let timezone = self.timezone.clone();
@@ -403,7 +401,6 @@ impl App {
                 }
                 MutationResult::SavedQueryDeleted { name } => {
                     tracing::info!("saved query deleted: {name}");
-                    // Refresh saved queries cache
                     self.refresh_saved_cache(None);
                 }
                 MutationResult::CacheRefreshed { saved, select_name } => {
@@ -515,7 +512,7 @@ impl App {
             tracing::info!("received query result");
 
             let tab = &mut self.tab;
-            tab.query_task = None; // Query finished, clear the handle.
+            tab.query_task = None;
 
             match query_result.result {
                 Ok(response) => {
@@ -560,7 +557,6 @@ impl App {
         }
     }
 
-    /// Handle a key event.
     #[allow(clippy::too_many_lines)]
     pub fn handle_key(&mut self, key: event::KeyEvent) {
         // Popups take priority over everything else.
@@ -585,7 +581,7 @@ impl App {
                 }
                 return;
             }
-            // Tab switching: Alt+1 through Alt+4
+            // Tab switching: Alt+1 through Alt+5 (Alt+5 only for admins)
             (KeyModifiers::ALT, KeyCode::Char('1')) => {
                 self.switch_to_main_tab(MainTab::Query);
                 return;
@@ -725,10 +721,8 @@ pub async fn run(
     direct_token: Option<&str>,
     driver_path: Option<&Path>,
 ) -> Result<(), CliError> {
-    // Load token.
     let token = config.load_token(direct_token)?;
 
-    // Create HTTP client.
     let client = if config.server.insecure {
         HttpClient::new_insecure(&config.server.url, token)?
     } else {
@@ -751,7 +745,8 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Fetch schema, history, saved queries, service schemas, server version, and permissions in parallel.
+    // Fetch schema, history, saved queries, service schemas, server version and
+    // permissions concurrently.
     tracing::info!("fetching startup data");
     let (
         schema_result,
@@ -895,22 +890,17 @@ where
         // Run debounced real-time validation on the active tab.
         app.active_tab_mut().maybe_validate();
 
-        // Poll for query results from background tasks.
         app.poll_query_results();
 
-        // Poll for mutation results (save/delete operations).
         app.poll_mutations();
 
-        // Poll for dashboard snapshot updates.
         app.poll_dashboard();
 
         // Poll for driver commands from the unix socket.
         app.poll_driver_commands(terminal);
 
-        // Draw UI.
         terminal.draw(|f| ui::render(app, f))?;
 
-        // Poll for events (100ms timeout).
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -930,7 +920,6 @@ where
             }
         }
 
-        // Check quit flag.
         if app.should_quit {
             break;
         }

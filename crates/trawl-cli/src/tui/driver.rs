@@ -66,7 +66,8 @@ pub struct DriverResponse {
     pub data: DriverData,
 }
 
-/// Response payload variants.
+/// Response payload: one flat struct shared by every command, with each
+/// absent field omitted from the wire.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct DriverData {
     // status fields
@@ -245,7 +246,6 @@ pub fn spawn_listener(
 ) -> Result<mpsc::UnboundedReceiver<DriverCommand>, std::io::Error> {
     cleanup_socket(path);
 
-    // Ensure parent directory exists.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -305,7 +305,6 @@ async fn handle_client(stream: tokio::net::UnixStream, tx: &mpsc::UnboundedSende
 
         let is_quit = matches!(request, DriverRequest::Quit);
 
-        // Determine timeout for this request.
         let timeout_ms = match &request {
             DriverRequest::Execute { timeout_ms, .. } => *timeout_ms,
             _ => 30_000, // 30s default for non-execute commands
@@ -323,7 +322,6 @@ async fn handle_client(stream: tokio::net::UnixStream, tx: &mpsc::UnboundedSende
             break;
         }
 
-        // Wait for the event loop to process the command and respond.
         let resp = match tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
             reply_rx,
@@ -506,7 +504,6 @@ impl App {
             }
         }
 
-        // Put the receiver back.
         self.driver_rx = Some(rx);
     }
 
@@ -546,13 +543,11 @@ impl App {
     }
 
     fn handle_driver_execute(&mut self, reply: tokio::sync::oneshot::Sender<DriverResponse>) {
-        // If there's already a waiter, reject.
         if self.driver_execute_waiter.is_some() {
             let _ = reply.send(DriverResponse::err("another execute is already pending"));
             return;
         }
 
-        // If the editor is empty, reject.
         if self.active_tab().editor.text().trim().is_empty() {
             let _ = reply.send(DriverResponse::err("empty query"));
             return;
@@ -904,7 +899,6 @@ mod tests {
         assert_eq!(json["ok"], true);
         assert_eq!(json["focus"], "editor");
         assert_eq!(json["main_tab"], "query");
-        // None fields should be absent
         assert!(json.get("query").is_none());
         assert!(json.get("content").is_none());
     }

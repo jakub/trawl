@@ -121,10 +121,10 @@ impl App {
         count
     }
 
-    /// Resolve the currently selected tree node into an action-relevant enum.
+    /// Resolve the selected tree row into `(kind, name, service)`.
     ///
-    /// Returns `(kind, name)` where kind is `common_header`, `common_field`,
-    /// `service`, or `service_field`, plus the relevant name string.
+    /// `kind` is one of `common_header`, `common_field`, `service`, `service_field`.
+    /// The third element carries the owning service, and only `service_field` has one.
     fn resolve_selected_node(&self) -> Option<(&str, String, Option<String>)> {
         let schema = self.panel.schema.as_ref()?;
         let filter = schema.filter.to_lowercase();
@@ -269,7 +269,8 @@ impl App {
         None
     }
 
-    /// Handle Enter key on a tree node.
+    /// Enter toggles a service node's expansion; on a field it inserts the DSL-quoted
+    /// name into the editor and jumps to the Query tab.
     fn handle_tree_enter(&mut self) {
         let Some((kind, name, _svc)) = self.resolve_selected_node() else {
             return;

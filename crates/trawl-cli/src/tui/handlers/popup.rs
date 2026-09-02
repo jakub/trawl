@@ -71,7 +71,6 @@ impl App {
                             let saved_id = *saved_id;
                             let name_copy = name.clone();
                             self.popup = None;
-                            // Spawn async task to delete
                             self.delete_saved_query(saved_id, name_copy);
                         }
                         // Cancel: N, Esc, or any other key
@@ -295,7 +294,8 @@ impl App {
         }
     }
 
-    /// Delete a saved query by ID.
+    /// Delete a saved query. Returns immediately; the outcome arrives later as a
+    /// `MutationResult`. `name` is carried through only for the log lines.
     pub(crate) fn delete_saved_query(&mut self, saved_id: i64, name: String) {
         let client = self.client.clone();
         let mutation_tx = self.mutation_tx.clone();
@@ -317,7 +317,8 @@ impl App {
         });
     }
 
-    /// Save the current query with the given name.
+    /// Save the active tab's editor text under `name`, or do nothing if it is blank.
+    /// Returns immediately; the outcome arrives later as a `MutationResult`.
     pub(crate) fn save_current_query(&mut self, name: String) {
         let query = self.active_tab().editor.text();
         if query.trim().is_empty() {

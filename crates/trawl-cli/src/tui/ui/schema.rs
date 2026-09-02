@@ -4,8 +4,8 @@
 
 //! Schema browser detail pane (right side of horizontal split).
 //!
-//! Renders contextual statistics for the currently selected tree node:
-//! service overview with sparklines, or field stats with sample values.
+//! Renders statistics for the selected tree node: a service overview with a
+//! daily-event chart, or a field's type, coverage and value range.
 
 use std::collections::HashSet;
 
@@ -232,7 +232,8 @@ fn render_service_detail(
     )));
     lines.push(Line::default());
 
-    // Sparkline for daily events.
+    // Labels the chart at the bottom of the pane; the field breakdown
+    // renders between the label and the chart.
     if !svc.daily_event_counts.is_empty() {
         lines.push(Line::from(Span::styled(
             "daily events:",
@@ -294,7 +295,7 @@ fn render_service_detail(
         let max_label = format_count(max_val);
         let min_label = format_count(min_val);
 
-        // Downsample for braille (2x resolution per column)
+        // Resample to braille resolution (2 points per column)
         let chart_width = chart_area.width.saturating_sub(8) as usize; // axis labels
         let target = chart_width.saturating_mul(2).max(1);
         let display_data = resample(&data, target);
@@ -365,7 +366,6 @@ fn render_field_detail(
 
     // Find the column stats.
     if let Some(svc_name) = service {
-        // Service-scoped field.
         if let Some(svc) = schema.services.iter().find(|s| s.name == svc_name)
             && let Some(col) = svc.columns.iter().find(|c| c.name == field_name)
         {
@@ -424,7 +424,6 @@ fn render_field_detail(
 /// `"2026-03-01 12:34:56.123000"` → `"2026-03-01 12:34:56.123"`
 /// Non-timestamp strings pass through unchanged.
 fn trim_timestamp(s: &str) -> &str {
-    // Only trim if it looks like a timestamp (contains a dot after a time-like pattern).
     if let Some(dot_pos) = s.rfind('.') {
         let after_dot = &s[dot_pos + 1..];
         if !after_dot.is_empty() && after_dot.bytes().all(|b| b == b'0') {
@@ -447,7 +446,6 @@ fn trim_timestamp(s: &str) -> &str {
 fn push_range_lines(lines: &mut Vec<Line<'_>>, min_v: &str, max_v: &str) {
     let min_t = trim_timestamp(min_v);
     let max_t = trim_timestamp(max_v);
-    // "range:      " is 12 chars
     let inline = format!("{min_t} \u{2013} {max_t}");
     if inline.len() <= 40 {
         lines.push(Line::from(format!("range:      {inline}")));

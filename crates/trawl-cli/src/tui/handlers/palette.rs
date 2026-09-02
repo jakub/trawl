@@ -142,12 +142,10 @@ impl App {
         }
     }
 
-    /// Set the palette input text and refresh all derived state.
-    ///
-    /// This is the single entry point for all input mutations — it handles
-    /// dot-aware item rebuilding, refiltering, and ghost text computation.
+    /// Set the palette input text and rebuild every piece of derived state:
+    /// dot-aware item list, filter, ghost text.
     fn set_palette_input(&mut self, new_input: &str) {
-        // Determine if we're in "service columns" mode (input contains a dot).
+        // A dot switches the item list from the whole palette to one service's columns.
         let (items, filter_text) = if let Some(dot_pos) = new_input.find('.') {
             let service_prefix = &new_input[..dot_pos];
             let after_dot = &new_input[dot_pos + 1..];
@@ -158,7 +156,6 @@ impl App {
                 (Vec::new(), after_dot.to_string())
             }
         } else {
-            // Full catalog mode.
             let items = build_palette_items(
                 self.dashboard.is_admin,
                 self.saved_cache.as_ref(),

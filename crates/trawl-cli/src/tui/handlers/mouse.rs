@@ -34,7 +34,7 @@ impl App {
         if self.popup.is_some() {
             if let Some(popup_rect) = self.layout.popup {
                 if contains(popup_rect, col, row) {
-                    // Click inside popup — no-op for v1.
+                    // A click inside a popup does nothing; keys and the wheel drive them.
                     return;
                 }
                 // Click outside popup — dismiss unless it's ConfirmDelete.
@@ -97,7 +97,6 @@ impl App {
 
         let mut x = self.layout.tab_bar.x;
         for (idx, (tab, label, shortcut)) in tabs.iter().enumerate() {
-            // Compute displayed label width (matches tabs.rs rendering).
             let label_text = if *tab == MainTab::Query {
                 let indicator = match &self.tab.status {
                     TabStatus::Idle => "",
@@ -116,7 +115,6 @@ impl App {
                 format!(" {label} ")
             };
 
-            // Unicode-aware display width.
             #[allow(clippy::cast_possible_truncation)]
             let span_width = unicode_display_width(&label_text) as u16;
 
@@ -168,7 +166,6 @@ impl App {
         // Header row: area.y + 1 (border).
         let header_y = area.y + 1;
         if row == header_y {
-            // Check if click hits a column header.
             for &(x_start, x_end, col_idx) in &self.layout.column_header_ranges {
                 if col >= x_start && col < x_end {
                     if let Some(ref mut config) = self.active_tab_mut().column_config {
@@ -272,7 +269,7 @@ impl App {
 
     /// Handle scroll wheel over the pane under the cursor.
     fn handle_scroll(&mut self, col: u16, row: u16, delta: i32) {
-        // Popup scroll (Help and `EventDetail` support it).
+        // Popup scroll.
         if let Some(popup_rect) = self.layout.popup
             && contains(popup_rect, col, row)
         {
@@ -376,10 +373,10 @@ fn apply_scroll_delta(current: usize, delta: i32, max: usize) -> usize {
     }
 }
 
-/// Compute the unicode display width of a string.
+/// Terminal cell width of a string, counting each `char` as one cell.
 ///
-/// Simple heuristic: each `char` = 1 cell. Handles the indicators (◉, ✓, ✗)
-/// which are all single-width.
+/// Good enough for the tab labels, whose only non-ASCII characters are the
+/// status indicators (◉, ✓, ✗), all single-width.
 fn unicode_display_width(s: &str) -> usize {
     s.chars().count()
 }
