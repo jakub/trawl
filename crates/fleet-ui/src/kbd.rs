@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Kbd/>` — keyboard shortcut chip (issue #31).
+//! `<Kbd/>` — keyboard shortcut chip.
 //!
 //! Two treatments, both shipped in fleet-ui.css:
 //! - default `.kbd` — the bordered chip (modal footer hints, menus).

@@ -5,18 +5,8 @@
 //! `<ConfirmModal/>` — reusable confirmation dialog (delete,
 //! destructive actions).
 //!
-//! Ported from trawl-web-ui with two improvements over the original:
-//! - `confirm_variant: Variant` replaces the `danger: bool` so the
-//!   confirm button's appearance is encoded with the same typed enum
-//!   used everywhere else, defaulting to `Variant::Danger`.
-//! - Scrim dismissal compares the click target's identity against a
-//!   `NodeRef` for the scrim element instead of string-matching the
-//!   `class` attribute, so adding sibling classes to the scrim won't
-//!   silently break dismissal.
-//!
-//! Since issue #28 it is a thin composition over the [`Modal`] shell
-//! (which owns the scrim/Escape/outside-click machinery this component
-//! introduced); the public API and rendered DOM are unchanged.
+//! A thin composition over the [`Modal`] shell, which owns the scrim,
+//! Escape and outside-click machinery.
 
 use leptos::prelude::*;
 

@@ -3,17 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Pure button variant. No `leptos`, no `web_sys` — builds on every
-//! target so the per-variant CSS-class fragment is exercised by native
-//! unit tests (mirrors [`crate::toast::kinds`]). The migration in issue
-//! #27 restructured trawl's login submit from hand-written
-//! `class="btn btn-full"` markup into `<Btn variant=Variant::Form>`.
-//!
-//! Scope note: the rendered class *composition*
-//! (`format!("{} btn-full", …)`) lives in the wasm-only
-//! [`Btn`](super::Btn) component, so it is not verified natively. These
-//! tests only lock the class fragment each variant maps to; the
-//! `btn-full` suffix and the ordering that make up the full attribute
-//! are a wasm-only concern.
+//! target so the per-variant CSS-class fragment and the full class
+//! composition in [`btn_class`] are exercised by native unit tests
+//! (mirrors [`crate::toast::kinds`]).
 
 /// Visual variant. Maps onto the CSS classes shipped in
 /// `styles/fleet-ui.css`.
@@ -55,8 +47,8 @@ impl Variant {
 ///   composes with the variant class: `btn-sec btn-xs`.
 /// * [`Size::Sm`] is a self-contained compact style — `.btn-sm` carries
 ///   its own background/border/hover — so it renders standalone and the
-///   variant class is suppressed (every pre-extraction call site used
-///   bare `class="btn-sm"`; composing would alter the hover background).
+///   variant class is suppressed; composing the two would alter the
+///   hover background.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Size {
     #[default]
@@ -78,11 +70,10 @@ impl Size {
     }
 }
 
-/// Compose the full `class` attribute rendered by `<Btn>`. Pure (and
-/// natively tested) so the variant/size/full interaction — including the
-/// `Sm`-standalone rule — is locked by unit tests rather than asserted
-/// in prose. Order is variant-then-size, matching the hand-written
-/// `class="btn-sec btn-xs"` markup this replaces.
+/// Compose the full `class` attribute rendered by `<Btn>`. Pure, so the
+/// variant/size/full interaction — including the `Sm`-standalone rule —
+/// is locked by native unit tests. Order is variant-then-size
+/// (`btn-sec btn-xs`).
 #[must_use]
 pub fn btn_class(variant: Variant, size: Size, full: bool) -> String {
     let base = match size {
@@ -128,8 +119,7 @@ mod tests {
             "btn btn-full"
         );
 
-        // Xs is a true modifier: composes variant-then-size, matching the
-        // existing hand-written `class="btn-sec btn-xs"` call sites.
+        // Xs is a true modifier: composes variant-then-size.
         assert_eq!(
             btn_class(Variant::Secondary, Size::Xs, false),
             "btn-sec btn-xs"
@@ -139,11 +129,10 @@ mod tests {
             "btn-pri btn-xs"
         );
 
-        // Sm is NOT a modifier: `.btn-sm` in the stylesheet is a
-        // self-contained compact style (own background/border/hover), and
-        // every pre-migration call site used it standalone. Emitting
-        // `btn-sec btn-sm` would change the hover background, so Sm
-        // suppresses the variant class entirely.
+        // Sm is not a modifier: `.btn-sm` in the stylesheet is a
+        // self-contained compact style (own background/border/hover).
+        // Emitting `btn-sec btn-sm` would change the hover background,
+        // so Sm suppresses the variant class entirely.
         assert_eq!(btn_class(Variant::Secondary, Size::Sm, false), "btn-sm");
     }
 }

@@ -2,15 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Segmented/>` — exclusive-choice pill strip (issue #31).
+//! `<Segmented/>` — exclusive-choice pill strip.
 //!
-//! Unifies trawl's three hand-rolled segmented controls (the export
-//! modal's `.fmt-btn` row, the schema page's `.seg-mini` density
-//! toggle — both since retired — and the date-range popover's mini
-//! tab strip) onto ONE
-//! canonical treatment (ADR-0003): a bordered pill group with a single
-//! accent-wash active style, `.seg > button.seg-opt(.on)` in
-//! fleet-ui.css.
+//! The one canonical treatment for an exclusive-choice control
+//! (ADR-0003): a bordered pill group with a single accent-wash active
+//! style, `.seg > button.seg-opt(.on)` in fleet-ui.css.
 //!
 //! Option identity is a `&'static str` id; apps with typed enums adapt
 //! at the call site (a two-line id ↔ enum map), keeping app semantics

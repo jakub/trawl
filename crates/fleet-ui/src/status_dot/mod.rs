@@ -2,9 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Typed `<StatusDot tone=StatusTone>` replacing the hand-rolled
-//! `class="status-dot …"` / `class="sd-dot …"` dot markup
-//! (issue #31, ADR-0003 unification).
+//! Typed `<StatusDot tone=StatusTone>` — the one dot family every
+//! health/outcome indicator renders (ADR-0003).
 //!
 //! Split into two layers, mirroring [`crate::button`]:
 //! - [`tone`] — the pure [`StatusTone`] enum and its CSS-class

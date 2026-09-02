@@ -14,22 +14,21 @@
 //! Two shapes:
 //!
 //! * **default** — `<div class><label for=id>…</label>{control}</div>`.
-//!   Explicit association: the caller SHOULD pass `id` and MUST thread
+//!   Explicit association: the caller should pass `id` and must thread
 //!   it onto the inner control so `<label for=id>` and
-//!   `aria-describedby` resolve. `id` is optional only for wrapper
-//!   parity with pre-extraction markup that had a bare `<label>` (e.g.
-//!   trawl's `.m-field` clusters) — omit it and no `for` is emitted.
+//!   `aria-describedby` resolve. `id` is optional for clusters that
+//!   carry a bare `<label>` (trawl's `.m-field` ones): omit it and no
+//!   `for` is emitted.
 //! * **wrap** (`wrap=true`) — `<label class><span>{label}</span>
 //!   {control}</label>`. Implicit association by nesting; no `for`/`id`
 //!   wiring, and the caption `<span>` stays unstyled (exactly the login
 //!   card's markup, which dogfoods this mode).
 //!
-//! `class` overrides the wrapper class (default `"field"`). Trawl's
-//! modal field clusters pass `class="m-field"` so migrating them onto
-//! `Field` moves zero pixels — `.modal .m-field` styling differs from
-//! `.field` on purpose. An override class is caller-supplied and
-//! therefore caller-styled: it lives in the app's stylesheet, not
-//! fleet-ui.css.
+//! `class` overrides the wrapper class (default `"field"`); trawl's
+//! modal field clusters pass `class="m-field"`, whose `.modal .m-field`
+//! styling differs from `.field` on purpose. An override class is
+//! caller-supplied and therefore caller-styled: it lives in the app's
+//! stylesheet, not fleet-ui.css.
 
 use leptos::prelude::*;
 
@@ -45,7 +44,7 @@ pub enum Helper {
 }
 
 /// Form-field wrapper. `children` is the underlying input/select/
-/// textarea. In default mode the caller SHOULD set `id` on that control
+/// textarea. In default mode the caller should set `id` on that control
 /// element so the emitted `<label for=id>` actually associates; in
 /// `wrap` mode nesting associates implicitly and `id` is unused for the
 /// label (it still namespaces the helper paragraph).

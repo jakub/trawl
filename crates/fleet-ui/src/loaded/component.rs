@@ -4,7 +4,7 @@
 
 //! The `<Loaded>` render-prop wrapper. Wasm-only (pulls leptos) — the
 //! pure [`LoadState`] mapping and the canonical copy live in
-//! [`super::state`] so they are native-testable (issue #31 C4).
+//! [`super::state`] so they are native-testable.
 
 use leptos::prelude::*;
 
@@ -26,14 +26,13 @@ use super::state::{LoadState, error_copy, loading_copy, missing_copy};
 /// forms. `error` overrides the error arm for surfaces that
 /// deliberately suppress error copy (trawl's facet sidebar and
 /// histogram render a quiet `—` because the results table already
-/// shows the failure) — the sanctioned C4 "explicit prop override".
-/// `missing` likewise overrides the [`LoadState::Missing`] arm; the
-/// default renders the canonical "not found" copy on the NEUTRAL
-/// `.load-hint` tone (a missing resource is not a failure), with
-/// `missing_subtitle` as an optional explanatory second line (issue
-/// #33 D5 — the story-404 shape). `missing_subtitle` decorates ONLY
-/// that default arm: pass a custom `missing` closure and the subtitle
-/// is ignored (render it yourself inside the closure).
+/// shows the failure). `missing` likewise overrides the
+/// [`LoadState::Missing`] arm; the default renders the canonical "not
+/// found" copy on the neutral `.load-hint` tone (a missing resource is
+/// not a failure), with `missing_subtitle` as an optional explanatory
+/// second line. `missing_subtitle` decorates only that default arm:
+/// pass a custom `missing` closure and the subtitle is ignored (render
+/// it yourself inside the closure).
 #[component]
 pub fn Loaded<T>(
     #[prop(into)] state: Signal<LoadState<T>>,

@@ -56,12 +56,10 @@ pub fn Login(
                 </h1>
                 <p class="subtitle">"Sign in with your API key"</p>
 
-                // Dogfooding (issue #28): ErrorBanner absorbs the
-                // conditional error strip (adds role="alert" — the only
-                // DOM delta on this card) and Field's wrap mode renders
-                // the exact label.field > span > input markup this form
-                // always had (the unstyled <span> caption is the point:
-                // default Field's styled <label> would visibly restyle it).
+                // ErrorBanner carries the role="alert" strip. Field's
+                // wrap mode renders label.field > span > input, whose
+                // unstyled <span> caption is the point: the default
+                // Field's styled <label> would visibly restyle it.
                 <ErrorBanner error=combined_error/>
 
                 <Field label="API key" wrap=true>
@@ -74,8 +72,7 @@ pub fn Login(
                     />
                 </Field>
 
-                // Dogfooding: fleet-ui's own Btn, not raw class="btn btn-full"
-                // markup. No on_click — a <button> inside a <form> defaults to
+                // No on_click — a <button> inside a <form> defaults to
                 // type=submit, so the form's on:submit drives the flow.
                 <Btn variant=Variant::Form full=true disabled=submitting>
                     {move || if submitting.get() { "Signing In…" } else { "Sign In" }}

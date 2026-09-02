@@ -4,20 +4,17 @@
 
 //! Pure status-dot tone. No `leptos`, no `web_sys` — builds on every
 //! target so the per-tone CSS-class fragment is exercised by native
-//! unit tests (mirrors [`crate::button::variant`]). Issue #31 folds
-//! trawl's two hand-rolled dot families — the four-way
-//! `"status-dot success" / "status-dot error" / …` run-status match
-//! (duplicated in `nets`/`runs`/`net_drawer`) and the binary
-//! `.sd-dot` / `.sd-dot.errors` schema-health dot — onto one canonical
-//! `.status-dot` family. Mapping a domain status *string* onto a tone
-//! stays app-side (ADR-0002: status vocabularies are app semantics).
+//! unit tests (mirrors [`crate::button::variant`]). Run status, schema
+//! health and everything else share the one `.status-dot` family;
+//! mapping a domain status *string* onto a tone stays app-side
+//! (ADR-0002: status vocabularies are app semantics).
 
 /// Dot tone. Maps onto the `.status-dot.{tone}` classes shipped in
 /// `styles/fleet-ui.css`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StatusTone {
     /// Bare `.status-dot` — an unknown/other status. Renders as an
-    /// invisible spacer dot, matching the pre-unification `_ =>` arm.
+    /// invisible spacer dot.
     #[default]
     Neutral,
     Success,
@@ -62,8 +59,7 @@ mod tests {
 
     #[test]
     fn dot_class_composition() {
-        // Bare class for the unknown-status arm, exactly as the four
-        // pre-unification `match` copies rendered it.
+        // The unknown-status arm carries no tone suffix.
         assert_eq!(dot_class(StatusTone::Neutral), "status-dot");
         assert_eq!(dot_class(StatusTone::Error), "status-dot error");
     }

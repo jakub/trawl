@@ -2,14 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Topmost-overlay arbitration for window-level Escape (issue #28).
+//! Topmost-overlay arbitration for window-level Escape.
 //!
 //! [`Modal`](crate::modal::Modal) and [`Drawer`](crate::drawer::Drawer)
 //! each bind Escape at the `window` level so it fires regardless of
 //! focus. But a drawer doesn't trap focus or make the background inert,
-//! so a modal can open on top of a live drawer — and with two
-//! unconditional window listeners, one Escape fired *both*, closing the
-//! modal *and* invoking the drawer's close callback (navigating away and
+//! so a modal can open on top of a live drawer, and two unconditional
+//! window listeners would let one Escape fire both: closing the modal
+//! and invoking the drawer's close callback (navigating away and
 //! discarding unsaved edits).
 //!
 //! This module is the referee. Every overlay pushes a layer on mount
@@ -26,7 +26,7 @@
 //! [`use_overlay_layer`] / [`use_overlay_layer_with`] Leptos glue is
 //! wasm-only.
 //!
-//! ## Focus ownership (issue #33)
+//! ## Focus ownership
 //!
 //! The same referee arbitrates *focus*: each layer registers a
 //! [`FocusPolicy`], and the topmost non-[`FocusPolicy::None`] layer
@@ -38,9 +38,9 @@
 //! ([`OverlayLayer::should_trap`]); [`FocusPolicy::Capture`] (Drawer)
 //! deliberately never traps — the drawer is non-modal and the
 //! background stays tabbable. The ownership queries are pure and
-//! native-tested; so are the two runtime *decisions* the glue used to
-//! bury inline — where initial focus lands ([`initial_focus`]) and
-//! whether a closing layer restores to its opener ([`should_restore`]).
+//! native-tested, as are the two runtime decisions beside them: where
+//! initial focus lands ([`initial_focus`]) and whether a closing layer
+//! restores to its opener ([`should_restore`]).
 //! Only the irreducible platform calls (element capture, `.focus()`,
 //! `query_selector_all`) stay wasm-only, inside
 //! [`use_overlay_layer_with`].
@@ -225,7 +225,7 @@ pub fn use_overlay_layer_with(
     }
 
     on_cleanup(move || {
-        // Ownership must be read BEFORE release: a drawer unmounting
+        // Ownership must be read before release: a drawer unmounting
         // beneath a live modal doesn't own focus and must not restore.
         // The restore predicate itself is the native-tested
         // `should_restore`; only `.focus()` stays glue.
@@ -242,13 +242,13 @@ pub fn use_overlay_layer_with(
 }
 
 /// Whether a closing overlay should restore focus to its captured
-/// opener — the pure predicate lifted out of [`use_overlay_layer_with`]'s
-/// `on_cleanup` so the restore contract is native-tested rather than
-/// buried in wasm-only glue. Restore only when this layer still **owned**
-/// focus at cleanup (a drawer closing beneath a live modal did not —
-/// restoring would yank focus out of the modal), its policy participates
-/// in focus ([`FocusPolicy::None`] layers never restore), and the opener
-/// is still connected to the document.
+/// opener — the pure predicate behind [`use_overlay_layer_with`]'s
+/// `on_cleanup`, so the restore contract is native-tested. Restore only
+/// when this layer still owned focus at cleanup (a drawer closing
+/// beneath a live modal does not — restoring would yank focus out of
+/// the modal), its policy participates in focus ([`FocusPolicy::None`]
+/// layers never restore), and the opener is still connected to the
+/// document.
 #[cfg(any(target_arch = "wasm32", test))]
 fn should_restore(owned: bool, policy: FocusPolicy, opener_connected: bool) -> bool {
     owned && policy != FocusPolicy::None && opener_connected
@@ -267,7 +267,7 @@ const FOCUSABLE: &str = "a[href], button:not([disabled]), input:not([disabled]),
 
 /// Whether an element's box metrics say it is actually rendered — the
 /// pure predicate behind [`focusable_descendants`]'s visibility filter.
-/// An element inside a `display:none` subtree has zero offset box AND
+/// An element inside a `display:none` subtree has zero offset box and
 /// zero client rects; the rects leg keeps rendered zero-box elements
 /// (inline links, `display:contents` hosts) in the tab order. Deliberate
 /// boundary: `visibility:hidden` elements still have boxes and pass —
@@ -345,10 +345,9 @@ fn focus_initial(panel: &web_sys::Element) {
 }
 
 /// Where one Tab keypress should send focus inside a trapping panel —
-/// the pure edge-wrap decision, split from the DOM so the trap's cycling
-/// logic is native-testable (the `owns_focus`/`should_trap` split, one
-/// level down). `None` means let the browser move focus naturally (no
-/// `prevent_default`).
+/// the pure edge-wrap decision, split from the DOM so the trap's
+/// cycling logic is native-testable. `None` means let the browser move
+/// focus naturally (no `prevent_default`).
 #[cfg(any(target_arch = "wasm32", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabWrap {
@@ -483,8 +482,8 @@ mod tests {
 
     #[test]
     fn menu_under_modal_yields_escape_to_the_modal_only() {
-        // Issue #31 C5: an open ActionsMenu is an overlay layer like any
-        // other. When a ConfirmModal (or Drawer) stacks above it, only
+        // An open ActionsMenu is an overlay layer like any other.
+        // When a ConfirmModal (or Drawer) stacks above it, only
         // the modal is Escape-eligible; when the modal closes, the menu
         // becomes topmost again and takes the next Escape.
         let menu = push_overlay_with(FocusPolicy::None);
@@ -514,7 +513,7 @@ mod tests {
         a.release();
     }
 
-    // ── focus ownership (issue #33 D1) ─────────────────────────────
+    // ── focus ownership ────────────────────────────────────────────
 
     #[test]
     fn drawer_alone_owns_focus_but_does_not_trap() {
@@ -566,7 +565,7 @@ mod tests {
         assert!(modal.should_trap());
         assert!(!menu.owns_focus());
 
-        // A None layer stacked ON TOP of a Trap modal (menu opened from
+        // A None layer stacked on top of a Trap modal (menu opened from
         // inside a modal) must not break the modal's trap: ownership
         // skips None layers when scanning down from the top.
         let inner_menu = push_overlay_with(FocusPolicy::None);
@@ -606,11 +605,11 @@ mod tests {
         );
     }
 
-    // ── focus classification (issue #33 D2) ────────────────────────
+    // ── focus classification ───────────────────────────────────────
     // `cycle_tab`'s DOM shell reads four booleans off the document and
     // hands them to `focus_pos`; these pin the empty/outside precedence
-    // and the 2×2 edge mapping natively so the classification feeding
-    // `tab_wrap` is no longer untested wasm-only glue.
+    // and the 2×2 edge mapping natively, so the classification feeding
+    // `tab_wrap` is tested off-target rather than only in a browser.
 
     #[test]
     fn focus_pos_empty_wins_over_every_other_bit() {
@@ -638,11 +637,11 @@ mod tests {
         assert_eq!(focus_pos(false, true, false, false), FocusPos::Interior);
     }
 
-    // ── Tab-cycle edge arithmetic (issue #33 D2) ───────────────────
+    // ── Tab-cycle edge arithmetic ──────────────────────────────────
     // `cycle_tab`'s DOM shell classifies focus into a `FocusPos` and
     // defers the wrap decision to `tab_wrap`; these pin the runtime
-    // trap's cycling behavior natively so it is no longer untested
-    // wasm-only glue. `false` = Tab, `true` = Shift+Tab.
+    // trap's cycling behavior natively. `false` = Tab, `true` =
+    // Shift+Tab.
 
     #[test]
     fn tab_forward_at_last_wraps_to_first() {
@@ -697,11 +696,11 @@ mod tests {
         assert_eq!(tab_wrap(FocusPos::Only, true), Some(TabWrap::Last));
     }
 
-    // ── initial-focus target (issue #33 D2) ────────────────────────
+    // ── initial-focus target ───────────────────────────────────────
     // `focus_initial`'s DOM shell queries focusable descendants and then
     // defers *where focus lands* to `initial_focus`; these pin that
-    // decision natively so "takes initial focus on open" is no longer an
-    // untested wasm-only claim.
+    // decision natively, so "takes initial focus on open" is a tested
+    // claim rather than a browser-only one.
 
     #[test]
     fn initial_focus_prefers_the_first_focusable() {
@@ -714,7 +713,7 @@ mod tests {
         assert_eq!(initial_focus(false), InitialFocus::Panel);
     }
 
-    // ── restore-to-opener predicate (issue #33 D2) ─────────────────
+    // ── restore-to-opener predicate ────────────────────────────────
     // `use_overlay_layer_with`'s on_cleanup reads DOM connectivity and
     // ownership, then defers the restore decision to `should_restore`;
     // these pin the "restores focus to the opener on close" guarantee —

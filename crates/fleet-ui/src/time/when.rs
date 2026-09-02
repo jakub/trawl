@@ -2,9 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<When/>` — the canonical timestamp label (issue #33 D4).
+//! `<When/>` — the canonical timestamp label.
 //!
-//! Relative mode renders trawl's [`time_ago`](super::time_ago)
+//! Relative mode renders the [`time_ago`](super::time_ago)
 //! buckets and re-renders off the shared 30s
 //! [`clock`](super::clock) tick; absolute mode renders
 //! `%Y-%m-%d %H:%M UTC` — the explicit zone marker is the point,

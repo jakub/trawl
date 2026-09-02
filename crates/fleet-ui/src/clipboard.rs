@@ -3,9 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Async clipboard write (wasm-only — there is no clipboard off the
-//! browser). Lifted verbatim from trawl's `clipboard.rs` (issue #33
-//! D6); [`crate::copy_button::CopyButton`] is the toast-wired UI over
-//! it, but the bare helper stays public for programmatic copies.
+//! browser). [`crate::copy_button::CopyButton`] is the toast-wired UI
+//! over it; the bare helper stays public for programmatic copies.
 
 use wasm_bindgen_futures::JsFuture;
 

@@ -2,9 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Toggle/>` — checkbox-backed slide switch (issue #31). The
-//! `.toggle` / `.toggle-slider` control from trawl's schedule-enabled
-//! switch, promoted verbatim.
+//! `<Toggle/>` — checkbox-backed slide switch over the `.toggle` /
+//! `.toggle-slider` CSS pair.
 
 use leptos::prelude::*;
 use leptos::web_sys;

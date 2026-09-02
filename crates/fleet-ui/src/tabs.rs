@@ -2,22 +2,22 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Tabs/>` — generic tab strip (issue #28).
+//! `<Tabs/>` — generic tab strip.
 //!
 //! One component, two class families, selected by [`TabsStyle`]:
 //!
 //! - [`TabsStyle::Workspace`] — trawl's search-workspace strip
 //!   (`.tabs > div.t.active`, weight 500, optional per-tab count chip).
-//! - [`TabsStyle::Drawer`] — the drawer strip both trawl drawers
-//!   copy-pasted (`.sd-tabs > span.tb.on`, weight 600, optional
-//!   trailing meta text). [`Drawer`](crate::Drawer) composes this
-//!   internally.
+//! - [`TabsStyle::Drawer`] — the drawer strip (`.sd-tabs > span.tb.on`,
+//!   weight 600, optional trailing meta text).
+//!   [`Drawer`](crate::Drawer) composes this internally.
 //!
-//! The two families render byte-identical markup to the hand-rolled
-//! strips they replace — including the element tags (`div` vs `span`)
-//! and the class-toggle idioms. Tab identity is a `&'static str` id;
-//! apps with typed tab enums adapt at the call site (a two-line
-//! id ↔ enum map), keeping app semantics in the app (ADR-0002).
+//! The families differ in element tag (`div` vs `span`) and in the
+//! active-class idiom because each matches its own CSS rules; merging
+//! them would point one strip at the other's font weight. Tab identity
+//! is a `&'static str` id; apps with typed tab enums adapt at the call
+//! site (a two-line id ↔ enum map), keeping app semantics in the app
+//! (ADR-0002).
 //!
 //! For exclusive-choice pill strips that aren't view tabs (format
 //! pickers and the like), use [`Segmented`](crate::segmented)
@@ -76,8 +76,8 @@ pub enum TabsStyle {
 /// `on_change` fires with the clicked tab's id. `meta` renders the
 /// drawer strip's trailing `.meta` text (service drawer's
 /// "N events · size · M fields"); ignored by the workspace family.
-/// (`meta` is a reactive optional — `MaybeProp` — so live counts tick
-/// (issue #33 D7) while static Strings still convert via `into`, and
+/// (`meta` is a reactive optional — `MaybeProp` — so live counts tick,
+/// while static `String`s still convert via `into` and
 /// [`Drawer`](crate::Drawer) forwards its own optional straight
 /// through.)
 ///

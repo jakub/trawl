@@ -2,14 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Atmosphere/>` — the WebGL mesh-gradient backdrop
-//! (jakub/coastwatch#308).
+//! `<Atmosphere/>` — the WebGL mesh-gradient backdrop.
 //!
 //! Lifecycle follows trawl-web-ui's `components/chart.rs` idiom:
 //! `NodeRef` div + `StoredValue<Option<ShaderHandle>>` + one `Effect`
 //! that constructs on first run and pushes uniform updates thereafter,
-//! with `on_cleanup` disposing the mount. Theme flips re-color the
-//! SAME mount via `setUniforms` — never a remount.
+//! with `on_cleanup` disposing the mount. Theme flips re-color the same
+//! mount via `setUniforms`, never a remount.
 //!
 //! Degradation is silent by design:
 //! - WebGL2 unavailable → `create_shader` returns `None`; a `failed`
@@ -18,23 +17,22 @@
 //! - `prefers-reduced-motion: reduce` → speed 0; the vendored package
 //!   stops its rAF loop entirely at speed 0, so a static frame costs
 //!   nothing per frame.
-//! - a LOST WebGL context is a permanent static floor BY DESIGN: the
-//!   vendored wrapper hides the dead canvas so the `.atmosphere` CSS
-//!   floor shows through, and there is deliberately no
-//!   `webglcontextrestored` remount — for a decorative backdrop, a
-//!   recovery dance is more machinery than the pixels are worth
-//!   (ADR-0012 consequences; not a bug to file later).
+//! - a lost WebGL context is a permanent static floor: the vendored
+//!   wrapper hides the dead canvas so the `.atmosphere` CSS floor shows
+//!   through, and there is deliberately no `webglcontextrestored`
+//!   remount, because for a decorative backdrop the recovery machinery
+//!   costs more than the pixels are worth (ADR-0012).
 //!
 //! The host `<div class="atmosphere">` is `aria-hidden` decoration —
 //! fixed, full-viewport, `z-index: -1`, `pointer-events: none` (see
 //! the `.atmosphere` section of `fleet-ui.css`). Consumers compose
-//! content ABOVE it, e.g. coastwatch's login card.
+//! content above it, e.g. coastwatch's login card.
 //!
-//! Mounting this costs a consumer one feature flag and the component:
-//! the vendored JS rides along as a compile-time wasm-bindgen snippet
-//! — no build wiring — but linking that snippet is exactly what the
-//! default-off `atmosphere` feature gates, so a consumer that wants
-//! the backdrop declares `fleet-ui = { …, features = ["atmosphere"] }`
+//! Mounting this costs a consumer one feature flag and the component.
+//! The vendored JS rides along as a compile-time wasm-bindgen snippet,
+//! needing no build wiring, but linking that snippet is what the
+//! default-off `atmosphere` feature gates, so a consumer that wants the
+//! backdrop declares `fleet-ui = { …, features = ["atmosphere"] }`
 //! (Trunk apps: `data-cargo-features` on the `rel="rust"` link). See
 //! the module doc of [`super::interop`].
 

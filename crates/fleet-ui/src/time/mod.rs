@@ -2,13 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Canonical timestamp presentation for fleet apps (issue #33 D4).
+//! Canonical timestamp presentation for fleet apps.
 //!
-//! Seeded from trawl's `time_fmt.rs` (tests migrated verbatim) —
-//! coastwatch carried six byte-identical `relative_age()` copies of
-//! the same idea, so the shared implementation lives here now. The
-//! relative-time functions take `now_ms` as a parameter (no clock
-//! dependency); all functions here are pure and native-tested,
+//! The relative-time functions take `now_ms` as a parameter instead of
+//! reading a clock, so everything here is pure and native-tested,
 //! matching the [`theme::prefs`](crate::theme::prefs) template.
 //!
 //! The wasm half: [`clock`] owns the single shared 30-second tick
@@ -98,8 +95,8 @@ pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
 
 /// Format a countdown to a future timestamp.
 ///
-/// Returns `"in Nm"`, `"in Nh"`, or `"overdue"` if the target is in the past.
-/// Used for next-run countdown in the Jobs section.
+/// Returns `"in <1m"` / `"in Nm"` / `"in Nh"` / `"in Nd"`, or `"overdue"`
+/// once the target is in the past.
 #[must_use]
 pub fn time_until(target_ms: i64, now_ms: i64) -> String {
     let remaining = target_ms - now_ms;

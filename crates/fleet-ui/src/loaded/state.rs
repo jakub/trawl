@@ -5,21 +5,20 @@
 //! Pure tri-state resource state. No `leptos`, no `web_sys` — builds
 //! on every target (the [`theme::prefs`](crate::theme::prefs) template)
 //! so the loading/error/ready mapping and the canonical copy strings
-//! are exercised by native unit tests (issue #31 C4). The wasm-only
+//! are exercised by native unit tests. The wasm-only
 //! [`Loaded`](super::component::Loaded) wrapper renders this state.
 
 use std::fmt::Display;
 
 /// The states every async-fetched surface passes through.
-/// Trawl's 22 hand-rolled `match resource.get()` blocks collapse onto
-/// this enum; `LocalResource::get()`'s `Option<Result<T, E>>` maps via
+///
+/// `LocalResource::get()`'s `Option<Result<T, E>>` maps via
 /// [`LoadState::from_resource`].
 ///
-/// [`LoadState::Missing`] (issue #33 D5) models "the resource does not
-/// exist" — a 404 detail page — as its own state rather than an error:
-/// detail pages render it as a neutral hint with explanatory copy, not
-/// a failure. Sites opt in via [`LoadState::from_resource_with_missing`];
-/// everything else compiles unchanged.
+/// [`LoadState::Missing`] models "the resource does not exist" — a 404
+/// detail page — as its own state rather than an error: detail pages
+/// render it as a neutral hint with explanatory copy, not a failure.
+/// Sites opt in via [`LoadState::from_resource_with_missing`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoadState<T> {
     Loading,
@@ -86,7 +85,7 @@ impl<T> LoadState<T> {
     }
 }
 
-/// Canonical loading copy: `loading…`, or `loading nets…` with a label.
+/// Canonical loading copy: `Loading…`, or `Loading nets…` with a label.
 #[must_use]
 pub fn loading_copy(label: Option<&str>) -> String {
     match label {
@@ -95,8 +94,8 @@ pub fn loading_copy(label: Option<&str>) -> String {
     }
 }
 
-/// Canonical error copy: `couldn't load: {msg}`, or
-/// `couldn't load nets: {msg}` with a label.
+/// Canonical error copy: `Couldn't load: {msg}`, or
+/// `Couldn't load nets: {msg}` with a label.
 #[must_use]
 pub fn error_copy(label: Option<&str>, msg: &str) -> String {
     match label {
@@ -105,7 +104,7 @@ pub fn error_copy(label: Option<&str>, msg: &str) -> String {
     }
 }
 
-/// Canonical missing copy: `not found`, or `story not found` with a
+/// Canonical missing copy: `Not found`, or `story not found` with a
 /// label.
 #[must_use]
 pub fn missing_copy(label: Option<&str>) -> String {
@@ -167,9 +166,9 @@ mod tests {
 
     #[test]
     fn from_resource_with_missing_classifies_the_four_states() {
-        // The story-404 shape (issue #33 D5): a classifier splits the
-        // error domain into "the resource does not exist" (Missing) and
-        // real failures (Error, still through the custom renderer).
+        // A classifier splits the error domain into "the resource does
+        // not exist" (Missing) and real failures (Error, still through
+        // the custom renderer).
         let map = |snapshot: Option<Result<u32, u16>>| {
             LoadState::from_resource_with_missing(
                 snapshot,

@@ -4,14 +4,15 @@
 
 //! `<ErrorBanner/>` — `role="alert"` message strip.
 //!
-//! Both apps hand-rolled page-namespaced `<div class="error">` strips;
-//! this is that strip with the alert role screen readers need. Renders
-//! nothing while the signal is `None`, so the conditional-render idiom
-//! (`{move || error.get().map(|msg| …)}`) collapses into a single
-//! component invocation. The class is `.error-banner`, NOT bare
-//! `.error` — a bare `.error` selector leaks padding/border onto every
-//! element that uses `error` as a state token (`.status-dot.error`,
-//! `.load-hint.error`, …).
+//! `role="alert"` is the point: a screen reader announces the message
+//! when it appears, which a plain `<div class="error">` does not.
+//!
+//! Renders nothing while the signal is `None`, so the
+//! conditional-render idiom (`{move || error.get().map(|msg| …)}`)
+//! collapses into a single component invocation. The class is
+//! `.error-banner`, not bare `.error`, because a bare `.error` selector
+//! leaks padding/border onto every element that uses `error` as a state
+//! token (`.status-dot.error`, `.load-hint.error`, …).
 
 use leptos::prelude::*;
 

@@ -2,13 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Native compile + contract test for `ToastKind` (issue #27, fleet-ui
-//! change 1: "`ToastKind` goes native").
+//! Native compile + contract test for `ToastKind`.
 //!
-//! This test intentionally runs on the host target: before the
-//! toast-module split, `fleet_ui::ToastKind` only existed under
-//! `cfg(target_arch = "wasm32")`, forcing coastwatch to re-port the
-//! whole toast module just to name the enum in native-compiling code.
+//! It runs on the host target on purpose: consumers name toast kinds
+//! from native-compiling code (API mappers, test helpers), so the enum
+//! must stay outside `cfg(target_arch = "wasm32")`.
 
 use fleet_ui::ToastKind;
 

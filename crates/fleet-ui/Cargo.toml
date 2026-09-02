@@ -23,9 +23,10 @@ atmosphere = []
 
 # fleet-ui is primarily wasm-only — leptos / web-sys / gloo only enter the
 # graph under cfg(target_arch = "wasm32"), matching the trawl-web-ui gating
-# pattern. The exception is the `theme::prefs` submodule: a pure serde_json
-# parser that builds and tests natively, so the localStorage JSON contract
-# is exercised by `cargo nextest run --workspace`.
+# pattern. The exceptions are the pure contract modules (`theme::prefs`,
+# `atmosphere::palette`, the geometry/state/tone helpers), which build and
+# test natively so their contracts are exercised by
+# `cargo nextest run --workspace`.
 [dependencies]
 # chrono backs the native-tested `time` module; `wasmbind` only kicks in
 # on wasm32, where Utc::now (the calendar fallback + shared clock tick)

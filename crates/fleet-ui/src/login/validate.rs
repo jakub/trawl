@@ -4,18 +4,18 @@
 
 //! Pure `<Login/>` logic: key validation + error precedence. No
 //! `leptos`, no `web_sys` — builds on every target so the two
-//! contracts the issue #27 migration added ("blank/whitespace keys are
-//! rejected before `on_submit` fires" and "local validation error wins
-//! over the external/server error") are exercised by native unit tests
-//! rather than deferred to a wasm integration suite. Mirrors
-//! [`crate::theme::prefs`] and [`crate::button::variant`].
+//! contracts ("blank/whitespace keys are rejected before `on_submit`
+//! fires" and "local validation error wins over the external/server
+//! error") are exercised by native unit tests rather than deferred to
+//! a wasm integration suite. Mirrors [`crate::theme::prefs`] and
+//! [`crate::button::variant`].
 
 /// The message surfaced when the submitted key is unusable. Public so
 /// the wasm component can render the exact same string the tests lock.
 pub const KEY_REQUIRED: &str = "API key is required";
 
 /// Validate the entered API key. `Err(KEY_REQUIRED)` when it's blank or
-/// whitespace-only (the component must NOT invoke `on_submit` in that
+/// whitespace-only (the component must not invoke `on_submit` in that
 /// case); `Ok(())` when it's usable.
 ///
 /// # Errors
