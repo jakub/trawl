@@ -2,70 +2,68 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Boot conformance pass (ADR-0009 slice 2, §2b): make the write-time
-//! invariant true over the STANDING corpus, not just files written after
-//! the catalog shipped.
+//! Boot conformance pass (ADR-0009): make the write-time invariant true over
+//! the standing corpus, not only over files written after the catalog pinned
+//! their fields.
 //!
-//! Runs inline at boot — after the storage epoch gate, before the ingest
-//! pipeline and HTTP serving — and only on ingest-enabled nodes (a
-//! query-only node does not own the data root).
+//! Runs inline at boot, after the storage epoch gate and before the ingest
+//! pipeline and HTTP serving, and only on ingest-enabled nodes (a query-only
+//! node does not own the data root).
 //!
 //! Identity is dual-sided: `catalog_state.catalog_id` in postgres is
 //! mirrored into a `data/CATALOG` marker file. The pass is skipped only
-//! when BOTH sides agree — a repointed `DATABASE_URL` or a data root
+//! when both sides agree, so a repointed `DATABASE_URL` or a data root
 //! restored from backup shows up as a mismatch and forces a re-run. A
 //! crash mid-pass leaves unrewritten files to be redetected on the next
-//! boot (every rewrite is staged, fsynced + atomically renamed).
+//! boot (every rewrite is staged, fsynced and atomically renamed).
 //!
-//! Cost, since the pass sits in front of HTTP serving and a re-arm can hit
-//! a corpus of any age (the first boot after upgrade is small — #52 moved
-//! the legacy root aside — but a lost marker, a restored data root or a
-//! recreated `trawl` database re-arms it over the whole standing corpus):
-//! the scan is deliberately **metadata-only unless a column still needs a
-//! pin vote**. Describing a file reads its footer; counting a column reads
-//! the column. Only UNPINNED fields vote (`most_rows_wins` ignores the
-//! pinned ones), so pins are loaded BEFORE the scan and the count query is
-//! narrowed to the voting columns — and skipped entirely for a file whose
-//! every field is already pinned. A re-arm against a catalog that already
-//! pins the corpus (the common one: the data and the catalog were always a
-//! pair) therefore costs one footer read per file, not one corpus read.
-//! Both phases emit a `catalog_conform_progress` heartbeat so a long pass
-//! is visibly working rather than indistinguishable from a hang, and every
-//! rewrite is durable on its own, so a boot killed by a supervisor's start
-//! timeout leaves the corpus strictly closer to conformant than it found it.
+//! Cost matters, because the pass sits in front of HTTP serving and a lost
+//! marker, a restored data root or a recreated `trawl` database re-arms it
+//! over a corpus of any age: the scan is metadata-only unless a column still
+//! needs a pin vote. Describing a file reads its footer; counting a column
+//! reads the column. Only unpinned fields vote (`most_rows_wins` ignores the
+//! pinned ones), so pins are loaded before the scan, the count query is
+//! narrowed to the voting columns, and a file whose every field is already
+//! pinned skips it entirely. A re-arm against a catalog that already pins the
+//! corpus (the common case: the data and the catalog were always a pair)
+//! therefore costs one footer read per file, not one corpus read. Both phases
+//! emit a `catalog_conform_progress` heartbeat so a long pass is visibly
+//! working rather than indistinguishable from a hang, and every rewrite is
+//! durable on its own, so a boot killed by a supervisor's start timeout
+//! leaves the corpus strictly closer to conformant than it found it.
 //!
 //! Per-path failures are isolated, never boot-fatal: a truncated, bit-rotted
-//! or foreign `.parquet` under the data root — or a whole subdirectory the
-//! walk cannot enumerate — is skipped with a warning and a
-//! `trawl_catalog_conform_skipped_total` bump, exactly like the rollup path
-//! sniffs and sets aside unreadable inputs rather than wedging. Nothing is
-//! moved or deleted (an operator's stray file is theirs), and because the
-//! corpus was then NOT proven conformant, completion is deliberately not
-//! published — the next boot re-runs the pass, so a transient read failure
-//! self-heals and a permanent one keeps warning.
+//! or foreign `.parquet` under the data root, or a whole subdirectory the
+//! walk cannot enumerate, is skipped with a warning and a
+//! `trawl_catalog_conform_skipped_total` bump, as the rollup path sets aside
+//! unreadable inputs rather than wedging. Nothing is moved or deleted (an
+//! operator's stray file is theirs), and since the corpus is then not proven
+//! conformant, completion is not published: the next boot re-runs the pass,
+//! so a transient read failure self-heals and a permanent one keeps warning.
 //!
-//! "Foreign" is decided by the PATH, before the file is ever read
-//! ([`layout_path`]): the pass rewrites a standing file IN PLACE, lossily
+//! "Foreign" is decided by the path, before the file is ever read
+//! ([`layout_path`]): the pass rewrites a standing file in place, lossily
 //! (every value the `TRY_CAST` cannot read becomes NULL) and irreversibly
-//! (the source is the destination — there is no backup, no dry-run, and no
-//! operator opt-in), so it may only ever touch files trawl itself wrote.
-//! That means a path that reads back as `{env}/{date}[/{HH}]/{service}.parquet`
-//! with every component passing the injective ingest predicates. A parquet an
-//! operator dropped anywhere else under the data root is skipped exactly like
-//! an unreadable one — same warning, same counter, same withheld completion —
+//! (the source is the destination, with no backup, no dry-run and no operator
+//! opt-in), so it may only ever touch files trawl itself wrote. That means a
+//! path that reads back as `{env}/{date}[/{HH}]/{service}.parquet` with every
+//! component passing the injective ingest predicates. A parquet an operator
+//! dropped anywhere else under the data root is skipped exactly like an
+//! unreadable one (same warning, same counter, same withheld completion),
 //! because "readable" is not "mine", and silently rewriting someone else's
-//! file would be the destructive surprise [`skip_file`] exists to refuse.
+//! file is the destructive surprise [`skip_file`] exists to refuse.
 //!
-//! The pass also BACKFILLS `field_services` from the files it adopted. Those
+//! The pass also backfills `field_services` from the files it adopted. Those
 //! rows are the authority behind `?service=` and the `last_seen` window on
-//! the schema surfaces, and until this they were written only by live
-//! compaction — so on an upgrade the migration created the table empty and a
-//! service whose data all predates the catalog answered `?service=` with
-//! nothing while its pins sat outside every window forever. The backfill is
-//! idempotent (the pass re-runs until the corpus is proven conformant) and
-//! stamped from each file's partition directory, never `now()`.
+//! the schema surfaces, and live compaction only ever observes what it
+//! writes, so without the backfill a service whose data is all standing
+//! parquet answers `?service=` with nothing while its pins sit outside every
+//! window forever. The backfill is idempotent (the pass re-runs until the
+//! corpus is proven conformant) and stamped from each file's partition
+//! directory, never `now()`.
 //!
-//! This machinery is deliberately the embryo of the repin rewriter (#53).
+//! The repin engine reuses this machinery: `layout_path`, `Progress` and
+//! `open_bounded_connection`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -207,26 +205,25 @@ pub enum ArchiveIdentity {
 ///
 /// An ingest-enabled node earns that proof by running the pass above. A
 /// query-only node deliberately does not (it owns nothing under the data
-/// root), yet it still serves `/api/v1/schema` — and since ADR-0009 slice 3
-/// that answer is the catalog's pins, not a `DESCRIBE`. Pins from an
-/// unrelated catalog describe unrelated columns: point a query-only trawld
-/// at a shared or read-only archive with a fresh `trawl` database and
-/// `/schema` advertises the seeded envelope while queries read entirely
-/// different physical columns. So the same dual-sided marker that lets the
-/// pass skip itself is checked here as a gate.
+/// root), yet it still serves `/api/v1/schema`, whose answer is the catalog's
+/// pins rather than a `DESCRIBE`. Pins from an unrelated catalog describe
+/// unrelated columns: point a query-only trawld at a shared or read-only
+/// archive with a fresh `trawl` database and `/schema` advertises the seeded
+/// envelope while queries read entirely different physical columns. So the
+/// same dual-sided marker that lets the pass skip itself is checked here as
+/// a gate.
 ///
-/// The refusal is deliberately narrow: only a marker naming ANOTHER catalog
+/// The refusal is deliberately narrow: only a marker naming another catalog
 /// is fatal, because only that is positive proof of the wrong pairing. A
-/// MISSING marker is not proof of anything — and it is an ordinary state,
-/// since [`publish_completion`] withholds the marker whenever the pass
-/// skipped a path (`catalog_conform_incomplete`; an operator's export
-/// subtree under the data root is enough), warns, and serves. Refusing the
-/// boot for that same corpus would make "disable ingest and restart to
-/// investigate" a startup failure curable only by re-enabling ingest, and
-/// would answer identical state with warn-and-serve on one node and
-/// fail-closed on the other. So an unmarked archive returns
-/// [`ArchiveIdentity::Unproven`] and the caller warns, exactly as the ingest
-/// node does.
+/// missing marker proves nothing, and it is an ordinary state, since
+/// [`publish_completion`] withholds the marker whenever the pass skipped a
+/// path (`catalog_conform_incomplete`; an operator's export subtree under the
+/// data root is enough), warns, and serves. Refusing the boot for that same
+/// corpus would make "disable ingest and restart to investigate" a startup
+/// failure curable only by re-enabling ingest, and would answer identical
+/// state with warn-and-serve on one node and fail-closed on the other. So an
+/// unmarked archive returns [`ArchiveIdentity::Unproven`] and the caller
+/// warns, exactly as the ingest node does.
 ///
 /// Only the unproven path walks the tree, so a matching marker costs one
 /// `read_to_string`.
@@ -262,7 +259,7 @@ pub async fn verify_archive_identity(
 /// Whether the data root positively holds no parquet — the only state in
 /// which an unprovable identity is provably harmless.
 ///
-/// A walk failure is NOT emptiness: the subtree it could not enumerate may
+/// A walk failure is not emptiness: the subtree it could not enumerate may
 /// hold the whole corpus, so it reads as standing data. That is conservative
 /// where it matters (a foreign marker still refuses) and costs nothing where
 /// it does not (an unmarked archive warns either way).
@@ -300,12 +297,11 @@ pub async fn ensure_conformance(
         .is_conformed()
         .await
         .map_err(|e| format!("failed to read conformance state: {e}"))?;
-    // The observation backfill has its OWN flag, and both must be set to
-    // skip the pass. `conformed_at` alone would make the backfill inert on
-    // exactly the installs it was written for: a node that conformed under
-    // the previous slice carries the marker and `conformed_at`, so the pass
-    // would return here — leaving `field_services` empty forever for every
-    // service whose data is standing parquet no live batch re-sends.
+    // The observation backfill has its own flag, and both must be set to
+    // skip the pass. Gating on `conformed_at` alone would leave a corpus
+    // that conformed before its observations were taken with an empty
+    // `field_services` forever, for every service whose data is standing
+    // parquet no live batch re-sends.
     let backfilled = store
         .services_backfilled()
         .await
@@ -332,7 +328,7 @@ pub async fn ensure_conformance(
          the observation backfill existed)"
     );
 
-    // Pins BEFORE the scan, not after: they are what makes the scan cheap.
+    // Pins before the scan, not after: they are what makes the scan cheap.
     // An already-pinned field never votes, so its column is never counted —
     // and a file with no unpinned field is described from its footer alone.
     let existing: HashMap<String, CanonicalType> = store
@@ -353,9 +349,9 @@ pub async fn ensure_conformance(
     };
 
     // Seed pins: declared fields came with the migration; custom fields by
-    // most-rows-wins across files — rows CARRYING the field, not the files'
+    // most-rows-wins across files — rows carrying the field, not the files'
     // row counts — ties by ladder order.
-    // Unrationed: these proposals describe columns that are ALREADY on
+    // Unrationed: these proposals describe columns that are already on
     // disk, and phase B rewrites whatever stays unpinned out of the files
     // carrying it. The ingest path's half-the-free-slots ration exists to
     // stop a burst from claiming the catalog; applying it here would only
@@ -387,9 +383,9 @@ pub async fn ensure_conformance(
 
     record_boot_conflicts(store, &conflicts).await;
 
-    // NOT best-effort, unlike the conflict evidence: `field_services` is the
+    // Not best-effort, unlike the conflict evidence: `field_services` is the
     // authority behind `?service=` and the `last_seen` window, and this pass
-    // is the ONLY thing that will ever observe a corpus no live batch
+    // is the only thing that will ever observe a corpus no live batch
     // re-sends. Dropping it with a warning would publish the marker over a
     // permanent gap; failing the boot leaves the pass armed for the retry.
     let observed = observations.len();
@@ -424,7 +420,7 @@ pub async fn ensure_conformance(
     })
 }
 
-/// Publish completion LAST: postgres side, then the marker file — and only
+/// Publish completion last: postgres side, then the marker file — and only
 /// when every file was accounted for. Skipped files mean the corpus is not
 /// proven conformant, so the identity stays unpublished and the next boot
 /// re-runs the pass rather than declaring victory forever.
@@ -465,7 +461,7 @@ async fn publish_completion(
 
 /// Isolate one bad path: warn, count, leave it exactly where it is.
 ///
-/// Deliberately not the rollup's quarantine-rename — the rollup MUST move a
+/// Deliberately not the rollup's quarantine-rename — the rollup must move a
 /// corrupt input aside or it re-reads it forever, whereas the boot pass just
 /// declines to touch what it cannot read. Renaming an operator's file at boot
 /// would be a destructive surprise on a path (foreign parquet dropped into
@@ -594,7 +590,7 @@ fn scan_corpus(
 
     let mut out = Vec::with_capacity(files.len());
     for (path, _) in files {
-        // The layout gate comes FIRST, before the file is opened: everything
+        // The layout gate comes first, before the file is opened: everything
         // downstream of the scan may rewrite the file in place, so a path
         // trawl did not write is set aside here, unread and untouched.
         let Some(layout) = layout_path(data_dir, &path) else {
@@ -632,7 +628,7 @@ pub(crate) struct LayoutPath {
 
 /// Read `path` back as trawl's own storage layout — `{env}/{date}/{HH}/
 /// {service}.parquet`, or `{env}/{date}/{service}.parquet` for a daily
-/// rollup — relative to the data root. `None` = foreign, i.e. NOT ours.
+/// rollup — relative to the data root. `None` = foreign, i.e. not ours.
 ///
 /// This is the whole safety gate on an in-place, lossy, irreversible rewrite,
 /// so it is deliberately the strict inverse of the write path rather than a
@@ -644,7 +640,7 @@ pub(crate) struct LayoutPath {
 ///
 /// The boundary it can draw is "a path the writer could have produced", not
 /// provenance: a file planted at an exactly-valid layout path is ours as far
-/// as anything here can tell. Deliberately NOT tightened with the configured
+/// as anything here can tell. Deliberately not tightened with the configured
 /// `[ingest] envs` allowlist — an env retired from the config still has a
 /// standing corpus that queries read and the invariant must therefore cover.
 ///
@@ -709,7 +705,7 @@ fn scan_file(
     // for the same reason `schema_refresh` uses it: a poisoned footer must
     // be a catchable error, never a `SIGSEGV` inside `DuckDB`'s
     // `parquet_metadata()`. A file `DuckDB` just described but this reader
-    // cannot is NOT a skip — the pass proves type conformance, and a missing
+    // cannot is not a skip — the pass proves type conformance, and a missing
     // row count costs only an observation's weight.
     let rows = trawl_engine::parquet_stats::read_file_stats(&path).map_or_else(
         |e| {
@@ -765,7 +761,7 @@ fn voting_columns(schema: &[ColInfo], pinned: &HashMap<String, CanonicalType>) -
 /// Counted in passes of at most [`AGG_CHUNK_COLS`] columns, for the same
 /// reason the pin ladder is chunked: the width is client-chosen, one
 /// aggregate per column over the full width degrades quadratically, and on a
-/// first boot (or a re-arm against an empty catalog) EVERY column votes —
+/// first boot (or a re-arm against an empty catalog) every column votes —
 /// per file, in front of HTTP serving, where a slow pass is indistinguishable
 /// from a hang to a supervisor start timeout.
 fn count_non_null(
@@ -804,9 +800,9 @@ fn count_non_null(
 ///
 /// The value-level candidate ladder needs the actual values; the boot pass
 /// works from schemas + row counts, so the two data-dependent lattice rows
-/// resolve conservatively: an out-of-range integer column proposes DOUBLE
-/// (always representable, never nulls) and an opaque JSON column (the old
-/// ten-column fallback wrote these) proposes VARCHAR (honest text).
+/// resolve conservatively: an out-of-range integer column proposes `DOUBLE`
+/// (always representable, never nulls) and an opaque `JSON` column proposes
+/// `VARCHAR` (honest text).
 fn boot_candidate(dtype: &str) -> CanonicalType {
     match normalize_duckdb_type(dtype) {
         TypeResolution::Pin(t) => t,
@@ -829,13 +825,13 @@ fn ladder_rank(ty: CanonicalType) -> usize {
 /// say over a fully populated column in a smaller one. Since the losers get
 /// `TRY_CAST` to the winner's pin, a misweighted vote is a data loss.
 ///
-/// Votes are grouped by the ASCII-case-FOLDED name and the proposal carries
-/// the folded spelling: the catalog holds folded names only (ingest folds
-/// at canonicalization), while parquet written before the fold shipped can
-/// carry mixed-case column names — `Dur` in one file and `dur` in another
-/// are one `DuckDB` column and must be one pin, decided by most-rows-wins
-/// within the folded group. The rewrite then renames such columns to the
-/// folded form ([`crate::ingest::compaction::ConformPlan`]).
+/// Votes are grouped by the ASCII-folded name and the proposal carries the
+/// folded spelling: the catalog holds folded names only (ingest folds at
+/// canonicalization), while standing parquet can carry mixed-case column
+/// names. `Dur` in one file and `dur` in another are one `DuckDB` column and
+/// must be one pin, decided by most-rows-wins within the folded group. The
+/// rewrite then renames such columns to the folded form
+/// ([`crate::ingest::compaction::ConformPlan`]).
 fn most_rows_wins(
     scan: &[FileScan],
     existing: &HashMap<String, CanonicalType>,
@@ -878,7 +874,7 @@ fn most_rows_wins(
 /// row per `(field, service)` pair — the input to
 /// [`CatalogStore::backfill_services`].
 ///
-/// Only PINNED fields are observed, which is exactly the post-rewrite column
+/// Only pinned fields are observed, which is exactly the post-rewrite column
 /// set: phase B drops every unpinned column from the files carrying it, and
 /// `field_services`'s field axis is bounded by the pin cap precisely because
 /// an unpinned field is never observed.
@@ -890,8 +886,8 @@ fn most_rows_wins(
 /// own row count — the same quantity compaction accumulates per batch, since
 /// a file is the sum of the batches that built it.
 ///
-/// Names are ASCII-folded and de-duplicated per file: a pre-fold corpus can
-/// carry `Dur` and `dur` as separate physical columns of ONE catalog field,
+/// Names are ASCII-folded and de-duplicated per file: standing parquet can
+/// carry `Dur` and `dur` as separate physical columns of one catalog field,
 /// and counting the file twice for it would inflate the weight.
 fn corpus_observations(
     scan: &[FileScan],
@@ -1000,7 +996,7 @@ fn rewrite_file(
     // Tally the nulled rows before rewriting: the rewrite destroys the
     // pre-cast values this evidence is drawn from.
     let conflicts = plan.tally_conflicts(conn, &source, &file.service)?;
-    // A guard-only plan that nulled nothing is the identity over THIS file:
+    // A guard-only plan that nulled nothing is the identity over this file:
     // the columns already are their pins' physical types and every value is
     // inside the pin's domain. Skipping it is what keeps the pass rewriting
     // the nonconformant files rather than the whole archive — `_severity` is
@@ -1025,13 +1021,13 @@ fn rewrite_file(
     ))
     .map_err(|e| format!("conform rewrite failed: {e}"))?;
     // Unlike every other staged rename in the tree, this one has no backing
-    // copy: the source IS the destination, and once the rename lands the
+    // copy: the source is the destination, and once the rename lands the
     // pre-conform file is gone. Compaction's `.tmp` is covered by the retained
     // WAL and the rollup keeps its hourlies until after the rename; here a
     // crash between the rename and writeback would leave a truncated parquet
     // where an hour (or a day) of logs used to be — and the next boot would
     // not retry, because a successful pass publishes the marker. So fsync the
-    // staged file BEFORE the rename, and unlike `publish_marker`'s best-effort
+    // staged file before the rename, and unlike `publish_marker`'s best-effort
     // directory sync this one is fatal: failing the file is a skip (the
     // original stays, the pass withholds completion, the next boot re-runs),
     // which is strictly better than publishing data that may not be there.
@@ -1241,8 +1237,8 @@ mod tests {
         );
     }
 
-    /// A pre-fold corpus can carry `Dur` and `dur` as separate physical
-    /// columns of ONE catalog field: that is one observation counted once,
+    /// Standing parquet can carry `Dur` and `dur` as separate physical
+    /// columns of one catalog field: that is one observation counted once,
     /// not the file's rows charged twice.
     #[test]
     fn case_variant_columns_are_one_observation() {

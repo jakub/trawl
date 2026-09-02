@@ -23,8 +23,8 @@ use crate::store::{FinishOutcome, FlipOutcome, RunStatus, ScheduleStore};
 
 /// Spawn the scheduler background task.
 ///
-/// Returns a join handle and shutdown sender. Dropping the sender or
-/// sending `true` signals the task to exit.
+/// The task exits on the first change to `shutdown_rx`, or when its sender
+/// is dropped; the value itself is never read.
 pub fn spawn_scheduler(
     schedule_store: ScheduleStore,
     key_store: KeyStore,
@@ -143,7 +143,6 @@ async fn poll_and_execute(
     };
 
     for (schedule, saved_query) in schedules {
-        // Check if enough time has passed since last run.
         let should_run = match schedule_store.latest_run(schedule.id).await {
             Ok(Some(last)) => {
                 let elapsed = chrono::Utc::now()
@@ -168,7 +167,7 @@ async fn poll_and_execute(
             continue;
         }
 
-        // Gate on key liveness in the fleet keystore (AC6).
+        // Gate on key liveness in the fleet keystore.
         if !owning_key_is_usable(key_store, schedule.id, schedule.key_id).await {
             continue;
         }
@@ -222,15 +221,15 @@ async fn poll_and_execute(
     }
 }
 
-/// Whether the schedule's owning key may still run scheduled queries: it
-/// must be live in the fleet keystore (active + unexpired) AND hold a trawl
-/// grant whose role still carries both [`Permission::Query`] and
-/// [`Permission::SavedQuery`] — the two authorities a scheduled saved-query
-/// run exercises. Revocation, expiry, grant-stripping, AND role downgrades
-/// (analyst → reader/ingest) all stop scheduled execution (AC6): a role that
-/// lacks either permission can no longer create or run saved queries
-/// interactively, so it must not keep running them on a schedule. Lookup
-/// failures skip conservatively.
+/// Whether the schedule's owning key may still run scheduled queries.
+///
+/// It must be live in the fleet keystore (active and unexpired) and its
+/// roles must still resolve both [`Permission::Query`] and
+/// [`Permission::SavedQuery`], the two authorities a scheduled saved-query
+/// run exercises. Revocation, expiry and role changes (analyst to
+/// reader/ingest) therefore all stop scheduled execution: a key that
+/// cannot create or run saved queries interactively must not keep running
+/// them on a schedule. Lookup failures skip conservatively.
 async fn owning_key_is_usable(key_store: &KeyStore, schedule_id: i64, key_id: i64) -> bool {
     let live = match key_store.get_live_key_by_id(key_id).await {
         Ok(live) => live,
@@ -308,7 +307,6 @@ pub(crate) async fn execute_scheduled_query(
             );
         }
         Err(e) => {
-            // Check if it was a timeout (ServerError::Timeout) or other error.
             let (status, error_msg) = if matches!(e, crate::error::ServerError::Timeout) {
                 (RunStatus::Timeout, format!("{e}"))
             } else {
@@ -396,11 +394,11 @@ pub(crate) async fn finish_run_or_recover(
             }
         }
         Err(e) => {
-            // A transient app-state DB error (pg restart/failover). This is an
-            // AMBIGUOUS COMMIT: for a single autocommit UPDATE the COMMIT can
+            // A transient app-state DB error (pg restart/failover) is an
+            // ambiguous commit: for a single autocommit UPDATE the COMMIT can
             // land server-side while the client's ack is lost, so sqlx returns
             // Err even though the row was written to status='success' with
-            // result_path set. We therefore must NOT delete the parquet here —
+            // result_path set. So the parquet must not be deleted here —
             // recovery flips the row only while it is still 'running'.
             tracing::error!(
                 event_type = "scheduler_error",
@@ -426,10 +424,11 @@ pub(crate) async fn finish_run_or_recover(
 /// disk, without ever destroying a success that actually committed.
 ///
 /// Guarded state transition: flip the row to `error` only while it is still
-/// `running`. If the success COMMIT actually landed (status is already
-/// `success`), the flip matches zero rows and we preserve the committed result
-/// instead of unlinking the file it points at. If the DB is still down the flip
-/// also fails and boot-time `cleanup_stale_runs` is the backstop.
+/// `running`. If the success commit actually landed (status is already
+/// `success`), the flip matches zero rows and the committed result is
+/// preserved rather than unlinking the file it points at. If the DB is still
+/// down the flip also fails and boot-time `cleanup_stale_runs` is the
+/// backstop.
 ///
 /// Owns the unlink-vs-preserve decision for the recovery outcome:
 /// - [`FlipOutcome::FlippedToError`] — the success never committed (row was
@@ -519,7 +518,6 @@ fn write_result_parquet(
     let full_path = format!("{base}/{relative}");
     let temp_path = format!("{full_path}.tmp");
 
-    // Ensure the parent directory exists.
     if let Err(e) = std::fs::create_dir_all(format!("{base}/scheduled/{query_name}")) {
         tracing::warn!(
             event_type = "scheduler_parquet_error",
@@ -530,7 +528,6 @@ fn write_result_parquet(
         return zstd_fallback(result);
     }
 
-    // Create a temporary executor for the parquet write.
     let executor = match trawl_engine::executor::Executor::new() {
         Ok(e) => e,
         Err(e) => {
@@ -626,7 +623,7 @@ mod pg_tests {
         std::path::Path::new(&format!("{base_dir}/{rel}")).exists()
     }
 
-    /// `finish_run` Ok(true): the committed result's file is preserved.
+    /// `finish_run` → `Persisted`: the committed result's file is preserved.
     #[sqlx::test]
     async fn finish_run_or_recover_keeps_file_on_committed_success(pool: PgPool) {
         let (store, _saved, rid) = seed_run(&pool, "kept").await;
@@ -643,8 +640,8 @@ mod pg_tests {
         assert_eq!(run.result_path.as_deref(), Some(rel));
     }
 
-    /// `finish_run` Ok(false): a run cascade-deleted mid-flight orphans the
-    /// file we just wrote, so the wiring must unlink it.
+    /// `finish_run` → `RunDeleted`: a run cascade-deleted mid-flight orphans
+    /// the file just written, so the wiring must unlink it.
     #[sqlx::test]
     async fn finish_run_or_recover_unlinks_orphan_after_cascade_delete(pool: PgPool) {
         let saved_store = SavedQueryStore::new(pool.clone());
@@ -665,8 +662,9 @@ mod pg_tests {
         );
     }
 
-    /// Recovery `fail_run_if_running` Ok(true): the success never committed
-    /// (row still `running`), so the parquet is orphaned and must be unlinked.
+    /// Recovery `fail_run_if_running` → `FlippedToError`: the success never
+    /// committed (row still `running`), so the parquet is orphaned and must
+    /// be unlinked.
     #[sqlx::test]
     async fn recover_ambiguous_finish_unlinks_when_run_still_running(pool: PgPool) {
         let (store, _saved, rid) = seed_run(&pool, "wedged").await;
@@ -687,8 +685,9 @@ mod pg_tests {
         assert_eq!(run.result_path, None);
     }
 
-    /// Recovery `fail_run_if_running` Ok(false): the ambiguous success already
-    /// committed, so the guard matches zero rows and the live file is preserved.
+    /// Recovery `fail_run_if_running` → `NotRunning`: the ambiguous success
+    /// already committed, so the guard matches zero rows and the live file is
+    /// preserved.
     #[sqlx::test]
     async fn recover_ambiguous_finish_preserves_committed_success(pool: PgPool) {
         let (store, _saved, rid) = seed_run(&pool, "committed").await;

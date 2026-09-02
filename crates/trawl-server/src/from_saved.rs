@@ -22,14 +22,14 @@ pub(crate) struct ResolvedFromSaved {
     /// The DSL string with the `from saved` stage stripped, suitable for
     /// re-parse + execution against the resolved source.
     pub remaining_dsl: String,
-    /// The saved query's OWN DSL — the text whose run produced the parquet
+    /// The saved query's own DSL — the text whose run produced the parquet
     /// this query reads.
     ///
-    /// Carried for the incomplete-results notice (ADR-0011 slice C1): the
-    /// stored results were computed from fields the saved query bound, so a
-    /// degraded pin among them is exactly as much a completeness caveat as
-    /// one in the stages the caller typed. Nothing stamps report runs at
-    /// write time, so the walk happens here, over both texts.
+    /// Carried for the incomplete-results notice (ADR-0011): the stored
+    /// results were computed from fields the saved query bound, so a
+    /// degraded pin among them is as much a completeness caveat as one in
+    /// the stages the caller typed. Nothing stamps report runs at write
+    /// time, so the walk happens here, over both texts.
     pub saved_dsl: String,
 }
 
@@ -48,13 +48,11 @@ pub(crate) async fn resolve(
     key_id: i64,
     data_dir: &str,
 ) -> Result<ResolvedFromSaved, ServerError> {
-    // Look up the saved query by name (user-scoped).
     let saved = saved_store
         .get_by_name(key_id, &stage.name)
         .await?
         .ok_or_else(|| ServerError::NotFound(format!("saved query '{}' not found", stage.name)))?;
 
-    // Resolve the run selector to a DuckDB source expression.
     let source = match stage.run {
         SavedRunSelector::Latest => resolve_latest(schedule_store, saved.id, data_dir).await?,
         SavedRunSelector::Specific(run_id) => {
@@ -63,10 +61,9 @@ pub(crate) async fn resolve(
         SavedRunSelector::All => resolve_all(schedule_store, saved.id, data_dir).await?,
     };
 
-    // Strip the `from saved` stage from the original DSL. Everything
-    // after the stage's span end is the remaining pipeline (e.g.
-    // " | stats count() by host"). Prepend "* " to form a valid query
-    // with an empty search stage so the remaining pipes are re-parsed.
+    // Everything after the stage's span end is the remaining pipeline (e.g.
+    // " | stats count() by host"). Prepend "*" to form a valid query with an
+    // empty search stage so the remaining pipes are re-parsed.
     let remaining = &original_dsl[stage_span_end..];
     let remaining_dsl = if remaining.trim().is_empty() {
         "*".to_string()
@@ -136,11 +133,11 @@ async fn resolve_all(
         ));
     }
 
-    // Build a UNION ALL BY NAME subquery that injects _run_id and _run_time.
     let mut parts = Vec::with_capacity(runs.len());
     for run in &runs {
         let Some(ref result_path) = run.result_path else {
-            // Skip legacy runs without parquet files.
+            // The store already filters `result_path IS NOT NULL`; this arm
+            // only unwraps the Option.
             continue;
         };
         let source = parquet_source(data_dir, result_path);
@@ -202,12 +199,13 @@ mod tests {
     }
 }
 
-/// Store-backed coverage for the run-selector resolution path (ADR-0004
-/// slice 3 ported it to the async pg stores). These exercise the branch
-/// logic against a real `#[sqlx::test]` database and, for `run=all`, run the
-/// emitted UNION subquery through `DuckDB` so the `TIMESTAMP '<offset>'`
-/// synthetic-column literal is proven to parse (guarding the offset-literal
-/// contract the pg `started_at` round-trip depends on).
+/// Store-backed coverage for the run-selector resolution path.
+///
+/// These exercise the branch logic against a real `#[sqlx::test]` database
+/// and, for `run=all`, run the emitted UNION subquery through `DuckDB` so
+/// the `TIMESTAMP '<offset>'` synthetic-column literal is proven to parse
+/// (guarding the offset-literal contract the pg `started_at` round-trip
+/// depends on).
 #[cfg(test)]
 mod pg_tests {
     use sqlx::PgPool;
@@ -540,9 +538,9 @@ mod pg_tests {
         assert_eq!(remaining_dsl, "*");
     }
 
-    /// The saved query's OWN text rides out of the resolve, because the
+    /// The saved query's own text rides out of the resolve, because the
     /// incomplete-results notice is stamped over both halves of what the
-    /// caller reads: the stages they typed AND the query whose recorded run
+    /// caller reads: the stages they typed, and the query whose recorded run
     /// produced the rows underneath them. Nothing stamps a report run at
     /// write time, so this is the only place those fields are still known.
     #[sqlx::test]

@@ -5,7 +5,7 @@
 //! UDP syslog listener.
 //!
 //! Binds a UDP socket and receives syslog datagrams. Each datagram is
-//! parsed, canonicalized through the ONE door under the `syslog` profile
+//! parsed, canonicalized through the one door under the `syslog` profile
 //! ([`convert::SyslogDoor::admit`]), and sent to the batcher.
 
 use std::sync::Arc;
@@ -57,7 +57,6 @@ pub async fn run_udp_listener(
                 let (len, src_addr) = result?;
                 let source_ip = super::canonical_peer(src_addr.ip());
 
-                // Check CIDR allowlist
                 if !super::is_allowed(&cidrs, source_ip) {
                     tracing::trace!(
                         event_type = "syslog_udp_rejected",
@@ -67,7 +66,6 @@ pub async fn run_udp_listener(
                     continue;
                 }
 
-                // Parse the raw datagram as UTF-8 syslog
                 let Ok(raw) = std::str::from_utf8(&buf[..len]) else {
                     metrics::counter!(crate::metrics::SYSLOG_PARSE_ERRORS_TOTAL, "transport" => "udp")
                         .increment(1);
@@ -84,8 +82,8 @@ pub async fn run_udp_listener(
 
                 // The one door: parse, then canonicalize under the syslog
                 // profile. A refusal is counted as a profile reject (a
-                // server bug — there is nobody to reject a datagram TO)
-                // and the frame is dropped.
+                // server bug: there is nobody to reject a datagram to) and
+                // the frame is dropped.
                 let Some(event) = door.admit(
                     raw,
                     source_ip,

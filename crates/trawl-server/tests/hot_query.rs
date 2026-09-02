@@ -18,7 +18,6 @@ use trawl_server::hot_buffer::{HotBuffer, HotBufferConfig};
 use trawl_server::ingest::wal::WalWriter;
 use trawl_server::pool::ExecutorPool;
 
-/// Build a JSON event map with the given fields.
 fn make_event(service: &str, message: &str) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("_time".into(), json!("2026-02-15T12:00:00Z"));
@@ -29,7 +28,6 @@ fn make_event(service: &str, message: &str) -> Map<String, Value> {
     m
 }
 
-/// Serialize events to ndjson bytes (for WAL writes).
 fn events_to_ndjson(events: &[Map<String, Value>]) -> Vec<u8> {
     let mut buf = Vec::new();
     for e in events {
@@ -54,7 +52,6 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         max_bytes: 10_000_000,
     }));
 
-    // Create executor pool pointing at our temp data dir.
     let pool = ExecutorPool::new(
         data_dir.to_str().unwrap().to_owned(),
         1,    // single executor for test
@@ -124,14 +121,12 @@ async fn hot_buffer_makes_events_immediately_queryable() {
     .await
     .expect("compaction should succeed");
 
-    // Verify hot buffer was drained.
     assert_eq!(
         hot_buffer.event_count(),
         0,
         "hot buffer should be empty after compaction"
     );
 
-    // Verify WAL file was deleted.
     assert!(
         !wal_path.exists(),
         "WAL file should be deleted after compaction"
@@ -249,11 +244,11 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     );
 }
 
-/// Hot/cold agreement through the REAL pin plumbing: a compaction tick
+/// Hot/cold agreement through the real pin plumbing: a compaction tick
 /// with the catalog wired seeds the pin, a later conflicting event sits in
 /// a `HotBuffer` sharing the same `FieldCatalog`, and the query returns
-/// every cold row with the hot value nulled — proving the pins flow
-/// buffer → snapshot → pool → emitter without any test-side shortcut.
+/// every cold row with the hot value nulled, so the pins travel buffer to
+/// snapshot to pool to emitter without a test-side shortcut.
 #[sqlx::test]
 async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) {
     use trawl_server::catalog::{CatalogContext, FieldCatalog};
@@ -362,24 +357,19 @@ async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) 
     );
 }
 
-// NOTE: the former `hot_case_variant_of_a_pinned_cold_field_does_not_throw_
-// the_union` test is deliberately gone with the `FieldCatalog::intersect`
-// case-variant defence it exercised: every producer ASCII-folds field names
-// at its own door BEFORE anything reaches the pipeline — HTTP ingest in
-// `envelope::canonicalize`, the syslog listener at SD-key construction
-// (`syslog::convert`), and telemetry in its `JsonVisitor` — so a hot buffer
-// carrying a mixed-case spelling of a pinned field cannot be produced by
-// the wired system. The end-to-end proofs are
+// NOTE: there is deliberately no hot-buffer case-variant test here. Every
+// producer enters `envelope::canonicalize`, the one door that ASCII-folds
+// field names, so a hot buffer carrying a mixed-case spelling of a pinned
+// field cannot be produced by the wired system. The end-to-end proofs are
 // `case_variant_field_names_fold_to_one_column_across_services` in
 // tests/field_catalog.rs and `syslog_mixed_case_sd_param_lands_folded_and_
 // pins_folded` below.
 
-/// The syslog producer routes through `envelope::canonicalize` now
-/// (ADR-0013 slice 2), so its fold is the DOOR's universal one rather
-/// than a listener-local rule at SD-key construction. This proves the
-/// whole journey is unchanged by that move: a mixed-case RFC 5424 SD
-/// param reaches the hot buffer folded, and compaction pins it under the
-/// folded name.
+/// The syslog producer routes through `envelope::canonicalize`, so it
+/// inherits that door's fold instead of carrying a listener-local one at
+/// SD-key construction (ADR-0013). The whole journey: a mixed-case RFC
+/// 5424 SD param reaches the hot buffer folded, and compaction pins it
+/// under the folded name.
 #[sqlx::test]
 async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgPool) {
     use indexmap::IndexMap;
@@ -483,7 +473,6 @@ async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgP
 
 #[tokio::test]
 async fn query_works_without_hot_buffer() {
-    // Verify the query path still works when no hot buffer is configured.
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let wal_dir = tmp.path().join("wal");
     let data_dir = tmp.path().join("data");
@@ -536,14 +525,12 @@ async fn query_works_without_hot_buffer() {
 
 #[tokio::test]
 async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours() {
-    // Issue #73, end to end through the real plumbing (compute_source → pool
-    // → executor): one service's data in one hour partition, sibling hour
-    // directories owned by ANOTHER service, and no hot buffer to paper over
-    // it. The planner used to emit `.../{HH}/nginx.parquet` for every hour
-    // directory that existed — including the five nginx never wrote to — and
-    // DuckDB rejects a list source wholesale when ONE element matches
-    // nothing, so `service=nginx last=6h` answered 200 with zero rows on an
-    // install whose only crime was running two services.
+    // End to end through the real plumbing (compute_source, pool,
+    // executor): one service's data in one hour partition, sibling hour
+    // directories owned by another service, and no hot buffer to paper over
+    // it. DuckDB rejects a list source wholesale when a single element
+    // matches nothing, so an hour directory in range that holds no nginx
+    // file must be resolved away before the read.
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let wal_dir = tmp.path().join("wal");
     let data_dir = tmp.path().join("data");
@@ -614,12 +601,11 @@ async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours(
     );
 }
 
-/// Slice A′ end to end: pinned `| where`/`| let` through the REAL query
-/// plumbing — catalog → pool → emitter — over the hot buffer, then over
-/// parquet after compaction, plus the SSE plan lane over the same events
-/// with the same single snapshot the handler feeds it. The scope shapes
-/// ride along: a rename remaps the pin, a bare-alias let copies it, a
-/// computed let kills it.
+/// Pinned `| where`/`| let` end to end through the real query plumbing
+/// (catalog, pool, emitter): over the hot buffer, then over parquet after
+/// compaction, plus the SSE plan lane over the same events with the single
+/// snapshot the handler feeds it. The scope shapes ride along: a rename
+/// remaps the pin, a bare-alias let copies it, a computed let kills it.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one linear end-to-end narrative
 async fn pinned_where_let_hot_cold_and_stream_agree() {
@@ -634,8 +620,8 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
     std::fs::create_dir_all(&wal_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // The envelope seed pins VARCHAR day-one; here the pin is seeded
-    // directly into the in-process cache the pool and the stream read.
+    // A VARCHAR pin, seeded straight into the in-process cache the pool
+    // and the stream both read.
     let catalog = Arc::new(FieldCatalog::new());
     catalog.merge([(
         "status".to_string(),
@@ -704,7 +690,7 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
         ("* | where not (status > 400)", 1),
         // rename remaps the pin to the new name.
         ("* | rename status as st | where st > 400", 1),
-        // a bare-alias let COPIES the pin — a broken walk would emit the
+        // a bare-alias let copies the pin — a broken walk would emit the
         // literal-driven comparison here, which throws over 'accepted'.
         ("* | let s2 = status | where s2 > 400", 1),
     ];
@@ -714,7 +700,7 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
         assert_eq!(run(dsl).await, expected, "hot: {dsl}");
     }
 
-    // The SSE plan lane: ONE snapshot feeds filter + plan, exactly as
+    // The SSE plan lane: one snapshot feeds filter + plan, exactly as
     // stream_query wires it.
     let stream_matches = |dsl: &str| -> usize {
         let ast = trawl_core::parser::parse(dsl).expect("parses");
@@ -728,10 +714,10 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
         events
             .iter()
             .filter(|event| {
-                // The handler's own shape: ONE instant per event, and
-                // ONE door owning both the filter and the stages
-                // (ADR-0017 §3) — a test that sampled two clocks would
-                // stop mirroring the lane it is here to mirror.
+                // The handler's own shape: one instant per event, one
+                // door owning both the filter and the stages (ADR-0017
+                // §3). A test that sampled two clocks would stop
+                // mirroring the lane it exists to mirror.
                 let ctx = trawl_core::context::EvalContext::capture();
                 matches!(
                     trawl_core::stream::accept_event(&filter, &mut stages, event, &ctx),
@@ -775,7 +761,7 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
 ///
 /// The vocabulary is the point: a band token, an `OTel` exact short name,
 /// an integer, an ordered comparison, an IN list and a glob over the
-/// canonical text all bind through ONE rule table, so a divergence here
+/// canonical text all bind through one rule table, so a divergence here
 /// is a missed lane rather than a missed case.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one linear end-to-end narrative
@@ -874,7 +860,7 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
         // `!=` widens with NULL in the search stage, so the row with no
         // derived severity matches.
         ("_severity!=error", 3),
-        // `level` is the sender's own field now.
+        // `level` is ordinary sender vocabulary, not a severity spelling.
         ("level=gold", 1),
     ];
 

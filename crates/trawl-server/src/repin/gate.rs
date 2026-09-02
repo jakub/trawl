@@ -2,30 +2,31 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The repin job's two compaction interlocks (ADR-0011 slice B).
+//! The repin job's two compaction interlocks (ADR-0011).
 //!
-//! 1. **The corpus gate** — a `tokio::sync::RwLock` whose READ side wraps
-//!    each compaction batch's pin-snapshot → conform → publish phase and
-//!    whose WRITE side the cutover holds across its final catch-up
-//!    increment, the per-env swap and the pin flip. Compaction snapshotting
-//!    its pins INSIDE the read guard is what makes the cutover's pin flip
-//!    safe without a stamp-and-validate protocol: no batch can conform
-//!    against the old pin and publish after the flip.
-//! 2. **The rollup pause** — a `watch`-backed flag suppressing the
-//!    file-RELOCATING daily rollup for the WHOLE job (RAII guard), so the
-//!    catch-up diff stays additive: compaction only ever adds or replaces
-//!    hour files while the shadow is being built, never moves them across
-//!    paths. WAL→parquet draining is never paused by this flag — only the
-//!    few seconds under the write guard pause it, and the hot buffer keeps
+//! 1. The corpus gate, a `tokio::sync::RwLock`. The read side wraps each
+//!    compaction batch's pin-snapshot, conform and publish phase; the
+//!    cutover holds the write side across its final catch-up increment,
+//!    the per-env swap and the pin flip. Compaction snapshotting its pins
+//!    inside the read guard is what makes the pin flip safe without a
+//!    stamp-and-validate protocol: no batch can conform against the old
+//!    pin and publish after the flip.
+//! 2. The rollup pause, a `watch`-backed flag suppressing the
+//!    file-relocating daily rollup for the life of the job (RAII guard),
+//!    so the catch-up diff stays additive: while the shadow is being
+//!    built, compaction only adds or replaces hour files, never moves them
+//!    across paths. This flag does not pause WAL to parquet draining; only
+//!    the few seconds under the write guard do, and the hot buffer keeps
 //!    every undrained event queryable throughout (ADR-0008).
 //!
-//! A flag alone would only stop a rollup that has not STARTED: the job
+//! A flag alone would only stop a rollup that has not started: the job
 //! claims the pause after a scan the rollup may already be running behind,
 //! and each of its day/service merges is a minutes-long relocation. So the
-//! two primitives are used TOGETHER, through [`RepinCoordinator::rollup_unit_guard`]
-//! — every relocating unit runs under the corpus gate's read side and reads
-//! the pause under it. The cutover therefore waits out the one unit already
-//! in flight, and every later unit stands down.
+//! two primitives are used together, through
+//! [`RepinCoordinator::rollup_unit_guard`] — every relocating unit runs
+//! under the corpus gate's read side and reads the pause under it. The
+//! cutover waits out the one unit already in flight, and every later unit
+//! stands down.
 
 use std::sync::Arc;
 
@@ -107,17 +108,16 @@ impl RepinCoordinator {
     /// proceed while holding the returned read guard, `None` = stand down
     /// without touching a file.
     ///
-    /// The read guard is taken FIRST and the pause is read UNDER it, and
+    /// The read guard is taken first and the pause is read under it, and
     /// that order is the whole point. A pause read on its own only says
     /// the rollup was unclaimed *at that instant* — the job could claim it
     /// the next moment, finish its build and swap the shadow in while the
     /// unit was still merging, so the unit's rename would republish a
     /// pre-repin file into the new generation and delete the repinned
-    /// hourlies under it. That is precisely the silently-promoted mixed
-    /// corpus the whole design exists to exclude (ADR-0011 amendment §2).
-    /// Read under the guard, `false` is binding: no cutover can start
-    /// while a read guard is held, so it means "no swap can happen before
-    /// this unit finishes".
+    /// hourlies under it. That is the silently-promoted mixed corpus the
+    /// design exists to exclude (ADR-0011 amendment §2). Read under the
+    /// guard, `false` is binding: no cutover can start while a read guard
+    /// is held, so it means no swap can happen before this unit finishes.
     pub async fn rollup_unit_guard(&self) -> Option<RwLockReadGuard<'_, ()>> {
         let guard = self.corpus_gate.read().await;
         (!self.rollup_paused()).then_some(guard)
@@ -166,7 +166,7 @@ impl RepinCoordinator {
 }
 
 /// RAII guard for the rollup pause: dropping it (job completion, failure,
-/// OR an engine task panic unwinding) resumes the rollup — a leaked pause
+/// or an engine task panic unwinding) resumes the rollup — a leaked pause
 /// would suppress consolidation forever.
 #[derive(Debug)]
 pub struct RollupPause {
@@ -227,7 +227,7 @@ mod tests {
         assert!(!c.rollup_paused(), "dropping the guard resumes the rollup");
     }
 
-    /// A relocating rollup unit is both claimed AND gated: a pause makes
+    /// A relocating rollup unit is both claimed and gated: a pause makes
     /// the next unit stand down, and a unit that got in first excludes the
     /// cutover until it finishes — the flag alone would only stop a rollup
     /// that had not started.

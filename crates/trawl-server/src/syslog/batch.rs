@@ -20,7 +20,7 @@ use crate::state::SyslogStats;
 
 /// A single canonicalized syslog event ready for batching.
 ///
-/// `env` and `service` are the door's OWN verdict (`Canonical::env` /
+/// `env` and `service` are the door's own verdict (`Canonical::env` /
 /// `Canonical::service`), not the listener's guess, and together they are
 /// the batch key: two envs must never share a WAL file, a hot-buffer
 /// drain key or a parquet partition (ADR-0009).
@@ -67,7 +67,6 @@ impl SyslogBatcher {
         }
     }
 
-    /// Get a sender for submitting events.
     pub fn sender(&self) -> SyslogSender {
         self.tx.clone()
     }
@@ -75,8 +74,9 @@ impl SyslogBatcher {
     /// Run the batcher loop until shutdown.
     ///
     /// While a flush is in progress (awaiting `spawn_blocking`), the
-    /// channel buffers incoming events (capacity 10k). Senders get
-    /// back-pressure via `try_send` failures at the listener level.
+    /// channel buffers incoming events (`channel_capacity`, 10k by
+    /// default). Senders get back-pressure via `try_send` failures at the
+    /// listener level.
     pub async fn run(mut self, mut shutdown_rx: watch::Receiver<bool>) {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_millis(self.batch_interval_ms));
@@ -91,7 +91,6 @@ impl SyslogBatcher {
             tokio::select! {
                 biased;
 
-                // Check shutdown
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         // Flush remaining events before exiting
@@ -106,7 +105,6 @@ impl SyslogBatcher {
                     }
                 }
 
-                // Receive events from listeners
                 event = self.rx.recv() => {
                     let Some(evt) = event else {
                         // All senders dropped — flush and exit
@@ -134,7 +132,6 @@ impl SyslogBatcher {
                     }
                 }
 
-                // Timer tick — flush if we have pending events
                 _ = interval.tick() => {
                     if pending_count > 0 {
                         self.flush(&mut pending, &mut pending_count, udp_count, tcp_count).await;
@@ -175,7 +172,6 @@ impl SyslogBatcher {
                 0
             });
 
-        // Update metrics
         metrics::counter!(crate::metrics::INGEST_EVENTS_TOTAL).increment(written as u64);
         if udp_count > 0 {
             metrics::counter!(crate::metrics::SYSLOG_EVENTS_TOTAL, "transport" => "udp")
@@ -186,7 +182,6 @@ impl SyslogBatcher {
                 .increment(tcp_count);
         }
 
-        // Update dashboard atomics.
         if let Some(ref stats) = self.stats {
             if udp_count > 0 {
                 stats.events_udp.fetch_add(udp_count, Ordering::Relaxed);
@@ -260,17 +255,14 @@ mod tests {
             batcher.run(shutdown_rx).await;
         });
 
-        // Send one event
         sender.send(make_event("test-svc")).await.unwrap();
 
         // Wait for timer flush (~10ms + some margin)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Shut down and wait
         let _ = shutdown_tx.send(true);
         handle.await.unwrap();
 
-        // Verify WAL file was created
         let files: Vec<_> = std::fs::read_dir(tmp.path().join("prod"))
             .unwrap()
             .filter_map(Result::ok)
@@ -328,7 +320,6 @@ mod tests {
         // Small delay to ensure events are received
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // Shutdown should flush remaining events
         let _ = shutdown_tx.send(true);
         handle.await.unwrap();
 
@@ -394,14 +385,10 @@ mod tests {
         );
     }
 
-    /// Acceptance criterion 7: the batch key is `(env, service)`.
-    ///
-    /// Before the cutover the syslog batcher keyed on service ALONE and
-    /// the writer stamped its own `default_env` on every file, so two
-    /// envs arriving in one interval under the same service name were
-    /// concatenated into a single WAL file under a single path root — a
-    /// silent misfile that no error and no repair code ever mentioned.
-    /// One service name, two envs, one interval is exactly that case.
+    /// The batch key is `(env, service)`, not service alone: one service
+    /// name arriving under two envs in one interval must not be
+    /// concatenated into a single WAL file under a single path root, which
+    /// would be a misfile no error and no repair code ever mentions.
     #[tokio::test]
     async fn batcher_keys_on_env_and_service_together() {
         let (batcher, tmp) = test_batcher(60_000, 10_000);

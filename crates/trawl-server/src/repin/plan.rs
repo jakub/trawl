@@ -2,12 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The repin scan (ADR-0011 slice B): the dry-run report, and the
-//! mandatory first phase of every executing job.
+//! The repin scan (ADR-0011): the dry-run report, and the mandatory first
+//! phase of every executing job.
 //!
-//! Counts over the SAME files the rewrite rewrites
+//! Counts over the same files the rewrite rewrites
 //! (`rewrite::affected_schema` — one affectedness gate, not two agreeing
-//! predicates) with the SAME expressions the rewrite writes
+//! predicates) with the same expressions the rewrite writes
 //! (`ingest::compaction::repin_count_exprs` over `repin_target_expr`), so
 //! the plan's `projected_nulls`/`resurrectable` are the rewrite's
 //! `rows_nulled`/`rows_resurrected` over an unchanged corpus — a report
@@ -15,7 +15,7 @@
 //! rewrite, which the catch-up loop then counts for real.
 //!
 //! Because those numbers are equal by construction rather than by
-//! approximation, the scan hands its PER-FILE readings ([`ScanTallies`])
+//! approximation, the scan hands its per-file readings ([`ScanTallies`])
 //! to the build instead of letting the first pass re-measure a corpus
 //! nothing has touched: an unchanged `(ino, len, mtime)` reuses the
 //! reading, anything else recounts.
@@ -30,7 +30,7 @@ use crate::repin::rewrite::{
 };
 use crate::store::MAX_CONFLICT_SAMPLES;
 
-/// The scan's PER-FILE readings, keyed by data-root-relative path and
+/// The scan's per-file readings, keyed by data-root-relative path and
 /// stamped with the signature they were measured at.
 ///
 /// The build begins synchronously after the scan returns, so in the common
@@ -55,8 +55,8 @@ pub struct ScanCounts {
     /// Bytes across the affected files — the double-hold peak the
     /// free-space pre-flight budgets for.
     pub affected_bytes: u64,
-    /// Rows whose numeral reads as a DIFFERENT severity in each dialect —
-    /// counted whatever the job asserted (issue #79).
+    /// Rows whose numeral reads as a different severity in each dialect —
+    /// counted whatever the job asserted.
     pub ambiguous_numerals: u64,
 }
 
@@ -70,13 +70,14 @@ pub struct ScanCounts {
 /// cannot open at all fails the scan exactly as it would fail the
 /// rewrite — before anything has been staged.
 ///
-/// The third return is up to [`MAX_CONFLICT_SAMPLES`] SAMPLES of the values
-/// the new pin cannot read (issue #79) — the evidence that turns "42 rows
-/// would be nulled" into a decision an operator can make. They ride the
-/// per-file counting statement rather than a second query, so the numbers
-/// and the evidence describe one read of one file, and the sampling stops
-/// being ASKED FOR once five distinct samples are held — a corpus-wide
-/// misfit pays for the sketch on the first files and nothing after.
+/// The third return is up to [`MAX_CONFLICT_SAMPLES`] samples of the values
+/// the new pin cannot read — the evidence that turns "42 rows would be
+/// nulled" into a decision an operator can make. They ride the per-file
+/// counting statement rather than a second query, so the numbers and the
+/// evidence describe one read of one file, and the sampling stops being
+/// asked for once `MAX_CONFLICT_SAMPLES` distinct samples are held: a
+/// corpus-wide misfit pays for the sketch on the first files and nothing
+/// after.
 pub(crate) fn scan(
     data_dir: &Path,
     memory_limit: &str,
@@ -106,7 +107,7 @@ pub(crate) fn scan(
         };
         let safe = path.to_string_lossy().replace('\'', "''");
         let source = format!("read_parquet('{safe}')");
-        // Sampling rides the counts until five distinct samples are held;
+        // Sampling rides the counts until the sample budget is full;
         // after that the plain statement is the cheaper one.
         let effect = if samples.len() < MAX_CONFLICT_SAMPLES {
             let (effect, found) =

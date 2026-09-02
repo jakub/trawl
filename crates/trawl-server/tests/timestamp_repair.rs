@@ -2,13 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! End-to-end tests for ADR-0008 malformed-time handling under the
-//! ADR-0009 envelope: every trigger variant ingests via the real handler,
-//! is queryable from the hot buffer, compacts to parquet without wedging,
-//! and stays queryable — with `_time` set to the arrival time, the
-//! `time.from_ingest` code in `_repairs`, and the original value findable
-//! in `_raw`. Plus the canonicalization acceptance criterion at the API
-//! level.
+//! End-to-end tests for malformed-time handling (ADR-0008): every bad-time
+//! variant ingests through the real handler, is queryable from the hot
+//! buffer, compacts to parquet without wedging, and stays queryable, with
+//! `_time` set to the arrival time, the `time.from_ingest` code in
+//! `_repairs`, and the original value findable in `_raw`. Canonicalization
+//! of a valid timestamp is covered at the API level too.
 
 mod common;
 
@@ -20,7 +19,6 @@ use trawl_api::value::Value;
 use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
 
-/// Extract the string value of `column` from the first row of a result.
 fn first_row_string(result: &trawl_api::value::QueryResult, column: &str) -> Option<String> {
     let idx = result.columns.iter().position(|c| c.name == column)?;
     match result.rows.first()?.get(idx)? {
@@ -30,9 +28,9 @@ fn first_row_string(result: &trawl_api::value::QueryResult, column: &str) -> Opt
     }
 }
 
-/// All four trigger variants from the issue: ingested via the handler,
-/// visible in the hot buffer, compacted without errors, and returned by a
-/// `last=1h` query afterwards — original preserved, timestamp at arrival.
+/// All four malformed-time variants: ingested through the handler, visible
+/// in the hot buffer, compacted without errors, and returned by a `last=1h`
+/// query afterwards, original preserved and timestamp at arrival.
 #[sqlx::test(migrations = false)]
 async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -72,7 +70,7 @@ async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
     }
     let after_ingest = chrono::Utc::now() + chrono::Duration::minutes(1);
 
-    // Phase 1: hot buffer — visible to a last=1h query BEFORE compaction.
+    // Phase 1: hot buffer, visible to a last=1h query before compaction.
     for (i, (bad, preserved)) in variants.iter().enumerate() {
         let result = query_client
             .query_paginated(&format!("service=svc{i} last=1h"), None, None)
@@ -161,10 +159,10 @@ async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
     }
 }
 
-/// Canonicalization acceptance criterion at the API level: an RFC 3339
-/// value with a +05:30 offset lands as the same instant in UTC with
-/// sub-second precision preserved, and an offset-less ISO 8601 value keeps
-/// its event time instead of being repaired to arrival time.
+/// Canonicalization at the API level: an RFC 3339 value with a +05:30 offset
+/// lands as the same instant in UTC with sub-second precision preserved, and
+/// an offset-less ISO 8601 value keeps its event time instead of being
+/// repaired to arrival time.
 #[sqlx::test(migrations = false)]
 async fn offset_timestamp_canonicalized_to_utc_instant(pool: sqlx::PgPool) {
     let server = setup(pool).await;

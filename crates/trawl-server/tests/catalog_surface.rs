@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! End-to-end tests for the catalog schema surface (ADR-0009 slice 3, #51):
+//! End-to-end tests for the catalog schema surface (ADR-0009):
 //! `/api/v1/schema` served from the catalog with `?service=`/`?all=`
 //! windowing, and the three read routes `/api/v1/schema/fields`,
 //! `/api/v1/schema/field?name=`, `/api/v1/schema/conflicts`.
@@ -243,7 +243,7 @@ async fn schema_service_param_scopes_fields(pool: sqlx::PgPool) {
     );
 }
 
-/// Regression: the UNSCOPED column set is TTL-cached (its aggregate spans
+/// Regression: the unscoped column set is TTL-cached (its aggregate spans
 /// every service, and the service axis is client-chosen and unbounded)
 /// while `?service=` is served fresh. The two must not share a slot — a
 /// scoped request must neither be answered from the unscoped cache nor
@@ -319,10 +319,9 @@ async fn aged_out_field_windowed_away_unless_all(pool: sqlx::PgPool) {
     );
 }
 
-/// A conflicting field that has not been conflicting for LONG carries no
-/// verdict at all — not a null one, no key: an install where a shipper had
-/// one bad afternoon must read exactly as it did before the analyzer
-/// shipped.
+/// A field that has been conflicting only briefly carries no verdict at
+/// all: no key on the wire, not a null one. Volume alone must not badge an
+/// install where a shipper had one bad afternoon.
 #[sqlx::test(migrations = false)]
 async fn a_freshly_conflicting_field_carries_no_verdict(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -357,7 +356,7 @@ async fn a_degraded_field_carries_the_verdict_and_its_samples(pool: sqlx::PgPool
         ingest_and_compact(&h, &[event("svc-b", &json!({"duration": value}))]).await;
     }
 
-    // The evidence is real; only its AGE is simulated. `first_at` is the one
+    // The evidence is real; only its age is simulated. `first_at` is the one
     // thing a test cannot wait 24 hours for.
     let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
         .await
@@ -416,7 +415,6 @@ async fn a_degraded_field_carries_the_verdict_and_its_samples(pool: sqlx::PgPool
         "an unconflicted envelope field carries no verdict key"
     );
 
-    // Same routes, unchanged gate: a key without schema_read is still 403.
     let (status, _) = h
         .get(&h.server.coastwatch_only_token, "/schema/fields")
         .await;
@@ -426,8 +424,8 @@ async fn a_degraded_field_carries_the_verdict_and_its_samples(pool: sqlx::PgPool
     );
 }
 
-/// Acceptance: a query that BINDS a degraded field is stamped with the
-/// incomplete-results notice — including when it projects the field away —
+/// Acceptance: a query that binds a degraded field is stamped with the
+/// incomplete-results notice, including when it projects the field away,
 /// while a query that binds none carries no key at all, and the gauge
 /// reflects the count after a refresh pass.
 #[sqlx::test(migrations = false)]
@@ -502,10 +500,9 @@ async fn a_query_binding_a_degraded_field_is_stamped(pool: sqlx::PgPool) {
     );
 }
 
-/// Acceptance (ADR-0011 slice C2, AC-1): `/api/v1/schema/services` badges a
-/// service with the degraded fields it ACTUALLY conflicted on — and a
-/// service that merely CARRIES the same column, having never disagreed with
-/// its pin, is not badged.
+/// Acceptance: `/api/v1/schema/services` badges a service with the degraded
+/// fields it actually conflicted on. A service that merely carries the same
+/// column, having never disagreed with its pin, is not badged.
 ///
 /// This is the false-positive case the wire field exists to prevent: the
 /// client-side join a SPA could otherwise do (`columns` ∩ degraded set)
@@ -520,7 +517,7 @@ async fn schema_services_badges_only_the_service_that_conflicted(pool: sqlx::PgP
         ingest_and_compact(&h, &[event("svc-b", &json!({"duration": value}))]).await;
     }
 
-    // Only the AGE of the evidence is simulated — the span half of the
+    // Only the age of the evidence is simulated: the span half of the
     // degrade gate is the one thing a test cannot wait 24 hours for.
     let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
         .await
@@ -587,7 +584,6 @@ async fn schema_services_badges_only_the_service_that_conflicted(pool: sqlx::PgP
         "a service that never conflicted carries no degraded_fields key at all: {body}"
     );
 
-    // Same route, unchanged gate.
     let (status, _) = h
         .get(&h.server.coastwatch_only_token, "/schema/services")
         .await;
@@ -596,10 +592,10 @@ async fn schema_services_badges_only_the_service_that_conflicted(pool: sqlx::PgP
         "the badge rides the existing SchemaRead gate, not a new one"
     );
 
-    // A store error keeps the ENTIRE previous snapshot — both halves or
-    // neither. Clearing on a postgres blip would silently un-badge the
-    // install; publishing a HALF-built one would be worse still, un-badging
-    // every service while leaving the query notice standing.
+    // A store error keeps the entire previous snapshot, both halves or
+    // neither: clearing on a postgres blip would silently un-badge the
+    // install, and publishing a half-built one would un-badge every service
+    // while leaving the query notice standing.
     sqlx::query("DROP TABLE field_conflict_stats")
         .execute(&mut conn)
         .await
@@ -946,7 +942,7 @@ async fn read_commands_render_populated_output(pool: sqlx::PgPool) {
     );
 
     // `trawl schema field DURATION` — the name folds server-side, the header
-    // block and BOTH tables (services, conflicts) render.
+    // block and both tables (services, conflicts) render.
     let mut out = Vec::new();
     trawl_cli::schema::run_field(
         &mut out,

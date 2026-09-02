@@ -20,11 +20,11 @@
 //!
 //! The same tick also reloads the degraded-field snapshot the query path
 //! stamps its incomplete-results notice from and `/schema/services` stamps
-//! its per-service badge from (ADR-0011 slices C1/C2) — the ONE part of
-//! this job that reads postgres, and the reason the "footer stats need
-//! neither postgres nor `DuckDB`" claim above is about the SCHEMA half
-//! only. That half is a single query on a healthy install; the attribution
-//! read behind it runs only once something is actually degraded.
+//! its per-service badge from (ADR-0011) — the one part of this job that
+//! reads postgres, and the reason the "footer stats need neither postgres
+//! nor `DuckDB`" claim above covers the schema half only. That half is a
+//! single query on a healthy install; the attribution read behind it runs
+//! only once something is actually degraded.
 //!
 //! Follows the same pattern as [`crate::monitor::spawn_snapshot_collector`].
 
@@ -59,7 +59,7 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
         let warned: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
         let warned_unpinned: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         // Types come from the in-process pin cache — the schema half needs
-        // neither postgres nor DuckDB (ADR-0009 slice 3).
+        // neither postgres nor DuckDB (ADR-0009).
         let catalog = Arc::clone(&state.query.field_catalog);
 
         loop {
@@ -107,36 +107,35 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
     })
 }
 
-/// Reload the degraded-field snapshot and publish the gauge (ADR-0011
-/// slices C1/C2).
+/// Reload the degraded-field snapshot and publish the gauge (ADR-0011).
 ///
 /// Runs on every node, ingesting or not: the notice is stamped by the query
 /// path and the badge by `/schema/services`, and a query-only node serves
 /// both.
 ///
 /// Two reads, one generation, and — when there is anything to attribute —
-/// one postgres SNAPSHOT: [`crate::store::CatalogStore::degraded_snapshot`]
+/// one postgres snapshot: [`crate::store::CatalogStore::degraded_snapshot`]
 /// runs both under a single `REPEATABLE READ` transaction, so a repin
-/// clearing a field's evidence between them can no longer publish a
-/// generation whose notice stands while its badges are gone. The healthy
-/// install still pays exactly the one query C1 shipped — the degraded set is
-/// empty, so no second read and no transaction happen at all.
+/// clearing a field's evidence between them cannot publish a generation
+/// whose notice stands while its badges are gone. A healthy install pays
+/// one query: the degraded set is empty, so no second read and no
+/// transaction happen at all.
 ///
-/// The attribution read is keyed on that (pin-capped) set AND on the service
+/// The attribution read is keyed on that (pin-capped) set and on the service
 /// names the schema cache can currently render, so neither axis can widen it
 /// into a scan of a table whose service axis is client-chosen. A tick whose
 /// service cache has not filled yet (boot) passes an empty service list and
 /// publishes an unattributed generation — one tick of missing badges,
 /// accepted.
 ///
-/// A store error keeps the ENTIRE previous snapshot rather than clearing it,
-/// and never publishes a half-built one. The alternative — an empty set on a
-/// postgres blip — silently un-badges every degraded field on the install for
-/// as long as the blip lasts, which is the one failure mode a notice must not
-/// have; and a snapshot with fields but no pairs is strictly worse than
-/// stale, since it would un-badge every service while leaving the notice
-/// standing. The gauge is left alone for the same reason: it would otherwise
-/// read as a fixed catalog.
+/// A store error keeps the entire previous snapshot rather than clearing it,
+/// and never publishes a half-built one. An empty set on a postgres blip
+/// would silently un-badge every degraded field on the install for as long
+/// as the blip lasts, which is the one failure mode a notice must not have;
+/// and a snapshot with fields but no pairs is worse than stale, since it
+/// would un-badge every service while leaving the notice standing. The gauge
+/// is left alone for the same reason: it would otherwise read as a fixed
+/// catalog.
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; the pin cap is exact
 pub async fn refresh_degraded_fields(state: &AppState) {
     // Taken before the await: the schema cache is a sync mutex, and it is
@@ -175,7 +174,7 @@ struct FileInfo {
 /// Perform the full service schema refresh.
 ///
 /// Walks parquet files, groups by service, then for each service reads parquet
-/// footers for column stats and row counts; column TYPES come from `catalog`
+/// footers for column stats and row counts; column types come from `catalog`
 /// (the in-process pin cache — no `DuckDB`, no postgres). `warned` carries the
 /// set of files that failed to read on the previous pass so each break is
 /// logged once; `warned_unpinned` does the same for columns with no pin.
@@ -234,7 +233,7 @@ fn refresh_service_schema(
     }
 
     // Warn once per newly-unpinned column (deduped across passes, like the
-    // unreadable-file skips): an UNPINNED column can only arise from
+    // unreadable-file skips): an unpinned column can only arise from
     // foreign/boot-skipped parquet — the condition `catalog_conform_skip` /
     // `catalog_conform_incomplete` already flags — or transiently during the
     // boot-conformance window, where it self-heals next tick.
@@ -328,10 +327,10 @@ fn build_service_schema(
     let column_stats = acc.finish();
 
     // Columns are driven by the footer stats accumulator (the union of every
-    // column name across the service's files) and TYPED by the catalog pin —
-    // the DuckDB DESCRIBE reconciler is gone (ADR-0009 slice 3). A
-    // physically-present column with no pin reports the UNPINNED sentinel:
-    // it can only arise from foreign or boot-skipped parquet.
+    // column name across the service's files) and typed by the catalog pin;
+    // no DuckDB DESCRIBE runs here (ADR-0009). A physically-present column
+    // with no pin reports the UNPINNED sentinel: it can only arise from
+    // foreign or boot-skipped parquet.
     let mut columns: Vec<ServiceColumnStats> = column_stats
         .iter()
         .map(|cs| {
@@ -369,7 +368,7 @@ fn build_service_schema(
         total_bytes,
         total_events,
         daily_event_counts,
-        // Stamped per REQUEST from the degraded snapshot, not cached here:
+        // Stamped per request from the degraded snapshot, not cached here:
         // the two caches have independent refresh points, and a badge frozen
         // into the schema cache would outlive a repin by up to a full TTL.
         degraded_fields: Vec::new(),
@@ -422,11 +421,10 @@ mod tests {
 
     #[test]
     fn catalog_pin_wins_over_footer_type_while_stats_stay_footer_true() {
-        // The #51 acceptance criterion: seed a catalog pin that disagrees
-        // with the file's physical type — DuckDB writes `VALUES (200)` as
-        // INTEGER, the pin says BIGINT — and the endpoint must report the
-        // catalog type while null/min/max/byte stats still match the
-        // footers. No DuckDB DESCRIBE runs at all.
+        // A catalog pin that disagrees with the file's physical type —
+        // DuckDB writes `VALUES (200)` as INTEGER, the pin says BIGINT —
+        // must be reported as the catalog type, while null/min/max/byte
+        // stats still match the footers. No DuckDB DESCRIBE runs at all.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         write_service_parquet(
@@ -531,9 +529,8 @@ mod tests {
 
     #[test]
     fn columns_follow_field_display_rank() {
-        // Envelope columns lead, custom columns follow alphabetically —
-        // mirrors query-result ordering (previously this was DESCRIBE's
-        // physical order).
+        // Envelope columns lead, custom columns follow alphabetically,
+        // mirroring query-result ordering.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         write_service_parquet(
@@ -633,15 +630,15 @@ mod tests {
         // ...the skip is recorded for log-dedup across passes...
         assert!(warned.lock().contains(&bad));
 
-        // ...and NO persistent quarantine/marker artifact is written to disk.
+        // ...and no persistent quarantine/marker artifact is written to disk.
         assert!(!base.join(".trawl-schema-quarantine").exists());
         assert!(!base.join(".trawl-schema-refresh.inflight").exists());
     }
 
     #[test]
     fn recovered_file_is_picked_up_next_pass() {
-        // A file that fails one pass but reads on the next must NOT be lost
-        // permanently (the regression the persistent quarantine introduced).
+        // A file that fails one pass but reads on the next must not be lost
+        // permanently: a skip lasts one pass, it is not a quarantine.
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         let svc = base.join("2026-06-20").join("svc.parquet");

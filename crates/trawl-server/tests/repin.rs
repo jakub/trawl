@@ -2,10 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! End-to-end repin tests (ADR-0011 slice B, issue #53), on the
-//! catalog-surface harness: a real TLS server over a per-test data root,
-//! ingest through HTTP, compaction driven per-tick with the catalog and
-//! the repin coordinator wired exactly as trawld wires them.
+//! End-to-end repin tests: a real TLS server over a per-test data root,
+//! ingest through HTTP, compaction driven per-tick with the catalog and the
+//! repin coordinator wired exactly as trawld wires them.
 
 mod common;
 
@@ -86,7 +85,7 @@ async fn harness(pool: sqlx::PgPool) -> Harness {
 }
 
 impl Harness {
-    /// One compaction tick with the catalog AND the repin coordinator
+    /// One compaction tick with the catalog and the repin coordinator
     /// wired, exactly as trawld's loop runs it.
     async fn compact_tick(&self) {
         let hot_buffer = self
@@ -161,9 +160,9 @@ impl Harness {
         panic!("repin job {id} did not reach a terminal state in time");
     }
 
-    /// The type `/api/v1/schema` advertises for a field — the TTL-CACHED
-    /// column listing, unlike [`Harness::pinned_type`], which reads
-    /// `/schema/fields` and bypasses that cache entirely.
+    /// The type `/api/v1/schema` advertises for a field, read off the
+    /// TTL-cached column listing. [`Harness::pinned_type`] reads
+    /// `/schema/fields`, which has no cache in front of it.
     async fn schema_endpoint_type(&self, field: &str) -> String {
         let resp = self.query.schema().await.expect("schema");
         resp.columns
@@ -202,7 +201,7 @@ fn event(service: &str, extra: &serde_json::Value) -> serde_json::Value {
     base
 }
 
-/// THE acceptance test: a BIGINT-pinned field with a shelved conflict
+/// The acceptance test: a BIGINT-pinned field with a shelved conflict
 /// value is repinned to VARCHAR. The dry run projects, the rewrite
 /// matches the projection, existing queries answer identically, the
 /// shelved value becomes queryable, unaffected files keep their inodes,
@@ -225,7 +224,7 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values(pool: sqlx:
         .await;
     assert_eq!(h.pinned_type("status").await, "BIGINT");
 
-    // A foreign parquet inside the env dir but OFF the layout: it must
+    // A foreign parquet inside the env dir but off the layout: it must
     // ride the swap byte-identical (hardlinked, same inode), never be
     // rewritten.
     let foreign = h.data_dir.join("prod/notes.parquet");
@@ -259,8 +258,8 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values(pool: sqlx:
         "the conflict value is shelved: only two rows carry a stored status"
     );
 
-    // Mandatory dry run: one affected file, one resurrectable value,
-    // nothing lost (VARCHAR is the always-lossless target).
+    // Dry run: one affected file, one resurrectable value, nothing lost
+    // (VARCHAR is the always-lossless target).
     let dry = match h
         .schema_admin
         .schema_repin("status", "varchar", None, true, false)
@@ -292,7 +291,7 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values(pool: sqlx:
     assert_eq!(done.rows_nulled, dry.projected_nulls);
     assert_eq!(done.files_done, dry.files_total);
 
-    // The pin flipped, with no window of absent pin.
+    // The pin flipped.
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
 
     // The invisibility promise: identical answers.
@@ -330,10 +329,10 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values(pool: sqlx:
 }
 
 /// `/api/v1/schema` caches its unscoped column listing for
-/// `schema_cache_ttl_secs`, so a repin cutover used to leave the endpoint
-/// advertising the OLD type for up to a TTL — the autocomplete surface
-/// disagreeing with the corpus it describes. The entry now carries the pin
-/// generation it was built under, so the flip invalidates it at once.
+/// `schema_cache_ttl_secs`, and the cached entry carries the pin generation
+/// it was built under. A cutover therefore invalidates it at once, instead
+/// of leaving the endpoint advertising the old type for up to a TTL while
+/// the corpus it describes has already been rewritten.
 ///
 /// The harness TTL is 60s (`tests/common/mod.rs`) and this test sleeps
 /// nowhere, so TTL expiry cannot explain a pass.
@@ -459,7 +458,7 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it(pool: sqlx::PgPo
     assert_eq!(h.count("oops last=1h | stats count()").await, 1);
 }
 
-/// The force gate is asked of the FINISHED shadow, not just the pre-build
+/// The force gate is asked of the finished shadow, not just the pre-build
 /// scan: a lossless plan whose corpus grows a non-conforming value while
 /// the rewrite runs is refused at the cutover, corpus untouched — and the
 /// same repin proceeds under force.
@@ -509,7 +508,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool
         other => panic!("expected started, got {other:?}"),
     };
 
-    // A value the new pin cannot read, ingested and compacted DURING the
+    // A value the new pin cannot read, ingested and compacted during the
     // build: the catch-up folds it in and the rewrite would null it.
     h.ingest_and_compact(&[event("api", &json!({"dur": "nope"}))])
         .await;
@@ -554,10 +553,10 @@ async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool
 
 /// A caller that walks away mid-scan must not strand the one-running
 /// slot. The scan is a full-corpus `DuckDB` pass, so a client or proxy
-/// timeout drops the request future long before it finishes: the claimed
-/// job's whole ladder therefore runs detached, terminalizes on its own,
-/// and leaves the next repin acceptable instead of 409ing every request
-/// until a daemon restart reconciles the orphan.
+/// timeout drops the request future long before it finishes. The claimed
+/// job therefore runs detached, terminalizes on its own, and leaves the
+/// next repin acceptable instead of 409ing every request until a daemon
+/// restart reconciles the orphan.
 #[sqlx::test(migrations = false)]
 async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPool) {
     use std::sync::atomic::Ordering;
@@ -633,21 +632,19 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPo
 /// rewrite — events land in the hot buffer immediately and exactly once in
 /// the post-cutover corpus, and a query loop across the rest of the job
 /// (release, catch-up, cutover, sweep) never errors. `/metrics` is scraped
-/// from INSIDE the rewrite: the running gauge is up and the
+/// from inside the rewrite: the running gauge is up and the
 /// `files_total`/`files_done` progress pair is readable while the job is
 /// still running, with the outcome counter landing only at the terminal
 /// state.
 ///
-/// Synchronised by ORDERING, not by timing (issue #79 review). The mid-job
-/// state this test observes — job row `running`, running gauge up,
-/// `files_done` ≥ 1 — exists only between the end of the first build pass
-/// (progress is published per PASS) and the job's terminal write, and a
-/// polling observer can miss that window or find the job already finished
-/// on its first read; both were reproducible here by removing the per-file
-/// delay, and `retries = 1` is why CI saw it as a flake rather than a
-/// failure. The build now HOLDS at its first published progress until this
-/// test releases it, so every mid-job assertion below is a fact about
-/// order. No sleeps, and no per-file delay at all.
+/// Synchronised by ordering, not by timing. Progress publishes per pass,
+/// not per file, so the mid-job state this test observes (job row
+/// `running`, running gauge up, `files_done` ≥ 1) exists only between the
+/// end of pass 0 and the job's terminal write, and a polling observer can
+/// miss that window or find the job already finished on its first read. The
+/// build holds at its first published progress until this test releases it,
+/// which makes every mid-job assertion below a fact about order. No sleeps,
+/// and no per-file delay at all.
 #[sqlx::test(migrations = false)]
 async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sqlx::PgPool) {
     use std::sync::atomic::Ordering;
@@ -665,7 +662,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     }
     assert_eq!(h.count("last=1h | stats count()").await, 6);
 
-    // Arm the hold BEFORE the request: from its first published progress
+    // Arm the hold before the request: from its first published progress
     // until this test releases it, the job cannot terminalize, so every
     // "during the rewrite" step below is during the rewrite by
     // construction.
@@ -694,7 +691,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
         other => panic!("expected a 409 error envelope, got {other:?}"),
     }
 
-    // Ingest DURING the build: visible immediately via the hot buffer.
+    // Ingest during the build: visible immediately via the hot buffer.
     let resp = h
         .ingest
         .ingest(&[event("api", &json!({"status": 418}))])
@@ -740,7 +737,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     assert_eq!(h.count("last=1h | stats count()").await, 7);
     let mid_job = scrape_metrics(&h.server.url).await;
 
-    // Progress is scrapeable MID-JOB: the running gauge is up and real
+    // Progress is scrapeable mid-job: the running gauge is up and real
     // per-file progress is already on it, by construction rather than by
     // catching a window.
     assert_eq!(
@@ -761,7 +758,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
         "the outcome counter must land only at the terminal state"
     );
 
-    // Query across the REST of the job — the release, the catch-up passes,
+    // Query across the rest of the job — the release, the catch-up passes,
     // the cutover's exclusion window and the sweep. No query may error.
     let query_loop = {
         let client = HttpClient::new_insecure(&h.server.url, &h.server.analyst_token).unwrap();
@@ -809,7 +806,7 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
     assert!(metrics.contains("trawl_catalog_repin_duration_seconds"));
 }
 
-/// The final pause DEFERS WAL draining — and does nothing else an operator
+/// The final pause defers WAL draining, and does nothing else an operator
 /// can observe. Inside the held pause (corpus gate + every executor permit)
 /// ingest still lands, the hot buffer still holds those events undrained
 /// (a drain follows a compaction batch, and no batch may run), and a query
@@ -819,13 +816,12 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
 /// no new tick and no operator action, and drains exactly the events it
 /// held. Past the cutover those events are in the corpus exactly once,
 /// before and after that drain lands: ADR-0008's invisible-events
-/// prohibition across ADR-0011 slice B's one stopped world.
+/// prohibition across the one stopped world a cutover needs.
 ///
 /// (Draining is deferred rather than continuous because the cutover takes
-/// the corpus gate's write side, which excludes whole compaction batches —
-/// the mechanism correction recorded in ADR-0011's 2026-08-12 amendment:
-/// a mixed-type corpus silently promotes instead of erring, so exclusion
-/// is the entire atomicity budget.)
+/// the corpus gate's write side, which excludes whole compaction batches.
+/// A mixed-type corpus silently promotes instead of erring, so exclusion is
+/// the entire atomicity budget, per ADR-0011.)
 #[sqlx::test(migrations = false)]
 async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -879,7 +875,7 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: 
     }
     assert!(entered, "the cutover never entered its pause");
 
-    // Ingest INTO the pause: the WAL writer and the hot buffer take
+    // Ingest into the pause: the WAL writer and the hot buffer take
     // neither the corpus gate nor an executor permit, so this must not
     // block on the cutover.
     let resp = tokio::time::timeout(
@@ -908,7 +904,7 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: 
         })
     };
 
-    // A compaction batch that starts INSIDE the pause — trawld's loop
+    // A compaction batch that starts inside the pause — trawld's loop
     // ticking on schedule, not a test-driven tick. It blocks at the corpus
     // gate and holds its WAL files and hot batch until the pause lifts.
     let deferred_drain = {
@@ -1003,7 +999,7 @@ async fn boot_reconciliation_completes_a_recovered_cutover(pool: sqlx::PgPool) {
         .await;
     assert_eq!(h.pinned_type("status").await, "BIGINT");
 
-    // Simulate a crash mid-cutover on a THROWAWAY root: job row claimed,
+    // Simulate a crash mid-cutover on a throwaway root: job row claimed,
     // marker written in phase cutover, swap half-done.
     let job_id = h
         .server
@@ -1084,7 +1080,7 @@ async fn boot_reconciliation_completes_a_recovered_cutover(pool: sqlx::PgPool) {
         "a recovered cutover re-arms the boot conformance pass"
     );
 
-    // A staging root that survives its sweep KEEPS the marker: the marker
+    // A staging root that survives its sweep keeps the marker: the marker
     // is the only thing licensing trawl to delete it, and a stranded root
     // suppresses retention and makes the next cutover's forward-only swap
     // ambiguous.
@@ -1195,7 +1191,8 @@ async fn resurrection_only_pass_recovers_without_retyping(pool: sqlx::PgPool) {
 
     // With force: a resurrection-only rewrite. `"accepted"` still has no
     // BIGINT reading — it stays shelved and counts as nulled-projection
-    // zero (it was ALREADY null) — but a recoverable value would return.
+    // zero, since it was already null — but a recoverable value would
+    // return.
     let dry = match h
         .schema_admin
         .schema_repin("status", "BIGINT", None, true, true)
@@ -1212,12 +1209,11 @@ async fn resurrection_only_pass_recovers_without_retyping(pool: sqlx::PgPool) {
     assert_eq!(dry.resurrectable, 0, "`accepted` has no BIGINT reading");
 }
 
-/// Boot recovery over a SEVERITY cutover marker (issue #79): the engine
-/// writes the marker with the CATALOG spelling, so recovery has to read it
-/// back that way. The physical parse has no `SEVERITY` spelling at all,
-/// which made this the one replay path that could REFUSE — and it refuses
-/// after the corpus is already half-swapped, where forward is the only safe
-/// direction.
+/// Boot recovery over a SEVERITY cutover marker: the engine writes the
+/// marker with the catalog spelling, so recovery has to read it back that
+/// way. The physical parse has no `SEVERITY` spelling at all, which makes
+/// this the one replay path that could refuse, and it would refuse after the
+/// corpus is already half-swapped, where forward is the only safe direction.
 #[sqlx::test(migrations = false)]
 async fn boot_reconciliation_replays_a_severity_cutover(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -1245,8 +1241,8 @@ async fn boot_reconciliation_replays_a_severity_cutover(pool: sqlx::PgPool) {
         .unwrap();
 
     // A throwaway root crashed mid-cutover: the shadow holds the new
-    // generation, the marker names the SEVERITY target as the engine spells
-    // it (`CanonicalType::as_catalog`).
+    // generation, the marker names the `SEVERITY` target as the engine
+    // spells it (`CanonicalType::as_catalog`).
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
     let dir = data.join("prod/2026-01-01/10");
@@ -1310,17 +1306,17 @@ async fn boot_reconciliation_replays_a_severity_cutover(pool: sqlx::PgPool) {
     assert!(!trawl_server::repin::marker_path(&data).exists());
 }
 
-/// A dry run must say whether the IDENTICAL executing request would refuse
-/// (issue #79): the plan's numbers alone read as a clean 200, and an
-/// operator would learn about the force gate from the request that was
-/// meant to do the work. Both triggers, on the report and on the status
-/// route — one decision function, three askers.
+/// A dry run must say whether the identical executing request would refuse.
+/// The plan's numbers alone read as a clean 200, so an operator would
+/// otherwise learn about the force gate from the request that was meant to
+/// do the work. Both triggers, on the report and on the status route (one
+/// decision function, three askers).
 #[sqlx::test(migrations = false)]
 async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
     let h = harness(pool).await;
 
-    // `level` carries a value no ladder rung reads (LOSS), `pri` carries a
-    // numeral both dialects read differently (AMBIGUITY) and nothing else.
+    // `level` carries a value no ladder rung reads (loss), `pri` carries a
+    // numeral both dialects read differently (ambiguity) and nothing else.
     h.ingest_and_compact(&[
         event("api", &json!({"level": "error", "pri": "error"})),
         event("api", &json!({"level": "gold", "pri": "3"})),
@@ -1329,7 +1325,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
     assert_eq!(h.pinned_type("level").await, "VARCHAR");
     assert_eq!(h.pinned_type("pri").await, "VARCHAR");
 
-    // (1) LOSS: `gold` has no reading at all.
+    // (1) Loss: `gold` has no reading at all.
     let dry = match h
         .schema_admin
         .schema_repin("level", "severity", None, true, false)
@@ -1366,7 +1362,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
     assert_eq!(latest.requires_force, Some(true));
     assert_eq!(latest.requires_force_reason, dry.requires_force_reason);
 
-    // (2) AMBIGUITY: nothing is lost, but `3` means err to syslog and
+    // (2) Ambiguity: nothing is lost, but `3` means err to syslog and
     // trace3 to OTel — the gate fires on the default OTel reading.
     let dry = match h
         .schema_admin
@@ -1418,11 +1414,11 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
     );
 }
 
-/// The force verdict has THREE states, and the missing one is the one that
-/// matters (issue #79 review): a claimed job whose scan has not recorded a
-/// plan yet reports NO verdict. Its counts are zeros meaning "not measured",
-/// and answering `false` there tells an operator polling the status route
-/// that a job about to 409 is clean.
+/// The force verdict has three states, and the missing one is the one that
+/// matters: a claimed job whose scan has not recorded a plan yet reports no
+/// verdict. Its counts are zeros meaning "not measured", so answering
+/// `false` there would tell an operator polling the status route that a job
+/// about to 409 is clean.
 #[sqlx::test(migrations = false)]
 async fn the_force_verdict_is_absent_until_the_scan_has_a_plan(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -1491,10 +1487,9 @@ async fn the_force_verdict_is_absent_until_the_scan_has_a_plan(pool: sqlx::PgPoo
     assert_eq!(clean.requires_force_reason, None);
 }
 
-/// The corpus every acceptance criterion is written against: one sender
-/// field carrying the five shapes a severity repin has to answer for — two
-/// case-variant tokens, an exact `OTel` short name, a dialect-ambiguous
-/// numeral, and a value no ladder rung reads.
+/// One sender field carrying the five shapes a severity repin has to answer
+/// for: two case-variant tokens, an exact `OTel` short name, a
+/// dialect-ambiguous numeral, and a value no ladder rung reads.
 fn severity_corpus() -> Vec<serde_json::Value> {
     ["error", "ERROR", "error2", "3", "gold"]
         .iter()
@@ -1502,9 +1497,9 @@ fn severity_corpus() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// AC2/AC5: the dry run's numbers ARE the executed rewrite's, and the
-/// report carries the evidence an operator decides on (which value cannot
-/// be read, and whether anything is still writing the field).
+/// The dry run's numbers are the executed rewrite's, and the report carries
+/// the evidence an operator decides on: which value cannot be read, and
+/// whether anything is still writing the field.
 #[sqlx::test(migrations = false)]
 async fn repin_to_severity_dry_run_matches_the_executed_rewrite(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -1534,7 +1529,7 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite(pool: sqlx::PgPo
         Some("otel"),
         "the default assertion"
     );
-    // AC5: the evidence, not just the count.
+    // The evidence, not just the count.
     assert_eq!(dry.unmapped_samples, vec!["gold".to_owned()]);
     let live = dry.liveness.as_ref().expect("the sender just wrote");
     assert_eq!(live.service, "api");
@@ -1593,17 +1588,18 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite(pool: sqlx::PgPo
     );
 }
 
-/// AC3: the syslog assertion INVERTS the numeral, is persisted on the job
-/// row, and reads back off the status route — the one dialect-changing
-/// decision an operator can make about their own corpus.
+/// The syslog assertion inverts the numeral, is persisted on the job row,
+/// and reads back off the status route: the one dialect-changing decision
+/// an operator can make about their own corpus.
 #[sqlx::test(migrations = false)]
 async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion(pool: sqlx::PgPool) {
     let h = harness(pool).await;
     h.ingest_and_compact(&severity_corpus()).await;
 
-    // The ambiguity gate does NOT fire under an explicit syslog assertion
-    // (AC4's other half is `a_dry_run_reports_the_force_verdict_it_would_hit`),
-    // but `gold` is still a loss, so this run is forced for that reason.
+    // The ambiguity gate does not fire under an explicit syslog assertion
+    // (the other half of that gate is covered by
+    // `a_dry_run_reports_the_force_verdict_it_would_hit`), but `gold` is
+    // still a loss, so this run is forced for that reason.
     let started = match h
         .schema_admin
         .schema_repin("level", "severity", Some("syslog"), false, true)
@@ -1621,7 +1617,7 @@ async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion(pool: sqlx
         "the assertion is persisted on the job row"
     );
 
-    // Syslog counts DOWN: `3` is err (17), not trace3 (3). Words are
+    // Syslog counts down: `3` is err (17), not trace3 (3). Words are
     // dialect-free, so the three tokens read exactly as before.
     assert_eq!(
         h.count("level=error last=1h | stats count()").await,
@@ -1632,10 +1628,10 @@ async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion(pool: sqlx
     assert_eq!(h.count("level>=warn last=1h | stats count()").await, 4);
 }
 
-/// AC6 + ruling 13: a value a PRIOR conform shelved comes back under the
-/// new pin — including one whose `_raw` key still carries the sender's
-/// original mixed-case spelling, which the case-variant fallback recovers
-/// best-effort (the documented Unicode-`lower()`-vs-ASCII-fold edge).
+/// A value a prior conform shelved comes back under the new pin, including
+/// one whose `_raw` key still carries the sender's original mixed-case
+/// spelling, which the case-variant fallback recovers best-effort (the
+/// documented Unicode-`lower()`-vs-ASCII-fold edge).
 #[sqlx::test(migrations = false)]
 async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key(pool: sqlx::PgPool) {
     let h = harness(pool).await;
@@ -1645,7 +1641,7 @@ async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key(pool: sq
         .await;
     assert_eq!(h.pinned_type("lvl").await, "BIGINT");
     // …and a token batch conflicts: the value is nulled and lives on in
-    // `_raw`, which holds the sender's ORIGINAL key spelling (`Lvl`),
+    // `_raw`, which holds the sender's original key spelling (`Lvl`),
     // because `_raw` is captured before the name fold.
     h.ingest_and_compact(&[event("api", &json!({"Lvl": "error"}))])
         .await;
@@ -1690,9 +1686,9 @@ async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key(pool: sq
     );
 }
 
-/// AC7: after the repin, the sender's own field IS on the ladder in every
-/// lane — the cold parquet, the hot buffer a live event lands in, the
-/// pipeline's `where`, and the in-memory matcher the live tail uses — and a
+/// After the repin, the sender's own field is on the ladder in every lane —
+/// the cold parquet, the hot buffer a live event lands in, the pipeline's
+/// `where`, and the in-memory matcher the live tail uses — and a
 /// newly-ingested `"error"` conforms to 17 with no further operator action.
 #[sqlx::test(migrations = false)]
 async fn post_repin_severity_binds_in_every_lane_including_live_ingest(pool: sqlx::PgPool) {
@@ -1713,7 +1709,7 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest(pool: sql
     // Cold: the rewritten corpus.
     assert_eq!(h.count("level>=warn last=1h | stats count()").await, 3);
 
-    // LIVE INGEST, uncompacted: the hot branch conforms through the same
+    // Live ingest, uncompacted: the hot branch conforms through the same
     // catalog pin, so a brand-new `"error"` is 17 the moment it lands —
     // nothing about the sender changed.
     let live = event("api", &json!({"level": "error"}));
@@ -1730,14 +1726,14 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest(pool: sql
         4,
         "the hot row reads on the ladder before compaction"
     );
-    // The PIPELINE lane binds the same pin (ADR-0011 slice A′).
+    // The pipeline lane binds the same pin (ADR-0011).
     assert_eq!(
         h.count("last=1h | where level >= \"error\" | stats count()")
             .await,
         4
     );
 
-    // The LIVE-TAIL lane: the same filter the SSE stream compiles, over the
+    // The live-tail lane: the same filter the SSE stream compiles, over the
     // same catalog snapshot the handler hands it.
     let pins = h.server.state.query.field_catalog.all();
     let matches = |dsl: &str| -> bool {
@@ -1758,9 +1754,9 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest(pool: sql
     assert_eq!(h.count("level=error last=1h | stats count()").await, 4);
 }
 
-/// Ruling 7: EVERY shadow pass — the initial build and the catch-up passes
-/// that fold in files compaction wrote meanwhile — rides the JOB's asserted
-/// dialect, while ordinary compaction stays on the `OTel` reading.
+/// Every shadow pass — the initial build and the catch-up passes that fold
+/// in files compaction wrote meanwhile — rides the job's asserted dialect,
+/// while ordinary compaction stays on the `OTel` reading.
 ///
 /// That combination is exactly the discontinuity the CLI warns about, so it
 /// is asserted rather than assumed: a `3` the catch-up rewrote reads as
@@ -1775,10 +1771,10 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel(poo
         .await;
     assert_eq!(h.pinned_type("level").await, "VARCHAR");
 
-    // A BARRIER, not just a delay: pass 0 takes its source snapshot and then
-    // waits, so the file this test writes next provably did NOT exist when
-    // the build enumerated its sources — only a CATCH-UP pass can carry it
-    // into the shadow, which is the claim under test. A delay alone would
+    // A barrier, not just a delay: pass 0 takes its source snapshot and then
+    // waits, so the file this test writes next provably did not exist when
+    // the build enumerated its sources. Only a catch-up pass can carry it
+    // into the shadow, which is the claim under test; a delay alone would
     // let pass 0 see the file, and the assertions below would hold even if
     // catch-up passes read the wrong dialect.
     trawl_server::repin::engine::TEST_SNAPSHOT_TAKEN.store(false, Ordering::SeqCst);
@@ -1805,7 +1801,7 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel(poo
         trawl_server::repin::engine::TEST_SNAPSHOT_TAKEN.load(Ordering::SeqCst),
         "the build never reached its first snapshot"
     );
-    // Written by compaction under the OLD pin, AFTER that snapshot.
+    // Written by compaction under the old pin, after that snapshot.
     h.ingest_and_compact(&[event("api", &json!({"level": "3"}))])
         .await;
     trawl_server::repin::engine::TEST_RELEASE_BUILD.store(true, Ordering::SeqCst);
@@ -1813,7 +1809,7 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel(poo
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
     // The mid-build row survived the swap, which only a catch-up pass can
-    // do: the cutover publishes the shadow WHOLESALE, so a file the build
+    // do: the cutover publishes the shadow wholesale, so a file the build
     // never folded in would be gone.
     assert_eq!(h.count("last=1h | stats count()").await, 2);
 

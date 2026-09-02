@@ -4,8 +4,11 @@
 
 //! HTTPS transport via axum over `tokio-rustls`.
 //!
-//! Uses a manual TLS accept loop with hyper for per-connection control
-//! and future mTLS support.
+//! The accept loop is manual because every connection is TLS-terminated
+//! with `tokio-rustls` before hyper serves it. That also puts the peer
+//! address into the request extensions, and lets the shutdown signal call
+//! `graceful_shutdown` per connection so idle keep-alives close instead of
+//! waiting out the drain timeout.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -64,11 +67,10 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/validate", post(handlers::validate_query))
         .route("/schema", get(handlers::schema))
         .route("/schema/services", get(handlers::schema_services))
-        // Catalog read routes (#51). The field DETAIL takes `?name=` rather
-        // than a path segment: a catalog key may contain `/`.
         .route("/schema/fields", get(handlers::catalog_fields))
         .route("/schema/repin", post(handlers::schema_repin))
         .route("/schema/repin/status", get(handlers::schema_repin_status))
+        // `?name=` rather than a path segment: a catalog key may contain `/`.
         .route("/schema/field", get(handlers::catalog_field))
         .route("/schema/conflicts", get(handlers::catalog_conflicts))
         .route("/schema/values/{field}", get(handlers::field_values))
@@ -142,7 +144,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .nest("/api/v1", ingest_routes)
         .route("/api/v1/health", get(handlers::health))
         .route("/metrics", get(handlers::prometheus_metrics))
-        // -- security hardening layers (outermost applied first) --
+        // -- security hardening layers (first .layer() = innermost) --
         .layer(CatchPanicLayer::new())
         .layer(ConcurrencyLimitLayer::new(max_conns))
         .layer(SetResponseHeaderLayer::overriding(

@@ -46,9 +46,7 @@ fn resolve_year_at<Tz: TimeZone + Copy>(
         .map_or(arrival_year, |(_, _, year)| year)
 }
 
-/// Map syslog severity to trawl's level vocabulary.
-///
-/// Map syslog facility to a human-readable string.
+/// Map a syslog facility to its conventional name (`kern`, `local0`, …).
 pub fn facility_to_str(facility: Option<SyslogFacility>) -> Option<&'static str> {
     Some(match facility? {
         SyslogFacility::LOG_KERN => "kern",
@@ -78,7 +76,6 @@ pub fn facility_to_str(facility: Option<SyslogFacility>) -> Option<&'static str>
     })
 }
 
-/// Extract process ID as a string from syslog `ProcId`.
 pub fn procid_to_string(procid: &Option<ProcId<&str>>) -> Option<String> {
     match procid {
         Some(ProcId::PID(pid)) => Some(pid.to_string()),

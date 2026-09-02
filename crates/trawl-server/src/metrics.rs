@@ -20,8 +20,8 @@ pub const QUERY_DURATION: &str = "trawl_query_duration_seconds";
 pub const INGEST_EVENTS_TOTAL: &str = "trawl_ingest_events_total";
 pub const INGEST_EVENTS_REJECTED_TOTAL: &str = "trawl_ingest_events_rejected_total";
 pub const INGEST_REPAIRS_TOTAL: &str = "trawl_ingest_repairs_total";
-/// Events a PROFILE producer (syslog, telemetry) had to drop, by
-/// `{profile, reason}` — ADR-0013 slice 2, ruling 4.
+/// Events a profile producer (syslog, telemetry) had to drop, by
+/// `{profile, reason}`.
 ///
 /// Those producers have no one to reject to, so a drop means the server
 /// refused its own boot-validated assertion: a bug, not a sender's
@@ -32,7 +32,7 @@ pub const INGEST_REPAIRS_TOTAL: &str = "trawl_ingest_repairs_total";
 /// The HTTP door keeps [`INGEST_EVENTS_REJECTED_TOTAL`], where per-event
 /// rejection is the contract.
 pub const INGEST_PROFILE_REJECT_TOTAL: &str = "trawl_ingest_profile_reject_total";
-/// Accepted events whose severity SOURCE mapped to nothing on the `OTel`
+/// Accepted events whose severity source mapped to nothing on the `OTel`
 /// ladder, so `_severity` was omitted (ADR-0013 §2). Deliberately a
 /// counter rather than a repair code: derivation into the `_` namespace
 /// touches nothing sender-visible, so there is nothing to confess in
@@ -272,7 +272,7 @@ pub fn describe_metrics() {
          in-flight batch (serialized bytes plus retained event maps)"
     );
 
-    // A described gauge has no SERIES until something sets it, and the
+    // A described gauge has no series until something sets it, and the
     // degraded count is set by a postgres read on the schema-refresh tick:
     // a node that boots with the store unreachable would export nothing at
     // all, which a dashboard reads exactly like "no degraded fields". Seed
@@ -368,7 +368,6 @@ pub fn collect_gauges(
     fallback_glob: &str,
     wal_dir: Option<&Path>,
 ) {
-    // Hot buffer gauges.
     if let Some(buf) = hot_buffer {
         metrics::gauge!(HOT_BUFFER_EVENTS).set(buf.event_count() as f64);
         metrics::gauge!(HOT_BUFFER_BYTES).set(buf.byte_count() as f64);
@@ -377,7 +376,6 @@ pub fn collect_gauges(
     // Parquet file gauges — walk the glob pattern's parent directory.
     collect_parquet_gauges(fallback_glob);
 
-    // WAL file gauges.
     if let Some(dir) = wal_dir {
         collect_wal_gauges(dir);
     }
@@ -428,7 +426,6 @@ fn collect_parquet_gauges(fallback_glob: &str) {
     metrics::gauge!(PARQUET_FILES).set(file_count as f64);
     metrics::gauge!(PARQUET_BYTES).set(total_bytes as f64);
 
-    // Update cache after setting gauges.
     let mut cached = cache.lock().expect("parquet cache poisoned");
     cached.file_count = file_count;
     cached.total_bytes = total_bytes;
@@ -455,7 +452,7 @@ pub(crate) fn walk_parquet_files(dir: &Path) -> std::io::Result<Vec<ParquetEntry
 }
 
 /// The same walk, isolating IO failures instead of aborting on the first:
-/// returns every file that WAS enumerable plus one `(path, error)` pair per
+/// returns every file that was enumerable plus one `(path, error)` pair per
 /// directory or entry that was not.
 ///
 /// A caller that treats an unreadable path as a per-path skip — the boot

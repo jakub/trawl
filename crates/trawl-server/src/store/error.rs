@@ -4,12 +4,11 @@
 
 //! Error types for the postgres app-state store.
 //!
-//! Postgres failures are classified centrally by **(SQLSTATE, constraint
-//! name)** — never by message text. Every constraint in
+//! Postgres failures are classified centrally by (SQLSTATE, constraint
+//! name), never by message text. Every constraint in
 //! `crates/trawl-server/migrations/` is named so this map stays exact.
 
-/// Errors from the app-state store (history, saved queries, schedules,
-/// report runs).
+/// Errors from every app-state store facade.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// The database is unreachable or errored unexpectedly. Maps to 503 on
@@ -125,7 +124,7 @@ pub(crate) fn classify_violation(e: &sqlx::Error) -> Option<PgViolation> {
 impl From<sqlx::Error> for StoreError {
     /// Default conversion for un-classified sqlx errors: the backend is
     /// unavailable or misbehaving. Call sites that expect constraint
-    /// violations must run [`classify_violation`] BEFORE falling back here.
+    /// violations must run [`classify_violation`] before falling back here.
     fn from(e: sqlx::Error) -> Self {
         Self::Unavailable(e)
     }

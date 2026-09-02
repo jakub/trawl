@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Postgres-backed repin job store (ADR-0011 slice B, issue #53).
+//! Postgres-backed repin job store (ADR-0011).
 //!
 //! One repin at a time, install-wide, enforced by the `repin_jobs_one_running`
 //! partial unique index — never an in-process mutex, so the guarantee holds
@@ -71,10 +71,10 @@ pub struct RepinJob {
     pub id: i64,
     /// The repinned field (catalog key, folded).
     pub field: String,
-    /// The pin at claim time (CATALOG spelling — `SEVERITY` is not
+    /// The pin at claim time (catalog spelling: `SEVERITY` is not
     /// `BIGINT`).
     pub from_type: String,
-    /// The target pin (CATALOG spelling).
+    /// The target pin (catalog spelling).
     pub to_type: String,
     /// Whether this job stops after the scan.
     pub dry_run: bool,
@@ -109,16 +109,16 @@ pub struct RepinJob {
     pub rows_nulled: i64,
     /// Outcome: values resurrected from `_raw`.
     pub rows_resurrected: i64,
-    /// The asserted dialect of the corpus's NUMERALS — `Some` exactly for a
-    /// `SEVERITY` target (issue #79). A legacy or non-severity job is
-    /// `None`, never a backfilled `otel` it did not assert.
+    /// The asserted dialect of the corpus's numerals: `Some` exactly for a
+    /// `SEVERITY` target. Any other job is `None`, never a backfilled `otel`
+    /// it did not assert.
     pub dialect: Option<String>,
-    /// Rows whose numeral reads as a DIFFERENT severity in each dialect
+    /// Rows whose numeral reads as a different severity in each dialect
     /// (the 1-7 overlap): the scan's projection until the finished shadow
     /// supersedes it with what the rewrite actually saw.
     pub ambiguous_numerals: i64,
     /// Up to five distinct sanitised samples of values the new pin cannot
-    /// read at all — `_raw` resurrection included.
+    /// read at all, `_raw` resurrection included.
     pub unmapped_samples: Vec<String>,
     /// Scan-time liveness: the newest observation of the field anywhere in
     /// the catalog, or `None` when nothing has written it inside the
@@ -128,12 +128,12 @@ pub struct RepinJob {
     pub field_last_service: Option<String>,
     /// When the scan recorded its plan, if it has. Until then the row's
     /// counts are zeros that mean "not measured yet", not "nothing to
-    /// report" — which is why the force verdict is ABSENT rather than false
-    /// before this is set (issue #79 review).
+    /// report", which is why the force verdict is absent rather than false
+    /// before this is set.
     pub planned_at: Option<DateTime<Utc>>,
 }
 
-/// What a repin job is claimed FOR — the row's immutable half.
+/// What a repin job is claimed for: the row's immutable half.
 ///
 /// A struct rather than seven positional arguments: `dialect` is the one
 /// piece an operator asserts that nothing else can derive, and threading it
@@ -159,10 +159,10 @@ pub struct RepinClaim<'a> {
     pub requested_by: Option<&'a str>,
 }
 
-/// Everything the scan learned, stamped onto the job row in ONE statement:
+/// Everything the scan learned, stamped onto the job row in one statement:
 /// the counts, the evidence and the liveness fact. One write because they
-/// are one reading of the corpus — a row carrying counts from one scan and
-/// samples from another would be a report of a corpus that never existed.
+/// are one reading of the corpus; a row carrying counts from one scan and
+/// samples from another would report a corpus that never existed.
 #[derive(Debug, Clone, Default)]
 pub struct RepinPlan {
     /// Affected files.
@@ -175,7 +175,7 @@ pub struct RepinPlan {
     pub resurrectable: i64,
     /// Bytes across the affected files (the double-hold peak).
     pub affected_bytes: i64,
-    /// Rows whose numeral reads as a DIFFERENT severity in each dialect.
+    /// Rows whose numeral reads as a different severity in each dialect.
     pub ambiguous_numerals: i64,
     /// Up to `MAX_CONFLICT_SAMPLES` distinct sanitised samples of the values
     /// the new pin cannot read.
@@ -241,7 +241,7 @@ impl RepinStore {
         Self { pool }
     }
 
-    /// Claim THE running slot: insert a `running` row, mapping a 23505 on
+    /// Claim the running slot: insert a `running` row, mapping a 23505 on
     /// `repin_jobs_one_running` to [`StoreError::RepinAlreadyRunning`].
     pub async fn claim(&self, claim: RepinClaim<'_>) -> Result<i64, StoreError> {
         let result = sqlx::query_scalar::<_, i64>(
@@ -292,10 +292,10 @@ impl RepinStore {
 
     /// Stamp rewrite progress/outcome tallies onto the job row.
     ///
-    /// `ambiguous_numerals` is the ONE column the plan and the outcome
+    /// `ambiguous_numerals` is the one column the plan and the outcome
     /// share: the scan's projection stands until the build has actually
-    /// written files, and then the shadow's own count — everything the
-    /// catch-up passes folded in included — supersedes it. That is what the
+    /// written files, and then the shadow's own count (including everything
+    /// the catch-up passes folded in) supersedes it. That count is what the
     /// cutover's force gate decides on, so it is what the report must show.
     pub async fn record_progress(
         &self,
@@ -323,7 +323,7 @@ impl RepinStore {
         Ok(())
     }
 
-    /// Move a job to a TERMINAL status (never `running`), stamping
+    /// Move a job to a terminal status (never `running`), stamping
     /// `finished_at` once.
     pub async fn finish(
         &self,
@@ -346,26 +346,25 @@ impl RepinStore {
     }
 
     /// The cutover's pin flip: `field_types` takes the new type and the job
-    /// completes, in ONE transaction — a crash between the two cannot leave
-    /// a flipped pin with a `running` job or vice versa.
+    /// completes, in one transaction, so a crash between the two cannot
+    /// leave a flipped pin with a `running` job or vice versa.
     ///
     /// Idempotent on purpose: boot recovery replays this after a crash in
     /// the cutover or cleanup window, and a redo must neither error nor
     /// restamp `finished_at`.
     ///
-    /// The field's conflict evidence is cleared in the same transaction
-    /// (ADR-0011 slice C1): it indicts a pin that no longer exists, and the
-    /// analyzer's gate is span-based, so evidence left behind would badge
-    /// the field as degraded forever — the operator's remedy would not clear
-    /// the sign that told them to apply it.
+    /// The field's conflict evidence is cleared in the same transaction: it
+    /// indicts a pin that no longer exists, and the analyzer's gate is
+    /// span-based, so evidence left behind would badge the field as degraded
+    /// forever and the operator's remedy would not clear the sign that told
+    /// them to apply it.
     ///
-    /// The clear is gated on THIS call being the one that completed the job,
-    /// which is the only part of the flip that is not naturally idempotent.
-    /// A forced lossy repin records its OWN fresh evidence after
-    /// `finish_cutover` returns (`repin::engine`'s `record_outcome`), so a
-    /// boot replay of an already-succeeded job — the cleanup window crashed,
-    /// the marker survived — would otherwise delete evidence describing the
-    /// NEW pin, which nothing would ever write again.
+    /// The clear is gated on this call being the one that completed the job,
+    /// the only part of the flip that is not naturally idempotent. A forced
+    /// lossy repin records fresh evidence after `finish_cutover` returns
+    /// (`repin::engine`'s `record_outcome`), so an ungated boot replay of an
+    /// already-succeeded job would delete evidence describing the new pin,
+    /// which nothing would ever write again.
     pub async fn finish_cutover(
         &self,
         id: i64,
@@ -441,7 +440,7 @@ impl RepinStore {
             .map_err(StoreError::from)
     }
 
-    /// Boot reconciliation: fail every `running` row EXCEPT `keep` (the job
+    /// Boot reconciliation: fail every `running` row except `keep` (the job
     /// a standing `data/REPIN` marker still owns — its recovery completes
     /// it instead). A `running` row with no marker is an orphan from a
     /// killed process whose job never reached the cutover: the corpus is

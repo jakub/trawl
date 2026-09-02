@@ -8,21 +8,13 @@
 //! source paths, hot buffer state, result sample, and timing. Designed
 //! for `tail -f /var/lib/trawl/query-debug.log | jq` debugging workflows.
 //!
-//! This file is MORE sensitive than the underlying event corpus: one
+//! This file is more sensitive than the underlying event corpus: one
 //! record combines identity, raw query text, SQL parameter values,
 //! filesystem layout, and result samples. It is therefore owner-only
 //! (`0600` on Unix, tightening a pre-existing looser file at open) and
 //! size-bounded: past `server.query_log_max_bytes` the file rolls over
 //! to a single retained `<path>.1` (also owner-only; `0` disables
-//! rollover). A rollover that fails — the log deleted under a running
-//! trawld, an occupied or unwritable `<path>.1` — keeps the entry and
-//! backs off a whole cap before trying again, so an unrotatable path
-//! costs one attempt per `max_bytes` written rather than one per query.
-//! A rollover that lands its rename but cannot reopen the active path
-//! attempts a no-clobber undo. If the active name was reoccupied, both
-//! files are preserved and the writer is left holding a file that is no
-//! longer the configured path, so the log *stops* rather than growing an
-//! unbounded, unwatched file full of identity and query text.
+//! rollover).
 //!
 //! Tightening is best-effort in exactly one direction: POSIX `chmod`
 //! requires the caller to own the file, so a pre-existing log owned by
@@ -63,7 +55,7 @@ struct Inner {
     /// query, forever.
     next_attempt_bytes: u64,
     /// Set when a rollover renamed the active file away, failed to
-    /// reopen `path`, AND failed to undo the rename: `writer` then holds
+    /// reopen `path`, and failed to undo the rename: `writer` then holds
     /// the *rotated* generation, and no further rollover can ever
     /// succeed because `path` no longer exists. Writing on would append
     /// to a file nobody is tailing, without bound and without the cap
@@ -89,7 +81,7 @@ fn create_owner_only(path: &Path) -> io::Result<File> {
 }
 
 fn open_owner_only_with(path: &Path, configure: impl FnOnce(&mut OpenOptions)) -> io::Result<File> {
-    // The helper sets `0600` at creation AND re-applies it to a
+    // The helper sets `0600` at creation and re-applies it to a
     // pre-existing looser file, handing back a failed `chmod` instead of
     // raising it — the tolerance below is this log's own policy.
     let (file, chmod_error) = trawl_config::fs::open_with_mode(path, 0o600, configure)?;
@@ -290,7 +282,7 @@ pub struct QueryLogEntry {
     pub ts: String,
     /// Authenticated user name.
     pub user: String,
-    /// User's role.
+    /// The key's role names, comma-joined; `none` when it holds no role.
     pub role: String,
     /// Raw DSL query string.
     pub dsl: String,
@@ -530,7 +522,7 @@ mod tests {
             "a failed rollover still writes the entry"
         );
 
-        // Clear the obstruction: the very next entry must NOT re-attempt.
+        // Clear the obstruction: the very next entry must not re-attempt.
         std::fs::remove_dir(&rotated).unwrap();
         log.write(&entry("e4"));
         assert!(

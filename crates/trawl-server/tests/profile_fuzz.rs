@@ -2,16 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The bounded, in-process half of the ingest fuzzer (issue #75, AC 9):
-//! all THREE producer profiles driven through the one canonicalizer, with
-//! the gates that are supposed to be universal asserted per profile.
+//! The bounded, in-process half of the ingest fuzzer: all three producer
+//! profiles driven through the one canonicalizer, with the gates that are
+//! supposed to be universal asserted per profile.
 //!
-//! Slice 2's whole claim is that a profile bypasses nothing — the ASCII
-//! fold, the sealed `_`-prefix strip, the field-name length drop, the
-//! `_raw` cap and the `_producer` stamp belong to the door and apply to
-//! every one of them. That claim is exactly the kind a per-door unit test
-//! proves only where someone thought to look, so this walks a hostile
-//! corpus through each door and asserts the invariants as a SET:
+//! A profile bypasses nothing: the ASCII fold, the sealed `_`-prefix strip,
+//! the field-name length drop, the `_raw` cap and the `_producer` stamp
+//! belong to the door and apply to every one of them. That claim is exactly
+//! the kind a per-door unit test proves only where someone thought to look,
+//! so this walks a hostile corpus through each door and asserts the
+//! invariants as a set:
 //!
 //! - no key in the output is in trawl's `_` namespace unless it is one of
 //!   the envelope's own slots (a payload `_producer` must have become a
@@ -20,9 +20,9 @@
 //! - every key is at most [`MAX_FIELD_NAME_BYTES`] and carries no ASCII
 //!   uppercase (the two rules the catalog and `DuckDB` respectively need);
 //! - `_producer` equals the profile that admitted the event;
-//! - what a profile ASSERTS is what the event carries;
-//! - the `trawld` profile NEVER rejects (AC 3's invariant, fuzzed —
-//!   there is nobody for trawld to reject to).
+//! - what a profile asserts is what the event carries;
+//! - the `trawld` profile never rejects, because there is nobody for
+//!   trawld to reject to.
 //!
 //! Deterministic and bounded: one fixed [`SEED`], a few thousand events
 //! per profile, seconds in the ordinary `cargo nextest` run. **To
@@ -32,7 +32,7 @@
 //!
 //! The wire-corpus generator in `xtask/src/ingest_fuzz.rs` is deliberately
 //! independent of this file: that one emits NDJSON to replay against a
-//! LIVE server (`--profile http|syslog|trawld`), this one drives the
+//! live server (`--profile http|syslog|trawld`), this one drives the
 //! function. Neither can stand in for the other, and sharing a generator
 //! across the crate boundary would mean a dev-dependency on the task
 //! runner.
@@ -54,7 +54,7 @@ const SEED: u64 = 0x5157_1075_0000_0075;
 
 /// Events per profile. Large enough that every cadence in
 /// [`hostile_payload`] fires many times over, small enough that the whole
-/// file is well under a second — this IS the bounded CI run, so it lives
+/// file is well under a second — this is the bounded CI run, so it lives
 /// in the default suite rather than behind `#[ignore]`.
 const ROUNDS: u64 = 1_500;
 
@@ -204,8 +204,8 @@ fn assert_universal_gates(obj: &Map<String, Value>, kind: ProducerKind, origin: 
     }
 }
 
-/// What a PROFILE asserted is what the event carries — the precedence
-/// ruling, checked on every accepted event rather than on one example.
+/// What a profile asserted is what the event carries, checked on every
+/// accepted event rather than on one example.
 fn assert_profile_assertions(canonical: &Canonical, asserted: &Asserted<'_>, origin: &str) {
     assert_eq!(canonical.env, asserted.env, "{origin}: env assertion lost");
     assert_eq!(
@@ -271,7 +271,7 @@ fn arrival() -> (chrono::DateTime<chrono::Utc>, String) {
 }
 
 /// The HTTP door: a sender owns its own identity, so this is the only
-/// profile that can REJECT — and the corpus plants the bad identities
+/// profile that can reject — and the corpus plants the bad identities
 /// deliberately, so "rejected iff planted" is an exact assertion rather
 /// than a tolerance.
 #[test]
@@ -364,7 +364,7 @@ fn the_http_profile_survives_a_hostile_corpus() {
 ///
 /// Frames go through [`SyslogDoor::admit`] — the real transport path,
 /// parser included — because that is where hostile PRI/timestamp/hostname
-/// shapes live. Payload MAPS go straight at the door under
+/// shapes live. Payload maps go straight at the door under
 /// `Producer::Syslog`, because a wire frame cannot spell a `_HOSTNAME`
 /// key and the sealed-namespace gate has to be proven for this profile
 /// too.
@@ -407,10 +407,9 @@ fn the_syslog_profile_survives_hostile_frames_and_payloads() {
     assert_reached(
         &seen,
         &[
-            // The three defects this issue fixes, provoked by the corpus:
-            // an uncapped 64 KB datagram, a frame the profile has to
-            // salvage a service for, and an absent frame timestamp that
-            // used to be silently substituted.
+            // Each one is provoked by the corpus: an oversized datagram, a
+            // frame the profile has to salvage a service for, a frame
+            // carrying no timestamp, and one carrying no hostname.
             "field.truncated",
             "service.from_profile",
             "time.from_ingest",
@@ -478,7 +477,7 @@ fn hostile_frame(rng: &mut Rng, round: u64) -> String {
         2 => format!("plain line with no framing at all, round {round}"),
         // An APP-NAME that fails the service charset.
         3 => format!("<{pri}>1 2026-02-15T12:00:00Z host bad/app - - - body"),
-        // A 64 KB datagram: the `_raw` cap the listener never applied.
+        // A body past the 64 KiB `_raw` cap, which has to bite here.
         4 => format!(
             "<{pri}>1 2026-02-15T12:00:00Z host app - - - {}",
             "A".repeat(70_000)
@@ -491,10 +490,10 @@ fn hostile_frame(rng: &mut Rng, round: u64) -> String {
     }
 }
 
-/// The `trawld` profile: rejection-free BY CONSTRUCTION (AC 3). Every
-/// identity it asserts is boot-validated and there is nobody to reject
-/// to, so a refusal here is a server bug — and the fuzz corpus is how
-/// that claim stops being an argument.
+/// The `trawld` profile is rejection-free by construction: every identity
+/// it asserts is boot-validated and there is nobody to reject to, so a
+/// refusal here is a server bug. The fuzz corpus is how that claim stops
+/// being an argument.
 #[test]
 fn the_trawld_profile_never_rejects_a_hostile_payload() {
     let derivation = Derivation::defaults();
@@ -506,8 +505,8 @@ fn the_trawld_profile_never_rejects_a_hostile_payload() {
     for round in 0..ROUNDS {
         let origin = format!("trawld round {round} (seed {SEED:#018x})");
         let mut payload = hostile_payload(&mut rng, &names);
-        // Tracing call sites do carry these names — losing them to the
-        // assertion (with the value findable in `_raw`) is the ruling.
+        // Tracing call sites do carry these names: the profile's assertion
+        // wins and the value stays findable in `_raw`.
         if round % 3 == 0 {
             payload.insert(schema::SERVICE.into(), json!("nginx"));
         }
@@ -544,7 +543,7 @@ fn the_trawld_profile_never_rejects_a_hostile_payload() {
         });
         assert_universal_gates(&canonical.obj, ProducerKind::Trawld, &origin);
         assert_profile_assertions(&canonical, &asserted, &origin);
-        // `message` is NOT asserted by this profile (the payload is the
+        // `message` is not asserted by this profile (the payload is the
         // message), so a payload one stands.
         if round % 11 == 0 {
             assert_eq!(
@@ -560,8 +559,8 @@ fn the_trawld_profile_never_rejects_a_hostile_payload() {
         &[
             "field.producer_asserted",
             "field.reserved_prefix",
-            // The compaction wedge this issue exists to close: a tracing
-            // field name past the catalog's key bound.
+            // A tracing field name past the catalog's key bound: it has to
+            // be dropped at the door, never carried into compaction.
             "field.name_too_long",
             "host.omitted",
         ],

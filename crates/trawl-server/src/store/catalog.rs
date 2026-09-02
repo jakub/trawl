@@ -3,25 +3,25 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Postgres-backed field catalog: type pins, per-service observations, and
-//! conflict evidence (ADR-0009 slice 2).
+//! conflict evidence (ADR-0009).
 //!
 //! The catalog is the write-time type authority: compaction pins every
-//! dynamic field's canonical type here BEFORE the first parquet file
-//! carrying it is written, and conforms every batch to the pins — so
+//! dynamic field's canonical type here before the first parquet file
+//! carrying it is written, and conforms every batch to the pins, so
 //! `union_by_name` across any set of trawl-written files can never
 //! conflict. Pins are add-only on the ingest path (the one mutation is the
-//! operator-triggered repin cutover, `store::repin`, ADR-0011 slice B) —
-//! and because a pin slot is therefore permanent while its name is a client-chosen
-//! JSON key, the catalog is bounded where a sender controls the axis: name
-//! length by [`trawl_core::schema::is_storable_field_name`], pin count by
+//! operator-triggered repin cutover, `store::repin`), and because a pin
+//! slot is therefore permanent while its name is a client-chosen JSON key,
+//! the catalog is bounded where a sender controls the axis: name length by
+//! [`trawl_core::schema::is_storable_field_name`], pin count by
 //! [`MAX_PINNED_FIELDS`], and per-field conflict evidence by
-//! [`MAX_CONFLICTS_PER_FIELD`]. `field_services` rows are deliberately
-//! ever-observed — nothing removes one — and its worst case is bounded by
-//! the pin cap on the field axis times the services a deployment really
-//! runs; consumers window on `last_seen`. Its SERVICE axis has no cap at
-//! all (service names are client-chosen and no row is ever removed), so the
-//! read surface pages it: [`CatalogStore::field_services`] takes a bounded
-//! limit and a [`ServiceCursor`], never the whole history.
+//! [`MAX_CONFLICTS_PER_FIELD`]. `field_services` rows are ever-observed:
+//! nothing removes one, and its worst case is bounded by the pin cap on the
+//! field axis times the services a deployment really runs; consumers window
+//! on `last_seen`. Its service axis has no cap at all (service names are
+//! client-chosen and no row is ever removed), so the read surface pages it:
+//! [`CatalogStore::field_services`] takes a bounded limit and a
+//! [`ServiceCursor`], never the whole history.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -44,11 +44,11 @@ pub struct PinProposal {
 }
 
 /// One append-only conflict record: a batch column whose `TRY_CAST` to its
-/// pin NULLED at least one value. A cast that nulls nothing is convergence,
-/// not conflict, and is never recorded (see `ConformPlan::tally_conflicts`)
-/// — an append-only row per lossless cast per compaction tick would grow
-/// without bound. What a genuinely lossy sender appends is bounded instead
-/// by [`MAX_CONFLICTS_PER_FIELD`].
+/// pin nulled at least one value. A cast that nulls nothing is convergence,
+/// not conflict, and is never recorded (see `ConformPlan::tally_conflicts`);
+/// a row per lossless cast per compaction tick would grow without bound.
+/// What a genuinely lossy sender appends is bounded instead by
+/// [`MAX_CONFLICTS_PER_FIELD`].
 #[derive(Debug, Clone)]
 pub struct FieldConflict {
     /// Field name.
@@ -62,16 +62,16 @@ pub struct FieldConflict {
     pub expected_type: CanonicalType,
     /// Rows whose value the cast nulled (recoverable from `_raw`).
     pub rows_nulled: u64,
-    /// Up to [`MAX_CONFLICT_SAMPLES`] DISTINCT values the cast nulled, each
+    /// Up to [`MAX_CONFLICT_SAMPLES`] distinct values the cast nulled, each
     /// sanitised and cut to [`MAX_CONFLICT_SAMPLE_BYTES`] at capture. A
-    /// SAMPLE, never a manifest: the exhaustive record of what was shelved
+    /// sample, never a manifest: the exhaustive record of what was shelved
     /// is `_raw`. Empty where the lane has no values in hand (the repin
-    /// rewrite counts its own nulls, ADR-0011 slice B).
+    /// rewrite counts its own nulls).
     pub samples: Vec<String>,
 }
 
 /// One `(field, service)` observation reconstructed from a standing parquet
-/// file rather than reported by the batch that wrote it — the boot
+/// file rather than reported by the batch that wrote it: the boot
 /// conformance pass's backfill ([`CatalogStore::backfill_services`]).
 #[derive(Debug, Clone)]
 pub struct ServiceObservation {
@@ -88,12 +88,12 @@ pub struct ServiceObservation {
     pub row_count: i64,
 }
 
-/// One `(field, service)` pair carrying durable conflict evidence — a
+/// One `(field, service)` pair carrying durable conflict evidence: a
 /// `field_conflict_stats` key, stripped of its counters
-/// ([`CatalogStore::conflict_service_pairs`], ADR-0011 slice C2).
+/// ([`CatalogStore::conflict_service_pairs`]).
 ///
-/// The counters are deliberately absent: the degraded VERDICT is per field
-/// (the pin is global), so all this row contributes is attribution — which
+/// The counters are deliberately absent: the degraded verdict is per field
+/// (the pin is global), so all this row contributes is attribution, which
 /// sender's data the evidence came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictServicePair {
@@ -138,7 +138,7 @@ impl ServiceCursor {
     ///
     /// `|` is outside the service charset (`[A-Za-z0-9._-]`, enforced at
     /// every ingest door), and RFC 3339 has no `|` either, so splitting at
-    /// the LAST `|` recovers both halves unambiguously.
+    /// the last `|` recovers both halves unambiguously.
     #[must_use]
     pub fn encode(&self) -> String {
         format!(
@@ -150,7 +150,7 @@ impl ServiceCursor {
     }
 
     /// Parse a cursor the server previously issued. `None` for anything
-    /// malformed — a cursor is opaque to clients, so a garbled one is a
+    /// malformed: a cursor is opaque to clients, so a garbled one is a
     /// client error, never a silently ignored filter.
     #[must_use]
     pub fn decode(raw: &str) -> Option<Self> {
@@ -169,16 +169,16 @@ impl ServiceCursor {
 /// Filter for [`CatalogStore::list_fields`].
 #[derive(Debug, Clone)]
 pub struct FieldListFilter {
-    /// Only fields observed for this service — and every aggregate below
+    /// Only fields observed for this service, and every aggregate below
     /// (`service_count`, `row_count`, `first_seen`, `last_seen`, and the
-    /// `since` window read off them) is computed from THAT service's
+    /// `since` window read off them) is computed from that service's
     /// observations alone. `None` lists every pin over every service.
     pub service: Option<String>,
     /// Window on the field's most recent observation: a field whose
-    /// `max(last_seen)` — within `service`, when set — predates this
-    /// instant is hidden. A field with NO observations at all (e.g. the
-    /// envelope seed on a fresh install) is ALWAYS shown — there is
-    /// nothing to age out. `None` disables the window.
+    /// `max(last_seen)` (within `service`, when set) predates this instant
+    /// is hidden. A field with no observations at all, such as the envelope
+    /// seed on a fresh install, is always shown, since there is nothing to
+    /// age out. `None` disables the window.
     pub since: Option<DateTime<Utc>>,
     /// Maximum rows returned (the caller clamps; see the route handlers).
     pub limit: i64,
@@ -285,48 +285,46 @@ pub struct FieldConflictRow {
 
 /// Maximum number of fields the catalog will ever pin.
 ///
-/// Field names are client-chosen JSON keys, and a pin SLOT is PERMANENT
+/// Field names are client-chosen JSON keys, and a pin slot is permanent
 /// (a repin retypes a pin, nothing reclaims one, and retention never
 /// reconciles `field_services`). Without a count bound, a sender that
-/// embeds identifiers in its keys — `user_12345_status`, accidental or
-/// hostile — grows postgres, the in-process [`crate::catalog::FieldCatalog`]
-/// cache, and every snapshot taken of it without limit. Name LENGTH is
+/// embeds identifiers in its keys, `user_12345_status`, accidental or
+/// hostile, grows postgres, the in-process [`crate::catalog::FieldCatalog`]
+/// cache, and every snapshot taken of it without limit. Name length is
 /// bounded by [`trawl_core::schema::is_storable_field_name`]; this bounds
-/// the COUNT.
+/// the count.
 ///
 /// A field denied a pin gets the same treatment as an unstorable name: it
 /// is absent from the pin map, so compaction's conform step drops the
-/// column and the values stay findable in `_raw`. Deliberately generous —
+/// column and the values stay findable in `_raw`. Deliberately generous:
 /// a real corpus that legitimately reaches five figures of distinct field
 /// names has a modelling problem this cap should surface, not a capacity
 /// problem trawl should silently absorb.
 ///
-/// **FILLING the cap is the attack the cap itself invites.** A slot, once
+/// Filling the cap is the attack the cap itself invites. A slot, once
 /// taken, is taken forever, and denial is silent in the data (the column is
-/// simply absent from every later parquet file). Left first-come-first-served
-/// the whole catalog was consumable in ONE compaction batch — a single
-/// request carrying ten thousand junk keys — after which every genuinely new
-/// field on the install, from every service, was permanently unstored. Two
-/// things keep that unreachable:
+/// simply absent from every later parquet file). One request carrying ten
+/// thousand junk keys would otherwise take the whole catalog in a single
+/// compaction batch. Two things keep that unreachable:
 ///
-/// - Admission from the ingest path is RATIONED: one batch may take at most
-///   half the FREE slots ([`Ration::HalfOfFree`]), so exhaustion is a slope
+/// - Admission from the ingest path is rationed: one batch may take at most
+///   half the free slots ([`Ration::HalfOfFree`]), so exhaustion is a slope
 ///   requiring sustained, repeated effort instead of a one-shot cliff, and
 ///   there is always headroom left for the next field a legitimate sender
 ///   introduces.
-/// - The fill level is a first-class signal —
-///   `trawl_catalog_pinned_fields` against `trawl_catalog_pin_capacity` —
+/// - The fill level is a first-class signal,
+///   `trawl_catalog_pinned_fields` against `trawl_catalog_pin_capacity`,
 ///   so an operator alerts on the slope, not on the wreckage. (The
 ///   `catalog_pin_cap_reached` warning only fires once slots are already
 ///   gone.)
 ///
-/// What neither buys is a REMEDY: the repin engine (ADR-0011 slice B)
-/// retypes a wrong pin, but reclaiming a taken SLOT means proving no
-/// standing parquet carries the column — deliberately out of scope; a
-/// hand-run `DELETE FROM field_types` breaks the write-time conformance
-/// invariant for files already on disk and must not be recommended. A
-/// sustained sender can still fill the catalog — the ration slows it and
-/// the gauges make it visible while it happens.
+/// What neither buys is a remedy: the repin engine retypes a wrong pin, but
+/// reclaiming a taken slot means proving no standing parquet carries the
+/// column, deliberately out of scope; a hand-run `DELETE FROM field_types`
+/// breaks the write-time conformance invariant for files already on disk
+/// and must not be recommended. A sustained sender can still fill the
+/// catalog; the ration slows it and the gauges make it visible while it
+/// happens.
 pub const MAX_PINNED_FIELDS: i64 = 10_000;
 
 /// Maximum `field_conflicts` rows kept per field — the newest survive.
@@ -338,28 +336,28 @@ pub const MAX_PINNED_FIELDS: i64 = 10_000;
 /// evidence table grows without limit while the sender's behaviour, and
 /// therefore the evidence's information content, stays constant.
 ///
-/// The bound is per FIELD, not per `(field, service)`: service names are
+/// The bound is per field, not per `(field, service)`: service names are
 /// client-chosen too, so a per-service window would only move the
 /// unbounded axis. A field conflicting across more services than the
-/// window is therefore sampled, not covered — the exhaustive, never-lossy
+/// window is therefore sampled, not covered; the exhaustive, never-lossy
 /// tallies are the `trawl_catalog_conflicts_total` /
-/// `trawl_catalog_rows_nulled_total` counters; these rows exist to show an
-/// operator WHICH values a pin is currently costing them, and the newest
+/// `trawl_catalog_rows_nulled_total` counters. These rows exist to show an
+/// operator which values a pin is currently costing them, and the newest
 /// evidence is the evidence they act on.
 pub const MAX_CONFLICTS_PER_FIELD: i64 = 100;
 
-/// Distinct misfit values kept per conflict row (ADR-0011 slice C1).
+/// Distinct misfit values kept per conflict row.
 ///
 /// The samples answer "which values is this pin costing me", which five
-/// distinct examples answer as well as five hundred — while five hundred
-/// per row, at the cap above, per field, at the pin cap, is a table whose
-/// size is set by how creatively a sender misformats its values. The
-/// exhaustive record is `_raw`, which already holds every one of them.
+/// distinct examples answer as well as five hundred would. Five hundred per
+/// row, at the cap above, per field, at the pin cap, is a table whose size
+/// is set by how creatively a sender misformats its values. The exhaustive
+/// record is `_raw`, which already holds every one of them.
 pub const MAX_CONFLICT_SAMPLES: usize = 5;
 
 /// Bytes kept per sample, cut on a `char` boundary at capture.
 ///
-/// A misfit value is client text of client-chosen length — a whole embedded
+/// A misfit value is client text of client-chosen length: a whole embedded
 /// document can arrive under a BIGINT pin. Enough to recognise the shape of
 /// what is arriving, far short of storing the payload a second time.
 pub const MAX_CONFLICT_SAMPLE_BYTES: usize = 256;
@@ -379,11 +377,11 @@ pub const MAX_CONFLICT_SAMPLE_BYTES: usize = 256;
 /// correct, the CLI simply omits the sample block, and the cause is counted
 /// on `trawl_catalog_sample_capture_failures_total`.
 ///
-/// It also bounds the OBSERVED-TYPE evidence the suggested target is derived
-/// from, and that is a deliberate narrowing: the suggestion now describes the
+/// It also bounds the observed-type evidence the suggested target is derived
+/// from, and that is a deliberate narrowing: the suggestion describes the
 /// newest episodes rather than the whole retained window. That reads the
-/// right way round — a field whose recent traffic is uniformly one rung
-/// should be repinned to that rung — and the suggestion is a starting point
+/// right way round, since a field whose recent traffic is uniformly one rung
+/// should be repinned to that rung, and the suggestion is a starting point
 /// for a dry run, never an action.
 const VERDICT_EVIDENCE_ROWS: i64 = 5;
 
@@ -433,16 +431,16 @@ fn warn_unstorable(op: &str, rejected: &[String]) {
     bump_rejected("name_too_long", rejected.len());
 }
 
-/// How many of the free pin slots ONE call may consume.
+/// How many of the free pin slots one call may consume.
 ///
 /// The pin count is bounded ([`MAX_PINNED_FIELDS`]) but a slot is spent
 /// permanently, so *how fast* the free slots can be spent is its own
-/// property — a bound nothing can take in one gulp behaves very differently
+/// property: a bound nothing can take in one gulp behaves very differently
 /// from one anything can. See [`MAX_PINNED_FIELDS`].
 #[derive(Debug, Clone, Copy)]
 enum Ration {
-    /// Ingest path: at most half the free slots, so no single batch — and
-    /// therefore no single ingest request — can consume the catalog.
+    /// Ingest path: at most half the free slots, so no single batch, and
+    /// therefore no single ingest request, can consume the catalog.
     HalfOfFree,
     /// Boot conformance pass: every free slot, because there a denied pin
     /// deletes a column that is already on disk
@@ -507,7 +505,7 @@ impl CatalogStore {
 
     /// Load every pin in the catalog.
     ///
-    /// A stored spelling outside the canonical five fails loudly — the
+    /// A stored spelling outside the canonical five fails loudly: the
     /// catalog is written by code, so that is corruption, not data.
     pub async fn load_pins(&self) -> Result<Vec<(String, CanonicalType)>, StoreError> {
         let rows = sqlx::query("SELECT field, duckdb_type FROM field_types ORDER BY field")
@@ -529,30 +527,30 @@ impl CatalogStore {
     }
 
     /// Pin every proposal whose field is absent from the catalog, then
-    /// return the AUTHORITATIVE pins for all proposed fields.
+    /// return the authoritative pins for all proposed fields.
     ///
     /// First-writer-wins: `INSERT ... ON CONFLICT (field) DO NOTHING`, then
     /// a re-read — so two racing batches (or a proposal against an existing
     /// pin) both come back with the same pin, never their own proposal.
     ///
     /// A field whose name cannot be a catalog key (see
-    /// [`unstorable_names`]) is DROPPED from the proposal set rather than
+    /// [`unstorable_names`]) is dropped from the proposal set rather than
     /// allowed to error the insert: pinning gates every parquet write, so
     /// one such name would otherwise retain the batch for retry on every
     /// tick, forever. Absent from the returned map, the column is simply
-    /// unpinned — which the conform step already treats as "drop it".
+    /// unpinned, which the conform step already treats as "drop it".
     ///
-    /// The same treatment bounds the catalog's SIZE: the insert only fills
+    /// The same treatment bounds the catalog's size: the insert only fills
     /// the slots left under [`MAX_PINNED_FIELDS`], so a batch arriving at a
     /// full catalog pins nothing new and its novel columns are dropped from
-    /// the parquet with their values still in `_raw` (never an `Err` — that
+    /// the parquet with their values still in `_raw` (never an `Err`, which
     /// would wedge compaction for a condition retrying cannot clear).
     ///
-    /// This is the ingest path, so admission is RATIONED to half the free
-    /// slots ([`Ration::HalfOfFree`] — see [`MAX_PINNED_FIELDS`] for why a
+    /// This is the ingest path, so admission is rationed to half the free
+    /// slots ([`Ration::HalfOfFree`]; see [`MAX_PINNED_FIELDS`] for why a
     /// batch that can take every remaining slot is the attack). A batch
     /// proposing more novel fields than its ration keeps the surplus for its
-    /// next tick: an unpinned column is dropped from THIS file only, and a
+    /// next tick: an unpinned column is dropped from this file only, and a
     /// field a sender keeps sending is proposed again ten seconds later.
     pub async fn pin_missing(
         &self,
@@ -561,13 +559,13 @@ impl CatalogStore {
         self.pin_missing_with(proposals, Ration::HalfOfFree).await
     }
 
-    /// Pin proposals WITHOUT the per-batch ration — the boot conformance
+    /// Pin proposals without the per-batch ration: the boot conformance
     /// pass only.
     ///
     /// That pass does not propose client input as it arrives: it proposes
     /// what a standing parquet corpus already contains, and its next act is
     /// to rewrite the files that disagree. There, a denied pin does not
-    /// decline to store a new column — it DELETES a column that is already
+    /// decline to store a new column, it deletes a column that is already
     /// on disk. Rationing the seed would therefore destroy data to slow an
     /// attacker who has already spent the slots, so the seed gets every free
     /// slot the cap allows; [`MAX_PINNED_FIELDS`] still bounds it absolutely.
@@ -634,9 +632,9 @@ impl CatalogStore {
         .execute(&self.pool)
         .await?;
 
-        // The fill level is the signal an operator can act on BEFORE the cap
+        // The fill level is the signal an operator can act on before the cap
         // bites; `catalog_pin_cap_reached` below only fires once the slots
-        // are already gone — and gone permanently (a repin retypes a slot,
+        // are already gone, and gone permanently (a repin retypes a slot,
         // nothing reclaims one).
         let pinned_now: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
             .fetch_one(&self.pool)
@@ -663,7 +661,7 @@ impl CatalogStore {
             .map_err(StoreError::from)?;
 
         // Whatever the insert could not seat comes back missing from the
-        // authoritative re-read — the one place that sees the cap bite,
+        // authoritative re-read, the one place that sees the cap bite,
         // however the slots were lost (full catalog, or a racing batch that
         // took the last ones).
         let denied: Vec<String> = {
@@ -692,19 +690,19 @@ impl CatalogStore {
     /// Upsert per-service observations for a compacted batch: `first_seen`
     /// is set once, `last_seen` advances, `row_count` accumulates.
     ///
-    /// `row_count` is ADDED to the stored value, so callers must pass the
-    /// rows THIS batch wrote — never a whole-file total, which would
+    /// `row_count` is added to the stored value, so callers must pass the
+    /// rows this batch wrote, never a whole-file total, which would
     /// re-count every earlier batch on every tick.
     ///
     /// Names that cannot be a catalog key are skipped for the same reason
-    /// as in [`Self::pin_missing`] — `field_services` keys on
+    /// as in [`Self::pin_missing`]: `field_services` keys on
     /// `(field, service)`, so an over-long name overflows this btree too.
     ///
-    /// Rows are ever-observed: nothing removes one, deliberately (the
-    /// issue's acceptance criterion). "Which services ever carried this
-    /// field" is historical fact, and consumers window on `last_seen`. The
-    /// table's worst case is bounded by [`MAX_PINNED_FIELDS`] on the field
-    /// axis times the distinct service names a deployment really ships.
+    /// Rows are ever-observed and nothing removes one, deliberately: "which
+    /// services ever carried this field" is historical fact, and consumers
+    /// window on `last_seen`. The table's worst case is bounded by
+    /// [`MAX_PINNED_FIELDS`] on the field axis times the distinct service
+    /// names a deployment really ships.
     pub async fn touch_services(
         &self,
         service: &str,
@@ -740,25 +738,24 @@ impl CatalogStore {
         Ok(())
     }
 
-    /// Backfill observations for a corpus that predates the catalog — the
+    /// Backfill observations for a corpus that predates the catalog: the
     /// boot conformance pass, not the ingest path.
     ///
     /// `field_services` is the authority behind `?service=` and the
-    /// `last_seen` window on the schema surfaces, and only compaction ever
-    /// wrote it: on an upgrade, migration 0002 creates the table EMPTY while
-    /// the boot pass pins (and rewrites) a corpus that no live batch will
-    /// re-observe until its service next sends the field. A service that
-    /// stopped sending — or an env retired but retained — would therefore
-    /// answer `?service=` with nothing at all, and its pins would sit outside
-    /// the `last_seen` window forever (a never-observed pin is always shown,
-    /// by design). This closes that gap from the standing files themselves.
+    /// `last_seen` window on the schema surfaces, and only compaction writes
+    /// it live, so a corpus the catalog did not observe being written has no
+    /// rows until each service next sends the field. A service that stopped
+    /// sending, or an env retired but retained, would answer `?service=`
+    /// with nothing at all, and its pins would sit outside the `last_seen`
+    /// window forever (a never-observed pin is always shown, by design).
+    /// This closes that gap from the standing files themselves.
     ///
-    /// **Idempotent**, because the pass re-runs on every boot until the
-    /// corpus is proven conformant: `first_seen` only moves earlier,
-    /// `last_seen` only later, and `row_count` takes the MAX rather than
-    /// accumulating — so re-running over the same corpus is a no-op and a
-    /// live tick's accumulated count is never clobbered downward by a
-    /// backfill that sees a retention-shrunk corpus.
+    /// Idempotent, because the pass re-runs on every boot until the corpus
+    /// is proven conformant: `first_seen` only moves earlier, `last_seen`
+    /// only later, and `row_count` takes the MAX rather than accumulating,
+    /// so re-running over the same corpus is a no-op and a live tick's
+    /// accumulated count is never clobbered downward by a backfill that sees
+    /// a retention-shrunk corpus.
     ///
     /// Callers must pass at most one row per `(field, service)`: postgres
     /// refuses to let one `ON CONFLICT DO UPDATE` statement touch a row
@@ -778,8 +775,8 @@ impl CatalogStore {
             .collect();
 
         // Chunked: the row count is (pinned fields x services a deployment
-        // ships), which the pin cap bounds at five figures on one axis alone
-        // — too many parameters' worth of arrays for a single statement.
+        // ships), which the pin cap bounds at five figures on one axis
+        // alone: too many parameters' worth of arrays for one statement.
         for chunk in storable.chunks(BACKFILL_CHUNK) {
             let fields: Vec<&str> = chunk.iter().map(|o| o.field.as_str()).collect();
             let services: Vec<&str> = chunk.iter().map(|o| o.service.as_str()).collect();
@@ -817,7 +814,7 @@ impl CatalogStore {
     /// keeps the work proportional to the batch — a field that stops
     /// conflicting keeps the evidence it already has and is never re-read.
     ///
-    /// A THIRD statement upserts the durable per-`(field, service)`
+    /// A third statement upserts the durable per-`(field, service)`
     /// aggregates (`field_conflict_stats`, migration 0009) the degraded-field
     /// analyzer judges a pin on. It is here, and not in a caller, because the
     /// trim above is exactly what makes it necessary: the detail rows a
@@ -825,7 +822,7 @@ impl CatalogStore {
     /// evicts first, so the aggregate has to be written by the same
     /// transaction that evicts them or it is a different number.
     ///
-    /// All three statements run in ONE transaction, so a reader never sees
+    /// All three statements run in one transaction, so a reader never sees
     /// the window overfull, a failed trim never leaves the insert behind, and
     /// no episode is ever counted in the aggregates without its evidence row
     /// (or the reverse).
@@ -896,21 +893,21 @@ impl CatalogStore {
         // pass accumulates conflicts across every file it rewrites, so one
         // call routinely carries many rows for the same `(field, service)`.
         // Pre-aggregating in the statement makes a call of N such rows one
-        // upsert of N episodes — the same hazard `backfill_services` avoids
+        // upsert of N episodes: the same hazard `backfill_services` avoids
         // by aggregating in its caller, answered here in SQL because this
         // caller's rows are the evidence and may not be collapsed.
         //
         // At-least-once, not exactly-once: the bookkeeping caller retries a
         // transaction whose COMMIT ACK was lost, and this upsert would then
         // add the same episodes and rows a second time. Accepted rather than
-        // carried on an idempotency key — the consequence is bounded to a
-        // slightly early or spurious badge on a field that IS conflicting,
+        // carried on an idempotency key: the consequence is bounded to a
+        // slightly early or spurious badge on a field that is conflicting,
         // and the remedy it points at (a dry run) is free and reversible.
         //
         // `last_at` is `now()`, not `GREATEST(existing, now())`: it is the
         // transaction's own clock, which cannot run backwards against a row
         // this same statement is the only writer of. `first_at` is left
-        // untouched on conflict for the mirror-image reason — the row's
+        // untouched on conflict for the mirror-image reason: the row's
         // existing value is by construction the earliest evidence there is
         // (migration 0009's backfill included).
         sqlx::query(
@@ -935,11 +932,11 @@ impl CatalogStore {
         Ok(())
     }
 
-    /// Read ONE PAGE of the observation rows for one field, most recent
+    /// Read one page of the observation rows for one field, most recent
     /// first, resuming after `after`.
     ///
     /// Paged, never whole: `field_services` is bounded on the field axis by
-    /// the pin cap but NOT on the service axis — service names are
+    /// the pin cap but not on the service axis. Service names are
     /// client-chosen and rows are ever-observed, so the history of a common
     /// envelope field grows with every service a sender ever invents,
     /// without spending a pin slot. An unpaged read would hand one
@@ -958,10 +955,10 @@ impl CatalogStore {
     /// shapes select the same rows, but only this one is *sargable*: the
     /// leading conjunct is a bound postgres can push into
     /// `field_services_field_last_seen_idx` (migration 0004) as an index
-    /// scan key, so the page STARTS at the cursor. Under the `OR` chain the
+    /// scan key, so the page starts at the cursor. Under the `OR` chain the
     /// whole thing degrades to a filter and every page re-reads the field's
-    /// entire history — bounding the allocation and the response body, but
-    /// not the read, which makes walking the pages quadratic.
+    /// entire history, bounding the allocation and the response body but not
+    /// the read, which makes walking the pages quadratic.
     ///
     /// Returns `(rows, next)`; `next` is `Some` when more rows follow.
     pub async fn field_services(
@@ -1028,13 +1025,13 @@ impl CatalogStore {
     /// [`Self::conflict_aggregates`], whole-catalog shape.
     ///
     /// Unkeyed and periodic (every schema-refresh tick, on every node), so
-    /// its SCAN axis is `field_conflict_stats` entire — which grows with the
-    /// distinct SERVICE names that have ever conflicted, an axis nothing
+    /// it scans `field_conflict_stats` entire, and that table grows with the
+    /// distinct service names that have ever conflicted, an axis nothing
     /// bounds. Measured at ~200ms over 1M rows, and accepted rather than
     /// indexed or incrementalised: reaching that size means a sender
-    /// inventing service names AND conflicting under each one, which already
-    /// costs it a parquet file per hour per name, and the axis this RETURNS
-    /// is one row per field — pin-capped.
+    /// inventing service names and conflicting under each one, which already
+    /// costs it a parquet file per hour per name, while what this returns is
+    /// one row per field, pin-capped.
     const CONFLICT_AGGREGATES_ALL_SQL: &'static str = "\
         SELECT field, min(first_at) AS first_at, max(last_at) AS last_at,
                count(*)::bigint                      AS services,
@@ -1043,18 +1040,18 @@ impl CatalogStore {
         FROM field_conflict_stats
         GROUP BY field";
 
-    /// Aggregate the durable conflict evidence per FIELD — the input the
+    /// Aggregate the durable conflict evidence per field: the input the
     /// degraded-field analyzer judges ([`crate::catalog::analyzer`]).
     ///
     /// `fields` keys the read to a page of pin names; `None` aggregates the
     /// whole table, which is what a refresh tick wants and is bounded on
     /// the returned axis by the pin cap.
     ///
-    /// Two SQL TEXTS rather than one `($1 IS NULL OR field = ANY($1))`
+    /// Two SQL texts rather than one `($1 IS NULL OR field = ANY($1))`
     /// shape, for the reason [`Self::list_fields`] documents at length: a
     /// prepared statement switching to its generic plan cannot push the
     /// `IS NULL`-guarded `OR` into the primary key, so the page-keyed read
-    /// would degrade into a full aggregate over a table whose SERVICE axis
+    /// would degrade into a full aggregate over a table whose service axis
     /// is client-chosen and never pruned.
     pub async fn conflict_aggregates(
         &self,
@@ -1064,7 +1061,7 @@ impl CatalogStore {
         Self::conflict_aggregates_tx(&mut conn, fields).await
     }
 
-    /// [`Self::conflict_aggregates`] inside a caller's transaction — the
+    /// [`Self::conflict_aggregates`] inside a caller's transaction: the
     /// half of [`Self::degraded_snapshot`] that has to share one postgres
     /// snapshot with [`Self::conflict_service_pairs_tx`].
     ///
@@ -1104,7 +1101,7 @@ impl CatalogStore {
             .map_err(StoreError::from)
     }
 
-    /// [`Self::conflict_service_pairs`]: keyed on BOTH axes, so neither can
+    /// [`Self::conflict_service_pairs`]: keyed on both axes, so neither can
     /// widen the scan into the whole table.
     const CONFLICT_SERVICE_PAIRS_SQL: &'static str = "\
         SELECT field, service
@@ -1112,20 +1109,19 @@ impl CatalogStore {
         WHERE field = ANY($1) AND service = ANY($2)
         ORDER BY field, service";
 
-    /// Which services actually conflicted on each of `fields` — the input
-    /// `/api/v1/schema/services` badges a service from (ADR-0011 slice C2).
+    /// Which services actually conflicted on each of `fields`: the input
+    /// `/api/v1/schema/services` badges a service from.
     ///
-    /// Keyed on both the (pin-capped, usually EMPTY) degraded set and the
+    /// Keyed on both the (pin-capped, usually empty) degraded set and the
     /// currently renderable service names, so the result is bounded by
-    /// |degraded| × |services the schema cache can render| and the SERVICE
-    /// axis — client-chosen and never pruned — cannot widen the scan.
-    /// An empty input on EITHER axis short-circuits: a healthy install pays
-    /// no query at all, which is what keeps the refresh tick's postgres cost
-    /// at the one read C1 shipped.
+    /// |degraded| × |services the schema cache can render| and the service
+    /// axis, client-chosen and never pruned, cannot widen the scan.
+    /// An empty input on either axis short-circuits, so a healthy install
+    /// pays no query at all and the refresh tick stays at one postgres read.
     ///
-    /// Deliberately NOT a per-service degraded verdict: the analyzer judges
+    /// Deliberately not a per-service degraded verdict: the analyzer judges
     /// a pin globally ([`crate::catalog::analyzer::ConflictAggregate`] is
-    /// per field), and these rows only say WHICH senders contributed the
+    /// per field), and these rows only say which senders contributed the
     /// evidence.
     pub async fn conflict_service_pairs(
         &self,
@@ -1136,7 +1132,7 @@ impl CatalogStore {
         Self::conflict_service_pairs_tx(&mut conn, fields, visible_services).await
     }
 
-    /// [`Self::conflict_service_pairs`] inside a caller's transaction — see
+    /// [`Self::conflict_service_pairs`] inside a caller's transaction; see
     /// [`Self::conflict_aggregates_tx`].
     pub async fn conflict_service_pairs_tx(
         tx: &mut sqlx::PgConnection,
@@ -1165,9 +1161,9 @@ impl CatalogStore {
     /// Begin a read-only `REPEATABLE READ` transaction over the conflict
     /// evidence.
     ///
-    /// `READ COMMITTED` — postgres' default, and what two separate pool
-    /// reads get — takes a fresh snapshot per statement, which is exactly
-    /// the tear [`Self::degraded_snapshot`] exists to close.
+    /// `READ COMMITTED`, postgres' default and what two separate pool reads
+    /// get, takes a fresh snapshot per statement, which is exactly the tear
+    /// [`Self::degraded_snapshot`] exists to close.
     pub async fn begin_evidence_snapshot(
         &self,
     ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, StoreError> {
@@ -1180,22 +1176,22 @@ impl CatalogStore {
 
     /// One generation of the degraded-field picture: the fields the
     /// analyzer indicts, and the `(field, service)` pairs that indicted
-    /// them, read as ONE fact.
+    /// them, read as one fact.
     ///
     /// The two halves are separate queries, and a repin's evidence clear
     /// ([`Self::clear_conflict_evidence`]) deletes from the table both of
     /// them read. Run under two snapshots, a clear landing between them
     /// publishes a generation with a degraded field and no services
-    /// attributed to it — the query notice standing while every badge
+    /// attributed to it: the query notice standing while every badge
     /// disappears, for as long as the refresh interval. So when there is
     /// anything to attribute, both reads share one `REPEATABLE READ`
     /// snapshot and see the same table.
     ///
-    /// The healthy install keeps C1's cost exactly: the probe below is the
-    /// one query it has always paid, and a catalog with nothing degraded
-    /// returns from it without opening a transaction at all. Only an
-    /// install that HAS a degraded pin pays the transactional re-read —
-    /// and it is that install whose badges the tear would drop.
+    /// A healthy install pays one query: the probe below, from which a
+    /// catalog with nothing degraded returns without opening a transaction
+    /// at all. Only an install that has a degraded pin pays the
+    /// transactional re-read, and it is that install whose badges the tear
+    /// would drop.
     ///
     /// `visible_services` bounds the attribution read's service axis (see
     /// [`Self::conflict_service_pairs`]); an empty list means the schema
@@ -1233,8 +1229,8 @@ impl CatalogStore {
     /// The retained detail evidence for `fields`, newest first: the
     /// `(observed_type, samples)` pairs a verdict is built from.
     ///
-    /// Read only for the fields that came back DEGRADED — usually none —
-    /// and bounded PER FIELD by [`VERDICT_EVIDENCE_ROWS`] through a LATERAL
+    /// Read only for the fields that came back degraded (usually none) and
+    /// bounded per field by [`VERDICT_EVIDENCE_ROWS`] through a LATERAL
     /// subquery, not by an outer LIMIT: a page-wide limit would spend the
     /// whole budget on the first field and leave the rest verdictless.
     /// Unbounded, one `/schema/fields` request with a large `?limit=` over a
@@ -1279,8 +1275,8 @@ impl CatalogStore {
     ///
     /// Called by the repin cutover ([`crate::store::RepinStore::finish_cutover`]):
     /// the evidence indicts a pin that no longer exists, and the analyzer's
-    /// gate is span-based — left standing, a repinned field would keep its
-    /// verdict forever, and the badge that told the operator to act would
+    /// gate is span-based, so left standing a repinned field would keep its
+    /// verdict forever and the badge that told the operator to act would
     /// survive their acting on it. Ordering is the cutover's, not ours: the
     /// clear runs before the job records its own outcome, so a forced lossy
     /// repin's fresh evidence is not swept away with the old.
@@ -1379,29 +1375,29 @@ impl CatalogStore {
     /// pin over standing parquet) must always appear — windowing only hides
     /// fields whose evidence says they aged out.
     ///
-    /// `filter.service` scopes the AGGREGATE, not just the row set: the
-    /// predicate goes INSIDE the `field_services` grouping, so a scoped
+    /// `filter.service` scopes the aggregate, not just the row set: the
+    /// predicate goes inside the `field_services` grouping, so a scoped
     /// listing reports that service's own counts and instants, and the
     /// `since` window is evaluated against that service's `last_seen`.
     /// Filtering only in the `WHERE` clause would leak every other
     /// service's numbers into the listing and keep a field alive in the
-    /// window because somebody ELSE still sends it. The `EXISTS` stays as
-    /// the presence test — a pin the service never carried has no group
+    /// window because somebody else still sends it. The `EXISTS` stays as
+    /// the presence test: a pin the service never carried has no group
     /// row, and the never-observed rule would otherwise show it.
     ///
-    /// The conflict evidence is a SECOND query, keyed on the field names
+    /// The conflict evidence is a second query, keyed on the field names
     /// this page actually returned, and skipped entirely when
     /// `filter.with_conflicts` is false. Joining a grouped
-    /// `SELECT ... FROM field_conflicts GROUP BY field` instead carried no
-    /// predicate a planner could push down, so every call — including the
-    /// deliberately uncached `?service=` one — materialised an aggregate
+    /// `SELECT ... FROM field_conflicts GROUP BY field` instead would carry
+    /// no predicate a planner can push down, so every call, including the
+    /// deliberately uncached `?service=` one, would materialise an aggregate
     /// over the whole table, which is bounded only by
     /// [`MAX_CONFLICTS_PER_FIELD`] x [`MAX_PINNED_FIELDS`] and not by the
     /// pin cap the scoped listing promises. Keyed on the page it rides
     /// 0002's `(field, at DESC)` index and reads at most
     /// `limit` x [`MAX_CONFLICTS_PER_FIELD`] rows.
     ///
-    /// Scoped and unscoped are two SQL TEXTS, not one
+    /// Scoped and unscoped are two SQL texts, not one
     /// `($1 IS NULL OR service = $1)` shape: sqlx prepares and caches every
     /// statement per pooled connection, and on execution 6 postgres
     /// (`plan_cache_mode=auto`) switches a prepared statement to its
@@ -1411,7 +1407,7 @@ impl CatalogStore {
     /// (measured at 0003's own sizing: 2 318 → 504 366 buffers), unbounded
     /// in the client-chosen service axis. Same reasoning as the cursor
     /// predicate in [`Self::field_services`]. The `since` guard keeps the
-    /// `IS NULL`-`OR` shape: it filters the joined rows AFTER aggregation,
+    /// `IS NULL`-`OR` shape: it filters the joined rows after aggregation,
     /// bounded by the pin cap, and is no index's scan key either way.
     ///
     /// Returns `(rows, truncated)`; `truncated` is set when more rows
@@ -1489,7 +1485,7 @@ impl CatalogStore {
         Ok((summaries, truncated))
     }
 
-    /// The catalog's fill level: `(pinned, capacity)` — the same pair the
+    /// The catalog's fill level: `(pinned, capacity)`, the same pair the
     /// `trawl_catalog_pinned_fields` / `trawl_catalog_pin_capacity` gauges
     /// publish, surfaced on the fields listing so a client sees headroom.
     pub async fn pin_stats(&self) -> Result<(i64, i64), StoreError> {
@@ -1499,7 +1495,7 @@ impl CatalogStore {
         Ok((pinned, self.pin_cap))
     }
 
-    /// Cross-field conflict listing, most recent first — the schema-health
+    /// Cross-field conflict listing, most recent first: the schema-health
     /// dashboard read (`trawl schema conflicts --last 7d`).
     ///
     /// `field`/`service` filter exactly; `since` windows on the recording
@@ -1596,10 +1592,10 @@ impl CatalogStore {
         Ok(())
     }
 
-    /// Re-arm the boot conformance pass (ADR-0011 slice B): a repin cutover
-    /// recovered at boot clears this so `ensure_conformance` re-proves the
-    /// corpus against the flipped pin in the same boot — the backstop for
-    /// any file an interrupted repin missed.
+    /// Re-arm the boot conformance pass: a repin cutover recovered at boot
+    /// clears this so `ensure_conformance` re-proves the corpus against the
+    /// flipped pin in the same boot, the backstop for any file an
+    /// interrupted repin missed.
     pub async fn clear_conformed(&self) -> Result<(), StoreError> {
         sqlx::query("UPDATE catalog_state SET conformed_at = NULL")
             .execute(&self.pool)
@@ -1610,11 +1606,10 @@ impl CatalogStore {
     /// Whether the boot pass has backfilled `field_services` from the
     /// standing corpus for this catalog.
     ///
-    /// Tracked separately from [`Self::is_conformed`] on purpose: the
-    /// backfill ([`Self::backfill_services`]) shipped a slice after
-    /// conformance did, so an install that conformed under the earlier slice
-    /// carries `conformed_at` set and this flag NULL — the one state where
-    /// the pass must run again.
+    /// Tracked separately from [`Self::is_conformed`] on purpose: a catalog
+    /// can carry `conformed_at` set while the backfill
+    /// ([`Self::backfill_services`]) has never run, and that is the one
+    /// state where the pass must run again.
     pub async fn services_backfilled(&self) -> Result<bool, StoreError> {
         let backfilled: bool =
             sqlx::query_scalar("SELECT services_backfilled_at IS NOT NULL FROM catalog_state")

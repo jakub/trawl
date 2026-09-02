@@ -2,11 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The repin engine (ADR-0011 slice B, issue #53): an operator-triggered
-//! shadow-generation rewrite of one field's corpus to a new
-//! candidate-ladder type, with resurrection of conflict-nulled values
-//! from `_raw`, an atomic crash-recoverable cutover, and a persisted
-//! one-at-a-time job.
+//! The repin engine (ADR-0011): an operator-triggered shadow-generation
+//! rewrite of one field's corpus to a new candidate-ladder type, with
+//! resurrection of conflict-nulled values from `_raw`, an atomic
+//! crash-recoverable cutover, and a persisted one-at-a-time job.
 //!
 //! Module map: `gate` (compaction interlocks), `marker` (the `data/REPIN`
 //! document + sibling staging layout), `plan` (the scan every job runs),
@@ -14,17 +13,17 @@
 //! per-env swap), `engine` (the job lifecycle), `recover` (the boot
 //! decision table).
 
-/// How recently the field must have been OBSERVED for a repin's report to
-/// call it live (issue #79, ruling 8).
+/// How recently the field must have been observed for a repin's report to
+/// call it live (ADR-0013 ruling 10).
 ///
-/// A repin translates HISTORY. If something is still writing the field, the
-/// live half keeps arriving in the INGEST-time reading, so a syslog-dialect
+/// A repin translates history. If something is still writing the field, the
+/// live half keeps arriving in the ingest-time reading, so a syslog-dialect
 /// rewrite leaves a discontinuity at the cutover instant — and the fix for
 /// that half is `[ingest] severity_from`, not another repin. The operator
 /// has to be told, so the report carries the fact and the CLI writes the
 /// warning.
 ///
-/// 24 hours, deliberately NOT `retention.max_age_days`: that window says
+/// 24 hours, deliberately not `retention.max_age_days`: that window says
 /// how much corpus a schema listing should describe, which is a different
 /// question with a different answer (90 days of history says nothing about
 /// whether a sender is still connected). It matches the degraded-pin

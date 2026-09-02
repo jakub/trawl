@@ -48,9 +48,9 @@ fn extract_eq_filter<'a>(
 /// day-level `data/{env}/{date}/{service}.parquet` after rollup.
 ///
 /// `env=X` pins the outer directory; otherwise every env directory on
-/// disk is searched. `service=X` narrows the file pattern — VERBATIM
-/// (path encoding is injective by validation, so `api.v2` and `api_v2`
-/// are distinct files and pruning is exact), but only when the literal
+/// disk is searched. `service=X` narrows the file pattern verbatim (path
+/// encoding is injective by validation, so `api.v2` and `api_v2` are
+/// distinct files and pruning is exact), but only when the literal
 /// satisfies the same `is_valid_service_name` predicate ingest enforces:
 /// a value no on-disk file can carry is also a value that must never be
 /// spliced into the glob list, so it falls back to the wildcard pattern.
@@ -60,19 +60,14 @@ fn extract_eq_filter<'a>(
 /// Returns a `DuckDB` list literal like
 /// `['data/prod/2026-08-02/14/*.parquet', ...]` when scoping is
 /// possible. Pruning is an optimization only: the SQL WHERE clause always
-/// re-filters, so a broader source is never incorrect — but NO exit here
-/// may widen to `{base}/**/*.parquet`, which reaches past the env
-/// dimension into `scheduled/` (materialized saved-query output, whose
-/// schema is a query's rather than an event's, so a union over it is a
-/// hard error under ADR-0008). Every "nothing to read" exit is
-/// [`no_match_source`].
-///
-/// UNPARSEABLE DSL is one of those exits. The source and the read are
-/// computed from the SAME text by the SAME parser, and the executor parses
-/// before it reads, so a source built from DSL that does not parse is
-/// never handed to `read_parquet` at all — the query has already been
-/// rejected. Returning a recursive glob here was therefore a value nothing
-/// read, and the last door back to the `**` glob.
+/// re-filters, so a broader source is never incorrect. No exit may widen
+/// to `{base}/**/*.parquet`, though, which reaches past the env dimension
+/// into `scheduled/` (materialized saved-query output, whose schema is a
+/// query's rather than an event's, so a union over it is a hard error
+/// under ADR-0008). Every "nothing to read" exit is [`no_match_source`],
+/// including unparseable DSL: the executor parses the same text with the
+/// same parser before it reads, so a source built from DSL that does not
+/// parse never reaches `read_parquet` at all.
 pub(crate) fn compute_source(base_dir: &str, dsl: &str) -> String {
     let base = base_dir.trim_end_matches('/');
 
@@ -105,12 +100,8 @@ pub(crate) fn compute_source(base_dir: &str, dsl: &str) -> String {
     };
 
     if envs.is_empty() {
-        // Cold start (no env directories yet). There is no log parquet to
-        // reach for, and `{base}/**/` would reach past the env dimension
-        // into `scheduled/` — materialized saved-query output the planner
-        // deliberately excludes (its schema is the query's, not an event's,
-        // so a union turns into a hard query error under ADR-0008). Match
-        // nothing, exactly as the invalid-env branch above does.
+        // Cold start (no env directories yet): nothing to read, and no
+        // widening to `{base}/**/`, which would reach `scheduled/`.
         return no_match_source(base, &file_pattern);
     }
 
@@ -243,13 +234,13 @@ fn date_scoped_globs(base: &str, file_pattern: &str) -> Vec<String> {
         let Some(name_str) = name.to_str() else {
             continue;
         };
-        // Match YYYY-MM-DD (exactly 10 chars, digits and dashes in right places).
         if is_date_dir_name(name_str) && entry.path().is_dir() {
             globs.push(format!("'{base}/{name_str}/**/{file_pattern}'"));
         }
     }
 
-    // Sort for deterministic ordering.
+    // `read_dir` yields entries in filesystem order; sort so the emitted
+    // source list is stable across calls.
     globs.sort();
     globs
 }
@@ -350,11 +341,9 @@ mod tests {
 
     #[test]
     fn bad_dsl_matches_nothing() {
-        // Unparseable DSL: nothing to prune from, and nothing will read this
-        // source either — the executor parses the same text before it reads,
-        // and rejects it. So this exit takes the no-match shape like every
-        // other "nothing to read" exit, rather than being a door back to the
-        // `**` glob that reaches `scheduled/`.
+        // Unparseable DSL takes the no-match shape like every other
+        // "nothing to read" exit, never the `**` glob that reaches
+        // `scheduled/`. The executor rejects the same text before it reads.
         let source = compute_source("/data", "| | invalid");
         assert_eq!(source, "/data/.no-such-env/*.parquet");
         assert!(!source.contains("**"));
@@ -591,7 +580,7 @@ mod tests {
 
         let source = compute_source(base, "last=48h");
 
-        // Should include BOTH day-level glob and the existing hourly dir.
+        // Should include both the day-level glob and the existing hourly dir.
         let day_glob = format!("'{base}/prod/{yesterday}/*.parquet'");
         let hourly_glob = format!("'{base}/prod/{yesterday}/14/*.parquet'");
         assert!(
@@ -606,9 +595,9 @@ mod tests {
 
     #[test]
     fn sanitizes_dotted_service() {
-        // INVERTED (ADR-0009): filenames carry the service verbatim, so a
-        // dotted service prunes to its own file — `api.v2` and `api_v2`
-        // are distinct.
+        // Filenames carry the service verbatim (ADR-0009), so a dotted
+        // service prunes to its own file: `api.v2` and `api_v2` are
+        // distinct.
         let source = compute_source("/data", "service=api.v2");
         assert_eq!(
             source, "/data/.no-such-env/api.v2.parquet",
@@ -709,7 +698,8 @@ mod tests {
             glob_matches(&source).is_empty(),
             "cold-start source must match nothing, got: {source}"
         );
-        // The fallback it replaced really did sweep the report run in.
+        // Sanity check: a `**` glob over the data root really does sweep
+        // the report run in, which is why no exit may emit one.
         assert!(
             glob_matches(&fallback).contains(&run.to_string_lossy().into_owned()),
             "sanity: the `**` fallback is what reached the scheduled run"

@@ -83,43 +83,39 @@ pub struct ExecuteOutcome {
     pub result: Result<QueryResult, ServerError>,
     /// Debug info, populated only when `capture_debug` was true.
     pub debug: Option<PoolDebugInfo>,
-    /// Result columns carrying the `SEVERITY` pin where the pipeline ENDS
-    /// — the presentation metadata the human-facing renderers display as
-    /// `OTel` tokens (ADR-0013 slice 2, ruling 9). Computed by
-    /// [`severity_columns_for`] INSIDE the permit-holding blocking task,
-    /// under the catalog snapshot the run EXECUTED with: the answer carries
-    /// ONE interpretation, and a repin landing between execution and the
-    /// response can neither token-render `BIGINT` rows nor strip tokens
-    /// from rows a `SEVERITY` pin produced. Empty for a failed, timed-out
-    /// or never-started run — there are no rows to present.
+    /// Result columns carrying the `SEVERITY` pin at the end of the
+    /// pipeline, which the human-facing renderers display as `OTel` tokens
+    /// (ADR-0013 ruling 9). [`severity_columns_for`] computes it inside the
+    /// permit-holding blocking task, under the catalog snapshot the run
+    /// executed with, so a repin landing between execution and the response
+    /// can neither token-render `BIGINT` rows nor strip tokens from rows a
+    /// `SEVERITY` pin produced. Empty for a failed, timed-out or
+    /// never-started run: there are no rows to present.
     pub severity_columns: Vec<String>,
 }
 
-/// The result columns that carry the `SEVERITY` pin where the pipeline ENDS
-/// — what the human-facing renderers display as `OTel` tokens (ADR-0013
-/// slice 2, ruling 9).
+/// The result columns that carry the `SEVERITY` pin at the end of the
+/// pipeline, which the human-facing renderers display as `OTel` tokens
+/// (ADR-0013 ruling 9).
 ///
-/// `pins` is the ROOT scope of the walk, and it must be the snapshot the run
-/// EXECUTED under, never a fresh read: a repin completing between execution
-/// and the response would otherwise token-render rows produced under a
-/// `BIGINT`/`VARCHAR` pin, or strip tokens from rows a `SEVERITY` pin
-/// produced. Since issue #79 that is a live hazard rather than a
-/// hypothetical one — `repin --to severity` exists, so the two snapshots
-/// CAN disagree about which columns are severities.
+/// `pins` is the root scope of the walk, and it must be the snapshot the
+/// run executed under, never a fresh read: `repin --to severity` can retype
+/// a field mid-flight, so a later snapshot would token-render rows produced
+/// under a `BIGINT`/`VARCHAR` pin, or strip tokens from rows a `SEVERITY`
+/// pin produced.
 ///
 /// Presentation only, so an unparseable query (execution reports the parse
 /// error) and an empty catalog both answer "nothing", never an error.
 ///
-/// **This runs on the blocking pool, inside the query's permit, and never
-/// on a reactor thread.** The parse is a SECOND one (the executor already
-/// parsed and emitted) and [`trawl_core::pin_scope::PinScope::advance`]
-/// compiles a `Regex` per `extract` stage purely to enumerate capture
-/// names — cost the CLIENT chooses through its DSL, so it belongs where
-/// `max_concurrent` bounds it and the query timeout covers it, beside the
-/// identical walk the emitter already performs there. It is paid only when
-/// a pipeline could have moved a pin off the name it was pinned under:
-/// nothing but a pipe stage can — `sev()` included — and a pipe stage needs
-/// a `|`, so a DSL without one is answered from the root scope directly. A
+/// Call it on the blocking pool, inside the query's permit, never on a
+/// reactor thread: the parse is a second one (the executor already parsed
+/// and emitted) and [`trawl_core::pin_scope::PinScope::advance`] compiles a
+/// `Regex` per `extract` stage purely to enumerate capture names. That cost
+/// is the client's choice of DSL, so it belongs where `max_concurrent`
+/// bounds it and the query timeout covers it, beside the identical walk the
+/// emitter already performs there. Only a pipe stage can move a pin off the
+/// name it was pinned under (`sev()` included), and a pipe stage needs a
+/// `|`, so a DSL without one is answered from the root scope directly. A
 /// `|` inside a quoted literal or a regex pays the parse and answers
 /// identically: the shortcut only ever errs toward the walk.
 pub(crate) fn severity_columns_for(
@@ -164,9 +160,8 @@ pub struct ExecutorPool {
     /// Hot buffer for fresh events not yet compacted to parquet.
     hot_buffer: Option<Arc<HotBuffer>>,
     /// Field catalog whose full pin snapshot types every query's
-    /// search-stage comparisons (ADR-0011 slice A). Defaults to an empty
-    /// catalog; the server wires the shared cache via
-    /// [`Self::with_field_catalog`].
+    /// search-stage comparisons. Defaults to an empty catalog; the server
+    /// wires the shared cache via [`Self::with_field_catalog`].
     field_catalog: Arc<crate::catalog::FieldCatalog>,
 }
 
@@ -317,10 +312,10 @@ fn capture_pool_debug(
                 .as_ref()
                 .map(|tf| tf.node.duration.to_seconds());
             // Pin-aware, so the debug-log SQL preview types comparisons the
-            // way the executed query does. It is a PREVIEW, not a transcript:
-            // it renders the PLANNER's source, and the executor may narrow a
+            // way the executed query does. It is a preview, not a transcript:
+            // it renders the planner's source, and the executor may narrow a
             // list source's elements (dropping ones no file backs) before it
-            // reads — so the logged source can be wider than the one that ran.
+            // reads, so the logged source can be wider than the one that ran.
             // Its `now()` anchor is its own for the same reason: a preview is
             // not the run, and there is no run's anchor to inherit here.
             let (sql, params) = match trawl_core::emitter::emit_with_pins(
@@ -406,9 +401,9 @@ impl ExecutorPool {
         }
     }
 
-    /// Attach the shared field-catalog pin cache (ADR-0011 slice A).
-    /// Builder-style, mirroring `HotBuffer::with_field_catalog`, so the
-    /// test call sites that need no catalog stay on `new`.
+    /// Attach the shared field-catalog pin cache. Builder-style, mirroring
+    /// `HotBuffer::with_field_catalog`, so the test call sites that need no
+    /// catalog stay on `new`.
     #[must_use]
     pub fn with_field_catalog(mut self, catalog: Arc<crate::catalog::FieldCatalog>) -> Self {
         self.field_catalog = catalog;
@@ -539,9 +534,9 @@ impl ExecutorPool {
             );
 
             // One catalog snapshot per query: every retry inside the
-            // executor sees the same comparison pins (ADR-0011 slice A),
-            // and the presentation metadata computed beside the rows is
-            // rooted in that same snapshot.
+            // executor sees the same comparison pins, and the presentation
+            // metadata computed beside the rows is rooted in that same
+            // snapshot.
             let pins = field_catalog.all();
             let (executor, result, debug) = run_query_blocking(
                 executor,
@@ -711,10 +706,10 @@ impl ExecutorPool {
                 capture_debug,
                 pool_wait_ms,
             );
-            // `dsl` here is what FOLLOWS `| from saved`, whose `PinScope`
-            // rule CLEARS the scope — so the presentation walk roots in an
-            // EMPTY catalog: a saved run's stored columns are not typed by
-            // what THIS corpus happens to pin now. The comparison pins above
+            // `dsl` here is what follows `| from saved`, whose `PinScope`
+            // rule clears the scope, so the presentation walk roots in an
+            // empty catalog: a saved run's stored columns are not typed by
+            // what this corpus happens to pin now. The comparison pins above
             // are a separate question and keep the live snapshot.
             let severity_columns = if result.is_ok() {
                 severity_columns_for(&trawl_core::schema::FieldTypes::new(), &dsl)
@@ -775,17 +770,15 @@ impl ExecutorPool {
         outcome
     }
 
-    /// Acquire EVERY permit — the repin cutover's exclusion primitive
-    /// (ADR-0011 slice B).
+    /// Acquire every permit: the repin cutover's exclusion primitive.
     ///
     /// Every lane that can read parquet funnels through this semaphore
-    /// (queries, `from saved`, exports, value sampling, ping), and each lane computes its
-    /// source and snapshots its comparison pins INSIDE the permit-holding
-    /// task — so holding all permits means no query can straddle the
-    /// per-env swap or the pin flip. SSE streams hold no permit, read no
-    /// parquet, and keep their compile-time snapshot until reconnect
-    /// (documented residual: a repin reaches a live stream at its next
-    /// connect).
+    /// (queries, `from saved`, exports, value sampling, ping), and each lane
+    /// computes its source and snapshots its comparison pins inside the
+    /// permit-holding task, so holding all permits means no query can
+    /// straddle the per-env swap or the pin flip. SSE streams hold no
+    /// permit, read no parquet, and keep their compile-time snapshot until
+    /// reconnect, so a repin reaches a live stream at its next connect.
     ///
     /// Bounded: a wedged query holds a permit forever, and an unbounded
     /// wait here would starve the cutover with the rollup suppressed and
@@ -835,27 +828,23 @@ impl ExecutorPool {
         }
     }
 
-    /// Get the configured maximum result rows limit.
     pub fn max_result_rows(&self) -> usize {
         self.max_result_rows
     }
 
-    /// Get the number of available query slots.
     pub fn available_permits(&self) -> usize {
         self.semaphore.available_permits()
     }
 
-    /// Get the total pool capacity (max concurrent queries).
+    /// The total pool capacity, i.e. the max concurrent queries.
     pub fn capacity(&self) -> usize {
         self.max_concurrent
     }
 
-    /// Get the base data directory path.
     pub fn base_dir(&self) -> &str {
         &self.base_dir
     }
 
-    /// Get the fallback glob pattern for queries.
     pub fn fallback_glob(&self) -> &Arc<str> {
         &self.fallback_glob
     }
@@ -891,10 +880,10 @@ impl ExecutorPool {
     /// Sample distinct values of one field for autocomplete.
     ///
     /// A parquet-reading lane like any other, so it funnels through the
-    /// same semaphore [`exclusive`](Self::exclusive) drains — and, like the
-    /// query lanes, expands its glob INSIDE the permit-holding task, so it
+    /// same semaphore [`exclusive`](Self::exclusive) drains, and, like the
+    /// query lanes, expands its glob inside the permit-holding task, so it
     /// cannot list paths before the repin cutover's per-env swap and read
-    /// them after (ADR-0011 slice B).
+    /// them after.
     ///
     /// `service`, when present, scopes the glob to one service's files; the
     /// caller is responsible for validating the name.
@@ -1070,7 +1059,7 @@ mod tests {
     use super::*;
 
     /// The severity presentation metadata is a property of the snapshot the
-    /// run EXECUTED under, so a repin landing between execution and the
+    /// run executed under, so a repin landing between execution and the
     /// response cannot retype the rows it already produced: the same DSL
     /// answers differently for a `SEVERITY` snapshot and a `BIGINT` one, and
     /// the executing task walks under the snapshot it ran with.
@@ -1095,10 +1084,10 @@ mod tests {
     }
 
     /// The pipe-free shortcut answers exactly what the walk answers: with no
-    /// pipeline the terminal scope IS the root scope, and a `|` that is only
+    /// pipeline the terminal scope is the root scope, and a `|` that is only
     /// regex punctuation still takes the walk.
     ///
-    /// The envelope's own `_severity` is deliberately NOT named — every
+    /// The envelope's own `_severity` is deliberately not named: every
     /// renderer keys that column by name, so the list carries only the
     /// columns a pipeline moved the pin onto (`PinScope::severity_columns`).
     #[test]
@@ -1130,12 +1119,11 @@ mod tests {
         assert!(severity_columns_for(&FieldTypes::new(), "service=nginx").is_empty());
     }
 
-    /// AC8, executed: the stamp rides back on `ExecuteOutcome` from the
-    /// run's OWN catalog snapshot, taken inside the permit-holding blocking
-    /// task. Repinning the field between the two runs changes the answer,
-    /// which is the whole coherence property — the response describes the
-    /// pins that produced its rows, not the catalog as it stands when the
-    /// JSON is assembled.
+    /// The stamp rides back on `ExecuteOutcome` from the run's own catalog
+    /// snapshot, taken inside the permit-holding blocking task. Repinning
+    /// the field between the two runs changes the answer, which is the whole
+    /// coherence property: the response describes the pins that produced its
+    /// rows, not the catalog as it stands when the JSON is assembled.
     #[tokio::test]
     async fn execute_stamps_severity_columns_from_the_runs_own_snapshot() {
         use crate::bus::IngestBatch;
@@ -1371,7 +1359,7 @@ mod tests {
         );
     }
 
-    /// The cutover's exclusion primitive: `exclusive()` holds EVERY permit,
+    /// The cutover's exclusion primitive: `exclusive()` holds every permit,
     /// so no query can start while the guard lives, and a wedged in-flight
     /// query bounds out with a timeout instead of starving the cutover
     /// forever.
@@ -1386,7 +1374,7 @@ mod tests {
             .expect("an idle pool is immediately exclusive");
         assert_eq!(pool.available_permits(), 0, "every permit is held");
 
-        // A query submitted while exclusive must WAIT, not run.
+        // A query submitted while exclusive must wait, not run.
         let p2 = pool.clone();
         let queued = tokio::spawn(async move {
             p2.execute(
@@ -1406,7 +1394,7 @@ mod tests {
 
         drop(guard);
         let outcome = queued.await.expect("queued query joins");
-        // (The DSL result itself is irrelevant — the point is it RAN.)
+        // (The DSL result itself is irrelevant; the point is that it ran.)
         let _ = outcome.result;
     }
 
@@ -1430,8 +1418,8 @@ mod tests {
         );
 
         drop(guard);
-        // (The sample itself fails against a nonexistent corpus — the point
-        // is that it only RAN once exclusivity was released.)
+        // (The sample itself fails against a nonexistent corpus; the point
+        // is that it only ran once exclusivity was released.)
         let _ = queued.await.expect("queued sample joins");
     }
 

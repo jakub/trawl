@@ -2,32 +2,29 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Turn a parsed syslog frame into a PAYLOAD the one canonicalizer can
-//! admit (ADR-0013 slice 2, ruling 1).
+//! Turn a parsed syslog frame into a payload the one canonicalizer admits.
 //!
-//! This module no longer builds an envelope. It owns exactly what the
-//! transport proves — the service the frame belongs to, the host it came
-//! from, the message body, and the parse ARTIFACTS (`syslog_severity`,
+//! This module builds no envelope. It owns exactly what the transport
+//! proves: the service the frame belongs to, the host it came from, the
+//! message body, and the parse artifacts (`syslog_severity`,
 //! `syslog_timestamp`, `syslog_facility`, `syslog_pid`, `syslog_msgid`,
-//! `syslog_source_ip`, the `sd_*` structured-data pairs) — and hands them
+//! `syslog_source_ip`, the `sd_*` structured-data pairs). It hands them
 //! to [`crate::ingest::envelope::canonicalize`] as an ordinary payload
-//! under the `syslog` profile.
+//! under the `syslog` profile (ADR-0013).
 //!
 //! Two consequences are the whole point:
 //!
-//! - the listener writes NO `_severity`. It publishes the RAW 0-7 PRI
-//!   numeral as an ordinary column and the syslog profile's FIXED
-//!   derivation source reads it back with `dialect = "syslog"`. Provenance
-//!   still licenses the inversion — enforced by where the config lives
-//!   rather than by a privileged writer — so the native listener and a
-//!   syslog-over-HTTP forwarder reach it through one mechanism;
-//! - every universal gate now applies to syslog: the ASCII fold, the
+//! - the listener writes no `_severity`. It publishes the raw 0-7 PRI
+//!   numeral as an ordinary column and the syslog profile's fixed
+//!   derivation source reads it back with `dialect = "syslog"`. What
+//!   licenses the inversion is the config declaring that dialect, not the
+//!   writer's privilege, so a syslog-over-HTTP forwarder reaches it
+//!   through the same mechanism;
+//! - every universal gate applies to syslog: the ASCII fold, the
 //!   sealed-prefix strip, the field-name length drop, nested
-//!   stringification, the `_raw` cap and `_repairs` assembly. The
-//!   producer-side caps that duplicated them (`MAX_SD_KEY_LEN`, the
-//!   ad-hoc SD fold) are deleted; the FRAME-level caps
-//!   ([`MAX_SD_ELEMENTS`], [`MAX_SD_PARAMS_TOTAL`]) stay here, because
-//!   they bound work done before there is a payload at all.
+//!   stringification, the `_raw` cap and `_repairs` assembly. Only the
+//!   frame-level caps ([`MAX_SD_ELEMENTS`], [`MAX_SD_PARAMS_TOTAL`]) live
+//!   here, because they bound work done before there is a payload at all.
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
@@ -54,9 +51,9 @@ const MAX_SD_PARAMS_TOTAL: usize = 128;
 
 /// What the syslog transport proves about one frame, ready for the door.
 ///
-/// The identity fields are ASSERTIONS (the profile is the authority on
-/// them); `map` holds only sender-visible payload — artifacts and
-/// structured data — and carries NO envelope field. `_raw` is the one
+/// The identity fields are assertions (the profile is the authority on
+/// them); `map` holds only sender-visible payload, artifacts and
+/// structured data, and carries no envelope field. `_raw` is the one
 /// exception, and it is a proposal rather than an envelope write: the
 /// pre-parse wire line is the most original form of a syslog event that
 /// exists, and the door caps it like any other.
@@ -66,32 +63,31 @@ pub struct SyslogPayload {
     pub service: String,
     /// The frame's hostname, else the peer address, else `None` — a
     /// hostname-less frame behind a trusted relay is kept with `host`
-    /// absent rather than stamped with the relay's address (ruling 4).
+    /// absent rather than stamped with the relay's address.
     pub host: Option<String>,
     /// The parsed message body.
     pub message: String,
     /// The payload the door canonicalizes: `_raw`, the `syslog_*`
     /// artifacts and the `sd_*` pairs.
     pub map: Map<String, Value>,
-    /// Codes the PRODUCER contributed. The door assembles `_repairs`.
+    /// Codes the producer contributed. The door assembles `_repairs`.
     pub repairs: Vec<RepairCode>,
 }
 
 /// Derive the service name for a syslog frame, and the repair it earned.
 ///
-/// Priority (ADR-0013 slice 2, ruling 7):
-/// 1. `source_service_map` lookup by source IP — explicit operator
-///    config, boot-validated as a service name, used verbatim;
-/// 2. a VALID APP-NAME / tag from the frame, verbatim;
-/// 3. `default_service` (also boot-validated) — with
-///    `service.from_profile` when an APP-NAME was PRESENT but unusable,
-///    and no repair at all when the frame simply carried none.
+/// Priority (ADR-0013):
+/// 1. `source_service_map` lookup by source IP: explicit operator config,
+///    boot-validated as a service name, used verbatim;
+/// 2. a valid APP-NAME / tag from the frame, verbatim;
+/// 3. `default_service` (also boot-validated), with `service.from_profile`
+///    when an APP-NAME was present but unusable, and no repair at all when
+///    the frame simply carried none.
 ///
-/// Note what is gone: the old sanitizer mapped `Living Room AP` onto
-/// `LivingRoomAP` and `../../escaped` onto `escaped`, inventing a service
-/// the sender never named and filing data under it silently. Falling back
-/// to the configured default and CONFESSING it is the honest answer —
-/// the original APP-NAME stays findable in `_raw`.
+/// An unusable APP-NAME is never sanitized: rewriting `Living Room AP` to
+/// `LivingRoomAP` would invent a service the sender never named and file
+/// data under it silently. The configured default plus a repair code is
+/// the honest answer, and the original APP-NAME stays findable in `_raw`.
 pub fn derive_service<S: BuildHasher>(
     source_ip: IpAddr,
     appname: Option<&str>,
@@ -111,11 +107,11 @@ pub fn derive_service<S: BuildHasher>(
     }
 }
 
-/// The RAW PRI severity numeral, 0-7, exactly as the frame spelled it.
+/// The raw PRI severity numeral, 0-7, exactly as the frame spelled it.
 ///
-/// Deliberately NOT inverted here (ruling 1): the numeral is published as
-/// an ordinary column and the profile's fixed derivation source, which
-/// declares `dialect = "syslog"`, is what maps it onto the `OTel` ladder.
+/// Deliberately not inverted here: the numeral is published as an ordinary
+/// column and the profile's fixed derivation source, which declares
+/// `dialect = "syslog"`, is what maps it onto the `OTel` ladder.
 const fn severity_numeral(sev: syslog_loose::SyslogSeverity) -> u8 {
     use syslog_loose::SyslogSeverity as S;
     match sev {
@@ -166,23 +162,23 @@ pub fn syslog_to_payload<S: BuildHasher>(
     };
 
     // The pre-parse wire line: the syslog profile's `_raw` proposal. The
-    // door truncates it at `MAX_RAW_CHARS` like every other door's, which
-    // is what a 64 KB datagram needs and never used to get.
+    // door truncates it at `MAX_RAW_CHARS` as it does every producer's,
+    // which is what a 64 KB datagram needs.
     map.insert(trawl_core::schema::RAW.into(), json!(raw));
 
-    // The severity ARTIFACT: raw 0-7, OMITTED when the frame carried no
-    // PRI at all. An absent source is not an unmapped one — writing a
-    // placeholder would make every PRI-less frame look like a mapping
-    // failure to `trawl_severity_unmapped_total`.
+    // The severity artifact: raw 0-7, omitted when the frame carried no
+    // PRI at all. An absent source is not an unmapped one: a placeholder
+    // would make every PRI-less frame look like a mapping failure to
+    // `trawl_severity_unmapped_total`.
     if let Some(sev) = msg.severity {
         map.insert(SYSLOG_SEVERITY_FIELD.into(), json!(severity_numeral(sev)));
     }
 
-    // The timestamp ARTIFACT, canonicalized to the envelope's spelling so
-    // the profile's fixed `_time` source can read it. OMITTED when the
-    // frame carried none — the old code substituted `Utc::now()` here,
-    // which made an absent frame timestamp indistinguishable from a
-    // present one and hid `time.from_ingest` from `_repairs` forever.
+    // The timestamp artifact, canonicalized to the envelope's spelling so
+    // the profile's fixed `_time` source can read it. Omitted when the
+    // frame carried none: substituting `Utc::now()` here would make an
+    // absent frame timestamp indistinguishable from a present one and hide
+    // `time.from_ingest` from `_repairs`.
     if let Some(ts) = msg.timestamp {
         map.insert(
             SYSLOG_TIMESTAMP_FIELD.into(),
@@ -207,9 +203,9 @@ pub fn syslog_to_payload<S: BuildHasher>(
     // Flatten RFC 5424 structured data, bounded so a malicious frame with
     // a huge SD payload cannot make the parse expensive. Keys go in as
     // the frame spelled them: SD-IDs and param names are conventionally
-    // mixed-case (`exampleSDID@32473`, `eventID`), and folding them —
-    // along with dropping over-long ones and resolving collisions — is
-    // the door's job now, under the same rule every producer gets.
+    // mixed-case (`exampleSDID@32473`, `eventID`); folding them, dropping
+    // over-long ones and resolving collisions is the door's job, under the
+    // same rule every producer gets.
     let mut sd_param_count: usize = 0;
     'outer: for element in msg.structured_data.iter().take(MAX_SD_ELEMENTS) {
         for (param_name, param_value) in &element.params {
@@ -235,7 +231,7 @@ pub fn syslog_to_payload<S: BuildHasher>(
 ///
 /// Threaded rather than reached through `AppState` so the listeners keep
 /// no handle on server state: the env allowlist and `default_env` come
-/// from `[ingest]` (the listener asserts a boot-VALIDATED env, so
+/// from `[ingest]` (the listener asserts a boot-validated env, so
 /// `env.defaulted` can never fire for it), `trusted_relays` is the same
 /// boot-parsed CIDR list the HTTP door consults, and `derivation` is the
 /// one resolved source policy every profile shares.
@@ -255,7 +251,7 @@ impl SyslogDoor {
     /// Parse one frame, canonicalize it under the `syslog` profile, and
     /// return the event to batch — or `None` when the door refused it.
     ///
-    /// A refusal here is a SERVER bug, not a sender's: everything the
+    /// A refusal here is a server bug, not a sender's: everything the
     /// profile asserts is boot-validated, and there is nobody to reject
     /// to. It is therefore counted on `trawl_ingest_profile_reject_total`
     /// (whose whole closed matrix is published at zero, so a flat series
@@ -270,7 +266,7 @@ impl SyslogDoor {
     ) -> Option<SyslogEvent> {
         let arrival_instant = Utc::now();
         let parsed = parse::parse_syslog(raw, arrival_instant);
-        // Membership, NOT `is_allowed`: an EMPTY relay list means "no
+        // Membership, not `is_allowed`: an empty relay list means "no
         // relays configured", the exact opposite of the empty CIDR
         // allowlist's "everything is allowed". Same predicate the HTTP
         // door uses, spelled the same way.
@@ -334,9 +330,9 @@ mod tests {
         }
     }
 
-    /// Drive a frame through the whole lane — parse, payload, door — as
-    /// the listeners do. Every assertion below is on what LANDS, because
-    /// the payload alone is no longer an event.
+    /// Drive a frame through the whole lane (parse, payload, door) as the
+    /// listeners do. Every assertion below is on what lands, because the
+    /// payload alone is not an event.
     fn admit(raw: &str, source_ip: &str) -> SyslogEvent {
         door()
             .admit(
@@ -437,8 +433,8 @@ mod tests {
 
     #[test]
     fn a_hostname_less_frame_behind_a_trusted_relay_keeps_the_event() {
-        // Ruling 4: absent-but-honest beats both the peer-fill lie (the
-        // relay's own address) and dropping the event.
+        // Absent-but-honest beats both the peer-fill lie (the relay's own
+        // address) and dropping the event.
         let relay = SyslogDoor {
             trusted_relays: vec![super::super::parse_cidr("10.0.0.0/8").unwrap()].into(),
             ..door()
@@ -456,7 +452,7 @@ mod tests {
         assert!(repairs(&event).contains(&"host.omitted"));
         assert!(!repairs(&event).contains(&"host.from_peer"));
 
-        // A frame that DOES carry a hostname is unaffected by the relay.
+        // A frame that does carry a hostname is unaffected by the relay.
         let event = relay
             .admit(
                 "<13>Mar 12 10:00:00 myhost app: hi",
@@ -469,12 +465,10 @@ mod tests {
         assert_eq!(event.map["host"], "myhost");
     }
 
-    /// Acceptance criterion 1 (ADR-0013 slice 2, ruling 1): the listener
-    /// writes NO `_severity`. It publishes the raw 0-7 numeral and the
-    /// profile's FIXED derivation source inverts it — and the answer is
-    /// identical to the matrix the hand-rolled writer produced, band for
-    /// band. A naive passthrough would invert every severity in the
-    /// corpus.
+    /// The listener writes no `_severity`: it publishes the raw 0-7 numeral
+    /// and the profile's fixed derivation source inverts it. A passthrough
+    /// that skipped the inversion would leave every syslog severity in the
+    /// corpus upside down on the `OTel` ladder.
     #[test]
     fn syslog_numerics_invert_onto_the_otel_ladder() {
         // (PRI severity, the OTel number derivation must land on).
@@ -509,14 +503,14 @@ mod tests {
             );
         }
 
-        // No PRI at all: the artifact is OMITTED rather than defaulted,
+        // No PRI at all: the artifact is omitted rather than defaulted,
         // so an absent source can never look like an unmapped one.
         let event = admit("no pri here", "10.0.0.1");
         assert!(!event.map.contains_key(SYSLOG_SEVERITY_FIELD));
         assert!(!event.map.contains_key(trawl_core::schema::SEVERITY));
     }
 
-    /// The full TEN-field envelope, assembled by the door.
+    /// The full ten-field envelope, assembled by the door.
     #[test]
     fn converted_event_carries_the_envelope() {
         let raw = "<134>Mar 12 10:00:00 web01 nginx: GET /";
@@ -551,7 +545,7 @@ mod tests {
             event.map["_producer"], "syslog",
             "provenance is data (ruling 6)"
         );
-        // `_repairs` is the tenth slot and is OMITTED when clean — this
+        // `_repairs` is the tenth slot and is omitted when clean: this
         // frame carries a hostname, a timestamp and a valid APP-NAME.
         assert!(
             !event.map.contains_key("_repairs"),
@@ -578,25 +572,19 @@ mod tests {
         assert_eq!(event.map["_time"], "2026-02-15T06:30:00.000000Z");
         assert!(!repairs(&event).contains(&"time.from_ingest"));
 
-        // A frame with NO parseable timestamp omits the artifact, so the
-        // door falls to arrival time and SAYS so. The old listener
-        // substituted `Utc::now()` inside the artifact itself, which made
-        // that indistinguishable from a frame that carried the time.
+        // A frame with no parseable timestamp omits the artifact, so the
+        // door falls to arrival time and records the repair.
         let event = admit("<13>no timestamp here", "10.0.0.1");
         assert!(!event.map.contains_key(SYSLOG_TIMESTAMP_FIELD));
         assert!(repairs(&event).contains(&"time.from_ingest"));
     }
 
-    /// The `_raw` cap is the door's, and it now reaches syslog.
+    /// The `_raw` cap is the door's, and it reaches syslog.
     ///
-    /// Before the cutover the listener wrote `_raw` itself and nothing
-    /// truncated it. That went unnoticed because the two constants are
-    /// COINCIDENTALLY equal — the UDP receive buffer is 65 536 BYTES and
-    /// `MAX_RAW_CHARS` is 65 536 CHARS — so an all-ASCII datagram happens
-    /// to fit. A TCP frame is read to the same byte bound with no such
-    /// relationship, and either transport carrying multi-byte text has
-    /// fewer chars than bytes only in the safe direction; what actually
-    /// held the line was luck, not a check. Now it is structural.
+    /// Worth pinning because the two bounds look interchangeable and are
+    /// not: the UDP receive buffer is 65 536 bytes while `MAX_RAW_CHARS`
+    /// is 65 536 chars, so an all-ASCII datagram fits by coincidence, and
+    /// a TCP frame read to the same byte bound has no such relationship.
     #[test]
     fn an_oversized_frame_is_truncated_by_the_doors_raw_cap() {
         let long = format!(
@@ -612,9 +600,8 @@ mod tests {
     }
 
     /// RFC 5424 SD-IDs and param names are conventionally mixed-case
-    /// (`exampleSDID@32473`, `eventID`). The listener no longer folds
-    /// them itself — the door's universal fold does, so there is one
-    /// rule and one place it can drift from.
+    /// (`exampleSDID@32473`, `eventID`). The door's universal fold handles
+    /// them, so there is one rule and one place it can drift from.
     #[test]
     fn sd_keys_are_folded_by_the_door() {
         let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [exampleSDID@32473 eventID="1011" eventSource="Application"] boom"#;
@@ -633,19 +620,13 @@ mod tests {
         assert!(repairs(&event).contains(&"field.name_case_folded"));
     }
 
-    /// Two params folding to one key keep ONE value, by the door's GLOBAL
-    /// case-collision rule rather than the listener-local one that used
-    /// to live here — and the event now CONFESSES the drop, which the
-    /// silent `or_insert` never did.
+    /// Two params folding to one key keep one value, by the door's global
+    /// case-collision rule, and the event records the drop in `_repairs`.
     ///
-    /// The tiebreak genuinely changes, and that is the point of having
-    /// one rule: the old fold-at-construction kept the first spelling in
-    /// DOCUMENT order, while the door keeps the exact-lowercase spelling
-    /// when the event carries it and otherwise the
-    /// ASCII-lexicographically first variant. Deterministic either way;
-    /// now it is the same determinism every producer gets, and nothing
-    /// honest can be done with two values for one `DuckDB` column
-    /// anyway — the loser stays in `_raw`.
+    /// The tiebreak is the door's: the exact-lowercase spelling when the
+    /// event carries it, otherwise the ASCII-lexicographically first
+    /// variant. Nothing honest can be done with two values for one
+    /// `DuckDB` column, and the loser stays in `_raw`.
     #[test]
     fn sd_key_collision_after_folding_is_the_doors_global_rule() {
         // Variant-only: `EVENTID` sorts before `eventID` in ASCII.
@@ -668,9 +649,8 @@ mod tests {
         assert_eq!(event.map["sd_x@1_eventid"], "exact");
     }
 
-    /// An SD key too long to be a catalog key used to be dropped SILENTLY
-    /// by `MAX_SD_KEY_LEN`. The door drops it too — and says so, and the
-    /// value stays in `_raw`.
+    /// An SD key too long to be a catalog key is dropped by the door's
+    /// name gate, which says so in `_repairs`; the value stays in `_raw`.
     #[test]
     fn an_over_long_sd_key_is_dropped_by_the_doors_name_gate() {
         let long_id = "z".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES);
@@ -691,8 +671,8 @@ mod tests {
         );
     }
 
-    /// Every universal gate reaches syslog now (AC2) — including the
-    /// sealed `_` prefix, which a structured-data param can spell.
+    /// Every universal gate reaches syslog, including the sealed `_`
+    /// prefix, which a structured-data param can spell.
     #[test]
     fn a_frame_faces_the_sealed_prefix_strip() {
         let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [_@1 x="y"] boom"#;
@@ -706,9 +686,10 @@ mod tests {
             event.map.keys().collect::<Vec<_>>()
         );
         // The `sd_` prefix means an SD param can never actually reach the
-        // reserved namespace — which is exactly the point of prefixing
-        // parse artifacts. The forgeable slot is `_producer`, stamped by
-        // the door from the profile and nothing else.
+        // reserved namespace, which is exactly the point of prefixing
+        // parse artifacts. `_producer` is the slot a sender would want to
+        // forge, and the door stamps it from the profile after the strip has
+        // already turned any incoming `_producer` into a bare `producer`.
         assert_eq!(event.map["_producer"], "syslog");
     }
 
@@ -729,14 +710,13 @@ mod tests {
             derive_service(other, Some("nginx"), &map, "default"),
             ("nginx".to_owned(), None)
         );
-        // An ABSENT APP-NAME is not a defect: the default, no repair.
+        // An absent APP-NAME is not a defect: the default, no repair.
         assert_eq!(
             derive_service(other, None, &map, "default"),
             ("default".to_owned(), None)
         );
-        // A PRESENT but unusable one is: the default, CONFESSED. The old
-        // sanitizer invented `LivingRoomAP` and `escaped` here and filed
-        // data under a service nobody named.
+        // A present but unusable one is: the default, with a repair code
+        // rather than a sanitized name nobody sent.
         for bad in ["Living Room AP", "../../escaped", ".hidden", "..", ""] {
             assert_eq!(
                 derive_service(other, Some(bad), &HashMap::new(), "syslog"),
@@ -746,11 +726,11 @@ mod tests {
         }
     }
 
-    /// ADR-0009 injectivity: the on-disk name IS the service value. Every
+    /// ADR-0009 injectivity: the on-disk name is the service value. Every
     /// path through `derive_service` must yield a name HTTP ingest would
-    /// also accept — the two config-sourced ones because config
-    /// validation refuses to start otherwise, the APP-NAME because it is
-    /// checked against the very same predicate.
+    /// also accept: the two config-sourced ones because config validation
+    /// refuses to start otherwise, the APP-NAME because it is checked
+    /// against the very same predicate.
     #[test]
     fn derive_service_output_is_always_a_valid_service_name() {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();

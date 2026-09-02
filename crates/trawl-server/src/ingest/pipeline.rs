@@ -4,9 +4,8 @@
 
 //! Shared ingest pipeline: WAL write → hot buffer → event bus.
 //!
-//! This module provides the core pipeline logic that both the HTTP ingest
-//! handler and the syslog listener use to durably store events and make
-//! them immediately queryable.
+//! Events are durable before they are visible: only a batch whose WAL write
+//! succeeded reaches the hot buffer and the event bus.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,19 +18,18 @@ use crate::hot_buffer::HotBuffer;
 use crate::ingest::wal::WalWriter;
 
 /// The service-name rule (ADR-0009), re-exported from `trawl-config` so
-/// that every ingestion path — HTTP ingest (which rejects violations),
-/// syslog ingest (which maps into the charset) and config load (which
-/// refuses to start) — decides from one definition.
+/// that every ingestion path decides from one definition: HTTP ingest
+/// rejects a violation, syslog ingest falls back to its configured default
+/// service, and config load refuses to start.
 pub use trawl_config::{MAX_SERVICE_NAME_LEN, is_valid_service_char, is_valid_service_name};
 
 /// The batch key: `(env, service)`.
 ///
 /// Two envs must never share a WAL batch, a hot-buffer drain key or a
-/// parquet partition (ADR-0009), so the env is part of the key on EVERY
-/// lane — the HTTP handler's and the syslog batcher's alike. It lives
-/// here, next to the writer that consumes it, because a batcher holding
-/// its own key type is exactly how the syslog lane came to file two envs
-/// under one name.
+/// parquet partition (ADR-0009), so the env is part of the key on every
+/// lane, the HTTP handler's and the syslog batcher's alike. The type lives
+/// next to the writer that consumes it: a batcher holding its own key type
+/// is how a lane starts filing two envs under one name.
 pub type BatchKey = (String, String);
 
 /// Events for a single service within a batch, ready for WAL writing.
@@ -46,7 +44,6 @@ pub struct ServiceBatch {
 impl ServiceBatch {
     /// Add an event to this batch, serializing it to ndjson in the process.
     pub fn push(&mut self, map: Map<String, serde_json::Value>) {
-        // Serialize to ndjson (newline-delimited JSON)
         if let Ok(line) = serde_json::to_vec(&map) {
             self.ndjson.extend_from_slice(&line);
             self.ndjson.push(b'\n');
@@ -57,10 +54,7 @@ impl ServiceBatch {
 
 /// Shared pipeline writer that encapsulates WAL + hot buffer + event bus.
 ///
-/// Shared pipeline writer that encapsulates WAL + hot buffer + event bus.
-///
-/// Used by both the syslog batcher and the HTTP ingest handler to write
-/// events through the ingest pipeline.
+/// Used by both the syslog batcher and the HTTP ingest handler.
 #[derive(Debug)]
 pub struct PipelineWriter {
     wal_writer: Arc<WalWriter>,
@@ -81,7 +75,6 @@ impl PipelineWriter {
         }
     }
 
-    /// Access the underlying WAL writer.
     pub fn wal_writer(&self) -> &Arc<WalWriter> {
         &self.wal_writer
     }
@@ -91,10 +84,9 @@ impl PipelineWriter {
     /// Returns the number of events successfully written. Events from
     /// groups that fail WAL writing are dropped (logged, not published).
     ///
-    /// The env comes from the KEY, never from a writer-held default: a
+    /// The env comes from the key, never from a writer-held default: a
     /// batcher that grouped by service alone would file every env it
-    /// received under one path root, silently. Deleting the field is what
-    /// makes that unrepresentable rather than merely fixed.
+    /// received under one path root, silently.
     pub fn write(&self, batches: IndexMap<BatchKey, ServiceBatch>) -> usize {
         let mut total_written = 0;
 

@@ -55,12 +55,10 @@ pub async fn query(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    // Increment total query counter for stats.
     state
         .total_queries
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    // Validate pagination parameters.
     let max_rows = state.query.pool.max_result_rows();
     let limit = req.limit.unwrap_or(max_rows).min(max_rows);
     let offset = req.offset.unwrap_or(0);
@@ -71,10 +69,10 @@ pub async fn query(
         )));
     }
 
-    // One id from the pool's counter keys the tracker entry AND the pool's
-    // interrupt map, so cancel-by-id interrupts the query the client sees.
-    // Allocated BEFORE query_start so every lifecycle event correlates on
-    // query_id without carrying the query text (issue #56 F5).
+    // One id from the pool's counter keys both the tracker entry and the
+    // pool's interrupt map, so cancel-by-id interrupts the query the client
+    // sees. Allocated before query_start so every lifecycle event correlates
+    // on query_id without carrying the query text.
     let query_id = state.query.pool.allocate_query_id();
     state.query.tracker.start(query_id, &verified, &req.query);
 
@@ -159,13 +157,13 @@ pub async fn query(
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let duration_secs = start.elapsed().as_secs_f64();
 
-    // Which result columns render as OTel tokens, decided by the EXECUTING
-    // task under the pins the rows were produced with — not by the catalog
-    // as it stands now, since history I/O and logging sit between execution
-    // and the response and a repin landing in that window must not retype
-    // the answer's presentation. The walk itself is a client-shaped cost (a
-    // regex compiled per `extract` stage), so it runs inside the query's
-    // permit on the blocking pool, never here on a reactor thread (see
+    // Which result columns render as OTel tokens, decided by the executing
+    // task under the pins the rows were produced with, not by the catalog as
+    // it stands now: history I/O and logging sit between execution and the
+    // response, and a repin landing in that window must not retype the
+    // answer's presentation. The walk is a client-shaped cost (a regex
+    // compiled per `extract` stage), so it runs inside the query's permit on
+    // the blocking pool, never here on a reactor thread (see
     // `crate::pool::severity_columns_for`).
     let severity_columns = outcome.severity_columns;
 
@@ -178,10 +176,10 @@ pub async fn query(
 
             state.query.tracker.complete(query_id, total);
 
-            // Auto-save successful queries to history (per user preference).
-            // verified.id is the authoritative fleet keystore id. Best-effort:
-            // a history-store write failure must not fail the query, but log it
-            // so a broken store (pg down, constraint trouble) is visible.
+            // Record the query in history under the authoritative fleet
+            // keystore id. Best-effort: a history-store write failure must
+            // not fail the query, but log it so a broken store (pg down,
+            // constraint trouble) is visible.
             if let Err(e) = state
                 .storage
                 .history
@@ -222,7 +220,6 @@ pub async fn query(
             metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "success").increment(1);
             metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
 
-            // Write query debug log entry (success).
             write_query_log(
                 &state,
                 &verified,
@@ -282,7 +279,7 @@ pub async fn query(
             metrics::counter!(crate::metrics::QUERIES_TOTAL, "status" => "error").increment(1);
             metrics::histogram!(crate::metrics::QUERY_DURATION).record(duration_secs);
 
-            // Default-filter failure events carry the CLASS only. Neither
+            // Default-filter failure events carry the class only. Neither
             // `safe_msg` nor the raw error is safe to persist here:
             // safe_message() deliberately preserves parser/emitter text
             // (which quotes the user's own tokens and format strings), and
@@ -375,7 +372,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
 
 /// `GET /api/v1/health` — unauthenticated health check with subsystem probes.
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
-    // Run duckdb and fleet keystore pings concurrently.
+    // Probe duckdb, the fleet keystore and the app-state store concurrently.
     //
     // `/health` is unauthenticated and unthrottled — it sits outside
     // `require_bearer_only` and `rate_limit_middleware` — so it must not amplify a
@@ -412,7 +409,6 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         .map_err(|e| format!("task join error: {e}"))
         .and_then(|r| r.map_err(|e| e.to_string()));
 
-    // Build checks map.
     let mut checks = HashMap::with_capacity(4);
     let duckdb_healthy = duckdb_ok.is_ok();
     let auth_healthy = auth_result.is_ok();
@@ -436,7 +432,6 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         data_result.map_or_else(|e| format!("error: {e}"), |()| "ok".into()),
     );
 
-    // Emit prometheus gauges.
     metrics::gauge!("trawl_health_check", "subsystem" => "duckdb").set(if duckdb_healthy {
         1.0
     } else {
@@ -508,7 +503,7 @@ pub struct SchemaParams {
 /// `GET /api/v1/schema` — the data schema, served from the field catalog.
 ///
 /// Columns are a `SELECT` over `field_types` LEFT JOIN `field_services`
-/// (ADR-0009 slice 3) — the write-time type authority, never a `DESCRIBE`.
+/// (ADR-0009) — the write-time type authority, never a `DESCRIBE`.
 /// By default fields whose most recent observation predates the retention
 /// window (`[retention] max_age_days`; 0 disables) are hidden; `?all=true`
 /// lifts the window, and a never-observed pin (e.g. the envelope seed) is
@@ -516,9 +511,10 @@ pub struct SchemaParams {
 /// carried.
 ///
 /// Corpus facts (dates, sizes, services, file count) stay a TTL-cached
-/// filesystem walk; `cached` reports whether THEY came from the cache.
+/// filesystem walk; `cached` reports whether those came from the cache,
+/// not the columns.
 ///
-/// The UNSCOPED column set is TTL-cached too (same TTL): it aggregates
+/// The unscoped column set is TTL-cached too (same TTL): it aggregates
 /// `field_services` across every service, and the service axis is
 /// client-chosen and unbounded while this endpoint is what autocomplete
 /// polls. A `?service=` listing is served straight from postgres — it is
@@ -537,8 +533,8 @@ pub async fn schema(
     let (hot_events, hot_bytes) = hot_buffer_stats(&state);
 
     // Columns: a catalog SELECT. Postgres down → 503 (the same dependency
-    // history/saved already have). Deliberately NO fallback to the
-    // in-process pin cache: that would fork schema truth again.
+    // history/saved already have). Deliberately no fallback to the
+    // in-process pin cache: that would fork schema truth.
     let since = if params.all == Some(true) {
         None
     } else {
@@ -554,15 +550,15 @@ pub async fn schema(
         // alternating traffic cannot evict the other shape's entry — see
         // `schema_columns_cache` in state.rs.
         let mut cache = state.query.schema_columns_cache.lock().await;
-        // Read the repin generation AFTER the mutex and BEFORE the SELECT.
-        // After: a request that waited on the mutex would otherwise validate
-        // the entry the holder just built against a generation it sampled
-        // before the flip. Before: an entry whose SELECT straddles a flip is
-        // then stamped with the OLD generation, so the next read discards it
-        // rather than serving a type the corpus no longer has.
+        // Read the repin generation after taking the mutex and before the
+        // SELECT. After: a request that waited on the mutex would otherwise
+        // validate the entry the holder just built against a generation it
+        // sampled before the flip. Before: an entry whose SELECT straddles a
+        // flip is then stamped with the older generation, so the next read
+        // discards it rather than serving a type the corpus no longer has.
         //
         // A request whose SELECT began before a flip may still return
-        // pre-flip columns in its OWN response (its postgres snapshot
+        // pre-flip columns in its own response (its postgres snapshot
         // legitimately predates the commit, and the corpus-facts walk below
         // can delay that response's arrival) — ordinary concurrent-read
         // semantics; the stale entry it stamps cannot be served to any
@@ -682,8 +678,9 @@ fn hot_buffer_stats(state: &AppState) -> (Option<u64>, Option<u64>) {
 /// Parse parquet file paths to extract corpus facts: earliest/latest date,
 /// total bytes, distinct services, and the parquet file count.
 ///
-/// Path structure: `{base}/{YYYY-MM-DD}/{service}.parquet`
-/// or `{base}/{YYYY-MM-DD}/{HH}/{service}.parquet`.
+/// Path structure: `{base}/{env}/{YYYY-MM-DD}/{HH}/{service}.parquet`, or
+/// `{base}/{env}/{YYYY-MM-DD}/{service}.parquet` for a daily rollup — hence
+/// the ancestor walk for the date component rather than a fixed depth.
 fn collect_catalog_metadata(
     fallback_glob: &str,
 ) -> (Option<String>, Option<String>, u64, Vec<String>, u64) {
@@ -710,12 +707,10 @@ fn collect_catalog_metadata(
     for (path, size) in &entries {
         total_bytes += size;
 
-        // Extract service name from filename stem.
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             services.insert(stem.to_owned());
         }
 
-        // Walk ancestors looking for a YYYY-MM-DD directory component.
         for ancestor in path.ancestors().skip(1) {
             if let Some(name) = ancestor.file_name().and_then(|n| n.to_str())
                 && is_date_dir(name)
@@ -763,16 +758,15 @@ pub async fn queries(
 /// `DELETE /api/v1/queries/{id}` — cancel a running query by ID.
 ///
 /// Admin (`ServerManage`) can cancel any query. `QueryCancel` holders can cancel
-/// their own queries only. Roles without `QueryCancel` are rejected outright.
+/// their own queries only. Keys without `QueryCancel` are rejected outright.
 pub async fn cancel_query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
     Path(query_id): Path<u64>,
 ) -> Result<Json<CancelResponse>, ServerError> {
-    // Admin can cancel any query; QueryCancel holders can cancel their own.
-    // Ownership is authorized by exact key id — names are mutable and
-    // non-unique, so two keys sharing a name must NOT be able to cancel
-    // each other's queries (`user` stays display-only).
+    // Ownership is authorized by exact key id: names are mutable and
+    // non-unique, so two keys sharing a name must not be able to cancel each
+    // other's queries (`user` stays display-only).
     let can_cancel = if verified.has_permission(Permission::ServerManage) {
         true
     } else if verified.has_permission(Permission::QueryCancel) {
@@ -804,7 +798,7 @@ pub async fn cancel_query(
 /// `POST /api/v1/validate` — validate a DSL query without executing it.
 ///
 /// Performs syntax and semantic validation (function names, arity, regex patterns)
-/// but does NOT check field existence (which would require schema introspection).
+/// but does not check field existence (which would require schema introspection).
 pub async fn validate_query(
     Extension(verified): Extension<VerifiedKey>,
     Json(req): Json<QueryRequest>,
@@ -872,7 +866,7 @@ pub async fn stats(
 /// Available to any authenticated user. No permission check needed — if the
 /// token passed auth middleware, the user is entitled to know their own identity and grants.
 pub async fn whoami(Extension(verified): Extension<VerifiedKey>) -> Json<WhoAmIResponse> {
-    // Permissions are server-scoped: only RECOGNIZED trawl permissions are
+    // Permissions are server-scoped: only recognized trawl permissions are
     // emitted, in canonical order — echoing raw keystore strings would
     // advertise gates no handler checks, and canonical order keeps the
     // golden wire tests deterministic. Role names travel unfiltered (roles
@@ -987,11 +981,11 @@ pub async fn schema_services(
     };
     let mut services = cached.services;
 
-    // Stamp the degraded badge (ADR-0011 slice C2) from the schema-refresh
-    // tick's snapshot — the same generation the query notice reads, so the
-    // two surfaces cannot disagree about a field.
+    // Stamp the degraded badge (ADR-0011) from the schema-refresh tick's
+    // snapshot — the same set the query notice reads, so the two surfaces
+    // cannot disagree about a field.
     //
-    // Intersected with the service's CURRENT columns: `field_conflict_stats`
+    // Intersected with the service's current columns: `field_conflict_stats`
     // is ever-observed evidence, so a field whose data has since aged out of
     // the retained corpus would otherwise keep badging a service that no
     // longer has anything to repin. Never the inverse join — carrying the
@@ -1087,7 +1081,7 @@ pub async fn catalog_fields(
         service: params.service.clone(),
         since: since_from_secs(params.since_secs),
         limit,
-        // This listing IS the conflict evidence surface, and the second
+        // This listing is the conflict evidence surface, and the second
         // query it costs is keyed on the page `limit` bounds.
         with_conflicts: true,
     };
@@ -1128,18 +1122,17 @@ pub async fn catalog_fields(
     }))
 }
 
-/// The degraded fields `dsl` BINDS, sorted — the incomplete-results notice
-/// (ADR-0011 slice C1 ruling 4).
+/// The degraded fields the DSL binds, sorted — the incomplete-results
+/// notice (ADR-0011).
 ///
 /// `texts` is every DSL the answer depends on: the query as typed, plus —
 /// for `from saved` — the saved query whose run produced the stored rows.
 ///
-/// Reads the in-process set the schema-refresh tick maintains: the query
-/// path never touches postgres, and it may not start now. The empty check
-/// comes first so a healthy install — every install, almost always — pays a
-/// lock acquisition and nothing else, never a parse.
+/// Reads the in-process set the schema-refresh tick maintains, because the
+/// query path never touches postgres. The empty check comes first so a
+/// healthy install pays a lock acquisition and nothing else, never a parse.
 ///
-/// Fields BOUND, not fields returned: a `where` on a degraded field that
+/// Fields bound, not fields returned: a `where` on a degraded field that
 /// projects it away is exactly the incomplete case
 /// ([`trawl_core::field_refs`]).
 fn degraded_fields_for<'a>(
@@ -1162,20 +1155,20 @@ fn degraded_fields_for<'a>(
 
 /// Read a pin's stored `DuckDB` spelling back as a canonical type.
 ///
-/// The column is `CHECK`-constrained to the canonical five, so the fallback
-/// is unreachable short of a hand-edited catalog; `VARCHAR` is the honest
-/// answer there — it is the one pin under which nothing further can be
-/// shelved.
+/// The column is `CHECK`-constrained to the canonical spellings, so the
+/// fallback is unreachable short of a hand-edited catalog; `VARCHAR` is the
+/// honest answer there — it is the one pin under which nothing further can
+/// be shelved.
 fn current_pin(duckdb_type: &str) -> trawl_core::schema::CanonicalType {
     trawl_core::schema::CanonicalType::from_catalog(duckdb_type)
         .unwrap_or(trawl_core::schema::CanonicalType::Varchar)
 }
 
-/// Verdicts for whichever of `pins` the analyzer finds degraded (ADR-0011
-/// slice C1). Absent from the map = healthy, which is the overwhelmingly
-/// common case and costs one aggregate read.
+/// Verdicts for whichever of `pins` the analyzer finds degraded (ADR-0011).
+/// Absent from the map = healthy, which is the common case and costs one
+/// aggregate read.
 ///
-/// Two PAGE-KEYED queries, never a join into the listing SQL: the same trap
+/// Two page-keyed queries, never a join into the listing SQL: the same trap
 /// [`crate::store::CatalogStore::list_fields`] documents for its conflict
 /// evidence applies here — a grouped subquery over the whole
 /// `field_conflict_stats` table has no predicate a planner can push down,
@@ -1215,7 +1208,7 @@ async fn degraded_verdicts(
 
 /// Query parameters for `GET /api/v1/schema/field`.
 ///
-/// The field name travels as a QUERY parameter, never a path segment: a
+/// The field name travels as a query parameter, never a path segment: a
 /// catalog key is any ASCII-folded client JSON key ≤255 bytes — it may
 /// contain `/`, `?`, or `%`, which a path segment cannot carry reliably.
 #[derive(Debug, Deserialize)]
@@ -1242,7 +1235,7 @@ const DEFAULT_FIELD_SERVICES_LIMIT: i64 = 100;
 /// for, and the rest is reached by paging.
 const MAX_FIELD_SERVICES_LIMIT: i64 = 1000;
 
-/// `GET /api/v1/schema/field?name=` — one field's pin, one PAGE of its
+/// `GET /api/v1/schema/field?name=` — one field's pin, one page of its
 /// per-service observations, and its retained conflict evidence
 /// (`trawl schema field`).
 pub async fn catalog_field(
@@ -1255,7 +1248,7 @@ pub async fn catalog_field(
     }
 
     // One DuckDB identifier has exactly one catalog spelling (ASCII-lower,
-    // folded at every ingest door) — fold the lookup the same way.
+    // folded in ingest::envelope::canonicalize) — fold the lookup the same way.
     let name = params.name.to_ascii_lowercase();
 
     let limit = params
@@ -1390,7 +1383,7 @@ pub async fn field_values(
         return Err(ServerError::Unauthorized("insufficient permissions".into()));
     }
 
-    let limit = params.limit.unwrap_or(10).min(100); // cap at 100
+    let limit = params.limit.unwrap_or(10).min(100);
     let cache_ttl = state.query.schema_cache_ttl_secs;
 
     // Validate service name if provided (prevent path traversal).
@@ -1404,13 +1397,11 @@ pub async fn field_values(
         )));
     }
 
-    // Cache key includes service scope.
     let cache_key = match &params.service {
         Some(svc) => format!("{field}:{svc}"),
         None => field.clone(),
     };
 
-    // Check cache.
     {
         let cache = state.query.field_values_cache.lock().await;
         if let Some(cached) = cache.get(&cache_key)
@@ -1435,7 +1426,7 @@ pub async fn field_values(
 
     // Through the pool: the glob is expanded inside the permit-holding task,
     // so this lane is excluded by the repin cutover like every other
-    // parquet reader (ADR-0011 slice B).
+    // parquet reader (ADR-0011).
     let values = state
         .query
         .pool
@@ -1454,7 +1445,6 @@ pub async fn field_values(
         "field values sampled"
     );
 
-    // Update cache.
     state.query.field_values_cache.lock().await.insert(
         cache_key,
         CachedFieldValues {
@@ -1549,8 +1539,8 @@ pub async fn list_saved(
     let key_id = verified.id;
 
     // Single bulk-join statement: schedule + latest run + run count arrive
-    // with the saved queries, so the query count is independent of item
-    // count (the sqlite-era loop was 1 + 3n round trips).
+    // with the saved queries, so the round-trip count is independent of how
+    // many saved queries the user has.
     let details = state.storage.saved.list_with_details(key_id).await?;
 
     let responses: Vec<SavedQueryResponse> = details
@@ -1628,7 +1618,7 @@ pub async fn delete_saved(
 
     let key_id = verified.id;
 
-    // The store collects parquet result paths and deletes the rows in ONE
+    // The store collects parquet result paths and deletes the rows in one
     // transaction (FK CASCADE wipes runs); we unlink the files after commit.
     let run_paths = state.storage.saved.delete(id, key_id).await?;
 
@@ -1692,22 +1682,21 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
     }
 }
 
-// -- repin handlers (ADR-0011 slice B) ----------------------------------------
+// -- repin handlers ----------------------------------------------------------
 
 /// Wire shape of one repin job row.
 ///
-/// `requires_force` is the THIRD asker of the one force decision the two
-/// live gates ask (`repin::force_refusal`), computed from this row's own
-/// persisted numbers: a dry run terminates `succeeded` by design, so the
-/// verdict has to ride the report or an operator learns about the refusal
-/// from the request that was meant to do the work. Never a second
-/// condition — a re-derived one would be free to drift from the gate.
+/// `requires_force` asks the same force decision the two live gates ask
+/// (`repin::force_refusal`), over this row's own persisted numbers: a dry
+/// run terminates `succeeded` by design, so the verdict has to ride the
+/// report or an operator learns about the refusal from the request that was
+/// meant to do the work. Never a second condition, which would be free to
+/// drift from the gate.
 ///
-/// It is ABSENT until the scan has recorded its plan (`planned_at`): a
+/// It is absent until the scan has recorded its plan (`planned_at`): a
 /// claimed job's counts are zeros that mean "not measured yet", and a poll
-/// in that window would otherwise read a confident `false` off a row that
-/// is about to refuse. Absent is not "no" — the consumer says "not known
-/// yet", which is what a running job's evidence actually is.
+/// in that window would otherwise read a confident `false` off a row that is
+/// about to refuse. Absent means "not known yet", not "no".
 fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse {
     let clamp = |v: i64| u64::try_from(v).unwrap_or(0);
     // The pin the job targets, and the dialect it asserted. An unparseable
@@ -1762,7 +1751,7 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
         dialect: job.dialect,
         ambiguous_numerals: clamp(job.ambiguous_numerals),
         unmapped_samples: job.unmapped_samples,
-        // Presence IS the verdict, so both halves must be present: a row
+        // Presence is the verdict, so both halves must be present: a row
         // with an observation instant and no service is a partially-written
         // job row, not a liveness warning.
         liveness: job
@@ -1775,8 +1764,8 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
     }
 }
 
-/// `POST /api/v1/schema/repin` — trigger a repin (ADR-0011 slice B).
-/// `SchemaWrite`-gated: the first data-mutating schema action.
+/// `POST /api/v1/schema/repin` — trigger a repin (ADR-0011).
+/// `SchemaWrite`-gated: the one data-mutating schema action.
 ///
 /// The HTTP status carries the verdict: 200 = dry-run report, 202 =
 /// rewrite started (poll `/schema/repin/status`), 409 = the scan projected
@@ -1827,9 +1816,9 @@ pub async fn schema_repin(
 }
 
 /// `GET /api/v1/schema/repin/status` — the running job if any, else the
-/// newest job of any status. `SchemaRead`-gated on purpose (ADR-0011
-/// slice C: read-only surfaces show state without offering the trigger),
-/// and served on query-only nodes too — the job rows live in postgres.
+/// newest job of any status. `SchemaRead`-gated on purpose (ADR-0011:
+/// read-only surfaces show state without offering the trigger), and served
+/// on query-only nodes too — the job rows live in postgres.
 pub async fn schema_repin_status(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2001,7 +1990,7 @@ pub async fn delete_schedule(
     let key_id = verified.id;
 
     // The store collects parquet result paths and deletes the schedule (and
-    // its cascaded runs) in ONE transaction; we unlink files after commit.
+    // its cascaded runs) in one transaction; we unlink files after commit.
     let run_paths = state
         .storage
         .schedule
@@ -2319,12 +2308,11 @@ pub async fn export(
 
     let format = params.format.unwrap_or(trawl_api::ExportFormat::Csv);
 
-    // Get max_export_rows from state.
     let max_export_rows = state.query.max_export_rows;
     let limit = req.limit.unwrap_or(max_export_rows).min(max_export_rows);
 
-    // One id keys the whole export lifecycle AND the pool's interrupt map,
-    // so the events correlate without carrying the query text (issue #56 F5).
+    // One id keys the whole export lifecycle and the pool's interrupt map,
+    // so the events correlate without carrying the query text.
     let query_id = state.query.pool.allocate_query_id();
 
     tracing::info!(
@@ -2411,7 +2399,6 @@ pub async fn export(
         }
     };
 
-    // Limit rows to max_export_rows.
     let limited = result.paginate(0, limit);
 
     let (content_type, filename, body) = match format {
@@ -2676,19 +2663,18 @@ fn sanitize_csv_formula(s: &str) -> Cow<'_, str> {
 /// Build an SSE snapshot event from the current aggregation state,
 /// applying post-stages to each row.
 ///
-/// `ctx` is the instant this ONE snapshot evaluates `now()` at, for
-/// every post-stage row alike (ADR-0017 §3) — a distinct type from the
-/// per-event context the feeding loop samples, so the two cannot be
-/// swapped at a call site. The caller samples it at the start of the
-/// snapshot attempt, before any row is taken, so the sample point does
-/// not depend on how many rows survive.
+/// `ctx` is the one instant this snapshot evaluates `now()` at, for every
+/// post-stage row alike (ADR-0017 §3) — a distinct type from the per-event
+/// context the feeding loop samples, so the two cannot be swapped at a call
+/// site. The caller samples it at the start of the snapshot attempt, before
+/// any row is taken, so the sample point does not depend on how many rows
+/// survive.
 fn emit_agg_snapshot(
     aggregation: &trawl_core::stream::CompiledAggregation,
     post_stages: &mut [trawl_core::stream::CompiledStage],
     ctx: &trawl_core::stream::SnapshotContext,
 ) -> Event {
     let (columns, rows) = trawl_core::stream::emit_snapshot(aggregation, post_stages, ctx);
-    // The wire door, and the only one on this path.
     let rows: Vec<_> = rows.into_iter().map(trawl_core::row::to_json).collect();
 
     let payload = serde_json::json!({
@@ -2698,8 +2684,8 @@ fn emit_agg_snapshot(
     Event::default().event("snapshot").data(payload.to_string())
 }
 
-/// The snapshot instant, sampled here and nowhere deeper: trawl-core
-/// takes a context as DATA and never reaches for a clock.
+/// The snapshot instant, sampled here and nowhere deeper: trawl-core takes
+/// a context as data and never reaches for a clock.
 fn snapshot_context() -> trawl_core::stream::SnapshotContext {
     trawl_core::stream::SnapshotContext::new(trawl_core::context::EvalContext::capture())
 }
@@ -2707,7 +2693,7 @@ fn snapshot_context() -> trawl_core::stream::SnapshotContext {
 /// `GET /api/v1/stream` — stream live events via Server-Sent Events (SSE).
 ///
 /// Subscribes to the event bus and filters incoming events in-memory
-/// using [`CompiledFilter`]. Each matching event is streamed individually
+/// using [`trawl_core::filter::CompiledFilter`]. Each matching event is streamed
 /// as an SSE `data` event. Requires ingest to be enabled (event bus available).
 #[allow(clippy::too_many_lines)]
 pub async fn stream_query(
@@ -2739,7 +2725,7 @@ pub async fn stream_query(
 
     // Same id vocabulary as /query and /export: correlate on the id, never
     // on the DSL, which can carry customer identifiers or incident
-    // indicators (issue #56 F5).
+    // indicators.
     let query_id = state.query.pool.allocate_query_id();
 
     tracing::info!(
@@ -2759,13 +2745,13 @@ pub async fn stream_query(
     // Parse and compile the filter once upfront.
     let ast = trawl_core::parser::parse(&query_dsl)
         .map_err(|errors| ServerError::BadRequest(format!("{errors:?}")))?;
-    // Rejects whatever the SQL emitter rejects (e.g. `level=eror`) instead
-    // of opening a live-looking stream that can never match an event.
-    // ONE catalog snapshot feeds BOTH the search-stage filter and the
+    // Rejects whatever the SQL emitter rejects (e.g. `_severity=eror`)
+    // instead of opening a live-looking stream that can never match an
+    // event. One catalog snapshot feeds both the search-stage filter and the
     // pipeline plan, so /query and /stream cannot disagree on a pinned
-    // comparison and the stream cannot disagree with itself (ADR-0011
-    // slices A/A′). The snapshot is held for the stream's life — a
-    // mid-stream repin waits for reconnect (slice B's invalidation path).
+    // comparison and the stream cannot disagree with itself (ADR-0011). The
+    // snapshot is held for the stream's life, so a mid-stream repin only
+    // takes effect on reconnect.
     let pin_snapshot = state.query.field_catalog.all();
     let filter = trawl_core::filter::CompiledFilter::compile(&ast.search, &pin_snapshot)
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
@@ -2803,10 +2789,10 @@ pub async fn stream_query(
                     match subscriber.recv().await {
                         Ok(batch) => {
                             for event in &batch.events {
-                                // ONE instant per event (ADR-0017 §3),
+                                // One instant per event (ADR-0017 §3),
                                 // sampled here and handed to the single
                                 // door that owns both the search-stage
-                                // window and the pipeline stages — the
+                                // window and the pipeline stages, so the
                                 // filter and the `now()` in a `| where`
                                 // cannot read different clocks.
                                 let ctx = trawl_core::context::EvalContext::capture();
@@ -2887,7 +2873,6 @@ pub async fn stream_query(
                                         }
                                     }
 
-                                    // Emit snapshot if event threshold reached.
                                     if events_since_snapshot >= SNAPSHOT_EVENT_THRESHOLD {
                                         let snapshot = emit_agg_snapshot(
                                             &aggregation,
@@ -2957,9 +2942,9 @@ mod tests {
         assert!(elapsed >= chrono::TimeDelta::seconds(3600));
         assert!(elapsed < chrono::TimeDelta::seconds(3700));
 
-        // Each of these blew up before: the first overflows the
-        // `DateTime - TimeDelta` subtraction, the rest overflow
-        // `TimeDelta::seconds` itself.
+        // Each value overflows a different step: the first the
+        // `DateTime - TimeDelta` subtraction, the rest `TimeDelta::seconds`
+        // itself.
         for s in [
             100_000_000_000_000_u64,
             10_000_000_000_000_000,

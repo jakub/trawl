@@ -4,10 +4,10 @@
 
 //! What counts as an env directory on disk (ADR-0009).
 //!
-//! The single definition shared by the query planner (`source.rs`, which
-//! globs `data/{env}/…`) and the compactor (`ingest::compaction`, which
-//! walks both `wal/{env}/` and `data/{env}/`). Both must agree on the
-//! set of envs, so the rule lives here once.
+//! The single definition, shared by the query planner (`source.rs`, which
+//! globs `data/{env}/…`), the compactor (`ingest::compaction`, which walks
+//! both `wal/{env}/` and `data/{env}/`) and the repin engine. They must all
+//! agree on the set of envs, so the rule lives here once.
 
 use std::path::{Path, PathBuf};
 

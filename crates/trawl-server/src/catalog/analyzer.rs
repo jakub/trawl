@@ -2,28 +2,25 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The degraded-field analyzer (ADR-0011 slice C1): a read-time verdict
-//! over the durable conflict evidence, with no daemon, no verdict table and
-//! no state of its own.
+//! The degraded-field analyzer: a read-time verdict over the durable conflict
+//! evidence, with no daemon, no verdict table and no state of its own.
 //!
-//! A pin that keeps nulling values is not itself news — a burst of bad data
-//! from one deploy is exactly what the conform is FOR, and the values stay
-//! in `_raw`. What deserves an operator's attention is a pin that has been
-//! losing data for long enough to be the system's model of the field rather
-//! than an incident. Hence a gate with two independent halves: the evidence
-//! must SPAN [`DEGRADED_MIN_SPAN`], and it must carry volume — either
+//! A pin that keeps nulling values is not itself news: a burst of bad data
+//! from one deploy is what the conform is for, and the values stay in `_raw`.
+//! What deserves an operator's attention is a pin that has been losing data
+//! long enough to be the system's model of the field rather than an incident.
+//! Hence a gate with two independent halves: the evidence must span
+//! [`DEGRADED_MIN_SPAN`], and it must carry volume, either
 //! [`DEGRADED_MIN_ROWS_SHELVED`] rows shelved or [`DEGRADED_MIN_EPISODES`]
 //! distinct episodes. The span alone would badge a field that lost two rows
 //! a month apart; the volume alone would badge one bad deploy.
 //!
-//! There is deliberately NO multi-sender gate (ADR-0011 slice C ruling 3):
-//! a homelab or SMB install commonly has exactly one legitimate producer per
-//! field, and requiring two would make the badge unreachable precisely where
-//! it is most useful. Sender count is displayed evidence. The residual is
-//! recorded rather than defended: the verdict is advisory, sender-influenceable
-//! signal, and the control against a hostile sender steering an operator into
-//! rewriting an archive is the human approval plus `schema_write` — never
-//! this function.
+//! There is no multi-sender gate (ADR-0011): a homelab or SMB install commonly
+//! has exactly one legitimate producer per field, and requiring two would make
+//! the badge unreachable precisely where it is most useful. Sender count is
+//! displayed evidence. The verdict is advisory and sender-influenceable; the
+//! control against a hostile sender steering an operator into rewriting an
+//! archive is the human approval plus `schema_write`, never this function.
 //!
 //! Pure by construction: no async, no pool, no clock beyond the instants it
 //! is handed. The store reads the rows ([`crate::store::CatalogStore::conflict_aggregates`]
@@ -56,7 +53,7 @@ pub const DEGRADED_MIN_EPISODES: i64 = 3;
 /// One field's conflict evidence, aggregated across every service that
 /// contributed it — the shape the analyzer judges.
 ///
-/// Per FIELD, never per `(field, service)`: the pin is global, so the
+/// Per field, never per `(field, service)`: the pin is global, so the
 /// verdict is, and `field_conflict_stats`' service axis is client-chosen
 /// and unbounded (the aggregation happens in SQL for that reason).
 #[derive(Debug, Clone)]
@@ -86,19 +83,19 @@ pub fn is_degraded(agg: &ConflictAggregate) -> bool {
 
 /// The type the evidence suggests repinning to.
 ///
-/// `observed_types` are the `DuckDB` types the conflicting BATCHES carried —
-/// per-column inferences, not per-value ones — so they are read through
+/// `observed_types` are the `DuckDB` types the conflicting batches carried,
+/// per-column inferences rather than per-value ones, so they are read through
 /// [`normalize_duckdb_type`], never `CanonicalType::from_catalog` (which
-/// knows only the canonical five and would drop `INTEGER`, `HUGEINT` and
-/// `JSON` on the floor). One rung, unanimously, and different from the
-/// current pin, is a suggestion; anything else — mixed rungs, `JSON` (which
-/// `read_json` infers for mixed scalars), an out-of-range integer, no
-/// evidence at all, or a rung that IS the current pin — resolves to
-/// `VARCHAR`.
+/// matches canonical spellings exactly and would drop `INTEGER`, `HUGEINT`
+/// and `JSON` on the floor). One rung, unanimously, and different from the
+/// current pin, is a suggestion; anything else resolves to `VARCHAR`: mixed
+/// rungs, `JSON` (which `read_json` infers for mixed scalars), an
+/// out-of-range integer, no evidence at all, or a rung that is the current
+/// pin.
 ///
-/// `VARCHAR` as the fallback is this ADR's framing decision, not a shrug: a
-/// field whose values genuinely disagree about their type is an enum-shaped
-/// field, and text is where it stops losing data.
+/// `VARCHAR` is the fallback by choice, not as a shrug: a field whose values
+/// genuinely disagree about their type is an enum-shaped field, and text is
+/// where it stops losing data.
 #[must_use]
 pub fn suggested_target(current: CanonicalType, observed_types: &[String]) -> CanonicalType {
     let mut uniform: Option<CanonicalType> = None;
@@ -121,7 +118,7 @@ pub fn suggested_target(current: CanonicalType, observed_types: &[String]) -> Ca
 /// Build the verdict for a field the caller has already found degraded.
 ///
 /// `evidence` is the field's retained conflict rows as
-/// `(observed_type, samples)`, NEWEST FIRST — the rows the recency window
+/// `(observed_type, samples)`, newest first — the rows the recency window
 /// kept, which is why the samples are a window while `rows_shelved` is a
 /// lifetime total. The two numbers will disagree, and should: one says what
 /// the pin has cost, the other shows what it is costing right now.
@@ -175,7 +172,7 @@ mod tests {
 
     /// Both halves of the gate, at their boundaries: the span is inclusive,
     /// the volume floors are inclusive and independent, and single-service
-    /// evidence qualifies (ruling 3 — sender count is never a gate).
+    /// evidence qualifies (sender count is never a gate).
     #[test]
     fn the_degraded_gate_is_span_and_volume() {
         let day = TimeDelta::hours(24);
@@ -210,8 +207,7 @@ mod tests {
         }
     }
 
-    /// One sender is enough — the whole point of dropping the multi-sender
-    /// gate.
+    /// One sender is enough: there is no multi-sender gate.
     #[test]
     fn single_service_evidence_qualifies() {
         let mut a = agg(TimeDelta::hours(25), 5, 500);

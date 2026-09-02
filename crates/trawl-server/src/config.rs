@@ -6,7 +6,5 @@
 //!
 //! Types are defined in the `trawl-config` crate so proxy-only consumers
 //! (e.g. `trawl-web`) don't transitively pull in the `DuckDB` engine chain.
-//! This module is a re-export shim — existing `trawl_server::config::X`
-//! imports elsewhere in the daemon keep working unchanged.
 
 pub use trawl_config::*;

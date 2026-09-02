@@ -314,8 +314,8 @@ mod tests {
         let cert_path = tmp.path().join("cert.pem");
         let key_path = tmp.path().join("key.pem");
 
-        // Generate by calling the internal function indirectly — use
-        // build_server_config with no paths, but override HOME.
+        // A real PEM pair on disk: this test drives the operator-supplied
+        // path branch, which loads the files instead of generating any.
         let san = vec!["localhost".to_owned(), "127.0.0.1".to_owned()];
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(san).unwrap();

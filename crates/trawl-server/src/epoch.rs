@@ -5,13 +5,18 @@
 //! The ADR-0009 storage-epoch cutover: restartable, filesystem-only.
 //!
 //! "Legacy data is dropped" needs a mechanism, not an incantation. The
-//! marker is `data/EPOCH` with content `2`; the legacy layout has none
-//! (epoch 1, implicit). The boot decision table — every branch idempotent:
+//! marker is `data/EPOCH`, holding [`CURRENT_EPOCH`]; the epoch-1 layout has
+//! none. The boot decision table, every branch idempotent:
 //!
 //! - no `data/` → create `data/` + `EPOCH`, normal boot (fresh install;
 //!   also the crash-resume case)
-//! - `data/EPOCH` == `2` → normal boot; warn if `data.pre-schema-v2/`
-//!   still exists
+//! - `data/EPOCH` == [`CURRENT_EPOCH`] → normal boot; warn if either
+//!   set-aside directory still exists
+//! - `data/EPOCH` == `2` → the envelope reshaped, so set the root aside as
+//!   `data.pre-epoch-3/` and start clean; a query-only node warns and
+//!   serves it instead, and an existing `data.pre-epoch-3/` refuses
+//! - any other `EPOCH` content → refuse to start rather than guess (most
+//!   often the root was written by a newer trawld)
 //! - `data/` without `EPOCH`, ingest disabled → leave it alone entirely:
 //!   this node writes nothing here, so the directory is not ours to move
 //!   (a query-only node pointed at someone else's parquet archive)
@@ -29,12 +34,12 @@
 //! There is no reachable state with a half-migrated root: the fresh root
 //! is assembled as a sibling `data.next` (EPOCH fsynced) and renamed into
 //! place, so a crash between the set-aside rename and the fresh-root
-//! rename leaves *no* `data/` — which resumes via the first branch.
-//! trawl never deletes `data.pre-schema-v2/`; retention skips it; the
-//! operator removes it at leisure.
+//! rename leaves *no* `data/`, which resumes via the first branch.
+//! trawl never deletes a set-aside; retention skips it; the operator
+//! removes it at leisure.
 //!
 //! One subtree does not move with the root: `scheduled/`, the report-run
-//! results. Those are not epoch-1 event data but materialized query
+//! results. Those are not event data but materialized query
 //! results whose *relative* path lives in a postgres `report_runs` row the
 //! cutover deliberately does not touch, so they ride across into the fresh
 //! root (see [`carry_over_report_runs`]) — every boot that sees a
@@ -49,7 +54,7 @@ pub const CURRENT_EPOCH: &str = "3";
 /// Marker filename inside the data root.
 pub const EPOCH_FILE: &str = "EPOCH";
 
-/// Suffix of the set-aside directory for a MARKER-LESS (epoch-1) root.
+/// Suffix of the set-aside directory for a marker-less (epoch-1) root.
 pub const SET_ASIDE_SUFFIX: &str = ".pre-schema-v2";
 
 /// Suffix of the set-aside directory for an epoch-2 root (ADR-0013).
@@ -96,8 +101,8 @@ pub enum Outcome {
 ///
 /// `wal_dir` is the *effective* WAL directory. When it lies outside the
 /// data root it is not covered by any rename of that root, so every branch
-/// that ends with this node owning `data_root` handles it explicitly: the
-/// legacy-rename branch always sets it aside (`{wal_dir}.pre-schema-v2`) so
+/// that ends with this node owning `data_root` handles it explicitly: a
+/// set-aside branch always moves it too, under that epoch's own suffix, so
 /// parquet and WAL move together, and the branches that rename nothing set
 /// it aside only if it still holds pre-cutover flat `*.ndjson` files, which
 /// the env-directory-walking compactor could otherwise never see again.
@@ -231,11 +236,11 @@ fn decide(data_root: &Path, wal_dir: &Path, ingest_enabled: bool) -> Result<Outc
     }
 }
 
-/// The epoch 2 → 3 branch of the decision table (ADR-0013 §9).
+/// The epoch 2 → 3 branch of the decision table (ADR-0013).
 ///
-/// The envelope reshaped, so an epoch-2 corpus carries `severity` and
-/// `severity_text` columns that mean something else now. No back-compat
-/// ruling is in force: set the root aside and start clean.
+/// An epoch-2 corpus carries `severity` and `severity_text` envelope
+/// columns that epoch 3 no longer defines, and there is no back-compat
+/// ruling: set the root aside and start clean.
 fn epoch_2_branch(
     data_root: &Path,
     wal_dir: &Path,
@@ -244,7 +249,7 @@ fn epoch_2_branch(
 ) -> Result<Outcome, String> {
     if !ingest_enabled {
         // A query-only node does not own the root, and an epoch-2 corpus
-        // READS fine under epoch-3 semantics (its severity columns are
+        // reads fine under epoch-3 semantics (its severity columns are
         // ordinary bare columns). Warn and serve, the same shape as the
         // marker-less branch.
         tracing::warn!(
@@ -291,7 +296,7 @@ fn carry_over_report_runs(aside: &Path, data_root: &Path) -> Result<(), String> 
         // No report-run subtree in this set-aside: nothing to carry.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         // Anything else — a permission wall, an IO fault, a non-directory
-        // planted at the path — is NOT evidence of absence. Folding it into
+        // planted at the path — is not evidence of absence. Folding it into
         // "nothing to carry" would boot cleanly while every postgres
         // report_runs row still pointed under the set-aside.
         Err(e) => {
@@ -349,10 +354,6 @@ fn carry_over_report_runs(aside: &Path, data_root: &Path) -> Result<(), String> 
 }
 
 /// The sibling set-aside path for a data root (`data.pre-schema-v2`).
-///
-/// Retention consults this too: the set-aside is outside `data/`, so it
-/// contributes no deletion candidates while still occupying the
-/// filesystem free-space measurements are taken from.
 pub fn set_aside_path(data_root: &Path) -> PathBuf {
     sibling_with_suffix(data_root, SET_ASIDE_SUFFIX)
 }
@@ -360,6 +361,11 @@ pub fn set_aside_path(data_root: &Path) -> PathBuf {
 /// Every set-aside a data root can have, newest cutover first. An install
 /// that has been through both bumps holds one of each, and trawl deletes
 /// neither.
+///
+/// Retention consults these: a set-aside is outside `data/`, so it
+/// contributes no deletion candidates while still occupying the filesystem
+/// free-space measurements are taken from, and the disk-pressure sweep
+/// stands down while one exists.
 pub fn set_aside_paths(data_root: &Path) -> [PathBuf; 2] {
     [
         sibling_with_suffix(data_root, EPOCH_3_SET_ASIDE_SUFFIX),
@@ -421,7 +427,7 @@ fn adopt_in_place(data_root: &Path) -> Result<(), String> {
 /// rename → dir fsync. A crash can then never publish a half-written
 /// marker — every reader sees either the previous content or the new one.
 ///
-/// This is the ONE implementation of that sequence: the epoch marker
+/// This is the one implementation of that sequence: the epoch marker
 /// ([`EPOCH_FILE`]), the catalog identity marker
 /// (`catalog::conform::publish_marker`) and the repin marker
 /// (`repin::marker::write_marker`) all publish through it, so a future
@@ -503,7 +509,7 @@ fn create_fresh_root(data_root: &Path) -> Result<(), String> {
 /// strings, so the branches share one body ([`set_aside_root`]) and a new
 /// epoch adds a constant rather than a fourth copy of the rename.
 struct SetAsideKind {
-    /// Suffix for the EXTERNAL WAL dir's own set-aside — one per epoch, so
+    /// Suffix for the external WAL dir's own set-aside — one per epoch, so
     /// one cutover's set-aside cannot clobber another's.
     wal_suffix: &'static str,
     /// How the corpus being set aside is named in operator-facing text.
@@ -549,7 +555,7 @@ fn set_aside_root(
     let wal_files = count_files_with_ext(wal_dir, "ndjson");
 
     // An external WAL dir does not move with the root, and every file in
-    // it is a pre-cutover event — set it aside FIRST, so a crash after
+    // it is a pre-cutover event — set it aside first, so a crash after
     // this rename still resumes correctly (the data root is untouched,
     // the branch re-runs, and the WAL set-aside is a no-op because the
     // source is gone) and the compactor can never drain pre-cutover
@@ -566,7 +572,7 @@ fn set_aside_root(
         )
     })?;
 
-    // A crash HERE leaves no data/ with the aside present — resumed by
+    // A crash here leaves no data/ with the aside present — resumed by
     // the fresh-install branch on next boot.
     create_fresh_root(data_root)?;
 
@@ -627,13 +633,13 @@ fn set_aside_external_wal_with(
 /// owe an answer for an *external* WAL dir: it lives outside the root they
 /// left alone, so no other step of the cutover ever looks at it.
 ///
-/// Pre-cutover WAL files sit flat at `{wal_dir}/*.ndjson`; epoch 2 puts
-/// every one under `{wal_dir}/{env}/`, and the compactor now iterates env
-/// directories only. A flat file left in place is therefore invisible
-/// forever: never compacted, never counted, never deleted — silent data
-/// loss plus an unbounded disk leak. Set such a dir aside with the same
-/// rename the legacy branch uses; a WAL dir that is empty or already in
-/// the epoch-2 env layout is left exactly as it is.
+/// Pre-cutover WAL files sit flat at `{wal_dir}/*.ndjson`, while the current
+/// layout puts every one under `{wal_dir}/{env}/` and the compactor iterates
+/// env directories only. A flat file left in place is therefore invisible
+/// forever: never compacted, never counted, never deleted, which is silent
+/// data loss plus an unbounded disk leak. Set such a dir aside with the same
+/// rename the legacy branch uses; a WAL dir that is empty or already in the
+/// env layout is left exactly as it is.
 fn set_aside_stranded_external_wal(data_root: &Path, wal_dir: &Path) -> Result<bool, String> {
     if wal_dir.starts_with(data_root) || !has_flat_legacy_wal(wal_dir) {
         return Ok(false);
@@ -772,7 +778,7 @@ mod tests {
         // The fresh root is empty but for its marker…
         assert_eq!(read_marker(&data), "3");
         assert!(!data.join("prod").exists(), "no epoch-2 data survives");
-        // …and the epoch-2 root is intact under the NEW suffix, so an
+        // …and the epoch-2 root is intact under its own suffix, so an
         // existing `.pre-schema-v2` from the ADR-0009 cutover is safe.
         let aside = tmp.path().join("data.pre-epoch-3");
         assert_eq!(
@@ -807,8 +813,8 @@ mod tests {
         assert!(tmp.path().join("data.pre-epoch-3").exists());
     }
 
-    /// A query-only node does not own the root — and an epoch-2 corpus
-    /// READS fine under epoch-3 semantics, so it warns and serves.
+    /// A query-only node does not own the root, and an epoch-2 corpus
+    /// reads fine under epoch-3 semantics, so it warns and serves.
     #[test]
     fn a_query_only_node_serves_an_epoch_2_root_untouched() {
         let tmp = tempfile::tempdir().unwrap();
@@ -870,7 +876,7 @@ mod tests {
     }
 
     /// Report runs ride across the epoch-3 cutover, exactly as they do
-    /// across the epoch-1 one: their postgres rows name a RELATIVE path.
+    /// across the epoch-1 one: their postgres rows name a relative path.
     #[test]
     fn report_runs_ride_across_the_epoch_3_cutover() {
         let tmp = tempfile::tempdir().unwrap();
@@ -957,7 +963,7 @@ mod tests {
 
     #[test]
     fn report_run_results_ride_across_the_cutover() {
-        // `report_runs.result_path` in postgres is RELATIVE and the cutover
+        // `report_runs.result_path` in postgres is relative and the cutover
         // touches no postgres state, so the files it names must land under
         // the fresh root — not in the aside, where every row would dangle.
         let tmp = tempfile::tempdir().unwrap();
@@ -1136,7 +1142,7 @@ mod tests {
         assert_eq!(std::fs::read(data.join("notes.txt")).unwrap(), b"not ours");
         assert!(data.join("lost+found").is_dir());
 
-        // And the adopted root is a normal epoch-2 root from then on.
+        // And the adopted root is a normal current-epoch root from then on.
         let second = ensure_current_epoch(&data, &wal, true).unwrap();
         assert_eq!(
             second,
@@ -1305,7 +1311,7 @@ mod tests {
             b"wal bytes"
         );
 
-        // Idempotent: the next boot is an ordinary epoch-2 boot.
+        // Idempotent: the next boot is an ordinary current-epoch boot.
         std::fs::create_dir_all(&wal).unwrap();
         let second = ensure_current_epoch(&data, &wal, true).unwrap();
         assert_eq!(
@@ -1318,8 +1324,8 @@ mod tests {
 
     #[test]
     fn an_epoch_2_external_wal_dir_is_left_alone() {
-        // Files under `{wal_dir}/{env}/` are live epoch-2 WAL the compactor
-        // can see: a root that needs no rename must not touch them.
+        // Files under `{wal_dir}/{env}/` are live WAL the compactor can
+        // see: a root that needs no rename must not touch them.
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         let wal = tmp.path().join("fast-wal");
