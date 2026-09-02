@@ -565,8 +565,7 @@ mod tests {
 
     #[test]
     fn streamed_children_ignore_output_limits_and_return_the_real_status() {
-        // The captured limits would reject this volume; a build or image pull
-        // must not be killed for being chatty.
+        // A build or image pull must not be killed for being chatty.
         let spec = CommandSpec::new("sh")
             .args(["-c", "head -c 65536 /dev/zero >/dev/null; exit 7"])
             .output_limits(16, 16)

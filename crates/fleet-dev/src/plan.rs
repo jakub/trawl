@@ -46,9 +46,10 @@ pub struct ProcessPlan {
 
 /// The controller-recognized role a manifest process plays.
 ///
-/// Classified once, here, where the app and its manifest are both in hand. The
-/// runtime renderer then reads the role off the plan instead of re-deriving it
-/// by pairing two collections positionally.
+/// Classified here, while the raw manifest process name is still in hand. The
+/// plan renames every process to `{app}-{process}`, so re-running `classify`
+/// downstream answers for the wrong name: a Trawl manifest process called
+/// `web` is stored as `trawl-web`, which is Trawl's own backend name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProcessRole {
