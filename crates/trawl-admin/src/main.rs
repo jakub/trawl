@@ -4,9 +4,9 @@
 
 //! trawl-admin — local operational tooling for trawl.
 //!
-//! Key management moved to `fleet-admin` with the fleet-auth postgres
-//! keystore cutover (ADR-0004 slice 1); this tool keeps the purely local
-//! concerns (TLS certificate generation).
+//! Local concerns only: TLS certificate generation. API key
+//! management lives in `fleet-admin`, against the fleet-auth postgres
+//! keystore (ADR-0004).
 
 use std::path::PathBuf;
 use std::process;
@@ -78,9 +78,8 @@ mod tests {
 
     #[test]
     fn keys_subcommand_is_gone() {
-        // Key management moved to fleet-admin (ADR-0004). A `keys`
-        // subcommand reappearing here would resurrect the sqlite keystore
-        // path.
+        // Key management belongs to fleet-admin (ADR-0004). A `keys`
+        // subcommand here would mean a second keystore path.
         let err = Cli::try_parse_from(["trawl-admin", "keys", "list"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
@@ -97,7 +96,7 @@ mod tests {
 
     #[test]
     fn db_flag_is_gone() {
-        // --db / TRAWL_AUTH_DB pointed at the retired sqlite keystore.
+        // There is no local keystore to point a --db / TRAWL_AUTH_DB at.
         let err = Cli::try_parse_from(["trawl-admin", "--db", "/tmp/x.db", "tls", "generate"])
             .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
