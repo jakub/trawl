@@ -670,18 +670,42 @@ fn path_prefix(source_root: &Path, file: &Path) -> String {
     prefix
 }
 
+/// Every `.rs` file under `dir`, following directory symlinks, visiting each
+/// real directory once.
+///
+/// The problem a symlink causes here is a CYCLE, not the symlink itself: a
+/// link pointing at one of its own ancestors is a directory forever and the
+/// walk descends it until the OS refuses a longer path. Refusing to follow
+/// links instead would drop whatever lives behind one, and behind one is
+/// exactly where the safety net has to look. Rustc compiles
+/// `include!("linked/mod.rs")` through a symlinked directory, and the module
+/// walk cannot see an `include!` edge at all, so the file would be scanned by
+/// nobody.
+///
+/// The cycle is broken on the CANONICAL directory, so a real directory
+/// reachable under two names is walked once and its files are collected under
+/// the name the walk arrived by.
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut visited = BTreeSet::new();
+    collect_rs_seen(dir, &mut visited, out);
+}
+
+fn collect_rs_seen(dir: &Path, visited: &mut BTreeSet<PathBuf>, out: &mut Vec<PathBuf>) {
+    // A directory that cannot be canonicalized cannot be read either, so
+    // stopping here loses nothing the `read_dir` below would have found.
+    let Ok(real) = fs::canonicalize(dir) else {
+        return;
+    };
+    if !visited.insert(real) {
+        return;
+    }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        // `symlink_metadata`, not `is_dir()`: a directory symlink pointing at
-        // one of its own ancestors stays a directory forever, and the walk
-        // recursed into it until the OS refused a deeper path. A symlinked
-        // `.rs` FILE is still collected, below.
-        if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
-            collect_rs(&path, out);
+        if path.is_dir() {
+            collect_rs_seen(&path, visited, out);
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
@@ -2603,21 +2627,29 @@ mod tests {
         assert!(facts.test_fn_spans.is_empty(), "{:?}", facts.test_fn_spans);
     }
 
-    /// A directory symlink pointing at one of its own ancestors keeps
-    /// `is_dir()` true forever, so the safety-net walk recursed into it once
-    /// per path component the OS still allowed, collecting the same files
-    /// hundreds of times on the way.
+    /// Both halves of the symlink rule at once. A link pointing at its own
+    /// ancestor is a cycle, and the walk used to descend it once per path
+    /// component the OS still allowed. A link pointing anywhere else is a
+    /// real subtree that only the safety net reaches, since `module_tree`
+    /// follows `mod` declarations and cannot see an `include!` edge, so
+    /// refusing to follow links would hide every file behind one.
     #[cfg(unix)]
     #[test]
-    fn a_directory_symlink_is_not_walked() {
-        let dir = scratch("symlink-loop");
+    fn a_symlinked_source_dir_is_walked_once_and_a_cycle_terminates() {
+        let dir = scratch("symlink-walk");
         let root = &dir.0;
         let src = root.join("src");
         write(&src.join("lib.rs"), "pub struct Store;\n");
-        std::os::unix::fs::symlink(&src, src.join("loop")).expect("symlink");
+        write(&root.join("shared").join("mod.rs"), "pub struct Shared;\n");
+        std::os::unix::fs::symlink(&src, src.join("cycle")).expect("cycle link");
+        std::os::unix::fs::symlink(root.join("shared"), src.join("linked")).expect("dir link");
 
         let mut found = Vec::new();
         collect_rs(&src, &mut found);
-        assert_eq!(found, vec![src.join("lib.rs")]);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![src.join("lib.rs"), src.join("linked").join("mod.rs")]
+        );
     }
 }
