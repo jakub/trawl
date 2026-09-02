@@ -14,8 +14,8 @@
 //! - `ingest-fuzz` — emit deterministic, Vector-compatible NDJSON corpora
 //!   for the ingest canonicalizer and field-catalog pin/conform boundary,
 //!   per producer profile (`--profile http|syslog|trawld`).
-//! - `e2e` — the real-browser Playwright suite (issue #118,
-//!   `crates/trawl-web-ui/e2e/`): trunk-build the SPA, `npm ci` the
+//! - `e2e` — the real-browser Playwright suite in
+//!   `crates/trawl-web-ui/e2e/`: trunk-build the SPA, `npm ci` the
 //!   suite's own devDependency, install the chromium browser, then run
 //!   the suite against the zero-npm-dep stub server in `e2e/harness/`.
 //!
@@ -95,7 +95,7 @@ enum Cmd {
         #[arg(long, default_value_t = 100)]
         events: usize,
     },
-    /// Run the real-browser Playwright suite (issue #118).
+    /// Run the real-browser Playwright suite.
     E2e {
         /// Skip the `trunk build` step — reuse whatever's already in
         /// `crates/trawl-web-ui/dist/`. Fails loudly at server startup
