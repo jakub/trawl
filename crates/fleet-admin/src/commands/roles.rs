@@ -5,10 +5,10 @@
 //! `fleet-admin roles ...` — CRUD for data-defined roles (ADR-0006).
 //!
 //! A role is a named cross-app bundle of `APP:PERMISSION` strings with an
-//! optional `rate_rpm` ceiling. Mutations naming a permission absent from
-//! the `app_permissions` vocabulary registry WARN on stderr but persist
-//! (warn-only by decision — a role may pre-name a permission an app is
-//! about to ship); the warning closes the silent-no-op typo hole.
+//! optional `rate_rpm` ceiling. A mutation naming a permission absent from
+//! the `app_permissions` registry warns on stderr and persists anyway: a
+//! role may pre-name a permission an app is about to ship, so the warning
+//! is only there to catch typos.
 
 use fleet_auth::{KeyStore, Role, RolePermission};
 
@@ -141,9 +141,8 @@ pub async fn add_perm(
 /// `roles set-rate <NAME> (--rate-rpm N | --default)`.
 ///
 /// `None` clears the ceiling back to the route-class config defaults.
-/// Non-destructive by design: the permission bundle and every key
-/// assignment survive, so re-tiering class-of-service no longer means
-/// `delete --force` + recreate + reassign.
+/// Non-destructive: the permission bundle and every key assignment survive,
+/// so re-tiering a class of service needs no delete-and-recreate.
 pub async fn set_rate(
     store: &KeyStore,
     name: &RoleName,

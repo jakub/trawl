@@ -3,10 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Integration coverage for `fleet-admin roles` against a real Postgres
-//! (ADR-0006 slice 1, issue #44 AC7).
+//! (ADR-0006).
 //!
 //! Command functions are exercised where they add behaviour over the
-//! store (confirmation flow, warn-only registry surface); pure store
+//! store (confirmation flow, warn-only permission registry); pure store
 //! round-trips call `KeyStore` directly, mirroring `keys_pg.rs`.
 
 mod common;
@@ -71,11 +71,10 @@ async fn create_duplicate_is_role_exists(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn unknown_permission_warns_but_persists(pool: sqlx::PgPool) {
-    // AC7: the registry is warn-only. `qyery` is not in app_permissions —
-    // the command must still succeed (exit 0 at the binary boundary is
-    // "returns Ok here") and the row must be persisted. The stderr warning
-    // text itself is exercised by the binary; here we pin the contract that
-    // matters: no error, row persisted, registry consulted.
+    // The registry is warn-only. `qyery` is not in app_permissions, so the
+    // command must still return Ok (exit 0 at the binary boundary) and the
+    // row must persist. The stderr warning text belongs to the binary; the
+    // contract pinned here is no error, row persisted, registry consulted.
     let store = common::migrated_store(pool).await;
 
     roles::create(&store, &role_name("typo"), &[rp("trawl", "qyery")], None)
@@ -190,14 +189,13 @@ async fn delete_unheld_role_succeeds(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn schema_write_is_grantable_through_a_role(pool: sqlx::PgPool) {
-    // ADR-0011 slice B (issue #53): the migration REGISTERS
-    // `trawl:schema_write` and grants it to nobody. The operator's whole
-    // path to a schema-admin is therefore one `fleet-admin roles create`
-    // — no deploy, and no `server_manage` riding along.
+    // The migration registers `trawl:schema_write` and grants it to nobody,
+    // so the operator's whole path to a schema-admin is one
+    // `fleet-admin roles create`: no deploy, no `server_manage` riding along.
     let store = common::migrated_store(pool).await;
 
     // Registered vocabulary: naming it in a role mutation warns about
-    // nothing (the registry is the warn-only surface exercised above).
+    // nothing (the warn-only registry exercised above).
     assert!(
         store
             .is_known_permission("trawl", "schema_write")
@@ -206,7 +204,7 @@ async fn schema_write_is_grantable_through_a_role(pool: sqlx::PgPool) {
         "slice B must register trawl:schema_write in app_permissions"
     );
 
-    // ...and no converted tier holds it before the operator acts.
+    // ...and no role holds it until the operator acts.
     for role in store.list_roles().await.unwrap() {
         assert!(
             !role.permissions.contains(&rp("trawl", "schema_write")),
@@ -259,7 +257,7 @@ async fn schema_write_is_grantable_through_a_role(pool: sqlx::PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn assign_unassign_roundtrip_through_role_commands(pool: sqlx::PgPool) {
-    // AC7 round-trip: roles create → keys create --role → assign/unassign
+    // Round-trip: roles create → keys create --role → assign/unassign,
     // visible through the verify path.
     let store = common::migrated_store(pool).await;
 

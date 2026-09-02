@@ -4,14 +4,12 @@
 
 //! `fleet-admin keys ...` — lifecycle for API keys in the Postgres keystore.
 //!
-//! Ports the trawl-admin shape onto fleet-auth's async [`KeyStore`].
 //! `create` writes the plaintext token to stdout once; everything else
 //! (metadata, prompts, summaries) goes to stderr so the output of
 //! `keys create` is shell-pipeable.
 //!
-//! Keys hold data-defined roles (ADR-0006): `create --role <NAME>`
-//! (repeatable) and `assign-role`/`unassign-role` replace the retired
-//! `--grant APP:ROLE` / `grant` / `revoke-grant` surface.
+//! Keys hold data-defined roles (ADR-0006): `create --role <NAME>` is
+//! repeatable, and `assign-role`/`unassign-role` change the set afterwards.
 
 use std::io::{BufRead, Write};
 use std::time::Duration;
@@ -119,7 +117,7 @@ pub async fn create(
     Ok(())
 }
 
-/// List API keys.
+/// List API keys — active only unless `all`.
 pub async fn list(store: &KeyStore, all: bool) -> Result<(), AdminError> {
     let keys = store.list_keys(!all).await?;
 
@@ -200,9 +198,7 @@ pub fn confirm_prompt<R: BufRead, W: Write>(
 /// Refuses with [`AdminError::NonInteractive`] unless both stdin and stderr
 /// are TTYs, so a piped destructive subcommand never proceeds without an
 /// explicit `--yes`. Otherwise locks the descriptors and defers to
-/// [`confirm_prompt`], returning whether the operator confirmed. Centralizes
-/// the non-interactive-refusal invariant so new confirmable subcommands don't
-/// hand-roll their own copy.
+/// [`confirm_prompt`], returning whether the operator confirmed.
 pub(crate) fn confirm_or_refuse(question: &str) -> Result<bool, AdminError> {
     use std::io::IsTerminal as _;
     let stdin = std::io::stdin();
@@ -216,7 +212,6 @@ pub(crate) fn confirm_or_refuse(question: &str) -> Result<bool, AdminError> {
     confirm_prompt(question, &mut reader, &mut writer).map_err(Into::into)
 }
 
-/// Assign a role to an existing key.
 pub async fn assign_role(
     store: &KeyStore,
     prefix: &KeyPrefix,
