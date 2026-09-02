@@ -109,11 +109,12 @@
 //! separators between digits, `"0404"`, `"1e3"` and `".5"` read, radix
 //! prefixes refused, and the cast's own laxness reproduced down to
 //! `'- '` reading zero — executed side by side in
-//! `trawl-engine/tests/duckdb_probe.rs`. Nothing compares through
-//! [`try_cast_double`]: it renders what a DOUBLE-pinned column stores, for
-//! the pin's pattern text ([`PatternForm::DoubleText`]) and for
-//! `tonumber()` in streaming eval, which reads the same cast domain
-//! (`crate::eval`).
+//! `trawl-engine/tests/duckdb_probe.rs`. [`try_cast_double`] is the DOUBLE
+//! pin's own cast, not the VARCHAR comparison space: it reads what a
+//! DOUBLE-pinned column stores, for the pin's pattern text
+//! ([`PatternForm::DoubleText`]), for a DOUBLE-pinned live value before
+//! `pin_match` compares it in DOUBLE's total order, and for `tonumber()`
+//! in streaming eval (`crate::eval`).
 
 use crate::ast::{FilterOp, LiteralValue};
 use crate::emitter::SqlValue;
@@ -1505,11 +1506,13 @@ pub fn canonical_double_text(x: f64) -> String {
 /// `TRY_CAST(col AS DOUBLE)` — the live mirror of the DOUBLE pin's own
 /// cast, and deliberately NOT `str::parse::<f64>`.
 ///
-/// Two callers, one cast domain: the DOUBLE pin's PATTERN text
+/// Three callers, one cast domain: the DOUBLE pin's PATTERN text
 /// ([`PatternForm::DoubleText`]) — what the conformed column holds, to be
-/// rendered and globbed — and `crate::eval`'s `tonumber()` scalar, whose
-/// SQL counterpart is the same `TRY_CAST(… AS DOUBLE)`. Nothing compares
-/// through it: that is [`decimal_micros`]' job (ADR-0011 ruling #6).
+/// rendered and globbed — `pin_match`'s reading of a DOUBLE-pinned live
+/// value before it compares in DOUBLE's total order ([`double_total_cmp`]),
+/// and `crate::eval`'s `tonumber()` scalar, whose SQL counterpart is the
+/// same `TRY_CAST(… AS DOUBLE)`. A VARCHAR pin's numeric comparison never
+/// comes through here: that is [`decimal_micros`]' job (ADR-0011 ruling #6).
 ///
 /// `DuckDB`'s cast domain is strictly wider than Rust's float parser in
 /// two ways (both executed in `trawl-engine/tests/duckdb_probe.rs`), and
