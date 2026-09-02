@@ -4,9 +4,9 @@
 
 //! Pure-logic display helpers for rendering [`QueryResult`] data.
 //!
-//! Extracted for reuse between the terminal UI (`trawl-cli`) and the
-//! browser SPA (`trawl-web-ui`). No I/O, no ratatui, no wasm-bindgen —
-//! safe to compile on both native and `wasm32-unknown-unknown`.
+//! Shared by the terminal UI (`trawl-cli`) and the browser SPA
+//! (`trawl-web-ui`). No I/O, no ratatui, no wasm-bindgen — safe to
+//! compile on both native and `wasm32-unknown-unknown`.
 
 use std::collections::HashMap;
 

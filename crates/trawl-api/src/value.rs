@@ -7,7 +7,7 @@
 //! These types are deliberately decoupled from `DuckDB`'s internal types
 //! to keep the public API stable across duckdb crate version changes.
 //!
-//! [`Value`] uses custom serde impls to serialize as JSON primitives
+//! [`Value`] uses custom serde impls to serialize as plain JSON values
 //! (not tagged enums), so these types double as the HTTP wire format.
 
 use std::cmp::Ordering;
@@ -18,12 +18,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A cell value from a query result row.
 ///
-/// Serializes as a JSON primitive: `null`, `true`, `42`, `3.14`, `"hello"`.
+/// Serializes as plain JSON: `null`, `true`, `42`, `3.14`, `"hello"`, or an
+/// array of those (a `list()`/`values()` aggregate).
 ///
 /// Integers are `i64`; unsigned values exceeding `i64::MAX` promote to `f64`
-/// with potential precision loss beyond 2^53. JSON arrays/objects encountered
-/// during deserialization are stringified (these don't occur in normal
-/// `DuckDB` result sets).
+/// with potential precision loss beyond 2^53. A JSON object encountered
+/// during deserialization is stringified (`DuckDB` result sets do not
+/// produce one).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -110,7 +111,6 @@ impl<'de> Visitor<'de> for ValueVisitor {
     }
 
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
-        // u64 values that fit in i64 stay as integers; others promote to float.
         if let Ok(i) = i64::try_from(v) {
             Ok(Value::Integer(i))
         } else {
@@ -215,10 +215,10 @@ pub fn cmp_by_display_rank(a: &str, b: &str) -> Ordering {
 /// name via `name`.
 ///
 /// The single home of this ordering, so the `/api/v1/schema` columns,
-/// `/api/v1/schema/fields` rows, `/api/v1/schema/services` columns, and the
-/// CLI field tables can never drift apart: they present columns the way query
-/// results order them, instead of a raw alphabetical sort that would put
-/// `_ingested` first.
+/// `/api/v1/schema/fields` rows and `/api/v1/schema/services` columns cannot
+/// drift apart, and the CLI tables that print those rows inherit it: they
+/// present columns the way query results order them, instead of a raw
+/// alphabetical sort that would put `_ingested` first.
 pub fn sort_by_display_rank<T>(items: &mut [T], name: impl Fn(&T) -> &str) {
     items.sort_by(|a, b| cmp_by_display_rank(name(a), name(b)));
 }
@@ -239,8 +239,8 @@ pub struct QueryResult {
 impl QueryResult {
     /// An empty result set with no columns or rows.
     ///
-    /// Used when source narrowing yields zero matching files — semantically
-    /// equivalent to "no matching data".
+    /// The answer when a query's source matches no parquet file: no data is
+    /// not an error.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -249,12 +249,11 @@ impl QueryResult {
         }
     }
 
-    /// Number of result rows.
     pub fn row_count(&self) -> usize {
         self.rows.len()
     }
 
-    /// Whether the result set is empty.
+    /// Whether the result carries no rows (columns are not consulted).
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
