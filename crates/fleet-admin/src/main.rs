@@ -293,6 +293,9 @@ async fn connect_pool() -> Result<PgPool, AdminError> {
         Err(std::env::VarError::NotPresent) => return Err(AdminError::MissingDatabaseUrl),
         Err(std::env::VarError::NotUnicode(_)) => return Err(AdminError::EmptyDatabaseUrl),
     };
+    // connect_pool is the named production pool owner for the fleet-admin
+    // CLI (ADR-0021 ruling 3).
+    #[allow(clippy::disallowed_methods)]
     PgPoolOptions::new()
         .max_connections(4)
         .connect(&url)

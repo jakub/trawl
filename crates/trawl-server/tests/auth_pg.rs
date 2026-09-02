@@ -21,7 +21,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{ensure_fixtures, roles, setup};
+use common::{roles, seed_data_root, setup};
 use fleet_auth::{KeyStore, PrincipalKind};
 use parking_lot::Mutex;
 use sqlx::PgPool;
@@ -94,9 +94,9 @@ fn authenticated_routes() -> Vec<(reqwest::Method, &'static str)> {
 // AC1: fleet-minted key round-trip
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn ac1_key_roundtrip_create_whoami_revoke_401(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ac1_key_roundtrip_create_whoami_revoke_401() {
+    let server = setup().await;
     let store = KeyStore::from_pool(server.fleet_pool.clone());
 
     // create (what fleet-admin does)
@@ -140,9 +140,9 @@ async fn ac1_key_roundtrip_create_whoami_revoke_401(pool: PgPool) {
 // AC3: route matrix
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn ac3_public_probes_unauthenticated(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ac3_public_probes_unauthenticated() {
+    let server = setup().await;
     let client = raw_client();
 
     let health = client
@@ -160,9 +160,9 @@ async fn ac3_public_probes_unauthenticated(pool: PgPool) {
     assert_eq!(metrics.status().as_u16(), 200);
 }
 
-#[sqlx::test(migrations = false)]
-async fn ac3_reader_blocked_from_export_stream_manage(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ac3_reader_blocked_from_export_stream_manage() {
+    let server = setup().await;
     for (method, path) in [
         (reqwest::Method::POST, "/api/v1/export"),
         (reqwest::Method::GET, "/api/v1/stream?query=*"),
@@ -185,9 +185,9 @@ async fn ac3_reader_blocked_from_export_stream_manage(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn ac3_ingest_only_key_can_ingest_but_nothing_else(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ac3_ingest_only_key_can_ingest_but_nothing_else() {
+    let server = setup().await;
 
     // Can ingest.
     let resp = raw_client()
@@ -220,9 +220,9 @@ async fn ac3_ingest_only_key_can_ingest_but_nothing_else(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn ac3_admin_cannot_ingest(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ac3_admin_cannot_ingest() {
+    let server = setup().await;
     let resp = raw_client()
         .post(format!("{}/api/v1/ingest", server.url))
         .header("authorization", format!("Bearer {}", server.admin_token))
@@ -238,9 +238,9 @@ async fn ac3_admin_cannot_ingest(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = false)]
-async fn ac3_grantless_key_403_on_every_authenticated_route(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ac3_grantless_key_403_on_every_authenticated_route() {
+    let server = setup().await;
     for (method, path) in authenticated_routes() {
         let (status, body) = request(
             &server.url,
@@ -257,18 +257,15 @@ async fn ac3_grantless_key_403_on_every_authenticated_route(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrations = false)]
-async fn ac3_grantless_key_never_reaches_rate_limiter(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn ac3_grantless_key_never_reaches_rate_limiter() {
     // Tight bucket for every key. A grantless key never reaches the rate
     // limiter (mandatory policy 403s it first) — so no request can ever be
     // 429, and none can succeed.
-    let server = common::setup_with_rate_limit(
-        pool,
-        RateLimitConfig {
-            default_rpm: 1,
-            ..RateLimitConfig::default()
-        },
-    )
+    let server = common::setup_with_rate_limit(RateLimitConfig {
+        default_rpm: 1,
+        ..RateLimitConfig::default()
+    })
     .await;
 
     for _ in 0..30 {
@@ -283,12 +280,12 @@ async fn ac3_grantless_key_never_reaches_rate_limiter(pool: PgPool) {
     }
 }
 
-/// A key whose role exists but resolves zero permissions anywhere is still
-/// 403 on every authenticated route: holding a role is not capability,
-/// permissions are.
-#[sqlx::test(migrations = false)]
-async fn ac3_zero_permission_role_key_403_everywhere(pool: PgPool) {
-    let server = setup(pool).await;
+/// Roles-as-data addition to the grantless matrix: a key whose role EXISTS
+/// but resolves zero permissions anywhere is still 403 on every
+/// authenticated route — holding a role is not capability, permissions are.
+#[tokio::test(flavor = "multi_thread")]
+async fn ac3_zero_permission_role_key_403_everywhere() {
+    let server = setup().await;
     let store = KeyStore::from_pool(server.fleet_pool.clone());
 
     store
@@ -329,18 +326,15 @@ async fn ac3_zero_permission_role_key_403_everywhere(pool: PgPool) {
 // spent separately on the interactive and ingest classes.
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class(pool: PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class() {
     // Generous class defaults so any 429 observed can only come from the
     // role's rate_rpm override — proving override-not-max.
-    let server = common::setup_with_rate_limit(
-        pool,
-        RateLimitConfig {
-            default_rpm: 10_000,
-            ingest_rpm: 10_000,
-            ..RateLimitConfig::default()
-        },
-    )
+    let server = common::setup_with_rate_limit(RateLimitConfig {
+        default_rpm: 10_000,
+        ingest_rpm: 10_000,
+        ..RateLimitConfig::default()
+    })
     .await;
     let store = KeyStore::from_pool(server.fleet_pool.clone());
 
@@ -416,9 +410,9 @@ async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class(pool: PgPool) {
 // AC4: /whoami wire shape frozen (golden JSON per role)
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn ac4_whoami_golden_json_per_role(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ac4_whoami_golden_json_per_role() {
+    let server = setup().await;
 
     // The frozen permission set each seeded role resolves to.
     let cases = [
@@ -498,9 +492,9 @@ fn opaque_401() -> serde_json::Value {
     serde_json::json!({ "error": { "code": "auth_error", "message": "authentication failed" } })
 }
 
-#[sqlx::test(migrations = false)]
-async fn ac5_envelope_missing_and_malformed_and_invalid_tokens(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ac5_envelope_missing_and_malformed_and_invalid_tokens() {
+    let server = setup().await;
 
     // missing
     let (status, body) = request(&server.url, reqwest::Method::GET, "/api/v1/whoami", None).await;
@@ -543,9 +537,9 @@ async fn ac5_envelope_missing_and_malformed_and_invalid_tokens(pool: PgPool) {
     assert_eq!(body, opaque_401());
 }
 
-#[sqlx::test(migrations = false)]
-async fn ac5_envelope_revoked_and_expired_tokens(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ac5_envelope_revoked_and_expired_tokens() {
+    let server = setup().await;
     let store = KeyStore::from_pool(server.fleet_pool.clone());
 
     // revoked
@@ -591,9 +585,9 @@ async fn ac5_envelope_revoked_and_expired_tokens(pool: PgPool) {
     assert_eq!(body, opaque_401());
 }
 
-#[sqlx::test(migrations = false)]
-async fn ac5_envelope_grantless_403(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ac5_envelope_grantless_403() {
+    let server = setup().await;
     let (status, body) = request(
         &server.url,
         reqwest::Method::GET,
@@ -610,9 +604,9 @@ async fn ac5_envelope_grantless_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = false)]
-async fn ac5_envelope_pg_down_503_without_backend_detail(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn ac5_envelope_pg_down_503_without_backend_detail() {
+    let server = setup().await;
 
     // Kill the auth backend under the running server.
     server.kill_fleet_database().await;
@@ -661,9 +655,15 @@ async fn scheduler_runs_after(
         .await
         .unwrap();
 
-    // Dedicated app-state database, migrated via the real boot path.
-    let app_db_url = common::create_app_database(&pool).await;
-    let storage = trawl_server::store::StorageState::connect(&app_db_url)
+    // Dedicated app-state database, migrated via the real boot path
+    // (`from_pool` is where the advisory lock and the migration live;
+    // `connect` only adds the pool). The pool is the fixture's, sized by
+    // `APP_POOL_MAX`: `StorageState::connect` would build trawld's
+    // PRODUCTION pool of 8 on top of the 5 this test already holds from
+    // `#[sqlx::test]`, which is most of a per-test connection budget spent
+    // on a scheduler that runs one query.
+    let app_db_url = common::create_app_database().await;
+    let storage = trawl_server::store::StorageState::from_pool(common::app_pool(&app_db_url).await)
         .await
         .expect("boot app storage");
 
@@ -686,8 +686,11 @@ async fn scheduler_runs_after(
         tokio::time::sleep(Duration::from_millis(pre_sleep_ms)).await;
     }
 
-    // Real parquet fixtures so a permitted run actually succeeds.
-    let data_glob = ensure_fixtures();
+    // Real parquet fixtures so a permitted run actually succeeds. The
+    // root is this test's own copy: the scheduler WRITES report output
+    // under `scheduled/`, which no other test may see.
+    let data_dir = tempfile::tempdir().expect("scheduler data root");
+    let data_glob = seed_data_root(data_dir.path());
     let base_dir = data_glob.trim_end_matches("/**/*.parquet").to_owned();
     let exec_pool = trawl_server::pool::ExecutorPool::new(base_dir, 1, 1000, None);
 
@@ -883,9 +886,11 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
 
     // Out-of-process mutation: a second connection to the same database
     // (what fleet-admin does).
-    let second = KeyStore::connect(&common::fleet_database_url(&pool))
-        .await
-        .unwrap();
+    // A SECOND pool on the same database, sized by the fixture rather than
+    // by `KeyStore::connect`'s production ceiling of 8: what the test needs
+    // is a connection the audit poller does not own, not a daemon's worth
+    // of them.
+    let second = KeyStore::from_pool(common::fleet_pool(&common::fleet_database_url(&pool)).await);
     let created = second
         .create_key(
             "made-by-fleet-admin",
@@ -963,9 +968,9 @@ async fn ac8_audit_poller_emits_events_for_out_of_process_mutations(pool: PgPool
 // SSE: revoked-before-connect → 401 (handshake-only auth, accepted policy)
 // ---------------------------------------------------------------------------
 
-#[sqlx::test(migrations = false)]
-async fn sse_stream_rejects_revoked_key_at_handshake(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn sse_stream_rejects_revoked_key_at_handshake() {
+    let server = setup().await;
     let store = KeyStore::from_pool(server.fleet_pool.clone());
 
     let created = store
@@ -998,9 +1003,9 @@ async fn sse_stream_rejects_revoked_key_at_handshake(pool: PgPool) {
 /// Killing the app-state database under a running server degrades /health
 /// (HTTP 200 — queries still serve) and turns store-backed endpoints into
 /// redacted 503s. Never a pg diagnostic on the wire.
-#[sqlx::test(migrations = false)]
-async fn storage_loss_degrades_health_and_503s_store_endpoints(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_loss_degrades_health_and_503s_store_endpoints() {
+    let server = setup().await;
     let client = raw_client();
 
     server.kill_app_database().await;
@@ -1058,9 +1063,9 @@ async fn storage_loss_degrades_health_and_503s_store_endpoints(pool: PgPool) {
 /// `/api/v1/dashboard` reports the enabled-schedule count from postgres:
 /// the async snapshot collector polls the store and the sync snapshot
 /// carries it onto the wire.
-#[sqlx::test(migrations = false)]
-async fn dashboard_reports_schedule_count_from_pg(pool: PgPool) {
-    let server = setup(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_reports_schedule_count_from_pg() {
+    let server = setup().await;
     let client = raw_client();
 
     // Create a saved query + schedule through the API.

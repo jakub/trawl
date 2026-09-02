@@ -60,7 +60,7 @@ struct Harness {
     schema_admin: HttpClient,
 }
 
-async fn harness(pool: sqlx::PgPool) -> Harness {
+async fn harness() -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
     let wal_dir = root.join("wal");
@@ -68,7 +68,7 @@ async fn harness(pool: sqlx::PgPool) -> Harness {
     std::fs::create_dir_all(&data_dir).unwrap();
     let data_glob = format!("{}/**/*.parquet", data_dir.display());
 
-    let server = setup_in_dir_with_data(pool, &root, data_glob, RateLimitConfig::default()).await;
+    let server = setup_in_dir_with_data(&root, data_glob, RateLimitConfig::default()).await;
     std::mem::forget(tmp); // outlives the server; OS cleans up
 
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
@@ -206,9 +206,9 @@ fn event(service: &str, extra: &serde_json::Value) -> serde_json::Value {
 /// matches the projection, existing queries answer identically, the
 /// shelved value becomes queryable, unaffected files keep their inodes,
 /// and a foreign file rides across untouched.
-#[sqlx::test(migrations = false)]
-async fn repin_is_invisible_to_queries_and_resurrects_shelved_values(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
+    let h = harness().await;
 
     // First typed sight pins BIGINT; the enum-shaped batch then conflicts
     // and its value is shelved into _raw.
@@ -336,9 +336,9 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values(pool: sqlx:
 ///
 /// The harness TTL is 60s (`tests/common/mod.rs`) and this test sleeps
 /// nowhere, so TTL expiry cannot explain a pass.
-#[sqlx::test(migrations = false)]
-async fn a_cutover_retypes_the_schema_endpoint_immediately(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cutover_retypes_the_schema_endpoint_immediately() {
+    let h = harness().await;
 
     h.ingest_and_compact(&[
         event("api", &json!({"status": 200})),
@@ -392,9 +392,9 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// attached (HTTP 409, job terminal `refused_needs_force`, corpus
 /// untouched), and proceeds under `--force` with exact null accounting
 /// plus conflict evidence.
-#[sqlx::test(migrations = false)]
-async fn lossy_repin_refuses_without_force_and_accounts_with_it(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
+    let h = harness().await;
 
     // A half-numeric text field pins VARCHAR (the ladder needs >=90%).
     h.ingest_and_compact(&[
@@ -462,9 +462,9 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it(pool: sqlx::PgPo
 /// scan: a lossless plan whose corpus grows a non-conforming value while
 /// the rewrite runs is refused at the cutover, corpus untouched — and the
 /// same repin proceeds under force.
-#[sqlx::test(migrations = false)]
-async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn late_arriving_loss_refuses_the_cutover_without_force() {
+    let h = harness().await;
 
     // Pin VARCHAR on a text value, then retire that file: what remains is
     // an all-numeric-text corpus, so the scan projects no loss at all.
@@ -553,16 +553,16 @@ async fn late_arriving_loss_refuses_the_cutover_without_force(pool: sqlx::PgPool
 
 /// A caller that walks away mid-scan must not strand the one-running
 /// slot. The scan is a full-corpus `DuckDB` pass, so a client or proxy
-/// timeout drops the request future long before it finishes. The claimed
-/// job therefore runs detached, terminalizes on its own, and leaves the
-/// next repin acceptable instead of 409ing every request until a daemon
-/// restart reconciles the orphan.
-#[sqlx::test(migrations = false)]
-async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPool) {
+/// timeout drops the request future long before it finishes: the claimed
+/// job's whole ladder therefore runs detached, terminalizes on its own,
+/// and leaves the next repin acceptable instead of 409ing every request
+/// until a daemon restart reconciles the orphan.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disconnected_caller_does_not_strand_the_running_slot() {
     use std::sync::atomic::Ordering;
     use trawl_server::repin::engine::TEST_SCAN_DELAY_MS;
 
-    let h = harness(pool).await;
+    let h = harness().await;
     for svc in ["api", "web", "worker"] {
         h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
             .await;
@@ -637,19 +637,22 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot(pool: sqlx::PgPo
 /// still running, with the outcome counter landing only at the terminal
 /// state.
 ///
-/// Synchronised by ordering, not by timing. Progress publishes per pass,
-/// not per file, so the mid-job state this test observes (job row
-/// `running`, running gauge up, `files_done` ≥ 1) exists only between the
-/// end of pass 0 and the job's terminal write, and a polling observer can
-/// miss that window or find the job already finished on its first read. The
-/// build holds at its first published progress until this test releases it,
-/// which makes every mid-job assertion below a fact about order. No sleeps,
-/// and no per-file delay at all.
-#[sqlx::test(migrations = false)]
-async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sqlx::PgPool) {
+/// Synchronised by ORDERING, not by timing (issue #79 review). The mid-job
+/// state this test observes — job row `running`, running gauge up,
+/// `files_done` ≥ 1 — exists only between the end of the first build pass
+/// (progress is published per PASS) and the job's terminal write, and a
+/// polling observer can miss that window or find the job already finished
+/// on its first read; both were reproducible here by removing the per-file
+/// delay, and `retries = 1` is why CI saw it as a flake rather than a
+/// failure. The build now HOLDS at its first published progress until this
+/// test releases it, so every mid-job assertion below is a fact about
+/// order. No sleeps, and no per-file delay at all.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     use std::sync::atomic::Ordering;
 
-    let h = harness(pool).await;
+    let h = harness().await;
 
     // Seed a few affected files across services, so the build's first pass
     // has real per-file progress to publish.
@@ -819,12 +822,14 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite(pool: sql
 /// prohibition across the one stopped world a cutover needs.
 ///
 /// (Draining is deferred rather than continuous because the cutover takes
-/// the corpus gate's write side, which excludes whole compaction batches.
-/// A mixed-type corpus silently promotes instead of erring, so exclusion is
-/// the entire atomicity budget, per ADR-0011.)
-#[sqlx::test(migrations = false)]
-async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// the corpus gate's write side, which excludes whole compaction batches —
+/// the mechanism correction recorded in ADR-0011's 2026-08-12 amendment:
+/// a mixed-type corpus silently promotes instead of erring, so exclusion
+/// is the entire atomicity budget.)
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
+    let h = harness().await;
     let hot = h
         .server
         .state
@@ -990,9 +995,10 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once(pool: 
 /// in the cutover phase finishes the job transactionally, flips the pin,
 /// re-arms the conformance pass, sweeps the aside, and removes the
 /// marker; orphaned running rows without a marker fail.
-#[sqlx::test(migrations = false)]
-async fn boot_reconciliation_completes_a_recovered_cutover(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+async fn boot_reconciliation_completes_a_recovered_cutover() {
+    let h = harness().await;
 
     // A pinned custom field to flip.
     h.ingest_and_compact(&[event("api", &json!({"status": 200}))])
@@ -1169,9 +1175,9 @@ async fn boot_reconciliation_completes_a_recovered_cutover(pool: sqlx::PgPool) {
 /// A resurrection-only pass (`to == current`, force): the shelved value
 /// comes back without changing the pin — the supported repair for a
 /// boot-conformed interrupted repin.
-#[sqlx::test(migrations = false)]
-async fn resurrection_only_pass_recovers_without_retyping(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn resurrection_only_pass_recovers_without_retyping() {
+    let h = harness().await;
     h.ingest_and_compact(&[event("api", &json!({"status": 200}))])
         .await;
     h.ingest_and_compact(&[event("api", &json!({"status": "accepted"}))])
@@ -1209,14 +1215,15 @@ async fn resurrection_only_pass_recovers_without_retyping(pool: sqlx::PgPool) {
     assert_eq!(dry.resurrectable, 0, "`accepted` has no BIGINT reading");
 }
 
-/// Boot recovery over a SEVERITY cutover marker: the engine writes the
-/// marker with the catalog spelling, so recovery has to read it back that
-/// way. The physical parse has no `SEVERITY` spelling at all, which makes
-/// this the one replay path that could refuse, and it would refuse after the
-/// corpus is already half-swapped, where forward is the only safe direction.
-#[sqlx::test(migrations = false)]
-async fn boot_reconciliation_replays_a_severity_cutover(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// Boot recovery over a SEVERITY cutover marker (issue #79): the engine
+/// writes the marker with the CATALOG spelling, so recovery has to read it
+/// back that way. The physical parse has no `SEVERITY` spelling at all,
+/// which made this the one replay path that could REFUSE — and it refuses
+/// after the corpus is already half-swapped, where forward is the only safe
+/// direction.
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_reconciliation_replays_a_severity_cutover() {
+    let h = harness().await;
 
     // A sender field an operator repins onto the ladder.
     h.ingest_and_compact(&[event("api", &json!({"level": "error"}))])
@@ -1306,14 +1313,14 @@ async fn boot_reconciliation_replays_a_severity_cutover(pool: sqlx::PgPool) {
     assert!(!trawl_server::repin::marker_path(&data).exists());
 }
 
-/// A dry run must say whether the identical executing request would refuse.
-/// The plan's numbers alone read as a clean 200, so an operator would
-/// otherwise learn about the force gate from the request that was meant to
-/// do the work. Both triggers, on the report and on the status route (one
-/// decision function, three askers).
-#[sqlx::test(migrations = false)]
-async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// A dry run must say whether the IDENTICAL executing request would refuse
+/// (issue #79): the plan's numbers alone read as a clean 200, and an
+/// operator would learn about the force gate from the request that was
+/// meant to do the work. Both triggers, on the report and on the status
+/// route — one decision function, three askers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
+    let h = harness().await;
 
     // `level` carries a value no ladder rung reads (loss), `pri` carries a
     // numeral both dialects read differently (ambiguity) and nothing else.
@@ -1414,14 +1421,14 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit(pool: sqlx::PgPool) {
     );
 }
 
-/// The force verdict has three states, and the missing one is the one that
-/// matters: a claimed job whose scan has not recorded a plan yet reports no
-/// verdict. Its counts are zeros meaning "not measured", so answering
-/// `false` there would tell an operator polling the status route that a job
-/// about to 409 is clean.
-#[sqlx::test(migrations = false)]
-async fn the_force_verdict_is_absent_until_the_scan_has_a_plan(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// The force verdict has THREE states, and the missing one is the one that
+/// matters (issue #79 review): a claimed job whose scan has not recorded a
+/// plan yet reports NO verdict. Its counts are zeros meaning "not measured",
+/// and answering `false` there tells an operator polling the status route
+/// that a job about to 409 is clean.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_force_verdict_is_absent_until_the_scan_has_a_plan() {
+    let h = harness().await;
     h.ingest_and_compact(&[event("api", &json!({"level": "error", "dur": 12}))])
         .await;
     h.ingest_and_compact(&[event("web", &json!({"level": "gold", "dur": 34}))])
@@ -1497,12 +1504,12 @@ fn severity_corpus() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The dry run's numbers are the executed rewrite's, and the report carries
-/// the evidence an operator decides on: which value cannot be read, and
-/// whether anything is still writing the field.
-#[sqlx::test(migrations = false)]
-async fn repin_to_severity_dry_run_matches_the_executed_rewrite(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// AC2/AC5: the dry run's numbers ARE the executed rewrite's, and the
+/// report carries the evidence an operator decides on (which value cannot
+/// be read, and whether anything is still writing the field).
+#[tokio::test(flavor = "multi_thread")]
+async fn repin_to_severity_dry_run_matches_the_executed_rewrite() {
+    let h = harness().await;
     h.ingest_and_compact(&severity_corpus()).await;
     assert_eq!(h.pinned_type("level").await, "VARCHAR");
     assert_eq!(h.count("last=1h | stats count()").await, 5);
@@ -1588,12 +1595,12 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite(pool: sqlx::PgPo
     );
 }
 
-/// The syslog assertion inverts the numeral, is persisted on the job row,
-/// and reads back off the status route: the one dialect-changing decision
-/// an operator can make about their own corpus.
-#[sqlx::test(migrations = false)]
-async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// AC3: the syslog assertion INVERTS the numeral, is persisted on the job
+/// row, and reads back off the status route — the one dialect-changing
+/// decision an operator can make about their own corpus.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion() {
+    let h = harness().await;
     h.ingest_and_compact(&severity_corpus()).await;
 
     // The ambiguity gate does not fire under an explicit syslog assertion
@@ -1628,13 +1635,13 @@ async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion(pool: sqlx
     assert_eq!(h.count("level>=warn last=1h | stats count()").await, 4);
 }
 
-/// A value a prior conform shelved comes back under the new pin, including
-/// one whose `_raw` key still carries the sender's original mixed-case
-/// spelling, which the case-variant fallback recovers best-effort (the
-/// documented Unicode-`lower()`-vs-ASCII-fold edge).
-#[sqlx::test(migrations = false)]
-async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+/// AC6 + ruling 13: a value a PRIOR conform shelved comes back under the
+/// new pin — including one whose `_raw` key still carries the sender's
+/// original mixed-case spelling, which the case-variant fallback recovers
+/// best-effort (the documented Unicode-`lower()`-vs-ASCII-fold edge).
+#[tokio::test(flavor = "multi_thread")]
+async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key() {
+    let h = harness().await;
 
     // First typed sight pins BIGINT…
     h.ingest_and_compact(&[event("api", &json!({"lvl": 17}))])
@@ -1690,9 +1697,9 @@ async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key(pool: sq
 /// the cold parquet, the hot buffer a live event lands in, the pipeline's
 /// `where`, and the in-memory matcher the live tail uses — and a
 /// newly-ingested `"error"` conforms to 17 with no further operator action.
-#[sqlx::test(migrations = false)]
-async fn post_repin_severity_binds_in_every_lane_including_live_ingest(pool: sqlx::PgPool) {
-    let h = harness(pool).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn post_repin_severity_binds_in_every_lane_including_live_ingest() {
+    let h = harness().await;
     h.ingest_and_compact(&severity_corpus()).await;
     let started = match h
         .schema_admin
@@ -1762,11 +1769,11 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest(pool: sql
 /// is asserted rather than assumed: a `3` the catch-up rewrote reads as
 /// syslog err, and the next `3` to arrive after the cutover reads as `OTel`
 /// trace3.
-#[sqlx::test(migrations = false)]
-async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel(pool: sqlx::PgPool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
     use std::sync::atomic::Ordering;
 
-    let h = harness(pool).await;
+    let h = harness().await;
     h.ingest_and_compact(&[event("api", &json!({"level": "error"}))])
         .await;
     assert_eq!(h.pinned_type("level").await, "VARCHAR");

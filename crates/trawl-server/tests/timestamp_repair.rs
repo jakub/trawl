@@ -28,11 +28,12 @@ fn first_row_string(result: &trawl_api::value::QueryResult, column: &str) -> Opt
     }
 }
 
-/// All four malformed-time variants: ingested through the handler, visible
-/// in the hot buffer, compacted without errors, and returned by a `last=1h`
-/// query afterwards, original preserved and timestamp at arrival.
-#[sqlx::test(migrations = false)]
-async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
+/// All four trigger variants from the issue: ingested via the handler,
+/// visible in the hot buffer, compacted without errors, and returned by a
+/// `last=1h` query afterwards — original preserved, timestamp at arrival.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+async fn trigger_variants_survive_ingest_compact_query() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
     let wal_dir = root.join("wal");
@@ -40,7 +41,7 @@ async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
     std::fs::create_dir_all(&data_dir).unwrap();
     let data_glob = format!("{}/**/*.parquet", data_dir.display());
 
-    let server = setup_in_dir_with_data(pool, &root, data_glob, RateLimitConfig::default()).await;
+    let server = setup_in_dir_with_data(&root, data_glob, RateLimitConfig::default()).await;
     // Leak the tempdir so it survives the server (cleaned up by OS).
     std::mem::forget(tmp);
 
@@ -159,13 +160,13 @@ async fn trigger_variants_survive_ingest_compact_query(pool: sqlx::PgPool) {
     }
 }
 
-/// Canonicalization at the API level: an RFC 3339 value with a +05:30 offset
-/// lands as the same instant in UTC with sub-second precision preserved, and
-/// an offset-less ISO 8601 value keeps its event time instead of being
-/// repaired to arrival time.
-#[sqlx::test(migrations = false)]
-async fn offset_timestamp_canonicalized_to_utc_instant(pool: sqlx::PgPool) {
-    let server = setup(pool).await;
+/// Canonicalization acceptance criterion at the API level: an RFC 3339
+/// value with a +05:30 offset lands as the same instant in UTC with
+/// sub-second precision preserved, and an offset-less ISO 8601 value keeps
+/// its event time instead of being repaired to arrival time.
+#[tokio::test(flavor = "multi_thread")]
+async fn offset_timestamp_canonicalized_to_utc_instant() {
+    let server = setup().await;
     let ingest_client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
     let query_client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 

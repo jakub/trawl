@@ -418,10 +418,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     if monitor_active {
         // Monitor mode: spawn HTTP server in background, run TUI on main.
-        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (shutdown, http_shutdown) = trawl_server::shutdown::shutdown_channel();
 
         let http_state = state.clone();
-        let http_shutdown = Arc::clone(&shutdown);
         let server_config = config.server.clone();
         let sd = state_dir.clone();
         tokio::spawn(async move {

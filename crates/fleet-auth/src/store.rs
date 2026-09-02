@@ -90,6 +90,9 @@ impl KeyStore {
         /// request path plus background pollers — not a tunable yet.
         const MAX_CONNECTIONS: u32 = 8;
 
+        // KeyStore::connect is the named production pool owner for the
+        // fleet keystore (ADR-0021 ruling 3).
+        #[allow(clippy::disallowed_methods)]
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
             .connect(database_url)

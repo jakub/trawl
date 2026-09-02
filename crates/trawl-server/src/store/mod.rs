@@ -30,8 +30,8 @@ pub mod status;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sqlx::PgPool;
 use sqlx::postgres::{PgConnection, PgPoolOptions};
-use sqlx::{Connection as _, PgPool};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -154,10 +154,12 @@ async fn guard_advisory_lock(mut conn: PgConnection, lost_tx: watch::Sender<bool
 impl StorageState {
     /// Connect to the trawl app-state database and prepare it for use.
     ///
-    /// Boot order is load-bearing: connect pool → take the session advisory
-    /// lock (before migrate: the lock exists to prevent two instances
-    /// racing boot-time migration) → run migrations → open the stores.
+    /// Builds the pool, then hands it to [`Self::from_pool`], which owns the
+    /// load-bearing part of the boot order.
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
+        // StorageState::connect is the named production pool owner for
+        // trawld's app-state database (ADR-0021 ruling 3).
+        #[allow(clippy::disallowed_methods)]
         let pool = PgPoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
             // Boot fails fast on an unreachable database instead of
@@ -169,11 +171,52 @@ impl StorageState {
             .await
             .map_err(StoreError::Unavailable)?;
 
-        // Sole-writer enforcement on a dedicated session connection (pool
-        // connections can be recycled, which would silently drop the lock).
-        let mut lock_conn = PgConnection::connect(database_url)
+        Self::from_pool(pool).await
+    }
+
+    /// Prepare an already-built pool for use: advisory lock, migrate, open
+    /// the stores.
+    ///
+    /// The pool is the only input, and that is the whole point: the
+    /// sole-writer lock is taken on a connection acquired from THIS pool,
+    /// so nothing here can name a different database than the writes do. A
+    /// second parameter naming a DSN could disagree with the pool, and two
+    /// processes locking two different databases both believe they are the
+    /// sole writer.
+    ///
+    /// The contract that makes it airtight is on the CALLER, and it runs
+    /// for the LIFETIME of the returned [`StorageState`], not just for the
+    /// duration of this call: the pool's connect target must never be
+    /// reconfigured. A sqlx 0.9 `Pool` clone shares one `Arc`, so
+    /// `set_connect_options` on a clone the caller kept repoints every
+    /// connection the stores open from then on, while the detached lock
+    /// session below stays on the old database. The result is a process
+    /// holding the sole-writer lock on one database and writing to
+    /// another. Repointing mid-call splits the lock from the migration the
+    /// same way.
+    ///
+    /// Every in-repo caller MOVES a pool it just built into this function
+    /// and keeps no clone of its own, so no runtime check is worth adding
+    /// for a shape nothing writes.
+    ///
+    /// The connection is then detached ([`sqlx::pool::PoolConnection::detach`]):
+    /// it leaves pool management entirely and is never recycled, so the
+    /// session-scoped `pg_advisory_lock` cannot be released underneath us
+    /// by a pooled connection going back on the idle list. The pool refills
+    /// the slot on demand, so the process ceiling is `max_connections` plus
+    /// this one dedicated session.
+    ///
+    /// Boot order is load-bearing here, not in the caller: take the session
+    /// advisory lock BEFORE migrate — the lock exists to prevent two
+    /// instances racing boot-time migration.
+    pub async fn from_pool(pool: PgPool) -> Result<Self, StoreError> {
+        // Sole-writer enforcement on a dedicated session connection, minted
+        // from the pool and detached so nothing can recycle it.
+        let mut lock_conn: PgConnection = pool
+            .acquire()
             .await
-            .map_err(StoreError::Unavailable)?;
+            .map_err(StoreError::Unavailable)?
+            .detach();
         let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(ADVISORY_LOCK_KEY)
             .fetch_one(&mut lock_conn)

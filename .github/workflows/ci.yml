@@ -75,10 +75,13 @@ jobs:
     # Connection budget: nextest is process-per-test and sqlx pools are
     # process-local, so unbounded parallelism can exceed the server's
     # max_connections (default 100 — GH service containers can't override
-    # the postgres command line). The `pg` nextest group in
-    # .config/nextest.toml bounds pg-heavy test parallelism instead.
+    # the postgres command line). The `postgres` nextest group in
+    # .config/nextest.toml bounds pg-heavy test parallelism instead, and
+    # the pg-admission-guard step below proves nothing escaped it.
     name: test
     runs-on: k8s-big
+    permissions:
+      contents: read
     services:
       postgres:
         image: postgres:18
@@ -94,13 +97,22 @@ jobs:
           --health-retries=15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: test
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
+      # nextest is pinned by VERSION, not just by the action sha: the action
+      # manifest at this sha ships 0.9.132, whose filterset grammar predates
+      # the `group()` predicate pg-admission-guard queries with -- the guard
+      # step failed on every run while local 0.9.143 parsed it fine. Pin the
+      # version the local gates validate.
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
+        with:
+          tool: nextest@0.9.143
       - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       # Explicit migration step: run the operational `fleet-admin migrate`
       # command against the service container. Spells out AC10's migration
@@ -131,6 +143,19 @@ jobs:
           # shared service container. The #[sqlx::test] harness hardwires
           # DATABASE_URL.
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Membership in the `postgres` group is hand-written in
+      # .config/nextest.toml; this recomputes it from the sources and fails
+      # if a pg-touching test runs outside the group. It runs after the
+      # suite on purpose: the test binaries are already built, so the guard
+      # only pays for `cargo nextest list`. Same feature selection as the
+      # run above, because a feature can compile a pg test file out.
+      - name: Guard the postgres admission group
+        run: >-
+          cargo xtask pg-admission-guard --
+          --no-default-features
+          --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
+        env:
+          DUCKDB_DOWNLOAD_LIB: "1"
       - name: Smoke-test downloaded DuckDB development launcher
         run: |
           cargo build -p trawl-server --no-default-features
@@ -276,7 +301,7 @@ jobs:
           shared-key: trawl-web-tests
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
         with:
-          tool: nextest
+          tool: nextest@0.9.143
       - run: cargo nextest run -p trawl-web
 
   trawl-web-release:

@@ -12,7 +12,6 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -44,7 +43,7 @@ use crate::handlers;
 use crate::ingest;
 use crate::policy::{normalize_auth_errors, require_trawl_grant};
 use crate::rate_limit::{RateLimitState, rate_limit_middleware};
-use crate::shutdown::shutdown_signal;
+use crate::shutdown::{ShutdownRx, shutdown_observed, shutdown_signal};
 use crate::state::{AppState, HttpConfig};
 use crate::tls;
 
@@ -245,24 +244,12 @@ async fn connection_gauge_middleware(request: Request, next: middleware::Next) -
     response
 }
 
-#[allow(clippy::too_many_lines)] // accept loop + shutdown drain are cohesive
-/// Start the HTTPS server with graceful shutdown.
-///
-/// Binds a TCP listener, wraps connections in TLS via `tokio-rustls`,
-/// and serves each connection through hyper + axum. On shutdown signal,
-/// stops accepting new connections and drains in-flight requests up to
-/// `shutdown_drain_secs`.
-pub async fn serve(
-    state: AppState,
-    http: &HttpConfig,
+/// Build the TLS acceptor for a serve path, warning when the certificate was
+/// auto-generated.
+fn build_tls_acceptor(
     config: &ServerConfig,
     state_dir: &Path,
-    external_shutdown: Option<Arc<tokio::sync::Notify>>,
-) -> Result<(), crate::error::ServerError> {
-    let drain_secs = http.shutdown_drain_secs;
-    let addr = &config.http_addr;
-
-    // Build TLS config (loads or auto-generates cert).
+) -> Result<TlsAcceptor, crate::error::ServerError> {
     let (tls_config, self_signed) = tls::build_server_config(
         config.tls_cert_path.as_deref(),
         config.tls_key_path.as_deref(),
@@ -277,15 +264,108 @@ pub async fn serve(
         );
     }
 
-    let tls_acceptor = TlsAcceptor::from(tls_config);
-    let pool = state.query.pool.clone();
-    let app = router(state, http);
+    Ok(TlsAcceptor::from(tls_config))
+}
+
+/// Start the HTTPS server with graceful shutdown.
+///
+/// Binds a TCP listener, wraps connections in TLS via `tokio-rustls`,
+/// and serves each connection through hyper + axum. On shutdown signal,
+/// stops accepting new connections and drains in-flight requests up to
+/// `shutdown_drain_secs`.
+pub async fn serve(
+    state: AppState,
+    http: &HttpConfig,
+    config: &ServerConfig,
+    state_dir: &Path,
+    external_shutdown: Option<ShutdownRx>,
+) -> Result<(), crate::error::ServerError> {
+    let addr = &config.http_addr;
+
+    // Build TLS config (loads or auto-generates cert).
+    let tls_acceptor = build_tls_acceptor(config, state_dir)?;
 
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| crate::error::ServerError::Internal(format!("failed to bind {addr}: {e}")))?;
 
     tracing::info!(event_type = "lifecycle", addr = %addr, "HTTPS server listening");
+
+    accept_loop(
+        listener,
+        tls_acceptor,
+        state,
+        http,
+        config,
+        external_shutdown,
+    )
+    .await
+}
+
+/// Serve over a listener the caller already bound.
+///
+/// Same TLS setup, accept loop and shutdown drain as [`serve`]. The one
+/// difference is where the socket comes from: `config.http_addr` is NOT
+/// consulted on this path, it is informational only, and the address logged
+/// at startup is the listener's own `local_addr`. That is the point — a
+/// caller binding port 0 to get a free port keeps the socket it tested.
+///
+/// This entry exists for callers that must own the bound socket, which today
+/// means the test fixture; production binds through [`serve`]. A caller that
+/// adopts a listener therefore decides where that socket is bound, and
+/// nothing on this path checks that decision against `config.http_addr`.
+pub async fn serve_with_listener(
+    listener: std::net::TcpListener,
+    state: AppState,
+    http: &HttpConfig,
+    config: &ServerConfig,
+    state_dir: &Path,
+    external_shutdown: Option<ShutdownRx>,
+) -> Result<(), crate::error::ServerError> {
+    let tls_acceptor = build_tls_acceptor(config, state_dir)?;
+
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| crate::error::ServerError::Internal(format!("listener local_addr: {e}")))?;
+
+    // A std listener is blocking by default, and tokio does not change that
+    // for us. Registering a blocking socket with the reactor turns the accept
+    // loop into a 100%-CPU spin, so set nonblocking here rather than trusting
+    // every caller to remember.
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| crate::error::ServerError::Internal(format!("set_nonblocking failed: {e}")))?;
+    let listener = TcpListener::from_std(listener).map_err(|e| {
+        crate::error::ServerError::Internal(format!("failed to adopt listener: {e}"))
+    })?;
+
+    tracing::info!(event_type = "lifecycle", addr = %local_addr, "HTTPS server listening");
+
+    accept_loop(
+        listener,
+        tls_acceptor,
+        state,
+        http,
+        config,
+        external_shutdown,
+    )
+    .await
+}
+
+/// The shared tail of both serve paths: cert hot-reload, the TLS accept loop,
+/// and the graceful shutdown drain.
+#[allow(clippy::too_many_lines)] // accept loop + shutdown drain are cohesive
+async fn accept_loop(
+    listener: TcpListener,
+    tls_acceptor: TlsAcceptor,
+    state: AppState,
+    http: &HttpConfig,
+    config: &ServerConfig,
+    external_shutdown: Option<ShutdownRx>,
+) -> Result<(), crate::error::ServerError> {
+    let drain_secs = http.shutdown_drain_secs;
+    let pool = state.query.pool.clone();
+    let app = router(state, http);
 
     // Watch channel for cert hot-reload. The accept loop reads the latest
     // acceptor from the receiver before each TLS handshake.
@@ -306,25 +386,28 @@ pub async fn serve(
         ));
     }
 
-    // Shutdown coordination: use external Notify (from monitor) or spawn
-    // our own signal listener for the non-monitor path.
-    let notify = if let Some(ext) = external_shutdown {
+    // Shutdown coordination: use the caller's channel (from monitor, or a
+    // test) or spawn our own signal listener for the non-monitor path.
+    let mut accept_rx = if let Some(ext) = external_shutdown {
         ext
     } else {
-        let n = Arc::new(tokio::sync::Notify::new());
-        let n_signal = Arc::clone(&n);
+        let (tx, rx) = crate::shutdown::shutdown_channel();
         tokio::spawn(async move {
             shutdown_signal().await;
-            n_signal.notify_waiters();
+            let _ = tx.send(true);
         });
-        n
+        rx
     };
 
     // Track spawned connection tasks for graceful drain.
     let mut connections = JoinSet::new();
 
+    // One receiver the connection tasks clone from. It is a separate handle
+    // because the accept arm below borrows `accept_rx` mutably for the whole
+    // `select!`, and a clone taken after the flag was set still observes it.
+    let conn_rx = accept_rx.clone();
+
     // Accept loop — runs until shutdown signal.
-    let n_accept = Arc::clone(&notify);
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -335,7 +418,7 @@ pub async fn serve(
                 let tls_acceptor = tls_rx.borrow().clone();
                 let tower_service = app.clone();
 
-                let n_conn = Arc::clone(&notify);
+                let mut conn_shutdown = conn_rx.clone();
                 connections.spawn(async move {
                     // Accept-loop diagnostics carry PREAUTH_TRANSPORT_TARGET,
                     // not this module's path: a bare TCP connect-and-close
@@ -374,7 +457,7 @@ pub async fn serve(
                                 tracing::debug!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "connection_error", peer = %peer_addr, error = %e, "connection error");
                             }
                         }
-                        () = n_conn.notified() => {
+                        () = shutdown_observed(&mut conn_shutdown) => {
                             conn.as_mut().graceful_shutdown();
                             if let Err(e) = conn.await {
                                 tracing::debug!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "connection_error", peer = %peer_addr, error = %e, "connection error during shutdown");
@@ -383,7 +466,7 @@ pub async fn serve(
                     }
                 });
             }
-            () = n_accept.notified() => {
+            () = shutdown_observed(&mut accept_rx) => {
                 tracing::info!(event_type = "lifecycle", "shutdown: stopping accept loop");
                 break;
             }

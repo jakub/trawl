@@ -15,7 +15,6 @@ pub mod state;
 pub mod ui;
 
 use std::io;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -24,7 +23,6 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tokio::sync::Notify;
 
 use crate::state::AppState;
 
@@ -105,8 +103,12 @@ pub fn spawn_snapshot_collector(
 ///
 /// Sets up the terminal in raw/alternate-screen mode, ticks at
 /// `refresh_ms` intervals, and restores the terminal on exit.
-/// Notifies `shutdown` on ctrl-c so the HTTP server can drain.
-pub async fn run(app_state: AppState, refresh_ms: u64, shutdown: Arc<Notify>) -> io::Result<()> {
+/// Sets the `shutdown` flag on ctrl-c so the HTTP server can drain.
+pub async fn run(
+    app_state: AppState,
+    refresh_ms: u64,
+    shutdown: crate::shutdown::ShutdownTx,
+) -> io::Result<()> {
     let _guard = TerminalGuard::new()?;
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -126,7 +128,7 @@ pub async fn run(app_state: AppState, refresh_ms: u64, shutdown: Arc<Notify>) ->
                         let is_quit = matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
                             || matches!(key.code, KeyCode::Char('q'));
                         if is_quit {
-                            shutdown.notify_waiters();
+                            let _ = shutdown.send(true);
                             return Ok(());
                         }
                     }

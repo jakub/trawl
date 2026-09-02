@@ -263,6 +263,9 @@ async fn validate_database(url: &str, expected_database: &str) -> Result<()> {
 }
 
 async fn validate_database_inner(url: &str, expected_database: &str) -> Result<()> {
+    // validate_database_inner is a short-lived, single-connection
+    // validation pool that closes before returning (ADR-0021 ruling 3).
+    #[allow(clippy::disallowed_methods)]
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(Duration::from_secs(5))
@@ -292,6 +295,9 @@ async fn validate_database_inner(url: &str, expected_database: &str) -> Result<(
 }
 
 async fn validate_extensions(url: &str, database: &str, required: &[&str]) -> Result<()> {
+    // validate_extensions is a short-lived, single-connection
+    // validation pool that closes before returning (ADR-0021 ruling 3).
+    #[allow(clippy::disallowed_methods)]
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(Duration::from_secs(5))
@@ -330,6 +336,10 @@ async fn validate_docker_capabilities(url: &str) -> Result<()> {
 }
 
 async fn validate_docker_capabilities_inner(url: &str) -> Result<()> {
+    // validate_docker_capabilities_inner is a short-lived,
+    // single-connection validation pool that closes before returning
+    // (ADR-0021 ruling 3).
+    #[allow(clippy::disallowed_methods)]
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(Duration::from_secs(5))
