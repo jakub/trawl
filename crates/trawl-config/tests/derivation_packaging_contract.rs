@@ -2,8 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The derivation-source packaging contract (issue #75, ADR-0013 slice 2
-//! ruling 5).
+//! The derivation-source packaging contract (ADR-0013).
 //!
 //! `severity_from` and `time_from` decide what `_severity` and `_time`
 //! read, and the answer must not depend on how trawl was installed. Five
@@ -13,7 +12,7 @@
 //! `crates/trawl-web/tests/log_filter_contract.rs`.
 //!
 //! Reading convention: the packaged TOMLs and the docs page state the
-//! DEFAULT first and any typed-form example after it, so "the first
+//! default first and any typed-form example after it, so "the first
 //! declaration in the file" is well-defined. The chart is live YAML, and
 //! is read through `helm template` when helm is on PATH — the real
 //! rendering, list plumbing included — falling back to `values.yaml`
@@ -40,11 +39,11 @@ fn read(relative: &str) -> String {
 
 /// The double-quoted strings in a TOML array literal, in order.
 ///
-/// Deliberately not a TOML parse: the packaged files state their
-/// defaults as COMMENTED lines, which is the whole idiom of those files
-/// (every knob is shown at its default, commented out). The default
-/// lines hold bare strings only — the typed `{ field = … }` form appears
-/// only in the examples this function is never pointed at.
+/// Deliberately not a TOML parse: the packaged files state their defaults
+/// as commented-out lines, which is the whole idiom of those files (every
+/// knob is shown at its default, commented out). The default lines hold
+/// bare strings only — the typed `{ field = … }` form appears only in the
+/// examples this function is never pointed at.
 fn quoted_strings(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = line;

@@ -6,14 +6,12 @@
 //!
 //! Lives in its own crate so consumers that only need the config types
 //! (e.g. `trawl-web`, the browser-facing session proxy) don't have to
-//! pull in `trawl-server`'s transitive deps — most loudly the `DuckDB`
-//! engine chain. Pre-extraction, `trawl-web` depended on `trawl-server`
-//! purely for `Config`/`WebConfig`, which dragged libduckdb-sys into
-//! every build of the proxy.
+//! pull in `trawl-server`'s transitive deps, most loudly the `DuckDB`
+//! engine chain: depending on `trawl-server` for `Config`/`WebConfig`
+//! alone drags libduckdb-sys into every build of the proxy.
 //!
-//! `trawl-server` still re-exports these types via
-//! `trawl_server::config::*` for backwards compatibility with internal
-//! modules; new code should prefer `trawl_config::...` directly.
+//! `trawl-server` re-exports these types via `trawl_server::config::*`
+//! for its own modules; other crates use `trawl_config::...` directly.
 
 use std::path::{Path, PathBuf};
 
@@ -82,7 +80,9 @@ pub struct ServerConfig {
     #[serde(default = "default_shutdown_drain_secs")]
     pub shutdown_drain_secs: u64,
 
-    /// Optional log file path. When set, logs are written to both stdout and this file.
+    /// Optional JSON log file. Written only when internal telemetry is off;
+    /// with telemetry on the WAL layer takes that slot and this path is never
+    /// opened.
     pub log_file: Option<PathBuf>,
 
     /// Path to TLS certificate (PEM). If omitted, a self-signed cert is auto-generated.
@@ -120,13 +120,16 @@ pub struct ServerConfig {
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
 
-    /// Schema cache TTL in seconds (default: 60). Controls how long
-    /// `GET /schema` results are cached before re-introspecting.
+    /// Schema cache TTL in seconds (default: 60). The one knob behind every
+    /// cached schema read: the unscoped `GET /schema` columns and corpus
+    /// facts, the `/schema/values` samples, and the background schema-refresh
+    /// interval. A `?service=`-scoped column read is always fresh.
     #[serde(default = "default_schema_cache_ttl_secs")]
     pub schema_cache_ttl_secs: u64,
 
     /// Maximum number of completed queries kept in the history ring buffer
-    /// (default: 1000). Visible via `GET /queries` (admin only).
+    /// (default: 1000). Visible via `GET /api/v1/queries` to any key holding
+    /// the `query` permission.
     #[serde(default = "default_max_query_history")]
     pub max_query_history: usize,
 
@@ -174,15 +177,16 @@ impl ServerConfig {
     }
 }
 
-/// Per-key rate limiting in requests per minute (ADR-0006 slice 0).
+/// Per-key rate limiting in requests per minute (ADR-0006).
 ///
-/// Every API key gets an independent token bucket: `default_rpm` on the
-/// interactive API routes, `ingest_rpm` on `/api/v1/ingest`. The split is by
-/// route, not by principal — a log shipper flushing batches and a human
-/// running `DuckDB` scans need ceilings two orders of magnitude apart, and
-/// collapsing both onto one number would either throttle ingest or hand every
-/// interactive key the shipper-sized ceiling. Per-role class-of-service
-/// returns in slice 1 as a `rate_rpm` role attribute.
+/// Every API key gets an independent token bucket per route class:
+/// `default_rpm` on the interactive API routes, `ingest_rpm` on
+/// `/api/v1/ingest` for a key holding the `ingest` permission (any other key
+/// on that route draws on `default_rpm`). Two ceilings, because a log shipper
+/// flushing batches and a human running `DuckDB` scans need budgets an order
+/// of magnitude apart: one number would either throttle ingest or hand every
+/// interactive key the shipper-sized ceiling. These are the class defaults; a
+/// role's `rate_rpm` in the fleet keystore overrides them for its keys.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitConfig {
     /// Requests/minute allowed per API key on the interactive API routes
@@ -193,18 +197,18 @@ pub struct RateLimitConfig {
     /// (default: 1000). 0 = disabled.
     #[serde(default = "default_ingest_rate_limit_rpm")]
     pub ingest_rpm: u32,
-    /// Legacy per-role knob, removed in ADR-0006 slice 0. Kept as a
-    /// deserialization sentinel so an old config's tuned value fails loudly
-    /// at validation instead of being silently ignored.
+    /// Retired per-role knob (ADR-0006), kept as a deserialization sentinel
+    /// so an old config's tuned value fails loudly at validation instead of
+    /// being silently ignored.
     #[serde(default)]
     pub admin: Option<u32>,
-    /// Legacy per-role knob, removed in ADR-0006 slice 0 (sentinel).
+    /// Retired per-role knob (sentinel).
     #[serde(default)]
     pub analyst: Option<u32>,
-    /// Legacy per-role knob, removed in ADR-0006 slice 0 (sentinel).
+    /// Retired per-role knob (sentinel).
     #[serde(default)]
     pub reader: Option<u32>,
-    /// Legacy per-role knob, removed in ADR-0006 slice 0 (sentinel).
+    /// Retired per-role knob (sentinel).
     #[serde(default)]
     pub ingest: Option<u32>,
 }
@@ -214,9 +218,8 @@ pub struct RateLimitConfig {
 pub struct DataConfig {
     /// Directory containing parquet files (e.g. "/var/lib/trawl/data").
     ///
-    /// Accepts either a bare directory path or a glob pattern for backwards
-    /// compatibility. If the path contains glob characters (`*`, `?`, `[`),
-    /// they are stripped to derive the base directory.
+    /// Accepts either a bare directory path or a glob pattern. Glob
+    /// characters (`*`, `?`, `[`) are stripped to derive the base directory.
     pub path: String,
 }
 
@@ -224,7 +227,6 @@ impl DataConfig {
     /// The base directory where parquet files live.
     pub fn base_dir(&self) -> PathBuf {
         if self.has_glob() {
-            // Legacy glob path — strip glob components.
             let path = Path::new(&self.path);
             let mut base = PathBuf::new();
             for component in path.components() {
@@ -252,7 +254,6 @@ impl DataConfig {
         }
     }
 
-    /// Whether the configured path contains glob characters.
     fn has_glob(&self) -> bool {
         self.path.contains('*') || self.path.contains('?') || self.path.contains('[')
     }
@@ -326,7 +327,7 @@ pub struct IngestConfig {
     #[serde(default = "default_telemetry_flush_interval_secs")]
     pub telemetry_flush_interval_secs: u64,
 
-    /// One cap on ALL memory internal telemetry holds while the WAL is
+    /// One cap on all the memory internal telemetry holds while the WAL is
     /// unhealthy: the active buffer, the retry queue, and the batch in
     /// flight through a write. Default: 16 MiB. Accepts human-readable
     /// sizes like `"16M"`. Like `hot_buffer_max_bytes`, the charge is an
@@ -377,12 +378,12 @@ pub struct IngestConfig {
     pub trusted_relays: Vec<String>,
 
     /// Wire keys `_severity` derives from, in precedence order — first
-    /// MAPPABLE wins (ADR-0013 slice 2, ruling 5). Every source is READ
-    /// and left where it is, as an ordinary sender column.
+    /// mappable wins (ADR-0013). Every source is read and left where it
+    /// is, as an ordinary sender column.
     ///
     /// Entries take the bare-string shorthand (`"level"`) or the typed
     /// form (`{ field = "syslog_severity", dialect = "syslog" }`); the
-    /// dialect governs NUMERICS only. A producer profile's FIXED sources
+    /// dialect governs numerics only. A producer profile's fixed sources
     /// prepend this list and are not configurable.
     ///
     /// Empty is legal and means "derive nothing". Default:
@@ -392,12 +393,12 @@ pub struct IngestConfig {
     ///
     /// Semantics (bare names only, no post-fold duplicates, bounded
     /// length, known dialect) are validated boot-fatally by the server:
-    /// this crate owns the SHAPE, trawl-server owns the rules.
+    /// this crate owns the shape, trawl-server owns the rules.
     #[serde(default = "default_severity_from")]
     pub severity_from: Vec<DerivationSourceSpec>,
 
     /// Wire keys `_time` derives from, in precedence order — first
-    /// PRESENT wins, and only `_time` itself is consumed (ADR-0013 §2).
+    /// present wins, and only `_time` itself is consumed (ADR-0013 §2).
     ///
     /// Must contain `_time`, which is also the sole reserved name
     /// permitted here (server-validated, boot-fatal). A `dialect` on an
@@ -408,7 +409,7 @@ pub struct IngestConfig {
 }
 
 /// One entry of a derivation source list, in either of its two TOML
-/// spellings (ADR-0013 slice 2, ruling 5).
+/// spellings (ADR-0013).
 ///
 /// ```toml
 /// severity_from = ["severity", { field = "syslog_severity", dialect = "syslog" }]
@@ -432,7 +433,7 @@ pub enum DerivationSourceSpec {
     },
 }
 
-/// Hand-written because `deny_unknown_fields` is not a serde VARIANT
+/// Hand-written because `deny_unknown_fields` is not a serde variant
 /// attribute: the typed form is deserialized through a private struct that
 /// carries it, then folded back into the public enum shape. The refusal is
 /// the point — see [`DerivationSourceSpec::Typed`].
@@ -468,7 +469,7 @@ impl DerivationSourceSpec {
     }
 
     /// The dialect token as written, or `None` when the entry did not
-    /// spell one (which is NOT the same as writing `dialect = "otel"`).
+    /// spell one (not the same as writing `dialect = "otel"`).
     pub fn dialect(&self) -> Option<&str> {
         match self {
             Self::Bare(_) => None,
@@ -480,9 +481,9 @@ impl DerivationSourceSpec {
 /// The packaged `severity_from` default (ADR-0013 §2): `severity` →
 /// `severity_text` → `level`, first mappable wins.
 ///
-/// `severity_text` stays a SOURCE even though it left the envelope — it
-/// is ordinary sender vocabulary now, and a shipper that emits it still
-/// means severity by it.
+/// `severity_text` is ordinary sender vocabulary rather than an envelope
+/// field, but a shipper that emits it means severity by it, so it stays a
+/// source.
 pub const DEFAULT_SEVERITY_FROM: &[&str] = &["severity", "severity_text", "level"];
 
 /// The packaged `time_from` default (ADR-0013 §2): `_time` →
@@ -833,8 +834,8 @@ impl Default for SyslogConfig {
 }
 
 // -- byte size deserializer --------------------------------------------------
-// Accepts either a raw integer (backward compat) or a string with a unit
-// suffix like "128K", "16M", "1G", "100MiB". All multipliers are binary
+// Accepts either a raw integer or a string with a unit suffix like
+// "128K", "16M", "1G", "100MiB". All multipliers are binary
 // (1024-based) because nobody means 1,000,000 when they write "1M" in a
 // server config file.
 
@@ -941,9 +942,11 @@ fn deserialize_byte_size_u64<'de, D: serde::Deserializer<'de>>(de: D) -> Result<
 }
 
 // -- default constants -------------------------------------------------------
-// Centralized so they can be referenced from other modules (e.g. http.rs
-// fallback) and grepped easily. The `default_*` functions exist only because
-// serde's `#[serde(default = "...")]` requires a function path.
+// Public so another crate can name the same value the deserializer would
+// supply: trawl-server's query tracker reads `DEFAULT_MAX_QUERY_HISTORY`, its
+// ingest derivation policy reads `DEFAULT_SEVERITY_FROM`/`DEFAULT_TIME_FROM`.
+// The `default_*` functions exist only because serde's
+// `#[serde(default = "...")]` requires a function path.
 
 /// Default HTTPS listen address.
 pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
@@ -984,13 +987,13 @@ pub const DEFAULT_RETENTION_MIN_FREE_DISK_BYTES: u64 = 1_073_741_824;
 /// Default retention check interval (seconds). 1 hour.
 pub const DEFAULT_RETENTION_INTERVAL_SECS: u64 = 3600;
 /// Default per-key rate limit on the interactive API routes
-/// (requests/minute). Sized as the loosest legacy *interactive* ceiling (the
-/// old admin role), not the ingest one — an upgrade must not silently hand a
-/// reader key a shipper-sized query budget.
+/// (requests/minute). Sized for a human at a terminal, an order of magnitude
+/// below `DEFAULT_INGEST_RATE_LIMIT_RPM` — an untuned key must not get a
+/// shipper-sized query budget.
 pub const DEFAULT_RATE_LIMIT_RPM: u32 = 100;
 /// Default per-key rate limit on `/api/v1/ingest` (requests/minute).
-/// Unchanged from the legacy ingest-role ceiling: vector flushes a batch per
-/// 1 MB / 5 s per source, and several sources commonly share one ingest key.
+/// Sized for shippers: vector flushes a batch per 1 MB / 5 s per source, and
+/// several sources commonly share one ingest key.
 pub const DEFAULT_INGEST_RATE_LIMIT_RPM: u32 = 1000;
 /// Default maximum concurrent SSE connections.
 pub const DEFAULT_MAX_SSE_CONNECTIONS: usize = 32;
@@ -1027,10 +1030,9 @@ fn default_compaction_memory_limit() -> String {
 
 fn default_event_bus_capacity() -> usize {
     // Mirror of `trawl_server::bus::DEFAULT_EVENT_BUS_CAPACITY = 4096`.
-    // Inlined here (rather than plumbed through a trawl-server dep) to
-    // keep `trawl-config` free of non-config dependencies. If the
-    // server ever bumps this value, update both locations; a
-    // `debug_assert_eq!` in trawl-server's bus module would catch drift.
+    // trawl-server depends on this crate, so the constant cannot be read back
+    // from there without a dependency cycle. Nothing checks the two copies for
+    // drift, so a bump has to touch both.
     4096
 }
 
@@ -1075,14 +1077,13 @@ pub const DEFAULT_AUDIT_INTERVAL_SECS: u64 = 30;
 /// API keys live in the fleet-auth Postgres keystore (`database_url`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
-    /// REMOVED in ADR-0004 slice 3 — retained only as a deprecated sentinel.
+    /// Retired knob, kept only as a sentinel.
     ///
-    /// The transitional `SQLite` app-state store (query history, saved
-    /// queries, schedules) moved to the dedicated `trawl` postgres database
-    /// (`[storage] database_url`). serde has no `deny_unknown_fields` here,
-    /// so without this field an old config's `db_path` would silently
-    /// vanish; instead [`Config::validate`] rejects it with a message naming
-    /// the migration.
+    /// App state (query history, saved queries, schedules) lives in the
+    /// dedicated `trawl` postgres database (`[storage] database_url`,
+    /// ADR-0004). serde has no `deny_unknown_fields` here, so without this
+    /// field an old config's `db_path` would silently vanish; instead
+    /// [`Config::validate`] rejects it with a message naming the migration.
     #[serde(default)]
     pub db_path: Option<PathBuf>,
 
@@ -1115,10 +1116,10 @@ impl AuthConfig {
     /// then `[auth] database_url` from the config file. Empty values count
     /// as unset.
     ///
-    /// The bare `DATABASE_URL` override was removed in ADR-0004 slice 3:
-    /// that variable is ceded to the sqlx test harness (`#[sqlx::test]`
-    /// hardwires it), and a process-wide `DATABASE_URL` must never silently
-    /// repoint trawld's keystore.
+    /// The bare `DATABASE_URL` is deliberately not consulted: that variable
+    /// belongs to the sqlx test harness (`#[sqlx::test]` hardwires it), and a
+    /// process-wide `DATABASE_URL` must never silently repoint trawld's
+    /// keystore.
     ///
     /// # Errors
     /// Returns [`ConfigError::Validation`] when neither source is set.
@@ -1147,12 +1148,12 @@ impl AuthConfig {
 }
 
 /// Storage settings for trawl's own app-state database (query history,
-/// saved queries, schedules, report runs — ADR-0004 slice 3).
+/// saved queries, schedules, report runs — ADR-0004).
 ///
 /// This is a dedicated `trawl` postgres database owned by trawl-server
 /// (boot-time migrated, advisory-locked sole writer). Deliberately separate
-/// from `[auth]`: the stores are app state, not auth, and there is NO
-/// fallback from one URL to the other.
+/// from `[auth]`: the stores are app state, not auth, and neither URL falls
+/// back to the other.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct StorageConfig {
     /// Postgres URL of the dedicated `trawl` app-state database (e.g.
@@ -1199,8 +1200,7 @@ impl StorageConfig {
 /// Consumed by the `trawl-web` binary, which translates cookie-based browser
 /// sessions into bearer-token requests against trawld. Every field is
 /// optional so the proxy can supply its own defaults without coupling trawld
-/// to the proxy's operational choices. Existing config.toml files without a
-/// `[web]` section continue to parse cleanly.
+/// to the proxy's operational choices.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WebConfig {
     /// Bind address for the proxy HTTP listener. Default: "127.0.0.1:8090".
@@ -1220,13 +1220,13 @@ pub struct WebConfig {
     /// Session TTL in seconds. Default: 86400 (24h).
     pub session_ttl_secs: Option<u64>,
 
-    /// Drop `Secure` on session cookies. Dev-only; MUST stay `false` in prod.
+    /// Drop `Secure` on session cookies. Dev-only; must stay `false` in prod.
     #[serde(default)]
     pub allow_insecure_cookies: bool,
 
     /// Parent domain for the shared `fleet_session` SSO cookie — the SSO
     /// knob shared by every fleet app so operator docs can say "set the same
-    /// value in every app" (ADR-0004 slice 2).
+    /// value in every app" (ADR-0004).
     ///
     /// When set (e.g. `".fleet.lab.ktle.net"`), the session cookie carries a
     /// `Domain=` attribute scoping it to the parent domain, so one login is
@@ -1349,7 +1349,7 @@ fn expand_tilde(path: &str) -> String {
 ///
 /// Package upgrades keep the operator's existing config (deb conffile
 /// semantics, reused helm config maps) and serde silently ignores unknown
-/// keys — so every removed knob has to fail LOUD, naming the migration that
+/// keys — so every removed knob has to fail loudly, naming the migration that
 /// killed it and what replaces it, rather than quietly dropping tuned values.
 ///
 /// `fields` pairs each removed key's fully-qualified name with whether the
@@ -1378,7 +1378,7 @@ fn reject_removed_fields(
 ///
 /// Other caps use zero as an explicit off switch, but an unbounded telemetry
 /// buffer can grow indefinitely behind a wedged WAL write. Self-telemetry has
-/// its own boolean off switch, so zero has no valid interpretation (issue #94).
+/// its own boolean off switch, so zero has no valid interpretation.
 fn validate_telemetry_buffer_max_bytes(bytes: usize) -> Result<(), ConfigError> {
     if bytes == 0 {
         return Err(ConfigError::Validation(
@@ -1501,15 +1501,11 @@ impl Config {
         self.ingest.enabled && self.ingest.internal_telemetry
     }
 
-    /// Validate configuration values.
     fn validate(&self) -> Result<(), ConfigError> {
         if self.data.path.is_empty() {
             return Err(ConfigError::Validation("data.path cannot be empty".into()));
         }
 
-        // db_path died in ADR-0004 slice 3: the app-state stores (query
-        // history, saved queries, schedules) moved to the dedicated trawl
-        // postgres database.
         reject_removed_fields(
             &[("auth.db_path", self.auth.db_path.is_some())],
             "the ADR-0004 slice-3 migration",
@@ -1519,8 +1515,6 @@ impl Config {
              file is not imported — recreate saved queries and schedules",
         )?;
 
-        // The per-role rate-limit knobs died in ADR-0006 slice 0: rate
-        // limiting is now per API key with a single default_rpm ceiling.
         let rl = &self.server.rate_limit;
         reject_removed_fields(
             &[
@@ -1735,9 +1729,9 @@ path = ""
 
     #[test]
     fn validation_rejects_leftover_db_path() {
-        // db_path died in ADR-0004 slice 3. Deb conffile upgrades preserve
-        // old trawld.toml files, so a leftover db_path must be a loud error
-        // naming the migration — never a silent ignore.
+        // Deb conffile upgrades preserve old trawld.toml files, so a leftover
+        // db_path must be a loud error naming the migration, never a silent
+        // ignore.
         let toml = r#"
 [server]
 [data]
@@ -1926,9 +1920,8 @@ path = "/data/*.parquet"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        // Interactive keys default to the loosest legacy *interactive*
-        // ceiling (old admin = 100), not the ingest one — the untuned upgrade
-        // path must not quietly widen a reader's query budget to 1000/min.
+        // Interactive keys default to 100/min, not the shipper-sized 1000:
+        // an untuned key must not get an ingest-sized query budget.
         assert_eq!(config.server.rate_limit.default_rpm, 100);
         assert_eq!(config.server.rate_limit.ingest_rpm, 1000);
         config.validate().unwrap();
@@ -1953,10 +1946,9 @@ path = "/data/*.parquet"
 
     #[test]
     fn validation_rejects_legacy_rate_limit_fields() {
-        // The per-role rate-limit knobs died in ADR-0006 slice 0 (per-key
-        // buckets). Deb conffile upgrades preserve old trawld.toml files, so
-        // a leftover per-role key must be a loud error naming the migration —
-        // never a silent ignore of the operator's tuned quotas.
+        // Deb conffile upgrades preserve old trawld.toml files, so a leftover
+        // per-role key must be a loud error naming the migration, never a
+        // silent ignore of the operator's tuned quotas.
         for legacy_key in ["admin", "analyst", "reader", "ingest"] {
             let toml = format!(
                 r#"
@@ -2237,7 +2229,7 @@ min_free_disk_bytes = "2G"
         assert_eq!(config.retention.min_free_disk_bytes, 2 * 1024 * 1024 * 1024);
     }
 
-    // -- new interval field tests --------------------------------------------
+    // -- interval field tests ------------------------------------------------
 
     #[test]
     fn interval_defaults_when_omitted() {
@@ -2284,7 +2276,8 @@ stats_interval_secs = 0
 
     #[test]
     fn web_section_optional_preserves_backcompat() {
-        // Existing trawld deployments have no [web] section — must still parse.
+        // A trawld.toml with no [web] section must still parse; the proxy
+        // supplies its own defaults.
         let toml = r#"
 [server]
 [data]
@@ -2300,7 +2293,7 @@ path = "/data/*.parquet"
         assert!(!config.web.allow_insecure_cookies);
     }
 
-    // -- fleet-auth cutover: [auth] database_url (ADR-0004 slice 1) ----------
+    // -- fleet-auth keystore: [auth] database_url (ADR-0004) -----------------
 
     #[test]
     fn auth_database_url_parses_from_toml() {
@@ -2379,8 +2372,8 @@ database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 
     #[test]
     fn legacy_auth_cache_ttl_key_still_parses() {
-        // auth_cache_ttl_secs died with trawld's AuthCache. Old trawld.toml
-        // files carrying it must keep parsing (serde ignores unknown fields).
+        // auth_cache_ttl_secs is not a config key; a trawld.toml still
+        // carrying it must keep parsing (serde ignores unknown fields).
         let toml = r#"
 [server]
 [data]
@@ -2412,7 +2405,7 @@ path = "/data"
         assert!(config.web.shared_domain.is_none());
     }
 
-    // -- [storage] database_url (ADR-0004 slice 3) ----------------------------
+    // -- [storage] database_url (ADR-0004) ------------------------------------
 
     #[test]
     fn storage_database_url_parses_from_toml() {
@@ -2481,7 +2474,7 @@ path = "/data"
         // The stores are app state, not auth: a configured [auth] database_url
         // must not leak into storage resolution. The resolver's signature
         // admits no auth input; this pins the end-to-end behaviour on a config
-        // carrying ONLY the auth URL.
+        // carrying only the auth URL.
         let toml = r#"
 [server]
 [data]
@@ -2808,7 +2801,7 @@ default_service = "syslog"
         .expect("valid syslog service names must load");
     }
 
-    // -- [ingest] derivation sources (ADR-0013 slice 2, ruling 5) ---------
+    // -- [ingest] derivation sources (ADR-0013) ---------------------------
     //
     // Shape only: this crate parses the TOML, trawl-server's
     // `ingest::producer::Derivation::resolve` owns every semantic rule
@@ -2832,7 +2825,7 @@ default_service = "syslog"
                 .iter()
                 .all(|s| s.dialect().is_none())
         );
-        // The code default IS what `IngestConfig::default()` holds, so a
+        // The code default is what `IngestConfig::default()` holds, so a
         // programmatically-built config and a parsed empty one agree.
         assert_eq!(
             config.ingest.severity_from,
@@ -2872,7 +2865,7 @@ time_from = ["_time"]
     #[test]
     fn derivation_source_empty_list_parses() {
         // Empty `severity_from` is legal ("derive nothing"); empty
-        // `time_from` is not — but that is a SEMANTIC rule the server
+        // `time_from` is not — but that is a semantic rule the server
         // enforces, so both must survive deserialization.
         let config = config_with_ingest("severity_from = []\ntime_from = []");
         assert!(config.ingest.severity_from.is_empty());
