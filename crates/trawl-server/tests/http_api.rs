@@ -2269,3 +2269,39 @@ async fn sse_freezes_now_per_event_and_per_snapshot() {
         );
     }
 }
+
+/// A shutdown that fires BEFORE the accept loop polls must still stop it.
+///
+/// The flag has to be state, not an edge. `Notify::notify_waiters()` wakes
+/// whoever is registered at that instant and stores nothing, so a signal
+/// landing before the loop's first `select!` (or while the accept arm's
+/// body runs, between two registrations) was lost and the server kept
+/// accepting after SIGTERM. Under the watch channel the late subscriber
+/// reads the value that is already there.
+///
+/// This test hangs on the old primitive and returns in milliseconds on the
+/// new one; the timeout is generous only so a loaded CI runner cannot turn
+/// a pass into a flake.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_set_before_boot_stops_the_accept_loop() {
+    let server = setup().await;
+
+    let (shutdown_tx, shutdown_rx) = trawl_server::shutdown::shutdown_channel();
+    shutdown_tx
+        .send(true)
+        .expect("this test holds the receiver");
+
+    // Only now does the loop exist, so the send above cannot have been
+    // observed by a registered waiter.
+    let task = server.spawn_server_with_shutdown(shutdown_rx);
+
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the accept loop must observe a shutdown that predates it")
+        .expect("the serve task must not panic")
+        .expect("serve returns cleanly after the drain");
+
+    // The sender outlives the loop, so what ended it was the flag and not
+    // a dropped channel.
+    drop(shutdown_tx);
+}

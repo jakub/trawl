@@ -958,6 +958,12 @@ pub struct TestServer {
     /// The serve task, retained so the readiness poll can tell "still
     /// starting" from "already dead" (see [`wait_for_ready`]).
     pub serve_task: tokio::task::JoinHandle<()>,
+    /// What a second boot over this state needs: TLS paths and drain
+    /// budget. Private, because a test that mutated them would be
+    /// describing a server this fixture did not build.
+    server_config: ServerConfig,
+    http_config: trawl_server::state::HttpConfig,
+    state_dir: PathBuf,
     /// Printed by the drop guard when the test panics.
     facts: FixtureFacts,
 }
@@ -975,6 +981,37 @@ impl Drop for TestServer {
 }
 
 impl TestServer {
+    /// Boot a SECOND server over this fixture's state and TLS material, on
+    /// an ephemeral port of its own, driven by a shutdown channel the
+    /// caller owns.
+    ///
+    /// The fixture's own server is already parked in `accept()` by the time
+    /// a test body runs, so it cannot answer what a signal does when it
+    /// lands BEFORE the accept loop first polls. Here the caller decides:
+    /// set the flag, then spawn.
+    pub fn spawn_server_with_shutdown(
+        &self,
+        shutdown: trawl_server::shutdown::ShutdownRx,
+    ) -> tokio::task::JoinHandle<Result<(), trawl_server::error::ServerError>> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port for a second server");
+        let state = self.state.clone();
+        let http_config = self.http_config.clone();
+        let server_config = self.server_config.clone();
+        let state_dir = self.state_dir.clone();
+        tokio::spawn(async move {
+            http::serve_with_listener(
+                listener,
+                state,
+                &http_config,
+                &server_config,
+                &state_dir,
+                Some(shutdown),
+            )
+            .await
+        })
+    }
+
     /// Force-drop the fleet keystore database under the running server.
     pub async fn kill_fleet_database(&self) {
         kill_database(&self.fleet_db_url).await;
@@ -1265,10 +1302,13 @@ pub async fn setup_in_dir_with_data(
         false,
     );
 
-    let serve_task = serve_and_wait(listener, &state, &config, http_config, &addr).await;
+    let serve_task = serve_and_wait(listener, &state, &config, http_config.clone(), &addr).await;
 
     TestServer {
         facts: FixtureFacts::new(&app_db_url, &fleet_db_url, &addr),
+        server_config: config.server.clone(),
+        http_config,
+        state_dir: config.state_dir(),
         url: format!("https://{addr}"),
         analyst_token,
         admin_token,

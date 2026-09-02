@@ -4,6 +4,32 @@
 
 //! Graceful shutdown signal handling.
 
+/// The sending half of the server-wide shutdown flag.
+pub type ShutdownTx = tokio::sync::watch::Sender<bool>;
+
+/// The receiving half of the server-wide shutdown flag.
+pub type ShutdownRx = tokio::sync::watch::Receiver<bool>;
+
+/// Create a shutdown channel, unset.
+///
+/// A watch channel rather than a `Notify`: the flag is STATE, so a task
+/// that subscribes (or re-polls) after the send still sees it.
+/// `Notify::notify_waiters()` stores nothing, and every waiter that had
+/// not registered at that instant missed the shutdown for good.
+#[must_use]
+pub fn shutdown_channel() -> (ShutdownTx, ShutdownRx) {
+    tokio::sync::watch::channel(false)
+}
+
+/// Resolve once the shutdown flag is set, or once the sender is gone.
+///
+/// A dropped sender means whoever owned the shutdown is gone, which is
+/// shutdown by another name. Both outcomes return, and neither is an
+/// error the caller has to handle.
+pub async fn shutdown_observed(rx: &mut ShutdownRx) {
+    let _ = rx.wait_for(|flagged| *flagged).await;
+}
+
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
 ///
 /// Returns when the first signal is received, allowing the server to

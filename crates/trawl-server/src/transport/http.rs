@@ -12,7 +12,6 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -44,7 +43,7 @@ use crate::handlers;
 use crate::ingest;
 use crate::policy::{normalize_auth_errors, require_trawl_grant};
 use crate::rate_limit::{RateLimitState, rate_limit_middleware};
-use crate::shutdown::shutdown_signal;
+use crate::shutdown::{ShutdownRx, shutdown_observed, shutdown_signal};
 use crate::state::{AppState, HttpConfig};
 use crate::tls;
 
@@ -279,7 +278,7 @@ pub async fn serve(
     http: &HttpConfig,
     config: &ServerConfig,
     state_dir: &Path,
-    external_shutdown: Option<Arc<tokio::sync::Notify>>,
+    external_shutdown: Option<ShutdownRx>,
 ) -> Result<(), crate::error::ServerError> {
     let addr = &config.http_addr;
 
@@ -321,7 +320,7 @@ pub async fn serve_with_listener(
     http: &HttpConfig,
     config: &ServerConfig,
     state_dir: &Path,
-    external_shutdown: Option<Arc<tokio::sync::Notify>>,
+    external_shutdown: Option<ShutdownRx>,
 ) -> Result<(), crate::error::ServerError> {
     let tls_acceptor = build_tls_acceptor(config, state_dir)?;
 
@@ -362,7 +361,7 @@ async fn accept_loop(
     state: AppState,
     http: &HttpConfig,
     config: &ServerConfig,
-    external_shutdown: Option<Arc<tokio::sync::Notify>>,
+    external_shutdown: Option<ShutdownRx>,
 ) -> Result<(), crate::error::ServerError> {
     let drain_secs = http.shutdown_drain_secs;
     let pool = state.query.pool.clone();
@@ -387,25 +386,28 @@ async fn accept_loop(
         ));
     }
 
-    // Shutdown coordination: use external Notify (from monitor) or spawn
-    // our own signal listener for the non-monitor path.
-    let notify = if let Some(ext) = external_shutdown {
+    // Shutdown coordination: use the caller's channel (from monitor, or a
+    // test) or spawn our own signal listener for the non-monitor path.
+    let mut accept_rx = if let Some(ext) = external_shutdown {
         ext
     } else {
-        let n = Arc::new(tokio::sync::Notify::new());
-        let n_signal = Arc::clone(&n);
+        let (tx, rx) = crate::shutdown::shutdown_channel();
         tokio::spawn(async move {
             shutdown_signal().await;
-            n_signal.notify_waiters();
+            let _ = tx.send(true);
         });
-        n
+        rx
     };
 
     // Track spawned connection tasks for graceful drain.
     let mut connections = JoinSet::new();
 
+    // One receiver the connection tasks clone from. It is a separate handle
+    // because the accept arm below borrows `accept_rx` mutably for the whole
+    // `select!`, and a clone taken after the flag was set still observes it.
+    let conn_rx = accept_rx.clone();
+
     // Accept loop — runs until shutdown signal.
-    let n_accept = Arc::clone(&notify);
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -416,7 +418,7 @@ async fn accept_loop(
                 let tls_acceptor = tls_rx.borrow().clone();
                 let tower_service = app.clone();
 
-                let n_conn = Arc::clone(&notify);
+                let mut conn_shutdown = conn_rx.clone();
                 connections.spawn(async move {
                     // Accept-loop diagnostics carry PREAUTH_TRANSPORT_TARGET,
                     // not this module's path: a bare TCP connect-and-close
@@ -455,7 +457,7 @@ async fn accept_loop(
                                 tracing::debug!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "connection_error", peer = %peer_addr, error = %e, "connection error");
                             }
                         }
-                        () = n_conn.notified() => {
+                        () = shutdown_observed(&mut conn_shutdown) => {
                             conn.as_mut().graceful_shutdown();
                             if let Err(e) = conn.await {
                                 tracing::debug!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "connection_error", peer = %peer_addr, error = %e, "connection error during shutdown");
@@ -464,7 +466,7 @@ async fn accept_loop(
                     }
                 });
             }
-            () = n_accept.notified() => {
+            () = shutdown_observed(&mut accept_rx) => {
                 tracing::info!(event_type = "lifecycle", "shutdown: stopping accept loop");
                 break;
             }
