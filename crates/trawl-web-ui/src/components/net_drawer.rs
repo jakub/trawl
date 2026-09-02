@@ -362,7 +362,6 @@ fn QuerySchedulePane(
                     }
                 >
                     <div style="display:flex; flex-direction:column; gap:10px">
-                        // interval chips
                         <div>
                             <label class="field-label">"Interval"</label>
                             <div class="interval-chips">
@@ -388,7 +387,6 @@ fn QuerySchedulePane(
                             />
                         </div>
 
-                        // max runs
                         <div>
                             <label class="field-label">"Max runs "</label>
                             <span style="color:var(--ink-3); font-size:11px">"(blank = unlimited)"</span>
@@ -402,7 +400,6 @@ fn QuerySchedulePane(
                             />
                         </div>
 
-                        // enabled toggle
                         <div style="display:flex; align-items:center; gap:8px">
                             <Toggle
                                 checked=enabled_buf
@@ -413,7 +410,6 @@ fn QuerySchedulePane(
                             </span>
                         </div>
 
-                        // actions
                         <div style="display:flex; gap:6px; align-items:center">
                             <Btn
                                 variant=Variant::Primary
@@ -459,7 +455,6 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
 
     view! {
         <div>
-            // Row count sparkline (trend over recent runs)
             {move || {
                 let data = runs.get()
                     .and_then(Result::ok)

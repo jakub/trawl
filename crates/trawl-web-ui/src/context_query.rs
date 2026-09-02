@@ -4,12 +4,11 @@
 
 //! The "Show context" query builder: a ±30s window around one result row.
 //!
-//! Pure + ungated so its tests run natively; the one caller (the results
+//! Pure and ungated so its tests run natively; the one caller (the results
 //! table's row actions) is wasm32-only. The window names the canonical
-//! `_time` column, because the DSL has zero aliases since ADR-0013 §6 —
-//! reintroducing `@timestamp` here would emit a filter on an ordinary
-//! sender field most events never carry, and Show context would silently
-//! return nothing.
+//! `_time` column, because the DSL has no aliases (ADR-0013 §6): naming
+//! `@timestamp` here would filter on an ordinary sender field most events
+//! never carry, and Show context would silently return nothing.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 

@@ -11,9 +11,8 @@
 //! arrangement: the backdrop layer is fixed, full-viewport,
 //! `z-index: -1`, so the login card composes above it with no stacking
 //! work here. That only paints because fleet-ui's `.login-shell`
-//! deliberately declares NO opaque background (an opaque normal-flow
-//! block would occlude the z-index:-1 canvas) — don't reintroduce one
-//! in `main.css`.
+//! declares no opaque background: an opaque normal-flow block would
+//! occlude the z-index:-1 canvas, so don't add one in `main.css`.
 
 use fleet_ui::{Atmosphere, UiPrefs};
 use leptos::prelude::*;
@@ -50,9 +49,8 @@ pub fn Login() -> impl IntoView {
         });
     });
 
-    // brand_accent="" (not the topbar's "_"): the pre-migration login
-    // h1 was plain accent "trawl" with no accent glyph, and zero visual
-    // change is the contract. The empty accent span renders nothing.
+    // Empty accent, unlike the topbar's "_": the login h1 is a plain
+    // "trawl", and the empty accent span renders nothing.
     view! {
         <Atmosphere theme=prefs.theme()/>
         <fleet_ui::Login

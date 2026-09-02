@@ -2,24 +2,21 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Native drift guard for issue #118's Playwright suite (`e2e/`).
+//! Native drift guard for the Playwright suite in `e2e/`.
 //!
 //! `e2e/selectors.ts` is the single source every spec imports selector
 //! strings and expected copy from. This test proves both halves of that
 //! contract hold: each exported entry's full `key: 'value',` assignment
 //! appears verbatim in `selectors.ts` (assignment-level, so a key's value
-//! can't rot while the old string survives in another entry), AND the
+//! can't rot while the old string survives in another entry), and the
 //! "hook" substring the selector is built from still appears in the Rust
-//! (or fleet-ui) source file that is supposed to emit it — the same
-//! `include_str!`-and-scan idiom as
-//! `crates/fleet-ui/tests/component_class_contract.rs`, applied across
-//! the crate boundary into the e2e suite's own selector sheet instead of
-//! into a stylesheet.
+//! (or fleet-ui) source file that emits it. Same `include_str!`-and-scan
+//! idiom as `crates/fleet-ui/tests/component_class_contract.rs`, aimed
+//! at the e2e suite's selector sheet instead of a stylesheet.
 //!
-//! This cannot run the SPA or `CodeMirror`, so it is not a substitute for
-//! actually running the suite (`cargo xtask e2e`) — it only proves the
-//! selectors/copy the suite is BUILT from haven't silently drifted out
-//! from under it between runs.
+//! This cannot run the SPA or `CodeMirror`, so it is no substitute for
+//! running the suite (`cargo xtask e2e`); it only proves the selectors
+//! and copy the suite is built from still match the source.
 
 const SELECTORS_TS: &str = include_str!("../e2e/selectors.ts");
 
@@ -33,13 +30,11 @@ const LOADED_STATE_RS: &str = include_str!("../../fleet-ui/src/loaded/state.rs")
 const RAIL_RS: &str = include_str!("../../fleet-ui/src/rail.rs");
 const SECTION_RS: &str = include_str!("../src/state/section.rs");
 
-/// One (assignment, source file, hook) triple: `assignment` is the FULL
-/// `key: 'value',` line as it appears in `selectors.ts` — pinning the
-/// assignment (not a bare substring) means a key's value can't rot while
-/// the old string survives elsewhere in the file — and `hook` must appear
-/// in `source`. A composite selector gets one entry per app-owned
-/// component (CodeMirror-owned fragments like `.cm-content` are exempt by
-/// design: only the browser run can prove those).
+/// One (assignment, source file, hook) triple: `assignment` is the full
+/// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
+/// appear in `source`. A composite selector gets one entry per app-owned
+/// component; `CodeMirror`-owned fragments like `.cm-content` are exempt
+/// by design, since only the browser run can prove those.
 struct Contract {
     assignment: &'static str,
     source_path: &'static str,
@@ -206,7 +201,7 @@ fn every_source_hook_still_exists() {
 
 #[test]
 fn every_selectors_ts_entry_is_pinned() {
-    // Completeness: a NEW selectors.ts entry must arrive with a contract,
+    // Completeness: a new selectors.ts entry must arrive with a contract,
     // or it is an unguarded selector the suite can silently rot on.
     for line in SELECTORS_TS.lines() {
         let trimmed = line.trim_start();

@@ -4,11 +4,11 @@
 
 //! `<FacetSidebar/>` — 224px Splunk-style filter rail.
 //!
-//! Header (Filters · count · clear all) + filter input + per-field
-//! collapsible groups with proportional value bars and hover-only
-//! include/exclude actions. Clicking `+` / `⊘` on a value adds an
-//! include / exclude `Filter` to the shared filters signal; the parent
-//! owns state and re-runs the query via URL navigation.
+//! Header (title, plus "Clear all" once a filter is set) + filter input
+//! + per-field collapsible groups with proportional value bars and
+//! hover-only include/exclude actions. Clicking `+` / `⊘` on a value
+//! adds an include / exclude `Filter` to the shared filters signal; the
+//! parent owns state and re-runs the query via URL navigation.
 
 use std::collections::HashMap;
 
@@ -54,9 +54,9 @@ pub fn FacetSidebar(
             <SearchInput value=needle placeholder="Filter field values"/>
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
-                // Deliberate quiet-error override (issue #31 C4): the
-                // results table already surfaces the query failure;
-                // repeating it in the facet rail is noise.
+                // Deliberate quiet-error override: the results table
+                // already reports the query failure, and repeating it in
+                // the facet rail is noise.
                 error=Box::new(|_| view! { <p class="facets-hint">"—"</p> }.into_any())
                 render=Box::new(move |resp: QueryResponse| {
                     let facets = compute_facets(&resp.result);

@@ -42,9 +42,9 @@ use crate::state::stream_session::{
     LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
 };
 
-/// Results-area tab. Moved here from the deleted `components/tabs.rs`
-/// when the strip itself became `fleet_ui::Tabs` (issue #28) — the
-/// typed enum is search-page semantics, not design-system chrome.
+/// Results-area tab. The typed enum is search-page semantics rather than
+/// design-system chrome, so it stays app-side while the strip itself is
+/// `fleet_ui::Tabs`.
 ///
 /// Patterns and Statistics from the design are deferred — we don't
 /// have pattern detection or pre-aggregated stats yet.
@@ -313,14 +313,13 @@ pub fn Search() -> impl IntoView {
             .map(|r| r.pagination.returned)
     });
 
-    // The degraded fields THIS execution reported (ADR-0011 slice C2).
-    // Read off the response, never re-derived and never refreshed from
-    // the catalog: it describes the answer already on screen.
+    // The degraded fields this execution reported. Read off the
+    // response, never re-derived and never refreshed from the catalog:
+    // it describes the answer already on screen.
     //
     // Empty in live mode by construction — the snapshot resource keeps
-    // running behind the live tail, and SSE carries no notice (a named
-    // C1 residual), so a stale snapshot's fields must not be shown over
-    // streamed rows.
+    // running behind the live tail, and SSE carries no notice, so a
+    // stale snapshot's fields must not be shown over streamed rows.
     let degraded_fields = Signal::derive(move || {
         if mode.get() == Mode::Live {
             return Vec::new();
@@ -384,7 +383,7 @@ pub fn Search() -> impl IntoView {
                         >"Export"</span>
                     }.into_any())
                 />
-                // Above the results BODY, not inside it: a zero-row
+                // Above the results body, not inside it: a zero-row
                 // answer is exactly when "some values are missing" is
                 // worth reading, and the Visualization tab is drawn from
                 // the same incomplete rows.

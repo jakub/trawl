@@ -163,9 +163,9 @@ pub fn HistoryPage() -> impl IntoView {
                             let on_rerun = on_rerun.clone();
                             let events = format_with_commas(h.row_count as u64);
                             let duration = format_duration(h.duration_ms);
-                            // <When> replaces the render-time snapshot:
-                            // the label ticks off fleet-ui's shared 30s
-                            // clock instead of freezing at page load.
+                            // `<When>` ticks off fleet-ui's shared 30s
+                            // clock, so the label doesn't freeze at page
+                            // load.
                             let executed_at = h.executed_at.clone();
                             view! {
                                 <div

@@ -12,10 +12,9 @@ use wasm_bindgen::JsValue;
 use crate::interop::uplot::{ChartHandle, Opts, create_chart};
 
 /// uPlot `AlignedData` is `[xs, ys1, ys2, ...]` where every inner array
-/// is equal length. All values are `f64`; xs are seconds-since-epoch.
-/// The server emits snapshots with `_time` as a string timestamp, so we
-/// use the row index as x when parsing is ambiguous — uPlot renders
-/// just fine against synthetic x values.
+/// is equal length and all values are `f64`. xs are row indices, not
+/// instants: the server emits `_time` as a string, snapshot rows arrive
+/// in order, and the chart only has to show relative shape.
 fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>) {
     let (series, _total) = extract_series(result);
     if series.is_empty() {
@@ -25,9 +24,6 @@ fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>) {
     let series_len = series[0].1.len();
     let aligned = js_sys::Array::new();
 
-    // x = row index as f64 (simpler than parsing the server's timestamp
-    // strings; the chart's job is to show relative shape, and snapshots
-    // are monotonically increasing).
     let xs = js_sys::Array::new_with_length(u32::try_from(series_len).unwrap_or(u32::MAX));
     for (i, x) in (0..series_len).enumerate() {
         // Snapshot lengths come from live-aggregated rows — bounded by
@@ -66,7 +62,6 @@ pub fn Chart(#[prop(into)] snapshot: Signal<Option<QueryResult>>) -> impl IntoVi
     let handle: StoredValue<Option<ChartHandle>, leptos::prelude::LocalStorage> =
         StoredValue::new_local(None);
 
-    // Mount/update whenever snapshot or the target div changes.
     Effect::new(move |_| {
         let Some(element) = node_ref.get() else {
             return;
@@ -108,6 +103,4 @@ pub fn Chart(#[prop(into)] snapshot: Signal<Option<QueryResult>>) -> impl IntoVi
     view! { <div class="chart" node_ref=node_ref></div> }
 }
 
-// Local imports used in unchecked_into — placed here so the file stays
-// self-contained without polluting the module prelude.
 use wasm_bindgen::JsCast;

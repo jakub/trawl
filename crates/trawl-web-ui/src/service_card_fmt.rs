@@ -6,9 +6,10 @@
 //! `<ServiceDrawer/>`. No I/O, no Leptos — just string munging.
 //!
 //! Ungated and top-level for the `tone_vocab` / `facets` reason: inside
-//! the wasm32-gated `components` module its `mod tests` never ran under
-//! `cargo nextest`. `components::service_card_fmt` still resolves — the
-//! module is re-exported there, so every call site keeps its path.
+//! the wasm32-gated `components` module its `mod tests` would never run
+//! under `cargo nextest`. `components::service_card_fmt` still resolves
+//! because the module is re-exported there, so every call site keeps its
+//! path.
 //! `today_yesterday_utc` is the one wasm32-only member (it reads the
 //! browser clock) and carries its own gate.
 
@@ -35,7 +36,7 @@ pub fn format_count(n: u64) -> String {
 /// Every digit, thousands-grouped: `"1,204,913"`, `"7"`, `"0"`.
 ///
 /// The counterpart to [`format_count`] for a number an operator accepts
-/// RESPONSIBILITY for — the values a repin would null, the rows carrying
+/// responsibility for: the values a repin would null, the rows carrying
 /// the field, what a finished job actually rewrote. "1.2k values become
 /// NULL" is not a fact anyone can act on, and grouping is what makes the
 /// exact digits readable at a glance.
@@ -195,11 +196,11 @@ pub fn today_yesterday_utc() -> (String, String) {
 }
 
 /// How many of this service's fields the catalog currently calls
-/// degraded (ADR-0011 slice C2).
+/// degraded.
 ///
-/// Reads the server-stamped list and NOTHING else. The count is not
+/// Reads the server-stamped list and nothing else. The count is not
 /// client-derivable: a service is on the list only when
-/// `field_conflict_stats` holds evidence that THIS service conflicted on
+/// `field_conflict_stats` holds evidence that this service conflicted on
 /// the field, so intersecting `columns` with an install-wide degraded set
 /// would badge every service that merely carries the column.
 #[must_use]
@@ -398,8 +399,8 @@ mod tests {
         assert_eq!(degraded_count(&svc(&["duration", "status"])), 2);
 
         assert!(is_degraded_column(&svc(&["duration"]), "duration"));
-        // AC-1's false positive, client side: the service CARRIES the
-        // column, and some other service degraded it — not badged here.
+        // The service carries the column and some other service degraded
+        // it: not badged here.
         assert!(!is_degraded_column(&svc(&[]), "duration"));
         assert!(!is_degraded_column(&svc(&["duration"]), "status"));
         // A degraded field the service no longer carries is filtered

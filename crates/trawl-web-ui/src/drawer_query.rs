@@ -16,17 +16,18 @@ pub struct TopValues {
     pub count_column: &'static str,
 }
 
-/// The alias the collision-avoiding form counts into — the same spelling
-/// the projection-collision error suggests as the way out.
+/// The alias the collision-avoiding `stats` form counts into. Only
+/// reached when the field itself folds to `count`, so any other spelling
+/// would serve; [`TopValues::count_column`] is what carries it to the
+/// reader.
 const TOP_VALUES_ALIAS: &str = "hits";
 
 /// `| top 10 <field>` projects the field beside a `count` column it mints
 /// itself, so a field whose name folds to `count` would name one output
-/// column twice — refused since the projection-collision check (ADR-0013
-/// ruling 8), which made the drawer's drill-in a 400 for exactly that
-/// field. The stats form asks the same question with an alias that cannot
-/// collide, and is used ONLY for the colliding name so every other field
-/// keeps the cheaper stage.
+/// column twice, which the projection-collision check refuses (ADR-0013
+/// ruling 8). The stats form asks the same question under an alias that
+/// cannot collide, and is used only for the colliding name so every other
+/// field keeps the cheaper stage.
 pub fn top_values_query(svc: &str, field: &str) -> Option<TopValues> {
     let rendered = trawl_core::parser::suggest::quote_dsl_field(field)?;
     let svc = svc.replace('"', "");
@@ -71,7 +72,7 @@ mod tests {
     }
 
     /// Every query this module composes has to survive the door it is
-    /// posted to: the parser AND the pipeline validation `/api/v1/query`
+    /// posted to: the parser and the pipeline validation `/api/v1/query`
     /// runs before emitting.
     fn assert_accepted(dsl: &str) {
         let query = trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));

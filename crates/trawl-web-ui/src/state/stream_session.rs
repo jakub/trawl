@@ -166,9 +166,9 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
         *guard.borrow_mut() = Some(timeout);
     });
 
-    // Attach listeners. `add_event_listener_with_callback` returns
-    // Result but the only failure mode is invalid UTF-8 event names,
-    // which are compile-time strings here.
+    // Attach listeners. The `Result` carries only an exception thrown by
+    // the JS call itself, and the event names are compile-time strings,
+    // so there is nothing here to act on.
     let _ = source.add_event_listener_with_callback("data", on_data.as_ref().unchecked_ref());
     let _ =
         source.add_event_listener_with_callback("snapshot", on_snapshot.as_ref().unchecked_ref());

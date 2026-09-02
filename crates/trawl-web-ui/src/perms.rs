@@ -23,8 +23,8 @@ const SERVER_MANAGE: &str = "server_manage";
 const SCHEMA_READ: &str = "schema_read";
 
 /// The permission `POST /api/v1/schema/repin` is gated on. The server is
-/// the sole enforcement (ADR-0011 slice B); this predicate only decides
-/// whether the UI offers the affordance.
+/// the sole enforcement; this predicate only decides whether the UI
+/// offers the affordance.
 const SCHEMA_WRITE: &str = "schema_write";
 
 /// Whether the resolved permission set carries trawl admin capability.
@@ -33,17 +33,19 @@ pub fn is_trawl_admin(permissions: &[String]) -> bool {
 }
 
 /// Whether the session may read the field catalog.
-// Consumed by the query notice's case-file links (ADR-0011 C2 M4): a
-// session without `schema_read` gets the field names as plain text,
-// because the link target would 403.
+// Consumed by the query notice's case-file links: a session without
+// `schema_read` gets the field names as plain text, because the link
+// target would 403.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn can_schema_read(permissions: &[String]) -> bool {
     permissions.iter().any(|p| p == SCHEMA_READ)
 }
 
 /// Whether the session may trigger a repin.
-// Consumed by the case file's repin affordance (ADR-0011 C2 M3); M2 is
-// the read-only surface, which offers the CLI line to everyone.
+// Consumed by the case file's remedy block, where the button and the
+// `trawl schema repin` line are alternatives rather than a disabled
+// pair: with the permission the reader gets the trigger, without it the
+// command to run from a shell.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn can_schema_write(permissions: &[String]) -> bool {
     permissions.iter().any(|p| p == SCHEMA_WRITE)

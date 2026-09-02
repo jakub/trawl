@@ -69,8 +69,8 @@ pub fn ServiceDrawer(
     /// so returning from the case file lands where it left. Cleared by
     /// the fields pane once it has been honoured.
     focus_field: RwSignal<Option<String>>,
-    /// Drill into a field's case file (ADR-0011 slice C2). The page owns
-    /// the navigation; the drawer only names the field.
+    /// Drill into a field's case file. The page owns the navigation; the
+    /// drawer only names the field.
     on_open_field: Callback<String>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
@@ -121,8 +121,8 @@ pub fn ServiceDrawer(
             active_tab=eff_tab
             on_tab_change=on_tab_change
             on_close=on_close
-            // Pre-migration this drawer's close X was 12px (net drawer:
-            // 14px) — see the `close_size` prop docs in fleet-ui.
+            // Deliberately not the 14px default; the `close_size` prop
+            // docs in fleet-ui explain why the sizes are not unified.
             close_size=12
             meta=meta_text
             title=Box::new(move || view! {
@@ -268,9 +268,9 @@ fn FieldsPane(
     let columns_owned = svc.columns.clone();
     let svc_for_degraded = svc.clone();
 
-    // Focus return across the drawer swap (F4). The badge's id is its
-    // position in `columns`, which is the drawer's own order and survives
-    // this table's client-side sorting.
+    // Focus return across the drawer swap. The badge's id is its position
+    // in `columns`, which is the drawer's own order and survives this
+    // table's client-side sorting.
     //
     // Re-run on `cardinality`, not once on mount: the row list is rebuilt
     // when the cardinality fetch lands, which would drop a focus placed
@@ -300,15 +300,14 @@ fn FieldsPane(
         });
     });
 
-    // Header-click handler: toggle direction if same key, else select
-    // with desc as default (matches sort-by-numeric expectation).
+    // Toggle direction if the key is already active, else select it at its
+    // natural direction: ascending for the name, descending for numbers.
     let toggle_sort = move |key: SortKey| {
         move |_| {
             let (cur_key, cur_asc) = sort.get_untracked();
             let next = if cur_key == key {
                 (key, !cur_asc)
             } else {
-                // default direction per column
                 let default_asc = matches!(key, SortKey::Name);
                 (key, default_asc)
             };
@@ -826,10 +825,6 @@ fn HistogramChart(resource: LocalResource<Result<QueryResponse, api::ApiError>>)
 
 /// uPlot column chart over the filled hourly grid — real time axis,
 /// hover readout, and zero-anchored y scale.
-///
-/// Replaces a hand-rolled strip of flex `<span>`s that had no notion of
-/// time: it gave every returned row an equal-width bar, so gaps in
-/// ingest silently collapsed instead of showing as gaps.
 #[component]
 fn IngestChart(slots: Vec<Slot>) -> impl IntoView {
     let node_ref = NodeRef::<leptos::html::Div>::new();
@@ -904,10 +899,8 @@ fn slots_to_aligned(slots: &[Slot]) -> JsValue {
 /// Pull `(bucket_start_ms, count)` out of a `timechart span=1h` response
 /// and lay it on a full 24-slot hourly grid.
 ///
-/// The server only emits rows for buckets that HAVE events, and the bar
-/// strip gives every row equal width — so a service that ingested during
-/// two hours of the day rendered as two half-width bars. Filling the
-/// grid puts each bar back at its real position.
+/// The server only emits rows for buckets that carry events, so filling
+/// the grid is what keeps each bar at its real position on the time axis.
 fn build_histogram(resp: &QueryResponse) -> Vec<Slot> {
     let cols = &resp.result.columns;
     let ti = cols.iter().position(|c| {

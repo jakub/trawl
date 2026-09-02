@@ -5,11 +5,10 @@
 //! `<EditorWrap/>` — the DSL editor with the date-range picker, Run
 //! button, and query tools stacked in a column on its right.
 //!
-//! The right column is a stack: date range, then Run, then the
-//! Save / Share / Format tool row. There is no header band — the
-//! editor frame is its own label, so the query box gets the full width.
-//! Run mirrors ⌘⏎ in the editor — both call the parent's submit
-//! callback.
+//! The stack order is date range, Run, then the Save / Share / Format
+//! tool row. There is no header band: the editor frame is its own label,
+//! so the query box gets the full width. Run mirrors ⌘⏎ in the editor —
+//! both call the parent's submit callback.
 
 use leptos::prelude::*;
 use leptos::web_sys;
@@ -23,7 +22,7 @@ use fleet_ui::{
 
 #[component]
 pub fn EditorWrap(
-    /// Editor buffer — bound to the DslEditor's textarea.
+    /// Editor buffer — bound to the `DslEditor` document.
     query: RwSignal<String>,
     /// Triggered on ⌘⏎ from the editor and on Run button click.
     #[prop(into)]
@@ -33,7 +32,7 @@ pub fn EditorWrap(
     /// URL navigation.
     #[prop(into)]
     range: Signal<RangeSpec>,
-    /// Called with the new range spec on quick-pill click or popover Apply.
+    /// Called with the new range spec on a preset pick or popover Apply.
     on_range_change: Callback<RangeSpec>,
     /// True while a query is in flight; flips Run → Hauling…
     #[prop(into)]
@@ -121,9 +120,9 @@ pub fn EditorWrap(
 }
 
 /// Date-range picker: a single trigger button (grafana-style) opening
-/// the popover with Relative / Absolute / Real-time tabs. The popover's
-/// preset grid is the one and only quick-range surface — the old
-/// always-visible pill strip was retired in the picker redesign.
+/// the popover with Relative / Absolute / Real-time tabs. Its preset
+/// grid is the only quick-range control; nothing else on the page picks
+/// a range.
 #[component]
 fn DateRange(
     #[prop(into)] value: Signal<RangeSpec>,
@@ -201,8 +200,8 @@ fn DateRangePopover(
             on:click=move |_| close()
         />
         <div class="dr-pop" on:click=|e: web_sys::MouseEvent| e.stop_propagation()>
-            // Popover shell stays app-side; the tab strip composes the
-            // fleet Segmented (issue #31) with a two-line id ↔ enum map.
+            // The popover shell stays app-side; only the tab strip comes
+            // from fleet-ui, joined to `Tab` by the id ↔ enum map below.
             <Segmented
                 size=Size::Sm
                 full=true

@@ -5,11 +5,12 @@
 //! `<Histogram/>` — 78px strip rendering a stacked ok/err bar chart
 //! over the current page's results.
 //!
-//! Time bucketing leans on `crate::histogram::bucketize`. Timestamps
-//! come from any `_time` / `time` / `timestamp` column when present;
-//! "is error" is `_severity >= 17` (the OTel ERROR band) when the
-//! derived column is present (ADR-0013 §9).
-//! Anything missing → render the "no histogram on this page" hint.
+//! Time bucketing leans on `crate::histogram::bucketize`. Timestamps come
+//! from a `_time` / `time` / `timestamp` / `@timestamp` column; with none
+//! of them there is nothing to bucket, and the strip renders the "No time
+//! series for this query" hint instead. "is error" is `_severity >= 17`
+//! (the OTel error band and above, ADR-0013 §9); a page carrying no
+//! `_severity` column draws every bar as ok.
 //!
 //! Y/X axis labels are rendered alongside the bars (`0` / `max/2` /
 //! `max` on the left; time anchors on the bottom derived from the
@@ -37,8 +38,8 @@ pub fn Histogram(
         <div class="histo">
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
-                // Deliberate quiet-error override (issue #31 C4): the
-                // results table already surfaces the query failure.
+                // Deliberate quiet-error override: the results table
+                // already reports the query failure.
                 error=Box::new(|_| view! { <div class="histo-hint">"—"</div> }.into_any())
                 render=Box::new(move |resp: QueryResponse| {
                     let buckets = build_buckets(&resp);
@@ -95,8 +96,8 @@ fn build_buckets(resp: &QueryResponse) -> Vec<Bucket> {
             "_time" | "time" | "timestamp" | "@timestamp"
         )
     });
-    // `_severity` ONLY (ADR-0013 §9): the derived slot nothing can
-    // shadow, and the `severity_text` fallback died with the column.
+    // `_severity` only (ADR-0013 §9): the derived slot nothing can
+    // shadow. A bare `severity` column is ordinary sender data.
     let severity_idx = crate::severity_cell::severity_column(cols.iter().map(|c| c.name.as_str()));
     let Some(ti) = time_idx else {
         return Vec::new();
@@ -137,9 +138,9 @@ fn pct(n: u32, max: u32) -> f64 {
     (f64::from(n) / f64::from(max)) * 100.0
 }
 
-/// Three x-axis labels derived from the current range: left ("-Xm"),
-/// middle (halfway), right ("now"). For absolute ranges, the bounds
-/// are rendered compactly.
+/// The three x-axis labels: the window's start on the left (`-Xm`, or the
+/// compact absolute stamp), the midpoint bucket's index in the middle,
+/// and `now` (or the compact end stamp) on the right.
 fn x_axis_labels(range: &RangeSpec, buckets: usize) -> (String, String, String) {
     match range {
         RangeSpec::Quick(q) => {

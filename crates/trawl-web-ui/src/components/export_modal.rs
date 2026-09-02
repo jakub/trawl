@@ -4,10 +4,10 @@
 
 //! `<ExportModal/>` — download query results as CSV, JSON, or Parquet.
 //!
-//! Built on `fleet_ui::Modal` (issue #28): the shell owns the scrim,
-//! Escape, Cmd/Ctrl+Enter submit, and the header (Download icon chip +
-//! close); this component owns the format picker, the download flow,
-//! and the footer hint/buttons.
+//! Built on `fleet_ui::Modal`: the shell owns the scrim, Escape,
+//! Cmd/Ctrl+Enter submit, and the header (Download icon chip + close);
+//! this component owns the format picker, the download flow, and the
+//! footer hint/buttons.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -105,8 +105,8 @@ pub fn ExportModal(
     }
 }
 
-/// Two-line id ↔ enum adapters (the fleet_ui::Segmented contract keeps
-/// typed option enums app-side, same as Tabs).
+/// Id ↔ enum adapters: `fleet_ui::Segmented` speaks string ids, so the
+/// typed option enum stays app-side.
 fn format_id(fmt: &ExportFormat) -> &'static str {
     match fmt {
         ExportFormat::Csv => "csv",

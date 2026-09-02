@@ -4,11 +4,10 @@
 
 //! `<ResultsTable/>` — paginated snapshot results table.
 //!
-//! Restyled for the v0.14 design: sans-serif column headers (matching
-//! the meta/filter strip) with a sort affordance, expandable rows that reveal a
-//! `_time` / field tag detail panel with Copy _raw / Show context /
-//! Find similar action buttons. Detail-row tag clicks add filters
-//! through a parent-supplied callback.
+//! Sans-serif column headers with a sort affordance, expandable rows that
+//! reveal a `_time` / field tag detail panel with Copy _raw / Show context /
+//! Find similar action buttons. Detail-row tag clicks add filters through a
+//! parent-supplied callback.
 
 use crate::api::{ApiError, PAGE_SIZE};
 use crate::context_query::{build_context_query, escape_dq, find_col};
@@ -84,11 +83,9 @@ fn ResultsTableBody(
         .into_any();
     }
 
-    // Severity-keyed cell rendering (ADR-0013 §9): the derived slot
-    // nothing can shadow, plus the columns the response DECLARED
-    // (`sev()` output, ADR-0013 slice 2). A bare `severity` column is
-    // ordinary sender data now, and the `severity_text` fallback died
-    // with the column.
+    // Cells render as severity tokens for `_severity` plus the columns the
+    // response declares (`sev()` output). A bare `severity` column is ordinary
+    // sender data, so it renders like any other field.
     let severity_cols =
         severity_columns(columns.iter().map(String::as_str), &resp.severity_columns);
     let expanded = RwSignal::new(None::<usize>);
@@ -263,9 +260,8 @@ fn RowFragment(
         .enumerate()
         .map(|(ci, v)| {
             if severity_cols.contains(&ci) {
-                // Results DISPLAY the token, never the number (ADR-0013
-                // §6). The wire keeps the number: json/csv/SSE carry it
-                // for arithmetic consumers, and rendering is presentation.
+                // Display shows the token; the wire (json/csv/SSE) keeps
+                // the number for arithmetic consumers.
                 let s = severity_display(v);
                 let cls = severity_class(v);
                 view! { <td><span class=cls>{s}</span></td> }.into_any()
@@ -347,9 +343,8 @@ fn RowFragment(
 
 #[component]
 fn CopyRawButton(row: Vec<Value>, columns: Vec<String>) -> impl IntoView {
-    // fleet-ui's <CopyButton> owns the clipboard write + toast wiring;
-    // the derived signal keeps raw_or_synthesized lazy (evaluated at
-    // click time, like the hand-rolled version).
+    // The derived signal keeps `raw_or_synthesized` lazy: it runs at click
+    // time, not on every render.
     let text = Signal::derive(move || raw_or_synthesized(&row, &columns));
     view! {
         <CopyButton text=text success_detail="Raw event copied to clipboard.">

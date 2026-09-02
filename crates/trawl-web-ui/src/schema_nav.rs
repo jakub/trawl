@@ -6,22 +6,23 @@
 //! functions so the parts that are easy to get subtly wrong are testable
 //! natively, off the browser.
 //!
-//! Two of the three exist because a query parameter is attacker-reachable
-//! text:
+//! Two of them exist because the text they handle is attacker-chosen (a
+//! query parameter, or a field name straight out of client JSON):
 //!
-//! - [`sanitize_tab`] parses `?stab=` through a CLOSED vocabulary at READ
+//! - [`sanitize_tab`] parses `?stab=` through a closed vocabulary at read
 //!   time and hands back a `&'static str` from that table. The page
 //!   re-concatenates the active tab into the field drill-in URL, so a raw
-//!   `stab=fields%26field%3Dx` would smuggle a SECOND `field=` parameter
+//!   `stab=fields%26field%3Dx` would smuggle a second `field=` parameter
 //!   into it — and `ParamsMap::get` takes the last. Nothing but a
 //!   canonical spelling can ever be re-emitted.
 //! - [`degraded_badge_id`] builds a focus target's element id from a row
-//!   INDEX, never from the field name: names are client-chosen text and
+//!   index, never from the field name: names are client-chosen text and
 //!   an id built from one would be interpolated straight into a DOM
 //!   lookup.
 //!
-//! The third, [`back_nav`], is the history-shape decision: the case file's
-//! back affordance may only POP an entry this app itself pushed.
+//! [`back_nav`] and [`back_nav_stack`] are the history-shape decision:
+//! the case file's back affordance may only pop an entry this app itself
+//! pushed.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -35,7 +36,7 @@ pub const DEFAULT_SCHEMA_TAB: &str = SCHEMA_TABS[0];
 
 /// Resolve a raw `?stab=` value to one of [`SCHEMA_TABS`].
 ///
-/// Matching is ASCII-case-insensitive and the CANONICAL spelling is what
+/// Matching is ASCII-case-insensitive and the canonical spelling is what
 /// comes back, so a `?stab=Fields` deep link still lands on the fields
 /// tab while the value the page re-emits stays inside the vocabulary.
 /// Anything else — empty, unknown, or a smuggled `&field=…` — is the
@@ -55,13 +56,13 @@ pub fn sanitize_tab(raw: Option<&str>) -> &'static str {
 /// entry it is standing on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackNav {
-    /// This app pushed the entry, so going back POPS it: the entry count
+    /// This app pushed the entry, so going back pops it: the entry count
     /// is where it was before the drill-in, and one browser Back leaves
     /// the schema page rather than landing on a duplicate of it.
     Pop,
     /// We did not push it — a `?field=` deep link, or a forward
     /// navigation onto an entry from an earlier session of the page — so
-    /// there is nothing of ours to pop and the entry is REPLACED with the
+    /// there is nothing of ours to pop and the entry is replaced with the
     /// return URL instead.
     Replace,
 }
@@ -82,15 +83,15 @@ pub fn back_nav(shown_field: &str, pushed_field: Option<&str>) -> BackNav {
     }
 }
 
-/// Apply [`back_nav`]'s decision to the page's push STACK, consuming the
+/// Apply [`back_nav`]'s decision to the page's push stack, consuming the
 /// entry it pops.
 ///
 /// A stack rather than one slot because drill-in is not one level deep:
-/// the case file's "a repin is running on X" line opens ANOTHER case
+/// the case file's "a repin is running on X" line opens another case
 /// file, so A → B → A is reachable, and a single slot would have the
 /// third push overwrite the first — leaving one of the two backs to
-/// REPLACE an entry it had actually pushed, which is the duplicate-entry
-/// bug `back_nav` exists to prevent.
+/// replace an entry it had actually pushed, which is the duplicate entry
+/// `back_nav` exists to prevent.
 ///
 /// Known residual: a user-initiated browser Back or Forward moves the
 /// history cursor without telling this page, which desyncs the stack.
@@ -133,17 +134,16 @@ mod tests {
         assert_eq!(sanitize_tab(Some("")), DEFAULT_SCHEMA_TAB);
         assert_eq!(sanitize_tab(Some("   ")), DEFAULT_SCHEMA_TAB);
         assert_eq!(sanitize_tab(Some("settings")), DEFAULT_SCHEMA_TAB);
-        // Case is forgiven on the way IN, canonicalised on the way OUT.
+        // Case is forgiven on the way in, canonicalised on the way out.
         assert_eq!(sanitize_tab(Some("Fields")), "fields");
         assert_eq!(sanitize_tab(Some("TAIL")), "tail");
     }
 
     #[test]
     fn stab_cannot_smuggle_a_second_parameter() {
-        // The finding: the drill-in URL is built as
-        // `?field=<f>&svc=<s>&stab=<tab>`, so a `stab` carrying its own
-        // separators would append a second `field=` — and the last one
-        // wins in `ParamsMap::get`.
+        // The drill-in URL is built as `?field=<f>&svc=<s>&stab=<tab>`,
+        // so a `stab` carrying its own separators would append a second
+        // `field=` — and the last one wins in `ParamsMap::get`.
         for hostile in [
             "fields&field=attacker",
             "fields%26field%3Dattacker",

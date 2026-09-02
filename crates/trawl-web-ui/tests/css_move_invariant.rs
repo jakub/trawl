@@ -2,21 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Native contract test for the "move, not copy" invariant of the
-//! issue #28 CSS split (issue #27 AC4). The chrome that moved into
-//! fleet-ui must live in `fleet-ui.css` ONLY — `main.css` may keep
-//! more-specific app overrides (`.dr-pop .tabs`, `.login-card .error`)
-//! but must not re-declare the base rules or collide on custom
-//! properties. `css_chrome_parity.rs` (in fleet-ui) already guards the
-//! fleet-SIDE presence of the moved rules; this guards the app-SIDE
-//! absence, which fleet-ui cannot see without reaching into its own
-//! consumer.
+//! Native contract test for the "move, not copy" split between the two
+//! stylesheets. The chrome that fleet-ui components render lives in
+//! `fleet-ui.css` alone: `main.css` may keep more-specific app overrides
+//! (`.tabs .action`, `.svc-cell .status-dot`) but must not re-declare a
+//! base rule or collide on a custom property. `css_chrome_parity.rs`
+//! (in fleet-ui) guards the fleet-side presence of those rules; this
+//! guards the app-side absence, which fleet-ui cannot see without
+//! reaching into its own consumer.
 //!
-//! This replaces the orphaned `scripts/css-crossgrep.sh` heuristic with
-//! a single source of truth that runs under `cargo nextest` on every
-//! push. `main.css` is read locally; `fleet-ui.css` is read across the
+//! `main.css` is read locally; `fleet-ui.css` is read across the
 //! sibling-crate boundary exactly as `index.html`'s trunk `<link>`
-//! already references it (`../fleet-ui/styles/fleet-ui.css`).
+//! references it (`../fleet-ui/styles/fleet-ui.css`).
 
 use std::collections::BTreeSet;
 
@@ -25,19 +22,18 @@ const FLEET_CSS: &str = include_str!("../../fleet-ui/styles/fleet-ui.css");
 
 /// Top-level selector strings declared in a stylesheet.
 ///
-/// Mirrors the `css-crossgrep.sh` heuristic: a rule-opening line begins
-/// at column 0 with a selector char and contains its `{` on the same
-/// line; the prefix before that `{` is the selector group, split on `,`
-/// into individual selectors. Continuation lines of a multi-line
-/// selector group don't open a brace at column 0 and are skipped —
-/// good enough for the flat style both files use.
+/// A rule-opening line begins at column 0 with a selector char and
+/// contains its `{` on the same line; the prefix before that `{` is the
+/// selector group, split on `,` into individual selectors. Continuation
+/// lines of a multi-line selector group don't open a brace at column 0
+/// and are skipped, which is good enough for the flat style both files
+/// use.
 fn top_level_selectors(css: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for line in css.lines() {
         let Some(first) = line.chars().next() else {
             continue;
         };
-        // Rule-opening lines start flush-left with a selector char.
         if !(first.is_ascii_alphabetic() || matches!(first, '.' | '#' | ':' | '*' | '[')) {
             continue;
         }
@@ -75,11 +71,10 @@ fn custom_properties(css: &str) -> BTreeSet<String> {
     out
 }
 
-/// The class families fleet-ui components render, which moved out of
-/// `main.css`; here we assert their app-side absence. The fleet-side
-/// presence guards live in two places: the issue #28 chrome rows are
-/// covered by `css_chrome_parity.rs`, and the issue #31 small-widget
-/// rows by `fleet-ui/tests/component_class_contract.rs`'s `emits(...)`
+/// The class families fleet-ui components render; this asserts their
+/// app-side absence. The fleet-side presence guards live in two places:
+/// the chrome rows in `css_chrome_parity.rs`, the small-widget rows in
+/// `fleet-ui/tests/component_class_contract.rs`'s `emits(...)`
 /// assertions.
 const MOVED_SELECTORS: &[&str] = &[
     ".btn-sm",
@@ -104,9 +99,7 @@ const MOVED_SELECTORS: &[&str] = &[
     ".sd-tabs .sp",
     ".sd-tabs .meta",
     ".sd-body",
-    // Issue #31 small-widget sweep — moved verbatim (or lightly
-    // generalized) into fleet-ui.css as each widget's consumers
-    // switched to the fleet component.
+    // Small widgets.
     ".sc-spark",
     ".status-dot",
     ".status-dot.success",
@@ -134,21 +127,20 @@ const MOVED_SELECTORS: &[&str] = &[
     ".actions-menu .item.danger:hover",
 ];
 
-/// Selector families the issue #31 unification RETIRED outright: their
-/// markup now renders a fleet-ui component with a DIFFERENT canonical
-/// class (`.bdg`, `.seg`, `.results-footer`, `.status-dot`,
-/// `.load-hint`), or was dead (`.live-badge`). Unlike
-/// [`MOVED_SELECTORS`] these must not exist in EITHER stylesheet —
-/// reappearing anywhere means per-site drift is growing back.
+/// Retired selector families: the markup renders a fleet-ui component
+/// under a different canonical class (`.bdg`, `.seg`,
+/// `.results-footer`, `.status-dot`, `.load-hint`), or nothing renders
+/// them at all (`.live-badge`). Unlike [`MOVED_SELECTORS`] these must
+/// not exist in either stylesheet; reappearing anywhere means per-site
+/// drift is growing back.
 const RETIRED_SELECTORS: &[&str] = &[
     ".live-badge",
     ".live-badge.live",
     ".live-badge.lagged",
     ".sd-dot",
     ".sd-dot.errors",
-    // No timeout tone survived unification: `run_status_tone` folds
-    // timeout into `StatusTone::Error`, so `.status-dot.timeout` renders
-    // nothing and must not creep back into either stylesheet.
+    // `run_status_tone` folds timeout into `StatusTone::Error`, so
+    // there is no `.status-dot.timeout` markup to style.
     ".status-dot.timeout",
     ".run .kbd-inline",
     ".results-loading",
@@ -240,9 +232,8 @@ fn app_control_fills_read_the_fill_token() {
     // fleet-ui's dark `--line` is a 10%-alpha white overlay and
     // `color-mix(<colour>, transparent)` multiplies alphas, so an app-side
     // fill written as `color-mix(in oklab, var(--line) N%, transparent)`
-    // renders at .10 x N in dark mode — the DSL editor and the range
-    // trigger shipped at ~2% that way. App fills read fleet-ui's per-theme
-    // `--fill` / `--fill-2` tokens instead.
+    // renders at .10 x N in dark mode (a 20% fill lands at 2%). App fills
+    // read fleet-ui's per-theme `--fill` / `--fill-2` tokens instead.
     assert!(
         APP_CSS.contains("var(--fill)"),
         "expected the app control fills to read fleet-ui's --fill token"

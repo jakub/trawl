@@ -2,12 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Native route contract for the removed cross-app surface.
+//! Native route contract: the `/intel` root has no registered route and
+//! unmatched routes render the app's 404 component.
 //!
-//! The Leptos router only compiles on wasm32. This source-level contract
-//! follows the existing native UI contract-test pattern: it proves the
-//! retired root has no registered route and that unmatched routes render
-//! the application's 404 component.
+//! The Leptos router only compiles on wasm32, so this reads `app.rs` as
+//! source text, following the native UI contract-test pattern.
 
 const APP: &str = include_str!("../src/app.rs");
 

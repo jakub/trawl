@@ -262,7 +262,6 @@ pub fn NetsPage() -> impl IntoView {
                                                 Some(run) => {
                                                     let when = time_ago(&run.started_at, now);
                                                     let tone = crate::components::run_status_tone(&run.status);
-                                                    // Compute next run countdown
                                                     let next_run_label = if sched.enabled {
                                                         let started_ms = js_sys::Date::parse(&run.started_at) as i64;
                                                         let next_ms = started_ms + (sched.interval_secs as i64 * 1000);
@@ -312,7 +311,7 @@ pub fn NetsPage() -> impl IntoView {
                                             <div style="flex:0 0 40px">
                                                 // fleet_ui::ActionsMenu owns the ⋯ trigger, the
                                                 // open state, and Escape/outside-click dismissal
-                                                // via the overlay stack (issue #31 C5).
+                                                // via the overlay stack.
                                                 <ActionsMenu items=vec![
                                                     ActionItem::new("▶ Open in search", {
                                                         let q = query_for_run.clone();
@@ -364,8 +363,8 @@ pub fn NetsPage() -> impl IntoView {
             }}
 
             // Delete confirmation modal — open/close plumbing via the
-            // natively-tested fleet_ui::ConfirmState (issue #31); the
-            // ConfirmModal composition stays app-side (ADR-0002).
+            // natively-tested fleet_ui::ConfirmState; the ConfirmModal
+            // composition stays app-side (ADR-0002).
             <Show when=move || confirm_delete.get().is_open()>
                 {move || {
                     let Some((_, del_name)) = confirm_delete.get().pending().cloned() else {

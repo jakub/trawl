@@ -17,14 +17,13 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 /// Map a saved-query run status string (trawl-api vocabulary) onto the
-/// fleet-ui status-dot tone. App-side on purpose (ADR-0002): the
-/// status vocabulary is trawl's, only the dot is generic.
+/// fleet-ui status-dot tone. App-side because the status vocabulary is
+/// trawl's; only the dot is generic.
 pub(crate) fn run_status_tone(status: &str) -> fleet_ui::StatusTone {
     match status {
         "success" => fleet_ui::StatusTone::Success,
-        // `timeout` is a failed execution, not a soft warning — it shares the
-        // red `Error` tone, exactly as the pre-unification `"error" | "timeout"`
-        // match arms rendered it. Do not split it onto its own yellow tone.
+        // `timeout` is a failed execution, not a soft warning, so it shares
+        // the red `Error` tone. Do not split it onto its own yellow tone.
         "error" | "timeout" => fleet_ui::StatusTone::Error,
         "running" => fleet_ui::StatusTone::Running,
         _ => fleet_ui::StatusTone::Neutral,
@@ -40,8 +39,8 @@ mod tests {
         assert_eq!(run_status_tone("success"), fleet_ui::StatusTone::Success);
         assert_eq!(run_status_tone("error"), fleet_ui::StatusTone::Error);
         // Load-bearing: `timeout` is a failed execution and must share the
-        // red `Error` tone, NOT split onto a soft-warning tone. A future
-        // edit moving it elsewhere has to turn this assertion red.
+        // red `Error` tone rather than a soft-warning one. A future edit
+        // moving it elsewhere has to turn this assertion red.
         assert_eq!(run_status_tone("timeout"), fleet_ui::StatusTone::Error);
         assert_eq!(run_status_tone("running"), fleet_ui::StatusTone::Running);
     }

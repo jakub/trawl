@@ -5,18 +5,13 @@
 //! `<SaveAsNetModal/>` — confirm-save dialog for turning a DSL query
 //! into a named saved query ("net").
 //!
-//! Single-field modal for now: just the display name. The mockup
-//! (`web_ui_mockups/app/pages-schema-history.jsx:67-192`) sketches a
-//! richer form with description / folder / tags / pin-to-sidebar /
-//! schedule-after-save, but the backend's `CreateSavedRequest` only
-//! carries `{ name, query }` — wiring the extra fields would mean
-//! growing the API first. Skeleton is structured so those fields can
-//! drop in next to the name `<Field>` when that work lands.
+//! One field, the display name, because the backend's
+//! `CreateSavedRequest` carries only `{ name, query }`; description,
+//! folder or tags would mean growing the API first.
 //!
-//! Built on `fleet_ui::Modal` (issue #28): the shell owns the scrim,
-//! Escape, and Cmd/Ctrl+Enter save; this component owns the name field
-//! (autofocused + pre-selected on mount, default derived from the
-//! query) and the footer hint/buttons.
+//! `fleet_ui::Modal` owns the scrim, Escape, and Cmd/Ctrl+Enter save;
+//! this component owns the name field (autofocused and pre-selected on
+//! mount, default derived from the query) and the footer hint/buttons.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -31,7 +26,7 @@ use fleet_ui::{Btn, Field, Icon, Kbd, Modal, ToastBus, ToastKind, Variant};
 pub fn SaveAsNetModal(
     /// The DSL query to save. Shown read-only in the preview strip.
     query: String,
-    /// Called after a successful save OR cancel — parent should clear
+    /// Called after a successful save or cancel — parent should clear
     /// whatever made the modal open. The bool is `true` on save, `false`
     /// on cancel; the parent can use that to decide whether to also
     /// clear the row selection, etc.

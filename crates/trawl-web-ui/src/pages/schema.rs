@@ -14,11 +14,10 @@
 //!   [`schema_nav::sanitize_tab`](crate::schema_nav::sanitize_tab): the
 //!   value is re-concatenated into the drill-in URL below, so only a
 //!   spelling from the closed vocabulary is ever carried forward.
-//! - `field=<name>` — opens the field case file (ADR-0011 slice C2),
-//!   which takes precedence over `svc=` and mounts independently of the
-//!   services snapshot, so `/search/schema?field=<name>` is a working
-//!   deep link. `svc=` is carried alongside as the back-arrow's return
-//!   context.
+//! - `field=<name>` — opens the field case file, which takes precedence
+//!   over `svc=` and mounts independently of the services snapshot, so
+//!   `/search/schema?field=<name>` is a working deep link. `svc=` is
+//!   carried alongside as the back-arrow's return context.
 //!
 //! Exactly one drawer is mounted at a time: `fleet_ui::Drawer` arbitrates
 //! Escape on the assumption of a single drawer layer, so the page swaps
@@ -102,13 +101,13 @@ pub fn SchemaPage() -> impl IntoView {
     // from a hand-edited URL, and an empty name resolves to nothing.
     let svc_selected = Memo::new(move |_| qm.get().get("svc").filter(|s| !s.is_empty()));
     let field_selected = Memo::new(move |_| qm.get().get("field").filter(|s| !s.is_empty()));
-    // Closed vocabulary at READ time: the resolved tab is re-emitted into
+    // Closed vocabulary at read time: the resolved tab is re-emitted into
     // the drill-in URL, so a raw `?stab=` could otherwise append a second
     // `field=` parameter to it (see `schema_nav::sanitize_tab`).
     let tab_param = Memo::new(move |_| sanitize_tab(qm.get().get("stab").as_deref()));
     let tab_sig: Signal<String> = Signal::derive(move || tab_param.get().to_string());
 
-    // Whether to OFFER the repin trigger on a degraded field's case
+    // Whether to offer the repin trigger on a degraded field's case
     // file. Affordance only — the server gates `POST /schema/repin` on
     // `schema_write` and is the sole enforcement — and read-only until
     // `/me` resolves, so a slow identity fetch never flashes a button
@@ -129,13 +128,13 @@ pub fn SchemaPage() -> impl IntoView {
     let nav = use_navigate();
     let goto_search = navigator();
 
-    // The field history entries THIS page pushed, innermost last. The
+    // The field history entries this page pushed, innermost last. The
     // case file's back affordance consults the top: popping an entry we
     // did not push would be someone else's history, and replacing one we
-    // DID push is what grew the stack by a duplicate service entry per
-    // drill/back cycle. A STACK rather than one slot because a case file
-    // links to another case file (the "a repin is running on X" line), so
-    // A → B → A would have the third push overwrite the first — see
+    // did push leaves a duplicate service entry per drill/back cycle. A
+    // stack rather than one slot because a case file links to another
+    // case file (the "a repin is running on X" line), so A → B → A would
+    // have the third push overwrite the first. See
     // `schema_nav::back_nav_stack` for the residual a browser-initiated
     // Back leaves.
     let pushed_fields = RwSignal::new(Vec::<String>::new());
@@ -172,7 +171,7 @@ pub fn SchemaPage() -> impl IntoView {
             .map(|svc| format!("svc={}&stab={}", enc(&svc), tab_param.get_untracked()))
     };
 
-    // Drilling into a field case file PUSHES, so browser-back leaves the
+    // Drilling into a field case file pushes, so browser-back leaves the
     // case file for wherever the operator came from.
     let push_field = {
         let nav = nav.clone();
@@ -189,7 +188,7 @@ pub fn SchemaPage() -> impl IntoView {
     };
 
     // Leaving the case file by its back arrow. Origin-aware, because the
-    // two cases are different history shapes: an entry we PUSHED is popped
+    // two cases are different history shapes: an entry we pushed is popped
     // (replacing it would leave the return URL twice over, so one browser
     // Back per drill/back cycle would go nowhere), while a deep link's
     // entry is not ours to pop and is replaced with the return context.
@@ -197,7 +196,7 @@ pub fn SchemaPage() -> impl IntoView {
         let nav = nav.clone();
         move || {
             let shown = field_selected.get_untracked();
-            // The decision CONSUMES the entry it pops, so the next back
+            // The decision consumes the entry it pops, so the next back
             // decides against the one below it rather than against a
             // name three drill-ins old.
             let decision = shown.as_deref().map_or(BackNav::Replace, |f| {
@@ -256,7 +255,7 @@ pub fn SchemaPage() -> impl IntoView {
             push(None, DEFAULT_SCHEMA_TAB);
         })
     };
-    // Closing the CASE FILE outright (its X, the scrim, or Escape with no
+    // Closing the case file outright (its X, the scrim, or Escape with no
     // service to go back to) clears every param, so nothing the drawer was
     // opened from is left mounted for the shell's own opener-restore to
     // find. Focus lands on the page heading rather than the document.
@@ -500,7 +499,7 @@ pub fn SchemaPage() -> impl IntoView {
                         />
                     }.into_any();
                 }
-                // Service drawer mounts only when `?svc=X` is set AND the
+                // Service drawer mounts only when `?svc=X` is set and the
                 // name resolves to a service in the current snapshot. If
                 // the user lands on a dead `?svc=foo`, we silently ignore
                 // it rather than popping an error modal.

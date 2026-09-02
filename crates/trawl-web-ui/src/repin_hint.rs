@@ -5,8 +5,8 @@
 //! The repin surface's pure logic: the CLI command the degraded case
 //! file offers, and the job-status vocabulary the SPA reads back.
 //!
-//! Both are MIRRORS of server-side authorities, deliberately not
-//! imports — the same arrangement `WELL_KNOWN_LOG_FIELDS` has:
+//! Both mirror a server-side authority rather than importing it — the
+//! same arrangement `WELL_KNOWN_LOG_FIELDS` has:
 //!
 //! - [`repin_command_hint`] mirrors `trawl-cli/src/schema.rs`'s
 //!   `render_verdict` remedy line, down to the refusal rule, so the two
@@ -21,12 +21,9 @@
 
 use trawl_core::sanitize::sanitize_display_text;
 
-/// The one non-terminal status (synthesis ruling R5). Every other
-/// spelling — including a status a future server adds — is terminal, so
-/// an unknown value stops polling and renders verbatim rather than
-/// spinning forever.
-// The status half of this module is consumed by the repin progress
-// surface (ADR-0011 C2 M3); M2 ships the mirror and its test.
+/// The one non-terminal status. Every other spelling — including a
+/// status a future server adds — is terminal, so an unknown value stops
+/// polling and renders verbatim rather than spinning forever.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const STATUS_RUNNING: &str = "running";
 
@@ -41,12 +38,12 @@ pub const REPIN_HINT_REFUSED: &str = "This field's name cannot be safely embedde
 /// `None` when the field's name cannot be carried by a command line.
 ///
 /// A field name is a client-chosen JSON key that ingest polices for
-/// length and case ONLY, so a name carrying a shell command or a bidi
+/// length and case only, so a name carrying a shell command or a bidi
 /// override is legal — and this line is written to be pasted into a
 /// shell. Two names get no command, matching the CLI exactly:
 ///
 /// - one that does not survive display sanitisation, because the
-///   sanitised spelling is a DIFFERENT string and would repin something
+///   sanitised spelling is a different string and would repin something
 ///   else (or nothing);
 /// - one starting with `-`, which the argument parser reads as a flag
 ///   however it is quoted.
@@ -80,7 +77,7 @@ pub fn repin_is_terminal(status: &str) -> bool {
 /// One hint string split into display segments: `(is_code, text)`, where
 /// a backtick-delimited run is code and the ticks themselves are gone.
 ///
-/// The hints above are written to be readable in a TERMINAL, where a
+/// The hints above are written to be readable in a terminal, where a
 /// backtick is the only markup there is. A browser must not paint the
 /// ticks, so the view renders each code run as `<span class="mono">` and
 /// the shared string stays CLI-compatible. An unterminated run is plain

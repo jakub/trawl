@@ -4,9 +4,9 @@
 
 //! Typed helpers for calling the trawl-web proxy from the browser.
 //!
-//! All calls are same-origin (`/me`, `/login`, `/logout`, `/api/v1/...`)
-//! and rely on the httpOnly session cookie being attached automatically
-//! by the browser. Never touches `Authorization` — that's the proxy's job.
+//! All calls are same-origin (`/api/auth/...`, `/api/v1/...`) and rely on
+//! the httpOnly session cookie being attached automatically by the
+//! browser. Never touches `Authorization` — that's the proxy's job.
 
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
@@ -83,7 +83,7 @@ pub struct LoginRequest<'a> {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)] // fields consumed by later commits (search page, admin gating)
+#[allow(dead_code)] // the shell reads identity from `/api/auth/me`, not the login answer
 pub struct LoginResponse {
     pub name: String,
     /// Names of every role the key holds (display only).
@@ -93,7 +93,7 @@ pub struct LoginResponse {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)] // `exp` is for client-side expiry countdowns in a later commit
+#[allow(dead_code)] // `exp` is decoded off the wire; nothing renders an expiry countdown
 pub struct MeResponse {
     pub name: String,
     /// Names of every role the key holds (display only).
@@ -103,8 +103,8 @@ pub struct MeResponse {
     pub exp: i64,
 }
 
-/// POST /login with the given API key. Returns identity on success,
-/// [`ApiError::Unauthorized`] on bad key.
+/// POST `/api/auth/login` with the given API key. Returns identity on
+/// success, [`ApiError::Unauthorized`] on bad key.
 pub async fn login(api_key: &str) -> Result<LoginResponse, ApiError> {
     let body = LoginRequest { api_key };
     let resp = Request::post("/api/auth/login")
@@ -123,7 +123,7 @@ pub async fn login(api_key: &str) -> Result<LoginResponse, ApiError> {
     }
 }
 
-/// GET /me — read current session identity.
+/// GET `/api/auth/me` — read current session identity.
 pub async fn me() -> Result<MeResponse, ApiError> {
     let resp = Request::get("/api/auth/me").send().await?;
     match resp.status() {
@@ -136,7 +136,7 @@ pub async fn me() -> Result<MeResponse, ApiError> {
     }
 }
 
-/// POST /logout — clears the session cookie.
+/// POST `/api/auth/logout` — clears the session cookie.
 pub async fn logout() -> Result<(), ApiError> {
     let resp = Request::post("/api/auth/logout").send().await?;
     match resp.status() {
@@ -208,7 +208,7 @@ pub async fn schema_services() -> Result<ServiceSchemaResponse, ApiError> {
     }
 }
 
-/// GET `/api/v1/schema/field?name=` — one field's pin, one PAGE of its
+/// GET `/api/v1/schema/field?name=` — one field's pin, one page of its
 /// per-service observations (page with the response's `services_cursor`
 /// as `after`), its retained conflict evidence, and the analyzer's
 /// verdict when the pin is degraded.
@@ -241,13 +241,13 @@ pub async fn catalog_field(
 }
 
 /// What `POST /api/v1/schema/repin` answered. The HTTP status carries
-/// the verdict (ADR-0011 slice B), so the call site branches on this
-/// rather than on a single body type.
+/// the verdict (ADR-0011), so the call site branches on this rather than
+/// on a single body type.
 #[derive(Debug, Clone)]
 pub enum RepinOutcome {
     /// 200 — the scan ran and stopped. The job is the plan.
     DryRun(RepinJobResponse),
-    /// 202 — the rewrite is claimed and running DETACHED. Poll
+    /// 202 — the rewrite is claimed and running detached. Poll
     /// [`repin_status`] for the rest of its life.
     Started(RepinJobResponse),
     /// 409 whose body decoded as a job — the scan projected values the
@@ -261,11 +261,11 @@ pub enum RepinOutcome {
 
 /// POST `/api/v1/schema/repin` — plan (`dry_run`) or start a repin.
 ///
-/// `SchemaWrite`-gated server-side, which is the ONLY enforcement: this
+/// `SchemaWrite`-gated server-side, which is the only enforcement: this
 /// call is issued exactly as written whatever the SPA believes about the
 /// session's permissions.
 ///
-/// The 409 is DOUBLE-SHAPED — a refusal carries the plan, a held slot
+/// The 409 is double-shaped — a refusal carries the plan, a held slot
 /// carries the error envelope — and the two are told apart by decoding
 /// the body ([`crate::repin_flow::classify_conflict`]), never by
 /// matching on error text.
@@ -276,7 +276,7 @@ pub async fn repin(
     force: bool,
 ) -> Result<RepinOutcome, ApiError> {
     let body = RepinRequest {
-        // The EXACT name, never the sanitised display copy: the catalog
+        // The exact name, never the sanitised display copy: the catalog
         // key is what the server folds and looks up.
         field: field.to_owned(),
         to: to.to_owned(),
@@ -318,7 +318,7 @@ pub async fn repin(
 /// GET `/api/v1/schema/repin/status` — the running job if any, else the
 /// newest job of any status.
 ///
-/// INSTALL-WIDE and unfiltered by design (synthesis R4: no `?id=`): the
+/// Install-wide and unfiltered by design (there is no `?id=`): the
 /// caller matches `job.id` against the id it holds and treats anything
 /// else as the slot having moved on.
 pub async fn repin_status() -> Result<RepinStatusResponse, ApiError> {

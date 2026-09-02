@@ -63,7 +63,6 @@ pub fn RunsPage() -> impl IntoView {
                 </div>
             </div>
 
-            // Stats cards
             <div class="stats-row">
                 {move || {
                     let active_nets = nets_for_stats.get()
@@ -105,7 +104,6 @@ pub fn RunsPage() -> impl IntoView {
                 }}
             </div>
 
-            // Runs table
             <div class="tbl" style="margin-top:16px">
                 <div class="tbl-hd">
                     <div style="flex:1">"Net"</div>
