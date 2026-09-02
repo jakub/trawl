@@ -110,19 +110,21 @@
 //!
 //! Which of the two it costs depends on the tree. Under `src/`,
 //! [`unit_files`] sweeps in every `.rs` file the module walk never reached,
-//! so a file the walk misses is usually SCANNED anyway, under the module
-//! prefix its PATH implies. Where that is not the prefix rustc gave the
-//! file, the derived name is one nextest never lists and the guard fails
-//! loudly. An integration target has no sweep. `tests/` is the module walk
-//! and nothing else, so a file the walk misses there is a file nobody
-//! reads.
+//! under every path that reaches it (a symlink can give one file two), so a
+//! file the walk misses is still SCANNED, under the module prefix its PATH
+//! implies. Where that is not the prefix rustc gave the file, the derived
+//! name is one nextest never lists and the guard fails loudly. An
+//! integration target has no sweep. `tests/` is the module walk and nothing
+//! else, so a file the walk misses there is a file nobody reads.
 //!
 //! * An `include!("cases.rs")` edge is invisible to the module walk, which
 //!   follows `mod` declarations and nothing else. In a `src/` tree the
 //!   sweep opens the file anyway, under the prefix its path implies rather
 //!   than the module the `include!` put it in, so the derived name fails
-//!   the guard on a test nextest never lists. In an integration target
-//!   nothing opens it at all. No crate here includes Rust source.
+//!   the guard on a test nextest never lists. Two places keep it silent:
+//!   an integration target, which has no sweep, and a file reachable only
+//!   through a directory this target excludes, `src/bin` for a library.
+//!   No crate here includes Rust source.
 //! * An identifier starting with a non-ASCII character is not lexed as a
 //!   word. On a FN that is loud rather than silent: the attribute block is
 //!   taken before the name is read, so `#[tokio::test] async fn 東京()`
@@ -694,46 +696,52 @@ fn path_prefix(source_root: &Path, file: &Path) -> String {
     prefix
 }
 
-/// Every `.rs` file under `dir`, following directory symlinks, visiting each
-/// real directory once.
+/// Every `.rs` file under `dir`, following directory symlinks, under EVERY
+/// path that reaches it.
 ///
 /// The problem a symlink causes here is a CYCLE, not the symlink itself: a
 /// link pointing at one of its own ancestors is a directory forever and the
 /// walk descends it until the OS refuses a longer path. Refusing to follow
-/// links instead would drop whatever lives behind one, and behind one is
-/// exactly where the safety net has to look. Rustc compiles
+/// links instead drops whatever lives behind one, and behind one is exactly
+/// where the safety net has to look. Rustc compiles
 /// `include!("linked/mod.rs")` through a symlinked directory, and the module
-/// walk cannot see an `include!` edge at all, so the file would be scanned by
-/// nobody.
+/// walk cannot see an `include!` edge at all, so nobody else opens that file.
 ///
-/// The cycle is broken on the CANONICAL directory, so a real directory
-/// reachable under two names is walked once and its files are collected under
-/// the name the walk arrived by.
+/// The cycle check is the ANCESTOR PATH, not a set of everything visited. A
+/// global set keeps whichever lexical path happened to reach a real directory
+/// first, and [`unit_files`] decides target ownership on the lexical path
+/// afterwards: a library excludes `src/bin`, so if `read_dir` yielded `bin`
+/// before the `src/shared -> bin/shared` link, the only recorded path was the
+/// excluded one and the file was scanned by nobody. Every acyclic alias is
+/// walked, and a file reachable two ways is collected twice, once per path.
+/// Duplicate lexical paths cost a duplicate finding at worst, which is loud;
+/// a dropped alias is a pg test nobody counted.
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
-    let mut visited = BTreeSet::new();
-    collect_rs_seen(dir, &mut visited, out);
+    let mut ancestors = Vec::new();
+    collect_rs_acyclic(dir, &mut ancestors, out);
 }
 
-fn collect_rs_seen(dir: &Path, visited: &mut BTreeSet<PathBuf>, out: &mut Vec<PathBuf>) {
+fn collect_rs_acyclic(dir: &Path, ancestors: &mut Vec<PathBuf>, out: &mut Vec<PathBuf>) {
     // A directory that cannot be canonicalized cannot be read either, so
     // stopping here loses nothing the `read_dir` below would have found.
     let Ok(real) = fs::canonicalize(dir) else {
         return;
     };
-    if !visited.insert(real) {
+    if ancestors.contains(&real) {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_rs_seen(&path, visited, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
+    ancestors.push(real);
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_acyclic(&path, ancestors, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
         }
     }
+    ancestors.pop();
 }
 
 /// Which tree the sources come from. The connection-API class applies to
@@ -2716,15 +2724,17 @@ mod tests {
         assert!(facts.test_fn_spans.is_empty(), "{:?}", facts.test_fn_spans);
     }
 
-    /// Both halves of the symlink rule at once. A link pointing at its own
-    /// ancestor is a cycle, and the walk used to descend it once per path
-    /// component the OS still allowed. A link pointing anywhere else is a
-    /// real subtree that only the safety net reaches, since `module_tree`
-    /// follows `mod` declarations and cannot see an `include!` edge, so
-    /// refusing to follow links would hide every file behind one.
+    /// Three halves of the symlink rule, and they pull against each other. A
+    /// link pointing at its own ancestor is a cycle, and the walk used to
+    /// descend it once per path component the OS still allowed. A link
+    /// pointing anywhere else is a real subtree that only the safety net
+    /// reaches, since `module_tree` follows `mod` declarations and cannot see
+    /// an `include!` edge. And two links to ONE directory are two aliases,
+    /// both of which have to come out: which lexical path a file is recorded
+    /// under is what decides, later, whether a target owns it.
     #[cfg(unix)]
     #[test]
-    fn a_symlinked_source_dir_is_walked_once_and_a_cycle_terminates() {
+    fn a_symlink_cycle_terminates_and_every_alias_is_collected() {
         let dir = scratch("symlink-walk");
         let root = &dir.0;
         let src = root.join("src");
@@ -2732,13 +2742,79 @@ mod tests {
         write(&root.join("shared").join("mod.rs"), "pub struct Shared;\n");
         std::os::unix::fs::symlink(&src, src.join("cycle")).expect("cycle link");
         std::os::unix::fs::symlink(root.join("shared"), src.join("linked")).expect("dir link");
+        std::os::unix::fs::symlink(root.join("shared"), src.join("aliased")).expect("alias link");
 
         let mut found = Vec::new();
         collect_rs(&src, &mut found);
         found.sort();
         assert_eq!(
             found,
-            vec![src.join("lib.rs"), src.join("linked").join("mod.rs")]
+            vec![
+                src.join("aliased").join("mod.rs"),
+                src.join("lib.rs"),
+                src.join("linked").join("mod.rs"),
+            ]
+        );
+    }
+
+    /// The alias rule with the ownership rule behind it, which is where a
+    /// global visited set turns into a silent pass. `src/shared` and
+    /// `src/bin/shared` are one directory, the library target excludes
+    /// `src/bin`, and `module_tree` cannot follow the `include!` that mounts
+    /// the file. Record only the `src/bin` alias, whichever `read_dir`
+    /// happens to yield first, and `unit_files` drops it as another target's
+    /// file. Nothing is scanned, and rustc still runs `cases::escapes`
+    /// against a postgres pool.
+    ///
+    /// The derived name is `shared::cases::escapes`, not the `cases::escapes`
+    /// rustc gives it: the sweep names a file by its PATH. That mismatch
+    /// fails the guard loudly, which is the documented cost of an `include!`
+    /// edge. Loud is not what this test is about. Evidence at all is.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_aliased_into_another_targets_directory_is_still_scanned() {
+        let dir = scratch("alias-ownership");
+        let root = &dir.0;
+        let src = root.join("src");
+        write(
+            &src.join("lib.rs"),
+            "#[cfg(test)]\nmod cases {\n    include!(\"shared/cases.rs\");\n}\n",
+        );
+        write(
+            &src.join("bin").join("shared").join("cases.rs"),
+            &format!(
+                "#[tokio::test]\nasync fn escapes() {{\n    let s = {}\"...\").await;\n}}\n",
+                call("KeyStore", "connect"),
+            ),
+        );
+        std::os::unix::fs::symlink(src.join("bin").join("shared"), src.join("shared"))
+            .expect("alias link");
+
+        // Both lexical paths, so the assertion does not depend on the order
+        // `read_dir` returns `bin` and `shared` in.
+        let mut found = Vec::new();
+        collect_rs(&src, &mut found);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                src.join("bin").join("shared").join("cases.rs"),
+                src.join("lib.rs"),
+                src.join("shared").join("cases.rs"),
+            ]
+        );
+
+        // The library's own view: net root `src/`, `src/bin` excluded.
+        let files = unit_files(&src.join("lib.rs"), Some(&src), Some(&src.join("bin")))
+            .expect("module tree");
+        let evidence = scan(&files, root, Scope::UnitTree);
+        assert_eq!(
+            sites(&evidence),
+            vec!["src/shared/cases.rs:3 KeyStore::connect"]
+        );
+        assert_eq!(
+            evidence[0].tests,
+            vec!["shared::cases::escapes".to_string()]
         );
     }
 }
