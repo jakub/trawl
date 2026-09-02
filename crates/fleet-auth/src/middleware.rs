@@ -5,7 +5,7 @@
 //! Axum middleware: [`require_session`] for cookie auth, [`require_bearer`]
 //! for `Authorization: Bearer flt_...` auth (ADR-0030).
 //!
-//! Both insert a [`VerifiedKey`] into request extensions on success.
+//! Both insert a [`crate::VerifiedKey`] into request extensions on success.
 //! Handlers extract it with `axum::Extension<VerifiedKey>`.
 //!
 //! Wiring pattern (callers):
@@ -105,7 +105,7 @@ impl std::fmt::Debug for SessionState {
 ///
 /// Flow: parse Cookie header → find `config.cookie_name` → decrypt → check
 /// expiry → `KeyStore::verify_key` → confirm the key resolves ≥1 permission
-/// in `config.app_namespace` → insert [`VerifiedKey`] into request
+/// in `config.app_namespace` → insert [`crate::VerifiedKey`] into request
 /// extensions → call inner.
 ///
 /// Failure mapping:
@@ -169,22 +169,22 @@ pub async fn require_session(
 /// Axum middleware: require a valid `Authorization: Bearer flt_...` header.
 ///
 /// Flow: parse Authorization header → extract bearer token →
-/// `KeyStore::verify_key` → insert [`VerifiedKey`] into request extensions
+/// `KeyStore::verify_key` → insert [`crate::VerifiedKey`] into request extensions
 /// → call inner.
 ///
-/// # Important — does NOT check the app namespace grant
+/// # Important: does not check the app namespace grant
 ///
 /// Unlike [`require_session`], this layer accepts *any* verified key
-/// regardless of which app(s) the key has grants in. This is intentional
-/// (ADR-0030: cross-app service principals must be able to call API
-/// routes), but it means **mounting this layer on a route is NOT
-/// sufficient authorisation** — every consumer MUST also gate the route
-/// with its own role guard that inspects `verified.role_for(app)` and
-/// rejects requests without a grant.
+/// regardless of which app(s) the key holds permissions in. That is
+/// intentional (ADR-0030: cross-app service principals must be able to call
+/// API routes), but it means mounting this layer on a route is not
+/// sufficient authorisation: every consumer must also gate the route on
+/// `verified.has_app_permission(app, permission)` and reject keys without
+/// it.
 ///
-/// In other words: this middleware authenticates, it does not authorise.
-/// Forgetting the role guard on a downstream route accepts any valid
-/// fleet token from any sibling app. The integration test
+/// This middleware authenticates, it does not authorise. Forgetting the
+/// permission guard on a downstream route accepts any valid fleet token from
+/// any sibling app. The integration test
 /// `bearer_does_not_enforce_namespace` locks this behaviour in.
 pub async fn require_bearer(
     State(state): State<SessionState>,
@@ -196,15 +196,12 @@ pub async fn require_bearer(
 
 /// Keystore-only auth state for [`require_bearer_only`].
 ///
-/// Unlike [`SessionState`] it carries no session key or cookie config — just
-/// the [`KeyStore`]. That is deliberate: a bearer-only service (a daemon that
-/// authenticates *only* `Authorization: Bearer flt_...` and never reads
-/// session cookies, e.g. trawld) has no cookie secret to embed, and this type
-/// makes that impossible to fake. Because `BearerState` has no session key,
-/// it *cannot* be handed to [`require_session`] — the type system forbids
-/// wiring cookie auth against a service that has no cookie material, so a
-/// future edit can't accidentally mount `require_session` on a meaningless
-/// key and have it type-check.
+/// Unlike [`SessionState`] it carries no session key or cookie config, just
+/// the [`KeyStore`]: a bearer-only service (a daemon that authenticates
+/// *only* `Authorization: Bearer flt_...` and never reads session cookies,
+/// e.g. trawld) has no cookie secret to embed. Carrying no session key also
+/// means it cannot be handed to [`require_session`], so cookie auth will not
+/// type-check against a service that has no cookie material.
 #[derive(Clone)]
 pub struct BearerState {
     store: KeyStore,
@@ -239,12 +236,12 @@ impl std::fmt::Debug for BearerState {
 /// session cookies — it lets them hold just a [`KeyStore`] rather than
 /// fabricating a throwaway session key to satisfy [`SessionState`].
 ///
-/// # Important — does NOT check the app namespace grant
+/// # Important: does not check the app namespace grant
 ///
 /// Like [`require_bearer`], this authenticates but does not authorise: it
-/// accepts *any* verified key regardless of app grants. Every consumer MUST
-/// still gate the route with its own role guard. See [`require_bearer`] for
-/// the full rationale.
+/// accepts *any* verified key regardless of app grants. Every consumer must
+/// still gate the route with its own permission guard. See
+/// [`require_bearer`] for the full rationale.
 pub async fn require_bearer_only(
     State(state): State<BearerState>,
     req: Request,
@@ -255,7 +252,7 @@ pub async fn require_bearer_only(
 
 /// Shared body for [`require_bearer`] and [`require_bearer_only`]: extract the
 /// bearer token, verify it against the [`KeyStore`], and insert the resulting
-/// [`VerifiedKey`] into request extensions before calling the inner service.
+/// [`crate::VerifiedKey`] into request extensions before calling the inner service.
 async fn verify_bearer(store: &KeyStore, mut req: Request, next: Next) -> Response {
     let Some(token) = extract_bearer(req.headers()) else {
         tracing::warn!("auth: missing or malformed bearer header");
@@ -329,9 +326,8 @@ pub(crate) fn unauthorized_json(message: &str) -> Response {
 /// 503 Service Unavailable for transient backend failures in the auth path.
 ///
 /// Distinct from 401 so operators can alarm separately on "auth backend
-/// down" vs "wrong credentials" — collapsing the two during a Postgres
-/// blip used to send on-call hunting for a brute-force attack while the
-/// DB was actually just rebooting. Paired with `tracing::error!(target:
+/// down" and "wrong credentials": collapsed into 401, a Postgres blip reads
+/// as a brute-force attack. Paired with `tracing::error!(target:
 /// "auth.backend", ...)` at the call site for filterable alerting.
 pub(crate) fn service_unavailable_json(detail: &str) -> Response {
     error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable", detail)
@@ -351,9 +347,9 @@ pub(crate) fn service_unavailable_json(detail: &str) -> Response {
 ///   call path (`verify_key` doesn't produce admin-only variants), so a
 ///   loud signal beats a silent one.
 ///
-/// `path` is a short tag ("session", "bearer", "login") that gets folded
-/// into the log line so the same KDF panic looks different depending on
-/// which surface it hit.
+/// `path` is one of "session", "bearer" or "login": it names the auth path in
+/// the log line and picks the 401 detail wording, so any other tag reads as a
+/// session failure.
 pub(crate) fn classify_verify_error(err: AuthError, path: &str) -> Response {
     match err {
         AuthError::Database(err) => {

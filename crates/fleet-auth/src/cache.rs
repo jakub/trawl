@@ -26,11 +26,11 @@
 //! ## Why `DashMap` with no eviction
 //!
 //! At fleet scale (<30 keys × maybe a few rotation revisions = bounded),
-//! the cache can't grow without bound — only **successful** verifications
-//! are inserted, so attack-spray of random tokens never grows the map. A
-//! key rotation produces a new `stored_hash` that misses naturally; the
-//! orphaned entry sits inert until process restart. If the population ever
-//! grows past low thousands, swap to a bounded LRU (e.g. moka) — but not now.
+//! the cache can't grow without bound — only successful verifications are
+//! inserted, so attack-spray of random tokens never grows the map. A key
+//! rotation produces a new `stored_hash` that misses naturally; the orphaned
+//! entry sits inert until process restart. Past a few thousand entries, swap
+//! to a bounded LRU (e.g. moka).
 
 use std::sync::Arc;
 
@@ -86,7 +86,6 @@ pub struct VerificationCache {
 }
 
 impl VerificationCache {
-    /// Construct an empty cache.
     pub fn new() -> Self {
         Self::default()
     }
@@ -134,9 +133,9 @@ mod tests {
 
     #[test]
     fn different_plaintext_produces_different_key_even_with_same_prefix_and_hash() {
-        // This is THE security regression test for the cache-key shape.
-        // Without `token_fingerprint` in the key, both lookups would hit and
-        // the second (wrong) token would skip argon2id.
+        // The security test for the cache-key shape: without
+        // `token_fingerprint` in the key, both lookups would hit and the
+        // second (wrong) token would skip argon2id.
         let cache = VerificationCache::new();
         let k_legit = key(
             "AAAAAAAA",

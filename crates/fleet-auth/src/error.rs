@@ -90,8 +90,8 @@ pub enum AuthError {
         name: String,
     },
 
-    /// The key already holds this role. Explicit error mirrors the old
-    /// grant doctrine: assignment mutations never silently no-op.
+    /// The key already holds this role. Assigning it twice is a typo, not
+    /// a success.
     #[error("role {role} is already assigned to key {prefix}")]
     RoleAlreadyAssigned {
         /// The key prefix.

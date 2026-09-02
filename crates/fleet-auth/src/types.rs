@@ -78,8 +78,8 @@ pub struct Role {
     /// Unique role name (lowercase alnum + underscore + hyphen).
     pub name: String,
     /// Optional per-role rate ceiling (requests/minute). A key's effective
-    /// RPM is the max across its roles; when set it OVERRIDES the route
-    /// class's config default (never max'd or summed with it).
+    /// RPM is the max across its roles; when set it replaces the route
+    /// class's config default rather than being max'd or summed with it.
     pub rate_rpm: Option<u32>,
     /// The `(app, permission)` bundle this role grants.
     pub permissions: Vec<RolePermission>,
@@ -119,8 +119,8 @@ pub struct ApiKeyInfo {
 
 /// The result of creating a new API key.
 ///
-/// The plaintext token is included ONCE — it must be shown to the user
-/// immediately and is never recoverable. Wrapped in [`Zeroizing`] so it is
+/// The plaintext token is returned once here and never persisted, so it must
+/// be shown to the user immediately. Wrapped in [`Zeroizing`] so it is
 /// cleared from memory on drop.
 #[derive(Clone)]
 pub struct CreatedKey {
@@ -166,7 +166,7 @@ pub struct VerifiedKey {
 impl VerifiedKey {
     /// Build a verified identity from the key row plus its resolved roles.
     ///
-    /// The ONLY constructor — union semantics live here and nowhere else:
+    /// The only constructor, so union semantics live here and nowhere else:
     /// role names are sorted, per-app permissions are the deduped union
     /// across roles, and `rate_rpm` is the max across roles that set it.
     pub fn from_roles(
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn from_roles_unions_overlapping_permissions() {
-        // Two overlapping roles resolve the deduped union (AC2).
+        // Two overlapping roles resolve the deduped union.
         let key = key_with(vec![
             role(
                 "tier1",
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn from_roles_cross_app_role_grants_in_both_namespaces() {
-        // One role spanning two apps grants in both from a single link (AC2).
+        // One role spanning two apps grants in both from a single link.
         let key = key_with(vec![role(
             "bridge",
             None,
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn from_roles_rate_rpm_is_max_across_roles() {
-        // AC5: max across roles; None when all null.
+        // Max across roles; None when every role leaves it unset.
         assert_eq!(key_with(vec![]).rate_rpm(), None);
         assert_eq!(
             key_with(vec![role("a", None, &[]), role("b", None, &[])]).rate_rpm(),

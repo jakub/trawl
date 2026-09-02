@@ -118,8 +118,8 @@ impl KeyStore {
 
     /// Create a new API key holding the named roles.
     ///
-    /// Returns the metadata AND the plaintext token — the latter must be
-    /// shown to the user immediately, it cannot be recovered later. Retries
+    /// Returns the metadata plus the plaintext token, which must be shown to
+    /// the user immediately because it cannot be recovered later. Retries
     /// on prefix collision (UNIQUE constraint), though collisions are
     /// astronomically unlikely with a 48-bit prefix space.
     ///
@@ -263,9 +263,10 @@ impl KeyStore {
     /// hash", "revoked", or "expired" — that distinction would be an
     /// enumeration oracle.
     ///
-    /// See the module docs for the full algorithm, including the timing
-    /// equalization on prefix miss and the TOCTOU recheck in the `last_used`
-    /// update.
+    /// A prefix miss still pays one argon2id verification so response time
+    /// doesn't leak prefix existence, and liveness is rechecked inside the
+    /// `last_used` UPDATE, which also locks the row for the role resolution
+    /// that follows.
     pub async fn verify_key(&self, plaintext: &str) -> Result<VerifiedKey, AuthError> {
         let prefix = token::extract_prefix(plaintext).ok_or_else(|| {
             AuthError::MalformedToken("token must start with flt_ and be at least 12 chars".into())
@@ -318,7 +319,7 @@ impl KeyStore {
         // The UPDATE both rechecks liveness and locks the api_keys row until
         // commit. Role assign/unassign operations lock the same row before
         // mutating key_roles, so the role resolution below observes a role
-        // set that cannot change underneath this in-flight verify (#11).
+        // set that cannot change underneath this in-flight verify.
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE api_keys
@@ -393,7 +394,7 @@ impl KeyStore {
         )))
     }
 
-    /// Load a key's roles WITH their permission bundles in one snapshot.
+    /// Load a key's roles with their permission bundles in one snapshot.
     ///
     /// A single `key_roles JOIN roles LEFT JOIN role_permissions` statement
     /// so the resolution is one consistent read (one statement, one
@@ -418,7 +419,7 @@ impl KeyStore {
         rows_to_roles(rows)
     }
 
-    /// Load just the sorted role NAMES for a key (admin list/detail views).
+    /// Load just the sorted role names for a key (admin list/detail views).
     async fn load_key_role_names(&self, key_id: i64) -> Result<Vec<String>, AuthError> {
         let rows = sqlx::query(
             "SELECT r.name
@@ -536,8 +537,8 @@ impl KeyStore {
 
     /// Assign a role to an existing key.
     ///
-    /// Locks the key row first — an in-flight `verify_key` on the same key
-    /// serializes against this mutation (#11). Errors with
+    /// Locks the key row first, so an in-flight `verify_key` on the same key
+    /// serializes against this mutation. Errors with
     /// [`AuthError::RoleAlreadyAssigned`] on a duplicate so assignment is
     /// never a silent no-op, and [`AuthError::RoleNotFound`] for unknown
     /// role names.

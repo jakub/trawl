@@ -2,14 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Conversion-equivalence tests for the roles-as-data migration
-//! (ADR-0006 slice 1, issue #44 AC1).
+//! Conversion-equivalence tests for the roles-as-data migration (ADR-0006).
 //!
-//! Applies the base keystore migration by hand, seeds legacy-shape keys
-//! with raw SQL (the pre-migration `api_key_role_assignment` grants),
-//! applies the roles-as-data migration, and asserts every key's resolved
-//! per-app permission set is exactly what the old compile-time tables
-//! granted (trawl's minus `key_manage`, coastwatch's `permissions_for`).
+//! Applies the base keystore migration by hand, seeds legacy-shape keys with
+//! raw SQL (`api_key_role_assignment` grants), applies the roles-as-data
+//! migration, and asserts every key's resolved per-app permission set is
+//! exactly what the frozen compile-time bundles granted (trawl's minus
+//! `key_manage`, coastwatch's `permissions_for`).
 
 #![cfg(feature = "keystore")]
 
@@ -24,8 +23,8 @@ const ROLES_MIGRATION: &str = include_str!("../migrations/20260726000001_roles_a
 const SCHEMA_WRITE_MIGRATION: &str =
     include_str!("../migrations/20260812000001_trawl_schema_write.sql");
 
-/// The legacy trawl role → permission tables (policy.rs), minus the dead
-/// `key_manage` the migration intentionally drops.
+/// The legacy trawl role → permission bundles, minus the dead `key_manage`
+/// the migration deliberately drops.
 fn legacy_trawl_permissions(role: &str) -> Vec<&'static str> {
     match role {
         "admin" => vec![
@@ -110,7 +109,7 @@ async fn seed_legacy_key(pool: &PgPool, name: &str, grants: &[(&str, &str)]) -> 
     (key_id, generated.plaintext.to_string())
 }
 
-/// Resolved per-app permission set for a key, straight from the new tables.
+/// Resolved per-app permission set for a key, straight from the roles tables.
 async fn resolved_permissions(pool: &PgPool, key_id: i64, app: &str) -> BTreeSet<String> {
     sqlx::query_scalar::<_, String>(
         "SELECT DISTINCT rp.permission
@@ -250,9 +249,8 @@ async fn ac1_conversion_preserves_every_legacy_grant(pool: PgPool) {
     .unwrap();
     assert!(!legacy_exists, "api_key_role_assignment must be dropped");
 
-    // trawl's live permission strings are registered (the roles-as-data
-    // conversion's 9 plus schema_write from the ADR-0011 slice-B
-    // migration); key_manage is not.
+    // trawl's live permission strings are registered: the conversion's nine
+    // plus schema_write from the migration applied above. key_manage is not.
     let registry: BTreeSet<String> = sqlx::query_scalar::<_, String>(
         "SELECT permission FROM app_permissions WHERE app = 'trawl'",
     )
@@ -353,7 +351,7 @@ async fn conversion_dedupes_shared_roles_across_keys(pool: PgPool) {
         .await
         .expect("base migration");
 
-    // Two keys with the same legacy (app, role) must converge on ONE role.
+    // Two keys with the same legacy (app, role) must converge on one role.
     let (a, _) = seed_legacy_key(&pool, "a", &[("trawl", "reader")]).await;
     let (b, _) = seed_legacy_key(&pool, "b", &[("trawl", "reader")]).await;
 

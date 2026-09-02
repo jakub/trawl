@@ -85,7 +85,6 @@ async fn create_and_verify_roundtrip(pool: sqlx::PgPool) {
 
 #[sqlx::test]
 async fn multi_role_key_resolves_the_union(pool: sqlx::PgPool) {
-    // AC2: overlapping roles resolve the deduped union.
     let store = KeyStore::from_pool(pool);
     store
         .create_role(
@@ -123,7 +122,7 @@ async fn multi_role_key_resolves_the_union(pool: sqlx::PgPool) {
 
 #[sqlx::test]
 async fn cross_app_role_grants_in_both_namespaces(pool: sqlx::PgPool) {
-    // AC2: one role spanning two apps grants in both from ONE key_roles row.
+    // One role spanning two apps grants in both from a single key_roles row.
     let store = KeyStore::from_pool(pool);
     store
         .create_role(
@@ -286,8 +285,8 @@ async fn get_role_unknown_is_role_not_found(pool: sqlx::PgPool) {
 
 #[sqlx::test]
 async fn add_and_remove_role_permissions_reflected_on_next_verify(pool: sqlx::PgPool) {
-    // AC2/AC7: a role mutation is visible to the very next verify_key call
-    // — permissions are resolved fresh, never cached.
+    // Permissions resolve fresh on every verify_key, never cached, so a role
+    // mutation is visible to the very next call.
     let store = KeyStore::from_pool(pool);
     store
         .create_role("mutable", None, &[rp("trawl", "query")])
@@ -331,8 +330,8 @@ async fn add_and_remove_role_permissions_reflected_on_next_verify(pool: sqlx::Pg
 
 #[sqlx::test]
 async fn set_role_rate_rpm_updates_in_place_without_touching_assignments(pool: sqlx::PgPool) {
-    // AC5: re-tiering class-of-service must not cost an authz outage — the
-    // key keeps the role (and its permissions) across the change.
+    // Re-tiering class-of-service must not cost an authz outage: the key keeps
+    // the role, and its permissions, across the change.
     let store = KeyStore::from_pool(pool);
     store
         .create_role("tier", Some(120), &[rp("trawl", "query")])
@@ -469,10 +468,9 @@ async fn wrong_token_with_existing_prefix_fails(pool: sqlx::PgPool) {
         )
         .await
         .unwrap();
-    // Same prefix, different body — should NOT verify (this is the security
-    // regression test for the cache key shape — if cache were
-    // (prefix, hash) only, this would falsely succeed after a successful
-    // verify of the legit token).
+    // Same prefix, different body must not verify. The cache key binds the
+    // plaintext's fingerprint; keying it on (prefix, stored_hash) alone would
+    // let this succeed once the legit token's verify populated the entry.
     store.verify_key(&created.plaintext_token).await.unwrap();
     let prefix_only = &created.plaintext_token[..12]; // "flt_" + 8
     let tampered = format!("{prefix_only}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0");
@@ -500,7 +498,6 @@ async fn cache_hit_skips_kdf_but_updates_last_used(pool: sqlx::PgPool) {
     let after_first = store.cache_stats().entries;
     assert_eq!(after_first, before + 1, "first verify populates cache");
 
-    // Capture last_used from after the first verify.
     let info = store.get_key_by_prefix(&created.info.prefix).await.unwrap();
     let last_used_first = info.last_used.expect("set by verify");
 
@@ -614,9 +611,8 @@ async fn concurrent_verifies_all_succeed(pool: sqlx::PgPool) {
     }
 }
 
-/// AC3: the #11 verify-vs-mutation serialization contract survives the
-/// cutover — an in-flight `verify_key` (which holds the `api_keys` row lock)
-/// forces a concurrent role unassignment on the same key to wait.
+/// An in-flight `verify_key` holds the `api_keys` row lock, so a concurrent
+/// role unassignment on the same key has to wait for it.
 #[sqlx::test]
 async fn unassign_role_waits_for_key_row_lock(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
@@ -999,7 +995,6 @@ async fn connect_malformed_url_errors() {
 fn validation_reexported_works() {
     assert!(validate_app_namespace("trawl").is_ok());
     assert!(validate_app_namespace("BAD").is_err());
-    // and token module is reachable
     let t = token::generate_token();
     assert!(t.plaintext.starts_with("flt_"));
 }

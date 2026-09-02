@@ -6,8 +6,8 @@
 //!
 //! Tokens use the `flt_` prefix followed by 32 bytes of base64url-encoded
 //! random data (43 chars after the prefix). The first 8 chars of the
-//! base64url body serve as the **prefix** used for listing, revocation, and
-//! the first cache key component.
+//! base64url body are the operational prefix. The indexed database lookup,
+//! revocation, and one component of the verification cache key all use it.
 
 use std::sync::LazyLock;
 
