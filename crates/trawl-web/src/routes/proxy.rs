@@ -69,17 +69,14 @@ async fn do_forward(
     let http = state.http();
     let (parts, body) = req.into_parts();
 
-    // CSRF defense for cookie-authed requests. The shared `fleet_session`
-    // cookie is `SameSite=Lax` and (in SSO mode) scoped to the parent domain,
-    // so the browser attaches it to same-site *sibling*-origin requests
-    // (`sibling.fleet…` → `trawl.fleet…`) — including mutating POST/PUT/
-    // DELETE. Without this check a victim loading attacker content on any
-    // sibling origin could forge state-changing calls carrying their session
-    // (delete/create saved queries, cancel queries, trigger exports). Reuse
-    // the same present-only Origin guard the auth endpoints use, before the
-    // victim's bearer token is ever forwarded upstream. Bearer clients
-    // (CLI/API) hold no cookie, send no `Origin`, and are not CSRF targets —
-    // so the guard applies only to the `Session` branch.
+    // CSRF defense for cookie-authed requests, run before the victim's
+    // bearer token is forwarded upstream. The shared `fleet_session` cookie
+    // is `SameSite=Lax` and, in SSO mode, scoped to the parent domain, so
+    // the browser attaches it to same-site sibling-origin requests
+    // (`sibling.fleet…` → `trawl.fleet…`), mutating verbs included: attacker
+    // content on any sibling origin could otherwise forge saved-query
+    // writes, query cancels or exports. Bearer clients (CLI/API) hold no
+    // cookie and are not CSRF targets, so the guard skips that branch.
     if matches!(auth, Auth::Session(_)) {
         crate::routes::auth::check_origin(&parts.headers, &parts.uri, "proxy")?;
     }
@@ -128,25 +125,24 @@ async fn do_forward(
         .map_err(|e| ProxyError::Internal(format!("response build: {e}")))
 }
 
-/// Whether — and how — a *proxied* upstream response should clear the
-/// shared `fleet_session` cookie; `None` leaves the cookie untouched.
+/// Whether a proxied upstream response should clear the shared
+/// `fleet_session` cookie, and with what directive; `None` leaves the
+/// cookie untouched.
 ///
-/// The single home for the proxy-path 401/403 cookie rule (ADR-0004
-/// slice 2), consulted identically by the generic forwarder and the SSE
-/// handler so a newly added proxied path can't silently diverge.
+/// The one home of the proxy-path 401/403 cookie rule (ADR-0004), consulted
+/// by both the generic forwarder and the SSE handler so a newly added
+/// proxied path can't silently diverge.
 ///
-/// Always `None` today: trawld returns an opaque `401` for BOTH classes of
-/// failure — a dead key (revoked/expired fleet-wide) AND a live key that
-/// merely lacks the permission grant for one endpoint (e.g. a non-admin
-/// whose SPA hits an admin-only route). The two are indistinguishable at
-/// this layer, so clearing on any proxied `401` would log valid users out
-/// of the entire fleet (shared `fleet_session`) on a routine authz denial;
-/// a `403` may likewise still carry grants for sibling apps. Cookie
-/// lifecycle is therefore owned solely by `auth::me`, which decides against
-/// the permission-free upstream `/whoami` — the only place a `401` is
-/// unambiguously a dead key. `_status`/`_auth` are the signals a future
-/// clear-on-`<status>` policy would key on (and where `AppState`'s
-/// `build_clear_cookie` would be invoked to mint the directive).
+/// Always `None`: trawld returns an opaque `401` both for a dead key
+/// (revoked/expired fleet-wide) and for a live key that merely lacks the
+/// grant for one endpoint (a non-admin whose SPA hits an admin-only route).
+/// This layer cannot tell them apart, so clearing on a proxied `401` would
+/// sign valid users out of the whole fleet on a routine authz denial, and a
+/// `403` may likewise still carry grants for sibling apps. Cookie lifecycle
+/// therefore belongs to `auth::me`, which decides against the
+/// permission-free upstream `/whoami`, the only place a `401` is
+/// unambiguously a dead key. `_status`/`_auth` are what a future
+/// clear-on-status policy would key on.
 #[must_use]
 pub(crate) fn clear_cookie_for_proxied_response(
     _status: StatusCode,
@@ -219,9 +215,6 @@ mod tests {
     }
 
     fn build_app(state: AppState) -> Router {
-        // `routes::build` already wires /login, /me, /logout, /api/v1/*
-        // forward, and the /api/v1/ingest blocker — exactly what we're
-        // testing.
         routes::build(state)
     }
 
@@ -421,17 +414,13 @@ mod tests {
         );
     }
 
-    // -- upstream auth mapping (AC #5) -------------------------------------
+    // -- upstream auth mapping ---------------------------------------------
 
     #[tokio::test]
     async fn forward_upstream_401_with_session_preserves_cookie() {
-        // trawld returns an opaque 401 for BOTH a dead key and a live key
-        // that merely lacks the permission grant for one endpoint (e.g. a
-        // non-admin whose SPA hits an admin-only route). The proxy can't
-        // tell them apart, so it must NOT clear the shared cookie on any
-        // proxied 401 — doing so would log valid users out of the entire
-        // fleet on a routine authz denial. Cookie lifecycle is owned by
-        // `auth::me`, which decides against the permission-free /whoami.
+        // trawld's 401 is opaque: a dead key and a live key lacking one
+        // endpoint's grant look identical here, so a proxied 401 must not
+        // clear the shared cookie. See `clear_cookie_for_proxied_response`.
         let upstream = MockServer::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
@@ -592,7 +581,7 @@ mod tests {
         // The shared `fleet_session` cookie is SameSite=Lax, so the browser
         // attaches it to same-site *sibling*-origin POSTs (a compromised
         // sibling.fleet… forging a write to trawl.fleet…). Present-only
-        // Origin validation must reject it BEFORE the victim's bearer token
+        // Origin validation must reject it before the victim's bearer token
         // reaches trawld. No upstream mock is mounted for the route: a 403
         // (not a forwarded 404) proves the request was blocked at the proxy.
         let upstream = MockServer::start().await;

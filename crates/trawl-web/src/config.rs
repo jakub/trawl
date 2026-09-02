@@ -4,10 +4,10 @@
 
 //! Configuration loading for `trawl-web`.
 //!
-//! The proxy reads the SAME `config.toml` as trawld, looking at its
-//! `[web]` section. Fields absent from that section fall back to sensible
-//! defaults picked here so operators can drop the proxy into an existing
-//! deployment without touching the daemon's config.
+//! The proxy reads the same `config.toml` as trawld, looking at its
+//! `[web]` section. Fields absent from that section fall back to defaults
+//! picked here so operators can drop the proxy into an existing deployment
+//! without touching the daemon's config.
 //!
 //! When present, the common `FLEET_SESSION_*` runtime variables override only
 //! their corresponding cookie settings. When absent, existing production
@@ -24,10 +24,11 @@ use trawl_config::{Config, ServerConfig, WebConfig};
 /// Default bind address for the proxy HTTP listener.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
 
-/// Fallback upstream URL used only if the loaded config exposes no
-/// `[server].http_addr` AND `[web].upstream_url` is also unset — i.e.
-/// nearly never. Matches the homelab/dev convention documented in
-/// CLAUDE.md.
+/// Upstream URL used when `[web].upstream_url` is unset and the caller
+/// supplied no [`ServerConfig`] to derive one from. `[server].http_addr`
+/// carries a serde default, so a config loaded from disk always derives its
+/// own upstream and never reaches this. The port is the one both packaged
+/// deployments give trawld, not `trawl_config::DEFAULT_HTTP_ADDR`.
 pub const FALLBACK_UPSTREAM_URL: &str = "https://127.0.0.1:5514";
 
 /// Default session TTL in seconds (24h).
@@ -211,8 +212,8 @@ fn warn_on_runtime_override(web: &WebConfig, runtime: &SessionRuntimeOverrides) 
     }
 }
 
-/// Map the shared fleet-auth runtime parser's errors onto this crate's
-/// config-error surface, preserving the pre-hoist variants and messages.
+/// Map the shared fleet-auth runtime parser's errors onto [`ConfigError`],
+/// so an operator sees one config-error vocabulary whatever produced it.
 impl From<SessionRuntimeError> for ConfigError {
     fn from(error: SessionRuntimeError) -> Self {
         match error {
@@ -297,10 +298,9 @@ fn split_addr(addr: &str) -> (&str, &str) {
 
 fn load_key(web: &WebConfig) -> Result<SessionKey, ConfigError> {
     // Both sources set → env wins silently by policy. That's a config
-    // shape that's easy to set accidentally (e.g. env var from a
+    // shape that's easy to set accidentally (e.g. an env var from a
     // secrets provider unexpectedly overlaps with a path configured
-    // in the TOML), so emit a loud warning with both identifiers.
-    // Documented precedence in the field-level rustdoc on WebConfig.
+    // in the TOML), so emit a loud warning naming both identifiers.
     if web.cookie_secret_env.is_some() && web.cookie_secret_path.is_some() {
         tracing::warn!(
             event_type = "session_key_ambiguous",
@@ -313,8 +313,8 @@ fn load_key(web: &WebConfig) -> Result<SessionKey, ConfigError> {
     if let Some(ref env_name) = web.cookie_secret_env {
         // Distinguish "var unset" from "var set but not UTF-8": the
         // former is a config mistake (wrong name, forgotten export),
-        // the latter is an encoding issue. Mapping both to a single
-        // "not valid UTF-8" error sent operators down the wrong path.
+        // the latter is an encoding issue. One shared "not valid UTF-8"
+        // error would point operators at the wrong problem.
         let raw = match std::env::var(env_name) {
             Ok(v) => v,
             Err(std::env::VarError::NotPresent) => {
@@ -609,12 +609,11 @@ mod tests {
         assert_eq!(resolved.upstream_url, FALLBACK_UPSTREAM_URL);
     }
 
-    /// Build a minimally populated `ServerConfig` for tests. Most fields
-    /// aren't exercised by the upstream-URL derivation but the struct
-    /// doesn't implement `Default` — see trawl-server's config module.
+    /// Build a `ServerConfig` for tests. The upstream-URL derivation reads
+    /// only `http_addr`, but `ServerConfig` implements no `Default`, so it
+    /// comes from a TOML parse where every other field takes its serde
+    /// default.
     fn dummy_server() -> ServerConfig {
-        // `toml::from_str` with only mandatory fields gives us a fully
-        // defaulted ServerConfig (serde defaults fill everything else).
         toml::from_str::<ServerConfig>("http_addr = \"127.0.0.1:8080\"").unwrap()
     }
 

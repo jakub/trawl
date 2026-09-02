@@ -9,11 +9,11 @@
 //! are cheap.
 //!
 //! `AppState` is also the single source of truth for session cookie
-//! headers: [`AppState::build_session_cookie`] and
-//! [`AppState::build_clear_cookie`] guarantee that every issue site and
-//! every clear site (login, logout, extractor, error mapping, proxy 401
-//! paths) emits the exact same attribute set — browsers reject clear
-//! directives whose `Domain`/`Path`/`SameSite` don't match issuance.
+//! headers: [`AppState::build_session_cookie`] (login) and
+//! [`AppState::build_clear_cookie`] (logout, the session extractor's
+//! expired-cookie path, `auth::me` on an upstream 401) emit one attribute
+//! set, because browsers ignore a clear directive whose
+//! `Domain`/`Path`/`SameSite` don't match issuance.
 
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ use reqwest::Client;
 
 use crate::config::ResolvedConfig;
 
-/// Handler-visible runtime state. `Arc`-internals ensure cloning is O(1).
+/// Handler-visible runtime state.
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Inner>,

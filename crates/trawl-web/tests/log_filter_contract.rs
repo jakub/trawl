@@ -2,14 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The trawl-web log-filter contract (issue #56).
+//! The trawl-web log-filter contract.
 //!
-//! trawl-web is a separate process with a separate tracing target, so it
-//! must never inherit trawld's target-only filter: that filter names
-//! neither `trawl_web` nor the proxy's `fleet_auth` events, and a non-empty
-//! target-only filter drops everything it does not name. These tests take
-//! the filter the Helm chart actually installs into the sidecar container
-//! and prove representative trawl-web diagnostics pass it.
+//! trawl-web is a separate process under its own tracing target, so it must
+//! never inherit trawld's target-only filter: that filter names no
+//! `trawl_web` target, and a non-empty target-only filter drops everything
+//! it does not name. These tests take the filter the Helm chart actually
+//! installs into the sidecar container and prove representative trawl-web
+//! diagnostics pass it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -192,9 +192,9 @@ fn representative_trawl_web_events_pass_the_installed_chart_filter() {
 
 #[test]
 fn trawld_filter_would_silence_the_sidecar() {
-    // Why the sidecar needs its own value: the daemon filter is
-    // target-only and names no trawl-web target, so inheriting it drops
-    // every proxy diagnostic. This is the regression the chart had.
+    // Why the sidecar needs its own value: trawld's filter is target-only
+    // and names no trawl_web target, so inheriting it drops every proxy
+    // diagnostic.
     let targets =
         targets_passing("trawl_server=info,trawld=info,auth.backend=info,storage.backend=info");
     assert!(

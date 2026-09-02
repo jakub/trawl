@@ -12,8 +12,8 @@
 //! 3. **valid decrypt but expired** → 401 + Set-Cookie: Max-Age=0
 //!    so the browser stops sending a token it can never redeem
 //!
-//! These tests drive (3) end-to-end by hand-crafting an expired
-//! cookie and observing the response.
+//! These tests drive all three end-to-end, hand-crafting the expired and
+//! tampered cookies and observing the response.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};

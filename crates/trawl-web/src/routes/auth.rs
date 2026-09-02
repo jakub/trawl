@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Authentication endpoints: `/login`, `/logout`, `/me`.
+//! Authentication endpoints, mounted at `/api/auth/{login,logout,me}`.
 //!
 //! The login flow is:
 //! 1. Browser POSTs `{api_key}` → proxy calls upstream `/whoami` with that
@@ -13,15 +13,16 @@
 //!    `Domain=` per `shared_domain`).
 //! 3. Browser is redirected client-side by the SPA.
 //!
-//! Roles/permissions are deliberately NOT in the cookie (ADR-0004 slice
-//! 2): the payload must be byte-identical across fleet apps for SSO, so
-//! `/me` re-derives the trawl permission set from upstream `/whoami` on
-//! every request. Under roles-as-data (ADR-0006) the gate is "≥1 resolved
-//! trawl permission" — role names are display/audit only.
+//! Roles and permissions stay out of the cookie (ADR-0004): the payload
+//! must be byte-identical across fleet apps for SSO, so `me` re-derives the
+//! trawl permission set from upstream `/whoami` on every request. Under
+//! roles-as-data (ADR-0006) the gate is at least one resolved trawl
+//! permission; role names are display/audit only.
 //!
 //! Login and logout validate the `Origin` header (present-only semantics,
-//! same helper as `fleet_auth::login`/`logout`) — with the shared cookie a
-//! forged cross-site logout would sign the user out of every fleet app.
+//! same helper as `fleet_auth::login`/`logout`), because with the shared
+//! cookie a forged cross-site logout would sign the user out of every
+//! fleet app.
 
 use axum::Json;
 use axum::extract::State;
@@ -35,13 +36,13 @@ use crate::error::ProxyError;
 use crate::middleware::session_extractor::Session;
 use crate::state::AppState;
 
-/// Request body for `POST /login`.
+/// Request body for `POST /api/auth/login`.
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub api_key: String,
 }
 
-/// Response body for `POST /login`.
+/// Response body for `POST /api/auth/login`.
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
     pub name: String,
@@ -54,22 +55,21 @@ pub struct LoginResponse {
 /// Reject cross-origin browser requests to cookie-authed, state-changing
 /// endpoints.
 ///
-/// Delegates to the shared [`fleet_auth::check_origin`] — the same
-/// present-only decision, log fields, and message that the fleet-auth
-/// substrate handlers use (ADR-0004 slice 2) — and maps its rejection onto
-/// this proxy's [`ProxyError::OriginMismatch`].
+/// Delegates to the shared [`fleet_auth::check_origin`] (same present-only
+/// decision, log fields and message as the fleet-auth handlers, ADR-0004)
+/// and maps its rejection onto [`ProxyError::OriginMismatch`].
 ///
-/// Used by the auth endpoints (`login`/`logout`) AND by the cookie-authed
-/// branch of the generic proxy forwarder (`routes::proxy`): the shared
-/// `fleet_session` cookie is `SameSite=Lax` and (in SSO mode) scoped to the
-/// parent domain, so the browser attaches it to same-site *sibling*-origin
-/// requests — this is the only thing standing between a compromised sibling
-/// app and a forged state-changing request carrying the victim's session.
+/// Used by `login`/`logout` and by the cookie-authed branch of the generic
+/// forwarder in `routes::proxy`: the shared `fleet_session` cookie is
+/// `SameSite=Lax` and, in SSO mode, scoped to the parent domain, so the
+/// browser attaches it to same-site sibling-origin requests. This check is
+/// the only thing standing between a compromised sibling app and a forged
+/// state-changing request carrying the victim's session.
 ///
-/// The request host is derived by the shared [`fleet_auth::request_host`]
-/// (`Host` header, falling back to the URI's `:authority`) — the one
-/// host-derivation fleet-auth's own handlers use too, so the HTTP/2
-/// `:authority` handling can't drift between the two origin guards.
+/// The request host comes from the shared [`fleet_auth::request_host`]
+/// (`Host` header, falling back to the URI's `:authority`), the same
+/// derivation fleet-auth's own handlers use, so HTTP/2 `:authority`
+/// handling can't drift between the two origin guards.
 pub(crate) fn check_origin(
     headers: &HeaderMap,
     uri: &Uri,
@@ -94,10 +94,9 @@ pub async fn login(
 
     let whoami = fetch_whoami(&state, &req.api_key).await?;
 
-    // Valid key but zero trawl permissions → 403 with NO cookie: mirrors
-    // upstream trawld's no-grant semantics (trawld 403s permissionless keys
-    // before /whoami anyway; this is the belt-and-suspenders branch). The
-    // user never gets a session for an app they can't access.
+    // Valid key but zero trawl permissions → 403 with no cookie, so the
+    // user never gets a session for an app they can't access. Trawld 403s
+    // permissionless keys before /whoami anyway; this checks again here.
     if whoami.permissions.is_empty() {
         return Err(ProxyError::Upstream(StatusCode::FORBIDDEN));
     }
@@ -106,7 +105,7 @@ pub async fn login(
     let ttl = i64::try_from(state.session_ttl_secs())
         .map_err(|_| ProxyError::Internal("session_ttl_secs out of i64 range".into()))?;
 
-    // App-agnostic payload — {token, name, exp}, NO role. Byte-identical
+    // App-agnostic payload: {token, name, exp}, no role. Byte-identical
     // across fleet apps, which is the SSO compatibility contract.
     let payload = SessionPayload {
         token: Zeroizing::new(req.api_key),
@@ -174,7 +173,7 @@ async fn fetch_whoami(state: &AppState, token: &str) -> Result<WhoAmI, ProxyErro
     }
 }
 
-/// Response body for `GET /me`.
+/// Response body for `GET /api/auth/me`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MeResponse {
     pub name: String,
@@ -185,16 +184,16 @@ pub struct MeResponse {
     pub exp: i64,
 }
 
-/// `GET /me` — identity + roles/permissions for the SPA's auth shell.
+/// Identity plus roles/permissions for the SPA's auth shell.
 ///
-/// Roles and permissions are fetched LIVE from upstream `/whoami` on every
+/// Roles and permissions are fetched live from upstream `/whoami` on every
 /// call (they never live in the cookie), so a role or permission change
 /// takes effect on the next request rather than at cookie expiry. Upstream
 /// mapping:
-/// - `/whoami` 401 (key revoked/expired fleet-wide) → 401 WITH a clear
-///   cookie — the session is dead everywhere.
+/// - `/whoami` 401 (key revoked/expired fleet-wide) → 401 with a clear
+///   cookie: the session is dead everywhere.
 /// - `/whoami` 200 but zero trawl permissions, or upstream 403 → 403 with
-///   the cookie PRESERVED — the key may still hold capability in sibling
+///   the cookie preserved: the key may still hold capability in sibling
 ///   apps.
 pub async fn me(
     State(state): State<AppState>,
@@ -442,7 +441,7 @@ mod tests {
         assert!(set_cookie.contains("Secure"));
     }
 
-    // -- cookie contract (AC #2) -----------------------------------------
+    // -- cookie contract ---------------------------------------------------
 
     /// State with `shared_domain` set — SSO mode.
     fn sso_state(upstream_url: String) -> AppState {
@@ -570,7 +569,7 @@ mod tests {
         );
     }
 
-    // -- cross-app cookie compat (AC #3) ----------------------------------
+    // -- cross-app cookie compat -------------------------------------------
 
     #[tokio::test]
     async fn login_cookie_is_fleet_auth_compatible_with_role_less_payload() {
@@ -624,7 +623,7 @@ mod tests {
             .unwrap()
             .1;
 
-        // Decrypt with an INDEPENDENTLY constructed fleet-auth key — this
+        // Decrypt with an independently constructed fleet-auth key, which
         // is what a sibling app holding the shared key does.
         let sibling_key = fleet_auth::SessionKey::from_bytes(key_bytes);
         let payload = fleet_auth::decrypt(&sibling_key, value).unwrap();
@@ -642,7 +641,7 @@ mod tests {
         );
     }
 
-    // -- origin validation (AC #6) ----------------------------------------
+    // -- origin validation -------------------------------------------------
 
     #[tokio::test]
     async fn login_rejects_cross_origin() {
@@ -684,12 +683,11 @@ mod tests {
 
     #[tokio::test]
     async fn logout_rejects_sso_sibling_origin_without_clearing() {
-        // Regression (ADR-0004 slice 2): a compromised sibling under the
-        // shared domain — or attacker-hosted content on one — can auto-submit
-        // a plain HTML form POST to trawl's logout endpoint. Its sibling
-        // `Origin` must NOT be trusted just because it lives under the same
-        // parent-domain cookie; the response must be 403 with NO Set-Cookie,
-        // so `fleet_session` is not cleared fleet-wide.
+        // A compromised sibling under the shared domain, or attacker-hosted
+        // content on one, can auto-submit a plain HTML form POST to trawl's
+        // logout endpoint. Its sibling Origin is not trusted just because it
+        // lives under the same parent-domain cookie: 403 with no Set-Cookie,
+        // so fleet_session is not cleared fleet-wide.
         let app = routes::build(sso_state("http://unused".into()));
 
         let req = Request::builder()
@@ -776,9 +774,9 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Sibling app under the SAME shared domain is a DIFFERENT origin and
-        // must be rejected (403, no cookie). Sharing a parent-domain cookie
-        // is not an origin allowlist — see `origin_allowed`.
+        // A sibling app under the same shared domain is a different origin
+        // and must be rejected (403, no cookie): sharing a parent-domain
+        // cookie is not an origin allowlist. See `origin_allowed`.
         let app = routes::build(sso_state(upstream.uri()));
         let req = Request::builder()
             .method("POST")
@@ -857,9 +855,9 @@ mod tests {
 
     #[tokio::test]
     async fn me_reflects_upstream_permission_change_between_calls() {
-        // AC #4 successor: roles/permissions live upstream, not in the
-        // cookie. Mutating the mock /whoami between two calls on ONE cookie
-        // must be reflected — proving a live fetch, not cookie residue.
+        // Roles and permissions live upstream, not in the cookie. Mutating
+        // the mock /whoami between two calls on one cookie must be
+        // reflected, which proves a live fetch rather than cookie residue.
         let (app, upstream, cookie) = login_and_get_cookie().await;
 
         let me_req = || {

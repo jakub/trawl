@@ -23,9 +23,9 @@ fn main() {
         && let Err(e) = fs::create_dir_all(&dist)
     {
         // Non-fatal: a missing `dist/` just means rust-embed sees no
-        // assets, which the runtime handles by returning 404s on /*
-        // (and the user sees an empty page). Worst case is a confusing
-        // first-run UX, not a broken build.
+        // assets, and the runtime answers every path with a 404 telling
+        // the operator to build the SPA. Worst case is a confusing first
+        // run, not a broken build.
         println!("cargo:warning=could not create {}: {e}", dist.display());
     }
 
