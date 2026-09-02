@@ -8,7 +8,7 @@
 //!
 //! Not "every field the query binds". `referenced_fields` skips bare-word
 //! search terms and the time bounds, so `error last=1h` runs with an
-//! EMPTY pin map even though it reads `message`, `_raw` and `_time` —
+//! empty pin map even though it reads `message`, `_raw` and `_time` —
 //! envelope fields whose production types are fixed, so there is no pin
 //! for the selector to vary and nothing is lost here.
 //!
@@ -23,7 +23,7 @@
 //!    parser accepted. libFuzzer owns that check: nothing here catches a
 //!    panic, so a panic aborts the process and is reported as a crash.
 //! 2. Every typed failure is an outcome someone named. See
-//!    [`classify_emit_failure`] — the classifiers exist to fail the BUILD
+//!    [`classify_emit_failure`] — the classifiers exist to fail the build
 //!    when a new error variant appears, not to inspect the error.
 //! 3. Pins change the SQL, never whether a query is emittable — except
 //!    where the crate documents a closed vocabulary. That is the
@@ -47,14 +47,14 @@ use trawl_core::schema::{CanonicalType, FieldTypes};
 /// instead of inside the pin rule table.
 const SRC: &str = "test.parquet";
 
-/// Accept a parse failure by NAMING every field of [`ParseError`].
+/// Accept a parse failure by naming every field of [`ParseError`].
 ///
-/// This function looks like it does nothing, and that is exactly the
-/// point. The exhaustive destructuring IS the guard: with no `..`, a
-/// field added to `ParseError` stops compiling right here, and whoever
-/// adds it has to decide whether the fuzzer should be checking the new
-/// information. A `..` would swallow that decision silently and the
-/// target would go on reporting green while covering less than it claims.
+/// This function looks like it does nothing, and that is the point: the
+/// exhaustive destructuring is the guard. With no `..`, a field added to
+/// `ParseError` stops compiling right here and whoever adds it has to
+/// decide whether the fuzzer should check the new information, where a
+/// `..` would swallow that decision and leave the target reporting green
+/// while covering less than it claims.
 fn classify_parse_failure(errors: &[ParseError]) {
     for err in errors {
         let ParseError {
@@ -74,14 +74,12 @@ fn classify_parse_failure(errors: &[ParseError]) {
     }
 }
 
-/// Accept an emit failure by NAMING every variant of [`EmitError`].
+/// Accept an emit failure by naming every variant of [`EmitError`].
 ///
 /// Same guard as [`classify_parse_failure`], one level up: no `_` arm and
 /// no `..` inside any variant pattern, so a new variant or a new field on
-/// an existing one is a compile error. Adding a wildcard here would
-/// defeat the whole mechanism — every future error shape would be
-/// silently accepted as a known outcome, which is the one thing this
-/// target is meant to prevent.
+/// an existing one is a compile error rather than an error shape silently
+/// accepted as a known outcome.
 fn classify_emit_failure(err: &EmitError, query: &str) {
     match err {
         EmitError::UnknownFunction {
@@ -121,12 +119,12 @@ fn classify_emit_failure(err: &EmitError, query: &str) {
     }
 }
 
-/// Accept a pin rule table refusal by NAMING every variant of
+/// Accept a pin rule table refusal by naming every variant of
 /// [`CompareError`].
 ///
 /// One variant today. The match stays exhaustive anyway for the reason
 /// the other two classifiers do: the differential oracle below leans on
-/// `CompareError`'s doc comment claiming SEVERITY is the ONLY pin with a
+/// `CompareError`'s doc comment claiming SEVERITY is the only pin with a
 /// closed vocabulary, so a second variant would mean that claim moved and
 /// the oracle needs rereading. Failing to compile is how that gets
 /// noticed.
@@ -176,7 +174,7 @@ fuzz_target!(|input: &str| {
 
     let pins = fuzz_input::derive_field_types(&query, case.selector);
 
-    // ONE anchor for both lanes. `now()` binds as a parameter (ADR-0017),
+    // One anchor for both lanes. `now()` binds as a parameter (ADR-0017),
     // so two `capture()` calls would put two different instants in the two
     // parameter lists and every differential comparison over a query using
     // `now()` would be reading clock skew rather than pin behaviour.
@@ -196,7 +194,7 @@ fuzz_target!(|input: &str| {
     // `CompareError`'s doc comment states that SEVERITY is the only pin
     // with a closed vocabulary and that every other rule table entry is
     // total over literals by construction. Read as a testable claim: a
-    // pin decides HOW a comparison is rendered, never WHETHER the query
+    // pin decides how a comparison is rendered, never whether the query
     // can be emitted at all. So with no SEVERITY pin anywhere in the map,
     // the two lanes must agree exactly on emittability.
     //

@@ -4,8 +4,8 @@
 
 //! Layer 1: primitive parsers.
 //!
-//! Numbers, quoted strings, bare words, `@`-prefixed system fields,
-//! filter operators, durations, and boolean/null keywords.
+//! Numbers, quoted strings, bare words, `@`-prefixed names, filter
+//! operators, durations, and boolean/null keywords.
 
 use chumsky::prelude::*;
 
@@ -61,7 +61,7 @@ pub(crate) fn int<'src>() -> impl Parser<'src, ParserInput<'src>, i64, ParserExt
 /// Parse a float (must contain a `.` to distinguish from int).
 ///
 /// The token is kept beside the parsed double: `f64` is lossy past 53 bits
-/// and pin-aware pipeline comparison binds the literal's TEXT, never the
+/// and pin-aware pipeline comparison binds the literal's text, never the
 /// re-rendered double (ADR-0011 ruling #6, [`FloatLiteral`]).
 pub(crate) fn float<'src>()
 -> impl Parser<'src, ParserInput<'src>, FloatLiteral, ParserExtra<'src>> + Clone {
@@ -151,7 +151,8 @@ pub(crate) fn ident<'src>()
         .labelled("identifier")
 }
 
-/// Parse an `@`-prefixed system field like `@timestamp`.
+/// Parse an `@`-prefixed name like `@timestamp`. The `@` is spelling
+/// only: the name is ordinary sender vocabulary, not a trawl slot.
 pub(crate) fn system_field<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     just('@')
@@ -161,10 +162,10 @@ pub(crate) fn system_field<'src>()
         .labelled("system field")
 }
 
-/// Parse a name in a position that is NOT a field: a function name, a
+/// Parse a name in a position that is not a field: a function name, a
 /// stage name, a saved-query name. These take no backticks (ADR-0013
-/// ruling 7) — `` `lower`(x) `` must not be a call — so this is the
-/// unquoted production, `field_name()` minus the backtick arm.
+/// ruling 7), since `` `lower`(x) `` must not be a call, so this is the
+/// unquoted production: `field_name()` minus the backtick arm.
 pub(crate) fn plain_name<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     system_field().or(ident())
@@ -172,17 +173,16 @@ pub(crate) fn plain_name<'src>()
 
 /// Parse a backtick-quoted name: `` `request id` ``.
 ///
-/// Backticks change how a name is LEXED, never what a name may be
+/// Backticks change how a name is lexed, never what a name may be
 /// (ADR-0013 ruling 7). Content is any character except a backtick; a
 /// doubled backtick escapes one. Empty names and names carrying a
-/// character that cannot be rendered as itself
-/// ([`is_unsafe_display_char`] — controls, bidi and zero-width format
-/// characters, the soft hyphen) are parse errors — the only two
-/// refusals, because this is lexing, not policy:
-/// the ASCII fold ([`crate::schema::catalog_key`]) and the sealed `_`
-/// namespace ([`crate::schema::is_reserved_name`]) apply to the result
-/// exactly as they do to a bare name. A dot inside the quotes is a
-/// literal character, not a nested-name segment.
+/// character that cannot be rendered as itself ([`is_unsafe_display_char`]:
+/// controls, bidi and zero-width format characters, the soft hyphen) are
+/// parse errors, and they are the only two refusals, because this is
+/// lexing, not policy: the ASCII fold ([`crate::schema::catalog_key`]) and
+/// the sealed `_` namespace ([`crate::schema::is_reserved_name`]) apply to
+/// the result exactly as they do to a bare name. A dot inside the quotes
+/// is a literal character, not a nested-name segment.
 pub(crate) fn quoted_name<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     choice((just("``").to('`'), none_of('`')))
@@ -208,8 +208,8 @@ pub(crate) fn quoted_name<'src>()
         .labelled("backtick-quoted field name")
 }
 
-/// Parse a field name — a backtick-quoted name, an `@`-prefixed system
-/// field, or a regular identifier.
+/// Parse a field name: a backtick-quoted name, an `@`-prefixed name, or
+/// a regular identifier.
 pub(crate) fn field_name<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     choice((quoted_name(), system_field(), ident()))
@@ -329,24 +329,23 @@ pub(crate) fn literal<'src>()
 
 /// Parse a bare (unquoted) value in a field filter — stops at whitespace and `|`.
 ///
-/// A backtick ENDS a bare value, the same exclusion the search stage's bare
+/// A backtick ends a bare value, the same exclusion the search stage's bare
 /// word makes and for the same reason (ADR-0013 ruling 7): a backticked
 /// name is a field reference in every field position, so no unquoted
 /// position may absorb one. A value that genuinely contains a backtick is
-/// written double-quoted (`` host="a`b" ``), which the quoted arm has
-/// always accepted.
+/// written double-quoted (`` host="a`b" ``).
 ///
-/// A comment opener INSIDE the value is a parse error, not data and not a
-/// comment (ADR-0014 ruling 2) — `color=#ff0000` names its own `#`
-/// instead of quietly becoming a text search for `color=`. It carries the
-/// VALUE-position message, whose hint quotes the value alone
-/// (`color="#ff0000"`): quoting the whole token would turn a field filter
-/// into a phrase search, and a hint that changes what the query means is
-/// worse than none. The value is
-/// still produced, so the diagnostic is emitted rather than returned: a
-/// structurally-successful branch keeps chumsky's alternative selection
-/// from ranking a worse error from a later arm ahead of this one, while
-/// `into_result()` is still `Err`.
+/// A comment opener inside the value is a parse error, not data and not a
+/// comment (ADR-0014 ruling 2): `color=#ff0000` names its own `#` instead
+/// of quietly becoming a text search for `color=`. It carries the
+/// value-position message, whose hint quotes the value alone
+/// (`color="#ff0000"`), because quoting the whole token would turn a field
+/// filter into a phrase search, and a hint that changes what the query
+/// means is worse than none. The value is still produced, so the
+/// diagnostic is emitted rather than returned: a structurally-successful
+/// branch keeps chumsky's alternative selection from ranking a worse error
+/// from a later arm ahead of this one, while `into_result()` is still
+/// `Err`.
 ///
 /// This is the single bare-RHS production — single values, comma-separated
 /// IN lists and glob detection all route through it — so both exclusions
@@ -372,7 +371,7 @@ pub(crate) fn bare_value<'src>()
                 emitter.emit(Rich::custom(
                     (start..start + crate::parser::comment::OPENER.len_utf8()).into(),
                     // The exact value slice rides along: this production
-                    // is the one place its bounds are KNOWN, and an IN
+                    // is the one place its bounds are known, and an IN
                     // list's element is its own `bare_value`, so the hint
                     // names the element the user can act on without
                     // re-deriving a boundary from the raw text.
@@ -444,8 +443,8 @@ mod tests {
         assert_eq!(v.text(), "-0.5");
     }
 
-    /// The token survives the parse verbatim, trailing zeros and all —
-    /// `f64` is lossy past 53 bits and pin-aware comparison binds the TEXT
+    /// The token survives the parse verbatim, trailing zeros and all:
+    /// `f64` is lossy past 53 bits and pin-aware comparison binds the text
     /// (ADR-0011 ruling #6), so re-rendering the double would silently
     /// answer for a different number.
     #[test]
@@ -510,7 +509,7 @@ mod tests {
 
     // ── backtick-quoted names (ADR-0013 ruling 7) ──────────────────────
 
-    /// Backticks change how a name is LEXED, never what a name may be:
+    /// Backticks change how a name is lexed, never what a name may be:
     /// the content is any character except a backtick, and the parse
     /// yields the bare name with the quotes gone.
     #[test]
@@ -552,9 +551,9 @@ mod tests {
         );
     }
 
-    /// Empty and control-char names are parse errors (ruling 7) — an
-    /// empty column name is unnameable and a control char would rewrite
-    /// the terminal line that renders it.
+    /// Empty and control-char names are parse errors (ruling 7): an empty
+    /// column name is unnameable and a control char would rewrite the
+    /// terminal line that renders it.
     #[test]
     fn backtick_name_empty_and_control_chars_rejected() {
         assert!(field_name().parse("``").into_result().is_err());
@@ -564,7 +563,7 @@ mod tests {
         assert!(field_name().parse("`\u{1b}[2J`").into_result().is_err());
     }
 
-    /// Function names, stage names and saved-query names are NOT fields,
+    /// Function names, stage names and saved-query names are not fields,
     /// so they take the unquoted production and no backticks.
     #[test]
     fn plain_name_takes_no_backticks() {
@@ -611,7 +610,7 @@ mod tests {
     fn test_keyword_boundary() {
         assert_eq!(keyword("and").parse("and").into_result().unwrap(), "and");
 
-        // "android" should NOT match as keyword "and"
+        // "android" should not match as keyword "and"
         assert!(keyword("and").parse("android").into_result().is_err());
     }
 

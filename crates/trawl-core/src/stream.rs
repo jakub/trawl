@@ -65,10 +65,9 @@ pub enum StreamPlanError {
     InvalidFormat(String),
     /// A function call the emitter's own tables refuse — an unknown name
     /// or the wrong argument count. This lane never runs
-    /// `validate_pipeline`, so without the mirror `/stream` accepted
-    /// `let s = sev()` and opened a live-looking stream that can only
-    /// ever evaluate to NULL, while `/api/v1/query` 400s on the same
-    /// text. One predicate, both doors — the reserved-name precedent.
+    /// `validate_pipeline`, so it mirrors the check itself: otherwise
+    /// `let s = sev()` opens a live-looking stream that can only ever
+    /// evaluate to NULL while `/api/v1/query` 400s on the same text.
     InvalidFunction(String),
     /// A pinned comparison the shared rule table refuses — an unknown
     /// severity value against a `SEVERITY`-pinned field (ADR-0013). The
@@ -117,19 +116,18 @@ impl std::error::Error for StreamPlanError {}
 /// Rejects unsupported stages (sort, pivot, multiple aggregations)
 /// with an error before the stream starts.
 ///
-/// `pins` is the pin scope in force at the FIRST stage of `pipeline`
-/// (ADR-0011 slice A′): the catalog snapshot's root for a whole-pipeline
-/// SSE stream, or the scope stamped at the kv split for a `rust_stages`
-/// batch tail. The compiler walks the SAME per-stage scope table the SQL
+/// `pins` is the pin scope in force at the first stage of `pipeline`
+/// (ADR-0011): the catalog snapshot's root for a whole-pipeline SSE
+/// stream, or the scope stamped at the kv split for a `rust_stages`
+/// batch tail. The compiler walks the same per-stage scope table the SQL
 /// emitter consumes (`crate::pin_scope`), stamping each `where`/`let`
-/// with the scope it must evaluate under — no default parameter, so
-/// pin-blindness is always explicit at the call site
-/// (`&PinScope::unpinned()`).
+/// with the scope it must evaluate under. There is no default, so
+/// pin-blindness is explicit at the call site (`&PinScope::unpinned()`).
 pub fn compile_stream_plan(
     pipeline: &[Spanned<PipeStage>],
     pins: &PinScope,
 ) -> Result<StreamPlan, StreamPlanError> {
-    // The shared projection-name check runs FIRST, over every stage —
+    // The shared projection-name check runs first, over every stage —
     // before the unsupported-stage and multi-aggregation refusals — so a
     // `pivot`/`eventstats` collision gets the semantic answer even where
     // the stage itself is not streamable (ADR-0013 ruling 8).
@@ -138,14 +136,12 @@ pub fn compile_stream_plan(
             .map_err(StreamPlanError::ProjectionCollision)?;
     }
 
-    // Find the first aggregation stage index (if any).
     let agg_idx = pipeline.iter().position(|s| is_agg_stage(&s.node));
 
     // The scope advances per stage — one walk, shared with the emitter.
     let mut scope = pins.clone();
 
     if let Some(idx) = agg_idx {
-        // Check for a second aggregation stage (not supported).
         if pipeline[idx + 1..].iter().any(|s| is_agg_stage(&s.node)) {
             return Err(StreamPlanError::UnsupportedStage {
                 stage: "multiple aggregations".to_string(),
@@ -273,7 +269,7 @@ pub enum CompiledStage {
     /// Cap output to N events.
     ///
     /// `count` is the cap as written, kept beside the live counter
-    /// because a POST-aggregation limit is re-armed for every emitted
+    /// because a post-aggregation limit is re-armed for every emitted
     /// snapshot ([`reset_limit`](CompiledStage::reset_limit)).
     Limit { count: u64, remaining: AtomicU64 },
     /// Pass through (ring buffer sizing is handled by the TUI).
@@ -281,13 +277,13 @@ pub enum CompiledStage {
     /// Filter events by condition.
     Where {
         condition: Spanned<crate::ast::Expr>,
-        /// The pin scope in force at this stage (ADR-0011 slice A′).
+        /// The pin scope in force at this stage (ADR-0011).
         pins: PinScope,
     },
     /// Compute derived fields.
     Let {
         assignments: Vec<(String, Spanned<crate::ast::Expr>)>,
-        /// The pin scope in force at this stage (ADR-0011 slice A′).
+        /// The pin scope in force at this stage (ADR-0011).
         pins: PinScope,
     },
     /// Extract fields via regex.
@@ -357,14 +353,14 @@ impl CompiledStage {
     /// aggregate plan cap two different things (ADR-0001: batch is the
     /// contract, streaming the mirror):
     ///
-    /// - a PRE-aggregation `limit` caps the INPUT set, which batch also
+    /// - a pre-aggregation `limit` caps the input set, which batch also
     ///   does exactly once, so its exhaustion stays sticky for the life
     ///   of the subscription;
-    /// - a POST-aggregation `limit` caps the RESULT set, and an emitted
-    ///   snapshot IS the live rendering of the batch result set — so it
-    ///   caps each snapshot, exactly as batch caps its one. Spending it
-    ///   for the plan's life would leave the stream permanently silent
-    ///   while the aggregation kept evolving, which mirrors nothing.
+    /// - a post-aggregation `limit` caps the result set, and an emitted
+    ///   snapshot is the live rendering of the batch result set, so it
+    ///   caps each snapshot as batch caps its one. Spending it for the
+    ///   plan's life would leave the stream permanently silent while the
+    ///   aggregation kept evolving, which mirrors nothing.
     ///
     /// Deliberately narrow: a `dedup` in the same position keeps its
     /// seen-set across snapshots, which is a separate question about
@@ -389,9 +385,9 @@ pub enum StageResult {
 
 // ── the live lane's sampling boundaries (ADR-0017 §3) ──────────────
 
-/// What ONE live event produced.
+/// What one live event produced.
 ///
-/// The live lane's unit of output is the EVENT, so this is also the
+/// The live lane's unit of output is the event, so this is also the
 /// unit an [`EvalContext`] covers: everything that reads `now()` on the
 /// way from the bus to the wire — the search-stage window, a
 /// `| where now() - _time < …`, a `| let age = now()` — reads the one
@@ -402,28 +398,25 @@ pub enum LiveOutcome {
     Emit(Row),
     /// The filter rejected it, or a stage dropped it.
     Filtered,
-    /// A `limit` stage ended the subscription. The event is NOT emitted
+    /// A `limit` stage ended the subscription. The event is not emitted
     /// (the stage that says `Done` has already refused it).
     Done,
 }
 
-/// The ONE per-event door of the live lane: match the search stage,
-/// then run the pipeline stages, both under a SINGLE instant.
+/// The one per-event door of the live lane: match the search stage,
+/// then run the pipeline stages, both under a single instant.
 ///
-/// This exists to make one-context-per-event STRUCTURAL. The filter's
-/// `last=` window and the pipeline's `now()` used to be two separate
-/// samples — the filter's taken once per BUS BATCH, the pipeline's per
-/// event — so one event could be admitted by a stale clock and rejected
-/// by a fresh one (or the reverse) inside a single query. There is one
-/// `ctx` parameter here and no clock read anywhere below it, so a
-/// caller cannot reintroduce the split.
+/// One-context-per-event is structural here: one `ctx` parameter, and no
+/// clock read anywhere below it, so the filter's `last=` window and the
+/// pipeline's `now()` cannot sample two instants and admit an event a
+/// later stage then rejects for being too old.
 ///
 /// The caller samples: one [`EvalContext::capture`] per event, at the
-/// top of the loop. A subscription's clock therefore ADVANCES between
-/// rows while each row stays internally frozen, which is exactly what
-/// ADR-0017 §3 asks of live pass-through (per-batch sampling was
-/// rejected: a bus batch is an upstream client's POST size, not a
-/// boundary the query author can see).
+/// top of the loop. A subscription's clock therefore advances between
+/// rows while each row stays internally frozen, which is what ADR-0017
+/// §3 asks of live pass-through (per-batch sampling is rejected: a bus
+/// batch is an upstream client's POST size, not a boundary the query
+/// author can see).
 pub fn accept_event(
     filter: &crate::filter::CompiledFilter,
     stages: &mut [CompiledStage],
@@ -447,18 +440,17 @@ pub fn accept_event(
     LiveOutcome::Emit(row)
 }
 
-/// The aggregate lane's per-event door: the SAME [`accept_event`] rule,
+/// The aggregate lane's per-event door: the same [`accept_event`] rule,
 /// with the surviving row fed into the accumulators.
 ///
 /// Returns whether the event reached the aggregation — the caller's
 /// snapshot-threshold counter. A pre-stage `Done` drops the event and
-/// does NOT end the subscription here: an aggregate stream's output is
-/// the snapshot, and a `limit` before the aggregation bounds what feeds
-/// it, which is the behaviour this lane has always had.
+/// does not end the subscription: an aggregate stream's output is the
+/// snapshot, and a `limit` before the aggregation bounds what feeds it.
 ///
 /// Both `now()` readers on this path — the filter window and any
 /// `| where`/`| let` before the aggregation — plus the timechart
-/// bucket's absent-`_time` fallback take the ONE `ctx` handed in, so a
+/// bucket's absent-`_time` fallback take the one `ctx` handed in, so a
 /// fed event is bucketed at the instant it was admitted under.
 pub fn accept_event_into_aggregate(
     filter: &crate::filter::CompiledFilter,
@@ -476,12 +468,11 @@ pub fn accept_event_into_aggregate(
     }
 }
 
-/// The instant ONE emitted aggregate snapshot reads `now()` at.
+/// The instant one emitted aggregate snapshot reads `now()` at.
 ///
-/// A distinct TYPE, not a second `EvalContext` parameter, because the
-/// two boundaries meet in one function and conflating them is the
-/// defect this milestone removes: a snapshot's post-stage rows are one
-/// unit of output together (ADR-0017 §3), while the events that FED
+/// A distinct type, not a second `EvalContext` parameter, because the
+/// two boundaries meet in one function: a snapshot's post-stage rows are
+/// one unit of output together (ADR-0017 §3), while the events that fed
 /// that snapshot each sampled their own instant, possibly seconds
 /// earlier. Neither can be passed where the other is expected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -489,7 +480,7 @@ pub struct SnapshotContext(EvalContext);
 
 impl SnapshotContext {
     /// The snapshot's instant, sampled by the caller at the start of the
-    /// snapshot attempt — BEFORE the rows are taken, so the sample point
+    /// snapshot attempt, before the rows are taken, so the sample point
     /// is deterministic even when the post-stages later drop every row.
     #[must_use]
     pub fn new(at: EvalContext) -> Self {
@@ -498,21 +489,20 @@ impl SnapshotContext {
 }
 
 /// Take an aggregate snapshot and run its post-stages, every row under
-/// the ONE snapshot instant.
+/// the one snapshot instant.
 ///
 /// Each pass re-arms the post-stages' `limit`s
 /// ([`CompiledStage::reset_limit`]): a snapshot is the live rendering of
-/// the batch result set, so `| stats … | limit N` caps EVERY snapshot at
-/// N, exactly as batch caps its one result set. The plan's pre-stages
-/// are not touched here and stay sticky — they cap the input.
+/// the batch result set, so `| stats … | limit N` caps every snapshot at
+/// N, as batch caps its one result set. The plan's pre-stages are not
+/// touched here and stay sticky — they cap the input.
 ///
-/// Deliberately NOT shared with `post_process::apply_aggregate`, whose
+/// Deliberately not shared with `post_process::apply_aggregate`, whose
 /// `StageResult::Done` ends the whole result set: here it drops the
-/// current row and the next row still gets its chance, which is what
-/// the live lane has always done. Merging the two loops would silently
-/// change one lane's row set. (That lane emits ONE snapshot from a
-/// freshly compiled plan, so its counters start armed and this re-arming
-/// would be a no-op there.)
+/// current row and the next row still gets its chance. Merging the two
+/// loops would silently change one lane's row set. (That lane emits one
+/// snapshot from a freshly compiled plan, so its counters start armed
+/// and this re-arming would be a no-op there.)
 pub fn emit_snapshot(
     aggregation: &CompiledAggregation,
     post_stages: &mut [CompiledStage],
@@ -594,25 +584,26 @@ fn compile_let(s: &LetStage, scope: &PinScope) -> Result<CompiledStage, StreamPl
     })
 }
 
-/// Walk an expression tree and validate date/time unit and format literals
-/// plus `level` comparison tokens.
+/// Walk an expression tree and validate function names and arity,
+/// closed-vocabulary literals, and pinned comparisons.
 ///
-/// This replicates the checks `emit_expr` performs on the batch path so that an
-/// unsupported unit, an invalid `strftime`/`strptime` format literal, or an
-/// unknown severity token in `where level == "..."` is rejected at
-/// `compile_stream_plan` time rather than silently evaluating to `Null` (or, in
-/// batch, erroring) in live tail.
+/// These are the checks `emit_expr` performs on the batch path, so an
+/// unsupported `date_part` unit, an unknown `sev()` dialect, an invalid
+/// `strftime`/`strptime` format literal, or an unknown severity token
+/// against a `SEVERITY`-pinned field is rejected at `compile_stream_plan`
+/// time rather than silently evaluating to `Null` in live tail while
+/// batch 400s on the same text.
 fn validate_expr(
     expr: &Spanned<crate::ast::Expr>,
     scope: &PinScope,
 ) -> Result<(), StreamPlanError> {
     match &expr.node {
         Expr::FunctionCall { name, args } => {
-            // Arity and name, from the emitter's single source of truth —
-            // for EVERY function, not just the ones with literal
+            // Arity and name, from the emitter's single source of truth,
+            // for every function and not just the ones with literal
             // positions: a wrong-arity call is a 400 in batch, and a
             // stream that silently nulls instead is the divergence this
-            // lane exists to prevent.
+            // check exists to prevent.
             validate_function_arity(name, args.len())
                 .map_err(|e| StreamPlanError::InvalidFunction(e.to_string()))?;
             let unit_positions = unit_literal_positions(name);
@@ -622,8 +613,8 @@ fn validate_expr(
                     Expr::Literal(LiteralValue::String(s)) => Some(s.as_str()),
                     _ => None,
                 });
-                // If arg exists check it; if it doesn't exist arity validation will
-                // catch it elsewhere.
+                // An absent position is an optional argument (`sev(x)`
+                // with no dialect); a wrong arity was refused above.
                 if arg.is_some() {
                     validate_unit_literal(name, *idx, allowlist, raw)
                         .map_err(|e| StreamPlanError::InvalidUnit(e.to_string()))?;
@@ -637,16 +628,15 @@ fn validate_expr(
                 validate_format_literal(name, s)
                     .map_err(|e| StreamPlanError::InvalidFormat(e.to_string()))?;
             }
-            // Recurse into all args.
             for arg in args {
                 validate_expr(arg, scope)?;
             }
         }
         Expr::Binary { lhs, op, rhs } => {
-            // The pinned rule table refuses an unknown severity value, and
-            // it must refuse it HERE — the SQL emitter 400s on the same
-            // shape, and eval (the only other consumer of this scope) has
-            // no error channel at all.
+            // The pinned rule table refuses an unknown severity value,
+            // and it must refuse it here: the SQL emitter 400s on the
+            // same shape, and eval (the only other consumer of this
+            // scope) has no error channel at all.
             validate_pinned_comparison(lhs, *op, rhs, scope)?;
             validate_expr(lhs, scope)?;
             validate_expr(rhs, scope)?;
@@ -665,7 +655,7 @@ fn validate_expr(
 }
 
 /// Resolve a bare field-vs-literal comparison through the shared pin rule
-/// table, for its ERROR alone — the compiled form is re-resolved per
+/// table, for its error alone: the compiled form is re-resolved per
 /// event by `crate::eval`, which reads the same scope.
 fn validate_pinned_comparison(
     lhs: &Spanned<crate::ast::Expr>,
@@ -725,7 +715,7 @@ fn compile_extract(s: &ExtractStage) -> Result<CompiledStage, StreamPlanError> {
         ExtractMode::Regex(pattern) => {
             let regex = regex::Regex::new(pattern)
                 .map_err(|e| StreamPlanError::InvalidRegex(e.to_string()))?;
-            // The `_` namespace is sealed at BOTH pipeline write positions
+            // The `_` namespace is sealed at both pipeline write positions
             // (ADR-0013 §5), and this lane is a door of its own: SSE parses
             // and compiles straight to a stream plan, never through
             // `emitter::validate_pipeline`. Without this mirror of
@@ -775,8 +765,8 @@ fn event_value<'e>(event: &'e Row, name: &str) -> Option<&'e EvalValue> {
 }
 
 /// A field's text for an identity or a display — [`row::cell_text`] for a
-/// cell the row carries, and the EMPTY string for one it does not (an
-/// absent field is not a NULL one, and never was).
+/// cell the row carries, and the empty string for one it does not (an
+/// absent field is not a NULL one).
 fn event_text(event: &Row, name: &str) -> String {
     event_value(event, name).map_or_else(String::new, row::cell_text)
 }
@@ -786,19 +776,19 @@ fn event_text(event: &Row, name: &str) -> String {
 /// Apply a `rename` stage in place, with the SQL's parallel semantics.
 ///
 /// The batch lane emits `* EXCLUDE (sources), src AS tgt, …`, so every
-/// target reads the PRE-stage row: `rename a as b, b as c` gives `b` the
+/// target reads the pre-stage row: `rename a as b, b as c` gives `b` the
 /// original `a` and `c` the original `b`, never the just-renamed value.
 /// A source this event does not carry makes its target absent (the SQL
 /// column would be NULL) rather than leaving the target's own stale
 /// value behind — the same rule [`PinScope::advance`] applies to pins,
 /// so value and pin can never come from different columns.
 ///
-/// Each source binds to the row's OWN spelling ([`bind_event_key`]), for
+/// Each source binds to the row's own spelling ([`bind_event_key`]), for
 /// the same reason [`PinScope::advance`] resolves its pin through
 /// [`crate::schema::catalog_key`]: `DuckDB` binds the emitted
 /// `"Status" AS "st"` to an ingest-folded `status` column
 /// case-insensitively, so `rename Status as st` has to carry the value
-/// across in this lane too — and the key REMOVED is the one that bound,
+/// across in this lane too, and the key removed is the one that bound,
 /// never the verbatim source.
 fn apply_rename(renames: &[(String, String)], event: &mut Row) {
     let sources: Vec<Option<String>> = renames
@@ -847,30 +837,30 @@ fn remove_folded_twins(event: &mut Row, name: &str) {
 /// Apply a `let` stage in place, with the SQL's column-then-alias
 /// resolution.
 ///
-/// The batch lane desugars the whole stage into ONE projection
+/// The batch lane desugars the whole stage into one projection
 /// (`COLUMNS(c -> c NOT IN (targets)), (expr) AS tgt, …`), and `DuckDB`
 /// binds a name inside it the way it binds any name in a `SELECT` list:
-/// an INPUT COLUMN wins, and only a name resolving to no input column
-/// falls through to the LATERAL COLUMN ALIAS a sibling just defined. Both
+/// an input column wins, and only a name resolving to no input column
+/// falls through to the lateral column alias a sibling just defined. Both
 /// halves are load-bearing, so this mirrors both:
 ///
-/// - a target that SHADOWS a column the row carries never feeds its
+/// - a target that shadows a column the row carries never feeds its
 ///   siblings — `let a = 1, b = a` and `let a = a + 1, b = a` over a row
-///   with an `a` both give `b` the ORIGINAL `a`; "carries" is `DuckDB`'s
+///   with an `a` both give `b` the original `a`; "carries" is `DuckDB`'s
 ///   own case-insensitive binding ([`bind_event_key`]), so `let A = 1,
 ///   b = A` shadows an `a` too;
-/// - a target the row does NOT carry — the ordinary case, since `let`
-///   usually names something new — IS the sibling's binding:
+/// - a target the row does not carry — the ordinary case, since `let`
+///   usually names something new — is the sibling's binding:
 ///   `let ms = 1000, total = ms * 2` gives `total = 2000`, matching
 ///   `/api/v1/query` (this lane is also the `rust_stages` batch tail
 ///   behind `extract kv`, where there is no SQL lane to fall back on).
 ///
-/// Pins do NOT follow the alias: [`PinScope::advance`] resolves every
-/// assignment's pin against the PRE-stage scope, so an alias-bound
+/// Pins do not follow the alias: [`PinScope::advance`] resolves every
+/// assignment's pin against the pre-stage scope, so an alias-bound
 /// sibling is unpinned — conservative, and identical in both lanes
 /// because both consume that one walk.
 ///
-/// The residual is the row-vs-relation gap: a column the CORPUS carries
+/// The residual is the row-vs-relation gap: a column the corpus carries
 /// but this row leaves absent (a sparse custom field) is a NULL column
 /// read in batch, while the live lane, seeing no key, binds the alias.
 fn apply_let(
@@ -879,11 +869,11 @@ fn apply_let(
     event: &mut Row,
     ctx: &EvalContext,
 ) {
-    // Decided against the PRE-stage row, before any alias lands: these
+    // Decided against the pre-stage row, before any alias lands: these
     // targets name a real column, so they stay invisible to their
     // siblings and their new values are applied only at the end.
-    // "Names a real column" is `DuckDB`'s own binding rule
-    // ([`bind_event_key`]), not an exact key match: a target spelled
+    // "Names a real column" is DuckDB's own binding rule
+    // (`bind_event_key`), not an exact key match: a target spelled
     // `Dur` shadows the row's `dur` exactly as a reference to it would
     // bind that column.
     let shadowing: Vec<bool> = assignments
@@ -892,9 +882,9 @@ fn apply_let(
         .collect();
     let mut resolved: Vec<(&str, EvalValue)> = Vec::with_capacity(assignments.len());
     for ((name, expr), shadows_column) in assignments.iter().zip(shadowing) {
-        // Stored as the evaluator produced it. A JSON round trip here is
-        // what used to turn `0/0` into NULL one stage before the query
-        // asked about it (see [`crate::row`]).
+        // Stored as the evaluator produced it: a JSON round trip here
+        // would turn `0/0` into NULL one stage before the query asks
+        // about it (see `crate::row`).
         let value = eval_expr_with_pins(expr, event, pins, ctx);
         if !shadows_column {
             // The lateral alias: a later sibling naming this target finds
@@ -909,28 +899,22 @@ fn apply_let(
     }
 }
 
-/// The TEXT an `extract` stage reads out of its source cell — the ONE
+/// The text an `extract` stage reads out of its source cell — the one
 /// answer both modes use, so the regex and kv arms cannot disagree about
 /// which cells an extraction reaches.
 ///
-/// The reach is exactly what it was before rows were typed, no wider. A
-/// row then carried `serde_json::Value` cells and both arms read a
-/// `Value::String` only, so a number or a boolean was never extracted
-/// from — and still is not. A stage-computed instant, though, crossed
-/// that boundary AS a JSON string (`Value::from(EvalValue::Timestamp)`
-/// wrote `timestamp_to_duckdb_text`), so
-/// `let t = strptime(…) | extract … from t` extracted from the timestamp
-/// text; typing the row turned that cell into `EvalValue::Timestamp` and
-/// silently stopped extracting. [`row::cell_text`] renders a `Timestamp`
-/// as [`crate::compare::Instant::cast_text`] — the CAST-AS-VARCHAR text,
-/// the same bytes that JSON string held — so the arm below restores the
-/// old reach rather than widening it.
+/// A string cell extracts, and so does a stage-computed instant, read as
+/// its `CAST(… AS VARCHAR)` text ([`row::cell_text`] over
+/// [`crate::compare::Instant::cast_text`]), so
+/// `let t = strptime(…) | extract … from t` sees the timestamp text. A
+/// number or a boolean is not text and extracts nothing.
 ///
-/// This lane is the only one that answers at all for a non-VARCHAR
-/// source: `DuckDB` has no `regexp_extract(TIMESTAMP, …)` overload and
-/// does not implicitly cast to VARCHAR, so the batch lane REFUSES such a
-/// query outright (Binder Error, probed in `stage_parity`), and behind
-/// `extract kv` there is no SQL lane — this code IS the batch tail.
+/// The timestamp arm is the one place this lane answers where the SQL
+/// lane cannot: `DuckDB` has no `regexp_extract(TIMESTAMP, …)` overload
+/// and does not implicitly cast to VARCHAR, so the batch lane refuses
+/// such a query outright (Binder Error, probed in `stage_parity`), and
+/// behind `extract kv` there is no SQL lane at all — this code is the
+/// batch tail.
 fn extract_source_text(event: &Row, source_field: &str) -> Option<String> {
     match event_value(event, source_field)? {
         EvalValue::Str(text) => Some(text.clone()),
@@ -1000,15 +984,13 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext
         }
 
         CompiledStage::Limit { remaining, .. } => {
-            // Exhaustion is STICKY, and `checked_sub` is what makes it
-            // so: a plain `fetch_sub` on a zero counter WRAPS to
-            // `u64::MAX`, so `Done` fired exactly once and the very next
-            // event read a full counter and passed. Every lane that
-            // keeps asking after a `Done` — the aggregate feed, which
-            // runs for the life of the subscription, and a snapshot's
-            // post-stages, which walk every row — admitted events past
-            // the limit, and the live pass-through door would have too
-            // for any caller that did not stop at the first `Done`.
+            // Exhaustion is sticky, and `checked_sub` is what makes it
+            // so: a plain `fetch_sub` on a zero counter wraps to
+            // `u64::MAX`, which would say `Done` once and then let the
+            // next event pass. The lanes that keep asking after a `Done`
+            // — the aggregate feed, which runs for the life of the
+            // subscription, and a snapshot's post-stages, which walk
+            // every row — depend on it.
             if remaining
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                     left.checked_sub(1)
@@ -1055,7 +1037,7 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext
             if let Some(text) = extract_source_text(event, source_field) {
                 let pairs = extract_key_value_pairs(&text, *separator);
                 for (k, v) in pairs {
-                    // The `_` namespace is sealed against LOG CONTENT too
+                    // The `_` namespace is sealed against log content too
                     // (ADR-0013 §1): a kv key is sender-controlled text, so
                     // an inserted `_severity`/`_time` would let a message
                     // body forge trawl's own verdict slots in both the SSE
@@ -1095,8 +1077,8 @@ pub fn apply_stage(stage: &mut CompiledStage, event: &mut Row, ctx: &EvalContext
 fn dedup_key(fields: &[String], event: &Row) -> Vec<String> {
     if fields.is_empty() {
         // dedup on entire event — every cell, kind-tagged so a string
-        // and a number of the same text stay different rows, exactly as
-        // JSON quoting made them ([`row::cell_key`]).
+        // and a number of the same text stay different rows
+        // (`row::cell_key`).
         let mut pairs: Vec<_> = event
             .iter()
             .map(|(k, v)| format!("{k}={}", row::cell_key(v)))
@@ -1116,11 +1098,10 @@ fn dedup_key(fields: &[String], event: &Row) -> Vec<String> {
 ///
 /// Tries integer, then float, then boolean, falling back to string.
 ///
-/// The finiteness guard is DELIBERATE and survives the retyping: a kv
-/// pair is sender TEXT out of a log line, with no SQL lane to agree
-/// with, so `x=inf` stays the string `"inf"` it reads as rather than
-/// becoming an infinity the sender never wrote. (It mirrors exactly what
-/// `serde_json::Number::from_f64` used to reject here.)
+/// The finiteness guard is deliberate: a kv pair is sender text out of a
+/// log line, with no SQL lane to agree with, so `x=inf` stays the string
+/// `"inf"` it reads as rather than becoming an infinity the sender never
+/// wrote.
 pub fn coerce_kv_value(s: String) -> EvalValue {
     if let Ok(i) = s.parse::<i64>() {
         return EvalValue::Int(i);
@@ -1163,12 +1144,10 @@ pub fn extract_key_value_pairs(text: &str, separator: char) -> Vec<(String, Stri
 
         let key_end = chars.peek().map_or(text.len(), |&(i, _)| i);
 
-        // check for separator
         if chars.peek().is_some_and(|&(_, c)| c == separator) {
             chars.next(); // consume separator
             let key = &text[key_start..key_end];
 
-            // parse value
             if let Some(&(_, '"')) = chars.peek() {
                 // quoted value
                 chars.next(); // consume opening quote
@@ -1373,11 +1352,12 @@ fn new_acc_state(acc: &CompiledAcc) -> AccState {
 }
 
 fn compile_agg_expr(agg: &AggExpr, stage: &str) -> Result<CompiledAcc, StreamPlanError> {
-    // The live accumulators read a BARE field out of the event; they have
+    // The live accumulators read a bare field out of the event; they have
     // no expression evaluator. A computed argument would therefore feed
     // nothing and answer NULL under a column the SQL lane fills with a
-    // real value — and since ADR-0013 ruling 8 both lanes now agree on the
-    // NAME, that divergence would be invisible. Refuse it instead.
+    // real value, and since both lanes agree on the output name
+    // (ADR-0013 ruling 8) that divergence would be invisible. Refuse it
+    // instead.
     let field = match agg.args.first() {
         None => None,
         Some(a) => match &a.node {
@@ -1402,7 +1382,7 @@ fn compile_agg_expr(agg: &AggExpr, stage: &str) -> Result<CompiledAcc, StreamPla
         },
     };
 
-    // The ONE output-name derivation, shared with the SQL emitter and
+    // The one output-name derivation, shared with the SQL emitter and
     // the pin-scope walk (ADR-0013 ruling 8): a computed argument names
     // its innermost field here exactly as it does in batch.
     let alias = crate::projection::agg_output_name(agg);
@@ -1486,7 +1466,7 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
 impl CompiledAggregation {
     /// Feed an event into the aggregation accumulators.
     ///
-    /// `ctx` is the EVENT's own evaluation context (ADR-0017 §3): the
+    /// `ctx` is the event's own evaluation context (ADR-0017 §3): the
     /// timechart bucket falls back to `now()` when the row carries no
     /// readable `_time`, and that reading must be the instant the event
     /// was admitted under, not a fresh clock — a second read would put
@@ -1683,17 +1663,18 @@ fn make_group_key(group_by: &[String], event: &Row) -> GroupKey {
 
 /// The span bucket an event lands in.
 ///
-/// The fallback for a row with no readable `_time` is `now()` — and
-/// `now()` here is the EVENT's context, the same instant its filter
+/// The fallback for a row with no readable `_time` is `now()`, and
+/// `now()` here is the event's context, the same instant its filter
 /// window and its `| where` read. Sampling a clock of its own would
 /// make a bucketless event land in a bucket nothing else in the query
-/// can name, and across a span boundary that is a different ROW in the
+/// can name, and across a span boundary that is a different row in the
 /// snapshot.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_wrap)]
 fn event_time_bucket(event: &Row, span_secs: u64, ctx: &EvalContext) -> i64 {
-    // Try to parse the _time field as RFC3339. The EXACT `_time` key,
-    // deliberately not `bind_event_key`: a pre-existing quirk of this
-    // lane, preserved rather than fixed here.
+    // The exact `_time` key, not `bind_event_key` as the rest of this
+    // lane uses: ingest folds every name to lowercase and the pipeline
+    // cannot mint a reserved one, so a trawl-written row has no case
+    // variant to bind.
     if let Some(EvalValue::Str(ts)) = event.get("_time")
         && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
     {
@@ -1705,17 +1686,14 @@ fn event_time_bucket(event: &Row, span_secs: u64, ctx: &EvalContext) -> i64 {
 
 /// The numeric reading an accumulator takes off a cell.
 ///
-/// Numbers ONLY — never a numeric-looking string, exactly as the JSON
-/// form read only `Value::Number`. Widening it would make `sum(x)` start
-/// counting text the SQL lane does not.
+/// Numbers only, never a numeric-looking string: widening it would make
+/// `sum(x)` start counting text the SQL lane does not.
 #[allow(clippy::cast_precision_loss)]
 fn extract_f64(event: &Row, field: &str) -> Option<f64> {
     event_value(event, field).and_then(|v| match v {
         EvalValue::Int(n) => Some(*n as f64),
-        // A JSON number above `i64::MAX` was readable here before it had
-        // its own cell — `Value::Number::as_f64` answered for it — so
-        // `sum`/`avg`/`min`/`max` still see it, rounded exactly as they
-        // saw it then.
+        // A JSON number above `i64::MAX` feeds `sum`/`avg`/`min`/`max`
+        // too, rounded to the nearest `f64`.
         EvalValue::UInt(n) => Some(*n as f64),
         EvalValue::Float(f) => Some(*f),
         _ => None,
@@ -1747,10 +1725,10 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Row) {
                 *count += 1;
             }
         }
-        // `f64::min`/`f64::max` IGNORE a NaN (`f64::max(NaN, 3.0)` is
-        // 3.0), which would make `max(x)` skip the very value `DuckDB`
-        // orders GREATEST. Both extremes go through the one probed order
-        // instead ([`crate::compare::double_total_cmp`]).
+        // `f64::min`/`f64::max` ignore a NaN (`f64::max(NaN, 3.0)` is
+        // 3.0), which would make `max(x)` skip the very value DuckDB
+        // orders greatest. Both extremes go through the one probed order
+        // instead (`crate::compare::double_total_cmp`).
         AccState::Min(current) => {
             if let Some(field) = &acc.field
                 && let Some(v) = extract_f64(event, field)
@@ -1829,10 +1807,9 @@ fn feed_acc_f64_vec(acc: &CompiledAcc, values: &mut Vec<f64>, event: &Row, max: 
 
 /// An accumulator's value as a cell.
 ///
-/// A computed double is stored as one — the JSON nulling that used to
-/// happen here was a WIRE concern living inside an accumulator, and the
-/// wire door still applies it ([`row::to_json`]). An empty accumulator is
-/// NULL, exactly as before.
+/// A computed double is stored as one, non-finite included: nulling a
+/// value JSON cannot spell is a wire concern the wire door owns
+/// ([`row::to_json`]). An empty accumulator is NULL.
 #[allow(clippy::cast_precision_loss)]
 fn snapshot_acc(state: &AccState) -> EvalValue {
     match state {
@@ -1862,9 +1839,10 @@ fn snapshot_acc(state: &AccState) -> EvalValue {
 
 /// Order a sample for the positional aggregates.
 ///
-/// `partial_cmp(…).unwrap_or(Equal)` left a NaN wherever it happened to
-/// sit, so `median(x)` depended on arrival order; the probed total order
-/// puts every NaN at the top, which is where `DuckDB` sorts it.
+/// The probed total order puts every NaN at the top, which is where
+/// `DuckDB` sorts it. `partial_cmp(…).unwrap_or(Equal)` would leave a
+/// NaN wherever it happened to sit and make `median(x)` depend on
+/// arrival order.
 fn sort_sample(values: &[f64]) -> Vec<f64> {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| crate::compare::double_total_cmp(*a, *b));
@@ -1915,7 +1893,7 @@ mod tests {
 
     /// The evaluation context these tests evaluate under.
     ///
-    /// A FIXED instant, not a capture: nothing below reaches for a
+    /// A fixed instant, not a capture: nothing below reaches for a
     /// clock, so neither does its fixture — the cases that care about
     /// `now()` name their own instant and assert against it.
     fn ctx() -> EvalContext {
@@ -1930,9 +1908,9 @@ mod tests {
         crate::row::from_json(pairs.as_object().unwrap())
     }
 
-    /// A row's cell as JSON, so the assertions below keep comparing
-    /// against the literals they always did (`serde_json::Value` knows
-    /// how to compare itself to a `&str`, an integer, a float…).
+    /// A row's cell as JSON, so an assertion can compare it against a
+    /// bare literal (`serde_json::Value` knows how to compare itself to
+    /// a `&str`, an integer, a float…).
     fn cell(row: &Row, key: &str) -> Value {
         Value::from(row.get(key).cloned().expect("cell present"))
     }
@@ -1979,11 +1957,11 @@ mod tests {
         assert!(matches!(plan, StreamPlan::PassThrough(stages) if stages.is_empty()));
     }
 
-    /// The timechart bucket reads the INGRESS `_time`, which is a wire
-    /// STRING — JSON has no timestamp type, and no stage can mint one
+    /// The timechart bucket reads the ingress `_time`, which is a wire
+    /// string: JSON has no timestamp type, and no stage can mint one
     /// under that name (`_time` is reserved, so `let`/`rename` refuse
     /// it). A retype of this read would silently bucket every event at
-    /// the CURRENT time through the fallback, which no assertion about
+    /// the current time through the fallback, which no assertion about
     /// counts would catch, so the bucket itself is asserted.
     #[test]
     fn the_time_bucket_reads_the_wire_string() {
@@ -1996,9 +1974,9 @@ mod tests {
             / i64::try_from(span).unwrap();
         assert_eq!(bucket, expected);
 
-        // …and an event with no `_time` falls back to the CONTEXT's
-        // instant, which is a DIFFERENT bucket — the failure mode the
-        // assertion above rules out for a real event.
+        // …and an event with no `_time` falls back to the context's
+        // instant, a different bucket — the failure mode the assertion
+        // above rules out for a real event.
         let bucketless = event(&json!({"service": "nginx"}));
         assert_ne!(event_time_bucket(&bucketless, span, &ctx()), expected);
     }
@@ -2031,7 +2009,6 @@ mod tests {
             ],
             keyword: "table",
         });
-        // The compiled stage preserves user-specified field order.
         let CompiledStage::Table { ref fields } = stage else {
             panic!("expected Table stage");
         };
@@ -2146,7 +2123,7 @@ mod tests {
 
     #[test]
     fn rename_from_absent_source_scrubs_the_target() {
-        // The SQL column exists corpus-wide even when THIS event lacks
+        // The SQL column exists corpus-wide even when this event lacks
         // it: the target becomes NULL, so it must not keep its own
         // pre-stage value.
         let mut stage = compile_rename(&RenameStage {
@@ -2184,14 +2161,13 @@ mod tests {
         assert_eq!(apply_stage(&mut stage, &mut ev, &ctx()), StageResult::Done);
     }
 
-    /// Exhaustion is STICKY: once a `limit` has said `Done` it says it
+    /// Exhaustion is sticky: once a `limit` has said `Done` it says it
     /// forever.
     ///
-    /// The counter used to be decremented with `fetch_sub`, which WRAPS
-    /// at zero — so `Done` fired exactly once and the very next event
-    /// read `u64::MAX` and passed. Every lane that keeps asking after a
-    /// `Done` (the aggregate feed, a snapshot's post-stages) therefore
-    /// admitted events past the limit.
+    /// Regression: a `fetch_sub` counter wraps at zero to `u64::MAX`, so
+    /// the event after the first `Done` passes — which the lanes that
+    /// keep asking (the aggregate feed, a snapshot's post-stages) turn
+    /// into events admitted past the limit.
     #[test]
     fn limit_exhaustion_is_sticky() {
         let mut stage = compile_limit(&LimitStage {
@@ -2270,7 +2246,7 @@ mod tests {
         );
     }
 
-    /// `where level == "..."` is an ORDINARY comparison on the sender's
+    /// `where level == "..."` is an ordinary comparison on the sender's
     /// own `level` column (ADR-0013 §6): zero aliases, so the stream
     /// reads the key it was given.
     fn level_where(op: BinaryOp, token: &str) -> Result<CompiledStage, StreamPlanError> {
@@ -2308,8 +2284,8 @@ mod tests {
         );
     }
 
-    /// There is no severity vocabulary on a bare name any more, so
-    /// nothing about `level` is rejected at compile time.
+    /// A bare name carries no severity vocabulary, so nothing about
+    /// `level` is rejected at compile time.
     #[test]
     fn level_is_an_ordinary_field_in_every_position() {
         for dsl in [
@@ -2333,8 +2309,8 @@ mod tests {
         }
     }
 
-    /// The pipeline may not MINT a reserved name — the same predicate
-    /// ingest strips by (ADR-0013 §5) — and BOTH doors refuse it: the
+    /// The pipeline may not mint a reserved name — the same predicate
+    /// ingest strips by (ADR-0013 §5) — and both doors refuse it: the
     /// SQL lane through `validate_pipeline`, the SSE lane (which never
     /// runs it) through its own plan compilation. Otherwise a capture
     /// group named `_severity` would 400 in batch and stream live,
@@ -2347,7 +2323,7 @@ mod tests {
             "* | rename service as _svc",
             r#"* | extract "(?P<_foo>.)" from message"#,
             r#"* | extract "(?P<_severity>\d+)" from message"#,
-            // Quoting changes the LEXING, never the policy (ADR-0013
+            // Quoting changes the lexing, never the policy (ADR-0013
             // ruling 7): a backticked write target is refused exactly as
             // the bare spelling is.
             "* | let `_foo` = 1",
@@ -2368,7 +2344,7 @@ mod tests {
         }
     }
 
-    /// The SEVERITY pin's closed vocabulary is enforced at COMPILE time
+    /// The SEVERITY pin's closed vocabulary is enforced at compile time
     /// in the stream lane too (ADR-0013): eval has no error channel, so
     /// an unknown token would otherwise open a live-looking stream that
     /// can never match while `/api/v1/query` 400s on the same text.
@@ -2397,7 +2373,7 @@ mod tests {
             );
         }
 
-        // The vocabulary itself compiles, and an UNPINNED `severity` is
+        // The vocabulary itself compiles, and an unpinned `severity` is
         // ordinary sender data with no vocabulary at all.
         for dsl in [
             r#"* | where _severity == "error""#,
@@ -2414,7 +2390,7 @@ mod tests {
         }
     }
 
-    /// `sev()`'s dialect is a closed vocabulary in the STREAM lane too:
+    /// `sev()`'s dialect is a closed vocabulary in the stream lane too:
     /// this lane never runs `validate_pipeline`, and eval has no error
     /// channel, so a dialect it cannot honour has to be refused where the
     /// plan is compiled — the same sentence the emitter gives.
@@ -2455,11 +2431,11 @@ mod tests {
         }
     }
 
-    /// Arity is the emitter's table in BOTH lanes, word for word: this
-    /// lane never runs `validate_pipeline`, so `/stream` accepted
-    /// `sev()` and `sev(a, b, c)` — opening a live-looking stream that
-    /// can only evaluate to NULL — while `/api/v1/query` 400d on the
-    /// same text.
+    /// Arity is the emitter's table in both lanes, word for word: this
+    /// lane never runs `validate_pipeline`, so without the mirror
+    /// `/stream` accepts `sev()` and `sev(a, b, c)` — opening a
+    /// live-looking stream that can only evaluate to NULL — while
+    /// `/api/v1/query` 400s on the same text.
     #[test]
     fn rejects_a_wrong_arity_call_with_the_emitters_own_sentence() {
         let scope = PinScope::unpinned();
@@ -2548,7 +2524,7 @@ mod tests {
     #[test]
     fn let_sibling_binds_the_alias_when_the_row_has_no_such_column() {
         // `let ms = 1000, total = ms * 2` — the row carries no `ms`, so
-        // DuckDB binds the LATERAL COLUMN ALIAS and the batch answers
+        // DuckDB binds the lateral column alias and the batch answers
         // 2000. This lane is also the `rust_stages` batch tail, so a NULL
         // here would be a silent wrong answer on /api/v1/query.
         let assignments = vec![
@@ -2579,8 +2555,8 @@ mod tests {
     #[test]
     fn let_siblings_read_the_pre_stage_event() {
         // SQL: one projection, `(1) AS a, (a) AS b` — the row carries an
-        // `a`, so the input COLUMN wins over the alias and `b` takes the
-        // ORIGINAL `a`.
+        // `a`, so the input column wins over the alias and `b` takes the
+        // original `a`.
         let assignments = vec![
             ("a".into(), span(Expr::Literal(LiteralValue::Int(1)))),
             ("b".into(), span(Expr::FieldRef("a".into()))),
@@ -2602,7 +2578,7 @@ mod tests {
     #[test]
     fn let_target_shadows_a_case_variant_column() {
         // `let A = 1, b = A` — DuckDB binds `A` to the input column `a`,
-        // so the target shadows it and `b` reads the ORIGINAL 5. An
+        // so the target shadows it and `b` reads the original 5. An
         // exact-key shadowing test would have made `A` a fresh alias and
         // handed `b` the 1.
         let assignments = vec![
@@ -2723,11 +2699,11 @@ mod tests {
         );
     }
 
-    /// A stage-computed instant is extractable TEXT in BOTH modes — the
-    /// reach the JSON row had, restored (see [`extract_source_text`]).
+    /// A stage-computed instant is extractable text in both modes (see
+    /// [`extract_source_text`]).
     ///
     /// This lane is the whole answer for such a source: the batch SQL
-    /// lane REFUSES `regexp_extract(TIMESTAMP, …)` outright (pinned in
+    /// lane refuses `regexp_extract(TIMESTAMP, …)` outright (pinned in
     /// `stage_parity`), and behind `extract kv` there is no SQL lane at
     /// all — this code is the batch tail.
     #[test]
@@ -2738,8 +2714,7 @@ mod tests {
                 .and_hms_opt(9, 0, 0)
                 .unwrap(),
         );
-        // The cell's own cast text, `2026-01-15 09:00:00` — what the row
-        // carried as a JSON string before it was typed.
+        // The cell's own cast text, `2026-01-15 09:00:00`.
         let text = row::cell_text(&EvalValue::Timestamp(instant));
 
         let mut stage = compile_extract(&ExtractStage {
@@ -2766,9 +2741,8 @@ mod tests {
         assert_eq!(cell_opt(&ev, "09"), Some(json!("00:00")));
     }
 
-    /// …and NOT one byte wider: a number or a boolean was a JSON number
-    /// or boolean before the row was typed, which neither arm read, so
-    /// neither arm reads one now.
+    /// …and not one byte wider: neither arm extracts from a numeric or
+    /// boolean cell.
     #[test]
     fn extract_still_skips_a_numeric_or_boolean_source() {
         let mut stage = compile_extract(&ExtractStage {
@@ -3543,7 +3517,7 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    // ── M6: unit allowlist validation (streaming path) ─────────────
+    // ── unit allowlist validation (streaming path) ─────────────────
 
     fn make_date_part_stage(unit: &str) -> Spanned<PipeStage> {
         span(PipeStage::Let(LetStage {
@@ -3615,7 +3589,7 @@ mod tests {
 
     #[test]
     fn stream_date_trunc_rejects_dow() {
-        // dow is in DATE_PART_UNITS but NOT in DATE_UNITS (date_trunc allowlist)
+        // dow is in DATE_PART_UNITS but not in DATE_UNITS (date_trunc allowlist)
         let pipeline = vec![make_date_trunc_stage("dow")];
         let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
         assert!(

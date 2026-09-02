@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Comments, and the ONE padding owner every whitespace-skipping site in
+//! Comments, and the one padding owner every whitespace-skipping site in
 //! the grammar goes through (ADR-0014).
 //!
 //! A comment is a grammar production — `'#' (!'\n')*` — admitted only
@@ -21,39 +21,38 @@
 //! delimiter" case is unenumerable — admitting `=` would stop
 //! `color=#ff0000` erroring).
 //!
-//! Every site that used to call chumsky's `.padded()` calls
-//! [`Spaced::spaced`] instead, and `chumsky::Parser::padded` is in
-//! clippy's `disallowed_methods` so a missed site — or a new one added
-//! later — fails the build rather than silently becoming a place
-//! comments do not work (ADR-0014 ruling 4).
+//! Every padding site goes through [`Spaced::spaced`], and
+//! `chumsky::Parser::padded` is in clippy's `disallowed_methods` so a
+//! missed site — or a new one added later — fails the build rather than
+//! silently becoming a place comments do not work (ADR-0014 ruling 4).
 
 use chumsky::input::InputRef;
 use chumsky::prelude::*;
 
 use crate::parser::primitives::{ParserExtra, ParserInput};
 
-/// The one comment opener. `//` was dropped in ADR-0014 ruling 3: it
-/// collides with every URL scheme, and it blanked to end-of-line, so it
-/// deleted sibling filters rather than merely truncating its own token.
+/// The one comment opener. `//` is not a second one (ADR-0014 ruling 3):
+/// it collides with every URL scheme, and blanking to end of line would
+/// delete sibling filters rather than truncate a single token.
 pub(crate) const OPENER: char = '#';
 
-/// The message a comment opener INSIDE an unquoted token carries
+/// The message a comment opener inside an unquoted token carries
 /// (ADR-0014 ruling 2). Never data, never a comment: quoted strings,
 /// backticked names and regex bodies carry `#` verbatim, so there is
 /// always an escape.
 ///
-/// The rule is one rule, but the WORKING SPELLING differs by position,
+/// The rule is one rule, but the working spelling differs by position,
 /// and a hint whose advice changes what the query means is worse than no
 /// hint at all — quoting a whole `color=#ff0000` turns a field filter
 /// into a phrase search. So the position is carried in the message, and
 /// [`hint_for`] is the one place each position's escape is written down.
 pub(crate) const MSG_OPENER_IN_TOKEN: &str = "'#' inside an unquoted token";
 
-/// [`MSG_OPENER_IN_TOKEN`] for the VALUE half of a field filter, whose
+/// [`MSG_OPENER_IN_TOKEN`] for the value half of a field filter, whose
 /// escape quotes the value alone (`color="#ff0000"`).
 pub(crate) const MSG_OPENER_IN_VALUE: &str = "'#' inside an unquoted value";
 
-/// [`MSG_OPENER_IN_TOKEN`] for a NEGATED search term, where quoting is no
+/// [`MSG_OPENER_IN_TOKEN`] for a negated search term, where quoting is no
 /// escape at all — `-"a#b"` is not a negated phrase, it is a bare term
 /// spelling literal quote characters. `NOT "a#b"` is the working form.
 pub(crate) const MSG_OPENER_IN_NEGATED_TERM: &str = "'#' inside a negated search term";
@@ -62,8 +61,8 @@ pub(crate) const MSG_OPENER_IN_NEGATED_TERM: &str = "'#' inside a negated search
 /// quoting is no escape either: a stage name is grammar, not data.
 pub(crate) const MSG_OPENER_IN_COMMAND: &str = "'#' inside a pipe stage name";
 
-/// The message a search-stage bare term STARTING with `//` carries — the
-/// loud half of dropping the second opener (ADR-0014 ruling 3).
+/// The message a search-stage bare term starting with `//` carries — the
+/// loud half of having exactly one opener (ADR-0014 ruling 3).
 pub(crate) const MSG_SLASHES_NOT_A_COMMENT: &str =
     "'//' does not start a comment — '#' is the comment character";
 
@@ -71,32 +70,31 @@ pub(crate) const MSG_SLASHES_NOT_A_COMMENT: &str =
 const HINT_SLASHES: &str =
     "write '#' to start a comment, or quote the term to search for the slashes";
 
-/// The `//` opener a search-stage bare term may not START with.
+/// The `//` opener a search-stage bare term may not start with.
 pub(crate) const SLASHES: &str = "//";
 
-/// What counts as LAYOUT between tokens: `char::is_whitespace`, Unicode
-/// and all, exactly as chumsky's `.padded()` always was. This is
+/// What counts as layout between tokens: `char::is_whitespace`, Unicode
+/// and all, the same set chumsky's `.padded()` consumes. This is
 /// consumption only — it says what separates two tokens, never where a
 /// comment may open.
 pub(crate) const fn is_layout(c: char) -> bool {
     c.is_whitespace()
 }
 
-/// Whether a comment may OPEN directly after `prev` — the character
+/// Whether a comment may open directly after `prev` — the character
 /// immediately before the `#`, or `None` at the start of the input.
 ///
-/// The boundary is ASCII whitespace, deliberately NARROWER than
+/// The boundary is ASCII whitespace, deliberately narrower than
 /// [`is_layout`], because the unquoted token charsets end on ASCII
 /// whitespace and nothing else: a no-break space is an ordinary character
-/// INSIDE a bare word or value. Reading `message="x"\u{a0}# last=1h` as a
+/// inside a bare word or value. Reading `message="x"\u{a0}# last=1h` as a
 /// comment while the token grammar reads `foo\u{a0}#` as one token would
-/// be the parser and the scanner answering the same question two ways.
-/// Both consequences are LOUD — `"x"\u{a0}# c` is a parse error at the
-/// `#`, `foo\u{a0}# c` is the inside-a-token error — never a silently
-/// different query.
+/// be two answers to the same question. Both consequences are loud —
+/// `"x"\u{a0}# c` is a parse error at the `#`, `foo\u{a0}# c` is the
+/// inside-a-token error — never a silently different query.
 ///
-/// The ONE predicate: [`skip_layout`] and [`crate::parser::scan`] both
-/// ask it, of the same character.
+/// [`skip_layout`] and [`crate::parser::scan`] both ask this predicate,
+/// of the same character.
 pub(crate) fn opens_comment_after(prev: Option<char>) -> bool {
     prev.is_none_or(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
 }
@@ -124,7 +122,7 @@ fn skip_comment<'src>(inp: &mut InputRef<'src, '_, ParserInput<'src>, ParserExtr
 /// Each iteration consumes at least one whitespace character, so the walk
 /// always terminates. A comment is reachable only after that whitespace —
 /// which is precisely the token-boundary rule, encoded structurally
-/// rather than tested by a lookback — and only when the LAST whitespace
+/// rather than tested by a lookback — and only when the last whitespace
 /// character consumed is one [`opens_comment_after`] admits, so the run
 /// `foo\u{a0}` leaves the following `#` to the token grammar.
 fn skip_layout<'src>(inp: &mut InputRef<'src, '_, ParserInput<'src>, ParserExtra<'src>>) {
@@ -147,12 +145,12 @@ fn skip_layout<'src>(inp: &mut InputRef<'src, '_, ParserInput<'src>, ParserExtra
 /// The layout run, as a parser.
 ///
 /// Written as a `custom` walk rather than a combinator tower on purpose:
-/// this parser is embedded at all 84 padding call sites, several of them
+/// this parser is embedded at every padding call site, several of them
 /// inside the recursive expression grammar, and a combinator form
-/// (`filter+ then comment? repeated`) inflates the nested parser TYPE
+/// (`filter+ then comment? repeated`) inflates the nested parser type
 /// enough to overflow the stack on a deep pipeline — the failure mode
-/// `expr.rs`'s existing `.boxed()` was added for. `custom` is one opaque
-/// type and allocates nothing.
+/// `expr.rs`'s `.boxed()` guards against. `custom` is one opaque type and
+/// allocates nothing.
 pub(crate) fn ws<'src>() -> impl Parser<'src, ParserInput<'src>, (), ParserExtra<'src>> + Clone {
     custom(|inp| {
         skip_layout(inp);
@@ -179,30 +177,29 @@ pub(crate) fn first_opener(text: &str) -> Option<usize> {
     text.find(OPENER)
 }
 
-/// Whether a search-stage bare term opens with `//` — an old-style
-/// comment line, which must fail loudly instead of becoming AND-ed text
-/// terms that narrow the result set to nothing.
+/// Whether a search-stage bare term opens with `//` — a comment line in
+/// some other language, which must fail loudly instead of becoming AND-ed
+/// text terms that narrow the result set to nothing.
 pub(crate) fn starts_with_slashes(text: &str) -> bool {
     text.starts_with(SLASHES)
 }
 
-/// The byte that separates a position message from the EXACT token slice
+/// The byte that separates a position message from the exact token slice
 /// the emitting production held, inside one `Rich::custom` payload.
 ///
 /// `Rich::custom` transports a string and nothing else, so a production
 /// that wants to hand the hint renderer more than its message has to
-/// spell both into that one string. A unit separator is the divider
-/// because the split takes the FIRST one: every message in this module is
-/// a `const` that carries none, so the head is always exactly the
-/// message, whatever control characters the user's own token carries
-/// after it.
+/// spell both into that one string. A unit separator is the divider, and
+/// the split takes the first one: every message in this module is a
+/// `const` that carries none, so the head is always exactly the message,
+/// whatever control characters the user's own token carries after it.
 const PAYLOAD_SEP: char = '\u{1f}';
 
-/// The messages a [`payload`] may be minted with — the ONE list
+/// The messages a [`payload`] may be minted with — the one list
 /// [`split_payload`] recognises.
 ///
 /// The separator is not enough on its own: other productions build their
-/// custom message by INTERPOLATING user-derived text (an invalid regex's
+/// custom message by interpolating user-derived text (an invalid regex's
 /// `Display`, a refused reserved name), so a query carrying a literal
 /// U+001F could hand the renderer a string that splits into a head this
 /// module never wrote. Splitting only on an exact head keeps a foreign
@@ -213,7 +210,7 @@ const PAYLOAD_MESSAGES: [&str; 3] = [
     MSG_OPENER_IN_NEGATED_TERM,
 ];
 
-/// The payload an emitting production sends when it HOLDS the offending
+/// The payload an emitting production sends when it holds the offending
 /// token: the position message, plus the exact slice the grammar refused.
 ///
 /// Passing the slice beats re-deriving it from the raw input. A left
@@ -227,7 +224,7 @@ const PAYLOAD_MESSAGES: [&str; 3] = [
 pub(crate) fn payload(msg: &str, exact: &str) -> String {
     // The call sites and [`PAYLOAD_MESSAGES`] must stay one set: a payload
     // minted with a message [`split_payload`] does not recognise comes back
-    // WHOLE, separator and slice and all, and would print as the message.
+    // whole, separator and slice and all, and would print as the message.
     debug_assert!(
         PAYLOAD_MESSAGES.contains(&msg),
         "payload minted with an unlisted message: {msg:?}"
@@ -248,25 +245,25 @@ pub(crate) fn split_payload(raw: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The hint for one of this module's messages. ONE owner: both emitters
+/// The hint for one of this module's messages. One owner: both emitters
 /// — the `validate` calls on the value and term productions, and the
 /// generic net in [`crate::parser::rich_to_parse_error`] — come here, so
 /// a position's working spelling is written down once.
 ///
-/// Every hint offers something the user can FOLLOW, and says what
+/// Every hint offers something the user can follow, and says what
 /// following it costs, which is why the position rides in the message:
 /// quoting the whole of `color=#ff0000` is a phrase search, quoting a
 /// `-`-negated term spells literal quote characters, and quoting a value
 /// carrying `*`/`?` stops it being a pattern.
 ///
-/// A CONCRETE rewrite is offered only where the emitting production held
-/// the exact slice ([`payload`]) AND the rewrite means what the hint
+/// A concrete rewrite is offered only where the emitting production held
+/// the exact slice ([`payload`]) and the rewrite means what the hint
 /// claims. `exact` is `None` for the generic net in
 /// [`crate::parser::rich_to_parse_error`], which knows only an offset:
 /// the token run around it can span several grammar tokens, and the
-/// POSITION is unknown — `| sort "a#b"` does not parse and
+/// position is unknown — `| sort "a#b"` does not parse and
 /// `| where a#b > 1` quietly becomes a string literal, whose escape is a
-/// backticked name, not quotes. So the net names the escapes ABSTRACTLY
+/// backticked name, not quotes. So the net names the escapes abstractly
 /// and mints no spelling.
 pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
     match msg {
@@ -280,20 +277,16 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
         }),
         MSG_OPENER_IN_VALUE => Some(match exact.filter(|t| quotable_verbatim(t)) {
             // Quoting a value is not operator-neutral: an unquoted `*`/`?`
-            // is the glob PATTERN (`crate::parser::search::has_glob_chars`
-            // decides it), and quoted wildcards are data. The advice is
-            // still the right one — a value carrying a `#` cannot stay
-            // unquoted — so it states what it costs instead of hiding it.
-            //
-            // What it costs is stated as the ONE thing true under every
-            // operator and every pin: a quoted value is never a pattern.
-            // The glob auto-detect overrides the operator the user typed
-            // (`f>a*` is a Glob, not a Gt), so quoting `f>#a*` yields a
-            // Gt comparison — "match it exactly" was true for `=` and
-            // false for every ordered operator. And the hint promises the
-            // `#` reaches the value, never that the value is one the
-            // field's pin admits: `_severity="#warn*"` carries the `#` and
-            // is then refused, loudly, by the severity vocabulary.
+            // is a glob pattern (`crate::parser::search::has_glob_chars`
+            // decides it) and quoted wildcards are data, and the glob
+            // auto-detect overrides the operator the user typed (`f>a*` is
+            // a Glob, not a Gt), so quoting `f>#a*` yields a Gt comparison.
+            // The advice is still the right one — a value carrying a `#`
+            // cannot stay unquoted — so it names the one cost true under
+            // every operator and every pin: a quoted value is never a
+            // pattern. It promises the `#` reaches the value, not that the
+            // field's pin admits it (`_severity="#warn*"` carries the `#`
+            // and is then refused by the severity vocabulary).
             Some(value) if crate::parser::search::has_glob_chars(value) => format!(
                 "quote the value (\"{value}\") to carry the '{OPENER}' \
                  (a quoted value is never a pattern), or {}",
@@ -317,7 +310,7 @@ fn comment_half() -> String {
     format!("put whitespace before the '{OPENER}' to start a comment")
 }
 
-/// The position-BLIND advice: both escapes named, no spelling minted.
+/// The position-blind advice: both escapes named, no spelling minted.
 ///
 /// The generic net fires wherever the two validators do not — a sort key,
 /// an expression, a stage argument — and each of those positions escapes
@@ -333,7 +326,7 @@ fn generic_advice() -> String {
 }
 
 /// Whether `"{text}"` is a rewrite the grammar reads back as exactly
-/// `text` — the ONE gate on the quoting half of every hint here.
+/// `text` — the one gate on the quoting half of every hint here.
 ///
 /// Two ways it is not, and both are reachable. A `"` or a `\` inside the
 /// text needs an escape (`quoted_string` reads `\"` and `\\`) that the
@@ -346,18 +339,18 @@ fn generic_advice() -> String {
 ///
 /// This is the double-quote counterpart of
 /// [`crate::parser::suggest::quote_dsl_field`], not a caller of it: that
-/// one answers how to spell a FIELD NAME, whose escape is backticks with
+/// one answers how to spell a field name, whose escape is backticks with
 /// doubling, and a backticked rendering here would name a field where the
-/// user meant to search for text. The invisible-character half IS shared
+/// user meant to search for text. The invisible-character half is shared
 /// — both go through [`crate::sanitize::is_unsafe_display_char`].
 fn quotable_verbatim(text: &str) -> bool {
     quotable(text, false)
 }
 
-/// [`quotable_verbatim`] for a SEARCH TERM, where a `,` is an ordinary
+/// [`quotable_verbatim`] for a search term, where a `,` is an ordinary
 /// word byte rather than a separator.
 ///
-/// `foo,#bar` is ONE positive bare term — the term charset ends at
+/// `foo,#bar` is one positive bare term — the term charset ends at
 /// whitespace, `|`, parens and a backtick, and nothing else — and
 /// `"foo,#bar"` is a `QuotedSearch` whose emitted SQL is the same
 /// substring match the bare term compiles to (`emitter/search.rs`). So
@@ -381,14 +374,14 @@ fn quotable(text: &str, comma_is_data: bool) -> bool {
 /// run of non-ASCII-whitespace, non-`|` bytes around it. Used to decide
 /// whether that token is a pipe stage name.
 ///
-/// It is deliberately NOT a hint source: a run recovered from an offset is
+/// It is deliberately not a hint source: a run recovered from an offset is
 /// a guess at both the token's bounds and its grammatical position, and a
-/// hint that quotes a guess is how `url=…?a=b#frag` came to be advised
-/// `"b#frag"`. Every concrete rewrite comes from the production that HELD
-/// the slice ([`payload`]).
+/// hint that quotes a guess would advise `"b#frag"` for
+/// `url=…?a=b#frag`. Every concrete rewrite comes from the production that
+/// held the slice ([`payload`]).
 ///
 /// ASCII whitespace because that is where the unquoted token charsets end
-/// — a no-break space sits INSIDE a bare word.
+/// — a no-break space sits inside a bare word.
 pub(crate) fn token_span(input: &str, offset: usize) -> (usize, &str) {
     let ends = |c: char| c.is_ascii_whitespace() || c == '|';
     let start = input[..offset.min(input.len())].rfind(ends).map_or(0, |i| {
@@ -403,7 +396,7 @@ pub(crate) fn token_span(input: &str, offset: usize) -> (usize, &str) {
 /// leading `-`, double-quoted — or `None` when quoting it is not a
 /// rewrite the user can paste ([`quotable_verbatim`]).
 ///
-/// A term that is ALREADY double-quoted is unwrapped first, so
+/// A term that is already double-quoted is unwrapped first, so
 /// `-"a#b"` is answered `NOT "a#b"` and not `NOT "\"a#b\""`.
 fn quoted_term(token: &str) -> Option<String> {
     let inner = token.strip_prefix('-').unwrap_or(token);
@@ -414,7 +407,7 @@ fn quoted_term(token: &str) -> Option<String> {
     quotable_as_term(body).then(|| format!("\"{body}\""))
 }
 
-/// The comment opener inside a PIPE STAGE NAME containing `offset`, if
+/// The comment opener inside a pipe stage name containing `offset`, if
 /// there is one — the position chumsky reports as a truncated unknown
 /// command (`| co#unt()` → "unknown command 'co'") because the stage word
 /// ends at the `#`.
@@ -433,10 +426,9 @@ pub(crate) fn opener_in_command_word(input: &str, offset: usize) -> Option<usize
 /// The project-owned padding combinator: whitespace and comments on both
 /// sides of a token.
 ///
-/// Every former `.padded()` site adopts this, which is what makes
-/// `a=1 # note\nhost=x` and `| stats count()\n# note\n| sort -count`
-/// work with no special case — `.padded()` is also what separates search
-/// tokens and pipeline stages.
+/// Padding is also what separates search tokens and pipeline stages, so
+/// routing every site through here is what makes `a=1 # note\nhost=x` and
+/// `| stats count()\n# note\n| sort -count` work with no special case.
 pub(crate) trait Spaced<'src, O>:
     Parser<'src, ParserInput<'src>, O, ParserExtra<'src>> + Clone + Sized
 {
@@ -465,7 +457,7 @@ mod tests {
         }
     }
 
-    /// A comment is reachable only AFTER whitespace — the token-boundary
+    /// A comment is reachable only after whitespace — the token-boundary
     /// rule, structural and without lookback.
     #[test]
     fn ws_does_not_open_a_comment_without_whitespace() {
@@ -487,7 +479,7 @@ mod tests {
 
     /// The boundary is ASCII whitespace: a no-break space is layout the
     /// run consumes, but it does not open a comment, because the token
-    /// charsets carry it INSIDE a bare word.
+    /// charsets carry it inside a bare word.
     #[test]
     fn only_ascii_whitespace_opens_a_comment() {
         for c in [' ', '\t', '\n', '\r'] {
@@ -512,7 +504,7 @@ mod tests {
                 .into_result()
                 .is_ok()
         );
-        // …and Unicode whitespace is still LAYOUT, consumed as ever
+        // …and Unicode whitespace is still layout, consumed either way
         assert!(
             ws().then_ignore(end())
                 .parse("\u{a0}\u{2003}")
@@ -540,9 +532,9 @@ mod tests {
         assert_eq!(token_span("x|color=#f", 8).1, "color=#f");
     }
 
-    /// A hint the user can FOLLOW: the value position quotes the EXACT
+    /// A hint the user can follow: the value position quotes the exact
     /// slice its production held, whatever the surrounding token looks
-    /// like. Re-deriving that slice from the raw text is what put a URL's
+    /// like. Re-deriving that slice from the raw text would put a URL's
     /// own query string inside the advice.
     #[test]
     fn a_value_hint_quotes_the_slice_the_production_held() {
@@ -574,7 +566,7 @@ mod tests {
         assert_eq!(split_payload("regex too long"), ("regex too long", None));
     }
 
-    /// A FOREIGN custom message carrying a separator round-trips whole:
+    /// A foreign custom message carrying a separator round-trips whole:
     /// other productions interpolate user-derived text into theirs (an
     /// invalid regex's `Display`, a refused reserved name), so the
     /// separator alone cannot decide.
@@ -608,7 +600,7 @@ mod tests {
             assert!(!quotable_verbatim(text), "{text:?}");
         }
 
-        // …and a `,` is a word byte in a TERM, where nothing splits on it
+        // …and a `,` is a word byte in a term, where nothing splits on it
         for text in ["foo,#bar", "#a,#b"] {
             assert!(quotable_as_term(text), "{text:?}");
             assert!(!quotable_verbatim(text), "{text:?}");
@@ -619,7 +611,7 @@ mod tests {
         assert_eq!(hint, "put whitespace before the '#' to start a comment");
     }
 
-    /// The position-BLIND net mints no spelling: it does not know the
+    /// The position-blind net mints no spelling: it does not know the
     /// token's bounds, and it does not know whether the position takes a
     /// quoted value or a backticked name.
     #[test]

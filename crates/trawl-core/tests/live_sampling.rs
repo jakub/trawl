@@ -2,23 +2,23 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The live lane's sampling boundaries (ADR-0017 §3), under a FAKE
+//! The live lane's sampling boundaries (ADR-0017 §3), under a fixed
 //! clock.
 //!
 //! Two boundaries, and they are not the same boundary:
 //!
-//! - **pass-through**: ONE instant per EVENT. A subscription's clock
-//!   advances between rows while each row is internally frozen — every
+//! - **pass-through**: one instant per event. A subscription's clock
+//!   advances between rows while each row is internally frozen: every
 //!   `now()` a row reads, in the search-stage window and in every stage
 //!   after it, is one value.
-//! - **aggregate snapshots**: ONE instant per emitted SNAPSHOT, for all
-//!   its post-stage rows. The events that FED that snapshot each sampled
+//! - **aggregate snapshots**: one instant per emitted snapshot, for all
+//!   its post-stage rows. The events that fed that snapshot each sampled
 //!   their own instant, possibly much earlier.
 //!
 //! Nothing here reads a clock: every case names its instants, so a
 //! failure is a semantic change and never a race. That is also the
-//! property under test — an evaluation path that reached for
-//! `Utc::now()` could not be pinned like this at all.
+//! property under test, since an evaluation path that sampled its own
+//! clock could not be pinned like this at all.
 
 use serde_json::{Map, Value, json};
 use trawl_core::context::EvalContext;
@@ -95,8 +95,8 @@ fn aggregate(dsl: &str) -> AggregatePlan {
 
 // ── pass-through: one instant per event ────────────────────────────
 
-/// AC2. Every `now()` one row reads is ONE value — across the SIBLING
-/// assignments of a single `let`, and across a LATER stage — while the
+/// Every `now()` one row reads is one value: across the sibling
+/// assignments of a single `let`, and across a later stage, while the
 /// subscription's clock advances between rows.
 ///
 /// The `| where echo == third` is the load-bearing half: if the two
@@ -138,16 +138,16 @@ fn one_event_freezes_now_across_siblings_and_a_later_stage() {
     );
 }
 
-/// AC2, the defect itself: the search-stage window and the pipeline are
-/// one `now()` reader, not two.
+/// The search-stage window and the pipeline are one `now()` reader, not
+/// two.
 ///
-/// The event is crafted so its fate DISAGREES between two instants 90
+/// The event is crafted so its fate disagrees between two instants 90
 /// seconds apart: at `admits`, a 60-second window admits it and
 /// `_time >= now()` holds exactly; at `rejects`, the window has moved
-/// past it and the comparison is false. Under two clocks — the shape
-/// the SSE loop had, a per-batch sample for the filter and a per-event
-/// one for the stages — the row is admitted by one and dropped by the
-/// other, in either direction. The door answers once.
+/// past it and the comparison is false. Under two clocks (a per-batch
+/// sample for the filter, a per-event one for the stages) the row is
+/// admitted by one and dropped by the other, in either direction. The
+/// door answers once.
 #[test]
 fn the_filter_and_the_stages_cannot_read_different_clocks() {
     let (filter, mut stages) = pass_through("last=60s | where _time >= now()");
@@ -155,9 +155,10 @@ fn the_filter_and_the_stages_cannot_read_different_clocks() {
     let rejects = at("2026-08-24T12:01:30Z");
     let ev = event(&json!({"_time": "2026-08-24T12:00:00Z", "message": "hello"}));
 
-    // The split, simulated by hand — the API no longer permits it.
-    // Stale filter sample, fresh stage sample: the window admits the
-    // event and the stage then silently drops it.
+    // The split, simulated by hand: `accept_event` takes one context for
+    // the window and the stages, so no caller can produce it. Stale
+    // filter sample, fresh stage sample: the window admits the event and
+    // the stage then silently drops it.
     assert!(
         filter.matches_at(&ev, &admits),
         "the window admits it at the earlier instant"
@@ -198,7 +199,7 @@ fn the_filter_and_the_stages_cannot_read_different_clocks() {
 /// The door's `Done` is what ends a subscription, and it does not emit
 /// the event that produced it — the handler stops at the first one.
 ///
-/// It also does not UN-say it. The subscription's events arrive in bus
+/// It also does not un-say it. The subscription's events arrive in bus
 /// batches, and the handler's `break` only covers the batch in hand; a
 /// door that answered `Done` once and then went back to emitting would
 /// put the next batch's events on the wire past `limit N`. The extra
@@ -225,10 +226,10 @@ fn a_limit_reports_done_rather_than_emitting() {
 /// The aggregate lane's pre-stages honour a `limit` too: exactly N
 /// events reach the accumulators.
 ///
-/// This lane never stops asking — an aggregate subscription keeps
-/// running so its snapshots stay current — so a `Done` that fired once
-/// and then lapsed let every later event feed the accumulators, and the
-/// snapshot counted them.
+/// This lane never stops asking, because an aggregate subscription keeps
+/// running so its snapshots stay current. So a `Done` that fired once and
+/// then lapsed would let every later event feed the accumulators, and the
+/// snapshot would count them.
 #[test]
 fn a_pre_stage_limit_caps_what_reaches_the_accumulators() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
@@ -263,11 +264,11 @@ fn a_pre_stage_limit_caps_what_reaches_the_accumulators() {
     );
 }
 
-/// A `limit` after the aggregation caps the SNAPSHOT's rows.
+/// A `limit` after the aggregation caps the snapshot's rows.
 ///
 /// Three groups, `limit 1`: the snapshot carries one row. A lapsing
-/// `Done` dropped the second row and then let the third through, which
-/// is both over the limit and a silently arbitrary row set.
+/// `Done` would drop the second row and let the third through, which is
+/// both over the limit and a silently arbitrary row set.
 #[test]
 fn a_post_stage_limit_caps_a_snapshots_rows() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
@@ -295,9 +296,9 @@ fn a_post_stage_limit_caps_a_snapshots_rows() {
 
 // ── aggregates: one instant per emitted snapshot ───────────────────
 
-/// AC3. Every post-stage row of ONE snapshot reads ONE instant — the
-/// snapshot's, not any feeding event's — and the next snapshot reads the
-/// next one.
+/// Every post-stage row of one snapshot reads one instant, the
+/// snapshot's rather than any feeding event's, and the next snapshot
+/// reads the next one.
 ///
 /// Two groups, so "one instant per snapshot" is discriminable from "one
 /// instant per row"; four feeding events at four distinct instants, so
@@ -348,7 +349,7 @@ fn a_snapshot_stamps_one_instant_on_every_group_row() {
         }
     }
 
-    // A second snapshot over the same accumulators reads the NEXT
+    // A second snapshot over the same accumulators reads the next
     // instant: the boundary is the emission, not the aggregation.
     let second = at("2026-08-24T11:05:30Z");
     let (_, rows) = stream::emit_snapshot(
@@ -434,8 +435,8 @@ fn a_dropped_group_does_not_move_the_survivors_instant() {
     assert_eq!(cell(&rows[0], "seen"), now_text(&snapshot));
 }
 
-/// The other half of ADR-0017 §3's aggregate rule: the events that FEED
-/// a snapshot sample PER EVENT, exactly as pass-through does.
+/// The other half of ADR-0017 §3's aggregate rule: the events that feed
+/// a snapshot sample per event, exactly as pass-through does.
 ///
 /// Grouping on the pre-stage `now()` makes that visible in the snapshot:
 /// two events under one instant are one group, a third under another
@@ -479,16 +480,16 @@ fn pre_stage_rows_sample_per_event() {
     );
 }
 
-// ── the timechart fallback reads the EVENT's context ───────────────
+// ── the timechart fallback reads the event's context ───────────────
 
-/// An event with no `_time` buckets at ITS OWN context's instant.
+/// An event with no `_time` buckets at its own context's instant.
 ///
-/// The instants here are in 2020, so a second clock read — the
-/// `Utc::now()` this fallback used to take — would land the event six
-/// years away from the bucket asserted. The pair straddles a span
-/// boundary by one second, which is the finer failure the coarse one
-/// hides: the bucket a bucketless event lands in is decided by the
-/// instant its own filter and stages read, not by a later one.
+/// The instants here are in 2020, so a fresh clock read inside the
+/// fallback would land the event six years away from the bucket
+/// asserted. The pair straddles a span boundary by one second, which is
+/// the finer failure the coarse one hides: the bucket a bucketless event
+/// lands in is decided by the instant its own filter and stages read, not
+/// by a later one.
 #[test]
 fn a_bucketless_event_buckets_at_its_own_contexts_instant() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
@@ -525,18 +526,18 @@ fn a_bucketless_event_buckets_at_its_own_contexts_instant() {
     );
 }
 
-/// A post-stage `limit` caps EVERY snapshot, not the plan's lifetime.
+/// A post-stage `limit` caps every snapshot, not the plan's lifetime.
 ///
 /// ADR-0001 makes batch the contract and streaming the mirror, and an
 /// emitted snapshot is the live rendering of the batch result set: what
 /// `| stats count() by host | limit 1` caps there is one result set, so
 /// here it caps each snapshot. Spending the limit once would leave the
-/// stream permanently silent while the aggregation kept evolving —
-/// a mirror of nothing.
+/// stream permanently silent while the aggregation kept evolving, a
+/// mirror of nothing.
 ///
-/// The asymmetry with a PRE-aggregation `limit`, which stays sticky for
+/// The asymmetry with a pre-aggregation `limit`, which stays sticky for
 /// the subscription's life, is the batch-mirroring one: that end caps
-/// the INPUT set, and batch reads its input once.
+/// the input set, and batch reads its input once.
 #[test]
 fn a_post_stage_limit_is_re_armed_for_each_snapshot() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =

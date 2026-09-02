@@ -5,18 +5,17 @@
 //! Whole-pipeline parity for the values that have no JSON spelling.
 //!
 //! `filter_parity` proves the search stage agrees and `pin_stage_parity`
-//! proves one `| where`/`| let` CELL agrees. Neither could see this
-//! milestone's bug, because it was not in a comparison: it was in the
-//! CARRIER. A row crossed each stage boundary as JSON, so a computed
-//! `0/0` became NULL one stage before anything asked about it, and
-//! `* | let x = 0/0 | where x == x` kept the row in batch while the live
-//! tail dropped it.
+//! proves one `| where`/`| let` cell agrees. Neither watches the carrier
+//! that moves a row between stages: a row crossing a stage boundary as
+//! JSON turns a computed `0/0` into NULL one stage before anything asks
+//! about it, so `* | let x = 0/0 | where x == x` keeps the row in batch
+//! while the live tail drops it.
 //!
-//! So these cases are whole PIPELINES, run through both lanes over the
-//! same events, compared cell by cell as TEXT — the batch side rendered
+//! So these cases are whole pipelines, run through both lanes over the
+//! same events, compared cell by cell as text: the batch side rendered
 //! by `DuckDB`'s own `::VARCHAR`, the live side by
 //! [`trawl_core::row::cell_text`], which is what a group key and a
-//! displayed cell already are. Each case also states the ANSWER, because
+//! displayed cell already are. Each case also states the answer, because
 //! two lanes can agree on the wrong one.
 
 use std::io::Write as _;
@@ -33,20 +32,20 @@ use trawl_core::stream::{StageResult, StreamPlan, apply_stage, compile_stream_pl
 /// comparison never depends on projection order.
 type TextRow = Vec<(String, String)>;
 
-/// A lane's whole answer: rows SORTED, so the comparison ignores order,
-/// and a `Vec` rather than a set, so it does not ignore MULTIPLICITY.
-/// A set would have compared a lane emitting one row equal to a lane
-/// emitting the same row twice — exactly the failure a broken `dedup`
+/// A lane's whole answer: rows sorted, so the comparison ignores order,
+/// and a `Vec` rather than a set, so it does not ignore multiplicity.
+/// A set would compare a lane emitting one row equal to a lane emitting
+/// the same row twice, which is exactly the failure a broken `dedup`
 /// produces.
 type TextRows = Vec<TextRow>;
 
 /// Whether a column takes part in the cell-by-cell comparison.
 ///
 /// `_time` does not, for the reason `pin_stage_parity` excludes it too:
-/// the live lane carries the sender's wire TEXT while the batch lane
+/// the live lane carries the sender's wire text while the batch lane
 /// renders the parsed instant (`2026-01-15T09:00:00Z` vs
-/// `2026-01-15 09:00:00`). That is a timestamp-representation question
-/// this milestone does not touch, and it would mask every case here.
+/// `2026-01-15 09:00:00`). That representation gap is out of scope here
+/// and would mask every case in the file.
 fn compared(column: &str) -> bool {
     column != "_time"
 }
@@ -70,15 +69,15 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
 }
 
 /// Run the pipeline as SQL and read every cell back as `DuckDB`'s own
-/// VARCHAR rendering — the one form that can carry `inf`/`nan`, where
+/// VARCHAR rendering, the one form that can carry `inf`/`nan`, where
 /// `to_json` would null them out and hide exactly what is under test.
 fn batch_rows(conn: &Connection, dsl: &str, events: &[Value]) -> TextRows {
     batch_outcome(conn, dsl, events)
         .unwrap_or_else(|error| panic!("batch must run for {dsl:?}: {error}"))
 }
 
-/// The same, surfacing a `DuckDB` ERROR instead of panicking on it — the
-/// shape a case needs when the batch lane REFUSES the query and the
+/// The same, surfacing a `DuckDB` error instead of panicking on it: the
+/// shape a case needs when the batch lane refuses the query and the
 /// streaming contract is "eval answers NULL / drops the row".
 fn batch_outcome(conn: &Connection, dsl: &str, events: &[Value]) -> Result<TextRows, String> {
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
@@ -148,9 +147,9 @@ fn batch_outcome(conn: &Connection, dsl: &str, events: &[Value]) -> Result<TextR
 
 /// Run the same pipeline through the live lane over the same events.
 fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
-    // ONE anchor for the whole comparison: these cases are about the
-    // CARRIER, not about the clock, so both lanes stay pinned to a
-    // single instant (ADR-0017 §3).
+    // One anchor for this lane's whole run: these cases are about the
+    // carrier, not about the clock, so no stage samples a second instant
+    // (ADR-0017 §3).
     let anchor = trawl_core::context::EvalContext::capture();
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let plan = compile_stream_plan(&query.pipeline, &PinScope::unpinned()).expect("plan compiles");
@@ -211,53 +210,51 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
     sorted(rendered)
 }
 
-/// Row order is an implementation detail of each lane; the CONTENT and
+/// Row order is an implementation detail of each lane; the content and
 /// how many times it appears are not.
 fn sorted(mut rows: TextRows) -> TextRows {
     rows.sort();
     rows
 }
 
-/// Both lanes, same events, same answer — returned so the caller can say
-/// what the answer must BE.
+/// Both lanes, same events, same answer, returned so the caller can say
+/// what the answer must be.
 ///
-/// The comparison is BYTE-EXACT, in every column. A normalization
-/// applied here would be applied to every cell of every case, and a
-/// non-injective one (folding `-nan` onto `nan`, say) would then launder
-/// a real VARCHAR divergence — an ordinary string cell carrying `-nan`
-/// through a stage — into agreement. Cases whose cell text is genuinely
-/// not comparable opt IN, by column, through
-/// [`agreed_folding_nan_in`].
+/// The comparison is byte-exact, in every column. A normalization applied
+/// here would be applied to every cell of every case, and a non-injective
+/// one (folding `-nan` onto `nan`, say) would then launder a real VARCHAR
+/// divergence, an ordinary string cell carrying `-nan` through a stage,
+/// into agreement. Cases whose cell text is genuinely not comparable opt
+/// in, by column, through [`agreed_folding_nan_in`].
 fn agreed(conn: &Connection, dsl: &str, events: &[Value]) -> TextRows {
     assert_lanes_agree(conn, dsl, events, None)
 }
 
-/// [`agreed`], with ONE named column's NaN sign folded in both lanes.
+/// [`agreed`], with one named column's NaN sign folded in both lanes.
 ///
-/// The opt-in exists for exactly one shape: a cell holding a COMPUTED
-/// NaN (`0.0 / 0`), whose sign is the hardware's rather than either
-/// engine's, read by two different renderers — the live side through the
-/// IDENTITY path, which ties the two signs deliberately so a group is
-/// one group ([`row::cell_text`]), the batch side through `::VARCHAR`,
-/// which prints the sign the value carries. No production path compares
-/// those bytes across lanes (the wire renders a NaN `null` on both
-/// sides).
+/// The opt-in exists for exactly one shape: a cell holding a computed NaN
+/// (`0.0 / 0`), whose sign is the hardware's rather than either engine's,
+/// read by two different renderers. The live side goes through the
+/// identity path, which ties the two signs deliberately so a group is one
+/// group ([`row::cell_text`]); the batch side through `::VARCHAR`, which
+/// prints the sign the value carries. No production path compares those
+/// bytes across lanes (the wire renders a NaN `null` on both sides).
 ///
-/// Everything else in the row — every other column, the row count, the
-/// multiplicity — stays byte-exact, and a case that names a column here
-/// says so in its own text.
+/// Everything else in the row stays byte-exact, every other column, the
+/// row count and the multiplicity alike, and a case that names a column
+/// here says so in its own text.
 fn agreed_folding_nan_in(conn: &Connection, dsl: &str, events: &[Value], column: &str) -> TextRows {
     assert_lanes_agree(conn, dsl, events, Some(column))
 }
 
 /// Both lanes over a case where one column holds a nondeterministic
-/// REPRESENTATIVE — which of several EQUAL rows each lane happened to
-/// keep, which `dedup` and a group-by both decide for themselves.
+/// representative: which of several equal rows each lane kept, a choice
+/// `dedup` and a group-by both make for themselves.
 ///
 /// Deliberately not [`agreed_folding_nan_in`]: that one exists for a
-/// value whose SIGN is the hardware's, and stretching it to cover a
+/// value whose sign is the hardware's, and stretching it to cover a
 /// representative choice would make its contract mean two things. Here
-/// every OTHER column is still compared byte-exactly, multiplicity
+/// every other column is still compared byte-exactly, multiplicity
 /// included, and the named column comes back per lane so the caller can
 /// say what each lane must show.
 fn agreed_apart_from(
@@ -327,7 +324,7 @@ fn assert_lanes_agree(
     batch
 }
 
-/// The value of one column across the agreed rows, sorted — one entry
+/// The value of one column across the agreed rows, sorted, one entry
 /// per row, so a repeated row is a repeated value.
 fn column(rows: &TextRows, name: &str) -> Vec<String> {
     let mut values: Vec<String> = rows
@@ -355,13 +352,13 @@ fn one_event() -> Vec<Value> {
     vec![json!({"service": "nginx", "n": 1})]
 }
 
-/// The case this milestone exists for: a computed NaN survives the stage
-/// boundary, so `x == x` is TRUE in both lanes (`DuckDB` orders NaN equal
-/// to itself — ADR-0011's total DOUBLE order).
+/// A computed NaN survives the stage boundary, so `x == x` is true in
+/// both lanes (`DuckDB` orders NaN equal to itself, ADR-0011's total
+/// DOUBLE order).
 #[test]
 fn a_computed_nan_survives_the_stage_boundary() {
     let conn = conn();
-    // `x` holds a COMPUTED NaN, whose sign is the hardware's — the one
+    // `x` holds a computed NaN, whose sign is the hardware's: the one
     // cell in this row the two lanes cannot be compared on byte for
     // byte. Every other column, and the row count, still are.
     let kept = agreed_folding_nan_in(
@@ -386,7 +383,7 @@ fn an_infinity_compares_in_a_later_stage() {
     assert_eq!(column(&rows, "y"), vec!["true"]);
 
     // NaN outranks every finite value, so a comparison against a large
-    // one is TRUE. (Spelled as a plain decimal: the DSL float grammar has
+    // one is true. (Spelled as a plain decimal: the DSL float grammar has
     // no exponent form.)
     let rows = agreed(
         &conn,
@@ -396,14 +393,14 @@ fn an_infinity_compares_in_a_later_stage() {
     assert_eq!(column(&rows, "y"), vec!["true"]);
 }
 
-/// A NaN group key is ONE group, rendered `nan` — not a null group, and
-/// not one group per row.
+/// A NaN group key is one group, rendered `nan`, not a null group and not
+/// one group per row.
 ///
-/// The key's TEXT is the parked divergence `-0.0` has: the identity path
-/// normalizes the sign the total order ties, while `DuckDB` displays
-/// whichever representative row it kept (`0.0 / 0` produces a NaN whose
-/// sign is the hardware's). So the GROUPING is compared across lanes and
-/// the rendering is asserted per lane.
+/// The key's text carries the same parked divergence `-0.0` has: the
+/// identity path normalizes the sign the total order ties, while `DuckDB`
+/// displays whichever representative row it kept (`0.0 / 0` produces a NaN
+/// whose sign is the hardware's). So the grouping is compared across lanes
+/// and the rendering is asserted per lane.
 #[test]
 fn a_nan_group_key_is_one_group() {
     let conn = conn();
@@ -428,14 +425,14 @@ fn a_nan_group_key_is_one_group() {
     );
 }
 
-/// Negative zero groups WITH positive zero — they compare equal, so a key
+/// Negative zero groups with positive zero: they compare equal, so a key
 /// that split them would contradict the comparison.
 ///
-/// The two lanes agree on the GROUPING and diverge, deliberately, on the
-/// key's TEXT: `DuckDB` shows whichever representative it kept (`-0.0`),
+/// The two lanes agree on the grouping and diverge, deliberately, on the
+/// key's text: `DuckDB` shows whichever representative it kept (`-0.0`),
 /// while [`row::cell_text`] normalizes the sign so that identity and
-/// display say the same thing. That is the one enumerated rendering
-/// delta of this milestone, pinned here rather than left to be noticed.
+/// display say the same thing. That rendering delta is pinned here rather
+/// than left to be noticed.
 #[test]
 fn negative_zero_groups_with_positive_zero() {
     let conn = conn();
@@ -459,7 +456,7 @@ fn negative_zero_groups_with_positive_zero() {
     );
 }
 
-/// The accumulators see an infinity as the value it is — `max` does not
+/// The accumulators see an infinity as the value it is: `max` does not
 /// skip it, `sum` does not ignore it, `min` still finds the finite one.
 #[test]
 fn the_aggregates_read_an_infinity() {
@@ -479,28 +476,28 @@ fn the_aggregates_read_an_infinity() {
     assert_eq!(column(&rows, "total"), vec!["inf"]);
 }
 
-/// Two NaN rows dedup to ONE: the identity a dedup key expresses is the
+/// Two NaN rows dedup to one: the identity a dedup key expresses is the
 /// same identity the comparison does.
 ///
-/// The two events are identical (dedup's SQL ranks by `_time`, and the
-/// lanes pick their survivor differently — first-seen live, newest in
-/// batch — so identical rows keep the case on its own subject).
+/// The two events are identical because dedup's SQL ranks by `_time` and
+/// the lanes pick their survivor differently (first-seen live, newest in
+/// batch), so identical rows keep the case on its own subject.
 #[test]
 fn two_nan_rows_dedup_to_one() {
     let conn = conn();
     let event = json!({"service": "nginx", "_time": "2026-01-15T09:00:00Z"});
     let events = vec![event.clone(), event];
-    // `x` is a COMPUTED NaN, so its sign is the hardware's and the two
-    // lanes render it through different doors — the one shape the fold
+    // `x` is a computed NaN, so its sign is the hardware's and the two
+    // lanes render it through different doors, the one shape the fold
     // exists for. The two source rows are identical, so which one
-    // survives cannot matter here; only the row COUNT is under test, and
+    // survives cannot matter here; only the row count is under test, and
     // every other column is still compared byte-exactly.
     let rows = agreed_folding_nan_in(&conn, "* | let x = 0.0 / 0 | dedup x", &events, "x");
     assert_eq!(rows.len(), 1, "one row survives dedup: {rows:?}");
 }
 
-/// A finite float takes the same text in both lanes — the ordinary case
-/// the specials above must not have broken.
+/// A finite float takes the same text in both lanes: the ordinary case
+/// the specials above must not break.
 #[test]
 fn finite_floats_render_the_same_in_both_lanes() {
     let conn = conn();
@@ -514,12 +511,12 @@ fn finite_floats_render_the_same_in_both_lanes() {
     assert_eq!(column(&rows, "c"), vec!["-1.5"]);
 }
 
-/// A STRING cell crosses a stage byte for byte — `-nan` included.
+/// A string cell crosses a stage byte for byte, `-nan` included.
 ///
-/// This is the case a global sign-fold in the harness would have
-/// laundered: `tostring(tonumber("-nan"))` is an ordinary VARCHAR whose
-/// sign is EXPLICIT IN THE TEXT (no hardware involved — the cast domain
-/// carries the sign from the input string, in both lanes), so a carrier
+/// This is the case a global sign-fold in the harness would launder:
+/// `tostring(tonumber("-nan"))` is an ordinary VARCHAR whose sign is
+/// explicit in the text (no hardware involved, since the cast domain
+/// carries the sign from the input string in both lanes), so a carrier
 /// regression that flipped it to `nan` is a real divergence and has to
 /// be visible. Nothing here is folded; the comparison is exact.
 #[test]
@@ -538,7 +535,7 @@ fn a_signed_nan_string_crosses_a_stage_byte_for_byte() {
         assert_eq!(column(&rows, "s"), vec![want], "{expression}");
     }
 
-    // …and the same text through a SECOND stage, so it crosses a
+    // …and the same text through a second stage, so it crosses a
     // boundary rather than being read where it was made: carried across
     // two stages and compared as text at the end.
     let rows = agreed(
@@ -550,16 +547,16 @@ fn a_signed_nan_string_crosses_a_stage_byte_for_byte() {
     assert_eq!(column(&rows, "t"), vec!["-nan"]);
 }
 
-/// The two NaN SIGNS are one identity: one group, one distinct value,
+/// The two NaN signs are one identity: one group, one distinct value,
 /// one row after `dedup`.
 ///
-/// `cell_text` renders a float through `DuckDB`'s own text, which
-/// carries the sign — right for `tostring()`, wrong for a KEY, because
-/// the comparator ties the two signs (`NaN = NaN` is true). A signed key
-/// split a group the engine does not split.
+/// `cell_text` renders a float through `DuckDB`'s own text, which carries
+/// the sign. That is right for `tostring()` and wrong for a key, because
+/// the comparator ties the two signs (`NaN = NaN` is true) and a signed
+/// key would split a group the engine does not split.
 ///
-/// The GROUPING is asserted in both lanes; the key's TEXT is the same
-/// parked divergence `-0.0` has, since `DuckDB` displays whichever
+/// The grouping is asserted in both lanes; the key's text carries the
+/// same parked divergence `-0.0` has, since `DuckDB` displays whichever
 /// representative row it kept.
 #[test]
 fn the_two_nan_signs_are_one_identity() {
@@ -568,7 +565,7 @@ fn the_two_nan_signs_are_one_identity() {
         json!({"service": "nginx", "_time": "2026-01-15T09:00:00Z", "flag": true}),
         json!({"service": "nginx", "_time": "2026-01-15T09:00:00Z", "flag": false}),
     ];
-    // `tonumber` carries the sign from the TEXT in both lanes, so the
+    // `tonumber` carries the sign from the text in both lanes, so the
     // two rows really do hold differently-signed NaNs.
     let signed = r#"let x = if(flag, tonumber("nan"), tonumber("-nan"))"#;
 
@@ -595,22 +592,22 @@ fn the_two_nan_signs_are_one_identity() {
         "the batch key is whichever NaN DuckDB kept: {batch_key:?}"
     );
 
-    // `values()` collects ONE member — it used to list both signs.
+    // `values()` collects one member: the two signs are one value.
     let listed = format!("* | {signed} | stats values(x) as vs");
     assert_eq!(
         column(&live_rows(&listed, &events), "vs"),
         vec![r#"["nan"]"#]
     );
 
-    // …and both `dedup` forms keep ONE row: the by-field form, and the
+    // …and both `dedup` forms keep one row: the by-field form, and the
     // whole-row one that reads the same cell through `cell_key`.
     //
-    // These NaNs are sign-EXPLICIT — they come from the text
-    // `tonumber("-nan")` reads, not from a computation — so nothing here
-    // is hardware-dependent. What each lane chooses for itself is which
-    // of the two equal rows SURVIVES, and the survivor carries its own
-    // spelling: `DuckDB` keeps whichever row it kept, while the live
-    // lane's identity ruling makes every NaN cell read `nan`.
+    // These NaNs are sign-explicit, read from the text `tonumber("-nan")`
+    // takes rather than computed, so nothing here is hardware-dependent.
+    // What each lane chooses for itself is which of the two equal rows
+    // survives, and the survivor carries its own spelling: `DuckDB` keeps
+    // whichever row it kept, while the live lane's identity rule makes
+    // every NaN cell read `nan`.
     for dedup in ["dedup x", "drop flag | dedup"] {
         let dsl = format!("* | {signed} | {dedup}");
         let (live_x, batch_x) = agreed_apart_from(&conn, &dsl, &events, "x");
@@ -628,7 +625,7 @@ fn the_two_nan_signs_are_one_identity() {
     }
 }
 
-/// A computed TIMESTAMP groups by the text `DuckDB` prints — not by the
+/// A computed TIMESTAMP groups by the text `DuckDB` prints, not by the
 /// JSON string it becomes on the wire, quote characters and all.
 #[test]
 fn a_timestamp_group_key_is_the_instants_own_text() {
@@ -648,12 +645,13 @@ fn a_timestamp_group_key_is_the_instants_own_text() {
     assert_eq!(column(&rows, "count"), vec!["2"]);
 }
 
-/// A number above `i64::MAX` is its OWN identity, not the double it
+/// A number above `i64::MAX` is its own identity, not the double it
 /// computes as.
 ///
-/// The row's door reads every cell now, so a pass-through field carrying
-/// `18446744073709551615` would have rounded on the way in — collapsing
-/// it with its neighbour in a `dedup`, and merging two groups into one.
+/// The row's door reads every cell, pass-through fields included, so
+/// `18446744073709551615` must not round on the way in: a rounded value
+/// collapses with its neighbour in a `dedup` and merges two groups into
+/// one.
 #[test]
 fn an_unsigned_number_keeps_its_identity_across_stages() {
     let conn = conn();
@@ -682,9 +680,9 @@ fn an_unsigned_number_keeps_its_identity_across_stages() {
 /// Whole pipelines over TIMESTAMP cells: the instant a stage computes
 /// compares, renders and groups the same in both lanes.
 ///
-/// Deliberately not covered by the specials matrix above, which EXCLUDES
-/// `_time` — that exclusion is about the sender's wire text, and it would
-/// have hidden every case here.
+/// A computed instant rather than `_time`, which [`compared`] excludes:
+/// that exclusion is about the sender's wire text and would hide every
+/// case here.
 #[test]
 fn a_computed_timestamp_agrees_across_the_lanes() {
     let conn = conn();
@@ -695,7 +693,7 @@ fn a_computed_timestamp_agrees_across_the_lanes() {
     for expression in [
         format!(r#"* | let t = {strptime} | where t > "2020-01-01" | table service"#),
         format!(r#"* | let t = {strptime} | where "2020-01-01" < t | table service"#),
-        // …and against an INFINITY, which orders above every date.
+        // …and against an infinity, which orders above every date.
         format!(r#"* | let t = {strptime} | where t < "infinity" | table service"#),
         format!(r#"* | let t = {strptime} | where t > "-infinity" | table service"#),
     ] {
@@ -703,7 +701,7 @@ fn a_computed_timestamp_agrees_across_the_lanes() {
         assert_eq!(kept.len(), 1, "the row must be kept: {expression}");
     }
 
-    // A comparison that does NOT hold drops the row in both lanes.
+    // A comparison that does not hold drops the row in both lanes.
     let dropped = agreed(
         &conn,
         &format!(r#"* | let t = {strptime} | where t > "2030-01-01" | table service"#),
@@ -711,7 +709,7 @@ fn a_computed_timestamp_agrees_across_the_lanes() {
     );
     assert!(dropped.is_empty(), "the row must be dropped: {dropped:?}");
 
-    // The instant's TEXT is DuckDB's own cast text on both sides.
+    // The instant's text is DuckDB's own cast text on both sides.
     let rendered = agreed(
         &conn,
         &format!("* | let t = {strptime} | let s = tostring(t) | table s"),
@@ -720,8 +718,8 @@ fn a_computed_timestamp_agrees_across_the_lanes() {
     assert_eq!(column(&rendered, "s"), vec!["2026-01-15 09:00:00"]);
 
     // An infinity is a value the comparison reaches, not a text it
-    // fails on: equality against one is FALSE for a finite instant in
-    // both lanes, where an unreadable text would have been UNKNOWN.
+    // fails on: equality against one is false for a finite instant in
+    // both lanes, where an unreadable text would be UNKNOWN.
     let unequal = agreed(
         &conn,
         &format!(r#"* | let t = {strptime} | let e = t == "infinity" | table e"#),
@@ -730,11 +728,11 @@ fn a_computed_timestamp_agrees_across_the_lanes() {
     assert_eq!(column(&unequal, "e"), vec!["false"]);
 }
 
-/// A text with no timestamp reading DROPS the row live, because the batch
+/// A text with no timestamp reading drops the row live, because the batch
 /// lane refuses the query outright.
 ///
-/// eval used to strip the malformed offset and compare the rest, so the
-/// row MATCHED where the equivalent query returned no rows at all.
+/// Stripping the malformed offset and comparing the rest would match the
+/// row where the equivalent query returns no rows at all.
 #[test]
 fn a_malformed_offset_drops_the_row_where_batch_refuses_the_query() {
     let conn = conn();
@@ -753,25 +751,21 @@ fn a_malformed_offset_drops_the_row_where_batch_refuses_the_query() {
     );
 }
 
-/// A stage-computed TIMESTAMP is TEXT to an `extract` — the reach the
-/// JSON row had, and the reach typing the row silently lost.
+/// A stage-computed TIMESTAMP is text to an `extract`.
 ///
-/// The two lanes do NOT agree on this shape, and never did: `DuckDB` has
-/// no `regexp_extract(TIMESTAMP, …)` overload and does not implicitly
-/// cast one to VARCHAR, so the emitted `regexp_extract("t", ?, 1)`
+/// The two lanes do not agree on this shape: `DuckDB` has no
+/// `regexp_extract(TIMESTAMP, …)` overload and does not implicitly cast
+/// one to VARCHAR, so the emitted `regexp_extract("t", ?, 1)`
 /// (`emitter::pipeline::process_extract` quotes the source field and
 /// casts nothing) is a Binder Error and the batch lane returns no rows at
-/// all. That refusal is PRE-EXISTING — the emitter is untouched by this
-/// milestone — and is pinned here so adding a cast later is a deliberate
-/// change rather than a drift.
+/// all. The refusal is pinned here so adding a cast later is a deliberate
+/// change rather than drift.
 ///
-/// What this case protects is the LIVE answer. Before rows were typed,
-/// `EvalValue::Timestamp` crossed the stage boundary as the JSON STRING
-/// `timestamp_to_duckdb_text` wrote, so this extraction found `2026`;
-/// typed cells stopped matching the `Str` arm and it silently found
-/// nothing. And behind `extract kv` that same code IS the batch tail,
-/// where there is no SQL lane to refuse anything — so the loss was the
-/// whole answer, not half of it.
+/// What this case protects is the live answer: a timestamp cell must
+/// still read as its cast text, or the extraction silently finds nothing.
+/// Behind `extract kv` that same code is the batch tail, where there is
+/// no SQL lane to refuse anything, so the loss would be the whole answer
+/// rather than half of it.
 #[test]
 fn extract_reads_a_computed_timestamp_where_batch_refuses_the_query() {
     let conn = conn();
@@ -785,20 +779,18 @@ fn extract_reads_a_computed_timestamp_where_batch_refuses_the_query() {
         "the refusal must be the missing TIMESTAMP overload: {error}"
     );
 
-    // The live lane reads the cell's cast text — the same bytes the JSON
-    // string held.
+    // The live lane reads the cell's cast text.
     let live = live_rows(dsl, &events);
     assert_eq!(column(&live, "y"), vec!["2026"]);
 }
 
-/// The D1 ordering guard: an SSE frame's BYTES are what they were before
-/// rows were typed.
+/// An SSE frame's bytes are the wire JSON of the event map itself.
 ///
-/// The pre-change lane serialized the event map itself, so the expected
-/// bytes are exactly `serde_json::to_string` of that map — computed here
-/// by the old path's own rule rather than transcribed. The literal below
-/// pins the same thing a second time, so a change to BOTH sides at once
-/// is still visible.
+/// The round trip through the row door (`from_json` then `to_json`) must
+/// change neither key order nor cell rendering, so the expectation is
+/// computed as `serde_json::to_string` of the map rather than
+/// transcribed. The literal below pins the same thing a second time, so a
+/// change to both sides at once is still visible.
 #[test]
 fn an_sse_frame_keeps_its_pre_change_bytes() {
     let event = json!({
@@ -815,9 +807,9 @@ fn an_sse_frame_keeps_its_pre_change_bytes() {
     });
     let map = event.as_object().unwrap();
 
-    // What the pre-change lane emitted: the wire JSON, serialized.
+    // The wire JSON, serialized.
     let before = serde_json::to_string(map).unwrap();
-    // What this lane emits: the same event, through both doors.
+    // The same event, through both row doors.
     let after = serde_json::to_string(&row::to_json(row::from_json(map))).unwrap();
     assert_eq!(after, before, "the frame bytes changed");
     assert_eq!(

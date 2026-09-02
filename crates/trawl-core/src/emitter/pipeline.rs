@@ -23,7 +23,6 @@ use crate::schema::catalog_key;
 const ASCII_FOLD_SQL: &str =
     "translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
 
-/// Process a single pipe stage, mutating the emitter state.
 pub(crate) fn process_stage(pipe: &PipeStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
     match pipe {
         PipeStage::Stats(s) => process_stats(s, ctx),
@@ -83,34 +82,32 @@ fn process_stats(
     agg_stage: &crate::ast::StatsStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
-    // A pending ORDER BY or LIMIT belongs to the aggregation's INPUT, and
-    // SQL would apply both to its OUTPUT — so they move into the CTE
-    // first, whether or not anything else modified the state. Placement
-    // is a property of the STAGE, never of what its arguments happen to
-    // bind: keying it off the parameter guard below made
+    // A pending ORDER BY or LIMIT belongs to the aggregation's input, and
+    // SQL would apply both to its output, so they move into the CTE first,
+    // whether or not anything else modified the state. Placement is a
+    // property of the stage, never of what its arguments happen to bind:
+    // keying it off the parameter guard below would make
     // `head 2 | stats count() as c` and
     // `head 2 | stats count() as c, max(now()) as n` answer differently.
     ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
 
-    // The aggregation expressions FIRST, through the ordering guard:
-    // they are the only part of this stage that can push a parameter,
-    // and a parameter in the SELECT list must not jump ahead of one the
-    // rendered statement puts after it (see
-    // [`EmitterState::emit_ordered_select`]). The group-by items are
-    // pure field quoting, so emitting them second changes no SQL text —
-    // and they MUST come second, because the guard may flush to a CTE,
-    // which clears `group_by`.
+    // The aggregation expressions first, through the ordering guard: they
+    // are the only part of this stage that can push a parameter, and a
+    // parameter in the SELECT list must not jump ahead of one the rendered
+    // statement puts after it (see [`EmitterState::emit_ordered_select`]).
+    // The group-by items are pure field quoting, so emitting them second
+    // changes no SQL text, and they have to come second because the guard
+    // may flush to a CTE, which clears `group_by`.
     let agg_items = ctx.emit_ordered_select(|ctx| {
         let mut items = Vec::with_capacity(agg_stage.aggregations.len());
         for agg in &agg_stage.aggregations {
-            // The SAME argument walk the expression lane uses: an
+            // The same argument walk the expression lane uses: an
             // aggregation position is still a call, and its per-position
             // literal rules (`sev()`'s dialect) apply there too.
             let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
 
             let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
 
-            // determine alias
             let alias = match &agg.alias {
                 Some(a) => quote_field(a),
                 None => default_agg_alias(agg),
@@ -195,12 +192,12 @@ fn process_frequency(
     sort_dir: &str,
     ctx: &mut EmitterState,
 ) {
-    // `top`/`rare` desugar to an AGGREGATION, so they take the same
+    // `top`/`rare` desugar to an aggregation, so they take the same
     // placement rule `stats`/`timechart` do: a pending ORDER BY or LIMIT
     // belongs to the input being counted, and leaving either here would
-    // absorb it into the aggregation's own SELECT — `head 2 | top 3 host`
-    // counting all six matching rows and then keeping two GROUPS, which
-    // is a different question from the one the pipeline asks.
+    // absorb it into the aggregation's own SELECT, making
+    // `head 2 | top 3 host` count all six matching rows and then keep two
+    // groups, which is a different question from the one the pipeline asks.
     ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
 
     let field_quoted = quote_field(field);
@@ -220,7 +217,6 @@ fn process_frequency(
     ctx.has_aggregation = true;
     ctx.had_explicit_columns = true;
 
-    // flush aggregation to CTE, then sort+limit on the result
     ctx.flush_to_cte();
     ctx.order_by.push(format!("\"count\" {sort_dir}"));
     ctx.limit = Some(count);
@@ -238,19 +234,19 @@ fn process_drop(drop_stage: &crate::ast::DropStage, ctx: &mut EmitterState) {
 /// except the ones the stage is about to project under its own aliases.
 ///
 /// Unlike `* EXCLUDE (...)` the lambda tolerates a name no incoming
-/// column carries — crucial for `let a = expr` where `a` is brand new.
-/// It folds BOTH sides because `DuckDB` binds identifiers
+/// column carries, which `let a = expr` needs when `a` is brand new.
+/// It folds both sides because `DuckDB` binds identifiers
 /// case-insensitively and [`crate::projection::check_projection`] folds
 /// every output name: a raw `c NOT IN ('Host')` would leave an incoming
 /// `host` in place beside the new `Host` and hand back two columns of one
 /// folded name.
 ///
-/// The fold is ASCII-ONLY on both sides — [`ASCII_FOLD_SQL`] on the column
-/// name, [`catalog_key`] on the literal — because that is the fold
+/// The fold is ASCII-only on both sides ([`ASCII_FOLD_SQL`] on the column
+/// name, [`catalog_key`] on the literal), because that is the fold
 /// `DuckDB`'s identifier equality performs. `lower()` folds Unicode too,
 /// so over a corpus carrying `ü` the backtickable target `` `Ü` `` would
-/// have deleted the `ü` column the query never named, while `DuckDB`
-/// itself keeps the two apart.
+/// delete the `ü` column the query never named, while `DuckDB` itself
+/// keeps the two apart.
 fn columns_excluding(names: &[String]) -> String {
     let list = names
         .iter()
@@ -367,7 +363,6 @@ fn process_dedup(dedup: &crate::ast::DedupStage, ctx: &mut EmitterState) {
         ];
         ctx.has_projection = true;
 
-        // flush the window function CTE
         ctx.flush_to_cte();
 
         // filter to keep only the first row per partition, drop _rn
@@ -389,9 +384,9 @@ fn process_timechart(
         None => auto_bucket_interval(ctx.time_filter.as_ref()),
     };
 
-    // The bucket is aliased AS "_time", which is ALSO the name of the
+    // The bucket is aliased AS "_time", which is also the name of the
     // physical event-time column it buckets. GROUP BY / ORDER BY must
-    // therefore reference the full expression, not the name — a bare
+    // therefore reference the full expression, not the name: a bare
     // "_time" would bind to the source column and silently break the
     // aggregation (one group per input row).
     let bucket = format!("time_bucket(INTERVAL '{interval}', TRY_CAST(\"_time\" AS TIMESTAMP))");
@@ -404,7 +399,7 @@ fn process_timechart(
     let agg_items = ctx.emit_ordered_select(|ctx| {
         let mut items = Vec::with_capacity(tc.aggregations.len());
         for agg in &tc.aggregations {
-            // The SAME argument walk the expression lane uses: an
+            // The same argument walk the expression lane uses: an
             // aggregation position is still a call, and its per-position
             // literal rules (`sev()`'s dialect) apply there too.
             let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
@@ -543,7 +538,6 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
     let mut targets = Vec::new();
     let mut computed = Vec::new();
     for agg in &stage.aggregations {
-        // Reject functions not supported as window functions in DuckDB.
         if matches!(
             agg.function.as_str(),
             "dc" | "distinct_count" | "values" | "list"
@@ -556,7 +550,7 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
             });
         }
 
-        // The SAME argument walk the expression lane uses: an
+        // The same argument walk the expression lane uses: an
         // aggregation position is still a call, and its per-position
         // literal rules (`sev()`'s dialect) apply there too.
         let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
@@ -572,9 +566,9 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
         targets.push(name);
     }
 
-    // An alias naming an incoming column OVERWRITES it (documented,
-    // `let`-like), so the wildcard must not also emit the original —
-    // through the same case-folding lambda `let` uses.
+    // An alias naming an incoming column overwrites it, `let`-like, so the
+    // wildcard must not also emit the original: same case-folding lambda
+    // `let` uses.
     let mut items = if targets.is_empty() {
         vec!["*".to_string()]
     } else {

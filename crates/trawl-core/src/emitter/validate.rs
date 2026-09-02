@@ -5,10 +5,9 @@
 //! Pre-emission pipeline validation.
 //!
 //! Catches malformed regexes, unknown function names, arity mismatches,
-//! projection-name collisions and reserved-namespace capture-group names,
-//! before any SQL emission
-//! state is mutated. This gives cleaner error reporting and avoids
-//! partially-built CTEs on failure.
+//! projection-name collisions and reserved-namespace capture-group names
+//! before any emission state is mutated, so a failure reports one clean
+//! error instead of leaving half-built CTEs behind.
 
 use crate::ast::{AggExpr, ExtractMode, PipeStage, Spanned};
 
@@ -67,7 +66,7 @@ pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError>
 
 /// Validate a function call: name must be known, arity must match, and
 /// its alias — the fourth pipeline write position, beside `let`/`rename`
-/// targets and `extract` capture groups — may not MINT a reserved name
+/// targets and `extract` capture groups — may not mint a reserved name
 /// (ADR-0013 §5).
 fn validate_function(agg: &AggExpr) -> Result<(), EmitError> {
     validate_function_arity(agg.function.as_str(), agg.args.len())?;
@@ -95,11 +94,11 @@ fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError>
                         .to_string(),
                 });
             }
-            // The pipeline may not MINT a reserved name (ADR-0013 §5):
+            // The pipeline may not mint a reserved name (ADR-0013 §5):
             // ingest strips the `_` prefix off an incoming key, so a
             // capture group that wrote one would be a column the DSL can
             // create and ingest can never carry. The SSE lane never runs
-            // `validate_pipeline`, so it mirrors this refusal where IT
+            // `validate_pipeline`, so it mirrors this refusal where it
             // compiles the regex (`stream::compile_extract`), the same
             // way the kv arm seals its keys in both lanes.
             for name in re.capture_names().flatten() {
@@ -120,8 +119,12 @@ fn validate_extract(extract: &crate::ast::ExtractStage) -> Result<(), EmitError>
     Ok(())
 }
 
-/// The one refusal both pipeline doors share: an assignment target,
-/// rename target or capture group in trawl's `_` namespace.
+/// Wrap [`crate::schema::reserved_name_message`] as an [`EmitError`].
+///
+/// Two write positions reach it here: an aggregate alias and an `extract`
+/// capture group. `let`/`rename` targets are refused earlier by
+/// `parser::pipe::assignment_target`, and the stream lane takes the same
+/// message text straight from `schema`.
 pub(crate) fn reserved_name_error(what: &str, name: &str) -> EmitError {
     EmitError::UnsupportedOperation {
         message: crate::schema::reserved_name_message(what, name),
@@ -145,7 +148,7 @@ mod tests {
         Spanned::new(node, 0..0)
     }
 
-    /// The aggregate alias is a pipeline WRITE position, so the emitter
+    /// The aggregate alias is a pipeline write position, so the emitter
     /// door seals it exactly as the parser door does (ADR-0013 §5) — a
     /// hand-built AST cannot mint a reserved column either.
     #[test]

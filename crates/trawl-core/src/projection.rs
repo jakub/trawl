@@ -21,9 +21,9 @@ use crate::parser::suggest::quote_dsl_field;
 use crate::schema::catalog_key;
 
 /// The column name an aggregate projects: its explicit `as` alias, else
-/// the `func_arg`/`func` default the SQL lane has always emitted.
+/// the `func_arg`/`func` default.
 ///
-/// This is the ONE derivation. The SQL emitter quotes it, the stream
+/// This is the one derivation. The SQL emitter quotes it, the stream
 /// compiler stores it on the accumulator, and the pin-scope walk removes
 /// it from the scope — so what a query names is what every lane writes.
 #[must_use]
@@ -104,12 +104,12 @@ impl Output {
 /// Render an aggregate the way the query spells it, for the message:
 /// `count()`, `avg(duration)`, `count() as total`.
 ///
-/// This goes through the query formatter — the ONE renderer, which quotes
+/// This goes through the query formatter — the one renderer, which quotes
 /// every name through [`quote_dsl_field`] — because the message pastes
 /// the result into a rewrite the user is told to type, and a name trawl
 /// offers must be a name trawl can parse back (ADR-0013 ruling 7).
 ///
-/// Unlike a NAME, an aggregate renders its ARGUMENTS, and a string literal
+/// Unlike a name, an aggregate renders its arguments, and a string literal
 /// argument's grammar (`none_of('"')`) admits ESC, BEL, U+202E and every
 /// other [`sanitize::is_unsafe_display_char`]. These messages are 400
 /// bodies rendered in a terminal, the TUI and a browser, and a saved query
@@ -152,12 +152,12 @@ fn label_name(name: &str) -> String {
 /// Non-projecting stages are `Ok` — the caller can hand every stage over
 /// without matching first.
 ///
-/// `pivot`'s output set is its `by` keys ALONE: the `on` field's values
+/// `pivot`'s output set is its `by` keys alone: the `on` field's values
 /// become columns `DuckDB` mints from the data at run time, and the `on`
 /// field itself is consumed. `eventstats` projects `*` plus its aliases,
-/// so an alias naming an incoming column overwrites it (documented,
-/// `let`-like) — but it must HAVE an alias, because the live lane cannot
-/// know a row's schema before the rows arrive.
+/// so an alias naming an incoming column overwrites it the way `let` does
+/// — but it must have an alias, because the live lane cannot know a row's
+/// schema before the rows arrive.
 ///
 /// # Errors
 ///
@@ -207,7 +207,7 @@ fn check_frequency(keyword: &str, field: &str, by: &[String]) -> Result<(), Stri
 /// aggregate, in projection order.
 ///
 /// Names are folded into a hash map keyed on [`catalog_key`], not scanned
-/// linearly: this runs for EVERY stage of every validated, emitted and
+/// linearly: this runs for every stage of every validated, emitted and
 /// streamed query, and a query is allowed thousands of group keys — a
 /// pairwise scan would be quadratic in request-controlled input.
 fn check_outputs(

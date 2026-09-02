@@ -2,23 +2,23 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Client-chosen text made safe to render (ADR-0011 slice C1).
+//! Client-chosen text made safe to render (ADR-0011).
 //!
-//! Two renderings carry text a sender picked. The conflict SAMPLES
+//! Several renderings carry text a sender picked. The conflict samples
 //! compaction captures are the obvious one — arbitrary event values,
 //! sanitised once at capture so every consumer downstream is safe by
-//! construction. The other is the CATALOG-SOURCED field name the CLI's case
+//! construction. Another is the catalog-sourced field name the CLI's case
 //! file prints (`schema field`'s `resp.name`, which is a client-chosen JSON
-//! key that ingest polices for length and case only). Both reach a terminal,
-//! a JSON body and (slice C2) a browser.
+//! key that ingest polices for length and case only). They reach a terminal,
+//! a JSON body and a browser alike.
 //!
-//! Field NAMES taken from a query need none of this: the bare production is
+//! Field names taken from a query need none of this: the bare production is
 //! `[A-Za-z_][A-Za-z0-9_]*` with `.` and `@`, and the backtick-quoted one
-//! (ADR-0013 ruling 7) admits any character EXCEPT the ones below — its
+//! (ADR-0013 ruling 7) admits any character except the ones below — its
 //! parser refuses a name carrying an [`is_unsafe_display_char`], so the
 //! query notice's footer and the names in a projection-collision message
 //! echo what the user typed through a grammar that admits no control or
-//! format character. The policing stops at names: a query STRING LITERAL
+//! format character. The policing stops at names: a query string literal
 //! (`none_of('"')`) admits everything below, so a message that renders an
 //! expression rather than a name — `projection::render_agg`, which prints
 //! an aggregate's arguments — sanitises its rendering here like any other

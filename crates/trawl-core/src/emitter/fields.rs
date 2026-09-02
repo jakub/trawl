@@ -7,7 +7,7 @@ use super::SqlValue;
 /// Double-quote a field name for safe use in SQL.
 ///
 /// Any embedded double-quotes are escaped by doubling them. The name is
-/// otherwise VERBATIM: the DSL has zero aliases (ADR-0013 §6), so the
+/// otherwise verbatim: the DSL has zero aliases (ADR-0013 §6), so the
 /// name you type is the column in DESCRIBE is the identifier in the SQL.
 pub(crate) fn quote_field(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -17,7 +17,7 @@ pub(crate) fn quote_field(name: &str) -> String {
 ///
 /// Tries `i64`, then `f64`, falls back to `String`.
 ///
-/// This is the NO-PIN branch of the comparison rules (ADR-0011 slice A):
+/// This is the no-pin branch of the comparison rules (ADR-0011):
 /// unpinned fields, embedded mode, and every typed-pin case the rule
 /// table leaves unchanged route through here via
 /// [`crate::compare::compare_form`], which owns the decision of when a
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn coerce_i64_overflow_becomes_float() {
-        // 2^63 overflows i64 but parses as f64
+        // past i64::MAX, so the i64 parse fails and the f64 one wins
         assert_eq!(
             coerce_filter_value("9999999999999999999"),
             SqlValue::Float(9_999_999_999_999_999_999.0)

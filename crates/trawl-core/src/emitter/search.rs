@@ -15,14 +15,13 @@ use super::state::EmitterState;
 /// Time filters are emitted first as a global WHERE clause (hoisted from
 /// groups during parsing). Then group tokens are emitted.
 ///
-/// For single-group queries, emits tokens directly (same as before).
-/// For multi-group (OR) queries, collects each group's clauses and
-/// combines them as `(a AND b) OR (c AND d)`.
+/// A single-group query emits its tokens directly; a multi-group (OR)
+/// query collects each group's clauses and combines them as
+/// `(a AND b) OR (c AND d)`.
 pub(crate) fn emit_search(
     search: &SearchStage,
     state: &mut EmitterState,
 ) -> Result<(), super::EmitError> {
-    // Mutual exclusivity: last= and earliest=/latest= cannot be combined.
     if search.time_filter.is_some() && (search.earliest.is_some() || search.latest.is_some()) {
         return Err(super::EmitError::UnsupportedOperation {
             message: "cannot combine 'last=' with 'earliest='/'latest='".to_string(),
@@ -40,7 +39,6 @@ pub(crate) fn emit_search(
         state.time_filter = Some(tf.node.duration);
     }
 
-    // Emit absolute time bounds.
     if let Some(earliest) = &search.earliest {
         let p = state.push_param(SqlValue::String(earliest.node.clone()));
         state.push_where(format!(
@@ -57,7 +55,7 @@ pub(crate) fn emit_search(
     match search.groups.len() {
         0 => {}
         1 => {
-            // single group — emit directly (backward-compatible)
+            // single group: emit tokens straight onto the state
             for token in &search.groups[0] {
                 emit_search_token(&token.node, state)?;
             }
@@ -180,16 +178,15 @@ fn emit_search_token(
     Ok(())
 }
 
-/// Emit one field filter — the comparison arm the catalog pin types
-/// (ADR-0011 slice A).
+/// Emit one field filter: the comparison arm the catalog pin types
+/// (ADR-0011).
 fn emit_field_filter(
     ff: &crate::ast::FieldFilter,
     state: &mut EmitterState,
 ) -> Result<(), super::EmitError> {
     let field = quote_field(&ff.field);
-    // The catalog pin typing this comparison (ADR-0011 slice A) — `None`
-    // outside the catalog-backed paths, which keeps every branch below
-    // literal-driven.
+    // The catalog pin typing this comparison: `None` outside the
+    // catalog-backed paths, which keeps every branch below literal-driven.
     let pin = state.compare_pin(&ff.field);
     match &ff.value {
         FilterValue::Literal(v) => match ff.op {
@@ -215,12 +212,12 @@ fn emit_field_filter(
                 .map(|v| compare::compare_form(pin, FilterOp::Eq, v))
                 .collect::<Result<_, _>>()?;
             let clause = match ff.op {
-                // Positive lists keep the existing set-membership renderer.
+                // Positive lists render as set membership.
                 FilterOp::Eq => in_list_sql(&field, forms, state),
                 // Search-stage `f!=a,b` is compositionally
                 // `f!=a AND f!=b`: every element binds through the same
                 // equality form as a positive list, then the scalar `!=`
-                // renderer supplies its established NULL widening.
+                // renderer supplies the NULL widening.
                 FilterOp::Ne => forms
                     .into_iter()
                     .map(|form| {

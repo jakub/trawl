@@ -21,8 +21,8 @@ use crate::parser::primitives::{
 
 /// How deeply one expression may nest before the grammar refuses it.
 ///
-/// Every nesting level — a parenthesised sub-expression, a function
-/// call's arguments, an `in (…)` list — is one more recursive descent
+/// Every nesting level (a parenthesised sub-expression, a function
+/// call's arguments, an `in (…)` list) is one more recursive descent
 /// through the whole precedence chain, and each descent costs stack. The
 /// input cap (`MAX_QUERY_LEN`) alone does not bound that: `a(a(a(…` fits
 /// twenty thousand levels into 64 KiB of text, which is enough to walk a
@@ -30,26 +30,20 @@ use crate::parser::primitives::{
 /// handlers, on a tokio worker whose stack is 2 MiB, so an unbounded
 /// grammar is a remote crash a single query can spell.
 ///
-/// How much a level costs is a property of the BUILD, not of the DSL: a
-/// release build spends tens of bytes per level, while an unoptimized
-/// build with full debuginfo spends tens of KILOBYTES (LLVM cannot merge
-/// the stack slots of chumsky's enormous combinator types once every one
-/// of them is a named debugger variable). That spread — three orders of
-/// magnitude — is why an unbounded grammar cannot be argued safe from
-/// one measurement, and it is how this bound came to be written: CI,
-/// which builds exactly that way, took SIGSEGV on 300 nested parens
-/// while the same corpus passed on a developer's
-/// `debug = "line-tables-only"` build using a sixth of the stack it had.
+/// What a level costs is a property of the build, not of the DSL: a
+/// release build spends tens of bytes per level, an unoptimized build
+/// with full debuginfo tens of kilobytes (LLVM cannot merge the stack
+/// slots of chumsky's enormous combinator types once every one of them
+/// is a named debugger variable). Three orders of magnitude of spread is
+/// why one measurement cannot argue an unbounded grammar safe, so the
+/// bound is measured against the hungriest build: unoptimized with full
+/// debuginfo, where a 2 MiB stack carries nesting into the forties and
+/// dies in the sixties.
 ///
-/// So the number is set against the HUNGRIEST build, measured there and
-/// not extrapolated: in an unoptimized full-debuginfo build a 2 MiB
-/// stack carries nesting into the forties and dies in the sixties, so
-/// sixteen is the bound — about a quarter of what that build survives,
-/// and a rounding error in a release one.
-///
-/// Sixteen is still far past any query a person writes: `((a + b) * (c -
-/// d))` is two, and the deepest expression in this repository's tests,
-/// docs and UI-composed queries is three.
+/// Sixteen is a quarter of what that build survives, a rounding error in
+/// a release one, and still far past any query a person writes:
+/// `((a + b) * (c - d))` is two, and the deepest expression in this
+/// repository's tests, docs and UI-composed queries is three.
 pub(crate) const MAX_EXPR_DEPTH: usize = 16;
 
 thread_local! {
@@ -63,7 +57,7 @@ thread_local! {
 /// Restores the nesting depth however the level is left — a match, a
 /// failed alternative chumsky will backtrack out of, or a panic. Without
 /// it a backtracked `(` would leak a level and later, legal nesting in
-/// the SAME query would be refused.
+/// the same query would be refused.
 struct DepthGuard;
 
 impl Drop for DepthGuard {
@@ -111,9 +105,9 @@ pub(crate) fn expr<'src>()
     recursive(|expr| {
         // --- atoms ---
 
-        // function_call: ident "(" args ")" — must try before bare field_ref.
-        // The head is the UNQUOTED production: a function is not a field,
-        // so `lower`(x) is a field reference, never a call (ADR-0013 §7).
+        // function_call: ident "(" args ")", tried before bare field_ref.
+        // The head is the unquoted production, because a function is not a
+        // field: `lower`(x) is a field reference, never a call (ADR-0013 §7).
         let func_call = spanned(
             plain_name()
                 .then_ignore(just('(').spaced())
@@ -222,12 +216,10 @@ pub(crate) fn expr<'src>()
             .clone()
             .then(
                 choice((
-                    // matches with regex literal support
                     keyword("matches")
                         .spaced()
                         .ignore_then(choice((regex_literal, additive.clone())))
                         .map(|rhs| CmpRhs::Binary(BinaryOp::Matches, rhs)),
-                    // like / ilike pattern matching
                     keyword("ilike")
                         .spaced()
                         .ignore_then(additive.clone())
@@ -236,11 +228,9 @@ pub(crate) fn expr<'src>()
                         .spaced()
                         .ignore_then(additive.clone())
                         .map(|rhs| CmpRhs::Binary(BinaryOp::Like, rhs)),
-                    // other comparison operators
                     cmp_op
                         .then(additive)
                         .map(|(op, rhs)| CmpRhs::Binary(op, rhs)),
-                    // in list
                     keyword("in")
                         .spaced()
                         .ignore_then(
@@ -334,7 +324,6 @@ pub(crate) fn expr<'src>()
     .labelled("expression")
 }
 
-/// Helper enum for comparison right-hand side.
 #[derive(Debug)]
 enum CmpRhs {
     Binary(BinaryOp, Spanned<Expr>),
@@ -349,7 +338,7 @@ mod tests {
         expr().parse(input).into_result().unwrap()
     }
 
-    /// A backticked name is ALWAYS a field reference (ADR-0013 ruling 7):
+    /// A backticked name is always a field reference (ADR-0013 ruling 7):
     /// function names are not fields, so the call head takes the
     /// unquoted production and `` `lower`(x) `` does not parse as a call.
     #[test]
@@ -605,7 +594,6 @@ mod tests {
 
     #[test]
     fn test_matches_string_literal() {
-        // string literal RHS still works
         let result = parse_expr(r#"host matches "pattern""#);
         match &result.node {
             Expr::Binary { lhs, op, rhs } => {

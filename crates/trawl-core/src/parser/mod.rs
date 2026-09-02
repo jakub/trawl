@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! DSL parser for trawl.s query language.
+//! DSL parser for trawl's query language.
 //!
 //! Transforms a query string like `service=nginx _severity=error last=2h | stats count() by host`
 //! into a structured AST representation.
@@ -57,13 +57,13 @@ impl std::fmt::Display for ParseError {
 /// Maximum query length in bytes. Prevents denial-of-service via pathological parser input.
 const MAX_QUERY_LEN: usize = 65_536;
 
-/// The most diagnostics ONE parse reports, however many the grammar
+/// The most diagnostics one parse reports, however many the grammar
 /// emitted.
 ///
-/// A single query can carry unboundedly many independent violations —
-/// `f=#a,#b,#c,…` emits one per element — and every one of them renders a
+/// A single query can carry unboundedly many independent violations
+/// (`f=#a,#b,#c,…` emits one per element) and every one of them renders a
 /// hint quoting text from the input, so the reported bytes grow as the
-/// product of the two. The cap is applied HERE, before rendering, so the
+/// product of the two. The cap is applied before rendering, so the
 /// quadratic work is never done rather than merely never returned; the
 /// server serializes every detail it is handed, so this is the bound the
 /// wire sees too.
@@ -73,11 +73,12 @@ const MAX_QUERY_LEN: usize = 65_536;
 ///
 /// The cap is not a plain truncation, because the list is not purely
 /// positional: the emitted diagnostics come first, and the failure that
-/// actually ENDED the parse is appended LAST. Truncating dropped it — an
-/// eight-element `f=#a,…` list hid `unknown command 'bogus_stage'`, the
-/// one error the query cannot succeed without fixing. So the report is
-/// the first `MAX_REPORTED_ERRORS - 1` PLUS that final one, whose message
-/// is annotated with how many were left out ([`omitted_suffix`]).
+/// ended the parse is appended last. Plain truncation drops that one, and
+/// it is the error the query cannot succeed without fixing (an
+/// eight-element `f=#a,…` list would hide `unknown command 'bogus'`). So
+/// the report is the first `MAX_REPORTED_ERRORS - 1` plus that final one,
+/// whose message is annotated with how many were left out
+/// ([`omitted_suffix`]).
 const MAX_REPORTED_ERRORS: usize = 8;
 
 /// How the annotation on the last reported error reads, so the count the
@@ -107,8 +108,7 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     }
 
     // Comments are a grammar production (ADR-0014), so the raw input goes
-    // straight to the parser — no pre-pass, and error spans index the real
-    // text rather than a byte-length-preserving copy of it.
+    // straight to the parser and error spans index the real text.
     let parser = query_parser();
     let result = parser.parse(input);
 
@@ -119,7 +119,7 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 }
 
 /// Render at most [`MAX_REPORTED_ERRORS`] diagnostics from one parse,
-/// keeping the TERMINAL failure whatever the emitted list does to the
+/// keeping the terminal failure whatever the emitted list does to the
 /// budget. Rendering is done only for the errors reported, so a
 /// pathological query costs a constant amount of work, not a product.
 fn report_errors(errors: &[Rich<'_, char>], input: &str) -> Vec<ParseError> {
@@ -169,7 +169,7 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
     let offset = span.start;
 
     // A comment opener the grammar could not admit (ADR-0014 rulings 2
-    // and 3). This runs BEFORE the generic enrichment because it owns its
+    // and 3). This runs before the generic enrichment because it owns its
     // own span: chumsky reports where the production died, which for
     // `| co#unt()` is the start of the stage word and for `// note` is one
     // slash of two — neither of which is the byte the user has to change.
@@ -203,7 +203,6 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
         })
         .collect();
 
-    // Detect specific error patterns and produce contextual messages + hints.
     let (message, hint) = enrich_error(input, offset, &found, &expected, label.as_deref());
 
     ParseError {
@@ -217,7 +216,7 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
 /// Find the pipe-command word around the error offset, if the error is in
 /// a position that looks like a pipe stage command (i.e. the word follows a `|`).
 ///
-/// Returns `Some(word)` if the word is NOT a known pipe stage (i.e. it's a typo),
+/// Returns `Some(word)` if the word is not a known pipe stage (i.e. it's a typo),
 /// or `None` if the error isn't in a pipe-command position or the word is valid.
 fn find_pipe_command_word(input: &str, offset: usize) -> Option<String> {
     // Guard against byte offsets that land inside a multi-byte character.
@@ -235,7 +234,6 @@ fn find_pipe_command_word(input: &str, offset: usize) -> Option<String> {
             pos + c.len_utf8()
         });
 
-    // Extract the full word from word_start forward.
     let candidate: String = input[word_start..]
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -245,13 +243,11 @@ fn find_pipe_command_word(input: &str, offset: usize) -> Option<String> {
         return None;
     }
 
-    // Check that there's a `|` before this word (with optional whitespace).
     let prefix = input[..word_start].trim_end();
     if !prefix.ends_with('|') {
         return None;
     }
 
-    // Only return the word if it's NOT a known pipe stage (i.e. it's a typo).
     if suggest::KNOWN_PIPE_STAGES.contains(&candidate.as_str()) {
         return None;
     }
@@ -276,7 +272,7 @@ struct CommentDiagnostic {
 }
 
 impl CommentDiagnostic {
-    /// No `exact`: this is the position-BLIND net, and a hint it minted a
+    /// No `exact`: this is the position-blind net, and a hint it minted a
     /// spelling for would be guessing at both the token's bounds and the
     /// position's escape (`comment::hint_for`).
     fn new(msg: &str, at: usize, len: usize) -> Self {
@@ -308,10 +304,10 @@ fn comment_diagnostic(input: &str, offset: usize) -> Option<CommentDiagnostic> {
         ));
     }
 
-    // …and the same net for the retired second opener, at the one place
-    // it could have been a comment: a token boundary (ADR-0014 ruling 3).
-    // The span is BOTH slashes — one of two underlines nothing the user
-    // can act on.
+    // …and the same net for `//`, which is not a comment opener, at the
+    // one place it could have been one: a token boundary (ADR-0014
+    // ruling 3). The span covers both slashes, since underlining one of
+    // the two points at nothing the user can act on.
     if comment::starts_with_slashes(rest) && preceded_by_whitespace(input, offset) {
         return Some(CommentDiagnostic::new(
             comment::MSG_SLASHES_NOT_A_COMMENT,
@@ -320,7 +316,7 @@ fn comment_diagnostic(input: &str, offset: usize) -> Option<CommentDiagnostic> {
         ));
     }
 
-    // A `#` inside a PIPE STAGE NAME. chumsky reports the start of the
+    // A `#` inside a pipe stage name. chumsky reports the start of the
     // word (the stage word ends at the `#`), which the unknown-command
     // rule below then renders as `unknown command 'co'` plus a suggestion
     // for a typo the user did not make.
@@ -355,7 +351,6 @@ fn enrich_error(
         return (format!("unknown command '{word}'"), hint);
     }
 
-    // Unterminated string literal
     if at_end && expects_end_quote {
         return (
             "unterminated string literal".to_string(),
@@ -363,7 +358,6 @@ fn enrich_error(
         );
     }
 
-    // Unmatched opening parenthesis
     if at_end && expects_close_paren {
         return (
             "unmatched opening parenthesis".to_string(),
@@ -371,7 +365,6 @@ fn enrich_error(
         );
     }
 
-    // Missing aggregation after stats
     if label == Some("stats stage") && expected.iter().any(|e| e == "aggregation expression") {
         return (
             format!("found {found}, expected aggregation expression"),
@@ -379,7 +372,6 @@ fn enrich_error(
         );
     }
 
-    // Default: produce the standard message with no hint
     let message = if expected.is_empty() {
         format!("unexpected {found}")
     } else {
@@ -549,7 +541,6 @@ mod tests {
         let result = parse("| badstage");
         assert!(result.is_err());
         let errors = result.unwrap_err();
-        // errors should have valid span information
         for error in &errors {
             assert!(error.span.start <= error.span.end);
         }
@@ -573,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_query_at_length_limit_not_rejected_for_length() {
-        // exactly at limit — should NOT fail with "query too long"
+        // exactly at limit — should not fail with "query too long"
         // (may fail for syntax reasons, which is fine)
         let query = "a".repeat(65_536);
         let result = parse(&query);
@@ -688,10 +679,10 @@ mod tests {
         assert_eq!(query.search.groups[0].len(), 1);
     }
 
-    /// `//` stopped being a comment opener (ADR-0014 ruling 3), and the
-    /// removal is LOUD at the one place it could have been one: a bare
-    /// term at a token boundary. Silently reading it as two AND-ed text
-    /// terms would narrow the match set to nothing.
+    /// `//` is not a comment opener (ADR-0014 ruling 3), and the refusal
+    /// is loud at the one place it could have been one: a bare term at a
+    /// token boundary. Silently reading it as two AND-ed text terms would
+    /// narrow the match set to nothing.
     #[test]
     fn test_double_slash_is_no_longer_a_comment() {
         let errors = parse("service=nginx // filter by service\n| stats count()").unwrap_err();
@@ -712,8 +703,8 @@ mod tests {
         );
     }
 
-    /// A `//` in a VALUE is ordinary data and needs no quoting — that is
-    /// the everyday half of ADR-0014 ruling 3.
+    /// A `//` in a value is ordinary data and needs no quoting, the
+    /// everyday half of ADR-0014 ruling 3.
     #[test]
     fn test_double_slash_in_a_value_is_data() {
         for (dsl, field, value) in [
@@ -733,8 +724,7 @@ mod tests {
                 "{dsl}"
             );
         }
-        // …and a sibling filter on the same line survives, which the
-        // blanking scanner deleted.
+        // …and a sibling filter on the same line survives.
         let query = parse("referrer=https://a.b/c status=200").expect("both filters");
         assert_eq!(query.search.groups[0].len(), 2);
     }
@@ -796,10 +786,9 @@ mod tests {
 
     // ── backtick escape (ADR-0013 ruling 7) ─────────────────────────────
 
-    /// A backticked NAME is a quoted context, so a `#` or `//` inside it
-    /// is part of the name. Nothing re-derives that fact any more — the
-    /// comment production is simply unreachable from inside
-    /// [`primitives::quoted_name`].
+    /// A backticked name is a quoted context, so a `#` or `//` inside it
+    /// is part of the name: the comment production is unreachable from
+    /// inside [`primitives::quoted_name`].
     #[test]
     fn backticked_names_carry_comment_openers_verbatim() {
         for (dsl, want) in [("| table `a#b`", "a#b"), ("| table `a//b`", "a//b")] {
@@ -822,7 +811,7 @@ mod tests {
             PipeStage::Table(t) => assert_eq!(t.fields, vec!["a#b".to_string()]),
             other => panic!("expected Table, got {other:?}"),
         }
-        // A comment AFTER a closed backtick is still a comment.
+        // A comment after a closed backtick is still a comment.
         let query = parse("`a b`=x # trailing").expect("parses");
         assert_eq!(query.search.groups[0].len(), 1);
         match &query.search.groups[0][0].node {
@@ -831,19 +820,18 @@ mod tests {
         }
     }
 
-    /// A stray backtick inside a REGEX literal must not protect a later
+    /// A stray backtick inside a regex literal must not protect a later
     /// comment: the comment's own words would parse as extra AND-ed
-    /// text-search terms and silently narrow the match set. The grammar
-    /// answers this by construction now — a regex body is a production,
-    /// not a scanner state — so a partner backtick later on cannot open a
-    /// pseudo-name across the comment either.
+    /// text-search terms and silently narrow the match set. A regex body
+    /// is a production, not a scanner state, so a partner backtick later
+    /// on cannot open a pseudo-name across the comment either.
     #[test]
     fn stray_backtick_does_not_shield_later_comments() {
         let query = parse("message=/back`tick/ # comment").expect("parses");
         assert_eq!(query.search.groups[0].len(), 1);
 
-        // …and with a legitimate backticked name AFTER the comment, whose
-        // presence used to open a pseudo-name across it.
+        // …and with a legitimate backticked name after the comment, whose
+        // opening tick must not pair with the stray one before it.
         let input = "message=/a`b/ # secret note\n`req id`=1";
         let query = parse(input).unwrap_or_else(|e| panic!("{input:?} parses: {e:?}"));
         assert_eq!(
@@ -868,8 +856,8 @@ mod tests {
             "host=a*`b#c` # outside",
             "host=a%`b#c` # outside",
             "host=a-`b#c` # outside",
-            // the plain typo, and the one that used to turn a comment's
-            // own words into AND-ed search terms
+            // the plain typo, then the shapes whose comment words must
+            // not become AND-ed search terms
             "service=`my service`",
             "host=`a # b` more",
             "status=200,`a # b` more",
@@ -925,7 +913,7 @@ mod tests {
             assert!(parse(dsl).is_ok(), "{dsl} must parse");
         }
 
-        // …and a tick inside a REGEX is ordinary body content, with the
+        // …and a tick inside a regex is ordinary body content, with the
         // trailing comment still a comment.
         let query = parse("host=/a+b`c/ # | bad_stage").expect("the comment is a comment");
         assert_eq!(
@@ -936,7 +924,7 @@ mod tests {
         assert_eq!(query.search.groups[0].len(), 1);
     }
 
-    /// A negated quoted NAME has no production in the search grammar, so
+    /// A negated quoted name has no production in the search grammar, so
     /// it is a loud parse error. Reading it as text would search for the
     /// literal ticks (matching nothing), and dropping the `-` to a term of
     /// its own would silently discard the negation.
@@ -963,10 +951,9 @@ mod tests {
         );
     }
 
-    /// An adversarial backtick run stays cheap. The retired scanner had a
-    /// quadratic shape here (a re-scan to end-of-input from every backtick
-    /// byte); the grammar has no such pass at all, so this is a plain
-    /// smoke test that the shapes still terminate with an answer.
+    /// An adversarial backtick run stays cheap: no pass over the text
+    /// re-scans to end of input from a backtick byte, so these shapes
+    /// terminate with an answer instead of going quadratic.
     #[test]
     fn a_backtick_run_parses_without_blowing_up() {
         let n = 65_536;
@@ -979,27 +966,23 @@ mod tests {
         }
     }
 
-    /// The pathological corpus parses **inside a 2 MiB stack** — the size
-    /// of a tokio worker thread, which is where trawld actually runs the
-    /// parser.
+    /// The pathological corpus parses inside a 2 MiB stack, the size of a
+    /// tokio worker thread, which is where trawld runs the parser.
     ///
-    /// The padding rewrite (ADR-0014 ruling 4) put a project-owned
-    /// combinator at every whitespace site, which deepens the parser's
-    /// nested TYPE and so its per-frame stack cost. `cargo test`'s own
-    /// threads get 8 MiB by default, so a suite that merely calls `parse`
-    /// would keep passing while the server overflowed. This runs the
-    /// corpus in a thread sized like the one that matters, and asserts it
-    /// finishes rather than dies.
+    /// `cargo test`'s own threads get 8 MiB by default, so a suite that
+    /// merely calls `parse` would keep passing while the server
+    /// overflowed. A frame is not cheap either: every padding site is a
+    /// project-owned combinator ([`comment::Spaced::spaced`]), which
+    /// deepens the parser's nested type and with it the per-frame stack
+    /// cost. So the corpus runs in a thread sized like the one that
+    /// matters, and the test asserts it finishes rather than dies.
     ///
-    /// Nesting is in the corpus at BOTH sides of the grammar's depth
+    /// Nesting is in the corpus at both sides of the grammar's depth
     /// bound: the deepest expression the DSL accepts must fit this stack
     /// (that is the bound's whole claim), and one far past it must reach
     /// a parse error rather than a recursion. What a level costs varies
-    /// hugely by build — an unoptimized full-debuginfo build spends
-    /// thousands of times what a release build does — so the shape that
-    /// used to sit here (300 nested parens, unbounded then) died on CI
-    /// while passing locally. The bound, not the measurement, is what
-    /// makes this test's claim true on every build.
+    /// by orders of magnitude between builds, so it is the bound rather
+    /// than any measurement that makes the claim true everywhere.
     #[test]
     fn the_pathological_corpus_parses_within_a_tokio_workers_stack() {
         /// A tokio worker thread's default stack.
@@ -1028,7 +1011,7 @@ mod tests {
             .stack_size(TOKIO_WORKER_STACK)
             .spawn(move || {
                 for body in &corpus {
-                    // the ANSWER is not the point — reaching one is
+                    // the answer is not the point — reaching one is
                     let _ = parse(body);
                 }
             })
@@ -1039,9 +1022,9 @@ mod tests {
 
     /// Expression nesting is bounded by the grammar, and the refusal is
     /// a parse error that names the bound — never a truncated query and
-    /// never a stack overflow (ADR-0014 follow-up: the depth of a
-    /// `where` clause is client-chosen, and `MAX_QUERY_LEN` alone lets
-    /// `a(a(a(…` spell twenty thousand levels inside 64 KiB).
+    /// never a stack overflow: the depth of a `where` clause is
+    /// client-chosen, and `MAX_QUERY_LEN` alone lets `a(a(a(…` spell
+    /// twenty thousand levels inside 64 KiB.
     ///
     /// All three recursion sites are covered — parentheses, a function
     /// call's arguments, an `in (…)` list — because each is one descent
@@ -1087,7 +1070,7 @@ mod tests {
         }
     }
 
-    /// A backtracked nesting level is GIVEN BACK: the depth counter is
+    /// A backtracked nesting level is given back: the depth counter is
     /// restored however chumsky leaves the level, so a query that tries
     /// (and abandons) many nested alternatives still parses its own
     /// legal nesting afterwards. A leak here would refuse valid queries
@@ -1110,7 +1093,7 @@ mod tests {
 
         // The counter is thread-local and a tokio worker is reused
         // across requests, so the claim that actually matters in
-        // production: a parse that FAILS while holding nesting levels
+        // production: a parse that fails while holding nesting levels
         // (aborted mid-expression, or refused at the depth bound) must
         // not poison the next parse on the same thread.
         let abandoned_midway = format!("* | where {}1 +", "(".repeat(n - 1));
@@ -1127,12 +1110,12 @@ mod tests {
         );
     }
 
-    /// A LEADING backtick that fails the quoted production is a loud
+    /// A leading backtick that fails the quoted production is a loud
     /// parse error, never a quiet slide into text search: unterminated,
-    /// empty, or a character that cannot render as itself inside — a
-    /// control character, but also the bidi and zero-width format
-    /// characters `sanitize` exists to neutralise, since a name that
-    /// parses is echoed verbatim into notices and error messages.
+    /// empty, or holding a character that cannot render as itself. That
+    /// covers control characters and the bidi and zero-width format
+    /// characters `sanitize` neutralises, since a name that parses is
+    /// echoed verbatim into notices and error messages.
     #[test]
     fn leading_backtick_that_is_not_a_name_is_a_parse_error() {
         for input in [

@@ -7,12 +7,10 @@
 //! The pin-aware fuzz target feeds one byte string into two places at once:
 //! the DSL text the parser reads, and a selector that invents a catalog pin
 //! for every name [`crate::field_refs::referenced_fields`] reports out of
-//! the parsed query. Both halves are decoded here, so
-//! the target and the PREPARE fixture in trawl-engine cannot drift. The
-//! fixture replays committed cases through this same decoder and asserts
-//! they cover every entry of [`CanonicalType::ALL`]; if the encoding
-//! lived in the fuzz target, the fixture would be re-implementing it and the
-//! two copies would answer differently the first time either changed.
+//! the parsed query. Both halves are decoded here so the target and the
+//! PREPARE fixture in trawl-engine cannot drift: the fixture replays
+//! committed cases through this same decoder and asserts they cover every
+//! entry of [`CanonicalType::ALL`].
 //!
 //! Why a production crate carries fuzz plumbing: the fuzz package declares
 //! its own `[workspace]` and the root workspace `exclude`s it, so no
@@ -23,37 +21,30 @@
 //!
 //! # The wire encoding
 //!
-//! `query \0 selector`, split at the FIRST NUL. With no NUL anywhere, the
-//! whole input is BOTH halves: the query text, and the selector bytes.
+//! `query \0 selector`, split at the first NUL. With no NUL anywhere, the
+//! whole input plays both parts: the query text, and the selector bytes.
 //!
 //! That fallback is what keeps the committed parse corpus usable as a seed
-//! corpus here, though only part of it. Audited 2026-08-25 against the 3842
-//! files under `crates/trawl-core/fuzz/corpus/parse/` as committed at
-//! `b9dafad3`: 2373 carry at least one NUL, 1214 are not valid UTF-8, and
-//! 1072 are both valid UTF-8 and NUL-free. 74 begin with a NUL, 213 end
-//! with one, 1973 hold more than one. Those files are libFuzzer mutation
-//! output rather than DSL anyone typed, so that shape is the expected one.
-//! `the_parse_corpus_decodes_within_the_encoding_contract` re-measures it
-//! on every test run and asserts a floor, not these exact counts.
+//! corpus here, though only part of it. Of the files under
+//! `crates/trawl-core/fuzz/corpus/parse/`, 1072 of 3842 were both valid
+//! UTF-8 and NUL-free when measured on 2026-08-25; the rest are libFuzzer
+//! mutation output rather than DSL anyone typed. A NUL-free valid-UTF-8
+//! seed decodes to itself byte for byte and gains a pin map derived from
+//! its own text, which is real DSL enough to seed the target with.
+//! `the_parse_corpus_decodes_within_the_encoding_contract` re-measures on
+//! every test run and asserts a floor, not an exact count.
 //!
-//! So the promise is narrow, and worth stating exactly. A NUL-free
-//! valid-UTF-8 seed decodes to itself byte for byte and gains a pin map
-//! derived from its own text; 1072 files do that, which is real DSL enough
-//! to seed the pin-aware target with. A NUL-bearing seed decodes to a
-//! shorter query plus a selector. That is a different fuzz input and a
-//! valid one, not corruption: libFuzzer treats a corpus as a starting
-//! population to mutate, never as a specification, so a seed that decodes
-//! to something other than itself costs coverage-seeding fidelity and
-//! nothing else.
+//! A NUL-bearing seed decodes to a shorter query plus a selector. That is a
+//! different fuzz input and a valid one, not corruption: libFuzzer treats a
+//! corpus as a starting population to mutate, never as a specification, so
+//! a seed that decodes to something other than itself costs coverage-seeding
+//! fidelity and nothing else.
 //!
-//! A length prefix or a fixed header would still be worse. It would eat
-//! bytes off the front of all 3842 files rather than off the 2373 that
-//! already carry a NUL. The 1214 non-UTF-8 files are unreachable either
-//! way, and were before this module existed: the older `parse` target
-//! takes `&str` too, so libFuzzer already discarded them there. That is
-//! pre-existing shared behaviour, not something this encoding introduced.
-//! libFuzzer reaches the independently mutable form on its own by inserting
-//! a NUL, which it does constantly.
+//! A length prefix or a fixed header would be worse: it would eat bytes off
+//! the front of every file rather than off the ones that already carry a
+//! NUL. Files that are not valid UTF-8 are unreachable either way, since
+//! both fuzz targets take `&str`. libFuzzer reaches the independently
+//! mutable form on its own by inserting a NUL, which it does constantly.
 
 use crate::ast::Query;
 use crate::schema::{CanonicalType, FieldTypes};
@@ -96,7 +87,7 @@ pub fn decode_case(input: &str) -> DecodedCase<'_> {
 ///
 /// Not "every field the query binds", which would overstate it:
 /// `referenced_fields` deliberately skips bare-word search terms and the
-/// time bounds, so `error last=1h` derives an EMPTY map even though it
+/// time bounds, so `error last=1h` derives an empty map even though it
 /// reads `message`, `_raw` and `_time` (asserted by
 /// `a_query_binding_no_fields_yields_an_empty_catalog`). That costs this
 /// target nothing. All three are envelope fields with fixed production
@@ -110,7 +101,7 @@ pub fn decode_case(input: &str) -> DecodedCase<'_> {
 /// one byte, repin one field, and the crash that appears is attributable to
 /// that pin rather than to a reshuffle of all of them.
 ///
-/// The byte maps modulo `ALL.len() + 1`: 0 leaves the field UNPINNED
+/// The byte maps modulo `ALL.len() + 1`: 0 leaves the field unpinned
 /// (absent from the map, which is its own case — the emitter's pin-blind
 /// path), and `n` picks `ALL[n - 1]`. The modulus is derived from
 /// [`CanonicalType::ALL`] rather than written out, so adding a canonical
@@ -120,7 +111,7 @@ pub fn decode_case(input: &str) -> DecodedCase<'_> {
 /// No admission policy is applied, deliberately. This does not consult
 /// `schema::is_contract_typed` and does not skip reserved `_`-prefixed
 /// names, so it will happily pin `host` to SEVERITY, which production
-/// refuses. The target's claim is that emission is TOTAL over every pin
+/// refuses. The target's claim is that emission is total over every pin
 /// map, not just the reachable ones: over-approximating costs some fuzzer
 /// time on maps the catalog would never hand out, while under-approximating
 /// would let a panic hide behind a rule that could be relaxed later.
@@ -152,16 +143,15 @@ mod tests {
         crate::parser::parse(dsl).expect("test DSL should parse")
     }
 
-    /// The corpus audit, in place of one handcrafted string that used to
-    /// stand in for the whole corpus. These are the invariants the module
-    /// doc's rationale rests on, measured against the real files:
+    /// The corpus audit: the invariants the module doc's rationale rests
+    /// on, measured against the real files.
     ///
     /// * `decode_case` returns for every valid-UTF-8 file (a panic fails
     ///   the test where it happens, so there is nothing else to assert).
     /// * The decoded query is a byte prefix of the input, always.
     /// * A valid-UTF-8, NUL-free file decodes to itself in both halves.
     ///
-    /// The count assertion is a FLOOR rather than equality. Committing more
+    /// The count assertion is a floor rather than equality. Committing more
     /// mutation output is a legitimate thing to do to a fuzz corpus and
     /// would break an exact count for no reason; what has to stay true is
     /// that enough real DSL still travels the fallback path to seed it.
@@ -214,7 +204,7 @@ mod tests {
             }
         }
 
-        // An empty directory IS drift: it means the corpus was dropped or
+        // An empty directory is drift: it means the corpus was dropped or
         // the path moved, and the audit would otherwise pass vacuously.
         assert!(
             total > 0,

@@ -2,28 +2,28 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Which catalog keys a query BINDS (ADR-0011 slice C1).
+//! Which catalog keys a query binds (ADR-0011).
 //!
 //! The incomplete-results notice on `/api/v1/query` intersects this set with
 //! the degraded-field set: a query that filters on a field whose pin has
-//! been shelving values is answering from data the pin destroyed, and that
-//! is true whether or not the field appears in the output. A `where` on a
-//! degraded field that projects it away is exactly the incomplete case, so
-//! the walk collects every BOUND name — filters, pipeline expressions,
-//! group-by keys, sort keys, projections — not the result columns.
+//! been shelving values is answering from data the pin destroyed, whether or
+//! not the field appears in the output. A `where` on a degraded field that
+//! projects it away is exactly the incomplete case, so the walk collects
+//! every bound name — filters, pipeline expressions, group-by keys, sort
+//! keys, projections — not the result columns.
 //!
-//! Deliberately NOT collected: bare-word and quoted text search, and the
-//! time filters. A bare term binds `message` and `_raw`, both envelope
-//! VARCHAR pins that cannot degrade in practice, and counting them would
-//! badge every text query on an install with one bad `_raw`.
+//! Not collected: bare-word and quoted text search, and the time filters. A
+//! bare term binds `message` and `_raw`, both envelope VARCHAR pins that
+//! cannot degrade in practice, and counting them would badge every text
+//! query on an install with one bad `_raw`.
 //!
-//! Deliberately NOT pin-scope-aware either. A name a `let` or `stats`
-//! INVENTS can enter the set; it is not a catalog pin, so intersecting with
-//! the degraded set drops it. The one residual is a computed target that
-//! SHADOWS a degraded field name (`| let status = … | where status > 400`),
-//! which costs one false badge on a query that reuses the name — accepted
-//! rather than defended, because the alternative is a second pin-scope walk
-//! whose only consumer is a notice.
+//! Not pin-scope-aware either. A name a `let` or `stats` invents can enter
+//! the set; it is not a catalog pin, so intersecting with the degraded set
+//! drops it. The one residual is a computed target that shadows a degraded
+//! field name (`| let status = … | where status > 400`), which costs one
+//! false badge on a query that reuses the name — accepted rather than
+//! defended, because the alternative is a second pin-scope walk whose only
+//! consumer is a notice.
 
 use std::collections::BTreeSet;
 
@@ -47,7 +47,7 @@ pub fn referenced_fields(query: &Query) -> BTreeSet<String> {
 /// contributes nothing.
 ///
 /// Total by design: the notice is only ever stamped on a query that already
-/// EXECUTED, so a parse failure here means the caller and the executor
+/// executed, so a parse failure here means the caller and the executor
 /// disagree — and a notice is not the place to surface that.
 #[must_use]
 pub fn referenced_fields_in(dsl: &str) -> BTreeSet<String> {
@@ -96,7 +96,7 @@ fn collect_stage(stage: &PipeStage, out: &mut BTreeSet<String>) {
     match stage {
         PipeStage::Where(s) => collect_expr(&s.condition.node, out),
         PipeStage::Let(s) => {
-            // RHS only — the targets are OUTPUTS, and a computed target is
+            // RHS only: the targets are outputs, and a computed target is
             // not a catalog field however it is spelled.
             for (_, expr) in &s.assignments {
                 collect_expr(&expr.node, out);
@@ -148,7 +148,7 @@ fn collect_stage(stage: &PipeStage, out: &mut BTreeSet<String>) {
             }
         }
         // Stages that bind no field at all. `drop` is one of them on
-        // purpose: it names a column to REMOVE, so nothing downstream can
+        // purpose: it names a column to remove, so nothing downstream can
         // depend on that column's values and naming it must not badge the
         // query.
         PipeStage::Drop(_)
@@ -228,7 +228,7 @@ mod tests {
                 &["duration", "host", "status"],
             ),
             ("* | sort -count, host | dedup host", &["count", "host"]),
-            // `drop` REMOVES a column: the answer cannot depend on its
+            // `drop` removes a column: the answer cannot depend on its
             // values, so naming it there binds nothing.
             ("* | where duration > 1 | drop message", &["duration"]),
             ("* | rename service as svc", &["service"]),
@@ -256,14 +256,12 @@ mod tests {
         }
     }
 
-    /// DSL aliases name their physical column: the notice must speak the
-    /// catalog's spelling, not the query's.
+    /// The notice speaks the catalog's spelling: the ASCII fold, and no
+    /// alias resolution, because the DSL has none (ADR-0013 §6).
     #[test]
     fn names_fold_and_never_alias() {
-        // Zero aliases (ADR-0013 §6): each name is its own catalog key.
         assert_eq!(refs("timestamp>\"2026-01-01\""), vec!["timestamp"]);
         assert_eq!(refs("* | sort -@timestamp"), vec!["@timestamp"]);
-        // Zero aliases: `level` binds the sender's own `level` column.
         assert_eq!(refs("level=error"), vec!["level"]);
         assert_eq!(refs("* | where level == \"error\""), vec!["level"]);
         assert_eq!(refs("Status=200"), vec!["status"]);

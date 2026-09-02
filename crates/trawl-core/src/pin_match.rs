@@ -2,10 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The shared in-memory pin-aware comparison core (ADR-0011 slice A′).
+//! The shared in-memory pin-aware comparison core (ADR-0011).
 //!
 //! One rule table ([`crate::compare`]) resolves how a field-vs-literal
-//! comparison binds under a catalog pin; this module EVALUATES the resolved
+//! comparison binds under a catalog pin; this module evaluates the resolved
 //! form against a live JSON value, mirroring what the emitted SQL answers
 //! over the conformed column. Two consumers: the search-stage matcher
 //! ([`crate::filter`]) and the pipeline expression evaluator
@@ -13,7 +13,7 @@
 //! the emitter renders and this one Rust mirror, proven equivalent by the
 //! parity suites.
 //!
-//! Two boundaries are deliberately NOT in here (the slice-A′ prep rulings):
+//! Two boundaries deliberately stay out of the shared apply:
 //!
 //! - [`crate::compare::CompareForm::Native`] never reaches the shared
 //!   apply — the lanes legitimately bind different literals (search
@@ -100,14 +100,14 @@ pub(crate) enum CoercedValue {
         text: String,
         number: Option<i128>,
     },
-    /// The TYPED-pin form: the column the SQL compares is the CONFORMED
+    /// The typed-pin form: the column the SQL compares is the conformed
     /// one, so this matcher reads the wire value's own conformed value
     /// first and compares that, in the pin's domain.
     ///
-    /// Without it every value the round-trip guard nulls out answered
-    /// differently on the two sides — a wire `1.5` under a BIGINT pin is
-    /// NULL in both batch lanes, so `duration>1` is UNKNOWN there and was
-    /// TRUE here.
+    /// Without it a value the round-trip guard nulls out would answer
+    /// differently on the two sides: a wire `1.5` under a BIGINT pin is
+    /// NULL in both batch lanes, so `duration>1` is UNKNOWN there, while a
+    /// literal-driven reading here would answer TRUE.
     Conformed {
         pin: CanonicalType,
         literal: PinLiteral,
@@ -144,11 +144,11 @@ pub(crate) enum PinLiteral {
 
 /// Map a resolved [`CompareForm`] onto the matcher's coercion vocabulary.
 ///
-/// One rule table, two consumers (ADR-0011 slice A): [`crate::compare`]
+/// One rule table, two consumers (ADR-0011): [`crate::compare`]
 /// decides how the literal binds, this translates the decision into the
 /// evaluator's terms:
 ///
-/// - `Native` — today's literal-driven coercion, verbatim.
+/// - `Native` — the literal-driven coercion, verbatim.
 /// - `Text` — string comparison against the event value's text form,
 ///   mirroring the SQL side's `col = '200'` on the VARCHAR column.
 /// - `NumericOnText` — comparison over the value's text form in the one
@@ -183,9 +183,8 @@ pub(crate) fn coerce_form(form: CompareForm) -> CoercedValue {
         // exactly one thing — `now()`'s statement anchor (ADR-0017 §3) —
         // and an anchor is never a comparison literal, so no door in
         // `compare.rs` can produce this form. Kept total, answering
-        // UNKNOWN (matches nothing, and `NOT` cannot invert it) rather
-        // than inventing a comparison rule for a shape that cannot
-        // arrive.
+        // UNKNOWN rather than inventing a comparison rule for a shape that
+        // cannot arrive.
         CompareForm::Native(SqlValue::Timestamp(_)) => {
             debug_assert!(false, "an anchor is not a comparison literal");
             CoercedValue::Conformed {
@@ -310,8 +309,8 @@ pub(crate) fn compare_values(
                 #[allow(clippy::cast_precision_loss)]
                 Some(apply_f64(ev, *fv as f64, op))
             } else {
-                // String filter value that happened to parse as int —
-                // fall back to string comparison.
+                // The event value reads as no number at all, so a numeric
+                // comparison cannot match it.
                 Some(false)
             }
         }
@@ -474,11 +473,9 @@ impl Conformed {
 ///
 /// A JSON bool under a numeric pin, and a number under the BOOLEAN pin,
 /// have no reading either: `'true'` is not a number to any cast, and the
-/// BOOLEAN cast's vocabulary stops at `1`/`0`, so `'200'` is NULL to it.
-/// (Before the conform went text-first, a numeric under a BOOLEAN pin read
-/// TRUE in a JSON-inferred hot column and NULL everywhere else — the
-/// state-dependence ADR-0011 removed.) An array or object — stringified at
-/// ingest, so never a pinned column's live shape — is likewise NULL.
+/// BOOLEAN cast's vocabulary stops at `1`/`0`, so `'200'` is NULL to it. An
+/// array or object — stringified at ingest, so never a pinned column's live
+/// shape — is likewise NULL.
 fn conformed_reading(v: &Value, pin: CanonicalType) -> Option<Conformed> {
     match pin {
         CanonicalType::BigInt => match v {
@@ -509,7 +506,7 @@ fn conformed_reading(v: &Value, pin: CanonicalType) -> Option<Conformed> {
             _ => None,
         }
         .map(Conformed::Time),
-        // The SEVERITY pin reads through the ONE kernel (ADR-0013 slice 2,
+        // The SEVERITY pin reads through the one kernel (ADR-0013
         // ruling 9) — the same function the conform rung's SQL is
         // generated from, so a wire `"error"` and a wire `17` conform
         // alike here and in `DuckDB`.
@@ -567,11 +564,9 @@ fn compare_conformed(reading: Conformed, op: CompareOp, literal: PinLiteral) -> 
 /// Each typed reading mirrors what [`crate::conform`] stored, not what the
 /// wire carried — the wire text is only the same string when the value
 /// already reads as its pin, and the divergences are silent (a live tail
-/// firing on events the equivalent batch query drops). Conformance casts
-/// the value's TEXT form under a round-trip guard, so the readings here are
-/// text readings too, and each is total on exactly the shapes that guard
-/// admits — see [`conformed_reading`] for the per-pin rules, established by
-/// execution probes in `trawl-engine/tests/duckdb_probe.rs`.
+/// firing on events the equivalent batch query drops). See
+/// [`conformed_reading`] for the per-pin rules, established by execution
+/// probes in `trawl-engine/tests/duckdb_probe.rs`.
 pub(crate) fn pattern_text(v: &Value, form: PatternForm) -> Option<String> {
     let pin = match form {
         PatternForm::Native => return Some(json_to_string(v)),
@@ -610,13 +605,14 @@ pub(crate) fn apply_ord(ord: std::cmp::Ordering, op: CompareOp) -> bool {
 
 /// Apply a comparison on f64 values, in `DuckDB`'s order.
 ///
-/// NOT Rust's IEEE operators: `DuckDB` orders DOUBLE totally, so every
-/// NaN is EQUAL to every other NaN and GREATER than every real value,
+/// Not Rust's IEEE operators: `DuckDB` orders DOUBLE totally, so every
+/// NaN is equal to every other NaN and greater than every real value,
 /// while IEEE `==` answers false and `<`/`>` answer false both ways. That
 /// difference is reachable from an ordinary query — a DOUBLE-pinned
 /// `metric=nan` binds a NaN literal against a column that may store one
-/// (the conform's round-trip guard keeps `nan` and `-nan` alike) — and it
-/// made the live tail drop an event the batch query returns.
+/// (the conform's round-trip guard keeps `nan` and `-nan` alike) — so the
+/// IEEE reading would make the live tail drop an event the batch query
+/// returns.
 ///
 /// One owner, one probe matrix: [`compare::double_total_cmp`], which
 /// `eval`'s comparison arms read too.

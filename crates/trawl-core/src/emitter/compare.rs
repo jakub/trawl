@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pin-aware comparison SQL renderers (ADR-0011 slices A/A′).
+//! Pin-aware comparison SQL renderers (ADR-0011).
 //!
 //! One set of renderers, two lanes: the search stage
 //! ([`super::search::emit_field_filter`]) and the pipeline expression
@@ -12,12 +12,11 @@
 //!
 //! The one deliberate difference between the lanes is the NULL rule for
 //! `!=`, carried as [`NullPolicy`]: the search stage's `!=` includes NULL
-//! columns (`… OR field IS NULL` — the documented ADR-0011 slice-A
-//! behavior), while a pipeline `where` keeps plain SQL null propagation —
-//! a NULL column is UNKNOWN and filtered, exactly what the pin-blind
-//! `where` has always answered. Importing the search widening into the
-//! pipeline would make a repin change missing-field semantics, which is
-//! precisely what slice A′ forbids.
+//! columns (`… OR field IS NULL`, the documented ADR-0011 behaviour),
+//! while a pipeline `where` keeps plain SQL null propagation — a NULL
+//! column is UNKNOWN and filtered, exactly what a pin-blind `where`
+//! answers. Importing the search widening into the pipeline would make a
+//! repin change missing-field semantics, which ADR-0011 forbids.
 
 use crate::ast::FilterOp;
 use crate::compare::{self, CompareForm, PatternForm};
@@ -38,11 +37,11 @@ pub(crate) enum NullPolicy {
 }
 
 /// The column expression a glob/regex matches against: the column itself,
-/// or the pin's canonical pattern text (ADR-0011 slice A) — glob on a
-/// BIGINT column matches its text form instead of leaving the outcome to
+/// or the pin's canonical pattern text (ADR-0011) — glob on a BIGINT
+/// column matches its text form instead of leaving the outcome to
 /// `DuckDB`'s implicit-cast rules, and a TIMESTAMP renders as the RFC 3339
 /// wire form the live matcher sees rather than `DuckDB`'s space-separated
-/// default. The live side mirrors this exactly (`crate::filter`).
+/// default. The live side mirrors this exactly (`crate::pin_match`).
 pub(crate) fn pattern_target(field: &str, pin: Option<crate::schema::CanonicalType>) -> String {
     match compare::pattern_form(pin) {
         PatternForm::Native => field.to_owned(),
@@ -137,29 +136,28 @@ pub(crate) fn comparison_sql(
 
 /// Render an IN list — each element binds like an equality.
 ///
-/// An ALL-SEVERITY list is one set over the ladder: every element's band
-/// or exact number collapses into the MINIMAL CONTIGUOUS RANGES covering
-/// them, so a contiguous list writes its subject exactly once
-/// (issue #82). A `TextOrNumeric` element has no single bound
-/// value, so a list carrying one expands to the OR of its per-element
-/// equalities: the same set membership, and the same shape the live
-/// matcher evaluates (its `InList` is an OR of `=` comparisons). Lists
-/// with neither keep the plain `IN (…)` shape, byte-identical to unpinned
-/// emission.
+/// An all-severity list is one set over the ladder: every element's band
+/// or exact number collapses into the minimal contiguous ranges covering
+/// them, so a contiguous list writes its subject exactly once. A
+/// `TextOrNumeric` element has no single bound value, so a list carrying
+/// one expands to the OR of its per-element equalities: the same set
+/// membership, and the same shape the live matcher evaluates (its
+/// `InList` is an OR of `=` comparisons). Lists with neither keep the
+/// plain `IN (…)` shape, byte-identical to unpinned emission.
 pub(crate) fn in_list_sql(
     field: &str,
     forms: Vec<CompareForm>,
     state: &mut EmitterState,
 ) -> String {
-    // A SEVERITY list is ONE set over the ladder, rendered as the minimal
+    // A SEVERITY list is one set over the ladder, rendered as the minimal
     // ranges covering it — no parameters, and one subject per run.
     if let Some(points) = compare::severity_points(&forms) {
         return severity_ranges_sql(field, FilterOp::Eq, &points);
     }
     // The forms with no single bound value: the VARCHAR pin's two-armed
     // equality, and the SEVERITY pin's band range (reachable here only
-    // MIXED with a non-severity element, which no pin can produce today —
-    // the arm stays total rather than trusting that).
+    // mixed with a non-severity element, which no pin can produce — the
+    // arm stays total rather than trusting that).
     let expands = |f: &CompareForm| {
         matches!(
             f,
@@ -195,7 +193,7 @@ pub(crate) fn in_list_sql(
 }
 
 /// The equality predicate for a VARCHAR-pinned numeric literal
-/// (ADR-0011 slice A): the stored text OR the column's numeric reading.
+/// (ADR-0011): the stored text OR the column's numeric reading.
 ///
 /// `=` is
 /// `(col = '200' OR COALESCE(dec(col) = dec('200'), FALSE))` and `!=` is
@@ -227,10 +225,9 @@ fn text_or_numeric(field: &str, op: FilterOp, literal: String, state: &mut Emitt
     }
 }
 
-/// THE `SEVERITY` set renderer (issue #82): the ladder points a
-/// comparison accepts, rendered as MINIMAL CONTIGUOUS RANGES so the
-/// subject is written once per run — once outright for every natural
-/// query.
+/// The `SEVERITY` set renderer: the ladder points a comparison accepts,
+/// rendered as minimal contiguous ranges so the subject is written once
+/// per run — once outright for every natural query.
 ///
 /// `points` comes from [`compare::severity_points`], the one expansion —
 /// a band's inclusive range, an exact number, or the union a whole IN list
@@ -238,32 +235,29 @@ fn text_or_numeric(field: &str, op: FilterOp, literal: String, state: &mut Emitt
 /// point renders `subject = p`, a longer run `subject BETWEEN lo AND hi`,
 /// and several runs are OR'd inside one paren group.
 ///
-/// Why ranges and not the point set: the SET is what the comparison
-/// MEANS, but the RANGE is what `DuckDB` executes. An `IN` list over a
-/// COMPUTED left-hand side leaves the engine's fast path — probed over 1M
-/// rows in `trawl-engine/tests/severity_set_bench.rs`, a single band cost
+/// Ranges and not the point set, because an `IN` list over a computed
+/// left-hand side leaves `DuckDB`'s fast path and a `sev()` subject is
+/// exactly such a left-hand side: over 1M rows a single band costs
 /// ~392 ms as `IN (17, 18, 19, 20)` against ~6 ms as `BETWEEN 17 AND 20`
-/// — and a `sev()` subject is exactly such a left-hand side. Merging
-/// serves BOTH goals at once, which is the whole point: `_severity=error`
-/// is one range, and the six base bands together are the single range
-/// `BETWEEN 1 AND 24`, so the kilobyte subject appears once and the
-/// predicate keeps the shape the engine likes.
+/// (`trawl-engine/tests/severity_set_bench.rs`). Merging also keeps that
+/// kilobyte-long subject to one appearance on a natural query —
+/// `_severity=error` is one range, and the six base bands together are
+/// the single range `BETWEEN 1 AND 24`.
 ///
 /// `!=` wraps the positive shape in `NOT (…)` rather than inverting each
-/// range, so the range algebra lives in ONE place. That is also the right
+/// range, so the range algebra lives in one place. That is also the right
 /// NULL behaviour: the positive shape over a NULL subject is UNKNOWN and
-/// `NOT (UNKNOWN)` is UNKNOWN, exactly as `NOT IN` answered — the strict
-/// pipeline lane is unchanged, and the search stage's widening still
-/// happens in [`comparison_sql`], outside this function.
+/// `NOT (UNKNOWN)` is UNKNOWN, exactly as `NOT IN` answers — the strict
+/// pipeline lane filters that row, and the search stage's widening happens
+/// in [`comparison_sql`], outside this function.
 ///
-/// The bounds are INLINED, not bound: they are `i64` by type, produced by
+/// The bounds are inlined, not bound: they are `i64` by type, produced by
 /// the closed ladder table, so no user text can reach the SQL through
-/// them. That is the same reasoning the band bounds were always inlined
-/// under, and it keeps the parameter list of a severity filter empty.
+/// them, and the parameter list of a severity filter stays empty.
 ///
 /// # Contract: the subject must not carry bound placeholders
 ///
-/// A multi-run set REPEATS the subject, while the emitter pushes one
+/// A multi-run set repeats the subject, while the emitter pushes one
 /// parameter per `push_param` call and not per occurrence — so a subject
 /// containing `?` would emit more placeholders than values were bound and
 /// desynchronize every parameter after it.
@@ -315,9 +309,9 @@ fn severity_ranges_sql(subject: &str, op: FilterOp, points: &[i64]) -> String {
 fn comparable_value(form: CompareForm) -> SqlValue {
     match form {
         // A typed pin binds exactly as the unpinned path does: the column
-        // on disk IS the pinned type, so `DuckDB` compares against it
-        // directly. The pin travels for the LIVE matcher's sake
-        // (`crate::filter`), which has to conform the wire value first.
+        // on disk is the pinned type, so `DuckDB` compares against it
+        // directly. The pin travels for the live matcher's sake
+        // (`crate::pin_match`), which has to conform the wire value first.
         CompareForm::Native(val) | CompareForm::Conformed { literal: val, .. } => val,
         CompareForm::Text(s) => SqlValue::String(s),
         // A SEVERITY column IS a BIGINT: the exact form binds one integer,
