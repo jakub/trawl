@@ -23,8 +23,8 @@ mod common;
 use sqlx::PgPool;
 use trawl_server::report_window::{ReportWindow, ScheduleWindow, WindowKind, truncate_to_micros};
 use trawl_server::store::{
-    DueClaim, DueClaimError, FinishOutcome, FlipOutcome, HistoryStore, RunClaim, RunStatus,
-    SavedQueryStore, ScheduleStore, StorageState, StoreError, WindowWriteError,
+    DueClaim, DueClaimError, FinishOutcome, FlipOutcome, HistoryStore, ManualRunClaim, RunClaim,
+    RunStatus, SavedQueryStore, ScheduleStore, StorageState, StoreError, WindowWriteError,
 };
 
 fn history(pool: &PgPool) -> HistoryStore {
@@ -7271,4 +7271,70 @@ async fn schedule_put_and_saved_put_cannot_commit_the_forbidden_pair(pool: PgPoo
         "a refused update stores nothing"
     );
     assert_pair_is_legal(&saved_store, &sched_store, second.id).await;
+}
+
+/// Every path that writes a `report_runs` row has to take the
+/// `saved_queries` lock first, whether or not its code asks for one.
+/// Inserting a run checks the `saved_query_id` foreign key, and that check
+/// takes FOR KEY SHARE on the parent row. A claim that locked the schedule
+/// and only then inserted would be holding level 2 while waiting for level
+/// 1, which closes a cycle against `set_schedule_checked` walking the same
+/// two levels the right way round. Postgres resolves a cycle by killing one
+/// side with 40P01, so the bug reads as an occasional 500 on a manual run,
+/// or an occasional 500 on the PUT beside it.
+///
+/// The blocker plays `set_schedule_checked`: it holds the saved-query row,
+/// then reaches for the schedule row once the manual claim is in flight.
+#[sqlx::test]
+async fn manual_claim_and_schedule_write_do_not_deadlock(pool: PgPool) {
+    let saved_store = saved(&pool);
+    let sched_store = schedules(&pool);
+    let sq = saved_store
+        .create(1, "manual-order", "service=x")
+        .await
+        .unwrap();
+    sched_store
+        .create_schedule(sq.id, 1, 3600, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+
+    // Level 1, held open: the first thing `set_schedule_checked` does.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_scalar::<_, i64>("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(sq.id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let claimant = sched_store.clone();
+    let sq_id = sq.id;
+    let claim = tokio::spawn(async move { claimant.claim_manual_run(sq_id, 1).await });
+
+    // Let the claim reach whatever it blocks on.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // Level 2, from the transaction that already holds level 1. Under the
+    // old order the claim is holding this row while waiting on the foreign
+    // key, and postgres' deadlock detector fires right here.
+    let second_level = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM schedules WHERE saved_query_id = $1 FOR UPDATE",
+    )
+    .bind(sq.id)
+    .fetch_one(&mut *blocker)
+    .await;
+    assert!(
+        second_level.is_ok(),
+        "the schedule write deadlocked against the manual claim: {:?}",
+        second_level.err()
+    );
+    blocker.commit().await.unwrap();
+
+    let claimed = claim
+        .await
+        .unwrap()
+        .expect("the manual claim must not deadlock either");
+    assert!(
+        matches!(claimed, ManualRunClaim::Started(_)),
+        "got {claimed:?}"
+    );
 }

@@ -2453,25 +2453,20 @@ pub async fn trigger_run(
 
     let key_id = verified.id;
 
-    // Look up the saved query (ownership check included).
-    let saved = state
-        .storage
-        .saved
-        .get(saved_id, key_id)
-        .await?
-        .ok_or_else(|| ServerError::NotFound("saved query not found".into()))?;
-
-    // One transaction: lock the schedule row, refuse a coverage mode,
-    // enforce max_runs, claim the run. Concurrent triggers cannot exceed the
-    // cap or double-claim, and a window added mid-request either lands
-    // before the lock (and refuses this run) or waits behind it.
-    let run_id = match state
+    // One transaction: lock the saved query and read the DSL from it, lock
+    // the schedule, refuse a coverage mode, enforce max_runs, claim the
+    // run. The ownership check rides the first lock, so this handler takes
+    // no snapshot of its own: what the run executes is what the claim
+    // recorded. Concurrent triggers cannot exceed the cap or double-claim,
+    // and a window added mid-request either lands before the lock (and
+    // refuses this run) or waits behind it.
+    let claimed = match state
         .storage
         .schedule
-        .claim_manual_run(saved_id, key_id, &saved.query)
+        .claim_manual_run(saved_id, key_id)
         .await?
     {
-        ManualRunClaim::Started(id) => id,
+        ManualRunClaim::Started(claimed) => claimed,
         ManualRunClaim::NoSchedule => {
             return Err(ServerError::BadRequest(
                 "attach a schedule before triggering a run".into(),
@@ -2502,8 +2497,8 @@ pub async fn trigger_run(
 
     // Return the summary immediately, execute in background.
     let summary = ReportRunSummary {
-        id: run_id,
-        query: saved.query.clone(),
+        id: claimed.run_id,
+        query: claimed.query.clone(),
         status: RunStatus::Running.as_str().to_string(),
         started_at: chrono::Utc::now().to_rfc3339(),
         finished_at: None,
@@ -2522,8 +2517,9 @@ pub async fn trigger_run(
 
     let schedule_store = state.storage.schedule.clone();
     let pool = state.query.pool.clone();
-    let query = saved.query;
-    let query_name = saved.name;
+    let run_id = claimed.run_id;
+    let query = claimed.query;
+    let query_name = claimed.query_name;
     let timeout_secs = state.query.timeout_secs;
 
     tokio::spawn(async move {
