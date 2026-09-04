@@ -383,9 +383,14 @@ Three outcomes:
   UNKNOWN, never an empty corpus). Each is a file whose columns are
   unknown, and the whole run fails closed rather than deleting on partial
   evidence; the message names the count and up to three paths. Or the
-  catalog store stopped answering while the corpus gate was held, which is
-  bounded at five seconds per statement and reported as UNKNOWN.
-- **503**: a query-only node, or the store is down.
+  catalog store stopped answering one of gc's reads while the corpus gate
+  was held, which is bounded at five seconds and reported as UNKNOWN.
+- **503**: a query-only node, or the store is down — including a purge
+  that failed or ran past its own five-second bound, which postgres
+  enforces inside the transaction rather than the server enforcing it by
+  walking away from a commit. The outcome is UNKNOWN either way, so gc
+  re-reads the catalog for its candidates and drops from the pin cache
+  every one postgres no longer holds, before it releases the corpus gate.
 
 The deletion is metadata only: catalog rows and the in-process pin cache,
 in one transaction, `repin_jobs` history untouched. Being wrong is cheap.
