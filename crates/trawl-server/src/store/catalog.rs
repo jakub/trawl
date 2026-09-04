@@ -282,14 +282,18 @@ const PURGE_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '5s'";
 /// tighter ones, but they only fire when the backend notices. A connection
 /// that dies mid-statement leaves this task waiting on a socket while the
 /// corpus gate stays shut and compaction batches pile up behind it, and no
-/// database-side setting can end that wait. Ten seconds is two statement
-/// bounds plus room for a busy pool checkout: an honest purge never
-/// approaches it, and a dead connection costs one gc run.
+/// database-side setting can end that wait. The bound must EXCEED the
+/// composed honest maximum: `statement_timeout` resets per statement, and
+/// prepare runs eight separately bounded waits (pool acquire ~10s, the
+/// advisory lock, the repin probe, the observation read, four deletes and
+/// the count at up to 5s each), so an honest worst case approaches fifty
+/// seconds. Sixty gives it margin; a dead connection still costs only one
+/// gc run, and the database-side bounds stay the precise ones.
 ///
 /// Cancelling here is safe because nothing has committed. That is the
 /// entire difference from [`PURGE_COMMIT_BOUND`], which cannot cancel
 /// anything.
-pub const PURGE_PREPARE_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+pub const PURGE_PREPARE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long [`CatalogStore::delete_pins`] waits for its own commit before
 /// it stops waiting and reports the outcome as unknown.

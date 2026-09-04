@@ -279,6 +279,12 @@ impl RepinStore {
     /// field in between refuses instead of scanning under a stale `from`.
     pub async fn claim(&self, claim: RepinClaim<'_>) -> Result<i64, StoreError> {
         let mut tx = self.pool.begin().await?;
+        // Bound the advisory-lock wait the same way the purge bounds its
+        // own side: `lock_timeout` does not cover advisory locks, so
+        // without this a claim could wait on a gc purge without limit.
+        sqlx::query("SET LOCAL statement_timeout = '5s'")
+            .execute(&mut *tx)
+            .await?;
         super::lock_catalog_lifecycle(&mut tx).await?;
 
         let expected = claim.from_type.as_catalog();

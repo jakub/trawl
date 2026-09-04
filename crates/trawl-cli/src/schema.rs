@@ -19,6 +19,12 @@ use crate::cli::{ConnectionParams, OutputFormat, render_driver_results};
 
 /// Parse a `--last` window like `30m`, `2h`, `7d`, `1w` into seconds.
 pub fn parse_last(input: &str) -> Result<u64, CliError> {
+    parse_window(input, "--last")
+}
+
+/// The `--last` grammar with the failing option named by the caller, so
+/// `gc-pins --older-than 30y` complains about `--older-than`, not `--last`.
+pub fn parse_window(input: &str, option: &str) -> Result<u64, CliError> {
     let input = input.trim();
     // Split off the last char, not the last byte: `split_at` panics off a
     // char boundary, and the unit position is exactly where a multi-byte
@@ -29,7 +35,7 @@ pub fn parse_last(input: &str) -> Result<u64, CliError> {
     };
     let n: u64 = num
         .parse()
-        .map_err(|_| CliError::Usage(format!("invalid --last window: {input:?}")))?;
+        .map_err(|_| CliError::Usage(format!("invalid {option} window: {input:?}")))?;
     let mult = match unit {
         "s" => 1,
         "m" => 60,
@@ -38,7 +44,7 @@ pub fn parse_last(input: &str) -> Result<u64, CliError> {
         "w" => 604_800,
         _ => {
             return Err(CliError::Usage(format!(
-                "invalid --last window: {input:?} (units: s, m, h, d, w)"
+                "invalid {option} window: {input:?} (units: s, m, h, d, w)"
             )));
         }
     };
@@ -491,6 +497,15 @@ mod tests {
             }],
             truncated: true,
         }
+    }
+
+    #[test]
+    fn a_window_error_names_the_option_that_failed() {
+        let err = parse_window("30y", "--older-than").unwrap_err().to_string();
+        assert!(err.contains("--older-than"), "{err}");
+        assert!(!err.contains("--last"), "{err}");
+        let err = parse_last("30y").unwrap_err().to_string();
+        assert!(err.contains("--last"), "{err}");
     }
 
     #[test]
@@ -1920,7 +1935,9 @@ pub async fn run_gc_pins<W: Write>(
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
     let format = resolve_format(format)?;
-    let older_than_secs = older_than.map(parse_last).transpose()?;
+    let older_than_secs = older_than
+        .map(|s| parse_window(s, "--older-than"))
+        .transpose()?;
     let client = make_client(&conn)?;
     // A refusal (409 for a repin owning the data root or an unreadable
     // corpus) arrives as a client error carrying the server's own message,

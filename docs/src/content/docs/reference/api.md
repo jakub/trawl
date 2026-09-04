@@ -336,7 +336,7 @@ rather than a receipt for a durable one. Restarting trawld is the
 stronger cancel: a killed job leaves the live corpus untouched and boot
 recovery sweeps its staging. Read the outcome from the status route.
 
-```
+```text
 POST /api/v1/schema/gc-pins
 ```
 
