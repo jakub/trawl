@@ -1858,7 +1858,12 @@ pub async fn schema_repin_cancel(
         ));
     };
 
-    let verdict = engine.cancel(&verified.name);
+    // Both halves of the caller's identity go to the engine: the display
+    // name the job row records, and the key prefix the audit events name
+    // beside it. A name is operator-chosen and can be reused or changed;
+    // the prefix is what says which credential actually asked.
+    let actor = crate::repin::CancelActor::new(verified.name.clone(), verified.prefix.clone());
+    let verdict = engine.cancel(&actor);
     let (status, outcome, detail) = verdict.wire();
     let mut job = None;
     if let Some(job_id) = verdict.job_id() {

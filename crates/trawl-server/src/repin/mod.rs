@@ -43,7 +43,9 @@ pub mod rewrite;
 
 pub(crate) use engine::force_refusal;
 
-pub use cancel::{CANCEL_LATENCY_CONTRACT, CancelHandle, CancelRegistry, CancelVerdict};
+pub use cancel::{
+    CANCEL_LATENCY_CONTRACT, CancelActor, CancelHandle, CancelRegistry, CancelVerdict,
+};
 pub use engine::{RepinEngine, StartOutcome};
 pub use gate::{RepinCoordinator, RollupPause};
 pub use marker::{RepinMarker, RepinPhase, aside_root, marker_path, shadow_root};

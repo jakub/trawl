@@ -37,8 +37,8 @@ use crate::error::ServerError;
 use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
 use crate::repin::cancel::{
-    CancelHandle, CancelRegistry, CancelVerdict, PassStop, STAGE_BUILD, STAGE_FINAL_GATE,
-    STAGE_SCAN, audit_cancel_refused, audit_cancel_requested, audit_cancelled,
+    CancelActor, CancelHandle, CancelRegistry, CancelVerdict, PassStop, STAGE_BUILD,
+    STAGE_FINAL_GATE, STAGE_SCAN, audit_cancel_refused, audit_cancel_requested, audit_cancelled,
 };
 use crate::repin::cutover::{
     finish_post_swap_staging, prepare_shadow_root, swap_envs, sweep_pre_swap_staging,
@@ -381,7 +381,7 @@ impl RepinEngine {
     /// `cancelled` terminal status. This detached write exists so the
     /// status route can show a cancel in flight while the job is still
     /// walking to its next file boundary.
-    pub fn cancel(self: &Arc<Self>, actor: &str) -> CancelVerdict {
+    pub fn cancel(self: &Arc<Self>, actor: &CancelActor) -> CancelVerdict {
         let verdict = self.cancel.request(actor);
         match verdict {
             CancelVerdict::Cancelling {
@@ -389,9 +389,13 @@ impl RepinEngine {
                 already_requested,
             } => {
                 let engine = Arc::clone(self);
-                let actor = actor.to_owned();
+                let actor = actor.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = engine.store.record_cancel_request(job_id, &actor).await {
+                    if let Err(e) = engine
+                        .store
+                        .record_cancel_request(job_id, actor.name())
+                        .await
+                    {
                         // The flag is the authority for the verdict the
                         // operator already holds; a store that cannot
                         // record the request costs the audit row, and the
@@ -792,7 +796,7 @@ impl RepinEngine {
     /// The effect site's first act: read who asked and say so in the audit
     /// trail, before any unwinding starts. `None` means no cancel is
     /// pending for this job and the caller's own verdict stands.
-    fn observe_cancel(&self, job_id: i64, stage: &'static str) -> Option<String> {
+    fn observe_cancel(&self, job_id: i64, stage: &'static str) -> Option<CancelActor> {
         let actor = self.cancel.pending(job_id)?;
         audit_cancelled(job_id, &actor, stage);
         Some(actor)
@@ -815,7 +819,7 @@ impl RepinEngine {
     /// `actor` is the name [`Self::observe_cancel`] already audited, passed
     /// in rather than re-read so the log line and the row's sentence cannot
     /// name two different people.
-    async fn finish_cancelled(&self, job_id: i64, stage: &'static str, actor: Option<String>) {
+    async fn finish_cancelled(&self, job_id: i64, stage: &'static str, actor: Option<CancelActor>) {
         let Some(actor) = actor else {
             // Only reachable if the registry stopped naming this job
             // between the check that decided to cancel and this call.
@@ -830,9 +834,9 @@ impl RepinEngine {
                 .await;
             return;
         };
-        match self.store.record_cancel_request(job_id, &actor).await {
+        match self.store.record_cancel_request(job_id, actor.name()).await {
             Ok(_) => {
-                let msg = cancelled_error(&actor, stage);
+                let msg = cancelled_error(actor.name(), stage);
                 self.finish(job_id, RepinJobStatus::Cancelled, Some(&msg))
                     .await;
             }
@@ -846,10 +850,11 @@ impl RepinEngine {
                      failed instead"
                 );
                 let msg = format!(
-                    "cancelled by {actor} during {stage}, but the cancel \
+                    "cancelled by {} during {stage}, but the cancel \
                      request could not be recorded in the job store, so the \
                      outcome is failed rather than cancelled; the live \
-                     corpus was never touched"
+                     corpus was never touched",
+                    actor.name()
                 );
                 self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
                     .await;
@@ -950,7 +955,7 @@ impl RepinEngine {
         let actor = self.observe_cancel(job_id, stage);
         let msg = actor.as_ref().map_or_else(
             || format!("cancelled during {stage}"),
-            |actor| cancelled_error(actor, stage),
+            |actor| cancelled_error(actor.name(), stage),
         );
         self.unwind_staging(job_id, RepinJobStatus::Cancelled, &msg)
             .await;

@@ -130,14 +130,51 @@ impl CancelVerdict {
     }
 }
 
+/// Who asked for a cancel.
+///
+/// Two fields because a display name answers a different question from the
+/// one an audit reader asks. `name` is the verified key's human label, the
+/// same identity source `requested_by` uses, so the job row reads
+/// coherently; it is operator-chosen and two keys may carry the same one.
+/// `key_prefix` is the keystore's stable identifier for the key itself, so
+/// a log reader can say which credential acted even after somebody renames
+/// it. The prefix is the key's public half — it is what the keystore lists
+/// keys by — so naming it leaks no token material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelActor {
+    name: String,
+    key_prefix: String,
+}
+
+impl CancelActor {
+    /// Build an actor from a verified key's display name and prefix.
+    pub fn new(name: impl Into<String>, key_prefix: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            key_prefix: key_prefix.into(),
+        }
+    }
+
+    /// The display name. What the job row's `cancelled_by` column and its
+    /// error sentence carry.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The stable key prefix. Audit events only.
+    #[must_use]
+    pub fn key_prefix(&self) -> &str {
+        &self.key_prefix
+    }
+}
+
 /// The registry's record of the one armed job.
 #[derive(Debug, Clone)]
 struct Entry {
     job_id: i64,
-    /// The first asker's name, once a request has been accepted. The
-    /// display name of the verified key, the same identity source
-    /// `requested_by` uses, so the row reads coherently.
-    cancelled_by: Option<String>,
+    /// The first asker, once a request has been accepted.
+    cancelled_by: Option<CancelActor>,
     /// Latched by [`CancelRegistry::commit`] immediately before the
     /// Cutover marker write. Past it every request is refused.
     committed: bool,
@@ -186,7 +223,7 @@ impl CancelRegistry {
     }
 
     /// Ask to cancel whatever is running. The handler's one call.
-    pub fn request(&self, by: &str) -> CancelVerdict {
+    pub fn request(&self, by: &CancelActor) -> CancelVerdict {
         let mut slot = self.slot.lock();
         let Some(entry) = slot.as_mut() else {
             return CancelVerdict::NoJobRunning;
@@ -198,7 +235,7 @@ impl CancelRegistry {
         }
         let already_requested = entry.cancelled_by.is_some();
         if !already_requested {
-            entry.cancelled_by = Some(by.to_owned());
+            entry.cancelled_by = Some(by.clone());
         }
         CancelVerdict::Cancelling {
             job_id: entry.job_id,
@@ -227,7 +264,7 @@ impl CancelRegistry {
     /// The pending request for `job_id`, if the job is still armed, has
     /// been asked to cancel, and has not latched.
     #[must_use]
-    pub fn pending(&self, job_id: i64) -> Option<String> {
+    pub fn pending(&self, job_id: i64) -> Option<CancelActor> {
         let slot = self.slot.lock();
         slot.as_ref()
             .filter(|entry| entry.job_id == job_id && !entry.committed)
@@ -271,7 +308,7 @@ impl CancelHandle {
     /// Who asked, if anyone has. The effect site reads this to name the
     /// actor in the job row's error sentence and the audit event.
     #[must_use]
-    pub fn cancelled_by(&self) -> Option<String> {
+    pub fn cancelled_by(&self) -> Option<CancelActor> {
         self.registry.pending(self.job_id)
     }
 
@@ -304,11 +341,16 @@ impl From<String> for PassStop {
 /// attempt so the trail matches what a reader of the job row can see.
 /// A repeat carries the new asker's name with `already_requested = true`:
 /// the row still names the first, and both facts belong in the log.
-pub fn audit_cancel_requested(job_id: i64, actor: &str, already_requested: bool) {
+///
+/// Both halves of the identity ride every one of these events: the display
+/// name an operator recognises and the key prefix that stays put when the
+/// name changes.
+pub fn audit_cancel_requested(job_id: i64, actor: &CancelActor, already_requested: bool) {
     tracing::info!(
         event_type = "repin_cancel_requested",
         job_id,
-        actor = %actor,
+        actor = %actor.name(),
+        actor_key_prefix = %actor.key_prefix(),
         already_requested,
         "repin cancellation requested"
     );
@@ -317,11 +359,12 @@ pub fn audit_cancel_requested(job_id: i64, actor: &str, already_requested: bool)
 /// The audit event for the effect: a file boundary observed the request and
 /// the unwind is about to run. Emitted before `abandon_build`'s warn line,
 /// so the log reads request → effect → sweep.
-pub fn audit_cancelled(job_id: i64, actor: &str, stage: &str) {
+pub fn audit_cancelled(job_id: i64, actor: &CancelActor, stage: &str) {
     tracing::info!(
         event_type = "repin_cancelled",
         job_id,
-        actor = %actor,
+        actor = %actor.name(),
+        actor_key_prefix = %actor.key_prefix(),
         stage = %stage,
         "repin job cancelled before the point of no return; the live \
          corpus was never touched"
@@ -330,11 +373,12 @@ pub fn audit_cancelled(job_id: i64, actor: &str, stage: &str) {
 
 /// The audit event for a refusal. Only the 409 has a job to name; a 404
 /// emits nothing, because an event with no subject is noise.
-pub fn audit_cancel_refused(job_id: i64, actor: &str) {
+pub fn audit_cancel_refused(job_id: i64, actor: &CancelActor) {
     tracing::info!(
         event_type = "repin_cancel_refused",
         job_id,
-        actor = %actor,
+        actor = %actor.name(),
+        actor_key_prefix = %actor.key_prefix(),
         "repin cancellation refused: the job is past its point of no return"
     );
 }
@@ -342,6 +386,10 @@ pub fn audit_cancel_refused(job_id: i64, actor: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn actor(name: &str) -> CancelActor {
+        CancelActor::new(name, format!("trwl_{name}"))
+    }
 
     fn armed(job_id: i64) -> (Arc<CancelRegistry>, CancelHandle) {
         let registry = Arc::new(CancelRegistry::default());
@@ -366,7 +414,7 @@ mod tests {
             let (registry, _handle) = armed(7);
             let asker = Arc::clone(&registry);
             let closer = Arc::clone(&registry);
-            let request = std::thread::spawn(move || asker.request("operator"));
+            let request = std::thread::spawn(move || asker.request(&actor("operator")));
             let commit = std::thread::spawn(move || closer.commit(7));
             let verdict = request.join().expect("request thread");
             let latched = commit.join().expect("commit thread");
@@ -374,7 +422,7 @@ mod tests {
             match (verdict, latched) {
                 (CancelVerdict::Cancelling { job_id, .. }, false) => {
                     assert_eq!(job_id, 7);
-                    assert_eq!(registry.pending(7).as_deref(), Some("operator"));
+                    assert_eq!(registry.pending(7), Some(actor("operator")));
                     cancelled_won += 1;
                 }
                 (CancelVerdict::PastPointOfNoReturn { job_id }, true) => {
@@ -405,7 +453,7 @@ mod tests {
         assert!(registry.commit(11));
         for _ in 0..3 {
             assert_eq!(
-                registry.request("operator"),
+                registry.request(&actor("operator")),
                 CancelVerdict::PastPointOfNoReturn { job_id: 11 }
             );
         }
@@ -419,7 +467,7 @@ mod tests {
     fn a_pending_request_stops_the_latch() {
         let (registry, handle) = armed(11);
         assert_eq!(
-            registry.request("alice"),
+            registry.request(&actor("alice")),
             CancelVerdict::Cancelling {
                 job_id: 11,
                 already_requested: false
@@ -432,7 +480,7 @@ mod tests {
                 stage: STAGE_FINAL_GATE
             })
         ));
-        assert_eq!(handle.cancelled_by().as_deref(), Some("alice"));
+        assert_eq!(handle.cancelled_by(), Some(actor("alice")));
     }
 
     /// A second asker changes nothing but the audit trail. The row's actor
@@ -442,20 +490,20 @@ mod tests {
     fn a_second_request_preserves_the_first_actor() {
         let (registry, handle) = armed(3);
         assert_eq!(
-            registry.request("alice"),
+            registry.request(&actor("alice")),
             CancelVerdict::Cancelling {
                 job_id: 3,
                 already_requested: false
             }
         );
         assert_eq!(
-            registry.request("bob"),
+            registry.request(&actor("bob")),
             CancelVerdict::Cancelling {
                 job_id: 3,
                 already_requested: true
             }
         );
-        assert_eq!(handle.cancelled_by().as_deref(), Some("alice"));
+        assert_eq!(handle.cancelled_by(), Some(actor("alice")));
     }
 
     /// Disarm is owner-checked. A job whose task ends late must not clear
@@ -469,17 +517,20 @@ mod tests {
 
         registry.disarm(1);
         assert_eq!(
-            registry.request("operator"),
+            registry.request(&actor("operator")),
             CancelVerdict::Cancelling {
                 job_id: 2,
                 already_requested: false
             },
             "job 2 is still armed"
         );
-        assert_eq!(second.cancelled_by().as_deref(), Some("operator"));
+        assert_eq!(second.cancelled_by(), Some(actor("operator")));
 
         registry.disarm(2);
-        assert_eq!(registry.request("operator"), CancelVerdict::NoJobRunning);
+        assert_eq!(
+            registry.request(&actor("operator")),
+            CancelVerdict::NoJobRunning
+        );
         assert_eq!(second.cancelled_by(), None);
     }
 

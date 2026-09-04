@@ -2401,6 +2401,7 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
         requested.fields["actor"].contains("schema-admin-key"),
         "{requested:?}"
     );
+    assert_key_prefix(&requested, &h.server.schema_admin_prefix);
     assert!(requested.fields["job_id"].contains(&cancelled.id.to_string()));
 
     let effect = capture
@@ -2415,6 +2416,7 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
         effect.fields["stage"].contains("build"),
         "the audit names where the cancel landed: {effect:?}"
     );
+    assert_key_prefix(&effect, &h.server.schema_admin_prefix);
 
     // (2) A refusal past the point of no return.
     TEST_PAST_NO_RETURN.store(false, Ordering::SeqCst);
@@ -2441,6 +2443,7 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
         .await
         .expect("the refusal is audited");
     assert!(refused.fields["actor"].contains("schema-admin-key"));
+    assert_key_prefix(&refused, &h.server.schema_admin_prefix);
     assert!(refused.fields["job_id"].contains(&completing.id.to_string()));
 
     // (3) Boot recovery over a crash-after-request state emits no
@@ -2507,6 +2510,21 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
 /// Its own copy rather than a shared one: `tests/common` is compiled into
 /// every integration binary in the crate, and a helper only this file uses
 /// would be dead code in all the others.
+/// Every cancel audit event names the key prefix beside the display name
+/// (#109 review F3). The name is operator-chosen and can be reused or
+/// renamed; the prefix is what identifies the credential that acted, so an
+/// event carrying only the name cannot answer "which key was this".
+fn assert_key_prefix(event: &audit_capture::Captured, prefix: &str) {
+    let seen = event
+        .fields
+        .get("actor_key_prefix")
+        .unwrap_or_else(|| panic!("no actor_key_prefix on {event:?}"));
+    assert!(
+        seen.contains(prefix),
+        "expected the acting key's prefix {prefix:?} in {event:?}"
+    );
+}
+
 mod audit_capture {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
