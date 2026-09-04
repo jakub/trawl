@@ -564,6 +564,21 @@ impl<'a> IntoIterator for &'a PublicOrigins {
     }
 }
 
+/// Reason logged when a request carries more than one `Origin` field.
+///
+/// Part of the same closed vocabulary as [`OriginParseError::reason`] and
+/// the `not_allowed`/`absent` arms of [`rejection_log_fields`]: every value
+/// the guard can put in the `reason` field is a `&'static str` chosen here,
+/// so the field's value set is bounded no matter what a client sends.
+pub const REASON_MULTIPLE_HEADERS: &str = "multiple_origin_headers";
+
+/// Reason logged when the single `Origin` field is not valid UTF-8.
+///
+/// A header value is bytes; `Origin` is ASCII. Anything else cannot be
+/// parsed, so there is no normalized text to log and the refusal names the
+/// encoding rather than the shape.
+pub const REASON_NON_UTF8: &str = "non_utf8_origin";
+
 /// Build the bounded fields for a cross-origin rejection log line.
 ///
 /// One vocabulary, one place. The reason is a `&'static str` from a closed

@@ -14,6 +14,16 @@
 //! The encoding is `base64url(nonce || ciphertext || tag)` with no padding.
 //! A fresh 24-byte nonce is drawn from the OS RNG on every encrypt. Tamper
 //! resistance and confidentiality come from XChaCha20-Poly1305.
+//!
+//! The CSRF guard over that cookie lives here too. [`check_origin`] compares
+//! a present `Origin` — whole: scheme, host and effective port — against the
+//! app's configured [`PublicOrigins`], which [`SessionConfig`] requires
+//! (ADR-0016). It used to compare the origin's host against the request's
+//! `Host` header, which let `http://` forge against `https://`, let any
+//! other port of the same name through, and made the answer depend on a
+//! header the reverse proxy in front rewrites. No request header other than
+//! `Origin` is read any more, and `crates/fleet-auth/tests/no_forwarded_trust.rs`
+//! is the guard that keeps it that way.
 
 use std::fs;
 use std::path::Path;
@@ -25,6 +35,10 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::origin::{
+    Origin, PublicOrigins, PublicOriginsError, REASON_MULTIPLE_HEADERS, REASON_NON_UTF8,
+    rejection_log_fields,
+};
 use crate::validation::validate_app_namespace;
 
 /// Length of the symmetric AEAD key in bytes (XChaCha20-Poly1305).
@@ -70,6 +84,20 @@ pub const ENV_SESSION_COOKIE_PATH: &str = "FLEET_SESSION_COOKIE_PATH";
 /// `Secure` flag. The only valid values are `true` and `false`.
 pub const ENV_SESSION_COOKIE_SECURE: &str = "FLEET_SESSION_COOKIE_SECURE";
 
+/// Canonical Fleet runtime environment variable carrying the deployment's
+/// browser-visible origins as a comma-separated list, e.g.
+/// `https://trawl.example.com,http://localhost:8090`.
+///
+/// This is the CSRF allowlist ADR-0016 compares a present `Origin` against,
+/// so it is deliberately an override of the same shape as the other
+/// `FLEET_SESSION_*` knobs rather than a dev-only side channel: development
+/// orchestration knows the browser origin it just published (a magic-DNS
+/// name and port, say) and configuration files do not. Entries are split on
+/// `,` and handed to `Origin::parse` verbatim — no trimming, because a
+/// space inside an entry means the operator wrote something this parser
+/// will not guess at.
+pub const ENV_SESSION_PUBLIC_ORIGINS: &str = "FLEET_SESSION_PUBLIC_ORIGINS";
+
 /// Errors from parsing the `FLEET_SESSION_*` runtime environment.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionRuntimeError {
@@ -83,6 +111,29 @@ pub enum SessionRuntimeError {
     InvalidValue {
         name: &'static str,
         reason: &'static str,
+    },
+
+    /// One entry of the public-origin list did not parse. The index is the
+    /// position in the comma-separated variable, so an operator staring at
+    /// a long line knows which piece to fix.
+    #[error("env var {name} entry {index} ({entry:?}) is not a valid origin: {source}")]
+    InvalidOrigin {
+        name: &'static str,
+        index: usize,
+        entry: String,
+        #[source]
+        source: crate::origin::OriginParseError,
+    },
+
+    /// Two entries name the same origin after normalization. Refused for
+    /// the same reason the config list refuses it: the operator believes
+    /// those two spellings differ, and the next spelling they add will be
+    /// one that genuinely does.
+    #[error("env var {name} lists entries {first} and {second} as the same origin")]
+    DuplicateOrigin {
+        name: &'static str,
+        first: usize,
+        second: usize,
     },
 }
 
@@ -110,6 +161,14 @@ pub struct SessionRuntimeOverrides {
     pub key: Option<SessionKey>,
     pub domain: RuntimeCookieDomain,
     pub secure: Option<bool>,
+    /// The CSRF allowlist from the environment (ADR-0016), `None` when the
+    /// variable is absent. A present value REPLACES whatever the config
+    /// file states — it never merges, because a merged allowlist would let
+    /// a stale config entry keep authorizing an origin the operator thinks
+    /// they moved away from. The consuming application is where that
+    /// displacement gets its warning, next to the other `FLEET_SESSION_*`
+    /// overrides it already warns about.
+    pub public_origins: Option<PublicOrigins>,
 }
 
 impl SessionRuntimeOverrides {
@@ -124,6 +183,7 @@ impl SessionRuntimeOverrides {
             read_optional_env(ENV_SESSION_COOKIE_DOMAIN)?,
             read_optional_env(ENV_SESSION_COOKIE_PATH)?,
             read_optional_env(ENV_SESSION_COOKIE_SECURE)?,
+            read_optional_env(ENV_SESSION_PUBLIC_ORIGINS)?,
         )
     }
 
@@ -136,6 +196,7 @@ impl SessionRuntimeOverrides {
         domain: Option<String>,
         path: Option<String>,
         secure: Option<String>,
+        public_origins: Option<String>,
     ) -> Result<Self, SessionRuntimeError> {
         let key = key
             .map(Zeroizing::new)
@@ -175,12 +236,53 @@ impl SessionRuntimeOverrides {
             }
         };
 
+        let public_origins = public_origins
+            .map(|raw| parse_env_public_origins(&raw))
+            .transpose()?;
+
         Ok(Self {
             key,
             domain,
             secure,
+            public_origins,
         })
     }
+}
+
+/// Read the comma-separated public-origin list from its environment
+/// variable through the ONE origin parser (ADR-0016).
+///
+/// The entries reach [`Origin::parse`] exactly as written. Trimming would
+/// be the parser quietly repairing input, and this parser refuses instead:
+/// a config file and an environment variable that normalized differently
+/// would be two allowlists wearing one name.
+fn parse_env_public_origins(raw: &str) -> Result<PublicOrigins, SessionRuntimeError> {
+    let name = ENV_SESSION_PUBLIC_ORIGINS;
+    PublicOrigins::parse(raw.split(',')).map_err(|err| match err {
+        PublicOriginsError::Entry {
+            index,
+            entry,
+            source,
+        } => SessionRuntimeError::InvalidOrigin {
+            name,
+            index,
+            entry,
+            source,
+        },
+        PublicOriginsError::Duplicate { first, second } => SessionRuntimeError::DuplicateOrigin {
+            name,
+            first,
+            second,
+        },
+        // Unreachable: `split(',')` always yields at least one element, so
+        // even an empty variable arrives as one empty entry and is refused
+        // by `Origin::parse`. Mapped rather than unwrapped because a
+        // panic here would be a startup crash on operator input.
+        PublicOriginsError::Empty => SessionRuntimeError::InvalidValue {
+            name,
+            reason: "expected a comma-separated list of browser-visible origins",
+        },
+    })
 }
 
 fn read_optional_env(name: &'static str) -> Result<Option<String>, SessionRuntimeError> {
@@ -438,6 +540,14 @@ pub struct SessionConfig {
     pub(crate) same_site: cookie::SameSite,
     pub(crate) app_namespace: String,
     pub(crate) post_login_redirect: String,
+    /// The browser-visible origins allowed to make cookie-authenticated
+    /// requests (ADR-0016). Not an `Option`: a deployment that has not
+    /// stated its own origin cannot be guarded, and the alternatives are
+    /// both silent failures — an empty list that allows everything is a
+    /// decorative guard, one that allows nothing breaks every browser with
+    /// no log line to explain it. The type is non-empty by construction,
+    /// so this field is the invariant rather than a value that needs one.
+    pub(crate) public_origins: PublicOrigins,
 }
 
 impl SessionConfig {
@@ -448,19 +558,27 @@ impl SessionConfig {
         SessionConfigBuilder::default()
     }
 
-    /// Convenience for the common "just need the two required fields"
-    /// case. Equivalent to
-    /// `Self::builder().cookie_name(...).app_namespace(...).build()`.
+    /// Convenience for the common "just need the required fields" case.
+    /// Equivalent to
+    /// `Self::builder().cookie_name(...).app_namespace(...).public_origins(...).build()`.
+    ///
+    /// `public_origins` is a positional argument rather than a builder-only
+    /// knob because it is a trust boundary, not a preference: ADR-0016 has
+    /// the web surface refuse to start without it, and a constructor that
+    /// let a caller forget it would put that refusal back in the hands of
+    /// whoever remembers to call the setter.
     ///
     /// # Errors
     /// As for [`SessionConfigBuilder::build`].
     pub fn new(
         cookie_name: impl Into<String>,
         app_namespace: impl Into<String>,
+        public_origins: PublicOrigins,
     ) -> Result<Self, crate::AuthError> {
         Self::builder()
             .cookie_name(cookie_name)
             .app_namespace(app_namespace)
+            .public_origins(public_origins)
             .build()
     }
 
@@ -509,10 +627,24 @@ impl SessionConfig {
         &self.post_login_redirect
     }
 
+    /// The origins a cookie-authenticated request may come from
+    /// (ADR-0016). Feed it straight to [`check_origin`]; there is no
+    /// second policy anywhere and nothing else in the request is
+    /// consulted, least of all `Host` or a forwarding header.
+    #[must_use]
+    pub fn public_origins(&self) -> &PublicOrigins {
+        &self.public_origins
+    }
+
     /// Validate the configuration. The builder calls this in
     /// [`SessionConfigBuilder::build`]; [`SessionState::new`] also calls
     /// it defensively in case a future internal path constructs a
     /// `SessionConfig` without going through the builder.
+    ///
+    /// `public_origins` gets no check here on purpose: [`PublicOrigins`]
+    /// cannot be built empty, so the invariant ADR-0016 cares about is
+    /// already carried by the value. A re-check would be a branch no input
+    /// can reach and no test can exercise.
     ///
     /// # Errors
     /// Returns [`crate::AuthError::InvalidApp`] when `cookie_name` is empty,
@@ -545,9 +677,11 @@ impl SessionConfig {
 ///
 /// SSO-friendly defaults: `cookie_name = "fleet_session"`, `secure = true`,
 /// `same_site = Lax`, `ttl_secs = DEFAULT_TTL_SECS`, no `Domain`, and
-/// `post_login_redirect = "/"`. The two required setters are
-/// [`Self::cookie_name`] (must be non-empty) and [`Self::app_namespace`]
-/// (must pass [`validate_app_namespace`]).
+/// `post_login_redirect = "/"`. The required setters are
+/// [`Self::app_namespace`] (must pass [`validate_app_namespace`]) and
+/// [`Self::public_origins`] (ADR-0016: there is no default browser origin
+/// to guess, so `build()` refuses rather than guessing); [`Self::cookie_name`]
+/// defaults but must be non-empty if set.
 ///
 /// Validation runs in [`Self::build`], so unset/invalid fields surface as a
 /// proper `Result` rather than a panic.
@@ -560,6 +694,7 @@ pub struct SessionConfigBuilder {
     same_site: Option<cookie::SameSite>,
     app_namespace: Option<String>,
     post_login_redirect: Option<String>,
+    public_origins: Option<PublicOrigins>,
 }
 
 impl SessionConfigBuilder {
@@ -630,13 +765,37 @@ impl SessionConfigBuilder {
         self
     }
 
+    /// The deployment's browser-visible origins. Required — `build()`
+    /// fails when it is unset (ADR-0016).
+    ///
+    /// Takes a parsed [`PublicOrigins`] rather than strings so the
+    /// operator's list is validated where it is read (startup, with the
+    /// config path in hand) instead of here, where a bad entry would
+    /// surface as an unhelpful builder error.
+    #[must_use]
+    pub fn public_origins(mut self, v: PublicOrigins) -> Self {
+        self.public_origins = Some(v);
+        self
+    }
+
     /// Build and validate.
     ///
     /// # Errors
-    /// Returns [`crate::AuthError::InvalidApp`] when validation fails
-    /// (empty `cookie_name`, invalid `post_login_redirect`,
-    /// `same_site == None` without `secure`, or invalid `app_namespace`).
+    /// Returns [`crate::AuthError::InvalidApp`] when `public_origins` was
+    /// never set, or when validation fails (empty `cookie_name`, invalid
+    /// `post_login_redirect`, `same_site == None` without `secure`, or
+    /// invalid `app_namespace`).
     pub fn build(self) -> Result<SessionConfig, crate::AuthError> {
+        // Missing origins first: a config that cannot be guarded is not a
+        // config with one bad field, and the message has to name the knob
+        // an operator has to go and write.
+        let public_origins = self.public_origins.ok_or_else(|| {
+            crate::AuthError::InvalidApp(
+                "public_origins is required: state the deployment's browser-visible \
+                 origin(s), e.g. [\"https://trawl.example.com\"] (ADR-0016)"
+                    .into(),
+            )
+        })?;
         let cfg = SessionConfig {
             cookie_name: self
                 .cookie_name
@@ -649,6 +808,7 @@ impl SessionConfigBuilder {
             same_site: self.same_site.unwrap_or(cookie::SameSite::Lax),
             app_namespace: self.app_namespace.unwrap_or_default(),
             post_login_redirect: self.post_login_redirect.unwrap_or_else(|| "/".to_owned()),
+            public_origins,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -814,148 +974,116 @@ pub fn decrypt(key: &SessionKey, cookie_value: &str) -> Result<SessionPayload, S
     Ok(payload)
 }
 
-/// Present-only Origin validation for state-changing auth endpoints
-/// (ADR-0004).
+/// Whether a present `Origin` is one of the deployment's configured public
+/// origins (ADR-0016).
 ///
-/// The shared `fleet_session` cookie makes logout forgeable cross-site: a
-/// forged POST to any fleet app's logout endpoint would clear the cookie
-/// for every sibling app. This helper closes that hole while keeping
-/// curl/scripted clients working:
+/// The comparison is whole-origin: scheme, host and effective port, both
+/// sides normalized by the one parser in [`crate::origin`]. The rule this
+/// replaced compared the `Origin`'s host against the request's `Host`
+/// header, which allowed `http://trawl.example` to forge against the
+/// `https://` deployment of the same name, allowed any other port of that
+/// name, and made a security verdict depend on a header the reverse proxy
+/// in front rewrites. `Host` is not a security input here any more, and
+/// neither is `Forwarded` or `X-Forwarded-*`: the verdict is a function of
+/// the operator's configured list and the bytes the browser stamped, and
+/// of nothing else.
 ///
-/// - `origin` **absent** → allow. Browsers always send `Origin` on
-///   cross-site POSTs, so the attack is blocked; non-browser clients
-///   (which send no `Origin`) keep working.
-/// - `origin` host equals the request `host` (ports stripped,
-///   case-insensitive) → allow.
-/// - Malformed `origin` (including the opaque `"null"` origin) → reject,
-///   fail closed.
-/// - Anything else → reject.
+/// - `origin` **absent** -> allowed. This is a browser CSRF control, not
+///   client authentication: browsers always stamp cross-site POSTs, while
+///   curl and scripted clients send no `Origin` and keep working.
+/// - `origin` parses to a configured origin -> allowed.
+/// - anything else -> rejected. That includes a sibling fleet app under
+///   the shared cookie domain: `Domain=` decides where a browser sends the
+///   cookie, never who may call these endpoints.
 ///
-/// Sharing a parent-domain cookie is not an origin allowlist. A sibling
-/// fleet app (`evil.fleet.example` posting to
-/// `trawl.fleet.example/logout`) is a different origin and is rejected
-/// even though both sit under the cookie's `Domain=`; otherwise a
-/// compromised sibling, or attacker-hosted content on one, could
-/// auto-submit a form POST that clears `fleet_session` fleet-wide.
-/// `Domain=` decides where the browser sends the cookie, never who may call
-/// these endpoints.
-///
-/// Pure string parsing, no request types, so both fleet-auth's own
-/// handlers and thin proxies that only take the `session` feature call
-/// the same function instead of growing diverged copies.
-///
-/// Note: the exact-host arm trusts the request `Host` header. A reverse
-/// proxy in front must forward the original `Host` or legitimate
-/// same-origin requests will be rejected.
+/// Prefer [`check_origin`], which also answers the two questions a bare
+/// `Option<&str>` cannot represent (more than one `Origin` field, a value
+/// that is not UTF-8) and emits the one rejection log.
 #[must_use]
-pub fn origin_allowed(origin: Option<&str>, host: Option<&str>) -> bool {
-    let Some(origin) = origin else {
-        return true;
-    };
-    let Some(origin_host) = origin_host(origin) else {
-        return false;
-    };
-
-    match host {
-        Some(request_host) => origin_host.eq_ignore_ascii_case(strip_port(request_host)),
-        None => false,
+pub fn origin_allowed(origin: Option<&str>, allowed: &PublicOrigins) -> bool {
+    match origin {
+        None => true,
+        Some(raw) => Origin::parse(raw).is_ok_and(|origin| allowed.contains(&origin)),
     }
 }
 
 /// Returned by [`check_origin`] when a request's `Origin` is rejected. The
-/// rejection has already been logged with its `origin`/`host`/`handler`
+/// rejection has already been logged with its `handler`/`reason`/`origin`
 /// fields; each caller maps this marker onto its own error/response type
 /// (403, no `Set-Cookie`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OriginRejected;
 
-/// Present-only Origin guard for state-changing auth endpoints, wrapping
-/// [`origin_allowed`] with the canonical rejection log.
+/// Guard a cookie-authenticated endpoint on the request's `Origin`
+/// (ADR-0016).
 ///
-/// Callers pass the raw `Origin`/`Host` header values (already `Option<&str>`)
-/// rather than a request type, so this stays usable from both fleet-auth's
-/// own axum handlers and thin proxies that take only the `session` feature.
-/// On rejection it emits the shared `tracing::warn!`, so the log fields and
-/// message can't drift between call sites, and returns [`OriginRejected`].
-/// `handler` labels the calling endpoint in that log line (e.g. `"login"`).
+/// Takes the whole [`http::HeaderMap`] rather than an `Option<&str>`
+/// because two of the four verdicts are properties of the map and not of
+/// any string: a request carrying two `Origin` fields has no single origin
+/// to compare (and `HeaderMap::get` would quietly hand back the first
+/// one), and a value that is not valid UTF-8 cannot be parsed at all. A
+/// caller that extracted the header itself would decide both of those on
+/// its own, which is the drift this function exists to prevent. It is also
+/// why the parameter is the map and not a request: nothing else in the
+/// request is consulted, so nothing else is asked for.
+///
+/// Verdicts, in order: no `Origin` -> `Ok`; two or more `Origin` fields
+/// (even byte-identical ones) -> rejected; a non-UTF-8 value -> rejected;
+/// otherwise parse and compare against `allowed`.
+///
+/// On rejection it emits exactly one `tracing::warn!` with bounded fields:
+/// `handler` (the caller's own `&'static str` label), `reason` (from the
+/// closed vocabulary in [`crate::origin`]) and `origin`, which is present
+/// only when the header parsed and is then the normalized text, never the
+/// raw bytes. An attacker chooses the header; they do not get to choose
+/// what lands in the log, how long it is, or whether it contains a newline.
 ///
 /// # Errors
 ///
-/// Returns [`OriginRejected`] when [`origin_allowed`] rejects the pair.
+/// Returns [`OriginRejected`] for every verdict above that is not `Ok`.
 pub fn check_origin(
-    origin: Option<&str>,
-    host: Option<&str>,
-    handler: &str,
+    headers: &http::HeaderMap,
+    allowed: &PublicOrigins,
+    handler: &'static str,
 ) -> Result<(), OriginRejected> {
-    if origin_allowed(origin, host) {
+    let mut values = headers.get_all(http::header::ORIGIN).iter();
+    let Some(only) = values.next() else {
+        return Ok(());
+    };
+    if values.next().is_some() {
+        // A browser sends at most one `Origin`. Two fields mean something
+        // between the browser and here appended one, so there is no single
+        // origin to compare: refuse instead of picking a copy. Identical
+        // copies are refused too, because "they matched, so it is fine"
+        // is a rule about this request, not about the next one.
+        return Err(reject(handler, REASON_MULTIPLE_HEADERS, None));
+    }
+    let Ok(text) = only.to_str() else {
+        return Err(reject(handler, REASON_NON_UTF8, None));
+    };
+    if origin_allowed(Some(text), allowed) {
         return Ok(());
     }
+    let (reason, origin) = rejection_log_fields(Some(text));
+    Err(reject(handler, reason, origin.as_deref()))
+}
+
+/// Emit the one cross-origin rejection log line and return the marker.
+///
+/// Every rejection path goes through here so the message and its fields
+/// cannot drift between the multi-header case, the encoding case and the
+/// parse/allowlist cases. `origin` is an `Option`: `tracing` records
+/// nothing for a `None` value, so a refusal with no safe text to print
+/// leaves the field out of the line entirely rather than printing a
+/// placeholder that looks like an origin.
+fn reject(handler: &'static str, reason: &'static str, origin: Option<&str>) -> OriginRejected {
     tracing::warn!(
-        origin = origin.unwrap_or("<unparseable>"),
-        host = host.unwrap_or("<none>"),
         handler,
+        reason,
+        origin,
         "auth: cross-origin request rejected"
     );
-    Err(OriginRejected)
-}
-
-/// Derive the request authority (host[:port]) for the Origin check, preferring
-/// the `Host` header and falling back to the URI's `:authority` pseudo-header.
-///
-/// HTTP/1.1 carries the target host in the `Host` header (the URI is
-/// origin-form, so `uri.authority()` is `None`); HTTP/2 carries it in the
-/// `:authority` pseudo-header, which hyper parks in the request URI while
-/// leaving `Host` absent. Consulting both keeps the same-host Origin guard
-/// working on either protocol.
-///
-/// This is the one host-derivation used by *both* fleet-auth's own axum
-/// handlers and thin session-only proxies (trawl-web), so the two `check_origin`
-/// call sites can't silently diverge on this CSRF-relevant surface. Feed the
-/// result straight into [`check_origin`].
-#[must_use]
-pub fn request_host<'a>(headers: &'a http::HeaderMap, uri: &'a http::Uri) -> Option<&'a str> {
-    headers
-        .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| uri.authority().map(http::uri::Authority::as_str))
-}
-
-/// Extract the host component from an `Origin` header value
-/// (`scheme "://" host [":" port]`). Returns `None` for anything that
-/// doesn't parse as a serialized origin — including the opaque `"null"`
-/// origin — so callers fail closed.
-fn origin_host(origin: &str) -> Option<&str> {
-    let (scheme, rest) = origin.split_once("://")?;
-    if scheme.is_empty()
-        || !scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    {
-        return None;
-    }
-    // A serialized origin has no path, query, fragment, or userinfo.
-    if rest.is_empty() || rest.contains(['/', '\\', '?', '#', '@']) {
-        return None;
-    }
-    let host = strip_port(rest);
-    if host.is_empty() { None } else { Some(host) }
-}
-
-/// Strip a trailing `:port` from a host, handling bracketed IPv6
-/// literals (`[::1]:8080` → `::1`). Values without a valid numeric port
-/// pass through unchanged.
-fn strip_port(host: &str) -> &str {
-    if let Some(rest) = host.strip_prefix('[') {
-        // IPv6 literal: everything up to the closing bracket.
-        if let Some(end) = rest.find(']') {
-            return &rest[..end];
-        }
-        return host; // malformed — compare as-is, will simply not match
-    }
-    match host.rsplit_once(':') {
-        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
-        _ => host,
-    }
+    OriginRejected
 }
 
 /// Check whether `now` is past a payload's `exp`.
@@ -1000,11 +1128,12 @@ mod tests {
         assert_eq!(ENV_SESSION_COOKIE_DOMAIN, "FLEET_SESSION_COOKIE_DOMAIN");
         assert_eq!(ENV_SESSION_COOKIE_PATH, "FLEET_SESSION_COOKIE_PATH");
         assert_eq!(ENV_SESSION_COOKIE_SECURE, "FLEET_SESSION_COOKIE_SECURE");
+        assert_eq!(ENV_SESSION_PUBLIC_ORIGINS, "FLEET_SESSION_PUBLIC_ORIGINS");
     }
 
     #[test]
     fn runtime_overrides_parse_the_valid_shapes() {
-        let absent = SessionRuntimeOverrides::parse(None, None, None, None).unwrap();
+        let absent = SessionRuntimeOverrides::parse(None, None, None, None, None).unwrap();
         assert!(absent.key.is_none());
         assert_eq!(absent.domain, RuntimeCookieDomain::PreserveConfigured);
         assert_eq!(absent.secure, None);
@@ -1015,14 +1144,20 @@ mod tests {
             Some(String::new()),
             Some("/".into()),
             Some("true".into()),
+            Some("https://trawl.example.com".into()),
         )
         .unwrap();
         assert_eq!(full.key.unwrap().to_base64url().as_str(), key.as_str());
         assert_eq!(full.domain, RuntimeCookieDomain::HostOnly);
         assert_eq!(full.secure, Some(true));
+        assert_eq!(
+            full.public_origins,
+            Some(PublicOrigins::parse(["https://trawl.example.com"]).unwrap())
+        );
+        assert!(absent.public_origins.is_none());
 
         let explicit =
-            SessionRuntimeOverrides::parse(None, Some(".fleet.example".into()), None, None)
+            SessionRuntimeOverrides::parse(None, Some(".fleet.example".into()), None, None, None)
                 .unwrap();
         assert_eq!(
             explicit.domain,
@@ -1032,15 +1167,16 @@ mod tests {
 
     #[test]
     fn invalid_runtime_values_fail_closed() {
-        let bad_key = SessionRuntimeOverrides::parse(Some("not-base64".into()), None, None, None)
-            .unwrap_err();
+        let bad_key =
+            SessionRuntimeOverrides::parse(Some("not-base64".into()), None, None, None, None)
+                .unwrap_err();
         assert!(
             matches!(bad_key, SessionRuntimeError::InvalidKey { name } if name == ENV_SESSION_AEAD_KEY)
         );
 
         for path in ["", "/app", "//"] {
-            let err =
-                SessionRuntimeOverrides::parse(None, None, Some(path.into()), None).unwrap_err();
+            let err = SessionRuntimeOverrides::parse(None, None, Some(path.into()), None, None)
+                .unwrap_err();
             assert!(matches!(
                 err,
                 SessionRuntimeError::InvalidValue { name, .. } if name == ENV_SESSION_COOKIE_PATH
@@ -1048,8 +1184,8 @@ mod tests {
         }
 
         for secure in ["TRUE", "1", "", "yes"] {
-            let err =
-                SessionRuntimeOverrides::parse(None, None, None, Some(secure.into())).unwrap_err();
+            let err = SessionRuntimeOverrides::parse(None, None, None, Some(secure.into()), None)
+                .unwrap_err();
             assert!(matches!(
                 err,
                 SessionRuntimeError::InvalidValue { name, .. } if name == ENV_SESSION_COOKIE_SECURE
@@ -1064,8 +1200,8 @@ mod tests {
             "fleet.example:8444",
             "fleet.example\r\nx-injected: yes",
         ] {
-            let err =
-                SessionRuntimeOverrides::parse(None, Some(domain.into()), None, None).unwrap_err();
+            let err = SessionRuntimeOverrides::parse(None, Some(domain.into()), None, None, None)
+                .unwrap_err();
             assert!(matches!(
                 err,
                 SessionRuntimeError::InvalidValue { name, .. } if name == ENV_SESSION_COOKIE_DOMAIN
@@ -1347,6 +1483,7 @@ mod tests {
     fn session_config_builder_emits_sso_friendly_defaults() {
         let cfg = SessionConfig::builder()
             .app_namespace("trawl")
+            .public_origins(test_origins())
             .build()
             .unwrap();
         assert_eq!(cfg.cookie_name(), "fleet_session");
@@ -1362,16 +1499,36 @@ mod tests {
     fn session_config_builder_rejects_empty_namespace() {
         // app_namespace defaults to empty — validate() must reject it so
         // callers can't accidentally ship a wide-open default.
-        let err = SessionConfig::builder().build().unwrap_err();
+        let err = SessionConfig::builder()
+            .public_origins(test_origins())
+            .build()
+            .unwrap_err();
         assert!(matches!(err, crate::AuthError::InvalidApp(_)));
     }
 
     #[test]
-    fn session_config_new_validates_namespace() {
-        let cfg = SessionConfig::new("fleet_session", "trawl").unwrap();
-        assert_eq!(cfg.app_namespace(), "trawl");
+    fn session_config_builder_requires_public_origins() {
+        // ADR-0016's loud upgrade, at the type's own door: there is no
+        // browser origin to default to, so a config that never states one
+        // does not exist. The message has to name the knob, because the
+        // operator reading it is looking for something to write down.
+        let err = SessionConfig::builder()
+            .app_namespace("trawl")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(&err, crate::AuthError::InvalidApp(m) if m.contains("public_origins")),
+            "got: {err:?}"
+        );
+    }
 
-        let err = SessionConfig::new("fleet_session", "BAD!").unwrap_err();
+    #[test]
+    fn session_config_new_validates_namespace() {
+        let cfg = SessionConfig::new("fleet_session", "trawl", test_origins()).unwrap();
+        assert_eq!(cfg.app_namespace(), "trawl");
+        assert_eq!(cfg.public_origins(), &test_origins());
+
+        let err = SessionConfig::new("fleet_session", "BAD!", test_origins()).unwrap_err();
         assert!(matches!(err, crate::AuthError::InvalidApp(_)));
     }
 
@@ -1380,6 +1537,7 @@ mod tests {
         let err = SessionConfig::builder()
             .cookie_name("")
             .app_namespace("trawl")
+            .public_origins(test_origins())
             .build()
             .unwrap_err();
         assert!(matches!(err, crate::AuthError::InvalidApp(m) if m.contains("cookie_name")));
@@ -1389,6 +1547,7 @@ mod tests {
     fn session_config_rejects_relative_redirect() {
         let err = SessionConfig::builder()
             .app_namespace("trawl")
+            .public_origins(test_origins())
             .post_login_redirect("home")
             .build()
             .unwrap_err();
@@ -1401,6 +1560,7 @@ mod tests {
     fn session_config_rejects_protocol_relative_redirect() {
         let err = SessionConfig::builder()
             .app_namespace("trawl")
+            .public_origins(test_origins())
             .post_login_redirect("//evil.example.com/path")
             .build()
             .unwrap_err();
@@ -1413,6 +1573,7 @@ mod tests {
         for bad in ["/\\evil.example.com/path", "/\\\\evil.example.com"] {
             let err = SessionConfig::builder()
                 .app_namespace("trawl")
+                .public_origins(test_origins())
                 .post_login_redirect(bad)
                 .build()
                 .unwrap_err();
@@ -1428,6 +1589,7 @@ mod tests {
         for bad in ["/ok\r\nX-Injected: 1", "/ok\nfoo", "/ok\0foo", "/ok\x7f"] {
             let err = SessionConfig::builder()
                 .app_namespace("trawl")
+                .public_origins(test_origins())
                 .post_login_redirect(bad)
                 .build()
                 .unwrap_err();
@@ -1442,6 +1604,7 @@ mod tests {
     fn session_config_rejects_samesite_none_without_secure() {
         let err = SessionConfig::builder()
             .app_namespace("trawl")
+            .public_origins(test_origins())
             .secure(false)
             .same_site(cookie::SameSite::None)
             .build()
@@ -1452,156 +1615,445 @@ mod tests {
         );
     }
 
-    // -- origin_allowed truth table -------------------------------------
+    // -- the origin guard's truth table (ADR-0016) ----------------------
 
-    #[test]
-    fn origin_absent_is_allowed() {
-        // curl / scripted logins / same-origin GET navigations don't send
-        // Origin — the check is present-only by design.
-        assert!(origin_allowed(None, Some("trawl.example.com")));
-        assert!(origin_allowed(None, None));
+    /// The allowlist every guard test runs against: a public HTTPS
+    /// deployment, the packaged loopback bind, and that bind's IPv6
+    /// spelling. Three entries, so "allowed" cannot be an accident of a
+    /// single-element list.
+    fn test_origins() -> PublicOrigins {
+        PublicOrigins::parse([
+            "https://trawl.example.com",
+            "http://localhost:8090",
+            "http://[::1]:8090",
+        ])
+        .expect("valid test allowlist")
     }
 
-    #[test]
-    fn origin_matching_request_host_is_allowed() {
-        assert!(origin_allowed(
-            Some("https://trawl.example.com"),
-            Some("trawl.example.com")
-        ));
-        // ports are stripped on both sides
-        assert!(origin_allowed(
-            Some("https://trawl.example.com:8443"),
-            Some("trawl.example.com:8443")
-        ));
-        assert!(origin_allowed(
-            Some("http://localhost:8090"),
-            Some("localhost:8090")
-        ));
-        // case-insensitive host comparison
-        assert!(origin_allowed(
-            Some("https://Trawl.Example.COM"),
-            Some("trawl.example.com")
-        ));
-        // bracketed IPv6 literal: the port is stripped inside the brackets on
-        // both sides, so `[::1]:8090` matches. Pins strip_port's IPv6 branch —
-        // a naive rsplit_once(':') rewrite would flip this to false and 403
-        // IPv6 localhost/homelab logins with no other failing test.
-        assert!(origin_allowed(
-            Some("http://[::1]:8090"),
-            Some("[::1]:8090")
-        ));
-    }
-
-    #[test]
-    fn sibling_under_shared_domain_is_rejected() {
-        // A parent-domain cookie is not an origin allowlist: origin
-        // validation stays strictly same-host, so a sibling fleet app
-        // posting to trawl's auth endpoints is rejected even though both
-        // live under the same cookie domain. Otherwise a compromised (or
-        // attacker-hosted) sibling could forge a logout that clears
-        // `fleet_session` fleet-wide.
-        assert!(!origin_allowed(
-            Some("https://evil.fleet.lab.ktle.net"),
-            Some("trawl.fleet.lab.ktle.net")
-        ));
-        // even the bare parent domain is a different host
-        assert!(!origin_allowed(
-            Some("https://fleet.lab.ktle.net"),
-            Some("trawl.fleet.lab.ktle.net")
-        ));
-    }
-
-    #[test]
-    fn origin_mismatch_is_rejected() {
-        // strict same-host mode: any other host is rejected
-        assert!(!origin_allowed(
-            Some("https://evil.example.com"),
-            Some("trawl.example.com")
-        ));
-        // no Host to match against → fail closed
-        assert!(!origin_allowed(Some("https://trawl.example.com"), None));
-        // suffix forgery: eviltrawl.example.com is NOT trawl.example.com
-        assert!(!origin_allowed(
-            Some("https://eviltrawl.example.com"),
-            Some("trawl.example.com")
-        ));
-        // distinct bracketed IPv6 literals must not match once ports are
-        // stripped inside the brackets (::2 != ::1)
-        assert!(!origin_allowed(
-            Some("http://[::2]:8090"),
-            Some("[::1]:8090")
-        ));
-        // port-only mismatch on the exact-host arm still passes because
-        // ports are stripped (Origin comparison is host-scoped here)
-        assert!(origin_allowed(
-            Some("https://trawl.example.com:9999"),
-            Some("trawl.example.com:8443")
-        ));
-    }
-
-    #[test]
-    fn origin_malformed_is_rejected() {
-        // opaque "null" origin (sandboxed iframe, data: URL) — fail closed
-        assert!(!origin_allowed(Some("null"), Some("trawl.example.com")));
-        // no scheme
-        assert!(!origin_allowed(
-            Some("trawl.example.com"),
-            Some("trawl.example.com")
-        ));
-        // garbage
-        assert!(!origin_allowed(Some("https://"), Some("trawl.example.com")));
-        assert!(!origin_allowed(Some(""), Some("trawl.example.com")));
-        // path smuggling: Origin never carries a path
-        assert!(!origin_allowed(
-            Some("https://evil.com/trawl.example.com"),
-            Some("trawl.example.com")
-        ));
-        // userinfo smuggling
-        assert!(!origin_allowed(
-            Some("https://trawl.example.com@evil.com"),
-            Some("trawl.example.com")
-        ));
-    }
-
-    // -- request_host Host-header / :authority fallback -----------------
-
-    #[test]
-    fn request_host_prefers_host_header() {
-        // HTTP/1.1: Host header present, URI is origin-form (no authority).
+    fn headers_with_origin(origin: &str) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::HOST, "trawl.example.com".parse().unwrap());
-        let uri: http::Uri = "/api/auth/logout".parse().unwrap();
-        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+        headers.insert(
+            http::header::ORIGIN,
+            http::HeaderValue::from_str(origin).expect("test origin is a header value"),
+        );
+        headers
+    }
+
+    /// Every row is a verdict the deployment has to get right, and most of
+    /// the `false` rows are a CSRF bypass if they ever flip. The `true`
+    /// rows matter just as much in the other direction: each is a spelling
+    /// a real browser sends for an origin the operator configured, and a
+    /// wrong `false` is a 403 nobody can explain.
+    const ORIGIN_VERDICTS: &[(&str, bool, &str)] = &[
+        ("https://trawl.example.com", true, "the configured origin"),
+        (
+            "https://trawl.example.com:443",
+            true,
+            "the default port spelled out is the same origin",
+        ),
+        (
+            "https://TRAWL.Example.COM",
+            true,
+            "scheme and DNS host are case-insensitive",
+        ),
+        (
+            "http://trawl.example.com",
+            false,
+            "cross-scheme forgery: the defect ADR-0016 closes",
+        ),
+        (
+            "https://trawl.example.com:8443",
+            false,
+            "another port of the same name is another origin",
+        ),
+        (
+            "https://evil.example.com",
+            false,
+            "an unrelated host, the classic forged form POST",
+        ),
+        (
+            "https://coastwatch.example.com",
+            false,
+            "a sibling fleet app: sharing the cookie's domain is not authority",
+        ),
+        (
+            "https://sub.trawl.example.com",
+            false,
+            "a subdomain of a configured origin is not that origin",
+        ),
+        (
+            "https://trawl.example.com.evil.com",
+            false,
+            "suffix forgery",
+        ),
+        (
+            "null",
+            false,
+            "the opaque origin (sandboxed iframe, data: URL)",
+        ),
+        ("http://[::1]:8090", true, "the configured IPv6 loopback"),
+        (
+            "http://[0:0:0:0:0:0:0:1]:8090",
+            true,
+            "the expanded spelling of that same address",
+        ),
+        (
+            "http://[::1]:9090",
+            false,
+            "IPv6 with another port is another origin",
+        ),
+        (
+            "http://127.0.0.1:8090",
+            false,
+            "three loopback spellings, three distinct origins",
+        ),
+        ("http://localhost:8090", true, "the packaged loopback bind"),
+        (
+            "http://localhost",
+            false,
+            "port 80 is not the configured 8090",
+        ),
+        (
+            "https://trawl.example.com/",
+            false,
+            "a trailing slash makes it a URL, not a serialized origin",
+        ),
+    ];
+
+    #[test]
+    fn the_guard_answers_the_truth_table() {
+        let allowed = test_origins();
+        for (origin, expected, why) in ORIGIN_VERDICTS {
+            let verdict = check_origin(&headers_with_origin(origin), &allowed, "login").is_ok();
+            assert_eq!(verdict, *expected, "{origin:?}: {why}");
+            // Same claim through the string-level door, so the two cannot
+            // disagree about a row.
+            assert_eq!(
+                origin_allowed(Some(origin), &allowed),
+                *expected,
+                "{origin:?}: {why}"
+            );
+        }
     }
 
     #[test]
-    fn request_host_falls_back_to_uri_authority() {
-        // HTTP/2: no Host header; hyper parks `:authority` in the request URI.
-        let headers = http::HeaderMap::new();
-        let uri: http::Uri = "https://trawl.example.com/api/auth/logout".parse().unwrap();
-        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+    fn an_absent_origin_is_allowed() {
+        // A browser CSRF control, not client authentication: curl, the CLI
+        // and every scripted client send no Origin and must keep working.
+        let allowed = test_origins();
+        assert!(check_origin(&http::HeaderMap::new(), &allowed, "logout").is_ok());
+        assert!(origin_allowed(None, &allowed));
     }
 
     #[test]
-    fn request_host_prefers_host_over_authority() {
-        // If both are present the Host header wins (matches HTTP/1.1 posture).
+    fn two_origin_headers_are_rejected_even_when_identical() {
+        // `HeaderMap::get` would hand back the first of the two and the
+        // guard would answer about a request nobody sent. Byte-identical
+        // copies are refused as well: the request still passed through
+        // something that appends Origin headers, and the next one it
+        // forwards may not be a copy.
+        let allowed = test_origins();
+        for second in ["https://trawl.example.com", "https://evil.example.com"] {
+            let mut headers = headers_with_origin("https://trawl.example.com");
+            headers.append(
+                http::header::ORIGIN,
+                http::HeaderValue::from_str(second).unwrap(),
+            );
+            assert!(
+                check_origin(&headers, &allowed, "login").is_err(),
+                "two Origin fields must be refused (second: {second})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_origin_is_rejected() {
+        // Header values are bytes; a serialized origin is ASCII. There is
+        // nothing to parse and nothing safe to log.
         let mut headers = http::HeaderMap::new();
-        headers.insert(http::header::HOST, "trawl.example.com".parse().unwrap());
-        let uri: http::Uri = "https://other.example.com/x".parse().unwrap();
-        assert_eq!(request_host(&headers, &uri), Some("trawl.example.com"));
+        headers.insert(
+            http::header::ORIGIN,
+            http::HeaderValue::from_bytes(&[0xff, 0xfe, 0x00_u8.wrapping_add(0x41)]).unwrap(),
+        );
+        assert!(check_origin(&headers, &test_origins(), "login").is_err());
     }
 
     #[test]
-    fn request_host_none_when_neither_present() {
-        let headers = http::HeaderMap::new();
-        let uri: http::Uri = "/api/auth/logout".parse().unwrap();
-        assert_eq!(request_host(&headers, &uri), None);
+    fn forwarding_headers_and_host_change_no_verdict() {
+        // The structural half of ADR-0016: these headers are free text to
+        // anyone who can reach the port, and the old rule let them move the
+        // answer. Now they are inert in both directions — they cannot open
+        // the guard for a foreign origin, and they cannot close it against
+        // a configured one.
+        let allowed = test_origins();
+        let forged = [
+            (http::header::HOST, "evil.example.com"),
+            (
+                http::HeaderName::from_static("x-forwarded-host"),
+                "evil.example.com",
+            ),
+            (http::HeaderName::from_static("x-forwarded-proto"), "http"),
+            (http::HeaderName::from_static("x-forwarded-port"), "8443"),
+            (
+                http::HeaderName::from_static("forwarded"),
+                "host=evil.example.com;proto=http",
+            ),
+        ];
+
+        for (origin, expected) in [
+            (Some("https://trawl.example.com"), true),
+            (Some("https://evil.example.com"), false),
+            (None, true),
+        ] {
+            let mut headers = origin.map_or_else(http::HeaderMap::new, headers_with_origin);
+            for (name, value) in &forged {
+                headers.insert(name.clone(), http::HeaderValue::from_static(value));
+            }
+            assert_eq!(
+                check_origin(&headers, &allowed, "logout").is_ok(),
+                expected,
+                "forged forwarding headers must not move the verdict for {origin:?}"
+            );
+        }
+    }
+
+    // -- the rejection log's contract -----------------------------------
+
+    /// Collects one formatted `field=value` line per event, so the tests
+    /// below can assert on what the guard actually recorded rather than on
+    /// what it meant to record.
+    #[derive(Clone, Default)]
+    struct CaptureLayer {
+        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    struct FieldWriter<'a>(&'a mut String);
+
+    impl tracing::field::Visit for FieldWriter<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value} ", field.name());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value:?} ", field.name());
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut line = format!("{} ", event.metadata().level());
+            event.record(&mut FieldWriter(&mut line));
+            self.lines.lock().expect("capture mutex").push(line);
+        }
+    }
+
+    /// Serializes the capture tests against each other.
+    ///
+    /// `tracing` caches every callsite's `Interest` process-wide and
+    /// rebuilds that cache whenever a subscriber registers or dies. Two of
+    /// these tests running at once can leave the guard's `warn!` callsite
+    /// cached as "never interested" for the thread that is about to emit,
+    /// so the event vanishes and the test reads "the guard did not log"
+    /// — which is exactly the failure it exists to catch, arriving at
+    /// random. One lock over register/emit/read makes the rebuild
+    /// deterministic. Poisoning is ignored deliberately: a panic in one
+    /// capture test must not turn the other three into cascade failures
+    /// that hide their own result.
+    static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run the guard under a capturing subscriber and hand back the lines
+    /// it emitted.
+    fn captured_lines(headers: &http::HeaderMap, handler: &'static str) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _serialized = CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let capture = CaptureLayer::default();
+        let lines = std::sync::Arc::clone(&capture.lines);
+        let subscriber = tracing_subscriber::registry().with(capture);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _ = check_origin(headers, &test_origins(), handler);
+        lines.lock().expect("capture mutex").clone()
+    }
+
+    #[test]
+    fn a_hostile_origin_header_never_reaches_the_log() {
+        // 10 KiB of attacker-chosen bytes. Whatever else this line says, it
+        // must not say this: a log field an attacker fills is a way to bury
+        // other evidence, blow up log storage, or smuggle terminal escapes
+        // into whoever greps for it.
+        let hostile = format!("https://{}.example.com", "a".repeat(10 * 1024));
+        let lines = captured_lines(&headers_with_origin(&hostile), "login");
+
+        assert_eq!(lines.len(), 1, "exactly one warn per rejection: {lines:?}");
+        let line = &lines[0];
+        assert!(line.starts_with("WARN"), "got: {line}");
+        assert!(line.contains("handler=login"), "got: {line}");
+        assert!(line.contains("reason=too_long"), "got: {line}");
+        assert!(
+            !line.contains("origin="),
+            "nothing parsed, so there is no safe origin text to print: {line}"
+        );
+        assert!(!line.contains(&hostile), "the raw header is in the log");
+        assert!(
+            !line.contains("aaaaaaaa"),
+            "not even a slice of the raw header: {line}"
+        );
+        assert!(line.len() < 200, "bounded line, got {} bytes", line.len());
+    }
+
+    #[test]
+    fn a_foreign_origin_logs_its_normalized_text() {
+        // The one case with safe text: it parsed, so what gets logged is
+        // the parser's own canonical form. That is what makes a
+        // misconfigured public_origins debuggable — the operator can paste
+        // the logged text straight into the config.
+        let lines = captured_lines(
+            &headers_with_origin("https://EVIL.example.com:443"),
+            "logout",
+        );
+
+        assert_eq!(lines.len(), 1, "got: {lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("handler=logout"), "got: {line}");
+        assert!(line.contains("reason=not_allowed"), "got: {line}");
+        assert!(
+            line.contains("origin=https://evil.example.com "),
+            "normalized, not echoed: {line}"
+        );
+    }
+
+    #[test]
+    fn every_rejection_reason_is_from_the_closed_vocabulary() {
+        let mut two = headers_with_origin("https://trawl.example.com");
+        two.append(
+            http::header::ORIGIN,
+            http::HeaderValue::from_static("https://trawl.example.com"),
+        );
+        let mut non_utf8 = http::HeaderMap::new();
+        non_utf8.insert(
+            http::header::ORIGIN,
+            http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+
+        for (headers, expected) in [
+            (two, REASON_MULTIPLE_HEADERS),
+            (non_utf8, REASON_NON_UTF8),
+            (headers_with_origin("null"), "not_serialized_origin"),
+            (
+                headers_with_origin("ws://trawl.example.com"),
+                "unsupported_scheme",
+            ),
+            (
+                headers_with_origin("https://evil.example.com"),
+                "not_allowed",
+            ),
+        ] {
+            let lines = captured_lines(&headers, "login");
+            assert_eq!(lines.len(), 1, "got: {lines:?}");
+            assert!(
+                lines[0].contains(&format!("reason={expected} ")),
+                "expected reason={expected}, got: {}",
+                lines[0]
+            );
+            // The two field-less refusals must stay field-less.
+            if expected == REASON_MULTIPLE_HEADERS || expected == REASON_NON_UTF8 {
+                assert!(!lines[0].contains("origin="), "got: {}", lines[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn an_allowed_origin_logs_nothing() {
+        assert!(
+            captured_lines(&headers_with_origin("https://trawl.example.com"), "login").is_empty()
+        );
+        assert!(captured_lines(&http::HeaderMap::new(), "login").is_empty());
+    }
+
+    // -- the public-origin runtime override -----------------------------
+
+    #[test]
+    fn the_public_origins_override_parses_a_comma_separated_list() {
+        let parsed = SessionRuntimeOverrides::parse(
+            None,
+            None,
+            None,
+            None,
+            Some("https://trawl.example.com,http://localhost:8090".into()),
+        )
+        .unwrap()
+        .public_origins
+        .expect("present");
+        assert_eq!(
+            parsed,
+            PublicOrigins::parse(["https://trawl.example.com", "http://localhost:8090"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_bad_override_entry_names_the_variable_and_the_index() {
+        // Entries are not trimmed: a space inside an entry is the operator
+        // writing something this parser refuses to guess at, and guessing
+        // is how a config list and an env list end up meaning different
+        // things.
+        for (raw, index) in [
+            ("https://trawl.example.com, http://localhost:8090", 1),
+            ("nonsense", 0),
+            ("", 0),
+            ("https://ok.example.com,", 1),
+        ] {
+            let err = SessionRuntimeOverrides::parse(None, None, None, None, Some(raw.into()))
+                .unwrap_err();
+            match err {
+                SessionRuntimeError::InvalidOrigin {
+                    name,
+                    index: reported,
+                    ..
+                } => {
+                    assert_eq!(name, ENV_SESSION_PUBLIC_ORIGINS);
+                    assert_eq!(reported, index, "for {raw:?}");
+                }
+                other => panic!("{raw:?} should name the entry, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_duplicated_override_entry_is_refused() {
+        let err = SessionRuntimeOverrides::parse(
+            None,
+            None,
+            None,
+            None,
+            Some("https://trawl.example.com,https://trawl.example.com:443".into()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SessionRuntimeError::DuplicateOrigin { name, first: 0, second: 1 }
+                    if name == ENV_SESSION_PUBLIC_ORIGINS
+            ),
+            "got: {err:?}"
+        );
     }
 
     #[test]
     fn session_config_no_domain_clears_domain_setter() {
         let cfg = SessionConfig::builder()
             .app_namespace("trawl")
+            .public_origins(test_origins())
             .domain("fleet.home.lan")
             .no_domain()
             .build()

@@ -44,16 +44,16 @@ pub use store::KeyStore;
 #[cfg(feature = "session")]
 pub use origin::{
     MAX_ORIGIN_HEADER_BYTES, Origin, OriginParseError, OriginScheme, PublicOrigins,
-    PublicOriginsError, rejection_log_fields,
+    PublicOriginsError, REASON_MULTIPLE_HEADERS, REASON_NON_UTF8, rejection_log_fields,
 };
 #[cfg(feature = "session")]
 pub use session::{
     DEFAULT_COOKIE_NAME, DEFAULT_TTL_SECS, ENV_SESSION_AEAD_KEY, ENV_SESSION_COOKIE_DOMAIN,
-    ENV_SESSION_COOKIE_PATH, ENV_SESSION_COOKIE_SECURE, KEY_LEN, NONCE_LEN, OriginRejected,
-    RuntimeCookieDomain, SessionConfig, SessionConfigBuilder, SessionError, SessionExpiry,
-    SessionKey, SessionPayload, SessionRuntimeError, SessionRuntimeOverrides,
-    build_clear_cookie_header, build_session_cookie_header, check_origin, decrypt, encrypt,
-    is_expired, origin_allowed, request_host,
+    ENV_SESSION_COOKIE_PATH, ENV_SESSION_COOKIE_SECURE, ENV_SESSION_PUBLIC_ORIGINS, KEY_LEN,
+    NONCE_LEN, OriginRejected, RuntimeCookieDomain, SessionConfig, SessionConfigBuilder,
+    SessionError, SessionExpiry, SessionKey, SessionPayload, SessionRuntimeError,
+    SessionRuntimeOverrides, build_clear_cookie_header, build_session_cookie_header, check_origin,
+    decrypt, encrypt, is_expired, origin_allowed,
 };
 // Re-export `cookie::SameSite` so consumers don't need to add `cookie` as a
 // direct dep just to populate `SessionConfig.same_site`.

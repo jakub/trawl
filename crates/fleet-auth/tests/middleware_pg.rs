@@ -24,8 +24,9 @@ use axum::middleware::from_fn_with_state;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use fleet_auth::{
-    KeyStore, PrincipalKind, RolePermission, SessionConfig, SessionExpiry, SessionKey,
-    SessionPayload, SessionState, VerifiedKey, encrypt, require_bearer, require_session,
+    KeyStore, PrincipalKind, PublicOrigins, RolePermission, SessionConfig, SessionExpiry,
+    SessionKey, SessionPayload, SessionState, VerifiedKey, encrypt, require_bearer,
+    require_session,
 };
 use tower::ServiceExt as _;
 use zeroize::Zeroizing;
@@ -46,7 +47,15 @@ async fn echo_handler(Extension(key): Extension<VerifiedKey>) -> impl IntoRespon
 }
 
 fn session_config(app_namespace: &str) -> SessionConfig {
-    SessionConfig::new("fleet_session", app_namespace).expect("valid session config")
+    // ADR-0016: `public_origins` is required, so even a fixture that never
+    // sends an `Origin` states one. These tests exercise `RequireSession`,
+    // which does not run the origin guard.
+    SessionConfig::new(
+        "fleet_session",
+        app_namespace,
+        PublicOrigins::parse(["https://trawl.example.com"]).expect("valid allowlist"),
+    )
+    .expect("valid session config")
 }
 
 fn session_state(store: KeyStore, app_namespace: &str) -> (SessionState, Arc<SessionKey>) {
@@ -512,6 +521,7 @@ async fn session_state_rejects_invalid_config(pool: sqlx::PgPool) {
     let err = SessionConfig::builder()
         .cookie_name("")
         .app_namespace("trawl")
+        .public_origins(PublicOrigins::parse(["https://trawl.example.com"]).unwrap())
         .build()
         .unwrap_err();
     assert!(matches!(err, fleet_auth::AuthError::InvalidApp(_)));
