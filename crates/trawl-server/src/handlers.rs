@@ -1821,7 +1821,17 @@ fn build_schedule_response(
         // thing being hidden.
         lag: schedule.window.map(|_| format_interval(schedule.lag_secs)),
         lag_secs: schedule.window.map(|_| schedule.lag_secs),
-        covered_through: schedule.covered_through.map(format_window_bound),
+        // Only a tiling schedule has a watermark that claims anything. The
+        // store KEEPS the stored value across a mode change on purpose
+        // (ADR-0018 ruling 14: an edit does not reset coverage, so
+        // switching back resumes where it stopped), which is exactly why
+        // reading the column alone would report a fixed-window or
+        // query-mode schedule as covered up to some instant nothing
+        // claims.
+        covered_through: match schedule.window {
+            Some(ScheduleWindow::SinceLast) => schedule.covered_through.map(format_window_bound),
+            Some(ScheduleWindow::Fixed { .. }) | None => None,
+        },
         next_fire_at: format_window_bound(schedule.next_fire_at),
     }
 }

@@ -667,7 +667,10 @@ Response body:
   force, not an absence.
 - `covered_through` is the `since_last` watermark, the end of the newest
   window a successful run covered. Absent for a fixed window and for query
-  mode, neither of which keeps one.
+  mode, neither of which claims coverage. A schedule that used to tile keeps
+  its watermark stored across a mode change, so switching back to
+  `since_last` resumes from it, but it is not reported while the schedule is
+  in a mode that does not mean it.
 - `next_fire_at` is the planned next fire instant. Always present, windowed
   or not. All three instants are RFC 3339, UTC, microseconds.
 

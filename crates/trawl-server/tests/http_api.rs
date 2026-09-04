@@ -3000,3 +3000,70 @@ async fn run_listing_carries_window_and_truncated_flag() {
     );
     assert_eq!(legacy.window_kind, None);
 }
+
+/// The watermark outlives the mode that meant it: ADR-0018 ruling 14 keeps
+/// `covered_through` across an edit so a schedule switched back to tiling
+/// resumes where it stopped. Reporting the stored value regardless would
+/// tell an operator that a fixed-window or query-mode schedule has coverage
+/// up to some instant, which is a claim neither mode makes.
+#[tokio::test(flavor = "multi_thread")]
+async fn covered_through_is_reported_only_while_the_schedule_tiles() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("watermark-modes", "service=x")
+        .await
+        .unwrap();
+    let tiling = client
+        .set_schedule(saved.id, "1h", None, true, Some("since_last"), None)
+        .await
+        .unwrap();
+    let seeded = tiling
+        .covered_through
+        .clone()
+        .expect("since_last is seeded at the origin of owed coverage");
+
+    let fixed = client
+        .set_schedule(saved.id, "1h", None, true, Some("2h"), None)
+        .await
+        .unwrap();
+    assert_eq!(fixed.window.as_deref(), Some("2h"));
+    assert_eq!(
+        fixed.covered_through, None,
+        "a fixed window is re-measured from every fire and claims no watermark"
+    );
+    assert_eq!(
+        client.get_schedule(saved.id).await.unwrap().covered_through,
+        None,
+        "GET agrees with the PUT that set the mode"
+    );
+
+    let query_mode = client
+        .set_schedule(saved.id, "1h", None, true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(query_mode.window, None);
+    assert_eq!(query_mode.covered_through, None);
+
+    // Back to tiling. The store kept the value, so coverage resumes where
+    // it stopped instead of restarting from the new anchor.
+    let again = client
+        .set_schedule(saved.id, "1h", None, true, Some("since_last"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        again.covered_through.as_deref(),
+        Some(seeded.as_str()),
+        "the watermark survived a round trip through two other modes"
+    );
+    assert_eq!(
+        client
+            .get_schedule(saved.id)
+            .await
+            .unwrap()
+            .covered_through
+            .as_deref(),
+        Some(seeded.as_str())
+    );
+}

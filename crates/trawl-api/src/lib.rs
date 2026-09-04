@@ -1313,7 +1313,12 @@ pub struct ScheduleResponse {
     pub lag_secs: Option<u64>,
     /// The `since_last` watermark: the end of the newest window a
     /// successful run covered (RFC 3339, UTC, microseconds). Absent for a
-    /// fixed window and for query mode, neither of which keeps one.
+    /// fixed window and for query mode, neither of which claims coverage.
+    ///
+    /// A schedule that used to tile keeps its watermark stored across a
+    /// mode change, so switching back to `since_last` resumes from it
+    /// rather than from the new anchor. It is not reported while the
+    /// schedule is in a mode that does not mean it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covered_through: Option<String>,
     /// The planned next fire instant (RFC 3339, UTC, microseconds). Always
