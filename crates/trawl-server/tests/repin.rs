@@ -16,6 +16,8 @@ use serde_json::json;
 use trawl_client::{HttpClient, RepinStart};
 use trawl_server::catalog::CatalogContext;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::repin::ceiling::RequestedCeilings;
+use trawl_server::repin::{RepinEngine, StartOutcome};
 
 fn now_ts() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
@@ -575,7 +577,15 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         .clone()
         .expect("an ingest-enabled node owns a repin engine");
     TEST_SCAN_DELAY_MS.store(500, Ordering::Relaxed);
-    let mut start = Box::pin(engine.start("status", "VARCHAR", None, true, false, Some("op")));
+    let mut start = Box::pin(engine.start(
+        "status",
+        "VARCHAR",
+        None,
+        true,
+        false,
+        RequestedCeilings::default(),
+        Some("op"),
+    ));
     // Let the claim land and the scan begin, then drop the future exactly
     // as hyper drops a handler whose connection went away.
     assert!(
@@ -1846,4 +1856,508 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
          HISTORY only"
     );
     assert_eq!(h.count("level=error last=1h | stats count()").await, 2);
+}
+
+// -- force ceilings (#111) ---------------------------------------------------
+//
+// Force used to be a blank check: whatever the finished shadow lost, force
+// covered it, however far the corpus had moved since the operator read the
+// plan. A forced job now carries a number per dimension and both gates hold
+// it to that number. These drive the engine directly — the request surface
+// carries the ceilings from a later milestone, and the engine API is where
+// the values are enforced.
+
+impl Harness {
+    fn engine(&self) -> std::sync::Arc<RepinEngine> {
+        self.server
+            .state
+            .repin
+            .clone()
+            .expect("an ingest-enabled node owns a repin engine")
+    }
+
+    /// The job row itself. The accepted ceilings are persisted state, not
+    /// wire state, until the wire carries them.
+    async fn job_row(&self, id: i64) -> trawl_server::store::RepinJob {
+        self.server
+            .state
+            .storage
+            .repin
+            .get(id)
+            .await
+            .expect("job read")
+            .expect("job row")
+    }
+}
+
+/// A field pinned VARCHAR whose values are `numeric` text plus `lossy`
+/// unreadable ones. Returns nothing; the pin is asserted here.
+async fn varchar_corpus(h: &Harness, numeric: &[&str], lossy: &[&str]) {
+    let mut events = Vec::new();
+    for v in numeric {
+        events.push(event("api", &json!({ "dur": v })));
+    }
+    for v in lossy {
+        events.push(event("api", &json!({ "dur": v })));
+    }
+    h.ingest_and_compact(&events).await;
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+}
+
+/// The accepted number itself passes. One unreadable row against a ceiling
+/// of exactly one is what force said it would tolerate, so the cutover runs
+/// and the accepted pair is on the job row for anyone auditing it later.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forced_repin_proceeds_at_exactly_the_ceiling_it_accepted() {
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops"]).await;
+
+    let engine = h.engine();
+    let started = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings {
+                max_nulled: Some(1),
+                max_ambiguous: None,
+            },
+            Some("op"),
+        )
+        .await
+        .expect("forced start")
+    {
+        StartOutcome::Started(job) => job,
+        other => panic!("expected a started job, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(done.rows_nulled, 1, "the loss is exactly what was accepted");
+    assert_eq!(h.pinned_type("dur").await, "BIGINT");
+
+    let row = h.job_row(started.id).await;
+    assert_eq!(row.max_nulled_rows, Some(1), "the request's own number");
+    assert_eq!(
+        row.accepted_max_nulled_rows,
+        Some(1),
+        "an explicit ceiling is what the job is held to"
+    );
+    assert_eq!(
+        row.accepted_max_ambiguous_rows,
+        Some(10),
+        "the unstated dimension keeps its scan-derived default"
+    );
+}
+
+/// One row past the accepted ceiling is a refusal, and it names both
+/// numbers: an operator whose next move is to re-run with a corrected flag
+/// needs to see what the corpus actually holds, not just that it was too
+/// much.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ceiling_below_the_corpus_refuses_naming_accepted_and_actual() {
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops", "nah"]).await;
+
+    let engine = h.engine();
+    let refused = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings {
+                max_nulled: Some(1),
+                max_ambiguous: None,
+            },
+            Some("op"),
+        )
+        .await
+        .expect("a refusal is an outcome, not an error")
+    {
+        StartOutcome::Refused(job) => job,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(
+        refused.status,
+        trawl_server::store::RepinJobStatus::RefusedNeedsForce
+    );
+    let reason = refused.error.expect("the refusal carries its reason");
+    assert!(reason.contains("accepted 1"), "{reason}");
+    assert!(reason.contains("2 nulled row(s)"), "{reason}");
+
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR", "corpus untouched");
+    assert_eq!(
+        h.count("last=1h | where dur == \"nah\" | stats count()")
+            .await,
+        1
+    );
+}
+
+/// `--max-nulled-rows 0` is a statement, not a mistake: force the ambiguity,
+/// accept no loss. It refuses at the SCAN gate, so the job never stages a
+/// byte — the whole point of asking the question before the build.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_zero_ceiling_refuses_before_anything_is_staged() {
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops"]).await;
+
+    let engine = h.engine();
+    let refused = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings {
+                max_nulled: Some(0),
+                max_ambiguous: Some(0),
+            },
+            Some("op"),
+        )
+        .await
+        .expect("a refusal is an outcome, not an error")
+    {
+        StartOutcome::Refused(job) => job,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let reason = refused.error.expect("the refusal carries its reason");
+    assert!(reason.contains("accepted 0"), "{reason}");
+
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+
+    let row = h.job_row(refused.id).await;
+    assert_eq!(row.accepted_max_nulled_rows, Some(0));
+}
+
+/// Force with no numbers attached resolves the ceiling from this job's own
+/// scan: 10% headroom over a floor of ten rows. On a corpus this small the
+/// floor is the binding term (one projected null buys eleven), and it is
+/// what lets the ordinary "read the plan, accept it" path survive the drift
+/// a live install produces while the build runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn boolean_force_resolves_the_ceiling_from_the_scan() {
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops"]).await;
+
+    let engine = h.engine();
+    let dry = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            true,
+            true,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .expect("forced dry run")
+    {
+        StartOutcome::DryRun(job) => job,
+        other => panic!("expected a dry-run report, got {other:?}"),
+    };
+    assert_eq!(dry.projected_nulls, 1, "`oops` has no BIGINT reading");
+    let row = h.job_row(dry.id).await;
+    assert_eq!(row.max_nulled_rows, None, "the request stated nothing");
+    assert_eq!(
+        row.accepted_max_nulled_rows,
+        Some(11),
+        "one projected null plus the floor of ten"
+    );
+    assert_eq!(
+        row.accepted_max_ambiguous_rows,
+        Some(10),
+        "a zero-count dimension is still the floor, never unlimited"
+    );
+
+    // And the resolved ceiling is a ceiling that works: the same repin,
+    // executed, is well inside it.
+    let started = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .expect("forced execute")
+    {
+        StartOutcome::Started(job) => job,
+        other => panic!("expected a started job, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(done.rows_nulled, 1);
+    assert_eq!(h.pinned_type("dur").await, "BIGINT");
+}
+
+/// The ceiling is enforced at the finished shadow too, which is the case it
+/// exists for. A lossless plan is forced with the default ceiling of ten;
+/// eleven unreadable rows land while the build runs, the catch-up folds them
+/// in, and the cutover is refused with the corpus at its old generation.
+#[tokio::test(flavor = "multi_thread")]
+async fn mid_build_growth_past_the_default_ceiling_refuses_the_cutover() {
+    let h = harness().await;
+
+    // Pin VARCHAR on a text value, then retire that file: what is left is an
+    // all-numeric corpus, so the scan projects no loss and the ceiling is
+    // the bare floor of ten.
+    h.ingest_and_compact(&[event("seed", &json!({"dur": "oops"}))])
+        .await;
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+    let seed_file = walk(&h.data_dir)
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "seed.parquet"))
+        .expect("seed.parquet exists");
+    std::fs::remove_file(&seed_file).unwrap();
+
+    // Enough affected files that the build is still running when the late
+    // batch lands.
+    for svc in ["api", "web", "worker", "edge", "db", "cache"] {
+        h.ingest_and_compact(&[event(svc, &json!({"dur": "12"}))])
+            .await;
+    }
+
+    let engine = h.engine();
+    trawl_server::repin::engine::TEST_FILE_DELAY_MS
+        .store(400, std::sync::atomic::Ordering::Relaxed);
+    let started = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .expect("forced execute")
+    {
+        StartOutcome::Started(job) => job,
+        other => panic!("expected a started job, got {other:?}"),
+    };
+    assert_eq!(
+        h.job_row(started.id).await.accepted_max_nulled_rows,
+        Some(10),
+        "a lossless scan accepts the floor and nothing more"
+    );
+
+    // Eleven values the new pin cannot read, ingested and compacted during
+    // the build: one row past what force accepted.
+    let late: Vec<_> = (0..11)
+        .map(|i| event("late", &json!({ "dur": format!("nope{i}") })))
+        .collect();
+    h.ingest_and_compact(&late).await;
+
+    let done = h.wait_terminal(started.id).await;
+    trawl_server::repin::engine::TEST_FILE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        done.status, "refused_needs_force",
+        "force covers the plan it was shown, not whatever arrives later \
+         (error: {:?})",
+        done.error
+    );
+    let reason = done.error.expect("the refusal carries its reason");
+    assert!(reason.contains("accepted 10"), "{reason}");
+    assert!(reason.contains("11 nulled row(s)"), "{reason}");
+    assert!(
+        reason.contains("force it with ceilings"),
+        "an operator who already passed force is told to raise the number, \
+         not to pass force: {reason}"
+    );
+
+    // Corpus untouched: old pin, every row, no staging left behind.
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+    assert_eq!(h.count("last=1h | stats count()").await, 17);
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+}
+
+/// A forced cutover leaves an audit record naming both pairs: what force
+/// accepted, and what the rewrite actually did. It is emitted only for a
+/// forced job that reached the cutover, so an unforced repin and a refused
+/// one leave nothing.
+#[tokio::test(flavor = "multi_thread")]
+// Three jobs in one body: the capture layer is a global subscriber, so the
+// forced, refused and unforced cases have to share a process to prove the
+// record fires for exactly one of them.
+#[allow(clippy::too_many_lines)]
+async fn a_forced_cutover_records_what_it_accepted_and_what_it_did() {
+    use audit_capture::Capture;
+    use tracing_subscriber::prelude::*;
+
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::registry().with(
+        capture
+            .clone()
+            .with_filter(tracing_subscriber::EnvFilter::new("trawl_server=info")),
+    );
+    // Global, not thread-local: the job runs detached on other workers.
+    tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
+
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops"]).await;
+    let engine = h.engine();
+
+    // A refusal reaches no cutover, so it records nothing.
+    let refused = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings {
+                max_nulled: Some(0),
+                max_ambiguous: None,
+            },
+            Some("op"),
+        )
+        .await
+        .expect("refusal")
+    {
+        StartOutcome::Refused(job) => job,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+
+    // The forced repin that does cut over.
+    let forced = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .expect("forced execute")
+    {
+        StartOutcome::Started(job) => job,
+        other => panic!("expected a started job, got {other:?}"),
+    };
+    let done = h.wait_terminal(forced.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+
+    // An unforced, lossless repin of a different field.
+    h.ingest_and_compact(&[event("api", &json!({"code": 200}))])
+        .await;
+    assert_eq!(h.pinned_type("code").await, "BIGINT");
+    let unforced = match engine
+        .start(
+            "code",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .expect("unforced execute")
+    {
+        StartOutcome::Started(job) => job,
+        other => panic!("expected a started job, got {other:?}"),
+    };
+    let done = h.wait_terminal(unforced.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+
+    let accepted: Vec<_> = capture
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.fields
+                .get("event_type")
+                .is_some_and(|t| t.contains("repin_force_accepted"))
+        })
+        .collect();
+    assert_eq!(
+        accepted.len(),
+        1,
+        "one forced cutover, one record (refused and unforced jobs leave \
+         none): {accepted:?}"
+    );
+    let record = &accepted[0];
+    let field = |name: &str| {
+        record
+            .fields
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} missing from {record:?}"))
+            .clone()
+    };
+    assert_eq!(field("job_id"), forced.id.to_string());
+    assert!(field("field").contains("dur"));
+    assert!(field("from").contains("VARCHAR"));
+    assert!(field("to").contains("BIGINT"));
+    assert_eq!(field("accepted_max_nulled_rows"), "11");
+    assert_eq!(field("accepted_max_ambiguous_rows"), "10");
+    assert_eq!(field("rows_nulled"), "1", "what the rewrite actually did");
+    assert_eq!(field("ambiguous_numerals"), "0");
+    assert_eq!(field("scanned_projected_nulls"), "1");
+    assert_eq!(field("scanned_ambiguous_numerals"), "0");
+    assert!(field("requested_by").contains("op"));
+    assert!(
+        !record.fields.contains_key("unmapped_samples"),
+        "the record is counts only, never sample values: {record:?}"
+    );
+    assert!(refused.error.is_some(), "the refused job kept its reason");
+}
+
+mod audit_capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    /// One captured tracing event's fields, stringified.
+    #[derive(Debug, Clone)]
+    pub struct Captured {
+        pub fields: BTreeMap<String, String>,
+    }
+
+    /// Capture layer recording every event's fields as strings.
+    #[derive(Clone, Default)]
+    pub struct Capture {
+        events: Arc<Mutex<Vec<Captured>>>,
+    }
+
+    impl Capture {
+        pub fn events(&self) -> Vec<Captured> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    struct Visitor<'a>(&'a mut BTreeMap<String, String>);
+
+    impl tracing::field::Visit for Visitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for Capture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut Visitor(&mut fields));
+            self.events.lock().unwrap().push(Captured { fields });
+        }
+    }
 }

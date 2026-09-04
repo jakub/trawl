@@ -1716,16 +1716,25 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
     } else {
         clamp(job.projected_nulls)
     };
+    // The terms this job actually ran under, off its own row. A row whose
+    // accepted ceilings are NULL predates them (migration 0015) and reads as
+    // the blank check it was, so an old job's verdict does not change shape
+    // under a new binary.
+    let terms = match (
+        job.force,
+        job.accepted_max_nulled_rows,
+        job.accepted_max_ambiguous_rows,
+    ) {
+        (true, Some(max_nulled), Some(max_ambiguous)) => {
+            crate::repin::ceiling::ForceTerms::forced(crate::repin::ceiling::Ceilings {
+                max_nulled: clamp(max_nulled),
+                max_ambiguous: clamp(max_ambiguous),
+            })
+        }
+        (force, _, _) => crate::repin::ceiling::ForceTerms::blank_check(force),
+    };
     let requires_force_reason = job.planned_at.and_then(|_| {
-        crate::repin::force_refusal(
-            to,
-            dialect,
-            nulled,
-            clamp(job.ambiguous_numerals),
-            // M3 reads the row's persisted ceilings here; a row without
-            // them is the legacy blank check.
-            crate::repin::ceiling::ForceTerms::blank_check(job.force),
-        )
+        crate::repin::force_refusal(to, dialect, nulled, clamp(job.ambiguous_numerals), terms)
     });
     trawl_api::RepinJobResponse {
         requires_force: job.planned_at.map(|_| requires_force_reason.is_some()),
@@ -1800,6 +1809,10 @@ pub async fn schema_repin(
             req.dialect.as_deref(),
             req.dry_run,
             req.force,
+            // The request cannot state a ceiling yet: the wire fields land
+            // with the client and CLI, and until they do every job resolves
+            // the scan-derived default.
+            crate::repin::ceiling::RequestedCeilings::default(),
             Some(&verified.name),
         )
         .await?;
