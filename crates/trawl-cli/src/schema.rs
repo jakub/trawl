@@ -1364,7 +1364,10 @@ pub fn ack_to_rows(field: &str, ack: &trawl_client::FieldAck) -> (Vec<String>, V
         .map(str::to_owned)
         .to_vec();
     let rows = vec![vec![
-        Json::from(trawl_core::sanitize::sanitize_display_text(field)),
+        // The exact catalog key, never the sanitised copy: this is the
+        // operator's own argument, and a scripted caller matches the record
+        // to it (repin_job_to_rows makes the same call for job.field).
+        Json::from(field.to_owned()),
         Json::from(ack.acked_at.clone()),
         Json::from(trawl_core::sanitize::sanitize_display_text(&ack.acked_by)),
         Json::from(ack.evidence_through),

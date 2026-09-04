@@ -854,14 +854,28 @@ fn job_outcome_line(job: &RepinJobResponse) -> String {
         STATUS_REFUSED => {
             let projected = format_exact(job.projected_nulls);
             match (job.force, accepted_ceilings(job)) {
-                (true, Some(bound)) => format!(
-                    "{field}: refused \u{2014} {projected} stored values cannot be kept as {}, \
-                     past the {} row(s) and {} dialect-ambiguous numeral(s) accepted. The corpus \
-                     is untouched.",
-                    job.to_type,
-                    format_exact(bound.max_nulled),
-                    format_exact(bound.max_ambiguous),
-                ),
+                // The number the gate compared is the finished shadow's own
+                // tally, not the scan projection: a cutover-gate refusal
+                // means the shadow grew PAST the ceiling, and the ceiling
+                // carries headroom above the scan, so quoting the
+                // projection here would read "8 is past 22". A scan-gate
+                // refusal persists no shadow tally and the projection is
+                // the number the gate saw.
+                (true, Some(bound)) => {
+                    let lost = if job.rows_nulled > 0 {
+                        format_exact(job.rows_nulled)
+                    } else {
+                        projected
+                    };
+                    format!(
+                        "{field}: refused \u{2014} {lost} stored values cannot be kept as {}, \
+                         past the {} row(s) and {} dialect-ambiguous numeral(s) accepted. The \
+                         corpus is untouched.",
+                        job.to_type,
+                        format_exact(bound.max_nulled),
+                        format_exact(bound.max_ambiguous),
+                    )
+                }
                 // Forced, but the row carries no resolved pair to name —
                 // a job a server older than the ceiling columns wrote.
                 (true, None) => format!(
