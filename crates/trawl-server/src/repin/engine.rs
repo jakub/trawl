@@ -36,6 +36,10 @@ use crate::catalog::conform::open_bounded_connection;
 use crate::error::ServerError;
 use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
+use crate::repin::cancel::{
+    CancelHandle, CancelRegistry, CancelVerdict, PassStop, STAGE_BUILD, STAGE_FINAL_GATE,
+    STAGE_SCAN, audit_cancel_refused, audit_cancel_requested, audit_cancelled,
+};
 use crate::repin::cutover::{
     finish_post_swap_staging, prepare_shadow_root, swap_envs, sweep_pre_swap_staging,
 };
@@ -146,6 +150,13 @@ pub enum StartOutcome {
     Refused(RepinJob),
     /// The rewrite is running in the background; poll the status surface.
     Started(RepinJob),
+    /// An operator cancelled the job before it reached its point of no
+    /// return, and this request's own ladder observed the cancel. The
+    /// terminal row is already written; the caller answers 200 with it,
+    /// never a fourth status code — 409 already means refused-needs-force
+    /// to a body-sniffing client, and the job body's `status` says
+    /// `cancelled` plainly enough.
+    Cancelled(RepinJob),
 }
 
 /// The repin engine — one per ingest-enabled daemon.
@@ -159,6 +170,10 @@ pub struct RepinEngine {
     data_dir: PathBuf,
     memory_limit: String,
     min_free_disk_bytes: u64,
+    /// The one armed job's cancel state (#109). In-process by design: a
+    /// cancel is a request to the daemon doing the work, and the node that
+    /// owns the data root is the only one that can stop it.
+    cancel: Arc<CancelRegistry>,
 }
 
 impl RepinEngine {
@@ -183,6 +198,7 @@ impl RepinEngine {
             data_dir,
             memory_limit,
             min_free_disk_bytes,
+            cancel: Arc::new(CancelRegistry::default()),
         }
     }
 
@@ -247,6 +263,12 @@ impl RepinEngine {
                 requested_by,
             })
             .await?;
+        // Arm the cancel registry with no `await` between it and the claim
+        // that created the job. Anything awaited here would be a window in
+        // which the one-running slot is held by a job nothing can cancel:
+        // the request would answer "no job running" while the scan burns
+        // through the corpus.
+        let cancel = self.cancel.arm(job_id);
 
         tracing::info!(
             event_type = "repin_start",
@@ -280,18 +302,75 @@ impl RepinEngine {
         let engine = Arc::clone(self);
         let decided = tokio::spawn(async move {
             engine
-                .decide(job_id, field, from, reading, dry_run, force)
+                .decide(job_id, field, from, reading, dry_run, force, cancel)
                 .await
         });
-        match decided.await {
+        let outcome = match decided.await {
             Ok(outcome) => outcome,
             Err(e) => {
+                // A panicked decision task observed no boundary, so this is
+                // `failed` even with a cancel pending (design decision 5:
+                // `cancelled` means the unwind actually ran).
                 let msg = format!("repin job task failed: {e}");
                 self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
                     .await;
                 Err(ServerError::Internal(msg))
             }
+        };
+        // The registry stays armed for exactly as long as a job is doing
+        // work: `run_job` disarms itself at the end of the background half
+        // (through the post-cutover sweep), and every other outcome ends
+        // here.
+        if !matches!(outcome, Ok(StartOutcome::Started(_))) {
+            self.cancel.disarm(job_id);
         }
+        outcome
+    }
+
+    /// Ask to cancel the running job. The handler's one call: the verdict
+    /// is decided synchronously under the registry lock and the persistence
+    /// it implies runs detached.
+    ///
+    /// Detached because a cancel must not be split by a client disconnect.
+    /// The in-process flag is already set when this returns, so the effect
+    /// site can fire before the request row lands; that is deliberate and
+    /// safe, because the effect site records the request itself (the store
+    /// call is idempotent and first-writer-preserving) before writing a
+    /// `cancelled` terminal status. This detached write exists so the
+    /// status route can show a cancel in flight while the job is still
+    /// walking to its next file boundary.
+    pub fn cancel(self: &Arc<Self>, actor: &str) -> CancelVerdict {
+        let verdict = self.cancel.request(actor);
+        match verdict {
+            CancelVerdict::Cancelling {
+                job_id,
+                already_requested,
+            } => {
+                let engine = Arc::clone(self);
+                let actor = actor.to_owned();
+                tokio::spawn(async move {
+                    if let Err(e) = engine.store.record_cancel_request(job_id, &actor).await {
+                        // The flag is the authority for the verdict the
+                        // operator already holds; a store that cannot
+                        // record the request costs the audit row, and the
+                        // effect site downgrades the outcome to `failed`
+                        // when its own write fails too.
+                        tracing::error!(
+                            event_type = "repin_store_error",
+                            job_id,
+                            error = %e,
+                            "failed to record the repin cancel request; the \
+                             cancellation itself is unaffected"
+                        );
+                    }
+                    audit_cancel_requested(job_id, &actor, already_requested);
+                });
+            }
+            CancelVerdict::PastPointOfNoReturn { job_id } => audit_cancel_refused(job_id, actor),
+            // A 404 has no job to name, so it emits no audit event.
+            CancelVerdict::NoJobRunning => {}
+        }
+        verdict
     }
 
     /// The claimed job's decision ladder: scan → report (dry run) → refuse
@@ -299,6 +378,10 @@ impl RepinEngine {
     ///
     /// Runs detached from the request (see `start`), so every exit path
     /// terminalizes the job row itself.
+    // The ladder is long because it is a ladder: every rung terminalizes
+    // the claimed job itself, and each one now arbitrates its verdict
+    // against a pending cancel.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn decide(
         self: Arc<Self>,
         job_id: i64,
@@ -307,6 +390,7 @@ impl RepinEngine {
         reading: RepinReading,
         dry_run: bool,
         force: bool,
+        cancel: CancelHandle,
     ) -> Result<StartOutcome, ServerError> {
         // Layout pre-flight, ahead of the minutes-long scan: the staging
         // siblings must share the data root's filesystem, because both
@@ -324,21 +408,42 @@ impl RepinEngine {
         {
             Ok(Ok(())) => {}
             Ok(Err(msg)) => {
-                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
-                    .await;
+                if self
+                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&msg))
+                    .await
+                {
+                    return self.cancelled_outcome(job_id).await;
+                }
                 return Err(ServerError::BadRequest(msg));
             }
             Err(msg) => {
-                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
-                    .await;
+                if self
+                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&msg))
+                    .await
+                {
+                    return self.cancelled_outcome(job_id).await;
+                }
                 return Err(ServerError::Internal(msg));
             }
         }
 
-        let (counts, tallies, samples) = match self.run_scan(&field, reading).await {
+        let (counts, tallies, samples) = match self.run_scan(&field, reading, &cancel).await {
             Ok(measured) => measured,
-            Err(e) => {
-                self.finish(job_id, RepinJobStatus::Failed, Some(&e)).await;
+            // A cancel observed inside the scan: nothing has been staged
+            // and no marker exists, so the whole unwind is the terminal
+            // write.
+            Err(PassStop::Cancelled { stage }) => {
+                let actor = self.observe_cancel(job_id, stage);
+                self.finish_cancelled(job_id, stage, actor).await;
+                return self.cancelled_outcome(job_id).await;
+            }
+            Err(PassStop::Failed(e)) => {
+                if self
+                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&e))
+                    .await
+                {
+                    return self.cancelled_outcome(job_id).await;
+                }
                 return Err(ServerError::Internal(format!("repin scan failed: {e}")));
             }
         };
@@ -362,8 +467,17 @@ impl RepinEngine {
             )
             .await
         {
-            self.finish(job_id, RepinJobStatus::Failed, Some(&e.to_string()))
-                .await;
+            if self
+                .settle_pre_cutover(
+                    job_id,
+                    STAGE_SCAN,
+                    RepinJobStatus::Failed,
+                    Some(&e.to_string()),
+                )
+                .await
+            {
+                return self.cancelled_outcome(job_id).await;
+            }
             return Err(ServerError::Store(e));
         }
 
@@ -371,7 +485,17 @@ impl RepinEngine {
         metrics::gauge!(crate::metrics::CATALOG_REPIN_FILES_TOTAL).set(counts.files_total as f64);
 
         if dry_run {
-            self.finish(job_id, RepinJobStatus::Succeeded, None).await;
+            // Even a completed dry run is arbitrated: a cancel that landed
+            // after the last file's post-check, while the plan was being
+            // written, is a request an operator made of a job that was
+            // still running. Reporting `succeeded` there would answer a
+            // cancel with the very report it was meant to stop.
+            if self
+                .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Succeeded, None)
+                .await
+            {
+                return self.cancelled_outcome(job_id).await;
+            }
             return Ok(StartOutcome::DryRun(self.job(job_id).await?));
         }
         // The scan gate: the same decision as the finished-shadow gate
@@ -386,8 +510,17 @@ impl RepinEngine {
             counts.ambiguous_numerals,
             force,
         ) {
-            self.finish(job_id, RepinJobStatus::RefusedNeedsForce, Some(&reason))
-                .await;
+            if self
+                .settle_pre_cutover(
+                    job_id,
+                    STAGE_SCAN,
+                    RepinJobStatus::RefusedNeedsForce,
+                    Some(&reason),
+                )
+                .await
+            {
+                return self.cancelled_outcome(job_id).await;
+            }
             return Ok(StartOutcome::Refused(self.job(job_id).await?));
         }
 
@@ -401,8 +534,12 @@ impl RepinEngine {
             Ok(available) => available,
             Err(e) => {
                 let msg = format!("failed to check free disk space: {e}");
-                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
-                    .await;
+                if self
+                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&msg))
+                    .await
+                {
+                    return self.cancelled_outcome(job_id).await;
+                }
                 return Err(ServerError::Internal(msg));
             }
         };
@@ -417,8 +554,12 @@ impl RepinEngine {
                  repin runs)",
                 counts.affected_bytes, self.min_free_disk_bytes
             );
-            self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
-                .await;
+            if self
+                .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&msg))
+                .await
+            {
+                return self.cancelled_outcome(job_id).await;
+            }
             return Err(ServerError::BadRequest(msg));
         }
 
@@ -426,7 +567,7 @@ impl RepinEngine {
         let tallies = Arc::new(tallies);
         tokio::spawn(async move {
             engine
-                .run_job(job_id, field, from, reading, force, tallies)
+                .run_job(job_id, field, from, reading, force, tallies, cancel)
                 .await;
         });
         Ok(StartOutcome::Started(self.job(job_id).await?))
@@ -436,13 +577,17 @@ impl RepinEngine {
         &self,
         field: &str,
         reading: RepinReading,
-    ) -> Result<(ScanCounts, ScanTallies, Vec<String>), String> {
+        cancel: &CancelHandle,
+    ) -> Result<(ScanCounts, ScanTallies, Vec<String>), PassStop> {
         let data_dir = self.data_dir.clone();
         let memory_limit = self.memory_limit.clone();
         let field = field.to_owned();
-        tokio::task::spawn_blocking(move || scan(&data_dir, &memory_limit, &field, reading))
-            .await
-            .map_err(|e| format!("repin scan task panicked: {e}"))?
+        let cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            scan(&data_dir, &memory_limit, &field, reading, &cancel)
+        })
+        .await
+        .map_err(|e| PassStop::Failed(format!("repin scan task panicked: {e}")))?
     }
 
     /// Is anything still writing this field? The newest observation inside
@@ -565,11 +710,117 @@ impl RepinEngine {
         });
     }
 
+    /// The terminal row a cancelled job carries, as the caller's outcome.
+    async fn cancelled_outcome(&self, job_id: i64) -> Result<StartOutcome, ServerError> {
+        Ok(StartOutcome::Cancelled(self.job(job_id).await?))
+    }
+
+    /// Terminalize a job that is still short of the point of no return,
+    /// arbitrating `candidate` against a pending cancel. Returns `true`
+    /// when the cancel won, in which case the row is already written and
+    /// the caller must not write its own verdict.
+    ///
+    /// Every pre-cutover terminal candidate goes through here, success
+    /// included, because the interesting race is the quiet one: a cancel
+    /// that lands after the last file's post-check but before the verdict
+    /// is written. Without arbitration that operator gets a 202 and then
+    /// watches the job report `succeeded`, with no way to tell whether the
+    /// cancel was too late or simply lost.
+    ///
+    /// The one deliberate exception is the finished-shadow force gate,
+    /// which is decided in `run_job` and keeps its `refused_needs_force`
+    /// verdict (design decision 7). Both outcomes leave the corpus
+    /// untouched, and the refusal is the one that tells the operator
+    /// something they did not already know.
+    async fn settle_pre_cutover(
+        &self,
+        job_id: i64,
+        stage: &'static str,
+        candidate: RepinJobStatus,
+        error: Option<&str>,
+    ) -> bool {
+        let Some(actor) = self.observe_cancel(job_id, stage) else {
+            self.finish(job_id, candidate, error).await;
+            return false;
+        };
+        self.finish_cancelled(job_id, stage, Some(actor)).await;
+        true
+    }
+
+    /// The effect site's first act: read who asked and say so in the audit
+    /// trail, before any unwinding starts. `None` means no cancel is
+    /// pending for this job and the caller's own verdict stands.
+    fn observe_cancel(&self, job_id: i64, stage: &'static str) -> Option<String> {
+        let actor = self.cancel.pending(job_id)?;
+        audit_cancelled(job_id, &actor, stage);
+        Some(actor)
+    }
+
+    /// The cancel effect site: record the request, then write the terminal
+    /// status the request earned.
+    ///
+    /// The order is the database's requirement, not a preference. A
+    /// `cancelled` row without a recorded request violates migration
+    /// 0014's CHECK, so the terminal write is unreachable until
+    /// `record_cancel_request` has landed. The detached request path
+    /// normally landed it seconds ago and this call is a no-op (it is
+    /// idempotent and keeps the first asker's name), but when that write
+    /// failed, this one is what makes `cancelled` legal. If it fails too,
+    /// the job ends `failed` naming the store trouble: the unwind still
+    /// ran and the corpus is still untouched, so the outcome word is the
+    /// only thing the operator loses.
+    ///
+    /// `actor` is the name [`Self::observe_cancel`] already audited, passed
+    /// in rather than re-read so the log line and the row's sentence cannot
+    /// name two different people.
+    async fn finish_cancelled(&self, job_id: i64, stage: &'static str, actor: Option<String>) {
+        let Some(actor) = actor else {
+            // Only reachable if the registry stopped naming this job
+            // between the check that decided to cancel and this call.
+            // `cancelled` would be a claim about a request nothing can
+            // point at, so it is `failed`.
+            let msg = format!(
+                "the repin was stopped during {stage} but its cancel \
+                 request could no longer be read; the live corpus was \
+                 never touched"
+            );
+            self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                .await;
+            return;
+        };
+        match self.store.record_cancel_request(job_id, &actor).await {
+            Ok(_) => {
+                let msg = cancelled_error(&actor, stage);
+                self.finish(job_id, RepinJobStatus::Cancelled, Some(&msg))
+                    .await;
+            }
+            Err(e) => {
+                tracing::error!(
+                    event_type = "repin_store_error",
+                    job_id,
+                    error = %e,
+                    "the cancel request could not be recorded, so the job \
+                     cannot be terminalized as cancelled; recording it as \
+                     failed instead"
+                );
+                let msg = format!(
+                    "cancelled by {actor} during {stage}, but the cancel \
+                     request could not be recorded in the job store, so the \
+                     outcome is failed rather than cancelled; the live \
+                     corpus was never touched"
+                );
+                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                    .await;
+            }
+        }
+    }
+
     /// The background half: build, catch up, cut over, sweep.
     ///
     /// `scanned` carries the mandatory pre-build scan's per-file readings
     /// so the build does not immediately re-measure a corpus nothing has
     /// touched (see [`ScanTallies`]).
+    #[allow(clippy::too_many_arguments)] // one bundle per claimed job
     async fn run_job(
         self: Arc<Self>,
         job_id: i64,
@@ -578,6 +829,7 @@ impl RepinEngine {
         reading: RepinReading,
         force: bool,
         scanned: Arc<ScanTallies>,
+        cancel: CancelHandle,
     ) {
         let started = std::time::Instant::now();
         let _rollup_pause = self.coordinator.pause_rollup();
@@ -585,7 +837,7 @@ impl RepinEngine {
 
         let to = reading.written.pin;
         let outcome = self
-            .run_job_inner(job_id, &field, from, reading, force, &scanned)
+            .run_job_inner(job_id, &field, from, reading, force, &scanned, &cancel)
             .await;
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(0.0);
         metrics::histogram!(crate::metrics::CATALOG_REPIN_DURATION_SECONDS)
@@ -603,25 +855,80 @@ impl RepinEngine {
                     "repin job complete: the corpus and the pin now agree"
                 );
             }
-            Err(JobAbort::Blocked(msg)) => {
-                self.abandon_build(job_id, RepinJobStatus::Blocked, &msg)
-                    .await;
+            Err(JobAbort::Cancelled { stage }) => {
+                self.abandon_cancelled(job_id, stage).await;
             }
+            // The finished-shadow force gate keeps its verdict even against
+            // a pending cancel (design decision 7): both leave the corpus
+            // untouched, and "the completed rewrite would null values you
+            // did not accept" is the fact the operator needs. Every other
+            // abort is arbitrated, because a cancel that landed while the
+            // failure was being written is still a cancel of a running job.
             Err(JobAbort::RefusedNeedsForce(msg)) => {
                 self.abandon_build(job_id, RepinJobStatus::RefusedNeedsForce, &msg)
                     .await;
             }
+            Err(JobAbort::Blocked(msg)) => {
+                self.abandon_arbitrated(job_id, RepinJobStatus::Blocked, &msg)
+                    .await;
+            }
             Err(JobAbort::Failed(msg)) => {
-                self.abandon_build(job_id, RepinJobStatus::Failed, &msg)
+                self.abandon_arbitrated(job_id, RepinJobStatus::Failed, &msg)
                     .await;
             }
         }
+
+        // The job task is over — through the post-cutover sweep, not merely
+        // past the swap. Until this line a cancel request is answered 409
+        // rather than 404, which also keeps a fresh repin from arming the
+        // registry while this one is still deleting its staging roots.
+        self.cancel.disarm(job_id);
+    }
+
+    /// Abandon the build, letting a pending cancel take the verdict over
+    /// `candidate`. The unwind is identical either way; only the word the
+    /// job row carries differs.
+    async fn abandon_arbitrated(&self, job_id: i64, candidate: RepinJobStatus, msg: &str) {
+        if self.cancel.pending(job_id).is_some() {
+            self.abandon_cancelled(job_id, STAGE_BUILD).await;
+        } else {
+            self.abandon_build(job_id, candidate, msg).await;
+        }
+    }
+
+    /// The build-phase cancel effect site: audit, sweep the shadow, drop
+    /// the marker, then terminalize through the persist-before-terminal
+    /// path.
+    ///
+    /// The audit comes first so the log reads request, effect, sweep. A
+    /// sweep of a whole shadow generation takes minutes on a real archive,
+    /// and an operator watching the log should see their cancel land before
+    /// the cleanup it caused.
+    async fn abandon_cancelled(&self, job_id: i64, stage: &'static str) {
+        let actor = self.observe_cancel(job_id, stage);
+        let msg = actor.as_ref().map_or_else(
+            || format!("cancelled during {stage}"),
+            |actor| cancelled_error(actor, stage),
+        );
+        self.unwind_staging(job_id, RepinJobStatus::Cancelled, &msg)
+            .await;
+        self.finish_cancelled(job_id, stage, actor).await;
     }
 
     /// Abandon a job whose corpus is still untouched (pre-swap): sweep the
     /// disposable shadow and any leftover aside, drop the marker, record
     /// the outcome.
     async fn abandon_build(&self, job_id: i64, status: RepinJobStatus, msg: &str) {
+        self.unwind_staging(job_id, status, msg).await;
+        self.finish(job_id, status, Some(msg)).await;
+    }
+
+    /// The disk half of abandoning a build, without the terminal write.
+    ///
+    /// Split out because a cancelled job takes the same unwind but a
+    /// different terminal write: `cancelled` is only legal once the request
+    /// row exists (see [`Self::finish_cancelled`]).
+    async fn unwind_staging(&self, job_id: i64, status: RepinJobStatus, msg: &str) {
         tracing::warn!(
             event_type = "repin_abandoned",
             job_id,
@@ -656,10 +963,9 @@ impl RepinEngine {
                  keeping the marker so the next boot retries the cleanup"
             );
         }
-        self.finish(job_id, status, Some(msg)).await;
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn run_job_inner(
         &self,
         job_id: i64,
@@ -668,6 +974,7 @@ impl RepinEngine {
         reading: RepinReading,
         force: bool,
         scanned: &Arc<ScanTallies>,
+        cancel: &CancelHandle,
     ) -> Result<(), JobAbort> {
         let to = reading.written.pin;
         let marker = RepinMarker {
@@ -700,9 +1007,8 @@ impl RepinEngine {
         let mut converged = false;
         for pass in 0..MAX_CATCHUP_PASSES {
             let changed = self
-                .run_pass(field, reading, &flipped, scanned, &mut state)
-                .await
-                .map_err(JobAbort::Failed)?;
+                .run_pass(field, reading, &flipped, scanned, &mut state, cancel)
+                .await?;
             self.publish_progress(job_id, &state).await;
 
             // Test-only: pin the mid-job state for an observer (see
@@ -766,10 +1072,11 @@ impl RepinEngine {
         self.coordinator.hold_cutover_for_tests().await;
 
         // Final increment under exclusion: nothing can write or read the
-        // corpus now, so this pass is the last word.
-        self.run_pass(field, reading, &flipped, scanned, &mut state)
-            .await
-            .map_err(JobAbort::Failed)?;
+        // corpus now, so this pass is the last word. Still cancellable —
+        // the exclusion guards are held, but nothing visible has moved, and
+        // dropping them on the unwind costs the corpus nothing.
+        self.run_pass(field, reading, &flipped, scanned, &mut state, cancel)
+            .await?;
         self.publish_progress(job_id, &state).await;
 
         // The authoritative loss gate. The pre-build scan only describes
@@ -796,11 +1103,26 @@ impl RepinEngine {
             )));
         }
 
-        // Point of no return.
+        // Point of no return, latched before it is published. `commit`
+        // compares against a pending cancel under the registry's own lock,
+        // so the two cannot both win: a cancel accepted before this line
+        // stops the marker write, and one arriving after it is answered
+        // 409. Everything below this statement is forward-only.
+        if !self.cancel.commit(job_id) {
+            return Err(JobAbort::Cancelled {
+                stage: STAGE_FINAL_GATE,
+            });
+        }
         let marker = RepinMarker {
             phase: RepinPhase::Cutover,
             ..marker
         };
+        // A marker that cannot be published is a job that never crossed:
+        // the failure unwinds through the ordinary abandon path with the
+        // corpus untouched. It arbitrates against a pending cancel like any
+        // other build failure, which in practice finds none — the latch a
+        // line above already refused every request that could still be
+        // pending.
         write_marker(&self.data_dir, &marker).map_err(JobAbort::Failed)?;
         if let Err(e) = swap_envs(&self.data_dir, &shadow, &aside_root(&self.data_dir)) {
             // Forward is the only direction past the marker: some envs may
@@ -888,6 +1210,7 @@ impl RepinEngine {
 
     /// One build/catch-up pass on the blocking pool. Returns how many
     /// source files were (re)processed or retired.
+    #[allow(clippy::too_many_arguments)] // the pass's inputs, one each
     async fn run_pass(
         &self,
         field: &str,
@@ -895,14 +1218,18 @@ impl RepinEngine {
         flipped: &Arc<HashMap<String, CanonicalType>>,
         scanned: &Arc<ScanTallies>,
         state: &mut BuildState,
-    ) -> Result<usize, String> {
+        cancel: &CancelHandle,
+    ) -> Result<usize, JobAbort> {
         let data_dir = self.data_dir.clone();
         let shadow = shadow_root(&self.data_dir);
         let memory_limit = self.memory_limit.clone();
         let field = field.to_owned();
         let flipped = Arc::clone(flipped);
         let scanned = Arc::clone(scanned);
+        let cancel = cancel.clone();
         let mut taken = std::mem::take(state);
+        // A cancelled pass returns its state like any other, so the work
+        // already staged is still described when the sweep runs.
         let (returned, changed) = tokio::task::spawn_blocking(move || {
             let changed = run_pass_blocking(
                 &data_dir,
@@ -913,13 +1240,14 @@ impl RepinEngine {
                 &flipped,
                 &scanned,
                 &mut taken,
-            )?;
-            Ok::<_, String>((taken, changed))
+                &cancel,
+            );
+            (taken, changed)
         })
         .await
-        .map_err(|e| format!("repin pass task panicked: {e}"))??;
+        .map_err(|e| JobAbort::Failed(format!("repin pass task panicked: {e}")))?;
         *state = returned;
-        Ok(changed)
+        Ok(changed?)
     }
 
     async fn publish_progress(&self, job_id: i64, state: &BuildState) {
@@ -1020,6 +1348,27 @@ enum JobAbort {
     /// The finished shadow nulled values the pre-build scan did not
     /// project (concurrent ingest), and the request carried no force.
     RefusedNeedsForce(String),
+    /// An operator cancelled the job and a boundary observed the request
+    /// before the point of no return (#109).
+    Cancelled {
+        stage: &'static str,
+    },
+}
+
+impl From<PassStop> for JobAbort {
+    fn from(stop: PassStop) -> Self {
+        match stop {
+            PassStop::Cancelled { stage } => Self::Cancelled { stage },
+            PassStop::Failed(msg) => Self::Failed(msg),
+        }
+    }
+}
+
+/// The one sentence a cancelled job row carries. The `error` column is the
+/// row's only prose slot, so it says who, where, and the fact an operator
+/// most wants confirmed: nothing visible changed.
+fn cancelled_error(actor: &str, stage: &str) -> String {
+    format!("cancelled by {actor} during {stage}; the live corpus was never touched")
 }
 
 /// What the shadow generation holds so far — the numbers the progress
@@ -1083,6 +1432,13 @@ impl BuildState {
 
 /// One pass, blocking: diff the source tree against what the shadow
 /// already reflects, (re)process the delta, retire removals.
+///
+/// `cancel` is checked on both sides of every file operation, retirements
+/// included: a retirement is a `remove_file` in the shadow, so stopping
+/// between two of them leaves a partial shadow the sweep deletes whole. The
+/// snapshot walk that opens the pass is not checkpointed (see
+/// [`crate::repin::cancel::CANCEL_LATENCY_CONTRACT`]), which is why the
+/// pass also checks before taking it.
 #[allow(clippy::too_many_arguments)]
 fn run_pass_blocking(
     data_dir: &Path,
@@ -1093,7 +1449,9 @@ fn run_pass_blocking(
     flipped: &HashMap<String, CanonicalType>,
     scanned: &ScanTallies,
     state: &mut BuildState,
-) -> Result<usize, String> {
+    cancel: &CancelHandle,
+) -> Result<usize, PassStop> {
+    cancel.check(STAGE_BUILD)?;
     let sources = snapshot_env_files(data_dir)?;
 
     // Test-only happened-before edge: this snapshot is taken, and nothing
@@ -1120,9 +1478,11 @@ fn run_pass_blocking(
         .cloned()
         .collect();
     for rel in &gone {
+        cancel.check(STAGE_BUILD)?;
         let _ = std::fs::remove_file(shadow.join(rel));
         state.processed.remove(rel);
         state.results.remove(rel);
+        cancel.check(STAGE_BUILD)?;
     }
 
     let todo: Vec<(PathBuf, FileSig)> = sources
@@ -1136,6 +1496,7 @@ fn run_pass_blocking(
     let conn = open_bounded_connection(data_dir, memory_limit)?;
     let changed = todo.len() + gone.len();
     for (rel, sig) in todo {
+        cancel.check(STAGE_BUILD)?;
         #[cfg(any(test, feature = "test-support"))]
         {
             let delay = TEST_FILE_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
@@ -1156,6 +1517,7 @@ fn run_pass_blocking(
         )?;
         state.results.insert(rel.clone(), tally);
         state.processed.insert(rel, sig);
+        cancel.check(STAGE_BUILD)?;
     }
     Ok(changed)
 }
@@ -1411,6 +1773,40 @@ mod tests {
                     if m.contains("only meaningful for a SEVERITY target")),
                 "{pin:?}: {err:?}"
             );
+        }
+    }
+
+    /// A stopped pass keeps its two meanings apart all the way to the
+    /// terminal write: a cancel is an operator's decision with a stage
+    /// attached, a failure is prose. Collapsing them would let a repin that
+    /// died on a `DuckDB` error report itself as cancelled, which reads as
+    /// "somebody stopped this on purpose".
+    #[test]
+    fn a_pass_stop_keeps_cancellation_and_failure_distinct() {
+        assert!(matches!(
+            JobAbort::from(PassStop::Cancelled { stage: STAGE_BUILD }),
+            JobAbort::Cancelled { stage } if stage == STAGE_BUILD
+        ));
+        assert!(matches!(
+            JobAbort::from(PassStop::Failed("read_parquet failed".to_owned())),
+            JobAbort::Failed(msg) if msg == "read_parquet failed"
+        ));
+    }
+
+    /// The cancelled row's one prose slot names who, where, and the fact
+    /// the operator most needs: nothing visible changed. Pinned because
+    /// this sentence is what the CLI prints and what an integration test
+    /// asserts on the row.
+    #[test]
+    fn the_cancelled_row_names_the_actor_the_stage_and_the_untouched_corpus() {
+        assert_eq!(
+            cancelled_error("ops-key", STAGE_BUILD),
+            "cancelled by ops-key during build; the live corpus was never touched"
+        );
+        for stage in [STAGE_SCAN, STAGE_BUILD, STAGE_FINAL_GATE] {
+            let msg = cancelled_error("ops-key", stage);
+            assert!(msg.contains(stage), "{msg}");
+            assert!(msg.contains("never touched"), "{msg}");
         }
     }
 

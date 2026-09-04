@@ -1802,9 +1802,16 @@ pub async fn schema_repin(
         )
         .await?;
     let (status, job) = match outcome {
-        crate::repin::StartOutcome::DryRun(job) => (StatusCode::OK, job),
         crate::repin::StartOutcome::Started(job) => (StatusCode::ACCEPTED, job),
         crate::repin::StartOutcome::Refused(job) => (StatusCode::CONFLICT, job),
+        // A job an operator cancelled while this request's own ladder was
+        // still running it (#109) answers 200 with the terminal row, the
+        // same as a dry-run report: never a fourth status code, because 409
+        // already means refused-needs-force to a body-sniffing client, and
+        // `job.status` says `cancelled` plainly.
+        crate::repin::StartOutcome::DryRun(job) | crate::repin::StartOutcome::Cancelled(job) => {
+            (StatusCode::OK, job)
+        }
     };
     Ok((
         status,

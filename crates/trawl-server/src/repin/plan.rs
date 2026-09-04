@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use crate::catalog::conform::{Progress, open_bounded_connection};
 use crate::ingest::compaction::RepinReading;
+use crate::repin::cancel::{CancelHandle, PassStop, STAGE_SCAN};
 use crate::repin::rewrite::{
     FileSig, RepinEffect, affected_schema, count_repin_effect, count_repin_effect_sampled,
 };
@@ -78,12 +79,20 @@ pub struct ScanCounts {
 /// asked for once `MAX_CONFLICT_SAMPLES` distinct samples are held: a
 /// corpus-wide misfit pays for the sketch on the first files and nothing
 /// after.
+///
+/// `cancel` is checked on both sides of every file's counting statement
+/// (#109). Before, so a job cancelled while the previous file was being
+/// read never opens the next one; after, so a cancel that lands during a
+/// long statement takes effect at that file's boundary rather than one file
+/// later. The snapshot walk above the loop is not checkpointed, as
+/// [`crate::repin::cancel::CANCEL_LATENCY_CONTRACT`] says.
 pub(crate) fn scan(
     data_dir: &Path,
     memory_limit: &str,
     field: &str,
     reading: RepinReading,
-) -> Result<(ScanCounts, ScanTallies, Vec<String>), String> {
+    cancel: &CancelHandle,
+) -> Result<(ScanCounts, ScanTallies, Vec<String>), PassStop> {
     let sources = crate::repin::rewrite::snapshot_env_files(data_dir)?;
     let conn = open_bounded_connection(data_dir, memory_limit)?;
 
@@ -92,6 +101,7 @@ pub(crate) fn scan(
     let mut samples: Vec<String> = Vec::new();
     let mut progress = Progress::new("repin-scan", sources.len());
     for (rel, sig) in sources {
+        cancel.check(STAGE_SCAN)?;
         progress.tick();
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -131,6 +141,7 @@ pub(crate) fn scan(
         counts.ambiguous_numerals += effect.ambiguous;
         counts.affected_bytes += std::fs::metadata(&path).map_or(0, |m| m.len());
         tallies.insert(rel, (sig, effect));
+        cancel.check(STAGE_SCAN)?;
     }
     Ok((counts, tallies, samples))
 }
