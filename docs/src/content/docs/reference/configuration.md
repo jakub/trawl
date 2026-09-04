@@ -362,7 +362,7 @@ Browser-facing session proxy (`trawl-web` binary). Reads the same `trawld.toml` 
 | `cookie_secret_path` | string | (none) | Path to a file holding the 32-byte AEAD cookie-encryption key |
 | `cookie_secret_env` | string | (none) | Env var holding the base64-encoded key. Takes precedence over `cookie_secret_path` |
 | `session_ttl_secs` | integer | `86400` | Browser session lifetime (24h default) |
-| `allow_insecure_cookies` | bool | `false` | Drop `Secure` flag on session cookies. Set true **only** when the proxy sits behind a TLS-terminating reverse proxy |
+| `allow_insecure_cookies` | bool | `false` | Drop `Secure` from session cookies. Set true only when the browser connects over HTTP. Keep false for browser HTTPS, including when a reverse proxy terminates TLS |
 | `shared_domain` | string | (none) | Parent domain for the shared `fleet_session` SSO cookie, e.g. `".fleet.lab.ktle.net"`. Mirrors coastwatch's `session.shared_domain` — set the same value in both apps. Unset/empty → origin-scoped cookie (standalone mode) |
 
 If neither `cookie_secret_path` nor `cookie_secret_env` is set, the proxy generates an ephemeral key on each startup — sessions won't survive restart. The Debian `trawld` package generates a persistent key at `/var/lib/trawl/web.cookie` automatically via its `postinst` script.
@@ -377,7 +377,7 @@ State what the browser's address bar shows. A few consequences worth knowing bef
 - **Behind a TLS-terminating proxy, configure the origin the browser sees**, e.g. `https://trawl.example.com`, not the `http://127.0.0.1:8090` the proxy forwards to. The backend never sees the browser's scheme, which is the whole reason the list is stated rather than derived.
 - **`Forwarded` and `X-Forwarded-*` are never read**, from any peer. The verdict never depends on a header a proxy rewrites or a client can type, so no proxy configuration can widen the allowlist and none is needed to keep it working.
 - **An empty list refuses to start.** There is no host-only fallback and no "empty means allow everything" default; both would fail silently, in opposite directions.
-- A sibling fleet app sharing the `fleet_session` cookie is a different origin and is rejected. Sharing a parent domain governs the cookie's reach, never who may act with it, so a compromised sibling cannot forge a logout that clears `fleet_session` fleet-wide.
+- A request carrying a sibling fleet app's origin is rejected unless that origin is in the allowlist, even when the apps share the `fleet_session` cookie. This blocks calls to protected endpoints, including logout. It does not protect the shared cookie from a compromised sibling: that app can overwrite or clear the parent-domain cookie through its own `Set-Cookie` response.
 
 Setting `shared_domain` enables fleet-wide single sign-on: the session cookie is scoped to the parent domain and every fleet app under it accepts it, provided all apps share the same session key (see the [fleet-auth cutover runbook](/reference/fleet-auth-cutover/) for key provisioning).
 
@@ -400,7 +400,7 @@ public_origins = ["http://127.0.0.1:8090", "http://localhost:8090"]
 
 #### `trawl-web` environment variables
 
-The proxy reads these at startup. Each overrides its `[web]` counterpart, and the `FLEET_SESSION_*` ones say so in the log when they displace a configured value.
+The proxy reads these at startup. Variables with a corresponding `[web]` field override that field, and the `FLEET_SESSION_*` variables log when they displace a configured value. `FLEET_SESSION_COOKIE_PATH` has no `[web]` counterpart.
 
 | Variable | Description |
 |----------|-------------|

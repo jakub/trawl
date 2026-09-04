@@ -157,7 +157,7 @@ ingress:
 Three things to keep in mind:
 
 1. **API clients keep talking to trawld directly.** `trawl query`, the `trawl-client` library, and vector all use bearer tokens against trawld's HTTPS port (5514). The web-UI ingress rejects non-cookie auth and blocks `/api/v1/ingest` outright. In-cluster clients hit the Service on 5514; external clients need a LoadBalancer or a second ingress with `ingress.backend: trawld`.
-2. **Cookie flags assume end-to-end TLS.** The proxy sets `Secure` on session cookies. If your ingress TLS-terminates AND forwards plain HTTP to the Service, browsers will discard the cookie. Flip `web.allowInsecureCookies: true` only in that topology — never over the open internet.
+2. **Keep `Secure` for browser HTTPS.** The proxy sets `Secure` on session cookies. Browsers accept these cookies over HTTPS even when the ingress forwards plain HTTP to the Service. Set `web.allowInsecureCookies: true` only when the browser itself connects over HTTP, such as on a local development network.
 3. **The ingress host is not the browser origin.** `web.publicOrigins` is required whenever `web.enabled`, and the chart refuses to render without it. State what the address bar shows, scheme and port included; the chart never derives it from `ingress.hosts` or `httpRoute.hostnames`, because a host rule carries no scheme and one install often answers to several names. The proxy compares a browser's `Origin` header against this list whole, and consults no forwarding header (ADR-0016), so a TLS-terminating ingress needs the `https://` origin here even though it forwards plain HTTP.
 
 ```yaml
@@ -335,7 +335,7 @@ The postgres DSNs still arrive via the `FLEET_DATABASE_URL` / `TRAWL_DATABASE_UR
 | `web.bindAddr` | string | `0.0.0.0:8090` | Bind address for trawl-web (pod-IP reachable) |
 | `web.publicOrigins` | list | `[]` | **Required when `web.enabled`.** Browser-visible origins allowed to carry a session cookie, e.g. `https://trawl.example.com`. Compared whole (scheme, host, port); never derived from ingress hosts. Rendered into `[web] public_origins` and passed to the sidecar as the identical `FLEET_SESSION_PUBLIC_ORIGINS`, so it survives a `config.raw`. The environment wins on read, and trawl-web warns only when the two lists differ |
 | `web.sessionTtlSecs` | int | `86400` | Browser session lifetime (seconds) |
-| `web.allowInsecureCookies` | bool | `false` | Drop `Secure` flag on session cookies (behind TLS-terminating ingress only) |
+| `web.allowInsecureCookies` | bool | `false` | Drop `Secure` from session cookies for browser HTTP. Keep false for browser HTTPS, including when an ingress terminates TLS |
 | `web.logLevel` | string | `trawl_web=info,fleet_auth=info` | RUST_LOG for the sidecar (the trawld `logLevel` names no trawl-web target) |
 | `web.resources` | object | cpu 50m / mem 64Mi–256Mi | Resource requests/limits for the sidecar |
 | `web.cookieSecret.existingSecret` | string | `""` | Name of a pre-existing Secret holding the cookie key (chart generates one when empty) |

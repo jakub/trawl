@@ -328,8 +328,8 @@ web:
   #     - https://trawl.example.com
   publicOrigins: []
   sessionTtlSecs: 86400
-  # Drop the Secure cookie flag. Enable ONLY if a TLS-terminating ingress
-  # sits in front and strips it.
+  # Drop the Secure cookie flag only when the browser connects over HTTP.
+  # Keep false for browser HTTPS, including when an ingress terminates TLS.
   allowInsecureCookies: false
   # Fleet SSO: parent domain for the shared fleet_session cookie, e.g.
   # ".fleet.lab.ktle.net". Set the SAME value in every fleet app (mirrors

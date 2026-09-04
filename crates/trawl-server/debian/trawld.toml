@@ -203,7 +203,8 @@ cookie_secret_path = "/var/lib/trawl/web.cookie"
 # session_ttl_secs = 86400
 
 # Drop the Secure flag on session cookies. Set true ONLY when the
-# proxy sits behind a TLS-terminating reverse proxy that strips it.
+# browser connects over HTTP. Keep false for browser HTTPS, including
+# when a reverse proxy terminates TLS.
 # allow_insecure_cookies = false
 
 # Fleet SSO: parent domain for the shared fleet_session cookie. Set the
