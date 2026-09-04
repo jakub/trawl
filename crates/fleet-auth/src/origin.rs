@@ -36,8 +36,8 @@ use std::str::FromStr;
 
 /// Longest `Origin` header this crate will look at, in bytes.
 ///
-/// A legal serialized origin cannot exceed 267 bytes (`https` + `://` + a
-/// 253-byte DNS name + `:65535`), so 512 is generous. The point is to
+/// A legal serialized origin cannot exceed 268 bytes (`https` + `://` + a
+/// 253-byte DNS name + the root dot + `:65535`), so 512 is generous. The point is to
 /// refuse before parsing: the header is attacker-controlled, and an
 /// unbounded input has no business reaching a loop, a `String`, or a log
 /// field. Config entries go through the same door for the same reason —
@@ -299,12 +299,24 @@ fn parse_port(text: &str) -> Result<u16, OriginParseError> {
 /// Validate a DNS host and return it lowercased.
 ///
 /// The rules are RFC 1123's hostname rules, applied strictly: labels of
-/// `[A-Za-z0-9-]` that neither start nor end with `-`, no empty label, no
-/// trailing dot, each label at most 63 bytes and the whole name at most
-/// 253. Case is accepted and folded away on the way out, because DNS is
+/// `[A-Za-z0-9-]` that neither start nor end with `-`, no empty label,
+/// each label at most 63 bytes and the whole name at most 253. Case is
+/// accepted and folded away on the way out, because DNS is
 /// case-insensitive and an origin has one spelling. `xn--` punycode labels
 /// satisfy all of this already, which is why no IDNA step is needed to
 /// state an internationalized origin.
+///
+/// One trailing dot is accepted, and kept. It is the DNS root label, and a
+/// browser preserves it: `new URL("https://trawl.example.com./").origin`
+/// is `https://trawl.example.com.`, so a deployment reached at that URL
+/// sends that origin, and refusing it here would leave that deployment
+/// unable to authorize itself at all. It is kept rather than folded away
+/// because folding is repair, and repair is what this parser does not do:
+/// the dotted and dotless names are two origins here exactly as they are
+/// two origins to the browser, and an operator who serves both states
+/// both. Exactly one dot, though. `example.com..` leaves an empty final
+/// label and a leading dot leaves an empty first one, and both stay
+/// refused.
 ///
 /// The final rule is the interesting one, and it is WHATWG's rather than
 /// RFC 1123's: a host that *ends in a number* must be an IPv4 address or
@@ -323,13 +335,19 @@ fn parse_port(text: &str) -> Result<u16, OriginParseError> {
 /// would let one browser origin be spelled two ways in one list, where
 /// the derived equality this module rests on sees two values. The same
 /// rule keeps `010.1.1.1` (octal `8.1.1.1` to a browser), `127.1` and the
-/// integer form `2130706433` out.
+/// integer form `2130706433` out. The root dot is split off before this
+/// test, so what it looks at is the last NON-EMPTY label: `127.0.0.1.`
+/// still ends in a number and is still refused, which is the right answer,
+/// because a browser reads that URL as IPv4 and sends `http://127.0.0.1`.
 fn parse_dns_host(text: &str) -> Result<String, OriginParseError> {
-    if text.len() > MAX_DNS_HOST_BYTES {
+    // The root dot belongs to no label. The walk below runs over the
+    // labels without it; the value returned keeps it.
+    let labels = text.strip_suffix('.').unwrap_or(text);
+    if labels.len() > MAX_DNS_HOST_BYTES {
         return Err(OriginParseError::InvalidHost);
     }
     let mut last_label_is_number = false;
-    for label in text.split('.') {
+    for label in labels.split('.') {
         if label.is_empty() || label.len() > MAX_DNS_LABEL_BYTES {
             return Err(OriginParseError::InvalidHost);
         }
@@ -820,11 +838,34 @@ mod tests {
         assert_eq!(error("https://例え.example.com"), NonAsciiHost);
         // The punycode form itself is an ordinary ASCII DNS name.
         assert!(Origin::parse("https://xn--80ak6aa92e.example.com").is_ok());
-        // A trailing dot is the fully-qualified spelling; a browser never
-        // sends one, so admitting it would create two names for one origin.
-        assert_eq!(error("https://trawl.example.com."), InvalidHost);
+        // A trailing dot is the DNS root label, and a browser keeps it in
+        // the origin it serializes, so it parses and stays its own
+        // spelling. Refusing it would leave an install reached at
+        // `https://trawl.example.com./` unable to state its own origin.
+        assert!(Origin::parse("https://trawl.example.com.").is_ok());
+        assert_ne!(
+            parsed("https://trawl.example.com."),
+            parsed("https://trawl.example.com")
+        );
+        assert_eq!(
+            parsed("https://trawl.example.com.").to_string(),
+            "https://trawl.example.com."
+        );
+        // Case still folds, and the dot survives the fold.
+        assert_eq!(
+            parsed("HTTPS://TRAWL.Example.COM."),
+            parsed("https://trawl.example.com.")
+        );
+        // Exactly one dot, and only at the end.
+        assert_eq!(error("https://example.com.."), InvalidHost);
         assert_eq!(error("https://trawl..example.com"), InvalidHost);
+        assert_eq!(error("https://.example.com"), InvalidHost);
         assert_eq!(error("https://.trawl.example.com"), InvalidHost);
+        assert_eq!(error("https://."), InvalidHost);
+        // The root dot does not excuse a host from the ends-in-a-number
+        // rule: a browser reads this URL as IPv4 and sends 127.0.0.1.
+        assert_eq!(error("http://127.0.0.1."), InvalidHost);
+        assert_eq!(error("http://0x7f000001."), InvalidHost);
         // Underscore is legal in DNS data but not in a hostname.
         assert_eq!(error("https://trawl_example.com"), InvalidHost);
         // Percent-escapes are a URL concept; an origin host is not escaped.
@@ -942,6 +983,12 @@ mod tests {
             ("http://[::1]:80", "http://[::1]"),
             ("http://[::FFFF:127.0.0.1]", "http://[::ffff:127.0.0.1]"),
             ("http://127.0.0.1:8090", "http://127.0.0.1:8090"),
+            // The root dot round-trips, dot included.
+            ("https://trawl.example.com.", "https://trawl.example.com."),
+            (
+                "HTTPS://TRAWL.Example.COM.:443",
+                "https://trawl.example.com.",
+            ),
         ] {
             let origin = parsed(input);
             assert_eq!(origin.to_string(), canonical, "canonical form of {input:?}");
@@ -965,8 +1012,8 @@ mod tests {
     // -- rejection log fields --------------------------------------------
 
     /// The ceiling on the logged origin text: `https` + `://` + a 253-byte
-    /// DNS host + `:65535`.
-    const MAX_LOG_TEXT_BYTES: usize = 5 + 3 + MAX_DNS_HOST_BYTES + 6;
+    /// DNS host + the root dot + `:65535`.
+    const MAX_LOG_TEXT_BYTES: usize = 5 + 3 + MAX_DNS_HOST_BYTES + 1 + 6;
 
     /// Every reason [`rejection_log_fields`] can produce. A log field
     /// whose value set is not closed is a cardinality and injection
@@ -1033,13 +1080,14 @@ mod tests {
         let text = text.expect("a parsed origin is logged");
         assert_eq!(text, "https://evil.example.com");
         assert!(is_bounded_log_text(&text));
-        // The longest legal origin there is — a 253-byte host on the
-        // longest scheme with the longest port — still fits the bound, so
-        // the bound is a fact about the type and not about this sample.
+        // The longest legal origin there is — a 253-byte host, rooted with
+        // the trailing dot, on the longest scheme with the longest port —
+        // still fits the bound, so the bound is a fact about the type and
+        // not about this sample.
         let label = "a".repeat(MAX_DNS_LABEL_BYTES);
         let host = format!("{label}.{label}.{label}.{}", "b".repeat(61));
         assert_eq!(host.len(), MAX_DNS_HOST_BYTES);
-        let text = rejection_log_fields(Some(&format!("https://{host}:65535")))
+        let text = rejection_log_fields(Some(&format!("https://{host}.:65535")))
             .1
             .expect("the longest legal origin parses");
         assert_eq!(text.len(), MAX_LOG_TEXT_BYTES);

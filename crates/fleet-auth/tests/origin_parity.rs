@@ -37,6 +37,12 @@ fn config_error(entry: &str) -> OriginParseError {
 const EQUIVALENT_SPELLINGS: &[(&str, &str)] = &[
     // Default ports are implied on the wire and often written in config.
     ("https://trawl.example.com", "https://trawl.example.com:443"),
+    // The root dot survives case folding and port defaulting like any
+    // other host text.
+    (
+        "https://TRAWL.example.com.",
+        "https://trawl.example.com.:443",
+    ),
     ("https://trawl.example.com:443", "https://trawl.example.com"),
     ("http://localhost", "http://localhost:80"),
     // Case: an operator pasting from a browser address bar gets mixed case.
@@ -68,6 +74,10 @@ const DISTINCT_PAIRS: &[(&str, &str)] = &[
     ("http://[::ffff:127.0.0.1]:8090", "http://127.0.0.1:8090"),
     // Neighbouring names.
     ("https://trawl.example.com", "https://trawl.example.org"),
+    // The rooted name and the unrooted one are two origins, because they
+    // are two origins to the browser that sends them.
+    ("https://trawl.example.com.", "https://trawl.example.com"),
+    ("https://trawl.example.com", "https://trawl.example.com."),
     ("https://trawl.example.com", "https://sub.trawl.example.com"),
 ];
 
@@ -113,7 +123,9 @@ const REFUSED: &[(&str, OriginParseError)] = &[
     ("https://:8090", OriginParseError::EmptyHost),
     ("https://tráwl.example.com", OriginParseError::NonAsciiHost),
     ("https://trawl_example.com", OriginParseError::InvalidHost),
-    ("https://trawl.example.com.", OriginParseError::InvalidHost),
+    ("https://trawl.example.com..", OriginParseError::InvalidHost),
+    ("https://.trawl.example.com", OriginParseError::InvalidHost),
+    ("http://127.0.0.1.", OriginParseError::InvalidHost),
     ("https://*.example.com", OriginParseError::InvalidHost),
     ("http://::1", OriginParseError::InvalidHost),
     ("http://[fe80::1%eth0]", OriginParseError::InvalidHost),
@@ -166,6 +178,34 @@ fn both_doors_refuse_the_same_inputs_for_the_same_reason() {
         assert_eq!(header_error, *expected, "header door on {input:?}");
         assert_eq!(config_error(input), *expected, "config door on {input:?}");
     }
+}
+
+#[test]
+fn a_rooted_host_is_one_spelling_through_both_doors() {
+    // A browser preserves the DNS root dot when it serializes an origin,
+    // so `https://trawl.example.com./` browses as
+    // `https://trawl.example.com.` and an install reached that way must be
+    // able to state exactly that. Neither door normalizes it in either
+    // direction, and Display keeps it, which is what makes the rejection
+    // log's text pasteable back into the config.
+    let rooted = Origin::parse("https://trawl.example.com.").expect("a rooted host parses");
+    assert_eq!(rooted.to_string(), "https://trawl.example.com.");
+    assert_eq!(Origin::parse(&rooted.to_string()), Ok(rooted.clone()));
+
+    let configured = PublicOrigins::parse(["https://trawl.example.com."]).expect("and configures");
+    assert!(configured.contains(&rooted));
+    assert!(!configured.contains(&Origin::parse("https://trawl.example.com").unwrap()));
+
+    // And the other way round: configuring the unrooted name does not
+    // silently admit the rooted one.
+    let unrooted = PublicOrigins::parse(["https://trawl.example.com"]).expect("parses");
+    assert!(!unrooted.contains(&rooted));
+
+    // Two spellings, so an operator serving both states both, and the
+    // duplicate check does not collapse them.
+    assert!(
+        PublicOrigins::parse(["https://trawl.example.com", "https://trawl.example.com."]).is_ok()
+    );
 }
 
 #[test]

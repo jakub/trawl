@@ -241,14 +241,18 @@ async fn upstream_server() -> MockServer {
     upstream
 }
 
-fn state_for(upstream: &MockServer) -> AppState {
+fn state_with(upstream: &MockServer, origins: &[&str]) -> AppState {
     let web = WebConfig {
         upstream_url: Some(upstream.uri()),
         allow_insecure_cookies: true,
-        public_origins: ALLOWED.iter().map(|o| (*o).to_owned()).collect(),
+        public_origins: origins.iter().map(|o| (*o).to_owned()).collect(),
         ..WebConfig::default()
     };
     AppState::from_config(ResolvedConfig::from_parsed(&web, None).unwrap()).unwrap()
+}
+
+fn state_for(upstream: &MockServer) -> AppState {
+    state_with(upstream, &ALLOWED)
 }
 
 async fn fixture() -> (MockServer, AppState, axum::Router) {
@@ -550,6 +554,39 @@ async fn an_allowed_origin_keeps_the_existing_cookie_answers() {
                 route.name
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn a_rooted_origin_is_its_own_spelling_end_to_end() {
+    // A browser keeps the DNS root dot when it serializes an origin:
+    // `new URL("https://trawl.example.com./").origin` is
+    // `https://trawl.example.com.`. So an install browsed at that URL
+    // sends the dotted form, has to be able to configure exactly it, and
+    // gets no free pass for the dotless name it did not configure.
+    let upstream = upstream_server().await;
+    let state = state_with(&upstream, &["https://trawl.example.com."]);
+    let app = routes::build(state.clone());
+    let cookie = valid_cookie(&state);
+    let route = ROUTES
+        .iter()
+        .find(|r| r.name == "proxied write")
+        .expect("the proxied write row exists");
+
+    for (origin, expected) in [
+        ("https://trawl.example.com.", route.ok),
+        ("https://trawl.example.com", StatusCode::FORBIDDEN),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(route, Some(origin), &route.credential(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            expected,
+            "a deployment configured as https://trawl.example.com. answering {origin}"
+        );
     }
 }
 
