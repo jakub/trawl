@@ -19,6 +19,12 @@ use crate::cli::{ConnectionParams, OutputFormat, render_driver_results};
 
 /// Parse a `--last` window like `30m`, `2h`, `7d`, `1w` into seconds.
 pub fn parse_last(input: &str) -> Result<u64, CliError> {
+    parse_window(input, "--last")
+}
+
+/// The `--last` grammar with the failing option named by the caller, so
+/// `gc-pins --older-than 30y` complains about `--older-than`, not `--last`.
+pub fn parse_window(input: &str, option: &str) -> Result<u64, CliError> {
     let input = input.trim();
     // Split off the last char, not the last byte: `split_at` panics off a
     // char boundary, and the unit position is exactly where a multi-byte
@@ -29,7 +35,7 @@ pub fn parse_last(input: &str) -> Result<u64, CliError> {
     };
     let n: u64 = num
         .parse()
-        .map_err(|_| CliError::Usage(format!("invalid --last window: {input:?}")))?;
+        .map_err(|_| CliError::Usage(format!("invalid {option} window: {input:?}")))?;
     let mult = match unit {
         "s" => 1,
         "m" => 60,
@@ -38,7 +44,7 @@ pub fn parse_last(input: &str) -> Result<u64, CliError> {
         "w" => 604_800,
         _ => {
             return Err(CliError::Usage(format!(
-                "invalid --last window: {input:?} (units: s, m, h, d, w)"
+                "invalid {option} window: {input:?} (units: s, m, h, d, w)"
             )));
         }
     };
@@ -514,6 +520,15 @@ mod tests {
     }
 
     #[test]
+    fn a_window_error_names_the_option_that_failed() {
+        let err = parse_window("30y", "--older-than").unwrap_err().to_string();
+        assert!(err.contains("--older-than"), "{err}");
+        assert!(!err.contains("--last"), "{err}");
+        let err = parse_last("30y").unwrap_err().to_string();
+        assert!(err.contains("--last"), "{err}");
+    }
+
+    #[test]
     fn parse_last_understands_dsl_units() {
         assert_eq!(parse_last("30s").unwrap(), 30);
         assert_eq!(parse_last("30m").unwrap(), 1800);
@@ -889,7 +904,14 @@ pub fn repin_job_to_rows(
     job: &trawl_client::RepinJobResponse,
     format: OutputFormat,
 ) -> (Vec<String>, Vec<Vec<Json>>) {
-    let columns = [
+    (repin_job_columns(), vec![repin_job_cells(job, format)])
+}
+
+/// The job row's column names. Shared with the cancel receipt, which
+/// carries the same columns so a machine format is one record with one
+/// header (#109).
+fn repin_job_columns() -> Vec<String> {
+    [
         "id",
         "field",
         "from",
@@ -910,6 +932,8 @@ pub fn repin_job_to_rows(
         "field_last_service",
         "requires_force",
         "requires_force_reason",
+        "cancel_requested_at",
+        "cancelled_by",
         "max_nulled_rows",
         "max_ambiguous_rows",
         "accepted_max_nulled_rows",
@@ -917,8 +941,12 @@ pub fn repin_job_to_rows(
         "error",
     ]
     .map(str::to_owned)
-    .to_vec();
-    let rows = vec![vec![
+    .to_vec()
+}
+
+/// One job's cells, in [`repin_job_columns`] order.
+fn repin_job_cells(job: &trawl_client::RepinJobResponse, format: OutputFormat) -> Vec<Json> {
+    vec![
         Json::from(job.id),
         Json::from(job.field.clone()),
         Json::from(job.from_type.clone()),
@@ -956,6 +984,13 @@ pub fn repin_job_to_rows(
         job.requires_force_reason
             .clone()
             .map_or(Json::Null, Json::from),
+        // Persisted facts (#109): on a `running` row they say a cancel is
+        // in flight, on a `failed` one they say the process died between
+        // the request and any boundary that could observe it.
+        job.cancel_requested_at
+            .clone()
+            .map_or(Json::Null, Json::from),
+        job.cancelled_by.clone().map_or(Json::Null, Json::from),
         // The request's own numbers beside the ones the job is held to: a
         // stated ceiling and a resolved one differ whenever the operator
         // stated none, and a machine consumer that cannot see both cannot
@@ -966,8 +1001,7 @@ pub fn repin_job_to_rows(
         job.accepted_max_ambiguous_rows
             .map_or(Json::Null, Json::from),
         job.error.clone().map_or(Json::Null, Json::from),
-    ]];
-    (columns, rows)
+    ]
 }
 
 /// The repin report's case file: the evidence a plan's numbers cannot
@@ -1132,7 +1166,12 @@ async fn bind_ceilings(
                 // A forced scan resolves its own ceilings, so a refusal here
                 // is one no ceiling covers. Report it instead of executing:
                 // the execution would refuse the same way, after a rewrite.
-                trawl_client::RepinStart::Refused(job) | trawl_client::RepinStart::Started(job) => {
+                // A cancelled or failed preview produced no plan either, and
+                // its own status is what the sentence names (#109).
+                trawl_client::RepinStart::Refused(job)
+                | trawl_client::RepinStart::Started(job)
+                | trawl_client::RepinStart::Cancelled(job)
+                | trawl_client::RepinStart::Failed(job) => {
                     render_repin_case_file(out, human, &job)?;
                     return Err(CliError::Usage(format!(
                         "repin preview did not produce a plan (job {} is {})",
@@ -1232,8 +1271,15 @@ pub async fn run_repin(
             },
         )
         .await?;
-    let (verdict, job) = match outcome {
+    let (started_as, job) = match outcome {
         trawl_client::RepinStart::Report(job) => ("dry run", job),
+        // The client separates a cancelled row from a report, so the
+        // verdict word is decided here rather than by sniffing the status
+        // string afterwards (#109).
+        trawl_client::RepinStart::Cancelled(job) => ("cancelled", job),
+        // A 200 that is neither: the row's own status is the verdict, and
+        // `repin_completion` turns it into a non-zero exit.
+        trawl_client::RepinStart::Failed(job) => ("did not complete", job),
         trawl_client::RepinStart::Started(job) => ("started", job),
         trawl_client::RepinStart::Refused(job) => (refusal_verdict(job.force), job),
     };
@@ -1242,12 +1288,9 @@ pub async fn run_repin(
     if flags.wait && job.status == "running" {
         job = wait_for_terminal(&client, job).await?;
     }
-    // Computed after the wait: a started job can still refuse at the
-    // cutover gate when data ingested after the scan turns out to be
-    // unreadable under the new type.
-    let refused = job.status == "refused_needs_force";
 
     if format == OutputFormat::Table {
+        let verdict = repin_verdict_word(started_as, &job.status, job.force);
         writeln!(out, "repin {}: {verdict}", job.field)?;
     }
     let (columns, rows) = repin_job_to_rows(&job, format);
@@ -1256,19 +1299,82 @@ pub async fn run_repin(
     // format (`label`), so a piped `-f json` stays one parseable record while
     // the operator still reads the evidence.
     render_repin_case_file(out, format == OutputFormat::Table, &job)?;
-    if refused {
-        let lost = if job.rows_nulled > 0 {
-            job.rows_nulled
-        } else {
-            job.projected_nulls
-        };
-        return Err(CliError::Usage(repin_refusal(
-            job.requires_force_reason.as_deref(),
-            flags.force,
-            lost,
-        )));
+    repin_completion(&job)
+}
+
+/// The word the table header prints.
+///
+/// The status the row ended on outranks the verdict the start request
+/// carried: a job started here and then cancelled, refused at the cutover
+/// gate or failed while `--wait` polled it would otherwise still print as
+/// "started".
+fn repin_verdict_word<'a>(started_as: &'a str, status: &str, forced: bool) -> &'a str {
+    match status {
+        "cancelled" => "cancelled",
+        "failed" => "failed",
+        "blocked" => "blocked",
+        // One status, two facts: `refusal_verdict` is the same split the
+        // start arm uses, so a job refused at the cutover gate after
+        // `--wait` prints the word its flags earned.
+        "refused_needs_force" => refusal_verdict(forced),
+        _ => started_as,
     }
-    Ok(())
+}
+
+/// Did the repin this invocation asked for actually happen?
+///
+/// Exit code is the only thing a script reads, so every terminal status
+/// that is not a completed rewrite (or the dry run's report, which is also
+/// `succeeded`) has to be an error here. `running` is the one non-terminal
+/// pass: without `--wait` the job is deliberately left in flight and the
+/// operator polls `repin-status`.
+///
+/// The catch-all arm is the point (#109 review R2-3). `failed` and
+/// `blocked` used to fall past the cancelled and refused checks into
+/// `Ok(())`, so a `--wait` that watched a job fail still exited 0, and a
+/// cancel whose request row could not be written — which downgrades the
+/// job to `failed` on a 200 — printed "dry run" and exited 0 as well.
+fn repin_completion(job: &trawl_client::RepinJobResponse) -> Result<(), CliError> {
+    match job.status.as_str() {
+        "succeeded" | "running" => Ok(()),
+        "refused_needs_force" => {
+            // A pre-scan refusal reports its projection; a cutover refusal
+            // reports what the finished rewrite actually nulled. The remedy
+            // branches on the flags the job itself carried (#111): telling a
+            // forced job to pass --force is advice it has already taken.
+            let lost = if job.rows_nulled > 0 {
+                job.rows_nulled
+            } else {
+                job.projected_nulls
+            };
+            Err(CliError::Usage(repin_refusal(
+                job.requires_force_reason.as_deref(),
+                job.force,
+                lost,
+            )))
+        }
+        "cancelled" => {
+            let by = job.cancelled_by.as_deref().unwrap_or("an operator");
+            Err(CliError::Usage(format!(
+                "repin cancelled by {}: the corpus was left untouched and the \
+                 pin is unchanged",
+                trawl_core::sanitize::sanitize_display_text(by)
+            )))
+        }
+        other => {
+            // The status and the error text both come off the wire, so both
+            // are sanitized before they reach a terminal.
+            let detail = job.error.as_deref().map_or_else(String::new, |e| {
+                format!(": {}", trawl_core::sanitize::sanitize_display_text(e))
+            });
+            Err(CliError::Usage(format!(
+                "repin ended {}{detail}. The rewrite this command asked for \
+                 did not complete; check `trawl schema repin-status` and the \
+                 server log",
+                trawl_core::sanitize::sanitize_display_text(other)
+            )))
+        }
+    }
 }
 
 /// The one-line verdict above a refused job's row.
@@ -1304,7 +1410,12 @@ fn repin_refusal(reason: Option<&str>, forced: bool, lost: u64) -> String {
         "re-run with --force to accept it"
     };
     match reason {
-        Some(reason) => format!("repin refused: {reason} — {remedy}"),
+        // The reason comes off the wire and lands on a terminal, so it
+        // sanitises like every other server sentence this file renders.
+        Some(reason) => {
+            let reason = trawl_core::sanitize::sanitize_display_text(reason);
+            format!("repin refused: {reason} — {remedy}")
+        }
         None => format!(
             "repin would null {lost} stored value(s); {remedy} (originals \
              remain findable in _raw)"
@@ -1322,14 +1433,45 @@ async fn wait_for_terminal(
     while latest.status == "running" {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         let status = client.schema_repin_status().await?;
-        match status.job {
-            Some(j) if j.id == id => latest = j,
-            // A different (or no) job means ours got reconciled away by a
-            // restart; report what we last saw.
-            _ => break,
-        }
+        latest = same_job(id, status.job)?;
     }
     Ok(latest)
+}
+
+/// One poll of the status surface, checked against the job `--wait` is
+/// following.
+///
+/// The status route answers with the running job, else the newest one, and
+/// there is no way to ask it for a job by id. So a poll that comes back
+/// naming a different job is not an answer about ours: our job terminalized
+/// (cancelled by another operator, say, or failed) and a second job claimed
+/// the freed slot before this poll ran.
+///
+/// Returning the last copy we held would be worse than useless, because
+/// that copy still says `running` — the caller's cancelled and refused
+/// checks would both read false and the command would exit 0 over a rewrite
+/// that never happened. The outcome is genuinely unknown here, so it is an
+/// error that says so and names the job it is about (#109 review F1).
+fn same_job(
+    id: i64,
+    seen: Option<trawl_client::RepinJobResponse>,
+) -> Result<trawl_client::RepinJobResponse, CliError> {
+    match seen {
+        Some(job) if job.id == id => Ok(job),
+        other => {
+            let now = other.map_or_else(
+                || "the status surface now reports no job at all".to_owned(),
+                |job| format!("repin job {} now occupies the status surface", job.id),
+            );
+            Err(CliError::Usage(format!(
+                "repin job {id} could not be followed to its end: {now}, and \
+                 the status surface cannot be asked for a job by id. This \
+                 job's outcome is unknown — it was not observed to succeed. \
+                 Check `trawl schema repin-status` and the server log for \
+                 job {id}"
+            )))
+        }
+    }
 }
 
 /// `trawl schema repin-status`.
@@ -1350,6 +1492,86 @@ pub async fn run_repin_status(
         None => writeln!(out, "no repin job has ever run")?,
     }
     Ok(())
+}
+
+/// `trawl schema repin-cancel` (#109).
+///
+/// No confirmation prompt, unlike the trigger: cancelling only ever leaves
+/// the corpus as it already is, so the destructive direction is the one
+/// that needs a human's word.
+///
+/// Exit code carries the verdict, because a script that asks for a stop has
+/// to know whether it got one: accepted exits 0, and both refusals — the
+/// job is past its point of no return, or nothing was running — exit
+/// non-zero through the usual error path.
+pub async fn run_repin_cancel(
+    out: &mut impl Write,
+    conn: ConnectionParams,
+    format: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    let format = resolve_format(format)?;
+    let client = make_client(&conn)?;
+    let (accepted, receipt) = match client.schema_repin_cancel().await? {
+        trawl_client::RepinCancel::Cancelling(r) => (true, r),
+        trawl_client::RepinCancel::PastPointOfNoReturn(r)
+        | trawl_client::RepinCancel::NoJobRunning(r) => (false, r),
+    };
+    // The server ships facts and the consumer writes the words, so the
+    // detail is printed as the server phrased it — through display
+    // sanitisation, like every other server sentence this command renders.
+    let detail = trawl_core::sanitize::sanitize_display_text(&receipt.detail);
+    if format == OutputFormat::Table {
+        // A human reads the sentence first and the job's numbers second, so
+        // the table keeps two blocks.
+        writeln!(out, "repin cancel: {detail}")?;
+        if let Some(job) = &receipt.job {
+            let (columns, rows) = repin_job_to_rows(job, format);
+            render_driver_results(&columns, &rows, format, out)?;
+        }
+    } else {
+        // One record, one header: the verdict and the job it is about are
+        // one answer, and a machine format that emitted them as two tables
+        // would put two headers of different widths in one csv stream.
+        // The job columns are null when the server attached no row.
+        let (columns, rows) = cancel_receipt_to_rows(&receipt, format);
+        render_driver_results(&columns, &rows, format, out)?;
+    }
+    if accepted {
+        return Ok(());
+    }
+    Err(CliError::Usage(format!("repin cancel refused: {detail}")))
+}
+
+/// A cancel receipt → exactly one record: the verdict, the server's
+/// sentence, and the job columns the verdict is about.
+///
+/// One record rather than two tables, because `-f csv` is a single stream:
+/// a receipt table followed by a job table would put two headers of
+/// different widths in it, which no csv reader accepts. A verdict with no
+/// job attached — a 404, or a store that could not serve the row — leaves
+/// the job columns null, so the shape does not depend on what the server
+/// managed to look up.
+fn cancel_receipt_to_rows(
+    receipt: &trawl_client::RepinCancelResponse,
+    format: OutputFormat,
+) -> (Vec<String>, Vec<Vec<Json>>) {
+    let outcome = match receipt.outcome {
+        trawl_client::RepinCancelOutcome::Cancelling => "cancelling",
+        trawl_client::RepinCancelOutcome::PastPointOfNoReturn => "past_point_of_no_return",
+        trawl_client::RepinCancelOutcome::NoJobRunning => "no_job_running",
+    };
+    let job_columns = repin_job_columns();
+    let mut columns = vec!["outcome".to_owned(), "detail".to_owned()];
+    let mut cells = vec![
+        Json::from(outcome),
+        Json::from(trawl_core::sanitize::sanitize_display_text(&receipt.detail)),
+    ];
+    cells.extend(receipt.job.as_ref().map_or_else(
+        || vec![Json::Null; job_columns.len()],
+        |job| repin_job_cells(job, format),
+    ));
+    columns.extend(job_columns);
+    (columns, vec![cells])
 }
 
 // -- degraded-badge acknowledgement -------------------------------------------
@@ -1545,6 +1767,8 @@ mod repin_tests {
             liveness: None,
             requires_force: Some(false),
             requires_force_reason: None,
+            cancel_requested_at: None,
+            cancelled_by: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
             accepted_max_nulled_rows: None,
@@ -1616,6 +1840,8 @@ mod repin_tests {
                  (the originals stay findable in _raw)"
                     .into(),
             ),
+            cancel_requested_at: None,
+            cancelled_by: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
             accepted_max_nulled_rows: None,
@@ -2065,5 +2291,484 @@ mod repin_tests {
             matches!(err, CliError::Usage(ref msg) if msg.contains("--yes")),
             "got {err:?}"
         );
+    }
+
+    /// The cancel receipt renders in every format, and a machine format
+    /// carries the verdict even when the server attached no job row.
+    ///
+    /// With a job attached it is still ONE record: one header, one width.
+    /// Two tables in one csv stream — a two-column receipt followed by the
+    /// 23-column job — is not a csv document at all (#109 review F4).
+    #[test]
+    fn a_cancel_receipt_renders_its_verdict_in_every_format() {
+        for (outcome, spelling) in [
+            (trawl_client::RepinCancelOutcome::Cancelling, "cancelling"),
+            (
+                trawl_client::RepinCancelOutcome::PastPointOfNoReturn,
+                "past_point_of_no_return",
+            ),
+            (
+                trawl_client::RepinCancelOutcome::NoJobRunning,
+                "no_job_running",
+            ),
+        ] {
+            let receipt = trawl_client::RepinCancelResponse {
+                outcome,
+                detail: "the words the server chose".into(),
+                job: None,
+            };
+            for format in [OutputFormat::Json, OutputFormat::Csv] {
+                let (columns, rows) = cancel_receipt_to_rows(&receipt, format);
+                let mut out = Vec::new();
+                render_driver_results(&columns, &rows, format, &mut out).unwrap();
+                let text = String::from_utf8(out).unwrap();
+                assert!(text.contains(spelling), "{format:?}: {text}");
+            }
+        }
+
+        // A job rides along: same header, same width, and the job's own
+        // facts are in the same record as the verdict.
+        let mut job = sample_job();
+        job.status = "cancelled".into();
+        job.cancelled_by = Some("ops".into());
+        let receipt = trawl_client::RepinCancelResponse {
+            outcome: trawl_client::RepinCancelOutcome::Cancelling,
+            detail: "cancel accepted".into(),
+            job: Some(job),
+        };
+
+        let (columns, rows) = cancel_receipt_to_rows(&receipt, OutputFormat::Csv);
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Csv, &mut out).unwrap();
+        let csv = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = csv.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "one header, one row: {csv}");
+        let header = lines[0];
+        assert!(header.starts_with("outcome,detail,"), "{header}");
+        assert_eq!(
+            header.matches("outcome").count(),
+            1,
+            "exactly one header line: {csv}"
+        );
+        let width = |line: &str| line.chars().filter(|c| *c == ',').count();
+        assert_eq!(width(lines[0]), width(lines[1]), "rectangular: {csv}");
+        assert!(lines[1].contains("cancelled"), "{csv}");
+        assert!(lines[1].contains("ops"), "{csv}");
+
+        // json is ndjson: one object carrying both halves.
+        let (columns, rows) = cancel_receipt_to_rows(&receipt, OutputFormat::Json);
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "one object: {text}");
+        let parsed: Json = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["outcome"], "cancelling");
+        assert_eq!(parsed["status"], "cancelled");
+        assert_eq!(parsed["cancelled_by"], "ops");
+
+        // No job attached: the same columns, nulled.
+        let bodiless = trawl_client::RepinCancelResponse {
+            outcome: trawl_client::RepinCancelOutcome::NoJobRunning,
+            detail: "nothing running".into(),
+            job: None,
+        };
+        let (with_job, _) = cancel_receipt_to_rows(&receipt, OutputFormat::Json);
+        let (without_job, rows) = cancel_receipt_to_rows(&bodiless, OutputFormat::Json);
+        assert_eq!(with_job, without_job);
+        let mut out = Vec::new();
+        render_driver_results(&without_job, &rows, OutputFormat::Json, &mut out).unwrap();
+        let parsed: Json =
+            serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["outcome"], "no_job_running");
+        assert_eq!(parsed["status"], Json::Null);
+    }
+
+    /// `--wait` follows one job, and a poll that comes back about another
+    /// one is an unknown outcome, never an answer.
+    ///
+    /// The race: job A is started under `--wait`, another operator cancels
+    /// it, A terminalizes, and job B claims the freed slot before A's next
+    /// poll. The status surface then names B. Handing back the caller's
+    /// stale copy of A would hand back a row still saying `running`, which
+    /// reads as neither cancelled nor refused, and the command would exit 0
+    /// over a rewrite that never ran.
+    #[test]
+    fn a_successor_job_on_the_status_surface_is_not_an_answer() {
+        let mut ours = sample_job();
+        ours.id = 7;
+        ours.status = "running".into();
+
+        assert_eq!(same_job(7, Some(ours.clone())).unwrap().id, 7);
+
+        let mut successor = sample_job();
+        successor.id = 8;
+        for seen in [Some(successor), None] {
+            let err = same_job(7, seen).expect_err("a poll about another job is not an answer");
+            let CliError::Usage(msg) = err else {
+                panic!("expected a usage error, got {err:?}")
+            };
+            assert!(msg.contains("repin job 7"), "{msg}");
+            assert!(msg.contains("unknown"), "{msg}");
+            assert!(msg.contains("repin-status"), "{msg}");
+        }
+    }
+
+    /// Only a completed rewrite (or a dry run's report) exits 0.
+    ///
+    /// `failed` is the reachable one this test exists for: a cancel whose
+    /// request row cannot be written downgrades the job to `failed`, the
+    /// route still answers 200, and under `--wait` the old code fell past
+    /// the cancelled and refused checks into `Ok(())` — exit 0 over a repin
+    /// that never ran (#109 review R2-3).
+    #[test]
+    fn only_a_finished_repin_exits_zero() {
+        for status in ["succeeded", "running"] {
+            let mut job = sample_job();
+            job.status = status.into();
+            repin_completion(&job).unwrap_or_else(|e| panic!("{status} must pass: {e:?}"));
+        }
+
+        for status in ["failed", "blocked", "something_new"] {
+            let mut job = sample_job();
+            job.status = status.into();
+            job.error = Some("the store went away".into());
+            let err = repin_completion(&job).expect_err("{status} is not a success");
+            let CliError::Usage(msg) = err else {
+                panic!("expected a usage error, got {err:?}")
+            };
+            assert!(msg.contains(status), "the real status is named: {msg}");
+            assert!(msg.contains("the store went away"), "{msg}");
+            assert!(msg.contains("repin-status"), "{msg}");
+            assert!(!msg.contains("dry run"), "{msg}");
+        }
+    }
+
+    /// The table header names what the row ended on, not what the start
+    /// request said. A `failed` row must never print as "dry run", and a
+    /// refusal keeps the split its flags earned: a forced job was stopped
+    /// by its ceilings, not by a missing flag it already passed.
+    #[test]
+    fn the_header_verdict_follows_the_terminal_row() {
+        assert_eq!(repin_verdict_word("dry run", "succeeded", false), "dry run");
+        assert_eq!(repin_verdict_word("started", "running", false), "started");
+        assert_eq!(repin_verdict_word("dry run", "failed", false), "failed");
+        assert_eq!(
+            repin_verdict_word("started", "cancelled", false),
+            "cancelled"
+        );
+        assert_eq!(repin_verdict_word("started", "blocked", false), "blocked");
+        assert_eq!(
+            repin_verdict_word("started", "refused_needs_force", false),
+            "refused: needs --force"
+        );
+        assert_eq!(
+            repin_verdict_word("started", "refused_needs_force", true),
+            "refused: over its ceilings"
+        );
+    }
+
+    /// A cancelled job row shows who asked and when, in the machine
+    /// formats a script reads.
+    #[test]
+    fn a_cancelled_job_row_names_the_asker() {
+        let mut job = sample_job();
+        job.status = "cancelled".into();
+        job.cancel_requested_at = Some("2026-09-03T21:00:00Z".into());
+        job.cancelled_by = Some("ops".into());
+        job.error = Some("cancelled by ops during build; the live corpus was never touched".into());
+        let (columns, rows) = repin_job_to_rows(&job, OutputFormat::Json);
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        let parsed: Json =
+            serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["status"], "cancelled");
+        assert_eq!(parsed["cancelled_by"], "ops");
+        assert_eq!(parsed["cancel_requested_at"], "2026-09-03T21:00:00Z");
+    }
+}
+
+/// `GcPinsResponse` candidates → generic (columns, rows).
+///
+/// One rectangle: the run's summary numbers are printed as labels around
+/// this table, never as a second header inside it, so a piped `-f csv` is
+/// one parseable record set.
+pub fn gc_candidates_to_rows(resp: &trawl_client::GcPinsResponse) -> (Vec<String>, Vec<Vec<Json>>) {
+    let columns = ["field", "type", "last_seen", "services"]
+        .map(str::to_owned)
+        .to_vec();
+    let rows = resp
+        .candidates
+        .iter()
+        .map(|c| {
+            vec![
+                Json::from(c.field.clone()),
+                Json::from(c.data_type.clone()),
+                c.last_seen.clone().map_or(Json::Null, Json::from),
+                Json::from(c.services),
+            ]
+        })
+        .collect();
+    (columns, rows)
+}
+
+/// A window in seconds as a short human span, for the summary lines.
+///
+/// Whole units only, largest that divides evenly, so `2592000` reads
+/// `30d` and `100000` stays `100000s`. The seconds are printed beside it,
+/// because they are the number the wire and the server logs carry.
+fn human_secs(secs: u64) -> String {
+    for (unit, size) in [("w", 604_800u64), ("d", 86_400), ("h", 3600), ("m", 60)] {
+        if secs >= size && secs.is_multiple_of(size) {
+            return format!("{}{unit}", secs / size);
+        }
+    }
+    format!("{secs}s")
+}
+
+/// The lines printed above the candidate table: what was asked for, what
+/// the retention floor did to it, and what the scan cost.
+///
+/// The CLI computes no window. All three numbers are the server's own, and
+/// the floor line says whether it applied, because "I asked for 7d and got
+/// 90d" is the surprise an operator has to be able to see.
+fn gc_summary_lines(resp: &trawl_client::GcPinsResponse) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "pin gc ({}) at {}",
+            if resp.dry_run { "dry run" } else { "executed" },
+            resp.decided_at
+        ),
+        format!(
+            "requested window: {} ({}s)",
+            human_secs(resp.requested_older_than_secs),
+            resp.requested_older_than_secs
+        ),
+    ];
+    lines.push(match resp.retention_floor_secs {
+        Some(floor) if floor > resp.requested_older_than_secs => format!(
+            "retention floor:  {} ({}s), raised the window: a pin cannot be \
+             called dead over a span shorter than the corpus trawl still keeps",
+            human_secs(floor),
+            floor
+        ),
+        Some(floor) => format!(
+            "retention floor:  {} ({}s), did not apply",
+            human_secs(floor),
+            floor
+        ),
+        None => "retention floor:  none (age retention is disabled)".to_owned(),
+    });
+    lines.push(format!(
+        "effective window: {} ({}s)",
+        human_secs(resp.effective_older_than_secs),
+        resp.effective_older_than_secs
+    ));
+    lines.push(format!(
+        "examined {} pin(s) past the window, read {} parquet footer(s)",
+        resp.pins_examined, resp.files_scanned
+    ));
+    lines
+}
+
+/// The line printed below the candidate table.
+fn gc_outcome_line(resp: &trawl_client::GcPinsResponse) -> String {
+    if resp.dry_run {
+        format!(
+            "{} pin(s) would be reclaimed; nothing was deleted (re-run without \
+             --dry-run)",
+            resp.candidates.len()
+        )
+    } else {
+        format!("{} pin(s) reclaimed", resp.deleted)
+    }
+}
+
+/// `trawl schema gc-pins [--dry-run] [--older-than <dur>]`.
+///
+/// The candidate list is the one table; the summary lines go around it
+/// through [`label`], so they reach stdout for a human and stderr under a
+/// machine format. A csv or ndjson run is therefore a single rectangular
+/// record set with no second header in the middle of it.
+///
+/// No confirmation prompt, unlike `repin`: this deletes catalog metadata
+/// only, and a field wrongly reclaimed re-pins cleanly the next time a
+/// sender writes it. `--dry-run` is the safety.
+pub async fn run_gc_pins<W: Write>(
+    out: &mut W,
+    conn: ConnectionParams,
+    dry_run: bool,
+    older_than: Option<&str>,
+    format: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    let format = resolve_format(format)?;
+    let older_than_secs = older_than
+        .map(|s| parse_window(s, "--older-than"))
+        .transpose()?;
+    let client = make_client(&conn)?;
+    // A refusal (409 for a repin owning the data root or an unreadable
+    // corpus) arrives as a client error carrying the server's own message,
+    // and `main` prints it and exits non-zero.
+    let resp = client.schema_gc_pins(dry_run, older_than_secs).await?;
+
+    let human = format == OutputFormat::Table;
+    for line in gc_summary_lines(&resp) {
+        label(out, human, &line)?;
+    }
+    let (columns, rows) = gc_candidates_to_rows(&resp);
+    render(out, &columns, &rows, format)?;
+    label(out, human, &gc_outcome_line(&resp))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+
+    fn sample_report(dry_run: bool) -> trawl_client::GcPinsResponse {
+        trawl_client::GcPinsResponse {
+            dry_run,
+            decided_at: "2026-09-04T12:00:00Z".into(),
+            requested_older_than_secs: 604_800,
+            retention_floor_secs: Some(7_776_000),
+            effective_older_than_secs: 7_776_000,
+            pins_examined: 3,
+            files_scanned: 12,
+            candidates: vec![
+                trawl_client::GcPinCandidate {
+                    field: "retired_counter".into(),
+                    data_type: "BIGINT".into(),
+                    last_seen: Some("2026-01-02T03:04:05Z".into()),
+                    services: 2,
+                },
+                trawl_client::GcPinCandidate {
+                    field: "typo_feild".into(),
+                    data_type: "VARCHAR".into(),
+                    last_seen: None,
+                    services: 0,
+                },
+            ],
+            deleted: if dry_run { 0 } else { 2 },
+        }
+    }
+
+    #[test]
+    fn candidate_rows_carry_every_column() {
+        let (columns, rows) = gc_candidates_to_rows(&sample_report(true));
+        assert_eq!(columns, ["field", "type", "last_seen", "services"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Json::from("retired_counter"));
+        assert_eq!(rows[0][3], Json::from(2));
+        // A never-observed pin is a candidate with a null observation, not
+        // a row the renderer drops.
+        assert_eq!(rows[1][2], Json::Null);
+    }
+
+    #[test]
+    fn human_secs_uses_whole_units_only() {
+        assert_eq!(human_secs(2_592_000), "30d");
+        assert_eq!(human_secs(604_800), "1w");
+        assert_eq!(human_secs(7200), "2h");
+        assert_eq!(human_secs(90), "90s");
+        assert_eq!(human_secs(0), "0s");
+    }
+
+    #[test]
+    fn older_than_takes_the_last_window_grammar() {
+        assert_eq!(parse_last("30d").unwrap(), 2_592_000);
+        assert_eq!(parse_last("12w").unwrap(), 7_257_600);
+        assert_eq!(parse_last("0s").unwrap(), 0);
+        for bad in ["30", "d", "7µ", "-1d", "30y", ""] {
+            assert!(
+                matches!(parse_last(bad), Err(CliError::Usage(_))),
+                "{bad:?} must be a usage error"
+            );
+        }
+    }
+
+    /// A csv run is one rectangle: exactly one header line, and every data
+    /// line carries the same field count. The summary rides stderr, which
+    /// is why a second header cannot appear here.
+    #[test]
+    fn csv_output_is_one_rectangle() {
+        let (columns, rows) = gc_candidates_to_rows(&sample_report(false));
+        let mut out = Vec::new();
+        render(&mut out, &columns, &rows, OutputFormat::Csv).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3, "one header + two rows: {text}");
+        assert_eq!(lines[0], "field,type,last_seen,services");
+        for line in &lines {
+            assert_eq!(line.matches(',').count(), 3, "ragged row: {line}");
+        }
+    }
+
+    #[test]
+    fn table_output_carries_the_window_provenance_and_the_count() {
+        let report = sample_report(true);
+        let summary = gc_summary_lines(&report).join("\n");
+        assert!(
+            summary.contains("requested window: 1w (604800s)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("retention floor:  90d (7776000s), raised the window"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("effective window: 90d (7776000s)"),
+            "{summary}"
+        );
+        assert!(summary.contains("read 12 parquet footer(s)"), "{summary}");
+        assert_eq!(
+            gc_outcome_line(&report),
+            "2 pin(s) would be reclaimed; nothing was deleted (re-run without \
+             --dry-run)"
+        );
+
+        let (columns, rows) = gc_candidates_to_rows(&report);
+        let mut out = Vec::new();
+        render(&mut out, &columns, &rows, OutputFormat::Table).unwrap();
+        let table = String::from_utf8(out).unwrap();
+        assert!(table.contains("retired_counter"), "{table}");
+        assert!(table.contains("typo_feild"), "{table}");
+    }
+
+    /// The two floor cases the summary must tell apart, plus the one where
+    /// there is no floor at all.
+    #[test]
+    fn the_floor_line_says_whether_it_applied() {
+        let mut report = sample_report(false);
+        assert!(gc_summary_lines(&report)[2].contains("raised the window"));
+
+        report.requested_older_than_secs = 15_552_000;
+        report.effective_older_than_secs = 15_552_000;
+        assert!(gc_summary_lines(&report)[2].contains("did not apply"));
+
+        report.retention_floor_secs = None;
+        assert!(gc_summary_lines(&report)[2].contains("age retention is disabled"));
+    }
+
+    #[test]
+    fn an_executed_run_reports_the_servers_deleted_count() {
+        let report = sample_report(false);
+        assert_eq!(gc_outcome_line(&report), "2 pin(s) reclaimed");
+        assert!(gc_summary_lines(&report)[0].contains("executed"));
+    }
+
+    #[test]
+    fn json_output_is_one_record_per_candidate() {
+        let (columns, rows) = gc_candidates_to_rows(&sample_report(false));
+        let mut out = Vec::new();
+        render(&mut out, &columns, &rows, OutputFormat::Json).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let records: Vec<Json> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("each line is a JSON object"))
+            .collect();
+        assert_eq!(records.len(), 2, "{text}");
+        assert_eq!(records[0]["field"], Json::from("retired_counter"));
+        assert_eq!(records[1]["last_seen"], Json::Null);
     }
 }

@@ -191,13 +191,14 @@ trawl schema repin status --to varchar --yes       # execute (background job)
 trawl schema repin status --to varchar --yes --wait  # poll to completion
 trawl schema repin dur --to bigint --yes --force   # accept a lossy projection
 trawl schema repin-status                          # the running/last job
+trawl schema repin-cancel                          # ask the running job to stop
 ```
 
 An executing repin confirms interactively; off a TTY it refuses without
 `--yes`. A repin whose dry run projects nulled values refuses without
 `--force` and prints the plan (the values it would null stay findable in
 `_raw`). `--to <current type> --force` runs a resurrection-only pass.
-Both commands honour `-f table|json|csv`.
+All three commands honour `-f table|json|csv`.
 
 **What `--force` accepts.** A forced repin is held to a number rather than
 to a blank cheque. `--max-nulled-rows N` bounds the rows the rewrite may
@@ -223,6 +224,43 @@ Every report — dry run, running job, terminal job — carries
 refused. A dry run succeeds by design, so without that column a plan
 carrying loss or dialect ambiguity would read as a clean pass and the
 refusal would arrive with the request that was meant to do the work.
+
+#### Stopping a running repin
+
+`schema repin-cancel` asks the running job to stop. It needs
+`schema_write` and takes no confirmation prompt, because cancelling only
+ever leaves the corpus as it already is. There are three answers, and the
+exit code carries the verdict:
+
+- accepted (exit 0): the job stops at the next file boundary of its scan or
+  build loop, sweeps its staging, and ends `cancelled` with the live corpus
+  and the pin unchanged. The snapshot walk and the filesystem preflight are
+  not checkpointed, so a job inside one of those stops when it leaves it.
+- past the point of no return (exit non-zero): the job is already swapping
+  the corpus. The request is refused rather than queued, and the job
+  completes.
+- no job running (exit non-zero): nothing to stop on this node.
+
+Acceptance is not a promise of a terminal `cancelled` status. A job that
+finishes first finishes, and a trawld that dies between the request and any
+boundary acting on it leaves the job `failed` with `cancel_requested_at`
+and `cancelled_by` set. A restart is the stronger cancel: killing trawld
+before the cutover leaves the live corpus untouched, and boot recovery
+sweeps the shadow generation.
+
+In `-f json` and `-f csv` the receipt is one record: the verdict, the
+server's sentence, and the job's own columns, nulled when no job is
+attached. `-f table` keeps the sentence and the job table as two blocks.
+
+`repin --wait` exits zero only for a repin that actually finished, and for
+a dry run's report. Every other terminal status is non-zero: `cancelled`
+names who asked, `refused_needs_force` says what would be lost, and
+`failed` or `blocked` print the row and the server's own error text. A
+script that read any of those as success would go on to trust a rewrite
+that never happened. It also exits non-zero when the status surface stops
+naming the job it is following: there is no way to ask that route for a job by id, so a second
+job claiming the freed slot leaves the first job's outcome unknown, and the
+message says so rather than reporting the last row it saw.
 
 #### Putting a sender's own field on the severity ladder
 
@@ -270,6 +308,47 @@ that matters is `rows_carrying` in the dry run, not the corpus total.
 `repin --to severity` needs `schema_write` and a human, like every other
 repin. `_severity` itself — and every other declared envelope field — is
 refused: its type is part of the event contract.
+
+### Reclaiming dead pin slots
+
+`schema gc-pins` deletes the catalog entries of fields nothing writes any
+more, freeing their slots against the install-wide pin cap. It needs the
+`schema_write` permission.
+
+```bash
+trawl schema gc-pins --dry-run                       # what would be reclaimed
+trawl schema gc-pins --dry-run --older-than 90d      # a stricter window
+trawl schema gc-pins                                 # execute
+```
+
+A pin is reclaimed only when both halves of the proof hold: nothing has
+observed the field inside the window, **and** no standing parquet declares
+the column. `--older-than` takes the same units as `--last` (`s`, `m`, `h`,
+`d`, `w`) and defaults to 30 days. The server raises it to the retention
+window when that is longer, and the report prints all three numbers, so a
+`--older-than 7d` against a 90-day retention says plainly that 90 days is
+what ran.
+
+There is no `--yes`. The deletion is catalog metadata only, and a field
+reclaimed by mistake pins again from scratch the next time a sender writes
+it, so `--dry-run` is the whole safety story. A refusal prints the server's message and
+exits non-zero without deleting anything: a repin owns the data root or
+claimed it mid-run, another gc run is already going, or something under
+the data root could not be read (including the root itself, which is
+UNKNOWN rather than an empty corpus).
+
+The summary lines go to stdout for a table and to stderr under `-f json`
+or `-f csv`, so a piped run is one rectangular record set of candidate
+rows.
+
+**This is a repair, not a defense.** `gc-pins` cleans up slots that went
+dead by accident: a typo'd field name, a decommissioned sender, a
+retired label. It is not an answer to hostile catalog exhaustion. A
+sender that mints new field names faster than the window expires still
+fills the catalog, and what stops that remains what always stopped it:
+the `MAX_PINNED_FIELDS` cap, the half-of-free-slots ration per compaction
+batch, and alerting on the `trawl_catalog_pinned_fields` /
+`trawl_catalog_pin_capacity` fill gauges.
 
 Embedded mode works for the field listing only — a plain `DESCRIBE` over
 local parquet, no server or postgres needed:

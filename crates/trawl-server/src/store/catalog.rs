@@ -9,9 +9,10 @@
 //! dynamic field's canonical type here before the first parquet file
 //! carrying it is written, and conforms every batch to the pins, so
 //! `union_by_name` across any set of trawl-written files can never
-//! conflict. Pins are add-only on the ingest path (the one mutation is the
-//! operator-triggered repin cutover, `store::repin`), and because a pin
-//! slot is therefore permanent while its name is a client-chosen JSON key,
+//! conflict. Pins are add-only on the ingest path (the two mutations are
+//! both operator-triggered: the repin cutover, `store::repin`, and the pin
+//! purge, [`CatalogStore::delete_pins`]), and because a pin slot is
+//! therefore spent for good by ingest while its name is a client-chosen key,
 //! the catalog is bounded where a sender controls the axis: name length by
 //! [`trawl_core::schema::is_storable_field_name`], pin count by
 //! [`MAX_PINNED_FIELDS`], and per-field conflict evidence by
@@ -294,6 +295,210 @@ pub struct FieldSummaryRow {
     pub rows_nulled: i64,
 }
 
+/// A pin nothing has observed since a cutoff: one gc candidate on the
+/// observation axis ([`CatalogStore::pins_unobserved_since`]).
+///
+/// The metadata axis has not been consulted yet, so this is a pin to
+/// disprove with a parquet footer, never a decision to delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcPinRow {
+    /// Field name (a catalog key).
+    pub field: String,
+    /// Pinned `DuckDB` type spelling, carried so the report and the audit
+    /// event can say what was deleted without a second read.
+    pub duckdb_type: String,
+    /// When the pin was taken. Read for the same reason as the type: the
+    /// catalog row is gone by the time the audit event is written, so the
+    /// record has to carry the pin's age itself.
+    pub pinned_at: DateTime<Utc>,
+    /// The newest observation of the field across every service, `None`
+    /// when it was never observed at all.
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Distinct services that ever carried the field, over its whole
+    /// history rather than the window: how much attribution the purge is
+    /// about to discard.
+    pub services: i64,
+}
+
+/// The pin purge transaction's own bounds, its first two statements in this
+/// order.
+///
+/// Postgres enforces them, so the bound survives what a client-side timeout
+/// cannot: the caller must not cancel that future, because a cancelled
+/// commit is an unknown outcome the pin cache would have to guess at. Five
+/// seconds is the same budget the gc engine gives its read-only gated calls;
+/// the corpus gate is held across all of them and every compaction batch
+/// waits behind it.
+///
+/// `statement_timeout` comes first because it is the only one of the two
+/// that bounds `pg_advisory_xact_lock`: `lock_timeout` covers heavyweight
+/// table and row locks, and an advisory lock is neither, so a lock_timeout-only
+/// transaction would wait on a held catalog lock forever.
+const PURGE_STATEMENT_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout = '5s'";
+/// The row-lock half of the purge's bounds; see
+/// [`PURGE_STATEMENT_TIMEOUT_SQL`].
+const PURGE_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '5s'";
+
+/// How long [`CatalogStore::delete_pins`] waits for the whole pre-commit
+/// phase before it cancels it.
+///
+/// The per-statement bounds above are enforced by postgres and are the
+/// tighter ones, but they only fire when the backend notices. A connection
+/// that dies mid-statement leaves this task waiting on a socket while the
+/// corpus gate stays shut and compaction batches pile up behind it, and no
+/// database-side setting can end that wait. The bound must EXCEED the
+/// composed honest maximum: `statement_timeout` resets per statement, and
+/// prepare runs eight separately bounded waits (pool acquire ~10s, the
+/// advisory lock, the repin probe, the observation read, four deletes and
+/// the count at up to 5s each), so an honest worst case approaches fifty
+/// seconds. Sixty gives it margin; a dead connection still costs only one
+/// gc run, and the database-side bounds stay the precise ones.
+///
+/// Cancelling here is safe because nothing has committed. That is the
+/// entire difference from [`PURGE_COMMIT_BOUND`], which cannot cancel
+/// anything.
+pub const PURGE_PREPARE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long [`CatalogStore::delete_pins`] waits for its own commit before
+/// it stops waiting and reports the outcome as unknown.
+///
+/// The commit is the one step postgres does not bound: once durable commit
+/// processing has begun the backend stops honouring cancellation, so a
+/// commit stuck behind a stalled fsync can outlast every
+/// `statement_timeout` in the transaction. The corpus gate is held across
+/// it and every compaction batch queues behind that, which is why waiting
+/// forever is not an option.
+///
+/// Giving up here does NOT cancel the commit. The future is detached onto
+/// its own task and runs to completion, so postgres decides the outcome
+/// exactly once and the caller merely stops knowing what it was. Thirty
+/// seconds is six times the per-statement bound: long enough that an
+/// ordinary busy checkpoint never trips it, short enough that a wedged
+/// volume costs one gc run instead of an ingest outage.
+pub const PURGE_COMMIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Commit the pin purge, or stop waiting for it after
+/// [`PURGE_COMMIT_BOUND`] without cancelling it.
+///
+/// The distinction is the whole function. A [`tokio::time::timeout`] around
+/// the commit would DROP the future, and a dropped commit is one postgres
+/// may still perform: the caller would report "nothing happened" over a
+/// catalog that lost the rows, and every reader's pin cache would keep
+/// serving them. Here the future is boxed, so the elapsed arm can hand the
+/// same future to a task of its own instead. Postgres decides the outcome
+/// exactly once either way; only this caller stops watching.
+///
+/// A commit that COMPLETES with an error is unknown too, and returns the
+/// same [`StoreError::PurgeCommitUnknown`]. `COMMIT` fails in two very
+/// different ways that the client cannot tell apart: postgres refused the
+/// transaction (rolled back, nothing deleted), or the connection died while
+/// the answer was on its way back from a backend that had already made the
+/// commit durable. Calling the second one "the store errored" would send
+/// the caller to the reconcile read, and that read can be answered by a
+/// replica-lag-free but still racing session a microsecond before the
+/// commit record is visible. Unknown is the true statement, and the
+/// caller's unknown path (over-evict everything, read nothing) is right for
+/// both.
+///
+/// `purged` is the candidate count, carried purely so the detached task's
+/// log line says how much is in doubt.
+async fn commit_or_detach(
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    purged: usize,
+) -> Result<(), StoreError> {
+    let mut commit = Box::pin(tx.commit());
+    tokio::select! {
+        // The commit is polled first on every wake, so one that lands in
+        // the same tick as the timer is a commit, not a timeout.
+        biased;
+        result = &mut commit => match result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // The pg diagnostics stay here, on the backend target, and
+                // the caller gets the outcome word only.
+                tracing::warn!(
+                    target: "storage.backend",
+                    event_type = "catalog_pin_purge_commit_failed",
+                    fields = purged,
+                    error = %e,
+                    "a field-catalog pin purge's commit returned an error; postgres \
+                     may have applied it anyway, so whether those pins are gone is \
+                     unknown"
+                );
+                Err(StoreError::PurgeCommitUnknown)
+            }
+        },
+        () = tokio::time::sleep(PURGE_COMMIT_BOUND) => {
+            tokio::spawn(async move {
+                match commit.await {
+                    Ok(()) => tracing::info!(
+                        event_type = "catalog_pin_purge_commit_late",
+                        fields = purged,
+                        after_secs = PURGE_COMMIT_BOUND.as_secs(),
+                        "a field-catalog pin purge committed after its caller stopped \
+                         waiting; those pins are gone"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "storage.backend",
+                        event_type = "catalog_pin_purge_commit_late_failed",
+                        fields = purged,
+                        after_secs = PURGE_COMMIT_BOUND.as_secs(),
+                        error = %e,
+                        "a field-catalog pin purge's commit reported an error after its \
+                         caller stopped waiting; whether those pins are gone is unknown"
+                    ),
+                }
+            });
+            Err(StoreError::PurgeCommitUnknown)
+        }
+    }
+}
+
+/// One pin a [`CatalogStore::delete_pins`] transaction gave up, with the
+/// metadata that transaction saw.
+///
+/// Everything here is read inside the purge transaction rather than carried
+/// over from the caller's earlier candidate snapshot. Between that snapshot
+/// and the purge, a repin cutover can retype the row and compaction can
+/// observe the field again, so a report built from the snapshot would name a
+/// type and a `last_seen` that were true minutes ago. The audit record is
+/// the only account of a row nobody can read any more; it says what was
+/// actually deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgedPin {
+    /// Field name, as `field_types` held it.
+    pub field: String,
+    /// The pinned `DuckDB` type spelling at deletion.
+    pub duckdb_type: String,
+    /// Which service's batch set the pin, when the row recorded one.
+    pub pinned_from: Option<String>,
+    /// When the pin was taken.
+    pub pinned_at: DateTime<Utc>,
+    /// The newest `field_services` observation, read in the same
+    /// transaction just before the observations were deleted. `None` when
+    /// the field was never observed.
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Distinct observation rows discarded with the pin: how much
+    /// per-service attribution the purge threw away.
+    pub services: i64,
+}
+
+/// What one [`CatalogStore::delete_pins`] transaction committed.
+///
+/// All of it is read INSIDE the transaction, so the caller can finish the
+/// reclaim (evict from the pin cache, publish the gauges, audit) with
+/// nothing fallible left to do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PurgedPins {
+    /// The pins `field_types` actually gave up, as the DELETE returned
+    /// them, sorted by field: the only set an audit event may name.
+    pub deleted: Vec<PurgedPin>,
+    /// Pins remaining at commit, for the fill gauges. Meaningless when
+    /// nothing was deleted (the empty-input early return reads zero), so
+    /// callers publish it only after a real purge.
+    pub pinned_now: i64,
+}
+
 /// One field's pin row ([`CatalogStore::field_pin`]).
 #[derive(Debug, Clone)]
 pub struct FieldPinRow {
@@ -349,9 +554,10 @@ pub struct FieldConflictRow {
 
 /// Maximum number of fields the catalog will ever pin.
 ///
-/// Field names are client-chosen JSON keys, and a pin slot is permanent
-/// (a repin retypes a pin, nothing reclaims one, and retention never
-/// reconciles `field_services`). Without a count bound, a sender that
+/// Field names are client-chosen JSON keys, and the ingest path never
+/// gives a slot back (a repin retypes a pin, retention never reconciles
+/// `field_services`, and only an operator running gc deletes one).
+/// Without a count bound, a sender that
 /// embeds identifiers in its keys, `user_12345_status`, accidental or
 /// hostile, grows postgres, the in-process [`crate::catalog::FieldCatalog`]
 /// cache, and every snapshot taken of it without limit. Name length is
@@ -382,13 +588,19 @@ pub struct FieldConflictRow {
 ///   `catalog_pin_cap_reached` warning only fires once slots are already
 ///   gone.)
 ///
-/// What neither buys is a remedy: the repin engine retypes a wrong pin, but
-/// reclaiming a taken slot means proving no standing parquet carries the
-/// column, deliberately out of scope; a hand-run `DELETE FROM field_types`
-/// breaks the write-time conformance invariant for files already on disk
-/// and must not be recommended. A sustained sender can still fill the
-/// catalog; the ration slows it and the gauges make it visible while it
-/// happens.
+/// The remedy for a slot spent by accident is pin garbage collection
+/// ([`crate::catalog::gc`], `trawl schema gc-pins`): a pin nothing has
+/// observed for the dead window and no standing parquet footer declares is
+/// deleted through [`CatalogStore::delete_pins`]. Both proofs are required,
+/// so the write-time conformance invariant holds by construction — a
+/// hand-run `DELETE FROM field_types` proves neither and must still never
+/// be recommended.
+///
+/// That is a repair, not a defense. Gc reclaims what a typo or a
+/// decommissioned sender left behind; against a sender still filling the
+/// catalog it collects nothing, because every pin it takes is observed and
+/// carried. The defense remains the cap, the per-batch ration and the fill
+/// gauges.
 pub const MAX_PINNED_FIELDS: i64 = 10_000;
 
 /// Maximum `field_conflicts` rows kept per field — the newest survive.
@@ -1879,6 +2091,325 @@ impl CatalogStore {
         .map_err(StoreError::from)
     }
 
+    /// Every pin whose newest observation predates `cutoff`, plus every pin
+    /// never observed at all: the gc candidate set on the observation axis
+    /// (ADR-0009 catalog, `crate::catalog::gc`).
+    ///
+    /// Never-observed pins are included, which is a deliberate divergence
+    /// from [`Self::list_fields`], where such a pin is always shown rather
+    /// than windowed out. The listing errs toward showing; gc errs toward
+    /// reclaiming, and the caller's [`crate::catalog::gc::candidacy`] is
+    /// where the envelope is protected and the footer scan is where a
+    /// candidate is disproved. This method judges nothing: it reads.
+    ///
+    /// The newest observation is a per-pin LATERAL `ORDER BY last_seen DESC
+    /// LIMIT 1`, an index-only lookup of one row through migration 0004's
+    /// `field_services_field_last_seen_idx`. Deliberately not the
+    /// `GROUP BY field` aggregate [`Self::list_fields`] uses: that one reads
+    /// every observation row in the table, and the service axis is
+    /// client-chosen and never pruned, so a periodic operator command would
+    /// carry a cost set by how many service names have ever been invented.
+    ///
+    /// The service count is a scalar subquery over the surviving rows only,
+    /// which is what the MATERIALIZED CTE buys: it fences the count so it
+    /// runs per candidate (bounded by [`MAX_PINNED_FIELDS`]) rather than per
+    /// pin. It counts the whole history, not the window — a candidate has no
+    /// observation inside the window by construction, so a windowed count
+    /// would be zero for every row.
+    pub async fn pins_unobserved_since(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<GcPinRow>, StoreError> {
+        let rows = sqlx::query(
+            "WITH candidate AS MATERIALIZED (
+                 SELECT t.field, t.duckdb_type, t.pinned_at, n.last_seen
+                 FROM field_types t
+                 LEFT JOIN LATERAL (
+                     SELECT fs.last_seen
+                     FROM field_services fs
+                     WHERE fs.field = t.field
+                     ORDER BY fs.last_seen DESC
+                     LIMIT 1
+                 ) n ON TRUE
+                 WHERE n.last_seen IS NULL OR n.last_seen < $1
+             )
+             SELECT c.field, c.duckdb_type, c.pinned_at, c.last_seen,
+                    (SELECT count(*) FROM field_services fs
+                     WHERE fs.field = c.field)::bigint AS services
+             FROM candidate c
+             ORDER BY c.field",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter()
+            .map(|row| {
+                Ok(GcPinRow {
+                    field: row.try_get("field")?,
+                    duckdb_type: row.try_get("duckdb_type")?,
+                    pinned_at: row.try_get("pinned_at")?,
+                    last_seen: row.try_get("last_seen")?,
+                    services: row.try_get("services")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Delete `fields` from the catalog entirely, in one transaction:
+    /// aggregates, conflict evidence, observations, then the pins
+    /// themselves. Returns the rows deleted from `field_types`.
+    ///
+    /// One transaction because a partial purge is a catalog that lies. Left
+    /// half-done, a field would keep observation rows and conflict evidence
+    /// with no pin to explain them, and the analyzer would go on indicting a
+    /// pin that does not exist. The order is child-to-parent so a foreign
+    /// key added later cannot make the delete order matter.
+    ///
+    /// A [`trawl_core::schema::is_contract_typed`] name is an error, not a
+    /// skipped element. The caller filters those out before it ever gets
+    /// here, so one arriving means the candidate set was built wrong, and
+    /// silently deleting the rest would hide that while leaving the operator
+    /// a report that claims a field they still have. Nothing is deleted:
+    /// the check runs before the transaction opens.
+    ///
+    /// `repin_jobs` is READ and never written. A repin's history says what
+    /// an operator did to the corpus, which stays true after the field is
+    /// gone — but a `running` row means a job that will later flip a pin,
+    /// so the transaction takes
+    /// [`super::CATALOG_LIFECYCLE_LOCK_KEY`], re-checks for one, and
+    /// refuses with [`StoreError::RepinAlreadyRunning`] rather than delete
+    /// the row that job is about to update.
+    ///
+    /// Returns [`PurgedPins`]: the rows `field_types` actually gave up, each
+    /// with the metadata this transaction read, and the fill count. All of
+    /// it comes out of the ONE transaction on purpose. The caller's next act
+    /// is a cache eviction that must not be skipped, and a post-commit
+    /// SELECT for the gauge is one more thing that can fail between the
+    /// commit and that eviction — which would leave the pin gone from
+    /// postgres and present in every reader's cache. Nothing fallible
+    /// happens after the commit here; the caller publishes the gauges
+    /// (infallibly, from the returned count) once the eviction is done.
+    ///
+    /// The purge is bounded in two phases, because the two halves fail
+    /// differently.
+    ///
+    /// Everything up to the commit runs in [`Self::prepare_purge`], under
+    /// postgres' own [`PURGE_STATEMENT_TIMEOUT_SQL`] AND a client-side
+    /// [`PURGE_PREPARE_BOUND`]. The database-side bound is the precise one
+    /// (`SET LOCAL statement_timeout` covers every statement including the
+    /// advisory-lock wait, which `lock_timeout` does not — it applies to
+    /// heavyweight table and row locks, not to `pg_advisory_xact_lock` — so
+    /// it is set first, and `lock_timeout` then bounds the row locks the
+    /// deletes take). It is also the one a half-open connection defeats:
+    /// the backend is idle and healthy, nothing trips its timeout, and this
+    /// task waits on a socket that will never answer while the corpus gate,
+    /// and every compaction batch behind it, waits on this task. So the
+    /// prepare phase is wrapped in a [`tokio::time::timeout`], which is
+    /// safe here for the one reason it is not safe around the commit:
+    /// dropping pre-commit work can only roll it back. On elapse the method
+    /// returns [`StoreError::PurgePrepareTimeout`], nothing was committed,
+    /// and the caller may settle its cache by re-reading the catalog.
+    ///
+    /// Only a prepared transaction ready to commit reaches
+    /// [`commit_or_detach`], and the commit is bounded differently because
+    /// postgres cannot bound it: once durable commit processing starts the
+    /// backend ignores cancellation, so a stalled fsync would hold the
+    /// corpus gate for as long as the volume takes. After
+    /// [`PURGE_COMMIT_BOUND`] this method stops waiting and returns
+    /// [`StoreError::PurgeCommitUnknown`], having first moved the commit
+    /// future onto a task of its own. The commit is never cancelled, only
+    /// unobserved: postgres still decides it exactly once, the detached
+    /// task logs which way it went, and the caller must treat both the
+    /// catalog rows and its own cache as unknown. A commit that completes
+    /// with an ERROR returns the same thing, for the same reason: the error
+    /// may have arrived from a backend that already made the commit
+    /// durable.
+    pub async fn delete_pins(&self, fields: &[String]) -> Result<PurgedPins, StoreError> {
+        if fields.is_empty() {
+            return Ok(PurgedPins::default());
+        }
+        if let Some(contract) = fields
+            .iter()
+            .find(|f| trawl_core::schema::is_contract_typed(f))
+        {
+            return Err(StoreError::Validation(format!(
+                "{contract} is one of trawl's contract fields — its pin is \
+                 declared, not reclaimable"
+            )));
+        }
+
+        // Phase one, cancellable: cancelling it can only roll back.
+        let (tx, deleted, pinned_now) =
+            match tokio::time::timeout(PURGE_PREPARE_BOUND, self.prepare_purge(fields)).await {
+                Ok(prepared) => prepared?,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        target: "storage.backend",
+                        event_type = "catalog_pin_purge_prepare_timeout",
+                        fields = fields.len(),
+                        after_secs = PURGE_PREPARE_BOUND.as_secs(),
+                        "a field-catalog pin purge gave up on the database before \
+                         committing; the transaction was dropped and rolled back"
+                    );
+                    return Err(StoreError::PurgePrepareTimeout);
+                }
+            };
+        // Phase two, never cancellable: detached instead.
+        commit_or_detach(tx, fields.len()).await?;
+
+        Ok(PurgedPins {
+            deleted,
+            pinned_now,
+        })
+    }
+
+    /// Everything the purge does before the commit: open the transaction,
+    /// bound it, take the catalog lifecycle lock, refuse a running repin,
+    /// read the audit metadata, delete, and count what is left.
+    ///
+    /// Split out of [`Self::delete_pins`] so the caller can put a
+    /// wall-clock bound on exactly this half. Dropping the returned future
+    /// at any point drops the transaction, which rolls back: no caller can
+    /// be told "nothing happened" over a catalog that lost rows. The
+    /// connection sqlx hands back may be poisoned by the cancellation, and
+    /// sqlx discards such a connection rather than returning it to the pool.
+    ///
+    /// Returns the live transaction, ready to commit and nothing else.
+    async fn prepare_purge(
+        &self,
+        fields: &[String],
+    ) -> Result<
+        (
+            sqlx::Transaction<'static, sqlx::Postgres>,
+            Vec<PurgedPin>,
+            i64,
+        ),
+        StoreError,
+    > {
+        let mut tx = self.pool.begin().await?;
+        // Bound the pre-commit work database-side, before anything that can
+        // wait. `statement_timeout` first, because the advisory lock below
+        // is a statement and no other setting bounds it.
+        for sql in [PURGE_STATEMENT_TIMEOUT_SQL, PURGE_LOCK_TIMEOUT_SQL] {
+            sqlx::query(sql).execute(&mut *tx).await?;
+        }
+        // The lock, then the re-check, then the delete: this transaction is
+        // the authority on "no repin owns a pin I am about to reclaim", and
+        // the caller's earlier checks are courtesy fast-paths. A repin claim
+        // takes the same lock (`RepinStore::claim`), so a claim that lands
+        // after gc's last look is either still waiting here or already
+        // visible to the SELECT below.
+        super::lock_catalog_lifecycle(&mut tx).await?;
+        let running: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM repin_jobs WHERE status = 'running' LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?;
+        if running.is_some() {
+            // Dropping the transaction rolls it back; nothing was deleted.
+            return Err(StoreError::RepinAlreadyRunning);
+        }
+        // The observation half of the audit record, read while the rows are
+        // still there. One statement for both numbers: the newest
+        // observation and how many the purge is about to discard.
+        let observed: HashMap<String, (Option<DateTime<Utc>>, i64)> = sqlx::query(
+            "SELECT field, max(last_seen) AS last_seen, count(*)::bigint AS services
+             FROM field_services WHERE field = ANY($1) GROUP BY field",
+        )
+        .bind(fields)
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get("field")?,
+                (row.try_get("last_seen")?, row.try_get("services")?),
+            ))
+        })
+        .collect::<Result<_, sqlx::Error>>()?;
+
+        // `field_degraded_ack` is listed rather than left to its FK
+        // cascade (#111). The cascade would fire here anyway, but every
+        // other table the purge empties is named in this list, and a
+        // reader checking what a reclaimed slot leaves behind should not
+        // have to open a migration to find the one exception. It is also
+        // the table whose survival would be worst: an ack is an operator's
+        // statement about a pin, and re-pinning the same name later must
+        // not resurrect a judgement made about the pin that is gone.
+        for sql in [
+            "DELETE FROM field_degraded_ack WHERE field = ANY($1)",
+            "DELETE FROM field_conflict_stats WHERE field = ANY($1)",
+            "DELETE FROM field_conflicts WHERE field = ANY($1)",
+            "DELETE FROM field_services WHERE field = ANY($1)",
+        ] {
+            sqlx::query(sql).bind(fields).execute(&mut *tx).await?;
+        }
+        // RETURNING, not `rows_affected`: the caller audits one event per
+        // reclaimed pin, and a name it merely ASKED for is not a name it
+        // deleted. A candidate can lose its row to a concurrent write
+        // between the scan and this statement, and a repin that finished in
+        // the same window leaves a type the caller's snapshot no longer
+        // knows — so the type comes back from here too.
+        let deleted_rows = sqlx::query(
+            "DELETE FROM field_types WHERE field = ANY($1)
+             RETURNING field, duckdb_type, pinned_from, pinned_at",
+        )
+        .bind(fields)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut deleted = deleted_rows
+            .iter()
+            .map(|row| {
+                let field: String = row.try_get("field")?;
+                let (last_seen, services) = observed.get(&field).copied().unwrap_or((None, 0));
+                Ok(PurgedPin {
+                    field,
+                    duckdb_type: row.try_get("duckdb_type")?,
+                    pinned_from: row.try_get("pinned_from")?,
+                    pinned_at: row.try_get("pinned_at")?,
+                    last_seen,
+                    services,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        // DELETE returns rows in no defined order; the report is field-sorted.
+        deleted.sort_by(|a, b| a.field.cmp(&b.field));
+        let pinned_now: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
+            .fetch_one(&mut *tx)
+            .await?;
+
+        Ok((tx, deleted, pinned_now))
+    }
+
+    /// Which of `fields` `field_types` still holds.
+    ///
+    /// The reconcile read behind a purge that failed BEFORE its commit was
+    /// sent: those errors prove a rollback, and this read settles the pin
+    /// cache against the surviving rows. A commit-phase failure never
+    /// reaches this read (the outcome is unknown and the engine over-evicts
+    /// instead, because this read could race a still-landing commit).
+    pub async fn pins_present(&self, fields: &[String]) -> Result<BTreeSet<String>, StoreError> {
+        if fields.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let present: Vec<String> =
+            sqlx::query_scalar("SELECT field FROM field_types WHERE field = ANY($1)")
+                .bind(fields)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(present.into_iter().collect())
+    }
+
+    /// Publish the pin fill gauges from a count the caller already holds.
+    ///
+    /// Infallible and cheap, so it can run at a point where a failure would
+    /// be unrecoverable — after [`Self::delete_pins`] has committed and the
+    /// in-process cache has dropped the pins.
+    pub fn publish_fill_gauges(&self, pinned: i64) {
+        set_fill_gauges(pinned, self.pin_cap);
+    }
+
     /// The catalog's stable identity (mirrored into the `data/CATALOG`
     /// marker so `DATABASE_URL` repoints and data-root restores are
     /// self-detecting).
@@ -1960,6 +2491,181 @@ mod tests {
             let decoded = ServiceCursor::decode(&cursor.encode()).expect("decodes");
             assert_eq!(decoded, cursor, "{service}");
         }
+    }
+
+    /// The purge bounds itself inside postgres, and the order of the two
+    /// settings is load-bearing: `statement_timeout` is the only one that
+    /// bounds the advisory-lock wait, so it must be in force before
+    /// `pg_advisory_xact_lock` runs.
+    ///
+    /// Source-shape. `SHOW statement_timeout` is only observable from
+    /// inside the transaction, which nothing outside this method can enter,
+    /// and the live behaviour (a purge that gives up instead of hanging on
+    /// a held row lock) is asserted in `tests/store_pg.rs`.
+    #[test]
+    fn the_purge_sets_its_bounds_before_it_takes_the_lock() {
+        let src = include_str!("catalog.rs");
+        let start = src
+            .find("    async fn prepare_purge(")
+            .expect("the pre-commit phase is one method");
+        let body = &src[start..];
+        let end = body.find("\n    }\n").expect("the method closes");
+        let body = &body[..end];
+
+        let bounds = body
+            .find("for sql in [PURGE_STATEMENT_TIMEOUT_SQL, PURGE_LOCK_TIMEOUT_SQL]")
+            .expect("the transaction sets both bounds, statement_timeout first");
+        let begin = body
+            .find("self.pool.begin()")
+            .expect("the transaction opens");
+        let lock = body
+            .find("lock_catalog_lifecycle")
+            .expect("the transaction takes the catalog lifecycle lock");
+        assert!(
+            begin < bounds && bounds < lock,
+            "the bounds belong between BEGIN and the advisory lock"
+        );
+        assert!(
+            PURGE_STATEMENT_TIMEOUT_SQL.starts_with("SET LOCAL statement_timeout")
+                && PURGE_LOCK_TIMEOUT_SQL.starts_with("SET LOCAL lock_timeout"),
+            "both bounds are transaction-local"
+        );
+    }
+
+    /// The purge's commit is bounded by a `select!`, and the arm that fires
+    /// hands the future to `tokio::spawn` instead of dropping it.
+    ///
+    /// Source-shape, and it has to be: making a live postgres take longer
+    /// than [`PURGE_COMMIT_BOUND`] to commit means stalling its fsync, which
+    /// no fixture here can do. What the shape guards is the difference
+    /// between "stopped waiting" and "cancelled". A `tokio::time::timeout`
+    /// wrapped around the commit would look almost identical and would drop
+    /// the future, leaving postgres free to commit rows nobody was told
+    /// about. `biased` belongs to the same decision: a commit that lands in
+    /// the same wake as the timer is a commit, not a timeout.
+    #[test]
+    fn the_purge_detaches_its_commit_instead_of_cancelling_it() {
+        let src = include_str!("catalog.rs");
+        let start = src
+            .find("async fn commit_or_detach(")
+            .expect("the commit has one owner");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("the function closes");
+        let body = &body[..end];
+
+        assert!(
+            src.contains("commit_or_detach(tx, fields.len()).await?;"),
+            "delete_pins commits through that owner"
+        );
+        let select = body
+            .find("tokio::select! {")
+            .expect("the commit is raced against a timer, not wrapped in a timeout");
+        assert!(
+            !body.contains("tokio::time::timeout"),
+            "a timeout around the commit would CANCEL it; the commit must be detached"
+        );
+        let biased = body[select..]
+            .find("biased;")
+            .expect("the select polls the commit first");
+        let timer = body[select..]
+            .find("tokio::time::sleep(PURGE_COMMIT_BOUND)")
+            .expect("the other arm is the bound");
+        assert!(biased < timer, "`biased` must precede the arms it orders");
+
+        let elapsed = &body[select + timer..];
+        let spawn = elapsed
+            .find("tokio::spawn(")
+            .expect("the elapsed arm detaches the still-boxed commit future");
+        let returns = elapsed
+            .find("Err(StoreError::PurgeCommitUnknown)")
+            .expect("the elapsed arm reports an unknown outcome");
+        assert!(
+            spawn < returns,
+            "the commit must be detached before the method walks away from it"
+        );
+        for logged in ["tracing::info!", "tracing::warn!"] {
+            assert!(
+                elapsed[spawn..returns].contains(logged),
+                "the detached task logs both outcomes; missing {logged}"
+            );
+        }
+
+        // The completion arm, before the timer arm: an Err there is
+        // UNKNOWN, never a store error the caller would try to settle by
+        // reading `field_types`. A commit can fail with the write already
+        // durable, so "it errored" does not mean "it rolled back".
+        let completion = &body[select..select + timer];
+        let failed = completion
+            .find("Err(e) =>")
+            .expect("the completion arm distinguishes a failed commit");
+        assert!(
+            completion[failed..].contains("Err(StoreError::PurgeCommitUnknown)"),
+            "a commit that completes with an error is an unknown outcome"
+        );
+        assert!(
+            !completion.contains("Ok(result?)") && !completion.contains("StoreError::Unavailable"),
+            "the `?` shorthand would map a failed commit onto an ordinary \
+             store error and send the caller to the reconcile read"
+        );
+        assert!(
+            completion[failed..].contains("tracing::warn!"),
+            "the pg diagnostics stay in the log; the caller gets the outcome word"
+        );
+    }
+
+    /// The purge is two phases with two different bounds, and the
+    /// cancelling one covers only the half where cancelling is safe.
+    ///
+    /// Source-shape, because the failure it guards against is a wall-clock
+    /// stall no fixture can produce: a connection that stops answering
+    /// while postgres itself is idle. What the shape asserts is the split.
+    /// The pre-commit work must sit inside `tokio::time::timeout` (dropping
+    /// it rolls back), the commit must sit outside it, and no timeout may
+    /// wrap both — one that did would drop a commit postgres goes on to
+    /// apply.
+    #[test]
+    fn the_purge_bounds_its_pre_commit_phase_and_only_that() {
+        let src = include_str!("catalog.rs");
+        let start = src
+            .find("    pub async fn delete_pins(")
+            .expect("delete_pins is one method");
+        let body = &src[start..];
+        let end = body.find("\n    }\n").expect("the method closes");
+        let body = &body[..end];
+
+        let bounded = body
+            .find("tokio::time::timeout(PURGE_PREPARE_BOUND, self.prepare_purge(fields))")
+            .expect("the pre-commit phase runs under the client-side bound");
+        let commit = body
+            .find("commit_or_detach(tx, fields.len()).await?;")
+            .expect("the commit runs through its own owner");
+        assert!(
+            bounded < commit,
+            "the bound belongs to the prepare phase, which must finish before \
+             the commit begins"
+        );
+        assert_eq!(
+            body.matches("tokio::time::timeout").count(),
+            1,
+            "exactly one cancelling bound, and it stops at the commit"
+        );
+        assert!(
+            body.contains("return Err(StoreError::PurgePrepareTimeout);"),
+            "an elapsed prepare is an ordinary bounded failure: nothing committed"
+        );
+
+        // The transaction is built and handed over whole. A prepare that
+        // committed anything itself would put a second, unbounded commit
+        // back in the cancellable half.
+        let prepare = src
+            .find("    async fn prepare_purge(")
+            .expect("the pre-commit phase is one method");
+        let prepare = &src[prepare..];
+        let prepare = &prepare[..prepare.find("\n    }\n").expect("the method closes")];
+        assert!(
+            !prepare.contains(".commit()") && !prepare.contains("commit_or_detach"),
+            "the prepare phase must return the transaction, never commit it"
+        );
     }
 
     /// A malformed cursor is a client error, never a silently dropped

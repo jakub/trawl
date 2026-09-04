@@ -1940,6 +1940,11 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
                 last_seen: iso8601(last_seen),
                 service,
             }),
+        // Persisted facts only (#109). A `running` row carrying these is a
+        // cancel in flight; the status route computes no "cancelling"
+        // pseudo-status over them.
+        cancel_requested_at: job.cancel_requested_at.map(iso8601),
+        cancelled_by: job.cancelled_by,
         // Both pairs ride the row unchanged: what the request stated, and
         // what the plan resolved. A NULL column stays absent on the wire —
         // "the request stated none" and "this row predates ceilings" are
@@ -1996,14 +2001,83 @@ pub async fn schema_repin(
         )
         .await?;
     let (status, job) = match outcome {
-        crate::repin::StartOutcome::DryRun(job) => (StatusCode::OK, job),
         crate::repin::StartOutcome::Started(job) => (StatusCode::ACCEPTED, job),
         crate::repin::StartOutcome::Refused(job) => (StatusCode::CONFLICT, job),
+        // A job an operator cancelled while this request's own ladder was
+        // still running it (#109) answers 200 with the terminal row, the
+        // same as a dry-run report: never a fourth status code, because 409
+        // already means refused-needs-force to a body-sniffing client, and
+        // `job.status` says `cancelled` plainly.
+        crate::repin::StartOutcome::DryRun(job) | crate::repin::StartOutcome::Cancelled(job) => {
+            (StatusCode::OK, job)
+        }
     };
     Ok((
         status,
         Json(trawl_api::RepinResponse {
             job: repin_job_to_wire(job),
+        }),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/schema/repin/cancel` — ask the running repin to stop
+/// (#109). `SchemaWrite`-gated like the trigger, and 503 on a query-only
+/// node for the same reason: a node that owns nothing under the data root
+/// runs no job to cancel.
+///
+/// No request body: there is at most one running job, and naming it would
+/// invite an operator to cancel a job that already ended and a newer one
+/// took the slot.
+///
+/// The verdict comes from the registry's own lock through
+/// [`crate::repin::CancelVerdict::wire`] — 202 accepted, 409 past the point
+/// of no return, 404 nothing running — and this handler renders it without
+/// deciding anything. The job row rides along for the two verdicts that
+/// name a job, so an operator sees what was cancelled without a second
+/// round trip; a store that cannot serve that row costs the body, never the
+/// verdict, because the cancel has already taken effect in process.
+pub async fn schema_repin_cancel(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<axum::response::Response, ServerError> {
+    if !verified.has_permission(Permission::SchemaWrite) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+    let Some(engine) = state.repin.as_ref() else {
+        return Err(ServerError::ServiceUnavailable(
+            "repin requires an ingest-enabled node (this node does not own \
+             the data root)"
+                .into(),
+        ));
+    };
+
+    // Both halves of the caller's identity go to the engine: the display
+    // name the job row records, and the key prefix the audit events name
+    // beside it. A name is operator-chosen and can be reused or changed;
+    // the prefix is what says which credential actually asked.
+    let actor = crate::repin::CancelActor::new(verified.name.clone(), verified.prefix.clone());
+    let verdict = engine.cancel(&actor);
+    let (status, outcome, detail) = verdict.wire();
+    let mut job = None;
+    if let Some(job_id) = verdict.job_id() {
+        match state.storage.repin.get(job_id).await {
+            Ok(row) => job = row.map(repin_job_to_wire),
+            Err(e) => tracing::error!(
+                event_type = "repin_store_error",
+                job_id,
+                error_class = e.class(),
+                "failed to read the repin job row for a cancel receipt; the \
+                 verdict is unaffected"
+            ),
+        }
+    }
+    Ok((
+        status,
+        Json(trawl_api::RepinCancelResponse {
+            outcome,
+            detail: detail.to_owned(),
+            job,
         }),
     )
         .into_response())
@@ -2024,6 +2098,50 @@ pub async fn schema_repin_status(
     Ok(Json(trawl_api::RepinStatusResponse {
         job: job.map(repin_job_to_wire),
     }))
+}
+
+/// `POST /api/v1/schema/gc-pins` reclaims pin slots held by fields
+/// nothing writes any more (#110). `SchemaWrite`-gated, like the repin
+/// trigger: both mutate the catalog, and neither is a read.
+///
+/// Dry and real runs both answer 200 with the same report; `dry_run` and
+/// `deleted` tell them apart. A refusal is a 409 through the ordinary
+/// error envelope: a repin owns the data root, or the corpus could not be
+/// read well enough to prove any pin dead. A query-only node answers 503,
+/// because proving a pin dead means reading parquet footers and it owns
+/// none.
+///
+/// The engine's `run` spawns its own task internally (a disconnect must
+/// not split the postgres commit from the cache eviction), so this handler
+/// awaits it directly rather than spawning a second time.
+pub async fn schema_gc_pins(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Json(req): Json<trawl_api::GcPinsRequest>,
+) -> Result<Json<trawl_api::GcPinsResponse>, ServerError> {
+    if !verified.has_permission(Permission::SchemaWrite) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+    let Some(engine) = state.gc.as_ref() else {
+        return Err(ServerError::ServiceUnavailable(
+            "pin gc requires an ingest-enabled node (this node does not own \
+             the data root)"
+                .into(),
+        ));
+    };
+
+    let actor = crate::catalog::gc::GcActor {
+        name: Some(verified.name.clone()),
+        key_prefix: Some(verified.prefix.clone()),
+    };
+    let report = engine
+        .run(
+            req.older_than_secs.map(std::time::Duration::from_secs),
+            req.dry_run,
+            actor,
+        )
+        .await?;
+    Ok(Json(report))
 }
 
 // -- schedule handlers -------------------------------------------------------

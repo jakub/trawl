@@ -369,6 +369,124 @@ The running job if any, else the newest job of any status —
 `schema_read`-gated (read-only surfaces show repin state without offering
 the trigger) and served on query-only nodes too.
 
+The job row also carries `cancel_requested_at` and `cancelled_by` when
+someone asked the job to stop: a `running` row carrying them is a cancel in
+flight, and a `failed` row carrying them is a process that died between the
+request and any boundary observing it.
+
+```text
+POST /api/v1/schema/repin/cancel
+```
+
+Ask the running repin to stop. `schema_write`-gated, no request body, and
+a query-only node answers 503 like the trigger route. The HTTP status
+carries the verdict and the body repeats it as `outcome`, with `detail` in
+words and the job row under `job` when there is one:
+
+- **202** `cancelling`: the request is accepted. The job stops at the next
+  file boundary of its scan or build loop, sweeps any staging it had built,
+  and ends `cancelled` with the live corpus untouched.
+- **409** `past_point_of_no_return`: the job latched its cutover before the
+  request arrived. The corpus is being swapped and there is nothing left to
+  unwind, so the request is refused rather than queued, and the job
+  completes normally.
+- **404** `no_job_running`: no repin job is running on this node, or the one
+  that was running has already chosen its outcome and there is nothing left
+  to stop. The two read the same to a caller: nothing was cancelled, and the
+  status route says how the job actually ended.
+
+The latency contract is a boundary, not an instant. The scan and build
+loops check before and after each file, but the whole-corpus snapshot walk
+and the filesystem preflight are not checkpointed, so a job inside one of
+those stops only when it leaves it. Early-phase cancels can therefore take
+longer than one file.
+
+A 202 accepts the request; it does not promise a terminal `cancelled`
+status. The job's own completion can win the race, and a process that dies
+between the request and any boundary acting on it lands `failed` with
+`cancel_requested_at` and `cancelled_by` preserved (recovery never infers
+`cancelled` from a request nothing acted on). Those two fields are written
+durably as the request is accepted, but a process death in the same instant
+as the request can still lose them, so treat the 202 as an accepted request
+rather than a receipt for a durable one. Restarting trawld is the
+stronger cancel: a killed job leaves the live corpus untouched and boot
+recovery sweeps its staging. Read the outcome from the status route.
+
+```text
+POST /api/v1/schema/gc-pins
+```
+
+Reclaim pin slots held by fields nothing writes any more.
+`schema_write`-gated, like the repin trigger; a query-only node answers
+503, because proving a pin dead means reading parquet footers and it owns
+none of them.
+
+```json
+{ "dry_run": true, "older_than_secs": 2592000 }
+```
+
+A pin is reclaimed only when **both** axes agree it is dead: no
+`field_services` observation at or after the cutoff, **and** no standing
+parquet under any live env directory declares the column. One axis alone
+is not enough. Observations can lapse while a file still carries the
+column, and a file can carry a column no live sender writes. The footer
+scan runs under the compaction corpus gate, so nothing publishes between
+the proof and the deletion.
+
+`older_than_secs` defaults to 30 days and is accepted literally, `0`
+included. The server then raises it to the retention window when that is
+longer: a pin cannot be called dead over a span shorter than the corpus
+trawl still keeps. The report names all three numbers
+(`requested_older_than_secs`, `retention_floor_secs`,
+`effective_older_than_secs`), and no client recomputes the window.
+
+Three outcomes:
+
+- **200**: the report, identical in shape for a dry run and a real one.
+  `dry_run` and `deleted` are what tell them apart: a dry run mutates
+  nothing at all (no delete, no cache eviction, no metric) and returns the
+  candidates it would have reclaimed.
+- **409**: refused, nothing mutated. Four shapes. A repin owns the data
+  root (a `data/REPIN` marker, a staging or aside root, or a running job
+  row: every footer under a corpus mid-rearrangement is provisional), or a
+  repin claimed one mid-purge, which the purge transaction itself refuses.
+  Another gc run is already in progress; a second one is turned away at
+  once rather than queued behind a scan that holds the corpus gate. The
+  corpus could not be read well enough to prove anything dead: a file that
+  will not open, a `.parquet` that is not a regular file, an unparseable
+  footer, a symlink under an env directory, a file that vanished mid-scan,
+  or a data root that cannot be listed at all (an unmounted volume is
+  UNKNOWN, never an empty corpus). Each is a file whose columns are
+  unknown, and the whole run fails closed rather than deleting on partial
+  evidence; the message names the count and up to three paths. Or the
+  catalog store stopped answering one of gc's reads while the corpus gate
+  was held, which is bounded at five seconds and reported as UNKNOWN.
+- **503**: a query-only node, or the store is down. The purge is bounded
+  in two phases and they answer differently. Everything before the commit
+  is bounded twice — postgres' own five-second statement bound inside the
+  transaction, and a ten-second client bound for the case postgres cannot
+  see, a connection that stops answering while the backend sits idle.
+  Cancelling there can only roll back, so nothing was reclaimed; gc
+  re-reads the catalog for its candidates and drops from the pin cache
+  every one postgres no longer holds, before it releases the corpus gate.
+  The commit itself cannot be cancelled at all: postgres stops honouring
+  cancellation once a commit is durable, so a commit that has not
+  confirmed within thirty seconds is DETACHED rather than abandoned, and a
+  commit that comes back with an error may have been applied by a backend
+  that already made it durable. Both are UNKNOWN, and both drop every
+  candidate from the pin cache without re-reading (a read would race the
+  commit). Re-run with `dry_run` to see which way it went.
+
+The deletion is metadata only: catalog rows and the in-process pin cache,
+in one transaction, `repin_jobs` history untouched. Being wrong is cheap.
+A reclaimed field that a sender writes again simply pins again from
+scratch. Envelope and sender-asserted contract fields (`_time`, `service`
+and the rest) are never candidates. One staleness residual: the unscoped
+`/api/v1/schema` column listing is TTL-cached, so a reclaimed field can
+still appear there for up to `schema_cache_ttl_secs` after the purge —
+the same window that endpoint already carries for newly pinned fields. A
+`?service=` request is served fresh.
+
 ```
 GET /api/v1/schema/services
 ```

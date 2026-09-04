@@ -1041,6 +1041,19 @@ pub struct RepinJobResponse {
     /// exactly when `requires_force` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_force_reason: Option<String>,
+    /// When an operator asked for this job to stop (ISO 8601 UTC), if any.
+    /// Written with `cancelled_by` and never overwritten, so it names the
+    /// first asker. A `running` row carrying it is a cancel in flight: the
+    /// job is walking to its next file boundary. A `failed` row carrying it
+    /// is the crash state — the process died between the request and any
+    /// boundary observing it, and recovery may not infer `cancelled` from a
+    /// request nothing acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_requested_at: Option<String>,
+    /// Display name of the key that asked. Same identity source as
+    /// `requested_by`, so the row is coherent about who did what.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_by: Option<String>,
     /// The loss ceiling the request stated, echoed back. Absent when the
     /// request stated none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1091,6 +1104,106 @@ pub struct RepinResponse {
 pub struct RepinStatusResponse {
     /// The job, or `None` when no repin has ever run.
     pub job: Option<RepinJobResponse>,
+}
+
+/// What `POST /api/v1/schema/repin/cancel` answered (#109).
+///
+/// The three variants are exclusive because the server decides them under
+/// one lock: a job is either still stoppable, past the point where there is
+/// anything left to unwind, or absent. The HTTP status carries the same
+/// verdict (202 / 409 / 404), and a client that reads both must find them
+/// agreeing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepinCancelOutcome {
+    /// The request is accepted. The job stops at its next file boundary.
+    Cancelling,
+    /// The job latched its point of no return first: the corpus is being
+    /// swapped and the job will complete. Not queued for later.
+    PastPointOfNoReturn,
+    /// No repin job is running on this node.
+    NoJobRunning,
+}
+
+/// Response body for `POST /api/v1/schema/repin/cancel`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepinCancelResponse {
+    /// The verdict, mirroring the HTTP status.
+    pub outcome: RepinCancelOutcome,
+    /// The verdict in words. The accepted one quotes the latency contract:
+    /// what "cancelling" promises, and what it does not.
+    pub detail: String,
+    /// The job the verdict is about, when there is one. Absent for
+    /// `no_job_running`, and absent when the store could not be read — a
+    /// row this handler failed to fetch never changes the verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<RepinJobResponse>,
+}
+
+/// Request body for `POST /api/v1/schema/gc-pins`.
+///
+/// Reclaims pin slots held by fields nothing writes any more. A pin is a
+/// scarce install-wide resource (`MAX_PINNED_FIELDS`), and a typo'd or
+/// retired sender field otherwise holds its slot forever.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GcPinsRequest {
+    /// Scan and report only — no mutation.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// How long a field must have gone unobserved to be dead. Defaults
+    /// server-side to 30 days; `0` is accepted literally (the standing
+    /// parquet footers are the second, independent proof). The server
+    /// raises it to the retention window when that is longer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub older_than_secs: Option<u64>,
+}
+
+/// Response from `POST /api/v1/schema/gc-pins`, the same shape for a dry
+/// run and a real one — `dry_run` and `deleted` are what tell them apart.
+///
+/// Every number the operator reads is the server's own: the effective
+/// window is decided once, in `catalog::gc`, and reported here. No client
+/// recomputes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcPinsResponse {
+    /// Whether this run stopped after the scan.
+    pub dry_run: bool,
+    /// The one instant the run is anchored to (RFC 3339 UTC): cutoff,
+    /// audit events and this report all read it.
+    pub decided_at: String,
+    /// The requested window in seconds, after the server default applied.
+    pub requested_older_than_secs: u64,
+    /// The retention window in seconds, when age retention is enabled.
+    /// A pin cannot be called dead over a span shorter than the corpus
+    /// trawl still keeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_floor_secs: Option<u64>,
+    /// The window actually applied: the larger of the two above.
+    pub effective_older_than_secs: u64,
+    /// Pins that passed the observation axis, before the footer scan.
+    pub pins_examined: u64,
+    /// Parquet files whose schema the run read.
+    pub files_scanned: u64,
+    /// Would-delete on a dry run, deleted on a real one. Field-sorted.
+    pub candidates: Vec<GcPinCandidate>,
+    /// Rows actually deleted; always 0 on a dry run.
+    pub deleted: u64,
+}
+
+/// One pin the run judged dead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcPinCandidate {
+    /// The field name (catalog spelling: ASCII-lowercase).
+    pub field: String,
+    /// The pin being reclaimed (a catalog type spelling).
+    #[serde(rename = "type")]
+    pub data_type: String,
+    /// Newest observation of the field (ISO 8601 UTC), absent when the
+    /// pin was never observed at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
+    /// How many services ever carried it.
+    pub services: i64,
 }
 
 // -- history -----------------------------------------------------------------
@@ -1527,6 +1640,8 @@ mod tests {
             max_ambiguous_rows: Some(3),
             accepted_max_nulled_rows: Some(22),
             accepted_max_ambiguous_rows: Some(3),
+            cancel_requested_at: None,
+            cancelled_by: None,
         })
         .unwrap();
         // An unstated request ceiling is absent, not zero.

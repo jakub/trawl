@@ -2111,6 +2111,43 @@ async fn repin_permission_matrix() {
     assert!(ingest.schema_repin_status().await.is_err());
 }
 
+/// Cancel is gated like the trigger, not like the status route: a
+/// `SchemaRead` key may watch a repin and may not stop one. With nothing
+/// running, an authorized ask is a 404 carrying the `no_job_running`
+/// verdict rather than an error envelope — the client decodes the status
+/// and the body's own outcome together, so both halves are asserted here.
+#[tokio::test(flavor = "multi_thread")]
+async fn repin_cancel_is_schema_write_gated_and_answers_when_idle() {
+    let server = setup().await;
+
+    for token in [&server.reader_token, &server.admin_token] {
+        let client = HttpClient::new_insecure(&server.url, token).unwrap();
+        let err = client
+            .schema_repin_cancel()
+            .await
+            .expect_err("cancel needs schema_write");
+        match err {
+            trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 401),
+            other => panic!("expected auth refusal, got {other:?}"),
+        }
+    }
+
+    let schema_admin = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
+    match schema_admin.schema_repin_cancel().await.unwrap() {
+        trawl_client::RepinCancel::NoJobRunning(receipt) => {
+            assert_eq!(
+                receipt.outcome,
+                trawl_client::RepinCancelOutcome::NoJobRunning
+            );
+            assert!(receipt.job.is_none(), "no job to attach: {receipt:?}");
+        }
+        other => panic!("expected no_job_running, got {other:?}"),
+    }
+    // Asking changed nothing: no job row was claimed by the refusal.
+    let status = schema_admin.schema_repin_status().await.unwrap();
+    assert!(status.job.is_none(), "a cancel claims no job");
+}
+
 /// Contract-typed fields, unknown target types and unpinned fields refuse
 /// with 400 before any job row exists — validation is side-effect-free.
 #[tokio::test(flavor = "multi_thread")]
@@ -2149,6 +2186,53 @@ async fn repin_validation_refusals_are_side_effect_free() {
     // No job row was ever claimed.
     let status = client.schema_repin_status().await.unwrap();
     assert!(status.job.is_none(), "validation refusals claim no job");
+}
+
+// ---------------------------------------------------------------------------
+// pin gc surface
+// ---------------------------------------------------------------------------
+
+/// `SchemaWrite` gates pin gc exactly as it gates the repin trigger: it
+/// deletes catalog rows, so a reader may not reach it and neither may the
+/// admin role, which never gained the permission. The schema-admin key
+/// runs it and gets a report.
+#[tokio::test(flavor = "multi_thread")]
+async fn gc_pins_permission_matrix() {
+    let server = setup().await;
+
+    for (who, token) in [
+        ("admin", &server.admin_token),
+        ("reader", &server.reader_token),
+        ("analyst", &server.analyst_token),
+        ("ingest", &server.ingest_token),
+    ] {
+        let client = HttpClient::new_insecure(&server.url, token).unwrap();
+        let err = client
+            .schema_gc_pins(true, Some(0))
+            .await
+            .expect_err("only schema_write may reclaim pins");
+        match err {
+            trawl_client::ClientError::Server { status, .. } => {
+                assert_eq!(status, 401, "{who} must be refused");
+            }
+            other => panic!("expected an auth refusal for {who}, got {other:?}"),
+        }
+    }
+
+    let ops = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
+    let report = ops
+        .schema_gc_pins(true, Some(0))
+        .await
+        .expect("schema_write runs a dry gc");
+    assert!(report.dry_run);
+    assert_eq!(report.deleted, 0, "a dry run deletes nothing: {report:?}");
+    // The window numbers are the server's own: a zero request is accepted
+    // literally and then floored at the packaged retention window.
+    assert_eq!(report.requested_older_than_secs, 0);
+    assert_eq!(
+        report.effective_older_than_secs,
+        report.retention_floor_secs.unwrap_or(0)
+    );
 }
 
 /// Read from an open SSE response until `needle` shows up, or fail loud.

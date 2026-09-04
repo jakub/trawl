@@ -82,6 +82,117 @@ pub enum StoreError {
     /// — one shadow rewrite at a time, install-wide.
     #[error("a repin job is already running (one at a time, install-wide)")]
     RepinAlreadyRunning,
+
+    /// The pin purge reached its commit and could not confirm the outcome:
+    /// either the commit outstayed its bound and was detached rather than
+    /// cancelled, or it completed with an error postgres may have applied
+    /// anyway.
+    ///
+    /// Distinct from [`Self::Unavailable`] because the caller must act
+    /// differently: a failure from BEFORE the commit can be settled by
+    /// re-reading `field_types`, while this one cannot. A detached commit
+    /// is still running, and a failed one may have been made durable before
+    /// the connection dropped, so a read races the commit either way and
+    /// can answer with the state on either side of it. The pin cache is
+    /// reconciled by over-eviction instead.
+    #[error(
+        "the field-catalog pin purge could not confirm its commit; postgres may have \
+         applied it anyway, so whether the pins were reclaimed is unknown"
+    )]
+    PurgeCommitUnknown,
+
+    /// The pin purge's pre-commit work ran past its client-side bound and
+    /// was cancelled, so nothing was committed.
+    ///
+    /// Postgres bounds each of those statements itself, but a connection
+    /// that stops answering mid-statement is invisible to a database-side
+    /// timeout: the backend is fine and the client is waiting on a socket
+    /// nobody will write to. The purge holds the corpus gate, and every
+    /// compaction batch queues behind that, so the wait is bounded here as
+    /// well. Cancelling before the commit is safe by construction — the
+    /// dropped transaction rolls back — which is why this is an ordinary
+    /// bounded failure and [`Self::PurgeCommitUnknown`] is not.
+    #[error(
+        "the field-catalog pin purge gave up waiting on the database before it \
+         committed; nothing was reclaimed"
+    )]
+    PurgePrepareTimeout,
+
+    /// The claim's `from` pin was not in `field_types` when the claim
+    /// transaction looked, under the catalog lifecycle lock.
+    ///
+    /// The engine reads the pin from the in-process cache, so between that
+    /// read and the claim a pin gc purge can have reclaimed the slot (or an
+    /// earlier repin retyped it). Claiming anyway would leave the cutover
+    /// updating a row that no longer exists.
+    #[error("{}", repin_pin_message(field, expected, found.as_deref()))]
+    RepinPinVanished {
+        /// The field the claim named (catalog key).
+        field: String,
+        /// The pin the caller read, in catalog spelling.
+        expected: &'static str,
+        /// The pin `field_types` actually holds, when it holds one.
+        found: Option<String>,
+    },
+}
+
+/// The sentence for [`StoreError::RepinPinVanished`].
+///
+/// A vanished pin reads exactly as the engine's own unpinned-field refusal,
+/// because from the operator's side it is the same fact: the field is not
+/// pinned, so there is nothing to repin. A pin that merely CHANGED gets its
+/// own sentence, since retrying against the current pin is the remedy.
+fn repin_pin_message(field: &str, expected: &str, found: Option<&str>) -> String {
+    match found {
+        None => format!("{field:?} is not a pinned field, so there is nothing to repin"),
+        Some(actual) => format!(
+            "{field:?} is pinned {actual}, not the {expected} this request was prepared \
+             against; re-read the field's pin and retry"
+        ),
+    }
+}
+
+impl StoreError {
+    /// A closed-set class label for log events, mirroring
+    /// [`crate::error::ServerError::error_class`]'s rationale: the raw
+    /// Display of `Unavailable`/`Migration` embeds pg diagnostics, and a
+    /// `tracing` event on the persisted path lands in the retained
+    /// `service=trawld` corpus, so events log this class instead.
+    pub fn class(&self) -> &'static str {
+        match self {
+            // `Unavailable` absorbs every sqlx failure, so a flat label
+            // would be constant at exactly the call sites that swallow the
+            // error; the sqlx variant is a closed, content-free subtype.
+            Self::Unavailable(e) => match e {
+                sqlx::Error::PoolTimedOut => "unavailable_pool_timeout",
+                sqlx::Error::PoolClosed => "unavailable_pool_closed",
+                sqlx::Error::Io(_) => "unavailable_io",
+                sqlx::Error::Tls(_) => "unavailable_tls",
+                sqlx::Error::Database(_) => "unavailable_database",
+                sqlx::Error::RowNotFound => "unavailable_row_not_found",
+                sqlx::Error::ColumnNotFound(_)
+                | sqlx::Error::ColumnDecode { .. }
+                | sqlx::Error::ColumnIndexOutOfBounds { .. }
+                | sqlx::Error::TypeNotFound { .. }
+                | sqlx::Error::Decode(_) => "unavailable_decode",
+                sqlx::Error::Configuration(_) => "unavailable_configuration",
+                _ => "unavailable_other",
+            },
+            Self::Migration(_) => "migration",
+            Self::LockHeld => "lock_held",
+            Self::DuplicateName { .. } => "duplicate_name",
+            Self::ScheduleExists { .. } => "schedule_exists",
+            Self::NotFound { .. } => "not_found",
+            Self::Validation(_) => "validation",
+            Self::InvalidInterval { .. } => "invalid_interval",
+            Self::IntervalTooShort { .. } => "interval_too_short",
+            Self::InvalidName { .. } => "invalid_name",
+            Self::RepinAlreadyRunning => "repin_already_running",
+            Self::PurgeCommitUnknown => "purge_commit_unknown",
+            Self::PurgePrepareTimeout => "purge_prepare_timeout",
+            Self::RepinPinVanished { .. } => "repin_pin_vanished",
+        }
+    }
 }
 
 /// A named-constraint violation classified from a postgres error.

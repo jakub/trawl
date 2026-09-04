@@ -179,6 +179,35 @@ enum SchemaSubcommand {
         format: Option<cli::OutputFormat>,
     },
 
+    /// Ask the running repin to stop. It stops at its next file boundary
+    /// and the live corpus is left untouched; a repin already swapping the
+    /// corpus is past the point where anything can be unwound and
+    /// completes.
+    RepinCancel {
+        /// Output format (auto-detected if omitted).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+    },
+
+    /// Reclaim pin slots held by fields nothing writes any more: no
+    /// observation inside the window and no standing parquet declares the
+    /// column.
+    #[command(name = "gc-pins")]
+    GcPins {
+        /// Scan and report only, no deletion.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// How long a field must have gone unobserved to count as dead
+        /// (e.g. "30d", "12w"). Defaults server-side to 30 days, and the
+        /// server raises it to the retention window when that is longer.
+        #[arg(long)]
+        older_than: Option<String>,
+
+        /// Output format (auto-detected if omitted).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+    },
     /// Acknowledge a field's degraded badge, or withdraw the
     /// acknowledgement. An ack covers the evidence that exists now: the
     /// next conflict episode raises the badge again.
@@ -467,6 +496,10 @@ async fn run(args: Cli) -> Result<(), CliError> {
 /// everywhere else a token-resolution failure must surface as itself.
 /// Swallowing it into an `Option` would re-report a broken profile as
 /// "schema field requires a server".
+// Long because it is one arm per subcommand: every arm unpacks its flags
+// and calls its runner, and splitting the match would only move arms behind
+// a second name.
+#[allow(clippy::too_many_lines)]
 async fn run_schema(
     cmd: SchemaSubcommand,
     cfg: &config::Config,
@@ -554,6 +587,23 @@ async fn run_schema(
         }
         SchemaSubcommand::RepinStatus { format } => {
             schema::run_repin_status(&mut out, conn(token)?, format).await
+        }
+        SchemaSubcommand::RepinCancel { format } => {
+            schema::run_repin_cancel(&mut out, conn(token)?, format).await
+        }
+        SchemaSubcommand::GcPins {
+            dry_run,
+            older_than,
+            format,
+        } => {
+            schema::run_gc_pins(
+                &mut out,
+                conn(token)?,
+                dry_run,
+                older_than.as_deref(),
+                format,
+            )
+            .await
         }
         SchemaSubcommand::Ack(args) => {
             let note = args.note.as_deref();

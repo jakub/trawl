@@ -945,6 +945,9 @@ pub struct TestServer {
     pub reader_token: String,
     pub ingest_token: String,
     pub schema_admin_token: String,
+    /// The schema-admin key's stable prefix — the identity the repin
+    /// cancel audit events name beside the display name (#109).
+    pub schema_admin_prefix: String,
     pub coastwatch_only_token: String,
     /// Pool on the per-test fleet database (mint/revoke keys mid-test).
     pub fleet_pool: PgPool,
@@ -1315,6 +1318,7 @@ pub async fn setup_in_dir_with_data(
         reader_token,
         ingest_token,
         schema_admin_token: schema_admin.plaintext_token.to_string(),
+        schema_admin_prefix: schema_admin.info.prefix.clone(),
         coastwatch_only_token: coastwatch_only.plaintext_token.to_string(),
         fleet_pool: fleet,
         fleet_db_url,

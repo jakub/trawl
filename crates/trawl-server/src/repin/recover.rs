@@ -170,9 +170,13 @@ pub async fn reconcile_store(
         let mut swept = recovered.swept;
         match recovered.action {
             RecoveredAction::AbandonedBuild => {
+                // Conditional: the marker's job is `running` by
+                // construction here, and a row that somehow already carries
+                // a verdict keeps it rather than being restamped `failed`
+                // by a replay.
                 storage
                     .repin
-                    .finish(
+                    .finish_if_running(
                         marker.job_id,
                         RepinJobStatus::Failed,
                         Some("interrupted while building the shadow generation; corpus untouched"),

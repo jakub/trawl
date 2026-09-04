@@ -100,6 +100,33 @@ pub fn spawn_retention(
     })
 }
 
+/// The longest age this install still keeps data for, in seconds, or
+/// `None` when age retention is disabled.
+///
+/// Pin garbage collection ([`crate::catalog::gc`]) floors its dead window
+/// here: calling a field dead over a span shorter than the corpus trawl
+/// still stores would reclaim a pin whose data is right there on disk.
+/// Disk-pressure retention contributes nothing: it deletes by free space
+/// rather than by age, so it names no window a pin could be judged
+/// against.
+///
+/// `max_age_days` is an unvalidated operator `u64`, so the multiply
+/// saturates; an "effectively never" setting floors the window at
+/// "effectively never", which refuses every candidate. That is the right
+/// answer for an install that keeps everything.
+///
+/// This is the one function per-env retention (#108) changes: the floor
+/// becomes the maximum enabled age across all envs, and every caller keeps
+/// asking the same question.
+#[must_use]
+pub fn maximum_enabled_age_secs(config: &RetentionConfig) -> Option<u64> {
+    const SECS_PER_DAY: u64 = 86_400;
+    if config.max_age_days == 0 {
+        return None;
+    }
+    Some(config.max_age_days.saturating_mul(SECS_PER_DAY))
+}
+
 /// A single retention tick. Testable via injectable `free_space_fn`.
 fn retention_tick(
     data_dir: &Path,
@@ -316,16 +343,22 @@ fn repin_claimed_mid_sweep(data_dir: &Path) -> bool {
 }
 
 /// Evidence that a repin job owns this data root right now, if any.
+///
+/// One line of policy over [`crate::repin::in_flight_evidence`], the shared
+/// authority: an unreadable answer counts as evidence and suppresses the
+/// sweep. Retention deletes files, so "I could not tell" has to fall on the
+/// side of not deleting them, and the tick that follows would fail reading
+/// the same directory anyway.
 fn repin_in_flight(data_dir: &Path) -> Option<&'static str> {
-    if crate::repin::marker_path(data_dir).exists() {
-        Some("marker")
-    } else if crate::repin::shadow_root(data_dir).exists() {
-        Some("shadow root")
-    } else if crate::repin::aside_root(data_dir).exists() {
-        Some("aside root")
-    } else {
-        None
-    }
+    crate::repin::in_flight_evidence(data_dir).unwrap_or_else(|e| {
+        tracing::warn!(
+            event_type = "retention_repin_evidence_unreadable",
+            error = %e,
+            "could not tell whether a repin owns the data root; suppressing \
+             this sweep rather than deleting under a job that may exist"
+        );
+        Some("unreadable")
+    })
 }
 
 /// Enumerate date-formatted directories across every env directory in
