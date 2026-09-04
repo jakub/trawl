@@ -51,8 +51,17 @@ ALTER TABLE schedules
 
 -- Backfill the planned cursor so existing schedules keep their cadence
 -- instead of all firing at once.
+--
+-- LEAST caps the multiplication at ten years, the same ceiling the duration
+-- grammar now enforces on every new write. Before that cap existed nothing
+-- bounded interval_secs above 60, and `interval * INTERVAL '1 second'`
+-- overflows postgres' interval type well short of BIGINT: one absurd legacy
+-- row would abort this whole migration and leave the daemon unable to boot.
+-- A schedule with a nonsense interval gets a far-future cursor, which is
+-- what its nonsense interval already meant.
 UPDATE schedules s SET next_fire_at = COALESCE(
-    (SELECT r.started_at + s.interval_secs * INTERVAL '1 second' FROM report_runs r
+    (SELECT r.started_at + LEAST(s.interval_secs, 315360000) * INTERVAL '1 second'
+       FROM report_runs r
       WHERE r.schedule_id = s.id ORDER BY r.started_at DESC, r.id DESC LIMIT 1),
     now());
 

@@ -2059,6 +2059,67 @@ async fn boot(url: &str) -> Result<StorageState, StoreError> {
     StorageState::from_pool(common::app_pool(url).await).await
 }
 
+/// 0017's `next_fire_at` backfill multiplies a schedule's `interval_secs`
+/// by one second to extrapolate the next fire, and nothing before this
+/// change bounded that column above 60. `interval * INTERVAL '1 second'`
+/// overflows postgres' interval type far below BIGINT, so one absurd legacy
+/// row would abort the migration and wedge boot for everything behind it.
+///
+/// This drives the real thing: migrate to 0016, plant `i64::MAX`, then
+/// apply 0017 and read the cursor it wrote.
+#[tokio::test]
+async fn migration_0017_survives_an_absurd_legacy_interval() {
+    let url = common::create_app_database().await;
+    let pool = common::app_pool(&url).await;
+    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new("migrations"))
+        .await
+        .expect("the crate's own migrations directory");
+
+    migrator.run_to(16, &pool).await.expect("migrate to 0016");
+
+    let saved_id: i64 = sqlx::query_scalar(
+        "INSERT INTO saved_queries (key_id, name, query, created_at, updated_at)
+         VALUES (1, 'legacy', 'q', now(), now()) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let schedule_id: i64 = sqlx::query_scalar(
+        "INSERT INTO schedules (saved_query_id, key_id, interval_secs, created_at, updated_at)
+         VALUES ($1, 1, 9223372036854775807, now(), now()) RETURNING id",
+    )
+    .bind(saved_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // The backfill only extrapolates for a schedule that has run.
+    sqlx::query(
+        "INSERT INTO report_runs (schedule_id, saved_query_id, query, status, started_at)
+         VALUES ($1, $2, 'q', 'success', now())",
+    )
+    .bind(schedule_id)
+    .bind(saved_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrator.run(&pool).await.expect("0017 must not abort");
+
+    let next: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT next_fire_at FROM schedules WHERE id = $1")
+            .bind(schedule_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let ten_years = chrono::Duration::seconds(315_360_000);
+    let slack = chrono::Duration::hours(1);
+    let now = chrono::Utc::now();
+    assert!(
+        next > now + ten_years - slack && next < now + ten_years + slack,
+        "the cursor is the capped extrapolation, not an overflow: {next}"
+    );
+}
+
 /// Fresh empty database + the real boot path applies the schema
 /// (advisory lock BEFORE migrate).
 #[tokio::test]

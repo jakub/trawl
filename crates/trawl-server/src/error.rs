@@ -280,6 +280,7 @@ impl IntoResponse for ServerError {
                 | StoreError::RepinPinVanished { .. }
                 | StoreError::InvalidInterval { .. }
                 | StoreError::IntervalTooShort { .. }
+                | StoreError::DurationTooLong { .. }
                 | StoreError::LagWithoutWindow { .. }
                 | StoreError::InvalidName { .. } => (
                     StatusCode::BAD_REQUEST,

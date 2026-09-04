@@ -49,8 +49,8 @@ pub use repin::{
 };
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{
-    FinishOutcome, FlipOutcome, ReportRun, RunClaim, Schedule, ScheduleStore, format_interval,
-    parse_duration_secs, parse_interval,
+    FinishOutcome, FlipOutcome, MAX_DURATION_SECS, ReportRun, RunClaim, Schedule, ScheduleStore,
+    format_interval, parse_duration_secs, parse_interval,
 };
 pub use status::RunStatus;
 

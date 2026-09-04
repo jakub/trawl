@@ -37,6 +37,15 @@ use crate::report_window::{ReportWindow, ScheduleWindow, WindowKind};
 
 const MIN_INTERVAL_SECS: u64 = 60;
 
+/// The longest duration the schedule grammar accepts: ten years.
+///
+/// Every duration here becomes date arithmetic somewhere — a fire cursor, a
+/// window bound, a lag applied to both — in postgres, in chrono, or in the
+/// DSL text a run executes. Each of those has its own overflow behaviour,
+/// and `10000000w` is a typo, never an intent. One cap up front gives all
+/// of them a domain, which is cheaper than proving each is total.
+pub const MAX_DURATION_SECS: u64 = 315_360_000;
+
 /// A schedule attached to a saved query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schedule {
@@ -139,6 +148,9 @@ pub enum FlipOutcome {
 /// `"0s"` and `"30s"` are legal answers: a report window's `lag` is a
 /// straggler allowance and zero is its default, while a schedule interval
 /// has a floor and goes through [`parse_interval`] instead.
+///
+/// There is a ceiling either way, [`MAX_DURATION_SECS`], because every
+/// duration the grammar parses ends up in date arithmetic.
 pub fn parse_duration_secs(s: &str) -> Result<u64, StoreError> {
     let s = s.trim();
     // char_indices, not byte split_at: a multi-byte trailing char would put
@@ -167,9 +179,15 @@ pub fn parse_duration_secs(s: &str) -> Result<u64, StoreError> {
             });
         }
     };
-    value.checked_mul(scale).ok_or(StoreError::InvalidInterval {
-        input: s.to_string(),
-    })
+    let secs = value
+        .checked_mul(scale)
+        .ok_or(StoreError::InvalidInterval {
+            input: s.to_string(),
+        })?;
+    if secs > MAX_DURATION_SECS {
+        return Err(StoreError::DurationTooLong { secs });
+    }
+    Ok(secs)
 }
 
 /// Parse a duration string into seconds, refusing anything below the 60s
@@ -1349,6 +1367,27 @@ mod tests {
         assert_eq!(parse_duration_secs("0s").unwrap(), 0);
         assert_eq!(parse_duration_secs("30s").unwrap(), 30);
         assert_eq!(parse_duration_secs("2h").unwrap(), 7200);
+    }
+
+    #[test]
+    fn parse_duration_secs_caps_at_ten_years() {
+        assert_eq!(
+            parse_duration_secs("315360000s").unwrap(),
+            MAX_DURATION_SECS
+        );
+        assert!(matches!(
+            parse_duration_secs("315360001s"),
+            Err(StoreError::DurationTooLong { secs: 315_360_001 })
+        ));
+        // The cap is on the parsed seconds, so every unit reaches it.
+        assert!(matches!(
+            parse_duration_secs("522w"),
+            Err(StoreError::DurationTooLong { .. })
+        ));
+        assert!(matches!(
+            parse_interval("100000d"),
+            Err(StoreError::DurationTooLong { .. })
+        ));
     }
 
     #[test]

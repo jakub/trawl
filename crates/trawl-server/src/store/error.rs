@@ -71,6 +71,19 @@ pub enum StoreError {
         secs: u64,
     },
 
+    /// A duration exceeded [`crate::store::MAX_DURATION_SECS`]. Every
+    /// duration the schedule grammar parses becomes date arithmetic, so the
+    /// grammar bounds them all rather than each consumer proving itself
+    /// total.
+    #[error(
+        "duration {secs}s exceeds the maximum of {} seconds (10 years)",
+        crate::store::MAX_DURATION_SECS
+    )]
+    DurationTooLong {
+        /// The requested duration in seconds.
+        secs: u64,
+    },
+
     /// A report-window `lag` was given on a schedule with no window
     /// (ADR-0018 ruling 6). The handler turns this into a 400.
     #[error(
@@ -198,6 +211,7 @@ impl StoreError {
             Self::Validation(_) => "validation",
             Self::InvalidInterval { .. } => "invalid_interval",
             Self::IntervalTooShort { .. } => "interval_too_short",
+            Self::DurationTooLong { .. } => "duration_too_long",
             Self::InvalidName { .. } => "invalid_name",
             Self::LagWithoutWindow { .. } => "lag_without_window",
             Self::RepinAlreadyRunning => "repin_already_running",
