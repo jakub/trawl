@@ -594,6 +594,52 @@ async fn gc_refuses_the_whole_run_on_an_unreadable_parquet() {
     assert_eq!(report.deleted, 1);
 }
 
+/// A data root that is not there is UNKNOWN, never an empty corpus. Read as
+/// empty, no footer would disprove anything and the run would reclaim every
+/// candidate pin in the catalog — an unmounted volume or a mistyped
+/// `data_dir` turned into a mass delete.
+#[tokio::test(flavor = "multi_thread")]
+async fn gc_refuses_a_data_root_that_is_not_there() {
+    let h = harness().await;
+    // A standing carrier, so `dead` is the only pin without one.
+    h.ingest_and_compact(&[event("api", &json!({"kept": 1}))])
+        .await;
+    h.pin_without_carrier("gone", "dead").await;
+
+    let vanished = h.data_dir.parent().unwrap().join("not-mounted");
+    let gc = Arc::new(PinGc::new(
+        h.server.state.storage.catalog.clone(),
+        h.server.state.storage.repin.clone(),
+        Arc::clone(&h.server.state.query.field_catalog),
+        Arc::clone(h.coordinator()),
+        vanished.clone(),
+        None,
+    ));
+
+    let err = gc
+        .run(Some(Duration::ZERO), false, GcActor::default())
+        .await
+        .expect_err("a missing data root fails the run closed");
+    assert_eq!(err.error_class(), "conflict", "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not-mounted"),
+        "the refusal names the root: {msg}"
+    );
+    assert!(msg.contains("deleted nothing"), "{msg}");
+    assert!(h.pinned("dead"), "a refused run deletes nothing");
+    assert!(h.pinned_in_store("dead").await);
+
+    // The same catalog over the real root reclaims exactly the dead pin, so
+    // the refusal was about the corpus and not about the candidate.
+    let report = h
+        .gc(None)
+        .run(Some(Duration::ZERO), false, GcActor::default())
+        .await
+        .expect("gc runs over the real data root");
+    assert_eq!(report.deleted, 1, "report: {report:?}");
+}
+
 /// A symlink under a live env is refused for the same reason: its target
 /// is a file trawl does not own.
 #[tokio::test(flavor = "multi_thread")]

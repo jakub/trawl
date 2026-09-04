@@ -719,16 +719,24 @@ fn prove_carriers(data_dir: &Path, mut dead: BTreeSet<String>) -> Result<Walk, S
 /// marker files, `scheduled/`, a directory whose name is not an env name —
 /// is outside the glob and outside this walk.
 ///
-/// A missing data root is a cold start, not a failure: no file exists, so
-/// no file carries anything.
+/// A data root that is not there is UNKNOWN, not empty. An absent
+/// directory reads identically to a corpus of zero files, and a corpus of
+/// zero files disproves nothing, so every candidate would be "dead" and the
+/// run would delete the whole catalog. An unmounted volume, a typo'd
+/// `[storage] data_dir`, a root moved aside by hand: each is a reason to
+/// refuse, and none is a reason to reclaim. A genuine cold start has an
+/// empty data root (trawld creates it at boot), which walks to zero files
+/// and is still refused only if a candidate exists — which, on a corpus
+/// nothing has ever written, it does not.
 fn env_dirs_strict(data_dir: &Path, problems: &mut Problems) -> Result<Vec<PathBuf>, String> {
     let entries = match std::fs::read_dir(data_dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => {
             return Err(format!(
-                "pin gc cannot list the data root {} ({e}), so it cannot \
-                 prove any pin dead and deleted nothing",
+                "pin gc cannot read the data root {} ({e}), so it cannot \
+                 prove any pin dead and deleted nothing. Check that the \
+                 volume is mounted and [storage] data_dir is right, then \
+                 re-run.",
                 data_dir.display()
             ));
         }
