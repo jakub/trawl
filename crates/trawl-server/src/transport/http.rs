@@ -69,6 +69,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/schema/fields", get(handlers::catalog_fields))
         .route("/schema/repin", post(handlers::schema_repin))
         .route("/schema/repin/status", get(handlers::schema_repin_status))
+        .route("/schema/repin/cancel", post(handlers::schema_repin_cancel))
         // `?name=` rather than a path segment: a catalog key may contain `/`.
         .route("/schema/field", get(handlers::catalog_field))
         .route("/schema/conflicts", get(handlers::catalog_conflicts))

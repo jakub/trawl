@@ -36,6 +36,23 @@ pub enum RepinStart {
     Refused(trawl_api::RepinJobResponse),
 }
 
+/// Outcome of `POST /api/v1/schema/repin/cancel` (#109) — the HTTP status
+/// decoded, with the body's own `outcome` checked against it.
+///
+/// Three variants for three status codes, because none of them is an error
+/// the caller should meet as an opaque `ClientError`: "too late" and
+/// "nothing running" are answers about the corpus, and a CLI has to print
+/// them before choosing an exit code.
+#[derive(Debug, Clone)]
+pub enum RepinCancel {
+    /// 202: accepted; the job stops at its next file boundary.
+    Cancelling(trawl_api::RepinCancelResponse),
+    /// 409: the job latched its point of no return and will complete.
+    PastPointOfNoReturn(trawl_api::RepinCancelResponse),
+    /// 404: no repin job is running on this node.
+    NoJobRunning(trawl_api::RepinCancelResponse),
+}
+
 /// HTTP client for the trawl daemon API.
 #[derive(Clone)]
 pub struct HttpClient {
@@ -530,6 +547,55 @@ impl HttpClient {
         })
     }
 
+    /// Ask the running repin to stop
+    /// (`POST /api/v1/schema/repin/cancel`, #109).
+    ///
+    /// Three statuses are answers rather than failures — 202 accepted, 409
+    /// too late, 404 nothing running — so they decode into variants the way
+    /// [`Self::schema_repin`] decodes its 409 plan, before the generic
+    /// status check turns them into an opaque error. Everything else (401,
+    /// 503 on a query-only node, 5xx) stays a [`ClientError::Server`].
+    pub async fn schema_repin_cancel(&self) -> Result<RepinCancel, ClientError> {
+        let url = self.endpoint("/api/v1/schema/repin/cancel");
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", self.auth_header_value())
+            .send()
+            .await
+            .map_err(sanitize_reqwest_error)?;
+
+        let status = resp.status().as_u16();
+        if !matches!(status, 202 | 409 | 404) {
+            // Turns any failure status into a `Server` error; a success
+            // status this endpoint never sends falls through as a protocol
+            // complaint rather than being guessed at.
+            check_status(resp).await?;
+            return Err(ClientError::Parse(format!(
+                "repin cancel: unexpected HTTP {status}"
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ClientError::Parse(e.to_string()))?;
+        let Ok(body) = serde_json::from_slice::<trawl_api::RepinCancelResponse>(&bytes) else {
+            // A 404 from a server that predates the route, or a 409 from
+            // something else on the path: the error envelope, not a verdict.
+            let error = serde_json::from_slice::<ErrorResponse>(&bytes).map_or_else(
+                |_| {
+                    trawl_api::ErrorEnvelope::simple(
+                        trawl_api::ErrorCode::InternalError,
+                        "unknown error",
+                    )
+                },
+                |e| e.error,
+            );
+            return Err(ClientError::Server { status, error });
+        };
+        decode_repin_cancel(status, body)
+    }
+
     /// Fetch the repin status surface
     /// (`GET /api/v1/schema/repin/status`).
     pub async fn schema_repin_status(&self) -> Result<RepinStatusResponse, ClientError> {
@@ -791,6 +857,28 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
     }
 }
 
+/// Pair the cancel endpoint's status code with the body's own `outcome`.
+///
+/// The server writes both from one table, so a disagreement means the
+/// response did not come from a server that shares this table — a proxy
+/// rewriting a status, or a version skew. Trusting either half silently
+/// would let a "202 accepted" be printed over a body that says nothing was
+/// running, so the mismatch is a protocol error instead.
+fn decode_repin_cancel(
+    status: u16,
+    body: trawl_api::RepinCancelResponse,
+) -> Result<RepinCancel, ClientError> {
+    use trawl_api::RepinCancelOutcome as O;
+    match (status, body.outcome) {
+        (202, O::Cancelling) => Ok(RepinCancel::Cancelling(body)),
+        (409, O::PastPointOfNoReturn) => Ok(RepinCancel::PastPointOfNoReturn(body)),
+        (404, O::NoJobRunning) => Ok(RepinCancel::NoJobRunning(body)),
+        (_, outcome) => Err(ClientError::Parse(format!(
+            "repin cancel: HTTP {status} disagrees with the body's outcome {outcome:?}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,5 +1042,74 @@ mod tests {
         assert_eq!(resp.recent.len(), 1);
         assert_eq!(resp.recent[0].rows, Some(100));
         assert!(!resp.recent[0].timed_out);
+    }
+
+    // ── repin cancel decode (#109) ──────────────────────────────────────
+
+    fn cancel_body(outcome: trawl_api::RepinCancelOutcome) -> trawl_api::RepinCancelResponse {
+        trawl_api::RepinCancelResponse {
+            outcome,
+            detail: "words".to_owned(),
+            job: None,
+        }
+    }
+
+    /// The three status codes the server sends decode into the three
+    /// variants, one for one. Asserted from this end as well as from the
+    /// server's `CancelVerdict::wire` table, so the two cannot drift apart
+    /// without one of the two tests failing.
+    #[test]
+    fn repin_cancel_status_codes_decode_to_their_variants() {
+        use trawl_api::RepinCancelOutcome as O;
+        assert!(matches!(
+            decode_repin_cancel(202, cancel_body(O::Cancelling)),
+            Ok(RepinCancel::Cancelling(_))
+        ));
+        assert!(matches!(
+            decode_repin_cancel(409, cancel_body(O::PastPointOfNoReturn)),
+            Ok(RepinCancel::PastPointOfNoReturn(_))
+        ));
+        assert!(matches!(
+            decode_repin_cancel(404, cancel_body(O::NoJobRunning)),
+            Ok(RepinCancel::NoJobRunning(_))
+        ));
+    }
+
+    /// A status code and a body discriminant that disagree are a protocol
+    /// error. Printing "accepted" over a body saying nothing was running
+    /// would tell an operator a job is stopping when none exists.
+    #[test]
+    fn repin_cancel_refuses_a_status_the_body_contradicts() {
+        use trawl_api::RepinCancelOutcome as O;
+        for (status, outcome) in [
+            (202, O::NoJobRunning),
+            (202, O::PastPointOfNoReturn),
+            (409, O::Cancelling),
+            (404, O::Cancelling),
+            (200, O::Cancelling),
+        ] {
+            let err = decode_repin_cancel(status, cancel_body(outcome))
+                .expect_err("mismatch must not decode");
+            assert!(
+                matches!(err, ClientError::Parse(_)),
+                "{status} + {outcome:?} gave {err:?}"
+            );
+        }
+    }
+
+    /// `snake_case` on the wire, and the outcome round-trips.
+    #[test]
+    fn repin_cancel_outcome_spells_snake_case() {
+        let json = serde_json::to_value(cancel_body(
+            trawl_api::RepinCancelOutcome::PastPointOfNoReturn,
+        ))
+        .unwrap();
+        assert_eq!(json["outcome"], "past_point_of_no_return");
+        assert!(json.get("job").is_none(), "an absent job is omitted");
+        let back: trawl_api::RepinCancelResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.outcome,
+            trawl_api::RepinCancelOutcome::PastPointOfNoReturn
+        );
     }
 }

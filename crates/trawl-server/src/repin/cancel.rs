@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use parking_lot::Mutex;
+use trawl_api::RepinCancelOutcome;
 
 /// The stage a cancel took effect in: the one vocabulary shared by the
 /// audit events, the job row's error sentence and (through M3) the CLI.
@@ -90,19 +91,6 @@ pub enum CancelVerdict {
     /// The job latched its point of no return before this request arrived.
     PastPointOfNoReturn { job_id: i64 },
     /// Nothing is running (or the running job's task has fully ended).
-    NoJobRunning,
-}
-
-/// The wire discriminant for a cancel verdict.
-///
-// M3: this enum moves to `trawl-api` (mirrored, `serde(rename_all =
-// "snake_case")`) so the client can validate that the status code and the
-// body's discriminant agree. It lives here for M2 because M2 ships no
-// transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepinCancelOutcome {
-    Cancelling,
-    PastPointOfNoReturn,
     NoJobRunning,
 }
 

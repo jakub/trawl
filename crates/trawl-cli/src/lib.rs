@@ -215,6 +215,16 @@ enum SchemaSubcommand {
         #[arg(long, short, value_enum)]
         format: Option<cli::OutputFormat>,
     },
+
+    /// Ask the running repin to stop. It stops at its next file boundary
+    /// and the live corpus is left untouched; a repin already swapping the
+    /// corpus is past the point where anything can be unwound and
+    /// completes.
+    RepinCancel {
+        /// Output format (auto-detected if omitted).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -407,6 +417,10 @@ async fn run(args: Cli) -> Result<(), CliError> {
 /// everywhere else a token-resolution failure must surface as itself.
 /// Swallowing it into an `Option` would re-report a broken profile as
 /// "schema field requires a server".
+// Long because it is one arm per subcommand: every arm unpacks its flags
+// and calls its runner, and splitting the match would only move arms behind
+// a second name.
+#[allow(clippy::too_many_lines)]
 async fn run_schema(
     cmd: SchemaSubcommand,
     cfg: &config::Config,
@@ -508,6 +522,9 @@ async fn run_schema(
         }
         SchemaSubcommand::RepinStatus { format } => {
             schema::run_repin_status(&mut out, conn(token)?, format).await
+        }
+        SchemaSubcommand::RepinCancel { format } => {
+            schema::run_repin_cancel(&mut out, conn(token)?, format).await
         }
     }
 }

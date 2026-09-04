@@ -1761,6 +1761,11 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
                 last_seen: iso8601(last_seen),
                 service,
             }),
+        // Persisted facts only (#109). A `running` row carrying these is a
+        // cancel in flight; the status route computes no "cancelling"
+        // pseudo-status over them.
+        cancel_requested_at: job.cancel_requested_at.map(iso8601),
+        cancelled_by: job.cancelled_by,
     }
 }
 
@@ -1817,6 +1822,63 @@ pub async fn schema_repin(
         status,
         Json(trawl_api::RepinResponse {
             job: repin_job_to_wire(job),
+        }),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/schema/repin/cancel` — ask the running repin to stop
+/// (#109). `SchemaWrite`-gated like the trigger, and 503 on a query-only
+/// node for the same reason: a node that owns nothing under the data root
+/// runs no job to cancel.
+///
+/// No request body: there is at most one running job, and naming it would
+/// invite an operator to cancel a job that already ended and a newer one
+/// took the slot.
+///
+/// The verdict comes from the registry's own lock through
+/// [`crate::repin::CancelVerdict::wire`] — 202 accepted, 409 past the point
+/// of no return, 404 nothing running — and this handler renders it without
+/// deciding anything. The job row rides along for the two verdicts that
+/// name a job, so an operator sees what was cancelled without a second
+/// round trip; a store that cannot serve that row costs the body, never the
+/// verdict, because the cancel has already taken effect in process.
+pub async fn schema_repin_cancel(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<axum::response::Response, ServerError> {
+    if !verified.has_permission(Permission::SchemaWrite) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+    let Some(engine) = state.repin.as_ref() else {
+        return Err(ServerError::ServiceUnavailable(
+            "repin requires an ingest-enabled node (this node does not own \
+             the data root)"
+                .into(),
+        ));
+    };
+
+    let verdict = engine.cancel(&verified.name);
+    let (status, outcome, detail) = verdict.wire();
+    let mut job = None;
+    if let Some(job_id) = verdict.job_id() {
+        match state.storage.repin.get(job_id).await {
+            Ok(row) => job = row.map(repin_job_to_wire),
+            Err(e) => tracing::error!(
+                event_type = "repin_store_error",
+                job_id,
+                error = %e,
+                "failed to read the repin job row for a cancel receipt; the \
+                 verdict is unaffected"
+            ),
+        }
+    }
+    Ok((
+        status,
+        Json(trawl_api::RepinCancelResponse {
+            outcome,
+            detail: detail.to_owned(),
+            job,
         }),
     )
         .into_response())
