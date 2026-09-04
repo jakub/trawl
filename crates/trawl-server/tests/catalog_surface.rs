@@ -1431,6 +1431,11 @@ async fn the_ack_audit_records_the_actor_and_never_the_note() {
     assert_eq!(acked.len(), 2, "one record per accepted ack: {acked:?}");
     assert!(acked[0].field("field").contains("duration"));
     assert_eq!(acked[0].field("created"), "true", "the row was inserted");
+    assert_eq!(
+        acked[0].field("advanced"),
+        "true",
+        "an insert is this call's own high-water"
+    );
     assert_eq!(acked[0].field("evidence_through"), "3");
     assert_eq!(acked[0].field("note_present"), "true");
     assert!(
@@ -1440,6 +1445,11 @@ async fn the_ack_audit_records_the_actor_and_never_the_note() {
     );
     assert!(acked[0].field("actor").contains("schema-admin-key"));
     assert_eq!(acked[1].field("created"), "false", "advanced, not created");
+    assert_eq!(
+        acked[1].field("advanced"),
+        "true",
+        "it acknowledged the episode the first ack did not cover"
+    );
     assert_eq!(acked[1].field("evidence_through"), "4");
     assert_eq!(acked[1].field("note_present"), "false");
 

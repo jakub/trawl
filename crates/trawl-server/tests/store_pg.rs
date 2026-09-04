@@ -3177,7 +3177,11 @@ mod degraded_ack {
         let store = catalog(&pool);
         degrade(&pool, "host", 3).await;
 
-        let AckOutcome::Acked { ack, created } = store
+        let AckOutcome::Acked {
+            ack,
+            created,
+            advanced,
+        } = store
             .acknowledge_degraded_field("host", "key-aaa", Some("that shipper really sends n/a"))
             .await
             .unwrap()
@@ -3185,6 +3189,7 @@ mod degraded_ack {
             panic!("degraded evidence must be acknowledgeable");
         };
         assert!(created, "the first ack inserts the row");
+        assert!(advanced, "a fresh row is this call's own high-water");
         assert_eq!(ack.field, "host");
         assert_eq!(ack.acked_by, "key-aaa");
         assert_eq!(ack.note.as_deref(), Some("that shipper really sends n/a"));
@@ -3195,6 +3200,7 @@ mod degraded_ack {
         let AckOutcome::Acked {
             ack: again,
             created,
+            advanced,
         } = store
             .acknowledge_degraded_field("host", "key-bbb", None)
             .await
@@ -3203,12 +3209,65 @@ mod degraded_ack {
             panic!("a second ack must be accepted");
         };
         assert!(!created, "the second ack advances the existing row");
+        assert!(advanced, "it saw more evidence than the row carried");
         assert_eq!(again.acked_by, "key-bbb");
         assert_eq!(again.note, None, "an ack without a note clears the old one");
         assert_eq!(again.evidence_through, 5, "the high-water advanced");
         assert!(again.acked_at >= ack.acked_at);
 
         assert_eq!(store.degraded_ack("host").await.unwrap(), Some(again));
+    }
+
+    /// A stale ack cannot steal the attribution of the ack that covered
+    /// more evidence.
+    ///
+    /// The interleaving: operator A reads six episodes and acknowledges
+    /// them. The evidence is then cleared and re-accrues to three, and
+    /// operator B — whose read saw only those three — acknowledges. B's
+    /// call must not put B's name, note and timestamp on a row that
+    /// accepted the pin through six, so the row comes back untouched and
+    /// the outcome says `advanced: false`.
+    #[sqlx::test]
+    async fn a_stale_ack_leaves_the_higher_water_marks_attribution_alone(pool: PgPool) {
+        let store = catalog(&pool);
+        degrade(&pool, "host", 6).await;
+        let AckOutcome::Acked { ack: first, .. } = store
+            .acknowledge_degraded_field("host", "key-aaa", Some("A looked at this"))
+            .await
+            .unwrap()
+        else {
+            panic!("degraded evidence must be acknowledgeable");
+        };
+        assert_eq!(first.evidence_through, 6);
+
+        // The evidence goes away and comes back smaller, which is what a
+        // repin's `clear_conflict_evidence` plus a fresh batch of conflicts
+        // does. The ack row survives it here because nothing in this test
+        // ran a cutover.
+        sqlx::query("DELETE FROM field_conflict_stats WHERE field = 'host'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        degrade(&pool, "host", 3).await;
+
+        let AckOutcome::Acked {
+            ack: after,
+            created,
+            advanced,
+        } = store
+            .acknowledge_degraded_field("host", "key-bbb", Some("B looked at less"))
+            .await
+            .unwrap()
+        else {
+            panic!("the stale ack is still an ordinary answer, not an error");
+        };
+        assert!(!created);
+        assert!(!advanced, "B's read covered less evidence than the row did");
+        assert_eq!(after.acked_by, "key-aaa", "A stays the acknowledger");
+        assert_eq!(after.note.as_deref(), Some("A looked at this"));
+        assert_eq!(after.acked_at, first.acked_at, "the timestamp is A's");
+        assert_eq!(after.evidence_through, 6, "the high-water never drops");
+        assert_eq!(store.degraded_ack("host").await.unwrap(), Some(after));
     }
 
     /// Below the threshold there is no verdict to suppress, and installing a

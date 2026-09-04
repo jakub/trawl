@@ -1388,11 +1388,21 @@ pub async fn ack_degraded_field(
         .acknowledge_degraded_field(&name, &verified.prefix, note)
         .await?;
     match outcome {
-        crate::store::AckOutcome::Acked { ack, created } => {
+        crate::store::AckOutcome::Acked {
+            ack,
+            created,
+            advanced,
+        } => {
             // The note is the one thing this record never carries: it is
             // operator prose, and a durable log line is not where the
             // operator chose to put it. Whether they wrote one is the part
             // an audit reader needs.
+            //
+            // `advanced = false` is the interleaving where this call read
+            // less evidence than a concurrent ack had already acknowledged:
+            // the stored row keeps the other operator's name, note and
+            // timestamp, and this event is the only record that the request
+            // happened at all.
             tracing::info!(
                 event_type = "field_degraded_acked",
                 field = %name,
@@ -1400,6 +1410,7 @@ pub async fn ack_degraded_field(
                 actor_prefix = %verified.prefix,
                 evidence_through = ack.evidence_through,
                 created,
+                advanced,
                 note_present = note.is_some(),
                 "operator acknowledged a degraded field"
             );

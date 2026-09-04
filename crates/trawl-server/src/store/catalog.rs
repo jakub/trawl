@@ -142,14 +142,21 @@ pub struct FieldHealthSnapshot {
 /// distinguishes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckOutcome {
-    /// The acknowledgement is stored. `created` distinguishes a fresh row
-    /// from an advanced one, which is the only difference the audit event
-    /// cares about.
+    /// The acknowledgement is stored. `created` and `advanced` are what the
+    /// audit event needs to tell the three shapes apart: a fresh row, a row
+    /// this call moved forward, and a row this call left alone because it
+    /// carried a higher high-water already.
     Acked {
-        /// The stored row, as postgres returned it.
+        /// The stored row, as postgres returned it. On a stale call this is
+        /// the OTHER operator's row, unchanged.
         ack: DegradedAck,
-        /// True when this call inserted the row rather than advancing one.
+        /// True when this call inserted the row rather than updating one.
         created: bool,
+        /// True when this call's evidence high-water was at least the
+        /// stored one, so the row now carries this call's actor, note and
+        /// timestamp. False means a concurrent ack had already covered more
+        /// evidence and this call changed nothing.
+        advanced: bool,
     },
     /// No pin by that name: there is nothing to acknowledge.
     Unpinned,
@@ -1443,7 +1450,13 @@ impl CatalogStore {
     ///
     /// The upsert ADVANCES: `evidence_through` never moves backwards, so a
     /// second ack racing a concurrent evidence clear cannot lower a
-    /// high-water another one just raised.
+    /// high-water another one just raised. The actor, the note and the
+    /// timestamp move with it, or not at all: two operators can read the
+    /// same field a moment apart, and the one whose read saw LESS evidence
+    /// must not end up named as the person who accepted the pin through the
+    /// higher count. So the metadata columns are replaced only when the
+    /// incoming high-water is at least the stored one, and a stale call
+    /// leaves the row exactly as it found it.
     pub async fn acknowledge_degraded_field(
         &self,
         field: &str,
@@ -1480,13 +1493,28 @@ impl CatalogStore {
         // for "this tuple was inserted, not updated": an updated tuple
         // carries the deleting transaction's id in xmax, an inserted one
         // carries zero.
+        //
+        // The three metadata columns move together under one condition, as
+        // CASE expressions rather than a WHERE on the DO UPDATE: a WHERE'd
+        // upsert that skips the update returns NO row, and the caller would
+        // lose both the stored ack and the ability to say whether it was
+        // this call that wrote it.
         let row = sqlx::query(
             "INSERT INTO field_degraded_ack (field, acked_by, note, evidence_through)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (field) DO UPDATE
-                SET acked_by         = EXCLUDED.acked_by,
-                    note             = EXCLUDED.note,
-                    acked_at         = now(),
+                SET acked_by         = CASE WHEN EXCLUDED.evidence_through
+                                                 >= field_degraded_ack.evidence_through
+                                            THEN EXCLUDED.acked_by
+                                            ELSE field_degraded_ack.acked_by END,
+                    note             = CASE WHEN EXCLUDED.evidence_through
+                                                 >= field_degraded_ack.evidence_through
+                                            THEN EXCLUDED.note
+                                            ELSE field_degraded_ack.note END,
+                    acked_at         = CASE WHEN EXCLUDED.evidence_through
+                                                 >= field_degraded_ack.evidence_through
+                                            THEN now()
+                                            ELSE field_degraded_ack.acked_at END,
                     evidence_through = GREATEST(field_degraded_ack.evidence_through,
                                                 EXCLUDED.evidence_through)
              RETURNING field, acked_at, acked_by, note, evidence_through, (xmax = 0) AS created",
@@ -1503,15 +1531,22 @@ impl CatalogStore {
             }
             _ => StoreError::from(e),
         })?;
+        let ack = DegradedAck {
+            field: row.try_get("field")?,
+            acked_at: row.try_get("acked_at")?,
+            acked_by: row.try_get("acked_by")?,
+            note: row.try_get("note")?,
+            evidence_through: row.try_get("evidence_through")?,
+        };
+        // The stored high-water is GREATEST(previous, ours), so it exceeds
+        // ours exactly when a concurrent ack had already covered more
+        // evidence and the CASE arms above kept its metadata. RETURNING
+        // cannot read the pre-update row, and it does not need to.
+        let advanced = ack.evidence_through <= agg.episodes;
         let outcome = AckOutcome::Acked {
-            ack: DegradedAck {
-                field: row.try_get("field")?,
-                acked_at: row.try_get("acked_at")?,
-                acked_by: row.try_get("acked_by")?,
-                note: row.try_get("note")?,
-                evidence_through: row.try_get("evidence_through")?,
-            },
+            ack,
             created: row.try_get("created")?,
+            advanced,
         };
         tx.commit().await?;
         Ok(outcome)
