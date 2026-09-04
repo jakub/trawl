@@ -184,6 +184,9 @@ struct Harness {
     key_id: i64,
     saved: SavedQueryStore,
     schedules: ScheduleStore,
+    /// A second pool onto the same app-state database, for the one test
+    /// that has to write a saved query the write-time gate refuses.
+    app_pool: PgPool,
     config: SchedulerConfig,
     _fleet_pool: PgPool,
     // Holds the app-state advisory lock and the pool the stores were built
@@ -230,6 +233,7 @@ async fn harness() -> Harness {
         key_store,
         saved: storage.saved.clone(),
         schedules: storage.schedule.clone(),
+        app_pool: common::app_pool(&app_db_url).await,
         config: SchedulerConfig {
             max_catchup_intervals: 24,
             ..SchedulerConfig::default()
@@ -449,7 +453,7 @@ async fn a_failed_run_holds_the_watermark_and_the_next_success_covers_both_inter
     // Parses and materializes, then the emitter refuses it: `count` is both
     // the group key and the aggregate's output name.
     h.saved
-        .update(sq, h.key_id, "service=fx | stats count() by count", None)
+        .update_checked(sq, h.key_id, "service=fx | stats count() by count", None)
         .await
         .expect("edit the saved DSL");
     h.tick(at(hours(1) + Duration::seconds(7))).await;
@@ -468,7 +472,7 @@ async fn a_failed_run_holds_the_watermark_and_the_next_success_covers_both_inter
     );
 
     h.saved
-        .update(sq, h.key_id, DSL, None)
+        .update_checked(sq, h.key_id, DSL, None)
         .await
         .expect("restore the saved DSL");
     h.tick(at(hours(2) + Duration::seconds(9))).await;
@@ -518,7 +522,7 @@ async fn first_failed_since_last_run_is_healed_by_next_success() {
     // Parses and materializes, then the emitter refuses it: `count` is both
     // the group key and the aggregate's output name.
     h.saved
-        .update(sq, h.key_id, "service=fx | stats count() by count", None)
+        .update_checked(sq, h.key_id, "service=fx | stats count() by count", None)
         .await
         .expect("break the saved DSL before the first run");
     h.tick(at(Duration::seconds(3))).await;
@@ -533,7 +537,7 @@ async fn first_failed_since_last_run_is_healed_by_next_success() {
     );
 
     h.saved
-        .update(sq, h.key_id, DSL, None)
+        .update_checked(sq, h.key_id, DSL, None)
         .await
         .expect("restore the saved DSL");
     h.tick(at(hours(1) + Duration::seconds(7))).await;
@@ -743,11 +747,16 @@ async fn a_materialize_failure_is_loud_and_leaves_the_cursor() {
     let sq = h
         .schedule("conflicted", DSL, Some(ScheduleWindow::SinceLast), 3600, 0)
         .await;
-    // The plain store update M4 puts the compatibility gate on.
-    h.saved
-        .update(sq, h.key_id, "service=fx last=1h | table _time", None)
+    // Write the forbidden pair the only way that is still possible: past
+    // the write-time gate, straight at the column. `update_checked` refuses
+    // this text under this schedule, so a tick that still refuses it is
+    // proof the claim re-reads stored state rather than trusting the gate.
+    sqlx::query("UPDATE saved_queries SET query = $1 WHERE id = $2")
+        .bind("service=fx last=1h | table _time")
+        .bind(sq)
+        .execute(&h.app_pool)
         .await
-        .expect("edit the saved DSL past the write-time gate");
+        .expect("plant the forbidden pair");
 
     h.tick(at(Duration::seconds(3))).await;
     assert!(h.runs(sq).await.is_empty(), "nothing may be claimed");

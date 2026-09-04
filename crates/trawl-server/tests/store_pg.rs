@@ -24,7 +24,7 @@ use sqlx::PgPool;
 use trawl_server::report_window::{ReportWindow, ScheduleWindow, WindowKind, truncate_to_micros};
 use trawl_server::store::{
     DueClaim, DueClaimError, FinishOutcome, FlipOutcome, HistoryStore, RunClaim, RunStatus,
-    SavedQueryStore, ScheduleStore, StorageState, StoreError,
+    SavedQueryStore, ScheduleStore, StorageState, StoreError, WindowWriteError,
 };
 
 fn history(pool: &PgPool) -> HistoryStore {
@@ -217,7 +217,7 @@ async fn saved_update(pool: PgPool) {
     let created = store.create(1, "test", "original query").await.unwrap();
 
     let updated = store
-        .update(created.id, 1, "updated query", None)
+        .update_checked(created.id, 1, "updated query", None)
         .await
         .unwrap();
     assert_eq!(updated.query, "updated query");
@@ -231,7 +231,7 @@ async fn saved_update_with_rename(pool: PgPool) {
     let created = store.create(1, "old-name", "query").await.unwrap();
 
     let updated = store
-        .update(created.id, 1, "query", Some("new-name"))
+        .update_checked(created.id, 1, "query", Some("new-name"))
         .await
         .unwrap();
     assert_eq!(updated.name, "new-name");
@@ -243,23 +243,32 @@ async fn saved_rename_to_taken_name_conflicts(pool: PgPool) {
     let store = saved(&pool);
     store.create(1, "taken", "q").await.unwrap();
     let other = store.create(1, "other", "q").await.unwrap();
-    let result = store.update(other.id, 1, "q", Some("taken")).await;
-    assert!(matches!(result, Err(StoreError::DuplicateName { .. })));
+    let result = store.update_checked(other.id, 1, "q", Some("taken")).await;
+    assert!(matches!(
+        result,
+        Err(WindowWriteError::Store(StoreError::DuplicateName { .. }))
+    ));
 }
 
 #[sqlx::test]
 async fn saved_update_nonexistent_returns_error(pool: PgPool) {
     let store = saved(&pool);
-    let result = store.update(999, 1, "query", None).await;
-    assert!(matches!(result, Err(StoreError::NotFound { .. })));
+    let result = store.update_checked(999, 1, "query", None).await;
+    assert!(matches!(
+        result,
+        Err(WindowWriteError::Store(StoreError::NotFound { .. }))
+    ));
 }
 
 #[sqlx::test]
 async fn saved_update_other_users_query_returns_error(pool: PgPool) {
     let store = saved(&pool);
     let created = store.create(1, "test", "query").await.unwrap();
-    let result = store.update(created.id, 2, "updated", None).await;
-    assert!(matches!(result, Err(StoreError::NotFound { .. })));
+    let result = store.update_checked(created.id, 2, "updated", None).await;
+    assert!(matches!(
+        result,
+        Err(WindowWriteError::Store(StoreError::NotFound { .. }))
+    ));
 }
 
 #[sqlx::test]
@@ -1533,9 +1542,15 @@ async fn claim_due_run_refuses_a_query_that_owns_its_own_window(pool: PgPool) {
         )
         .await
         .unwrap();
-    // The plain store update M4 puts the compatibility gate on.
-    saved(&pool)
-        .update(sq_id, 1, "service=fx last=1h | table _time", None)
+    // Write the forbidden pair the only way that is still possible: past
+    // the write-time gate, straight at the column. `update_checked` refuses
+    // this text under this schedule, which is exactly what makes the
+    // claim-time re-check below a test of stored state rather than a second
+    // reading of the same request.
+    sqlx::query("UPDATE saved_queries SET query = $1 WHERE id = $2")
+        .bind("service=fx last=1h | table _time")
+        .bind(sq_id)
+        .execute(&pool)
         .await
         .unwrap();
 

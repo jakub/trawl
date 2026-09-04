@@ -37,7 +37,7 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{AssertSqlSafe, PgPool, Row as _};
 
-use super::error::{PgViolation, StoreError, classify_violation};
+use super::error::{PgViolation, StoreError, WindowWriteError, classify_violation};
 use super::history::{bind_u64, bind_usize};
 use super::saved::{SavedQuery, row_to_saved_query_at};
 use super::status::{RunStatus, decode_status};
@@ -423,7 +423,10 @@ pub(crate) fn row_to_schedule_at(row: &PgRow, prefix: &str) -> Result<Schedule, 
 /// hand-edit, a future kind this binary predates). That is a decode failure,
 /// not a `None` window: silently reading it as "no window" would hand the
 /// scheduler a legacy schedule and execute the DSL verbatim.
-fn decode_window(row: &PgRow, prefix: &str) -> Result<Option<ScheduleWindow>, sqlx::Error> {
+pub(crate) fn decode_window(
+    row: &PgRow,
+    prefix: &str,
+) -> Result<Option<ScheduleWindow>, sqlx::Error> {
     let kind: Option<String> = row.try_get(format!("{prefix}window_kind").as_str())?;
     let secs: Option<i64> = row.try_get(format!("{prefix}window_secs").as_str())?;
     let decode_err = |msg: String| sqlx::Error::Decode(msg.into());
@@ -581,59 +584,19 @@ impl ScheduleStore {
         lag_secs: u64,
         now: DateTime<Utc>,
     ) -> Result<Schedule, StoreError> {
-        ensure_min_interval(interval_secs)?;
-        ensure_lag_has_window(window, lag_secs)?;
-
-        // A `since_last` schedule owes coverage from its first window's
-        // start, so that instant is written down now rather than inferred
-        // from an absent watermark after the first run (see
-        // [`seed_covered_through`]). Every other mode keeps none.
-        let covered_through = match window {
-            Some(ScheduleWindow::SinceLast) => {
-                Some(seed_covered_through(now, interval_secs, lag_secs)?)
-            }
-            Some(ScheduleWindow::Fixed { .. }) | None => None,
-        };
-
-        let row = sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO schedules
-                 (saved_query_id, key_id, interval_secs, max_runs, enabled,
-                  window_kind, window_secs, lag_secs, covered_through, next_fire_at,
-                  created_at, updated_at)
-             VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7, $8, $9, now(), now())
-             RETURNING {SCHEDULE_COLS}"
-        )))
-        .bind(saved_query_id)
-        .bind(key_id)
-        .bind(bind_u64(interval_secs))
-        .bind(max_runs.map(bind_u64))
-        .bind(window.map(|w| w.kind().as_str()))
-        .bind(window.and_then(ScheduleWindow::secs).map(bind_u64))
-        .bind(bind_u64(lag_secs))
-        .bind(covered_through)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| match classify_violation(&e) {
-            Some(PgViolation::ScheduleTaken) => StoreError::ScheduleExists { saved_query_id },
-            Some(PgViolation::ForeignKey) => StoreError::NotFound {
-                id: saved_query_id,
-                resource: "saved query",
-            },
-            _ => StoreError::from(e),
-        })?;
-
-        let schedule = row_to_schedule(&row)?;
-
-        tracing::info!(
-            event_type = "schedule_created",
-            schedule_id = schedule.id,
+        let mut conn = self.pool.acquire().await?;
+        let schedule = create_schedule_in(
+            &mut conn,
             saved_query_id,
             key_id,
             interval_secs,
-            "Schedule created"
-        );
-
+            max_runs,
+            window,
+            lag_secs,
+            now,
+        )
+        .await?;
+        log_schedule_created(&schedule);
         Ok(schedule)
     }
 
@@ -670,75 +633,156 @@ impl ScheduleStore {
         lag_secs: u64,
         now: DateTime<Utc>,
     ) -> Result<Schedule, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let schedule = match update_schedule_in(
+            &mut tx,
+            id,
+            key_id,
+            interval_secs,
+            max_runs,
+            enabled,
+            window,
+            lag_secs,
+            now,
+        )
+        .await
+        {
+            Ok(schedule) => schedule,
+            Err(e) => {
+                tx.rollback().await?;
+                return Err(e);
+            }
+        };
+        tx.commit().await?;
+        log_schedule_updated(&schedule);
+        Ok(schedule)
+    }
+
+    /// Create or update the schedule of a saved query, with ADR-0018's
+    /// window/query compatibility proved in the same transaction as the
+    /// write (rulings 7 and 12).
+    ///
+    /// This is the HTTP door. The pair it writes is two rows an operator
+    /// edits independently, and the rule spans both of them, so a
+    /// read-then-write sequence would leave the window a schedule to hold
+    /// and a `last=` in the saved DSL one interleaving apart: read the DSL,
+    /// have [`super::SavedQueryStore::update_checked`] commit a time clause,
+    /// then write the window over a query that now owns its own. Locking
+    /// the saved query FOR UPDATE and reading its text under that lock is
+    /// what closes it — the other direction takes the same lock first, so
+    /// one of the two waits and sees the other's committed text.
+    ///
+    /// LOCK ORDER: `saved_queries` -> `schedules`, the order every
+    /// multi-row path in this module takes.
+    ///
+    /// Query mode (`window` is `None`) parses nothing:
+    /// [`validate_window_compatibility`] returns immediately, and the saved
+    /// text stays as unexamined here as `create_saved` leaves it.
+    ///
+    /// `enabled` reaches the UPDATE path only. A schedule that does not
+    /// exist yet is created enabled, exactly as the handler's old
+    /// create-or-update pair did, because [`Self::create_schedule`] has
+    /// never taken the flag.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_schedule_checked(
+        &self,
+        saved_query_id: i64,
+        key_id: i64,
+        interval_secs: u64,
+        max_runs: Option<u64>,
+        enabled: bool,
+        window: Option<ScheduleWindow>,
+        lag_secs: u64,
+        now: DateTime<Utc>,
+    ) -> Result<Schedule, WindowWriteError> {
+        // Cheap refusals before any lock: a bad interval or a lag with no
+        // window is decided by the arguments alone.
         ensure_min_interval(interval_secs)?;
         ensure_lag_has_window(window, lag_secs)?;
 
         let mut tx = self.pool.begin().await?;
 
-        let current = sqlx::query(AssertSqlSafe(format!(
-            "SELECT {SCHEDULE_COLS} FROM schedules
-             WHERE id = $1 AND key_id = $2 FOR UPDATE"
-        )))
-        .bind(id)
+        // Level 1: the saved query. The lock and the DSL read are one
+        // statement, and the ownership check rides the same WHERE clause.
+        let dsl: Option<String> = sqlx::query_scalar(
+            "SELECT query FROM saved_queries WHERE id = $1 AND key_id = $2 FOR UPDATE",
+        )
+        .bind(saved_query_id)
         .bind(key_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(current) = current else {
+        let Some(dsl) = dsl else {
             tx.rollback().await?;
             return Err(StoreError::NotFound {
-                id,
-                resource: "schedule",
-            });
-        };
-        let current = row_to_schedule(&current)?;
-        let reanchor = current.interval_secs != interval_secs || current.window != window;
-        let seed = match (reanchor, window) {
-            (true, Some(ScheduleWindow::SinceLast)) => {
-                Some(seed_covered_through(now, interval_secs, lag_secs)?)
+                id: saved_query_id,
+                resource: "saved query",
             }
-            _ => None,
+            .into());
         };
 
-        let row = sqlx::query(AssertSqlSafe(format!(
-            "UPDATE schedules
-             SET interval_secs = $1, max_runs = $2, enabled = $3,
-                 window_kind = $4, window_secs = $5, lag_secs = $6,
-                 next_fire_at = CASE WHEN $7 THEN $8 ELSE next_fire_at END,
-                 covered_through = COALESCE(covered_through, $11),
-                 updated_at = now()
-             WHERE id = $9 AND key_id = $10
-             RETURNING {SCHEDULE_COLS}"
-        )))
-        .bind(bind_u64(interval_secs))
-        .bind(max_runs.map(bind_u64))
-        .bind(enabled)
-        .bind(window.map(|w| w.kind().as_str()))
-        .bind(window.and_then(ScheduleWindow::secs).map(bind_u64))
-        .bind(bind_u64(lag_secs))
-        .bind(reanchor)
-        .bind(now)
-        .bind(id)
+        if let Err(e) = validate_window_compatibility(window, &dsl) {
+            tx.rollback().await?;
+            return Err(e.into());
+        }
+
+        // Which of the two writes to make. An unlocked read is enough: the
+        // saved-query lock above serializes every writer of this pair, so
+        // no schedule can appear or vanish between here and the write.
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM schedules WHERE saved_query_id = $1 AND key_id = $2",
+        )
+        .bind(saved_query_id)
         .bind(key_id)
-        .bind(seed)
         .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(StoreError::NotFound {
-            id,
-            resource: "schedule",
-        })?;
+        .await?;
+
+        // Level 2: the schedule.
+        let written = match existing {
+            Some(id) => {
+                update_schedule_in(
+                    &mut tx,
+                    id,
+                    key_id,
+                    interval_secs,
+                    max_runs,
+                    enabled,
+                    window,
+                    lag_secs,
+                    now,
+                )
+                .await
+            }
+            None => {
+                create_schedule_in(
+                    &mut tx,
+                    saved_query_id,
+                    key_id,
+                    interval_secs,
+                    max_runs,
+                    window,
+                    lag_secs,
+                    now,
+                )
+                .await
+            }
+        };
+        let schedule = match written {
+            Ok(schedule) => schedule,
+            Err(e) => {
+                tx.rollback().await?;
+                return Err(e.into());
+            }
+        };
 
         tx.commit().await?;
 
-        tracing::info!(
-            event_type = "schedule_updated",
-            schedule_id = id,
-            key_id,
-            interval_secs,
-            enabled,
-            "Schedule updated"
-        );
+        if existing.is_some() {
+            log_schedule_updated(&schedule);
+        } else {
+            log_schedule_created(&schedule);
+        }
 
-        Ok(row_to_schedule(&row)?)
+        Ok(schedule)
     }
 
     /// Delete a schedule by its saved query id, collecting the parquet paths
@@ -1661,6 +1705,197 @@ async fn lock_for_claim(
         dsl: saved.try_get("query")?,
         schedule,
     }))
+}
+
+/// Insert one schedule row, returning it decoded.
+///
+/// ONE spelling of the statement for the two doors:
+/// [`ScheduleStore::create_schedule`], which runs it on a pooled
+/// connection, and [`ScheduleStore::set_schedule_checked`], which runs it
+/// inside the transaction that holds the saved-query lock. Taking a
+/// connection rather than a pool is what lets the second one exist: a
+/// second copy of the INSERT would be a second place for a column to be
+/// forgotten.
+///
+/// Logging is the caller's, deliberately. This function can run inside a
+/// transaction that later rolls back, and "Schedule created" is not a thing
+/// to say about a row nobody can see.
+#[allow(clippy::too_many_arguments)]
+async fn create_schedule_in(
+    conn: &mut sqlx::PgConnection,
+    saved_query_id: i64,
+    key_id: i64,
+    interval_secs: u64,
+    max_runs: Option<u64>,
+    window: Option<ScheduleWindow>,
+    lag_secs: u64,
+    now: DateTime<Utc>,
+) -> Result<Schedule, StoreError> {
+    ensure_min_interval(interval_secs)?;
+    ensure_lag_has_window(window, lag_secs)?;
+
+    // A `since_last` schedule owes coverage from its first window's start,
+    // so that instant is written down now rather than inferred from an
+    // absent watermark after the first run (see [`seed_covered_through`]).
+    // Every other mode keeps none.
+    let covered_through = match window {
+        Some(ScheduleWindow::SinceLast) => {
+            Some(seed_covered_through(now, interval_secs, lag_secs)?)
+        }
+        Some(ScheduleWindow::Fixed { .. }) | None => None,
+    };
+
+    let row = sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO schedules
+             (saved_query_id, key_id, interval_secs, max_runs, enabled,
+              window_kind, window_secs, lag_secs, covered_through, next_fire_at,
+              created_at, updated_at)
+         VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7, $8, $9, now(), now())
+         RETURNING {SCHEDULE_COLS}"
+    )))
+    .bind(saved_query_id)
+    .bind(key_id)
+    .bind(bind_u64(interval_secs))
+    .bind(max_runs.map(bind_u64))
+    .bind(window.map(|w| w.kind().as_str()))
+    .bind(window.and_then(ScheduleWindow::secs).map(bind_u64))
+    .bind(bind_u64(lag_secs))
+    .bind(covered_through)
+    .bind(now)
+    .fetch_one(conn)
+    .await
+    .map_err(|e| match classify_violation(&e) {
+        Some(PgViolation::ScheduleTaken) => StoreError::ScheduleExists { saved_query_id },
+        Some(PgViolation::ForeignKey) => StoreError::NotFound {
+            id: saved_query_id,
+            resource: "saved query",
+        },
+        _ => StoreError::from(e),
+    })?;
+
+    Ok(row_to_schedule(&row)?)
+}
+
+/// Update one schedule row under its own `FOR UPDATE` lock, returning it
+/// decoded.
+///
+/// The twin of [`create_schedule_in`], and the same reason for taking a
+/// connection: [`ScheduleStore::update_schedule`] gives it a transaction of
+/// its own, [`ScheduleStore::set_schedule_checked`] gives it the one
+/// already holding the saved-query lock. Re-locking a schedule the caller
+/// has effectively pinned costs nothing and keeps this function correct on
+/// its own.
+///
+/// Two cursor rules, both about not moving coverage the operator did not
+/// ask to move:
+///
+/// - An existing `covered_through` is never touched. Editing a schedule (or
+///   its saved DSL) does not reset the watermark — the per-run resolved
+///   snapshot is the audit trail (ADR-0018 ruling 14). An ABSENT one is
+///   seeded when the edit re-anchors a `since_last` schedule, for the
+///   reason [`seed_covered_through`] gives: the re-anchored cursor is a
+///   fresh origin of owed coverage, and a first run that fails under it
+///   must not drop its interval. The SQL is a `COALESCE`, so "seed only
+///   when absent" is one statement rather than a read followed by a
+///   decision.
+/// - `next_fire_at` is re-anchored to `now` only when the cadence itself
+///   changed: a different `interval_secs` or a different window. Editing
+///   `max_runs` or flipping `enabled` leaves the planned cursor alone, so a
+///   schedule cannot be kept permanently un-due by repeated edits. The
+///   comparison reads the current row under `FOR UPDATE`, in the same
+///   transaction as the write, so a concurrent edit cannot land between the
+///   read and the decision.
+#[allow(clippy::too_many_arguments)]
+async fn update_schedule_in(
+    conn: &mut sqlx::PgConnection,
+    id: i64,
+    key_id: i64,
+    interval_secs: u64,
+    max_runs: Option<u64>,
+    enabled: bool,
+    window: Option<ScheduleWindow>,
+    lag_secs: u64,
+    now: DateTime<Utc>,
+) -> Result<Schedule, StoreError> {
+    ensure_min_interval(interval_secs)?;
+    ensure_lag_has_window(window, lag_secs)?;
+
+    let current = sqlx::query(AssertSqlSafe(format!(
+        "SELECT {SCHEDULE_COLS} FROM schedules
+         WHERE id = $1 AND key_id = $2 FOR UPDATE"
+    )))
+    .bind(id)
+    .bind(key_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(current) = current else {
+        return Err(StoreError::NotFound {
+            id,
+            resource: "schedule",
+        });
+    };
+    let current = row_to_schedule(&current)?;
+    let reanchor = current.interval_secs != interval_secs || current.window != window;
+    let seed = match (reanchor, window) {
+        (true, Some(ScheduleWindow::SinceLast)) => {
+            Some(seed_covered_through(now, interval_secs, lag_secs)?)
+        }
+        _ => None,
+    };
+
+    let row = sqlx::query(AssertSqlSafe(format!(
+        "UPDATE schedules
+         SET interval_secs = $1, max_runs = $2, enabled = $3,
+             window_kind = $4, window_secs = $5, lag_secs = $6,
+             next_fire_at = CASE WHEN $7 THEN $8 ELSE next_fire_at END,
+             covered_through = COALESCE(covered_through, $11),
+             updated_at = now()
+         WHERE id = $9 AND key_id = $10
+         RETURNING {SCHEDULE_COLS}"
+    )))
+    .bind(bind_u64(interval_secs))
+    .bind(max_runs.map(bind_u64))
+    .bind(enabled)
+    .bind(window.map(|w| w.kind().as_str()))
+    .bind(window.and_then(ScheduleWindow::secs).map(bind_u64))
+    .bind(bind_u64(lag_secs))
+    .bind(reanchor)
+    .bind(now)
+    .bind(id)
+    .bind(key_id)
+    .bind(seed)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(StoreError::NotFound {
+        id,
+        resource: "schedule",
+    })?;
+
+    Ok(row_to_schedule(&row)?)
+}
+
+/// Announce a committed schedule creation. One spelling for both doors.
+fn log_schedule_created(schedule: &Schedule) {
+    tracing::info!(
+        event_type = "schedule_created",
+        schedule_id = schedule.id,
+        saved_query_id = schedule.saved_query_id,
+        key_id = schedule.key_id,
+        interval_secs = schedule.interval_secs,
+        "Schedule created"
+    );
+}
+
+/// Announce a committed schedule edit. One spelling for both doors.
+fn log_schedule_updated(schedule: &Schedule) {
+    tracing::info!(
+        event_type = "schedule_updated",
+        schedule_id = schedule.id,
+        key_id = schedule.key_id,
+        interval_secs = schedule.interval_secs,
+        enabled = schedule.enabled,
+        "Schedule updated"
+    );
 }
 
 /// Insert one `running` row for a claim, returning its id.

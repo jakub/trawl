@@ -33,12 +33,12 @@ use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::PoolDebugInfo;
 use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
-use crate::report_window::format_window_bound;
+use crate::report_window::{ScheduleWindow, format_window_bound};
 use crate::scheduler::execute_scheduled_query;
 use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
     HistoryEntry, ReportRun, RunClaim, RunStatus, SavedQuery, Schedule, ScheduleWithStats,
-    format_interval, parse_interval,
+    format_interval, parse_duration_secs, parse_interval,
 };
 
 // -- handlers ----------------------------------------------------------------
@@ -1750,11 +1750,14 @@ pub async fn update_saved(
 
     let key_id = verified.id;
 
-    // NotFound → 404, InvalidName → 400, DuplicateName → 409.
+    // NotFound → 404, InvalidName → 400, DuplicateName → 409, and a new
+    // DSL that contradicts the schedule's window → 400 naming both sides.
+    // The store proves that under the saved-query row lock, so the pair a
+    // window forbids cannot be assembled by two requests racing.
     let saved = state
         .storage
         .saved
-        .update(id, key_id, &req.query, req.name.as_deref())
+        .update_checked(id, key_id, &req.query, req.name.as_deref())
         .await?;
 
     Ok(Json(saved_query_response(saved)))
@@ -2198,6 +2201,25 @@ async fn try_resolve_from_saved(
     Ok(Some(resolved))
 }
 
+/// What the `lag` field accepts, spelled out for a rejection message.
+const DURATION_GRAMMAR: &str = "a duration: a number and one of s, m, h, d, w";
+
+/// What the `window` field accepts. The duration half carries the same 60s
+/// floor as the schedule interval, which is why the store's own message
+/// about a short one says "interval".
+const WINDOW_GRAMMAR: &str = "\"since_last\" or a duration: a number and one of s, m, h, d, w";
+
+/// Turn a duration-grammar rejection into a 400 that names the request
+/// field and what that field would have taken.
+///
+/// The store's message says what was wrong with the value. What it cannot
+/// say is which of two duration fields carried it, and an operator who gets
+/// `invalid interval format: "11y"` back from a request with both a
+/// `window` and a `lag` has to guess.
+fn invalid_duration(field: &str, grammar: &str, e: &crate::store::StoreError) -> ServerError {
+    ServerError::BadRequest(format!("invalid {field}: {e}; {field} takes {grammar}"))
+}
+
 /// `PUT /api/v1/saved/{id}/schedule` — create or update a schedule.
 pub async fn set_schedule(
     State(state): State<AppState>,
@@ -2212,58 +2234,42 @@ pub async fn set_schedule(
     let key_id = verified.id;
     let interval_secs = parse_interval(&req.interval)
         .map_err(|e| ServerError::BadRequest(format!("invalid interval: {e}")))?;
+    let window = req
+        .window
+        .as_deref()
+        .map(ScheduleWindow::parse)
+        .transpose()
+        .map_err(|e| invalid_duration("window", WINDOW_GRAMMAR, &e))?;
+    // Absent is zero, the default ADR-0018 ruling 6 gives a window. A lag
+    // WITHOUT a window is not decided here: the store owns that refusal,
+    // because it is the one place both write doors pass through.
+    let lag_secs = req
+        .lag
+        .as_deref()
+        .map(parse_duration_secs)
+        .transpose()
+        .map_err(|e| invalid_duration("lag", DURATION_GRAMMAR, &e))?
+        .unwrap_or(0);
 
-    // Verify saved query ownership.
-    state
-        .storage
-        .saved
-        .get(saved_id, key_id)
-        .await?
-        .ok_or_else(|| ServerError::NotFound("saved query not found or unauthorized".into()))?;
-
-    // Try update first, fall back to create. A racing create between the
-    // two statements surfaces as ScheduleExists → 409.
-    let schedule = match state
+    // Ownership, the window/query compatibility rule and the create-or-
+    // update decision all happen in one transaction under the saved-query
+    // row lock. Reading the pair out here and deciding afterwards would let
+    // a concurrent PUT of the saved query's DSL slip a time clause under
+    // the window between the check and the write.
+    let schedule = state
         .storage
         .schedule
-        .get_schedule_for_saved_query(saved_id, key_id)
-        .await?
-    {
-        Some(existing) => {
-            state
-                .storage
-                .schedule
-                .update_schedule(
-                    existing.id,
-                    key_id,
-                    interval_secs,
-                    req.max_runs,
-                    req.enabled,
-                    // The window/lag half of the request arrives with the
-                    // handler milestone; today every schedule is the legacy
-                    // shape, whose DSL owns its own time clause.
-                    None,
-                    0,
-                    chrono::Utc::now(),
-                )
-                .await?
-        }
-        None => {
-            state
-                .storage
-                .schedule
-                .create_schedule(
-                    saved_id,
-                    key_id,
-                    interval_secs,
-                    req.max_runs,
-                    None,
-                    0,
-                    chrono::Utc::now(),
-                )
-                .await?
-        }
-    };
+        .set_schedule_checked(
+            saved_id,
+            key_id,
+            interval_secs,
+            req.max_runs,
+            req.enabled,
+            window,
+            lag_secs,
+            chrono::Utc::now(),
+        )
+        .await?;
 
     // Freshly created/updated schedules can already have runs (updates);
     // fetch the stats the response carries.

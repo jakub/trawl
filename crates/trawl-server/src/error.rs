@@ -161,6 +161,20 @@ impl ServerError {
     }
 }
 
+impl From<crate::store::WindowWriteError> for ServerError {
+    /// Split a checked window write back into the two answers it already
+    /// carries. Neither half gains or loses anything here: the store fault
+    /// keeps the SQLSTATE mapping every other store error gets, and the
+    /// policy refusal keeps its 400 and its message.
+    fn from(err: crate::store::WindowWriteError) -> Self {
+        use crate::store::WindowWriteError as E;
+        match err {
+            E::Store(e) => Self::Store(e),
+            E::Policy(e) => Self::WindowPolicy(e),
+        }
+    }
+}
+
 impl From<fleet_auth::AuthError> for ServerError {
     /// Map fleet-auth keystore failures onto trawl's error contract.
     ///

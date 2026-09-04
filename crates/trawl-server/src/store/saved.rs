@@ -8,11 +8,12 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
 use sqlx::{AssertSqlSafe, PgPool, Row as _};
 
-use super::error::{PgViolation, StoreError, classify_violation};
+use super::error::{PgViolation, StoreError, WindowWriteError, classify_violation};
 use super::schedule::{
-    LATEST_RUN_COLS, LATEST_RUN_JOINS, ReportRun, Schedule, latest_run_and_count_from_row,
-    row_to_schedule_at, schedule_cols_as,
+    LATEST_RUN_COLS, LATEST_RUN_JOINS, ReportRun, Schedule, decode_window,
+    latest_run_and_count_from_row, row_to_schedule_at, schedule_cols_as,
 };
+use crate::report_window::validate_window_compatibility;
 
 /// Validate that a saved query name matches `[a-zA-Z0-9_-]+`.
 fn validate_name(name: &str) -> Result<(), StoreError> {
@@ -215,19 +216,75 @@ impl SavedQueryStore {
         Ok(saved)
     }
 
-    /// Update an existing saved query (DSL and optionally name).
+    /// Update an existing saved query (DSL and optionally name), refusing
+    /// text that contradicts the window its schedule already carries
+    /// (ADR-0018 rulings 7 and 12).
+    ///
+    /// This is the only door onto a saved query's text after creation, and
+    /// the reason it is the only one is the rule it enforces. A schedule
+    /// window and a `last=` in the query both claim to say what a report
+    /// covers, and neither side may be written over the other: an
+    /// unchecked twin of this method would be a way to put a time clause
+    /// under a standing window without ever being told no.
     ///
     /// Returns `NotFound` if the query doesn't exist or isn't owned by the
-    /// user, `InvalidName`/`DuplicateName` on name problems.
-    pub async fn update(
+    /// user, `InvalidName`/`DuplicateName` on name problems, and the
+    /// policy refusal when the new text and the standing window disagree.
+    ///
+    /// LOCK ORDER: `saved_queries` FOR UPDATE, then a plain read of the
+    /// schedule. The read takes no lock on purpose. Every writer of this
+    /// pair — this method and
+    /// [`super::ScheduleStore::set_schedule_checked`] — locks the saved
+    /// query first, so a window write is either already committed (and this
+    /// read sees it) or is waiting for this transaction to end. Locking the
+    /// schedule as well would add a second level to hold for a value
+    /// nothing can change under us.
+    ///
+    /// A query with no schedule, or a query-mode one, stores its text
+    /// unexamined: [`validate_window_compatibility`] returns immediately
+    /// for `None`, and `create` has never parsed DSL either.
+    pub async fn update_checked(
         &self,
         id: i64,
         key_id: i64,
         query: &str,
         name: Option<&str>,
-    ) -> Result<SavedQuery, StoreError> {
+    ) -> Result<SavedQuery, WindowWriteError> {
         if let Some(n) = name {
             validate_name(n)?;
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        let owned: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM saved_queries WHERE id = $1 AND key_id = $2 FOR UPDATE",
+        )
+        .bind(id)
+        .bind(key_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if owned.is_none() {
+            tx.rollback().await?;
+            return Err(StoreError::NotFound {
+                id,
+                resource: "saved query",
+            }
+            .into());
+        }
+
+        let schedule =
+            sqlx::query("SELECT window_kind, window_secs FROM schedules WHERE saved_query_id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let window = match schedule.as_ref().map(|row| decode_window(row, "")) {
+            Some(decoded) => decoded?,
+            None => None,
+        };
+
+        if let Err(e) = validate_window_compatibility(window, query) {
+            tx.rollback().await?;
+            return Err(e.into());
         }
 
         let row = sqlx::query(AssertSqlSafe(format!(
@@ -240,7 +297,7 @@ impl SavedQueryStore {
         .bind(name)
         .bind(id)
         .bind(key_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| match classify_violation(&e) {
             Some(PgViolation::SavedNameTaken) => StoreError::DuplicateName {
@@ -252,6 +309,8 @@ impl SavedQueryStore {
             id,
             resource: "saved query",
         })?;
+
+        tx.commit().await?;
 
         tracing::info!(
             event_type = "saved_query_updated",

@@ -42,7 +42,7 @@ pub use catalog::{
     MAX_CONFLICTS_PER_FIELD, MAX_PINNED_FIELDS, PURGE_COMMIT_BOUND, PinProposal, PurgedPin,
     PurgedPins, ServiceCursor, ServiceObservation,
 };
-pub use error::StoreError;
+pub use error::{StoreError, WindowWriteError};
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use repin::{
     CutoverOutcome, JobTotals, RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore,

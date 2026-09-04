@@ -8,6 +8,8 @@
 //! name), never by message text. Every constraint in
 //! `crates/trawl-server/migrations/` is named so this map stays exact.
 
+use crate::report_window::WindowPolicyError;
+
 /// Errors from every app-state store facade.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -219,6 +221,39 @@ impl StoreError {
             Self::PurgePrepareTimeout => "purge_prepare_timeout",
             Self::RepinPinVanished { .. } => "repin_pin_vanished",
         }
+    }
+}
+
+/// The error of a store write that first had to prove a schedule window and
+/// a saved query's text compatible (ADR-0018 rulings 7 and 12).
+///
+/// Two write paths reach that rule from opposite sides —
+/// [`crate::store::ScheduleStore::set_schedule_checked`] attaches a window
+/// to standing text, [`crate::store::SavedQueryStore::update_checked`]
+/// replaces the text under a standing window — and both can fail either as
+/// a store fault or as a policy refusal. They stay apart because the wire
+/// treatments differ: a store fault is redacted or mapped by SQLSTATE,
+/// while the refusal is the operator's own two inputs and reaches the
+/// client intact.
+///
+/// It is deliberately not a [`StoreError`] variant, for the reason
+/// [`crate::store::DueClaimError`] gives: `ServerError` already maps
+/// [`WindowPolicyError`] to a 400 that keeps its message, and a second
+/// route to the same wire would be free to drift from the first.
+#[derive(Debug, thiserror::Error)]
+pub enum WindowWriteError {
+    /// The app-state store failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The window and the query text cannot both say what the report
+    /// covers.
+    #[error(transparent)]
+    Policy(#[from] WindowPolicyError),
+}
+
+impl From<sqlx::Error> for WindowWriteError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Store(StoreError::from(e))
     }
 }
 
