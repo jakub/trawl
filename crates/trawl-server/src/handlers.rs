@@ -1274,12 +1274,18 @@ pub async fn catalog_field(
     // MAX_CONFLICTS_PER_FIELD newest rows per field in the writing
     // transaction, so this read is bounded by construction.
     let conflicts = state.storage.catalog.conflicts_for_field(&name).await?;
-    let verdict = degraded_verdicts(
-        &state.storage.catalog,
-        &[(name.clone(), current_pin(&pin.duckdb_type))],
-    )
-    .await?
-    .remove(&name);
+    // The verdict and the ack that suppresses it are one fact, so they come
+    // from one snapshot: read separately, an ack or a repin cutover landing
+    // between them publishes a pair that was never true.
+    let health = state.storage.catalog.field_health_snapshot(&name).await?;
+    let verdict = health
+        .aggregate
+        .as_ref()
+        .filter(|agg| crate::catalog::analyzer::is_degraded(agg))
+        .map(|agg| {
+            crate::catalog::analyzer::verdict(agg, current_pin(&pin.duckdb_type), &health.evidence)
+        });
+    let ack = health.ack;
 
     Ok(Json(trawl_api::CatalogFieldResponse {
         name: pin.field,
@@ -1309,7 +1315,169 @@ pub async fn catalog_field(
             })
             .collect(),
         verdict,
+        ack: ack.map(ack_to_wire),
     }))
+}
+
+/// Render a stored acknowledgement onto the wire.
+fn ack_to_wire(ack: crate::store::DegradedAck) -> trawl_api::FieldAck {
+    trawl_api::FieldAck {
+        acked_at: iso8601(ack.acked_at),
+        acked_by: ack.acked_by,
+        note: ack.note,
+        evidence_through: u64::try_from(ack.evidence_through).unwrap_or(0),
+    }
+}
+
+/// The field an ack route acts on, as a query parameter for the reason
+/// [`CatalogFieldParams`] documents: a catalog key can carry `/`, `?` or `%`.
+#[derive(Debug, Deserialize)]
+pub struct FieldAckParams {
+    /// Field name (ASCII-folded before lookup, mirroring ingest's fold).
+    pub name: String,
+}
+
+/// Request body for `POST /api/v1/schema/field/ack`.
+#[derive(Debug, Default, Deserialize)]
+pub struct FieldAckRequest {
+    /// Why the operator is accepting the pin as it stands. Optional, capped
+    /// at [`MAX_ACK_NOTE_BYTES`], stored verbatim and never logged.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Byte cap for an acknowledgement note, mirroring the migration's CHECK.
+///
+/// Checked here as well as there so an over-long note is a 400 naming the
+/// limit rather than a constraint violation surfacing as a store error, and
+/// so the refusal costs no transaction.
+const MAX_ACK_NOTE_BYTES: usize = 1024;
+
+/// `POST /api/v1/schema/field/ack?name=` — acknowledge a degraded verdict
+/// (issue #111). `SchemaWrite`-gated: it changes what every read surface
+/// says about the field.
+///
+/// The ack covers the evidence that exists right now and no more, so the
+/// badge returns the moment the pin shelves another batch. 404 = no such
+/// pin; 409 = the field's evidence does not meet the degraded threshold, so
+/// there is no verdict to acknowledge and installing a high-water would
+/// swallow the evidence that raises the badge for the first time.
+pub async fn ack_degraded_field(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<FieldAckParams>,
+    Json(req): Json<FieldAckRequest>,
+) -> Result<axum::response::Response, ServerError> {
+    if !verified.has_permission(Permission::SchemaWrite) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+    let name = trawl_core::schema::catalog_key(&params.name);
+    let note = req.note.as_deref();
+    if let Some(note) = note
+        && note.len() > MAX_ACK_NOTE_BYTES
+    {
+        return Err(ServerError::BadRequest(format!(
+            "acknowledgement note is {} bytes; the limit is {MAX_ACK_NOTE_BYTES}",
+            note.len()
+        )));
+    }
+
+    let outcome = state
+        .storage
+        .catalog
+        .acknowledge_degraded_field(&name, &verified.prefix, note)
+        .await?;
+    match outcome {
+        crate::store::AckOutcome::Acked {
+            ack,
+            created,
+            advanced,
+        } => {
+            // The note is the one thing this record never carries: it is
+            // operator prose, and a durable log line is not where the
+            // operator chose to put it. Whether they wrote one is the part
+            // an audit reader needs.
+            //
+            // `advanced = false` is the interleaving where this call read
+            // less evidence than a concurrent ack had already acknowledged:
+            // the stored row keeps the other operator's name, note and
+            // timestamp, and this event is the only record that the request
+            // happened at all.
+            tracing::info!(
+                event_type = "field_degraded_acked",
+                field = %name,
+                actor = %verified.name,
+                actor_prefix = %verified.prefix,
+                evidence_through = ack.evidence_through,
+                created,
+                advanced,
+                note_present = note.is_some(),
+                "operator acknowledged a degraded field"
+            );
+            Ok((StatusCode::OK, Json(ack_to_wire(ack))).into_response())
+        }
+        crate::store::AckOutcome::Unpinned => {
+            Err(ServerError::NotFound(format!("field not pinned: {name}")))
+        }
+        // The refusal wears the same `{"error": {...}}` envelope every other
+        // error on this API does; only the status distinguishes it.
+        crate::store::AckOutcome::NotDegraded => Ok((
+            StatusCode::CONFLICT,
+            Json(trawl_api::ErrorResponse {
+                error: trawl_api::ErrorEnvelope::simple(
+                    trawl_api::ErrorCode::BadRequest,
+                    format!(
+                        "{name} is not degraded: the badge needs evidence spanning \
+                     {span_hours}h and either {rows} rows shelved or \
+                     {episodes} conflict episodes. There is nothing to \
+                     acknowledge.",
+                        span_hours = crate::catalog::analyzer::DEGRADED_MIN_SPAN.num_hours(),
+                        rows = crate::catalog::analyzer::DEGRADED_MIN_ROWS_SHELVED,
+                        episodes = crate::catalog::analyzer::DEGRADED_MIN_EPISODES,
+                    ),
+                ),
+            }),
+        )
+            .into_response()),
+    }
+}
+
+/// `DELETE /api/v1/schema/field/ack?name=` — withdraw an acknowledgement,
+/// re-raising the badge if the evidence still indicts the pin.
+///
+/// Idempotent: 204 whether or not a row was there, because "this field is
+/// not acknowledged" is the state the caller asked for either way. Only an
+/// unpinned field refuses (404) — the caller has the wrong name, which no
+/// amount of retrying fixes.
+pub async fn clear_degraded_field_ack(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Query(params): Query<FieldAckParams>,
+) -> Result<axum::response::Response, ServerError> {
+    if !verified.has_permission(Permission::SchemaWrite) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+    let name = trawl_core::schema::catalog_key(&params.name);
+    if state.storage.catalog.field_pin(&name).await?.is_none() {
+        return Err(ServerError::NotFound(format!("field not pinned: {name}")));
+    }
+
+    if state
+        .storage
+        .catalog
+        .clear_degraded_ack_owned(&name)
+        .await?
+    {
+        tracing::info!(
+            event_type = "field_degraded_ack_cleared",
+            field = %name,
+            reason = "operator",
+            actor = %verified.name,
+            actor_prefix = %verified.prefix,
+            "operator withdrew a degraded-field acknowledgement"
+        );
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Query parameters for `GET /api/v1/schema/conflicts`.
@@ -1716,14 +1884,25 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
     } else {
         clamp(job.projected_nulls)
     };
+    // The terms this job actually ran under, off its own row. A row whose
+    // accepted ceilings are NULL predates them (migration 0015) and reads as
+    // the blank check it was, so an old job's verdict does not change shape
+    // under a new binary.
+    let terms = match (
+        job.force,
+        job.accepted_max_nulled_rows,
+        job.accepted_max_ambiguous_rows,
+    ) {
+        (true, Some(max_nulled), Some(max_ambiguous)) => {
+            crate::repin::ceiling::ForceTerms::forced(crate::repin::ceiling::Ceilings {
+                max_nulled: clamp(max_nulled),
+                max_ambiguous: clamp(max_ambiguous),
+            })
+        }
+        (force, _, _) => crate::repin::ceiling::ForceTerms::blank_check(force),
+    };
     let requires_force_reason = job.planned_at.and_then(|_| {
-        crate::repin::force_refusal(
-            to,
-            dialect,
-            nulled,
-            clamp(job.ambiguous_numerals),
-            job.force,
-        )
+        crate::repin::force_refusal(to, dialect, nulled, clamp(job.ambiguous_numerals), terms)
     });
     trawl_api::RepinJobResponse {
         requires_force: job.planned_at.map(|_| requires_force_reason.is_some()),
@@ -1761,6 +1940,19 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
                 last_seen: iso8601(last_seen),
                 service,
             }),
+        // Persisted facts only (#109). A `running` row carrying these is a
+        // cancel in flight; the status route computes no "cancelling"
+        // pseudo-status over them.
+        cancel_requested_at: job.cancel_requested_at.map(iso8601),
+        cancelled_by: job.cancelled_by,
+        // Both pairs ride the row unchanged: what the request stated, and
+        // what the plan resolved. A NULL column stays absent on the wire —
+        // "the request stated none" and "this row predates ceilings" are
+        // both read as "no number here", never as zero.
+        max_nulled_rows: job.max_nulled_rows.map(clamp),
+        max_ambiguous_rows: job.max_ambiguous_rows.map(clamp),
+        accepted_max_nulled_rows: job.accepted_max_nulled_rows.map(clamp),
+        accepted_max_ambiguous_rows: job.accepted_max_ambiguous_rows.map(clamp),
     }
 }
 
@@ -1798,18 +1990,94 @@ pub async fn schema_repin(
             req.dialect.as_deref(),
             req.dry_run,
             req.force,
+            // Stated or not: an absent ceiling means "derive one from this
+            // job's own scan", and a ceiling without force is a 400 the
+            // engine raises.
+            crate::repin::ceiling::RequestedCeilings {
+                max_nulled: req.max_nulled_rows,
+                max_ambiguous: req.max_ambiguous_rows,
+            },
             Some(&verified.name),
         )
         .await?;
     let (status, job) = match outcome {
-        crate::repin::StartOutcome::DryRun(job) => (StatusCode::OK, job),
         crate::repin::StartOutcome::Started(job) => (StatusCode::ACCEPTED, job),
         crate::repin::StartOutcome::Refused(job) => (StatusCode::CONFLICT, job),
+        // A job an operator cancelled while this request's own ladder was
+        // still running it (#109) answers 200 with the terminal row, the
+        // same as a dry-run report: never a fourth status code, because 409
+        // already means refused-needs-force to a body-sniffing client, and
+        // `job.status` says `cancelled` plainly.
+        crate::repin::StartOutcome::DryRun(job) | crate::repin::StartOutcome::Cancelled(job) => {
+            (StatusCode::OK, job)
+        }
     };
     Ok((
         status,
         Json(trawl_api::RepinResponse {
             job: repin_job_to_wire(job),
+        }),
+    )
+        .into_response())
+}
+
+/// `POST /api/v1/schema/repin/cancel` — ask the running repin to stop
+/// (#109). `SchemaWrite`-gated like the trigger, and 503 on a query-only
+/// node for the same reason: a node that owns nothing under the data root
+/// runs no job to cancel.
+///
+/// No request body: there is at most one running job, and naming it would
+/// invite an operator to cancel a job that already ended and a newer one
+/// took the slot.
+///
+/// The verdict comes from the registry's own lock through
+/// [`crate::repin::CancelVerdict::wire`] — 202 accepted, 409 past the point
+/// of no return, 404 nothing running — and this handler renders it without
+/// deciding anything. The job row rides along for the two verdicts that
+/// name a job, so an operator sees what was cancelled without a second
+/// round trip; a store that cannot serve that row costs the body, never the
+/// verdict, because the cancel has already taken effect in process.
+pub async fn schema_repin_cancel(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<axum::response::Response, ServerError> {
+    if !verified.has_permission(Permission::SchemaWrite) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+    let Some(engine) = state.repin.as_ref() else {
+        return Err(ServerError::ServiceUnavailable(
+            "repin requires an ingest-enabled node (this node does not own \
+             the data root)"
+                .into(),
+        ));
+    };
+
+    // Both halves of the caller's identity go to the engine: the display
+    // name the job row records, and the key prefix the audit events name
+    // beside it. A name is operator-chosen and can be reused or changed;
+    // the prefix is what says which credential actually asked.
+    let actor = crate::repin::CancelActor::new(verified.name.clone(), verified.prefix.clone());
+    let verdict = engine.cancel(&actor);
+    let (status, outcome, detail) = verdict.wire();
+    let mut job = None;
+    if let Some(job_id) = verdict.job_id() {
+        match state.storage.repin.get(job_id).await {
+            Ok(row) => job = row.map(repin_job_to_wire),
+            Err(e) => tracing::error!(
+                event_type = "repin_store_error",
+                job_id,
+                error_class = e.class(),
+                "failed to read the repin job row for a cancel receipt; the \
+                 verdict is unaffected"
+            ),
+        }
+    }
+    Ok((
+        status,
+        Json(trawl_api::RepinCancelResponse {
+            outcome,
+            detail: detail.to_owned(),
+            job,
         }),
     )
         .into_response())
@@ -1830,6 +2098,50 @@ pub async fn schema_repin_status(
     Ok(Json(trawl_api::RepinStatusResponse {
         job: job.map(repin_job_to_wire),
     }))
+}
+
+/// `POST /api/v1/schema/gc-pins` reclaims pin slots held by fields
+/// nothing writes any more (#110). `SchemaWrite`-gated, like the repin
+/// trigger: both mutate the catalog, and neither is a read.
+///
+/// Dry and real runs both answer 200 with the same report; `dry_run` and
+/// `deleted` tell them apart. A refusal is a 409 through the ordinary
+/// error envelope: a repin owns the data root, or the corpus could not be
+/// read well enough to prove any pin dead. A query-only node answers 503,
+/// because proving a pin dead means reading parquet footers and it owns
+/// none.
+///
+/// The engine's `run` spawns its own task internally (a disconnect must
+/// not split the postgres commit from the cache eviction), so this handler
+/// awaits it directly rather than spawning a second time.
+pub async fn schema_gc_pins(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Json(req): Json<trawl_api::GcPinsRequest>,
+) -> Result<Json<trawl_api::GcPinsResponse>, ServerError> {
+    if !verified.has_permission(Permission::SchemaWrite) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+    let Some(engine) = state.gc.as_ref() else {
+        return Err(ServerError::ServiceUnavailable(
+            "pin gc requires an ingest-enabled node (this node does not own \
+             the data root)"
+                .into(),
+        ));
+    };
+
+    let actor = crate::catalog::gc::GcActor {
+        name: Some(verified.name.clone()),
+        key_prefix: Some(verified.prefix.clone()),
+    };
+    let report = engine
+        .run(
+            req.older_than_secs.map(std::time::Duration::from_secs),
+            req.dry_run,
+            actor,
+        )
+        .await?;
+    Ok(Json(report))
 }
 
 // -- schedule handlers -------------------------------------------------------

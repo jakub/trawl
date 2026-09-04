@@ -129,6 +129,27 @@ before anything is built): the siblings would land on the parent
 filesystem, where neither the hardlinks nor the swap's renames can reach
 them — put the data root inside the volume, as both packaged layouts do.
 
+Force on such a job names a number. Ingest keeps writing for the whole
+build, so the finished shadow is never exactly the corpus the scan
+measured; a forced request may state `max_nulled_rows` and
+`max_ambiguous_rows`, and an unstated one resolves from that job's own scan
+as `scan + max(scan / 10 rounded up, 10)`. One decision function answers
+all three askers (the scan gate, the finished-shadow gate, and the job row
+on the wire), so a dry run cannot promise an outcome the execution would
+refuse, and a rewrite that came out worse than what force accepted refuses
+the cutover with the accepted and actual counts named.
+
+The badge over that evidence can also be acknowledged rather than repinned,
+for the case where the fix is with the sender and the shelved rows have to
+stay shelved: `POST /api/v1/schema/field/ack` records an episode
+high-water, and the analyzer suppresses the verdict while the field's
+episode count stays at or below it. A count rather than a timestamp,
+because compaction can record several episodes inside one clock tick and a
+time-keyed ack would suppress evidence nobody had seen. The next episode
+re-raises the badge, the operator can withdraw the ack outright, and a
+successful repin deletes it in the same transaction as the pin flip, since
+the evidence it acknowledged no longer describes the pin.
+
 An additive catch-up loop folds in files compaction writes meanwhile (the
 file-relocating daily rollup is paused for the whole job, so the diff is
 pure additions/replacements). The cutover is a few seconds under two

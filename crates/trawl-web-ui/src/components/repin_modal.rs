@@ -16,9 +16,20 @@
 //!    plan whose `projected_nulls` looks non-zero. The checkbox appears
 //!    once `refused_needs_force` has come back, defaults off, and must
 //!    be checked before the forced run can be started.
-//! 3. **The plan is a snapshot, not a reservation.** Ingest keeps
+//! 3. **Force accepts a printed number, and binds that number.** The
+//!    ceilings a forced run is held to are resolved server-side from a
+//!    FORCED scan, so the dialog asks for a forced plan, shows the pair
+//!    that plan resolved, and the execution restates it as explicit
+//!    ceilings. Sending none and letting the server re-derive would bind
+//!    a limit nobody read, which is what ceilings exist to stop (issue
+//!    #111). It is the same rule the CLI's `--yes --force` preview
+//!    keeps. The acceptance opens for a forced scan this dialog asked
+//!    for and nothing else: a refusal carrying ceilings is a run that
+//!    busted them, not a consent to run it again, and a refusal for a
+//!    target the strip does not offer is not this dialog's plan at all.
+//! 4. **The plan is a snapshot, not a reservation.** Ingest keeps
 //!    running; the real run rescans, and its numbers can differ.
-//! 4. **An indeterminate outcome never offers to run again.** A real run
+//! 5. **An indeterminate outcome never offers to run again.** A real run
 //!    whose response was lost may have claimed a job; only a status
 //!    probe that can prove which job is ours resolves that, and the
 //!    absence of proof leaves the operator a re-probe, never a second
@@ -35,8 +46,9 @@ use trawl_core::sanitize::sanitize_display_text;
 
 use crate::api::{self, ApiError, RepinOutcome};
 use crate::repin_flow::{
-    LostRun, ProbedJob, Recovery, SlotCheck, StatusProbe, Unproven, default_target,
-    indeterminate_text, is_pre_claim_failure, recovery_verdict, repin_targets, slot_check,
+    BoundCeilings, ForceStep, LostRun, ProbedJob, Recovery, SlotCheck, StatusProbe, Unproven,
+    default_target, force_step, indeterminate_text, is_pre_claim_failure, recovery_verdict,
+    refusal_is_reusable, repin_targets, slot_check,
 };
 use crate::service_card_fmt::{format_bytes, format_exact};
 use fleet_ui::{Btn, Icon, Modal, Segmented, SegmentedOption, Variant};
@@ -100,6 +112,59 @@ enum Phase {
     },
 }
 
+/// One request off this dialog: which rung of the ladder it is, and what
+/// it binds. (`Rung`, not `Run`, because `dry_run` is one of them.)
+#[derive(Debug, Clone, Copy)]
+struct Rung {
+    dry_run: bool,
+    force: bool,
+    /// The ceilings this request states, `Some` on the forced execution
+    /// alone — and then always the pair the operator has just read.
+    ceilings: Option<BoundCeilings>,
+}
+
+impl Rung {
+    /// The plan, unforced. What mounting asks for.
+    fn plan() -> Self {
+        Self {
+            dry_run: true,
+            force: false,
+            ceilings: None,
+        }
+    }
+
+    /// The forced scan: the only thing that resolves the ceilings a
+    /// forced execution can restate. It writes nothing.
+    fn forced_plan() -> Self {
+        Self {
+            dry_run: true,
+            force: true,
+            ceilings: None,
+        }
+    }
+
+    /// The real run, accepting no loss. The server refuses it if the
+    /// scan projects any.
+    fn execute() -> Self {
+        Self {
+            dry_run: false,
+            force: false,
+            ceilings: None,
+        }
+    }
+
+    /// The forced run, held to `ceilings` — the pair on screen. `None`
+    /// is the case where a forced scan resolved none and there is
+    /// nothing to restate.
+    fn forced_execute(ceilings: Option<BoundCeilings>) -> Self {
+        Self {
+            dry_run: false,
+            force: true,
+            ceilings,
+        }
+    }
+}
+
 /// The dialog's own reactive handles, carried to the out-of-line probes
 /// as one value. They are `Copy` handles; a probe that took eight
 /// positional signals is a probe that writes the wrong one.
@@ -108,6 +173,13 @@ struct Handles {
     phase: RwSignal<Phase>,
     probing: RwSignal<bool>,
     force: RwSignal<bool>,
+    /// Whether a FORCED scan has answered in this dialog for the plan on
+    /// screen. It is what opens the acceptance, and it survives nothing:
+    /// a target change, a refusal, an adopted job all clear it. A forced
+    /// report that resolved no ceilings has nothing more to give, so it
+    /// also stops the dialog offering a rescan that would read the whole
+    /// corpus for the same answer.
+    previewed: RwSignal<bool>,
     busy_field: RwSignal<Option<String>>,
     slot_note: RwSignal<Option<String>>,
     /// False once this dialog is disposed. Every signal above then
@@ -146,14 +218,23 @@ pub fn RepinModal(
 ) -> impl IntoView {
     let shown_field = sanitize_display_text(&field);
     let targets = repin_targets(&current_type);
+    // A refusal is the scan of ONE target. Re-presenting it under any
+    // other rung would put its counts, and the ceilings a forced run
+    // restates, against a cast that produced none of them — so a target
+    // this dialog does not offer (a CLI-started `SEVERITY` or
+    // resurrection repin) drops the plan here and the dialog starts from
+    // a fresh scan. The refusal itself is not lost: the case file keeps
+    // it as a receipt and points at the CLI.
+    let refused = refused.filter(|job| refusal_is_reusable(&current_type, &job.to_type));
     let initial = refused.as_ref().map_or_else(
         || default_target(&current_type, &suggested_to).as_catalog(),
         |job| {
             // The refusal's own target, so the re-presented numbers and
-            // the selected rung cannot disagree.
-            repin_targets(&current_type)
-                .into_iter()
-                .find(|c| c.as_catalog() == job.to_type)
+            // the selected rung cannot disagree. Offered by the filter
+            // above, so the lookup always finds it.
+            targets
+                .iter()
+                .find(|c| c.as_catalog().eq_ignore_ascii_case(&job.to_type))
                 .map_or_else(
                     || default_target(&current_type, &suggested_to).as_catalog(),
                     |c| c.as_catalog(),
@@ -165,6 +246,9 @@ pub fn RepinModal(
     let phase =
         RwSignal::new(refused.map_or(Phase::Planning, |job| Phase::NeedsForce(Box::new(job))));
     let force = RwSignal::new(false);
+    // A refusal handed in was scanned unforced, exactly like one this
+    // dialog provokes: no forced scan has run for it either way.
+    let previewed = RwSignal::new(false);
     let busy = RwSignal::new(false);
     // A status probe is in flight — the recovery read after a lost
     // response, or the slot re-check. Tracked apart from `busy`: neither
@@ -191,15 +275,21 @@ pub fn RepinModal(
         phase,
         probing,
         force,
+        previewed,
         busy_field,
         slot_note,
         alive,
     };
 
     let field_for_calls = field.clone();
-    // The one place a repin request is issued. `dry_run`/`force` decide
-    // which rung of the ladder; nothing else varies.
-    let submit = Callback::new(move |(dry_run, forced): (bool, bool)| {
+    // The one place a repin request is issued. The `Run` decides which
+    // rung of the ladder; nothing else varies.
+    let submit = Callback::new(move |run: Rung| {
+        let Rung {
+            dry_run,
+            force: forced,
+            ceilings,
+        } = run;
         if busy.get_untracked() {
             return;
         }
@@ -224,7 +314,7 @@ pub fn RepinModal(
         let field = field_for_calls.clone();
         let to = target.get_untracked();
         spawn_local(async move {
-            let outcome = api::repin(&field, &to, dry_run, forced).await;
+            let outcome = api::repin(&field, &to, dry_run, forced, ceilings).await;
             // 202 first, before any liveness or generation gate: the job
             // is claimed and running detached server-side, so the one
             // thing that must survive a dialog closed mid-claim is the
@@ -254,13 +344,32 @@ pub fn RepinModal(
             match outcome {
                 // 200 is the scan report and nothing else — the server
                 // only answers it to a dry run.
-                Ok(RepinOutcome::DryRun(job)) => phase.set(Phase::Plan(Box::new(job))),
+                Ok(RepinOutcome::DryRun(job)) => {
+                    // A FORCED scan is the preview: its report resolved
+                    // the ceilings the execution restates, so it belongs
+                    // back on the forced rung rather than presented as a
+                    // plan that could be run unforced.
+                    previewed.set(forced);
+                    force.set(false);
+                    phase.set(if forced {
+                        Phase::NeedsForce(Box::new(job))
+                    } else {
+                        Phase::Plan(Box::new(job))
+                    });
+                }
                 // Handed to the case file above, before the gates.
                 Ok(RepinOutcome::Started(_)) => {}
                 Ok(RepinOutcome::Refused(job)) => {
                     // Re-arm the acceptance: a refusal must be accepted
                     // for the plan actually shown, never carried over.
                     force.set(false);
+                    // And a refusal is never itself a preview, however it
+                    // was reached. An unforced run has no ceilings to
+                    // show; a FORCED run refused at the cutover gate has
+                    // the pair it just exceeded, which is the last thing
+                    // to re-offer. Either way the next forced run buys a
+                    // fresh scan first.
+                    previewed.set(false);
                     phase.set(Phase::NeedsForce(Box::new(job)));
                 }
                 Ok(RepinOutcome::Busy(msg)) => {
@@ -310,7 +419,7 @@ pub fn RepinModal(
     // Mount: the plan comes first, always — unless a refusal was handed
     // in, which already carries one.
     if matches!(phase.get_untracked(), Phase::Planning) {
-        submit.run((true, false));
+        submit.run(Rung::plan());
     }
 
     let cancel = Callback::new(move |()| on_close.run(None));
@@ -326,13 +435,24 @@ pub fn RepinModal(
             // A dry-run failure is retryable because it is a dry run:
             // the scan mutates nothing, so a second one at worst costs
             // another full-corpus pass.
-            Phase::NeedsPlan | Phase::Failed { .. } => submit.run((true, false)),
-            Phase::Plan(_) => submit.run((false, false)),
-            Phase::NeedsForce(_) => {
-                if force.get_untracked() {
-                    submit.run((false, true));
+            Phase::NeedsPlan | Phase::Failed { .. } => submit.run(Rung::plan()),
+            Phase::Plan(_) => submit.run(Rung::execute()),
+            Phase::NeedsForce(job) => match force_step(&job, previewed.get_untracked()) {
+                // The ceilings are not known yet, so there is nothing to
+                // accept: this click buys the numbers, and writes
+                // nothing.
+                ForceStep::NeedsPreview => submit.run(Rung::forced_plan()),
+                ForceStep::Bound(bound) => {
+                    if force.get_untracked() {
+                        submit.run(Rung::forced_execute(Some(bound)));
+                    }
                 }
-            }
+                ForceStep::Unbound => {
+                    if force.get_untracked() {
+                        submit.run(Rung::forced_execute(None));
+                    }
+                }
+            },
             // The only action an unproven outcome offers. Re-probing is
             // idempotent; re-running would not be.
             Phase::Indeterminate {
@@ -351,7 +471,10 @@ pub fn RepinModal(
             Phase::Planning => "Planning…",
             Phase::NeedsPlan => "Get plan",
             Phase::Plan(_) => "Run repin",
-            Phase::NeedsForce(_) => "Run forced repin",
+            Phase::NeedsForce(job) => match force_step(&job, previewed.get()) {
+                ForceStep::NeedsPreview => "Get forced plan",
+                ForceStep::Bound(_) | ForceStep::Unbound => "Run forced repin",
+            },
             Phase::Submitting => "Starting…",
             Phase::Busy(_) => "Check again",
             Phase::Indeterminate { .. } => "Check status",
@@ -364,7 +487,12 @@ pub fn RepinModal(
         }
         match phase.get() {
             Phase::Planning | Phase::Submitting => true,
-            Phase::NeedsForce(_) => !force.get(),
+            // Asking for the numbers needs no acceptance; accepting them
+            // does.
+            Phase::NeedsForce(job) => match force_step(&job, previewed.get()) {
+                ForceStep::NeedsPreview => false,
+                ForceStep::Bound(_) | ForceStep::Unbound => !force.get(),
+            },
             Phase::NeedsPlan
             | Phase::Plan(_)
             | Phase::Busy(_)
@@ -373,7 +501,11 @@ pub fn RepinModal(
         }
     });
     let primary_variant = move || match phase.get() {
-        Phase::NeedsForce(_) => Variant::Danger,
+        // A scan is not a mutation, however red the phase around it.
+        Phase::NeedsForce(job) => match force_step(&job, previewed.get()) {
+            ForceStep::NeedsPreview => Variant::Primary,
+            ForceStep::Bound(_) | ForceStep::Unbound => Variant::Danger,
+        },
         _ => Variant::Primary,
     };
 
@@ -442,6 +574,9 @@ pub fn RepinModal(
                         }
                         target.set(id);
                         force.set(false);
+                        // Ceilings are a function of the scan, and the
+                        // scan was for another target.
+                        previewed.set(false);
                         // The plan on screen was scanned for a different
                         // target. It is not adapted, it is discarded.
                         generation.update(|g| *g += 1);
@@ -482,34 +617,91 @@ pub fn RepinModal(
                     </p>
                 }.into_any(),
                 Phase::Plan(job) => plan_block(&job, false),
-                Phase::NeedsForce(job) => view! {
-                    {plan_block(&job, true)}
-                    <div class="rp-force">
-                        <label>
-                            <input
-                                type="checkbox"
-                                prop:checked=move || force.get()
-                                on:change=move |e| {
-                                    force.set(checked_from_event(&e));
-                                }
-                            />
-                            // The acceptance carries the snapshot caveat
-                            // itself: ingest keeps running, so the count
-                            // being accepted is the last scan's, not a
-                            // reservation.
-                            " I accept that the values the new pin cannot keep — "
-                            {format_exact(job.projected_nulls)}
-                            " at the last scan — become NULL"
-                        </label>
-                        <p class="rp-note">
-                            "A forced repin writes NULL wherever the new pin cannot keep the \
-                             stored value. The originals stay findable in "
-                            <span class="mono">"_raw"</span>
-                            ", and a later repin back can resurrect them from there — but the \
-                             typed column will not carry them until it does."
-                        </p>
-                    </div>
-                }.into_any(),
+                Phase::NeedsForce(job) => {
+                    let step = force_step(&job, previewed.get());
+                    let projected = format_exact(job.projected_nulls);
+                    view! {
+                        {plan_block(&job, true)}
+                        {match step {
+                            // No forced scan has answered here yet, and
+                            // only a forced scan settles the numbers.
+                            // Nothing to accept, so no acceptance is
+                            // offered.
+                            ForceStep::NeedsPreview => view! {
+                                <p class="rp-note">
+                                    "A forced repin is held to a limit per dimension — rows the \
+                                     new pin cannot read, and numerals that mean different \
+                                     severities in each dialect. The server resolves those \
+                                     numbers from a forced scan, so \"Get forced plan\" reads \
+                                     the corpus once more and shows exactly what a forced run \
+                                     would be allowed to do. It writes nothing."
+                                </p>
+                            }.into_any(),
+                            ForceStep::Bound(bound) => view! {
+                                <div class="rp-force">
+                                    <label>
+                                        <input
+                                            type="checkbox"
+                                            prop:checked=move || force.get()
+                                            on:change=move |e| {
+                                                force.set(checked_from_event(&e));
+                                            }
+                                        />
+                                        // The numbers accepted here are
+                                        // the ones the request sends, so
+                                        // the bound the server enforces
+                                        // is the bound on screen.
+                                        " I accept up to "
+                                        {format_exact(bound.max_nulled)}
+                                        " row(s) the new pin cannot keep becoming NULL, and up to "
+                                        {format_exact(bound.max_ambiguous)}
+                                        " dialect-ambiguous numeral(s)"
+                                    </label>
+                                    <p class="rp-note">
+                                        "The last scan projected "{projected}
+                                        " unreadable value(s); the limits above are that scan \
+                                         plus headroom, because ingest keeps running while the \
+                                         rewrite does. The repin refuses at the cutover, with \
+                                         the corpus untouched, if the finished rewrite is worse \
+                                         than what you accept here."
+                                    </p>
+                                    <p class="rp-note">
+                                        "A forced repin writes NULL wherever the new pin cannot \
+                                         keep the stored value. The originals stay findable in "
+                                        <span class="mono">"_raw"</span>
+                                        ", and a later repin back can resurrect them from there \
+                                         — but the typed column will not carry them until it \
+                                         does."
+                                    </p>
+                                </div>
+                            }.into_any(),
+                            // A forced scan that resolved no ceilings.
+                            // Rescanning would say the same thing, so the
+                            // run is offered without a number to restate.
+                            ForceStep::Unbound => view! {
+                                <div class="rp-force">
+                                    <label>
+                                        <input
+                                            type="checkbox"
+                                            prop:checked=move || force.get()
+                                            on:change=move |e| {
+                                                force.set(checked_from_event(&e));
+                                            }
+                                        />
+                                        " I accept that the values the new pin cannot keep — "
+                                        {projected}
+                                        " at the last scan — become NULL"
+                                    </label>
+                                    <p class="rp-note">
+                                        "The server reported no resolved limits for this job, so \
+                                         the run is held to the ones its own scan derives rather \
+                                         than to a number shown here."
+                                    </p>
+                                </div>
+                            }.into_any(),
+                        }}
+                    }.into_any()
+                },
                 Phase::Submitting => view! {
                     <p class="rp-note">"Claiming the repin slot…"</p>
                 }.into_any(),
@@ -682,6 +874,10 @@ fn probe_recovery(
             Recovery::Adopt => {
                 if let Some(job) = found {
                     handles.force.set(false);
+                    // No forced scan has answered in this dialog for the
+                    // adopted row, whatever ceilings it carries, so the
+                    // forced rung starts at the preview.
+                    handles.previewed.set(false);
                     handles.phase.set(Phase::NeedsForce(Box::new(job)));
                 }
             }
@@ -720,6 +916,7 @@ fn probe_slot(adopt_free: bool, handles: Handles) {
                     handles.busy_field.set(None);
                     handles.slot_note.set(None);
                     handles.force.set(false);
+                    handles.previewed.set(false);
                     handles.phase.set(Phase::NeedsPlan);
                 }
             }

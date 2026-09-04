@@ -72,6 +72,7 @@ pub const CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL: &str = "trawl_catalog_bookkeeping_
 pub const CATALOG_PINNED_FIELDS: &str = "trawl_catalog_pinned_fields";
 pub const CATALOG_PIN_CAPACITY: &str = "trawl_catalog_pin_capacity";
 pub const CATALOG_DEGRADED_FIELDS: &str = "trawl_catalog_degraded_fields";
+pub const CATALOG_PINS_GC_TOTAL: &str = "trawl_catalog_pins_gc_total";
 pub const CATALOG_REPIN_JOBS_TOTAL: &str = "trawl_catalog_repin_jobs_total";
 pub const CATALOG_REPIN_RUNNING: &str = "trawl_catalog_repin_running";
 pub const CATALOG_REPIN_FILES_TOTAL: &str = "trawl_catalog_repin_files_total";
@@ -230,10 +231,10 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         CATALOG_PINNED_FIELDS,
-        "Field-catalog pins in use. A pin slot is permanent (a repin \
-         retypes a pin, nothing reclaims one), so this only ever climbs — \
-         alert on it against trawl_catalog_pin_capacity, well before the \
-         cap starts denying pins"
+        "Field-catalog pins in use. Ingest never gives a slot back, so \
+         this only climbs until an operator runs pin gc — alert on it \
+         against trawl_catalog_pin_capacity, well before the cap starts \
+         denying pins"
     );
     describe_gauge!(
         CATALOG_PIN_CAPACITY,
@@ -248,6 +249,13 @@ pub fn describe_metrics() {
          nothing clears the count on its own. Advisory and \
          sender-influenceable by construction: one misbehaving producer can \
          raise it, which is why it may never gate anything automatically"
+    );
+    describe_counter!(
+        CATALOG_PINS_GC_TOTAL,
+        "Pin slots reclaimed by `trawl schema gc-pins`: fields nothing had \
+         observed for the dead window and no standing parquet footer \
+         declared. Operator-triggered, so it moves in steps and only when \
+         somebody runs the command; dry runs never increment it"
     );
     describe_counter!(
         CATALOG_REPIN_JOBS_TOTAL,

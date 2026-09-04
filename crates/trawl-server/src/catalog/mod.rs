@@ -24,6 +24,7 @@
 
 pub mod analyzer;
 pub mod conform;
+pub mod gc;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,17 +38,24 @@ use crate::store::CatalogStore;
 #[derive(Debug, Default)]
 pub struct FieldCatalog {
     pins: RwLock<HashMap<String, CanonicalType>>,
-    /// Bumped only by [`FieldCatalog::repin`]: a stamp readers hold beside
-    /// a cached derivation of the pin set, so a repin can invalidate that
-    /// cache without the retyping path knowing it exists.
+    /// Non-additive catalog mutation generation: bumped by
+    /// [`FieldCatalog::repin`] and [`FieldCatalog::touch_generation`], the
+    /// paths that make a served answer wrong rather than incomplete
+    /// ([`FieldCatalog::evict_many`] deliberately does NOT stamp; the gc
+    /// engine bumps per outcome, following what the store deleted). It is
+    /// a stamp readers hold beside a cached derivation of the pin set, so
+    /// those paths invalidate that cache without knowing it exists.
     ///
     /// [`FieldCatalog::merge`] and [`FieldCatalog::replace`] deliberately
     /// do not bump it: those are add-only (a new pin, or boot hydration),
     /// and a caching reader that already served a page without the new
     /// field is no more wrong than it was a millisecond earlier. Bumping
     /// there would burn the cache's TTL on every compaction batch that pins
-    /// something. Retyping is the only change that makes a served answer
-    /// wrong rather than incomplete.
+    /// something.
+    ///
+    /// The name is the original one and stays: it is on the wire in no
+    /// sense, but it is what the cached-schema code reads, and renaming it
+    /// would churn more than it explains.
     repin_generation: std::sync::atomic::AtomicU64,
 }
 
@@ -82,13 +90,57 @@ impl FieldCatalog {
             .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
-    /// How many times a pin has been retyped in this process.
+    /// Drop `fields` from the cache, returning how many were actually
+    /// there: the pin purge's half of gc ([`crate::catalog::gc`]).
+    ///
+    /// One write lock for the whole set, and NO generation bump: the
+    /// caller stamps that separately with [`Self::touch_generation`].
+    ///
+    /// The split exists because this map cannot answer the question the
+    /// stamp is for. What invalidates a cached derivation of the pin set is
+    /// what the CATALOG lost, and a purge that deletes rows in postgres may
+    /// find nothing here to remove — a gc retry after an earlier
+    /// over-eviction is exactly that shape. Bumping on `removed > 0` would
+    /// skip precisely the case that needs it, so the gc engine bumps once
+    /// per outcome instead, and no caller gets a bump it did not ask for.
+    ///
+    /// Infallible on purpose. The gc engine calls this immediately after
+    /// the postgres commit, inside the corpus gate, with nothing fallible
+    /// in between, so the cache can never be emptied ahead of the store.
+    /// The reverse gap is the survivable one: a panic between the two
+    /// leaves a cached pin for a field postgres no longer has, and since gc
+    /// only deletes fields no standing file carries, nothing conforms
+    /// against it and the next boot's hydration drops it.
+    pub fn evict_many<'a>(&self, fields: impl IntoIterator<Item = &'a str>) -> usize {
+        let mut guard = self.pins.write();
+        fields
+            .into_iter()
+            .filter(|field| guard.remove(*field).is_some())
+            .count()
+    }
+
+    /// Stamp one non-additive change to the pin set.
+    ///
+    /// The purge path's only bump, called once per gc outcome: after a
+    /// commit that deleted rows, after a commit whose outcome is unknown
+    /// (postgres may have deleted them), and after a reconcile that dropped
+    /// cached pins postgres no longer holds. Ordered Release like the
+    /// repin's, and taken after the map write it describes, so a reader can
+    /// see the new pins under the old stamp (over-invalidation, discarded
+    /// on the next read) but never the old pins under the new one.
+    pub fn touch_generation(&self) {
+        self.repin_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// How many non-additive changes the pin set has taken in this process
+    /// (a retype or a purge).
     ///
     /// Opaque; only equality is meaningful. A cached derivation of the pin
     /// set (today: the `/api/v1/schema` column listing) stamps the value it
     /// was built under and refuses to serve when it no longer matches, so a
-    /// repin cutover retypes that endpoint immediately instead of at the
-    /// next TTL expiry.
+    /// repin cutover or a pin purge retypes that endpoint immediately
+    /// instead of at the next TTL expiry.
     #[must_use]
     pub fn repin_generation(&self) -> u64 {
         self.repin_generation
@@ -269,6 +321,58 @@ mod tests {
 
         cache.repin("status", CanonicalType::BigInt);
         assert_eq!(cache.repin_generation(), start + 2, "every repin bumps");
+    }
+
+    /// The purge takes the whole set under one lock and leaves the stamp to
+    /// its caller: a bump per removed field would invalidate the schema
+    /// cache once per deleted pin for a single operator command.
+    #[test]
+    fn evict_many_removes_the_set_without_stamping_it() {
+        let cache = catalog(&[
+            ("typo", CanonicalType::Varchar),
+            ("dead", CanonicalType::BigInt),
+            ("live", CanonicalType::Double),
+        ]);
+        let start = cache.repin_generation();
+
+        let removed = cache.evict_many(["typo", "dead", "never_pinned"]);
+
+        assert_eq!(removed, 2, "only the pins that were there count");
+        assert_eq!(cache.get("typo"), None);
+        assert_eq!(cache.get("dead"), None);
+        assert_eq!(cache.get("live"), Some(CanonicalType::Double));
+        assert_eq!(
+            cache.repin_generation(),
+            start,
+            "the eviction does not stamp itself"
+        );
+
+        cache.touch_generation();
+        assert_eq!(cache.repin_generation(), start + 1, "one purge, one bump");
+    }
+
+    /// A purge the cache never held is still a purge: the generation
+    /// follows the STORE.
+    ///
+    /// This is the retry shape. A run whose commit outcome was unknown
+    /// over-evicts every candidate, so the map is already empty when the
+    /// operator runs gc again and `evict_many` removes nothing. A bump
+    /// conditioned on that count would be skipped, and the
+    /// `/api/v1/schema` listing would keep naming a field postgres has
+    /// deleted until its TTL ran out.
+    #[test]
+    fn a_purge_the_cache_never_held_still_bumps_the_generation() {
+        let cache = catalog(&[("live", CanonicalType::Double)]);
+        let start = cache.repin_generation();
+
+        assert_eq!(cache.evict_many(["dead"]), 0, "nothing was in the map");
+        assert_eq!(cache.evict_many(std::iter::empty()), 0);
+        assert_eq!(cache.repin_generation(), start, "the map did not change");
+
+        cache.touch_generation();
+
+        assert_eq!(cache.repin_generation(), start + 1, "the store did");
+        assert_eq!(cache.get("live"), Some(CanonicalType::Double));
     }
 
     #[test]

@@ -170,44 +170,7 @@ enum SchemaSubcommand {
 
     /// Repin a field to a new type: shadow-rewrite the corpus with
     /// resurrection of conflict-nulled values from _raw (ADR-0011).
-    Repin {
-        /// Field name (folded to the catalog's ASCII-lowercase spelling).
-        field: String,
-
-        /// Target type: BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, VARCHAR, or
-        /// SEVERITY.
-        #[arg(long)]
-        to: String,
-
-        /// For --to severity only: which dialect the corpus's NUMERALS are
-        /// read in (otel counts up 1-24, syslog counts down 0-7). The
-        /// ladders overlap over 1-7 with opposite meanings, so only the
-        /// operator can say which one the sender meant.
-        #[arg(long, value_enum)]
-        dialect: Option<cli::SeverityDialect>,
-
-        /// Scan and report only — no mutation.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Accept a lossy projection (values the new type cannot read are
-        /// nulled; originals stay findable in _raw), or run a
-        /// resurrection-only pass when --to equals the current pin.
-        #[arg(long)]
-        force: bool,
-
-        /// Skip the interactive confirmation (required off a TTY).
-        #[arg(long)]
-        yes: bool,
-
-        /// Poll the job to completion instead of returning immediately.
-        #[arg(long)]
-        wait: bool,
-
-        /// Output format (auto-detected if omitted).
-        #[arg(long, short, value_enum)]
-        format: Option<cli::OutputFormat>,
-    },
+    Repin(RepinArgs),
 
     /// Show the running (or most recent) repin job.
     RepinStatus {
@@ -215,6 +178,132 @@ enum SchemaSubcommand {
         #[arg(long, short, value_enum)]
         format: Option<cli::OutputFormat>,
     },
+
+    /// Ask the running repin to stop. It stops at its next file boundary
+    /// and the live corpus is left untouched; a repin already swapping the
+    /// corpus is past the point where anything can be unwound and
+    /// completes.
+    RepinCancel {
+        /// Output format (auto-detected if omitted).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+    },
+
+    /// Reclaim pin slots held by fields nothing writes any more: no
+    /// observation inside the window and no standing parquet declares the
+    /// column.
+    #[command(name = "gc-pins")]
+    GcPins {
+        /// Scan and report only, no deletion.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// How long a field must have gone unobserved to count as dead
+        /// (e.g. "30d", "12w"). Defaults server-side to 30 days, and the
+        /// server raises it to the retention window when that is longer.
+        #[arg(long)]
+        older_than: Option<String>,
+
+        /// Output format (auto-detected if omitted).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+    },
+    /// Acknowledge a field's degraded badge, or withdraw the
+    /// acknowledgement. An ack covers the evidence that exists now: the
+    /// next conflict episode raises the badge again.
+    Ack(AckArgs),
+}
+
+/// `trawl schema ack` arguments.
+#[derive(clap::Args)]
+struct AckArgs {
+    /// Field name (folded to the catalog's ASCII-lowercase spelling).
+    field: String,
+
+    /// Why the pin is being accepted as it stands (max 1024 bytes).
+    #[arg(long, conflicts_with = "clear")]
+    note: Option<String>,
+
+    /// Withdraw the acknowledgement instead of writing one.
+    #[arg(long)]
+    clear: bool,
+
+    /// Output format (auto-detected if omitted).
+    #[arg(long, short, value_enum)]
+    format: Option<cli::OutputFormat>,
+}
+
+/// `trawl schema repin` arguments.
+///
+/// Its own struct rather than an inline variant body: the flag list is long
+/// enough that the dispatch arm was doing more unpacking than dispatching,
+/// and [`RepinArgs::flags`] is the one place the command line turns into the
+/// bundle [`schema::run_repin`] takes.
+#[derive(clap::Args)]
+#[allow(clippy::struct_excessive_bools)] // four independent CLI switches
+struct RepinArgs {
+    /// Field name (folded to the catalog's ASCII-lowercase spelling).
+    field: String,
+
+    /// Target type: BIGINT, DOUBLE, TIMESTAMP, BOOLEAN, VARCHAR, or
+    /// SEVERITY.
+    #[arg(long)]
+    to: String,
+
+    /// For --to severity only: which dialect the corpus's NUMERALS are
+    /// read in (otel counts up 1-24, syslog counts down 0-7). The
+    /// ladders overlap over 1-7 with opposite meanings, so only the
+    /// operator can say which one the sender meant.
+    #[arg(long, value_enum)]
+    dialect: Option<cli::SeverityDialect>,
+
+    /// Scan and report only — no mutation.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Accept a lossy projection (values the new type cannot read are
+    /// nulled; originals stay findable in _raw), or run a
+    /// resurrection-only pass when --to equals the current pin.
+    #[arg(long)]
+    force: bool,
+
+    /// Skip the interactive confirmation (required off a TTY).
+    #[arg(long)]
+    yes: bool,
+
+    /// Poll the job to completion instead of returning immediately.
+    #[arg(long)]
+    wait: bool,
+
+    /// With --force: the most rows the rewrite may null before the
+    /// cutover is refused. Omitted, the server derives one from its own
+    /// scan (10% headroom over a floor of 10 rows) and the CLI prints
+    /// the number it binds.
+    #[arg(long)]
+    max_nulled_rows: Option<u64>,
+
+    /// With --force, --to severity: the most dialect-ambiguous numerals
+    /// (1-7) the rewrite may carry before the cutover is refused.
+    #[arg(long)]
+    max_ambiguous_rows: Option<u64>,
+
+    /// Output format (auto-detected if omitted).
+    #[arg(long, short, value_enum)]
+    format: Option<cli::OutputFormat>,
+}
+
+impl RepinArgs {
+    fn flags(&self) -> schema::RepinFlags {
+        schema::RepinFlags {
+            dialect: self.dialect,
+            dry_run: self.dry_run,
+            force: self.force,
+            yes: self.yes,
+            wait: self.wait,
+            max_nulled_rows: self.max_nulled_rows,
+            max_ambiguous_rows: self.max_ambiguous_rows,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -407,6 +496,10 @@ async fn run(args: Cli) -> Result<(), CliError> {
 /// everywhere else a token-resolution failure must surface as itself.
 /// Swallowing it into an `Option` would re-report a broken profile as
 /// "schema field requires a server".
+// Long because it is one arm per subcommand: every arm unpacks its flags
+// and calls its runner, and splitting the match would only move arms behind
+// a second name.
+#[allow(clippy::too_many_lines)]
 async fn run_schema(
     cmd: SchemaSubcommand,
     cfg: &config::Config,
@@ -480,34 +573,49 @@ async fn run_schema(
             )
             .await
         }
-        SchemaSubcommand::Repin {
-            field,
-            to,
-            dialect,
-            dry_run,
-            force,
-            yes,
-            wait,
-            format,
-        } => {
+        SchemaSubcommand::Repin(args) => {
+            let flags = args.flags();
             schema::run_repin(
                 &mut out,
                 conn(token)?,
-                &field,
-                &to,
-                schema::RepinFlags {
-                    dialect,
-                    dry_run,
-                    force,
-                    yes,
-                    wait,
-                },
-                format,
+                &args.field,
+                &args.to,
+                flags,
+                args.format,
             )
             .await
         }
         SchemaSubcommand::RepinStatus { format } => {
             schema::run_repin_status(&mut out, conn(token)?, format).await
+        }
+        SchemaSubcommand::RepinCancel { format } => {
+            schema::run_repin_cancel(&mut out, conn(token)?, format).await
+        }
+        SchemaSubcommand::GcPins {
+            dry_run,
+            older_than,
+            format,
+        } => {
+            schema::run_gc_pins(
+                &mut out,
+                conn(token)?,
+                dry_run,
+                older_than.as_deref(),
+                format,
+            )
+            .await
+        }
+        SchemaSubcommand::Ack(args) => {
+            let note = args.note.as_deref();
+            schema::run_ack(
+                &mut out,
+                conn(token)?,
+                &args.field,
+                note,
+                args.clear,
+                args.format,
+            )
+            .await
         }
     }
 }
@@ -702,4 +810,105 @@ fn render_driver_data(
     cli::render_driver_results(columns, rows, format, &mut out)?;
     out.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    /// clap's own consistency check over the whole command tree: a
+    /// conflicting-argument name that does not exist is a runtime panic
+    /// otherwise, and `schema ack --clear` names `note`.
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    /// The repin ceilings parse as numbers and default to absent. Absent is
+    /// "let the server's scan decide", which is not the same as zero.
+    #[test]
+    fn repin_ceiling_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "trawl",
+            "schema",
+            "repin",
+            "status",
+            "--to",
+            "VARCHAR",
+            "--force",
+            "--yes",
+            "--max-nulled-rows",
+            "250",
+            "--max-ambiguous-rows",
+            "0",
+        ])
+        .expect("both ceilings parse");
+        let Some(Command::Schema {
+            cmd: SchemaSubcommand::Repin(args),
+        }) = cli.command
+        else {
+            panic!("expected a schema repin command");
+        };
+        assert!(args.force);
+        assert_eq!(args.max_nulled_rows, Some(250));
+        assert_eq!(args.max_ambiguous_rows, Some(0));
+        // The bundle the command handler receives carries them unchanged.
+        let flags = args.flags();
+        assert_eq!(flags.max_nulled_rows, Some(250));
+        assert_eq!(flags.max_ambiguous_rows, Some(0));
+
+        let cli =
+            Cli::try_parse_from(["trawl", "schema", "repin", "status", "--to", "VARCHAR"]).unwrap();
+        let Some(Command::Schema {
+            cmd: SchemaSubcommand::Repin(args),
+        }) = cli.command
+        else {
+            panic!("expected a schema repin command");
+        };
+        assert_eq!(args.max_nulled_rows, None);
+        assert_eq!(args.max_ambiguous_rows, None);
+
+        assert!(
+            Cli::try_parse_from([
+                "trawl",
+                "schema",
+                "repin",
+                "status",
+                "--to",
+                "VARCHAR",
+                "--max-nulled-rows",
+                "many",
+            ])
+            .is_err(),
+            "a ceiling is a row count, not a word"
+        );
+    }
+
+    /// `schema ack` takes a note or clears, never both: withdrawing an
+    /// acknowledgement writes no note, so accepting one would silently drop
+    /// what the operator typed.
+    #[test]
+    fn ack_note_and_clear_are_mutually_exclusive() {
+        let cli = Cli::try_parse_from(["trawl", "schema", "ack", "duration", "--note", "fix due"])
+            .unwrap();
+        let Some(Command::Schema {
+            cmd: SchemaSubcommand::Ack(args),
+        }) = cli.command
+        else {
+            panic!("expected a schema ack command");
+        };
+        assert_eq!(args.field, "duration");
+        assert_eq!(args.note.as_deref(), Some("fix due"));
+        assert!(!args.clear);
+
+        assert!(Cli::try_parse_from(["trawl", "schema", "ack", "duration", "--clear"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "trawl", "schema", "ack", "duration", "--clear", "--note", "fix due",
+            ])
+            .is_err(),
+            "--clear and --note must not be accepted together"
+        );
+    }
 }

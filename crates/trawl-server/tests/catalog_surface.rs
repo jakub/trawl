@@ -109,6 +109,19 @@ impl Harness {
         (status, body)
     }
 
+    /// DELETE an API path with the given token; return (status, body text).
+    async fn delete(&self, token: &str, path_and_query: &str) -> (u16, String) {
+        let resp = self
+            .raw
+            .delete(format!("{}/api/v1{path_and_query}", self.server.url))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status().as_u16();
+        (status, resp.text().await.unwrap_or_default())
+    }
+
     /// Scrape `/metrics` (unauthenticated, outside `/api/v1`).
     async fn metrics(&self) -> String {
         self.raw
@@ -1059,5 +1072,474 @@ async fn catalog_routes_require_schema_read() {
 
         let (status, _) = h.get(&h.server.reader_token, path).await;
         assert_eq!(status, 200, "{path} must 200 for schema_read holders");
+    }
+}
+
+// -- degraded-badge acknowledgement (issue #111) ------------------------------
+
+/// Pin `duration` BIGINT, then shelve three string values under it and
+/// backdate the evidence so the span half of the gate is met.
+///
+/// Only the AGE is simulated: the conflicts are real, written by the real
+/// conform. Waiting 24 hours is the one thing a test cannot do.
+async fn degraded_duration(h: &Harness) {
+    ingest_and_compact(h, &[event("svc-a", &json!({"duration": 4200}))]).await;
+    for value in ["N/A", "pending", "N/A"] {
+        ingest_and_compact(h, &[event("svc-b", &json!({"duration": value}))]).await;
+    }
+    let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
+        .await
+        .expect("connect app db");
+    sqlx::query(
+        "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+         WHERE field = 'duration'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("backdate the evidence");
+}
+
+/// The verdict on `/schema/fields` for one field, if it carries one.
+async fn listed_verdict(h: &Harness, field: &str) -> Option<serde_json::Value> {
+    let (status, body) = h.get(&h.server.analyst_token, "/schema/fields").await;
+    assert_eq!(status, 200);
+    let row = field_row(&body, field);
+    row.get("verdict").cloned()
+}
+
+/// Whether a query binding `duration` is stamped with the notice, after the
+/// refresh tick has republished the snapshot.
+async fn query_is_stamped(h: &Harness) -> bool {
+    trawl_server::schema_refresh::refresh_degraded_fields(&h.server.state).await;
+    let (status, body) = h
+        .post(
+            &h.server.analyst_token,
+            "/query",
+            json!({"query": "last=1h | where duration > 1 | table host"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    body.get("degraded_fields").is_some()
+}
+
+/// Whether `/schema/services` badges svc-b, the sender that conflicted.
+async fn service_is_badged(h: &Harness) -> bool {
+    trawl_server::schema_refresh::refresh_degraded_fields(&h.server.state).await;
+    let (status, body) = h.get(&h.server.analyst_token, "/schema/services").await;
+    assert_eq!(status, 200, "{body}");
+    body["services"]
+        .as_array()
+        .expect("services array")
+        .iter()
+        .find(|s| s["name"] == "svc-b")
+        .expect("svc-b listed")
+        .get("degraded_fields")
+        .is_some()
+}
+
+/// Acceptance: acknowledging a degraded pin takes the badge off all FOUR
+/// read surfaces at once — the field listing, the field detail, the query
+/// notice and the per-service badge — because every one of them asks the
+/// same `is_degraded`. Then one more shelved batch re-raises all four,
+/// while the acknowledgement itself stays visible on the detail: "we knew
+/// on Tuesday, it is still happening" is the information the operator needs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ack_suppresses_every_surface_until_new_evidence_arrives() {
+    let h = harness().await;
+    degraded_duration(&h).await;
+
+    // Populate the per-service schema cache the badge is stamped from.
+    let _refresh = trawl_server::schema_refresh::spawn_schema_refresh(h.server.state.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, _) = h.get(&h.server.analyst_token, "/schema/services").await;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "schema refresh never populated the service cache"
+        );
+        if status == 200 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(listed_verdict(&h, "duration").await.is_some(), "badged");
+    assert!(query_is_stamped(&h).await, "notice stands before the ack");
+    assert!(service_is_badged(&h).await, "svc-b badged before the ack");
+
+    let (status, ack) = h
+        .post(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=DURATION",
+            json!({"note": "sender is being fixed, ticket OPS-12"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{ack}");
+    assert_eq!(
+        ack["evidence_through"], 3,
+        "the ack covers the evidence that exists: {ack}"
+    );
+    assert!(
+        !ack["acked_by"].as_str().expect("acked_by").is_empty(),
+        "the acknowledging key's stable prefix is recorded: {ack}"
+    );
+    assert_eq!(ack["note"], "sender is being fixed, ticket OPS-12");
+
+    assert!(
+        listed_verdict(&h, "duration").await.is_none(),
+        "the listing badge is suppressed (the name folds like every other \
+         catalog lookup: ?name=DURATION acked `duration`)"
+    );
+    let (_, detail) = h
+        .get(&h.server.analyst_token, "/schema/field?name=duration")
+        .await;
+    assert!(detail.get("verdict").is_none(), "detail verdict: {detail}");
+    assert_eq!(
+        detail["ack"]["evidence_through"], 3,
+        "the ack is what the detail shows instead: {detail}"
+    );
+    assert!(
+        !query_is_stamped(&h).await,
+        "the query notice is suppressed"
+    );
+    assert!(
+        !service_is_badged(&h).await,
+        "the service badge is suppressed"
+    );
+
+    // One more shelved value: episode 4 is past the acknowledged 3.
+    ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "later"}))]).await;
+
+    let verdict = listed_verdict(&h, "duration")
+        .await
+        .expect("new evidence re-raises the listing badge");
+    assert_eq!(verdict["episodes"], 4, "{verdict}");
+    let (_, detail) = h
+        .get(&h.server.analyst_token, "/schema/field?name=duration")
+        .await;
+    assert!(
+        detail.get("verdict").is_some(),
+        "detail re-raised: {detail}"
+    );
+    assert_eq!(
+        detail["ack"]["evidence_through"], 3,
+        "the stale ack stays beside the re-raised verdict: {detail}"
+    );
+    assert!(query_is_stamped(&h).await, "the notice is back");
+    assert!(service_is_badged(&h).await, "the service badge is back");
+}
+
+/// A field nobody could badge cannot be acknowledged: the 409 names the
+/// threshold, and an unknown field is a 404. Neither writes anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn acking_a_field_with_no_verdict_is_refused() {
+    let h = harness().await;
+    // Real conflicts, all of them from the last few seconds: volume without
+    // span is exactly what the badge is designed not to fire on.
+    ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
+    for _ in 0..4 {
+        ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "N/A"}))]).await;
+    }
+
+    let (status, body) = h
+        .post(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=duration",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    let message = body["error"]["message"].as_str().expect("error message");
+    assert!(message.contains("24"), "names the span: {message}");
+    assert!(message.contains("100"), "names the row floor: {message}");
+    assert!(message.contains('3'), "names the episode floor: {message}");
+
+    let (status, body) = h
+        .post(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=never_pinned_field",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+
+    let (_, detail) = h
+        .get(&h.server.analyst_token, "/schema/field?name=duration")
+        .await;
+    assert!(
+        detail.get("ack").is_none(),
+        "a refused ack writes nothing: {detail}"
+    );
+}
+
+/// Withdrawing an ack re-raises the badge and is idempotent: the second
+/// DELETE is the same 204, because "not acknowledged" is the state the
+/// caller asked for either way. Only an unknown field refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawing_an_ack_re_raises_the_badge_and_repeats_cleanly() {
+    let h = harness().await;
+    degraded_duration(&h).await;
+    let (status, _) = h
+        .post(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=duration",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(listed_verdict(&h, "duration").await.is_none());
+
+    let (status, body) = h
+        .delete(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=duration",
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    assert!(body.is_empty(), "204 carries no body: {body:?}");
+    assert!(
+        listed_verdict(&h, "duration").await.is_some(),
+        "the badge is back the moment the ack is withdrawn"
+    );
+    let (_, detail) = h
+        .get(&h.server.analyst_token, "/schema/field?name=duration")
+        .await;
+    assert!(detail.get("ack").is_none(), "the ack is gone: {detail}");
+
+    let (status, _) = h
+        .delete(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=duration",
+        )
+        .await;
+    assert_eq!(status, 204, "withdrawing nothing is still 204");
+
+    let (status, _) = h
+        .delete(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=never_pinned_field",
+        )
+        .await;
+    assert_eq!(status, 404, "an unknown field is the one refusal");
+}
+
+/// The note is capped at 1024 bytes, and the refusal happens before the
+/// store: a 1025-byte note is a 400 naming the limit, not a constraint
+/// violation. The boundary itself is accepted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_ack_note_is_refused_before_the_store() {
+    let h = harness().await;
+    degraded_duration(&h).await;
+
+    let (status, body) = h
+        .post(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=duration",
+            json!({"note": "x".repeat(1025)}),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    let message = body["error"]["message"].as_str().expect("error message");
+    assert!(message.contains("1025"), "{message}");
+    assert!(message.contains("1024"), "{message}");
+    assert!(
+        listed_verdict(&h, "duration").await.is_some(),
+        "the refused ack suppressed nothing"
+    );
+
+    let (status, ack) = h
+        .post(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=duration",
+            json!({"note": "x".repeat(1024)}),
+        )
+        .await;
+    assert_eq!(status, 200, "the boundary is inclusive: {ack}");
+    assert_eq!(ack["note"].as_str().expect("note").len(), 1024);
+}
+
+/// Both ack verbs ride `schema_write`: a `schema_read` key may read the
+/// badge and not answer it. 401 for an authenticated key without the
+/// permission, 403 for a key with no trawl grant at all — the same
+/// convention the repin route follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ack_routes_require_schema_write() {
+    let h = harness().await;
+    degraded_duration(&h).await;
+
+    for token in [&h.server.analyst_token, &h.server.reader_token] {
+        let (status, _) = h
+            .post(token, "/schema/field/ack?name=duration", json!({}))
+            .await;
+        assert_eq!(status, 401, "a schema_read key cannot acknowledge");
+        let (status, _) = h.delete(token, "/schema/field/ack?name=duration").await;
+        assert_eq!(status, 401, "nor withdraw");
+    }
+
+    let (status, _) = h
+        .post(
+            &h.server.coastwatch_only_token,
+            "/schema/field/ack?name=duration",
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        status, 403,
+        "a grantless key is refused by the policy layer"
+    );
+
+    assert!(
+        listed_verdict(&h, "duration").await.is_some(),
+        "none of the refusals acknowledged anything"
+    );
+}
+
+/// The audit trail: who acknowledged what, whether the row was created or
+/// advanced, and which of the two things clears one. The operator's note is
+/// never copied into an event — only whether they wrote one.
+#[tokio::test(flavor = "multi_thread")]
+// One process, one global subscriber, so the whole lifecycle (ack, advance,
+// operator withdrawal, repin clear) has to be asserted from one body.
+#[allow(clippy::too_many_lines)]
+async fn the_ack_audit_records_the_actor_and_never_the_note() {
+    use common::audit_capture::Capture;
+    use tracing_subscriber::prelude::*;
+
+    const NOTE: &str = "operator prose that must never reach a log line";
+
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::registry().with(
+        capture
+            .clone()
+            .with_filter(tracing_subscriber::EnvFilter::new("trawl_server=info")),
+    );
+    // Global: the repin job runs detached on other workers.
+    tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
+
+    let h = harness().await;
+    degraded_duration(&h).await;
+
+    let (status, _) = h
+        .post(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=duration",
+            json!({"note": NOTE}),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    // New evidence, then a second ack: the row is advanced, not created.
+    ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "later"}))]).await;
+    let (status, _) = h
+        .post(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=duration",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    let acked = capture.of_type("field_degraded_acked", "field", "duration");
+    assert_eq!(acked.len(), 2, "one record per accepted ack: {acked:?}");
+    assert!(acked[0].field("field").contains("duration"));
+    assert_eq!(acked[0].field("created"), "true", "the row was inserted");
+    assert_eq!(
+        acked[0].field("advanced"),
+        "true",
+        "an insert is this call's own high-water"
+    );
+    assert_eq!(acked[0].field("evidence_through"), "3");
+    assert_eq!(acked[0].field("note_present"), "true");
+    assert!(
+        !acked[0].field("actor_prefix").is_empty(),
+        "the stable prefix identifies the key: {:?}",
+        acked[0]
+    );
+    assert!(acked[0].field("actor").contains("schema-admin-key"));
+    assert_eq!(acked[1].field("created"), "false", "advanced, not created");
+    assert_eq!(
+        acked[1].field("advanced"),
+        "true",
+        "it acknowledged the episode the first ack did not cover"
+    );
+    assert_eq!(acked[1].field("evidence_through"), "4");
+    assert_eq!(acked[1].field("note_present"), "false");
+
+    // The operator withdraws it: one clear, reason `operator`. The second
+    // DELETE removes nothing, so it records nothing.
+    let (status, _) = h
+        .delete(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=duration",
+        )
+        .await;
+    assert_eq!(status, 204);
+    let (status, _) = h
+        .delete(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=duration",
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    // Re-ack, then repin the field: the pin the ack was about is gone, so
+    // the cutover takes the ack with the evidence and says so.
+    let (status, _) = h
+        .post(
+            &h.server.schema_admin_token,
+            "/schema/field/ack?name=duration",
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, started) = h
+        .post(
+            &h.server.schema_admin_token,
+            "/schema/repin",
+            json!({"field": "duration", "to": "VARCHAR", "force": true}),
+        )
+        .await;
+    assert_eq!(status, 202, "the repin runs detached: {started}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (_, body) = h.get(&h.server.analyst_token, "/schema/repin/status").await;
+        let job_status = body["job"]["status"].as_str().unwrap_or("").to_owned();
+        if job_status == "succeeded" {
+            break;
+        }
+        assert!(
+            !["failed", "refused_needs_force", "blocked"].contains(&job_status.as_str()),
+            "the repin must reach the cutover: {body}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the repin never finished: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let cleared = capture.of_type("field_degraded_ack_cleared", "field", "duration");
+    let reasons: Vec<String> = cleared.iter().map(|e| e.field("reason")).collect();
+    assert_eq!(
+        cleared.len(),
+        2,
+        "one withdrawal and one repin; the no-op DELETE records nothing: \
+         {cleared:?}"
+    );
+    assert!(reasons[0].contains("operator"), "{reasons:?}");
+    assert!(reasons[1].contains("repin"), "{reasons:?}");
+    assert!(
+        !cleared[1].field("job_id").is_empty(),
+        "the repin clear names its job: {:?}",
+        cleared[1]
+    );
+
+    for record in capture.events() {
+        for (name, value) in &record.fields {
+            assert!(
+                !value.contains(NOTE),
+                "the note reached a log line as {name}: {record:?}"
+            );
+        }
     }
 }

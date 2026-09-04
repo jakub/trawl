@@ -211,6 +211,7 @@ mod tests {
             "failed",
             "refused_needs_force",
             "blocked",
+            "cancelled",
             // not in the vocabulary — a future server's spelling
             "something_new",
         ] {

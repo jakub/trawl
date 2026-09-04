@@ -115,6 +115,36 @@ pub fn marker_path(data_dir: &Path) -> PathBuf {
     data_dir.join(REPIN_MARKER)
 }
 
+/// Evidence that a repin job owns this data root right now: the marker, a
+/// shadow root, or an aside root, named for a log line, or `None` when
+/// there is none.
+///
+/// The one authority on that question. Retention stands down on it and pin
+/// gc refuses on it, and both are about not touching a corpus a repin is
+/// mid-way through rearranging, so a second implementation is a second
+/// opinion about whether it is safe to delete something.
+///
+/// Fallible, unlike [`Path::exists`], which folds every I/O error into
+/// `false`. Here `false` means "go ahead", so a data root that cannot be
+/// stat'ed would read as permission to proceed. Callers decide what an
+/// unreadable answer means to them; both of today's treat it as evidence.
+///
+/// # Errors
+/// The first `try_exists` error, with the marker checked before the shadow
+/// root and the shadow before the aside.
+pub fn in_flight_evidence(data_dir: &Path) -> Result<Option<&'static str>, std::io::Error> {
+    for (path, what) in [
+        (marker_path(data_dir), "marker"),
+        (shadow_root(data_dir), "shadow root"),
+        (aside_root(data_dir), "aside root"),
+    ] {
+        if path.try_exists()? {
+            return Ok(Some(what));
+        }
+    }
+    Ok(None)
+}
+
 /// Prove the staging siblings will land on the data root's own filesystem
 /// and that the whole env subtree the engine moves lives on that same
 /// filesystem — i.e. that neither the data root nor anything nested under

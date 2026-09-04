@@ -10,8 +10,9 @@
 //! Module map: `gate` (compaction interlocks), `marker` (the `data/REPIN`
 //! document + sibling staging layout), `plan` (the scan every job runs),
 //! `rewrite` (per-file hardlink-or-rewrite), `cutover` (the idempotent
-//! per-env swap), `engine` (the job lifecycle), `recover` (the boot
-//! decision table).
+//! per-env swap), `engine` (the job lifecycle), `cancel` (the cooperative
+//! cancel registry and its point-of-no-return latch), `recover` (the boot
+//! decision table), `ceiling` (the numbers a forced job accepted).
 
 /// How recently the field must have been observed for a repin's report to
 /// call it live (ADR-0013 ruling 10).
@@ -31,6 +32,8 @@
 /// window over which "still writing" is a fact rather than a coincidence.
 pub const LIVENESS_WINDOW: std::time::Duration = std::time::Duration::from_hours(24);
 
+pub mod cancel;
+pub mod ceiling;
 pub mod cutover;
 pub mod engine;
 pub mod gate;
@@ -40,6 +43,13 @@ pub mod recover;
 pub mod rewrite;
 
 pub(crate) use engine::force_refusal;
+
+pub use cancel::{
+    CANCEL_LATENCY_CONTRACT, CancelActor, CancelDecision, CancelHandle, CancelRegistry,
+    CancelVerdict, Settlement,
+};
 pub use engine::{RepinEngine, StartOutcome};
 pub use gate::{RepinCoordinator, RollupPause};
-pub use marker::{RepinMarker, RepinPhase, aside_root, marker_path, shadow_root};
+pub use marker::{
+    RepinMarker, RepinPhase, aside_root, in_flight_evidence, marker_path, shadow_root,
+};
