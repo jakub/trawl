@@ -375,6 +375,20 @@ async fn gc_floors_at_the_longest_age_any_env_keeps() {
     let h = harness().await;
     h.pin_without_carrier("gone", "dead").await;
 
+    // Old enough for a seven-day cutoff to delete, but still inside prod's
+    // year. A fresh observation would survive either cutoff.
+    let pool = common::app_pool(&h.server.app_db_url).await;
+    let updated = sqlx::query(
+        "UPDATE field_services SET first_seen = now() - interval '60 days',
+                                  last_seen = now() - interval '60 days'
+         WHERE field = 'dead'",
+    )
+    .execute(&pool)
+    .await
+    .expect("age the pin observation");
+    assert_eq!(updated.rows_affected(), 1);
+    pool.close().await;
+
     // lab ages out in a week, prod keeps a year: the corpus still reaches
     // back a year.
     let mut per_env = trawl_server::config::RetentionConfig {
@@ -409,7 +423,23 @@ async fn gc_floors_at_the_longest_age_any_env_keeps() {
         "the reported floor is the maximum age, never the minimum"
     );
     assert_eq!(report.deleted, 0);
-    assert!(h.pinned("dead"), "nothing is a year unobserved here");
+    assert!(
+        h.pinned("dead"),
+        "a 60-day-old pin is inside the year floor"
+    );
+    assert!(h.pinned_in_store("dead").await);
+
+    let unfloored = h
+        .gc(Some(0))
+        .run(
+            Some(Duration::from_secs(7 * DAY)),
+            false,
+            GcActor::default(),
+        )
+        .await
+        .expect("gc without the retention floor runs");
+    assert_eq!(unfloored.deleted, 1);
+    assert!(!h.pinned_in_store("dead").await);
 }
 
 /// An empty parquet still declares its schema, and the schema is the

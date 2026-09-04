@@ -176,7 +176,8 @@ config:
     minFreeDiskBytes: "1G"
     retentionIntervalSecs: 3600
     # Per-env age overrides: env name -> max_age_days. An env with no
-    # entry keeps maxAgeDays above; 0 keeps that env's data forever.
+    # entry keeps maxAgeDays above; 0 disables age-based deletion for that
+    # env. Its data remains eligible for disk-pressure deletion.
     # Disk pressure stays install-wide and deletes by expiry ratio: the
     # date directory that has used up the largest fraction of its env's
     # age limit goes first.

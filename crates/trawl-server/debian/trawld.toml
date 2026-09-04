@@ -136,8 +136,9 @@ database_url = "postgres://trawl:CHANGE_ME@db.example.internal:5432/trawl"
 
 [retention]
 # Delete date directories older than this many days in every env without a
-# [retention.env.<name>] entry. 0 = keep forever for those envs (an env with
-# its own finite entry still ages out).
+# [retention.env.<name>] entry. 0 disables age-based deletion for those
+# envs. An env with its own finite entry still ages out. Disk pressure can
+# delete data in any env, including one with a zero age limit.
 # max_age_days = 90
 
 # If free disk space drops below this threshold, delete date directories
@@ -148,8 +149,9 @@ database_url = "postgres://trawl:CHANGE_ME@db.example.internal:5432/trawl"
 # How often the retention task runs (seconds).
 # retention_interval_secs = 3600
 
-# Per-env age override; max_age_days is required, 0 keeps that env
-# forever. An env with no table keeps the global max_age_days. Disk
+# Per-env age override; max_age_days is required, 0 disables age-based
+# deletion. That env's data remains eligible for disk-pressure deletion.
+# An env with no table keeps the global max_age_days. Disk
 # pressure stays install-wide. Keep these tables LAST in [retention]: in
 # TOML a scalar written after this header lands inside it.
 # [retention.env.prod]
