@@ -102,10 +102,14 @@ pub enum FlipOutcome {
     NotRunning,
 }
 
-/// Parse a duration string (same syntax as the DSL `last=` filter) into seconds.
+/// Parse a duration string (same syntax as the DSL `last=` filter) into
+/// seconds, with no lower bound.
 ///
-/// Supported units: `s`, `m`, `h`, `d`, `w`. Minimum interval is 60 seconds.
-pub fn parse_interval(s: &str) -> Result<u64, StoreError> {
+/// Supported units: `s`, `m`, `h`, `d`, `w`. This is the grammar alone, so
+/// `"0s"` and `"30s"` are legal answers: a report window's `lag` is a
+/// straggler allowance and zero is its default, while a schedule interval
+/// has a floor and goes through [`parse_interval`] instead.
+pub fn parse_duration_secs(s: &str) -> Result<u64, StoreError> {
     let s = s.trim();
     // char_indices, not byte split_at: a multi-byte trailing char would put
     // `s.len() - 1` inside a UTF-8 sequence and panic on user-supplied input.
@@ -119,23 +123,32 @@ pub fn parse_interval(s: &str) -> Result<u64, StoreError> {
         input: s.to_string(),
     })?;
 
-    let secs = match unit {
-        's' => value,
-        'm' => value * 60,
-        'h' => value * 3600,
-        'd' => value * 86400,
-        'w' => value * 604_800,
+    // Checked: `999999999999w` is client input, and a wrapping multiply
+    // would turn a nonsense duration into a plausible small one.
+    let scale = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
+        'w' => 604_800,
         _ => {
             return Err(StoreError::InvalidInterval {
                 input: s.to_string(),
             });
         }
     };
+    value.checked_mul(scale).ok_or(StoreError::InvalidInterval {
+        input: s.to_string(),
+    })
+}
 
+/// Parse a duration string into seconds, refusing anything below the 60s
+/// schedule floor. The grammar is [`parse_duration_secs`].
+pub fn parse_interval(s: &str) -> Result<u64, StoreError> {
+    let secs = parse_duration_secs(s)?;
     if secs < MIN_INTERVAL_SECS {
         return Err(StoreError::IntervalTooShort { secs });
     }
-
     Ok(secs)
 }
 
@@ -154,7 +167,11 @@ fn ensure_min_interval(secs: u64) -> Result<(), StoreError> {
 
 /// Format seconds into a human-readable duration string (e.g. "5m", "1h").
 pub fn format_interval(secs: u64) -> String {
-    if secs.is_multiple_of(604_800) {
+    // Zero first: every modulus divides it, so the ladder below would render
+    // "0w" and a `lag = 0` would read back as a week.
+    if secs == 0 {
+        "0s".to_owned()
+    } else if secs.is_multiple_of(604_800) {
         format!("{}w", secs / 604_800)
     } else if secs.is_multiple_of(86400) {
         format!("{}d", secs / 86400)
@@ -1051,6 +1068,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_secs_has_no_floor() {
+        assert_eq!(parse_duration_secs("0s").unwrap(), 0);
+        assert_eq!(parse_duration_secs("30s").unwrap(), 30);
+        assert_eq!(parse_duration_secs("2h").unwrap(), 7200);
+    }
+
+    #[test]
+    fn parse_duration_secs_rejects_overflow() {
+        // u64 seconds overflow rather than wrapping to a plausible span.
+        assert!(matches!(
+            parse_duration_secs("99999999999999999w"),
+            Err(StoreError::InvalidInterval { .. })
+        ));
+        assert!(matches!(
+            parse_interval("99999999999999999w"),
+            Err(StoreError::InvalidInterval { .. })
+        ));
+    }
+
+    #[test]
     fn format_interval_roundtrip() {
         assert_eq!(format_interval(60), "1m");
         assert_eq!(format_interval(300), "5m");
@@ -1058,6 +1095,8 @@ mod tests {
         assert_eq!(format_interval(86400), "1d");
         assert_eq!(format_interval(604_800), "1w");
         assert_eq!(format_interval(90), "90s");
+        // Zero is a lag, not a week: every modulus divides it.
+        assert_eq!(format_interval(0), "0s");
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub mod pool;
 pub mod query_log;
 pub mod rate_limit;
 pub mod repin;
+pub mod report_window;
 pub mod retention;
 pub mod scheduler;
 pub mod schema_refresh;
