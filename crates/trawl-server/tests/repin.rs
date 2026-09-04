@@ -2348,7 +2348,7 @@ async fn mid_build_growth_past_the_default_ceiling_refuses_the_cutover() {
 // forced, refused and unforced cases have to share a process to prove the
 // record fires for exactly one of them.
 #[allow(clippy::too_many_lines)]
-async fn a_forced_cutover_records_what_it_accepted_and_what_it_did() {
+async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
     use common::audit_capture::Capture;
     use tracing_subscriber::prelude::*;
 
@@ -2429,15 +2429,7 @@ async fn a_forced_cutover_records_what_it_accepted_and_what_it_did() {
     let done = h.wait_terminal(unforced.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
 
-    let accepted: Vec<_> = capture
-        .events()
-        .into_iter()
-        .filter(|e| {
-            e.fields
-                .get("event_type")
-                .is_some_and(|t| t.contains("repin_force_accepted"))
-        })
-        .collect();
+    let accepted = capture.of_type("repin_force_accepted", "field", "dur");
     assert_eq!(
         accepted.len(),
         1,
@@ -2468,4 +2460,103 @@ async fn a_forced_cutover_records_what_it_accepted_and_what_it_did() {
         "the record is counts only, never sample values: {record:?}"
     );
     assert!(refused.error.is_some(), "the refused job kept its reason");
+
+    // The other place a cutover completes: boot recovery. A crash between
+    // the swap and the pin flip leaves the marker, and the replay finishes
+    // the flip — including the ack clear, which owes the same audit record
+    // the live path emits. `code` is pinned and untouched by the jobs above.
+    let catalog = &h.server.state.storage.catalog;
+    for _ in 0..3 {
+        catalog
+            .record_conflicts(&[trawl_server::store::FieldConflict {
+                field: "code".to_owned(),
+                service: "api".to_owned(),
+                observed_type: "VARCHAR".to_owned(),
+                expected_type: trawl_core::schema::CanonicalType::BigInt,
+                rows_nulled: 3,
+                samples: Vec::new(),
+            }])
+            .await
+            .unwrap();
+    }
+    let mut conn =
+        <sqlx::postgres::PgConnection as sqlx::Connection>::connect(&h.server.app_db_url)
+            .await
+            .expect("connect app db");
+    sqlx::query(
+        "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+         WHERE field = 'code'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("backdate the evidence");
+    catalog
+        .acknowledge_degraded_field("code", "key-aaa", None)
+        .await
+        .unwrap();
+
+    let recovered_job = h
+        .server
+        .state
+        .storage
+        .repin
+        .claim(trawl_server::store::RepinClaim {
+            field: "code",
+            from_type: trawl_core::schema::CanonicalType::BigInt,
+            to_type: trawl_core::schema::CanonicalType::Varchar,
+            dialect: None,
+            dry_run: false,
+            force: false,
+            requested_by: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
+        })
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(data.join("prod")).unwrap();
+    let replay_marker = trawl_server::repin::RepinMarker {
+        job_id: recovered_job,
+        field: "code".to_owned(),
+        from_type: "BIGINT".to_owned(),
+        to_type: "VARCHAR".to_owned(),
+        phase: trawl_server::repin::RepinPhase::Cutover,
+    };
+    let replay = |marker: trawl_server::repin::RepinMarker| {
+        let data = data.clone();
+        let storage = h.server.state.storage.clone();
+        let cache = h.server.state.query.field_catalog.clone();
+        async move {
+            trawl_server::repin::marker::write_marker(&data, &marker).unwrap();
+            let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
+                .unwrap()
+                .expect("marker present");
+            trawl_server::repin::recover::reconcile_store(&storage, &cache, &data, Some(recovered))
+                .await
+                .expect("store reconciliation");
+        }
+    };
+    replay(replay_marker.clone()).await;
+
+    let cleared = capture.of_type("field_degraded_ack_cleared", "field", "code");
+    assert_eq!(
+        cleared.len(),
+        1,
+        "the recovered cutover audits the ack it cleared: {cleared:?}"
+    );
+    assert!(cleared[0].field("reason").contains("repin"));
+    assert_eq!(cleared[0].field("job_id"), recovered_job.to_string());
+    assert!(catalog.degraded_ack("code").await.unwrap().is_none());
+
+    // The replay: the job is already `succeeded`, so the flip completes
+    // nothing, clears nothing and announces nothing.
+    replay(replay_marker).await;
+    assert_eq!(
+        capture
+            .of_type("field_degraded_ack_cleared", "field", "code")
+            .len(),
+        1,
+        "a boot replay must not re-announce a clear that happened once"
+    );
 }

@@ -1427,7 +1427,7 @@ async fn the_ack_audit_records_the_actor_and_never_the_note() {
         .await;
     assert_eq!(status, 200);
 
-    let acked = capture.of_type("field_degraded_acked");
+    let acked = capture.of_type("field_degraded_acked", "field", "duration");
     assert_eq!(acked.len(), 2, "one record per accepted ack: {acked:?}");
     assert!(acked[0].field("field").contains("duration"));
     assert_eq!(acked[0].field("created"), "true", "the row was inserted");
@@ -1496,7 +1496,7 @@ async fn the_ack_audit_records_the_actor_and_never_the_note() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let cleared = capture.of_type("field_degraded_ack_cleared");
+    let cleared = capture.of_type("field_degraded_ack_cleared", "field", "duration");
     let reasons: Vec<String> = cleared.iter().map(|e| e.field("reason")).collect();
     assert_eq!(
         cleared.len(),

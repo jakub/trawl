@@ -1274,13 +1274,18 @@ pub async fn catalog_field(
     // MAX_CONFLICTS_PER_FIELD newest rows per field in the writing
     // transaction, so this read is bounded by construction.
     let conflicts = state.storage.catalog.conflicts_for_field(&name).await?;
-    let verdict = degraded_verdicts(
-        &state.storage.catalog,
-        &[(name.clone(), current_pin(&pin.duckdb_type))],
-    )
-    .await?
-    .remove(&name);
-    let ack = state.storage.catalog.degraded_ack(&name).await?;
+    // The verdict and the ack that suppresses it are one fact, so they come
+    // from one snapshot: read separately, an ack or a repin cutover landing
+    // between them publishes a pair that was never true.
+    let health = state.storage.catalog.field_health_snapshot(&name).await?;
+    let verdict = health
+        .aggregate
+        .as_ref()
+        .filter(|agg| crate::catalog::analyzer::is_degraded(agg))
+        .map(|agg| {
+            crate::catalog::analyzer::verdict(agg, current_pin(&pin.duckdb_type), &health.evidence)
+        });
+    let ack = health.ack;
 
     Ok(Json(trawl_api::CatalogFieldResponse {
         name: pin.field,

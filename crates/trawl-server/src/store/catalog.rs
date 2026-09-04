@@ -123,6 +123,18 @@ pub struct DegradedAck {
     pub evidence_through: i64,
 }
 
+/// One field's health picture, read under a single snapshot by
+/// [`CatalogStore::field_health_snapshot`].
+#[derive(Debug, Clone)]
+pub struct FieldHealthSnapshot {
+    /// The field's conflict aggregate, absent when it has no evidence.
+    pub aggregate: Option<crate::catalog::analyzer::ConflictAggregate>,
+    /// Newest `(observed_type, samples)` rows behind that aggregate.
+    pub evidence: Vec<(String, Vec<String>)>,
+    /// The operator's acknowledgement, if the field carries one.
+    pub ack: Option<DegradedAck>,
+}
+
 /// What [`CatalogStore::acknowledge_degraded_field`] did, or why it refused.
 ///
 /// A typed outcome rather than an error: neither refusal is a fault. The
@@ -1287,6 +1299,46 @@ impl CatalogStore {
         Ok((degraded, pairs))
     }
 
+    /// Everything `/schema/field` needs to describe one field's health, read
+    /// as one fact: the conflict aggregate the verdict is computed from, the
+    /// detail rows the verdict cites, and the operator's acknowledgement.
+    ///
+    /// Three statements under one `REPEATABLE READ` snapshot, for the same
+    /// reason [`Self::degraded_snapshot`] takes one. An ack lands between
+    /// two pooled reads and the response says "degraded, unacknowledged"
+    /// while the ack that suppressed the verdict already exists; a repin
+    /// cutover lands there instead and the response shows an ack beside
+    /// evidence it no longer describes. Neither pair was ever true.
+    ///
+    /// The aggregate is `None` when the field has no conflict evidence at
+    /// all, which is the healthy case.
+    pub async fn field_health_snapshot(
+        &self,
+        field: &str,
+    ) -> Result<FieldHealthSnapshot, StoreError> {
+        let mut tx = self.begin_evidence_snapshot().await?;
+        let names = [field.to_owned()];
+        let aggregate = Self::conflict_aggregates_tx(&mut tx, Some(&names))
+            .await?
+            .into_iter()
+            .next();
+        let evidence = if aggregate.is_some() {
+            Self::conflict_evidence_for_tx(&mut tx, &names)
+                .await?
+                .remove(field)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let ack = Self::degraded_ack_tx(&mut tx, field).await?;
+        tx.commit().await?;
+        Ok(FieldHealthSnapshot {
+            aggregate,
+            evidence,
+            ack,
+        })
+    }
+
     /// The retained detail evidence for `fields`, newest first: the
     /// `(observed_type, samples)` pairs a verdict is built from.
     ///
@@ -1300,6 +1352,16 @@ impl CatalogStore {
     /// payload — for every degraded field on the page.
     pub async fn conflict_evidence_for(
         &self,
+        fields: &[String],
+    ) -> Result<HashMap<String, Vec<(String, Vec<String>)>>, StoreError> {
+        let mut conn = self.pool.acquire().await?;
+        Self::conflict_evidence_for_tx(&mut conn, fields).await
+    }
+
+    /// [`Self::conflict_evidence_for`] inside a caller's transaction, so a
+    /// verdict and the evidence it cites can come from one snapshot.
+    async fn conflict_evidence_for_tx(
+        tx: &mut sqlx::PgConnection,
         fields: &[String],
     ) -> Result<HashMap<String, Vec<(String, Vec<String>)>>, StoreError> {
         if fields.is_empty() {
@@ -1318,7 +1380,7 @@ impl CatalogStore {
         )
         .bind(fields)
         .bind(VERDICT_EVIDENCE_ROWS)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let mut out: HashMap<String, Vec<(String, Vec<String>)>> = HashMap::new();
@@ -1457,12 +1519,21 @@ impl CatalogStore {
 
     /// One field's acknowledgement, if it has one.
     pub async fn degraded_ack(&self, field: &str) -> Result<Option<DegradedAck>, StoreError> {
+        let mut conn = self.pool.acquire().await?;
+        Self::degraded_ack_tx(&mut conn, field).await
+    }
+
+    /// [`Self::degraded_ack`] inside a caller's transaction.
+    async fn degraded_ack_tx(
+        tx: &mut sqlx::PgConnection,
+        field: &str,
+    ) -> Result<Option<DegradedAck>, StoreError> {
         let row = sqlx::query(
             "SELECT field, acked_at, acked_by, note, evidence_through
              FROM field_degraded_ack WHERE field = $1",
         )
         .bind(field)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         row.map(|row| -> Result<DegradedAck, sqlx::Error> {
             Ok(DegradedAck {

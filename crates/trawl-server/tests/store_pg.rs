@@ -3342,6 +3342,48 @@ mod degraded_ack {
         );
     }
 
+    /// `/schema/field` reads the verdict's inputs and the ack that
+    /// suppresses it as one fact, so the two cannot contradict each other in
+    /// one response.
+    #[sqlx::test]
+    async fn field_health_snapshot_carries_the_verdict_and_its_ack_together(pool: PgPool) {
+        let store = catalog(&pool);
+        degrade(&pool, "host", 3).await;
+
+        // Before the ack: evidence, no acknowledgement, no high-water.
+        let health = store.field_health_snapshot("host").await.unwrap();
+        let agg = health.aggregate.expect("the field has evidence");
+        assert_eq!(agg.episodes, 3);
+        assert_eq!(agg.ack_evidence_through, None);
+        assert!(health.ack.is_none());
+        assert!(
+            !health.evidence.is_empty(),
+            "the verdict's cited samples come from the same snapshot"
+        );
+
+        store
+            .acknowledge_degraded_field("host", "key-aaa", Some("known"))
+            .await
+            .unwrap();
+
+        let health = store.field_health_snapshot("host").await.unwrap();
+        let agg = health.aggregate.expect("the evidence is still there");
+        let ack = health.ack.expect("the acknowledgement");
+        assert_eq!(
+            agg.ack_evidence_through,
+            Some(ack.evidence_through),
+            "the aggregate's high-water and the ack row are one reading"
+        );
+        assert_eq!(ack.acked_by, "key-aaa");
+
+        // A field with no evidence at all: no aggregate, and no evidence
+        // query spent looking for rows that cannot exist.
+        let health = store.field_health_snapshot("service").await.unwrap();
+        assert!(health.aggregate.is_none());
+        assert!(health.evidence.is_empty());
+        assert!(health.ack.is_none());
+    }
+
     /// The note cap is a CHECK, so an over-long note is refused rather than
     /// silently truncated. 1024 bytes exactly is accepted.
     #[sqlx::test]

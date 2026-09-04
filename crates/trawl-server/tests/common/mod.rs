@@ -1410,11 +1410,28 @@ pub mod audit_capture {
             self.events.lock().unwrap().clone()
         }
 
-        /// Every captured event whose `event_type` is `name`.
-        pub fn of_type(&self, name: &str) -> Vec<Captured> {
+        /// Every captured event whose `event_type` is `name` and whose
+        /// `key` field carries `value`.
+        ///
+        /// The correlation half is not optional. The subscriber this layer
+        /// installs is GLOBAL, so under `cargo test` — which runs a
+        /// binary's tests as threads in one process, unlike nextest's
+        /// process per test — a sibling test's ack or repin lands in the
+        /// same buffer and an exact-count assertion fails for reasons that
+        /// have nothing to do with the code under test. Every audit event
+        /// worth asserting names its subject (a field, an actor, a job), so
+        /// filtering on the unique name the test chose costs nothing and
+        /// makes the count mean what it says.
+        ///
+        /// Values are captured through `Debug`, so a string field arrives
+        /// quoted: the match is `contains`, not equality.
+        pub fn of_type(&self, name: &str, key: &str, value: &str) -> Vec<Captured> {
             self.events()
                 .into_iter()
-                .filter(|e| e.fields.get("event_type").is_some_and(|t| t.contains(name)))
+                .filter(|e| {
+                    e.fields.get("event_type").is_some_and(|t| t.contains(name))
+                        && e.fields.get(key).is_some_and(|v| v.contains(value))
+                })
                 .collect()
         }
     }
