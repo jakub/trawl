@@ -7,6 +7,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Scheduler-owned report windows (ADR-0018 rulings 6-14, #107).** A
+  schedule now says what its runs cover, instead of leaving it to whatever
+  time clause the saved query happened to carry. `PUT
+  /api/v1/saved/{id}/schedule` takes `window` and `lag`: `"since_last"`
+  tiles, so consecutive runs cover consecutive intervals with no gap and no
+  double-count, while a duration such as `"2h"` is a fixed trailing span
+  re-measured from every fire. `lag` shifts both bounds back to cover
+  events that arrive after the boundary they belong to. A schedule with no
+  `window` is unchanged: the saved DSL executes verbatim.
+
+  A `since_last` schedule keeps a watermark, `covered_through`, that
+  advances only on success and is seeded at the schedule's origin, so a
+  failed first run is healed by the next one rather than dropped. Missed
+  runs coalesce into ONE window rather than backfilling N runs, bounded by
+  the new `[scheduler] max_catchup_intervals` (default 24, must be at least
+  1): past the bound the window start is clamped forward, the run row
+  carries `window_truncated: true`, and `trawl_scheduler_window_truncated_total`
+  counts it. That counter is the one to alert on, since a truncated run is
+  the only case where coverage is permanently missing from the series.
+
+  Each run stores the RESOLVED query text, the saved DSL with
+  `earliest="..." latest="..."` spliced in front, so a report reproduces by
+  paste. Run rows carry `window_start`, `window_end`, `window_truncated`
+  and `window_kind`; all four are absent together for a run that had no
+  window and are never backfilled. Every successful run is recorded now,
+  zero-row runs included, and a zero-row run is queryable through `| from
+  saved <name> run=latest`. A window and a query-owned time clause are
+  refused in both write directions with a 400 naming both sides, as is a
+  window on a `from saved` query and a `lag` with no window. A manual
+  `POST /api/v1/saved/{id}/run` against a windowed schedule is a 409: the
+  schedule owns its coverage, and a manual run would either double-count a
+  window or advance the watermark past coverage nothing produced.
 - **Self-hosted Geist typography (#119).** `fleet-ui` now owns pinned Geist
   1.8.0 and Geist Mono 1.8.0 variable WOFF2 assets, their SHA-256 checksums,
   source record, and OFL-1.1 attribution. The SPA, fleet-ui workbench, and
@@ -427,6 +459,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   coastwatch is red against the path dependency until it does, and it will
   need its own `public_origins` list.
 
+- **The scheduler fires on planned boundaries (#107).** A schedule carries a
+  fire cursor, `next_fire_at`, and a tick claims the latest boundary at or
+  before its sampled instant. Runs used to be due on elapsed time since the
+  last run STARTED, so execution time and poll jitter walked the schedule
+  forward: a 90-second run on an hourly cadence drifted a minute and a half
+  per fire. Boundaries missed while trawld was down are folded into one
+  catch-up window instead of replayed. `next_fire_at` is on the schedule
+  response, re-anchored to now when the interval or the window changes and
+  left alone when only `max_runs` or `enabled` does.
 - **`now()` is one instant per unit of output (ADR-0017 §3, #106).** It used
   to be read per CALL SITE: a `let` and a `where` in one statement could see
   different instants, and the streaming lane sampled its filter window once
@@ -576,6 +617,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   this is a token-rendering change only.
 
 ### Fixed
+- **`PUT /api/v1/saved/{id}/schedule` honours `enabled` on create (#107).**
+  The flag reached the update path only; the create path's INSERT hardcoded
+  it to true. A `PUT {"interval": "1h", "enabled": false}` on a saved query
+  with no schedule yet therefore created an ENABLED schedule, which the next
+  tick claimed and ran.
+- **`run=latest` and `run=N` no longer skip past a zero-row success (#107).**
+  A successful run that found no rows wrote no parquet and no blob, and the
+  lookup filtered such rows out, so `| from saved <name> run=latest`
+  answered from an OLDER run: a superseded window presented as the current
+  report, with nothing on the wire to say so. A zero-row result is now
+  persisted as a compressed JSON blob holding its column names, which
+  resolves to an empty typed source that downstream stages bind against
+  (`stats count()` over it answers 0). `run=N` resolves a run exactly as
+  `run=latest` does, and neither falls through to an older run: a run whose
+  parquet write failed and left rows in the blob is a 409 naming the run,
+  and a success with neither file nor blob is a 500. `run=all` keeps
+  unioning files only, so `_run_id` never names a run that found nothing.
 - **The streaming evaluator answers what the query engine answers (#105).**
   Every DSL expression runs in two lanes — `DuckDB` SQL for `/api/v1/query`,
   an in-memory evaluator for the SSE live tail and for the `rust_stages`

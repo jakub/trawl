@@ -598,13 +598,150 @@ DELETE /api/v1/saved/{id}         # delete a saved query
 
 ### Schedules
 
-Attach cron-style schedules to saved queries for periodic execution.
+Attach a schedule to a saved query to run it periodically. Schedules are
+fixed intervals, not cron expressions: a schedule has one period (`"1h"`,
+`"24h"`) and a planned fire cursor, and there is no calendar syntax.
 
 ```
 PUT    /api/v1/saved/{id}/schedule    # create or update schedule
 GET    /api/v1/saved/{id}/schedule    # get schedule
 DELETE /api/v1/saved/{id}/schedule    # delete schedule
+POST   /api/v1/saved/{id}/run         # trigger one run now (query mode only)
 ```
+
+Request body:
+
+```json
+{
+  "interval": "1h",
+  "window": "since_last",
+  "lag": "5m",
+  "max_runs": 100,
+  "enabled": true
+}
+```
+
+- `interval` is the period, a duration: a number and one of `s`, `m`, `h`,
+  `d`, `w`. Minimum 60s, maximum 10 years.
+- `window` says what each run covers (ADR-0018 ruling 6). Three spellings.
+  `"since_last"` tiles: each run covers `[the previous run's window end,
+  this fire - lag)`, so consecutive runs cover consecutive intervals and a
+  failed run's gap is healed by the next success. A duration such as
+  `"2h"` is a fixed trailing span, re-measured from every fire and never
+  healing anything; it takes the same 60s floor as the interval. Absent is
+  query mode, the legacy shape: the saved DSL runs verbatim and the run
+  records no bounds.
+- `lag` is the late-arrival allowance, default `"0s"`. It shifts *both* window
+  bounds back, so it delays coverage rather than widening it: an event
+  that landed after the boundary it belongs to is still inside the window
+  that covers it. There is no 60s floor on `lag`, and it is meaningful
+  only with a `window`.
+- `enabled` defaults to `true`. It is honoured on create as well as on
+  update, so `{"interval": "1h", "enabled": false}` on a saved query with
+  no schedule yet creates a disabled one.
+
+Response body:
+
+```json
+{
+  "id": 3,
+  "saved_query_id": 7,
+  "interval": "1h",
+  "interval_secs": 3600,
+  "enabled": true,
+  "window": "since_last",
+  "lag": "5m",
+  "lag_secs": 300,
+  "covered_through": "2026-03-14T01:55:00.000000Z",
+  "next_fire_at": "2026-03-14T03:00:00.000000Z",
+  "total_runs": 2,
+  "created_at": "2026-03-14T02:00:00Z",
+  "updated_at": "2026-03-14T02:00:00Z"
+}
+```
+
+- `window` is the normalized mode, `"since_last"` or a duration. Absent in
+  query mode.
+- `lag` and `lag_secs` are present exactly when `window` is. A windowed
+  schedule with no lag reports `"0s"` and `0`, which is the value in
+  force, not an absence.
+- `covered_through` is the `since_last` watermark, the end of the newest
+  window a successful run covered. Absent for a fixed window and for query
+  mode, neither of which keeps one.
+- `next_fire_at` is the planned next fire instant. Always present, windowed
+  or not. All three instants are RFC 3339, UTC, microseconds.
+
+Report-run rows (in `last_run` here and in the run listings below) carry
+four more fields:
+
+- `window_start` and `window_end` are the half-open interval `[start, end)`
+  the run covered.
+- `window_truncated` reports completeness. `false` is the positive claim that the run covered
+  everything it owed; `true` means the `since_last` catch-up gap exceeded
+  `max_catchup_intervals` and the start was clamped forward.
+- `window_kind` is `"since_last"` or `"fixed"`, the mode the run was
+  *claimed* under, so an edit racing a run cannot change what the run
+  means.
+
+All four are absent together for a run that had no window: a query-mode
+run, a manual run, or one from before the schedule grew a window. They are
+never backfilled. Absent therefore means "not a windowed run", `false`
+means "windowed and complete", and `true` means "windowed and clamped".
+
+Four requests are refused with 400, each naming both sides of the
+conflict, because the server has no basis for choosing which one to drop:
+
+- a window on a saved query that carries its own time clause:
+
+  ```
+  schedule window "since_last" conflicts with the saved query's last= time clause; remove one side
+  ```
+
+  The check runs in both directions and under the saved query's row lock,
+  so `PUT /api/v1/saved/{id}` editing a `last=` into the DSL of a query
+  that already has a window is refused with the same message. The pair
+  cannot be assembled by two racing requests.
+- a window on a query that reads `from saved`, whose input is stored
+  results rather than ingest events:
+
+  ```
+  schedule window "since_last" conflicts with the saved query's "from saved" source; stored report rows cannot receive a _time window
+  ```
+- a `lag` with no `window`:
+
+  ```
+  lag 300s needs a report window: without `window` the saved query owns its own time clause and trawl shifts no bounds. Set window to "since_last" or a duration, or drop lag
+  ```
+- a duration that does not parse, in any of the three fields. The message
+  names the field and what that field would have taken, because a request
+  carrying both a `window` and a `lag` would otherwise leave you guessing
+  which one was rejected:
+
+  ```
+  invalid window: invalid interval format: "5x"; window takes "since_last" or a duration: a number and one of s, m, h, d, w
+  ```
+
+  A short window reports the interval floor it shares (`schedule interval
+  30s is below minimum of 60s`), and anything over ten years reports
+  `duration 315360001s exceeds the maximum of 315360000 seconds (10
+  years)`.
+
+A window over text that does not parse at all is refused too: `schedule
+window "2h" cannot be attached to a query that does not parse: ...`. Query
+mode parses nothing, so a saved query with no window keeps storing whatever
+text you give it.
+
+`POST /api/v1/saved/{id}/run` runs a query-mode schedule immediately. On a
+windowed one it is a 409:
+
+```
+schedule uses coverage mode "since_last"; manual runs are disabled for windowed schedules; watch GET /api/v1/saved/7/schedule (covered_through, next_fire_at)
+```
+
+The schedule owns what its reports cover, and a manual run would either
+double-count a window or advance the watermark past coverage nothing
+produced. It is a 409 rather than a 400 because the request becomes fine
+again the moment the window is dropped.
 
 ### Report runs
 
@@ -612,6 +749,36 @@ DELETE /api/v1/saved/{id}/schedule    # delete schedule
 GET /api/v1/saved/{id}/runs           # list report runs (paginated)
 GET /api/v1/saved/{id}/runs/{run_id}  # get a specific run with result data
 ```
+
+A run's `query` is the *resolved* text, not the saved text: for a windowed
+run the scheduler prepends `earliest="<start>" latest="<end>" ` to the
+saved DSL and stores the result, so a run reproduces by paste. The prefix
+is a splice on the text rather than a re-render of the parse tree, which
+keeps your comments and your spelling intact. That is also why the saved
+query may not carry its own time clause.
+
+Every successful run is recorded, including one that found no rows. A
+zero-row run has no parquet file (there is no schema to write), so its
+columns are stored as a compressed JSON blob; `GET
+/saved/{id}/runs/{run_id}` returns those columns with an empty row list,
+and the run keeps its window like any other.
+
+Reading runs back through the DSL follows from that. `| from saved <name>
+run=latest` resolves the newest successful run and refuses to look past
+it, so a zero-row run answers as itself (as an empty typed source that
+downstream stages bind against) instead of quietly serving an older
+window's numbers. `run=N` resolves one run by id and answers identically.
+`run=all` unions the runs that produced a *file*, so a zero-row run is not
+a member and `_run_id` never names one. A run whose parquet write failed
+and fell back to the blob holds rows with no file to point a query at, and
+is a 409:
+
+```
+report run 42 produced 17 rows but no parquet result, so it cannot be read through `from saved`; fetch it at /api/v1/saved/7/runs/42 instead, or wait for the next scheduled run
+```
+
+The mechanism behind the windows, with a worked example, is in
+[scheduled reports](/architecture/data-flow/#scheduled-reports).
 
 ### Export
 

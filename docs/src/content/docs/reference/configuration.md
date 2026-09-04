@@ -345,10 +345,15 @@ env with a longer retention still has that data on disk.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable scheduled query execution |
-| `poll_interval_secs` | integer | `10` | Check for due schedules |
+| `poll_interval_secs` | integer | `10` | How often the scheduler looks for due schedules. It is the polling rate only: a schedule fires on its own planned boundary (`next_fire_at`), so a slow poll delays a run, it never shifts the window that run covers |
 | `report_max_rows` | integer | `10000` | Max rows stored per report run |
 | `max_runs_per_schedule` | integer | `100` | Completed runs kept per schedule |
 | `report_retention_days` | integer | `30` | Delete report runs older than N days |
+| `max_catchup_intervals` | integer | `24` | How many whole schedule intervals one `since_last` catch-up run may cover. Must be at least 1; trawld refuses to start on `0` |
+
+A schedule in `since_last` mode keeps a watermark and tiles forward from it, so runs missed while trawld was down do not vanish: the next successful run covers everything back to the watermark in one window. `max_catchup_intervals` bounds that window. Past the bound the start is clamped forward to `window_end - max_catchup_intervals * interval`, the run row carries `window_truncated: true`, and `trawl_scheduler_window_truncated_total` counts it. The coverage before the clamp is then permanently missing from the report series, which is the trade: one enormous query after a week of downtime would be worse. The unit is intervals, not hours, so the default of 24 means a day of missed hourly runs or 24 days of missed daily ones. Raise it if you would rather pay for the catch-up query than lose the coverage; there is no "never clamp" switch, spell that as a large number.
+
+Window modes, `lag` and the watermark are per-schedule settings, not config: see [scheduled reports](/architecture/data-flow/#scheduled-reports) for the mechanism and the [schedules API](/reference/api/#schedules) for the request and response fields.
 
 ### `[web]`
 

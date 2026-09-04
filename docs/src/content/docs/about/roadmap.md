@@ -26,7 +26,7 @@ Query, validate, and embedded mode. Four output formats (table, JSON, CSV, parqu
 Multi-tab editor with syntax highlighting, schema browser with field profiling, query history, saved queries, live tail via SSE, vim-style result search, clipboard integration, and driver mode for programmatic control.
 
 ### Scheduled reports
-Cron-style periodic query execution with zstd-compressed result storage, crash recovery, and atomic run tracking.
+Fixed-interval query execution with zstd-compressed result storage, crash recovery, and atomic run tracking. The schedule owns the reporting window, not the query text: `since_last` tiles consecutive runs with no gap and no double-count, a fixed trailing span re-measures from every fire, and `lag` covers late arrivals. Runs fire on planned boundaries, missed ones coalesce into a single catch-up window bounded by `max_catchup_intervals`, and each run stores the resolved DSL it executed, so a report reproduces by paste (ADR-0018).
 
 ### Testing
 ~100 emitter snapshots, filter/SQL parity property test, ~30 engine integration tests against fixture parquet, ~40 HTTP integration tests against real server instances, hot buffer pipeline end-to-end test.
