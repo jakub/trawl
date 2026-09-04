@@ -3124,6 +3124,267 @@ mod catalog {
             "conformance marking must not rotate the identity"
         );
     }
+
+    /// Pin gc's candidate set and the schema listing's window are two
+    /// readings of one fact, `field_services.last_seen`, so for a pin that
+    /// has ever been observed they must partition it: alive in the listing,
+    /// or a gc candidate, never both and never neither. One cutoff drives
+    /// both reads, so a drift in either rule shows up here.
+    #[sqlx::test]
+    async fn gc_candidates_are_the_complement_of_the_schema_window(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[
+                proposal("fresh", CanonicalType::BigInt),
+                proposal("stale", CanonicalType::Varchar),
+                proposal("edge", CanonicalType::Double),
+                proposal("multi", CanonicalType::Varchar),
+            ])
+            .await
+            .unwrap();
+
+        for field in ["fresh", "stale", "edge", "multi"] {
+            store
+                .touch_services("svc-a", &[field.to_owned()], 1)
+                .await
+                .unwrap();
+        }
+        // `multi` is stale for one sender and current for another: the
+        // newest observation across services is what decides it.
+        store
+            .touch_services("svc-b", &["multi".to_owned()], 1)
+            .await
+            .unwrap();
+
+        age_observation(&pool, "stale", "svc-a", 60).await;
+        age_observation(&pool, "edge", "svc-a", 30).await;
+        age_observation(&pool, "multi", "svc-a", 60).await;
+
+        // Between `edge` (30 days back) and `stale` (60), so `edge` is
+        // alive and `stale` is not.
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(45);
+
+        let candidates = store.pins_unobserved_since(cutoff).await.unwrap();
+        let candidate_names: Vec<&str> = candidates.iter().map(|c| c.field.as_str()).collect();
+        let (listed, _) = store
+            .list_fields(&trawl_server::store::FieldListFilter {
+                since: Some(cutoff),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let listed_names: Vec<&str> = listed.iter().map(|r| r.field.as_str()).collect();
+
+        for field in ["fresh", "stale", "edge", "multi"] {
+            let is_candidate = candidate_names.contains(&field);
+            let is_listed = listed_names.contains(&field);
+            assert!(
+                is_candidate != is_listed,
+                "{field}: candidate={is_candidate} listed={is_listed} — an \
+                 observed pin belongs to exactly one side of the cutoff"
+            );
+        }
+        assert!(candidate_names.contains(&"stale"));
+        assert!(!candidate_names.contains(&"fresh"));
+        assert!(
+            !candidate_names.contains(&"multi"),
+            "svc-b still writes it, so the newest observation keeps it alive"
+        );
+
+        // The row carries what the report and the audit event need.
+        let stale = candidates.iter().find(|c| c.field == "stale").unwrap();
+        assert_eq!(stale.duckdb_type, "VARCHAR");
+        assert_eq!(stale.services, 1);
+        assert!(stale.last_seen.is_some_and(|seen| seen < cutoff));
+    }
+
+    /// The one place gc and the listing disagree on purpose: a pin nothing
+    /// ever observed is always shown by `/schema` (there is no `last_seen`
+    /// to age out) and is a gc candidate (a `curl` typo pinned once and
+    /// never written is exactly the slot gc reclaims). Asserted so a later
+    /// "make them agree" cleanup has to argue with a test.
+    #[sqlx::test]
+    async fn never_observed_pin_diverges_from_the_listing_rule(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[proposal("typoed_feild", CanonicalType::Varchar)])
+            .await
+            .unwrap();
+
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+
+        let candidates = store.pins_unobserved_since(cutoff).await.unwrap();
+        let typoed = candidates
+            .iter()
+            .find(|c| c.field == "typoed_feild")
+            .expect("a never-observed pin is a candidate");
+        assert_eq!(typoed.last_seen, None);
+        assert_eq!(typoed.services, 0);
+
+        let (listed, _) = store
+            .list_fields(&trawl_server::store::FieldListFilter {
+                since: Some(cutoff),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            listed.iter().any(|r| r.field == "typoed_feild"),
+            "the listing shows a never-observed pin at the same cutoff"
+        );
+
+        // The envelope seed is never observed either, so it comes back here
+        // too — the store reads, and `catalog::gc::candidacy` is what
+        // refuses to reclaim a contract field.
+        assert!(candidates.iter().any(|c| c.field == "_severity"));
+    }
+
+    #[sqlx::test]
+    async fn delete_pins_refuses_a_contract_typed_name(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[proposal("duration", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+
+        for contract in ["_severity", "service", "_time", "message"] {
+            let err = store
+                .delete_pins(&[contract.to_owned(), "duration".to_owned()])
+                .await
+                .expect_err("a contract field is not reclaimable");
+            assert!(
+                matches!(&err, trawl_server::store::StoreError::Validation(msg)
+                    if msg.contains(contract)),
+                "{contract}: unexpected error {err:?}"
+            );
+        }
+
+        // Nothing was deleted: the refusal precedes the transaction, so the
+        // ordinary field named beside the contract one survives too.
+        let pins = store.load_pins().await.unwrap();
+        assert!(pins.iter().any(|(f, _)| f == "duration"));
+        assert!(pins.iter().any(|(f, _)| f == "_severity"));
+    }
+
+    /// Gc's whole safety argument is that being wrong costs a re-pin: the
+    /// purge leaves no trace in any of the four tables, so the field comes
+    /// back through the ordinary ingest path as if it were new.
+    #[sqlx::test]
+    async fn delete_pins_leaves_no_residue_and_a_clean_repin_follows(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[
+                proposal("dead", CanonicalType::BigInt),
+                proposal("keep", CanonicalType::Varchar),
+            ])
+            .await
+            .unwrap();
+        for field in ["dead", "keep"] {
+            store
+                .touch_services("svc-a", &[field.to_owned()], 5)
+                .await
+                .unwrap();
+            store
+                .record_conflicts(&[FieldConflict {
+                    field: field.to_owned(),
+                    service: "svc-a".to_owned(),
+                    observed_type: "VARCHAR".to_owned(),
+                    expected_type: CanonicalType::BigInt,
+                    rows_nulled: 2,
+                    samples: vec!["accepted".to_owned()],
+                }])
+                .await
+                .unwrap();
+        }
+
+        let deleted = store.delete_pins(&["dead".to_owned()]).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        for (table, sql) in [
+            (
+                "field_types",
+                "SELECT count(*)::bigint FROM field_types WHERE field = $1",
+            ),
+            (
+                "field_services",
+                "SELECT count(*)::bigint FROM field_services WHERE field = $1",
+            ),
+            (
+                "field_conflicts",
+                "SELECT count(*)::bigint FROM field_conflicts WHERE field = $1",
+            ),
+            (
+                "field_conflict_stats",
+                "SELECT count(*)::bigint FROM field_conflict_stats WHERE field = $1",
+            ),
+        ] {
+            let purged: i64 = sqlx::query_scalar(sql)
+                .bind("dead")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(purged, 0, "{table} still holds rows for the purged field");
+            let kept: i64 = sqlx::query_scalar(sql)
+                .bind("keep")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert!(kept > 0, "{table} lost the neighbouring field's rows");
+        }
+
+        // Re-arrival through the normal path: a fresh pin, its own type,
+        // and a first observation. Nothing carried over from the old life.
+        let pins = store
+            .pin_missing(&[proposal("dead", CanonicalType::Varchar)])
+            .await
+            .unwrap();
+        assert_eq!(
+            pins.get("dead"),
+            Some(&CanonicalType::Varchar),
+            "the slot is genuinely free — the old BIGINT pin did not win"
+        );
+        store
+            .touch_services("svc-b", &["dead".to_owned()], 1)
+            .await
+            .unwrap();
+
+        let (rows, _) = store
+            .list_fields(&trawl_server::store::FieldListFilter::default())
+            .await
+            .unwrap();
+        let reborn = rows.iter().find(|r| r.field == "dead").unwrap();
+        assert_eq!(reborn.duckdb_type, "VARCHAR");
+        assert_eq!(reborn.service_count, 1, "svc-a's history did not survive");
+        assert_eq!(reborn.row_count, 1);
+        assert_eq!(reborn.conflict_count, 0, "old evidence did not survive");
+    }
+
+    /// A repin's history is what an operator did to the corpus, and it
+    /// stays true after the field is gone.
+    #[sqlx::test]
+    async fn delete_pins_never_touches_repin_history(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[proposal("dead", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO repin_jobs (field, from_type, to_type, dry_run, status, requested_by)
+             VALUES ('dead', 'BIGINT', 'VARCHAR', FALSE, 'succeeded', 'ops')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        store.delete_pins(&["dead".to_owned()]).await.unwrap();
+
+        let jobs: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM repin_jobs WHERE field = 'dead'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(jobs, 1);
+    }
 }
 
 // ---------------------------------------------------------------------------

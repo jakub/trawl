@@ -343,16 +343,22 @@ fn repin_claimed_mid_sweep(data_dir: &Path) -> bool {
 }
 
 /// Evidence that a repin job owns this data root right now, if any.
+///
+/// One line of policy over [`crate::repin::in_flight_evidence`], the shared
+/// authority: an unreadable answer counts as evidence and suppresses the
+/// sweep. Retention deletes files, so "I could not tell" has to fall on the
+/// side of not deleting them, and the tick that follows would fail reading
+/// the same directory anyway.
 fn repin_in_flight(data_dir: &Path) -> Option<&'static str> {
-    if crate::repin::marker_path(data_dir).exists() {
-        Some("marker")
-    } else if crate::repin::shadow_root(data_dir).exists() {
-        Some("shadow root")
-    } else if crate::repin::aside_root(data_dir).exists() {
-        Some("aside root")
-    } else {
-        None
-    }
+    crate::repin::in_flight_evidence(data_dir).unwrap_or_else(|e| {
+        tracing::warn!(
+            event_type = "retention_repin_evidence_unreadable",
+            error = %e,
+            "could not tell whether a repin owns the data root; suppressing \
+             this sweep rather than deleting under a job that may exist"
+        );
+        Some("unreadable")
+    })
 }
 
 /// Enumerate date-formatted directories across every env directory in

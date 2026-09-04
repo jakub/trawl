@@ -9,9 +9,10 @@
 //! dynamic field's canonical type here before the first parquet file
 //! carrying it is written, and conforms every batch to the pins, so
 //! `union_by_name` across any set of trawl-written files can never
-//! conflict. Pins are add-only on the ingest path (the one mutation is the
-//! operator-triggered repin cutover, `store::repin`), and because a pin
-//! slot is therefore permanent while its name is a client-chosen JSON key,
+//! conflict. Pins are add-only on the ingest path (the two mutations are
+//! both operator-triggered: the repin cutover, `store::repin`, and the pin
+//! purge, [`CatalogStore::delete_pins`]), and because a pin slot is
+//! therefore spent for good by ingest while its name is a client-chosen key,
 //! the catalog is bounded where a sender controls the axis: name length by
 //! [`trawl_core::schema::is_storable_field_name`], pin count by
 //! [`MAX_PINNED_FIELDS`], and per-field conflict evidence by
@@ -230,6 +231,27 @@ pub struct FieldSummaryRow {
     pub rows_nulled: i64,
 }
 
+/// A pin nothing has observed since a cutoff: one gc candidate on the
+/// observation axis ([`CatalogStore::pins_unobserved_since`]).
+///
+/// The metadata axis has not been consulted yet, so this is a pin to
+/// disprove with a parquet footer, never a decision to delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcPinRow {
+    /// Field name (a catalog key).
+    pub field: String,
+    /// Pinned `DuckDB` type spelling, carried so the report and the audit
+    /// event can say what was deleted without a second read.
+    pub duckdb_type: String,
+    /// The newest observation of the field across every service, `None`
+    /// when it was never observed at all.
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Distinct services that ever carried the field, over its whole
+    /// history rather than the window: how much attribution the purge is
+    /// about to discard.
+    pub services: i64,
+}
+
 /// One field's pin row ([`CatalogStore::field_pin`]).
 #[derive(Debug, Clone)]
 pub struct FieldPinRow {
@@ -285,9 +307,10 @@ pub struct FieldConflictRow {
 
 /// Maximum number of fields the catalog will ever pin.
 ///
-/// Field names are client-chosen JSON keys, and a pin slot is permanent
-/// (a repin retypes a pin, nothing reclaims one, and retention never
-/// reconciles `field_services`). Without a count bound, a sender that
+/// Field names are client-chosen JSON keys, and the ingest path never
+/// gives a slot back (a repin retypes a pin, retention never reconciles
+/// `field_services`, and only an operator running gc deletes one).
+/// Without a count bound, a sender that
 /// embeds identifiers in its keys, `user_12345_status`, accidental or
 /// hostile, grows postgres, the in-process [`crate::catalog::FieldCatalog`]
 /// cache, and every snapshot taken of it without limit. Name length is
@@ -318,13 +341,19 @@ pub struct FieldConflictRow {
 ///   `catalog_pin_cap_reached` warning only fires once slots are already
 ///   gone.)
 ///
-/// What neither buys is a remedy: the repin engine retypes a wrong pin, but
-/// reclaiming a taken slot means proving no standing parquet carries the
-/// column, deliberately out of scope; a hand-run `DELETE FROM field_types`
-/// breaks the write-time conformance invariant for files already on disk
-/// and must not be recommended. A sustained sender can still fill the
-/// catalog; the ration slows it and the gauges make it visible while it
-/// happens.
+/// The remedy for a slot spent by accident is pin garbage collection
+/// ([`crate::catalog::gc`], `trawl schema gc-pins`): a pin nothing has
+/// observed for the dead window and no standing parquet footer declares is
+/// deleted through [`CatalogStore::delete_pins`]. Both proofs are required,
+/// so the write-time conformance invariant holds by construction — a
+/// hand-run `DELETE FROM field_types` proves neither and must still never
+/// be recommended.
+///
+/// That is a repair, not a defense. Gc reclaims what a typo or a
+/// decommissioned sender left behind; against a sender still filling the
+/// catalog it collects nothing, because every pin it takes is observed and
+/// carried. The defense remains the cap, the per-batch ration and the fill
+/// gauges.
 pub const MAX_PINNED_FIELDS: i64 = 10_000;
 
 /// Maximum `field_conflicts` rows kept per field — the newest survive.
@@ -1563,6 +1592,131 @@ impl CatalogStore {
         })
         .transpose()
         .map_err(StoreError::from)
+    }
+
+    /// Every pin whose newest observation predates `cutoff`, plus every pin
+    /// never observed at all: the gc candidate set on the observation axis
+    /// (ADR-0009 catalog, `crate::catalog::gc`).
+    ///
+    /// Never-observed pins are included, which is a deliberate divergence
+    /// from [`Self::list_fields`], where such a pin is always shown rather
+    /// than windowed out. The listing errs toward showing; gc errs toward
+    /// reclaiming, and the caller's [`crate::catalog::gc::candidacy`] is
+    /// where the envelope is protected and the footer scan is where a
+    /// candidate is disproved. This method judges nothing: it reads.
+    ///
+    /// The newest observation is a per-pin LATERAL `ORDER BY last_seen DESC
+    /// LIMIT 1`, an index-only lookup of one row through migration 0004's
+    /// `field_services_field_last_seen_idx`. Deliberately not the
+    /// `GROUP BY field` aggregate [`Self::list_fields`] uses: that one reads
+    /// every observation row in the table, and the service axis is
+    /// client-chosen and never pruned, so a periodic operator command would
+    /// carry a cost set by how many service names have ever been invented.
+    ///
+    /// The service count is a scalar subquery over the surviving rows only,
+    /// which is what the MATERIALIZED CTE buys: it fences the count so it
+    /// runs per candidate (bounded by [`MAX_PINNED_FIELDS`]) rather than per
+    /// pin. It counts the whole history, not the window — a candidate has no
+    /// observation inside the window by construction, so a windowed count
+    /// would be zero for every row.
+    pub async fn pins_unobserved_since(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<GcPinRow>, StoreError> {
+        let rows = sqlx::query(
+            "WITH candidate AS MATERIALIZED (
+                 SELECT t.field, t.duckdb_type, n.last_seen
+                 FROM field_types t
+                 LEFT JOIN LATERAL (
+                     SELECT fs.last_seen
+                     FROM field_services fs
+                     WHERE fs.field = t.field
+                     ORDER BY fs.last_seen DESC
+                     LIMIT 1
+                 ) n ON TRUE
+                 WHERE n.last_seen IS NULL OR n.last_seen < $1
+             )
+             SELECT c.field, c.duckdb_type, c.last_seen,
+                    (SELECT count(*) FROM field_services fs
+                     WHERE fs.field = c.field)::bigint AS services
+             FROM candidate c
+             ORDER BY c.field",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter()
+            .map(|row| {
+                Ok(GcPinRow {
+                    field: row.try_get("field")?,
+                    duckdb_type: row.try_get("duckdb_type")?,
+                    last_seen: row.try_get("last_seen")?,
+                    services: row.try_get("services")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Delete `fields` from the catalog entirely, in one transaction:
+    /// aggregates, conflict evidence, observations, then the pins
+    /// themselves. Returns the rows deleted from `field_types`.
+    ///
+    /// One transaction because a partial purge is a catalog that lies. Left
+    /// half-done, a field would keep observation rows and conflict evidence
+    /// with no pin to explain them, and the analyzer would go on indicting a
+    /// pin that does not exist. The order is child-to-parent so a foreign
+    /// key added later cannot make the delete order matter.
+    ///
+    /// A [`trawl_core::schema::is_contract_typed`] name is an error, not a
+    /// skipped element. The caller filters those out before it ever gets
+    /// here, so one arriving means the candidate set was built wrong, and
+    /// silently deleting the rest would hide that while leaving the operator
+    /// a report that claims a field they still have. Nothing is deleted:
+    /// the check runs before the transaction opens.
+    ///
+    /// `repin_jobs` is untouched. A repin's history says what an operator
+    /// did to the corpus, which stays true after the field is gone.
+    ///
+    /// The fill gauges are re-published from the post-commit count, so the
+    /// headroom an operator alerts on reflects the reclaim immediately
+    /// rather than at the next pin write.
+    pub async fn delete_pins(&self, fields: &[String]) -> Result<u64, StoreError> {
+        if fields.is_empty() {
+            return Ok(0);
+        }
+        if let Some(contract) = fields
+            .iter()
+            .find(|f| trawl_core::schema::is_contract_typed(f))
+        {
+            return Err(StoreError::Validation(format!(
+                "{contract} is one of trawl's contract fields — its pin is \
+                 declared, not reclaimable"
+            )));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        for sql in [
+            "DELETE FROM field_conflict_stats WHERE field = ANY($1)",
+            "DELETE FROM field_conflicts WHERE field = ANY($1)",
+            "DELETE FROM field_services WHERE field = ANY($1)",
+        ] {
+            sqlx::query(sql).bind(fields).execute(&mut *tx).await?;
+        }
+        let deleted = sqlx::query("DELETE FROM field_types WHERE field = ANY($1)")
+            .bind(fields)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+
+        let pinned_now: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
+            .fetch_one(&self.pool)
+            .await?;
+        set_fill_gauges(pinned_now, self.pin_cap);
+
+        Ok(deleted)
     }
 
     /// The catalog's stable identity (mirrored into the `data/CATALOG`
