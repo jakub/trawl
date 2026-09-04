@@ -37,7 +37,7 @@ use crate::report_window::{ScheduleWindow, format_window_bound};
 use crate::scheduler::execute_scheduled_query;
 use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
-    HistoryEntry, ReportRun, RunClaim, RunStatus, SavedQuery, Schedule, ScheduleWithStats,
+    HistoryEntry, ManualRunClaim, ReportRun, RunStatus, SavedQuery, Schedule, ScheduleWithStats,
     format_interval, parse_duration_secs, parse_interval,
 };
 
@@ -2437,8 +2437,11 @@ pub async fn runs_stats(
 /// `POST /api/v1/saved/{id}/run` — trigger an immediate report run for a saved query.
 ///
 /// Bypasses the scheduler interval check. Requires a schedule to be attached
-/// (the run is stored under that schedule's history). Returns the run summary
-/// immediately with status "running" — execution continues in the background.
+/// (the run is stored under that schedule's history), and that schedule must
+/// be in query mode: a windowed one owns what its reports cover, so a manual
+/// run is a 409 naming the mode and the route that shows where coverage has
+/// reached (ADR-0018 ruling 6). Returns the run summary immediately with
+/// status "running" — execution continues in the background.
 pub async fn trigger_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2458,30 +2461,39 @@ pub async fn trigger_run(
         .await?
         .ok_or_else(|| ServerError::NotFound("saved query not found".into()))?;
 
-    let schedule = state
-        .storage
-        .schedule
-        .get_schedule_for_saved_query(saved_id, key_id)
-        .await?
-        .ok_or_else(|| {
-            ServerError::BadRequest("attach a schedule before triggering a run".into())
-        })?;
-
-    // One transaction: lock the schedule row, enforce max_runs, claim the
-    // run. Concurrent triggers cannot exceed the cap or double-claim.
+    // One transaction: lock the schedule row, refuse a coverage mode,
+    // enforce max_runs, claim the run. Concurrent triggers cannot exceed the
+    // cap or double-claim, and a window added mid-request either lands
+    // before the lock (and refuses this run) or waits behind it.
     let run_id = match state
         .storage
         .schedule
-        .claim_run(schedule.id, saved_id, &saved.query, schedule.max_runs, None)
+        .claim_manual_run(saved_id, key_id, &saved.query)
         .await?
     {
-        RunClaim::Started(id) => id,
-        RunClaim::MaxRunsReached => {
+        ManualRunClaim::Started(id) => id,
+        ManualRunClaim::NoSchedule => {
+            return Err(ServerError::BadRequest(
+                "attach a schedule before triggering a run".into(),
+            ));
+        }
+        // 409, not 400: the request is well formed and will be fine again
+        // if the operator drops the window. The message names the mode it
+        // found and the route that answers "where has coverage reached",
+        // which is what someone asking for a manual run actually wants.
+        ManualRunClaim::CoverageMode(window) => {
+            return Err(ServerError::Conflict(format!(
+                "schedule uses coverage mode \"{window}\"; manual runs are disabled for \
+                 windowed schedules; watch GET /api/v1/saved/{saved_id}/schedule \
+                 (covered_through, next_fire_at)"
+            )));
+        }
+        ManualRunClaim::MaxRunsReached => {
             return Err(ServerError::BadRequest(
                 "max runs reached for this net".into(),
             ));
         }
-        RunClaim::AlreadyRunning => {
+        ManualRunClaim::AlreadyRunning => {
             return Err(ServerError::BadRequest(
                 "a run is already in progress for this net".into(),
             ));

@@ -124,6 +124,31 @@ pub enum RunClaim {
     MaxRunsReached,
 }
 
+/// Outcome of an operator-triggered run claim
+/// ([`ScheduleStore::claim_manual_run`]).
+///
+/// [`ManualRunClaim::CoverageMode`] is the one that is not about capacity.
+/// A schedule with a window OWNS what its reports cover: `since_last` tiles
+/// from a watermark a manual run would either skip past or double, and a
+/// fixed window is measured from a planned fire a manual run does not have.
+/// Neither has defined bounds outside the schedule, so the run is refused
+/// rather than given bounds nobody chose (ADR-0018 ruling 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualRunClaim {
+    /// A run row was created; execute it.
+    Started(i64),
+    /// The saved query has no schedule, so there is nothing to record a
+    /// run under.
+    NoSchedule,
+    /// The schedule owns a window. The mode travels with the refusal so
+    /// the caller can name it.
+    CoverageMode(ScheduleWindow),
+    /// A run is already in progress for this schedule.
+    AlreadyRunning,
+    /// The schedule has reached its `max_runs` cap.
+    MaxRunsReached,
+}
+
 /// Outcome of a scheduler tick's due-run decision
 /// ([`ScheduleStore::claim_due_run`]).
 ///
@@ -989,6 +1014,87 @@ impl ScheduleStore {
                 tx.rollback().await?;
                 match classify_violation(&e) {
                     Some(PgViolation::RunAlreadyRunning) => Ok(RunClaim::AlreadyRunning),
+                    _ => Err(e.into()),
+                }
+            }
+        }
+    }
+
+    /// Claim an operator-triggered run of a saved query's schedule.
+    ///
+    /// The whole decision is one transaction holding the schedule row
+    /// `FOR UPDATE`, and the coverage-mode test is asked FIRST, before the
+    /// cap count and before the insert. A windowed schedule is refused
+    /// outright (ADR-0018 ruling 6), and asking under the lock is what
+    /// makes the refusal reliable: a `PUT .../schedule` that adds a window
+    /// either commits before this read or waits behind it, so a manual run
+    /// can never slip through on a snapshot taken a moment earlier.
+    ///
+    /// `query` is the saved DSL, executed and stored verbatim. A manual run
+    /// is query mode by definition, so it records no window and the caller
+    /// never has to splice one on.
+    ///
+    /// LOCK ORDER: `schedules` -> `report_runs`. `saved_queries` is skipped
+    /// rather than reordered around, the same as [`Self::claim_run`] and
+    /// [`Self::finish_run`].
+    pub async fn claim_manual_run(
+        &self,
+        saved_query_id: i64,
+        key_id: i64,
+        query: &str,
+    ) -> Result<ManualRunClaim, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let locked = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {SCHEDULE_COLS} FROM schedules
+             WHERE saved_query_id = $1 AND key_id = $2 FOR UPDATE"
+        )))
+        .bind(saved_query_id)
+        .bind(key_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(locked) = locked else {
+            tx.rollback().await?;
+            return Ok(ManualRunClaim::NoSchedule);
+        };
+        let schedule = row_to_schedule(&locked)?;
+
+        if let Some(window) = schedule.window {
+            tx.rollback().await?;
+            return Ok(ManualRunClaim::CoverageMode(window));
+        }
+
+        // The cap is counted from the LOCKED row's `max_runs`, not from a
+        // value the caller read earlier: concurrent triggers serialize
+        // here, and each one sees the winner's committed run count.
+        if let Some(max) = schedule.max_runs {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM report_runs WHERE schedule_id = $1")
+                    .bind(schedule.id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if u64::try_from(count).unwrap_or_default() >= max {
+                tx.rollback().await?;
+                return Ok(ManualRunClaim::MaxRunsReached);
+            }
+        }
+
+        match insert_running_run(&mut tx, schedule.id, saved_query_id, query, None).await {
+            Ok(id) => {
+                tx.commit().await?;
+                tracing::info!(
+                    event_type = "report_run_started",
+                    run_id = id,
+                    schedule_id = schedule.id,
+                    saved_query_id,
+                    "Report run started"
+                );
+                Ok(ManualRunClaim::Started(id))
+            }
+            Err(e) => {
+                tx.rollback().await?;
+                match classify_violation(&e) {
+                    Some(PgViolation::RunAlreadyRunning) => Ok(ManualRunClaim::AlreadyRunning),
                     _ => Err(e.into()),
                 }
             }
