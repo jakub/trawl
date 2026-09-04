@@ -184,6 +184,13 @@ pub async fn bookkeeping_timeouts(url: &str) -> std::collections::BTreeMap<Strin
 /// loaded machine, the budget expires, the evidence never lands, and the
 /// test fails on a value assertion that says nothing about the code under
 /// test. This turns that into a sentence naming the cause.
+///
+/// The recorder is process-global, so under plain `cargo test` (which runs
+/// tests as threads of one process) a SIBLING test's timeout inside this
+/// window trips the assertion too. That is deliberate slack, not a defect:
+/// either way the failure names bookkeeping starvation rather than a
+/// mystery value, and nextest (the repo's runner everywhere) isolates
+/// per-process, where the window can only see its own test.
 pub fn assert_bookkeeping_quiet(
     before: &std::collections::BTreeMap<String, f64>,
     after: &std::collections::BTreeMap<String, f64>,
@@ -193,9 +200,10 @@ pub fn assert_bookkeeping_quiet(
         assert!(
             *now <= then,
             "catalog bookkeeping starvation: the {write} write was abandoned at its \
-             budget during this test ({then} -> {now} on {}), so the evidence it \
-             would have written is missing and the assertion below is measuring a \
-             slow postgres, not the product",
+             budget during this test's window ({then} -> {now} on {}), so evidence \
+             is missing and the assertion below is measuring a slow postgres, not \
+             the product (under plain `cargo test` the abandoning test may be a \
+             concurrent sibling; nextest isolates per-process)",
             trawl_server::metrics::CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL,
         );
     }

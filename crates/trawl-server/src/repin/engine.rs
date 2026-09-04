@@ -777,10 +777,23 @@ impl RepinEngine {
             .stage_cutover_input(job_id, staged_totals, &staged_tallies)
             .await
             .map_err(|e| {
-                JobAbort::Failed(format!(
-                    "could not stage the cutover tallies: {e}. Nothing has moved — \
-                     the corpus stands at its pre-repin generation"
-                ))
+                // The full error stays server-side: the abort message is
+                // persisted on the job row and served to SchemaRead via the
+                // status route, and a StoreError's Display can carry raw
+                // postgres diagnostics the wire contract redacts.
+                tracing::error!(
+                    event_type = "repin_store_error",
+                    job_id,
+                    error = %e,
+                    "staging the cutover tallies failed; aborting before the marker"
+                );
+                JobAbort::Failed(
+                    "could not stage the cutover tallies (app-state store \
+                     error; details in the server log). Nothing has moved — \
+                     the corpus stands at its pre-repin generation; retry \
+                     the repin"
+                        .to_owned(),
+                )
             })?;
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(crate::metrics::CATALOG_REPIN_FILES_DONE)
