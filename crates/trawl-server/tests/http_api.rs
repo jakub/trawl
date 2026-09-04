@@ -2417,3 +2417,404 @@ async fn shutdown_set_before_boot_stops_the_accept_loop() {
     // a dropped channel.
     drop(shutdown_tx);
 }
+
+// ---------------------------------------------------------------------------
+// Report windows on the write surface (ADR-0018 rulings 6, 7, 12)
+// ---------------------------------------------------------------------------
+
+/// The status and message of a refused request, or a panic naming what came
+/// back instead. Both halves matter here: the status is what a client
+/// branches on, the message is the whole point of a refusal that names two
+/// sides.
+fn refusal<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) -> (u16, String) {
+    match result.expect_err("expected a refusal") {
+        trawl_client::ClientError::Server { status, error } => (status, error.message),
+        other => panic!("expected a server error, got: {other:?}"),
+    }
+}
+
+/// Ruling 7: a schedule window and a query that spells its own interval are
+/// two answers to one question, so attaching them is a 400 that names both.
+/// The operator drops one; the server has no basis for choosing which.
+#[tokio::test(flavor = "multi_thread")]
+async fn schedule_window_on_a_query_with_a_time_clause_is_refused_naming_both() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    for (name, dsl, spelling) in [
+        ("win-last", "service=x last=1h", "last="),
+        (
+            "win-earliest",
+            "service=x earliest=\"2026-01-01T00:00:00Z\"",
+            "earliest=",
+        ),
+        (
+            "win-latest",
+            "service=x latest=\"2026-01-01T00:00:00Z\"",
+            "latest=",
+        ),
+    ] {
+        let saved = client.create_saved(name, dsl).await.unwrap();
+        let (status, message) = refusal(
+            client
+                .set_schedule(saved.id, "1h", None, true, Some("since_last"), None)
+                .await,
+        );
+        assert_eq!(status, 400, "for {dsl}: {message}");
+        assert!(message.contains("since_last"), "for {dsl}: {message}");
+        assert!(message.contains(spelling), "for {dsl}: {message}");
+        assert!(
+            client.get_schedule(saved.id).await.is_err(),
+            "a refused PUT leaves no schedule behind, for {dsl}"
+        );
+    }
+}
+
+/// The same rule from the other side: the query text is what moves, and the
+/// standing window is what refuses it. A refused edit stores nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn adding_a_time_clause_to_a_windowed_saved_query_is_refused() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("windowed-edit", "service=x")
+        .await
+        .unwrap();
+    client
+        .set_schedule(saved.id, "1h", None, true, Some("since_last"), None)
+        .await
+        .expect("a query with no time clause takes a window");
+
+    let (status, message) = refusal(
+        client
+            .update_saved(saved.id, "service=x earliest=\"2026-01-01T00:00:00Z\"")
+            .await,
+    );
+    assert_eq!(status, 400, "{message}");
+    assert!(message.contains("since_last"), "{message}");
+    assert!(message.contains("earliest="), "{message}");
+
+    let list = client.list_saved().await.unwrap();
+    let stored = list
+        .queries
+        .iter()
+        .find(|q| q.id == saved.id)
+        .expect("the saved query survives its refused edit");
+    assert_eq!(stored.query, "service=x", "a refused edit stores nothing");
+}
+
+/// Ruling 12: `from saved` reads stored report rows, not ingest events, so
+/// no `_time` window applies to it — in either write direction.
+#[tokio::test(flavor = "multi_thread")]
+async fn from_saved_source_is_refused_a_window() {
+    const FROM_SAVED: &str = "| from saved daily_rollup";
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let reader = client
+        .create_saved("reads-reports", FROM_SAVED)
+        .await
+        .unwrap();
+    let (status, message) = refusal(
+        client
+            .set_schedule(reader.id, "1h", None, true, Some("2h"), None)
+            .await,
+    );
+    assert_eq!(status, 400, "{message}");
+    assert!(message.contains("from saved"), "{message}");
+    assert!(message.contains("2h"), "{message}");
+
+    let plain = client
+        .create_saved("plain-then-report", "service=x")
+        .await
+        .unwrap();
+    client
+        .set_schedule(plain.id, "1h", None, true, Some("2h"), None)
+        .await
+        .expect("an ingest query takes a fixed window");
+    let (status, message) = refusal(client.update_saved(plain.id, FROM_SAVED).await);
+    assert_eq!(status, 400, "{message}");
+    assert!(message.contains("from saved"), "{message}");
+}
+
+/// Ruling 6: a windowed schedule owns what its reports cover, so a manual
+/// run has no bounds anyone chose. The 409 names the mode it found and the
+/// route that answers "where has coverage reached".
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_run_of_a_coverage_mode_schedule_is_409() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    for (name, window) in [("cov-since", "since_last"), ("cov-fixed", "2h")] {
+        let saved = client.create_saved(name, "* | head 3").await.unwrap();
+        client
+            .set_schedule(saved.id, "1h", None, true, Some(window), None)
+            .await
+            .unwrap();
+
+        let (status, message) = refusal(client.trigger_run(saved.id).await);
+        assert_eq!(status, 409, "for {window}: {message}");
+        assert!(
+            message.contains(&format!("\"{window}\"")),
+            "for {window}: {message}"
+        );
+        assert!(
+            message.contains(&format!("/api/v1/saved/{}/schedule", saved.id)),
+            "for {window}: {message}"
+        );
+        assert!(
+            message.contains("covered_through") && message.contains("next_fire_at"),
+            "for {window}: {message}"
+        );
+
+        let runs = client
+            .list_report_runs(saved.id, Some(10), None)
+            .await
+            .unwrap();
+        assert!(
+            runs.runs.is_empty(),
+            "for {window}: a refused trigger claims nothing"
+        );
+    }
+}
+
+/// Query mode keeps today's manual run exactly: the saved DSL verbatim, and
+/// a run row that claims no coverage.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_run_of_a_query_mode_schedule_still_starts() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("manual-query-mode", "* | head 3")
+        .await
+        .unwrap();
+    client
+        .set_schedule(saved.id, "1h", None, true, None, None)
+        .await
+        .unwrap();
+
+    let summary = client.trigger_run(saved.id).await.unwrap();
+    assert_eq!(summary.status, "running");
+    assert_eq!(summary.query, "* | head 3");
+    assert_eq!(summary.window_kind, None);
+
+    // Fixtures are tiny; the background execution lands well inside this.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let runs = client
+        .list_report_runs(saved.id, Some(10), None)
+        .await
+        .unwrap();
+    assert_eq!(runs.runs.len(), 1);
+    let run = &runs.runs[0];
+    assert_eq!(run.status, "success");
+    assert_eq!(run.query, "* | head 3", "the saved DSL runs verbatim");
+    assert_eq!(run.window_start, None);
+    assert_eq!(run.window_end, None);
+    assert_eq!(run.window_truncated, None);
+    assert_eq!(run.window_kind, None);
+}
+
+/// What a schedule answers about its own window, and what it refuses to be
+/// given. The `lag` pair rides the window: a windowed schedule with no lag
+/// reports the `"0s"` in force, query mode reports nothing at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn schedule_response_carries_window_fields() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let tiling = client
+        .create_saved("resp-tiling", "service=x")
+        .await
+        .unwrap();
+    let resp = client
+        .set_schedule(tiling.id, "1h", None, true, Some("since_last"), Some("5m"))
+        .await
+        .unwrap();
+    assert_eq!(resp.window.as_deref(), Some("since_last"));
+    assert_eq!(resp.lag.as_deref(), Some("5m"));
+    assert_eq!(resp.lag_secs, Some(300));
+    assert!(
+        resp.covered_through.is_some(),
+        "a since_last schedule is seeded owing coverage from its first window's start"
+    );
+    assert!(!resp.next_fire_at.is_empty());
+
+    let fixed = client
+        .create_saved("resp-fixed", "service=x")
+        .await
+        .unwrap();
+    let resp = client
+        .set_schedule(fixed.id, "1h", None, true, Some("2h"), None)
+        .await
+        .unwrap();
+    assert_eq!(resp.window.as_deref(), Some("2h"));
+    assert_eq!(resp.lag.as_deref(), Some("0s"));
+    assert_eq!(resp.lag_secs, Some(0));
+    assert_eq!(
+        resp.covered_through, None,
+        "a fixed window is re-measured from every fire and keeps no watermark"
+    );
+
+    // Query mode: the saved DSL owns its own interval, and nothing about a
+    // window is reported.
+    let query_mode = client
+        .create_saved("resp-query-mode", "service=x last=1h")
+        .await
+        .unwrap();
+    let resp = client
+        .set_schedule(query_mode.id, "1h", None, true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(resp.window, None);
+    assert_eq!(resp.lag, None);
+    assert_eq!(resp.lag_secs, None);
+    assert_eq!(resp.covered_through, None);
+    assert!(!resp.next_fire_at.is_empty());
+
+    let fetched = client.get_schedule(tiling.id).await.unwrap();
+    assert_eq!(fetched.window.as_deref(), Some("since_last"));
+    assert_eq!(fetched.lag.as_deref(), Some("5m"));
+    assert_eq!(fetched.lag_secs, Some(300));
+    assert_eq!(
+        fetched.covered_through,
+        resp_covered(&client, tiling.id).await
+    );
+
+    // A lag with no window shifts nothing, so it is refused rather than
+    // stored as a number that changes no answer.
+    let refused = client
+        .create_saved("resp-refusals", "service=x")
+        .await
+        .unwrap();
+    let (status, message) = refusal(
+        client
+            .set_schedule(refused.id, "1h", None, true, None, Some("5m"))
+            .await,
+    );
+    assert_eq!(status, 400, "{message}");
+    assert!(message.contains("lag"), "{message}");
+    assert!(message.contains("window"), "{message}");
+
+    // Below the 60s floor, an unknown unit, and past the ten-year cap.
+    for bad in ["5s", "11y", "600w"] {
+        let (status, message) = refusal(
+            client
+                .set_schedule(refused.id, "1h", None, true, Some(bad), None)
+                .await,
+        );
+        assert_eq!(status, 400, "for {bad}: {message}");
+        assert!(message.contains("window"), "for {bad}: {message}");
+    }
+}
+
+/// The watermark a GET reports, for the equality above.
+async fn resp_covered(client: &HttpClient, saved_id: i64) -> Option<String> {
+    client.get_schedule(saved_id).await.unwrap().covered_through
+}
+
+/// Ruling 11: a run records the window it covered, and a run that had none
+/// omits all four fields rather than claiming a complete window of nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_listing_carries_window_and_truncated_flag() {
+    use trawl_server::report_window::{ReportWindow, WindowKind};
+    use trawl_server::store::{RunClaim, RunStatus, ScheduleStore};
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("run-windows", "service=x")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", None, true, Some("since_last"), None)
+        .await
+        .unwrap();
+
+    // Seed the runs through the store: the point here is the read surface,
+    // and driving a tick would put a clock between the test and its
+    // assertions.
+    let store = ScheduleStore::new(common::app_pool(&server.app_db_url).await);
+    let instant = |text: &str| {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+    let seed = |window: Option<ReportWindow>| {
+        let store = store.clone();
+        async move {
+            let claimed = store
+                .claim_run(schedule.id, saved.id, "service=x", None, window.as_ref())
+                .await
+                .unwrap();
+            let RunClaim::Started(id) = claimed else {
+                panic!("seeding a run must start it, got {claimed:?}")
+            };
+            // One running row per schedule, so each seed finishes before the
+            // next one is claimed.
+            store
+                .finish_run(id, RunStatus::Success, 5, Some(0), None, None, None)
+                .await
+                .unwrap();
+            id
+        }
+    };
+
+    let complete = seed(Some(ReportWindow {
+        start: instant("2026-03-14T02:00:00Z"),
+        end: instant("2026-03-14T03:00:00Z"),
+        truncated: false,
+        kind: WindowKind::SinceLast,
+    }))
+    .await;
+    let truncated = seed(Some(ReportWindow {
+        start: instant("2026-03-14T03:00:00Z"),
+        end: instant("2026-03-15T03:00:00Z"),
+        truncated: true,
+        kind: WindowKind::SinceLast,
+    }))
+    .await;
+    let legacy = seed(None).await;
+
+    let runs = client
+        .list_report_runs(saved.id, Some(10), None)
+        .await
+        .unwrap();
+    let row = |id: i64| {
+        runs.runs
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("run {id} must be listed"))
+    };
+
+    let complete = row(complete);
+    assert_eq!(
+        complete.window_start.as_deref(),
+        Some("2026-03-14T02:00:00.000000Z")
+    );
+    assert_eq!(
+        complete.window_end.as_deref(),
+        Some("2026-03-14T03:00:00.000000Z")
+    );
+    assert_eq!(
+        complete.window_truncated,
+        Some(false),
+        "false is the positive claim that the run covers everything it owed"
+    );
+    assert_eq!(complete.window_kind.as_deref(), Some("since_last"));
+
+    assert_eq!(row(truncated).window_truncated, Some(true));
+
+    let legacy = row(legacy);
+    assert_eq!(legacy.window_start, None);
+    assert_eq!(legacy.window_end, None);
+    assert_eq!(
+        legacy.window_truncated, None,
+        "a run with no window claims nothing, not a complete window"
+    );
+    assert_eq!(legacy.window_kind, None);
+}

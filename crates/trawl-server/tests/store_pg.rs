@@ -7118,3 +7118,150 @@ mod repin_store {
         assert_eq!(staged(&pool, id).await, (None, None));
     }
 }
+
+/// Read both halves of a saved query back and assert the pair ADR-0018
+/// ruling 7 forbids is not on disk. The check is the rule itself, so the
+/// assertion cannot drift from what the write doors enforce.
+async fn assert_pair_is_legal(
+    saved_store: &SavedQueryStore,
+    sched_store: &ScheduleStore,
+    sq_id: i64,
+) {
+    let dsl = saved_store.get(sq_id, 1).await.unwrap().unwrap().query;
+    let window = sched_store
+        .get_schedule_for_saved_query(sq_id, 1)
+        .await
+        .unwrap()
+        .and_then(|s| s.window);
+    assert_eq!(
+        trawl_server::report_window::validate_window_compatibility(window, &dsl),
+        Ok(()),
+        "committed pair is forbidden: window {window:?} over {dsl:?}"
+    );
+}
+
+/// ADR-0018 ruling 7 forbids exactly one pair — a schedule window over a
+/// query that spells its own interval — and the two write doors that could
+/// assemble it run concurrently.
+///
+/// Neither door can see the other's uncommitted row, so what makes the rule
+/// hold is that both take the `saved_queries` lock FIRST: the loser waits,
+/// then reads what the winner committed and refuses. The blocker
+/// transaction pins the interleaving to the dangerous window by holding
+/// that row exactly as the other door would while its write is in flight.
+///
+/// Both orders are exercised, and the invariant is asserted with the rule
+/// itself: whatever committed, `validate_window_compatibility` must accept
+/// the pair that is on disk at the end.
+#[sqlx::test]
+async fn schedule_put_and_saved_put_cannot_commit_the_forbidden_pair(pool: PgPool) {
+    let saved_store = saved(&pool);
+    let sched_store = schedules(&pool);
+
+    // Order A: the saved-query edit wins the lock, the schedule write waits
+    // and must refuse against the text that landed.
+    let first = saved_store
+        .create(1, "pair-dsl-first", "service=x")
+        .await
+        .unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_scalar::<_, i64>("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(first.id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE saved_queries SET query = $1 WHERE id = $2")
+        .bind("service=x last=1h")
+        .bind(first.id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let window_writer = sched_store.clone();
+    let first_id = first.id;
+    let now = chrono::Utc::now();
+    let task = tokio::spawn(async move {
+        window_writer
+            .set_schedule_checked(
+                first_id,
+                1,
+                3600,
+                None,
+                true,
+                Some(ScheduleWindow::SinceLast),
+                0,
+                now,
+            )
+            .await
+    });
+
+    // Let the schedule write reach the lock before the edit commits.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    blocker.commit().await.unwrap();
+
+    let err = task
+        .await
+        .unwrap()
+        .expect_err("the window must be refused against the DSL that committed first");
+    assert!(matches!(err, WindowWriteError::Policy(_)), "got {err:?}");
+    assert!(err.to_string().contains("last="), "{err}");
+    assert!(
+        sched_store
+            .get_schedule_for_saved_query(first.id, 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused set_schedule writes no schedule at all"
+    );
+    assert_pair_is_legal(&saved_store, &sched_store, first.id).await;
+
+    // Order B: the window wins the lock, the saved-query edit waits and must
+    // refuse against the window that landed. The blocker inserts the
+    // schedule by hand because it has to happen on the connection holding
+    // the parent row: the FK would otherwise queue behind its own lock.
+    let second = saved_store
+        .create(1, "pair-window-first", "service=x")
+        .await
+        .unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_scalar::<_, i64>("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(second.id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO schedules
+             (saved_query_id, key_id, interval_secs, max_runs, enabled,
+              window_kind, window_secs, lag_secs, covered_through, next_fire_at,
+              created_at, updated_at)
+         VALUES ($1, 1, 3600, NULL, TRUE, 'since_last', NULL, 0, NULL, now(), now(), now())",
+    )
+    .bind(second.id)
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+
+    let dsl_writer = saved_store.clone();
+    let second_id = second.id;
+    let task = tokio::spawn(async move {
+        dsl_writer
+            .update_checked(second_id, 1, "service=x last=1h", None)
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    blocker.commit().await.unwrap();
+
+    let err = task
+        .await
+        .unwrap()
+        .expect_err("the edit must be refused against the window that committed first");
+    assert!(matches!(err, WindowWriteError::Policy(_)), "got {err:?}");
+    assert!(err.to_string().contains("since_last"), "{err}");
+    assert_eq!(
+        saved_store.get(second.id, 1).await.unwrap().unwrap().query,
+        "service=x",
+        "a refused update stores nothing"
+    );
+    assert_pair_is_legal(&saved_store, &sched_store, second.id).await;
+}
