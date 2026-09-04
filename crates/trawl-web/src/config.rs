@@ -21,6 +21,7 @@
 //! treating an empty list as "allow everything" installs the vulnerability
 //! this allowlist exists to close, silently.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use fleet_auth::{
@@ -268,28 +269,49 @@ fn warn_on_runtime_override(web: &WebConfig, runtime: &SessionRuntimeOverrides) 
         // unvalidated and unbounded. The override's origins ARE printed:
         // they parsed, so each one is at most a serialized origin's worth
         // of ASCII, and the whole point of this line is telling the
-        // operator which allowlist is actually in force.
+        // operator which allowlist is actually in force. Their COUNT is
+        // its own field and the text is capped, because a list long enough
+        // to bury the message is a list nobody reads.
+        let (origins_count, origins) = summarize_origins(from_environment);
         tracing::warn!(
             event_type = "session_public_origins_override",
             env = ENV_SESSION_PUBLIC_ORIGINS,
             configured_entries = web.public_origins.len(),
-            origins = %render_origins(from_environment),
+            origins_count,
+            origins = %origins,
             "the environment replaces the configured browser-origin allowlist"
         );
     }
 }
 
-/// Render an allowlist for one log line: canonical origins, comma-joined.
+/// How many origins one diagnostic line names before it stops listing.
 ///
-/// Goes through `Display` on each [`fleet_auth::Origin`] rather than the
-/// operator's own strings, so the line shows what the guard will actually
-/// compare against, so `https://x:443` configured shows as `https://x`.
-fn render_origins(origins: &PublicOrigins) -> String {
-    origins
+/// A deployment states one or two origins; eight is well past what anyone
+/// reads off a startup line, and the list is operator-supplied with no
+/// ceiling on its length, so the line needs one of its own.
+const MAX_LOGGED_ORIGINS: usize = 8;
+
+/// Summarize an allowlist for one log line: how many origins there are,
+/// and the first few of them.
+///
+/// Two fields rather than one string, because the count is the fact an
+/// operator checks (did my list load?) and the text is the sample that
+/// tells them which list loaded. The text goes through `Display` on each
+/// [`fleet_auth::Origin`] rather than the operator's own strings, so it
+/// shows what the guard will actually compare against: `https://x:443` in
+/// the file shows as `https://x`, which is what a browser sends.
+pub fn summarize_origins(origins: &PublicOrigins) -> (usize, String) {
+    let count = origins.iter().count();
+    let mut text = origins
         .iter()
+        .take(MAX_LOGGED_ORIGINS)
         .map(ToString::to_string)
         .collect::<Vec<_>>()
-        .join(",")
+        .join(",");
+    if let Some(hidden) = count.checked_sub(MAX_LOGGED_ORIGINS).filter(|n| *n > 0) {
+        write!(text, ",… and {hidden} more").expect("writing to a String cannot fail");
+    }
+    (count, text)
 }
 
 /// Map the shared fleet-auth runtime parser's errors onto [`ConfigError`],
@@ -439,6 +461,37 @@ mod tests {
 
     /// The origin every fixture below states as the browser-visible one.
     const TEST_ORIGIN: &str = "https://trawl.example.com";
+
+    #[test]
+    fn a_long_allowlist_is_summarized_by_count_and_a_capped_sample() {
+        // Nothing bounds how many origins an operator states, so the
+        // startup line states the number and shows a sample rather than
+        // pasting the whole list into one field.
+        let entries: Vec<String> = (0..20)
+            .map(|i| format!("https://o{i}.example.com"))
+            .collect();
+        let origins = PublicOrigins::parse(&entries).expect("20 distinct origins parse");
+
+        let (count, text) = summarize_origins(&origins);
+        assert_eq!(count, 20, "the count is exact whatever the text shows");
+        let (shown, tail) = text.rsplit_once(',').expect("the suffix follows a comma");
+        assert_eq!(shown.split(',').count(), 8, "{text}");
+        assert!(shown.starts_with("https://o0.example.com"), "{text}");
+        assert!(shown.ends_with("https://o7.example.com"), "{text}");
+        assert!(!text.contains("https://o8.example.com"), "{text}");
+        assert_eq!(tail, "… and 12 more");
+    }
+
+    #[test]
+    fn a_short_allowlist_is_shown_whole_with_no_suffix() {
+        let origins =
+            PublicOrigins::parse(["https://trawl.example.com:443", "http://localhost:8090"])
+                .expect("two origins parse");
+        let (count, text) = summarize_origins(&origins);
+        assert_eq!(count, 2);
+        // Normalized, so the line shows what the guard compares against.
+        assert_eq!(text, "https://trawl.example.com,http://localhost:8090");
+    }
 
     /// A `[web]` section carrying the one setting that has no default.
     ///
