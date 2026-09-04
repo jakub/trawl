@@ -559,39 +559,45 @@ impl PinGc {
         }
 
         let fields: Vec<String> = walk.dead.iter().cloned().collect();
-        // NOT bounded here. The purge bounds its own pre-commit statements
-        // inside postgres, and its commit is awaited without a cancellation
-        // wrapper on purpose: a timeout that fired across the commit would
-        // drop a future postgres goes on to commit, and this run would
-        // answer "deleted nothing" over a catalog that lost the rows while
-        // every reader's cache kept them.
+        // NOT bounded here. The purge bounds each of its own phases, and it
+        // has to be the one to do it: the pre-commit phase is cancellable
+        // and gets a wall-clock timeout inside the store, while the commit
+        // gets a bound that DETACHES instead of cancelling. A timeout out
+        // here would fire across both, drop a future postgres goes on to
+        // commit, and this run would answer "deleted nothing" over a
+        // catalog that lost the rows while every reader's cache kept them.
         let purged = match self.store.delete_pins(&fields).await {
             Ok(purged) => purged,
-            // The commit outstayed its bound and is STILL RUNNING on a task
-            // of its own. This is the one error where the reconcile read is
-            // wrong: it would race the in-flight commit and could come back
-            // with either state, and a "still pinned" answer read a
-            // microsecond before the commit lands is a cache left holding
-            // pins postgres is about to delete. So skip the read entirely
+            // The run reached the commit and cannot say what postgres did
+            // with it: either the commit outstayed its bound and is STILL
+            // RUNNING on a task of its own, or it returned an error that a
+            // backend which already made it durable can send. This is the
+            // one error where the reconcile read is wrong: it races the
+            // commit and could come back with either state, and a "still
+            // pinned" answer read a microsecond early is a cache left
+            // holding pins postgres has deleted. So skip the read entirely
             // and over-evict every candidate.
             Err(crate::store::StoreError::PurgeCommitUnknown) => {
                 self.cache.evict_many(fields.iter().map(String::as_str));
                 return Err(ServerError::ServiceUnavailable(format!(
-                    "pin gc's purge did not confirm its commit within {}s and is still \
-                     in flight, so whether {} pin(s) were reclaimed is unknown; every \
-                     candidate has been dropped from the pin cache, which is safe \
-                     either way. Run `trawl schema gc-pins --dry-run` to see what the \
-                     catalog actually holds before running it again.",
-                    crate::store::PURGE_COMMIT_BOUND.as_secs(),
+                    "pin gc's purge could not confirm its commit, so whether {} pin(s) \
+                     were reclaimed is unknown: the commit either outstayed its {}s \
+                     bound and is still in flight, or reported an error postgres may \
+                     have applied anyway. Every candidate has been dropped from the \
+                     pin cache, which is safe either way. Run `trawl schema gc-pins \
+                     --dry-run` to see what the catalog actually holds before running \
+                     it again.",
                     fields.len(),
+                    crate::store::PURGE_COMMIT_BOUND.as_secs(),
                 )));
             }
             Err(e) => {
-                // Any error at all, unclassified: by the time one is
-                // visible here the DELETE may or may not have been issued,
-                // and no error text distinguishes the two. The cache is
-                // reconciled against postgres before the gate opens, so
-                // cache-vs-store divergence cannot outlive the gate.
+                // Everything that failed BEFORE the commit, unclassified:
+                // the DELETE may or may not have been issued, but nothing
+                // was committed, so re-reading `field_types` settles it.
+                // The cache is reconciled against postgres before the gate
+                // opens, so cache-vs-store divergence cannot outlive the
+                // gate.
                 self.reconcile_cache(&fields).await;
                 return Err(match e {
                     // The purge transaction's own running-row check is the
@@ -631,8 +637,14 @@ impl PinGc {
         })
     }
 
-    /// Settle the pin cache against postgres after a purge that failed with
-    /// an unknown outcome, while the corpus gate is still held.
+    /// Settle the pin cache against postgres after a purge that failed
+    /// BEFORE its commit, while the corpus gate is still held.
+    ///
+    /// Every error this serves comes from the purge's pre-commit phase — a
+    /// failed statement, a refused claim, the client-side prepare bound —
+    /// and none of them can have committed anything. That is what makes
+    /// re-reading `field_types` a settlement rather than a race: the answer
+    /// is stable, because no commit is on its way.
     ///
     /// The asymmetry is the whole point. Evicting a pin postgres still
     /// holds costs a re-read: `pin_missing` goes to postgres, finds the row
@@ -648,12 +660,13 @@ impl PinGc {
     /// anyway.
     ///
     /// One error never gets here at all.
-    /// [`crate::store::StoreError::PurgeCommitUnknown`] means the commit is
-    /// still in flight on a detached task, and a read racing it can answer
-    /// with the state on either side of it. Reading "still pinned" a
-    /// microsecond before the commit lands would leave the cache holding
-    /// pins postgres is deleting, which is the corruption this whole
-    /// asymmetry exists to prevent, so that arm skips the read and
+    /// [`crate::store::StoreError::PurgeCommitUnknown`] means the commit
+    /// was reached and its outcome is unknown — detached and still running,
+    /// or failed by a backend that may have made it durable first — and a
+    /// read racing that can answer with the state on either side of it.
+    /// Reading "still pinned" a microsecond early would leave the cache
+    /// holding pins postgres has deleted, which is the corruption this
+    /// whole asymmetry exists to prevent, so that arm skips the read and
     /// over-evicts unconditionally.
     async fn reconcile_cache(&self, fields: &[String]) {
         match self
@@ -1182,8 +1195,10 @@ mod tests {
     /// what is worth asserting is that a gated statement cannot be ADDED
     /// without a decision about its bound. The gate excludes whole
     /// compaction batches, and an unbounded read there is an ingest stall of
-    /// unbounded length — while a CANCELLED purge is worse than a slow one,
-    /// because the commit it abandons may still land.
+    /// unbounded length — while a purge cancelled from OUT here is worse
+    /// than a slow one, because the commit it abandons may still land. The
+    /// purge is bounded, just not by this caller: it splits its own phases
+    /// and applies a cancelling bound to the one where cancelling is safe.
     #[test]
     fn every_gated_store_read_rides_the_timeout_and_the_purge_does_not() {
         let body = gated_section();
@@ -1267,11 +1282,12 @@ mod tests {
         purge_failure_arms().1
     }
 
-    /// A purge whose commit is still in flight must NOT re-read postgres.
+    /// A purge whose commit outcome is unknown must NOT re-read postgres.
     ///
-    /// The commit was detached, not cancelled, so a reconcile read races
-    /// it: "still pinned" answered a microsecond early would leave the
-    /// cache serving pins postgres goes on to delete. The safe move is the
+    /// The commit was detached rather than cancelled, or it failed in a way
+    /// that does not prove a rollback, so a reconcile read races it either
+    /// way: "still pinned" answered a microsecond early would leave the
+    /// cache serving pins postgres has deleted. The safe move is the
     /// over-evicting one, so this arm evicts every candidate and asks the
     /// store nothing.
     ///
@@ -1287,7 +1303,7 @@ mod tests {
         );
         assert!(
             !unknown.contains("reconcile_cache") && !unknown.contains("pins_present"),
-            "the unknown-commit arm must not read postgres; the commit is still in flight"
+            "the unknown-commit arm must not read postgres; a read races the commit"
         );
         assert!(
             unknown.contains("--dry-run"),

@@ -3481,11 +3481,17 @@ mod catalog {
         assert_eq!(purged.pinned_now, after, "the count is the committed one");
     }
 
-    /// The purge bounds itself inside postgres. A row lock somebody else
-    /// holds costs it five seconds and an error, never an unbounded wait —
-    /// and that db-side bound is what lets the gc engine await the commit
-    /// with no cancellation wrapper at all while the corpus gate, and every
-    /// compaction batch queued behind it, waits on the answer.
+    /// The purge bounds its pre-commit phase twice over. A row lock
+    /// somebody else holds costs it five seconds and an error, never an
+    /// unbounded wait, while the corpus gate and every compaction batch
+    /// queued behind it wait on the answer.
+    ///
+    /// Two bounds cover this, and either refusal is correct: postgres'
+    /// `lock_timeout` at five seconds, and the caller's ten-second
+    /// `PURGE_PREPARE_BOUND` for the case postgres cannot see, a connection
+    /// that stops answering while the backend sits idle. What matters is
+    /// that the wait ends and the transaction rolls back; which bound
+    /// noticed is not the contract.
     ///
     /// The purge takes the row lock at `DELETE FROM field_types`, so this
     /// exercises the `lock_timeout` half; the `statement_timeout` half is
@@ -3519,7 +3525,11 @@ mod catalog {
              is not in force, and a wrapped timeout is not an option here"
         );
         assert!(
-            matches!(err, trawl_server::store::StoreError::Unavailable(_)),
+            matches!(
+                err,
+                trawl_server::store::StoreError::Unavailable(_)
+                    | trawl_server::store::StoreError::PurgePrepareTimeout
+            ),
             "unexpected error {err:?}"
         );
         assert!(

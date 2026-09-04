@@ -247,7 +247,12 @@ impl IntoResponse for ServerError {
                 // request did not complete, and retrying is safe only after
                 // the operator has looked. The message says so; it names no
                 // pg diagnostics.
-                StoreError::PurgeCommitUnknown => (
+                // Same 503 for the pre-commit bound, and the same reason to
+                // say more than "store unavailable": the operator's next
+                // move differs from a plain outage. This one adds that
+                // nothing was reclaimed, which is provable — the dropped
+                // transaction rolled back.
+                StoreError::PurgeCommitUnknown | StoreError::PurgePrepareTimeout => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, e.to_string()),
                 ),

@@ -385,18 +385,21 @@ Three outcomes:
   evidence; the message names the count and up to three paths. Or the
   catalog store stopped answering one of gc's reads while the corpus gate
   was held, which is bounded at five seconds and reported as UNKNOWN.
-- **503**: a query-only node, or the store is down — including a purge
-  that failed or ran past its own five-second bound, which postgres
-  enforces inside the transaction rather than the server enforcing it by
-  walking away from a commit. The outcome is UNKNOWN either way, so gc
+- **503**: a query-only node, or the store is down. The purge is bounded
+  in two phases and they answer differently. Everything before the commit
+  is bounded twice — postgres' own five-second statement bound inside the
+  transaction, and a ten-second client bound for the case postgres cannot
+  see, a connection that stops answering while the backend sits idle.
+  Cancelling there can only roll back, so nothing was reclaimed; gc
   re-reads the catalog for its candidates and drops from the pin cache
   every one postgres no longer holds, before it releases the corpus gate.
-  One 503 says more: a commit that has not confirmed within thirty
-  seconds. Postgres stops honouring cancellation once a commit is durable,
-  so trawl detaches that commit rather than abandoning it, stops waiting,
-  and drops every candidate from the pin cache without re-reading (a read
-  would race the commit still in flight). Re-run with `dry_run` to see
-  which way it went.
+  The commit itself cannot be cancelled at all: postgres stops honouring
+  cancellation once a commit is durable, so a commit that has not
+  confirmed within thirty seconds is DETACHED rather than abandoned, and a
+  commit that comes back with an error may have been applied by a backend
+  that already made it durable. Both are UNKNOWN, and both drop every
+  candidate from the pin cache without re-reading (a read would race the
+  commit). Re-run with `dry_run` to see which way it went.
 
 The deletion is metadata only: catalog rows and the in-process pin cache,
 in one transaction, `repin_jobs` history untouched. Being wrong is cheap.

@@ -83,19 +83,40 @@ pub enum StoreError {
     #[error("a repin job is already running (one at a time, install-wide)")]
     RepinAlreadyRunning,
 
-    /// The pin purge's commit outstayed its bound and was detached rather
-    /// than cancelled, so whether the rows are gone is unknown here.
+    /// The pin purge reached its commit and could not confirm the outcome:
+    /// either the commit outstayed its bound and was detached rather than
+    /// cancelled, or it completed with an error postgres may have applied
+    /// anyway.
     ///
     /// Distinct from [`Self::Unavailable`] because the caller must act
-    /// differently: an ordinary store error can be settled by re-reading
-    /// `field_types`, while this one cannot. The commit is still in flight
-    /// on its own task, so a read would race it and could answer with
-    /// either state. The pin cache is reconciled by over-eviction instead.
+    /// differently: a failure from BEFORE the commit can be settled by
+    /// re-reading `field_types`, while this one cannot. A detached commit
+    /// is still running, and a failed one may have been made durable before
+    /// the connection dropped, so a read races the commit either way and
+    /// can answer with the state on either side of it. The pin cache is
+    /// reconciled by over-eviction instead.
     #[error(
-        "the field-catalog pin purge did not confirm its commit in time; it is still \
-         in flight, so whether the pins were reclaimed is unknown"
+        "the field-catalog pin purge could not confirm its commit; postgres may have \
+         applied it anyway, so whether the pins were reclaimed is unknown"
     )]
     PurgeCommitUnknown,
+
+    /// The pin purge's pre-commit work ran past its client-side bound and
+    /// was cancelled, so nothing was committed.
+    ///
+    /// Postgres bounds each of those statements itself, but a connection
+    /// that stops answering mid-statement is invisible to a database-side
+    /// timeout: the backend is fine and the client is waiting on a socket
+    /// nobody will write to. The purge holds the corpus gate, and every
+    /// compaction batch queues behind that, so the wait is bounded here as
+    /// well. Cancelling before the commit is safe by construction — the
+    /// dropped transaction rolls back — which is why this is an ordinary
+    /// bounded failure and [`Self::PurgeCommitUnknown`] is not.
+    #[error(
+        "the field-catalog pin purge gave up waiting on the database before it \
+         committed; nothing was reclaimed"
+    )]
+    PurgePrepareTimeout,
 
     /// The claim's `from` pin was not in `field_types` when the claim
     /// transaction looked, under the catalog lifecycle lock.
