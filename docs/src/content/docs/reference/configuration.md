@@ -65,6 +65,9 @@ HTTPS listener, query limits, TLS, and rate limiting.
 For size, duration, and retention knobs, `0` disables the limit only where
 the field says so. In particular, `server.query_log_max_bytes = 0` disables
 query-log rollover and `retention.max_age_days = 0` disables the age sweep.
+A per-env `retention.env.<name>.max_age_days = 0` keeps that env's data forever
+as far as age goes, and, like a global `0`, it leaves the `/api/v1/schema`
+listing with no retention window at all.
 `ingest.telemetry_buffer_max_bytes` is the deliberate exception: it must be a
 positive byte count because an unbounded buffer can grow without limit behind
 a wedged WAL write. To turn that pipeline off, set `internal_telemetry = false`.
@@ -232,7 +235,7 @@ Changing either list is **forward-only**. There is no policy history and nothing
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_age_days` | integer | `90` | Delete data older than N days; `0` disables |
+| `max_age_days` | integer | `90` | Delete data older than N days in every env without an override; `0` disables |
 | `min_free_disk_bytes` | byte size | `"1G"` | Delete oldest data when free disk drops below; `0` disables |
 | `retention_interval_secs` | integer | `3600` | Retention check frequency (default: 1 hour) |
 
@@ -254,6 +257,82 @@ grows. `trawl_catalog_repin_running` cannot: it is 0 in exactly the
 stranded case.
 
 Disk-pressure deletion is suppressed while a pre-cutover `data.pre-schema-v2/` set-aside directory exists (it sits outside `data/`, so deleting partitions could never reclaim it); each tick under pressure logs `retention_disk_pressure_suppressed` instead. Remove the set-aside to reclaim the space and re-enable the policy. Age-based retention is unaffected.
+
+#### `[retention.env.<name>]`
+
+One table per env gives that env its own age limit. The key is the env name
+as it appears under the data root.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_age_days` | integer | *(required)* | Delete this env's data older than N days; `0` keeps it forever |
+
+```toml
+[retention]
+max_age_days = 90
+min_free_disk_bytes = "1G"
+retention_interval_secs = 3600
+
+[retention.env.prod]
+max_age_days = 365
+
+[retention.env.lab]
+max_age_days = 7
+```
+
+An env with no table of its own keeps the global `max_age_days`. There is no
+per-env disk floor and no per-env byte quota. One filesystem has one pool of
+free space, so disk pressure stays install-wide.
+
+`max_age_days` is required inside the table. An empty `[retention.env.lab]`
+fails the load instead of picking between "inherit the global" and "keep
+forever", which are opposite answers. The table also refuses unknown keys, so
+a misplaced `min_free_disk_bytes` inside it fails the load rather than being
+ignored.
+
+Keys are held to the env charset `[a-z0-9_-]{1,32}` with `wal` and `scheduled`
+reserved, exactly as `ingest.envs` entries are, and a bad key is fatal at boot.
+A key naming an env that is not in `ingest.envs` is legal. De-listing an env
+stops new ingest for it while its directories stay on disk and still need an
+age policy. An entry naming an env with no directory under the data root warns
+at boot and keeps running (`retention_env_without_dir`). That is usually a
+typo, and a typo here is otherwise silent, since the override governs nothing
+and the env it was meant for keeps aging out under the global.
+
+**Put the per-env tables last.** In TOML a sub-table header ends the table
+above it, so a scalar written after `[retention.env.prod]` lands inside
+`[retention.env.prod]`. Writing `min_free_disk_bytes` there is an unknown key
+and writing `max_age_days` there is a duplicate key, so the load fails either
+way rather than misconfiguring the install, but the fix is ordering: the three
+global scalars first, the per-env tables after them.
+
+##### How disk pressure ranks envs
+
+Under pressure trawl deletes by expiry ratio, not by date. A date directory's
+ratio is its age divided by its env's effective `max_age_days`, and the highest
+ratio goes first, and equal ratios break on the older date, then on the path.
+With `prod` at 365 days and `lab` at 7, a 300-day prod directory sits at 0.82
+and a 6-day lab directory at 0.86, so the sweep takes the lab directory and the
+prod evidence survives. Plain oldest-first would have done the opposite and
+deleted 300-day prod evidence to make room for six-day-old lab noise.
+
+An env at `max_age_days = 0` ranks after everything that expires, but it is
+still a candidate. Nothing is exempt from pressure, because a sweep that
+cannot reach the free-space floor is a wedged daemon. So the age limit is a
+maximum, never a guaranteed minimum. Under sustained pressure trawl deletes
+data younger than any limit you configured, keep-forever envs included. If
+that matters, give the archive more room rather than a longer age.
+
+##### The `/schema` horizon
+
+`GET /api/v1/schema` hides a field whose most recent observation predates the
+retention horizon, and `trawl schema gc-pins` uses the same number as its
+floor. The horizon is the longest effective age across the install: the global
+`max_age_days` against every override, whichever is largest. A `0` anywhere in
+that set means no window at all, exactly as a global `0` has always meant, and
+`?all=true` still lifts whatever window applies. The maximum is the safe
+direction. A minimum would hide a field, and let gc reclaim its pin, while an
+env with a longer retention still has that data on disk.
 
 ### `[scheduler]`
 
@@ -359,6 +438,10 @@ internal_telemetry = true
 [retention]
 max_age_days = 90
 min_free_disk_bytes = "1G"
+
+# Sub-tables go last: a scalar after this header lands inside it.
+[retention.env.prod]
+max_age_days = 365
 ```
 
 ---

@@ -228,3 +228,13 @@ database_url = "postgres://fleet:fleet@localhost:5433/trawl"
 # How often the retention task runs (seconds). More frequent checks
 # respond faster to disk pressure but add minor I/O overhead.
 # retention_interval_secs = 3600
+
+# Per-env age override. One table per env, keyed by the env name under
+# the data root; max_age_days is required and 0 keeps that env forever.
+# An env with no table keeps the global max_age_days above. Disk pressure
+# stays install-wide and deletes by expiry ratio (age / that env's
+# max_age_days, highest first), so per-env intent survives the emergency
+# sweep. Keep these tables LAST in [retention]: in TOML a scalar written
+# after this header lands inside it.
+# [retention.env.prod]
+# max_age_days = 365

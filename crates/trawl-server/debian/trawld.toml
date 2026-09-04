@@ -144,6 +144,13 @@ database_url = "postgres://trawl:CHANGE_ME@db.example.internal:5432/trawl"
 # How often the retention task runs (seconds).
 # retention_interval_secs = 3600
 
+# Per-env age override; max_age_days is required, 0 keeps that env
+# forever. An env with no table keeps the global max_age_days. Disk
+# pressure stays install-wide. Keep these tables LAST in [retention]: in
+# TOML a scalar written after this header lands inside it.
+# [retention.env.prod]
+# max_age_days = 365
+
 [web]
 # Browser-facing session proxy (trawl-web). Shared config with trawld.
 #

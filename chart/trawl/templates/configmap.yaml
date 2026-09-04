@@ -88,6 +88,15 @@ data:
     max_age_days = {{ .Values.config.retention.maxAgeDays | int }}
     min_free_disk_bytes = {{ .Values.config.retention.minFreeDiskBytes | quote }}
     retention_interval_secs = {{ .Values.config.retention.retentionIntervalSecs | int }}
+    {{- /* Per-env age overrides. These sub-tables must follow the three
+         scalars above: in TOML a scalar after a sub-table header lands
+         inside that sub-table. Helm ranges a map in key order, so the
+         rendered config is stable across upgrades. */}}
+    {{- range $name, $days := .Values.config.retention.envs }}
+
+    [retention.env.{{ $name }}]
+    max_age_days = {{ $days | int }}
+    {{- end }}
 
     [syslog]
     enabled = {{ .Values.config.syslog.enabled }}
