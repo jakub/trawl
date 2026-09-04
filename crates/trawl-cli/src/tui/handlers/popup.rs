@@ -248,47 +248,67 @@ impl App {
     }
 
     /// Handle key events for the set-schedule popup.
+    ///
+    /// Tab/Shift+Tab and Up/Down move between the three rows, Enter submits
+    /// from whichever row has focus, Esc cancels, and every other key goes to
+    /// the focused editor.
     fn handle_set_schedule_key(&mut self, key: event::KeyEvent) {
         match (key.modifiers, key.code) {
-            // Confirm: Enter
+            // Confirm: Enter, from any row
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                if let Some(Popup::SetSchedule {
-                    saved_id,
-                    ref editor,
-                    ..
-                }) = self.popup
-                {
-                    let interval = editor.text().trim().to_owned();
-                    if !interval.is_empty() {
-                        let saved_id_copy = saved_id;
-                        self.popup = None;
-                        let client = self.client.clone();
-                        let mutation_tx = self.mutation_tx.clone();
-                        tokio::spawn(async move {
-                            let result = match client
-                                .set_schedule(saved_id_copy, &interval, None, true, None, None)
-                                .await
-                            {
-                                Ok(_) => MutationResult::ScheduleSet {
-                                    saved_query_id: saved_id_copy,
-                                },
-                                Err(e) => MutationResult::Error {
-                                    message: format!("failed to set schedule: {e}"),
-                                },
-                            };
-                            let _ = mutation_tx.send(result);
-                        });
-                    }
-                }
+                let Some(Popup::SetSchedule(form)) = &self.popup else {
+                    return;
+                };
+                let saved_id = form.saved_id;
+                let Some((interval, window, lag)) = form.submission() else {
+                    return;
+                };
+
+                self.popup = None;
+                let client = self.client.clone();
+                let mutation_tx = self.mutation_tx.clone();
+                tokio::spawn(async move {
+                    let result = match client
+                        .set_schedule(
+                            saved_id,
+                            &interval,
+                            None,
+                            true,
+                            window.as_deref(),
+                            lag.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(_) => MutationResult::ScheduleSet {
+                            saved_query_id: saved_id,
+                        },
+                        Err(e) => MutationResult::Error {
+                            message: format!("failed to set schedule: {e}"),
+                        },
+                    };
+                    let _ = mutation_tx.send(result);
+                });
             }
             // Cancel: Esc
             (KeyModifiers::NONE, KeyCode::Esc) => {
                 self.popup = None;
             }
-            // Delegate all other keys to the editor
+            // Row navigation. BackTab arrives with SHIFT on some terminals and
+            // bare on others, so the modifier is not part of the match.
+            (KeyModifiers::NONE, KeyCode::Tab | KeyCode::Down) => {
+                if let Some(Popup::SetSchedule(ref mut form)) = self.popup {
+                    form.focus = form.focus.next();
+                }
+            }
+            (_, KeyCode::BackTab) | (KeyModifiers::NONE, KeyCode::Up) => {
+                if let Some(Popup::SetSchedule(ref mut form)) = self.popup {
+                    form.focus = form.focus.prev();
+                }
+            }
+            // Delegate all other keys to the focused editor
             _ => {
-                if let Some(Popup::SetSchedule { ref mut editor, .. }) = self.popup {
-                    editor.handle_key(key);
+                if let Some(Popup::SetSchedule(ref mut form)) = self.popup {
+                    form.focused_mut().handle_key(key);
                 }
             }
         }

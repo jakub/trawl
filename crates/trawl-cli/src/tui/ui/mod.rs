@@ -184,7 +184,7 @@ fn popup_area(popup: &Popup, frame_area: Rect) -> Rect {
         Popup::EventDetail { .. } => centered_rect(70, 80, frame_area),
         Popup::ConfirmDelete { .. } | Popup::SaveQuery { .. } => centered_rect(60, 35, frame_area),
         Popup::Error { .. } => centered_rect(60, 30, frame_area),
-        Popup::SetSchedule { .. } => centered_rect(60, 40, frame_area),
+        Popup::SetSchedule { .. } => centered_rect(70, 45, frame_area),
         Popup::ColumnPicker { .. } => centered_rect(50, 60, frame_area),
         Popup::CommandPalette { .. } => centered_rect(65, 75, frame_area),
     }
@@ -562,6 +562,48 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// The set-schedule popup with the window row focused: the interval and
+    /// window rows carry prefilled text, the empty lag row shows what an
+    /// empty row means rather than nothing.
+    #[test]
+    fn render_with_schedule_popup() {
+        use crate::tui::state::{ScheduleField, ScheduleForm};
+
+        let mut app = test_app();
+        let mut form = ScheduleForm::new(
+            5,
+            "nightly errors".to_owned(),
+            Some(&make_schedule(Some("since_last"), None)),
+        );
+        form.focus = ScheduleField::Window;
+        app.popup = Some(Popup::SetSchedule(Box::new(form)));
+
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// A terminal too small to hold the popup must not panic: the cursor
+    /// clamp is the arithmetic that would. Narrower than ~37 columns trips a
+    /// pre-existing overflow in the empty-results placeholder behind the
+    /// popup, which is a separate bug and not this popup's business.
+    #[test]
+    fn render_schedule_popup_on_a_tiny_terminal() {
+        use crate::tui::state::ScheduleForm;
+
+        let mut app = test_app();
+        app.popup = Some(Popup::SetSchedule(Box::new(ScheduleForm::new(
+            5,
+            "nightly errors".to_owned(),
+            None,
+        ))));
+
+        let backend = TestBackend::new(42, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
     }
 
     #[test]
