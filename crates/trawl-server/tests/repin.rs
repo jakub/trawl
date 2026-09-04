@@ -395,6 +395,7 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 #[tokio::test(flavor = "multi_thread")]
 async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     let h = harness().await;
+    let timeouts_before = common::bookkeeping_timeouts(&h.server.url).await;
 
     // A half-numeric text field pins VARCHAR (the ladder needs >=90%).
     h.ingest_and_compact(&[
@@ -443,6 +444,10 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
         .catalog_conflicts(Some("dur"), None, None, None)
         .await
         .expect("conflicts");
+    common::assert_bookkeeping_quiet(
+        &timeouts_before,
+        &common::bookkeeping_timeouts(&h.server.url).await,
+    );
     assert!(
         conflicts
             .conflicts
