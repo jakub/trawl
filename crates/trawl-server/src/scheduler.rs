@@ -11,6 +11,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -19,7 +20,8 @@ use fleet_auth::KeyStore;
 use crate::config::SchedulerConfig;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
-use crate::store::{FinishOutcome, FlipOutcome, RunStatus, ScheduleStore};
+use crate::report_window::{format_window_bound, truncate_to_micros};
+use crate::store::{ClaimedRun, DueClaim, FinishOutcome, FlipOutcome, RunStatus, ScheduleStore};
 
 /// Spawn the scheduler background task.
 ///
@@ -92,7 +94,25 @@ async fn scheduler_loop(
             }
         }
 
-        poll_and_execute(&schedule_store, &key_store, &pool, &config, timeout_secs).await;
+        // ONE clock reading per tick, truncated to the microsecond every
+        // stored bound shares (postgres TIMESTAMPTZ, DuckDB TIMESTAMP, and
+        // the rendered `earliest=`/`latest=` text). Sampling per schedule
+        // would let two schedules in the same poll disagree about which
+        // boundary has passed.
+        let now = truncate_to_micros(chrono::Utc::now());
+        // Dropping the handles detaches the executions: each records its own
+        // outcome through `finish_run`, so the loop never waits on one.
+        drop(
+            poll_and_execute(
+                &schedule_store,
+                &key_store,
+                &pool,
+                &config,
+                timeout_secs,
+                now,
+            )
+            .await,
+        );
 
         // Periodic retention cleanup.
         retention_counter += 1;
@@ -123,13 +143,26 @@ async fn scheduler_loop(
     }
 }
 
-async fn poll_and_execute(
+/// One scheduler tick: claim and spawn every schedule due at `now`.
+///
+/// `now` is a parameter rather than a clock reading, and [`scheduler_loop`]
+/// samples it once per tick, so every schedule in a poll is judged against
+/// the same instant. Tests drive this function directly with an explicit
+/// instant: tiling, catch-up clamping and lag are all statements about
+/// hours of coverage, and there is no other way to make them fast.
+///
+/// Returns the spawned execution tasks. The loop drops them — each run
+/// records its own outcome through `finish_run` — and tests await them.
+pub async fn poll_and_execute(
     schedule_store: &ScheduleStore,
     key_store: &KeyStore,
     pool: &ExecutorPool,
     config: &SchedulerConfig,
     timeout_secs: u64,
-) {
+    now: DateTime<Utc>,
+) -> Vec<JoinHandle<()>> {
+    let mut spawned = Vec::new();
+
     let schedules = match schedule_store.list_enabled_schedules().await {
         Ok(s) => s,
         Err(e) => {
@@ -138,90 +171,95 @@ async fn poll_and_execute(
                 error = %e,
                 "failed to list enabled schedules"
             );
-            return;
+            return spawned;
         }
     };
 
-    for (schedule, saved_query) in schedules {
-        let should_run = match schedule_store.latest_run(schedule.id).await {
-            Ok(Some(last)) => {
-                let elapsed = chrono::Utc::now()
-                    .signed_duration_since(last.started_at)
-                    .num_seconds()
-                    .unsigned_abs();
-                elapsed >= schedule.interval_secs
-            }
-            Ok(None) => true, // Never run before.
-            Err(e) => {
-                tracing::warn!(
-                    event_type = "scheduler_error",
-                    schedule_id = schedule.id,
-                    error = %e,
-                    "failed to check latest run"
-                );
-                false
-            }
-        };
-
-        if !should_run {
-            continue;
-        }
-
-        // Gate on key liveness in the fleet keystore.
+    // The listing is the enumeration and nothing more: which schedules
+    // exist. Every value the run depends on — cadence, window, watermark,
+    // and above all the saved DSL — is re-read inside `claim_due_run`,
+    // under the row locks it takes.
+    for (schedule, _saved_query) in schedules {
+        // Key liveness comes BEFORE the claim, so an unusable key leaves the
+        // fire cursor exactly where it was. The cursor is the coverage
+        // boundary: skipping the claim means a `since_last` schedule covers
+        // the whole outage in one window once the key is usable again,
+        // instead of losing every boundary that passed while it was not.
         if !owning_key_is_usable(key_store, schedule.id, schedule.key_id).await {
             continue;
         }
 
-        // Claim a run in one transaction: the max_runs check and the insert
-        // are atomic (FOR UPDATE on the schedule row), and the partial
-        // unique index rejects a second concurrent 'running' row.
-        let run_id = match schedule_store
-            .claim_run(
-                schedule.id,
-                saved_query.id,
-                &saved_query.query,
-                schedule.max_runs,
-                // The planner that resolves a schedule's window into the
-                // run's bounds arrives with the scheduler milestone.
-                None,
-            )
+        // Plan, materialize, claim and move the cursor — one transaction.
+        let claimed = match schedule_store
+            .claim_due_run(schedule.id, now, config.max_catchup_intervals)
             .await
         {
-            Ok(crate::store::RunClaim::Started(id)) => id,
-            Ok(crate::store::RunClaim::AlreadyRunning | crate::store::RunClaim::MaxRunsReached) => {
-                continue;
-            }
+            Ok(DueClaim::Started(claimed)) => claimed,
+            Ok(
+                DueClaim::NotDue
+                | DueClaim::Advanced
+                | DueClaim::AlreadyRunning
+                | DueClaim::MaxRunsReached,
+            ) => continue,
             Err(e) => {
+                // The class, never the message: a window failure's Display
+                // can quote the saved DSL and the parser's own text, and
+                // this event lands in the retained `service=trawld` corpus.
                 tracing::error!(
                     event_type = "scheduler_error",
                     schedule_id = schedule.id,
-                    error = %e,
-                    "failed to start run"
+                    error_class = e.class(),
+                    "failed to claim a due run; the schedule's fire cursor is unchanged"
                 );
                 continue;
             }
         };
 
-        // Spawn execution as a separate task so it doesn't block the poll loop.
+        if let Some(window) = claimed.window
+            && window.truncated
+        {
+            metrics::counter!(crate::metrics::SCHEDULER_WINDOW_TRUNCATED_TOTAL).increment(1);
+            // The bounds are instants, not operator text, so they are safe
+            // as event fields. They are fields and never metric labels: an
+            // instant is unbounded cardinality.
+            tracing::warn!(
+                event_type = "scheduler_window_truncated",
+                schedule_id = schedule.id,
+                run_id = claimed.run_id,
+                window_start = %format_window_bound(window.start),
+                window_end = %format_window_bound(window.end),
+                "report window clamped to max_catchup_intervals; the span before its start stays uncovered"
+            );
+        }
+
+        // Execute the text the claim RESOLVED and stored, never the saved
+        // DSL from the listing: with a window those two differ by the very
+        // bounds the run row claims to cover.
+        let ClaimedRun {
+            run_id,
+            query_name,
+            resolved_query,
+            ..
+        } = claimed;
         let store = schedule_store.clone();
         let pool = pool.clone();
-        let query = saved_query.query.clone();
-        let query_name = saved_query.name.clone();
         let max_rows = config.report_max_rows;
 
-        tokio::spawn(async move {
+        spawned.push(tokio::spawn(async move {
             execute_scheduled_query(
                 store,
                 pool,
                 run_id,
-                &query,
+                &resolved_query,
                 &query_name,
                 max_rows,
                 timeout_secs,
             )
             .await;
-        });
+        }));
     }
+
+    spawned
 }
 
 /// Whether the schedule's owning key may still run scheduled queries.
