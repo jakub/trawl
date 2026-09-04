@@ -509,7 +509,14 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let colon_col: usize = 15; // offset of ":" within each line
     let longest_line = "Command Palette: https://trawl.sh".len(); // 33 chars
     let w = inner.width as usize;
-    let left_pad = (w.saturating_sub(longest_line)) / 2 - 1;
+    // Both subtractions saturate. The `- 1` is the deliberate one-column
+    // shift, and on a pane too narrow to hold the longest line the halved
+    // width is already 0, so plain subtraction underflowed: a panic in
+    // debug, and `" ".repeat(usize::MAX)` in release. That is any terminal
+    // under 39 columns, since the block eats two borders and two of
+    // padding.
+    let left_pad = w.saturating_sub(longest_line) / 2;
+    let left_pad = left_pad.saturating_sub(1);
     let pad = " ".repeat(left_pad);
 
     let label = |name: &str, val: &str| -> String {
@@ -1462,5 +1469,33 @@ mod severity_tests {
         // No reading: the grid's own rendering, never a guess.
         assert_eq!(severity_cell_text(&Value::Integer(99)), "99");
         assert_eq!(severity_cell_text(&Value::String("gold".into())), "gold");
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use crate::tui::tests::test_app;
+
+    /// The placeholder centres its help block on a 33-column line, and the
+    /// centring did the shift-one-left with a plain subtraction: below 39
+    /// terminal columns the halved width is already 0, so it underflowed.
+    /// Debug builds panicked, release builds asked for `usize::MAX` spaces.
+    ///
+    /// 20x6 is well inside a real tmux split. A fresh app has no results,
+    /// so this is the placeholder pane, and the whole UI is drawn rather
+    /// than the one function: a narrow terminal narrows every pane at once.
+    #[test]
+    fn placeholder_renders_in_a_terminal_too_narrow_to_centre_in() {
+        for (width, height) in [(20, 6), (1, 1), (38, 10), (39, 10)] {
+            let mut app = test_app();
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| crate::tui::ui::render(&mut app, f))
+                .unwrap_or_else(|e| panic!("{width}x{height} must render: {e}"));
+        }
     }
 }
