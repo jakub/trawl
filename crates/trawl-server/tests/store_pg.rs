@@ -3298,7 +3298,14 @@ mod catalog {
         }
 
         let purged = store.delete_pins(&["dead".to_owned()]).await.unwrap();
-        assert_eq!(purged.deleted, vec!["dead".to_owned()]);
+        assert_eq!(
+            purged
+                .deleted
+                .iter()
+                .map(|p| p.field.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dead"]
+        );
 
         for (table, sql) in [
             (
@@ -3366,11 +3373,14 @@ mod catalog {
     /// skipped, so a post-commit SELECT for the gauge would be a fallible
     /// step in exactly the wrong place.
     ///
-    /// The returned names are the DELETE's own RETURNING set, never the
+    /// The returned rows are the DELETE's own RETURNING set, never the
     /// request: a candidate whose row went away underneath the run must not
-    /// show up in an audit event claiming this run deleted it.
+    /// show up in an audit event claiming this run deleted it. Their
+    /// metadata is the transaction's own read, never the caller's earlier
+    /// snapshot — a repin can retype a row between the two, and the audit
+    /// record is the only surviving account of what was deleted.
     #[sqlx::test]
-    async fn delete_pins_returns_the_deleted_names_and_the_fill_count(pool: PgPool) {
+    async fn delete_pins_returns_the_deleted_metadata_and_the_fill_count(pool: PgPool) {
         let store = catalog(&pool);
         store
             .pin_missing(&[
@@ -3379,8 +3389,21 @@ mod catalog {
             ])
             .await
             .unwrap();
+        for service in ["svc-a", "svc-b"] {
+            store
+                .touch_services(service, &["dead".to_owned()], 3)
+                .await
+                .unwrap();
+        }
         let before: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM field_types")
             .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // The staleness the caller cannot avoid: it read BIGINT, and a
+        // repin cutover retyped the row before the purge ran.
+        sqlx::query("UPDATE field_types SET duckdb_type = 'VARCHAR' WHERE field = 'dead'")
+            .execute(&pool)
             .await
             .unwrap();
 
@@ -3390,16 +3413,89 @@ mod catalog {
             .unwrap();
 
         assert_eq!(
-            purged.deleted,
-            vec!["dead".to_owned()],
+            purged
+                .deleted
+                .iter()
+                .map(|p| p.field.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dead"],
             "a name the catalog never held is not a name this run deleted"
         );
+        let pin = &purged.deleted[0];
+        assert_eq!(
+            pin.duckdb_type, "VARCHAR",
+            "the metadata is the row the transaction deleted, not the \
+             BIGINT a pre-purge snapshot would have carried"
+        );
+        assert_eq!(pin.pinned_from.as_deref(), Some("svc-a"));
+        assert_eq!(
+            pin.services, 2,
+            "both observations were counted before they were deleted"
+        );
+        assert!(
+            pin.last_seen.is_some(),
+            "the newest observation is captured while field_services still \
+             holds it"
+        );
+        assert!(pin.pinned_at <= chrono::Utc::now());
         let after: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM field_types")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(purged.pinned_now, before - 1);
         assert_eq!(purged.pinned_now, after, "the count is the committed one");
+    }
+
+    /// The purge bounds itself inside postgres. A row lock somebody else
+    /// holds costs it five seconds and an error, never an unbounded wait —
+    /// and that db-side bound is what lets the gc engine await the commit
+    /// with no cancellation wrapper at all while the corpus gate, and every
+    /// compaction batch queued behind it, waits on the answer.
+    ///
+    /// The purge takes the row lock at `DELETE FROM field_types`, so this
+    /// exercises the `lock_timeout` half; the `statement_timeout` half is
+    /// what bounds the advisory lock a step earlier, which no test can hold
+    /// from outside (`CATALOG_LIFECYCLE_LOCK_KEY` is crate-private).
+    #[sqlx::test]
+    async fn delete_pins_gives_up_on_a_held_row_lock_instead_of_waiting(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[proposal("dead", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT field FROM field_types WHERE field = 'dead' FOR UPDATE")
+            .fetch_all(&mut *blocker)
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let err = store
+            .delete_pins(&["dead".to_owned()])
+            .await
+            .expect_err("a purge that cannot take its row lock must fail, not hang");
+        let waited = started.elapsed();
+        blocker.rollback().await.unwrap();
+
+        assert!(
+            waited < std::time::Duration::from_secs(30),
+            "the purge waited {waited:?} on a held row lock; the db-side bound \
+             is not in force, and a wrapped timeout is not an option here"
+        );
+        assert!(
+            matches!(err, trawl_server::store::StoreError::Unavailable(_)),
+            "unexpected error {err:?}"
+        );
+        assert!(
+            store
+                .load_pins()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(f, _)| f == "dead"),
+            "a bounded-out purge rolls back and deletes nothing"
+        );
     }
 
     /// The purge's own half of the pin-gc race: the running-row check

@@ -256,16 +256,64 @@ pub struct GcPinRow {
     pub services: i64,
 }
 
+/// The pin purge transaction's own bounds, its first two statements in this
+/// order.
+///
+/// Postgres enforces them, so the bound survives what a client-side timeout
+/// cannot: the caller must not cancel that future, because a cancelled
+/// commit is an unknown outcome the pin cache would have to guess at. Five
+/// seconds is the same budget the gc engine gives its read-only gated calls;
+/// the corpus gate is held across all of them and every compaction batch
+/// waits behind it.
+///
+/// `statement_timeout` comes first because it is the only one of the two
+/// that bounds `pg_advisory_xact_lock`: `lock_timeout` covers heavyweight
+/// table and row locks, and an advisory lock is neither, so a lock_timeout-only
+/// transaction would wait on a held catalog lock forever.
+const PURGE_STATEMENT_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout = '5s'";
+/// The row-lock half of the purge's bounds; see
+/// [`PURGE_STATEMENT_TIMEOUT_SQL`].
+const PURGE_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '5s'";
+
+/// One pin a [`CatalogStore::delete_pins`] transaction gave up, with the
+/// metadata that transaction saw.
+///
+/// Everything here is read inside the purge transaction rather than carried
+/// over from the caller's earlier candidate snapshot. Between that snapshot
+/// and the purge, a repin cutover can retype the row and compaction can
+/// observe the field again, so a report built from the snapshot would name a
+/// type and a `last_seen` that were true minutes ago. The audit record is
+/// the only account of a row nobody can read any more; it says what was
+/// actually deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgedPin {
+    /// Field name, as `field_types` held it.
+    pub field: String,
+    /// The pinned `DuckDB` type spelling at deletion.
+    pub duckdb_type: String,
+    /// Which service's batch set the pin, when the row recorded one.
+    pub pinned_from: Option<String>,
+    /// When the pin was taken.
+    pub pinned_at: DateTime<Utc>,
+    /// The newest `field_services` observation, read in the same
+    /// transaction just before the observations were deleted. `None` when
+    /// the field was never observed.
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Distinct observation rows discarded with the pin: how much
+    /// per-service attribution the purge threw away.
+    pub services: i64,
+}
+
 /// What one [`CatalogStore::delete_pins`] transaction committed.
 ///
-/// Both numbers are read INSIDE the transaction, so the caller can finish
-/// the reclaim (evict from the pin cache, publish the gauges, audit) with
+/// All of it is read INSIDE the transaction, so the caller can finish the
+/// reclaim (evict from the pin cache, publish the gauges, audit) with
 /// nothing fallible left to do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PurgedPins {
     /// The pins `field_types` actually gave up, as the DELETE returned
-    /// them: the only set an audit event may name.
-    pub deleted: Vec<String>,
+    /// them, sorted by field: the only set an audit event may name.
+    pub deleted: Vec<PurgedPin>,
     /// Pins remaining at commit, for the fill gauges. Meaningless when
     /// nothing was deleted (the empty-input early return reads zero), so
     /// callers publish it only after a real purge.
@@ -1705,15 +1753,27 @@ impl CatalogStore {
     /// refuses with [`StoreError::RepinAlreadyRunning`] rather than delete
     /// the row that job is about to update.
     ///
-    /// Returns [`PurgedPins`]: the names `field_types` actually gave up and
-    /// the fill count read in the same transaction. Both come out of the
-    /// ONE transaction on purpose. The caller's next act is a cache
-    /// eviction that must not be skipped, and a post-commit SELECT for the
-    /// gauge is one more thing that can fail between the commit and that
-    /// eviction — which would leave the pin gone from postgres and present
-    /// in every reader's cache. Nothing fallible happens after the commit
-    /// here; the caller publishes the gauges (infallibly, from the returned
-    /// count) once the eviction is done.
+    /// Returns [`PurgedPins`]: the rows `field_types` actually gave up, each
+    /// with the metadata this transaction read, and the fill count. All of
+    /// it comes out of the ONE transaction on purpose. The caller's next act
+    /// is a cache eviction that must not be skipped, and a post-commit
+    /// SELECT for the gauge is one more thing that can fail between the
+    /// commit and that eviction — which would leave the pin gone from
+    /// postgres and present in every reader's cache. Nothing fallible
+    /// happens after the commit here; the caller publishes the gauges
+    /// (infallibly, from the returned count) once the eviction is done.
+    ///
+    /// Every statement before the commit is bounded by postgres itself
+    /// ([`PURGE_STATEMENT_TIMEOUT_SQL`]) rather than by a caller's
+    /// [`tokio::time::timeout`]. A timeout wrapped around this future would
+    /// have to cancel it somewhere, and the one place cancellation cannot be
+    /// made safe is the commit: the caller would see "timed out, nothing
+    /// happened" while postgres went on to commit the delete, and the pin
+    /// cache would keep entries for rows that no longer exist. `SET LOCAL
+    /// statement_timeout` bounds every statement including the advisory-lock
+    /// wait, which `lock_timeout` does not cover (it applies to heavyweight
+    /// table and row locks, not to `pg_advisory_xact_lock`), so it is set
+    /// first; `lock_timeout` then bounds the row locks the deletes take.
     pub async fn delete_pins(&self, fields: &[String]) -> Result<PurgedPins, StoreError> {
         if fields.is_empty() {
             return Ok(PurgedPins::default());
@@ -1729,6 +1789,12 @@ impl CatalogStore {
         }
 
         let mut tx = self.pool.begin().await?;
+        // Bound the pre-commit work database-side, before anything that can
+        // wait. `statement_timeout` first, because the advisory lock below
+        // is a statement and no other setting bounds it.
+        for sql in [PURGE_STATEMENT_TIMEOUT_SQL, PURGE_LOCK_TIMEOUT_SQL] {
+            sqlx::query(sql).execute(&mut *tx).await?;
+        }
         // The lock, then the re-check, then the delete: this transaction is
         // the authority on "no repin owns a pin I am about to reclaim", and
         // the caller's earlier checks are courtesy fast-paths. A repin claim
@@ -1744,6 +1810,25 @@ impl CatalogStore {
             // Dropping the transaction rolls it back; nothing was deleted.
             return Err(StoreError::RepinAlreadyRunning);
         }
+        // The observation half of the audit record, read while the rows are
+        // still there. One statement for both numbers: the newest
+        // observation and how many the purge is about to discard.
+        let observed: HashMap<String, (Option<DateTime<Utc>>, i64)> = sqlx::query(
+            "SELECT field, max(last_seen) AS last_seen, count(*)::bigint AS services
+             FROM field_services WHERE field = ANY($1) GROUP BY field",
+        )
+        .bind(fields)
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get("field")?,
+                (row.try_get("last_seen")?, row.try_get("services")?),
+            ))
+        })
+        .collect::<Result<_, sqlx::Error>>()?;
+
         for sql in [
             "DELETE FROM field_conflict_stats WHERE field = ANY($1)",
             "DELETE FROM field_conflicts WHERE field = ANY($1)",
@@ -1754,12 +1839,33 @@ impl CatalogStore {
         // RETURNING, not `rows_affected`: the caller audits one event per
         // reclaimed pin, and a name it merely ASKED for is not a name it
         // deleted. A candidate can lose its row to a concurrent write
-        // between the scan and this statement.
-        let deleted: Vec<String> =
-            sqlx::query_scalar("DELETE FROM field_types WHERE field = ANY($1) RETURNING field")
-                .bind(fields)
-                .fetch_all(&mut *tx)
-                .await?;
+        // between the scan and this statement, and a repin that finished in
+        // the same window leaves a type the caller's snapshot no longer
+        // knows — so the type comes back from here too.
+        let deleted_rows = sqlx::query(
+            "DELETE FROM field_types WHERE field = ANY($1)
+             RETURNING field, duckdb_type, pinned_from, pinned_at",
+        )
+        .bind(fields)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut deleted = deleted_rows
+            .iter()
+            .map(|row| {
+                let field: String = row.try_get("field")?;
+                let (last_seen, services) = observed.get(&field).copied().unwrap_or((None, 0));
+                Ok(PurgedPin {
+                    field,
+                    duckdb_type: row.try_get("duckdb_type")?,
+                    pinned_from: row.try_get("pinned_from")?,
+                    pinned_at: row.try_get("pinned_at")?,
+                    last_seen,
+                    services,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        // DELETE returns rows in no defined order; the report is field-sorted.
+        deleted.sort_by(|a, b| a.field.cmp(&b.field));
         let pinned_now: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
             .fetch_one(&mut *tx)
             .await?;
@@ -1769,6 +1875,24 @@ impl CatalogStore {
             deleted,
             pinned_now,
         })
+    }
+
+    /// Which of `fields` `field_types` still holds.
+    ///
+    /// The reconcile read behind a failed purge: an error from
+    /// [`Self::delete_pins`] leaves the caller unable to say whether the
+    /// transaction committed, and this is the question that settles it for
+    /// the pin cache.
+    pub async fn pins_present(&self, fields: &[String]) -> Result<BTreeSet<String>, StoreError> {
+        if fields.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let present: Vec<String> =
+            sqlx::query_scalar("SELECT field FROM field_types WHERE field = ANY($1)")
+                .bind(fields)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(present.into_iter().collect())
     }
 
     /// Publish the pin fill gauges from a count the caller already holds.
@@ -1861,6 +1985,45 @@ mod tests {
             let decoded = ServiceCursor::decode(&cursor.encode()).expect("decodes");
             assert_eq!(decoded, cursor, "{service}");
         }
+    }
+
+    /// The purge bounds itself inside postgres, and the order of the two
+    /// settings is load-bearing: `statement_timeout` is the only one that
+    /// bounds the advisory-lock wait, so it must be in force before
+    /// `pg_advisory_xact_lock` runs.
+    ///
+    /// Source-shape. `SHOW statement_timeout` is only observable from
+    /// inside the transaction, which nothing outside this method can enter,
+    /// and the live behaviour (a purge that gives up instead of hanging on
+    /// a held row lock) is asserted in `tests/store_pg.rs`.
+    #[test]
+    fn the_purge_sets_its_bounds_before_it_takes_the_lock() {
+        let src = include_str!("catalog.rs");
+        let start = src
+            .find("    pub async fn delete_pins(")
+            .expect("delete_pins is one method");
+        let body = &src[start..];
+        let end = body.find("\n    }\n").expect("the method closes");
+        let body = &body[..end];
+
+        let bounds = body
+            .find("for sql in [PURGE_STATEMENT_TIMEOUT_SQL, PURGE_LOCK_TIMEOUT_SQL]")
+            .expect("the transaction sets both bounds, statement_timeout first");
+        let begin = body
+            .find("self.pool.begin()")
+            .expect("the transaction opens");
+        let lock = body
+            .find("lock_catalog_lifecycle")
+            .expect("the transaction takes the catalog lifecycle lock");
+        assert!(
+            begin < bounds && bounds < lock,
+            "the bounds belong between BEGIN and the advisory lock"
+        );
+        assert!(
+            PURGE_STATEMENT_TIMEOUT_SQL.starts_with("SET LOCAL statement_timeout")
+                && PURGE_LOCK_TIMEOUT_SQL.starts_with("SET LOCAL lock_timeout"),
+            "both bounds are transaction-local"
+        );
     }
 
     /// A malformed cursor is a client error, never a silently dropped

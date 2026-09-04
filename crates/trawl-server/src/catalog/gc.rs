@@ -33,7 +33,7 @@ use trawl_core::schema::{catalog_key, is_contract_typed};
 use crate::catalog::FieldCatalog;
 use crate::error::ServerError;
 use crate::repin::RepinCoordinator;
-use crate::store::{CatalogStore, GcPinRow, RepinJobStatus, RepinStore};
+use crate::store::{CatalogStore, GcPinRow, PurgedPin, RepinJobStatus, RepinStore};
 
 /// How long a field must go unobserved before gc will consider it dead,
 /// when the request names no window of its own.
@@ -151,8 +151,8 @@ pub fn candidacy(
     }
 }
 
-/// How long ANY postgres operation performed under the corpus gate may take
-/// before the run gives up on it.
+/// How long any READ-ONLY postgres operation performed under the corpus
+/// gate may take before the run gives up on it.
 ///
 /// The gate is held across every one of them, and while it is held no
 /// compaction batch can publish, so a postgres that has stopped answering
@@ -160,6 +160,11 @@ pub fn candidacy(
 /// per operation rather than one for the whole gated section: each is a
 /// single round trip, and a per-call bound is the one an operator can read
 /// off the refusal.
+///
+/// Read-only only. Cancelling a read costs the answer and nothing else;
+/// cancelling the purge would abandon a transaction whose commit may still
+/// land, which is why that one is bounded inside postgres instead
+/// ([`crate::store::CatalogStore::delete_pins`]).
 const IN_GATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many offending paths a fail-closed refusal names. The rest are a
@@ -322,7 +327,6 @@ impl PinGc {
                     .to_owned(),
             ));
         };
-
         // 1. Entry checks, before any work: a repin rearranging the corpus
         //    makes every footer proof provisional.
         self.refuse_if_repin_owns_the_corpus().await?;
@@ -347,8 +351,8 @@ impl PinGc {
                 window: &window,
                 decided_at,
                 dry_run,
-                rows: &rows,
-                dead: &BTreeSet::new(),
+                pins_examined: 0,
+                pins: &[],
                 files_scanned: 0,
                 deleted: 0,
             }
@@ -366,7 +370,7 @@ impl PinGc {
         drop(gate);
 
         let Purged {
-            dead,
+            pins,
             files_scanned,
             deleted,
         } = outcome?;
@@ -380,15 +384,15 @@ impl PinGc {
             window: &window,
             decided_at,
             dry_run,
-            rows: &rows,
-            dead: &dead,
+            pins_examined: rows.len(),
+            pins: &pins,
             files_scanned,
             deleted,
         }
         .build();
         if !dry_run {
-            for row in rows.iter().filter(|row| dead.contains(&row.field)) {
-                log_deleted(row, &response, &actor);
+            for pin in &pins {
+                log_deleted(pin, &response, &actor);
             }
         }
         log_complete(&response, &actor, gate_held_ms);
@@ -434,40 +438,47 @@ impl PinGc {
             // whose real form is irreversible. A real run with an empty set
             // takes the same exit for the simpler reason that there is
             // nothing to delete.
+            let pins = rows
+                .iter()
+                .filter(|row| walk.dead.contains(&row.field))
+                .map(projected)
+                .collect();
             return Ok(Purged {
-                dead: walk.dead,
+                pins,
                 files_scanned: walk.files_scanned,
                 deleted: 0,
             });
         }
 
         let fields: Vec<String> = walk.dead.iter().cloned().collect();
-        // A timeout here is the sharpest UNKNOWN of the lot: the statement
-        // was already sent, so postgres may have committed it after we
-        // stopped waiting. Refusing evicts nothing (an eviction over rows
-        // that survived would hide a pin the store still has) and retrying
-        // blind would delete a second time or report a deletion that never
-        // happened, so the operator's dry run is the way out.
-        let purged = match self
-            .in_gate(
-                "deleting the proved-dead pins",
-                self.store.delete_pins(&fields),
-            )
-            .await
-        {
+        // NOT bounded here. The purge bounds its own pre-commit statements
+        // inside postgres, and its commit is awaited without a cancellation
+        // wrapper on purpose: a timeout that fired across the commit would
+        // drop a future postgres goes on to commit, and this run would
+        // answer "deleted nothing" over a catalog that lost the rows while
+        // every reader's cache kept them.
+        let purged = match self.store.delete_pins(&fields).await {
             Ok(purged) => purged,
-            // The purge transaction's own running-row check is the
-            // authority on the claim race, and it refuses inside the
-            // transaction, so nothing was deleted.
-            Err(ServerError::Store(crate::store::StoreError::RepinAlreadyRunning)) => {
-                return Err(ServerError::Conflict(
-                    "a repin job claimed the catalog while pin gc was proving its \
-                     candidates dead, so the purge refused and deleted nothing; \
-                     re-run pin gc once the repin finishes"
-                        .to_owned(),
-                ));
+            Err(e) => {
+                // Any error at all, unclassified: by the time one is
+                // visible here the DELETE may or may not have been issued,
+                // and no error text distinguishes the two. The cache is
+                // reconciled against postgres before the gate opens, so
+                // cache-vs-store divergence cannot outlive the gate.
+                self.reconcile_cache(&fields).await;
+                return Err(match e {
+                    // The purge transaction's own running-row check is the
+                    // authority on the claim race, and it refuses inside
+                    // the transaction, so nothing was deleted.
+                    crate::store::StoreError::RepinAlreadyRunning => ServerError::Conflict(
+                        "a repin job claimed the catalog while pin gc was proving its \
+                         candidates dead, so the purge refused and deleted nothing; \
+                         re-run pin gc once the repin finishes"
+                            .to_owned(),
+                    ),
+                    other => ServerError::from(other),
+                });
             }
-            Err(e) => return Err(e),
         };
         // Committed, so the cache may lose them — and must, before the gate
         // opens: infallible, one lock, one generation bump, nothing
@@ -476,21 +487,65 @@ impl PinGc {
         // this sequence has no fallible step left; the gauges follow the
         // eviction, never precede it.
         self.cache
-            .evict_many(purged.deleted.iter().map(String::as_str));
+            .evict_many(purged.deleted.iter().map(|pin| pin.field.as_str()));
         self.store.publish_fill_gauges(purged.pinned_now);
 
         // The purge's own RETURNING set replaces the walk's projection from
         // here on, so the report and the audit records can only name pins
-        // this run actually deleted. The two differ when a candidate loses
-        // its row underneath the run (a concurrent purge, an operator with
-        // psql): the walk still believes in it, postgres does not.
-        let dead: BTreeSet<String> = purged.deleted.into_iter().collect();
-        let deleted = u64::try_from(dead.len()).unwrap_or(u64::MAX);
+        // this run actually deleted, described as the transaction saw them.
+        // The two differ when a candidate loses its row underneath the run
+        // (a concurrent purge, an operator with psql): the walk still
+        // believes in it, postgres does not.
+        let deleted = u64::try_from(purged.deleted.len()).unwrap_or(u64::MAX);
         Ok(Purged {
-            dead,
+            pins: purged.deleted,
             files_scanned: walk.files_scanned,
             deleted,
         })
+    }
+
+    /// Settle the pin cache against postgres after a purge that failed with
+    /// an unknown outcome, while the corpus gate is still held.
+    ///
+    /// The asymmetry is the whole point. Evicting a pin postgres still
+    /// holds costs a re-read: `pin_missing` goes to postgres, finds the row
+    /// and puts it back, and in the meantime a column is treated as
+    /// unpinned. NOT evicting a pin postgres deleted is corruption: readers
+    /// keep typing comparisons by a pin no row backs, and compaction
+    /// conforms new batches to it. So the failure of the reconcile READ is
+    /// resolved by over-evicting every candidate, never by leaving the
+    /// cache alone.
+    ///
+    /// The read is bounded by [`IN_GATE_TIMEOUT`] like the other gated
+    /// reads: cancelling it is safe, and the timeout arm evicts everything
+    /// anyway.
+    async fn reconcile_cache(&self, fields: &[String]) {
+        match self
+            .in_gate(
+                "reconciling the pin cache after a failed purge",
+                self.store.pins_present(fields),
+            )
+            .await
+        {
+            Ok(present) => {
+                self.cache.evict_many(
+                    fields
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|field| !present.contains(*field)),
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    event_type = "catalog_gc_reconcile_failed",
+                    error_class = e.error_class(),
+                    candidates = fields.len(),
+                    "pin gc could not re-read the catalog after a failed purge; \
+                     evicting every candidate from the pin cache"
+                );
+                self.cache.evict_many(fields.iter().map(String::as_str));
+            }
+        }
     }
 
     /// Refuse while a repin owns the data root: marker, shadow or aside
@@ -573,10 +628,11 @@ struct Report<'a> {
     window: &'a DeadWindow,
     decided_at: DateTime<Utc>,
     dry_run: bool,
-    /// Every candidate the observation axis produced.
-    rows: &'a [GcPinRow],
-    /// The candidates the footer scan left undisproved.
-    dead: &'a BTreeSet<String>,
+    /// How many candidates the observation axis produced.
+    pins_examined: usize,
+    /// The pins the run reports: what the purge transaction returned on a
+    /// real run, what the footer scan left undisproved on a dry one.
+    pins: &'a [PurgedPin],
     files_scanned: u64,
     /// Rows postgres reported deleted; 0 on a dry run.
     deleted: u64,
@@ -586,17 +642,17 @@ impl Report<'_> {
     /// One shape for a dry run and a real one — `dry_run` and `deleted`
     /// are what tell them apart.
     fn build(self) -> trawl_api::GcPinsResponse {
-        // `pins_unobserved_since` orders by field, so the candidate list is
-        // field-sorted without a second sort.
+        // Both producers are field-sorted already (`pins_unobserved_since`
+        // orders by field, the purge sorts its RETURNING set), so the
+        // candidate list needs no second sort.
         let candidates = self
-            .rows
+            .pins
             .iter()
-            .filter(|row| self.dead.contains(&row.field))
-            .map(|row| trawl_api::GcPinCandidate {
-                field: row.field.clone(),
-                data_type: row.duckdb_type.clone(),
-                last_seen: row.last_seen.map(iso8601),
-                services: row.services,
+            .map(|pin| trawl_api::GcPinCandidate {
+                field: pin.field.clone(),
+                data_type: pin.duckdb_type.clone(),
+                last_seen: pin.last_seen.map(iso8601),
+                services: pin.services,
             })
             .collect::<Vec<_>>();
         trawl_api::GcPinsResponse {
@@ -605,11 +661,27 @@ impl Report<'_> {
             requested_older_than_secs: self.window.requested_secs,
             retention_floor_secs: self.window.floor_secs,
             effective_older_than_secs: self.window.effective_secs,
-            pins_examined: self.rows.len() as u64,
+            pins_examined: self.pins_examined as u64,
             files_scanned: self.files_scanned,
             candidates,
             deleted: self.deleted,
         }
+    }
+}
+
+/// One candidate as the pre-gate snapshot described it, for the dry run.
+///
+/// A dry run deletes nothing, so there is no transaction to read the
+/// current row from and nothing to audit; `pinned_from` is the one field
+/// the candidate query does not carry and no report renders it.
+fn projected(row: &GcPinRow) -> PurgedPin {
+    PurgedPin {
+        field: row.field.clone(),
+        duckdb_type: row.duckdb_type.clone(),
+        pinned_from: None,
+        pinned_at: row.pinned_at,
+        last_seen: row.last_seen,
+        services: row.services,
     }
 }
 
@@ -636,7 +708,7 @@ fn log_complete(r: &trawl_api::GcPinsResponse, actor: &GcActor, gate_held_ms: u6
 /// touches metrics or logs.
 #[derive(Debug)]
 struct Purged {
-    dead: BTreeSet<String>,
+    pins: Vec<PurgedPin>,
     files_scanned: u64,
     deleted: u64,
 }
@@ -644,16 +716,20 @@ struct Purged {
 /// One audit record per pin actually deleted (execution only).
 ///
 /// The catalog row is gone after this, so everything the record needs is
-/// in it: what the pin was, when it was taken, when it was last observed,
-/// and the window that judged it.
-fn log_deleted(row: &GcPinRow, r: &trawl_api::GcPinsResponse, actor: &GcActor) {
+/// in it: what the pin was, who set it, when it was taken, when it was last
+/// observed, and the window that judged it. Every one of those comes from
+/// the purge transaction, not from the candidate snapshot the run started
+/// with, so a repin that finished in between cannot make the record name a
+/// type the row no longer had.
+fn log_deleted(pin: &PurgedPin, r: &trawl_api::GcPinsResponse, actor: &GcActor) {
     tracing::info!(
         event_type = "catalog_pin_gc",
-        field = %row.field,
-        deleted_type = %row.duckdb_type,
-        pinned_at = %iso8601(row.pinned_at),
-        last_seen = row.last_seen.map(iso8601).as_deref(),
-        services = row.services,
+        field = %pin.field,
+        deleted_type = %pin.duckdb_type,
+        pinned_from = pin.pinned_from.as_deref(),
+        pinned_at = %iso8601(pin.pinned_at),
+        last_seen = pin.last_seen.map(iso8601).as_deref(),
+        services = pin.services,
         decided_at = %r.decided_at,
         requested_older_than_secs = r.requested_older_than_secs,
         retention_floor_secs = r.retention_floor_secs,
@@ -942,27 +1018,33 @@ mod tests {
         );
     }
 
-    /// Every postgres call made with the corpus gate held rides
-    /// [`IN_GATE_TIMEOUT`], not just the purge.
-    ///
-    /// Source-shape, and deliberately so: no fixture can make a live
-    /// postgres stop answering in the middle of a gated transaction, so
-    /// what is worth asserting is that a gated statement cannot be ADDED
-    /// without the bound. The gate excludes whole compaction batches, and
-    /// an unbounded wait there is an ingest stall of unbounded length.
-    #[test]
-    fn every_gated_store_call_rides_the_timeout() {
+    /// The body of `prove_and_purge`, for the two source-shape tests below.
+    fn gated_section() -> &'static str {
         let src = include_str!("gc.rs");
         let start = src
             .find("    async fn prove_and_purge(")
             .expect("the gated section is one function");
         let body = &src[start..];
         let end = body.find("\n    }\n").expect("the function closes");
-        let body = &body[..end];
+        &body[..end]
+    }
 
+    /// Every READ made with the corpus gate held rides [`IN_GATE_TIMEOUT`],
+    /// and the purge deliberately does not.
+    ///
+    /// Source-shape, and deliberately so: no fixture can make a live
+    /// postgres stop answering in the middle of a gated transaction, so
+    /// what is worth asserting is that a gated statement cannot be ADDED
+    /// without a decision about its bound. The gate excludes whole
+    /// compaction batches, and an unbounded read there is an ingest stall of
+    /// unbounded length — while a CANCELLED purge is worse than a slow one,
+    /// because the commit it abandons may still land.
+    #[test]
+    fn every_gated_store_read_rides_the_timeout_and_the_purge_does_not() {
+        let body = gated_section();
         assert!(
             body.contains(".in_gate("),
-            "the gated section makes its store calls through in_gate"
+            "the gated section makes its store reads through in_gate"
         );
         for call in ["self.store.", "self.repin_store."] {
             for (idx, _) in body.match_indices(call) {
@@ -972,13 +1054,51 @@ mod tests {
                 let head = body[..idx].rsplit(';').next().unwrap_or_default();
                 let tail = body[idx..].split(';').next().unwrap_or_default();
                 let statement = format!("{head}{tail}");
+                if !statement.contains(".await") {
+                    continue;
+                }
+                if statement.contains("delete_pins(") {
+                    assert!(
+                        !statement.contains(".in_gate("),
+                        "the purge must not be wrapped in a cancellation \
+                         timeout; postgres bounds it: {statement}"
+                    );
+                    continue;
+                }
                 assert!(
-                    !statement.contains(".await") || statement.contains(".in_gate("),
-                    "an awaited `{call}` call under the corpus gate must ride \
+                    statement.contains(".in_gate("),
+                    "an awaited `{call}` READ under the corpus gate must ride \
                      in_gate: {statement}"
                 );
             }
         }
+    }
+
+    /// A purge that failed with an unknown outcome reconciles the pin cache
+    /// against postgres BEFORE the caller drops the corpus gate.
+    ///
+    /// Source-shape too: injecting a store failure into a live purge means
+    /// killing postgres mid-transaction, which no fixture here can do. What
+    /// the shape guards is the ordering — reconcile, then return — because
+    /// a `return Err` added above the reconcile would let a cache holding
+    /// pins postgres deleted go on serving comparisons and conforming
+    /// batches under them.
+    #[test]
+    fn a_failed_purge_reconciles_the_cache_before_it_returns() {
+        let body = gated_section();
+        let arm = body
+            .split("match self.store.delete_pins(&fields).await")
+            .nth(1)
+            .expect("the purge is one match on delete_pins");
+        let reconcile = arm
+            .find("self.reconcile_cache(&fields).await;")
+            .expect("the error arm reconciles the cache");
+        let returns = arm.find("return Err(").expect("the error arm returns");
+        assert!(
+            reconcile < returns,
+            "the reconcile must precede the refusal, so no error path leaves \
+             the gate with the cache and the store disagreeing"
+        );
     }
 
     /// The divergence from the schema listing, asserted so a later "make
