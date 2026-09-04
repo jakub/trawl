@@ -35,6 +35,44 @@
 //!
 //! This file lives in `tests/`, which the walk never enters, so it neither
 //! scans itself nor the sibling test that does plant those headers.
+//!
+//! # Threat model
+//!
+//! The scan catches an honest reintroduction, and that is all it is for.
+//! An honest reintroduction is the likely one: a `Host` fallback pasted
+//! back from an older revision, a helper restored during a refactor, a
+//! debugging read of `X-Forwarded-Proto` that survives into a commit,
+//! someone adding a "just for the loopback bind" special case in good
+//! faith. Every one of those arrives spelled the ordinary way, as
+//! `header::HOST`, `"x-forwarded-proto"` or `:authority`, and the scan
+//! stops it at `cargo test` instead of at review, whenever review happens
+//! to be looking elsewhere.
+//!
+//! It does not catch a contributor who wants the read to go unseen. The
+//! scan is line-oriented text matching, so a string literal continued
+//! across a newline, a raw string trimmed at runtime, `concat!` of two
+//! halves, or a `HeaderName` built from numeric bytes all walk straight
+//! past it. `DOCUMENTED_NON_GOALS` below is exactly that list, asserted
+//! to be undetected so the scope is a decision on the record rather than a
+//! gap someone finds later and assumes was an oversight.
+//!
+//! No text scan can close that gap, which is why there is no third
+//! scanner. Chasing evasions means partially evaluating Rust: today's
+//! rewrite defeats the line rule, tomorrow's defeats a token rule, and
+//! even a full parse of the syntax tree loses to a header name computed
+//! at runtime. Each round costs real work and buys a smaller share of a
+//! threat this test was never the control for.
+//!
+//! What holds the invariant against a hostile contributor is code review,
+//! helped by how little there is to review: `check_origin` takes a
+//! `HeaderMap`, a `PublicOrigins` allowlist and a `&'static str` log
+//! label, and nothing else is in scope to read. The label cannot carry a
+//! request value. So the question a reviewer has to answer is only ever
+//! "which header fields does this function read from that map", and the
+//! answer has to stay "`Origin`, and no other". `tests/origin_guard_truth_table.rs`
+//! then proves through the public API that `Host`, `Forwarded` and the
+//! `X-Forwarded-*` family move no verdict, which is the behavioural half
+//! of the same claim.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -258,6 +296,42 @@ fn the_scan_catches_every_shape_a_reintroduction_takes() {
         expected,
         "scanned fixture:\n{}",
         FIXTURE.join("\n")
+    );
+}
+
+/// Evasions the scan is not trying to catch, kept here so its scope is
+/// legible.
+///
+/// Each line reads a `Host` header while spelling it in a way no
+/// line-oriented text match sees. They are pinned as *undetected*: if a
+/// later change starts catching one, this test fails and points at the
+/// threat model above, so widening the scan is a deliberate decision
+/// rather than a side effect. If one of these ever shows up in
+/// `crates/fleet-auth/src`, the control that catches it is review.
+const DOCUMENTED_NON_GOALS: &[&str] = &[
+    // 1-2: a string literal continued across a line break. rustc joins it
+    //      back into "host"; the scanner reads two lines, neither of which
+    //      contains the name.
+    "    let split = parts.headers.get(\"ho\\",
+    "st\");",
+    // 3: a raw string whose spaces are trimmed at runtime.
+    "    let trimmed = parts.headers.get(r\" host \".trim());",
+    // 4: the name assembled by a macro at compile time.
+    "    let joined = parts.headers.get(concat!(\"ho\", \"st\"));",
+    // 5: the name built from bytes, no text at all.
+    "    let built = HeaderName::from_bytes(&[104, 111, 115, 116]).unwrap();",
+];
+
+#[test]
+fn documented_non_goals_are_not_detected() {
+    let findings = scan_source(&DOCUMENTED_NON_GOALS.join("\n"));
+    assert!(
+        findings.is_empty(),
+        "these evasions are out of scope by decision, not by accident. A text scan \
+         cannot prove this invariant, and review is the control for a hostile \
+         reintroduction. If widening the scan was intended, update the threat model \
+         in this file's module doc and move the line out of DOCUMENTED_NON_GOALS. \
+         Detected: {findings:?}"
     );
 }
 
