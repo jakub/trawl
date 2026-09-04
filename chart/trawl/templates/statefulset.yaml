@@ -1,6 +1,13 @@
 {{- if and .Values.crashDump.enabled (not .Values.persistence.enabled) -}}
 {{- fail "crashDump.enabled=true requires persistence.enabled=true so crash dumps and trawld data survive pod replacement; enable persistence.enabled or disable crashDump.enabled" -}}
 {{- end }}
+{{- /* ADR-0016: the CSRF guard compares a browser's Origin against origins
+     the operator states. There is no default worth having, so the chart
+     refuses here rather than shipping a proxy that 403s every browser.
+     This template always renders when web.enabled, unlike the ingress. */ -}}
+{{- if and .Values.web.enabled (not .Values.web.publicOrigins) -}}
+{{- fail "web.enabled=true requires web.publicOrigins: list the browser-visible origins of this deployment (scheme, host and port, matched whole), e.g. --set-string 'web.publicOrigins[0]=https://trawl.example.com'. It is never derived from ingress hosts or httpRoute hostnames." -}}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -171,6 +178,11 @@ spec:
             # trawl_web nor the proxy's fleet_auth events.
             - name: RUST_LOG
               value: {{ .Values.web.logLevel | quote }}
+            # The browser-origin allowlist, also passed as an env var so a
+            # config.raw that replaces the generated TOML still carries it.
+            # trawl-web reads this in preference to [web] public_origins.
+            - name: FLEET_SESSION_PUBLIC_ORIGINS
+              value: {{ join "," .Values.web.publicOrigins | quote }}
             {{- with .Values.web.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -111,6 +111,12 @@ fn chart_defaults(key: &str, values_key: &str) -> Vec<String> {
         // Both DSN Secrets are `required`; the names are irrelevant here.
         .args(["--set", "auth.database.existingSecret=test-fleet-dsn"])
         .args(["--set", "storage.database.existingSecret=test-trawl-dsn"])
+        // The web sidecar refuses to render without a browser-origin
+        // allowlist (ADR-0016); the value is irrelevant here.
+        .args([
+            "--set-string",
+            "web.publicOrigins[0]=https://trawl.example.com",
+        ])
         .output();
     match rendered {
         Ok(out) => {
