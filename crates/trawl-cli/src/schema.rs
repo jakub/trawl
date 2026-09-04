@@ -306,6 +306,26 @@ pub async fn run_field<W: Write>(
         render_verdict(out, human, &resp.name, v)?;
     }
 
+    // A standing ack renders beside the verdict either way: suppressed
+    // means "acked and quiet", a verdict above it means new evidence
+    // re-raised the badge past the acknowledged high-water.
+    if let Some(ack) = &resp.ack {
+        label(
+            out,
+            human,
+            &format!(
+                "\nacknowledged: through episode {} by {} at {}{}",
+                ack.evidence_through,
+                trawl_core::sanitize::sanitize_display_text(&ack.acked_by),
+                ack.acked_at,
+                match &ack.note {
+                    Some(n) => format!(" ({})", trawl_core::sanitize::sanitize_display_text(n)),
+                    None => String::new(),
+                }
+            ),
+        )?;
+    }
+
     label(out, human, "\nservices:")?;
     let (columns, rows) = field_services_to_rows(&resp);
     render(out, &columns, &rows, format)?;
