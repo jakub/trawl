@@ -84,6 +84,46 @@ pub enum StoreError {
     RepinAlreadyRunning,
 }
 
+impl StoreError {
+    /// A closed-set class label for log events, mirroring
+    /// [`crate::error::ServerError::error_class`]'s rationale: the raw
+    /// Display of `Unavailable`/`Migration` embeds pg diagnostics, and a
+    /// `tracing` event on the persisted path lands in the retained
+    /// `service=trawld` corpus, so events log this class instead.
+    pub fn class(&self) -> &'static str {
+        match self {
+            // `Unavailable` absorbs every sqlx failure, so a flat label
+            // would be constant at exactly the call sites that swallow the
+            // error; the sqlx variant is a closed, content-free subtype.
+            Self::Unavailable(e) => match e {
+                sqlx::Error::PoolTimedOut => "unavailable_pool_timeout",
+                sqlx::Error::PoolClosed => "unavailable_pool_closed",
+                sqlx::Error::Io(_) => "unavailable_io",
+                sqlx::Error::Tls(_) => "unavailable_tls",
+                sqlx::Error::Database(_) => "unavailable_database",
+                sqlx::Error::RowNotFound => "unavailable_row_not_found",
+                sqlx::Error::ColumnNotFound(_)
+                | sqlx::Error::ColumnDecode { .. }
+                | sqlx::Error::ColumnIndexOutOfBounds { .. }
+                | sqlx::Error::TypeNotFound { .. }
+                | sqlx::Error::Decode(_) => "unavailable_decode",
+                sqlx::Error::Configuration(_) => "unavailable_configuration",
+                _ => "unavailable_other",
+            },
+            Self::Migration(_) => "migration",
+            Self::LockHeld => "lock_held",
+            Self::DuplicateName { .. } => "duplicate_name",
+            Self::ScheduleExists { .. } => "schedule_exists",
+            Self::NotFound { .. } => "not_found",
+            Self::Validation(_) => "validation",
+            Self::InvalidInterval { .. } => "invalid_interval",
+            Self::IntervalTooShort { .. } => "interval_too_short",
+            Self::InvalidName { .. } => "invalid_name",
+            Self::RepinAlreadyRunning => "repin_already_running",
+        }
+    }
+}
+
 /// A named-constraint violation classified from a postgres error.
 ///
 /// The `(SQLSTATE, constraint name)` pairs here are the single source of

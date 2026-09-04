@@ -160,6 +160,21 @@ impl Harness {
         panic!("repin job {id} did not reach a terminal state in time");
     }
 
+    /// Poll until the `data/REPIN` marker is gone. On the SUCCESS path the
+    /// row terminalizes inside `finish_cutover`'s transaction while the
+    /// detached task is still sweeping staging, so `wait_terminal` is not a
+    /// barrier for filesystem cleanup; the marker is removed last (it is
+    /// what licenses deleting the staging roots), so its absence is.
+    async fn wait_cleanup(&self) {
+        for _ in 0..600 {
+            if !trawl_server::repin::marker_path(&self.data_dir).exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("repin marker still present after cleanup budget");
+    }
+
     /// The type `/api/v1/schema` advertises for a field, read off the
     /// TTL-cached column listing. [`Harness::pinned_type`] reads
     /// `/schema/fields`, which has no cache in front of it.
@@ -1840,4 +1855,889 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
          HISTORY only"
     );
     assert_eq!(h.count("level=error last=1h | stats count()").await, 2);
+}
+
+// -- cancellation (#109) -----------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use trawl_client::RepinCancel;
+use trawl_client::RepinJobResponse;
+use trawl_server::repin::engine::{
+    TEST_FORCE_REFUSAL_REACHED, TEST_HOLD_AFTER_NO_RETURN, TEST_HOLD_AFTER_PROGRESS,
+    TEST_HOLD_AT_FORCE_REFUSAL, TEST_HOLD_IN_SCAN, TEST_PAST_NO_RETURN, TEST_PROGRESS_PUBLISHED,
+    TEST_RELEASE_CUTOVER, TEST_RELEASE_FORCE_REFUSAL, TEST_RELEASE_JOB, TEST_RELEASE_SCAN,
+    TEST_SCAN_HELD,
+};
+use trawl_server::store::{RepinJob, RepinJobStatus};
+
+/// Bounded wait for a barrier the engine publishes. It proves nothing on
+/// its own: it turns "the job reached that point" into an ordering the
+/// assertions after it can stand on, and fails loudly rather than letting a
+/// test proceed past a barrier that was never reached.
+async fn await_barrier(flag: &AtomicBool, what: &str) {
+    for _ in 0..600 {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{what}");
+}
+
+/// Every live file under the data root, as (relative path, length, content
+/// hash). The corpus a cancelled job must leave exactly as it found it.
+fn corpus_digest(data_dir: &std::path::Path) -> std::collections::BTreeMap<String, (u64, u64)> {
+    use std::hash::{Hash as _, Hasher as _};
+
+    walk(data_dir)
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).expect("read a corpus file");
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            let rel = path
+                .strip_prefix(data_dir)
+                .expect("a corpus path under the data root")
+                .display()
+                .to_string();
+            (rel, (bytes.len() as u64, hasher.finish()))
+        })
+        .collect()
+}
+
+/// One labelled counter's value out of a scrape body.
+fn counter_value(scrape: &str, name: &str, labels: &str) -> Option<f64> {
+    let prefix = format!("{name}{{{labels}}}");
+    scrape.lines().find_map(|line| {
+        let rest = line.strip_prefix(&prefix)?.strip_prefix(' ')?;
+        rest.trim().parse().ok()
+    })
+}
+
+impl Harness {
+    async fn repin_row(&self, id: i64) -> RepinJob {
+        self.server
+            .state
+            .storage
+            .repin
+            .get(id)
+            .await
+            .expect("job row")
+            .expect("job")
+    }
+
+    /// Wait for the detached request path to record the cancel on the job
+    /// row, and return the instant it wrote. Bounded.
+    async fn await_cancel_request(&self, id: i64) -> chrono::DateTime<chrono::Utc> {
+        for _ in 0..600 {
+            if let Some(at) = self.repin_row(id).await.cancel_requested_at {
+                return at;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the cancel request never reached the job row");
+    }
+
+    /// Run retention the way trawld runs it (a spawned loop on a one-second
+    /// tick), and wait for a tick to publish the suppression gauge. The
+    /// gauge is 1 for every tick that stands down, so a stranded marker or
+    /// staging root shows up here as a timeout rather than a pass.
+    async fn await_retention_gauge(&self) -> f64 {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let _retention = trawl_server::retention::spawn_retention(
+            self.data_dir.clone(),
+            trawl_server::config::RetentionConfig {
+                max_age_days: 90,
+                min_free_disk_bytes: 0,
+                retention_interval_secs: 1,
+            },
+            rx,
+        );
+        for _ in 0..200 {
+            if let Some(value) = gauge_value(
+                &scrape_metrics(&self.server.url).await,
+                trawl_server::metrics::RETENTION_SUPPRESSED,
+            ) {
+                return value;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("retention never published its suppression gauge");
+    }
+}
+
+/// AC1: a cancel mid-build stops the job at the next file boundary and
+/// leaves nothing behind: no staging, no marker, and a corpus identical
+/// byte for byte to the one the job started from.
+///
+/// Held at the build's first published progress, so "mid-build" is an
+/// ordering rather than a hope: the shadow generation exists, the marker is
+/// on disk, and the job cannot terminalize until this test releases it.
+/// The second cancel is the idempotence check. A repeat is accepted, and
+/// the row still names the first request, timestamp included.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one cancel, and everything it must leave alone
+async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
+    let h = harness().await;
+    for svc in ["api", "web", "worker"] {
+        h.ingest_and_compact(&[
+            event(svc, &json!({"status": 200})),
+            event(svc, &json!({"status": 404})),
+        ])
+        .await;
+    }
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+    let before = corpus_digest(&h.data_dir);
+    assert!(before.len() >= 3, "a multi-file corpus: {before:?}");
+
+    TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
+    TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
+    TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+
+    let started = match h
+        .schema_admin
+        .schema_repin("status", "VARCHAR", None, false, false)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    await_barrier(
+        &TEST_PROGRESS_PUBLISHED,
+        "the build never published progress",
+    )
+    .await;
+
+    // Mid-build means there is something to unwind: the shadow generation
+    // and the marker that licenses its deletion both exist right now.
+    assert!(trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(trawl_server::repin::marker_path(&h.data_dir).exists());
+
+    let receipt = match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
+        RepinCancel::Cancelling(body) => body,
+        other => panic!("expected an accepted cancel, got {other:?}"),
+    };
+    assert!(
+        receipt
+            .detail
+            .contains(trawl_server::repin::CANCEL_LATENCY_CONTRACT),
+        "the 202 tells the operator what accepted means: {}",
+        receipt.detail
+    );
+    assert_eq!(
+        receipt.job.as_ref().map(|j| j.id),
+        Some(started.id),
+        "the receipt names the job it stopped"
+    );
+    let requested_at = h.await_cancel_request(started.id).await;
+
+    // Idempotent: a second asker is accepted and changes nothing.
+    match h
+        .schema_admin
+        .schema_repin_cancel()
+        .await
+        .expect("second cancel")
+    {
+        RepinCancel::Cancelling(_) => {}
+        other => panic!("a repeat request is accepted, got {other:?}"),
+    }
+
+    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "cancelled", "error: {:?}", done.error);
+    assert_eq!(done.cancelled_by.as_deref(), Some("schema-admin-key"));
+    assert!(done.cancel_requested_at.is_some());
+    let error = done.error.clone().expect("a cancelled row explains itself");
+    assert!(
+        error.contains("cancelled by schema-admin-key during build")
+            && error.contains("never touched"),
+        "{error}"
+    );
+    assert_eq!(
+        h.repin_row(started.id).await.cancel_requested_at,
+        Some(requested_at),
+        "neither the repeat request nor the effect site may restamp the first"
+    );
+
+    // Nothing staged survives, and the marker went with it.
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+
+    // The corpus is the one the job started from, file for file.
+    assert_eq!(corpus_digest(&h.data_dir), before);
+    assert_eq!(h.pinned_type("status").await, "BIGINT", "the pin stands");
+    assert_eq!(h.count("last=1h | stats count()").await, 6);
+    assert_eq!(h.count("status>=400 last=1h | stats count()").await, 3);
+
+    // Metered exactly once, under the outcome the operator asked for.
+    let scrape = scrape_metrics(&h.server.url).await;
+    assert_eq!(
+        counter_value(
+            &scrape,
+            trawl_server::metrics::CATALOG_REPIN_JOBS_TOTAL,
+            "outcome=\"cancelled\""
+        ),
+        Some(1.0),
+        "one cancelled job, one increment: {scrape}"
+    );
+    assert_eq!(
+        counter_value(
+            &scrape,
+            trawl_server::metrics::CATALOG_REPIN_JOBS_TOTAL,
+            "outcome=\"succeeded\""
+        ),
+        None,
+        "a cancelled job is not a completed one"
+    );
+
+    // And retention is free again: the sweep stands down for a marker or a
+    // staging root, and the cancel left neither.
+    let suppressed = h.await_retention_gauge().await;
+    assert!(
+        suppressed.abs() < f64::EPSILON,
+        "a cancelled job must not leave retention suppressed: {suppressed}"
+    );
+}
+
+/// AC2: a cancel during the mandatory scan stops at a file boundary, and
+/// the job terminalizes without ever publishing a plan or touching the
+/// disk. A dry run's own request answers 200 with the cancelled row, never
+/// a fourth status code, since 409 already means refused-needs-force.
+///
+/// The scan is HELD at its first file rather than merely slowed: a scan
+/// that finished first would record a plan, which is exactly what this
+/// asserts never happened.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
+    let h = harness().await;
+    let services = ["api", "web", "worker", "edge"];
+    for svc in services {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+
+    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
+    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
+    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+
+    let client = h.schema_admin.clone();
+    let dry = tokio::spawn(async move {
+        client
+            .schema_repin("status", "VARCHAR", None, true, false)
+            .await
+    });
+    await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
+
+    // A scan has staged nothing, so there is nothing on disk to unwind.
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+
+    match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
+        RepinCancel::Cancelling(_) => {}
+        other => panic!("expected an accepted cancel, got {other:?}"),
+    }
+    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+
+    let report = match dry
+        .await
+        .expect("join")
+        .expect("a cancelled dry run answers with its row, not an error")
+    {
+        // The 200 is shared with the dry-run report, and the client tells
+        // the two apart by the row's own status, so a cancelled job can
+        // never be printed as a plan.
+        RepinStart::Cancelled(job) => job,
+        other => panic!("expected the cancelled row, got {other:?}"),
+    };
+    assert_eq!(report.status, "cancelled");
+    assert_eq!(report.cancelled_by.as_deref(), Some("schema-admin-key"));
+    let error = report
+        .error
+        .clone()
+        .expect("a cancelled row explains itself");
+    assert!(error.contains("during scan"), "{error}");
+
+    // No plan: the counts are the row's zeros meaning "not measured", and
+    // `planned_at` is what says so.
+    let row = h.repin_row(report.id).await;
+    assert_eq!(row.planned_at, None, "no partial plan may be published");
+    assert_eq!(report.files_total, 0);
+    assert!(
+        report.files_total < u64::try_from(services.len()).unwrap(),
+        "the scan stopped short of the corpus"
+    );
+
+    // And the disk was never touched, before or after the stop.
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+}
+
+/// AC3: past the point of no return a cancel is refused, not queued. The
+/// job latched before the Cutover marker went down, so there is nothing
+/// left to unwind, and the refusal writes nothing to the row, because a
+/// request that took no effect must not read as one that did.
+///
+/// Held between the marker write and the first env swap, the window the
+/// refusal exists for; it is two renames wide in production, so a test
+/// aiming at it by timing would be asserting on its own scheduler.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_past_the_point_of_no_return_is_refused_and_the_job_completes() {
+    let h = harness().await;
+    h.ingest_and_compact(&[
+        event("api", &json!({"status": 200})),
+        event("api", &json!({"status": 404})),
+    ])
+    .await;
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+
+    TEST_PAST_NO_RETURN.store(false, Ordering::SeqCst);
+    TEST_RELEASE_CUTOVER.store(false, Ordering::SeqCst);
+    TEST_HOLD_AFTER_NO_RETURN.store(true, Ordering::SeqCst);
+
+    let started = match h
+        .schema_admin
+        .schema_repin("status", "VARCHAR", None, false, false)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    await_barrier(&TEST_PAST_NO_RETURN, "the job never reached its cutover").await;
+    assert!(trawl_server::repin::marker_path(&h.data_dir).exists());
+
+    // (No query is issued while the hold runs: the cutover holds every
+    // executor permit, and a query into it would wait, not fail. The cancel
+    // route reads postgres only.)
+    let receipt = match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
+        RepinCancel::PastPointOfNoReturn(body) => body,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(receipt.job.as_ref().map(|j| j.id), Some(started.id));
+    assert!(
+        receipt.detail.contains("point of no return"),
+        "{}",
+        receipt.detail
+    );
+    let refused = h.repin_row(started.id).await;
+    assert_eq!(
+        (refused.cancel_requested_at, refused.cancelled_by),
+        (None, None),
+        "a refused request leaves no trace on the row"
+    );
+
+    TEST_RELEASE_CUTOVER.store(true, Ordering::SeqCst);
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(done.cancel_requested_at, None);
+    assert_eq!(done.cancelled_by, None);
+
+    // Forward: the corpus is the new generation and the pin agrees.
+    assert_eq!(h.pinned_type("status").await, "VARCHAR");
+    assert_eq!(h.count("last=1h | stats count()").await, 2);
+    assert_eq!(h.count("status>=400 last=1h | stats count()").await, 1);
+    h.wait_cleanup().await;
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+}
+
+/// AC4: a process that dies between an accepted cancel request and any
+/// boundary observing it recovers as `failed`, never `cancelled`.
+///
+/// `cancelled` is a live-process word: it means a file boundary saw the
+/// request and the unwind actually ran. Recovery cannot know that, and it
+/// must not infer it from `cancel_requested_at`, so the request fields
+/// survive as the audit trail they are, beside a `failed` verdict.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_between_a_cancel_request_and_its_effect_recovers_as_failed() {
+    let h = harness().await;
+    h.ingest_and_compact(&[event("api", &json!({"status": 200}))])
+        .await;
+
+    let store = h.server.state.storage.repin.clone();
+    let claim = trawl_server::store::RepinClaim {
+        field: "status",
+        from_type: trawl_core::schema::CanonicalType::BigInt,
+        to_type: trawl_core::schema::CanonicalType::Varchar,
+        dialect: None,
+        dry_run: false,
+        force: false,
+        requested_by: Some("op"),
+    };
+    let job_id = store.claim(claim).await.expect("claim");
+    let requested = store
+        .record_cancel_request(job_id, "ops-key")
+        .await
+        .expect("record the request")
+        .expect("the running job takes it");
+    assert_eq!(requested.status, RepinJobStatus::Running);
+
+    // The crash state on disk: a building marker over a shadow generation
+    // the process never finished.
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let dir = data.join("prod/2026-01-01/10");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("svc.parquet"), b"old generation").unwrap();
+    let shadow = trawl_server::repin::shadow_root(&data);
+    std::fs::create_dir_all(shadow.join("prod/2026-01-01/10")).unwrap();
+    std::fs::write(
+        shadow.join("prod/2026-01-01/10/svc.parquet"),
+        b"half-written generation",
+    )
+    .unwrap();
+    trawl_server::repin::marker::write_marker(
+        &data,
+        &trawl_server::repin::RepinMarker {
+            job_id,
+            field: "status".to_owned(),
+            from_type: "BIGINT".to_owned(),
+            to_type: "VARCHAR".to_owned(),
+            phase: trawl_server::repin::RepinPhase::Building,
+        },
+    )
+    .unwrap();
+
+    // Both halves of boot recovery, in the order a boot runs them.
+    let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
+        .unwrap()
+        .expect("marker present");
+    assert_eq!(
+        recovered.action,
+        trawl_server::repin::recover::RecoveredAction::AbandonedBuild
+    );
+    trawl_server::repin::recover::reconcile_store(
+        &h.server.state.storage,
+        &h.server.state.query.field_catalog,
+        &data,
+        Some(recovered),
+    )
+    .await
+    .expect("store reconciliation");
+
+    let done = h.repin_row(job_id).await;
+    assert_eq!(
+        done.status,
+        RepinJobStatus::Failed,
+        "recovery may not infer `cancelled` from a request nothing acted on"
+    );
+    assert_eq!(done.cancel_requested_at, requested.cancel_requested_at);
+    assert_eq!(done.cancelled_by.as_deref(), Some("ops-key"));
+    assert_eq!(
+        std::fs::read(data.join("prod/2026-01-01/10/svc.parquet")).unwrap(),
+        b"old generation",
+        "the live corpus was never touched"
+    );
+    assert!(!shadow.exists(), "the disposable shadow is swept");
+    assert!(!trawl_server::repin::marker_path(&data).exists());
+
+    // The one-running slot is free: the next repin is claimed, not 409ed.
+    let next = store.claim(claim).await.expect("the slot is free again");
+    assert_ne!(next, job_id);
+}
+
+/// AC5: the audit trail an operator reads after the fact: the request, the
+/// effect (with the stage it landed in), and the refusal, plus the one event
+/// boot recovery must NOT emit.
+///
+/// One test rather than three: the capture layer is a global subscriber and
+/// only the first installer in a process wins, so the three paths have to
+/// share it.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // three cancel paths, one subscriber
+async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
+    use audit_capture::Capture;
+    use tracing_subscriber::prelude::*;
+
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone().with_filter(
+        tracing_subscriber::EnvFilter::new(trawl_server::telemetry::DEFAULT_LOG_FILTER),
+    ));
+    // Global, not thread-local: the engine runs on other tokio workers and
+    // on the blocking pool.
+    tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
+
+    let h = harness().await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+
+    // (1) A build-stage cancel: request, then effect.
+    TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
+    TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
+    TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+    let cancelled = match h
+        .schema_admin
+        .schema_repin("status", "VARCHAR", None, false, false)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    await_barrier(
+        &TEST_PROGRESS_PUBLISHED,
+        "the build never published progress",
+    )
+    .await;
+    match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
+        RepinCancel::Cancelling(_) => {}
+        other => panic!("expected an accepted cancel, got {other:?}"),
+    }
+    h.await_cancel_request(cancelled.id).await;
+    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    assert_eq!(h.wait_terminal(cancelled.id).await.status, "cancelled");
+
+    // The request event is written by a detached task (a cancel must not be
+    // split by a client disconnect), so it is waited for rather than
+    // assumed present the instant the 202 lands.
+    let requested = capture
+        .await_event("repin_cancel_requested")
+        .await
+        .expect("the accepted request is audited");
+    assert!(
+        requested.fields["actor"].contains("schema-admin-key"),
+        "{requested:?}"
+    );
+    assert_key_prefix(&requested, &h.server.schema_admin_prefix);
+    assert!(requested.fields["job_id"].contains(&cancelled.id.to_string()));
+
+    let effect = capture
+        .await_event("repin_cancelled")
+        .await
+        .expect("the effect site is audited");
+    assert!(
+        effect.fields["actor"].contains("schema-admin-key"),
+        "{effect:?}"
+    );
+    assert!(
+        effect.fields["stage"].contains("build"),
+        "the audit names where the cancel landed: {effect:?}"
+    );
+    assert_key_prefix(&effect, &h.server.schema_admin_prefix);
+
+    // (2) A refusal past the point of no return.
+    TEST_PAST_NO_RETURN.store(false, Ordering::SeqCst);
+    TEST_RELEASE_CUTOVER.store(false, Ordering::SeqCst);
+    TEST_HOLD_AFTER_NO_RETURN.store(true, Ordering::SeqCst);
+    let completing = match h
+        .schema_admin
+        .schema_repin("status", "VARCHAR", None, false, false)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    await_barrier(&TEST_PAST_NO_RETURN, "the job never reached its cutover").await;
+    match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
+        RepinCancel::PastPointOfNoReturn(_) => {}
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    TEST_RELEASE_CUTOVER.store(true, Ordering::SeqCst);
+    assert_eq!(h.wait_terminal(completing.id).await.status, "succeeded");
+    let refused = capture
+        .await_event("repin_cancel_refused")
+        .await
+        .expect("the refusal is audited");
+    assert!(refused.fields["actor"].contains("schema-admin-key"));
+    assert_key_prefix(&refused, &h.server.schema_admin_prefix);
+    assert!(refused.fields["job_id"].contains(&completing.id.to_string()));
+
+    // (3) Boot recovery over a crash-after-request state emits no
+    // `repin_cancelled`: nothing observed the request, so nothing may claim
+    // the unwind ran.
+    let effects_before = capture.count("repin_cancelled");
+    let store = h.server.state.storage.repin.clone();
+    let job_id = store
+        .claim(trawl_server::store::RepinClaim {
+            field: "status",
+            from_type: trawl_core::schema::CanonicalType::Varchar,
+            to_type: trawl_core::schema::CanonicalType::BigInt,
+            dialect: None,
+            dry_run: false,
+            force: true,
+            requested_by: Some("op"),
+        })
+        .await
+        .expect("claim");
+    store
+        .record_cancel_request(job_id, "ops-key")
+        .await
+        .expect("record the request");
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(data.join("prod/2026-01-01/10")).unwrap();
+    std::fs::write(data.join("prod/2026-01-01/10/svc.parquet"), b"old").unwrap();
+    trawl_server::repin::marker::write_marker(
+        &data,
+        &trawl_server::repin::RepinMarker {
+            job_id,
+            field: "status".to_owned(),
+            from_type: "VARCHAR".to_owned(),
+            to_type: "BIGINT".to_owned(),
+            phase: trawl_server::repin::RepinPhase::Building,
+        },
+    )
+    .unwrap();
+    let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
+        .unwrap()
+        .expect("marker present");
+    trawl_server::repin::recover::reconcile_store(
+        &h.server.state.storage,
+        &h.server.state.query.field_catalog,
+        &data,
+        Some(recovered),
+    )
+    .await
+    .expect("store reconciliation");
+    assert_eq!(
+        h.repin_row(job_id).await.status,
+        RepinJobStatus::Failed,
+        "the crash state recovers as failed"
+    );
+    assert_eq!(
+        capture.count("repin_cancelled"),
+        effects_before,
+        "recovery must not audit an effect no boundary observed"
+    );
+}
+
+/// Build a corpus whose pre-build scan is lossless and whose finished
+/// shadow is not: an all-numeric-text `dur` column under a VARCHAR pin,
+/// held at the build's first published progress so the test can compact a
+/// value BIGINT cannot read into the catch-up's path.
+///
+/// Returns the started job. The caller owns the release
+/// (`TEST_RELEASE_JOB`) and whatever barrier it wants next.
+async fn start_a_repin_the_finished_shadow_will_refuse(h: &Harness) -> RepinJobResponse {
+    // Pin VARCHAR on a text value, then retire the file that carried it:
+    // what is left is all numeric text, so the scan projects no loss.
+    h.ingest_and_compact(&[event("seed", &json!({"dur": "oops"}))])
+        .await;
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+    let seed = walk(&h.data_dir)
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "seed.parquet"))
+        .expect("seed.parquet exists");
+    std::fs::remove_file(&seed).unwrap();
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"dur": "12"}))])
+            .await;
+    }
+
+    TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
+    TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
+    TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+    let started = match h
+        .schema_admin
+        .schema_repin("dur", "BIGINT", None, false, false)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    await_barrier(
+        &TEST_PROGRESS_PUBLISHED,
+        "the build never published progress",
+    )
+    .await;
+
+    // The late loss, provably after pass 0's snapshot: catch-up folds it
+    // in and the finished shadow's gate refuses the cutover.
+    h.ingest_and_compact(&[event("api", &json!({"dur": "nope"}))])
+        .await;
+    started
+}
+
+/// R3-1: a cancel pending when the finished-shadow force refusal settles
+/// wins. The operator asked for a stop and got a 202; parking the job as
+/// `refused_needs_force` instead would be an accepted cancel silently
+/// ignored, and nothing latched a point of no return to justify it.
+///
+/// Both verdicts leave the corpus untouched, so nothing is at stake on
+/// disk. What is at stake is whether a 202 means anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_pending_at_the_force_refusal_takes_the_verdict() {
+    let h = harness().await;
+    let started = start_a_repin_the_finished_shadow_will_refuse(&h).await;
+
+    // Hold the job on its decided refusal, which is the only way to be
+    // inside the window this asserts on: last file boundary to settlement,
+    // microseconds wide when nothing holds it.
+    TEST_FORCE_REFUSAL_REACHED.store(false, Ordering::SeqCst);
+    TEST_RELEASE_FORCE_REFUSAL.store(false, Ordering::SeqCst);
+    TEST_HOLD_AT_FORCE_REFUSAL.store(true, Ordering::SeqCst);
+    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    await_barrier(
+        &TEST_FORCE_REFUSAL_REACHED,
+        "the finished shadow never refused the cutover",
+    )
+    .await;
+
+    match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
+        RepinCancel::Cancelling(_) => {}
+        other => panic!("a job short of its point of no return is cancellable, got {other:?}"),
+    }
+    TEST_RELEASE_FORCE_REFUSAL.store(true, Ordering::SeqCst);
+
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(
+        done.status, "cancelled",
+        "the accepted cancel outranks the refusal (error: {:?})",
+        done.error
+    );
+    assert_eq!(done.cancelled_by.as_deref(), Some("schema-admin-key"));
+    let error = done.error.clone().expect("a cancelled row explains itself");
+    assert!(
+        error.contains("cancelled by schema-admin-key during build"),
+        "{error}"
+    );
+
+    // The unwind ran either way: old pin, every row, no staging.
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+    assert_eq!(h.count("last=1h | stats count()").await, 3);
+    assert_eq!(
+        h.count("last=1h | where dur == \"nope\" | stats count()")
+            .await,
+        1
+    );
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+}
+
+/// The other side of R3-1: a refusal that settled first keeps its verdict,
+/// and the cancel that arrives afterwards is told there is nothing running
+/// (404). Arbitration decides one way or the other under the registry
+/// lock, so a late request cannot rewrite a settled row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_after_the_force_refusal_settled_finds_nothing_to_stop() {
+    let h = harness().await;
+    let started = start_a_repin_the_finished_shadow_will_refuse(&h).await;
+    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+
+    // A terminal row is written after settlement, so reading one is the
+    // ordering this needs: the refusal has already latched the registry.
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(
+        done.status, "refused_needs_force",
+        "loss that appeared after the scan still needs force (error: {:?})",
+        done.error
+    );
+
+    match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
+        RepinCancel::NoJobRunning(_) => {}
+        other => panic!("a settled job has no work left to stop, got {other:?}"),
+    }
+    let row = h.repin_row(started.id).await;
+    assert_eq!(row.status, RepinJobStatus::RefusedNeedsForce);
+    assert_eq!(
+        (row.cancel_requested_at, row.cancelled_by),
+        (None, None),
+        "a request that took no effect leaves no trace on the row"
+    );
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+}
+
+/// A tracing capture layer over the events this file asserts on.
+///
+/// Its own copy rather than a shared one: `tests/common` is compiled into
+/// every integration binary in the crate, and a helper only this file uses
+/// would be dead code in all the others.
+/// Every cancel audit event names the key prefix beside the display name
+/// (#109 review F3). The name is operator-chosen and can be reused or
+/// renamed; the prefix is what identifies the credential that acted, so an
+/// event carrying only the name cannot answer "which key was this".
+fn assert_key_prefix(event: &audit_capture::Captured, prefix: &str) {
+    let seen = event
+        .fields
+        .get("actor_key_prefix")
+        .unwrap_or_else(|| panic!("no actor_key_prefix on {event:?}"));
+    assert!(
+        seen.contains(prefix),
+        "expected the acting key's prefix {prefix:?} in {event:?}"
+    );
+}
+
+mod audit_capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// One captured event: its fields, stringified.
+    #[derive(Debug, Clone)]
+    pub struct Captured {
+        pub fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    pub struct Capture {
+        events: Arc<Mutex<Vec<Captured>>>,
+    }
+
+    impl Capture {
+        fn matching(&self, event_type: &str) -> Vec<Captured> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    e.fields
+                        .get("event_type")
+                        .is_some_and(|t| t.contains(event_type))
+                })
+                .cloned()
+                .collect()
+        }
+
+        /// How many of `event_type` have been captured so far.
+        pub fn count(&self, event_type: &str) -> usize {
+            self.matching(event_type).len()
+        }
+
+        /// The first `event_type` captured, waiting a bounded while for it:
+        /// the request audit is written by a detached task, so its arrival
+        /// is ordered after the 202 rather than with it.
+        pub async fn await_event(&self, event_type: &str) -> Option<Captured> {
+            for _ in 0..200 {
+                if let Some(found) = self.matching(event_type).into_iter().next() {
+                    return Some(found);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            None
+        }
+    }
+
+    struct Visitor<'a>(&'a mut BTreeMap<String, String>);
+
+    impl tracing::field::Visit for Visitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for Capture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut Visitor(&mut fields));
+            self.events.lock().unwrap().push(Captured { fields });
+        }
+    }
 }

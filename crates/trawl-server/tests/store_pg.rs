@@ -3175,9 +3175,11 @@ mod repin_store {
         assert!(matches!(err, StoreError::RepinAlreadyRunning));
 
         // A terminal job frees the slot.
-        s.finish(id, RepinJobStatus::Failed, Some("test"))
-            .await
-            .unwrap();
+        assert!(
+            s.finish_if_running(id, RepinJobStatus::Failed, Some("test"))
+                .await
+                .unwrap()
+        );
         s.claim(RepinClaim {
             field: "dur",
             from_type: CanonicalType::Varchar,
@@ -3455,9 +3457,11 @@ mod repin_store {
         )
         .await
         .unwrap();
-        s.finish(first, RepinJobStatus::Succeeded, None)
-            .await
-            .unwrap();
+        assert!(
+            s.finish_if_running(first, RepinJobStatus::Succeeded, None)
+                .await
+                .unwrap()
+        );
 
         let second = s
             .claim(RepinClaim {
@@ -3488,9 +3492,11 @@ mod repin_store {
             "the shadow's own ambiguity count supersedes the scan's"
         );
 
-        s.finish(second, RepinJobStatus::Blocked, Some("cutover starved"))
-            .await
-            .unwrap();
+        assert!(
+            s.finish_if_running(second, RepinJobStatus::Blocked, Some("cutover starved"))
+                .await
+                .unwrap()
+        );
         let latest = s.latest().await.unwrap().expect("newest terminal job");
         assert_eq!(latest.id, second);
         assert_eq!(latest.status, RepinJobStatus::Blocked);
@@ -3540,7 +3546,11 @@ mod repin_store {
         let job = s.get(id).await.unwrap().unwrap();
         assert_eq!(job.to_type, "SEVERITY");
         assert_eq!(job.dialect.as_deref(), Some("syslog"));
-        s.finish(id, RepinJobStatus::Succeeded, None).await.unwrap();
+        assert!(
+            s.finish_if_running(id, RepinJobStatus::Succeeded, None)
+                .await
+                .unwrap()
+        );
 
         // And back off the severity pin, which 0012's widened `from_type`
         // CHECK admits.
@@ -3559,9 +3569,11 @@ mod repin_store {
         let job = s.get(back).await.unwrap().unwrap();
         assert_eq!(job.from_type, "SEVERITY");
         assert_eq!(job.dialect, None);
-        s.finish(back, RepinJobStatus::Succeeded, None)
-            .await
-            .unwrap();
+        assert!(
+            s.finish_if_running(back, RepinJobStatus::Succeeded, None)
+                .await
+                .unwrap()
+        );
 
         // The scope CHECK, both directions: a severity target with no
         // dialect, and a dialect on any other target, are corruption the
@@ -3583,5 +3595,181 @@ mod repin_store {
         assert!(catalog.is_conformed().await.unwrap());
         catalog.clear_conformed().await.unwrap();
         assert!(!catalog.is_conformed().await.unwrap());
+    }
+
+    /// A claimed job to cancel, with nothing else asserted.
+    async fn claim_running(s: &RepinStore) -> i64 {
+        s.claim(RepinClaim {
+            field: "status",
+            from_type: CanonicalType::BigInt,
+            to_type: CanonicalType::Varchar,
+            dialect: None,
+            dry_run: false,
+            force: false,
+            requested_by: Some("key-1"),
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The cancel round trip: the request lands on the running row, the job
+    /// terminalizes `cancelled`, and both columns read back.
+    #[sqlx::test]
+    async fn a_cancelled_job_keeps_its_request_fields(pool: PgPool) {
+        let s = store(&pool);
+        let id = claim_running(&s).await;
+
+        let job = s
+            .record_cancel_request(id, "key-op")
+            .await
+            .unwrap()
+            .expect("a running job accepts the request");
+        assert_eq!(job.cancelled_by.as_deref(), Some("key-op"));
+        let requested_at = job.cancel_requested_at.expect("both halves are written");
+        assert_eq!(
+            job.status,
+            RepinJobStatus::Running,
+            "the request is not the effect"
+        );
+
+        assert!(
+            s.finish_if_running(
+                id,
+                RepinJobStatus::Cancelled,
+                Some("cancelled by key-op during build; the live corpus was never touched"),
+            )
+            .await
+            .unwrap()
+        );
+
+        let job = s.get(id).await.unwrap().unwrap();
+        assert_eq!(job.status, RepinJobStatus::Cancelled);
+        assert_eq!(job.cancelled_by.as_deref(), Some("key-op"));
+        assert_eq!(job.cancel_requested_at, Some(requested_at));
+        assert!(job.finished_at.is_some());
+    }
+
+    /// First writer wins: a second operator cancelling a job already
+    /// cancelling changes neither the actor nor the instant, so the audit
+    /// trail names the request that actually took effect. A request against
+    /// a terminal job is `None` — it lost the race with the job's own
+    /// ladder.
+    #[sqlx::test]
+    async fn a_second_cancel_request_preserves_the_first(pool: PgPool) {
+        let s = store(&pool);
+        let id = claim_running(&s).await;
+
+        let first = s
+            .record_cancel_request(id, "key-op")
+            .await
+            .unwrap()
+            .unwrap();
+        let second = s
+            .record_cancel_request(id, "key-other")
+            .await
+            .unwrap()
+            .expect("the job is still running");
+        assert_eq!(second.cancelled_by.as_deref(), Some("key-op"));
+        assert_eq!(second.cancel_requested_at, first.cancel_requested_at);
+
+        assert!(
+            s.finish_if_running(id, RepinJobStatus::Cancelled, Some("cancelled"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            s.record_cancel_request(id, "key-late")
+                .await
+                .unwrap()
+                .is_none(),
+            "a terminal job has nothing left to cancel"
+        );
+        let job = s.get(id).await.unwrap().unwrap();
+        assert_eq!(job.cancelled_by.as_deref(), Some("key-op"));
+    }
+
+    /// A terminal verdict is never rewritten: the second writer reports
+    /// `false` and the row keeps the first one's status, error and instant.
+    #[sqlx::test]
+    async fn finish_if_running_never_overwrites_a_terminal_row(pool: PgPool) {
+        let s = store(&pool);
+        let id = claim_running(&s).await;
+
+        // The request has to be on the row before the verdict: the
+        // migration refuses a `cancelled` status with no recorded asker.
+        s.record_cancel_request(id, "key-op")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            s.finish_if_running(id, RepinJobStatus::Cancelled, Some("cancelled by key-op"))
+                .await
+                .unwrap()
+        );
+        let after_first = s.get(id).await.unwrap().unwrap();
+
+        assert!(
+            !s.finish_if_running(id, RepinJobStatus::Succeeded, None)
+                .await
+                .unwrap(),
+            "the row is no longer running"
+        );
+        let after_second = s.get(id).await.unwrap().unwrap();
+        assert_eq!(after_second.status, RepinJobStatus::Cancelled);
+        assert_eq!(after_second.error.as_deref(), Some("cancelled by key-op"));
+        assert_eq!(after_second.finished_at, after_first.finished_at);
+    }
+
+    /// The crash state (migration 0014): a job whose cancel was requested
+    /// but never observed dies `running` and boot reconciliation fails it,
+    /// request fields and all. The constraints must admit that row —
+    /// `cancelled` is live-process-only, so recovery may not infer it from
+    /// a populated `cancel_requested_at`.
+    #[sqlx::test]
+    async fn a_failed_job_may_carry_cancel_request_fields(pool: PgPool) {
+        let s = store(&pool);
+        let id = claim_running(&s).await;
+        s.record_cancel_request(id, "key-op")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let failed = s.reconcile_orphans(None).await.unwrap();
+        assert_eq!(failed, 1);
+
+        let job = s.get(id).await.unwrap().unwrap();
+        assert_eq!(job.status, RepinJobStatus::Failed);
+        assert_eq!(job.cancelled_by.as_deref(), Some("key-op"));
+        assert!(job.cancel_requested_at.is_some());
+    }
+
+    /// The other direction of the same rule: `cancelled` without a recorded
+    /// request is a status nothing asked for, and the database refuses it
+    /// rather than storing a verdict with no author.
+    #[sqlx::test]
+    async fn cancelled_without_a_request_is_refused(pool: PgPool) {
+        let s = store(&pool);
+        let id = claim_running(&s).await;
+
+        let err = sqlx::query("UPDATE repin_jobs SET status = 'cancelled' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect_err("the CHECK refuses an unrequested cancellation");
+        assert!(
+            format!("{err}").contains("repin_jobs_cancelled_request_check"),
+            "unexpected error: {err}"
+        );
+
+        // And the paired CHECK: neither column stands alone.
+        let err = sqlx::query("UPDATE repin_jobs SET cancelled_by = 'key-op' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect_err("an actor with no instant is half a fact");
+        assert!(
+            format!("{err}").contains("repin_jobs_cancel_request_check"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -2090,6 +2090,43 @@ async fn repin_permission_matrix() {
     assert!(ingest.schema_repin_status().await.is_err());
 }
 
+/// Cancel is gated like the trigger, not like the status route: a
+/// `SchemaRead` key may watch a repin and may not stop one. With nothing
+/// running, an authorized ask is a 404 carrying the `no_job_running`
+/// verdict rather than an error envelope — the client decodes the status
+/// and the body's own outcome together, so both halves are asserted here.
+#[tokio::test(flavor = "multi_thread")]
+async fn repin_cancel_is_schema_write_gated_and_answers_when_idle() {
+    let server = setup().await;
+
+    for token in [&server.reader_token, &server.admin_token] {
+        let client = HttpClient::new_insecure(&server.url, token).unwrap();
+        let err = client
+            .schema_repin_cancel()
+            .await
+            .expect_err("cancel needs schema_write");
+        match err {
+            trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 401),
+            other => panic!("expected auth refusal, got {other:?}"),
+        }
+    }
+
+    let schema_admin = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
+    match schema_admin.schema_repin_cancel().await.unwrap() {
+        trawl_client::RepinCancel::NoJobRunning(receipt) => {
+            assert_eq!(
+                receipt.outcome,
+                trawl_client::RepinCancelOutcome::NoJobRunning
+            );
+            assert!(receipt.job.is_none(), "no job to attach: {receipt:?}");
+        }
+        other => panic!("expected no_job_running, got {other:?}"),
+    }
+    // Asking changed nothing: no job row was claimed by the refusal.
+    let status = schema_admin.schema_repin_status().await.unwrap();
+    assert!(status.job.is_none(), "a cancel claims no job");
+}
+
 /// Contract-typed fields, unknown target types and unpinned fields refuse
 /// with 400 before any job row exists — validation is side-effect-free.
 #[tokio::test(flavor = "multi_thread")]

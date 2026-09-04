@@ -1001,6 +1001,19 @@ pub struct RepinJobResponse {
     /// exactly when `requires_force` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_force_reason: Option<String>,
+    /// When an operator asked for this job to stop (ISO 8601 UTC), if any.
+    /// Written with `cancelled_by` and never overwritten, so it names the
+    /// first asker. A `running` row carrying it is a cancel in flight: the
+    /// job is walking to its next file boundary. A `failed` row carrying it
+    /// is the crash state — the process died between the request and any
+    /// boundary observing it, and recovery may not infer `cancelled` from a
+    /// request nothing acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_requested_at: Option<String>,
+    /// Display name of the key that asked. Same identity source as
+    /// `requested_by`, so the row is coherent about who did what.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_by: Option<String>,
 }
 
 /// Evidence that a repin's subject is still being written.
@@ -1033,6 +1046,40 @@ pub struct RepinResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepinStatusResponse {
     /// The job, or `None` when no repin has ever run.
+    pub job: Option<RepinJobResponse>,
+}
+
+/// What `POST /api/v1/schema/repin/cancel` answered (#109).
+///
+/// The three variants are exclusive because the server decides them under
+/// one lock: a job is either still stoppable, past the point where there is
+/// anything left to unwind, or absent. The HTTP status carries the same
+/// verdict (202 / 409 / 404), and a client that reads both must find them
+/// agreeing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepinCancelOutcome {
+    /// The request is accepted. The job stops at its next file boundary.
+    Cancelling,
+    /// The job latched its point of no return first: the corpus is being
+    /// swapped and the job will complete. Not queued for later.
+    PastPointOfNoReturn,
+    /// No repin job is running on this node.
+    NoJobRunning,
+}
+
+/// Response body for `POST /api/v1/schema/repin/cancel`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepinCancelResponse {
+    /// The verdict, mirroring the HTTP status.
+    pub outcome: RepinCancelOutcome,
+    /// The verdict in words. The accepted one quotes the latency contract:
+    /// what "cancelling" promises, and what it does not.
+    pub detail: String,
+    /// The job the verdict is about, when there is one. Absent for
+    /// `no_job_running`, and absent when the store could not be read — a
+    /// row this handler failed to fetch never changes the verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<RepinJobResponse>,
 }
 
