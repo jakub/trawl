@@ -61,10 +61,19 @@ ALTER TABLE schedules ALTER COLUMN next_fire_at SET NOT NULL;
 ALTER TABLE schedules
     ADD CONSTRAINT schedules_window_kind CHECK (
         window_kind IS NULL OR window_kind IN ('since_last', 'fixed')),
+    -- Written as a CASE so every branch is TRUE or FALSE, never NULL. A
+    -- CHECK accepts NULL, so the obvious OR-of-arms spelling has a hole:
+    -- for (window_kind NULL, window_secs 60) the fixed arm evaluates
+    -- NULL = 'fixed' AND TRUE = NULL, the other arms are FALSE, and
+    -- FALSE OR FALSE OR NULL is NULL. The row would be stored with a span
+    -- and no mode, which no decoder can read back.
     ADD CONSTRAINT schedules_window_shape CHECK (
-         (window_kind IS NULL AND window_secs IS NULL)
-      OR (window_kind = 'since_last' AND window_secs IS NULL)
-      OR (window_kind = 'fixed' AND window_secs IS NOT NULL AND window_secs >= 60)),
+        CASE WHEN window_kind IS NULL         THEN window_secs IS NULL
+             WHEN window_kind = 'since_last'  THEN window_secs IS NULL
+             WHEN window_kind = 'fixed'       THEN window_secs IS NOT NULL
+                                                   AND window_secs >= 60
+             ELSE FALSE
+        END),
     ADD CONSTRAINT schedules_lag_nonneg CHECK (lag_secs >= 0);
 
 ALTER TABLE report_runs
@@ -76,6 +85,12 @@ ALTER TABLE report_runs
 -- The four columns are one fact: a run either carries a half-open window
 -- claimed under a named mode, or carries none. A partial bound would be a
 -- window nothing can read.
+--
+-- A CASE here for the same reason as `schedules_window_shape`: every branch
+-- has to be TRUE or FALSE. `window_start < window_end` is the one predicate
+-- that can be NULL, so it sits last in the ELSE branch, behind the three
+-- IS NOT NULL tests. A FALSE from any of those makes the AND chain FALSE
+-- whatever follows, so the comparison is only reached with two real bounds.
 ALTER TABLE report_runs
     ADD CONSTRAINT report_runs_window_kind CHECK (
         window_kind IS NULL OR window_kind IN ('since_last', 'fixed')),

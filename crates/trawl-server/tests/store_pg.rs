@@ -538,6 +538,19 @@ async fn schedule_update_other_user_not_found(pool: PgPool) {
 // schedule windows (ADR-0018 rulings 6-14)
 // ---------------------------------------------------------------------------
 
+/// The (SQLSTATE, constraint name) pair of a rejected write. Constraint
+/// tests assert on this rather than on message text, the same way the
+/// store's own error mapping does.
+fn violation(e: sqlx::Error) -> (Option<String>, Option<String>) {
+    match e {
+        sqlx::Error::Database(db) => (
+            db.code().map(|c| c.to_string()),
+            db.constraint().map(str::to_owned),
+        ),
+        other => panic!("expected a database error, got {other:?}"),
+    }
+}
+
 /// Read a schedule's raw cursor columns, bypassing the decoder.
 async fn raw_cursors(
     pool: &PgPool,
@@ -1058,6 +1071,67 @@ async fn fixed_and_legacy_schedules_keep_no_watermark(pool: PgPool) {
     }
 }
 
+/// A CHECK accepts NULL as readily as TRUE, so a shape constraint written
+/// as an OR of arms has a hole wherever an arm can evaluate to NULL.
+///
+/// `(window_kind NULL, window_secs 60)` was that hole: the fixed arm read
+/// `NULL = 'fixed' AND TRUE`, which is NULL, the other arms were FALSE, and
+/// the constraint let a span with no mode through. Every arm is a CASE
+/// branch now, and these are the writes that used to land.
+#[sqlx::test]
+async fn window_shape_rejects_null_kind_with_span(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "two-valued").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+
+    let expected = (
+        Some("23514".to_owned()),
+        Some("schedules_window_shape".to_owned()),
+    );
+
+    // A span with no mode.
+    let err =
+        sqlx::query("UPDATE schedules SET window_kind = NULL, window_secs = 60 WHERE id = $1")
+            .bind(sched.id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert_eq!(violation(err), expected, "a span with no mode");
+
+    // Its mirror: a mode that needs a span, with none.
+    let err =
+        sqlx::query("UPDATE schedules SET window_kind = 'fixed', window_secs = NULL WHERE id = $1")
+            .bind(sched.id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert_eq!(violation(err), expected, "fixed with no span");
+
+    // The run side has the same obligation: bounds with no claim-time mode.
+    let err = sqlx::query(
+        "INSERT INTO report_runs
+             (schedule_id, saved_query_id, query, status, started_at,
+              window_start, window_end, window_truncated)
+         VALUES ($1, $2, 'q', 'error', now(), now() - INTERVAL '1 hour', now(), FALSE)",
+    )
+    .bind(sched.id)
+    .bind(sq_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        violation(err),
+        (
+            Some("23514".to_owned()),
+            Some("report_runs_window_shape".to_owned())
+        ),
+        "a run window with no mode"
+    );
+}
+
 /// The named CHECKs are the backstop under the typed API: a partial run
 /// window and a `fixed` schedule with no span are both unwritable.
 #[sqlx::test]
@@ -1069,14 +1143,6 @@ async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
         .create_schedule(sq_id, 1, 300, None, None, 0, now)
         .await
         .unwrap();
-
-    let constraint_of = |e: sqlx::Error| match e {
-        sqlx::Error::Database(db) => (
-            db.code().map(|c| c.to_string()),
-            db.constraint().map(str::to_owned),
-        ),
-        other => panic!("expected a database error, got {other:?}"),
-    };
 
     // window_start with no end/truncated.
     let err = sqlx::query(
@@ -1090,7 +1156,7 @@ async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
     .await
     .unwrap_err();
     assert_eq!(
-        constraint_of(err),
+        violation(err),
         (
             Some("23514".to_owned()),
             Some("report_runs_window_shape".to_owned())
@@ -1110,7 +1176,7 @@ async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
     .await
     .unwrap_err();
     assert_eq!(
-        constraint_of(err),
+        violation(err),
         (
             Some("23514".to_owned()),
             Some("report_runs_window_shape".to_owned())
@@ -1124,7 +1190,7 @@ async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
         .await
         .unwrap_err();
     assert_eq!(
-        constraint_of(err),
+        violation(err),
         (
             Some("23514".to_owned()),
             Some("schedules_window_shape".to_owned())
@@ -1139,7 +1205,7 @@ async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
             .await
             .unwrap_err();
     assert_eq!(
-        constraint_of(err),
+        violation(err),
         (
             Some("23514".to_owned()),
             Some("schedules_window_shape".to_owned())
