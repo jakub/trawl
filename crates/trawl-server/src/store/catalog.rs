@@ -466,6 +466,121 @@ fn bump_rejected(reason: &'static str, count: usize) {
     .increment(count as u64);
 }
 
+/// The whole of [`CatalogStore::record_conflicts`], inside a transaction the
+/// caller owns: append the evidence rows, trim every touched field back to
+/// `conflict_cap`, upsert the durable `field_conflict_stats` aggregates.
+///
+/// It commits nothing. Compaction's own bookkeeping wants a transaction per
+/// batch and gets one from `record_conflicts`; the repin cutover has to write
+/// this evidence in the SAME transaction that flips the pin, so that the read
+/// which first sees `succeeded` also sees the conflicts the repin caused
+/// (issue #137). Two writers of `field_conflicts` would be two answers to
+/// "what does the trim measure" and two chances to forget the aggregates, so
+/// there is one body and two entry points.
+pub(super) async fn record_conflicts_in(
+    tx: &mut sqlx::PgConnection,
+    conflicts: &[FieldConflict],
+    conflict_cap: i64,
+) -> Result<(), StoreError> {
+    let fields: Vec<&str> = conflicts.iter().map(|c| c.field.as_str()).collect();
+    let services: Vec<&str> = conflicts.iter().map(|c| c.service.as_str()).collect();
+    let observed: Vec<&str> = conflicts.iter().map(|c| c.observed_type.as_str()).collect();
+    let expected: Vec<&str> = conflicts
+        .iter()
+        .map(|c| c.expected_type.as_catalog())
+        .collect();
+    let nulled: Vec<i64> = conflicts
+        .iter()
+        .map(|c| i64::try_from(c.rows_nulled).unwrap_or(i64::MAX))
+        .collect();
+    // `TEXT[][]` has no sqlx binding (postgres multidimensional arrays
+    // must be rectangular, and these rows are not), so the per-row sample
+    // sets ride as JSON and are unnested back to arrays in the statement.
+    let samples: Vec<String> = conflicts
+        .iter()
+        .map(|c| serde_json::to_string(&c.samples).unwrap_or_else(|_| "[]".to_owned()))
+        .collect();
+
+    sqlx::query(
+        "INSERT INTO field_conflicts
+             (field, service, observed_type, expected_type, rows_nulled, samples)
+         SELECT f, s, o, e, n, ARRAY(SELECT jsonb_array_elements_text(j::jsonb))
+         FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[],
+                     $6::text[]) AS t(f, s, o, e, n, j)",
+    )
+    .bind(&fields)
+    .bind(&services)
+    .bind(&observed)
+    .bind(&expected)
+    .bind(&nulled)
+    .bind(&samples)
+    .execute(&mut *tx)
+    .await?;
+
+    // The trim runs as its own statement rather than a CTE beside the
+    // insert: CTEs of one statement share its snapshot, so a ranking
+    // CTE cannot see the rows the insert alongside it just wrote —
+    // which is precisely the set the window has to rank.
+    sqlx::query(
+        "DELETE FROM field_conflicts c
+         USING (
+             SELECT id, row_number() OVER (
+                 PARTITION BY field ORDER BY at DESC, id DESC
+             ) AS rn
+             FROM field_conflicts WHERE field = ANY($1)
+         ) ranked
+         WHERE c.id = ranked.id AND ranked.rn > $2",
+    )
+    .bind(&fields)
+    .bind(conflict_cap)
+    .execute(&mut *tx)
+    .await?;
+
+    // The durable aggregates the trim above must not be able to erase.
+    //
+    // The GROUP BY is not an optimisation: postgres refuses to let one
+    // `ON CONFLICT DO UPDATE` touch a row twice, and the boot conformance
+    // pass accumulates conflicts across every file it rewrites, so one
+    // call routinely carries many rows for the same `(field, service)`.
+    // Pre-aggregating in the statement makes a call of N such rows one
+    // upsert of N episodes: the same hazard `backfill_services` avoids
+    // by aggregating in its caller, answered here in SQL because this
+    // caller's rows are the evidence and may not be collapsed.
+    //
+    // At-least-once, not exactly-once: the bookkeeping caller retries a
+    // transaction whose COMMIT ACK was lost, and this upsert would then
+    // add the same episodes and rows a second time. Accepted rather than
+    // carried on an idempotency key: the consequence is bounded to a
+    // slightly early or spurious badge on a field that is conflicting,
+    // and the remedy it points at (a dry run) is free and reversible.
+    //
+    // `last_at` is `now()`, not `GREATEST(existing, now())`: it is the
+    // transaction's own clock, which cannot run backwards against a row
+    // this same statement is the only writer of. `first_at` is left
+    // untouched on conflict for the mirror-image reason: the row's
+    // existing value is by construction the earliest evidence there is
+    // (migration 0009's backfill included).
+    sqlx::query(
+        "INSERT INTO field_conflict_stats
+             (field, service, episodes, rows_nulled_total)
+         SELECT f, s, count(*)::bigint, COALESCE(sum(n), 0)::bigint
+         FROM UNNEST($1::text[], $2::text[], $3::bigint[]) AS t(f, s, n)
+         GROUP BY f, s
+         ON CONFLICT (field, service) DO UPDATE
+         SET last_at           = now(),
+             episodes          = field_conflict_stats.episodes + EXCLUDED.episodes,
+             rows_nulled_total = field_conflict_stats.rows_nulled_total
+                                 + EXCLUDED.rows_nulled_total",
+    )
+    .bind(&fields)
+    .bind(&services)
+    .bind(&nulled)
+    .execute(&mut *tx)
+    .await?;
+
+    Ok(())
+}
+
 /// Postgres-backed field catalog. Cheap to clone (shared pool).
 #[derive(Debug, Clone)]
 pub struct CatalogStore {
@@ -826,108 +941,16 @@ impl CatalogStore {
     /// the window overfull, a failed trim never leaves the insert behind, and
     /// no episode is ever counted in the aggregates without its evidence row
     /// (or the reverse).
+    ///
+    /// This is the entry point that owns that transaction. The statements
+    /// themselves are [`record_conflicts_in`], which a caller with a
+    /// transaction of its own calls directly.
     pub async fn record_conflicts(&self, conflicts: &[FieldConflict]) -> Result<(), StoreError> {
         if conflicts.is_empty() {
             return Ok(());
         }
-        let fields: Vec<&str> = conflicts.iter().map(|c| c.field.as_str()).collect();
-        let services: Vec<&str> = conflicts.iter().map(|c| c.service.as_str()).collect();
-        let observed: Vec<&str> = conflicts.iter().map(|c| c.observed_type.as_str()).collect();
-        let expected: Vec<&str> = conflicts
-            .iter()
-            .map(|c| c.expected_type.as_catalog())
-            .collect();
-        let nulled: Vec<i64> = conflicts
-            .iter()
-            .map(|c| i64::try_from(c.rows_nulled).unwrap_or(i64::MAX))
-            .collect();
-        // `TEXT[][]` has no sqlx binding (postgres multidimensional arrays
-        // must be rectangular, and these rows are not), so the per-row sample
-        // sets ride as JSON and are unnested back to arrays in the statement.
-        let samples: Vec<String> = conflicts
-            .iter()
-            .map(|c| serde_json::to_string(&c.samples).unwrap_or_else(|_| "[]".to_owned()))
-            .collect();
-
         let mut tx = self.pool.begin().await?;
-
-        sqlx::query(
-            "INSERT INTO field_conflicts
-                 (field, service, observed_type, expected_type, rows_nulled, samples)
-             SELECT f, s, o, e, n, ARRAY(SELECT jsonb_array_elements_text(j::jsonb))
-             FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[],
-                         $6::text[]) AS t(f, s, o, e, n, j)",
-        )
-        .bind(&fields)
-        .bind(&services)
-        .bind(&observed)
-        .bind(&expected)
-        .bind(&nulled)
-        .bind(&samples)
-        .execute(&mut *tx)
-        .await?;
-
-        // The trim runs as its own statement rather than a CTE beside the
-        // insert: CTEs of one statement share its snapshot, so a ranking
-        // CTE cannot see the rows the insert alongside it just wrote —
-        // which is precisely the set the window has to rank.
-        sqlx::query(
-            "DELETE FROM field_conflicts c
-             USING (
-                 SELECT id, row_number() OVER (
-                     PARTITION BY field ORDER BY at DESC, id DESC
-                 ) AS rn
-                 FROM field_conflicts WHERE field = ANY($1)
-             ) ranked
-             WHERE c.id = ranked.id AND ranked.rn > $2",
-        )
-        .bind(&fields)
-        .bind(self.conflict_cap)
-        .execute(&mut *tx)
-        .await?;
-
-        // The durable aggregates the trim above must not be able to erase.
-        //
-        // The GROUP BY is not an optimisation: postgres refuses to let one
-        // `ON CONFLICT DO UPDATE` touch a row twice, and the boot conformance
-        // pass accumulates conflicts across every file it rewrites, so one
-        // call routinely carries many rows for the same `(field, service)`.
-        // Pre-aggregating in the statement makes a call of N such rows one
-        // upsert of N episodes: the same hazard `backfill_services` avoids
-        // by aggregating in its caller, answered here in SQL because this
-        // caller's rows are the evidence and may not be collapsed.
-        //
-        // At-least-once, not exactly-once: the bookkeeping caller retries a
-        // transaction whose COMMIT ACK was lost, and this upsert would then
-        // add the same episodes and rows a second time. Accepted rather than
-        // carried on an idempotency key: the consequence is bounded to a
-        // slightly early or spurious badge on a field that is conflicting,
-        // and the remedy it points at (a dry run) is free and reversible.
-        //
-        // `last_at` is `now()`, not `GREATEST(existing, now())`: it is the
-        // transaction's own clock, which cannot run backwards against a row
-        // this same statement is the only writer of. `first_at` is left
-        // untouched on conflict for the mirror-image reason: the row's
-        // existing value is by construction the earliest evidence there is
-        // (migration 0009's backfill included).
-        sqlx::query(
-            "INSERT INTO field_conflict_stats
-                 (field, service, episodes, rows_nulled_total)
-             SELECT f, s, count(*)::bigint, COALESCE(sum(n), 0)::bigint
-             FROM UNNEST($1::text[], $2::text[], $3::bigint[]) AS t(f, s, n)
-             GROUP BY f, s
-             ON CONFLICT (field, service) DO UPDATE
-             SET last_at           = now(),
-                 episodes          = field_conflict_stats.episodes + EXCLUDED.episodes,
-                 rows_nulled_total = field_conflict_stats.rows_nulled_total
-                                     + EXCLUDED.rows_nulled_total",
-        )
-        .bind(&fields)
-        .bind(&services)
-        .bind(&nulled)
-        .execute(&mut *tx)
-        .await?;
-
+        record_conflicts_in(&mut tx, conflicts, self.conflict_cap).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1663,5 +1686,68 @@ mod tests {
         ] {
             assert!(ServiceCursor::decode(raw).is_none(), "{raw:?}");
         }
+    }
+}
+
+/// Transaction coverage for [`record_conflicts_in`], which no integration
+/// test can reach: it is crate-internal on purpose, so the only callers are
+/// the two entry points in this crate.
+#[cfg(test)]
+mod pg_tests {
+    use sqlx::PgPool;
+
+    use super::{CatalogStore, FieldConflict, MAX_CONFLICTS_PER_FIELD, record_conflicts_in};
+    use trawl_core::schema::CanonicalType;
+
+    /// The helper writes into the caller's transaction and commits nothing
+    /// of its own: a rollback takes the evidence rows AND the durable
+    /// aggregates with it. The repin cutover depends on exactly this, since
+    /// it materialises evidence in the transaction that flips the pin, and a
+    /// self-committing helper would leave conflicts behind for a flip that
+    /// never happened.
+    #[sqlx::test]
+    async fn record_conflicts_in_commits_nothing_of_its_own(pool: PgPool) {
+        let store = CatalogStore::new(pool.clone());
+        let conflict = FieldConflict {
+            field: "duration".to_owned(),
+            service: "svc-a".to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: 3,
+            samples: vec!["accepted".to_owned()],
+        };
+
+        let mut tx = pool.begin().await.unwrap();
+        record_conflicts_in(
+            &mut tx,
+            std::slice::from_ref(&conflict),
+            MAX_CONFLICTS_PER_FIELD,
+        )
+        .await
+        .unwrap();
+        let inside: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM field_conflicts WHERE field = 'duration'")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(inside, 1, "the rows are there inside the transaction");
+        tx.rollback().await.unwrap();
+
+        assert!(
+            store
+                .conflicts_for_field("duration")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rolled-back transaction leaves no evidence rows"
+        );
+        assert!(
+            store
+                .conflict_aggregates(Some(&["duration".to_owned()]))
+                .await
+                .unwrap()
+                .is_empty(),
+            "nor any durable aggregate"
+        );
     }
 }
