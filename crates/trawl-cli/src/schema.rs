@@ -1017,6 +1017,10 @@ pub async fn run_repin(
         .await?;
     let (verdict, job) = match outcome {
         trawl_client::RepinStart::Report(job) => ("dry run", job),
+        // The client separates a cancelled row from a report, so the
+        // verdict word is decided here rather than by sniffing the status
+        // string afterwards (#109).
+        trawl_client::RepinStart::Cancelled(job) => ("cancelled", job),
         trawl_client::RepinStart::Started(job) => ("started", job),
         trawl_client::RepinStart::Refused(job) => ("refused: needs --force", job),
     };
@@ -1028,7 +1032,8 @@ pub async fn run_repin(
     // A job someone cancelled while we waited did not do the work this
     // invocation asked for. Reading that as success is how a script goes on
     // to trust a rewrite that never happened, so it prints the row and then
-    // exits non-zero (#109).
+    // exits non-zero (#109). The immediate 200-cancelled arrives already
+    // decoded; this catches the one a `--wait` poll discovers.
     let cancelled = job.status == "cancelled";
     // Computed after the wait: a started job can still refuse at the
     // cutover gate when data ingested after the scan turns out to be
@@ -1037,8 +1042,8 @@ pub async fn run_repin(
 
     if format == OutputFormat::Table {
         // The status the row ended on outranks the verdict the start
-        // request carried: a job cancelled during its own ladder answers
-        // 200, which would otherwise be printed as "dry run".
+        // request carried: a job started here and cancelled while `--wait`
+        // polled it would otherwise still print as "started".
         let verdict = if cancelled { "cancelled" } else { verdict };
         writeln!(out, "repin {}: {verdict}", job.field)?;
     }

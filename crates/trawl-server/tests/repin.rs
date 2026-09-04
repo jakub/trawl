@@ -2144,8 +2144,11 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
         .expect("join")
         .expect("a cancelled dry run answers with its row, not an error")
     {
-        RepinStart::Report(job) => job,
-        other => panic!("expected the cancelled row as a report, got {other:?}"),
+        // The 200 is shared with the dry-run report, and the client tells
+        // the two apart by the row's own status, so a cancelled job can
+        // never be printed as a plan.
+        RepinStart::Cancelled(job) => job,
+        other => panic!("expected the cancelled row, got {other:?}"),
     };
     assert_eq!(report.status, "cancelled");
     assert_eq!(report.cancelled_by.as_deref(), Some("schema-admin-key"));

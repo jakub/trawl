@@ -29,6 +29,10 @@ use crate::types::{
 pub enum RepinStart {
     /// 200: a dry-run report (the job is terminal `succeeded`).
     Report(trawl_api::RepinJobResponse),
+    /// 200 with a `cancelled` row: an operator stopped the job while this
+    /// request's own ladder was still running it (#109). The corpus is
+    /// untouched and the pin unchanged, so this is never a report.
+    Cancelled(trawl_api::RepinJobResponse),
     /// 202: the rewrite is running; poll `schema_repin_status`.
     Started(trawl_api::RepinJobResponse),
     /// 409 with a job body: the scan projected nulled values and no force
@@ -485,8 +489,10 @@ impl HttpClient {
     ///
     /// The HTTP status carries the verdict, so this returns a three-way
     /// outcome instead of flattening 409-with-plan into an opaque error:
-    /// 200 = dry-run report, 202 = rewrite started, 409 with a job body =
-    /// lossy without force (the plan rides back). Every other failure —
+    /// 200 = dry-run report or a cancelled job, 202 = rewrite started, 409
+    /// with a job body = lossy without force (the plan rides back). The 200
+    /// pair is told apart by the row's own status, never by the code alone
+    /// (see [`decode_repin_start`]). Every other failure —
     /// including the "already running" 409, whose body is the error
     /// envelope — surfaces as [`ClientError::Server`].
     pub async fn schema_repin(
@@ -541,10 +547,7 @@ impl HttpClient {
             .json()
             .await
             .map_err(|e| ClientError::Parse(e.to_string()))?;
-        Ok(match status {
-            202 => RepinStart::Started(outcome.job),
-            _ => RepinStart::Report(outcome.job),
-        })
+        decode_repin_start(status, outcome.job)
     }
 
     /// Ask the running repin to stop
@@ -864,6 +867,35 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
 /// rewriting a status, or a version skew. Trusting either half silently
 /// would let a "202 accepted" be printed over a body that says nothing was
 /// running, so the mismatch is a protocol error instead.
+/// Decode a successful repin trigger response: the status code plus the
+/// job row's own status.
+///
+/// The status code alone is not the verdict on this route. A 200 carries
+/// either a dry-run report or a job an operator cancelled mid-ladder
+/// (#109), and those are opposite answers: one describes work that was
+/// measured, the other work that never happened. Reading the row's status
+/// is what tells them apart.
+///
+/// A 200 naming a `running` job contradicts the route's contract — both
+/// 200 shapes are terminal rows — so it is a protocol error rather than a
+/// report a caller would print as a plan. A 202 is left alone: the server
+/// reads the row back after spawning the rewrite, so a fast job can
+/// legitimately be terminal by the time it is serialised.
+fn decode_repin_start(
+    status: u16,
+    job: trawl_api::RepinJobResponse,
+) -> Result<RepinStart, ClientError> {
+    match (status, job.status.as_str()) {
+        (202, _) => Ok(RepinStart::Started(job)),
+        (_, "cancelled") => Ok(RepinStart::Cancelled(job)),
+        (_, "running") => Err(ClientError::Parse(format!(
+            "repin: HTTP {status} carried a job still marked running, which \
+             this route only answers with a terminal row"
+        ))),
+        _ => Ok(RepinStart::Report(job)),
+    }
+}
+
 fn decode_repin_cancel(
     status: u16,
     body: trawl_api::RepinCancelResponse,
@@ -1042,6 +1074,71 @@ mod tests {
         assert_eq!(resp.recent.len(), 1);
         assert_eq!(resp.recent[0].rows, Some(100));
         assert!(!resp.recent[0].timed_out);
+    }
+
+    // ── repin start decode (#109) ───────────────────────────────────────
+
+    fn start_job(status: &str) -> trawl_api::RepinJobResponse {
+        trawl_api::RepinJobResponse {
+            id: 1,
+            field: "status".to_owned(),
+            from_type: "BIGINT".to_owned(),
+            to_type: "VARCHAR".to_owned(),
+            dry_run: true,
+            force: false,
+            status: status.to_owned(),
+            requested_by: Some("ops".to_owned()),
+            started_at: "2026-09-03T10:00:00Z".to_owned(),
+            finished_at: None,
+            error: None,
+            files_total: 0,
+            rows_carrying: 0,
+            projected_nulls: 0,
+            resurrectable: 0,
+            affected_bytes: 0,
+            files_done: 0,
+            rows_rewritten: 0,
+            rows_nulled: 0,
+            rows_resurrected: 0,
+            dialect: None,
+            ambiguous_numerals: 0,
+            unmapped_samples: Vec::new(),
+            liveness: None,
+            requires_force: None,
+            requires_force_reason: None,
+            cancel_requested_at: None,
+            cancelled_by: None,
+        }
+    }
+
+    /// A 200 carrying a cancelled job is not a report. The two shapes share
+    /// a status code on purpose (409 already means refused-needs-force to a
+    /// body-sniffing decoder), so the row's own status is what separates
+    /// "here is your plan" from "somebody stopped this".
+    #[test]
+    fn a_cancelled_job_decodes_as_cancelled_not_as_a_report() {
+        assert!(matches!(
+            decode_repin_start(200, start_job("cancelled")),
+            Ok(RepinStart::Cancelled(_))
+        ));
+        assert!(matches!(
+            decode_repin_start(200, start_job("succeeded")),
+            Ok(RepinStart::Report(_))
+        ));
+        assert!(matches!(
+            decode_repin_start(202, start_job("running")),
+            Ok(RepinStart::Started(_))
+        ));
+    }
+
+    /// Both 200 shapes are terminal rows, so a 200 naming a running job is
+    /// a contract violation and stays an error instead of being printed as
+    /// a plan.
+    #[test]
+    fn a_running_job_under_a_200_is_a_protocol_error() {
+        let err = decode_repin_start(200, start_job("running"))
+            .expect_err("200 + running must not decode");
+        assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
     }
 
     // ── repin cancel decode (#109) ──────────────────────────────────────
