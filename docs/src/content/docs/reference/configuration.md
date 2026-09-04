@@ -288,7 +288,9 @@ free space, so disk pressure stays install-wide.
 fails the load instead of picking between "inherit the global" and "keep
 forever", which are opposite answers. The table also refuses unknown keys, so
 a misplaced `min_free_disk_bytes` inside it fails the load rather than being
-ignored.
+ignored. So does the whole `[retention]` section: `[retention.evn.prod]` is
+refused by name at load instead of loading, being discarded, and leaving prod
+on the global limit.
 
 Keys are held to the env charset `[a-z0-9_-]{1,32}` with `wal` and `scheduled`
 reserved, exactly as `ingest.envs` entries are, and a bad key is fatal at boot.

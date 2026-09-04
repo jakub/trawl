@@ -595,17 +595,40 @@ fn default_env_name() -> String {
 
 /// Data retention policy settings.
 ///
-/// Both policies are always-on with sensible defaults. Set either to 0
-/// to disable that specific policy. If both are 0, the retention task
-/// spawns but performs no deletions.
+/// Two independent policies, both always-on with defaults. Age retention
+/// deletes a date directory once it is older than the limit that applies
+/// to its env, which is the env's own `[retention.env.<name>]` entry when
+/// it has one and the global `max_age_days` otherwise. Disk-pressure
+/// retention is install-wide: below `min_free_disk_bytes` free, it deletes
+/// date directories one at a time until the volume is back over the
+/// threshold, taking the directory that has used up the largest fraction
+/// of its env's age limit first.
+///
+/// A 0 anywhere means "keep forever" for whatever it governs, never "the
+/// whole task is off": a global 0 with `[retention.env.prod] max_age_days
+/// = 30` still ages prod out, and an env whose own entry is 0 keeps its
+/// data past the global limit. A directory that no age limit will ever
+/// reach is still a disk-pressure candidate, ranked after everything that
+/// expires.
+///
+/// Unlike the rest of the config, this section refuses keys it does not
+/// know, and so does every `[retention.env.<name>]` table. Everywhere else
+/// a typo costs a setting that stays at its default. Here it costs data:
+/// `[retention.evn.prod] max_age_days = 365` would otherwise load, be
+/// discarded, and leave prod ageing out at the global limit while the
+/// operator reads their own config as keeping it a year.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
-    /// Delete date directories older than this many days. 0 = disabled.
+    /// Delete date directories older than this many days, for every env
+    /// without a `[retention.env.<name>]` entry of its own. 0 = those envs
+    /// keep their data forever.
     #[serde(default = "default_retention_max_age_days")]
     pub max_age_days: u64,
 
-    /// If free disk space drops below this many bytes, delete oldest
-    /// data first regardless of age. 0 = disabled.
+    /// If free disk space drops below this many bytes, delete date
+    /// directories regardless of age until it is back above, highest
+    /// expiry ratio (age over the env's limit) first. 0 = disabled.
     /// Accepts human-readable sizes like `"1G"`, `"500M"`.
     #[serde(
         default = "default_retention_min_free_disk_bytes",
@@ -2897,6 +2920,36 @@ min_free_disk_bytes = "1G"
         .expect_err("disk pressure is install-wide; no per-env knob exists")
         .to_string();
         assert!(err.contains("min_free_disk_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn retention_rejects_a_misspelled_sub_table_name() {
+        // The whole point of denying unknown keys here: `evn` parses as a
+        // perfectly valid table, and without the refusal the override is
+        // silently discarded while prod ages out at the global limit.
+        let err = config_with_retention(
+            r"
+max_age_days = 7
+
+[retention.evn.prod]
+max_age_days = 365
+",
+        )
+        .expect_err("a misspelled sub-table must not load")
+        .to_string();
+        assert!(err.contains("evn"), "got: {err}");
+    }
+
+    #[test]
+    fn retention_rejects_a_misspelled_scalar() {
+        let err = config_with_retention(
+            r"
+max_age_dayz = 7
+",
+        )
+        .expect_err("a misspelled scalar must not load")
+        .to_string();
+        assert!(err.contains("max_age_dayz"), "got: {err}");
     }
 
     #[test]
