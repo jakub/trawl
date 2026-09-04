@@ -2015,6 +2015,129 @@ async fn trigger_run_rejects_when_already_running() {
     }
 }
 
+/// Poll until `saved_id` has `n` finished runs, returning them newest first.
+///
+/// `trigger_run` returns as soon as the run row exists; the execution is a
+/// spawned task. Polling beats a fixed sleep: a slow machine gets more time,
+/// a fast one does not pay for it.
+async fn wait_for_finished_runs(
+    client: &HttpClient,
+    saved_id: i64,
+    n: usize,
+) -> Vec<trawl_api::ReportRunSummary> {
+    for _ in 0..100 {
+        let runs = client
+            .list_report_runs(saved_id, Some(10), None)
+            .await
+            .unwrap()
+            .runs;
+        if runs.len() >= n && runs.iter().all(|r| r.status != "running") {
+            return runs;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{n} finished runs never appeared for saved query {saved_id}");
+}
+
+/// ADR-0018 ruling 13, end to end: a report run that finds nothing is
+/// recorded with its result, is served by the run endpoint, and is the run
+/// `run=latest` answers from.
+///
+/// The old empty-result path wrote neither a parquet file nor a blob, and
+/// `run=latest` skipped runs with no file, so a report that had just gone
+/// quiet kept answering with the PREVIOUS run's rows. Nothing said the data
+/// was stale.
+#[tokio::test(flavor = "multi_thread")]
+async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // Run one has rows: the fixture corpus carries nginx events.
+    let saved = client
+        .create_saved("zero_row_report", "service=nginx | table service")
+        .await
+        .unwrap();
+    client
+        .set_schedule(saved.id, "1h", None, true, None, None)
+        .await
+        .unwrap();
+    client.trigger_run(saved.id).await.unwrap();
+    let first = wait_for_finished_runs(&client, saved.id, 1).await;
+    assert_eq!(first[0].status, "success");
+    assert!(
+        first[0].row_count.unwrap_or(0) > 0,
+        "the first run must have rows to be worth mistaking for the latest: {:?}",
+        first[0]
+    );
+
+    // Run two is the same report over a query that now matches nothing. The
+    // filter is on `host`, not `service`: a service filter prunes the path
+    // glob, and a run that reaches no file at all has no columns either (the
+    // `(SELECT 1 WHERE FALSE)` case). This is the ordinary one: the files
+    // are read, and no row survives the filter.
+    client
+        .update_saved(
+            saved.id,
+            "service=nginx host=no_such_host | table service, host",
+        )
+        .await
+        .unwrap();
+    client.trigger_run(saved.id).await.unwrap();
+    let runs = wait_for_finished_runs(&client, saved.id, 2).await;
+    let newest = &runs[0];
+    assert_eq!(newest.status, "success", "{newest:?}");
+    assert_eq!(newest.row_count, Some(0), "{newest:?}");
+    assert!(
+        newest.result_path.is_none(),
+        "a zero-row run has no parquet to point at: {newest:?}"
+    );
+
+    // The zero-row run is served with its columns, not as a null result.
+    let fetched = client
+        .get_report_run(saved.id, newest.id)
+        .await
+        .unwrap()
+        .result
+        .expect("a zero-row run still carries a result");
+    assert_eq!(fetched.rows.len(), 0, "{fetched:?}");
+    assert!(
+        !fetched.columns.is_empty(),
+        "the blob keeps the column names: {fetched:?}"
+    );
+
+    // And it is what `run=latest` resolves. Reading the older run would
+    // count its rows here.
+    let counted = client
+        .query_paginated(
+            "| from saved zero_row_report run=latest | stats count()",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(counted.result.rows.len(), 1, "{:?}", counted.result);
+    assert_eq!(
+        counted.result.rows[0][0].to_string(),
+        "0",
+        "the newest run found nothing: {:?}",
+        counted.result
+    );
+
+    let listed = client
+        .query_paginated(
+            "| from saved zero_row_report run=latest | table service",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        listed.result.rows.is_empty(),
+        "no rows to list: {:?}",
+        listed.result
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Rename net (update with name)
 // ---------------------------------------------------------------------------

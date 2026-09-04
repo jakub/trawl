@@ -2246,9 +2246,16 @@ async fn successful_run_selectors(pool: PgPool) {
         .await
         .unwrap();
 
+    // `run=latest` takes the newest SUCCESS, path or no path: a run whose
+    // result had no rows has no parquet, and skipping it would answer from
+    // a window that has already been superseded (ADR-0018 ruling 13).
     let latest = store.latest_successful_run(sq_id).await.unwrap().unwrap();
-    assert_eq!(latest.id, r2, "latest successful WITH a parquet path");
+    assert_eq!(
+        latest.id, r3,
+        "the newest success, whether or not it wrote a file"
+    );
 
+    // `run=all` unions files, so a run without one is not a member.
     let all = store.list_successful_runs(sq_id).await.unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].id, r2);

@@ -608,6 +608,72 @@ async fn a_thirty_interval_gap_coalesces_into_one_clamped_run() {
     );
 }
 
+/// Ruling 13: a window that held no events is still a run. It records its
+/// bounds, it carries its (empty) result as a zstd blob because a zero-row
+/// parquet has no schema to be written from, and it is the run
+/// `latest_successful_run` returns.
+///
+/// The older run's file is still on disk, which is exactly the trap: before
+/// this, `run=latest` filtered on `result_path IS NOT NULL` and answered
+/// from that older file, reporting a superseded window as the current one.
+#[tokio::test]
+async fn a_zero_row_run_records_its_window_and_is_the_latest_success() {
+    let h = harness().await;
+    let sq = h
+        .schedule(
+            "quiet",
+            DSL,
+            Some(ScheduleWindow::Fixed { secs: 300 }),
+            3600,
+            0,
+        )
+        .await;
+
+    // [T0-5m, T0) holds the event one microsecond before T0.
+    h.tick(t0()).await;
+    // [T0+55m, T0+1h) holds nothing: the fixture's neighbours are at +30m
+    // and at +1h, and +1h is the exclusive end.
+    h.tick(at(hours(1))).await;
+
+    let runs = h.runs(sq).await;
+    assert_eq!(runs.len(), 2, "one run per planned fire");
+    assert_eq!(h.run_rows(&runs[0]), vec![at(micros(-1))]);
+
+    let quiet = &runs[1];
+    assert_eq!(quiet.status, RunStatus::Success, "empty is not failure");
+    assert_eq!(quiet.row_count, Some(0));
+    assert_eq!(
+        window_of(quiet),
+        (Some(at(mins(55))), Some(at(hours(1))), Some(false)),
+        "the run says what it covered, even having found nothing"
+    );
+    assert_eq!(quiet.window_kind, Some(WindowKind::Fixed));
+    assert!(
+        quiet.result_path.is_none(),
+        "a zero-row result has no schema to write a parquet from: {quiet:?}"
+    );
+    assert!(
+        h.schedules
+            .get_run_result(quiet.id, h.key_id)
+            .await
+            .expect("read the run's result blob")
+            .is_some(),
+        "the empty result is persisted as a blob, so `run=latest` has \
+         something to resolve"
+    );
+
+    let latest = h
+        .schedules
+        .latest_successful_run(sq)
+        .await
+        .expect("read the latest successful run")
+        .expect("there are two successes");
+    assert_eq!(
+        latest.id, quiet.id,
+        "the newest success is the answer, file or no file"
+    );
+}
+
 /// A fixed trailing window is re-measured from every planned fire and keeps
 /// no watermark, so it never heals a gap: missed fires are simply missed,
 /// and `lag` delays coverage rather than widening it (ruling 6).

@@ -1527,13 +1527,23 @@ impl ScheduleStore {
     }
 
     /// Get the most recent successful run for a saved query (`run=latest`).
+    ///
+    /// The NEWEST success, whether or not it wrote a parquet file. A run
+    /// with no rows has no file (there is no schema to write one from) and
+    /// carries its result as a blob instead, and skipping it here would make
+    /// `run=latest` silently answer from an older run: the same report, but
+    /// over a window that has already been superseded. The caller decides
+    /// what to do with a run that has no path (`from_saved::resolve_latest`
+    /// builds an empty typed source from the blob's column names), and its
+    /// refusals name THIS run rather than resolving a different one
+    /// (ADR-0018 ruling 13).
     pub async fn latest_successful_run(
         &self,
         saved_query_id: i64,
     ) -> Result<Option<ReportRun>, StoreError> {
         let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {RUN_COLS} FROM report_runs
-             WHERE saved_query_id = $1 AND status = 'success' AND result_path IS NOT NULL
+             WHERE saved_query_id = $1 AND status = 'success'
              ORDER BY started_at DESC, id DESC
              LIMIT 1"
         )))
@@ -1545,6 +1555,13 @@ impl ScheduleStore {
 
     /// List all successful runs with parquet results for a saved query
     /// (`run=all`), oldest first.
+    ///
+    /// The `result_path IS NOT NULL` filter stays, unlike
+    /// [`Self::latest_successful_run`]'s: `run=all` unions the runs' files,
+    /// and a zero-row run has none. Adding it as an empty typed source would
+    /// contribute no rows to the union while risking a column-type clash
+    /// with the real files, so a zero-row run is simply not a member (see
+    /// `from_saved::resolve_all`).
     pub async fn list_successful_runs(
         &self,
         saved_query_id: i64,

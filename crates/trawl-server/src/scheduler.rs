@@ -544,6 +544,20 @@ pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
 ///
 /// Returns `(Some(relative_path), None)` on success, or `(None, Some(blob))`
 /// as a zstd-JSON fallback if parquet writing fails.
+///
+/// A ZERO-ROW result always takes the blob. Parquet cannot carry it: the
+/// writer serialises the rows as ndjson and lets `read_json` infer the
+/// schema, so with no rows there is no schema to write and
+/// `write_query_result_to_parquet` returns without creating a file. The blob
+/// is the one representation that keeps the column NAMES, it is what
+/// `get_report_run` already reads back, and it is what
+/// `from_saved::resolve_latest` turns into an empty typed source. It also
+/// costs almost nothing: a few dozen bytes of compressed JSON for a run
+/// whose whole content is its header.
+///
+/// Recording it matters because `run=latest` resolves the NEWEST successful
+/// run and refuses to look past it. A run persisted with neither a path nor
+/// a blob would be a success nothing can read (ADR-0018 ruling 13).
 fn write_result_parquet(
     pool: &ExecutorPool,
     run_id: i64,
@@ -551,7 +565,7 @@ fn write_result_parquet(
     result: &trawl_api::value::QueryResult,
 ) -> (Option<String>, Option<Vec<u8>>) {
     if result.rows.is_empty() {
-        return (None, None);
+        return zstd_fallback(result);
     }
 
     let base = pool.base_dir().trim_end_matches('/');
@@ -610,12 +624,42 @@ fn write_result_parquet(
     (Some(relative), None)
 }
 
-/// Compress a `QueryResult` as a zstd JSON blob (fallback when parquet write fails).
+/// Compress a `QueryResult` as a zstd JSON blob (the representation for a
+/// zero-row run, and the fallback when a parquet write fails).
 fn zstd_fallback(result: &trawl_api::value::QueryResult) -> (Option<String>, Option<Vec<u8>>) {
     let blob = serde_json::to_vec(result)
         .ok()
         .and_then(|json| zstd::encode_all(json.as_slice(), 3).ok());
     (None, blob)
+}
+
+/// Read back what [`zstd_fallback`] wrote: a zstd-compressed JSON
+/// `QueryResult`, or `None` for an absent or unreadable blob.
+///
+/// Lives beside the writer so the two halves of the representation are one
+/// pair. Both readers call it: `get_report_run`, which serves the run over
+/// HTTP, and `from_saved::resolve_latest`, which turns a zero-row run's
+/// column names back into a queryable source.
+pub(crate) fn decode_result_blob(blob: Option<Vec<u8>>) -> Option<trawl_api::value::QueryResult> {
+    let compressed = blob?;
+    let decompressed = zstd::decode_all(compressed.as_slice())
+        .inspect_err(|e| {
+            tracing::warn!(
+                event_type = "run_result_blob_zstd_decode_failed",
+                error = %e,
+                "failed to zstd-decode a report run's result blob"
+            );
+        })
+        .ok()?;
+    serde_json::from_slice::<trawl_api::value::QueryResult>(&decompressed)
+        .inspect_err(|e| {
+            tracing::warn!(
+                event_type = "run_result_blob_deserialize_failed",
+                error = %e,
+                "failed to deserialize a report run's result blob"
+            );
+        })
+        .ok()
 }
 
 /// Pg-backed coverage for the ambiguous-commit recovery *wiring* — the

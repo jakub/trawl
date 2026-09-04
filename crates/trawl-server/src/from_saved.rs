@@ -54,7 +54,9 @@ pub(crate) async fn resolve(
         .ok_or_else(|| ServerError::NotFound(format!("saved query '{}' not found", stage.name)))?;
 
     let source = match stage.run {
-        SavedRunSelector::Latest => resolve_latest(schedule_store, saved.id, data_dir).await?,
+        SavedRunSelector::Latest => {
+            resolve_latest(schedule_store, saved.id, key_id, data_dir).await?
+        }
         SavedRunSelector::Specific(run_id) => {
             resolve_specific(schedule_store, run_id, key_id, data_dir).await?
         }
@@ -78,24 +80,67 @@ pub(crate) async fn resolve(
     })
 }
 
-/// Resolve `run=latest` — most recent successful run with a parquet result.
+/// Resolve `run=latest` to the most recent successful run.
+///
+/// The newest success is the only run this selector may answer from. Every
+/// arm below either resolves THAT run or fails naming it; none falls
+/// through to an older one, because an older run covers an older window and
+/// answering from it silently is the reporting equivalent of a stale read
+/// (ADR-0018 ruling 13).
+///
+/// Three shapes reach here:
+///
+/// - a `result_path`: the ordinary run, read as parquet.
+/// - no path, a blob with no rows: the run genuinely found nothing. Its
+///   blob still carries the column names, so it resolves to the empty typed
+///   source [`empty_typed_source`] builds, and `| stats count()` over it
+///   answers 0.
+/// - no path, a blob WITH rows: a run whose parquet write failed and fell
+///   back to the blob. It exists and `GET /saved/{id}/runs/{run_id}` serves
+///   it, but there is no file to point a query at, so this is a 409 naming
+///   the run. The next successful run makes the selector work again, which
+///   is what makes 409 the right status rather than 404 or 500.
 async fn resolve_latest(
     schedule_store: &ScheduleStore,
     saved_query_id: i64,
+    key_id: i64,
     data_dir: &str,
 ) -> Result<String, ServerError> {
     let run = schedule_store
         .latest_successful_run(saved_query_id)
         .await?
-        .ok_or_else(|| {
-            ServerError::NotFound("no successful runs with parquet results".to_string())
-        })?;
+        .ok_or_else(|| ServerError::NotFound("no successful runs".to_string()))?;
 
-    let result_path = run.result_path.ok_or_else(|| {
-        ServerError::Internal("latest successful run has no result_path".to_string())
-    })?;
+    if let Some(ref result_path) = run.result_path {
+        return Ok(parquet_source(data_dir, result_path));
+    }
 
-    Ok(parquet_source(data_dir, &result_path))
+    // `get_run_result` scopes the blob by the schedule's owning key, the
+    // same ownership join `resolve_specific` reads a run through.
+    let blob = schedule_store.get_run_result(run.id, key_id).await?;
+    let Some(result) = crate::scheduler::decode_result_blob(blob) else {
+        // A success with neither a file nor a readable blob is corrupt
+        // state, not an empty window: say so about this run instead of
+        // quietly serving the previous one. The detail is logged, not
+        // returned.
+        return Err(ServerError::Internal(format!(
+            "report run {} succeeded with no parquet result and no readable result blob",
+            run.id
+        )));
+    };
+
+    if result.rows.is_empty() {
+        return Ok(empty_typed_source(&result.columns));
+    }
+
+    Err(ServerError::Conflict(format!(
+        "report run {run} produced {rows} rows but no parquet result, so it cannot be read \
+         through `from saved`; fetch it at /api/v1/saved/{saved}/runs/{run} instead, or wait \
+         for the next scheduled run",
+        run = run.id,
+        rows = result.rows.len(),
+        saved = run.saved_query_id,
+    )))
 }
 
 /// Resolve `run=N` — a specific run by ID.
@@ -120,6 +165,15 @@ async fn resolve_specific(
 }
 
 /// Resolve `run=all` — all successful runs, unioned with `_run_id` and `_run_time` metadata.
+///
+/// Zero-row runs are deliberately NOT members. They have no parquet file
+/// (see [`empty_typed_source`]), a union branch built from their column
+/// names would contribute no rows anyway, and its all-NULL columns could
+/// only clash with the typed ones the real files bring. The visible
+/// consequence: `_run_id` and `_run_time` never name a run that found
+/// nothing, so `run=all` describes the runs that produced data, not every
+/// run that happened. `run=latest` is the selector that answers for a
+/// zero-row run.
 async fn resolve_all(
     schedule_store: &ScheduleStore,
     saved_query_id: i64,
@@ -158,6 +212,38 @@ async fn resolve_all(
     Ok(format!("({})", parts.join(" UNION ALL BY NAME ")))
 }
 
+/// Build a zero-row source that still carries a run's column NAMES.
+///
+/// A successful report run with no rows has no parquet file: the ndjson
+/// writer behind `write_query_result_to_parquet` has nothing to infer a
+/// schema from, so there is no typed empty parquet to point at. The run's
+/// zstd JSON blob is the one representation that kept the column names, and
+/// this turns them back into a FROM source: `(SELECT NULL AS "a", NULL AS
+/// "b" WHERE FALSE)`. Downstream stages bind their fields, aggregates
+/// answer over an empty relation, and no row is invented.
+///
+/// Every column is NULL-typed. That is enough for `| where`, `stats` and
+/// `table` (probed in `empty_typed_source_executes_downstream_shapes`), and
+/// it is the only honest type available: the blob records names, not the
+/// `DuckDB` types the run's rows would have had.
+///
+/// A result with ZERO columns is `QueryResult::empty()`, the answer a run
+/// gets when its own source matched no file at all. There are no names to
+/// carry, so the source is a one-column dummy nothing binds to:
+/// `(SELECT 1 WHERE FALSE)`. A downstream field reference then fails to
+/// bind, which is the truth about that run: it recorded no schema.
+fn empty_typed_source(columns: &[trawl_api::value::Column]) -> String {
+    if columns.is_empty() {
+        return "(SELECT 1 WHERE FALSE)".to_string();
+    }
+    let projected = columns
+        .iter()
+        .map(|c| format!("NULL AS \"{}\"", c.name.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("(SELECT {projected} WHERE FALSE)")
+}
+
 /// Build a `read_parquet()` expression for a single result file.
 ///
 /// `result_path` is relative to `data_dir` (e.g. `scheduled/my_query/run_42.parquet`).
@@ -170,6 +256,83 @@ fn parquet_source(data_dir: &str, result_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn cols(names: &[&str]) -> Vec<trawl_api::value::Column> {
+        names
+            .iter()
+            .map(|n| trawl_api::value::Column {
+                name: (*n).to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_typed_source_projects_quoted_names() {
+        assert_eq!(
+            empty_typed_source(&cols(&["a", "b"])),
+            r#"(SELECT NULL AS "a", NULL AS "b" WHERE FALSE)"#
+        );
+        assert_eq!(
+            empty_typed_source(&cols(&[r#"we"ird"#])),
+            r#"(SELECT NULL AS "we""ird" WHERE FALSE)"#
+        );
+        assert_eq!(empty_typed_source(&[]), "(SELECT 1 WHERE FALSE)");
+    }
+
+    /// Execution probe: the NULL-typed empty source has to survive every
+    /// downstream shape a `from saved` pipeline can put after it, through the
+    /// real emitter and a real `DuckDB`. A NULL column is an untyped literal
+    /// in `DuckDB`, so "does `count()` over it work" is a question only
+    /// execution answers.
+    #[test]
+    fn empty_typed_source_executes_downstream_shapes() {
+        let executor = trawl_engine::executor::Executor::new().unwrap();
+        let pins = trawl_core::schema::FieldTypes::new();
+        let source = empty_typed_source(&cols(&["a", "b", "_time"]));
+
+        let run = |dsl: &str| {
+            executor
+                .run_query(dsl, &source, &pins, 100, 0)
+                .unwrap_or_else(|e| panic!("{dsl} over {source} failed: {e}"))
+        };
+
+        // Filtering an untyped NULL column: binds, matches nothing.
+        assert_eq!(run("* | where a > 5").rows.len(), 0);
+        // A row-count aggregate still answers, with zero.
+        let counted = run("* | stats count()");
+        assert_eq!(counted.rows.len(), 1);
+        assert_eq!(counted.rows[0][0].to_string(), "0");
+        // An aggregate that reads the NULL column itself.
+        assert_eq!(run("* | stats avg(a)").rows.len(), 1);
+        // Projection binds the name and returns no rows.
+        let projected = run("* | table a");
+        assert_eq!(projected.rows.len(), 0);
+        assert_eq!(projected.columns.len(), 1);
+        assert_eq!(projected.columns[0].name, "a");
+        // `_time` survives the TIMESTAMP cast the time-aware stages emit.
+        assert_eq!(run("* | sort -_time | head 5").rows.len(), 0);
+        executor
+            .run_query("* | table _time", &source, &pins, 100, 0)
+            .expect("_time column must bind");
+        // The timestamp cast the union and display paths put on `_time`,
+        // asked of DuckDB directly so the assertion does not depend on which
+        // stage happens to emit it today.
+        duckdb::Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                r#"SELECT TRY_CAST("_time" AS TIMESTAMP) AS t FROM {source}"#
+            ))
+            .expect("TRY_CAST over a NULL-typed _time column must plan");
+        // The zero-column fallback is a valid source too (nothing binds).
+        assert_eq!(
+            executor
+                .run_query("* | stats count()", &empty_typed_source(&[]), &pins, 100, 0)
+                .unwrap()
+                .rows[0][0]
+                .to_string(),
+            "0"
+        );
+    }
 
     #[test]
     fn parquet_source_basic() {
@@ -256,6 +419,49 @@ mod pg_tests {
         rid
     }
 
+    /// Start then finish a run whose result is a zstd JSON blob instead of a
+    /// parquet file, the way `write_result_parquet` persists a zero-row (or
+    /// parquet-write-failed) result. Returns its id.
+    async fn run_with_blob(
+        store: &ScheduleStore,
+        schedule_id: i64,
+        saved_id: i64,
+        result: &trawl_api::value::QueryResult,
+    ) -> i64 {
+        let rid = match store
+            .claim_run(schedule_id, saved_id, "q", None, None)
+            .await
+            .unwrap()
+        {
+            RunClaim::Started(id) => id,
+            other => panic!("expected a started run, got {other:?}"),
+        };
+        let json = serde_json::to_vec(result).unwrap();
+        let blob = zstd::encode_all(json.as_slice(), 3).unwrap();
+        store
+            .finish_run(
+                rid,
+                RunStatus::Success,
+                10,
+                Some(result.rows.len()),
+                None,
+                Some(&blob),
+                None,
+            )
+            .await
+            .unwrap();
+        rid
+    }
+
+    /// A `QueryResult` with the given column names and no rows: what a run
+    /// whose window held nothing records.
+    fn zero_row_result(names: &[&str]) -> trawl_api::value::QueryResult {
+        trawl_api::value::QueryResult {
+            columns: super::tests::cols(names),
+            rows: Vec::new(),
+        }
+    }
+
     /// Schedule id for a saved query (seed always creates exactly one).
     async fn schedule_id(store: &ScheduleStore, saved_id: i64) -> i64 {
         store
@@ -301,7 +507,7 @@ mod pg_tests {
         )
         .await;
 
-        let source = resolve_latest(&sched_store, saved_id, "/data")
+        let source = resolve_latest(&sched_store, saved_id, 1, "/data")
             .await
             .unwrap();
         // Newest wins (started_at DESC, id DESC).
@@ -312,14 +518,174 @@ mod pg_tests {
     async fn resolve_latest_not_found_without_successful_runs(pool: PgPool) {
         let (saved_id, sched_store, _saved) = seed(&pool, 1, "latest_none").await;
         let sid = schedule_id(&sched_store, saved_id).await;
-        // An error run and a success-without-parquet run are both ineligible.
+        // A failed run is not a run this selector can answer from.
         run(&sched_store, sid, saved_id, RunStatus::Error, None).await;
-        run(&sched_store, sid, saved_id, RunStatus::Success, None).await;
 
-        let err = resolve_latest(&sched_store, saved_id, "/data")
+        let err = resolve_latest(&sched_store, saved_id, 1, "/data")
             .await
-            .expect_err("no successful parquet run must be NotFound");
+            .expect_err("no successful run must be NotFound");
         assert!(matches!(err, ServerError::NotFound(_)), "got: {err:?}");
+    }
+
+    /// A success carrying neither a parquet path nor a result blob is
+    /// corrupt state. The selector must say so about that run, not quietly
+    /// resolve the older run behind it.
+    #[sqlx::test]
+    async fn resolve_latest_errors_on_a_success_with_neither_file_nor_blob(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "latest_corrupt").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        run(
+            &sched_store,
+            sid,
+            saved_id,
+            RunStatus::Success,
+            Some("p/run_1.parquet"),
+        )
+        .await;
+        let orphan = run(&sched_store, sid, saved_id, RunStatus::Success, None).await;
+
+        let err = resolve_latest(&sched_store, saved_id, 1, "/data")
+            .await
+            .expect_err("a success with no result at all must not resolve");
+        match err {
+            ServerError::Internal(msg) => assert!(
+                msg.contains(&orphan.to_string()),
+                "the message must name the run: {msg}"
+            ),
+            other => panic!("expected Internal, got: {other:?}"),
+        }
+    }
+
+    /// The point of ADR-0018 ruling 13: a run that found nothing is still the
+    /// newest run, and `run=latest` has to answer from IT. Resolving the
+    /// older run behind it would report yesterday's rows as today's.
+    #[sqlx::test]
+    async fn resolve_latest_answers_a_zero_row_success_not_an_older_run(pool: PgPool) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "latest_zero").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+
+        write_parquet(data_dir, "scheduled/latest_zero/run_1.parquet", 1);
+        run(
+            &sched_store,
+            sid,
+            saved_id,
+            RunStatus::Success,
+            Some("scheduled/latest_zero/run_1.parquet"),
+        )
+        .await;
+        run_with_blob(&sched_store, sid, saved_id, &zero_row_result(&["n", "msg"])).await;
+
+        let source = resolve_latest(&sched_store, saved_id, 1, data_dir)
+            .await
+            .expect("a zero-row success resolves to its own empty source");
+        assert_eq!(source, r#"(SELECT NULL AS "n", NULL AS "msg" WHERE FALSE)"#);
+
+        // Executed, because the assertion that matters is the ANSWER: the
+        // older run holds one row, and reading it here would count 1.
+        let executor = trawl_engine::executor::Executor::new().unwrap();
+        let pins = trawl_core::schema::FieldTypes::new();
+        let counted = executor
+            .run_query("* | stats count()", &source, &pins, 100, 0)
+            .unwrap();
+        assert_eq!(counted.rows[0][0].to_string(), "0");
+        assert_eq!(
+            executor
+                .run_query("* | table n", &source, &pins, 100, 0)
+                .unwrap()
+                .rows
+                .len(),
+            0
+        );
+    }
+
+    /// A run whose parquet write failed kept its rows in the blob. It exists
+    /// and the run endpoint serves it, but there is no file to query, so the
+    /// selector refuses NAMING that run instead of silently reading the
+    /// older one behind it.
+    #[sqlx::test]
+    async fn resolve_latest_over_a_blob_backed_nonempty_run_errors(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "latest_blob").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        run(
+            &sched_store,
+            sid,
+            saved_id,
+            RunStatus::Success,
+            Some("scheduled/latest_blob/run_1.parquet"),
+        )
+        .await;
+        let blob_run = run_with_blob(
+            &sched_store,
+            sid,
+            saved_id,
+            &trawl_api::value::QueryResult {
+                columns: super::tests::cols(&["n"]),
+                rows: vec![vec![trawl_api::value::Value::Integer(7)]],
+            },
+        )
+        .await;
+
+        let err = resolve_latest(&sched_store, saved_id, 1, "/data")
+            .await
+            .expect_err("a blob-backed run with rows is not queryable here");
+        match err {
+            ServerError::Conflict(msg) => {
+                assert!(
+                    msg.contains(&blob_run.to_string()),
+                    "the refusal must name the run: {msg}"
+                );
+                assert!(
+                    !msg.contains("run_1.parquet"),
+                    "and must not point at the older run: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got: {other:?}"),
+        }
+    }
+
+    /// `run=all` unions files. A zero-row run has none, so it contributes
+    /// nothing and `_run_id` never names it (see `resolve_all`).
+    #[sqlx::test]
+    async fn resolve_all_skips_zero_row_members(pool: PgPool) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "all_zero").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+
+        write_parquet(data_dir, "scheduled/all_zero/run_1.parquet", 1);
+        let with_rows = run(
+            &sched_store,
+            sid,
+            saved_id,
+            RunStatus::Success,
+            Some("scheduled/all_zero/run_1.parquet"),
+        )
+        .await;
+        let empty = run_with_blob(&sched_store, sid, saved_id, &zero_row_result(&["n"])).await;
+
+        let source = resolve_all(&sched_store, saved_id, data_dir).await.unwrap();
+        assert!(
+            !source.contains(&format!("{empty} AS _run_id")),
+            "the zero-row run is not a member: {source}"
+        );
+
+        let executor = trawl_engine::executor::Executor::new().unwrap();
+        let rows = executor
+            .run_query(
+                "* | table _run_id",
+                &source,
+                &trawl_core::schema::FieldTypes::new(),
+                100,
+                0,
+            )
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1, "one member, one row");
+        assert_eq!(rows[0][0].to_string(), with_rows.to_string());
     }
 
     // --- resolve_specific ---------------------------------------------------

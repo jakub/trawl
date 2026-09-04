@@ -2544,7 +2544,12 @@ pub async fn trigger_run(
 
 /// `GET /api/v1/saved/{id}/runs/{run_id}` — get a single report run with result data.
 ///
-/// Prefers parquet result files (via `result_path`) over legacy zstd blobs.
+/// Prefers parquet result files (via `result_path`) over the zstd JSON blob.
+/// A run has a blob instead of a file in two cases: its result had no rows
+/// (there is no schema to write a parquet from), or the parquet write failed
+/// and the scheduler fell back. Either way the blob carries the column names,
+/// so a zero-row run answers with its columns and an empty row list rather
+/// than a null result.
 pub async fn get_report_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2569,15 +2574,15 @@ pub async fn get_report_run(
         ));
     }
 
-    // Pre-fetch legacy blob (cheap if NULL in db). A genuine absence is `Ok(None)`;
+    // Pre-fetch the blob (cheap if NULL in db). A genuine absence is `Ok(None)`;
     // a StoreError here is a live db fault and must surface as 5xx, not empty result.
-    let legacy_blob = state
+    let result_blob = state
         .storage
         .schedule
         .get_run_result(run_id, key_id)
         .await?;
 
-    // Try parquet result first, fall back to legacy zstd blob.
+    // Try parquet result first, fall back to the zstd blob.
     let result = if let Some(ref result_path) = run.result_path {
         let base_dir = state.query.pool.base_dir().to_owned();
         let max_rows = state.query.pool.max_result_rows();
@@ -2596,51 +2601,28 @@ pub async fn get_report_run(
                     event_type = "report_run_parquet_read_failed",
                     run_id,
                     error = %e,
-                    "failed to read parquet result, trying legacy blob"
+                    "failed to read parquet result, trying the result blob"
                 );
-                decompress_legacy_blob(legacy_blob)
+                crate::scheduler::decode_result_blob(result_blob)
             }
             Err(e) => {
                 tracing::warn!(
                     event_type = "report_run_parquet_task_failed",
                     run_id,
                     error = %e,
-                    "parquet read task panicked, trying legacy blob"
+                    "parquet read task panicked, trying the result blob"
                 );
-                decompress_legacy_blob(legacy_blob)
+                crate::scheduler::decode_result_blob(result_blob)
             }
         }
     } else {
-        decompress_legacy_blob(legacy_blob)
+        crate::scheduler::decode_result_blob(result_blob)
     };
 
     Ok(Json(ReportRunResponse {
         summary: report_run_summary(run),
         result,
     }))
-}
-
-/// Decompress a legacy zstd-compressed JSON result blob.
-fn decompress_legacy_blob(blob: Option<Vec<u8>>) -> Option<QueryResult> {
-    let compressed = blob?;
-    let decompressed = zstd::decode_all(compressed.as_slice())
-        .inspect_err(|e| {
-            tracing::warn!(
-                event_type = "legacy_blob_zstd_decode_failed",
-                error = %e,
-                "failed to zstd-decode legacy result blob"
-            );
-        })
-        .ok()?;
-    serde_json::from_slice::<QueryResult>(&decompressed)
-        .inspect_err(|e| {
-            tracing::warn!(
-                event_type = "legacy_blob_deserialize_failed",
-                error = %e,
-                "failed to deserialize legacy result blob"
-            );
-        })
-        .ok()
 }
 
 /// `POST /api/v1/export` — export query results as CSV, JSON, or Parquet.
