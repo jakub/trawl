@@ -1862,9 +1862,11 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use trawl_client::RepinCancel;
+use trawl_client::RepinJobResponse;
 use trawl_server::repin::engine::{
-    TEST_HOLD_AFTER_NO_RETURN, TEST_HOLD_AFTER_PROGRESS, TEST_HOLD_IN_SCAN, TEST_PAST_NO_RETURN,
-    TEST_PROGRESS_PUBLISHED, TEST_RELEASE_CUTOVER, TEST_RELEASE_JOB, TEST_RELEASE_SCAN,
+    TEST_FORCE_REFUSAL_REACHED, TEST_HOLD_AFTER_NO_RETURN, TEST_HOLD_AFTER_PROGRESS,
+    TEST_HOLD_AT_FORCE_REFUSAL, TEST_HOLD_IN_SCAN, TEST_PAST_NO_RETURN, TEST_PROGRESS_PUBLISHED,
+    TEST_RELEASE_CUTOVER, TEST_RELEASE_FORCE_REFUSAL, TEST_RELEASE_JOB, TEST_RELEASE_SCAN,
     TEST_SCAN_HELD,
 };
 use trawl_server::store::{RepinJob, RepinJobStatus};
@@ -2506,6 +2508,144 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
         effects_before,
         "recovery must not audit an effect no boundary observed"
     );
+}
+
+/// Build a corpus whose pre-build scan is lossless and whose finished
+/// shadow is not: an all-numeric-text `dur` column under a VARCHAR pin,
+/// held at the build's first published progress so the test can compact a
+/// value BIGINT cannot read into the catch-up's path.
+///
+/// Returns the started job. The caller owns the release
+/// (`TEST_RELEASE_JOB`) and whatever barrier it wants next.
+async fn start_a_repin_the_finished_shadow_will_refuse(h: &Harness) -> RepinJobResponse {
+    // Pin VARCHAR on a text value, then retire the file that carried it:
+    // what is left is all numeric text, so the scan projects no loss.
+    h.ingest_and_compact(&[event("seed", &json!({"dur": "oops"}))])
+        .await;
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+    let seed = walk(&h.data_dir)
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "seed.parquet"))
+        .expect("seed.parquet exists");
+    std::fs::remove_file(&seed).unwrap();
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"dur": "12"}))])
+            .await;
+    }
+
+    TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
+    TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
+    TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+    let started = match h
+        .schema_admin
+        .schema_repin("dur", "BIGINT", None, false, false)
+        .await
+        .expect("execute")
+    {
+        RepinStart::Started(job) => job,
+        other => panic!("expected started, got {other:?}"),
+    };
+    await_barrier(
+        &TEST_PROGRESS_PUBLISHED,
+        "the build never published progress",
+    )
+    .await;
+
+    // The late loss, provably after pass 0's snapshot: catch-up folds it
+    // in and the finished shadow's gate refuses the cutover.
+    h.ingest_and_compact(&[event("api", &json!({"dur": "nope"}))])
+        .await;
+    started
+}
+
+/// R3-1: a cancel pending when the finished-shadow force refusal settles
+/// wins. The operator asked for a stop and got a 202; parking the job as
+/// `refused_needs_force` instead would be an accepted cancel silently
+/// ignored, and nothing latched a point of no return to justify it.
+///
+/// Both verdicts leave the corpus untouched, so nothing is at stake on
+/// disk. What is at stake is whether a 202 means anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_pending_at_the_force_refusal_takes_the_verdict() {
+    let h = harness().await;
+    let started = start_a_repin_the_finished_shadow_will_refuse(&h).await;
+
+    // Hold the job on its decided refusal, which is the only way to be
+    // inside the window this asserts on: last file boundary to settlement,
+    // microseconds wide when nothing holds it.
+    TEST_FORCE_REFUSAL_REACHED.store(false, Ordering::SeqCst);
+    TEST_RELEASE_FORCE_REFUSAL.store(false, Ordering::SeqCst);
+    TEST_HOLD_AT_FORCE_REFUSAL.store(true, Ordering::SeqCst);
+    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    await_barrier(
+        &TEST_FORCE_REFUSAL_REACHED,
+        "the finished shadow never refused the cutover",
+    )
+    .await;
+
+    match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
+        RepinCancel::Cancelling(_) => {}
+        other => panic!("a job short of its point of no return is cancellable, got {other:?}"),
+    }
+    TEST_RELEASE_FORCE_REFUSAL.store(true, Ordering::SeqCst);
+
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(
+        done.status, "cancelled",
+        "the accepted cancel outranks the refusal (error: {:?})",
+        done.error
+    );
+    assert_eq!(done.cancelled_by.as_deref(), Some("schema-admin-key"));
+    let error = done.error.clone().expect("a cancelled row explains itself");
+    assert!(
+        error.contains("cancelled by schema-admin-key during build"),
+        "{error}"
+    );
+
+    // The unwind ran either way: old pin, every row, no staging.
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+    assert_eq!(h.count("last=1h | stats count()").await, 3);
+    assert_eq!(
+        h.count("last=1h | where dur == \"nope\" | stats count()")
+            .await,
+        1
+    );
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+}
+
+/// The other side of R3-1: a refusal that settled first keeps its verdict,
+/// and the cancel that arrives afterwards is told there is nothing running
+/// (404). Arbitration decides one way or the other under the registry
+/// lock, so a late request cannot rewrite a settled row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_after_the_force_refusal_settled_finds_nothing_to_stop() {
+    let h = harness().await;
+    let started = start_a_repin_the_finished_shadow_will_refuse(&h).await;
+    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+
+    // A terminal row is written after settlement, so reading one is the
+    // ordering this needs: the refusal has already latched the registry.
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(
+        done.status, "refused_needs_force",
+        "loss that appeared after the scan still needs force (error: {:?})",
+        done.error
+    );
+
+    match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
+        RepinCancel::NoJobRunning(_) => {}
+        other => panic!("a settled job has no work left to stop, got {other:?}"),
+    }
+    let row = h.repin_row(started.id).await;
+    assert_eq!(row.status, RepinJobStatus::RefusedNeedsForce);
+    assert_eq!(
+        (row.cancel_requested_at, row.cancelled_by),
+        (None, None),
+        "a request that took no effect leaves no trace on the row"
+    );
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
 }
 
 /// A tracing capture layer over the events this file asserts on.

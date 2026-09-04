@@ -183,6 +183,28 @@ pub static TEST_SCAN_HELD: std::sync::atomic::AtomicBool =
 pub static TEST_RELEASE_SCAN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only hold at the finished-shadow force refusal, after the gate has
+/// decided to refuse and before the job settles that verdict against a
+/// pending cancel (#109).
+///
+/// The window runs from the last file boundary of the final increment to
+/// the settlement, which no other barrier reaches and which real timing
+/// makes microseconds wide. A test that wants "a cancel was pending when
+/// the refusal settled" has to be inside it, not near it.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_HOLD_AT_FORCE_REFUSAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the cutover once it is holding on a decided force refusal.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_FORCE_REFUSAL_REACHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the test to let the held refusal reach settlement.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_RELEASE_FORCE_REFUSAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// What `start` decided.
 #[derive(Debug)]
 pub enum StartOutcome {
@@ -792,11 +814,11 @@ impl RepinEngine {
     /// watches the job report `succeeded`, with no way to tell whether the
     /// cancel was too late or simply lost.
     ///
-    /// The one deliberate exception is the finished-shadow force gate,
-    /// which is decided in `run_job` and keeps its `refused_needs_force`
-    /// verdict (design decision 7). Both outcomes leave the corpus
-    /// untouched, and the refusal is the one that tells the operator
-    /// something they did not already know.
+    /// There is no exception. The background half's finished-shadow force
+    /// refusal settles the same way, through [`Self::abandon_build`]: an
+    /// operator's stop outranks a park, both leave the corpus untouched,
+    /// and answering an accepted cancel with `refused_needs_force` would
+    /// make the 202 a lie.
     async fn settle_pre_cutover(
         &self,
         job_id: i64,
@@ -936,22 +958,22 @@ impl RepinEngine {
                 let actor = self.settle_cancel(job_id, stage);
                 self.abandon_cancelled(job_id, stage, actor).await;
             }
-            // The finished-shadow force gate keeps its verdict even against
-            // a pending cancel (design decision 7): both leave the corpus
-            // untouched, and "the completed rewrite would null values you
-            // did not accept" is the fact the operator needs. Every other
-            // abort is arbitrated, because a cancel that landed while the
-            // failure was being written is still a cancel of a running job.
+            // Every pre-cutover abort takes the same door, the force
+            // refusal included: a cancel that landed while the verdict was
+            // being written is still a cancel of a running job, and the
+            // operator who asked for a stop gets one. The refusal costs
+            // that operator nothing — it was protecting a corpus the cancel
+            // leaves untouched anyway.
             Err(JobAbort::RefusedNeedsForce(msg)) => {
                 self.abandon_build(job_id, RepinJobStatus::RefusedNeedsForce, &msg)
                     .await;
             }
             Err(JobAbort::Blocked(msg)) => {
-                self.abandon_arbitrated(job_id, RepinJobStatus::Blocked, &msg)
+                self.abandon_build(job_id, RepinJobStatus::Blocked, &msg)
                     .await;
             }
             Err(JobAbort::Failed(msg)) => {
-                self.abandon_arbitrated(job_id, RepinJobStatus::Failed, &msg)
+                self.abandon_build(job_id, RepinJobStatus::Failed, &msg)
                     .await;
             }
         }
@@ -961,23 +983,6 @@ impl RepinEngine {
         // rather than 404, which also keeps a fresh repin from arming the
         // registry while this one is still deleting its staging roots.
         self.cancel.disarm(job_id);
-    }
-
-    /// Abandon the build, letting a pending cancel take the verdict over
-    /// `candidate`. The unwind is identical either way; only the word the
-    /// job row carries differs.
-    ///
-    /// The choice is settled under the registry lock before the sweep
-    /// starts, so the minutes the sweep spends deleting a shadow
-    /// generation are not a window in which a cancel is accepted and then
-    /// loses to the candidate that was already chosen.
-    async fn abandon_arbitrated(&self, job_id: i64, candidate: RepinJobStatus, msg: &str) {
-        if let Some(actor) = self.settle_cancel(job_id, STAGE_BUILD) {
-            self.abandon_cancelled(job_id, STAGE_BUILD, Some(actor))
-                .await;
-        } else {
-            self.abandon_build(job_id, candidate, msg).await;
-        }
     }
 
     /// The build-phase cancel effect site: audit, sweep the shadow, drop
@@ -1006,12 +1011,31 @@ impl RepinEngine {
         self.finish_cancelled(job_id, stage, actor).await;
     }
 
-    /// Abandon a job whose corpus is still untouched (pre-swap): sweep the
-    /// disposable shadow and any leftover aside, drop the marker, record
-    /// the outcome.
-    async fn abandon_build(&self, job_id: i64, status: RepinJobStatus, msg: &str) {
-        self.unwind_staging(job_id, status, msg).await;
-        self.finish(job_id, status, Some(msg)).await;
+    /// Abandon a job whose corpus is still untouched (pre-swap): settle
+    /// `candidate` against a pending cancel, then sweep the disposable
+    /// shadow and any leftover aside, drop the marker and record the
+    /// outcome. The unwind is identical either way; only the word the job
+    /// row carries differs.
+    ///
+    /// This is the only door out of a pre-cutover terminal candidate in the
+    /// background half, and the rule has no exceptions: every pre-cutover
+    /// terminal candidate settles under the registry lock, and there is no
+    /// other door. A new [`JobAbort`] arm cannot compile its way past
+    /// settlement, because the non-arbitrated abandon does not exist. The
+    /// synchronous half's door is [`Self::settle_pre_cutover`], same rule.
+    ///
+    /// Settling before the sweep starts is the point. Sweeping a whole
+    /// shadow generation takes minutes on a real archive, and had the
+    /// verdict been chosen first, a cancel landing during those minutes
+    /// would be answered 202 and then lose to a decision already made.
+    async fn abandon_build(&self, job_id: i64, candidate: RepinJobStatus, msg: &str) {
+        if let Some(actor) = self.settle_cancel(job_id, STAGE_BUILD) {
+            self.abandon_cancelled(job_id, STAGE_BUILD, Some(actor))
+                .await;
+            return;
+        }
+        self.unwind_staging(job_id, candidate, msg).await;
+        self.finish(job_id, candidate, Some(msg)).await;
     }
 
     /// The disk half of abandoning a build, without the terminal write.
@@ -1185,6 +1209,19 @@ impl RepinEngine {
             totals.ambiguous,
             force,
         ) {
+            // Test-only: pin the window between a decided refusal and its
+            // settlement (see `TEST_HOLD_AT_FORCE_REFUSAL`). Bounded, and
+            // armed once.
+            #[cfg(any(test, feature = "test-support"))]
+            if TEST_HOLD_AT_FORCE_REFUSAL.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                TEST_FORCE_REFUSAL_REACHED.store(true, std::sync::atomic::Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while !TEST_RELEASE_FORCE_REFUSAL.load(std::sync::atomic::Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
             return Err(JobAbort::RefusedNeedsForce(format!(
                 "the completed rewrite is not what the pre-build scan \
                  projected — data ingested after the scan carries values the \
