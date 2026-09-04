@@ -394,20 +394,27 @@ impl RepinEngine {
     /// status route can show a cancel in flight while the job is still
     /// walking to its next file boundary.
     pub fn cancel(self: &Arc<Self>, actor: &CancelActor) -> CancelVerdict {
-        let verdict = self.cancel.request(actor);
-        match verdict {
+        let decision = self.cancel.request(actor);
+        match decision.verdict {
             CancelVerdict::Cancelling {
                 job_id,
                 already_requested,
             } => {
                 let engine = Arc::clone(self);
-                let actor = actor.clone();
+                let caller = actor.clone();
+                // The registry's retained actor, never the caller's: a
+                // repeat is audited under the name that asked, but the
+                // durable row may only ever carry the first asker. Two
+                // detached writes racing with the caller's own name is how
+                // the row ends up naming somebody the registry and the
+                // effect audit both disagree with.
+                let recorded = decision
+                    .retained
+                    .unwrap_or_else(|| actor.clone())
+                    .name()
+                    .to_owned();
                 tokio::spawn(async move {
-                    if let Err(e) = engine
-                        .store
-                        .record_cancel_request(job_id, actor.name())
-                        .await
-                    {
+                    if let Err(e) = engine.store.record_cancel_request(job_id, &recorded).await {
                         // The flag is the authority for the verdict the
                         // operator already holds; a store that cannot
                         // record the request costs the audit row, and the
@@ -421,14 +428,14 @@ impl RepinEngine {
                              cancellation itself is unaffected"
                         );
                     }
-                    audit_cancel_requested(job_id, &actor, already_requested);
+                    audit_cancel_requested(job_id, &caller, already_requested);
                 });
             }
             CancelVerdict::PastPointOfNoReturn { job_id } => audit_cancel_refused(job_id, actor),
             // A 404 has no job to name, so it emits no audit event.
             CancelVerdict::NoJobRunning => {}
         }
-        verdict
+        decision.verdict
     }
 
     /// The claimed job's decision ladder: scan → report (dry run) → refuse

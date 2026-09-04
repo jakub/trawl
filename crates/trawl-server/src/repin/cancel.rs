@@ -96,6 +96,37 @@ pub enum CancelVerdict {
     NoJobRunning,
 }
 
+/// What [`CancelRegistry::request`] decided: the verdict the handler
+/// renders, and the actor the registry retained for it.
+///
+/// The two are separate because a repeat request has two actors and they
+/// answer different questions. The audit trail wants this caller ("bob
+/// also asked"), while the durable record wants the first asker, whose
+/// request is the one that will actually stop the job. Persisting the
+/// caller instead was a real race: every repeat spawned its own store
+/// write, and `record_cancel_request` keeps the first row to LAND, not the
+/// first to be decided, so a repeat that overtook the original wrote bob
+/// into a job the registry and the effect audit both say alice cancelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelDecision {
+    /// The answer this caller is given.
+    pub verdict: CancelVerdict,
+    /// The actor the job row must name, present exactly when the verdict is
+    /// [`CancelVerdict::Cancelling`]. On a first request it is this caller;
+    /// on a repeat it is the earlier asker the registry kept.
+    pub retained: Option<CancelActor>,
+}
+
+impl CancelDecision {
+    /// A verdict with no actor to persist: the two refusals.
+    fn plain(verdict: CancelVerdict) -> Self {
+        Self {
+            verdict,
+            retained: None,
+        }
+    }
+}
+
 /// What [`CancelRegistry::settle`] decided for a job that is about to write
 /// a terminal status short of the point of no return.
 ///
@@ -250,10 +281,15 @@ impl CancelRegistry {
     }
 
     /// Ask to cancel whatever is running. The handler's one call.
-    pub fn request(&self, by: &CancelActor) -> CancelVerdict {
+    ///
+    /// The decision carries the retained actor as well as the verdict,
+    /// because on a repeat the two name different people: the verdict is
+    /// this caller's answer, while the retained actor is the first asker,
+    /// the only name the job row may ever carry.
+    pub fn request(&self, by: &CancelActor) -> CancelDecision {
         let mut slot = self.slot.lock();
         let Some(entry) = slot.as_mut() else {
-            return CancelVerdict::NoJobRunning;
+            return CancelDecision::plain(CancelVerdict::NoJobRunning);
         };
         // The two latches are asked in this order because they mean
         // different things to an operator. `committed` is "too late, the
@@ -262,20 +298,21 @@ impl CancelRegistry {
         // same as nothing running: there is no work left to stop, and a
         // 409 would tell the operator the corpus is moving when it is not.
         if entry.committed {
-            return CancelVerdict::PastPointOfNoReturn {
+            return CancelDecision::plain(CancelVerdict::PastPointOfNoReturn {
                 job_id: entry.job_id,
-            };
+            });
         }
         if entry.settled {
-            return CancelVerdict::NoJobRunning;
+            return CancelDecision::plain(CancelVerdict::NoJobRunning);
         }
         let already_requested = entry.cancelled_by.is_some();
-        if !already_requested {
-            entry.cancelled_by = Some(by.clone());
-        }
-        CancelVerdict::Cancelling {
-            job_id: entry.job_id,
-            already_requested,
+        let retained = entry.cancelled_by.get_or_insert_with(|| by.clone()).clone();
+        CancelDecision {
+            verdict: CancelVerdict::Cancelling {
+                job_id: entry.job_id,
+                already_requested,
+            },
+            retained: Some(retained),
         }
     }
 
@@ -483,7 +520,7 @@ mod tests {
             let (registry, _handle) = armed(7);
             let asker = Arc::clone(&registry);
             let closer = Arc::clone(&registry);
-            let request = std::thread::spawn(move || asker.request(&actor("operator")));
+            let request = std::thread::spawn(move || asker.request(&actor("operator")).verdict);
             let commit = std::thread::spawn(move || closer.commit(7));
             let verdict = request.join().expect("request thread");
             let latched = commit.join().expect("commit thread");
@@ -522,7 +559,7 @@ mod tests {
         assert!(registry.commit(11));
         for _ in 0..3 {
             assert_eq!(
-                registry.request(&actor("operator")),
+                registry.request(&actor("operator")).verdict,
                 CancelVerdict::PastPointOfNoReturn { job_id: 11 }
             );
         }
@@ -536,7 +573,7 @@ mod tests {
     fn a_pending_request_stops_the_latch() {
         let (registry, handle) = armed(11);
         assert_eq!(
-            registry.request(&actor("alice")),
+            registry.request(&actor("alice")).verdict,
             CancelVerdict::Cancelling {
                 job_id: 11,
                 already_requested: false
@@ -561,7 +598,7 @@ mod tests {
         assert_eq!(registry.settle(5), Settlement::Candidate);
         for _ in 0..3 {
             assert_eq!(
-                registry.request(&actor("operator")),
+                registry.request(&actor("operator")).verdict,
                 CancelVerdict::NoJobRunning
             );
         }
@@ -580,7 +617,7 @@ mod tests {
     fn a_pending_request_beats_a_terminal_candidate() {
         let (registry, handle) = armed(5);
         assert!(matches!(
-            registry.request(&actor("alice")),
+            registry.request(&actor("alice")).verdict,
             CancelVerdict::Cancelling { .. }
         ));
         assert_eq!(registry.settle(5), Settlement::Cancelled(actor("alice")));
@@ -588,7 +625,10 @@ mod tests {
         assert_eq!(handle.cancelled_by(), Some(actor("alice")));
         // And the job is settled either way: a second asker is not told
         // their cancel was accepted when the first one already took it.
-        assert_eq!(registry.request(&actor("bob")), CancelVerdict::NoJobRunning);
+        assert_eq!(
+            registry.request(&actor("bob")).verdict,
+            CancelVerdict::NoJobRunning
+        );
     }
 
     /// Settling is per job. A job whose task is ending must not latch the
@@ -601,7 +641,7 @@ mod tests {
         let _second = registry.arm(2);
         assert_eq!(registry.settle(1), Settlement::Candidate);
         assert!(matches!(
-            registry.request(&actor("operator")),
+            registry.request(&actor("operator")).verdict,
             CancelVerdict::Cancelling { job_id: 2, .. }
         ));
     }
@@ -616,7 +656,7 @@ mod tests {
         assert!(registry.commit(9));
         assert_eq!(registry.settle(9), Settlement::Candidate);
         assert_eq!(
-            registry.request(&actor("operator")),
+            registry.request(&actor("operator")).verdict,
             CancelVerdict::PastPointOfNoReturn { job_id: 9 }
         );
     }
@@ -628,20 +668,60 @@ mod tests {
     fn a_second_request_preserves_the_first_actor() {
         let (registry, handle) = armed(3);
         assert_eq!(
-            registry.request(&actor("alice")),
+            registry.request(&actor("alice")).verdict,
             CancelVerdict::Cancelling {
                 job_id: 3,
                 already_requested: false
             }
         );
         assert_eq!(
-            registry.request(&actor("bob")),
+            registry.request(&actor("bob")).verdict,
             CancelVerdict::Cancelling {
                 job_id: 3,
                 already_requested: true
             }
         );
         assert_eq!(handle.cancelled_by(), Some(actor("alice")));
+    }
+
+    /// A repeat's decision hands the persistence path the FIRST asker, not
+    /// the caller.
+    ///
+    /// The engine writes the request row from a detached task, so bob's
+    /// write can reach postgres before alice's. `record_cancel_request`
+    /// keeps whichever row lands first, so persisting the caller's own name
+    /// would durably record bob while the registry, the effect audit and
+    /// the job's error sentence all name alice. Handing the retained actor
+    /// back with the verdict makes every write, first or repeat, carry the
+    /// same name.
+    #[test]
+    fn a_repeat_request_carries_the_first_actor_for_persistence() {
+        let (registry, _handle) = armed(3);
+        let first = registry.request(&actor("alice"));
+        assert_eq!(first.retained, Some(actor("alice")));
+
+        let repeat = registry.request(&actor("bob"));
+        assert_eq!(
+            repeat.verdict,
+            CancelVerdict::Cancelling {
+                job_id: 3,
+                already_requested: true
+            },
+            "bob is still told the cancel is accepted"
+        );
+        assert_eq!(
+            repeat.retained,
+            Some(actor("alice")),
+            "but the name that reaches the job row is the first asker's"
+        );
+
+        // The refusals have nothing to persist.
+        let (settled, _handle) = armed(4);
+        settled.settle(4);
+        assert_eq!(settled.request(&actor("bob")).retained, None);
+        let (latched, _handle) = armed(5);
+        assert!(latched.commit(5));
+        assert_eq!(latched.request(&actor("bob")).retained, None);
     }
 
     /// Disarm is owner-checked. A job whose task ends late must not clear
@@ -655,7 +735,7 @@ mod tests {
 
         registry.disarm(1);
         assert_eq!(
-            registry.request(&actor("operator")),
+            registry.request(&actor("operator")).verdict,
             CancelVerdict::Cancelling {
                 job_id: 2,
                 already_requested: false
@@ -666,7 +746,7 @@ mod tests {
 
         registry.disarm(2);
         assert_eq!(
-            registry.request(&actor("operator")),
+            registry.request(&actor("operator")).verdict,
             CancelVerdict::NoJobRunning
         );
         assert_eq!(second.cancelled_by(), None);
