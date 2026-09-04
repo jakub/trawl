@@ -3239,6 +3239,41 @@ mod catalog {
         assert!(candidates.iter().any(|c| c.field == "_severity"));
     }
 
+    /// The epoch is a cutoff postgres will actually take.
+    ///
+    /// `catalog::gc::cutoff_for` clamps an unsubtractable window there, and
+    /// the point of the clamp is that the query still runs: chrono's
+    /// minimum is outside `timestamptz`, so binding it fails at the driver
+    /// and a huge `--older-than` would 503 instead of matching almost
+    /// nothing. At the epoch every observed pin is alive and only the
+    /// never-observed ones come back.
+    #[sqlx::test]
+    async fn the_epoch_cutoff_binds_and_leaves_only_never_observed_pins(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[
+                proposal("observed", CanonicalType::BigInt),
+                proposal("never_observed", CanonicalType::Varchar),
+            ])
+            .await
+            .unwrap();
+        store
+            .touch_services("svc-a", &["observed".to_owned()], 1)
+            .await
+            .unwrap();
+
+        let candidates = store
+            .pins_unobserved_since(chrono::DateTime::UNIX_EPOCH)
+            .await
+            .expect("the epoch is inside timestamptz, so the bind succeeds");
+        let names: Vec<&str> = candidates.iter().map(|c| c.field.as_str()).collect();
+        assert!(names.contains(&"never_observed"));
+        assert!(
+            !names.contains(&"observed"),
+            "no observation predates 1970, so an observed pin is alive at the epoch"
+        );
+    }
+
     #[sqlx::test]
     async fn delete_pins_refuses_a_contract_typed_name(pool: PgPool) {
         let store = catalog(&pool);

@@ -849,19 +849,28 @@ fn log_deleted(pin: &PurgedPin, r: &trawl_api::GcPinsResponse, actor: &GcActor) 
     );
 }
 
-/// `decided_at` minus the window, saturating at the earliest representable
-/// instant.
+/// `decided_at` minus the window, clamped at the unix epoch.
 ///
 /// `max_age_days` is an unvalidated operator number, so an "effectively
 /// never" retention floor lands here as a window no subtraction can hold.
-/// Saturating to the beginning of time makes every OBSERVED pin alive,
-/// which is the direction that deletes nothing.
+/// Going as far back as the arithmetic allows makes every OBSERVED pin
+/// alive, which is the direction that deletes nothing.
+///
+/// The floor is the epoch rather than [`DateTime::<Utc>::MIN_UTC`] because
+/// the cutoff is bound into a `timestamptz` comparison, and chrono's
+/// minimum (year -262143) is outside what postgres will accept: binding it
+/// turns a huge but perfectly valid `older_than_secs` into a 503 at query
+/// time instead of a run that conservatively matches nothing. The two are
+/// identical in effect. `field_services.last_seen` is written by trawl at
+/// observation time, so no row predates the install, let alone 1970, and
+/// every observed pin is on the alive side of either instant.
 fn cutoff_for(decided_at: DateTime<Utc>, window_secs: u64) -> DateTime<Utc> {
     i64::try_from(window_secs)
         .ok()
         .and_then(chrono::TimeDelta::try_seconds)
         .and_then(|d| decided_at.checked_sub_signed(d))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+        .unwrap_or(DateTime::UNIX_EPOCH)
+        .max(DateTime::UNIX_EPOCH)
 }
 
 fn iso8601(dt: DateTime<Utc>) -> String {
@@ -1207,6 +1216,34 @@ mod tests {
             "the reconcile must precede the refusal, so no error path leaves \
              the gate with the cache and the store disagreeing"
         );
+    }
+
+    /// A window nothing can subtract lands on the unix epoch, not on
+    /// chrono's minimum.
+    ///
+    /// The cutoff is bound straight into a `timestamptz` comparison, and
+    /// postgres refuses year -262143, so the old saturating floor turned an
+    /// absurd-but-valid `--older-than` into a 503 at bind time. The epoch
+    /// answers the same question (nothing was observed before 1970) and
+    /// binds.
+    #[test]
+    fn an_unsubtractable_window_clamps_to_the_epoch() {
+        let decided_at = at(1_800_000_000);
+        for window in [u64::MAX, u64::try_from(i64::MAX).unwrap(), 1 << 62] {
+            assert_eq!(
+                cutoff_for(decided_at, window),
+                DateTime::UNIX_EPOCH,
+                "window {window} must clamp to the epoch"
+            );
+        }
+        // A window that merely reaches back past 1970 clamps too, and an
+        // ordinary one is untouched.
+        assert_eq!(
+            cutoff_for(decided_at, 1_800_000_001),
+            DateTime::UNIX_EPOCH,
+            "a cutoff before 1970 is the epoch"
+        );
+        assert_eq!(cutoff_for(decided_at, 86_400), at(1_799_913_600));
     }
 
     /// The divergence from the schema listing, asserted so a later "make
