@@ -100,6 +100,33 @@ pub fn spawn_retention(
     })
 }
 
+/// The longest age this install still keeps data for, in seconds, or
+/// `None` when age retention is disabled.
+///
+/// Pin garbage collection ([`crate::catalog::gc`]) floors its dead window
+/// here: calling a field dead over a span shorter than the corpus trawl
+/// still stores would reclaim a pin whose data is right there on disk.
+/// Disk-pressure retention contributes nothing: it deletes by free space
+/// rather than by age, so it names no window a pin could be judged
+/// against.
+///
+/// `max_age_days` is an unvalidated operator `u64`, so the multiply
+/// saturates; an "effectively never" setting floors the window at
+/// "effectively never", which refuses every candidate. That is the right
+/// answer for an install that keeps everything.
+///
+/// This is the one function per-env retention (#108) changes: the floor
+/// becomes the maximum enabled age across all envs, and every caller keeps
+/// asking the same question.
+#[must_use]
+pub fn maximum_enabled_age_secs(config: &RetentionConfig) -> Option<u64> {
+    const SECS_PER_DAY: u64 = 86_400;
+    if config.max_age_days == 0 {
+        return None;
+    }
+    Some(config.max_age_days.saturating_mul(SECS_PER_DAY))
+}
+
 /// A single retention tick. Testable via injectable `free_space_fn`.
 fn retention_tick(
     data_dir: &Path,

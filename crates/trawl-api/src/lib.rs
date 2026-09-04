@@ -1083,6 +1083,72 @@ pub struct RepinCancelResponse {
     pub job: Option<RepinJobResponse>,
 }
 
+/// Request body for `POST /api/v1/schema/gc-pins`.
+///
+/// Reclaims pin slots held by fields nothing writes any more. A pin is a
+/// scarce install-wide resource (`MAX_PINNED_FIELDS`), and a typo'd or
+/// retired sender field otherwise holds its slot forever.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GcPinsRequest {
+    /// Scan and report only — no mutation.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// How long a field must have gone unobserved to be dead. Defaults
+    /// server-side to 30 days; `0` is accepted literally (the standing
+    /// parquet footers are the second, independent proof). The server
+    /// raises it to the retention window when that is longer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub older_than_secs: Option<u64>,
+}
+
+/// Response from `POST /api/v1/schema/gc-pins`, the same shape for a dry
+/// run and a real one — `dry_run` and `deleted` are what tell them apart.
+///
+/// Every number the operator reads is the server's own: the effective
+/// window is decided once, in `catalog::gc`, and reported here. No client
+/// recomputes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcPinsResponse {
+    /// Whether this run stopped after the scan.
+    pub dry_run: bool,
+    /// The one instant the run is anchored to (RFC 3339 UTC): cutoff,
+    /// audit events and this report all read it.
+    pub decided_at: String,
+    /// The requested window in seconds, after the server default applied.
+    pub requested_older_than_secs: u64,
+    /// The retention window in seconds, when age retention is enabled.
+    /// A pin cannot be called dead over a span shorter than the corpus
+    /// trawl still keeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_floor_secs: Option<u64>,
+    /// The window actually applied: the larger of the two above.
+    pub effective_older_than_secs: u64,
+    /// Pins that passed the observation axis, before the footer scan.
+    pub pins_examined: u64,
+    /// Parquet files whose schema the run read.
+    pub files_scanned: u64,
+    /// Would-delete on a dry run, deleted on a real one. Field-sorted.
+    pub candidates: Vec<GcPinCandidate>,
+    /// Rows actually deleted; always 0 on a dry run.
+    pub deleted: u64,
+}
+
+/// One pin the run judged dead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcPinCandidate {
+    /// The field name (catalog spelling: ASCII-lowercase).
+    pub field: String,
+    /// The pin being reclaimed (a catalog type spelling).
+    #[serde(rename = "type")]
+    pub data_type: String,
+    /// Newest observation of the field (ISO 8601 UTC), absent when the
+    /// pin was never observed at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
+    /// How many services ever carried it.
+    pub services: i64,
+}
+
 // -- history -----------------------------------------------------------------
 
 /// Response from the history endpoint.

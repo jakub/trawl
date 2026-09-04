@@ -24,6 +24,7 @@
 
 pub mod analyzer;
 pub mod conform;
+pub mod gc;
 
 use std::collections::HashMap;
 use std::sync::Arc;
