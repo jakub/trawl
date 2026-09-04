@@ -1301,8 +1301,9 @@ impl CatalogStore {
     /// gate is span-based, so left standing a repinned field would keep its
     /// verdict forever and the badge that told the operator to act would
     /// survive their acting on it. Ordering is the cutover's, not ours: the
-    /// clear runs before the job records its own outcome, so a forced lossy
-    /// repin's fresh evidence is not swept away with the old.
+    /// clear runs first and the forced lossy repin's own evidence is written
+    /// after it, in that same transaction, so the new evidence is never swept
+    /// away with the old and no read falls between the two.
     pub async fn clear_conflict_evidence(
         tx: &mut sqlx::PgConnection,
         field: &str,

@@ -3389,6 +3389,211 @@ mod repin_store {
         );
     }
 
+    /// The evidence barrier itself (issue #137): the transaction that turns
+    /// the job `succeeded` is the one that writes the loss it staged, detail
+    /// rows and durable aggregates alike. The read below happens after that
+    /// single call and finds both — there is no window where a client can
+    /// see a completed repin whose losses are unrecorded.
+    #[sqlx::test]
+    async fn finish_cutover_materialises_the_staged_loss(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        let id = running_execution(&s, "duration").await;
+        s.stage_cutover_input(
+            id,
+            RepinTotals {
+                files_done: 2,
+                rows_rewritten: 100,
+                rows_nulled: 9,
+                rows_resurrected: 0,
+                ambiguous_numerals: 0,
+            },
+            &[("nginx".to_owned(), 7), ("api".to_owned(), 2)],
+        )
+        .await
+        .unwrap();
+
+        s.finish_cutover(id, "duration", CanonicalType::BigInt)
+            .await
+            .unwrap();
+
+        let job = s.get(id).await.unwrap().expect("job row");
+        assert_eq!(job.status, RepinJobStatus::Succeeded);
+
+        let mut conflicts = catalog.conflicts_for_field("duration").await.unwrap();
+        conflicts.sort_by(|a, b| a.service.cmp(&b.service));
+        assert_eq!(
+            conflicts.len(),
+            2,
+            "one row per lossy service: {conflicts:?}"
+        );
+        assert_eq!(conflicts[0].service, "api");
+        assert_eq!(conflicts[0].rows_nulled, 2);
+        assert_eq!(conflicts[1].service, "nginx");
+        assert_eq!(conflicts[1].rows_nulled, 7);
+        for row in &conflicts {
+            assert_eq!(
+                row.observed_type, "VARCHAR",
+                "evidence names the pin the values were stored under"
+            );
+            assert_eq!(row.expected_type, "BIGINT");
+            assert!(
+                row.samples.is_empty(),
+                "the rewrite counts nulls, it never carries the values back"
+            );
+        }
+
+        // The aggregates move with the detail: they are what the degraded
+        // analyzer reads, and the trim cannot erase them.
+        let aggregates = catalog
+            .conflict_aggregates(Some(&["duration".to_owned()]))
+            .await
+            .unwrap();
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(aggregates[0].episodes, 2);
+        assert_eq!(aggregates[0].rows_nulled_total, 9);
+    }
+
+    /// A boot replay of a completed cutover writes the staged evidence a
+    /// second time into neither table: the completing UPDATE returns a row
+    /// only for the call that moved the job out of `running`, and the
+    /// staged tallies ride out on that row.
+    #[sqlx::test]
+    async fn finish_cutover_replay_does_not_double_insert_staged_evidence(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        let id = running_execution(&s, "duration").await;
+        s.stage_cutover_input(
+            id,
+            RepinTotals {
+                rows_nulled: 4,
+                ..RepinTotals::default()
+            },
+            &[("nginx".to_owned(), 4)],
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..3 {
+            s.finish_cutover(id, "duration", CanonicalType::BigInt)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            catalog.conflicts_for_field("duration").await.unwrap().len(),
+            1
+        );
+        let aggregates = catalog
+            .conflict_aggregates(Some(&["duration".to_owned()]))
+            .await
+            .unwrap();
+        assert_eq!(aggregates[0].episodes, 1, "one episode, replayed twice");
+        assert_eq!(aggregates[0].rows_nulled_total, 4);
+    }
+
+    /// Empty staged arrays are a proof, not an absence: the rewrite ran and
+    /// nulled nothing, so the cutover records nothing and says nothing.
+    #[sqlx::test]
+    async fn finish_cutover_records_nothing_for_a_lossless_repin(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        let id = running_execution(&s, "duration").await;
+        s.stage_cutover_input(id, RepinTotals::default(), &[])
+            .await
+            .unwrap();
+
+        s.finish_cutover(id, "duration", CanonicalType::BigInt)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.get(id).await.unwrap().unwrap().status,
+            RepinJobStatus::Succeeded
+        );
+        assert!(
+            catalog
+                .conflicts_for_field("duration")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// NULL staged columns mean staging never ran — a job from before the
+    /// barrier, or one whose engine died between the Cutover marker and the
+    /// flip. Past that marker the corpus is already the new generation, so
+    /// the completion goes forward: the job succeeds with no evidence, and
+    /// the operator's signal is a `repin_evidence_unstaged` warn (shape
+    /// asserted at the call site, not here — this test proves the forward
+    /// completion and the absence of invented evidence).
+    #[sqlx::test]
+    async fn finish_cutover_completes_forward_when_nothing_was_staged(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        let id = running_execution(&s, "duration").await;
+        assert_eq!(
+            staged(&pool, id).await,
+            (None, None),
+            "the premise: this job never staged"
+        );
+
+        s.finish_cutover(id, "duration", CanonicalType::BigInt)
+            .await
+            .expect("an unstaged completing call goes forward, never refuses");
+
+        assert_eq!(
+            s.get(id).await.unwrap().unwrap().status,
+            RepinJobStatus::Succeeded
+        );
+        assert!(
+            catalog
+                .conflicts_for_field("duration")
+                .await
+                .unwrap()
+                .is_empty(),
+            "no tallies means no evidence, never invented evidence"
+        );
+    }
+
+    /// The identity check: the job row's own field and target must match the
+    /// flip being asked for. A mismatch is the wrong job about to complete
+    /// somebody else's cutover, so nothing is mutated — not the pin, not the
+    /// job row.
+    #[sqlx::test]
+    async fn finish_cutover_refuses_a_flip_the_job_never_claimed(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        let id = running_execution(&s, "duration").await;
+
+        let err = s
+            .finish_cutover(id, "status", CanonicalType::BigInt)
+            .await
+            .expect_err("a different field must not complete this job");
+        assert!(matches!(err, StoreError::Validation(_)), "{err:?}");
+
+        let err = s
+            .finish_cutover(id, "duration", CanonicalType::Varchar)
+            .await
+            .expect_err("a different target must not complete this job");
+        assert!(matches!(err, StoreError::Validation(_)), "{err:?}");
+
+        assert_eq!(
+            s.get(id).await.unwrap().unwrap().status,
+            RepinJobStatus::Running,
+            "a refused cutover leaves the job running"
+        );
+        let pins: std::collections::HashMap<_, _> =
+            catalog.load_pins().await.unwrap().into_iter().collect();
+        assert!(!pins.contains_key("duration"), "and pins nothing");
+
+        let err = s
+            .finish_cutover(id + 10_000, "duration", CanonicalType::BigInt)
+            .await
+            .expect_err("no such job");
+        assert!(matches!(err, StoreError::NotFound { .. }), "{err:?}");
+    }
+
     /// Boot reconciliation: an orphaned `running` row (killed process, no
     /// marker) fails; the marker's own job — mid-recovery — is kept.
     #[sqlx::test]
