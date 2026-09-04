@@ -27,8 +27,16 @@ use crate::types::{
 /// Outcome of `POST /api/v1/schema/repin` — the HTTP status decoded.
 #[derive(Debug, Clone)]
 pub enum RepinStart {
-    /// 200: a dry-run report (the job is terminal `succeeded`).
+    /// 200 with a `succeeded` row: a dry-run report.
     Report(trawl_api::RepinJobResponse),
+    /// 200 with a terminal row that is neither a report nor a
+    /// cancellation. Today that is `failed`, reached when the cancel
+    /// effect site could not record its request row and downgraded the
+    /// outcome (#109): the job stopped, the corpus is untouched, and the
+    /// row's own `status` is the verdict. A caller must render that status
+    /// and treat it as a failure — reading it as a report is how "dry run"
+    /// gets printed over a job that did nothing.
+    Failed(trawl_api::RepinJobResponse),
     /// 200 with a `cancelled` row: an operator stopped the job while this
     /// request's own ladder was still running it (#109). The corpus is
     /// untouched and the pin unchanged, so this is never a report.
@@ -860,13 +868,6 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
     }
 }
 
-/// Pair the cancel endpoint's status code with the body's own `outcome`.
-///
-/// The server writes both from one table, so a disagreement means the
-/// response did not come from a server that shares this table — a proxy
-/// rewriting a status, or a version skew. Trusting either half silently
-/// would let a "202 accepted" be printed over a body that says nothing was
-/// running, so the mismatch is a protocol error instead.
 /// Decode a successful repin trigger response: the status code plus the
 /// job row's own status.
 ///
@@ -881,21 +882,36 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
 /// report a caller would print as a plan. A 202 is left alone: the server
 /// reads the row back after spawning the rewrite, so a fast job can
 /// legitimately be terminal by the time it is serialised.
+///
+/// Every success arm names the status it decodes, and there is no wildcard
+/// into `Report`. There used to be, and a `failed` row fell through it: a
+/// cancel whose request row could not be written downgrades the job to
+/// `failed` and the route still answers 200, which the CLI then printed as
+/// "dry run" and exited 0 over. An unrecognised status is
+/// [`RepinStart::Failed`], which no caller can read as success.
 fn decode_repin_start(
     status: u16,
     job: trawl_api::RepinJobResponse,
 ) -> Result<RepinStart, ClientError> {
     match (status, job.status.as_str()) {
         (202, _) => Ok(RepinStart::Started(job)),
-        (_, "cancelled") => Ok(RepinStart::Cancelled(job)),
         (_, "running") => Err(ClientError::Parse(format!(
             "repin: HTTP {status} carried a job still marked running, which \
              this route only answers with a terminal row"
         ))),
-        _ => Ok(RepinStart::Report(job)),
+        (_, "succeeded") => Ok(RepinStart::Report(job)),
+        (_, "cancelled") => Ok(RepinStart::Cancelled(job)),
+        _ => Ok(RepinStart::Failed(job)),
     }
 }
 
+/// Pair the cancel endpoint's status code with the body's own `outcome`.
+///
+/// The server writes both from one table, so a disagreement means the
+/// response did not come from a server that shares this table — a proxy
+/// rewriting a status, or a version skew. Trusting either half silently
+/// would let a "202 accepted" be printed over a body that says nothing was
+/// running, so the mismatch is a protocol error instead.
 fn decode_repin_cancel(
     status: u16,
     body: trawl_api::RepinCancelResponse,
@@ -1129,6 +1145,24 @@ mod tests {
             decode_repin_start(202, start_job("running")),
             Ok(RepinStart::Started(_))
         ));
+    }
+
+    /// A 200 carrying a `failed` row is not a report either.
+    ///
+    /// The path is real: a cancel whose request row cannot be written
+    /// downgrades the job to `failed`, and that row still rides out on the
+    /// original POST's 200. Under the old wildcard arm the CLI printed
+    /// "dry run" and exited 0 over a repin that never ran (#109 review
+    /// R2-3).
+    #[test]
+    fn a_failed_job_under_a_200_never_decodes_as_a_report() {
+        for status in ["failed", "blocked", "refused_needs_force"] {
+            let decoded = decode_repin_start(200, start_job(status));
+            assert!(
+                matches!(decoded, Ok(RepinStart::Failed(ref job)) if job.status == status),
+                "{status} decoded as {decoded:?}"
+            );
+        }
     }
 
     /// Both 200 shapes are terminal rows, so a 200 naming a running job is

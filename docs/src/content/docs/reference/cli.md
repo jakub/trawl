@@ -214,11 +214,13 @@ In `-f json` and `-f csv` the receipt is one record: the verdict, the
 server's sentence, and the job's own columns, nulled when no job is
 attached. `-f table` keeps the sentence and the job table as two blocks.
 
-`repin --wait` exits non-zero when another actor cancels the job mid-wait.
-The row prints as usual and the message names who asked; a script that read
-that exit as success would go on to trust a rewrite that never happened. It
-also exits non-zero when the status surface stops naming the job it is
-following: there is no way to ask that route for a job by id, so a second
+`repin --wait` exits zero only for a repin that actually finished, and for
+a dry run's report. Every other terminal status is non-zero: `cancelled`
+names who asked, `refused_needs_force` says what would be lost, and
+`failed` or `blocked` print the row and the server's own error text. A
+script that read any of those as success would go on to trust a rewrite
+that never happened. It also exits non-zero when the status surface stops
+naming the job it is following: there is no way to ask that route for a job by id, so a second
 job claiming the freed slot leaves the first job's outcome unknown, and the
 message says so rather than reporting the last row it saw.
 

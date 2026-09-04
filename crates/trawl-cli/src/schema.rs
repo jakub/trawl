@@ -1025,12 +1025,15 @@ pub async fn run_repin(
             flags.force,
         )
         .await?;
-    let (verdict, job) = match outcome {
+    let (started_as, job) = match outcome {
         trawl_client::RepinStart::Report(job) => ("dry run", job),
         // The client separates a cancelled row from a report, so the
         // verdict word is decided here rather than by sniffing the status
         // string afterwards (#109).
         trawl_client::RepinStart::Cancelled(job) => ("cancelled", job),
+        // A 200 that is neither: the row's own status is the verdict, and
+        // `repin_completion` turns it into a non-zero exit.
+        trawl_client::RepinStart::Failed(job) => ("did not complete", job),
         trawl_client::RepinStart::Started(job) => ("started", job),
         trawl_client::RepinStart::Refused(job) => ("refused: needs --force", job),
     };
@@ -1039,22 +1042,9 @@ pub async fn run_repin(
     if flags.wait && job.status == "running" {
         job = wait_for_terminal(&client, job).await?;
     }
-    // A job someone cancelled while we waited did not do the work this
-    // invocation asked for. Reading that as success is how a script goes on
-    // to trust a rewrite that never happened, so it prints the row and then
-    // exits non-zero (#109). The immediate 200-cancelled arrives already
-    // decoded; this catches the one a `--wait` poll discovers.
-    let cancelled = job.status == "cancelled";
-    // Computed after the wait: a started job can still refuse at the
-    // cutover gate when data ingested after the scan turns out to be
-    // unreadable under the new type.
-    let refused = job.status == "refused_needs_force";
 
     if format == OutputFormat::Table {
-        // The status the row ended on outranks the verdict the start
-        // request carried: a job started here and cancelled while `--wait`
-        // polled it would otherwise still print as "started".
-        let verdict = if cancelled { "cancelled" } else { verdict };
+        let verdict = repin_verdict_word(started_as, &job.status);
         writeln!(out, "repin {}: {verdict}", job.field)?;
     }
     let (columns, rows) = repin_job_to_rows(&job, format);
@@ -1063,36 +1053,84 @@ pub async fn run_repin(
     // format (`label`), so a piped `-f json` stays one parseable record while
     // the operator still reads the evidence.
     render_repin_case_file(out, format == OutputFormat::Table, &job)?;
-    if refused {
-        // A pre-scan refusal reports its projection; a cutover refusal
-        // reports what the finished rewrite actually nulled. The server's own
-        // reason is the authoritative one when it sent it — the two gates and
-        // the wire all ask one function, and it names ambiguity as well as
-        // loss.
-        if let Some(reason) = job.requires_force_reason {
-            return Err(CliError::Usage(format!(
-                "repin refused: {reason} — re-run with --force to accept it"
-            )));
+    repin_completion(&job)
+}
+
+/// The word the table header prints.
+///
+/// The status the row ended on outranks the verdict the start request
+/// carried: a job started here and then cancelled, refused at the cutover
+/// gate or failed while `--wait` polled it would otherwise still print as
+/// "started".
+fn repin_verdict_word<'a>(started_as: &'a str, status: &str) -> &'a str {
+    match status {
+        "cancelled" => "cancelled",
+        "failed" => "failed",
+        "blocked" => "blocked",
+        "refused_needs_force" => "refused: needs --force",
+        _ => started_as,
+    }
+}
+
+/// Did the repin this invocation asked for actually happen?
+///
+/// Exit code is the only thing a script reads, so every terminal status
+/// that is not a completed rewrite (or the dry run's report, which is also
+/// `succeeded`) has to be an error here. `running` is the one non-terminal
+/// pass: without `--wait` the job is deliberately left in flight and the
+/// operator polls `repin-status`.
+///
+/// The catch-all arm is the point (#109 review R2-3). `failed` and
+/// `blocked` used to fall past the cancelled and refused checks into
+/// `Ok(())`, so a `--wait` that watched a job fail still exited 0, and a
+/// cancel whose request row could not be written — which downgrades the
+/// job to `failed` on a 200 — printed "dry run" and exited 0 as well.
+fn repin_completion(job: &trawl_client::RepinJobResponse) -> Result<(), CliError> {
+    match job.status.as_str() {
+        "succeeded" | "running" => Ok(()),
+        "refused_needs_force" => {
+            // A pre-scan refusal reports its projection; a cutover refusal
+            // reports what the finished rewrite actually nulled. The server's
+            // own reason is the authoritative one when it sent it — the two
+            // gates and the wire all ask one function, and it names ambiguity
+            // as well as loss.
+            if let Some(reason) = job.requires_force_reason.as_deref() {
+                return Err(CliError::Usage(format!(
+                    "repin refused: {reason} — re-run with --force to accept it"
+                )));
+            }
+            let lost = if job.rows_nulled > 0 {
+                job.rows_nulled
+            } else {
+                job.projected_nulls
+            };
+            Err(CliError::Usage(format!(
+                "repin would null {lost} stored value(s); re-run with --force \
+                 to accept the loss (originals remain findable in _raw)"
+            )))
         }
-        let lost = if job.rows_nulled > 0 {
-            job.rows_nulled
-        } else {
-            job.projected_nulls
-        };
-        return Err(CliError::Usage(format!(
-            "repin would null {lost} stored value(s); re-run with --force to \
-             accept the loss (originals remain findable in _raw)"
-        )));
+        "cancelled" => {
+            let by = job.cancelled_by.as_deref().unwrap_or("an operator");
+            Err(CliError::Usage(format!(
+                "repin cancelled by {}: the corpus was left untouched and the \
+                 pin is unchanged",
+                trawl_core::sanitize::sanitize_display_text(by)
+            )))
+        }
+        other => {
+            // The status and the error text both come off the wire, so both
+            // are sanitized before they reach a terminal.
+            let detail = job.error.as_deref().map_or_else(String::new, |e| {
+                format!(": {}", trawl_core::sanitize::sanitize_display_text(e))
+            });
+            Err(CliError::Usage(format!(
+                "repin ended {}{detail}. The rewrite this command asked for \
+                 did not complete; check `trawl schema repin-status` and the \
+                 server log",
+                trawl_core::sanitize::sanitize_display_text(other)
+            )))
+        }
     }
-    if cancelled {
-        let by = job.cancelled_by.as_deref().unwrap_or("an operator");
-        return Err(CliError::Usage(format!(
-            "repin cancelled by {}: the corpus was left untouched and the pin \
-             is unchanged",
-            trawl_core::sanitize::sanitize_display_text(by)
-        )));
-    }
-    Ok(())
 }
 
 /// Poll the status surface until the job leaves `running`.
@@ -1700,6 +1738,51 @@ mod repin_tests {
             assert!(msg.contains("unknown"), "{msg}");
             assert!(msg.contains("repin-status"), "{msg}");
         }
+    }
+
+    /// Only a completed rewrite (or a dry run's report) exits 0.
+    ///
+    /// `failed` is the reachable one this test exists for: a cancel whose
+    /// request row cannot be written downgrades the job to `failed`, the
+    /// route still answers 200, and under `--wait` the old code fell past
+    /// the cancelled and refused checks into `Ok(())` — exit 0 over a repin
+    /// that never ran (#109 review R2-3).
+    #[test]
+    fn only_a_finished_repin_exits_zero() {
+        for status in ["succeeded", "running"] {
+            let mut job = sample_job();
+            job.status = status.into();
+            repin_completion(&job).unwrap_or_else(|e| panic!("{status} must pass: {e:?}"));
+        }
+
+        for status in ["failed", "blocked", "something_new"] {
+            let mut job = sample_job();
+            job.status = status.into();
+            job.error = Some("the store went away".into());
+            let err = repin_completion(&job).expect_err("{status} is not a success");
+            let CliError::Usage(msg) = err else {
+                panic!("expected a usage error, got {err:?}")
+            };
+            assert!(msg.contains(status), "the real status is named: {msg}");
+            assert!(msg.contains("the store went away"), "{msg}");
+            assert!(msg.contains("repin-status"), "{msg}");
+            assert!(!msg.contains("dry run"), "{msg}");
+        }
+    }
+
+    /// The table header names what the row ended on, not what the start
+    /// request said. A `failed` row must never print as "dry run".
+    #[test]
+    fn the_header_verdict_follows_the_terminal_row() {
+        assert_eq!(repin_verdict_word("dry run", "succeeded"), "dry run");
+        assert_eq!(repin_verdict_word("started", "running"), "started");
+        assert_eq!(repin_verdict_word("dry run", "failed"), "failed");
+        assert_eq!(repin_verdict_word("started", "cancelled"), "cancelled");
+        assert_eq!(repin_verdict_word("started", "blocked"), "blocked");
+        assert_eq!(
+            repin_verdict_word("started", "refused_needs_force"),
+            "refused: needs --force"
+        );
     }
 
     /// A cancelled job row shows who asked and when, in the machine
