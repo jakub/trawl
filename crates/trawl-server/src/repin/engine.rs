@@ -387,6 +387,33 @@ impl RepinEngine {
                 // A panicked decision task observed no boundary, so this is
                 // `failed` even with a cancel pending (design decision 5:
                 // `cancelled` means the unwind actually ran).
+                //
+                // Settle first, under the registry lock and before any store
+                // I/O: `finish` rides out postgres trouble for seconds and
+                // can hand the write to a detached retry loop, and an entry
+                // still armed through all of that answers 202 to cancels of
+                // a job whose task no longer exists — accepted requests
+                // nothing will ever observe. Settling closes the slot the way
+                // every other pre-cutover terminal does; the disarm below
+                // then clears it.
+                //
+                // A cancel that was already pending is not relabelled and
+                // emits no `repin_cancelled` event: that event means a
+                // boundary saw the request and the unwind ran, and neither
+                // happened here. The request fields are on the row already,
+                // so the audit trail keeps who asked; this line says only
+                // that the effect never came.
+                if let Settlement::Cancelled(actor) = self.cancel.settle(job_id) {
+                    tracing::warn!(
+                        event_type = "repin_cancel_unobserved",
+                        job_id,
+                        actor = %actor.name(),
+                        actor_key_prefix = %actor.key_prefix(),
+                        "the repin task died before any boundary observed the \
+                         pending cancel; the job is recorded failed, not \
+                         cancelled"
+                    );
+                }
                 let msg = format!("repin job task failed: {e}");
                 self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
                     .await;
@@ -1989,6 +2016,60 @@ mod tests {
             !body[spawn..].contains("self.job("),
             "nothing may read the job row after the spawn: a failure there \
              is reported as a synchronous one and disarms a running job"
+        );
+    }
+
+    /// A panicked decision task settles before it writes anything.
+    ///
+    /// `finish` is not a quick write: it retries a struggling postgres for
+    /// seconds and can hand the terminal write to a detached loop. An entry
+    /// left armed for that whole stretch answers every cancel request 202,
+    /// for a task that has already died — an accepted cancel nothing will
+    /// ever act on, which is the exact dishonesty the settlement lock
+    /// exists to prevent. Settling first closes the slot, so those requests
+    /// get the truthful "no job running".
+    ///
+    /// The outcome word does not move: a panic is an unobserved failure,
+    /// so a pending cancel still ends the job `failed` (design decision 5),
+    /// and the arm emits no `repin_cancelled` — that event asserts an
+    /// unwind ran.
+    ///
+    /// Shape assertion over the source. The panic path needs a panicking
+    /// `decide`, which no test can provoke without a fault seam through the
+    /// engine's own ladder; what is covered is the ordering, not a
+    /// live panic. `CancelRegistry`'s own settle-then-request behaviour is
+    /// covered in `cancel.rs`.
+    #[test]
+    fn a_panicked_decision_settles_before_it_touches_the_store() {
+        const SOURCE: &str = include_str!("engine.rs");
+        let start = SOURCE
+            .find("    pub async fn start(")
+            .expect("start is still a method on the engine");
+        let end = SOURCE[start..]
+            .find("    pub fn cancel(")
+            .expect("the cancel entry point still follows start")
+            + start;
+        let body = &SOURCE[start..end];
+        let panic_arm = body
+            .find("let outcome = match decided.await")
+            .expect("start still joins the detached decision task");
+        let arm = &body[panic_arm..];
+
+        let settle = arm
+            .find("self.cancel.settle(job_id)")
+            .expect("the panic arm still settles the registry");
+        let finish = arm
+            .find("self.finish(job_id")
+            .expect("the panic arm still terminalizes the row");
+        assert!(
+            settle < finish,
+            "the registry must be settled before the terminal write, which \
+             can spend seconds retrying a struggling store"
+        );
+        assert!(
+            !arm[..finish].contains("audit_cancelled("),
+            "a panic is an unobserved failure: no `repin_cancelled` event, \
+             because no boundary saw the request and no unwind ran"
         );
     }
 
