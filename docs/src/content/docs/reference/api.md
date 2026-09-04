@@ -329,7 +329,10 @@ A 202 accepts the request; it does not promise a terminal `cancelled`
 status. The job's own completion can win the race, and a process that dies
 between the request and any boundary acting on it lands `failed` with
 `cancel_requested_at` and `cancelled_by` preserved (recovery never infers
-`cancelled` from a request nothing acted on). Restarting trawld is the
+`cancelled` from a request nothing acted on). Those two fields are written
+durably as the request is accepted, but a process death in the same instant
+as the request can still lose them, so treat the 202 as an accepted request
+rather than a receipt for a durable one. Restarting trawld is the
 stronger cancel: a killed job leaves the live corpus untouched and boot
 recovery sweeps its staging. Read the outcome from the status route.
 

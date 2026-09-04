@@ -400,9 +400,23 @@ impl RepinEngine {
                 // A cancel that was already pending is not relabelled and
                 // emits no `repin_cancelled` event: that event means a
                 // boundary saw the request and the unwind ran, and neither
-                // happened here. The request fields are on the row already,
-                // so the audit trail keeps who asked; this line says only
-                // that the effect never came.
+                // happened here. What the row must still carry is who
+                // asked, and that is why the request is written HERE,
+                // synchronously, before the terminal status.
+                //
+                // The cancel path spawns its own detached
+                // `record_cancel_request`, and this arm used to rely on it.
+                // It is a race: `record_cancel_request` only matches a row
+                // whose status is still `running`, so a terminal write that
+                // lands first makes the detached recorder update zero rows
+                // and the job ends `failed` with NULL
+                // `cancel_requested_at`/`cancelled_by`, after the caller was
+                // told 202. Both writes are idempotent and
+                // first-writer-preserving, so ordering only matters for the
+                // one that must precede the terminal, and doing it here
+                // means the detached twin is harmless whichever way it
+                // falls. A store failure costs the request fields and
+                // nothing else: the job still terminalizes `failed`.
                 if let Settlement::Cancelled(actor) = self.cancel.settle(job_id) {
                     tracing::warn!(
                         event_type = "repin_cancel_unobserved",
@@ -413,6 +427,18 @@ impl RepinEngine {
                          pending cancel; the job is recorded failed, not \
                          cancelled"
                     );
+                    if let Err(store_err) =
+                        self.store.record_cancel_request(job_id, actor.name()).await
+                    {
+                        tracing::error!(
+                            event_type = "repin_store_error",
+                            job_id,
+                            error = %store_err,
+                            "the pending cancel request could not be recorded \
+                             before the failed terminal; the job row will not \
+                             name who asked"
+                        );
+                    }
                 }
                 let msg = format!("repin job task failed: {e}");
                 self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
@@ -2077,6 +2103,54 @@ mod tests {
             !arm[..finish].contains("audit_cancelled("),
             "a panic is an unobserved failure: no `repin_cancelled` event, \
              because no boundary saw the request and no unwind ran"
+        );
+    }
+
+    /// A panicked decision task records the pending cancel request itself,
+    /// synchronously, before it writes the terminal status.
+    ///
+    /// The cancel path spawns a detached `record_cancel_request`, and this
+    /// arm used to rely on it. That is a race with a wrong answer:
+    /// `record_cancel_request` only matches a row still `running`, so if
+    /// the `failed` terminal lands first the recorder updates zero rows and
+    /// the job ends with NULL `cancel_requested_at`/`cancelled_by` even
+    /// though the operator was told 202. Doing the write here makes one of
+    /// the two synchronous, and since it is idempotent and keeps the first
+    /// asker, the detached twin is then harmless in either order.
+    ///
+    /// Shape assertion over the source, for the same reason as its sibling
+    /// above: reaching this arm needs a panicking `decide`, and there is no
+    /// fault seam through the ladder to provoke one. What is covered is the
+    /// ordering. The store behaviour the ordering depends on (a terminal
+    /// row takes no later request) is covered against real postgres in
+    /// `store_pg.rs`.
+    #[test]
+    fn a_panicked_decision_records_a_pending_cancel_before_the_terminal_write() {
+        const SOURCE: &str = include_str!("engine.rs");
+        let start = SOURCE
+            .find("    pub async fn start(")
+            .expect("start is still a method on the engine");
+        let end = SOURCE[start..]
+            .find("    pub fn cancel(")
+            .expect("the cancel entry point still follows start")
+            + start;
+        let body = &SOURCE[start..end];
+        let panic_arm = body
+            .find("let outcome = match decided.await")
+            .expect("start still joins the detached decision task");
+        let arm = &body[panic_arm..];
+
+        let record = arm
+            .find("self.store.record_cancel_request(job_id, actor.name()).await")
+            .expect("the panic arm still records a pending cancel request");
+        let finish = arm
+            .find("self.finish(job_id")
+            .expect("the panic arm still terminalizes the row");
+        assert!(
+            record < finish,
+            "the request must be recorded before the terminal write: a \
+             `failed` row takes no later request, and the detached recorder \
+             would silently update nothing"
         );
     }
 
