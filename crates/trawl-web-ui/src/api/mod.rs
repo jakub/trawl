@@ -286,6 +286,10 @@ pub async fn repin(
         dialect: None,
         dry_run,
         force,
+        // The SPA offers no ceiling controls, so the server resolves both
+        // from the job's own scan.
+        max_nulled_rows: None,
+        max_ambiguous_rows: None,
     };
     let resp = Request::post("/api/v1/schema/repin")
         .header("content-type", "application/json")

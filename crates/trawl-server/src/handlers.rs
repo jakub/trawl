@@ -1924,6 +1924,14 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
                 last_seen: iso8601(last_seen),
                 service,
             }),
+        // Both pairs ride the row unchanged: what the request stated, and
+        // what the plan resolved. A NULL column stays absent on the wire —
+        // "the request stated none" and "this row predates ceilings" are
+        // both read as "no number here", never as zero.
+        max_nulled_rows: job.max_nulled_rows.map(clamp),
+        max_ambiguous_rows: job.max_ambiguous_rows.map(clamp),
+        accepted_max_nulled_rows: job.accepted_max_nulled_rows.map(clamp),
+        accepted_max_ambiguous_rows: job.accepted_max_ambiguous_rows.map(clamp),
     }
 }
 
@@ -1961,10 +1969,13 @@ pub async fn schema_repin(
             req.dialect.as_deref(),
             req.dry_run,
             req.force,
-            // The request cannot state a ceiling yet: the wire fields land
-            // with the client and CLI, and until they do every job resolves
-            // the scan-derived default.
-            crate::repin::ceiling::RequestedCeilings::default(),
+            // Stated or not: an absent ceiling means "derive one from this
+            // job's own scan", and a ceiling without force is a 400 the
+            // engine raises.
+            crate::repin::ceiling::RequestedCeilings {
+                max_nulled: req.max_nulled_rows,
+                max_ambiguous: req.max_ambiguous_rows,
+            },
             Some(&verified.name),
         )
         .await?;

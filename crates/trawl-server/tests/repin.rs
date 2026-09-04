@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use common::{TestServer, setup_in_dir_with_data};
 use serde_json::json;
-use trawl_client::{HttpClient, RepinStart};
+use trawl_client::{HttpClient, RepinCeilings, RepinStart};
 use trawl_server::catalog::CatalogContext;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::repin::ceiling::RequestedCeilings;
@@ -264,7 +264,14 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
     // (VARCHAR is the always-lossless target).
     let dry = match h
         .schema_admin
-        .schema_repin("status", "varchar", None, true, false)
+        .schema_repin(
+            "status",
+            "varchar",
+            None,
+            true,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("dry run")
     {
@@ -280,7 +287,14 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
     // Execute; the dry-run projection is the rewrite's outcome.
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -353,7 +367,14 @@ async fn a_cutover_retypes_the_schema_endpoint_immediately() {
 
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -409,7 +430,14 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     // Lossy without force: 409, plan attached, nothing changed.
     let refused = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", None, false, false)
+        .schema_repin(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("refusal is a decoded outcome, not a transport error")
     {
@@ -425,7 +453,7 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     // evidence like any lossy conform.
     let started = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", None, false, true)
+        .schema_repin("dur", "BIGINT", None, false, true, RepinCeilings::default())
         .await
         .expect("forced execute")
     {
@@ -488,7 +516,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
     }
     let dry = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", None, true, false)
+        .schema_repin("dur", "BIGINT", None, true, false, RepinCeilings::default())
         .await
         .expect("dry run")
     {
@@ -502,7 +530,14 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
         .store(400, std::sync::atomic::Ordering::Relaxed);
     let started = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", None, false, false)
+        .schema_repin(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -539,7 +574,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
     // The operator's answer: the same repin, forced, accepts the loss.
     let forced = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", None, false, true)
+        .schema_repin("dur", "BIGINT", None, false, true, RepinCeilings::default())
         .await
         .expect("forced execute")
     {
@@ -628,7 +663,14 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
     // And the slot is free: the next repin is served, not 409ed.
     match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, true, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("the running slot is free again")
     {
@@ -685,7 +727,14 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
 
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -697,7 +746,14 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     // through the error envelope.
     let second = h
         .schema_admin
-        .schema_repin("status", "DOUBLE", None, false, false)
+        .schema_repin(
+            "status",
+            "DOUBLE",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await;
     match second {
         Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 409),
@@ -871,7 +927,14 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
     coordinator.set_cutover_hold_ms(3_000);
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1201,7 +1264,14 @@ async fn resurrection_only_pass_recovers_without_retyping() {
     // Same type without force is a 400 (nothing to do without intent).
     let err = h
         .schema_admin
-        .schema_repin("status", "BIGINT", None, false, false)
+        .schema_repin(
+            "status",
+            "BIGINT",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect_err("same-type without force refuses");
     match err {
@@ -1215,7 +1285,14 @@ async fn resurrection_only_pass_recovers_without_retyping() {
     // return.
     let dry = match h
         .schema_admin
-        .schema_repin("status", "BIGINT", None, true, true)
+        .schema_repin(
+            "status",
+            "BIGINT",
+            None,
+            true,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("dry run")
     {
@@ -1329,6 +1406,28 @@ async fn boot_reconciliation_replays_a_severity_cutover() {
     assert!(!trawl_server::repin::marker_path(&data).exists());
 }
 
+/// A dry run through the HTTP client, unwrapped to its report.
+///
+/// The ceilings stay at their defaults: a dry run mutates nothing, so what
+/// it is held to is the scan-derived number, which is the one an operator
+/// reading the plan is offered.
+async fn dry_run(
+    client: &HttpClient,
+    field: &str,
+    to: &str,
+    dialect: Option<&str>,
+    force: bool,
+) -> trawl_client::RepinJobResponse {
+    match client
+        .schema_repin(field, to, dialect, true, force, RepinCeilings::default())
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    }
+}
+
 /// A dry run must say whether the IDENTICAL executing request would refuse
 /// (issue #79): the plan's numbers alone read as a clean 200, and an
 /// operator would learn about the force gate from the request that was
@@ -1349,15 +1448,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
     assert_eq!(h.pinned_type("pri").await, "VARCHAR");
 
     // (1) Loss: `gold` has no reading at all.
-    let dry = match h
-        .schema_admin
-        .schema_repin("level", "severity", None, true, false)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let dry = dry_run(&h.schema_admin, "level", "severity", None, false).await;
     assert_eq!(dry.status, "succeeded", "a dry run still succeeds");
     assert_eq!(dry.projected_nulls, 1);
     assert_eq!(
@@ -1387,15 +1478,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
 
     // (2) Ambiguity: nothing is lost, but `3` means err to syslog and
     // trace3 to OTel — the gate fires on the default OTel reading.
-    let dry = match h
-        .schema_admin
-        .schema_repin("pri", "severity", None, true, false)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let dry = dry_run(&h.schema_admin, "pri", "severity", None, false).await;
     assert_eq!(dry.projected_nulls, 0, "every value has an OTel reading");
     assert_eq!(dry.ambiguous_numerals, 1);
     assert_eq!(dry.requires_force, Some(true), "{dry:?}");
@@ -1405,15 +1488,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
 
     // Asserting syslog answers the ambiguity, so the same corpus needs no
     // force at all — and `--force` clears the OTel one.
-    let dry = match h
-        .schema_admin
-        .schema_repin("pri", "severity", Some("syslog"), true, false)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let dry = dry_run(&h.schema_admin, "pri", "severity", Some("syslog"), false).await;
     assert_eq!(dry.dialect.as_deref(), Some("syslog"));
     assert_eq!(dry.ambiguous_numerals, 1, "the COUNT is dialect-blind");
     assert_eq!(
@@ -1421,15 +1496,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
         Some(false),
         "an asserted dialect IS the answer to the ambiguity: {dry:?}"
     );
-    let forced = match h
-        .schema_admin
-        .schema_repin("pri", "severity", None, true, true)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let forced = dry_run(&h.schema_admin, "pri", "severity", None, true).await;
     assert_eq!(
         forced.requires_force,
         Some(false),
@@ -1456,7 +1523,14 @@ async fn the_force_verdict_is_absent_until_the_scan_has_a_plan() {
     let client = h.schema_admin.clone();
     let dry = tokio::spawn(async move {
         client
-            .schema_repin("level", "severity", None, true, false)
+            .schema_repin(
+                "level",
+                "severity",
+                None,
+                true,
+                false,
+                RepinCeilings::default(),
+            )
             .await
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1493,15 +1567,7 @@ async fn the_force_verdict_is_absent_until_the_scan_has_a_plan() {
 
     // The third state: a plan with nothing to accept (a BIGINT field to
     // VARCHAR, which is lossless by construction).
-    let clean = match h
-        .schema_admin
-        .schema_repin("dur", "varchar", None, true, false)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let clean = dry_run(&h.schema_admin, "dur", "varchar", None, false).await;
     assert_eq!(
         clean.requires_force,
         Some(false),
@@ -1530,15 +1596,7 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite() {
     assert_eq!(h.pinned_type("level").await, "VARCHAR");
     assert_eq!(h.count("last=1h | stats count()").await, 5);
 
-    let dry = match h
-        .schema_admin
-        .schema_repin("level", "severity", None, true, false)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let dry = dry_run(&h.schema_admin, "level", "severity", None, false).await;
     assert_eq!(dry.files_total, 1);
     assert_eq!(dry.rows_carrying, 5, "every row carries a level");
     assert_eq!(dry.projected_nulls, 1, "only `gold` has no reading");
@@ -1566,7 +1624,14 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite() {
     // the scan projected.
     let started = match h
         .schema_admin
-        .schema_repin("level", "severity", None, false, true)
+        .schema_repin(
+            "level",
+            "severity",
+            None,
+            false,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1625,7 +1690,14 @@ async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion() {
     // still a loss, so this run is forced for that reason.
     let started = match h
         .schema_admin
-        .schema_repin("level", "severity", Some("syslog"), false, true)
+        .schema_repin(
+            "level",
+            "severity",
+            Some("syslog"),
+            false,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1674,15 +1746,7 @@ async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key() {
         "the token was shelved by the BIGINT pin"
     );
 
-    let dry = match h
-        .schema_admin
-        .schema_repin("lvl", "severity", None, true, true)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let dry = dry_run(&h.schema_admin, "lvl", "severity", None, true).await;
     assert_eq!(
         dry.resurrectable, 1,
         "the shelved `error` is recoverable from _raw under a case-variant key"
@@ -1691,7 +1755,14 @@ async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key() {
 
     let started = match h
         .schema_admin
-        .schema_repin("lvl", "severity", None, false, true)
+        .schema_repin(
+            "lvl",
+            "severity",
+            None,
+            false,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1719,7 +1790,14 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest() {
     h.ingest_and_compact(&severity_corpus()).await;
     let started = match h
         .schema_admin
-        .schema_repin("level", "severity", None, false, true)
+        .schema_repin(
+            "level",
+            "severity",
+            None,
+            false,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1806,7 +1884,14 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
 
     let started = match h
         .schema_admin
-        .schema_repin("level", "severity", Some("syslog"), false, true)
+        .schema_repin(
+            "level",
+            "severity",
+            Some("syslog"),
+            false,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1902,6 +1987,70 @@ async fn varchar_corpus(h: &Harness, numeric: &[&str], lossy: &[&str]) {
     }
     h.ingest_and_compact(&events).await;
     assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+}
+
+/// The ceilings travel over HTTP, both ways (issue #111 M5).
+///
+/// Every other ceiling test drives the engine directly, so nothing yet
+/// proves the request fields reach it or that the resolved pair comes back.
+/// This one goes through the client: a forced dry run stating zero comes
+/// back refused, echoing what it asked for beside what the job was held to.
+/// The CLI reads exactly those two fields to restate a preview's numbers.
+#[tokio::test(flavor = "multi_thread")]
+async fn stated_ceilings_travel_over_the_wire_and_the_accepted_pair_returns() {
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops"]).await;
+
+    let report = match h
+        .schema_admin
+        .schema_repin(
+            "dur",
+            "BIGINT",
+            None,
+            true,
+            true,
+            RepinCeilings {
+                max_nulled_rows: Some(0),
+                max_ambiguous_rows: None,
+            },
+        )
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(report.max_nulled_rows, Some(0), "the request echoes back");
+    assert_eq!(report.max_ambiguous_rows, None, "unstated stays absent");
+    assert_eq!(report.accepted_max_nulled_rows, Some(0), "explicit wins");
+    // The unstated half is the scan-derived default, never "unlimited".
+    assert!(
+        report.accepted_max_ambiguous_rows.is_some(),
+        "an unstated ceiling still resolves: {report:?}"
+    );
+    // One unreadable row against a ceiling of zero: the executing request
+    // would refuse, and the dry run says so through the same decision.
+    assert_eq!(report.requires_force, Some(true));
+    let reason = report.requires_force_reason.expect("a reason");
+    assert!(reason.contains("accepted 0"), "{reason}");
+
+    // A ceiling without force is a request that means nothing: 400.
+    let err = h
+        .schema_admin
+        .schema_repin(
+            "dur",
+            "BIGINT",
+            None,
+            true,
+            false,
+            RepinCeilings {
+                max_nulled_rows: Some(5),
+                max_ambiguous_rows: None,
+            },
+        )
+        .await
+        .expect_err("a ceiling without force is a bad request");
+    assert!(format!("{err}").contains("400"), "{err}");
 }
 
 /// The accepted number itself passes. One unreadable row against a ceiling

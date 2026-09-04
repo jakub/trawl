@@ -764,6 +764,91 @@ pub struct RepinFlags {
     pub yes: bool,
     /// Poll the job to completion.
     pub wait: bool,
+    /// The most rows the forced rewrite may null, as stated on the command
+    /// line. `None` leaves the number to the server's scan.
+    pub max_nulled_rows: Option<u64>,
+    /// The same bound for dialect-ambiguous numerals.
+    pub max_ambiguous_rows: Option<u64>,
+}
+
+/// The ceilings a forced repin is held to, both resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundCeilings {
+    /// Rows the rewrite may null.
+    pub max_nulled: u64,
+    /// Dialect-ambiguous numerals the rewrite may carry.
+    pub max_ambiguous: u64,
+}
+
+/// How a run reaches the numbers its forced execution is bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingPlan {
+    /// Nothing to bind: an unforced repin accepts no loss at all, and a dry
+    /// run mutates nothing, so neither has terms to state.
+    NotApplicable,
+    /// The command line stated both numbers. Execute with them as they
+    /// stand, and print them: no preview scan is needed to know them.
+    Stated(BoundCeilings),
+    /// A forced execution that stated fewer than both numbers. The missing
+    /// half only exists once a scan has counted the corpus, so the run does
+    /// a forced dry run first, prints the ceilings that scan resolved, and
+    /// then executes stating those same numbers.
+    Preview,
+}
+
+/// Decide how a `schema repin` invocation reaches its ceilings, before any
+/// network access.
+///
+/// The rule is that an operator never reads a number the execution is not
+/// actually held to. A scan-derived default is resolved per job, and a
+/// forced execution runs its own scan, so printing the preview's number and
+/// then letting the execution derive a fresh one would print a number
+/// nothing enforces. Restating the preview's numbers as explicit ceilings
+/// makes the printed line the enforced bound by construction, at the cost of
+/// a second scan on this path only.
+#[must_use]
+pub fn ceiling_plan(flags: &RepinFlags) -> CeilingPlan {
+    if flags.dry_run || !flags.force {
+        return CeilingPlan::NotApplicable;
+    }
+    match (flags.max_nulled_rows, flags.max_ambiguous_rows) {
+        (Some(max_nulled), Some(max_ambiguous)) => CeilingPlan::Stated(BoundCeilings {
+            max_nulled,
+            max_ambiguous,
+        }),
+        _ => CeilingPlan::Preview,
+    }
+}
+
+/// The ceilings a preview report resolved, when it resolved both.
+///
+/// A report missing either half is a job whose scan recorded no plan (or a
+/// server older than the ceiling columns). There is nothing honest to print
+/// or to restate there, so the caller falls back to whatever the flags said
+/// and lets the execution resolve the rest.
+#[must_use]
+pub fn accepted_ceilings(job: &trawl_client::RepinJobResponse) -> Option<BoundCeilings> {
+    Some(BoundCeilings {
+        max_nulled: job.accepted_max_nulled_rows?,
+        max_ambiguous: job.accepted_max_ambiguous_rows?,
+    })
+}
+
+/// The sentence the CLI prints before a forced execution starts.
+#[must_use]
+fn ceiling_notice(bound: BoundCeilings, from_preview: bool) -> String {
+    format!(
+        "force accepts up to {} unreadable row(s) and {} dialect-ambiguous \
+         numeral(s){}. The repin refuses at the cutover if the finished \
+         rewrite is worse than that.",
+        bound.max_nulled,
+        bound.max_ambiguous,
+        if from_preview {
+            ", resolved from a preview scan"
+        } else {
+            ""
+        }
+    )
 }
 
 /// One repin job → generic key/value (columns, rows) for the driver
@@ -805,6 +890,8 @@ pub fn repin_job_to_rows(
         "field_last_service",
         "requires_force",
         "requires_force_reason",
+        "accepted_max_nulled_rows",
+        "accepted_max_ambiguous_rows",
         "error",
     ]
     .map(str::to_owned)
@@ -846,6 +933,9 @@ pub fn repin_job_to_rows(
         job.requires_force.map_or(Json::Null, Json::from),
         job.requires_force_reason
             .clone()
+            .map_or(Json::Null, Json::from),
+        job.accepted_max_nulled_rows.map_or(Json::Null, Json::from),
+        job.accepted_max_ambiguous_rows
             .map_or(Json::Null, Json::from),
         job.error.clone().map_or(Json::Null, Json::from),
     ]];
@@ -931,6 +1021,20 @@ fn render_repin_case_file<W: Write>(
         )?;
     }
 
+    // What this job is actually held to, once its scan has resolved the
+    // numbers. An unforced job has none: it accepts no loss at all.
+    if let Some(bound) = accepted_ceilings(job) {
+        label(
+            out,
+            human,
+            &format!(
+                "\naccepted ceilings: {} unreadable row(s), {} dialect-ambiguous \
+                 numeral(s)",
+                bound.max_nulled, bound.max_ambiguous
+            ),
+        )?;
+    }
+
     match (job.requires_force, &job.requires_force_reason) {
         (Some(true), Some(reason)) => label(
             out,
@@ -953,11 +1057,85 @@ fn render_repin_case_file<W: Write>(
     Ok(())
 }
 
+/// Resolve the ceilings a forced execution states, printing them first.
+///
+/// A forced run that did not state both numbers scans the corpus first, so
+/// what gets printed is what the execution then carries. Deriving the
+/// numbers twice would print one and enforce another: the corpus grows
+/// between the two scans, and the default is a function of the scan.
+async fn bind_ceilings(
+    out: &mut impl Write,
+    client: &trawl_client::HttpClient,
+    field: &str,
+    to: &str,
+    dialect: Option<&str>,
+    flags: RepinFlags,
+    human: bool,
+) -> Result<Option<BoundCeilings>, CliError> {
+    let plan = ceiling_plan(&flags);
+    let bound = match plan {
+        CeilingPlan::NotApplicable => None,
+        CeilingPlan::Stated(bound) => Some(bound),
+        CeilingPlan::Preview => {
+            let preview = client
+                .schema_repin(
+                    field,
+                    to,
+                    dialect,
+                    true,
+                    true,
+                    trawl_client::RepinCeilings {
+                        max_nulled_rows: flags.max_nulled_rows,
+                        max_ambiguous_rows: flags.max_ambiguous_rows,
+                    },
+                )
+                .await?;
+            match preview {
+                trawl_client::RepinStart::Report(job) => accepted_ceilings(&job),
+                // A forced scan resolves its own ceilings, so a refusal here
+                // is one no ceiling covers. Report it instead of executing:
+                // the execution would refuse the same way, after a rewrite.
+                trawl_client::RepinStart::Refused(job) | trawl_client::RepinStart::Started(job) => {
+                    render_repin_case_file(out, human, &job)?;
+                    return Err(CliError::Usage(format!(
+                        "repin preview did not produce a plan (job {} is {})",
+                        job.id, job.status
+                    )));
+                }
+            }
+        }
+    };
+    if let Some(bound) = bound {
+        label(
+            out,
+            human,
+            &ceiling_notice(bound, plan == CeilingPlan::Preview),
+        )?;
+    } else if plan == CeilingPlan::Preview {
+        // The preview reported no resolved ceilings, so there is no number
+        // to print or to restate. The execution derives its own, exactly as
+        // a repin did before ceilings existed.
+        label(
+            out,
+            human,
+            "note: the server reported no resolved ceilings; the repin runs \
+             under the ones its own scan derives",
+        )?;
+    }
+    Ok(bound)
+}
+
 /// `trawl schema repin <field> --to <type>`.
 ///
 /// An executing repin rewrites the archive, so it confirms interactively —
 /// and off a TTY it refuses without `--yes` rather than assuming (a piped
 /// or scripted invocation must state its intent). Dry runs never prompt.
+///
+/// A forced execution prints the ceilings it accepts before it starts. When
+/// the command line stated both, those are the numbers; otherwise the run
+/// takes a forced dry run first and restates the ceilings that scan
+/// resolved, so the printed line is the bound the job is held to rather
+/// than a default a second scan might land somewhere else.
 pub async fn run_repin(
     out: &mut impl Write,
     conn: ConnectionParams,
@@ -998,13 +1176,23 @@ pub async fn run_repin(
     }
 
     let client = make_client(&conn)?;
+    let dialect = flags.dialect.map(crate::cli::SeverityDialect::token);
+    let human = format == OutputFormat::Table;
+
+    let bound = bind_ceilings(out, &client, field, to, dialect, flags, human).await?;
+
     let outcome = client
         .schema_repin(
             field,
             to,
-            flags.dialect.map(crate::cli::SeverityDialect::token),
+            dialect,
             flags.dry_run,
             flags.force,
+            trawl_client::RepinCeilings {
+                max_nulled_rows: bound.map_or(flags.max_nulled_rows, |b| Some(b.max_nulled)),
+                max_ambiguous_rows: bound
+                    .map_or(flags.max_ambiguous_rows, |b| Some(b.max_ambiguous)),
+            },
         )
         .await?;
     let (verdict, job) = match outcome {
@@ -1095,6 +1283,139 @@ pub async fn run_repin_status(
     Ok(())
 }
 
+// -- degraded-badge acknowledgement -------------------------------------------
+
+/// One acknowledgement → generic (columns, rows): a single record, like the
+/// repin job row, so `-f json` is one parseable object.
+///
+/// The note is operator prose that came back off the wire, so it goes
+/// through display sanitisation before it reaches a terminal.
+pub fn ack_to_rows(field: &str, ack: &trawl_client::FieldAck) -> (Vec<String>, Vec<Vec<Json>>) {
+    let columns = ["field", "acked_at", "acked_by", "evidence_through", "note"]
+        .map(str::to_owned)
+        .to_vec();
+    let rows = vec![vec![
+        Json::from(trawl_core::sanitize::sanitize_display_text(field)),
+        Json::from(ack.acked_at.clone()),
+        Json::from(trawl_core::sanitize::sanitize_display_text(&ack.acked_by)),
+        Json::from(ack.evidence_through),
+        ack.note.as_deref().map_or(Json::Null, |n| {
+            Json::from(trawl_core::sanitize::sanitize_display_text(n))
+        }),
+    ]];
+    (columns, rows)
+}
+
+/// `trawl schema ack <field> [--note <text>] [--clear]`.
+///
+/// Acknowledging a degraded badge says "I have seen this evidence", not "the
+/// pin is fine": the ack covers the conflict episodes that exist when the
+/// server writes it, so the next episode raises the badge again. A repin of
+/// the field clears it outright.
+///
+/// `--clear` withdraws the acknowledgement. It prints one line rather than a
+/// record: the DELETE has no body, and a null-filled row would be a record
+/// the server never sent.
+pub async fn run_ack<W: Write>(
+    out: &mut W,
+    conn: ConnectionParams,
+    field: &str,
+    note: Option<&str>,
+    clear: bool,
+    format: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    let format = resolve_format(format)?;
+    let human = format == OutputFormat::Table;
+    let client = make_client(&conn)?;
+
+    if clear {
+        client.schema_field_ack_clear(field).await?;
+        label(
+            out,
+            human,
+            &format!(
+                "acknowledgement cleared: {} (the badge returns if the \
+                 evidence still indicts the pin)",
+                trawl_core::sanitize::sanitize_display_text(field)
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let ack = client.schema_field_ack(field, note).await?;
+    let (columns, rows) = ack_to_rows(field, &ack);
+    render(out, &columns, &rows, format)?;
+    label(
+        out,
+        human,
+        &format!(
+            "acknowledged through {} conflict episode(s); the next episode \
+             raises the badge again",
+            ack.evidence_through
+        ),
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod ack_tests {
+    use super::*;
+
+    fn sample_ack() -> trawl_client::FieldAck {
+        trawl_client::FieldAck {
+            acked_at: "2026-09-02T09:00:00Z".into(),
+            acked_by: "tkl_abc123".into(),
+            note: Some("sender ships a fix on Friday".into()),
+            evidence_through: 7,
+        }
+    }
+
+    /// The ack renders as one record in every format the schema family
+    /// honours: a scripted caller reads it without parsing prose.
+    #[test]
+    fn the_ack_renders_as_one_record_in_every_format() {
+        let (columns, rows) = ack_to_rows("duration", &sample_ack());
+        assert_eq!(rows.len(), 1, "an ack is one record");
+        for format in [OutputFormat::Table, OutputFormat::Json, OutputFormat::Csv] {
+            let mut out = Vec::new();
+            render_driver_results(&columns, &rows, format, &mut out).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("duration"), "{format:?}: {text}");
+            assert!(text.contains("tkl_abc123"), "{format:?}: {text}");
+        }
+
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        let parsed: Json =
+            serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["evidence_through"], 7);
+        assert_eq!(parsed["note"], "sender ships a fix on Friday");
+
+        // No note is null, never an empty string: the operator wrote
+        // nothing, and an empty note would read as one they left blank.
+        let mut bare = sample_ack();
+        bare.note = None;
+        let (columns, rows) = ack_to_rows("duration", &bare);
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        let parsed: Json =
+            serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["note"], Json::Null);
+    }
+
+    /// The note is sender-adjacent text in a terminal: an operator can paste
+    /// anything into it, and it comes back over the wire, so it is
+    /// sanitised on display like every other value this file prints.
+    #[test]
+    fn a_hostile_note_is_sanitised_before_it_reaches_the_terminal() {
+        let mut ack = sample_ack();
+        ack.note = Some("boom\u{1b}[2Jgone".into());
+        let (_, rows) = ack_to_rows("duration", &ack);
+        let note = rows[0][4].as_str().unwrap();
+        assert!(!note.contains('\u{1b}'), "escape survived: {note:?}");
+    }
+}
+
 #[cfg(test)]
 mod repin_tests {
     use super::*;
@@ -1127,6 +1448,10 @@ mod repin_tests {
             liveness: None,
             requires_force: Some(false),
             requires_force_reason: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
+            accepted_max_nulled_rows: None,
+            accepted_max_ambiguous_rows: None,
         }
     }
 
@@ -1194,6 +1519,10 @@ mod repin_tests {
                  (the originals stay findable in _raw)"
                     .into(),
             ),
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
+            accepted_max_nulled_rows: None,
+            accepted_max_ambiguous_rows: None,
         };
 
         let mut out = Vec::new();
@@ -1340,6 +1669,136 @@ mod repin_tests {
         assert!(!text.contains("requires --force"), "{text}");
     }
 
+    /// The ceiling decision, at the level where it is a decision: which
+    /// numbers a forced run is bound to, and whether it has to scan first
+    /// to learn them.
+    ///
+    /// The flow around it needs a server (two round trips, the second
+    /// carrying the first's answer), so what a unit test can pin is the
+    /// decision and the values, not the wire. The paired evidence that the
+    /// second request really carries them lives in the server's repin
+    /// integration tests, which see the persisted request ceilings.
+    #[test]
+    fn a_forced_run_binds_stated_ceilings_and_previews_for_the_rest() {
+        let base = RepinFlags {
+            dialect: None,
+            dry_run: false,
+            force: false,
+            yes: true,
+            wait: false,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
+        };
+        // Unforced: no loss is accepted at all, so there are no terms.
+        assert_eq!(ceiling_plan(&base), CeilingPlan::NotApplicable);
+        // A dry run mutates nothing; there is nothing to hold it to.
+        assert_eq!(
+            ceiling_plan(&RepinFlags {
+                dry_run: true,
+                force: true,
+                max_nulled_rows: Some(5),
+                ..base
+            }),
+            CeilingPlan::NotApplicable
+        );
+        // Both stated: execute with them, no preview scan.
+        assert_eq!(
+            ceiling_plan(&RepinFlags {
+                force: true,
+                max_nulled_rows: Some(250),
+                max_ambiguous_rows: Some(0),
+                ..base
+            }),
+            CeilingPlan::Stated(BoundCeilings {
+                max_nulled: 250,
+                max_ambiguous: 0,
+            })
+        );
+        // One stated is not both: the other half only exists once a scan
+        // has counted the corpus.
+        for flags in [
+            RepinFlags {
+                force: true,
+                max_nulled_rows: Some(250),
+                ..base
+            },
+            RepinFlags {
+                force: true,
+                max_ambiguous_rows: Some(3),
+                ..base
+            },
+            RepinFlags {
+                force: true,
+                ..base
+            },
+        ] {
+            assert_eq!(ceiling_plan(&flags), CeilingPlan::Preview);
+        }
+    }
+
+    /// What the preview hands the execution: both accepted numbers, or
+    /// nothing. A half-resolved report is a job that has not scanned (or a
+    /// server without ceilings), and restating half of a pair would bind
+    /// one dimension while the other quietly re-derived.
+    #[test]
+    fn the_preview_restates_both_accepted_ceilings_or_neither() {
+        let mut job = sample_job();
+        job.accepted_max_nulled_rows = Some(22);
+        job.accepted_max_ambiguous_rows = Some(10);
+        assert_eq!(
+            accepted_ceilings(&job),
+            Some(BoundCeilings {
+                max_nulled: 22,
+                max_ambiguous: 10,
+            })
+        );
+        // The printed sentence carries the numbers the request will state.
+        let notice = ceiling_notice(accepted_ceilings(&job).unwrap(), true);
+        assert!(notice.contains("22"), "{notice}");
+        assert!(notice.contains("10"), "{notice}");
+        assert!(notice.contains("preview scan"), "{notice}");
+        assert!(!ceiling_notice(accepted_ceilings(&job).unwrap(), false).contains("preview scan"));
+
+        job.accepted_max_ambiguous_rows = None;
+        assert_eq!(accepted_ceilings(&job), None);
+        assert_eq!(accepted_ceilings(&sample_job()), None);
+    }
+
+    /// The accepted ceilings are part of the case file and part of the
+    /// machine record: an operator reading a finished job sees the terms it
+    /// ran under without asking postgres.
+    #[test]
+    fn the_case_file_and_the_row_report_the_accepted_ceilings() {
+        let mut job = sample_job();
+        job.force = true;
+        job.accepted_max_nulled_rows = Some(22);
+        job.accepted_max_ambiguous_rows = Some(10);
+
+        let mut out = Vec::new();
+        render_repin_case_file(&mut out, true, &job).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("accepted ceilings: 22"), "{text}");
+        assert!(text.contains("10 dialect-ambiguous"), "{text}");
+
+        let (columns, rows) = repin_job_to_rows(&job, OutputFormat::Json);
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        let parsed: Json =
+            serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["accepted_max_nulled_rows"], 22);
+        assert_eq!(parsed["accepted_max_ambiguous_rows"], 10);
+
+        // An unforced job accepts no loss, so it states no ceilings.
+        let (_, rows) = repin_job_to_rows(&sample_job(), OutputFormat::Json);
+        assert_eq!(
+            rows[0][columns
+                .iter()
+                .position(|c| c == "accepted_max_nulled_rows")
+                .unwrap()],
+            Json::Null
+        );
+    }
+
     /// An executing repin off a TTY refuses without `--yes` before any
     /// network access — the connection params here are deliberately
     /// unusable, so reaching the client would fail differently.
@@ -1362,6 +1821,8 @@ mod repin_tests {
                 force: false,
                 yes: false,
                 wait: false,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             },
             Some(OutputFormat::Json),
         )
@@ -1392,6 +1853,8 @@ mod repin_tests {
             force: false,
             yes: false,
             wait: false,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
         };
         for to in ["VARCHAR", "bigint"] {
             let mut out = Vec::new();

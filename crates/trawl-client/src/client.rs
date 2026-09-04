@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 use crate::error::ClientError;
 use crate::types::{
     CancelResponse, CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse,
-    DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, FieldValuesResponse,
+    DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, FieldAck, FieldValuesResponse,
     HealthResponse, HistoryResponse, IngestResponse, ListAllRunsResponse, ListReportRunsResponse,
     ListSavedResponse, QueriesResponse, QueryResponse, RepinStatusResponse, ReportRunResponse,
     ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaResponse,
@@ -34,6 +34,19 @@ pub enum RepinStart {
     /// 409 with a job body: the scan projected nulled values and no force
     /// flag was passed — the job is the plan the refusal is based on.
     Refused(trawl_api::RepinJobResponse),
+}
+
+/// The ceilings a repin request states, if any.
+///
+/// Both absent is the ordinary case: the server derives each number from
+/// the job's own scan. A stated ceiling beside `force: false` is a 400 —
+/// an unforced repin accepts no loss at all, so there is nothing to bound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepinCeilings {
+    /// The most rows the rewrite may null.
+    pub max_nulled_rows: Option<u64>,
+    /// The most dialect-ambiguous numerals it may carry.
+    pub max_ambiguous_rows: Option<u64>,
 }
 
 /// HTTP client for the trawl daemon API.
@@ -439,6 +452,49 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
+    /// Acknowledge a degraded verdict
+    /// (`POST /api/v1/schema/field/ack?name=`).
+    ///
+    /// The ack covers the conflict evidence that exists at the moment the
+    /// server writes it and nothing beyond, so the badge returns as soon as
+    /// the pin shelves another batch. 404 (no such pin) and 409 (the field
+    /// is not degraded, so there is no verdict to acknowledge) both surface
+    /// as [`ClientError::Server`] carrying the server's own sentence.
+    pub async fn schema_field_ack(
+        &self,
+        name: &str,
+        note: Option<&str>,
+    ) -> Result<FieldAck, ClientError> {
+        let url = self.endpoint("/api/v1/schema/field/ack");
+        let req = self
+            .client
+            .post(&url)
+            .query(&[("name", name)])
+            .json(&crate::types::FieldAckRequestRef { note });
+        self.send_authenticated(req).await
+    }
+
+    /// Withdraw an acknowledgement
+    /// (`DELETE /api/v1/schema/field/ack?name=`).
+    ///
+    /// Idempotent by design: the server answers 204 whether or not a row
+    /// was there, since "this field is not acknowledged" is the state the
+    /// caller asked for either way. Only an unpinned field refuses (404).
+    /// There is no body to decode, so nothing is returned.
+    pub async fn schema_field_ack_clear(&self, name: &str) -> Result<(), ClientError> {
+        let url = self.endpoint("/api/v1/schema/field/ack");
+        let resp = self
+            .client
+            .delete(&url)
+            .query(&[("name", name)])
+            .header("Authorization", self.auth_header_value())
+            .send()
+            .await
+            .map_err(sanitize_reqwest_error)?;
+        check_status(resp).await?;
+        Ok(())
+    }
+
     /// List recent type conflicts (`GET /api/v1/schema/conflicts`).
     pub async fn catalog_conflicts(
         &self,
@@ -472,6 +528,9 @@ impl HttpClient {
     /// lossy without force (the plan rides back). Every other failure —
     /// including the "already running" 409, whose body is the error
     /// envelope — surfaces as [`ClientError::Server`].
+    ///
+    /// `ceilings` are the bounds a forced repin binds itself to; an absent
+    /// one leaves the number to the server's own scan.
     pub async fn schema_repin(
         &self,
         field: &str,
@@ -479,6 +538,7 @@ impl HttpClient {
         dialect: Option<&str>,
         dry_run: bool,
         force: bool,
+        ceilings: RepinCeilings,
     ) -> Result<RepinStart, ClientError> {
         let url = self.endpoint("/api/v1/schema/repin");
         let body = trawl_api::RepinRequest {
@@ -487,6 +547,8 @@ impl HttpClient {
             dialect: dialect.map(str::to_owned),
             dry_run,
             force,
+            max_nulled_rows: ceilings.max_nulled_rows,
+            max_ambiguous_rows: ceilings.max_ambiguous_rows,
         };
         let resp = self
             .client
