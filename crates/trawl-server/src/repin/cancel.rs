@@ -127,6 +127,25 @@ impl CancelDecision {
     }
 }
 
+/// What [`CancelRegistry::commit`] decided at the point of no return.
+///
+/// Three answers rather than a bool because the marker write lives inside
+/// the decision now, and its failure is neither a crossing nor a cancel:
+/// the job unwinds like any other pre-cutover failure, with the entry
+/// still cancellable.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Commit<E> {
+    /// The marker is published and the point of no return is latched.
+    /// Everything past this is forward-only.
+    Latched,
+    /// A cancel is pending, or this job no longer owns the registry. No
+    /// marker was written and nothing latched.
+    Refused,
+    /// Publishing the marker failed. Nothing latched; `E` is the writer's
+    /// own error.
+    Failed(E),
+}
+
 /// What [`CancelRegistry::settle`] decided for a job that is about to write
 /// a terminal status short of the point of no return.
 ///
@@ -316,21 +335,41 @@ impl CancelRegistry {
         }
     }
 
-    /// The engine's last check before the Cutover marker write.
+    /// Cross the point of no return: refuse a pending cancel, publish the
+    /// Cutover marker, and latch — all three under the one lock.
     ///
-    /// `false` means a cancel is pending (or this job no longer owns the
-    /// registry) and the marker must not be written; `true` latches the
-    /// point of no return, and every later request is refused. Comparing
-    /// and latching under one lock is what makes cancel-vs-commit a
-    /// decision instead of a race.
-    pub fn commit(&self, job_id: i64) -> bool {
+    /// `publish` is the marker write itself, and it runs inside the lock on
+    /// purpose. Latching first and writing after was a third state nothing
+    /// could correct: a marker write that failed (no space, a failed fsync
+    /// or rename) unwound the job as `failed` while the latched entry kept
+    /// telling every cancel request the corpus was being swapped, for the
+    /// rest of the sweep, and [`Self::settle`] refuses to touch a latched
+    /// entry. Publication is the fact that makes the crossing real, so it
+    /// is the fact the latch waits for.
+    ///
+    /// The write is synchronous — a staged temp file, an fsync, two renames
+    /// — and happens once per job, so holding a `parking_lot` mutex across
+    /// it costs a cancel request a few milliseconds at most. `publish` must
+    /// stay sync for that reason: nothing may await under this lock.
+    ///
+    /// # Errors
+    /// [`Commit::Failed`] carries `publish`'s own error, with the entry
+    /// left unlatched so the failure routes through the ordinary
+    /// pre-cutover settlement, where a pending cancel may now win.
+    pub fn commit<E>(&self, job_id: i64, publish: impl FnOnce() -> Result<(), E>) -> Commit<E> {
         let mut slot = self.slot.lock();
-        match slot.as_mut() {
-            Some(entry) if entry.job_id == job_id && entry.cancelled_by.is_none() => {
+        let Some(entry) = slot
+            .as_mut()
+            .filter(|entry| entry.job_id == job_id && entry.cancelled_by.is_none())
+        else {
+            return Commit::Refused;
+        };
+        match publish() {
+            Ok(()) => {
                 entry.committed = true;
-                true
+                Commit::Latched
             }
-            _ => false,
+            Err(e) => Commit::Failed(e),
         }
     }
 
@@ -497,6 +536,12 @@ mod tests {
         CancelActor::new(name, format!("trwl_{name}"))
     }
 
+    /// Latch with a publication that always succeeds: the tests that do
+    /// not care about the marker write.
+    fn latch(registry: &CancelRegistry, job_id: i64) -> Commit<String> {
+        registry.commit(job_id, || Ok(()))
+    }
+
     fn armed(job_id: i64) -> (Arc<CancelRegistry>, CancelHandle) {
         let registry = Arc::new(CancelRegistry::default());
         let handle = registry.arm(job_id);
@@ -521,17 +566,17 @@ mod tests {
             let asker = Arc::clone(&registry);
             let closer = Arc::clone(&registry);
             let request = std::thread::spawn(move || asker.request(&actor("operator")).verdict);
-            let commit = std::thread::spawn(move || closer.commit(7));
+            let commit = std::thread::spawn(move || latch(&closer, 7));
             let verdict = request.join().expect("request thread");
             let latched = commit.join().expect("commit thread");
 
             match (verdict, latched) {
-                (CancelVerdict::Cancelling { job_id, .. }, false) => {
+                (CancelVerdict::Cancelling { job_id, .. }, Commit::Refused) => {
                     assert_eq!(job_id, 7);
                     assert_eq!(registry.pending(7), Some(actor("operator")));
                     cancelled_won += 1;
                 }
-                (CancelVerdict::PastPointOfNoReturn { job_id }, true) => {
+                (CancelVerdict::PastPointOfNoReturn { job_id }, Commit::Latched) => {
                     assert_eq!(job_id, 7);
                     assert_eq!(
                         registry.pending(7),
@@ -556,7 +601,7 @@ mod tests {
     #[test]
     fn a_latched_job_refuses_every_later_request() {
         let (registry, handle) = armed(11);
-        assert!(registry.commit(11));
+        assert_eq!(latch(&registry, 11), Commit::Latched);
         for _ in 0..3 {
             assert_eq!(
                 registry.request(&actor("operator")).verdict,
@@ -565,6 +610,45 @@ mod tests {
         }
         assert_eq!(handle.check(STAGE_BUILD).ok(), Some(()));
         assert_eq!(handle.cancelled_by(), None);
+    }
+
+    /// A publication that fails latches nothing, and the job stays
+    /// cancellable.
+    ///
+    /// Writing the marker after the latch left a state nothing could
+    /// correct: the write failed, the job unwound as `failed`, and the
+    /// latched entry answered "past the point of no return" to every cancel
+    /// for the rest of the sweep, while `settle` refused to touch it. Since
+    /// the write happens inside the decision, its failure is just a failure
+    /// — the next request is accepted, and the settlement can hand the job
+    /// to it.
+    #[test]
+    fn a_failed_publication_leaves_the_job_cancellable() {
+        let (registry, handle) = armed(11);
+        assert_eq!(
+            registry.commit(11, || Err("no space left on device".to_owned())),
+            Commit::Failed("no space left on device".to_owned())
+        );
+
+        assert_eq!(
+            registry.request(&actor("alice")).verdict,
+            CancelVerdict::Cancelling {
+                job_id: 11,
+                already_requested: false
+            },
+            "a job that never published its marker never crossed"
+        );
+        assert_eq!(
+            registry.settle(11),
+            Settlement::Cancelled(actor("alice")),
+            "and the pre-cutover settlement hands it the cancel"
+        );
+        assert_eq!(handle.cancelled_by(), Some(actor("alice")));
+
+        // A second attempt after a pending cancel is refused, as any latch
+        // is: the failed write did not put the entry in a state that skips
+        // the arbitration.
+        assert_eq!(latch(&registry, 11), Commit::Refused);
     }
 
     /// Ask first, then latch: the latch fails, and the effect site can
@@ -579,7 +663,7 @@ mod tests {
                 already_requested: false
             }
         );
-        assert!(!registry.commit(11));
+        assert_eq!(latch(&registry, 11), Commit::Refused);
         assert!(matches!(
             handle.check(STAGE_FINAL_GATE),
             Err(PassStop::Cancelled {
@@ -653,7 +737,7 @@ mod tests {
     #[test]
     fn settling_never_downgrades_the_point_of_no_return() {
         let (registry, _handle) = armed(9);
-        assert!(registry.commit(9));
+        assert_eq!(latch(&registry, 9), Commit::Latched);
         assert_eq!(registry.settle(9), Settlement::Candidate);
         assert_eq!(
             registry.request(&actor("operator")).verdict,
@@ -720,7 +804,7 @@ mod tests {
         settled.settle(4);
         assert_eq!(settled.request(&actor("bob")).retained, None);
         let (latched, _handle) = armed(5);
-        assert!(latched.commit(5));
+        assert_eq!(latch(&latched, 5), Commit::Latched);
         assert_eq!(latched.request(&actor("bob")).retained, None);
     }
 
@@ -758,10 +842,14 @@ mod tests {
     #[test]
     fn commit_needs_the_job_to_own_the_registry() {
         let registry = Arc::new(CancelRegistry::default());
-        assert!(!registry.commit(1));
+        assert_eq!(latch(&registry, 1), Commit::Refused);
         let _handle = registry.arm(1);
-        assert!(!registry.commit(2), "another job's id may not latch");
-        assert!(registry.commit(1));
+        assert_eq!(
+            latch(&registry, 2),
+            Commit::Refused,
+            "another job's id may not latch"
+        );
+        assert_eq!(latch(&registry, 1), Commit::Latched);
     }
 
     /// The wire table: three verdicts, three distinct status codes, three

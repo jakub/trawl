@@ -37,7 +37,7 @@ use crate::error::ServerError;
 use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
 use crate::repin::cancel::{
-    CancelActor, CancelHandle, CancelRegistry, CancelVerdict, PassStop, STAGE_BUILD,
+    CancelActor, CancelHandle, CancelRegistry, CancelVerdict, Commit, PassStop, STAGE_BUILD,
     STAGE_FINAL_GATE, STAGE_SCAN, Settlement, audit_cancel_refused, audit_cancel_requested,
     audit_cancelled,
 };
@@ -1286,27 +1286,34 @@ impl RepinEngine {
             )));
         }
 
-        // Point of no return, latched before it is published. `commit`
-        // compares against a pending cancel under the registry's own lock,
-        // so the two cannot both win: a cancel accepted before this line
-        // stops the marker write, and one arriving after it is answered
-        // 409. Everything below this statement is forward-only.
-        if !self.cancel.commit(job_id) {
-            return Err(JobAbort::Cancelled {
-                stage: STAGE_FINAL_GATE,
-            });
-        }
+        // The point of no return: refusing a pending cancel, publishing the
+        // Cutover marker and latching are one operation under the registry
+        // lock. A cancel accepted before it stops the marker write; one
+        // arriving after it is answered 409; and a marker that cannot be
+        // published is a job that never crossed at all, so it leaves the
+        // entry unlatched and unwinds through the ordinary abandon path —
+        // where a cancel that is still pending wins, honestly, instead of
+        // being told for the rest of the sweep that the corpus is moving.
+        // Everything below this block is forward-only.
         let marker = RepinMarker {
             phase: RepinPhase::Cutover,
             ..marker
         };
-        // A marker that cannot be published is a job that never crossed:
-        // the failure unwinds through the ordinary abandon path with the
-        // corpus untouched. It arbitrates against a pending cancel like any
-        // other build failure, which in practice finds none — the latch a
-        // line above already refused every request that could still be
-        // pending.
-        write_marker(&self.data_dir, &marker).map_err(JobAbort::Failed)?;
+        let data_dir = &self.data_dir;
+        // The closure is synchronous and stays that way: it runs while the
+        // registry's mutex is held.
+        match self
+            .cancel
+            .commit(job_id, || write_marker(data_dir, &marker))
+        {
+            Commit::Latched => {}
+            Commit::Refused => {
+                return Err(JobAbort::Cancelled {
+                    stage: STAGE_FINAL_GATE,
+                });
+            }
+            Commit::Failed(msg) => return Err(JobAbort::Failed(msg)),
+        }
 
         // Test-only: pin the window a cancel can only be refused in (see
         // `TEST_HOLD_AFTER_NO_RETURN`). Bounded, and armed once.
