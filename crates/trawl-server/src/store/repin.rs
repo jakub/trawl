@@ -263,7 +263,44 @@ impl RepinStore {
 
     /// Claim the running slot: insert a `running` row, mapping a 23505 on
     /// `repin_jobs_one_running` to [`StoreError::RepinAlreadyRunning`].
+    ///
+    /// One transaction under [`super::CATALOG_LIFECYCLE_LOCK_KEY`], because
+    /// the claim is the second half of a check-then-act the engine started
+    /// when it read the field's pin out of the in-process cache. Pin gc's
+    /// purge takes the same lock, so the two orderings are the only ones
+    /// possible: gc commits first and this claim finds no pin (refused
+    /// here), or the claim commits first and gc's own in-transaction
+    /// running-row check refuses the purge. The interleaving that mints a
+    /// memory-only pin — gc deleting the row a claimed cutover later
+    /// UPDATEs to zero rows — cannot be constructed.
+    ///
+    /// The revalidation is exact: the pin must still be the one the caller
+    /// prepared against, not merely present, so a repin that flipped the
+    /// field in between refuses instead of scanning under a stale `from`.
     pub async fn claim(&self, claim: RepinClaim<'_>) -> Result<i64, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        // Bound the advisory-lock wait the same way the purge bounds its
+        // own side: `lock_timeout` does not cover advisory locks, so
+        // without this a claim could wait on a gc purge without limit.
+        sqlx::query("SET LOCAL statement_timeout = '5s'")
+            .execute(&mut *tx)
+            .await?;
+        super::lock_catalog_lifecycle(&mut tx).await?;
+
+        let expected = claim.from_type.as_catalog();
+        let found: Option<String> =
+            sqlx::query_scalar("SELECT duckdb_type FROM field_types WHERE field = $1")
+                .bind(claim.field)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if found.as_deref() != Some(expected) {
+            return Err(StoreError::RepinPinVanished {
+                field: claim.field.to_owned(),
+                expected,
+                found,
+            });
+        }
+
         let result = sqlx::query_scalar::<_, i64>(
             "INSERT INTO repin_jobs (field, from_type, to_type, dialect, dry_run, force,
                                      requested_by)
@@ -271,18 +308,20 @@ impl RepinStore {
              RETURNING id",
         )
         .bind(claim.field)
-        .bind(claim.from_type.as_catalog())
+        .bind(expected)
         .bind(claim.to_type.as_catalog())
         .bind(claim.dialect.map(Dialect::token))
         .bind(claim.dry_run)
         .bind(claim.force)
         .bind(claim.requested_by)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await;
-        result.map_err(|e| match classify_violation(&e) {
+        let id = result.map_err(|e| match classify_violation(&e) {
             Some(PgViolation::RepinAlreadyRunning) => StoreError::RepinAlreadyRunning,
             _ => StoreError::from(e),
-        })
+        })?;
+        tx.commit().await?;
+        Ok(id)
     }
 
     /// Stamp the scan's whole reading onto the job row.

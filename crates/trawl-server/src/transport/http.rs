@@ -74,6 +74,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/schema/field", get(handlers::catalog_field))
         .route("/schema/conflicts", get(handlers::catalog_conflicts))
         .route("/schema/values/{field}", get(handlers::field_values))
+        .route("/schema/gc-pins", post(handlers::schema_gc_pins))
         .route("/queries", get(handlers::queries))
         .route("/queries/{id}", delete(handlers::cancel_query))
         .route("/stats", get(handlers::stats))

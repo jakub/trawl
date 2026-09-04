@@ -14,10 +14,10 @@ use crate::error::ClientError;
 use crate::types::{
     CancelResponse, CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse,
     DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, FieldValuesResponse,
-    HealthResponse, HistoryResponse, IngestResponse, ListAllRunsResponse, ListReportRunsResponse,
-    ListSavedResponse, QueriesResponse, QueryResponse, RepinStatusResponse, ReportRunResponse,
-    ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaResponse,
-    ServiceSchemaResponse, StatsResponse, ValidationResponse, WhoAmIResponse,
+    GcPinsResponse, HealthResponse, HistoryResponse, IngestResponse, ListAllRunsResponse,
+    ListReportRunsResponse, ListSavedResponse, QueriesResponse, QueryResponse, RepinStatusResponse,
+    ReportRunResponse, ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
+    SchemaResponse, ServiceSchemaResponse, StatsResponse, ValidationResponse, WhoAmIResponse,
 };
 use crate::types::{
     CreateSavedRequestRef, ErrorResponse, ExportRequestRef, SetScheduleRequestRef, StreamEvent,
@@ -612,6 +612,32 @@ impl HttpClient {
     pub async fn schema_repin_status(&self) -> Result<RepinStatusResponse, ClientError> {
         let url = self.endpoint("/api/v1/schema/repin/status");
         let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Reclaim pin slots held by dead fields
+    /// (`POST /api/v1/schema/gc-pins`).
+    ///
+    /// A dry run and a real one both answer 200 with the same report, so
+    /// there is one return type: `dry_run` and `deleted` on the body say
+    /// which happened. Every refusal is the ordinary error envelope, so a
+    /// 409 (a repin owns the data root, or the corpus could not be read)
+    /// arrives as [`ClientError::Server`] with the server's message and
+    /// the caller renders it.
+    ///
+    /// `older_than_secs` is the requested window; the server floors it at
+    /// the retention window and reports both numbers back.
+    pub async fn schema_gc_pins(
+        &self,
+        dry_run: bool,
+        older_than_secs: Option<u64>,
+    ) -> Result<GcPinsResponse, ClientError> {
+        let url = self.endpoint("/api/v1/schema/gc-pins");
+        let body = trawl_api::GcPinsRequest {
+            dry_run,
+            older_than_secs,
+        };
+        let req = self.client.post(&url).json(&body);
         self.send_authenticated(req).await
     }
 
@@ -1242,5 +1268,88 @@ mod tests {
             back.outcome,
             trawl_api::RepinCancelOutcome::PastPointOfNoReturn
         );
+    }
+
+    // ── serde: gc-pins ──────────────────────────────────────────────────
+
+    #[test]
+    fn gc_pins_request_omits_an_unset_window() {
+        let req = trawl_api::GcPinsRequest {
+            dry_run: true,
+            older_than_secs: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["dry_run"], true);
+        assert!(
+            json.get("older_than_secs").is_none(),
+            "an omitted window lets the server pick its default: {json}"
+        );
+
+        let req = trawl_api::GcPinsRequest {
+            dry_run: false,
+            older_than_secs: Some(0),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        // Zero is a request, not an absence: the footer axis is the other
+        // half of the proof, so it is accepted literally.
+        assert_eq!(json["older_than_secs"], 0);
+    }
+
+    #[test]
+    fn gc_pins_dry_run_response_deserializes() {
+        let json = r#"{"dry_run":true,"decided_at":"2026-09-04T12:00:00Z",
+            "requested_older_than_secs":604800,"retention_floor_secs":7776000,
+            "effective_older_than_secs":7776000,"pins_examined":3,
+            "files_scanned":12,"deleted":0,
+            "candidates":[{"field":"retired","type":"BIGINT",
+              "last_seen":"2026-01-02T03:04:05Z","services":2},
+             {"field":"typo","type":"VARCHAR","services":0}]}"#;
+        let resp: GcPinsResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.dry_run);
+        assert_eq!(resp.deleted, 0);
+        assert_eq!(resp.retention_floor_secs, Some(7_776_000));
+        assert_eq!(resp.candidates.len(), 2);
+        assert_eq!(resp.candidates[0].data_type, "BIGINT");
+        assert_eq!(
+            resp.candidates[0].last_seen.as_deref(),
+            Some("2026-01-02T03:04:05Z")
+        );
+        // A never-observed pin is a candidate with no observation instant,
+        // and the wire omits the field rather than sending null.
+        assert!(resp.candidates[1].last_seen.is_none());
+    }
+
+    #[test]
+    fn gc_pins_executed_response_deserializes_without_a_floor() {
+        let json = r#"{"dry_run":false,"decided_at":"2026-09-04T12:00:00Z",
+            "requested_older_than_secs":2592000,
+            "effective_older_than_secs":2592000,"pins_examined":1,
+            "files_scanned":40,"candidates":[{"field":"gone","type":"DOUBLE",
+              "services":1}],"deleted":1}"#;
+        let resp: GcPinsResponse = serde_json::from_str(json).unwrap();
+        assert!(!resp.dry_run);
+        assert_eq!(resp.deleted, 1);
+        // Retention disabled: no floor, so the requested window stands.
+        assert_eq!(resp.retention_floor_secs, None);
+        assert_eq!(resp.effective_older_than_secs, 2_592_000);
+    }
+
+    /// A gc refusal has one body shape, the error envelope, so the client
+    /// hands the caller the server's own sentence to render.
+    #[test]
+    fn gc_pins_conflict_decodes_to_a_server_error() {
+        let body = r#"{"error":{"code":"internal_error",
+            "message":"a repin owns the data root; pin gc deleted nothing",
+            "details":[]}}"#;
+        let envelope: ErrorResponse = serde_json::from_str(body).unwrap();
+        let err = ClientError::Server {
+            status: 409,
+            error: envelope.error,
+        };
+        assert_eq!(
+            err.error_envelope().map(|e| e.message.as_str()),
+            Some("a repin owns the data root; pin gc deleted nothing")
+        );
+        assert!(err.to_string().contains("HTTP 409"), "{err}");
     }
 }

@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use parquet::basic::Repetition;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
 
@@ -55,6 +56,20 @@ pub enum ParquetStatsError {
         /// The underlying parquet error.
         #[source]
         source: parquet::errors::ParquetError,
+    },
+    /// A top-level schema element that is not a scalar column: a nested
+    /// group, or a repeated primitive. Only [`read_column_names`] raises
+    /// this; the stats reader reads whatever `path_in_schema` says.
+    #[error(
+        "parquet file {} declares non-scalar top-level column {field:?} — \
+         trawl writes only flat schemas",
+        path.display()
+    )]
+    NonScalarColumn {
+        /// The file carrying the nested element.
+        path: PathBuf,
+        /// The offending top-level schema element's name.
+        field: String,
     },
 }
 
@@ -241,6 +256,58 @@ pub fn read_file_stats(path: &Path) -> Result<FileStats, ParquetStatsError> {
     })
 }
 
+/// Read the column names a parquet file declares, from its schema
+/// descriptor alone.
+///
+/// The names come from the schema, not from the row groups, so a file with
+/// zero rows still names every column it declares. That is the whole point:
+/// pin garbage collection uses this as proof that no standing file carries
+/// a field, and an empty-but-schema'd file is a carrier.
+///
+/// Top-level elements only, and never a leaf path. A column literally named
+/// `a.b` and a nested group `a` with a child `b` have the same dotted
+/// `path_in_schema` (which is what [`read_file_stats`] reports), so reading
+/// leaves would let a nested foreign file answer for a scalar field that
+/// does not exist. Rather than guess, a non-scalar top-level element is an
+/// error ([`ParquetStatsError::NonScalarColumn`]) and the caller's proof
+/// fails closed. Repeated primitives are refused with it: a repeated leaf
+/// is a list encoding, not a scalar column.
+///
+/// Names are returned exactly as the file spells them. Folding to a catalog
+/// key is the server's job ([`trawl_core::schema::catalog_key`]) — this
+/// crate has no opinion about catalog identity.
+///
+/// # Errors
+/// [`ParquetStatsError::Open`] if the file cannot be opened,
+/// [`ParquetStatsError::Footer`] if its footer cannot be parsed, and
+/// [`ParquetStatsError::NonScalarColumn`] for a nested or repeated
+/// top-level element.
+pub fn read_column_names(path: &Path) -> Result<Vec<String>, ParquetStatsError> {
+    let file = File::open(path).map_err(|source| ParquetStatsError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let reader = SerializedFileReader::new(file).map_err(|source| ParquetStatsError::Footer {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let root = reader.metadata().file_metadata().schema();
+
+    let mut names = Vec::with_capacity(root.get_fields().len());
+    for field in root.get_fields() {
+        let repeated = field.get_basic_info().has_repetition()
+            && field.get_basic_info().repetition() == Repetition::REPEATED;
+        if !field.is_primitive() || repeated {
+            return Err(ParquetStatsError::NonScalarColumn {
+                path: path.to_path_buf(),
+                field: field.name().to_owned(),
+            });
+        }
+        names.push(field.name().to_owned());
+    }
+    Ok(names)
+}
+
 /// Accumulates [`FileStats`] from many files into per-column
 /// [`ParquetColumnStats`] plus a total row count — the footer-based replacement
 /// for `DuckDB`'s `parquet_metadata()` aggregation.
@@ -394,6 +461,83 @@ mod tests {
         let path = dir.path().join("garbage.parquet");
         std::fs::write(&path, b"this is definitely not a parquet file").unwrap();
         assert!(read_file_stats(&path).is_err());
+    }
+
+    #[test]
+    fn column_names_come_from_the_schema_not_the_rows() {
+        // A file with no rows has no row groups at all, so anything that
+        // read column chunks would call it carrier-less. Its schema still
+        // declares the columns, which is exactly the evidence gc needs.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        write_parquet(&conn, &path, "SELECT 200 AS status, 'x' AS msg WHERE 1 = 0");
+
+        assert_eq!(read_file_stats(&path).unwrap().num_rows, 0);
+        assert_eq!(
+            read_column_names(&path).unwrap(),
+            vec!["status".to_owned(), "msg".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_dotted_scalar_name_is_returned_whole() {
+        // `a.b` as a column name and `a` as a group with child `b` share one
+        // `path_in_schema`. Reading top-level elements keeps them apart: this
+        // file has a scalar column whose name contains a dot.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dotted.parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        write_parquet(&conn, &path, "SELECT 1 AS \"a.b\"");
+
+        assert_eq!(read_column_names(&path).unwrap(), vec!["a.b".to_owned()]);
+    }
+
+    #[test]
+    fn a_nested_schema_is_refused_not_flattened() {
+        // Foreign parquet trawl never writes. Flattening it to `a.b` would
+        // let it answer for a scalar field of that name; the proof refuses.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        write_parquet(&conn, &path, "SELECT {'b': 1} AS a");
+
+        // The stats reader reports the flattened leaf path, which is the
+        // conflation this reader exists to avoid.
+        let stats = read_file_stats(&path).unwrap();
+        assert!(stats.columns.iter().any(|c| c.name == "a.b"));
+
+        match read_column_names(&path) {
+            Err(ParquetStatsError::NonScalarColumn { field, .. }) => assert_eq!(field, "a"),
+            other => panic!("expected a NonScalarColumn refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_and_garbage_footers_are_err_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+
+        let garbage = dir.path().join("garbage.parquet");
+        std::fs::write(&garbage, b"PAR1 and then nothing that parses").unwrap();
+        assert!(matches!(
+            read_column_names(&garbage),
+            Err(ParquetStatsError::Footer { .. })
+        ));
+
+        // A real file cut short: the magic and the footer length survive at
+        // the head, the metadata thrift does not.
+        let whole = dir.path().join("whole.parquet");
+        write_parquet(&conn, &whole, "SELECT 1 AS n");
+        let bytes = std::fs::read(&whole).unwrap();
+        let truncated = dir.path().join("truncated.parquet");
+        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(read_column_names(&truncated).is_err());
+
+        assert!(matches!(
+            read_column_names(Path::new("/nonexistent/nope.parquet")),
+            Err(ParquetStatsError::Open { .. })
+        ));
     }
 
     #[test]

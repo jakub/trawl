@@ -49,6 +49,11 @@ pub struct AppState {
     /// node owns nothing under the data root, so `POST /api/v1/schema/repin`
     /// answers 503 there.
     pub repin: Option<Arc<crate::repin::RepinEngine>>,
+    /// The pin garbage collector. `Some` on the same terms as
+    /// [`Self::repin`]: proving a pin dead means reading every parquet
+    /// footer under the data root, and a query-only node owns none of
+    /// them.
+    pub gc: Option<Arc<crate::catalog::gc::PinGc>>,
 }
 
 /// Maximum concurrent admin dashboard-stats SSE streams. Hard-coded (no
@@ -694,19 +699,33 @@ impl AppState {
             metrics_handle,
             dashboard_snapshot: Arc::new(Mutex::new(None)),
             repin: None,
+            gc: None,
         };
         let state = {
             let mut state = state;
-            state.repin = repin_coordinator.map(|coordinator| {
+            state.repin = repin_coordinator.as_ref().map(|coordinator| {
                 Arc::new(crate::repin::RepinEngine::new(
                     state.storage.repin.clone(),
                     state.storage.catalog.clone(),
                     Arc::clone(&state.query.field_catalog),
-                    coordinator,
+                    Arc::clone(coordinator),
                     state.query.pool.clone(),
                     config.data.base_dir(),
                     config.ingest.compaction_memory_limit.clone(),
                     config.retention.min_free_disk_bytes,
+                ))
+            });
+            // The retention floor is resolved once here: retention config
+            // is fixed for the process, and the gc engine reports the
+            // window it applied rather than recomputing it per request.
+            state.gc = repin_coordinator.map(|coordinator| {
+                Arc::new(crate::catalog::gc::PinGc::new(
+                    state.storage.catalog.clone(),
+                    state.storage.repin.clone(),
+                    Arc::clone(&state.query.field_catalog),
+                    coordinator,
+                    config.data.base_dir(),
+                    crate::retention::maximum_enabled_age_secs(&config.retention),
                 ))
             });
             state

@@ -270,6 +270,47 @@ that matters is `rows_carrying` in the dry run, not the corpus total.
 repin. `_severity` itself — and every other declared envelope field — is
 refused: its type is part of the event contract.
 
+### Reclaiming dead pin slots
+
+`schema gc-pins` deletes the catalog entries of fields nothing writes any
+more, freeing their slots against the install-wide pin cap. It needs the
+`schema_write` permission.
+
+```bash
+trawl schema gc-pins --dry-run                       # what would be reclaimed
+trawl schema gc-pins --dry-run --older-than 90d      # a stricter window
+trawl schema gc-pins                                 # execute
+```
+
+A pin is reclaimed only when both halves of the proof hold: nothing has
+observed the field inside the window, **and** no standing parquet declares
+the column. `--older-than` takes the same units as `--last` (`s`, `m`, `h`,
+`d`, `w`) and defaults to 30 days. The server raises it to the retention
+window when that is longer, and the report prints all three numbers, so a
+`--older-than 7d` against a 90-day retention says plainly that 90 days is
+what ran.
+
+There is no `--yes`. The deletion is catalog metadata only, and a field
+reclaimed by mistake pins again from scratch the next time a sender writes
+it, so `--dry-run` is the whole safety story. A refusal prints the server's message and
+exits non-zero without deleting anything: a repin owns the data root or
+claimed it mid-run, another gc run is already going, or something under
+the data root could not be read (including the root itself, which is
+UNKNOWN rather than an empty corpus).
+
+The summary lines go to stdout for a table and to stderr under `-f json`
+or `-f csv`, so a piped run is one rectangular record set of candidate
+rows.
+
+**This is a repair, not a defense.** `gc-pins` cleans up slots that went
+dead by accident: a typo'd field name, a decommissioned sender, a
+retired label. It is not an answer to hostile catalog exhaustion. A
+sender that mints new field names faster than the window expires still
+fills the catalog, and what stops that remains what always stopped it:
+the `MAX_PINNED_FIELDS` cap, the half-of-free-slots ration per compaction
+batch, and alerting on the `trawl_catalog_pinned_fields` /
+`trawl_catalog_pin_capacity` fill gauges.
+
 Embedded mode works for the field listing only — a plain `DESCRIBE` over
 local parquet, no server or postgres needed:
 

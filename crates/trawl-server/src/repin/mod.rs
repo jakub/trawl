@@ -49,4 +49,6 @@ pub use cancel::{
 };
 pub use engine::{RepinEngine, StartOutcome};
 pub use gate::{RepinCoordinator, RollupPause};
-pub use marker::{RepinMarker, RepinPhase, aside_root, marker_path, shadow_root};
+pub use marker::{
+    RepinMarker, RepinPhase, aside_root, in_flight_evidence, marker_path, shadow_root,
+};

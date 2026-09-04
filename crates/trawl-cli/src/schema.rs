@@ -19,6 +19,12 @@ use crate::cli::{ConnectionParams, OutputFormat, render_driver_results};
 
 /// Parse a `--last` window like `30m`, `2h`, `7d`, `1w` into seconds.
 pub fn parse_last(input: &str) -> Result<u64, CliError> {
+    parse_window(input, "--last")
+}
+
+/// The `--last` grammar with the failing option named by the caller, so
+/// `gc-pins --older-than 30y` complains about `--older-than`, not `--last`.
+pub fn parse_window(input: &str, option: &str) -> Result<u64, CliError> {
     let input = input.trim();
     // Split off the last char, not the last byte: `split_at` panics off a
     // char boundary, and the unit position is exactly where a multi-byte
@@ -29,7 +35,7 @@ pub fn parse_last(input: &str) -> Result<u64, CliError> {
     };
     let n: u64 = num
         .parse()
-        .map_err(|_| CliError::Usage(format!("invalid --last window: {input:?}")))?;
+        .map_err(|_| CliError::Usage(format!("invalid {option} window: {input:?}")))?;
     let mult = match unit {
         "s" => 1,
         "m" => 60,
@@ -38,7 +44,7 @@ pub fn parse_last(input: &str) -> Result<u64, CliError> {
         "w" => 604_800,
         _ => {
             return Err(CliError::Usage(format!(
-                "invalid --last window: {input:?} (units: s, m, h, d, w)"
+                "invalid {option} window: {input:?} (units: s, m, h, d, w)"
             )));
         }
     };
@@ -491,6 +497,15 @@ mod tests {
             }],
             truncated: true,
         }
+    }
+
+    #[test]
+    fn a_window_error_names_the_option_that_failed() {
+        let err = parse_window("30y", "--older-than").unwrap_err().to_string();
+        assert!(err.contains("--older-than"), "{err}");
+        assert!(!err.contains("--last"), "{err}");
+        let err = parse_last("30y").unwrap_err().to_string();
+        assert!(err.contains("--last"), "{err}");
     }
 
     #[test]
@@ -1803,5 +1818,290 @@ mod repin_tests {
         assert_eq!(parsed["status"], "cancelled");
         assert_eq!(parsed["cancelled_by"], "ops");
         assert_eq!(parsed["cancel_requested_at"], "2026-09-03T21:00:00Z");
+    }
+}
+
+/// `GcPinsResponse` candidates → generic (columns, rows).
+///
+/// One rectangle: the run's summary numbers are printed as labels around
+/// this table, never as a second header inside it, so a piped `-f csv` is
+/// one parseable record set.
+pub fn gc_candidates_to_rows(resp: &trawl_client::GcPinsResponse) -> (Vec<String>, Vec<Vec<Json>>) {
+    let columns = ["field", "type", "last_seen", "services"]
+        .map(str::to_owned)
+        .to_vec();
+    let rows = resp
+        .candidates
+        .iter()
+        .map(|c| {
+            vec![
+                Json::from(c.field.clone()),
+                Json::from(c.data_type.clone()),
+                c.last_seen.clone().map_or(Json::Null, Json::from),
+                Json::from(c.services),
+            ]
+        })
+        .collect();
+    (columns, rows)
+}
+
+/// A window in seconds as a short human span, for the summary lines.
+///
+/// Whole units only, largest that divides evenly, so `2592000` reads
+/// `30d` and `100000` stays `100000s`. The seconds are printed beside it,
+/// because they are the number the wire and the server logs carry.
+fn human_secs(secs: u64) -> String {
+    for (unit, size) in [("w", 604_800u64), ("d", 86_400), ("h", 3600), ("m", 60)] {
+        if secs >= size && secs.is_multiple_of(size) {
+            return format!("{}{unit}", secs / size);
+        }
+    }
+    format!("{secs}s")
+}
+
+/// The lines printed above the candidate table: what was asked for, what
+/// the retention floor did to it, and what the scan cost.
+///
+/// The CLI computes no window. All three numbers are the server's own, and
+/// the floor line says whether it applied, because "I asked for 7d and got
+/// 90d" is the surprise an operator has to be able to see.
+fn gc_summary_lines(resp: &trawl_client::GcPinsResponse) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "pin gc ({}) at {}",
+            if resp.dry_run { "dry run" } else { "executed" },
+            resp.decided_at
+        ),
+        format!(
+            "requested window: {} ({}s)",
+            human_secs(resp.requested_older_than_secs),
+            resp.requested_older_than_secs
+        ),
+    ];
+    lines.push(match resp.retention_floor_secs {
+        Some(floor) if floor > resp.requested_older_than_secs => format!(
+            "retention floor:  {} ({}s), raised the window: a pin cannot be \
+             called dead over a span shorter than the corpus trawl still keeps",
+            human_secs(floor),
+            floor
+        ),
+        Some(floor) => format!(
+            "retention floor:  {} ({}s), did not apply",
+            human_secs(floor),
+            floor
+        ),
+        None => "retention floor:  none (age retention is disabled)".to_owned(),
+    });
+    lines.push(format!(
+        "effective window: {} ({}s)",
+        human_secs(resp.effective_older_than_secs),
+        resp.effective_older_than_secs
+    ));
+    lines.push(format!(
+        "examined {} pin(s) past the window, read {} parquet footer(s)",
+        resp.pins_examined, resp.files_scanned
+    ));
+    lines
+}
+
+/// The line printed below the candidate table.
+fn gc_outcome_line(resp: &trawl_client::GcPinsResponse) -> String {
+    if resp.dry_run {
+        format!(
+            "{} pin(s) would be reclaimed; nothing was deleted (re-run without \
+             --dry-run)",
+            resp.candidates.len()
+        )
+    } else {
+        format!("{} pin(s) reclaimed", resp.deleted)
+    }
+}
+
+/// `trawl schema gc-pins [--dry-run] [--older-than <dur>]`.
+///
+/// The candidate list is the one table; the summary lines go around it
+/// through [`label`], so they reach stdout for a human and stderr under a
+/// machine format. A csv or ndjson run is therefore a single rectangular
+/// record set with no second header in the middle of it.
+///
+/// No confirmation prompt, unlike `repin`: this deletes catalog metadata
+/// only, and a field wrongly reclaimed re-pins cleanly the next time a
+/// sender writes it. `--dry-run` is the safety.
+pub async fn run_gc_pins<W: Write>(
+    out: &mut W,
+    conn: ConnectionParams,
+    dry_run: bool,
+    older_than: Option<&str>,
+    format: Option<OutputFormat>,
+) -> Result<(), CliError> {
+    let format = resolve_format(format)?;
+    let older_than_secs = older_than
+        .map(|s| parse_window(s, "--older-than"))
+        .transpose()?;
+    let client = make_client(&conn)?;
+    // A refusal (409 for a repin owning the data root or an unreadable
+    // corpus) arrives as a client error carrying the server's own message,
+    // and `main` prints it and exits non-zero.
+    let resp = client.schema_gc_pins(dry_run, older_than_secs).await?;
+
+    let human = format == OutputFormat::Table;
+    for line in gc_summary_lines(&resp) {
+        label(out, human, &line)?;
+    }
+    let (columns, rows) = gc_candidates_to_rows(&resp);
+    render(out, &columns, &rows, format)?;
+    label(out, human, &gc_outcome_line(&resp))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+
+    fn sample_report(dry_run: bool) -> trawl_client::GcPinsResponse {
+        trawl_client::GcPinsResponse {
+            dry_run,
+            decided_at: "2026-09-04T12:00:00Z".into(),
+            requested_older_than_secs: 604_800,
+            retention_floor_secs: Some(7_776_000),
+            effective_older_than_secs: 7_776_000,
+            pins_examined: 3,
+            files_scanned: 12,
+            candidates: vec![
+                trawl_client::GcPinCandidate {
+                    field: "retired_counter".into(),
+                    data_type: "BIGINT".into(),
+                    last_seen: Some("2026-01-02T03:04:05Z".into()),
+                    services: 2,
+                },
+                trawl_client::GcPinCandidate {
+                    field: "typo_feild".into(),
+                    data_type: "VARCHAR".into(),
+                    last_seen: None,
+                    services: 0,
+                },
+            ],
+            deleted: if dry_run { 0 } else { 2 },
+        }
+    }
+
+    #[test]
+    fn candidate_rows_carry_every_column() {
+        let (columns, rows) = gc_candidates_to_rows(&sample_report(true));
+        assert_eq!(columns, ["field", "type", "last_seen", "services"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Json::from("retired_counter"));
+        assert_eq!(rows[0][3], Json::from(2));
+        // A never-observed pin is a candidate with a null observation, not
+        // a row the renderer drops.
+        assert_eq!(rows[1][2], Json::Null);
+    }
+
+    #[test]
+    fn human_secs_uses_whole_units_only() {
+        assert_eq!(human_secs(2_592_000), "30d");
+        assert_eq!(human_secs(604_800), "1w");
+        assert_eq!(human_secs(7200), "2h");
+        assert_eq!(human_secs(90), "90s");
+        assert_eq!(human_secs(0), "0s");
+    }
+
+    #[test]
+    fn older_than_takes_the_last_window_grammar() {
+        assert_eq!(parse_last("30d").unwrap(), 2_592_000);
+        assert_eq!(parse_last("12w").unwrap(), 7_257_600);
+        assert_eq!(parse_last("0s").unwrap(), 0);
+        for bad in ["30", "d", "7µ", "-1d", "30y", ""] {
+            assert!(
+                matches!(parse_last(bad), Err(CliError::Usage(_))),
+                "{bad:?} must be a usage error"
+            );
+        }
+    }
+
+    /// A csv run is one rectangle: exactly one header line, and every data
+    /// line carries the same field count. The summary rides stderr, which
+    /// is why a second header cannot appear here.
+    #[test]
+    fn csv_output_is_one_rectangle() {
+        let (columns, rows) = gc_candidates_to_rows(&sample_report(false));
+        let mut out = Vec::new();
+        render(&mut out, &columns, &rows, OutputFormat::Csv).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3, "one header + two rows: {text}");
+        assert_eq!(lines[0], "field,type,last_seen,services");
+        for line in &lines {
+            assert_eq!(line.matches(',').count(), 3, "ragged row: {line}");
+        }
+    }
+
+    #[test]
+    fn table_output_carries_the_window_provenance_and_the_count() {
+        let report = sample_report(true);
+        let summary = gc_summary_lines(&report).join("\n");
+        assert!(
+            summary.contains("requested window: 1w (604800s)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("retention floor:  90d (7776000s), raised the window"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("effective window: 90d (7776000s)"),
+            "{summary}"
+        );
+        assert!(summary.contains("read 12 parquet footer(s)"), "{summary}");
+        assert_eq!(
+            gc_outcome_line(&report),
+            "2 pin(s) would be reclaimed; nothing was deleted (re-run without \
+             --dry-run)"
+        );
+
+        let (columns, rows) = gc_candidates_to_rows(&report);
+        let mut out = Vec::new();
+        render(&mut out, &columns, &rows, OutputFormat::Table).unwrap();
+        let table = String::from_utf8(out).unwrap();
+        assert!(table.contains("retired_counter"), "{table}");
+        assert!(table.contains("typo_feild"), "{table}");
+    }
+
+    /// The two floor cases the summary must tell apart, plus the one where
+    /// there is no floor at all.
+    #[test]
+    fn the_floor_line_says_whether_it_applied() {
+        let mut report = sample_report(false);
+        assert!(gc_summary_lines(&report)[2].contains("raised the window"));
+
+        report.requested_older_than_secs = 15_552_000;
+        report.effective_older_than_secs = 15_552_000;
+        assert!(gc_summary_lines(&report)[2].contains("did not apply"));
+
+        report.retention_floor_secs = None;
+        assert!(gc_summary_lines(&report)[2].contains("age retention is disabled"));
+    }
+
+    #[test]
+    fn an_executed_run_reports_the_servers_deleted_count() {
+        let report = sample_report(false);
+        assert_eq!(gc_outcome_line(&report), "2 pin(s) reclaimed");
+        assert!(gc_summary_lines(&report)[0].contains("executed"));
+    }
+
+    #[test]
+    fn json_output_is_one_record_per_candidate() {
+        let (columns, rows) = gc_candidates_to_rows(&sample_report(false));
+        let mut out = Vec::new();
+        render(&mut out, &columns, &rows, OutputFormat::Json).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let records: Vec<Json> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("each line is a JSON object"))
+            .collect();
+        assert_eq!(records.len(), 2, "{text}");
+        assert_eq!(records[0]["field"], Json::from("retired_counter"));
+        assert_eq!(records[1]["last_seen"], Json::Null);
     }
 }
