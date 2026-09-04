@@ -43,7 +43,7 @@ pub use catalog::{
 };
 pub use error::StoreError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
-pub use repin::{RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore};
+pub use repin::{RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore, RepinTotals};
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{
     FinishOutcome, FlipOutcome, ReportRun, RunClaim, Schedule, ScheduleStore, format_interval,

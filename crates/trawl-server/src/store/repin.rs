@@ -187,6 +187,28 @@ pub struct RepinPlan {
     pub field_last_service: Option<String>,
 }
 
+/// The five counts a rewrite ends with: what [`RepinStore::record_progress`]
+/// publishes as it goes, and what [`RepinStore::stage_cutover_input`] freezes
+/// once the last pass is in.
+///
+/// A struct because the staging write takes them beside the per-service
+/// tallies, and five same-typed positional counts next to a slice is how a
+/// call site swaps `rows_nulled` and `rows_resurrected` without the compiler
+/// noticing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepinTotals {
+    /// Affected files rewritten.
+    pub files_done: i64,
+    /// Rows written through the rewrite.
+    pub rows_rewritten: i64,
+    /// Stored values the new pin could not keep.
+    pub rows_nulled: i64,
+    /// Values recovered from `_raw`.
+    pub rows_resurrected: i64,
+    /// Rows whose numeral reads as a different severity in each dialect.
+    pub ambiguous_numerals: i64,
+}
+
 fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
     let status: String = row.try_get("status")?;
     let status = RepinJobStatus::parse(&status).ok_or_else(|| {
@@ -320,6 +342,78 @@ impl RepinStore {
         .bind(ambiguous_numerals)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Freeze the finished shadow's tallies on the job row: the five final
+    /// counts and the per-service rows the rewrite nulled, in one statement.
+    ///
+    /// This is the evidence barrier (issue #137). The cutover materialises
+    /// `field_conflicts` rows from these tallies in the same transaction
+    /// that flips the pin, so the read that first sees `succeeded` also sees
+    /// the evidence. That only works if the tallies are durable before the
+    /// `data/REPIN` Cutover marker goes down, because past that marker the
+    /// engine is forward-only and a crash completes the flip from the marker
+    /// alone, with no shadow left to re-count.
+    ///
+    /// One UPDATE, not one per column set: the counts and the per-service
+    /// tallies are one reading of the finished shadow, and a row carrying
+    /// totals from the last pass beside tallies from the one before would
+    /// describe a corpus that never existed. `services` is
+    /// `(service, rows_nulled)` pairs, already ordered and capped by the
+    /// caller.
+    ///
+    /// Zero rows updated is an invariant violation, never a quiet success:
+    /// the `WHERE` demands a `running`, non-dry-run row, so no match means
+    /// the job was already terminal (an orphan reconciliation, a concurrent
+    /// finish) or is a dry run that has no rewrite to stage. Either way the
+    /// caller is about to write a Cutover marker for a job postgres does not
+    /// agree is running, and it must not.
+    ///
+    /// Re-staging the same job while it is still `running` is fine: the
+    /// statement is a plain overwrite, so a retried staging call lands the
+    /// same row.
+    pub async fn stage_cutover_input(
+        &self,
+        id: i64,
+        totals: RepinTotals,
+        services: &[(String, i64)],
+    ) -> Result<(), StoreError> {
+        let names: Vec<&str> = services.iter().map(|(s, _)| s.as_str()).collect();
+        let rows: Vec<i64> = services.iter().map(|(_, n)| *n).collect();
+
+        let mut tx = self.pool.begin().await?;
+        // The staging commit is the durability barrier the Cutover marker
+        // depends on, so it is flushed to disk before this call returns,
+        // whatever `synchronous_commit` the session or the server default
+        // otherwise carries.
+        sqlx::query("SET LOCAL synchronous_commit = on")
+            .execute(&mut *tx)
+            .await?;
+        let staged = sqlx::query_scalar::<_, i64>(
+            "UPDATE repin_jobs
+             SET files_done = $2, rows_rewritten = $3, rows_nulled = $4,
+                 rows_resurrected = $5, ambiguous_numerals = $6,
+                 nulled_services = $7, nulled_service_rows = $8
+             WHERE id = $1 AND status = 'running' AND NOT dry_run
+             RETURNING id",
+        )
+        .bind(id)
+        .bind(totals.files_done)
+        .bind(totals.rows_rewritten)
+        .bind(totals.rows_nulled)
+        .bind(totals.rows_resurrected)
+        .bind(totals.ambiguous_numerals)
+        .bind(&names)
+        .bind(&rows)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if staged.is_none() {
+            return Err(StoreError::Validation(format!(
+                "repin job id={id} is not a running execution: cutover tallies cannot be staged"
+            )));
+        }
+        tx.commit().await?;
         Ok(())
     }
 
