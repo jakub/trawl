@@ -699,7 +699,7 @@ fn iso8601(dt: DateTime<Utc>) -> String {
 /// refused by the time this runs.
 ///
 /// It fails the whole run closed. A symlink under an env dir, a `.parquet`
-/// whose footer will not parse, a nested foreign schema, a directory that
+/// that is not a regular file, a `.parquet` whose footer will not parse, a nested foreign schema, a directory that
 /// cannot be listed, a file that vanished mid-walk: each is a file whose
 /// columns are unknown, and an unknown file cannot be part of a proof that
 /// nothing carries a field. Returning "no carrier found" from a corpus that
@@ -748,6 +748,15 @@ fn prove_carriers(data_dir: &Path, mut dead: BTreeSet<String>) -> Result<Walk, S
             } else if meta.is_dir() {
                 stack.push(path);
             } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                // Regular-file, decided from the SAME lstat that refused the
+                // symlink. A FIFO, a device node or a unix socket wearing a
+                // `.parquet` name is not a file trawl wrote, and opening one
+                // under the corpus gate can block until somebody writes the
+                // other end — an ingest stall with no timeout on it.
+                if !meta.is_file() {
+                    problems.note(&path, "not a regular file");
+                    continue;
+                }
                 files_scanned += 1;
                 match trawl_engine::parquet_stats::read_column_names(&path) {
                     Ok(names) => {

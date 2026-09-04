@@ -784,6 +784,49 @@ async fn gc_refuses_the_whole_run_on_a_symlink_under_a_live_env() {
     assert!(h.pinned("dead"));
 }
 
+/// A `.parquet` that is not a regular file is refused, not opened. Opening
+/// a FIFO blocks until somebody writes the other end, and the walk runs
+/// with the corpus gate held, so that is an ingest stall with no timeout on
+/// it. The unix socket here stands in for the whole class (a FIFO, a device
+/// node): all of them fail the same lstat check.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn gc_refuses_a_parquet_that_is_not_a_regular_file() {
+    let h = harness().await;
+    h.ingest_and_compact(&[event("api", &json!({"kept": 1}))])
+        .await;
+    h.pin_without_carrier("gone", "dead").await;
+
+    let odd = h.data_dir.join("prod").join("not-a-file.parquet");
+    std::fs::create_dir_all(odd.parent().unwrap()).unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(&odd).expect("bind a socket file");
+
+    let run = tokio::time::timeout(
+        Duration::from_secs(30),
+        h.gc(None)
+            .run(Some(Duration::ZERO), false, GcActor::default()),
+    )
+    .await
+    .expect("the run must answer promptly rather than block on the open");
+    let err = run.expect_err("a non-regular parquet fails the run closed");
+
+    assert_eq!(err.error_class(), "conflict", "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("not-a-file.parquet"), "{msg}");
+    assert!(msg.contains("not a regular file"), "{msg}");
+    assert!(h.pinned("dead"), "a refused run deletes nothing");
+    assert!(h.pinned_in_store("dead").await);
+
+    // Removed, the same request goes through.
+    std::fs::remove_file(&odd).unwrap();
+    let report = h
+        .gc(None)
+        .run(Some(Duration::ZERO), false, GcActor::default())
+        .await
+        .expect("gc runs over a corpus of ordinary files");
+    assert_eq!(report.deleted, 1, "report: {report:?}");
+}
+
 mod capture {
     //! Minimal tracing capture: every event's fields as strings.
 
