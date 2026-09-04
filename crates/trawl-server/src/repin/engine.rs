@@ -140,6 +140,48 @@ pub static TEST_PROGRESS_PUBLISHED: std::sync::atomic::AtomicBool =
 pub static TEST_RELEASE_JOB: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only hold immediately past the point of no return: the latch is
+/// taken and the Cutover marker is published, but no env has been swapped
+/// yet (#109).
+///
+/// A cancel arriving in that window must be refused, and the refusal is the
+/// one cancellation answer no barrier already reachable can pin. The window
+/// is otherwise microseconds wide, two renames per env, so a test aiming
+/// at it by timing would be asserting on its own scheduler.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_HOLD_AFTER_NO_RETURN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the cutover once it is holding past the point of no return.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_PAST_NO_RETURN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the test to let the held cutover swap the corpus.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_RELEASE_CUTOVER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only hold inside the scan, at the first file's boundary (#109).
+///
+/// The scan-stage cancel needs the scan pinned mid-corpus, not merely made
+/// slow: a delay leaves "did the cancel land before the last file" to the
+/// scheduler, and a scan that finished first publishes a plan, which is
+/// exactly the thing the test asserts never happened.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_HOLD_IN_SCAN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the scan once it is holding at a file boundary.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_SCAN_HELD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the test to let the held scan read its next file.
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_RELEASE_SCAN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// What `start` decided.
 #[derive(Debug)]
 pub enum StartOutcome {
@@ -1124,6 +1166,20 @@ impl RepinEngine {
         // line above already refused every request that could still be
         // pending.
         write_marker(&self.data_dir, &marker).map_err(JobAbort::Failed)?;
+
+        // Test-only: pin the window a cancel can only be refused in (see
+        // `TEST_HOLD_AFTER_NO_RETURN`). Bounded, and armed once.
+        #[cfg(any(test, feature = "test-support"))]
+        if TEST_HOLD_AFTER_NO_RETURN.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            TEST_PAST_NO_RETURN.store(true, std::sync::atomic::Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !TEST_RELEASE_CUTOVER.load(std::sync::atomic::Ordering::SeqCst)
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
         if let Err(e) = swap_envs(&self.data_dir, &shadow, &aside_root(&self.data_dir)) {
             // Forward is the only direction past the marker: some envs may
             // already serve the new generation. A process that released

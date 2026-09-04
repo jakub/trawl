@@ -110,6 +110,23 @@ pub(crate) fn scan(
             if delay > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay));
             }
+            // Test-only hold at this file's boundary, so a cancel can be
+            // requested of a scan that provably has files left to read
+            // (see `crate::repin::engine::TEST_HOLD_IN_SCAN`). Bounded,
+            // and armed once, so later files are read at full speed.
+            if crate::repin::engine::TEST_HOLD_IN_SCAN
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                crate::repin::engine::TEST_SCAN_HELD
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !crate::repin::engine::TEST_RELEASE_SCAN
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
         }
         let path = data_dir.join(&rel);
         let Some((schema, _layout)) = affected_schema(&conn, data_dir, &path, field)? else {
