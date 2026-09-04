@@ -598,6 +598,11 @@ impl ScheduleStore {
     /// application instant per tick and compares fire cursors against it,
     /// and a test driving a fake clock has to be able to create a schedule
     /// that is due at its own instant.
+    ///
+    /// The schedule is created ENABLED. This door takes no flag because it
+    /// has no caller that wants one: the HTTP door is
+    /// [`Self::set_schedule_checked`], which passes the request's `enabled`
+    /// to the same INSERT.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_schedule(
         &self,
@@ -616,6 +621,7 @@ impl ScheduleStore {
             key_id,
             interval_secs,
             max_runs,
+            true,
             window,
             lag_secs,
             now,
@@ -704,10 +710,9 @@ impl ScheduleStore {
     /// [`validate_window_compatibility`] returns immediately, and the saved
     /// text stays as unexamined here as `create_saved` leaves it.
     ///
-    /// `enabled` reaches the UPDATE path only. A schedule that does not
-    /// exist yet is created enabled, exactly as the handler's old
-    /// create-or-update pair did, because [`Self::create_schedule`] has
-    /// never taken the flag.
+    /// `enabled` reaches both paths: a `PUT` carrying `enabled: false` on a
+    /// saved query with no schedule yet creates a disabled one, rather than
+    /// creating it enabled and leaving the caller to send a second request.
     #[allow(clippy::too_many_arguments)]
     pub async fn set_schedule_checked(
         &self,
@@ -784,6 +789,7 @@ impl ScheduleStore {
                     key_id,
                     interval_secs,
                     max_runs,
+                    enabled,
                     window,
                     lag_secs,
                     now,
@@ -1833,6 +1839,7 @@ async fn create_schedule_in(
     key_id: i64,
     interval_secs: u64,
     max_runs: Option<u64>,
+    enabled: bool,
     window: Option<ScheduleWindow>,
     lag_secs: u64,
     now: DateTime<Utc>,
@@ -1856,13 +1863,14 @@ async fn create_schedule_in(
              (saved_query_id, key_id, interval_secs, max_runs, enabled,
               window_kind, window_secs, lag_secs, covered_through, next_fire_at,
               created_at, updated_at)
-         VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7, $8, $9, now(), now())
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())
          RETURNING {SCHEDULE_COLS}"
     )))
     .bind(saved_query_id)
     .bind(key_id)
     .bind(bind_u64(interval_secs))
     .bind(max_runs.map(bind_u64))
+    .bind(enabled)
     .bind(window.map(|w| w.kind().as_str()))
     .bind(window.and_then(ScheduleWindow::secs).map(bind_u64))
     .bind(bind_u64(lag_secs))

@@ -1798,6 +1798,65 @@ async fn runs_stats_rejects_reader() {
 }
 
 // ---------------------------------------------------------------------------
+// Schedule create/update
+// ---------------------------------------------------------------------------
+
+/// `enabled` has to mean the same thing on both halves of the PUT. The
+/// create path used to hardcode TRUE, so a client that asked for a schedule
+/// it would enable later got one that fired on the next tick instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn put_schedule_honours_enabled_on_create() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("disabled-on-create", "* | head 3")
+        .await
+        .unwrap();
+
+    // The saved query has no schedule yet, so this PUT takes the CREATE arm.
+    let created = client
+        .set_schedule(saved.id, "1h", None, false, None, None)
+        .await
+        .unwrap();
+    assert!(
+        !created.enabled,
+        "a create-path PUT must return the schedule it was asked for"
+    );
+    assert!(
+        !client.get_schedule(saved.id).await.unwrap().enabled,
+        "and the row it wrote must be disabled too"
+    );
+
+    // The row says disabled; the proof is that a tick does not run it. A
+    // schedule is created due at its own creation instant, so an enabled one
+    // would be claimed by the very next tick.
+    let key_store = KeyStore::from_pool(server.fleet_pool.clone());
+    for handle in trawl_server::scheduler::poll_and_execute(
+        &server.state.storage.schedule,
+        &key_store,
+        &server.state.query.pool,
+        &trawl_server::config::SchedulerConfig::default(),
+        30,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        handle.await.expect("a scheduled execution must not panic");
+    }
+
+    let runs = client
+        .list_report_runs(saved.id, Some(10), None)
+        .await
+        .unwrap();
+    assert!(
+        runs.runs.is_empty(),
+        "a disabled schedule must not be claimed by a tick, got {:?}",
+        runs.runs
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Trigger run endpoint
 // ---------------------------------------------------------------------------
 
