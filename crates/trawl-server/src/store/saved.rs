@@ -11,7 +11,7 @@ use sqlx::{AssertSqlSafe, PgPool, Row as _};
 use super::error::{PgViolation, StoreError, classify_violation};
 use super::schedule::{
     LATEST_RUN_COLS, LATEST_RUN_JOINS, ReportRun, Schedule, latest_run_and_count_from_row,
-    row_to_schedule_at,
+    row_to_schedule_at, schedule_cols_as,
 };
 
 /// Validate that a saved query name matches `[a-zA-Z0-9_-]+`.
@@ -113,20 +113,14 @@ impl SavedQueryStore {
     ) -> Result<Vec<SavedQueryDetails>, StoreError> {
         let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT sq.id, sq.key_id, sq.name, sq.query, sq.created_at, sq.updated_at,
-                    s.id             AS s_id,
-                    s.saved_query_id AS s_saved_query_id,
-                    s.key_id         AS s_key_id,
-                    s.interval_secs  AS s_interval_secs,
-                    s.max_runs       AS s_max_runs,
-                    s.enabled        AS s_enabled,
-                    s.created_at     AS s_created_at,
-                    s.updated_at     AS s_updated_at,
+                    {schedule_cols},
                     {LATEST_RUN_COLS}
              FROM saved_queries sq
              LEFT JOIN schedules s ON s.saved_query_id = sq.id
              {LATEST_RUN_JOINS}
              WHERE sq.key_id = $1
              ORDER BY sq.name ASC",
+            schedule_cols = schedule_cols_as("s.", "s_")
         )))
         .bind(key_id)
         .fetch_all(&self.pool)

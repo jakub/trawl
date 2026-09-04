@@ -71,6 +71,18 @@ pub enum StoreError {
         secs: u64,
     },
 
+    /// A report-window `lag` was given on a schedule with no window
+    /// (ADR-0018 ruling 6). The handler turns this into a 400.
+    #[error(
+        "lag {lag_secs}s needs a report window: without `window` the saved query owns \
+         its own time clause and trawl shifts no bounds. Set window to \"since_last\" \
+         or a duration, or drop lag"
+    )]
+    LagWithoutWindow {
+        /// The requested lag in seconds.
+        lag_secs: u64,
+    },
+
     /// Saved query name contains invalid characters.
     #[error("invalid saved query name '{name}': must match [a-zA-Z0-9_-]+")]
     InvalidName {
@@ -187,6 +199,7 @@ impl StoreError {
             Self::InvalidInterval { .. } => "invalid_interval",
             Self::IntervalTooShort { .. } => "interval_too_short",
             Self::InvalidName { .. } => "invalid_name",
+            Self::LagWithoutWindow { .. } => "lag_without_window",
             Self::RepinAlreadyRunning => "repin_already_running",
             Self::PurgeCommitUnknown => "purge_commit_unknown",
             Self::PurgePrepareTimeout => "purge_prepare_timeout",

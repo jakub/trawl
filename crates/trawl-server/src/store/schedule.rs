@@ -29,6 +29,7 @@ use super::error::{PgViolation, StoreError, classify_violation};
 use super::history::{bind_u64, bind_usize};
 use super::saved::{SavedQuery, row_to_saved_query_at};
 use super::status::{RunStatus, decode_status};
+use crate::report_window::{ReportWindow, ScheduleWindow};
 
 const MIN_INTERVAL_SECS: u64 = 60;
 
@@ -41,6 +42,18 @@ pub struct Schedule {
     pub interval_secs: u64,
     pub max_runs: Option<u64>,
     pub enabled: bool,
+    /// The window this schedule covers, or `None` for the legacy shape
+    /// where the saved DSL is executed verbatim (ADR-0018 ruling 6).
+    pub window: Option<ScheduleWindow>,
+    /// Late-arrival allowance shifting both window bounds back. Zero unless
+    /// a window is set.
+    pub lag_secs: u64,
+    /// The `since_last` watermark: the end of the newest window a
+    /// successful run covered. `None` until the first one lands.
+    pub covered_through: Option<DateTime<Utc>>,
+    /// The planned next fire instant. The scheduler fires on this rather
+    /// than on `last_run + interval`, so fire-time drift never accumulates.
+    pub next_fire_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -61,6 +74,15 @@ pub struct ReportRun {
     pub error_message: Option<String>,
     /// Filesystem path to the parquet result file (relative to data dir).
     pub result_path: Option<String>,
+    /// Inclusive lower bound of the window this run covered; `None` for a
+    /// run whose query owned its own time clause (ADR-0018 ruling 11).
+    pub window_start: Option<DateTime<Utc>>,
+    /// Exclusive upper bound of the covered window.
+    pub window_end: Option<DateTime<Utc>>,
+    /// Whether the covered window was clamped forward past an uncovered
+    /// catch-up gap. `None` (not `Some(false)`) for a run with no window:
+    /// `Some(false)` is the positive claim that the window is complete.
+    pub window_truncated: Option<bool>,
 }
 
 /// Outcome of a transactional run claim ([`ScheduleStore::claim_run`]).
@@ -165,6 +187,20 @@ fn ensure_min_interval(secs: u64) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Refuse a lag on a schedule that has no window.
+///
+/// `lag` shifts a window's bounds back to cover stragglers, so without a
+/// window there is nothing for it to shift: the saved DSL owns its own time
+/// clause and trawl must execute it verbatim. Accepting the pair would store
+/// a number that changes no answer, and the operator would read the schedule
+/// back as if the allowance were in force.
+fn ensure_lag_has_window(window: Option<ScheduleWindow>, lag_secs: u64) -> Result<(), StoreError> {
+    if window.is_none() && lag_secs > 0 {
+        return Err(StoreError::LagWithoutWindow { lag_secs });
+    }
+    Ok(())
+}
+
 /// Format seconds into a human-readable duration string (e.g. "5m", "1h").
 pub fn format_interval(secs: u64) -> String {
     // Zero first: every modulus divides it, so the ladder below would render
@@ -197,9 +233,37 @@ pub(crate) fn row_to_schedule_at(row: &PgRow, prefix: &str) -> Result<Schedule, 
             .try_get::<Option<i64>, _>(col("max_runs").as_str())?
             .map(|v| u64::try_from(v).unwrap_or_default()),
         enabled: row.try_get(col("enabled").as_str())?,
+        window: decode_window(row, prefix)?,
+        lag_secs: u64::try_from(row.try_get::<i64, _>(col("lag_secs").as_str())?)
+            .unwrap_or_default(),
+        covered_through: row.try_get(col("covered_through").as_str())?,
+        next_fire_at: row.try_get(col("next_fire_at").as_str())?,
         created_at: row.try_get(col("created_at").as_str())?,
         updated_at: row.try_get(col("updated_at").as_str())?,
     })
+}
+
+/// Decode the `window_kind`/`window_secs` pair into a [`ScheduleWindow`].
+///
+/// The pairing is enforced by `schedules_window_shape`, so an unpaired or
+/// unknown value here means the row was written past the constraint (a
+/// hand-edit, a future kind this binary predates). That is a decode failure,
+/// not a `None` window: silently reading it as "no window" would hand the
+/// scheduler a legacy schedule and execute the DSL verbatim.
+fn decode_window(row: &PgRow, prefix: &str) -> Result<Option<ScheduleWindow>, sqlx::Error> {
+    let kind: Option<String> = row.try_get(format!("{prefix}window_kind").as_str())?;
+    let secs: Option<i64> = row.try_get(format!("{prefix}window_secs").as_str())?;
+    let decode_err = |msg: String| sqlx::Error::Decode(msg.into());
+    match (kind.as_deref(), secs) {
+        (None, None) => Ok(None),
+        (Some("since_last"), None) => Ok(Some(ScheduleWindow::SinceLast)),
+        (Some("fixed"), Some(secs)) => Ok(Some(ScheduleWindow::Fixed {
+            secs: u64::try_from(secs).unwrap_or_default(),
+        })),
+        (kind, secs) => Err(decode_err(format!(
+            "schedule window_kind={kind:?} with window_secs={secs:?} is not a valid window"
+        ))),
+    }
 }
 
 /// Decode a [`ReportRun`] from columns named `{prefix}id`, `{prefix}status`, …
@@ -221,6 +285,9 @@ pub(crate) fn row_to_report_run_at(row: &PgRow, prefix: &str) -> Result<ReportRu
             .map(|v| usize::try_from(v).unwrap_or_default()),
         error_message: row.try_get(col("error_message").as_str())?,
         result_path: row.try_get(col("result_path").as_str())?,
+        window_start: row.try_get(col("window_start").as_str())?,
+        window_end: row.try_get(col("window_end").as_str())?,
+        window_truncated: row.try_get(col("window_truncated").as_str())?,
     })
 }
 
@@ -247,6 +314,9 @@ pub(crate) const LATEST_RUN_COLS: &str = "lr.id             AS r_id,
      lr.row_count      AS r_row_count,
      lr.error_message  AS r_error_message,
      lr.result_path    AS r_result_path,
+     lr.window_start   AS r_window_start,
+     lr.window_end     AS r_window_end,
+     lr.window_truncated AS r_window_truncated,
      rc.run_count      AS run_count";
 
 /// LEFT JOIN LATERAL fragment resolving the single latest run (`lr`, tie-broken
@@ -277,11 +347,12 @@ pub(crate) fn latest_run_and_count_from_row(
     Ok((latest_run, total_runs))
 }
 
-const SCHEDULE_COLS: &str =
-    "id, saved_query_id, key_id, interval_secs, max_runs, enabled, created_at, updated_at";
+const SCHEDULE_COLS: &str = "id, saved_query_id, key_id, interval_secs, max_runs, enabled, \
+     window_kind, window_secs, lag_secs, covered_through, next_fire_at, created_at, updated_at";
 
 const RUN_COLS: &str = "id, schedule_id, saved_query_id, query, status, started_at, finished_at, \
-     duration_ms, row_count, error_message, result_path";
+     duration_ms, row_count, error_message, result_path, window_start, window_end, \
+     window_truncated";
 
 /// Postgres-backed storage for schedules and report runs. Cheap to clone.
 #[derive(Debug, Clone)]
@@ -300,25 +371,42 @@ impl ScheduleStore {
     }
 
     /// Create a schedule for a saved query.
+    ///
+    /// `now` is the caller's instant and becomes the schedule's first
+    /// `next_fire_at`, so a schedule created at T is due at T. It is
+    /// deliberately not the database's `now()`: the scheduler samples one
+    /// application instant per tick and compares fire cursors against it,
+    /// and a test driving a fake clock has to be able to create a schedule
+    /// that is due at its own instant.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_schedule(
         &self,
         saved_query_id: i64,
         key_id: i64,
         interval_secs: u64,
         max_runs: Option<u64>,
+        window: Option<ScheduleWindow>,
+        lag_secs: u64,
+        now: DateTime<Utc>,
     ) -> Result<Schedule, StoreError> {
         ensure_min_interval(interval_secs)?;
+        ensure_lag_has_window(window, lag_secs)?;
 
         let row = sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO schedules
-                 (saved_query_id, key_id, interval_secs, max_runs, enabled, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, TRUE, now(), now())
+                 (saved_query_id, key_id, interval_secs, max_runs, enabled,
+                  window_kind, window_secs, lag_secs, next_fire_at, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7, $8, now(), now())
              RETURNING {SCHEDULE_COLS}"
         )))
         .bind(saved_query_id)
         .bind(key_id)
         .bind(bind_u64(interval_secs))
         .bind(max_runs.map(bind_u64))
+        .bind(window.map(ScheduleWindow::kind))
+        .bind(window.and_then(ScheduleWindow::secs).map(bind_u64))
+        .bind(bind_u64(lag_secs))
+        .bind(now)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| match classify_violation(&e) {
@@ -345,6 +433,21 @@ impl ScheduleStore {
     }
 
     /// Update an existing schedule. Returns `NotFound` if not owned by `key_id`.
+    ///
+    /// Two cursor rules, both about not moving coverage the operator did not
+    /// ask to move:
+    ///
+    /// - `covered_through` is never touched. Editing a schedule (or its saved
+    ///   DSL) does not reset the watermark — the per-run resolved snapshot is
+    ///   the audit trail (ADR-0018 ruling 14).
+    /// - `next_fire_at` is re-anchored to `now` only when the cadence itself
+    ///   changed: a different `interval_secs` or a different window. Editing
+    ///   `max_runs` or flipping `enabled` leaves the planned cursor alone, so
+    ///   a schedule cannot be kept permanently un-due by repeated edits. The
+    ///   comparison reads the current row under `FOR UPDATE`, in the same
+    ///   transaction as the write, so a concurrent edit cannot land between
+    ///   the read and the decision.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_schedule(
         &self,
         id: i64,
@@ -352,26 +455,60 @@ impl ScheduleStore {
         interval_secs: u64,
         max_runs: Option<u64>,
         enabled: bool,
+        window: Option<ScheduleWindow>,
+        lag_secs: u64,
+        now: DateTime<Utc>,
     ) -> Result<Schedule, StoreError> {
         ensure_min_interval(interval_secs)?;
+        ensure_lag_has_window(window, lag_secs)?;
+
+        let mut tx = self.pool.begin().await?;
+
+        let current = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {SCHEDULE_COLS} FROM schedules
+             WHERE id = $1 AND key_id = $2 FOR UPDATE"
+        )))
+        .bind(id)
+        .bind(key_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(current) = current else {
+            tx.rollback().await?;
+            return Err(StoreError::NotFound {
+                id,
+                resource: "schedule",
+            });
+        };
+        let current = row_to_schedule(&current)?;
+        let reanchor = current.interval_secs != interval_secs || current.window != window;
 
         let row = sqlx::query(AssertSqlSafe(format!(
             "UPDATE schedules
-             SET interval_secs = $1, max_runs = $2, enabled = $3, updated_at = now()
-             WHERE id = $4 AND key_id = $5
+             SET interval_secs = $1, max_runs = $2, enabled = $3,
+                 window_kind = $4, window_secs = $5, lag_secs = $6,
+                 next_fire_at = CASE WHEN $7 THEN $8 ELSE next_fire_at END,
+                 updated_at = now()
+             WHERE id = $9 AND key_id = $10
              RETURNING {SCHEDULE_COLS}"
         )))
         .bind(bind_u64(interval_secs))
         .bind(max_runs.map(bind_u64))
         .bind(enabled)
+        .bind(window.map(ScheduleWindow::kind))
+        .bind(window.and_then(ScheduleWindow::secs).map(bind_u64))
+        .bind(bind_u64(lag_secs))
+        .bind(reanchor)
+        .bind(now)
         .bind(id)
         .bind(key_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or(StoreError::NotFound {
             id,
             resource: "schedule",
         })?;
+
+        tx.commit().await?;
 
         tracing::info!(
             event_type = "schedule_updated",
@@ -472,12 +609,12 @@ impl ScheduleStore {
         key_id: i64,
     ) -> Result<Option<(Schedule, Option<ReportRun>, u64)>, StoreError> {
         let row = sqlx::query(AssertSqlSafe(format!(
-            "SELECT s.id, s.saved_query_id, s.key_id, s.interval_secs, s.max_runs,
-                    s.enabled, s.created_at, s.updated_at,
+            "SELECT {cols},
                     {LATEST_RUN_COLS}
              FROM schedules s
              {LATEST_RUN_JOINS}
              WHERE s.saved_query_id = $1 AND s.key_id = $2",
+            cols = schedule_cols("s.")
         )))
         .bind(saved_query_id)
         .bind(key_id)
@@ -493,9 +630,8 @@ impl ScheduleStore {
     /// List all enabled schedules with their associated saved queries.
     /// Used by the scheduler — no ownership check (internal/cross-user).
     pub async fn list_enabled_schedules(&self) -> Result<Vec<(Schedule, SavedQuery)>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT s.id, s.saved_query_id, s.key_id, s.interval_secs, s.max_runs,
-                    s.enabled, s.created_at, s.updated_at,
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {cols},
                     sq.id         AS sq_id,
                     sq.key_id     AS sq_key_id,
                     sq.name       AS sq_name,
@@ -506,7 +642,8 @@ impl ScheduleStore {
              JOIN saved_queries sq ON sq.id = s.saved_query_id
              WHERE s.enabled = TRUE
              ORDER BY s.id",
-        )
+            cols = schedule_cols("s.")
+        )))
         .fetch_all(&self.pool)
         .await?;
 
@@ -528,12 +665,18 @@ impl ScheduleStore {
     /// Claim a run transactionally: lock the schedule row, enforce
     /// `max_runs`, and insert the running row — all in one transaction so
     /// concurrent manual triggers can never exceed the cap.
+    ///
+    /// `window` is the interval the run is about to cover, recorded on the
+    /// row at claim time because that is when it is decided. `None` writes
+    /// all three bound columns NULL: the query owns its own time clause and
+    /// trawl claims no coverage for it.
     pub async fn claim_run(
         &self,
         schedule_id: i64,
         saved_query_id: i64,
         query: &str,
         max_runs: Option<u64>,
+        window: Option<&ReportWindow>,
     ) -> Result<RunClaim, StoreError> {
         let mut tx = self.pool.begin().await?;
 
@@ -565,13 +708,18 @@ impl ScheduleStore {
         }
 
         let inserted = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO report_runs (schedule_id, saved_query_id, query, status, started_at)
-             VALUES ($1, $2, $3, 'running', now())
+            "INSERT INTO report_runs
+                 (schedule_id, saved_query_id, query, status, started_at,
+                  window_start, window_end, window_truncated)
+             VALUES ($1, $2, $3, 'running', now(), $4, $5, $6)
              RETURNING id",
         )
         .bind(schedule_id)
         .bind(saved_query_id)
         .bind(query)
+        .bind(window.map(|w| w.start))
+        .bind(window.map(|w| w.end))
+        .bind(window.map(|w| w.truncated))
         .fetch_one(&mut *tx)
         .await;
 
@@ -1017,8 +1165,37 @@ impl ScheduleStore {
 
 /// Build a prefixed run column list (e.g. `r.id, r.schedule_id, …`).
 fn run_cols(prefix: &str) -> String {
-    RUN_COLS
-        .split(", ")
+    prefixed(RUN_COLS, prefix)
+}
+
+/// Build a prefixed schedule column list (e.g. `s.id, s.saved_query_id, …`).
+///
+/// The twin of [`run_cols`]: every statement that joins schedules spells the
+/// same list, so a column added to [`SCHEDULE_COLS`] reaches all of them
+/// instead of only the ones someone remembered to edit.
+fn schedule_cols(prefix: &str) -> String {
+    prefixed(SCHEDULE_COLS, prefix)
+}
+
+/// Build a schedule column list aliased for a joined decode, e.g.
+/// `s.id AS s_id, s.saved_query_id AS s_saved_query_id, …`.
+///
+/// The shape [`row_to_schedule_at`] reads when a schedule rides along with
+/// another row. Generated rather than spelled out, so a new schedule column
+/// cannot reach the struct and miss the join.
+pub(crate) fn schedule_cols_as(table: &str, alias: &str) -> String {
+    SCHEDULE_COLS
+        .split(',')
+        .map(|c| {
+            let c = c.trim();
+            format!("{table}{c} AS {alias}{c}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn prefixed(cols: &str, prefix: &str) -> String {
+    cols.split(',')
         .map(|c| format!("{prefix}{}", c.trim()))
         .collect::<Vec<_>>()
         .join(", ")
@@ -1103,7 +1280,44 @@ mod tests {
     fn run_cols_prefixes_every_column() {
         let cols = run_cols("r.");
         assert!(cols.starts_with("r.id, r.schedule_id"));
-        assert!(cols.ends_with("r.result_path"));
+        assert!(cols.ends_with("r.window_truncated"));
         assert!(!cols.contains(" ,"));
+        assert_eq!(cols.split(", ").count(), RUN_COLS.split(',').count());
+    }
+
+    #[test]
+    fn schedule_cols_as_aliases_every_column() {
+        let cols = schedule_cols_as("s.", "s_");
+        assert!(cols.starts_with("s.id AS s_id, s.saved_query_id AS s_saved_query_id"));
+        assert!(cols.ends_with("s.updated_at AS s_updated_at"));
+        assert_eq!(cols.split(", ").count(), SCHEDULE_COLS.split(',').count());
+    }
+
+    #[test]
+    fn schedule_cols_prefixes_every_column() {
+        let cols = schedule_cols("s.");
+        assert!(cols.starts_with("s.id, s.saved_query_id"));
+        assert!(cols.ends_with("s.updated_at"));
+        assert!(cols.contains("s.window_kind, s.window_secs"));
+        assert!(!cols.contains(" ,"));
+        assert_eq!(cols.split(", ").count(), SCHEDULE_COLS.split(',').count());
+    }
+
+    /// Every run column reachable through the embedded `last_run` of a
+    /// schedule response. `LATEST_RUN_COLS` is a hand-written alias list, so
+    /// a column added to `RUN_COLS` alone would decode as missing there —
+    /// silently, for exactly one of the two ways a run is read.
+    #[test]
+    fn latest_run_cols_carries_every_run_column() {
+        for col in RUN_COLS.split(',').map(str::trim) {
+            assert!(
+                LATEST_RUN_COLS.contains(&format!("lr.{col} ")),
+                "LATEST_RUN_COLS is missing lr.{col}"
+            );
+            assert!(
+                LATEST_RUN_COLS.contains(&format!("AS r_{col}")),
+                "LATEST_RUN_COLS is missing the r_{col} alias"
+            );
+        }
     }
 }

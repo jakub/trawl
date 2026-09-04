@@ -21,6 +21,7 @@
 mod common;
 
 use sqlx::PgPool;
+use trawl_server::report_window::{ReportWindow, ScheduleWindow, truncate_to_micros};
 use trawl_server::store::{
     FinishOutcome, FlipOutcome, HistoryStore, RunClaim, RunStatus, SavedQueryStore, ScheduleStore,
     StorageState, StoreError,
@@ -350,11 +351,11 @@ async fn saved_list_with_details_bulk_join(pool: PgPool) {
     saved_store.create(1, "gamma", "q3").await.unwrap();
 
     let sched_a = schedule_store
-        .create_schedule(a.id, 1, 300, Some(10))
+        .create_schedule(a.id, 1, 300, Some(10), None, 0, chrono::Utc::now())
         .await
         .unwrap();
     schedule_store
-        .create_schedule(b.id, 1, 600, None)
+        .create_schedule(b.id, 1, 600, None, None, 0, chrono::Utc::now())
         .await
         .unwrap();
 
@@ -410,7 +411,7 @@ async fn seed_run(
     query: &str,
 ) -> i64 {
     match store
-        .claim_run(schedule_id, saved_query_id, query, None)
+        .claim_run(schedule_id, saved_query_id, query, None, None)
         .await
         .unwrap()
     {
@@ -424,7 +425,10 @@ async fn schedule_create_and_get(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test-query").await;
 
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     assert_eq!(schedule.saved_query_id, sq_id);
     assert_eq!(schedule.interval_secs, 300);
     assert!(schedule.enabled);
@@ -443,8 +447,13 @@ async fn schedule_duplicate_returns_error(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
 
-    store.create_schedule(sq_id, 1, 300, None).await.unwrap();
-    let result = store.create_schedule(sq_id, 1, 600, None).await;
+    store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let result = store
+        .create_schedule(sq_id, 1, 600, None, None, 0, chrono::Utc::now())
+        .await;
     assert!(matches!(result, Err(StoreError::ScheduleExists { .. })));
 }
 
@@ -452,7 +461,9 @@ async fn schedule_duplicate_returns_error(pool: PgPool) {
 async fn schedule_for_missing_saved_query_is_not_found(pool: PgPool) {
     // 23503 on the named FK maps to NotFound, not a raw pg error.
     let store = schedules(&pool);
-    let result = store.create_schedule(12345, 1, 300, None).await;
+    let result = store
+        .create_schedule(12345, 1, 300, None, None, 0, chrono::Utc::now())
+        .await;
     assert!(matches!(result, Err(StoreError::NotFound { .. })));
 }
 
@@ -464,13 +475,20 @@ async fn schedule_rejects_sub_minute_interval(pool: PgPool) {
     let sq_id = seed_saved(&pool, 1, "test").await;
 
     assert!(matches!(
-        store.create_schedule(sq_id, 1, 30, None).await,
+        store
+            .create_schedule(sq_id, 1, 30, None, None, 0, chrono::Utc::now())
+            .await,
         Err(StoreError::IntervalTooShort { secs: 30 })
     ));
 
-    let created = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     assert!(matches!(
-        store.update_schedule(created.id, 1, 45, None, true).await,
+        store
+            .update_schedule(created.id, 1, 45, None, true, None, 0, chrono::Utc::now())
+            .await,
         Err(StoreError::IntervalTooShort { secs: 45 })
     ));
 }
@@ -480,9 +498,21 @@ async fn schedule_update(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
 
-    let created = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     let updated = store
-        .update_schedule(created.id, 1, 600, Some(10), false)
+        .update_schedule(
+            created.id,
+            1,
+            600,
+            Some(10),
+            false,
+            None,
+            0,
+            chrono::Utc::now(),
+        )
         .await
         .unwrap();
     assert_eq!(updated.interval_secs, 600);
@@ -494,16 +524,400 @@ async fn schedule_update(pool: PgPool) {
 async fn schedule_update_other_user_not_found(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let created = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
-    let result = store.update_schedule(created.id, 2, 600, None, true).await;
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let result = store
+        .update_schedule(created.id, 2, 600, None, true, None, 0, chrono::Utc::now())
+        .await;
     assert!(matches!(result, Err(StoreError::NotFound { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// schedule windows (ADR-0018 rulings 6-14)
+// ---------------------------------------------------------------------------
+
+/// Read a schedule's raw cursor columns, bypassing the decoder.
+async fn raw_cursors(
+    pool: &PgPool,
+    id: i64,
+) -> (
+    Option<String>,
+    Option<i64>,
+    i64,
+    Option<chrono::DateTime<chrono::Utc>>,
+    chrono::DateTime<chrono::Utc>,
+) {
+    sqlx::query_as(
+        "SELECT window_kind, window_secs, lag_secs, covered_through, next_fire_at
+         FROM schedules WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// All three window modes survive the round trip, and a `fixed` window keeps
+/// its span. Absent stays absent: a legacy schedule must not acquire a
+/// window by being written through the new columns.
+#[sqlx::test]
+async fn schedule_window_round_trips(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+
+    for (name, window, lag) in [
+        ("legacy", None, 0),
+        ("tiled", Some(ScheduleWindow::SinceLast), 300),
+        ("trailing", Some(ScheduleWindow::Fixed { secs: 7200 }), 0),
+    ] {
+        let sq_id = seed_saved(&pool, 1, name).await;
+        let created = store
+            .create_schedule(sq_id, 1, 300, None, window, lag, now)
+            .await
+            .unwrap();
+        assert_eq!(created.window, window, "{name}: created window");
+        assert_eq!(created.lag_secs, lag, "{name}: created lag");
+        assert_eq!(
+            created.covered_through, None,
+            "{name}: watermark starts unset"
+        );
+
+        let fetched = store
+            .get_schedule_for_saved_query(sq_id, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.window, window, "{name}: refetched window");
+        assert_eq!(fetched.lag_secs, lag, "{name}: refetched lag");
+
+        let (kind, secs, ..) = raw_cursors(&pool, created.id).await;
+        assert_eq!(kind.as_deref(), window.map(ScheduleWindow::kind));
+        assert_eq!(
+            secs,
+            window
+                .and_then(ScheduleWindow::secs)
+                .map(i64::try_from)
+                .transpose()
+                .unwrap()
+        );
+    }
+}
+
+/// `next_fire_at` is the caller's instant, not the database clock: the
+/// scheduler samples one application instant per tick, and a test with a
+/// fake clock has to be able to create a schedule that is already due.
+#[sqlx::test]
+async fn schedule_create_anchors_next_fire_at_to_caller_instant(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "anchored").await;
+    let now = truncate_to_micros(chrono::Utc::now()) - chrono::Duration::hours(3);
+
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, Some(ScheduleWindow::SinceLast), 0, now)
+        .await
+        .unwrap();
+    assert_eq!(created.next_fire_at, now);
+
+    let (.., next_fire_at) = raw_cursors(&pool, created.id).await;
+    assert_eq!(next_fire_at, now);
+}
+
+/// The planned cursor moves when the cadence changes and stays put
+/// otherwise. Re-anchoring on every edit would let repeated `max_runs` or
+/// `enabled` edits keep a schedule permanently un-due.
+#[sqlx::test]
+async fn schedule_update_reanchors_only_on_cadence_change(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "reanchor").await;
+    let t0 = truncate_to_micros(chrono::Utc::now());
+    let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
+
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, t0)
+        .await
+        .unwrap();
+    assert_eq!(created.next_fire_at, t0);
+
+    // max_runs and enabled: not cadence.
+    let same = store
+        .update_schedule(created.id, 1, 300, Some(5), false, None, 0, at(1))
+        .await
+        .unwrap();
+    assert_eq!(same.next_fire_at, t0, "max_runs/enabled must not re-anchor");
+
+    // interval: cadence.
+    let interval = store
+        .update_schedule(created.id, 1, 600, Some(5), false, None, 0, at(2))
+        .await
+        .unwrap();
+    assert_eq!(interval.next_fire_at, at(2), "interval change re-anchors");
+
+    // window: cadence, since it changes what a fire covers.
+    let windowed = store
+        .update_schedule(
+            created.id,
+            1,
+            600,
+            Some(5),
+            false,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            at(3),
+        )
+        .await
+        .unwrap();
+    assert_eq!(windowed.next_fire_at, at(3), "window change re-anchors");
+
+    // lag alone: shifts bounds, not cadence.
+    let lagged = store
+        .update_schedule(
+            created.id,
+            1,
+            600,
+            Some(5),
+            false,
+            Some(ScheduleWindow::SinceLast),
+            120,
+            at(4),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lagged.next_fire_at, at(3), "lag change must not re-anchor");
+    assert_eq!(lagged.lag_secs, 120);
+}
+
+/// Editing a schedule never rewinds or advances coverage: the watermark is
+/// owned by successful runs alone (ADR-0018 ruling 14).
+#[sqlx::test]
+async fn schedule_update_preserves_covered_through(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "watermark").await;
+    let now = truncate_to_micros(chrono::Utc::now());
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, Some(ScheduleWindow::SinceLast), 0, now)
+        .await
+        .unwrap();
+
+    let mark = now - chrono::Duration::hours(1);
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(mark)
+        .bind(created.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for (interval, window, enabled) in [
+        (300, Some(ScheduleWindow::SinceLast), true),
+        (900, Some(ScheduleWindow::Fixed { secs: 900 }), false),
+        (900, None, true),
+    ] {
+        let updated = store
+            .update_schedule(created.id, 1, interval, None, enabled, window, 0, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.covered_through,
+            Some(mark),
+            "edit ({interval}, {window:?}) must leave the watermark alone"
+        );
+    }
+}
+
+/// A lag with no window is refused at the store boundary, on both write
+/// paths, with the typed error the handler renders as a 400.
+#[sqlx::test]
+async fn schedule_lag_without_window_is_refused(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "lagless").await;
+    let now = chrono::Utc::now();
+
+    assert!(matches!(
+        store
+            .create_schedule(sq_id, 1, 300, None, None, 60, now)
+            .await,
+        Err(StoreError::LagWithoutWindow { lag_secs: 60 })
+    ));
+
+    let created = store
+        .create_schedule(
+            sq_id,
+            1,
+            300,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            60,
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .update_schedule(created.id, 1, 300, None, true, None, 60, now)
+            .await,
+        Err(StoreError::LagWithoutWindow { lag_secs: 60 })
+    ));
+    // The refused update changed nothing.
+    let unchanged = store
+        .get_schedule_for_saved_query(sq_id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.window, Some(ScheduleWindow::SinceLast));
+    assert_eq!(unchanged.lag_secs, 60);
+}
+
+/// A claimed run carries the window it is about to cover, and a claim with
+/// no window reads back three NULLs rather than a zero-length one.
+#[sqlx::test]
+async fn claimed_run_round_trips_its_window(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+
+    let windowed_sq = seed_saved(&pool, 1, "windowed").await;
+    let sched = store
+        .create_schedule(
+            windowed_sq,
+            1,
+            300,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+    let window = ReportWindow {
+        start: now - chrono::Duration::hours(2),
+        end: now,
+        truncated: true,
+    };
+    let rid = match store
+        .claim_run(sched.id, windowed_sq, "q", None, Some(&window))
+        .await
+        .unwrap()
+    {
+        RunClaim::Started(id) => id,
+        other => panic!("expected a started run, got {other:?}"),
+    };
+    let run = store.get_run(rid, 1).await.unwrap().unwrap();
+    assert_eq!(run.window_start, Some(window.start));
+    assert_eq!(run.window_end, Some(window.end));
+    assert_eq!(run.window_truncated, Some(true));
+
+    let legacy_sq = seed_saved(&pool, 1, "legacy-run").await;
+    let legacy_sched = store
+        .create_schedule(legacy_sq, 1, 300, None, None, 0, now)
+        .await
+        .unwrap();
+    let legacy_rid = seed_run(&store, legacy_sched.id, legacy_sq, "q").await;
+    let legacy = store.get_run(legacy_rid, 1).await.unwrap().unwrap();
+    assert_eq!(legacy.window_start, None);
+    assert_eq!(legacy.window_end, None);
+    assert_eq!(
+        legacy.window_truncated, None,
+        "a run with no window claims nothing, not completeness"
+    );
+}
+
+/// The named CHECKs are the backstop under the typed API: a partial run
+/// window and a `fixed` schedule with no span are both unwritable.
+#[sqlx::test]
+async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "checks").await;
+    let now = chrono::Utc::now();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, now)
+        .await
+        .unwrap();
+
+    let constraint_of = |e: sqlx::Error| match e {
+        sqlx::Error::Database(db) => (
+            db.code().map(|c| c.to_string()),
+            db.constraint().map(str::to_owned),
+        ),
+        other => panic!("expected a database error, got {other:?}"),
+    };
+
+    // window_start with no end/truncated.
+    let err = sqlx::query(
+        "INSERT INTO report_runs
+             (schedule_id, saved_query_id, query, status, started_at, window_start)
+         VALUES ($1, $2, 'q', 'error', now(), now())",
+    )
+    .bind(sched.id)
+    .bind(sq_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        constraint_of(err),
+        (
+            Some("23514".to_owned()),
+            Some("report_runs_window_shape".to_owned())
+        )
+    );
+
+    // An end at or before the start is not a half-open interval.
+    let err = sqlx::query(
+        "INSERT INTO report_runs
+             (schedule_id, saved_query_id, query, status, started_at,
+              window_start, window_end, window_truncated)
+         VALUES ($1, $2, 'q', 'error', now(), now(), now() - INTERVAL '1 hour', FALSE)",
+    )
+    .bind(sched.id)
+    .bind(sq_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        constraint_of(err),
+        (
+            Some("23514".to_owned()),
+            Some("report_runs_window_shape".to_owned())
+        )
+    );
+
+    // A fixed window with no span.
+    let err = sqlx::query("UPDATE schedules SET window_kind = 'fixed' WHERE id = $1")
+        .bind(sched.id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        constraint_of(err),
+        (
+            Some("23514".to_owned()),
+            Some("schedules_window_shape".to_owned())
+        )
+    );
+
+    // And one below the 60s floor.
+    let err =
+        sqlx::query("UPDATE schedules SET window_kind = 'fixed', window_secs = 30 WHERE id = $1")
+            .bind(sched.id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        constraint_of(err),
+        (
+            Some("23514".to_owned()),
+            Some("schedules_window_shape".to_owned())
+        )
+    );
 }
 
 #[sqlx::test]
 async fn schedule_delete(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let paths = store.delete_schedule(sq_id, 1).await.unwrap();
     assert!(paths.is_empty());
@@ -520,7 +934,10 @@ async fn schedule_delete(pool: PgPool) {
 async fn schedule_delete_other_user_not_found(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     let result = store.delete_schedule(sq_id, 2).await;
     assert!(matches!(result, Err(StoreError::NotFound { .. })));
 }
@@ -531,8 +948,14 @@ async fn schedule_user_isolation(pool: PgPool) {
     let sq1 = seed_saved(&pool, 1, "user1-query").await;
     let sq2 = seed_saved(&pool, 2, "user2-query").await;
 
-    store.create_schedule(sq1, 1, 300, None).await.unwrap();
-    store.create_schedule(sq2, 2, 600, None).await.unwrap();
+    store
+        .create_schedule(sq1, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    store
+        .create_schedule(sq2, 2, 600, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     assert!(
         store
@@ -560,7 +983,10 @@ async fn cascade_on_saved_query_delete(pool: PgPool) {
         .create(1, "test", "_severity=error")
         .await
         .unwrap();
-    let schedule = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq.id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let run_id = seed_run(&store, schedule.id, sq.id, "_severity=error").await;
     assert_eq!(
@@ -596,7 +1022,10 @@ async fn cascade_on_saved_query_delete(pool: PgPool) {
 async fn schedule_delete_collects_run_paths(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let run_id = seed_run(&store, schedule.id, sq_id, "q").await;
     store
@@ -624,7 +1053,10 @@ async fn schedule_delete_collects_run_paths(pool: PgPool) {
 async fn start_and_finish_run(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let run_id = seed_run(&store, schedule.id, sq_id, "_severity=error").await;
 
@@ -660,10 +1092,13 @@ async fn start_and_finish_run(pool: PgPool) {
 async fn sequential_run_prevention(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let first = store
-        .claim_run(schedule.id, sq_id, "q", None)
+        .claim_run(schedule.id, sq_id, "q", None, None)
         .await
         .unwrap();
     let RunClaim::Started(first_id) = first else {
@@ -672,7 +1107,7 @@ async fn sequential_run_prevention(pool: PgPool) {
 
     // Second claim is refused (already running) via the named 23505.
     let second = store
-        .claim_run(schedule.id, sq_id, "q", None)
+        .claim_run(schedule.id, sq_id, "q", None, None)
         .await
         .unwrap();
     assert!(matches!(second, RunClaim::AlreadyRunning), "got {second:?}");
@@ -683,7 +1118,7 @@ async fn sequential_run_prevention(pool: PgPool) {
         .await
         .unwrap();
     let third = store
-        .claim_run(schedule.id, sq_id, "q", None)
+        .claim_run(schedule.id, sq_id, "q", None, None)
         .await
         .unwrap();
     assert!(matches!(third, RunClaim::Started(_)), "got {third:?}");
@@ -693,7 +1128,10 @@ async fn sequential_run_prevention(pool: PgPool) {
 async fn list_runs_paginated_and_isolated(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     for i in 0usize..5 {
         let run_id = seed_run(&store, schedule.id, sq_id, "q").await;
@@ -727,7 +1165,10 @@ async fn list_runs_paginated_and_isolated(pool: PgPool) {
 async fn cleanup_stale_runs_marks_error(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     // Start a run but don't finish it (simulates crash).
     seed_run(&store, schedule.id, sq_id, "q").await;
@@ -747,7 +1188,10 @@ async fn cleanup_stale_runs_marks_error(pool: PgPool) {
 async fn latest_run_returns_newest(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     assert!(store.latest_run(schedule.id).await.unwrap().is_none());
 
@@ -774,10 +1218,25 @@ async fn list_enabled_schedules_filters_disabled(pool: PgPool) {
     let sq1 = seed_saved(&pool, 1, "enabled-query").await;
     let sq2 = seed_saved(&pool, 2, "disabled-query").await;
 
-    store.create_schedule(sq1, 1, 300, None).await.unwrap();
-    let disabled = store.create_schedule(sq2, 2, 600, None).await.unwrap();
     store
-        .update_schedule(disabled.id, 2, 600, None, false)
+        .create_schedule(sq1, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let disabled = store
+        .create_schedule(sq2, 2, 600, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    store
+        .update_schedule(
+            disabled.id,
+            2,
+            600,
+            None,
+            false,
+            None,
+            0,
+            chrono::Utc::now(),
+        )
         .await
         .unwrap();
 
@@ -793,9 +1252,18 @@ async fn list_all_runs_paginated_and_isolated(pool: PgPool) {
     let sq1 = seed_saved(&pool, 1, "alpha").await;
     let sq2 = seed_saved(&pool, 1, "beta").await;
     let sq3 = seed_saved(&pool, 2, "other-user").await;
-    let sched1 = store.create_schedule(sq1, 1, 300, None).await.unwrap();
-    let sched2 = store.create_schedule(sq2, 1, 300, None).await.unwrap();
-    let sched3 = store.create_schedule(sq3, 2, 300, None).await.unwrap();
+    let sched1 = store
+        .create_schedule(sq1, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let sched2 = store
+        .create_schedule(sq2, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let sched3 = store
+        .create_schedule(sq3, 2, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     for _ in 0..3 {
         let rid = seed_run(&store, sched1.id, sq1, "q1").await;
@@ -839,7 +1307,10 @@ async fn runs_stats_counts_by_status(pool: PgPool) {
     assert_eq!((total, success, error, timeout, avg), (0, 0, 0, 0, None));
 
     let sq_id = seed_saved(&pool, 1, "stats-test").await;
-    let sched = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     for (status, ms, err) in [
         (RunStatus::Success, 100, None),
@@ -873,7 +1344,10 @@ async fn runs_stats_counts_by_status(pool: PgPool) {
 async fn delete_old_runs_retention_and_paths(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "retention").await;
-    let sched = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     // Four finished runs with paths; backdate the first two beyond the cutoff.
     let mut run_ids = Vec::new();
@@ -926,7 +1400,10 @@ async fn delete_old_runs_retention_and_paths(pool: PgPool) {
 async fn successful_run_selectors(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "sel").await;
-    let sched = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     // error run (no path), success with path, success without path.
     let r1 = seed_run(&store, sched.id, sq_id, "q").await;
@@ -980,13 +1457,16 @@ async fn successful_run_selectors(pool: PgPool) {
 async fn concurrent_start_run_yields_exactly_one_claim(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "race").await;
-    let sched = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let s1 = store.clone();
     let s2 = store.clone();
     let (a, b) = tokio::join!(
-        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", None).await }),
-        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", None).await }),
+        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", None, None).await }),
+        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", None, None).await }),
     );
     let a = a.unwrap().unwrap();
     let b = b.unwrap().unwrap();
@@ -1006,7 +1486,10 @@ async fn concurrent_start_run_yields_exactly_one_claim(pool: PgPool) {
 async fn concurrent_claims_respect_max_runs(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "cap").await;
-    let sched = store.create_schedule(sq_id, 1, 300, Some(2)).await.unwrap();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, Some(2), None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     // One finished run: exactly one claim slot remains under max_runs = 2.
     let rid = seed_run(&store, sched.id, sq_id, "q").await;
@@ -1018,8 +1501,8 @@ async fn concurrent_claims_respect_max_runs(pool: PgPool) {
     let s1 = store.clone();
     let s2 = store.clone();
     let (a, b) = tokio::join!(
-        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", Some(2)).await }),
-        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", Some(2)).await }),
+        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", Some(2), None).await }),
+        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", Some(2), None).await }),
     );
     let a = a.unwrap().unwrap();
     let b = b.unwrap().unwrap();
@@ -1043,7 +1526,10 @@ async fn finish_run_after_cascade_delete_reports_orphan(pool: PgPool) {
     let saved_store = saved(&pool);
     let store = schedules(&pool);
     let sq = saved_store.create(1, "midflight", "q").await.unwrap();
-    let sched = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq.id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let rid = seed_run(&store, sched.id, sq.id, "q").await;
 
@@ -1080,7 +1566,10 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
 
     // A still-running run flips to error and the result path is cleared.
     let sq = saved_store.create(1, "running", "q").await.unwrap();
-    let sched = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq.id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     let rid = seed_run(&store, sched.id, sq.id, "q").await;
 
     assert_eq!(
@@ -1098,7 +1587,10 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
     // A run whose success already committed must survive the guarded flip:
     // the ambiguous-commit case where the first finish_run's COMMIT landed.
     let sq2 = saved_store.create(1, "committed", "q").await.unwrap();
-    let sched2 = store.create_schedule(sq2.id, 1, 300, None).await.unwrap();
+    let sched2 = store
+        .create_schedule(sq2.id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     let rid2 = seed_run(&store, sched2.id, sq2.id, "q").await;
     assert_eq!(
         store
@@ -1154,7 +1646,7 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     let sched_store = schedules(&pool);
     let sq = saved_store.create(1, "race", "q").await.unwrap();
     let sched = sched_store
-        .create_schedule(sq.id, 1, 300, None)
+        .create_schedule(sq.id, 1, 300, None, None, 0, chrono::Utc::now())
         .await
         .unwrap();
     let rid = seed_run(&sched_store, sched.id, sq.id, "q").await;
@@ -1207,7 +1699,7 @@ async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
     let sched_store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "race").await;
     let sched = sched_store
-        .create_schedule(sq_id, 1, 300, None)
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
         .await
         .unwrap();
     let rid = seed_run(&sched_store, sched.id, sq_id, "q").await;

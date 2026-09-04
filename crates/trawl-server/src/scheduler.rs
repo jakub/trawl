@@ -181,6 +181,9 @@ async fn poll_and_execute(
                 saved_query.id,
                 &saved_query.query,
                 schedule.max_runs,
+                // The planner that resolves a schedule's window into the
+                // run's bounds arrives with the scheduler milestone.
+                None,
             )
             .await
         {
@@ -598,11 +601,11 @@ mod pg_tests {
         let sched_store = ScheduleStore::new(pool.clone());
         let saved = saved_store.create(1, name, "q").await.unwrap();
         let sched = sched_store
-            .create_schedule(saved.id, 1, 300, None)
+            .create_schedule(saved.id, 1, 300, None, None, 0, chrono::Utc::now())
             .await
             .unwrap();
         let rid = match sched_store
-            .claim_run(sched.id, saved.id, "q", None)
+            .claim_run(sched.id, saved.id, "q", None, None)
             .await
             .unwrap()
         {

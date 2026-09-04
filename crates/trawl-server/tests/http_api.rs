@@ -1885,7 +1885,7 @@ async fn trigger_run_rejects_when_max_runs_reached() {
     // count(*) >= max_runs short-circuits the claim before the insert.
     let store = ScheduleStore::new(common::app_pool(&server.app_db_url).await);
     let seeded = store
-        .claim_run(schedule.id, saved.id, "* | head 3", None)
+        .claim_run(schedule.id, saved.id, "* | head 3", None, None)
         .await
         .unwrap();
     assert!(
@@ -1931,7 +1931,7 @@ async fn trigger_run_rejects_when_already_running() {
     // task the happy-path trigger spawns.
     let store = ScheduleStore::new(common::app_pool(&server.app_db_url).await);
     let seeded = store
-        .claim_run(schedule.id, saved.id, "* | head 3", None)
+        .claim_run(schedule.id, saved.id, "* | head 3", None, None)
         .await
         .unwrap();
     assert!(

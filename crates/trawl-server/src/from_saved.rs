@@ -226,7 +226,7 @@ mod pg_tests {
             .await
             .unwrap();
         sched_store
-            .create_schedule(saved.id, key_id, 300, None)
+            .create_schedule(saved.id, key_id, 300, None, None, 0, chrono::Utc::now())
             .await
             .unwrap();
         (saved.id, sched_store, saved_store)
@@ -242,7 +242,7 @@ mod pg_tests {
         path: Option<&str>,
     ) -> i64 {
         let rid = match store
-            .claim_run(schedule_id, saved_id, "q", None)
+            .claim_run(schedule_id, saved_id, "q", None, None)
             .await
             .unwrap()
         {

@@ -2224,6 +2224,12 @@ pub async fn set_schedule(
                     interval_secs,
                     req.max_runs,
                     req.enabled,
+                    // The window/lag half of the request arrives with the
+                    // handler milestone; today every schedule is the legacy
+                    // shape, whose DSL owns its own time clause.
+                    None,
+                    0,
+                    chrono::Utc::now(),
                 )
                 .await?
         }
@@ -2231,7 +2237,15 @@ pub async fn set_schedule(
             state
                 .storage
                 .schedule
-                .create_schedule(saved_id, key_id, interval_secs, req.max_runs)
+                .create_schedule(
+                    saved_id,
+                    key_id,
+                    interval_secs,
+                    req.max_runs,
+                    None,
+                    0,
+                    chrono::Utc::now(),
+                )
                 .await?
         }
     };
@@ -2437,7 +2451,7 @@ pub async fn trigger_run(
     let run_id = match state
         .storage
         .schedule
-        .claim_run(schedule.id, saved_id, &saved.query, schedule.max_runs)
+        .claim_run(schedule.id, saved_id, &saved.query, schedule.max_runs, None)
         .await?
     {
         RunClaim::Started(id) => id,
