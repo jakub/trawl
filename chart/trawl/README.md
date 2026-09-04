@@ -331,7 +331,7 @@ The postgres DSNs still arrive via the `FLEET_DATABASE_URL` / `TRAWL_DATABASE_UR
 | `ingress.backend` | string | `web` | Target service port: `web` (trawl-web, default) or `trawld` (raw HTTPS API) |
 | `web.enabled` | bool | `true` | Run the trawl-web session proxy sidecar |
 | `web.bindAddr` | string | `0.0.0.0:8090` | Bind address for trawl-web (pod-IP reachable) |
-| `web.publicOrigins` | list | `[]` | **Required when `web.enabled`.** Browser-visible origins allowed to carry a session cookie, e.g. `https://trawl.example.com`. Compared whole (scheme, host, port); never derived from ingress hosts. Also passed to the sidecar as `FLEET_SESSION_PUBLIC_ORIGINS`, so it survives a `config.raw` |
+| `web.publicOrigins` | list | `[]` | **Required when `web.enabled`.** Browser-visible origins allowed to carry a session cookie, e.g. `https://trawl.example.com`. Compared whole (scheme, host, port); never derived from ingress hosts. Rendered into `[web] public_origins` and passed to the sidecar as the identical `FLEET_SESSION_PUBLIC_ORIGINS`, so it survives a `config.raw`. The environment wins on read, and trawl-web warns only when the two lists differ |
 | `web.sessionTtlSecs` | int | `86400` | Browser session lifetime (seconds) |
 | `web.allowInsecureCookies` | bool | `false` | Drop `Secure` flag on session cookies (behind TLS-terminating ingress only) |
 | `web.logLevel` | string | `trawl_web=info,fleet_auth=info` | RUST_LOG for the sidecar (the trawld `logLevel` names no trawl-web target) |

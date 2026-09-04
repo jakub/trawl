@@ -264,24 +264,56 @@ fn warn_on_runtime_override(web: &WebConfig, runtime: &SessionRuntimeOverrides) 
     if let Some(from_environment) = &runtime.public_origins
         && !web.public_origins.is_empty()
     {
-        // The configured entries are counted, not printed: when the
-        // environment wins they are never parsed, so their text is
-        // unvalidated and unbounded. The override's origins ARE printed:
-        // they parsed, so each one is at most a serialized origin's worth
-        // of ASCII, and the whole point of this line is telling the
-        // operator which allowlist is actually in force. Their COUNT is
-        // its own field and the text is capped, because a list long enough
-        // to bury the message is a list nobody reads.
+        // Both packaged deployments render one list into the config file
+        // and hand the same list to the environment — the helm chart
+        // injects the variable whenever the sidecar runs, so the
+        // `config.raw` escape hatch stays covered — so warning on the
+        // variable's mere presence fires on every default install and
+        // teaches operators to scroll past the one line that says their
+        // allowlist is not the one they wrote. Compare the two instead.
+        // A configured list that does not parse counts as displaced: it
+        // could never have been in force, and that is worth saying.
+        let displaced = !PublicOrigins::parse(&web.public_origins)
+            .is_ok_and(|configured| same_origins(&configured, from_environment));
+        // The override's origins are printed because they parsed: each is
+        // at most a serialized origin's worth of ASCII, and the point of
+        // the line is telling the operator which allowlist is in force.
+        // Their COUNT is its own field and the text is capped, because a
+        // list long enough to bury the message is a list nobody reads.
         let (origins_count, origins) = summarize_origins(from_environment);
-        tracing::warn!(
-            event_type = "session_public_origins_override",
-            env = ENV_SESSION_PUBLIC_ORIGINS,
-            configured_entries = web.public_origins.len(),
-            origins_count,
-            origins = %origins,
-            "the environment replaces the configured browser-origin allowlist"
-        );
+        if displaced {
+            // The configured entries stay counted rather than printed:
+            // this arm covers the list that failed to parse, whose text is
+            // unvalidated and unbounded.
+            tracing::warn!(
+                event_type = "session_public_origins_override",
+                env = ENV_SESSION_PUBLIC_ORIGINS,
+                configured_entries = web.public_origins.len(),
+                origins_count,
+                origins = %origins,
+                "the environment replaces the configured browser-origin allowlist"
+            );
+        } else {
+            tracing::info!(
+                event_type = "session_public_origins_override_matched",
+                env = ENV_SESSION_PUBLIC_ORIGINS,
+                origins_count,
+                origins = %origins,
+                "the environment restates the configured browser-origin allowlist"
+            );
+        }
     }
+}
+
+/// Whether two allowlists hold the same origins, order aside.
+///
+/// [`PublicOrigins::parse`] refuses two entries that normalize alike, so
+/// neither list can repeat an origin and equal lengths plus one-way
+/// containment is set equality. Both sides went through the same parser, so
+/// `https://x:443` in the file and `https://x` in the environment are the
+/// same origin here exactly as they are at the guard.
+fn same_origins(left: &PublicOrigins, right: &PublicOrigins) -> bool {
+    left.iter().count() == right.iter().count() && left.iter().all(|origin| right.contains(origin))
 }
 
 /// How many origins one diagnostic line names before it stops listing.
@@ -802,6 +834,83 @@ mod tests {
         );
         // Never the operator's unparsed configured text.
         assert!(!warning.contains(TEST_ORIGIN), "got: {warning}");
+    }
+
+    #[test]
+    fn an_environment_list_matching_the_file_is_noted_at_info_not_warned() {
+        // What every default helm install does: the chart renders the list
+        // into the TOML and hands the same list to the sidecar's
+        // environment. Nothing is displaced, so the displacement warning
+        // must stay quiet — otherwise it fires at every pod start and
+        // stops meaning anything. Order differs and one entry writes out
+        // the default port, both of which the parser normalizes away.
+        let web = WebConfig {
+            public_origins: vec![
+                "http://localhost:8090".to_owned(),
+                "https://trawl.example.com:443".to_owned(),
+            ],
+            ..WebConfig::default()
+        };
+        let runtime = SessionRuntimeOverrides::parse(
+            None,
+            None,
+            None,
+            None,
+            Some(format!("{TEST_ORIGIN},http://localhost:8090")),
+        )
+        .unwrap();
+
+        let (resolved, lines) =
+            captured_resolution(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
+        assert!(resolved.is_ok());
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("WARN") && line.contains("public_origins")),
+            "the lists match, nothing was displaced: {lines:?}"
+        );
+        let noted = lines
+            .iter()
+            .find(|line| line.contains("session_public_origins_override_matched"))
+            .unwrap_or_else(|| panic!("the match itself is worth one line; got: {lines:?}"));
+        assert!(noted.starts_with("INFO"), "got: {noted}");
+        assert!(noted.contains("origins_count=2"), "got: {noted}");
+    }
+
+    #[test]
+    fn an_unparseable_configured_list_is_a_displacement_and_warns() {
+        // The file states an allowlist that could never have been in
+        // force. The environment's list is what runs, which is exactly the
+        // displacement the warning exists for — and the only hint the
+        // operator gets that their config file is broken.
+        let web = WebConfig {
+            public_origins: vec!["https://trawl.example.com/app".to_owned()],
+            ..WebConfig::default()
+        };
+        let runtime = SessionRuntimeOverrides::parse(
+            None,
+            None,
+            None,
+            None,
+            Some("http://localhost:8081".to_owned()),
+        )
+        .unwrap();
+
+        let (resolved, lines) =
+            captured_resolution(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
+        assert!(
+            resolved.is_ok(),
+            "the environment's list is valid, so startup proceeds"
+        );
+
+        let warning = lines
+            .iter()
+            .find(|line| line.contains("session_public_origins_override"))
+            .unwrap_or_else(|| panic!("a broken configured list is displaced; got: {lines:?}"));
+        assert!(warning.starts_with("WARN"), "got: {warning}");
+        assert!(warning.contains("configured_entries=1"), "got: {warning}");
+        // Still never the operator's unparsed text, least of all here.
+        assert!(!warning.contains("/app"), "got: {warning}");
     }
 
     #[test]
