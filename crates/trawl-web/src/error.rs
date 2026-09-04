@@ -32,10 +32,15 @@ pub enum ProxyError {
     #[error("session expired")]
     ExpiredSession { clear_cookie: HeaderValue },
 
-    /// A browser sent a cross-origin request to a state-changing auth
-    /// endpoint (login/logout). With the shared `fleet_session` cookie a
-    /// forged logout would sign the user out of every fleet app, so the
-    /// `Origin` header is validated by default (ADR-0004).
+    /// A browser sent a cookie-authenticated request whose `Origin` is not
+    /// one of the deployment's configured `public_origins` (ADR-0016).
+    /// Raised by the `Session` extractor for every cookie route and by
+    /// `login`/`logout`, which have no session to extract.
+    ///
+    /// 403, and deliberately no `Set-Cookie`: the response to a request
+    /// the browser was never allowed to make must not change the session
+    /// it was riding, or a foreign page could log a user out of every
+    /// fleet app by provoking a rejection.
     #[error("cross-origin request rejected")]
     OriginMismatch,
 

@@ -19,10 +19,13 @@
 //! roles-as-data (ADR-0006) the gate is at least one resolved trawl
 //! permission; role names are display/audit only.
 //!
-//! Login and logout validate the `Origin` header against the deployment's
-//! configured `public_origins` (present-only semantics, same helper as
-//! `fleet_auth::login`/`logout`), because with the shared cookie a forged
-//! cross-site logout would sign the user out of every fleet app.
+//! Login and logout call [`fleet_auth::check_origin`] themselves, before
+//! any upstream call and before a cookie is minted or cleared, because
+//! they are the two cookie endpoints with no session to extract. `me` does
+//! not: it takes the `Session` extractor, which runs the same guard for
+//! it (ADR-0016, `middleware::session_extractor`). The check matters most
+//! on logout, where the shared `fleet_session` cookie means a forged
+//! cross-site request would sign the user out of every fleet app.
 
 use axum::Json;
 use axum::extract::State;
@@ -52,41 +55,17 @@ pub struct LoginResponse {
     pub permissions: Vec<String>,
 }
 
-/// Reject cross-origin browser requests to cookie-authed, state-changing
-/// endpoints.
-///
-/// Delegates to the shared [`fleet_auth::check_origin`] (same present-only
-/// decision, log fields and message as the fleet-auth handlers, ADR-0016)
-/// and maps its rejection onto [`ProxyError::OriginMismatch`].
-///
-/// Used by `login`/`logout` and by the cookie-authed branch of the generic
-/// forwarder in `routes::proxy`: the shared `fleet_session` cookie is
-/// `SameSite=Lax` and, in SSO mode, scoped to the parent domain, so the
-/// browser attaches it to same-site sibling-origin requests. This check is
-/// the only thing standing between a compromised sibling app and a forged
-/// state-changing request carrying the victim's session.
-///
-/// The comparison is whole-origin (scheme, host and effective port)
-/// against the operator's configured [`AppState::public_origins`], which
-/// is why this takes state. Nothing here reads `Host`, the request URI's
-/// authority, or any `X-Forwarded-*` header: under a reverse proxy those
-/// are the proxy's opinion, and a CSRF verdict that moves with them is a
-/// verdict the deployment topology can flip.
-pub(crate) fn check_origin(
-    state: &AppState,
-    headers: &HeaderMap,
-    handler: &'static str,
-) -> Result<(), ProxyError> {
-    fleet_auth::check_origin(headers, state.public_origins(), handler)
-        .map_err(|_| ProxyError::OriginMismatch)
-}
-
 pub async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ProxyError> {
-    check_origin(&state, &headers, "login")?;
+    // These two are the only handlers that ask the guard themselves,
+    // because they are the only cookie endpoints with no session to
+    // extract: login has no cookie yet and logout is throwing one away.
+    // Everywhere else the guard rides the `Session`/`Auth` extractor.
+    fleet_auth::check_origin(&headers, state.public_origins(), "login")
+        .map_err(|_| ProxyError::OriginMismatch)?;
 
     if req.api_key.trim().is_empty() {
         return Err(ProxyError::BadRequest("api_key is required".into()));
@@ -229,7 +208,10 @@ pub async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ProxyError> {
-    check_origin(&state, &headers, "logout")?;
+    // Before the clear directive is built, so a foreign page cannot make
+    // the browser drop a session it was never allowed to read.
+    fleet_auth::check_origin(&headers, state.public_origins(), "logout")
+        .map_err(|_| ProxyError::OriginMismatch)?;
 
     let header_value = state
         .build_clear_cookie()

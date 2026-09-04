@@ -69,18 +69,14 @@ async fn do_forward(
     let http = state.http();
     let (parts, body) = req.into_parts();
 
-    // CSRF defense for cookie-authed requests, run before the victim's
-    // bearer token is forwarded upstream. The shared `fleet_session` cookie
-    // is `SameSite=Lax` and, in SSO mode, scoped to the parent domain, so
-    // the browser attaches it to same-site sibling-origin requests
-    // (`sibling.fleet…` → `trawl.fleet…`), mutating verbs included: attacker
-    // content on any sibling origin could otherwise forge saved-query
-    // writes, query cancels or exports. Bearer clients (CLI/API) hold no
-    // cookie and are not CSRF targets, so the guard skips that branch.
-    if matches!(auth, Auth::Session(_)) {
-        crate::routes::auth::check_origin(state, &parts.headers, "proxy")?;
-    }
-
+    // CSRF defense already ran: `auth` is here, which means the request
+    // either carried a valid bearer header (no cookie, so not a CSRF
+    // target) or passed the origin guard in the `Session` extractor
+    // (ADR-0016). The guard used to be an explicit call right here, which
+    // covered this forwarder and nothing else; the SSE handlers take the
+    // same `Auth` and had no such call, so a foreign page could stream the
+    // victim's logs. Owning the check in the extractor is what makes the
+    // rule hold for every cookie route, including the next one.
     let upstream_uri = build_upstream_uri(state.upstream_url(), &parts.uri)?;
 
     let mut upstream_req = http
