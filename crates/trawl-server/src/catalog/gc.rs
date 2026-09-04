@@ -214,6 +214,53 @@ pub struct PinGc {
     /// was read before the first run deleted anything, which has no useful
     /// answer to give. The honest reply is 409 now.
     admission: Arc<tokio::sync::Mutex<()>>,
+    /// Test-only observation and hold points, held on the engine rather
+    /// than in a static so one test's armed hold cannot leak into another
+    /// test's run in the same binary (the repin coordinator's idiom).
+    #[cfg(any(test, feature = "test-support"))]
+    hooks: Arc<TestHooks>,
+}
+
+/// Test-only synchronisation points inside [`PinGc::run`].
+///
+/// Two orderings a gc test needs and cannot get from a sleep. Whether a run
+/// currently holds admission, so a second caller's 409 is asserted against a
+/// fact rather than a guess; and a hold right after the candidate read, so a
+/// concurrent catalog write provably lands between that read and the purge.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+struct TestHooks {
+    admitted: std::sync::atomic::AtomicBool,
+    /// `true` while a test wants the run parked after its candidate read.
+    post_candidate_hold: tokio::sync::watch::Sender<bool>,
+    /// `true` while a run is actually parked there.
+    post_candidate_parked: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for TestHooks {
+    fn default() -> Self {
+        Self {
+            admitted: std::sync::atomic::AtomicBool::new(false),
+            post_candidate_hold: tokio::sync::watch::channel(false).0,
+            post_candidate_parked: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+/// Sets the admitted flag for as long as a run holds the admission lock,
+/// including the early-return paths, because a flag left true would make the
+/// next test's poll return immediately.
+#[cfg(any(test, feature = "test-support"))]
+struct AdmissionSignal(Arc<TestHooks>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for AdmissionSignal {
+    fn drop(&mut self) {
+        self.0
+            .admitted
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// What the footer scan proved, and what it cost.
@@ -278,7 +325,58 @@ impl PinGc {
             data_dir,
             retention_floor_secs,
             admission: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(any(test, feature = "test-support"))]
+            hooks: Arc::new(TestHooks::default()),
         }
+    }
+
+    /// Test-only: whether a run holds admission right now. A second run's
+    /// 409 is only meaningful once this is true.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn admission_held(&self) -> bool {
+        self.hooks
+            .admitted
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Test-only: park the next run between its candidate read and the
+    /// corpus gate, until [`Self::release_post_candidate_hold`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn arm_post_candidate_hold(&self) {
+        self.hooks.post_candidate_hold.send_replace(true);
+    }
+
+    /// Test-only: whether a run is parked in that hold right now — the
+    /// rising edge a test waits for before it writes to the catalog.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn parked_after_candidate_read(&self) -> bool {
+        self.hooks
+            .post_candidate_parked
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Test-only: let the parked run continue.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn release_post_candidate_hold(&self) {
+        self.hooks.post_candidate_hold.send_replace(false);
+    }
+
+    /// The run's side of the hold: a no-op unless a test armed it.
+    #[cfg(any(test, feature = "test-support"))]
+    async fn hold_after_candidate_read(&self) {
+        let mut rx = self.hooks.post_candidate_hold.subscribe();
+        if !*rx.borrow_and_update() {
+            return;
+        }
+        self.hooks
+            .post_candidate_parked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = rx.wait_for(|armed| !*armed).await;
+        self.hooks
+            .post_candidate_parked
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Run one collection, dry or real.
@@ -327,6 +425,14 @@ impl PinGc {
                     .to_owned(),
             ));
         };
+        #[cfg(any(test, feature = "test-support"))]
+        let _admission_signal = {
+            self.hooks
+                .admitted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            AdmissionSignal(Arc::clone(&self.hooks))
+        };
+
         // 1. Entry checks, before any work: a repin rearranging the corpus
         //    makes every footer proof provisional.
         self.refuse_if_repin_owns_the_corpus().await?;
@@ -363,6 +469,8 @@ impl PinGc {
 
         // 4. The metadata axis, under the corpus write gate: no compaction
         //    batch may publish a file between the scan and the delete.
+        #[cfg(any(test, feature = "test-support"))]
+        self.hold_after_candidate_read().await;
         let gate = self.coordinator.cutover_guard().await;
         let held_since = Instant::now();
         let outcome = self.prove_and_purge(&rows, dry_run).await;

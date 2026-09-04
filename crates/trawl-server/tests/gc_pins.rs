@@ -77,6 +77,20 @@ fn gauge_value(scrape: &str, name: &str) -> Option<f64> {
     })
 }
 
+/// Wait for one of the engine's test signals to rise, or fail saying which.
+///
+/// Bounded polling, never a fixed sleep: the signal is the ordering proof,
+/// and the bound only turns a hang into a readable failure.
+async fn await_signal(mut ready: impl FnMut() -> bool, what: &str) {
+    for _ in 0..1_000 {
+        if ready() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
 /// Every `*.parquet` under a directory tree.
 fn walk_parquet(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -472,8 +486,11 @@ async fn gc_waits_for_the_compaction_batch_and_sees_what_it_published() {
 /// route must not add up to an ingest stall.
 ///
 /// Deterministic by construction: the first run is held at the corpus gate
-/// by a compaction batch, so it provably still owns the admission lock when
-/// the second one asks.
+/// by a compaction batch, and the test waits on the engine's own
+/// admission-held signal before it asks again. Polling the route instead
+/// would deadlock under the opposite scheduler order — the polled call could
+/// be the one that took admission, and it would then block on the corpus
+/// gate this test is holding, awaited inline forever.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_concurrent_gc_run_is_refused_immediately() {
     let h = harness().await;
@@ -492,30 +509,23 @@ async fn a_second_concurrent_gc_run_is_refused_immediately() {
                 .await
         })
     };
+    await_signal(|| gc.admission_held(), "the first run takes admission").await;
 
-    // The first run has to reach the gate before the admission lock is
-    // observable; it cannot finish while the batch is held, so this loop
-    // ends on the refusal rather than on a timer.
-    let mut refusal = None;
-    for _ in 0..200 {
-        match gc.run(Some(Duration::ZERO), true, GcActor::default()).await {
-            Err(e)
-                if e.error_class() == "conflict"
-                    && e.to_string().contains("already in progress") =>
-            {
-                refusal = Some(e);
-                break;
-            }
-            other => {
-                assert!(
-                    !first.is_finished(),
-                    "the first run answered while the corpus gate was held: {other:?}"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-    }
-    let refusal = refusal.expect("a second run must be refused while the first holds admission");
+    // Admission is provably held by the spawned run, so this call is the
+    // second one and can only be refused; it never reaches the gate.
+    let refusal = gc
+        .run(Some(Duration::ZERO), true, GcActor::default())
+        .await
+        .expect_err("a second run must be refused while the first holds admission");
+    assert_eq!(refusal.error_class(), "conflict", "{refusal}");
+    assert!(
+        refusal.to_string().contains("already in progress"),
+        "{refusal}"
+    );
+    assert!(
+        !first.is_finished(),
+        "the first run must still be held at the corpus gate"
+    );
     assert!(refusal.to_string().contains("pin gc run"), "{refusal}");
     assert!(h.pinned("dead"), "a refused second run deletes nothing");
 
@@ -547,9 +557,11 @@ async fn the_report_names_only_the_pins_the_purge_returned() {
     h.pin_without_carrier("gone", "dead").await;
     h.pin_without_carrier("also_gone", "deader").await;
 
-    // Hold the run at the corpus gate: its candidate set is already read.
-    let batch = h.coordinator().compaction_guard().await;
+    // Park the run right after its candidate read. The engine's own hold,
+    // not a sleep: the concurrent purge below has to land after that read
+    // and before the gate, and a timer only makes that likely.
     let gc = h.gc(None);
+    gc.arm_post_candidate_hold();
     let run = {
         let gc = Arc::clone(&gc);
         tokio::spawn(async move {
@@ -557,8 +569,11 @@ async fn the_report_names_only_the_pins_the_purge_returned() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!run.is_finished(), "the batch holds the gate");
+    await_signal(
+        || gc.parked_after_candidate_read(),
+        "the run to park after its candidate read",
+    )
+    .await;
 
     // One candidate is reclaimed by somebody else while the run waits.
     h.server
@@ -569,7 +584,7 @@ async fn the_report_names_only_the_pins_the_purge_returned() {
         .await
         .expect("a concurrent purge");
 
-    drop(batch);
+    gc.release_post_candidate_hold();
     let report = run.await.expect("gc task").expect("gc runs");
 
     assert_eq!(
@@ -844,8 +859,15 @@ mod capture {
     }
 
     impl Capture {
-        /// Every captured event carrying `event_type = ty`.
-        pub fn of_type(&self, ty: &str) -> Vec<Captured> {
+        /// Every captured event carrying `event_type = ty` AND the given
+        /// actor name.
+        ///
+        /// The subscriber is process-global, so it sees every gc run in the
+        /// binary, including sibling tests' spawned tasks. The actor is the
+        /// per-run identity that separates them; an unfiltered count would
+        /// be a count of whatever else happened to be running.
+        pub fn of_type(&self, ty: &str, actor: &str) -> Vec<Captured> {
+            let actor = format!("{actor:?}");
             self.events
                 .lock()
                 .unwrap()
@@ -854,6 +876,7 @@ mod capture {
                     e.fields
                         .get("event_type")
                         .is_some_and(|t| t.contains(ty) && t.len() == ty.len() + 2)
+                        && e.fields.get("actor") == Some(&actor)
                 })
                 .cloned()
                 .collect()
@@ -900,6 +923,20 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
     // Global, not thread-local: the run happens on another tokio worker.
     tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
 
+    // Every run in this test signs its events with one name no other test
+    // uses, because the subscriber above is process-global and sees the gc
+    // runs of every test in the binary.
+    let actor_name = format!(
+        "gc-audit-{}",
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .expect("a representable instant")
+    );
+    let actor = || GcActor {
+        name: Some(actor_name.clone()),
+        key_prefix: Some("k_abc123".to_owned()),
+    };
+
     let h = harness().await;
     h.ingest_and_compact(&[event("api", &json!({"kept": 1}))])
         .await;
@@ -915,7 +952,7 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
         .expect("ingest published the fill gauge");
 
     let dry = gc
-        .run(Some(Duration::ZERO), true, GcActor::default())
+        .run(Some(Duration::ZERO), true, actor())
         .await
         .expect("dry run");
     let would_delete: Vec<&str> = dry.candidates.iter().map(|c| c.field.as_str()).collect();
@@ -936,16 +973,12 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
         metric_before
     );
     assert!(
-        events.of_type("catalog_pin_gc").is_empty(),
+        events.of_type("catalog_pin_gc", &actor_name).is_empty(),
         "a dry run deletes nothing, so it records no deletion"
     );
 
-    let actor = GcActor {
-        name: Some("schema-admin-key".to_owned()),
-        key_prefix: Some("k_abc123".to_owned()),
-    };
     let real = gc
-        .run(Some(Duration::ZERO), false, actor)
+        .run(Some(Duration::ZERO), false, actor())
         .await
         .expect("execution");
     assert_eq!(real.deleted, 2, "report: {real:?}");
@@ -979,31 +1012,34 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
         "the reclaim must show up in the fill gauge"
     );
 
-    let audited = events.of_type("catalog_pin_gc");
+    let audited = events.of_type("catalog_pin_gc", &actor_name);
     assert_eq!(audited.len(), 2, "one record per deleted pin: {audited:?}");
     let fields: Vec<&str> = audited.iter().map(|e| e.fields["field"].as_str()).collect();
     assert_eq!(fields, vec!["dead", "deader"]);
     for record in &audited {
-        assert_eq!(record.fields["actor"], "\"schema-admin-key\"");
         assert_eq!(record.fields["actor_key_prefix"], "\"k_abc123\"");
         assert_eq!(record.fields["deleted_type"], "VARCHAR");
         assert!(record.fields.contains_key("pinned_at"));
         assert!(record.fields.contains_key("last_seen"));
         assert_eq!(record.fields["effective_older_than_secs"], "0");
     }
-    let summary = events.of_type("catalog_pin_gc_complete");
+    let summary = events.of_type("catalog_pin_gc_complete", &actor_name);
     assert_eq!(summary.len(), 2, "one per run, dry included: {summary:?}");
     assert!(summary.last().unwrap().fields.contains_key("gate_held_ms"));
     assert!(summary.last().unwrap().fields.contains_key("files_scanned"));
 
     // A repeat run has nothing left to reclaim.
     let again = gc
-        .run(Some(Duration::ZERO), false, GcActor::default())
+        .run(Some(Duration::ZERO), false, actor())
         .await
         .expect("repeat run");
     assert_eq!(again.deleted, 0, "report: {again:?}");
     assert!(again.candidates.is_empty());
-    assert_eq!(events.of_type("catalog_pin_gc").len(), 2, "no new records");
+    assert_eq!(
+        events.of_type("catalog_pin_gc", &actor_name).len(),
+        2,
+        "no new records"
+    );
     assert_eq!(
         counter_value(
             &scrape_metrics(&h.server.url).await,
@@ -1018,7 +1054,7 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
         "and evicts nothing"
     );
     assert_eq!(
-        events.of_type("catalog_pin_gc_complete").len(),
+        events.of_type("catalog_pin_gc_complete", &actor_name).len(),
         3,
         "but still says what it did"
     );
