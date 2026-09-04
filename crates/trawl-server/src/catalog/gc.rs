@@ -409,7 +409,7 @@ impl PinGc {
         }
 
         let fields: Vec<String> = walk.dead.iter().cloned().collect();
-        let deleted =
+        let purged =
             match tokio::time::timeout(PURGE_TIMEOUT, self.store.delete_pins(&fields)).await {
                 // The purge transaction's own running-row check is the
                 // authority on the claim race, and it refuses inside the
@@ -444,9 +444,15 @@ impl PinGc {
             };
         // Committed, so the cache may lose them — and must, before the gate
         // opens: infallible, one lock, one generation bump, nothing
-        // fallible between it and the commit.
-        self.cache.evict_many(fields.iter().map(String::as_str));
+        // fallible between it and the commit. The store hands back the
+        // remaining-pin count from inside its own transaction precisely so
+        // this sequence has no fallible step left; the gauges follow the
+        // eviction, never precede it.
+        self.cache
+            .evict_many(purged.deleted.iter().map(String::as_str));
+        self.store.publish_fill_gauges(purged.pinned_now);
 
+        let deleted = u64::try_from(purged.deleted.len()).unwrap_or(u64::MAX);
         Ok(Purged {
             dead: walk.dead,
             files_scanned: walk.files_scanned,

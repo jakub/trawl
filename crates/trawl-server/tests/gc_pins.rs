@@ -68,6 +68,15 @@ fn counter_value(scrape: &str, name: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// A gauge's value, `None` when nothing has published it. Gauges render as
+/// f64, so this reads them that way rather than assuming an integer form.
+fn gauge_value(scrape: &str, name: &str) -> Option<f64> {
+    scrape.lines().find_map(|line| {
+        let rest = line.strip_prefix(name)?.strip_prefix(' ')?;
+        rest.trim().parse().ok()
+    })
+}
+
 /// Every `*.parquet` under a directory tree.
 fn walk_parquet(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -687,10 +696,10 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
     let gc = h.gc(None);
     let cache = &h.server.state.query.field_catalog;
     let generation_before = cache.repin_generation();
-    let metric_before = counter_value(
-        &scrape_metrics(&h.server.url).await,
-        "trawl_catalog_pins_gc_total",
-    );
+    let before_scrape = scrape_metrics(&h.server.url).await;
+    let metric_before = counter_value(&before_scrape, "trawl_catalog_pins_gc_total");
+    let pinned_gauge_before = gauge_value(&before_scrape, "trawl_catalog_pinned_fields")
+        .expect("ingest published the fill gauge");
 
     let dry = gc
         .run(Some(Duration::ZERO), true, GcActor::default())
@@ -742,12 +751,19 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
         generation_before + 1,
         "one purge, one generation bump"
     );
+    let after_purge = scrape_metrics(&h.server.url).await;
     assert_eq!(
-        counter_value(
-            &scrape_metrics(&h.server.url).await,
-            "trawl_catalog_pins_gc_total"
-        ),
+        counter_value(&after_purge, "trawl_catalog_pins_gc_total"),
         metric_before + 2
+    );
+    // The fill gauge follows the eviction, published from the count the
+    // purge transaction returned. Nothing fallible sits between the commit
+    // and the eviction, so the operator's headroom reflects the reclaim as
+    // soon as the run answers.
+    assert_eq!(
+        gauge_value(&after_purge, "trawl_catalog_pinned_fields"),
+        Some(pinned_gauge_before - 2.0),
+        "the reclaim must show up in the fill gauge"
     );
 
     let audited = events.of_type("catalog_pin_gc");

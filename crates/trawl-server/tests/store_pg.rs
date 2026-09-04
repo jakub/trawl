@@ -3297,8 +3297,8 @@ mod catalog {
                 .unwrap();
         }
 
-        let deleted = store.delete_pins(&["dead".to_owned()]).await.unwrap();
-        assert_eq!(deleted, 1);
+        let purged = store.delete_pins(&["dead".to_owned()]).await.unwrap();
+        assert_eq!(purged.deleted, vec!["dead".to_owned()]);
 
         for (table, sql) in [
             (
@@ -3357,6 +3357,49 @@ mod catalog {
         assert_eq!(reborn.service_count, 1, "svc-a's history did not survive");
         assert_eq!(reborn.row_count, 1);
         assert_eq!(reborn.conflict_count, 0, "old evidence did not survive");
+    }
+
+    /// The purge hands back everything the caller needs to finish the
+    /// reclaim, all read inside the one transaction: the names
+    /// `field_types` actually gave up, and the pins remaining for the fill
+    /// gauges. The caller's next act is an eviction that must not be
+    /// skipped, so a post-commit SELECT for the gauge would be a fallible
+    /// step in exactly the wrong place.
+    ///
+    /// The returned names are the DELETE's own RETURNING set, never the
+    /// request: a candidate whose row went away underneath the run must not
+    /// show up in an audit event claiming this run deleted it.
+    #[sqlx::test]
+    async fn delete_pins_returns_the_deleted_names_and_the_fill_count(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[
+                proposal("dead", CanonicalType::BigInt),
+                proposal("keep", CanonicalType::Varchar),
+            ])
+            .await
+            .unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM field_types")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let purged = store
+            .delete_pins(&["dead".to_owned(), "never_pinned".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            purged.deleted,
+            vec!["dead".to_owned()],
+            "a name the catalog never held is not a name this run deleted"
+        );
+        let after: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM field_types")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(purged.pinned_now, before - 1);
+        assert_eq!(purged.pinned_now, after, "the count is the committed one");
     }
 
     /// The purge's own half of the pin-gc race: the running-row check

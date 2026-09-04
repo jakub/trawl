@@ -256,6 +256,22 @@ pub struct GcPinRow {
     pub services: i64,
 }
 
+/// What one [`CatalogStore::delete_pins`] transaction committed.
+///
+/// Both numbers are read INSIDE the transaction, so the caller can finish
+/// the reclaim (evict from the pin cache, publish the gauges, audit) with
+/// nothing fallible left to do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PurgedPins {
+    /// The pins `field_types` actually gave up, as the DELETE returned
+    /// them: the only set an audit event may name.
+    pub deleted: Vec<String>,
+    /// Pins remaining at commit, for the fill gauges. Meaningless when
+    /// nothing was deleted (the empty-input early return reads zero), so
+    /// callers publish it only after a real purge.
+    pub pinned_now: i64,
+}
+
 /// One field's pin row ([`CatalogStore::field_pin`]).
 #[derive(Debug, Clone)]
 pub struct FieldPinRow {
@@ -1689,12 +1705,18 @@ impl CatalogStore {
     /// refuses with [`StoreError::RepinAlreadyRunning`] rather than delete
     /// the row that job is about to update.
     ///
-    /// The fill gauges are re-published from the post-commit count, so the
-    /// headroom an operator alerts on reflects the reclaim immediately
-    /// rather than at the next pin write.
-    pub async fn delete_pins(&self, fields: &[String]) -> Result<u64, StoreError> {
+    /// Returns [`PurgedPins`]: the names `field_types` actually gave up and
+    /// the fill count read in the same transaction. Both come out of the
+    /// ONE transaction on purpose. The caller's next act is a cache
+    /// eviction that must not be skipped, and a post-commit SELECT for the
+    /// gauge is one more thing that can fail between the commit and that
+    /// eviction — which would leave the pin gone from postgres and present
+    /// in every reader's cache. Nothing fallible happens after the commit
+    /// here; the caller publishes the gauges (infallibly, from the returned
+    /// count) once the eviction is done.
+    pub async fn delete_pins(&self, fields: &[String]) -> Result<PurgedPins, StoreError> {
         if fields.is_empty() {
-            return Ok(0);
+            return Ok(PurgedPins::default());
         }
         if let Some(contract) = fields
             .iter()
@@ -1729,19 +1751,33 @@ impl CatalogStore {
         ] {
             sqlx::query(sql).bind(fields).execute(&mut *tx).await?;
         }
-        let deleted = sqlx::query("DELETE FROM field_types WHERE field = ANY($1)")
-            .bind(fields)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        // RETURNING, not `rows_affected`: the caller audits one event per
+        // reclaimed pin, and a name it merely ASKED for is not a name it
+        // deleted. A candidate can lose its row to a concurrent write
+        // between the scan and this statement.
+        let deleted: Vec<String> =
+            sqlx::query_scalar("DELETE FROM field_types WHERE field = ANY($1) RETURNING field")
+                .bind(fields)
+                .fetch_all(&mut *tx)
+                .await?;
+        let pinned_now: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
+            .fetch_one(&mut *tx)
+            .await?;
         tx.commit().await?;
 
-        let pinned_now: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
-            .fetch_one(&self.pool)
-            .await?;
-        set_fill_gauges(pinned_now, self.pin_cap);
+        Ok(PurgedPins {
+            deleted,
+            pinned_now,
+        })
+    }
 
-        Ok(deleted)
+    /// Publish the pin fill gauges from a count the caller already holds.
+    ///
+    /// Infallible and cheap, so it can run at a point where a failure would
+    /// be unrecoverable — after [`Self::delete_pins`] has committed and the
+    /// in-process cache has dropped the pins.
+    pub fn publish_fill_gauges(&self, pinned: i64) {
+        set_fill_gauges(pinned, self.pin_cap);
     }
 
     /// The catalog's stable identity (mirrored into the `data/CATALOG`
