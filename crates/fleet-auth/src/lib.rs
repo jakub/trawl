@@ -25,6 +25,8 @@ pub mod store;
 pub mod token;
 
 #[cfg(feature = "session")]
+pub mod origin;
+#[cfg(feature = "session")]
 pub mod session;
 
 #[cfg(feature = "axum")]
@@ -39,6 +41,11 @@ pub use migrations::MIGRATOR;
 #[cfg(feature = "keystore")]
 pub use store::KeyStore;
 
+#[cfg(feature = "session")]
+pub use origin::{
+    MAX_ORIGIN_HEADER_BYTES, Origin, OriginParseError, OriginScheme, PublicOrigins,
+    PublicOriginsError, rejection_log_fields,
+};
 #[cfg(feature = "session")]
 pub use session::{
     DEFAULT_COOKIE_NAME, DEFAULT_TTL_SECS, ENV_SESSION_AEAD_KEY, ENV_SESSION_COOKIE_DOMAIN,
