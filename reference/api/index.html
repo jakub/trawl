@@ -290,6 +290,43 @@ next boot’s marker replay.</p>
 <p>The running job if any, else the newest job of any status —
 <code dir="auto">schema_read</code>-gated (read-only surfaces show repin state without offering
 the trigger) and served on query-only nodes too.</p>
+<p>The job row also carries <code dir="auto">cancel_requested_at</code> and <code dir="auto">cancelled_by</code> when
+someone asked the job to stop: a <code dir="auto">running</code> row carrying them is a cancel in
+flight, and a <code dir="auto">failed</code> row carrying them is a process that died between the
+request and any boundary observing it.</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="text"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">POST /api/v1/schema/repin/cancel</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="POST /api/v1/schema/repin/cancel"><div></div></button></div></figure></div>
+<p>Ask the running repin to stop. <code dir="auto">schema_write</code>-gated, no request body, and
+a query-only node answers 503 like the trigger route. The HTTP status
+carries the verdict and the body repeats it as <code dir="auto">outcome</code>, with <code dir="auto">detail</code> in
+words and the job row under <code dir="auto">job</code> when there is one:</p>
+<ul>
+<li><strong>202</strong> <code dir="auto">cancelling</code>: the request is accepted. The job stops at the next
+file boundary of its scan or build loop, sweeps any staging it had built,
+and ends <code dir="auto">cancelled</code> with the live corpus untouched.</li>
+<li><strong>409</strong> <code dir="auto">past_point_of_no_return</code>: the job latched its cutover before the
+request arrived. The corpus is being swapped and there is nothing left to
+unwind, so the request is refused rather than queued, and the job
+completes normally.</li>
+<li><strong>404</strong> <code dir="auto">no_job_running</code>: no repin job is running on this node, or the one
+that was running has already chosen its outcome and there is nothing left
+to stop. The two read the same to a caller: nothing was cancelled, and the
+status route says how the job actually ended.</li>
+</ul>
+<p>The latency contract is a boundary, not an instant. The scan and build
+loops check before and after each file, but the whole-corpus snapshot walk
+and the filesystem preflight are not checkpointed, so a job inside one of
+those stops only when it leaves it. Early-phase cancels can therefore take
+longer than one file.</p>
+<p>A 202 accepts the request; it does not promise a terminal <code dir="auto">cancelled</code>
+status. The job’s own completion can win the race, and a process that dies
+between the request and any boundary acting on it lands <code dir="auto">failed</code> with
+<code dir="auto">cancel_requested_at</code> and <code dir="auto">cancelled_by</code> preserved (recovery never infers
+<code dir="auto">cancelled</code> from a request nothing acted on). Those two fields are written
+durably as the request is accepted, but a process death in the same instant
+as the request can still lose them, so treat the 202 as an accepted request
+rather than a receipt for a durable one. Restarting trawld is the
+stronger cancel: a killed job leaves the live corpus untouched and boot
+recovery sweeps its staging. Read the outcome from the status route.</p>
 <div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">GET /api/v1/schema/services</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="GET /api/v1/schema/services"><div></div></button></div></figure></div>
 <p>Rich per-service schema (per-column null counts, min/max, sizes, daily
 volumes) from the background footer scan. Types come from the catalog’s
@@ -366,4 +403,4 @@ tick and no request-path query touches the aggregates.</p>
 <div class="sl-heading-wrapper level-h3"><h3 id="metrics">Metrics</h3><a class="sl-anchor-link" href="#metrics"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Metrics”</span></a></div>
 <div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">GET /metrics</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="GET /metrics"><div></div></button></div></figure></div>
 <p>Prometheus metrics. Unauthenticated. Outside the <code dir="auto">/api/v1</code> namespace.</p>
-</div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/api.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a><p>Last updated: <time datetime="2026-08-26T06:13:55.000Z">Aug 26, 2026</time></p></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/reference/cli/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">CLI &amp; TUI</span></span></a><a href="/reference/web-ui/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Web UI</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
+</div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/api.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a><p>Last updated: <time datetime="2026-09-04T15:56:56.000Z">Sep 4, 2026</time></p></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/reference/cli/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">CLI &amp; TUI</span></span></a><a href="/reference/web-ui/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Web UI</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
