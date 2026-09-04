@@ -12,7 +12,7 @@
 use trawl_core::ast::{FromSavedStage, SavedRunSelector};
 
 use crate::error::ServerError;
-use crate::store::{SavedQueryStore, ScheduleStore};
+use crate::store::{ReportRun, RunStatus, SavedQueryStore, ScheduleStore};
 
 /// Result of resolving a `from saved` stage.
 #[derive(Debug)]
@@ -80,15 +80,14 @@ pub(crate) async fn resolve(
     })
 }
 
-/// Resolve `run=latest` to the most recent successful run.
+/// The source ONE successful run reads from, whichever selector picked it.
 ///
-/// The newest success is the only run this selector may answer from. Every
-/// arm below either resolves THAT run or fails naming it; none falls
-/// through to an older one, because an older run covers an older window and
-/// answering from it silently is the reporting equivalent of a stale read
-/// (ADR-0018 ruling 13).
+/// `run=latest` and `run=N` differ in how they find the run, never in what
+/// a run means, so both come here. A run id that happens to be the latest
+/// has to answer the same as `run=latest`, and before this it did not: the
+/// id path 404'd a run with no parquet file while `run=latest` resolved it.
 ///
-/// Three shapes reach here:
+/// Three shapes, all of them successful runs:
 ///
 /// - a `result_path`: the ordinary run, read as parquet.
 /// - no path, a blob with no rows: the run genuinely found nothing. Its
@@ -98,31 +97,25 @@ pub(crate) async fn resolve(
 /// - no path, a blob WITH rows: a run whose parquet write failed and fell
 ///   back to the blob. It exists and `GET /saved/{id}/runs/{run_id}` serves
 ///   it, but there is no file to point a query at, so this is a 409 naming
-///   the run. The next successful run makes the selector work again, which
-///   is what makes 409 the right status rather than 404 or 500.
-async fn resolve_latest(
+///   the run. For `run=latest` the next scheduled run clears it, which is
+///   what makes 409 the right status rather than 404 or 500.
+async fn source_for_run(
+    run: &ReportRun,
     schedule_store: &ScheduleStore,
-    saved_query_id: i64,
     key_id: i64,
     data_dir: &str,
 ) -> Result<String, ServerError> {
-    let run = schedule_store
-        .latest_successful_run(saved_query_id)
-        .await?
-        .ok_or_else(|| ServerError::NotFound("no successful runs".to_string()))?;
-
     if let Some(ref result_path) = run.result_path {
         return Ok(parquet_source(data_dir, result_path));
     }
 
     // `get_run_result` scopes the blob by the schedule's owning key, the
-    // same ownership join `resolve_specific` reads a run through.
+    // same ownership join `get_run` reads a run through.
     let blob = schedule_store.get_run_result(run.id, key_id).await?;
     let Some(result) = crate::scheduler::decode_result_blob(blob) else {
         // A success with neither a file nor a readable blob is corrupt
-        // state, not an empty window: say so about this run instead of
-        // quietly serving the previous one. The detail is logged, not
-        // returned.
+        // state, not an empty window. Say so about this run rather than
+        // resolving something else. The detail is logged, not returned.
         return Err(ServerError::Internal(format!(
             "report run {} succeeded with no parquet result and no readable result blob",
             run.id
@@ -143,7 +136,37 @@ async fn resolve_latest(
     )))
 }
 
+/// Resolve `run=latest` to the most recent successful run.
+///
+/// The newest success is the only run this selector may answer from:
+/// [`source_for_run`] either resolves THAT run or fails naming it, and
+/// nothing here falls through to an older one. An older run covers an older
+/// window, and answering from it without saying so is a stale report
+/// (ADR-0018 ruling 13).
+async fn resolve_latest(
+    schedule_store: &ScheduleStore,
+    saved_query_id: i64,
+    key_id: i64,
+    data_dir: &str,
+) -> Result<String, ServerError> {
+    let run = schedule_store
+        .latest_successful_run(saved_query_id)
+        .await?
+        .ok_or_else(|| ServerError::NotFound("no successful runs".to_string()))?;
+
+    source_for_run(&run, schedule_store, key_id, data_dir).await
+}
+
 /// Resolve `run=N` — a specific run by ID.
+///
+/// Two refusals of its own, then the shared resolution. A run id nobody owns
+/// (or that does not exist) is a 404 that says nothing more, and a run that
+/// did not SUCCEED has no result to query: `finish_run` writes the result
+/// only on the success path, so a `running`, `error` or `timeout` row has
+/// neither a file nor a blob. Before this the status went unchecked and the
+/// NULL `result_path` did the refusing by accident, which now reads as
+/// corrupt state instead. The message names the status, so a caller can tell
+/// "not yet" from "never".
 async fn resolve_specific(
     schedule_store: &ScheduleStore,
     run_id: i64,
@@ -155,13 +178,14 @@ async fn resolve_specific(
         .await?
         .ok_or_else(|| ServerError::NotFound(format!("report run {run_id} not found")))?;
 
-    let result_path = run.result_path.ok_or_else(|| {
-        ServerError::NotFound(format!(
-            "report run {run_id} has no parquet result (may be a legacy zstd-only run)"
-        ))
-    })?;
+    if run.status != RunStatus::Success {
+        return Err(ServerError::NotFound(format!(
+            "report run {run_id} has no result to query (status: {})",
+            run.status.as_str()
+        )));
+    }
 
-    Ok(parquet_source(data_dir, &result_path))
+    source_for_run(&run, schedule_store, key_id, data_dir).await
 }
 
 /// Resolve `run=all` — all successful runs, unioned with `_run_id` and `_run_time` metadata.
@@ -172,8 +196,8 @@ async fn resolve_specific(
 /// only clash with the typed ones the real files bring. The visible
 /// consequence: `_run_id` and `_run_time` never name a run that found
 /// nothing, so `run=all` describes the runs that produced data, not every
-/// run that happened. `run=latest` is the selector that answers for a
-/// zero-row run.
+/// run that happened. The single-run selectors, `run=latest` and `run=N`,
+/// both answer for a zero-row run.
 async fn resolve_all(
     schedule_store: &ScheduleStore,
     saved_query_id: i64,
@@ -739,17 +763,127 @@ mod pg_tests {
         assert!(matches!(err, ServerError::NotFound(_)), "got: {err:?}");
     }
 
+    /// A success with neither a file nor a blob is corrupt state, and `run=N`
+    /// says so in the same words `run=latest` does.
     #[sqlx::test]
-    async fn resolve_specific_not_found_when_run_has_no_parquet(pool: PgPool) {
-        let (saved_id, sched_store, _saved) = seed(&pool, 1, "specific_noparquet").await;
+    async fn resolve_specific_errors_on_a_success_with_neither_file_nor_blob(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "specific_noresult").await;
         let sid = schedule_id(&sched_store, saved_id).await;
-        // A legacy blob-only success run: found by id, but no result_path.
         let rid = run(&sched_store, sid, saved_id, RunStatus::Success, None).await;
 
         let err = resolve_specific(&sched_store, rid, 1, "/data")
             .await
-            .expect_err("run without result_path must be NotFound");
-        assert!(matches!(err, ServerError::NotFound(_)), "got: {err:?}");
+            .expect_err("a success with no result at all must not resolve");
+        match err {
+            ServerError::Internal(msg) => assert!(
+                msg.contains(&rid.to_string()),
+                "the message must name the run: {msg}"
+            ),
+            other => panic!("expected Internal, got: {other:?}"),
+        }
+    }
+
+    /// The point of the shared [`source_for_run`]: a run id answers exactly
+    /// as it would if it happened to be the latest. A zero-row run resolves
+    /// to its own empty source instead of 404ing for want of a file.
+    #[sqlx::test]
+    async fn resolve_specific_answers_a_zero_row_run(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "specific_zero").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        let rid = run_with_blob(&sched_store, sid, saved_id, &zero_row_result(&["n", "msg"])).await;
+
+        let source = resolve_specific(&sched_store, rid, 1, "/data")
+            .await
+            .expect("a zero-row run resolves by id");
+        assert_eq!(source, r#"(SELECT NULL AS "n", NULL AS "msg" WHERE FALSE)"#);
+
+        let counted = trawl_engine::executor::Executor::new()
+            .unwrap()
+            .run_query(
+                "* | stats count()",
+                &source,
+                &trawl_core::schema::FieldTypes::new(),
+                100,
+                0,
+            )
+            .unwrap();
+        assert_eq!(counted.rows[0][0].to_string(), "0");
+    }
+
+    /// And a run whose rows live in the blob is the same 409 by id as it is
+    /// by `run=latest`: it exists, the run endpoint serves it, but there is
+    /// no file for a query to read.
+    #[sqlx::test]
+    async fn resolve_specific_refuses_a_blob_backed_nonempty_run(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "specific_blob").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        let rid = run_with_blob(
+            &sched_store,
+            sid,
+            saved_id,
+            &trawl_api::value::QueryResult {
+                columns: super::tests::cols(&["n"]),
+                rows: vec![vec![trawl_api::value::Value::Integer(7)]],
+            },
+        )
+        .await;
+
+        let err = resolve_specific(&sched_store, rid, 1, "/data")
+            .await
+            .expect_err("a blob-backed run with rows is not queryable here");
+        match err {
+            ServerError::Conflict(msg) => assert!(
+                msg.contains(&rid.to_string()),
+                "the refusal must name the run: {msg}"
+            ),
+            other => panic!("expected Conflict, got: {other:?}"),
+        }
+    }
+
+    /// A run that did not succeed has no result to serve. The status is the
+    /// check now, not an incidentally NULL `result_path`, and the message
+    /// carries it so a caller can tell "not yet" from "never".
+    #[sqlx::test]
+    async fn resolve_specific_refuses_a_run_that_did_not_succeed(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "specific_status").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+
+        // In flight: claimed, never finished.
+        let running = match sched_store
+            .claim_run(sid, saved_id, "q", None, None)
+            .await
+            .unwrap()
+        {
+            RunClaim::Started(id) => id,
+            other => panic!("expected a started run, got {other:?}"),
+        };
+        let err = resolve_specific(&sched_store, running, 1, "/data")
+            .await
+            .expect_err("a running run has no result");
+        match err {
+            ServerError::NotFound(msg) => assert!(msg.contains("running"), "{msg}"),
+            other => panic!("expected NotFound, got: {other:?}"),
+        }
+        sched_store
+            .finish_run(
+                running,
+                RunStatus::Error,
+                10,
+                None,
+                Some("boom"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = resolve_specific(&sched_store, running, 1, "/data")
+            .await
+            .expect_err("a failed run has no result either");
+        match err {
+            ServerError::NotFound(msg) => assert!(msg.contains("error"), "{msg}"),
+            other => panic!("expected NotFound, got: {other:?}"),
+        }
     }
 
     // --- resolve_all --------------------------------------------------------
