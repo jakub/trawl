@@ -305,10 +305,12 @@ and the env it was meant for keeps aging out under the global.
 
 **Put the per-env tables last.** In TOML a sub-table header ends the table
 above it, so a scalar written after `[retention.env.prod]` lands inside
-`[retention.env.prod]`. Writing `min_free_disk_bytes` there is an unknown key
-and writing `max_age_days` there is a duplicate key, so the load fails either
-way rather than misconfiguring the install, but the fix is ordering: the three
-global scalars first, the per-env tables after them.
+`[retention.env.prod]`. `min_free_disk_bytes` written there is an unknown key
+and fails the load. `max_age_days` written there is worse: if the table
+already has one it is a duplicate key and fails, but if it does not, the
+scalar you meant as the global becomes prod's own limit and loads clean,
+with every other env on the default. Keep the three global scalars first and
+the per-env tables after them.
 
 ##### How disk pressure ranks envs
 
