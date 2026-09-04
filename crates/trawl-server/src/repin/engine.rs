@@ -46,7 +46,7 @@ use crate::repin::marker::{
 };
 use crate::repin::plan::{ScanCounts, ScanTallies, scan};
 use crate::repin::rewrite::{FileSig, ProcessTally, process_file, snapshot_env_files};
-use crate::store::{CatalogStore, FieldConflict, RepinJob, RepinJobStatus, RepinStore};
+use crate::store::{CatalogStore, FieldConflict, JobTotals, RepinJob, RepinJobStatus, RepinStore};
 
 /// Catch-up passes before the job gives up (steadily-shrinking deltas
 /// converge in two or three; a delta that refuses to shrink under real
@@ -330,7 +330,7 @@ impl RepinEngine {
             Ok(outcome) => outcome,
             Err(e) => {
                 let msg = format!("repin job task failed: {e}");
-                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                self.finish(job_id, RepinJobStatus::Failed, Some(&msg), None)
                     .await;
                 Err(ServerError::Internal(msg))
             }
@@ -368,12 +368,12 @@ impl RepinEngine {
         {
             Ok(Ok(())) => {}
             Ok(Err(msg)) => {
-                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                self.finish(job_id, RepinJobStatus::Failed, Some(&msg), None)
                     .await;
                 return Err(ServerError::BadRequest(msg));
             }
             Err(msg) => {
-                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                self.finish(job_id, RepinJobStatus::Failed, Some(&msg), None)
                     .await;
                 return Err(ServerError::Internal(msg));
             }
@@ -382,7 +382,8 @@ impl RepinEngine {
         let (counts, tallies, samples) = match self.run_scan(&field, reading).await {
             Ok(measured) => measured,
             Err(e) => {
-                self.finish(job_id, RepinJobStatus::Failed, Some(&e)).await;
+                self.finish(job_id, RepinJobStatus::Failed, Some(&e), None)
+                    .await;
                 return Err(ServerError::Internal(format!("repin scan failed: {e}")));
             }
         };
@@ -424,7 +425,7 @@ impl RepinEngine {
             )
             .await
         {
-            self.finish(job_id, RepinJobStatus::Failed, Some(&e.to_string()))
+            self.finish(job_id, RepinJobStatus::Failed, Some(&e.to_string()), None)
                 .await;
             return Err(ServerError::Store(e));
         }
@@ -433,7 +434,8 @@ impl RepinEngine {
         metrics::gauge!(crate::metrics::CATALOG_REPIN_FILES_TOTAL).set(counts.files_total as f64);
 
         if dry_run {
-            self.finish(job_id, RepinJobStatus::Succeeded, None).await;
+            self.finish(job_id, RepinJobStatus::Succeeded, None, None)
+                .await;
             return Ok(StartOutcome::DryRun(self.job(job_id).await?));
         }
         // The scan gate: the same decision as the finished-shadow gate
@@ -448,8 +450,13 @@ impl RepinEngine {
             counts.ambiguous_numerals,
             terms,
         ) {
-            self.finish(job_id, RepinJobStatus::RefusedNeedsForce, Some(&reason))
-                .await;
+            self.finish(
+                job_id,
+                RepinJobStatus::RefusedNeedsForce,
+                Some(&reason),
+                None,
+            )
+            .await;
             return Ok(StartOutcome::Refused(self.job(job_id).await?));
         }
 
@@ -463,7 +470,7 @@ impl RepinEngine {
             Ok(available) => available,
             Err(e) => {
                 let msg = format!("failed to check free disk space: {e}");
-                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                self.finish(job_id, RepinJobStatus::Failed, Some(&msg), None)
                     .await;
                 return Err(ServerError::Internal(msg));
             }
@@ -479,7 +486,7 @@ impl RepinEngine {
                  repin runs)",
                 counts.affected_bytes, self.min_free_disk_bytes
             );
-            self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+            self.finish(job_id, RepinJobStatus::Failed, Some(&msg), None)
                 .await;
             return Err(ServerError::BadRequest(msg));
         }
@@ -566,10 +573,16 @@ impl RepinEngine {
     /// reconciliation. The outcome counter increments only when the write
     /// lands: a row still `running` must not be metered as a terminal
     /// outcome.
-    async fn finish(&self, job_id: i64, status: RepinJobStatus, error: Option<&str>) {
+    async fn finish(
+        &self,
+        job_id: i64,
+        status: RepinJobStatus,
+        error: Option<&str>,
+        totals: Option<JobTotals>,
+    ) {
         const FAST_ATTEMPTS: u32 = 3;
         for attempt in 1..=FAST_ATTEMPTS {
-            match self.store.finish(job_id, status, error).await {
+            match self.store.finish(job_id, status, error, totals).await {
                 Ok(()) => {
                     count_outcome(status);
                     return;
@@ -601,7 +614,7 @@ impl RepinEngine {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(FINISH_RETRY_INTERVAL).await;
-                match store.finish(job_id, status, error.as_deref()).await {
+                match store.finish(job_id, status, error.as_deref(), totals).await {
                     Ok(()) => {
                         count_outcome(status);
                         tracing::info!(
@@ -653,7 +666,8 @@ impl RepinEngine {
 
         match outcome {
             Ok(()) => {
-                self.finish(job_id, RepinJobStatus::Succeeded, None).await;
+                self.finish(job_id, RepinJobStatus::Succeeded, None, None)
+                    .await;
                 tracing::info!(
                     event_type = "repin_complete",
                     job_id,
@@ -664,15 +678,25 @@ impl RepinEngine {
                 );
             }
             Err(JobAbort::Blocked(msg)) => {
-                self.abandon_build(job_id, RepinJobStatus::Blocked, &msg)
+                self.abandon_build(job_id, RepinJobStatus::Blocked, &msg, None)
                     .await;
             }
-            Err(JobAbort::RefusedNeedsForce(msg)) => {
-                self.abandon_build(job_id, RepinJobStatus::RefusedNeedsForce, &msg)
-                    .await;
+            Err(JobAbort::RefusedNeedsForce { msg, totals }) => {
+                // The refusal decided on these numbers, so they ride the
+                // terminal write: the periodic progress write is
+                // best-effort, and a store blip just before the gate would
+                // otherwise leave the wire reporting the refusal beside a
+                // stale `rows_nulled`.
+                self.abandon_build(
+                    job_id,
+                    RepinJobStatus::RefusedNeedsForce,
+                    &msg,
+                    Some(totals),
+                )
+                .await;
             }
             Err(JobAbort::Failed(msg)) => {
-                self.abandon_build(job_id, RepinJobStatus::Failed, &msg)
+                self.abandon_build(job_id, RepinJobStatus::Failed, &msg, None)
                     .await;
             }
         }
@@ -681,7 +705,13 @@ impl RepinEngine {
     /// Abandon a job whose corpus is still untouched (pre-swap): sweep the
     /// disposable shadow and any leftover aside, drop the marker, record
     /// the outcome.
-    async fn abandon_build(&self, job_id: i64, status: RepinJobStatus, msg: &str) {
+    async fn abandon_build(
+        &self,
+        job_id: i64,
+        status: RepinJobStatus,
+        msg: &str,
+        totals: Option<JobTotals>,
+    ) {
         tracing::warn!(
             event_type = "repin_abandoned",
             job_id,
@@ -716,7 +746,7 @@ impl RepinEngine {
                  keeping the marker so the next boot retries the cleanup"
             );
         }
-        self.finish(job_id, status, Some(msg)).await;
+        self.finish(job_id, status, Some(msg), totals).await;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -859,12 +889,15 @@ impl RepinEngine {
                 "re-run the dry run for the current plan, then pass force to \
                  accept it"
             };
-            return Err(JobAbort::RefusedNeedsForce(format!(
-                "the completed rewrite is not what the pre-build scan \
-                 projected — data ingested after the scan carries values the \
-                 plan never saw: {reason}. The cutover is refused and the \
-                 corpus stands at its pre-repin generation; {remedy}"
-            )));
+            return Err(JobAbort::RefusedNeedsForce {
+                msg: format!(
+                    "the completed rewrite is not what the pre-build scan \
+                     projected — data ingested after the scan carries values \
+                     the plan never saw: {reason}. The cutover is refused and \
+                     the corpus stands at its pre-repin generation; {remedy}"
+                ),
+                totals: job_totals(totals),
+            });
         }
 
         // The audit record of a forced cutover, emitted where the decision is
@@ -1034,19 +1067,7 @@ impl RepinEngine {
 
     async fn publish_progress(&self, job_id: i64, state: &BuildState) {
         let totals = state.totals();
-        let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
-        if let Err(e) = self
-            .store
-            .record_progress(
-                job_id,
-                clamp(totals.files_done),
-                clamp(totals.rows),
-                clamp(totals.nulled),
-                clamp(totals.resurrected),
-                clamp(totals.ambiguous),
-            )
-            .await
-        {
+        if let Err(e) = self.store.record_progress(job_id, job_totals(totals)).await {
             tracing::warn!(event_type = "repin_store_error", job_id, error = %e, "progress write failed");
         }
         #[allow(clippy::cast_precision_loss)]
@@ -1123,13 +1144,32 @@ where
         .map_err(|e| format!("repin {what} task panicked: {e}"))
 }
 
+/// The store's shape for what the build has tallied so far. Saturating
+/// rather than wrapping: a count past `i64::MAX` is not a corpus anyone has,
+/// and the honest ceiling beats a negative row count.
+fn job_totals(totals: BuildTotals) -> JobTotals {
+    let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    JobTotals {
+        files_done: clamp(totals.files_done),
+        rows_rewritten: clamp(totals.rows),
+        rows_nulled: clamp(totals.nulled),
+        rows_resurrected: clamp(totals.resurrected),
+        ambiguous_numerals: clamp(totals.ambiguous),
+    }
+}
+
 /// Why a job stopped short of the swap.
 enum JobAbort {
     Failed(String),
     Blocked(String),
     /// The finished shadow nulled values the pre-build scan did not
-    /// project (concurrent ingest), and the request carried no force.
-    RefusedNeedsForce(String),
+    /// project (concurrent ingest), or more than the accepted ceilings
+    /// allow. Carries the tallies the gate decided on so the terminal
+    /// write can persist the verdict and its evidence together.
+    RefusedNeedsForce {
+        msg: String,
+        totals: JobTotals,
+    },
 }
 
 /// What the shadow generation holds so far — the numbers the progress

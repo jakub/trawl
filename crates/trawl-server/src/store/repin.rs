@@ -213,6 +213,25 @@ pub struct RepinPlan {
     pub accepted_max_ambiguous_rows: Option<i64>,
 }
 
+/// The rewrite's running tallies: what the shadow generation holds so far.
+///
+/// One struct rather than five positional `i64`s, because the periodic
+/// progress write and the terminal write that carries a refusal's numbers
+/// stamp the same five columns and must not drift apart in their order.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JobTotals {
+    /// Affected files rewritten so far.
+    pub files_done: i64,
+    /// Rows written through the rewrite.
+    pub rows_rewritten: i64,
+    /// Stored values the rewrite nulled.
+    pub rows_nulled: i64,
+    /// Values resurrected from `_raw`.
+    pub rows_resurrected: i64,
+    /// Rows whose numeral reads differently in each dialect.
+    pub ambiguous_numerals: i64,
+}
+
 /// What one call to [`RepinStore::finish_cutover`] actually did.
 ///
 /// The call is idempotent, so "did the flip work" is not the interesting
@@ -355,15 +374,7 @@ impl RepinStore {
     /// written files, and then the shadow's own count (including everything
     /// the catch-up passes folded in) supersedes it. That count is what the
     /// cutover's force gate decides on, so it is what the report must show.
-    pub async fn record_progress(
-        &self,
-        id: i64,
-        files_done: i64,
-        rows_rewritten: i64,
-        rows_nulled: i64,
-        rows_resurrected: i64,
-        ambiguous_numerals: i64,
-    ) -> Result<(), StoreError> {
+    pub async fn record_progress(&self, id: i64, totals: JobTotals) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE repin_jobs
              SET files_done = $2, rows_rewritten = $3, rows_nulled = $4,
@@ -371,11 +382,11 @@ impl RepinStore {
              WHERE id = $1",
         )
         .bind(id)
-        .bind(files_done)
-        .bind(rows_rewritten)
-        .bind(rows_nulled)
-        .bind(rows_resurrected)
-        .bind(ambiguous_numerals)
+        .bind(totals.files_done)
+        .bind(totals.rows_rewritten)
+        .bind(totals.rows_nulled)
+        .bind(totals.rows_resurrected)
+        .bind(totals.ambiguous_numerals)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -383,21 +394,42 @@ impl RepinStore {
 
     /// Move a job to a terminal status (never `running`), stamping
     /// `finished_at` once.
+    ///
+    /// `totals` is `Some` when the caller holds counts the row must not
+    /// contradict — the cutover's ceiling refusal is the case that matters:
+    /// it decides on the finished shadow's own tallies, and the periodic
+    /// `record_progress` write that would otherwise have carried them is
+    /// best-effort, so a store blip immediately before the refusal would
+    /// leave the wire reporting `refused_needs_force` beside `rows_nulled:
+    /// 0`. Writing them in the same statement as the status makes the
+    /// verdict and the numbers behind it land together or not at all. `None`
+    /// leaves the counters as they stand.
     pub async fn finish(
         &self,
         id: i64,
         status: RepinJobStatus,
         error: Option<&str>,
+        totals: Option<JobTotals>,
     ) -> Result<(), StoreError> {
         debug_assert_ne!(status, RepinJobStatus::Running);
         sqlx::query(
             "UPDATE repin_jobs
-             SET status = $2, error = $3, finished_at = COALESCE(finished_at, now())
+             SET status = $2, error = $3, finished_at = COALESCE(finished_at, now()),
+                 files_done = COALESCE($4, files_done),
+                 rows_rewritten = COALESCE($5, rows_rewritten),
+                 rows_nulled = COALESCE($6, rows_nulled),
+                 rows_resurrected = COALESCE($7, rows_resurrected),
+                 ambiguous_numerals = COALESCE($8, ambiguous_numerals)
              WHERE id = $1",
         )
         .bind(id)
         .bind(status.as_str())
         .bind(error)
+        .bind(totals.map(|t| t.files_done))
+        .bind(totals.map(|t| t.rows_rewritten))
+        .bind(totals.map(|t| t.rows_nulled))
+        .bind(totals.map(|t| t.rows_resurrected))
+        .bind(totals.map(|t| t.ambiguous_numerals))
         .execute(&self.pool)
         .await?;
         Ok(())

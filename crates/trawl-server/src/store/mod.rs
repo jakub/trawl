@@ -43,7 +43,9 @@ pub use catalog::{
 };
 pub use error::StoreError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
-pub use repin::{CutoverOutcome, RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore};
+pub use repin::{
+    CutoverOutcome, JobTotals, RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore,
+};
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{
     FinishOutcome, FlipOutcome, ReportRun, RunClaim, Schedule, ScheduleStore, format_interval,

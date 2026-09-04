@@ -176,6 +176,7 @@ pub async fn reconcile_store(
                         marker.job_id,
                         RepinJobStatus::Failed,
                         Some("interrupted while building the shadow generation; corpus untouched"),
+                        None,
                     )
                     .await
                     .map_err(|e| format!("failed to fail recovered repin job: {e}"))?;

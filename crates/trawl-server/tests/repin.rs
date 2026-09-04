@@ -2325,6 +2325,11 @@ async fn mid_build_growth_past_the_default_ceiling_refuses_the_cutover() {
         "an operator who already passed force is told to raise the number, \
          not to pass force: {reason}"
     );
+    assert_eq!(
+        done.rows_nulled, 11,
+        "the terminal write carries the tallies the gate refused on, so the \
+         verdict and its evidence cannot disagree on the wire"
+    );
 
     // Corpus untouched: old pin, every row, no staging left behind.
     assert_eq!(h.pinned_type("dur").await, "VARCHAR");

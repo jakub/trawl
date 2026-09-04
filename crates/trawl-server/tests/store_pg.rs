@@ -3382,7 +3382,7 @@ mod repin_store {
     use sqlx::PgPool;
     use trawl_core::schema::CanonicalType;
     use trawl_server::store::{
-        CatalogStore, RepinClaim, RepinJobStatus, RepinPlan, RepinStore, StoreError,
+        CatalogStore, JobTotals, RepinClaim, RepinJobStatus, RepinPlan, RepinStore, StoreError,
     };
 
     fn store(pool: &PgPool) -> RepinStore {
@@ -3427,7 +3427,7 @@ mod repin_store {
         assert!(matches!(err, StoreError::RepinAlreadyRunning));
 
         // A terminal job frees the slot.
-        s.finish(id, RepinJobStatus::Failed, Some("test"))
+        s.finish(id, RepinJobStatus::Failed, Some("test"), None)
             .await
             .unwrap();
         s.claim(RepinClaim {
@@ -3725,7 +3725,7 @@ mod repin_store {
         )
         .await
         .unwrap();
-        s.finish(first, RepinJobStatus::Succeeded, None)
+        s.finish(first, RepinJobStatus::Succeeded, None, None)
             .await
             .unwrap();
 
@@ -3743,7 +3743,18 @@ mod repin_store {
             })
             .await
             .unwrap();
-        s.record_progress(second, 5, 1200, 2, 7, 3).await.unwrap();
+        s.record_progress(
+            second,
+            JobTotals {
+                files_done: 5,
+                rows_rewritten: 1200,
+                rows_nulled: 2,
+                rows_resurrected: 7,
+                ambiguous_numerals: 3,
+            },
+        )
+        .await
+        .unwrap();
 
         let latest = s.latest().await.unwrap().expect("a running job");
         assert_eq!(latest.id, second);
@@ -3760,9 +3771,14 @@ mod repin_store {
             "the shadow's own ambiguity count supersedes the scan's"
         );
 
-        s.finish(second, RepinJobStatus::Blocked, Some("cutover starved"))
-            .await
-            .unwrap();
+        s.finish(
+            second,
+            RepinJobStatus::Blocked,
+            Some("cutover starved"),
+            None,
+        )
+        .await
+        .unwrap();
         let latest = s.latest().await.unwrap().expect("newest terminal job");
         assert_eq!(latest.id, second);
         assert_eq!(latest.status, RepinJobStatus::Blocked);
@@ -3814,7 +3830,9 @@ mod repin_store {
         let job = s.get(id).await.unwrap().unwrap();
         assert_eq!(job.to_type, "SEVERITY");
         assert_eq!(job.dialect.as_deref(), Some("syslog"));
-        s.finish(id, RepinJobStatus::Succeeded, None).await.unwrap();
+        s.finish(id, RepinJobStatus::Succeeded, None, None)
+            .await
+            .unwrap();
 
         // And back off the severity pin, which 0012's widened `from_type`
         // CHECK admits.
@@ -3835,7 +3853,7 @@ mod repin_store {
         let job = s.get(back).await.unwrap().unwrap();
         assert_eq!(job.from_type, "SEVERITY");
         assert_eq!(job.dialect, None);
-        s.finish(back, RepinJobStatus::Succeeded, None)
+        s.finish(back, RepinJobStatus::Succeeded, None, None)
             .await
             .unwrap();
 
@@ -4064,6 +4082,72 @@ mod repin_store {
             catalog.degraded_ack("host").await.unwrap().is_some(),
             "the replay must not touch an ack written after the flip"
         );
+    }
+
+    /// The terminal write can carry the tallies the caller decided on.
+    ///
+    /// The cutover's ceiling refusal is why: it gates on the finished
+    /// shadow's own counts, and the periodic `record_progress` write that
+    /// would otherwise have persisted them is best-effort, so a store blip
+    /// just before the gate would leave a `refused_needs_force` row beside
+    /// `rows_nulled: 0`. Passing `None` leaves the counters alone, which is
+    /// what every other terminal path wants.
+    #[sqlx::test]
+    async fn a_terminal_write_can_persist_the_counts_behind_its_verdict(pool: PgPool) {
+        let s = store(&pool);
+        let claim = RepinClaim {
+            field: "dur",
+            from_type: CanonicalType::Varchar,
+            to_type: CanonicalType::BigInt,
+            dialect: None,
+            dry_run: false,
+            force: true,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
+            requested_by: None,
+        };
+        let id = s.claim(claim).await.unwrap();
+
+        // No progress write has landed: the row's counters are the claim's
+        // zeros, exactly the state a failed progress write leaves.
+        assert_eq!(s.get(id).await.unwrap().unwrap().rows_nulled, 0);
+
+        s.finish(
+            id,
+            RepinJobStatus::RefusedNeedsForce,
+            Some("11 nulled row(s) over an accepted 10"),
+            Some(JobTotals {
+                files_done: 6,
+                rows_rewritten: 17,
+                rows_nulled: 11,
+                rows_resurrected: 2,
+                ambiguous_numerals: 4,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let job = s.get(id).await.unwrap().unwrap();
+        assert_eq!(job.status, RepinJobStatus::RefusedNeedsForce);
+        assert_eq!(
+            (
+                job.files_done,
+                job.rows_rewritten,
+                job.rows_nulled,
+                job.rows_resurrected,
+                job.ambiguous_numerals
+            ),
+            (6, 17, 11, 2, 4),
+            "the refusal and the numbers behind it land in one statement"
+        );
+
+        // A totals-free terminal write leaves them standing.
+        s.finish(id, RepinJobStatus::Failed, Some("later"), None)
+            .await
+            .unwrap();
+        let job = s.get(id).await.unwrap().unwrap();
+        assert_eq!(job.status, RepinJobStatus::Failed);
+        assert_eq!((job.rows_nulled, job.ambiguous_numerals), (11, 4));
     }
 
     /// A resurrection-only repin (`to == current`) writes no new type, so
