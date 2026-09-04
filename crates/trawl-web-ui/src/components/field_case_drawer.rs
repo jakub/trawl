@@ -854,23 +854,35 @@ fn job_outcome_line(job: &RepinJobResponse) -> String {
         STATUS_REFUSED => {
             let projected = format_exact(job.projected_nulls);
             match (job.force, accepted_ceilings(job)) {
-                // The number the gate compared is the finished shadow's own
-                // tally, not the scan projection: a cutover-gate refusal
-                // means the shadow grew PAST the ceiling, and the ceiling
-                // carries headroom above the scan, so quoting the
-                // projection here would read "8 is past 22". A scan-gate
-                // refusal persists no shadow tally and the projection is
-                // the number the gate saw.
+                // Name the counter that actually exceeded its ceiling.
+                // The gate compared the finished shadow's own tallies, and
+                // either side (or both) can be the one that tripped; a
+                // refusal where NEITHER visible actual exceeds is the
+                // scan-gate case, where no shadow exists and the
+                // projection is the number the gate saw.
                 (true, Some(bound)) => {
-                    let lost = if job.rows_nulled > 0 {
-                        format_exact(job.rows_nulled)
-                    } else {
-                        projected
+                    let over_nulled = job.rows_nulled > bound.max_nulled;
+                    let over_ambiguous = job.ambiguous_numerals > bound.max_ambiguous;
+                    let excess = match (over_nulled, over_ambiguous) {
+                        (true, true) => format!(
+                            "{} nulled row(s) and {} dialect-ambiguous numeral(s)",
+                            format_exact(job.rows_nulled),
+                            format_exact(job.ambiguous_numerals),
+                        ),
+                        (false, true) => format!(
+                            "{} dialect-ambiguous numeral(s)",
+                            format_exact(job.ambiguous_numerals),
+                        ),
+                        (true, false) => {
+                            format!("{} nulled row(s)", format_exact(job.rows_nulled))
+                        }
+                        (false, false) => {
+                            format!("{projected} projected nulled row(s)")
+                        }
                     };
                     format!(
-                        "{field}: refused \u{2014} {lost} stored values cannot be kept as {}, \
-                         past the {} row(s) and {} dialect-ambiguous numeral(s) accepted. The \
-                         corpus is untouched.",
+                        "{field}: refused as {} \u{2014} {excess}, past the {} row(s) and {} \
+                         dialect-ambiguous numeral(s) accepted. The corpus is untouched.",
                         job.to_type,
                         format_exact(bound.max_nulled),
                         format_exact(bound.max_ambiguous),

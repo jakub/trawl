@@ -1359,15 +1359,23 @@ pub async fn run_repin_status(
 ///
 /// The note is operator prose that came back off the wire, so it goes
 /// through display sanitisation before it reaches a terminal.
-pub fn ack_to_rows(field: &str, ack: &trawl_client::FieldAck) -> (Vec<String>, Vec<Vec<Json>>) {
+pub fn ack_to_rows(
+    field: &str,
+    ack: &trawl_client::FieldAck,
+    format: OutputFormat,
+) -> (Vec<String>, Vec<Vec<Json>>) {
     let columns = ["field", "acked_at", "acked_by", "evidence_through", "note"]
         .map(str::to_owned)
         .to_vec();
     let rows = vec![vec![
-        // The exact catalog key, never the sanitised copy: this is the
-        // operator's own argument, and a scripted caller matches the record
-        // to it (repin_job_to_rows makes the same call for job.field).
-        Json::from(field.to_owned()),
+        // Machine formats carry the exact catalog key (the operator's own
+        // argument, matched by scripted callers); the table cell is display
+        // text on a terminal and sanitises like every other rendered value.
+        Json::from(if format == OutputFormat::Table {
+            trawl_core::sanitize::sanitize_display_text(field)
+        } else {
+            field.to_owned()
+        }),
         Json::from(ack.acked_at.clone()),
         Json::from(trawl_core::sanitize::sanitize_display_text(&ack.acked_by)),
         Json::from(ack.evidence_through),
@@ -1415,7 +1423,7 @@ pub async fn run_ack<W: Write>(
     }
 
     let ack = client.schema_field_ack(field, note).await?;
-    let (columns, rows) = ack_to_rows(field, &ack);
+    let (columns, rows) = ack_to_rows(field, &ack, format);
     render(out, &columns, &rows, format)?;
     label(
         out,
@@ -1446,7 +1454,7 @@ mod ack_tests {
     /// honours: a scripted caller reads it without parsing prose.
     #[test]
     fn the_ack_renders_as_one_record_in_every_format() {
-        let (columns, rows) = ack_to_rows("duration", &sample_ack());
+        let (columns, rows) = ack_to_rows("duration", &sample_ack(), OutputFormat::Json);
         assert_eq!(rows.len(), 1, "an ack is one record");
         for format in [OutputFormat::Table, OutputFormat::Json, OutputFormat::Csv] {
             let mut out = Vec::new();
@@ -1467,7 +1475,7 @@ mod ack_tests {
         // nothing, and an empty note would read as one they left blank.
         let mut bare = sample_ack();
         bare.note = None;
-        let (columns, rows) = ack_to_rows("duration", &bare);
+        let (columns, rows) = ack_to_rows("duration", &bare, OutputFormat::Json);
         let mut out = Vec::new();
         render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
         let parsed: Json =
@@ -1482,9 +1490,26 @@ mod ack_tests {
     fn a_hostile_note_is_sanitised_before_it_reaches_the_terminal() {
         let mut ack = sample_ack();
         ack.note = Some("boom\u{1b}[2Jgone".into());
-        let (_, rows) = ack_to_rows("duration", &ack);
+        let (_, rows) = ack_to_rows("duration", &ack, OutputFormat::Json);
         let note = rows[0][4].as_str().unwrap();
         assert!(!note.contains('\u{1b}'), "escape survived: {note:?}");
+    }
+
+    /// The field column splits by format: the table cell is terminal
+    /// display and sanitises; machine formats carry the exact catalog key
+    /// a scripted caller matches on.
+    #[test]
+    fn the_table_field_cell_sanitises_and_the_machine_cell_does_not() {
+        let hostile = "du\u{1b}[2Jration";
+        let (_, table) = ack_to_rows(hostile, &sample_ack(), OutputFormat::Table);
+        let (_, json) = ack_to_rows(hostile, &sample_ack(), OutputFormat::Json);
+        let table_cell = table[0][0].as_str().unwrap();
+        let json_cell = json[0][0].as_str().unwrap();
+        assert!(
+            !table_cell.contains('\u{1b}'),
+            "table cell keeps the escape: {table_cell:?}"
+        );
+        assert_eq!(json_cell, hostile, "machine cell must stay exact");
     }
 }
 
