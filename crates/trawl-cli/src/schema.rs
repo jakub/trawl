@@ -783,7 +783,14 @@ pub fn repin_job_to_rows(
     job: &trawl_client::RepinJobResponse,
     format: OutputFormat,
 ) -> (Vec<String>, Vec<Vec<Json>>) {
-    let columns = [
+    (repin_job_columns(), vec![repin_job_cells(job, format)])
+}
+
+/// The job row's column names. Shared with the cancel receipt, which
+/// carries the same columns so a machine format is one record with one
+/// header (#109).
+fn repin_job_columns() -> Vec<String> {
+    [
         "id",
         "field",
         "from",
@@ -809,8 +816,12 @@ pub fn repin_job_to_rows(
         "error",
     ]
     .map(str::to_owned)
-    .to_vec();
-    let rows = vec![vec![
+    .to_vec()
+}
+
+/// One job's cells, in [`repin_job_columns`] order.
+fn repin_job_cells(job: &trawl_client::RepinJobResponse, format: OutputFormat) -> Vec<Json> {
+    vec![
         Json::from(job.id),
         Json::from(job.field.clone()),
         Json::from(job.from_type.clone()),
@@ -856,8 +867,7 @@ pub fn repin_job_to_rows(
             .map_or(Json::Null, Json::from),
         job.cancelled_by.clone().map_or(Json::Null, Json::from),
         job.error.clone().map_or(Json::Null, Json::from),
-    ]];
-    (columns, rows)
+    ]
 }
 
 /// The repin report's case file: the evidence a plan's numbers cannot
@@ -1183,15 +1193,19 @@ pub async fn run_repin_cancel(
     // sanitisation, like every other server sentence this command renders.
     let detail = trawl_core::sanitize::sanitize_display_text(&receipt.detail);
     if format == OutputFormat::Table {
+        // A human reads the sentence first and the job's numbers second, so
+        // the table keeps two blocks.
         writeln!(out, "repin cancel: {detail}")?;
+        if let Some(job) = &receipt.job {
+            let (columns, rows) = repin_job_to_rows(job, format);
+            render_driver_results(&columns, &rows, format, out)?;
+        }
     } else {
-        // The verdict is the point of this command, so a machine format
-        // records it whether or not a job row came with it.
-        let (columns, rows) = cancel_receipt_to_rows(&receipt);
-        render_driver_results(&columns, &rows, format, out)?;
-    }
-    if let Some(job) = &receipt.job {
-        let (columns, rows) = repin_job_to_rows(job, format);
+        // One record, one header: the verdict and the job it is about are
+        // one answer, and a machine format that emitted them as two tables
+        // would put two headers of different widths in one csv stream.
+        // The job columns are null when the server attached no row.
+        let (columns, rows) = cancel_receipt_to_rows(&receipt, format);
         render_driver_results(&columns, &rows, format, out)?;
     }
     if accepted {
@@ -1200,23 +1214,36 @@ pub async fn run_repin_cancel(
     Err(CliError::Usage(format!("repin cancel refused: {detail}")))
 }
 
-/// The bodiless half of a cancel receipt → one row, so `-f json` and
-/// `-f csv` carry the verdict even when there is no job row to attach.
+/// A cancel receipt → exactly one record: the verdict, the server's
+/// sentence, and the job columns the verdict is about.
+///
+/// One record rather than two tables, because `-f csv` is a single stream:
+/// a receipt table followed by a job table would put two headers of
+/// different widths in it, which no csv reader accepts. A verdict with no
+/// job attached — a 404, or a store that could not serve the row — leaves
+/// the job columns null, so the shape does not depend on what the server
+/// managed to look up.
 fn cancel_receipt_to_rows(
     receipt: &trawl_client::RepinCancelResponse,
+    format: OutputFormat,
 ) -> (Vec<String>, Vec<Vec<Json>>) {
     let outcome = match receipt.outcome {
         trawl_client::RepinCancelOutcome::Cancelling => "cancelling",
         trawl_client::RepinCancelOutcome::PastPointOfNoReturn => "past_point_of_no_return",
         trawl_client::RepinCancelOutcome::NoJobRunning => "no_job_running",
     };
-    (
-        vec!["outcome".to_owned(), "detail".to_owned()],
-        vec![vec![
-            Json::from(outcome),
-            Json::from(trawl_core::sanitize::sanitize_display_text(&receipt.detail)),
-        ]],
-    )
+    let job_columns = repin_job_columns();
+    let mut columns = vec!["outcome".to_owned(), "detail".to_owned()];
+    let mut cells = vec![
+        Json::from(outcome),
+        Json::from(trawl_core::sanitize::sanitize_display_text(&receipt.detail)),
+    ];
+    cells.extend(receipt.job.as_ref().map_or_else(
+        || vec![Json::Null; job_columns.len()],
+        |job| repin_job_cells(job, format),
+    ));
+    columns.extend(job_columns);
+    (columns, vec![cells])
 }
 
 #[cfg(test)]
@@ -1556,6 +1583,10 @@ mod repin_tests {
 
     /// The cancel receipt renders in every format, and a machine format
     /// carries the verdict even when the server attached no job row.
+    ///
+    /// With a job attached it is still ONE record: one header, one width.
+    /// Two tables in one csv stream — a two-column receipt followed by the
+    /// 23-column job — is not a csv document at all (#109 review F4).
     #[test]
     fn a_cancel_receipt_renders_its_verdict_in_every_format() {
         for (outcome, spelling) in [
@@ -1574,14 +1605,71 @@ mod repin_tests {
                 detail: "the words the server chose".into(),
                 job: None,
             };
-            let (columns, rows) = cancel_receipt_to_rows(&receipt);
             for format in [OutputFormat::Json, OutputFormat::Csv] {
+                let (columns, rows) = cancel_receipt_to_rows(&receipt, format);
                 let mut out = Vec::new();
                 render_driver_results(&columns, &rows, format, &mut out).unwrap();
                 let text = String::from_utf8(out).unwrap();
                 assert!(text.contains(spelling), "{format:?}: {text}");
             }
         }
+
+        // A job rides along: same header, same width, and the job's own
+        // facts are in the same record as the verdict.
+        let mut job = sample_job();
+        job.status = "cancelled".into();
+        job.cancelled_by = Some("ops".into());
+        let receipt = trawl_client::RepinCancelResponse {
+            outcome: trawl_client::RepinCancelOutcome::Cancelling,
+            detail: "cancel accepted".into(),
+            job: Some(job),
+        };
+
+        let (columns, rows) = cancel_receipt_to_rows(&receipt, OutputFormat::Csv);
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Csv, &mut out).unwrap();
+        let csv = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = csv.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "one header, one row: {csv}");
+        let header = lines[0];
+        assert!(header.starts_with("outcome,detail,"), "{header}");
+        assert_eq!(
+            header.matches("outcome").count(),
+            1,
+            "exactly one header line: {csv}"
+        );
+        let width = |line: &str| line.chars().filter(|c| *c == ',').count();
+        assert_eq!(width(lines[0]), width(lines[1]), "rectangular: {csv}");
+        assert!(lines[1].contains("cancelled"), "{csv}");
+        assert!(lines[1].contains("ops"), "{csv}");
+
+        // json is ndjson: one object carrying both halves.
+        let (columns, rows) = cancel_receipt_to_rows(&receipt, OutputFormat::Json);
+        let mut out = Vec::new();
+        render_driver_results(&columns, &rows, OutputFormat::Json, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "one object: {text}");
+        let parsed: Json = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["outcome"], "cancelling");
+        assert_eq!(parsed["status"], "cancelled");
+        assert_eq!(parsed["cancelled_by"], "ops");
+
+        // No job attached: the same columns, nulled.
+        let bodiless = trawl_client::RepinCancelResponse {
+            outcome: trawl_client::RepinCancelOutcome::NoJobRunning,
+            detail: "nothing running".into(),
+            job: None,
+        };
+        let (with_job, _) = cancel_receipt_to_rows(&receipt, OutputFormat::Json);
+        let (without_job, rows) = cancel_receipt_to_rows(&bodiless, OutputFormat::Json);
+        assert_eq!(with_job, without_job);
+        let mut out = Vec::new();
+        render_driver_results(&without_job, &rows, OutputFormat::Json, &mut out).unwrap();
+        let parsed: Json =
+            serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["outcome"], "no_job_running");
+        assert_eq!(parsed["status"], Json::Null);
     }
 
     /// `--wait` follows one job, and a poll that comes back about another
