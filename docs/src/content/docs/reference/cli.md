@@ -96,6 +96,7 @@ trawl schema fields --last 7d          # only fields observed in the window
 trawl schema field duration            # detail: type, when/where pinned, which services
 trawl schema conflicts --last 7d       # schema-health dashboard
 trawl schema conflicts --field duration --service envoy
+trawl schema ack duration --note "fix due Friday"   # acknowledge a degraded badge
 ```
 
 `fields` and `conflicts` render through the standard output formats
@@ -148,6 +149,24 @@ already have, and — because a successful repin clears the field's conflict
 evidence in the same transaction as the flip — the badge goes out with the
 damage it was reporting. Repinning to a *different* type does both as well.
 
+**Acknowledging a badge you are not repinning yet.** Sometimes the fix is
+with the sender and the shelved rows have to stay shelved for a while.
+`schema ack` says "seen, and accepted for now" without touching the corpus:
+
+```bash
+trawl schema ack duration --note "sender ships a fix on Friday"
+trawl schema ack duration --clear     # withdraw it
+```
+
+The ack covers the conflict evidence that exists when it is written and
+nothing beyond, so the badge goes quiet and comes straight back the moment
+the pin shelves another batch. That is the whole lifecycle: acknowledge,
+suppressed, a new episode re-raises it, and a repin clears the ack along
+with the evidence it acknowledged. `--note` is optional prose (max 1024
+bytes) and cannot be combined with `--clear`, which writes no note.
+Acknowledging needs `schema_write`, and a field whose evidence does not
+meet the degraded threshold is refused: there is nothing to acknowledge.
+
 `field` pages its service observations — the service axis is client-chosen
 and never pruned, so the server caps a page at 1000 rows (default 100).
 When more remain, a cursor is printed to stderr; pass it to `--after` for
@@ -179,6 +198,22 @@ An executing repin confirms interactively; off a TTY it refuses without
 `--force` and prints the plan (the values it would null stay findable in
 `_raw`). `--to <current type> --force` runs a resurrection-only pass.
 Both commands honour `-f table|json|csv`.
+
+**What `--force` accepts.** A forced repin is held to a number rather than
+to a blank cheque. `--max-nulled-rows N` bounds the rows the rewrite may
+null and `--max-ambiguous-rows N` the dialect-ambiguous numerals it may
+carry; state neither and the server derives both from its own scan, ten
+percent headroom over a floor of ten rows. The headroom is there because
+ingest keeps writing for the whole build, so the finished shadow is never
+quite the corpus the plan photographed, and a cutover refuses only when the
+rewrite comes out worse than what force accepted.
+
+`--yes --force` prints the ceilings it accepts, resolved from a preview
+scan, and binds them: without explicit flags the run takes a forced dry run
+first, prints those numbers, and then states them on the executing request.
+The printed line is therefore the bound the job is held to, not a default
+that a second scan might land somewhere else. State both flags and the
+preview is skipped.
 
 Every report — dry run, running job, terminal job — carries
 `requires_force`: whether the *identical executing* request would be
