@@ -1377,3 +1377,89 @@ async fn boot_conformance_pass(state: &trawl_server::state::AppState, config: &C
 pub async fn setup() -> TestServer {
     setup_with_rate_limit(RateLimitConfig::default()).await
 }
+
+/// A tracing capture layer, for the tests that assert on audit events.
+///
+/// Shared because the events it exists to prove are emitted from several
+/// subsystems (the repin engine, the schema handlers) and asserted from
+/// several test binaries, each of which is its own process.
+pub mod audit_capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    /// One captured tracing event's fields, stringified.
+    #[derive(Debug, Clone)]
+    pub struct Captured {
+        pub fields: BTreeMap<String, String>,
+    }
+
+    impl Captured {
+        /// One field's captured value, or a panic naming the event.
+        pub fn field(&self, name: &str) -> String {
+            self.fields
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} missing from {self:?}"))
+                .clone()
+        }
+    }
+
+    /// Capture layer recording every event's fields as strings.
+    #[derive(Clone, Default)]
+    pub struct Capture {
+        events: Arc<Mutex<Vec<Captured>>>,
+    }
+
+    impl Capture {
+        pub fn events(&self) -> Vec<Captured> {
+            self.events.lock().unwrap().clone()
+        }
+
+        /// Every captured event whose `event_type` is `name` and whose
+        /// `key` field carries `value`.
+        ///
+        /// The correlation half is not optional. The subscriber this layer
+        /// installs is GLOBAL, so under `cargo test` — which runs a
+        /// binary's tests as threads in one process, unlike nextest's
+        /// process per test — a sibling test's ack or repin lands in the
+        /// same buffer and an exact-count assertion fails for reasons that
+        /// have nothing to do with the code under test. Every audit event
+        /// worth asserting names its subject (a field, an actor, a job), so
+        /// filtering on the unique name the test chose costs nothing and
+        /// makes the count mean what it says.
+        ///
+        /// Values are captured through `Debug`, so a string field arrives
+        /// quoted: the match is `contains`, not equality.
+        pub fn of_type(&self, name: &str, key: &str, value: &str) -> Vec<Captured> {
+            self.events()
+                .into_iter()
+                .filter(|e| {
+                    e.fields.get("event_type").is_some_and(|t| t.contains(name))
+                        && e.fields.get(key).is_some_and(|v| v.contains(value))
+                })
+                .collect()
+        }
+    }
+
+    struct Visitor<'a>(&'a mut BTreeMap<String, String>);
+
+    impl tracing::field::Visit for Visitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for Capture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut Visitor(&mut fields));
+            self.events.lock().unwrap().push(Captured { fields });
+        }
+    }
+}

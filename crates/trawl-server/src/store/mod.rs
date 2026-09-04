@@ -36,14 +36,17 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 pub use catalog::{
-    CatalogStore, ConflictListRow, ConflictServicePair, FieldConflict, FieldConflictRow,
-    FieldListFilter, FieldPinRow, FieldServiceRow, FieldSummaryRow, GcPinRow,
-    MAX_CONFLICT_SAMPLE_BYTES, MAX_CONFLICT_SAMPLES, MAX_CONFLICTS_PER_FIELD, MAX_PINNED_FIELDS,
-    PURGE_COMMIT_BOUND, PinProposal, PurgedPin, PurgedPins, ServiceCursor, ServiceObservation,
+    AckOutcome, CatalogStore, ConflictListRow, ConflictServicePair, DegradedAck, FieldConflict,
+    FieldConflictRow, FieldHealthSnapshot, FieldListFilter, FieldPinRow, FieldServiceRow,
+    FieldSummaryRow, GcPinRow, MAX_CONFLICT_SAMPLE_BYTES, MAX_CONFLICT_SAMPLES,
+    MAX_CONFLICTS_PER_FIELD, MAX_PINNED_FIELDS, PURGE_COMMIT_BOUND, PinProposal, PurgedPin,
+    PurgedPins, ServiceCursor, ServiceObservation,
 };
 pub use error::StoreError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
-pub use repin::{RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore};
+pub use repin::{
+    CutoverOutcome, JobTotals, RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore,
+};
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{
     FinishOutcome, FlipOutcome, ReportRun, RunClaim, Schedule, ScheduleStore, format_interval,

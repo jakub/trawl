@@ -3330,6 +3330,21 @@ mod catalog {
                 }])
                 .await
                 .unwrap();
+            // An operator's acknowledgement of the degraded badge (#111).
+            // It indicts a pin, so reclaiming the slot must take it with
+            // the rest: a name that comes back later must not inherit a
+            // judgement made about the pin that is gone. Written straight
+            // to the table rather than through `acknowledge_degraded_field`
+            // — this test is about what the purge deletes, not about which
+            // evidence the analyzer calls degraded.
+            sqlx::query(
+                "INSERT INTO field_degraded_ack (field, acked_by, note, evidence_through)
+                 VALUES ($1, 'key-op', 'seen', 1)",
+            )
+            .bind(field)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
 
         let purged = store.delete_pins(&["dead".to_owned()]).await.unwrap();
@@ -3358,6 +3373,10 @@ mod catalog {
             (
                 "field_conflict_stats",
                 "SELECT count(*)::bigint FROM field_conflict_stats WHERE field = $1",
+            ),
+            (
+                "field_degraded_ack",
+                "SELECT count(*)::bigint FROM field_degraded_ack WHERE field = $1",
             ),
         ] {
             let purged: i64 = sqlx::query_scalar(sql)
@@ -3616,6 +3635,8 @@ mod catalog {
                     dialect: None,
                     dry_run: false,
                     force: false,
+                    max_nulled_rows: None,
+                    max_ambiguous_rows: None,
                     requested_by: Some("ops"),
                 })
                 .await
@@ -3675,6 +3696,355 @@ mod catalog {
 }
 
 // ---------------------------------------------------------------------------
+// degraded-field acknowledgement
+// ---------------------------------------------------------------------------
+
+mod degraded_ack {
+    use sqlx::PgPool;
+    use sqlx::Row as _;
+    use trawl_core::schema::CanonicalType;
+    use trawl_server::store::{AckOutcome, CatalogStore, FieldConflict};
+
+    fn catalog(pool: &PgPool) -> CatalogStore {
+        CatalogStore::new(pool.clone())
+    }
+
+    fn episode(field: &str) -> FieldConflict {
+        FieldConflict {
+            field: field.to_owned(),
+            service: "svc-a".to_owned(),
+            observed_type: "VARCHAR".to_owned(),
+            expected_type: CanonicalType::BigInt,
+            rows_nulled: 3,
+            samples: vec!["n/a".to_owned()],
+        }
+    }
+
+    /// Record `episodes` conflict episodes for a pinned field and age the
+    /// evidence past the analyzer's 24h span. The evidence is real; only its
+    /// age is simulated, which is the one thing a test cannot wait for.
+    async fn degrade(pool: &PgPool, field: &str, episodes: usize) {
+        let store = catalog(pool);
+        for _ in 0..episodes {
+            store.record_conflicts(&[episode(field)]).await.unwrap();
+        }
+        sqlx::query(
+            "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+             WHERE field = $1",
+        )
+        .bind(field)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The happy path and the advance: a first ack stores the current
+    /// episode high-water, a second one replaces the actor and the note and
+    /// moves the high-water up to the evidence recorded since.
+    #[sqlx::test]
+    async fn ack_upsert_advances_the_high_water_and_replaces_note_and_actor(pool: PgPool) {
+        let store = catalog(&pool);
+        degrade(&pool, "host", 3).await;
+
+        let AckOutcome::Acked {
+            ack,
+            created,
+            advanced,
+        } = store
+            .acknowledge_degraded_field("host", "key-aaa", Some("that shipper really sends n/a"))
+            .await
+            .unwrap()
+        else {
+            panic!("degraded evidence must be acknowledgeable");
+        };
+        assert!(created, "the first ack inserts the row");
+        assert!(advanced, "a fresh row is this call's own high-water");
+        assert_eq!(ack.field, "host");
+        assert_eq!(ack.acked_by, "key-aaa");
+        assert_eq!(ack.note.as_deref(), Some("that shipper really sends n/a"));
+        assert_eq!(ack.evidence_through, 3, "the episode sum at ack time");
+
+        // More evidence, then a second ack from a different operator.
+        degrade(&pool, "host", 2).await;
+        let AckOutcome::Acked {
+            ack: again,
+            created,
+            advanced,
+        } = store
+            .acknowledge_degraded_field("host", "key-bbb", None)
+            .await
+            .unwrap()
+        else {
+            panic!("a second ack must be accepted");
+        };
+        assert!(!created, "the second ack advances the existing row");
+        assert!(advanced, "it saw more evidence than the row carried");
+        assert_eq!(again.acked_by, "key-bbb");
+        assert_eq!(again.note, None, "an ack without a note clears the old one");
+        assert_eq!(again.evidence_through, 5, "the high-water advanced");
+        assert!(again.acked_at >= ack.acked_at);
+
+        assert_eq!(store.degraded_ack("host").await.unwrap(), Some(again));
+    }
+
+    /// A stale ack cannot steal the attribution of the ack that covered
+    /// more evidence.
+    ///
+    /// The interleaving: operator A reads six episodes and acknowledges
+    /// them. The evidence is then cleared and re-accrues to three, and
+    /// operator B — whose read saw only those three — acknowledges. B's
+    /// call must not put B's name, note and timestamp on a row that
+    /// accepted the pin through six, so the row comes back untouched and
+    /// the outcome says `advanced: false`.
+    #[sqlx::test]
+    async fn a_stale_ack_leaves_the_higher_water_marks_attribution_alone(pool: PgPool) {
+        let store = catalog(&pool);
+        degrade(&pool, "host", 6).await;
+        let AckOutcome::Acked { ack: first, .. } = store
+            .acknowledge_degraded_field("host", "key-aaa", Some("A looked at this"))
+            .await
+            .unwrap()
+        else {
+            panic!("degraded evidence must be acknowledgeable");
+        };
+        assert_eq!(first.evidence_through, 6);
+
+        // The evidence goes away and comes back smaller, which is what a
+        // repin's `clear_conflict_evidence` plus a fresh batch of conflicts
+        // does. The ack row survives it here because nothing in this test
+        // ran a cutover.
+        sqlx::query("DELETE FROM field_conflict_stats WHERE field = 'host'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        degrade(&pool, "host", 3).await;
+
+        let AckOutcome::Acked {
+            ack: after,
+            created,
+            advanced,
+        } = store
+            .acknowledge_degraded_field("host", "key-bbb", Some("B looked at less"))
+            .await
+            .unwrap()
+        else {
+            panic!("the stale ack is still an ordinary answer, not an error");
+        };
+        assert!(!created);
+        assert!(!advanced, "B's read covered less evidence than the row did");
+        assert_eq!(after.acked_by, "key-aaa", "A stays the acknowledger");
+        assert_eq!(after.note.as_deref(), Some("A looked at this"));
+        assert_eq!(after.acked_at, first.acked_at, "the timestamp is A's");
+        assert_eq!(after.evidence_through, 6, "the high-water never drops");
+        assert_eq!(store.degraded_ack("host").await.unwrap(), Some(after));
+    }
+
+    /// Below the threshold there is no verdict to suppress, and installing a
+    /// high-water anyway would swallow the evidence that would have raised
+    /// the badge for the first time. Two shapes: an unpinned field, and a
+    /// pinned one whose evidence is one episode short of the gate.
+    #[sqlx::test]
+    async fn ack_refuses_below_the_degraded_threshold(pool: PgPool) {
+        let store = catalog(&pool);
+
+        assert_eq!(
+            store
+                .acknowledge_degraded_field("nonexistent", "key-aaa", None)
+                .await
+                .unwrap(),
+            AckOutcome::Unpinned,
+            "no pin, nothing to acknowledge"
+        );
+        assert_eq!(
+            store
+                .acknowledge_degraded_field("host", "key-aaa", None)
+                .await
+                .unwrap(),
+            AckOutcome::NotDegraded,
+            "a pinned field with no evidence at all"
+        );
+
+        // Two episodes over 48 hours: the span is met, the volume is not
+        // (three episodes, or a hundred rows shelved).
+        degrade(&pool, "host", 2).await;
+        assert_eq!(
+            store
+                .acknowledge_degraded_field("host", "key-aaa", None)
+                .await
+                .unwrap(),
+            AckOutcome::NotDegraded,
+            "one episode short of the gate"
+        );
+        assert_eq!(store.degraded_ack("host").await.unwrap(), None);
+
+        // The episode that tips it over is acknowledgeable.
+        degrade(&pool, "host", 1).await;
+        assert!(matches!(
+            store
+                .acknowledge_degraded_field("host", "key-aaa", None)
+                .await
+                .unwrap(),
+            AckOutcome::Acked { .. }
+        ));
+    }
+
+    /// The operator's own un-acknowledge, and its idempotency: the second
+    /// clear removes nothing and says so.
+    #[sqlx::test]
+    async fn clearing_an_ack_reports_whether_a_row_went(pool: PgPool) {
+        let store = catalog(&pool);
+        degrade(&pool, "host", 3).await;
+        store
+            .acknowledge_degraded_field("host", "key-aaa", None)
+            .await
+            .unwrap();
+
+        assert!(store.clear_degraded_ack_owned("host").await.unwrap());
+        assert_eq!(store.degraded_ack("host").await.unwrap(), None);
+        assert!(
+            !store.clear_degraded_ack_owned("host").await.unwrap(),
+            "a second clear removes nothing"
+        );
+    }
+
+    /// An ack indicts a pin and cannot outlive one: dropping the
+    /// `field_types` row takes the acknowledgement with it.
+    #[sqlx::test]
+    async fn deleting_the_pin_cascades_the_ack_away(pool: PgPool) {
+        let store = catalog(&pool);
+        degrade(&pool, "host", 3).await;
+        store
+            .acknowledge_degraded_field("host", "key-aaa", None)
+            .await
+            .unwrap();
+        assert!(store.degraded_ack("host").await.unwrap().is_some());
+
+        sqlx::query("DELETE FROM field_types WHERE field = 'host'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.degraded_ack("host").await.unwrap(),
+            None,
+            "the FK cascade removed it"
+        );
+    }
+
+    /// The two aggregate SQL texts are separate for planner reasons, so they
+    /// are two places the ack join can drift. Keyed and unkeyed must report
+    /// the same acknowledged high-water for the same field, and `None` for a
+    /// field nobody acknowledged.
+    #[sqlx::test]
+    async fn both_aggregate_forms_report_the_same_acked_through(pool: PgPool) {
+        let store = catalog(&pool);
+        degrade(&pool, "host", 3).await;
+        degrade(&pool, "message", 3).await;
+        store
+            .acknowledge_degraded_field("host", "key-aaa", None)
+            .await
+            .unwrap();
+
+        let keyed = store
+            .conflict_aggregates(Some(&["host".to_owned(), "message".to_owned()]))
+            .await
+            .unwrap();
+        let all = store.conflict_aggregates(None).await.unwrap();
+        let through = |rows: &[trawl_server::catalog::analyzer::ConflictAggregate], f: &str| {
+            rows.iter()
+                .find(|a| a.field == f)
+                .expect("the field's evidence")
+                .ack_evidence_through
+        };
+        assert_eq!(through(&keyed, "host"), Some(3));
+        assert_eq!(through(&all, "host"), through(&keyed, "host"));
+        assert_eq!(
+            through(&keyed, "message"),
+            None,
+            "an unacknowledged field carries no high-water"
+        );
+        assert_eq!(through(&all, "message"), None);
+        assert_eq!(
+            keyed.len(),
+            all.len(),
+            "the join is LEFT: it must not drop a field"
+        );
+    }
+
+    /// `/schema/field` reads the verdict's inputs and the ack that
+    /// suppresses it as one fact, so the two cannot contradict each other in
+    /// one response.
+    #[sqlx::test]
+    async fn field_health_snapshot_carries_the_verdict_and_its_ack_together(pool: PgPool) {
+        let store = catalog(&pool);
+        degrade(&pool, "host", 3).await;
+
+        // Before the ack: evidence, no acknowledgement, no high-water.
+        let health = store.field_health_snapshot("host").await.unwrap();
+        let agg = health.aggregate.expect("the field has evidence");
+        assert_eq!(agg.episodes, 3);
+        assert_eq!(agg.ack_evidence_through, None);
+        assert!(health.ack.is_none());
+        assert!(
+            !health.evidence.is_empty(),
+            "the verdict's cited samples come from the same snapshot"
+        );
+
+        store
+            .acknowledge_degraded_field("host", "key-aaa", Some("known"))
+            .await
+            .unwrap();
+
+        let health = store.field_health_snapshot("host").await.unwrap();
+        let agg = health.aggregate.expect("the evidence is still there");
+        let ack = health.ack.expect("the acknowledgement");
+        assert_eq!(
+            agg.ack_evidence_through,
+            Some(ack.evidence_through),
+            "the aggregate's high-water and the ack row are one reading"
+        );
+        assert_eq!(ack.acked_by, "key-aaa");
+
+        // A field with no evidence at all: no aggregate, and no evidence
+        // query spent looking for rows that cannot exist.
+        let health = store.field_health_snapshot("service").await.unwrap();
+        assert!(health.aggregate.is_none());
+        assert!(health.evidence.is_empty());
+        assert!(health.ack.is_none());
+    }
+
+    /// The note cap is a CHECK, so an over-long note is refused rather than
+    /// silently truncated. 1024 bytes exactly is accepted.
+    #[sqlx::test]
+    async fn the_note_cap_is_enforced_in_bytes(pool: PgPool) {
+        let store = catalog(&pool);
+        degrade(&pool, "host", 3).await;
+
+        let at_cap = "n".repeat(1024);
+        assert!(matches!(
+            store
+                .acknowledge_degraded_field("host", "key-aaa", Some(&at_cap))
+                .await
+                .unwrap(),
+            AckOutcome::Acked { .. }
+        ));
+
+        let over = "n".repeat(1025);
+        store
+            .acknowledge_degraded_field("host", "key-aaa", Some(&over))
+            .await
+            .expect_err("an over-long note is refused");
+        let stored: String =
+            sqlx::query("SELECT note FROM field_degraded_ack WHERE field = 'host'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .try_get("note")
+                .unwrap();
+        assert_eq!(stored.len(), 1024, "the refused note did not land");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // repin jobs
 // ---------------------------------------------------------------------------
 
@@ -3682,7 +4052,7 @@ mod repin_store {
     use sqlx::PgPool;
     use trawl_core::schema::CanonicalType;
     use trawl_server::store::{
-        CatalogStore, RepinClaim, RepinJobStatus, RepinPlan, RepinStore, StoreError,
+        CatalogStore, JobTotals, RepinClaim, RepinJobStatus, RepinPlan, RepinStore, StoreError,
     };
 
     fn store(pool: &PgPool) -> RepinStore {
@@ -3724,6 +4094,8 @@ mod repin_store {
                 dry_run: false,
                 force: false,
                 requested_by: Some("key-1"),
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             })
             .await
             .unwrap();
@@ -3738,6 +4110,8 @@ mod repin_store {
                 dry_run: false,
                 force: false,
                 requested_by: None,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             })
             .await
             .expect_err("a second running job must refuse");
@@ -3745,7 +4119,7 @@ mod repin_store {
 
         // A terminal job frees the slot.
         assert!(
-            s.finish_if_running(id, RepinJobStatus::Failed, Some("test"))
+            s.finish_if_running(id, RepinJobStatus::Failed, Some("test"), None)
                 .await
                 .unwrap()
         );
@@ -3757,6 +4131,8 @@ mod repin_store {
             dry_run: false,
             force: false,
             requested_by: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
         })
         .await
         .expect("a terminal job frees the one-running slot");
@@ -3778,6 +4154,8 @@ mod repin_store {
                 dry_run: false,
                 force: false,
                 requested_by: None,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             }),
             s2.claim(RepinClaim {
                 field: "status",
@@ -3787,6 +4165,8 @@ mod repin_store {
                 dry_run: false,
                 force: false,
                 requested_by: None,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             }),
         );
         let wins = [&a, &b].iter().filter(|r| r.is_ok()).count();
@@ -3812,6 +4192,8 @@ mod repin_store {
                 dry_run: false,
                 force: false,
                 requested_by: None,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             })
             .await
             .unwrap();
@@ -3868,6 +4250,8 @@ mod repin_store {
                 dry_run: false,
                 force: false,
                 requested_by: None,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             })
             .await
             .unwrap();
@@ -3923,6 +4307,8 @@ mod repin_store {
                 dry_run: false,
                 force: true,
                 requested_by: None,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             })
             .await
             .unwrap();
@@ -3978,6 +4364,8 @@ mod repin_store {
                 dry_run: false,
                 force: false,
                 requested_by: None,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             })
             .await
             .unwrap();
@@ -4012,6 +4400,8 @@ mod repin_store {
                 dry_run: true,
                 force: false,
                 requested_by: None,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             })
             .await
             .unwrap();
@@ -4027,12 +4417,14 @@ mod repin_store {
                 unmapped_samples: vec!["gold".to_owned(), "platinum".to_owned()],
                 field_last_seen: Some(chrono::Utc::now()),
                 field_last_service: Some("nginx".to_owned()),
+                accepted_max_nulled_rows: None,
+                accepted_max_ambiguous_rows: None,
             },
         )
         .await
         .unwrap();
         assert!(
-            s.finish_if_running(first, RepinJobStatus::Succeeded, None)
+            s.finish_if_running(first, RepinJobStatus::Succeeded, None, None)
                 .await
                 .unwrap()
         );
@@ -4046,10 +4438,23 @@ mod repin_store {
                 dry_run: false,
                 force: true,
                 requested_by: Some("key-9"),
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             })
             .await
             .unwrap();
-        s.record_progress(second, 5, 1200, 2, 7, 3).await.unwrap();
+        s.record_progress(
+            second,
+            JobTotals {
+                files_done: 5,
+                rows_rewritten: 1200,
+                rows_nulled: 2,
+                rows_resurrected: 7,
+                ambiguous_numerals: 3,
+            },
+        )
+        .await
+        .unwrap();
 
         let latest = s.latest().await.unwrap().expect("a running job");
         assert_eq!(latest.id, second);
@@ -4067,9 +4472,14 @@ mod repin_store {
         );
 
         assert!(
-            s.finish_if_running(second, RepinJobStatus::Blocked, Some("cutover starved"))
-                .await
-                .unwrap()
+            s.finish_if_running(
+                second,
+                RepinJobStatus::Blocked,
+                Some("cutover starved"),
+                None
+            )
+            .await
+            .unwrap()
         );
         let latest = s.latest().await.unwrap().expect("newest terminal job");
         assert_eq!(latest.id, second);
@@ -4112,6 +4522,8 @@ mod repin_store {
             dry_run,
             force: false,
             requested_by: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
         };
 
         let id = s
@@ -4122,7 +4534,7 @@ mod repin_store {
         assert_eq!(job.to_type, "SEVERITY");
         assert_eq!(job.dialect.as_deref(), Some("syslog"));
         assert!(
-            s.finish_if_running(id, RepinJobStatus::Succeeded, None)
+            s.finish_if_running(id, RepinJobStatus::Succeeded, None, None)
                 .await
                 .unwrap()
         );
@@ -4139,6 +4551,8 @@ mod repin_store {
                 dry_run: true,
                 force: false,
                 requested_by: None,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
             })
             .await
             .expect("a repin away from SEVERITY is claimable");
@@ -4146,7 +4560,7 @@ mod repin_store {
         assert_eq!(job.from_type, "SEVERITY");
         assert_eq!(job.dialect, None);
         assert!(
-            s.finish_if_running(back, RepinJobStatus::Succeeded, None)
+            s.finish_if_running(back, RepinJobStatus::Succeeded, None, None)
                 .await
                 .unwrap()
         );
@@ -4162,6 +4576,422 @@ mod repin_store {
         s.claim(claim(CanonicalType::BigInt, Some(Dialect::Otel), true))
             .await
             .expect_err("only a SEVERITY job may carry a dialect");
+    }
+
+    /// The force ceilings round-trip: the REQUESTED numbers ride the claim,
+    /// the ACCEPTED ones ride the plan, and the job row reports all four
+    /// apart. Zero is a legitimate ceiling ("force the ambiguity, not one
+    /// row of loss"), so it must survive as zero rather than as absent.
+    #[sqlx::test]
+    async fn force_ceilings_round_trip_through_claim_and_plan(pool: PgPool) {
+        let s = store(&pool);
+        // The claim proves the pin it was prepared against (#110).
+        pin(&pool, "status", CanonicalType::BigInt).await;
+        let id = s
+            .claim(RepinClaim {
+                field: "status",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: false,
+                force: true,
+                max_nulled_rows: Some(40),
+                max_ambiguous_rows: Some(0),
+                requested_by: Some("key-1"),
+            })
+            .await
+            .unwrap();
+
+        let claimed = s.get(id).await.unwrap().unwrap();
+        assert_eq!(claimed.max_nulled_rows, Some(40));
+        assert_eq!(claimed.max_ambiguous_rows, Some(0));
+        assert_eq!(
+            (
+                claimed.accepted_max_nulled_rows,
+                claimed.accepted_max_ambiguous_rows
+            ),
+            (None, None),
+            "nothing is accepted until the scan resolves it"
+        );
+
+        s.record_plan(
+            id,
+            RepinPlan {
+                projected_nulls: 30,
+                accepted_max_nulled_rows: Some(40),
+                accepted_max_ambiguous_rows: Some(0),
+                ..RepinPlan::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let planned = s.get(id).await.unwrap().unwrap();
+        assert_eq!(planned.max_nulled_rows, Some(40), "the request's echo");
+        assert_eq!(planned.max_ambiguous_rows, Some(0));
+        assert_eq!(planned.accepted_max_nulled_rows, Some(40));
+        assert_eq!(planned.accepted_max_ambiguous_rows, Some(0));
+        assert!(planned.planned_at.is_some());
+    }
+
+    /// A job that states no ceiling reads back absent on all four columns —
+    /// the same shape a row written before migration 0015 has, which the
+    /// gate reads as the legacy blank check rather than as a ceiling of
+    /// zero.
+    #[sqlx::test]
+    async fn a_job_with_no_ceilings_reads_back_absent(pool: PgPool) {
+        let s = store(&pool);
+        // The claim proves the pin it was prepared against (#110), so the
+        // slot has to exist before the job can take it.
+        pin(&pool, "status", CanonicalType::BigInt).await;
+        let id = s
+            .claim(RepinClaim {
+                field: "status",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: true,
+                force: true,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
+                requested_by: None,
+            })
+            .await
+            .unwrap();
+        s.record_plan(id, RepinPlan::default()).await.unwrap();
+
+        let job = s.get(id).await.unwrap().unwrap();
+        assert_eq!(
+            (
+                job.max_nulled_rows,
+                job.max_ambiguous_rows,
+                job.accepted_max_nulled_rows,
+                job.accepted_max_ambiguous_rows,
+            ),
+            (None, None, None, None)
+        );
+    }
+
+    /// The cutover clears the operator's degraded acknowledgement with the
+    /// evidence it acknowledged, in the same transaction as the flip, and
+    /// says so exactly once.
+    #[sqlx::test]
+    async fn finish_cutover_clears_the_degraded_ack(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        for _ in 0..3 {
+            catalog
+                .record_conflicts(&[trawl_server::store::FieldConflict {
+                    field: "host".to_owned(),
+                    service: "svc-a".to_owned(),
+                    observed_type: "VARCHAR".to_owned(),
+                    expected_type: CanonicalType::BigInt,
+                    rows_nulled: 3,
+                    samples: vec!["n/a".to_owned()],
+                }])
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+             WHERE field = 'host'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        catalog
+            .acknowledge_degraded_field("host", "key-aaa", Some("known"))
+            .await
+            .unwrap();
+
+        let id = s
+            .claim(RepinClaim {
+                field: "host",
+                from_type: CanonicalType::Varchar,
+                to_type: CanonicalType::BigInt,
+                dialect: None,
+                dry_run: false,
+                force: false,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
+                requested_by: None,
+            })
+            .await
+            .unwrap();
+
+        let outcome = s
+            .finish_cutover(id, "host", CanonicalType::BigInt)
+            .await
+            .unwrap();
+        assert!(outcome.completed, "this call completed the job");
+        assert!(outcome.cleared_ack, "and removed the acknowledgement");
+        assert_eq!(catalog.degraded_ack("host").await.unwrap(), None);
+
+        let replay = s
+            .finish_cutover(id, "host", CanonicalType::BigInt)
+            .await
+            .unwrap();
+        assert!(!replay.completed, "the replay completed nothing");
+        assert!(!replay.cleared_ack, "so the audit event fires exactly once");
+    }
+
+    /// The replay gate covers the ack the same way it covers the evidence:
+    /// an acknowledgement written AFTER the flip describes the NEW pin, and
+    /// a boot replay of an already-succeeded cutover must leave it alone.
+    #[sqlx::test]
+    async fn finish_cutover_replay_keeps_an_ack_written_after_the_flip(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        let id = s
+            .claim(RepinClaim {
+                field: "host",
+                from_type: CanonicalType::Varchar,
+                to_type: CanonicalType::BigInt,
+                dialect: None,
+                dry_run: false,
+                force: true,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
+                requested_by: None,
+            })
+            .await
+            .unwrap();
+        s.finish_cutover(id, "host", CanonicalType::BigInt)
+            .await
+            .unwrap();
+
+        // The forced job's own outcome evidence, and an operator who has
+        // looked at it and accepted the new pin's losses too.
+        for _ in 0..3 {
+            catalog
+                .record_conflicts(&[trawl_server::store::FieldConflict {
+                    field: "host".to_owned(),
+                    service: "svc-a".to_owned(),
+                    observed_type: "VARCHAR".to_owned(),
+                    expected_type: CanonicalType::BigInt,
+                    rows_nulled: 3,
+                    samples: Vec::new(),
+                }])
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+             WHERE field = 'host'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        catalog
+            .acknowledge_degraded_field("host", "key-aaa", None)
+            .await
+            .unwrap();
+
+        let replay = s
+            .finish_cutover(id, "host", CanonicalType::BigInt)
+            .await
+            .unwrap();
+        assert!(!replay.completed);
+        assert!(!replay.cleared_ack);
+        assert!(
+            catalog.degraded_ack("host").await.unwrap().is_some(),
+            "the replay must not touch an ack written after the flip"
+        );
+    }
+
+    /// The terminal write can carry the tallies the caller decided on.
+    ///
+    /// The cutover's ceiling refusal is why: it gates on the finished
+    /// shadow's own counts, and the periodic `record_progress` write that
+    /// would otherwise have persisted them is best-effort, so a store blip
+    /// just before the gate would leave a `refused_needs_force` row beside
+    /// `rows_nulled: 0`. Passing `None` leaves the counters alone, which is
+    /// what every other terminal path wants.
+    #[sqlx::test]
+    async fn a_terminal_write_can_persist_the_counts_behind_its_verdict(pool: PgPool) {
+        let s = store(&pool);
+        pin(&pool, "dur", CanonicalType::Varchar).await;
+        let claim = RepinClaim {
+            field: "dur",
+            from_type: CanonicalType::Varchar,
+            to_type: CanonicalType::BigInt,
+            dialect: None,
+            dry_run: false,
+            force: true,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
+            requested_by: None,
+        };
+        let id = s.claim(claim).await.unwrap();
+
+        // No progress write has landed: the row's counters are the claim's
+        // zeros, exactly the state a failed progress write leaves.
+        assert_eq!(s.get(id).await.unwrap().unwrap().rows_nulled, 0);
+
+        assert!(
+            s.finish_if_running(
+                id,
+                RepinJobStatus::RefusedNeedsForce,
+                Some("11 nulled row(s) over an accepted 10"),
+                Some(JobTotals {
+                    files_done: 6,
+                    rows_rewritten: 17,
+                    rows_nulled: 11,
+                    rows_resurrected: 2,
+                    ambiguous_numerals: 4,
+                }),
+            )
+            .await
+            .unwrap()
+        );
+
+        let job = s.get(id).await.unwrap().unwrap();
+        assert_eq!(job.status, RepinJobStatus::RefusedNeedsForce);
+        assert_eq!(
+            (
+                job.files_done,
+                job.rows_rewritten,
+                job.rows_nulled,
+                job.rows_resurrected,
+                job.ambiguous_numerals
+            ),
+            (6, 17, 11, 2, 4),
+            "the refusal and the numbers behind it land in one statement"
+        );
+
+        // The write is conditional (#109), so a second one lands on a row
+        // that is no longer running: it reports it changed nothing, and
+        // neither the verdict nor the numbers behind it move.
+        assert!(
+            !s.finish_if_running(id, RepinJobStatus::Failed, Some("later"), None)
+                .await
+                .unwrap()
+        );
+        let job = s.get(id).await.unwrap().unwrap();
+        assert_eq!(job.status, RepinJobStatus::RefusedNeedsForce);
+        assert_eq!((job.rows_nulled, job.ambiguous_numerals), (11, 4));
+
+        // And `None` on a running job leaves whatever the progress writes
+        // recorded, which is what every other terminal path wants.
+        let second = s.claim(claim).await.unwrap();
+        s.record_progress(
+            second,
+            JobTotals {
+                files_done: 1,
+                rows_rewritten: 3,
+                rows_nulled: 0,
+                rows_resurrected: 0,
+                ambiguous_numerals: 0,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            s.finish_if_running(second, RepinJobStatus::Failed, Some("later"), None)
+                .await
+                .unwrap()
+        );
+        let job = s.get(second).await.unwrap().unwrap();
+        assert_eq!(job.status, RepinJobStatus::Failed);
+        assert_eq!((job.files_done, job.rows_rewritten), (1, 3));
+    }
+
+    /// A resurrection-only repin (`to == current`) writes no new type, so
+    /// the pin flip's `IS DISTINCT FROM` UPDATE matches no row and used to
+    /// take no lock. `acknowledge_degraded_field` serializes against the
+    /// cutover by taking `FOR SHARE` on the pin row, so with nothing to wait
+    /// on, an ack that had already read the episode sum could commit its
+    /// high-water after the cutover cleared the counters and suppress the
+    /// new pin's first episodes.
+    ///
+    /// The blocker holds exactly the lock the ack takes. Before the fix the
+    /// same-type cutover sailed past it; now it waits, and once the ack
+    /// releases, the cutover deletes the row the ack just wrote.
+    #[sqlx::test]
+    async fn same_type_cutover_waits_on_a_racing_ack(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        for _ in 0..3 {
+            catalog
+                .record_conflicts(&[trawl_server::store::FieldConflict {
+                    field: "host".to_owned(),
+                    service: "svc-a".to_owned(),
+                    observed_type: "VARCHAR".to_owned(),
+                    expected_type: CanonicalType::Varchar,
+                    rows_nulled: 3,
+                    samples: Vec::new(),
+                }])
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+             WHERE field = 'host'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        catalog
+            .acknowledge_degraded_field("host", "key-aaa", None)
+            .await
+            .unwrap();
+
+        // A resurrection-only job: same type in and out.
+        let id = s
+            .claim(RepinClaim {
+                field: "host",
+                from_type: CanonicalType::Varchar,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: false,
+                force: true,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
+                requested_by: None,
+            })
+            .await
+            .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM field_types WHERE field = 'host' FOR SHARE")
+            .fetch_optional(&mut *blocker)
+            .await
+            .unwrap();
+
+        let cutover_store = store(&pool);
+        let mut cutover = tokio::spawn(async move {
+            cutover_store
+                .finish_cutover(id, "host", CanonicalType::Varchar)
+                .await
+        });
+
+        let stalled = tokio::time::timeout(std::time::Duration::from_millis(500), &mut cutover)
+            .await
+            .is_err();
+        assert!(
+            stalled,
+            "the cutover must wait for the ack's row lock even when the type does not change"
+        );
+
+        blocker.rollback().await.unwrap();
+        let outcome = cutover.await.unwrap().unwrap();
+        assert!(outcome.completed);
+        assert!(
+            outcome.cleared_ack,
+            "the cutover that ran second removes the ack the racing operator wrote"
+        );
+        assert_eq!(catalog.degraded_ack("host").await.unwrap(), None);
+
+        // The other order: the cutover has cleared the evidence, so the next
+        // ack finds no verdict to suppress and refuses rather than
+        // installing a high-water over the new pin's counters.
+        assert_eq!(
+            catalog
+                .acknowledge_degraded_field("host", "key-aaa", None)
+                .await
+                .unwrap(),
+            trawl_server::store::AckOutcome::NotDegraded
+        );
     }
 
     /// The claim's half of the pin-gc race: the engine reads a field's pin
@@ -4186,6 +5016,8 @@ mod repin_store {
             dialect: None,
             dry_run: false,
             force: false,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
             requested_by: Some("ops"),
         };
         let err = s
@@ -4249,6 +5081,8 @@ mod repin_store {
             dialect: None,
             dry_run: false,
             force: false,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
             requested_by: Some("key-1"),
         })
         .await
@@ -4280,6 +5114,7 @@ mod repin_store {
                 id,
                 RepinJobStatus::Cancelled,
                 Some("cancelled by key-op during build; the live corpus was never touched"),
+                None,
             )
             .await
             .unwrap()
@@ -4316,7 +5151,7 @@ mod repin_store {
         assert_eq!(second.cancel_requested_at, first.cancel_requested_at);
 
         assert!(
-            s.finish_if_running(id, RepinJobStatus::Cancelled, Some("cancelled"))
+            s.finish_if_running(id, RepinJobStatus::Cancelled, Some("cancelled"), None)
                 .await
                 .unwrap()
         );
@@ -4345,14 +5180,19 @@ mod repin_store {
             .unwrap()
             .unwrap();
         assert!(
-            s.finish_if_running(id, RepinJobStatus::Cancelled, Some("cancelled by key-op"))
-                .await
-                .unwrap()
+            s.finish_if_running(
+                id,
+                RepinJobStatus::Cancelled,
+                Some("cancelled by key-op"),
+                None
+            )
+            .await
+            .unwrap()
         );
         let after_first = s.get(id).await.unwrap().unwrap();
 
         assert!(
-            !s.finish_if_running(id, RepinJobStatus::Succeeded, None)
+            !s.finish_if_running(id, RepinJobStatus::Succeeded, None, None)
                 .await
                 .unwrap(),
             "the row is no longer running"

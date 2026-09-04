@@ -71,14 +71,47 @@ pub struct ConflictAggregate {
     /// Rows nulled summed across those services — lifetime, unlike the
     /// `field_conflicts` window's sum.
     pub rows_nulled_total: i64,
+    /// The episode high-water an operator has acknowledged for this field
+    /// (`field_degraded_ack.evidence_through`), or `None` when nobody has.
+    pub ack_evidence_through: Option<i64>,
 }
 
-/// Whether the evidence indicts the pin: sustained AND consequential.
+/// Whether the evidence alone indicts the pin: sustained AND consequential.
+///
+/// The raw rule, blind to acknowledgement. Two callers need it that way:
+/// [`is_degraded`], which subtracts the operator's answer, and the ack
+/// route's store method, which must be able to advance an existing
+/// high-water on a field its own ack is currently suppressing.
 #[must_use]
-pub fn is_degraded(agg: &ConflictAggregate) -> bool {
+pub fn meets_degraded_threshold(agg: &ConflictAggregate) -> bool {
     agg.last_at - agg.first_at >= DEGRADED_MIN_SPAN
         && (agg.rows_nulled_total >= DEGRADED_MIN_ROWS_SHELVED
             || agg.episodes >= DEGRADED_MIN_EPISODES)
+}
+
+/// Whether the field is degraded as every read surface reports it: the
+/// evidence meets the threshold and no acknowledgement covers it.
+///
+/// Suppression is a comparison of COUNTS, not of clocks: an ack records the
+/// episode total it was written against, and evidence up to and including
+/// that total is what the operator saw. Episode 4 after an ack through 3
+/// re-raises the verdict. A timestamp high-water would lose to a clock tie —
+/// evidence recorded in the same transaction second as the ack would be
+/// suppressed unseen, and postgres' `now()` is the transaction's clock, so
+/// ties are ordinary rather than exotic.
+///
+/// The counter only grows (`field_conflict_stats.episodes` is a running sum,
+/// and a repin's clear deletes the ack with the evidence), so an ack can
+/// never suppress more than the operator acknowledged.
+#[must_use]
+pub fn is_degraded(agg: &ConflictAggregate) -> bool {
+    meets_degraded_threshold(agg) && !acknowledged(agg)
+}
+
+/// Whether an acknowledgement covers all the evidence there is.
+fn acknowledged(agg: &ConflictAggregate) -> bool {
+    agg.ack_evidence_through
+        .is_some_and(|through| agg.episodes <= through)
 }
 
 /// The type the evidence suggests repinning to.
@@ -167,6 +200,7 @@ mod tests {
             services: 1,
             episodes,
             rows_nulled_total: rows,
+            ack_evidence_through: None,
         }
     }
 
@@ -199,12 +233,71 @@ mod tests {
             ),
         ];
         for (span, episodes, rows, expect, why) in cases {
+            let a = agg(span, episodes, rows);
             assert_eq!(
-                is_degraded(&agg(span, episodes, rows)),
+                meets_degraded_threshold(&a),
                 expect,
                 "{why}: span={span}, episodes={episodes}, rows={rows}"
             );
+            assert_eq!(
+                is_degraded(&a),
+                expect,
+                "unacknowledged, the two halves agree: {why}"
+            );
         }
+    }
+
+    /// The suppression half, at its boundary. The threshold is met in every
+    /// row, so the ack is the only thing deciding — and it decides on the
+    /// episode count, which is why the two suppressed rows carry different
+    /// clocks and the same verdict.
+    #[test]
+    fn an_ack_suppresses_evidence_up_to_its_high_water() {
+        let day = TimeDelta::hours(25);
+        let cases: [(i64, Option<i64>, bool, &str); 5] = [
+            (3, None, true, "threshold met, nobody acknowledged it"),
+            (3, Some(3), false, "acknowledged through the last episode"),
+            (4, Some(3), true, "one episode past the ack re-raises it"),
+            (
+                3,
+                Some(9),
+                false,
+                "a high-water above the count still covers it (the counter \
+                 only grows, so this is a cleared-evidence remnant)",
+            ),
+            (3, Some(0), true, "a zero high-water suppresses nothing"),
+        ];
+        for (episodes, through, expect, why) in cases {
+            let mut a = agg(day, episodes, 0);
+            a.ack_evidence_through = through;
+            assert!(
+                meets_degraded_threshold(&a),
+                "the raw rule ignores the ack: {why}"
+            );
+            assert_eq!(is_degraded(&a), expect, "{why}");
+        }
+    }
+
+    /// Two fields whose newest evidence lands on the same instant, one
+    /// acknowledged through 3 episodes and one at 4: the count decides, and
+    /// an identical clock changes nothing. This is the case a timestamp
+    /// high-water would get wrong.
+    #[test]
+    fn equal_clocks_differing_counts_are_decided_by_the_count() {
+        let shared_last_at = Utc::now();
+        let build = |episodes: i64| ConflictAggregate {
+            first_at: shared_last_at - TimeDelta::hours(48),
+            last_at: shared_last_at,
+            episodes,
+            ..agg(TimeDelta::hours(48), episodes, 0)
+        };
+        let mut acked = build(3);
+        acked.ack_evidence_through = Some(3);
+        let mut raised = build(4);
+        raised.ack_evidence_through = Some(3);
+        assert_eq!(acked.last_at, raised.last_at, "same clock");
+        assert!(!is_degraded(&acked));
+        assert!(is_degraded(&raised));
     }
 
     /// One sender is enough: there is no multi-sender gate.

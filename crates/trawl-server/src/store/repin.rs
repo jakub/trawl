@@ -134,6 +134,17 @@ pub struct RepinJob {
     pub field_last_seen: Option<DateTime<Utc>>,
     /// One service behind that observation (audit/display only).
     pub field_last_service: Option<String>,
+    /// Ceiling on nulled rows as the REQUEST stated it, or `None` when the
+    /// operator stated none (or the row predates migration 0015).
+    pub max_nulled_rows: Option<i64>,
+    /// Ceiling on dialect-ambiguous numerals as the request stated it.
+    pub max_ambiguous_rows: Option<i64>,
+    /// The nulled-row ceiling the job is actually HELD to, resolved once at
+    /// plan time. `None` until the scan records its plan, and on every
+    /// legacy row (the blank-check force).
+    pub accepted_max_nulled_rows: Option<i64>,
+    /// The ambiguity ceiling the job is held to. See above.
+    pub accepted_max_ambiguous_rows: Option<i64>,
     /// When the scan recorded its plan, if it has. Until then the row's
     /// counts are zeros that mean "not measured yet", not "nothing to
     /// report", which is why the force verdict is absent rather than false
@@ -173,6 +184,12 @@ pub struct RepinClaim<'a> {
     pub dry_run: bool,
     /// Whether a lossy projection was explicitly accepted.
     pub force: bool,
+    /// The nulled-row ceiling the request asked for, if it asked for one.
+    /// The REQUEST's number, echoed back unchanged; what the job is held to
+    /// is resolved at plan time and rides [`RepinPlan`].
+    pub max_nulled_rows: Option<i64>,
+    /// The ambiguity ceiling the request asked for, if any. See above.
+    pub max_ambiguous_rows: Option<i64>,
     /// Requesting key's display name (audit).
     pub requested_by: Option<&'a str>,
 }
@@ -203,6 +220,51 @@ pub struct RepinPlan {
     pub field_last_seen: Option<DateTime<Utc>>,
     /// One service behind that observation.
     pub field_last_service: Option<String>,
+    /// The nulled-row ceiling this job is held to, resolved from the scan
+    /// above plus whatever the request stated. Written in the same statement
+    /// as the counts it was derived from, because a row carrying a ceiling
+    /// resolved from a different scan would report terms no gate ever
+    /// applied. `None` only for an unforced job, which refuses on any loss
+    /// and has nothing to hold.
+    pub accepted_max_nulled_rows: Option<i64>,
+    /// The ambiguity ceiling this job is held to. See above.
+    pub accepted_max_ambiguous_rows: Option<i64>,
+}
+
+/// The rewrite's running tallies: what the shadow generation holds so far.
+///
+/// One struct rather than five positional `i64`s, because the periodic
+/// progress write and the terminal write that carries a refusal's numbers
+/// stamp the same five columns and must not drift apart in their order.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JobTotals {
+    /// Affected files rewritten so far.
+    pub files_done: i64,
+    /// Rows written through the rewrite.
+    pub rows_rewritten: i64,
+    /// Stored values the rewrite nulled.
+    pub rows_nulled: i64,
+    /// Values resurrected from `_raw`.
+    pub rows_resurrected: i64,
+    /// Rows whose numeral reads differently in each dialect.
+    pub ambiguous_numerals: i64,
+}
+
+/// What one call to [`RepinStore::finish_cutover`] actually did.
+///
+/// The call is idempotent, so "did the flip work" is not the interesting
+/// question — a boot replay of an already-succeeded job returns success
+/// having changed nothing. What the caller needs to know is whether THIS
+/// call was the one that completed the job, because the side effects gated
+/// on that (the evidence clear, the ack clear) are the ones an audit event
+/// may be emitted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutoverOutcome {
+    /// This call moved the job from `running` to `succeeded`.
+    pub completed: bool,
+    /// This call removed the field's degraded acknowledgement. False when
+    /// there was none, and always false on a replay.
+    pub cleared_ack: bool,
 }
 
 fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
@@ -236,6 +298,10 @@ fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
         unmapped_samples: row.try_get("unmapped_samples")?,
         field_last_seen: row.try_get("field_last_seen")?,
         field_last_service: row.try_get("field_last_service")?,
+        max_nulled_rows: row.try_get("max_nulled_rows")?,
+        max_ambiguous_rows: row.try_get("max_ambiguous_rows")?,
+        accepted_max_nulled_rows: row.try_get("accepted_max_nulled_rows")?,
+        accepted_max_ambiguous_rows: row.try_get("accepted_max_ambiguous_rows")?,
         planned_at: row.try_get("planned_at")?,
         cancel_requested_at: row.try_get("cancel_requested_at")?,
         cancelled_by: row.try_get("cancelled_by")?,
@@ -246,7 +312,8 @@ const JOB_COLS: &str = "id, field, from_type, to_type, dry_run, force, status, r
      started_at, finished_at, error, files_total, rows_carrying, projected_nulls, \
      resurrectable, affected_bytes, files_done, rows_rewritten, rows_nulled, rows_resurrected, \
      dialect, ambiguous_numerals, unmapped_samples, field_last_seen, field_last_service, \
-     planned_at, cancel_requested_at, cancelled_by";
+     max_nulled_rows, max_ambiguous_rows, accepted_max_nulled_rows, \
+     accepted_max_ambiguous_rows, planned_at, cancel_requested_at, cancelled_by";
 
 /// Postgres-backed repin job store. Cheap to clone (shared pool).
 #[derive(Debug, Clone)]
@@ -303,8 +370,8 @@ impl RepinStore {
 
         let result = sqlx::query_scalar::<_, i64>(
             "INSERT INTO repin_jobs (field, from_type, to_type, dialect, dry_run, force,
-                                     requested_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                     max_nulled_rows, max_ambiguous_rows, requested_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              RETURNING id",
         )
         .bind(claim.field)
@@ -313,6 +380,8 @@ impl RepinStore {
         .bind(claim.dialect.map(Dialect::token))
         .bind(claim.dry_run)
         .bind(claim.force)
+        .bind(claim.max_nulled_rows)
+        .bind(claim.max_ambiguous_rows)
         .bind(claim.requested_by)
         .fetch_one(&mut *tx)
         .await;
@@ -325,12 +394,18 @@ impl RepinStore {
     }
 
     /// Stamp the scan's whole reading onto the job row.
+    ///
+    /// The accepted ceilings ride the same statement as the counts they were
+    /// resolved from: they are one reading of the corpus, and a row whose
+    /// terms came from a different scan than its numbers would describe a
+    /// decision nothing ever made.
     pub async fn record_plan(&self, id: i64, plan: RepinPlan) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE repin_jobs
              SET files_total = $2, rows_carrying = $3, projected_nulls = $4,
                  resurrectable = $5, affected_bytes = $6, ambiguous_numerals = $7,
                  unmapped_samples = $8, field_last_seen = $9, field_last_service = $10,
+                 accepted_max_nulled_rows = $11, accepted_max_ambiguous_rows = $12,
                  planned_at = now()
              WHERE id = $1",
         )
@@ -344,6 +419,8 @@ impl RepinStore {
         .bind(&plan.unmapped_samples)
         .bind(plan.field_last_seen)
         .bind(plan.field_last_service.as_deref())
+        .bind(plan.accepted_max_nulled_rows)
+        .bind(plan.accepted_max_ambiguous_rows)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -356,15 +433,7 @@ impl RepinStore {
     /// written files, and then the shadow's own count (including everything
     /// the catch-up passes folded in) supersedes it. That count is what the
     /// cutover's force gate decides on, so it is what the report must show.
-    pub async fn record_progress(
-        &self,
-        id: i64,
-        files_done: i64,
-        rows_rewritten: i64,
-        rows_nulled: i64,
-        rows_resurrected: i64,
-        ambiguous_numerals: i64,
-    ) -> Result<(), StoreError> {
+    pub async fn record_progress(&self, id: i64, totals: JobTotals) -> Result<(), StoreError> {
         sqlx::query(
             "UPDATE repin_jobs
              SET files_done = $2, rows_rewritten = $3, rows_nulled = $4,
@@ -372,11 +441,11 @@ impl RepinStore {
              WHERE id = $1",
         )
         .bind(id)
-        .bind(files_done)
-        .bind(rows_rewritten)
-        .bind(rows_nulled)
-        .bind(rows_resurrected)
-        .bind(ambiguous_numerals)
+        .bind(totals.files_done)
+        .bind(totals.rows_rewritten)
+        .bind(totals.rows_nulled)
+        .bind(totals.rows_resurrected)
+        .bind(totals.ambiguous_numerals)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -395,21 +464,43 @@ impl RepinStore {
     ///
     /// `finish_cutover` terminalizes under the same `status = 'running'`
     /// condition, so a job whose cutover completed reads `false` here.
+    ///
+    /// `totals` is `Some` when the caller holds counts the row must not
+    /// contradict — the cutover's ceiling refusal is the case that matters:
+    /// it decides on the finished shadow's own tallies, and the periodic
+    /// `record_progress` write that would otherwise have carried them is
+    /// best-effort, so a store blip immediately before the refusal would
+    /// leave the wire reporting `refused_needs_force` beside `rows_nulled:
+    /// 0`. Writing them in the same statement as the status makes the
+    /// verdict and the numbers behind it land together or not at all. `None`
+    /// leaves the counters as they stand. A `false` return leaves them
+    /// untouched too: the row this call lost to is the one that decided.
     pub async fn finish_if_running(
         &self,
         id: i64,
         status: RepinJobStatus,
         error: Option<&str>,
+        totals: Option<JobTotals>,
     ) -> Result<bool, StoreError> {
         debug_assert_ne!(status, RepinJobStatus::Running);
         let done = sqlx::query(
             "UPDATE repin_jobs
-             SET status = $2, error = $3, finished_at = COALESCE(finished_at, now())
+             SET status = $2, error = $3, finished_at = COALESCE(finished_at, now()),
+                 files_done = COALESCE($4, files_done),
+                 rows_rewritten = COALESCE($5, rows_rewritten),
+                 rows_nulled = COALESCE($6, rows_nulled),
+                 rows_resurrected = COALESCE($7, rows_resurrected),
+                 ambiguous_numerals = COALESCE($8, ambiguous_numerals)
              WHERE id = $1 AND status = 'running'",
         )
         .bind(id)
         .bind(status.as_str())
         .bind(error)
+        .bind(totals.map(|t| t.files_done))
+        .bind(totals.map(|t| t.rows_rewritten))
+        .bind(totals.map(|t| t.rows_nulled))
+        .bind(totals.map(|t| t.rows_resurrected))
+        .bind(totals.map(|t| t.ambiguous_numerals))
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -465,19 +556,47 @@ impl RepinStore {
     /// forever and the operator's remedy would not clear the sign that told
     /// them to apply it.
     ///
-    /// The clear is gated on this call being the one that completed the job,
-    /// the only part of the flip that is not naturally idempotent. A forced
-    /// lossy repin records fresh evidence after `finish_cutover` returns
-    /// (`repin::engine`'s `record_outcome`), so an ungated boot replay of an
-    /// already-succeeded job would delete evidence describing the new pin,
-    /// which nothing would ever write again.
+    /// The operator's acknowledgement of the degraded badge goes with it, in
+    /// the same transaction and under the same gate: an ack suppresses a
+    /// verdict about a pin, and that pin is gone. Whether the DELETE removed
+    /// anything comes back on [`CutoverOutcome::cleared_ack`], so the audit
+    /// event fires for the clear that happened and never for a boot replay
+    /// of it. One line per OBSERVED clear, which is weaker than one per
+    /// clear: the DELETE commits here, and a crash before the caller emits
+    /// loses the line with nothing left to replay it from
+    /// (`repin::engine`).
+    ///
+    /// Both clears are gated on this call being the one that completed the
+    /// job, the only part of the flip that is not naturally idempotent. A
+    /// forced lossy repin records fresh evidence after `finish_cutover`
+    /// returns (`repin::engine`'s `record_outcome`), so an ungated boot
+    /// replay of an already-succeeded job would delete evidence describing
+    /// the new pin, which nothing would ever write again — and an ack an
+    /// operator wrote after the flip would go the same way.
+    ///
+    /// The transaction OPENS with `SELECT 1 FROM field_types WHERE field =
+    /// $1 FOR UPDATE`, and that lock is not incidental to the pin flip. The
+    /// flip's own UPDATE is predicated `duckdb_type IS DISTINCT FROM $2`, so
+    /// a resurrection-only repin (`to == current`) matches no row and takes
+    /// no lock at all. `acknowledge_degraded_field` serializes against this
+    /// transaction by taking `FOR SHARE` on that same row, so without the
+    /// explicit lock a same-type cutover has nothing for the ack to wait on:
+    /// the ack reads the episode sum, this transaction clears the evidence
+    /// and the ack row, and the ack's upsert lands afterwards as a
+    /// high-water over counters that were just reset — suppressing the new
+    /// pin's first episodes. Locking unconditionally makes the two orders
+    /// the only two outcomes for every repin, not just the retyping ones.
     pub async fn finish_cutover(
         &self,
         id: i64,
         field: &str,
         to_type: CanonicalType,
-    ) -> Result<(), StoreError> {
+    ) -> Result<CutoverOutcome, StoreError> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT 1 FROM field_types WHERE field = $1 FOR UPDATE")
+            .bind(field)
+            .fetch_optional(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE field_types
              SET duckdb_type = $2, pinned_from = '_repin', pinned_at = now()
@@ -496,11 +615,16 @@ impl RepinStore {
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        let mut cleared_ack = false;
         if completed > 0 {
             super::CatalogStore::clear_conflict_evidence(&mut tx, field).await?;
+            cleared_ack = super::CatalogStore::clear_degraded_ack(&mut tx, field).await?;
         }
         tx.commit().await?;
-        Ok(())
+        Ok(CutoverOutcome {
+            completed: completed > 0,
+            cleared_ack,
+        })
     }
 
     /// Read one job row.

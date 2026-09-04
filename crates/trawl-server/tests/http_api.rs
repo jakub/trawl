@@ -2038,7 +2038,14 @@ async fn repin_permission_matrix() {
     // no schema_write.
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
     let err = admin
-        .schema_repin("status", "VARCHAR", None, true, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            trawl_client::RepinCeilings::default(),
+        )
         .await
         .expect_err("admin lacks schema_write");
     match err {
@@ -2057,7 +2064,14 @@ async fn repin_permission_matrix() {
     // then refused on the merits, with no side effect).
     let schema_admin = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
     let err = schema_admin
-        .schema_repin("never_pinned_field", "VARCHAR", None, true, false)
+        .schema_repin(
+            "never_pinned_field",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            trawl_client::RepinCeilings::default(),
+        )
         .await
         .expect_err("unpinned field refuses on the merits");
     match err {
@@ -2077,7 +2091,14 @@ async fn repin_permission_matrix() {
     let status = reader.schema_repin_status().await.unwrap();
     assert!(status.job.is_none(), "no repin has run on this server");
     let err = reader
-        .schema_repin("status", "VARCHAR", None, true, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            trawl_client::RepinCeilings::default(),
+        )
         .await
         .expect_err("reader lacks schema_write");
     match err {
@@ -2145,7 +2166,14 @@ async fn repin_validation_refusals_are_side_effect_free() {
         ("status", "SEVERITY"),
     ] {
         let err = client
-            .schema_repin(field, to, None, true, false)
+            .schema_repin(
+                field,
+                to,
+                None,
+                true,
+                false,
+                trawl_client::RepinCeilings::default(),
+            )
             .await
             .expect_err("must refuse");
         match err {

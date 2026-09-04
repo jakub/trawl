@@ -12,14 +12,14 @@ pub mod client;
 pub mod error;
 pub mod types;
 
-pub use client::{HttpClient, RepinCancel, RepinStart};
+pub use client::{HttpClient, RepinCancel, RepinCeilings, RepinStart};
 pub use error::ClientError;
 pub use types::{
     ActiveQuerySnapshot, CancelResponse, CatalogConflictRow, CatalogConflictsResponse,
     CatalogFieldResponse, CatalogFieldServiceRow, CatalogFieldSummary, CatalogFieldsResponse,
     CompletedQuerySnapshot, CreateSavedRequest, DashboardSnapshot, DegradedVerdict,
     DeleteSavedResponse, ErrorCode, ErrorDetail, ErrorEnvelope, ErrorResponse, ErrorSpan,
-    ExportFormat, ExportRequest, FieldValuesResponse, GcPinCandidate, GcPinsResponse,
+    ExportFormat, ExportRequest, FieldAck, FieldValuesResponse, GcPinCandidate, GcPinsResponse,
     HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse, IngestEventError,
     IngestResponse, ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse,
     QueryRequest, QueryResponse, QueryStatus, RepinCancelOutcome, RepinCancelResponse,

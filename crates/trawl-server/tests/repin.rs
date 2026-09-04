@@ -13,9 +13,11 @@ use std::time::Duration;
 
 use common::{TestServer, setup_in_dir_with_data};
 use serde_json::json;
-use trawl_client::{HttpClient, RepinStart};
+use trawl_client::{HttpClient, RepinCeilings, RepinStart};
 use trawl_server::catalog::CatalogContext;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::repin::ceiling::RequestedCeilings;
+use trawl_server::repin::{RepinEngine, StartOutcome};
 
 fn now_ts() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
@@ -277,7 +279,14 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
     // (VARCHAR is the always-lossless target).
     let dry = match h
         .schema_admin
-        .schema_repin("status", "varchar", None, true, false)
+        .schema_repin(
+            "status",
+            "varchar",
+            None,
+            true,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("dry run")
     {
@@ -293,7 +302,14 @@ async fn repin_is_invisible_to_queries_and_resurrects_shelved_values() {
     // Execute; the dry-run projection is the rewrite's outcome.
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -366,7 +382,14 @@ async fn a_cutover_retypes_the_schema_endpoint_immediately() {
 
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -422,7 +445,14 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     // Lossy without force: 409, plan attached, nothing changed.
     let refused = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", None, false, false)
+        .schema_repin(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("refusal is a decoded outcome, not a transport error")
     {
@@ -438,7 +468,7 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     // evidence like any lossy conform.
     let started = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", None, false, true)
+        .schema_repin("dur", "BIGINT", None, false, true, RepinCeilings::default())
         .await
         .expect("forced execute")
     {
@@ -450,19 +480,33 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     assert_eq!(done.rows_nulled, 1);
     assert_eq!(h.pinned_type("dur").await, "BIGINT");
 
-    let conflicts = h
-        .query
-        .catalog_conflicts(Some("dur"), None, None, None)
-        .await
-        .expect("conflicts");
-    assert!(
-        conflicts
+    // The evidence lands AFTER the flip: the job row reads `succeeded` the
+    // moment the pin flip commits, and `record_outcome` writes the conflict
+    // rows once the cutover's guards are released. So poll for it rather
+    // than read once — on a loaded machine the single read raced the write
+    // and reported an empty list.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let conflicts = loop {
+        let conflicts = h
+            .query
+            .catalog_conflicts(Some("dur"), None, None, None)
+            .await
+            .expect("conflicts");
+        if conflicts
             .conflicts
             .iter()
-            .any(|c| c.expected_type == "BIGINT" && c.rows_nulled == 1),
-        "a forced lossy repin records its losses: {:?}",
-        conflicts.conflicts
-    );
+            .any(|c| c.expected_type == "BIGINT" && c.rows_nulled == 1)
+        {
+            break conflicts;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a forced lossy repin records its losses: {:?}",
+            conflicts.conflicts
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(conflicts.conflicts.len(), 1, "{:?}", conflicts.conflicts);
 
     // The numeric survivor still answers.
     assert_eq!(
@@ -501,7 +545,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
     }
     let dry = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", None, true, false)
+        .schema_repin("dur", "BIGINT", None, true, false, RepinCeilings::default())
         .await
         .expect("dry run")
     {
@@ -515,7 +559,14 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
         .store(400, std::sync::atomic::Ordering::Relaxed);
     let started = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", None, false, false)
+        .schema_repin(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -552,7 +603,7 @@ async fn late_arriving_loss_refuses_the_cutover_without_force() {
     // The operator's answer: the same repin, forced, accepts the loss.
     let forced = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", None, false, true)
+        .schema_repin("dur", "BIGINT", None, false, true, RepinCeilings::default())
         .await
         .expect("forced execute")
     {
@@ -590,7 +641,15 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         .clone()
         .expect("an ingest-enabled node owns a repin engine");
     TEST_SCAN_DELAY_MS.store(500, Ordering::Relaxed);
-    let mut start = Box::pin(engine.start("status", "VARCHAR", None, true, false, Some("op")));
+    let mut start = Box::pin(engine.start(
+        "status",
+        "VARCHAR",
+        None,
+        true,
+        false,
+        RequestedCeilings::default(),
+        Some("op"),
+    ));
     // Let the claim land and the scan begin, then drop the future exactly
     // as hyper drops a handler whose connection went away.
     assert!(
@@ -633,7 +692,14 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
     // And the slot is free: the next repin is served, not 409ed.
     match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, true, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("the running slot is free again")
     {
@@ -690,7 +756,14 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
 
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -702,7 +775,14 @@ async fn ingest_queries_and_a_second_repin_ride_through_a_slow_rewrite() {
     // through the error envelope.
     let second = h
         .schema_admin
-        .schema_repin("status", "DOUBLE", None, false, false)
+        .schema_repin(
+            "status",
+            "DOUBLE",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await;
     match second {
         Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 409),
@@ -876,7 +956,14 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
     coordinator.set_cutover_hold_ms(3_000);
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1035,6 +1122,8 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
             dry_run: false,
             force: false,
             requested_by: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
         })
         .await
         .unwrap();
@@ -1164,6 +1253,8 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
             dry_run: false,
             force: false,
             requested_by: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
         })
         .await
         .unwrap();
@@ -1202,7 +1293,14 @@ async fn resurrection_only_pass_recovers_without_retyping() {
     // Same type without force is a 400 (nothing to do without intent).
     let err = h
         .schema_admin
-        .schema_repin("status", "BIGINT", None, false, false)
+        .schema_repin(
+            "status",
+            "BIGINT",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect_err("same-type without force refuses");
     match err {
@@ -1216,7 +1314,14 @@ async fn resurrection_only_pass_recovers_without_retyping() {
     // return.
     let dry = match h
         .schema_admin
-        .schema_repin("status", "BIGINT", None, true, true)
+        .schema_repin(
+            "status",
+            "BIGINT",
+            None,
+            true,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("dry run")
     {
@@ -1258,6 +1363,8 @@ async fn boot_reconciliation_replays_a_severity_cutover() {
             dry_run: false,
             force: true,
             requested_by: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
         })
         .await
         .unwrap();
@@ -1328,6 +1435,28 @@ async fn boot_reconciliation_replays_a_severity_cutover() {
     assert!(!trawl_server::repin::marker_path(&data).exists());
 }
 
+/// A dry run through the HTTP client, unwrapped to its report.
+///
+/// The ceilings stay at their defaults: a dry run mutates nothing, so what
+/// it is held to is the scan-derived number, which is the one an operator
+/// reading the plan is offered.
+async fn dry_run(
+    client: &HttpClient,
+    field: &str,
+    to: &str,
+    dialect: Option<&str>,
+    force: bool,
+) -> trawl_client::RepinJobResponse {
+    match client
+        .schema_repin(field, to, dialect, true, force, RepinCeilings::default())
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    }
+}
+
 /// A dry run must say whether the IDENTICAL executing request would refuse
 /// (issue #79): the plan's numbers alone read as a clean 200, and an
 /// operator would learn about the force gate from the request that was
@@ -1348,15 +1477,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
     assert_eq!(h.pinned_type("pri").await, "VARCHAR");
 
     // (1) Loss: `gold` has no reading at all.
-    let dry = match h
-        .schema_admin
-        .schema_repin("level", "severity", None, true, false)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let dry = dry_run(&h.schema_admin, "level", "severity", None, false).await;
     assert_eq!(dry.status, "succeeded", "a dry run still succeeds");
     assert_eq!(dry.projected_nulls, 1);
     assert_eq!(
@@ -1386,15 +1507,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
 
     // (2) Ambiguity: nothing is lost, but `3` means err to syslog and
     // trace3 to OTel — the gate fires on the default OTel reading.
-    let dry = match h
-        .schema_admin
-        .schema_repin("pri", "severity", None, true, false)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let dry = dry_run(&h.schema_admin, "pri", "severity", None, false).await;
     assert_eq!(dry.projected_nulls, 0, "every value has an OTel reading");
     assert_eq!(dry.ambiguous_numerals, 1);
     assert_eq!(dry.requires_force, Some(true), "{dry:?}");
@@ -1404,15 +1517,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
 
     // Asserting syslog answers the ambiguity, so the same corpus needs no
     // force at all — and `--force` clears the OTel one.
-    let dry = match h
-        .schema_admin
-        .schema_repin("pri", "severity", Some("syslog"), true, false)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let dry = dry_run(&h.schema_admin, "pri", "severity", Some("syslog"), false).await;
     assert_eq!(dry.dialect.as_deref(), Some("syslog"));
     assert_eq!(dry.ambiguous_numerals, 1, "the COUNT is dialect-blind");
     assert_eq!(
@@ -1420,15 +1525,7 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
         Some(false),
         "an asserted dialect IS the answer to the ambiguity: {dry:?}"
     );
-    let forced = match h
-        .schema_admin
-        .schema_repin("pri", "severity", None, true, true)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let forced = dry_run(&h.schema_admin, "pri", "severity", None, true).await;
     assert_eq!(
         forced.requires_force,
         Some(false),
@@ -1455,7 +1552,14 @@ async fn the_force_verdict_is_absent_until_the_scan_has_a_plan() {
     let client = h.schema_admin.clone();
     let dry = tokio::spawn(async move {
         client
-            .schema_repin("level", "severity", None, true, false)
+            .schema_repin(
+                "level",
+                "severity",
+                None,
+                true,
+                false,
+                RepinCeilings::default(),
+            )
             .await
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1492,15 +1596,7 @@ async fn the_force_verdict_is_absent_until_the_scan_has_a_plan() {
 
     // The third state: a plan with nothing to accept (a BIGINT field to
     // VARCHAR, which is lossless by construction).
-    let clean = match h
-        .schema_admin
-        .schema_repin("dur", "varchar", None, true, false)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let clean = dry_run(&h.schema_admin, "dur", "varchar", None, false).await;
     assert_eq!(
         clean.requires_force,
         Some(false),
@@ -1529,15 +1625,7 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite() {
     assert_eq!(h.pinned_type("level").await, "VARCHAR");
     assert_eq!(h.count("last=1h | stats count()").await, 5);
 
-    let dry = match h
-        .schema_admin
-        .schema_repin("level", "severity", None, true, false)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let dry = dry_run(&h.schema_admin, "level", "severity", None, false).await;
     assert_eq!(dry.files_total, 1);
     assert_eq!(dry.rows_carrying, 5, "every row carries a level");
     assert_eq!(dry.projected_nulls, 1, "only `gold` has no reading");
@@ -1565,7 +1653,14 @@ async fn repin_to_severity_dry_run_matches_the_executed_rewrite() {
     // the scan projected.
     let started = match h
         .schema_admin
-        .schema_repin("level", "severity", None, false, true)
+        .schema_repin(
+            "level",
+            "severity",
+            None,
+            false,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1624,7 +1719,14 @@ async fn a_syslog_repin_inverts_the_ladder_and_persists_the_assertion() {
     // still a loss, so this run is forced for that reason.
     let started = match h
         .schema_admin
-        .schema_repin("level", "severity", Some("syslog"), false, true)
+        .schema_repin(
+            "level",
+            "severity",
+            Some("syslog"),
+            false,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1673,15 +1775,7 @@ async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key() {
         "the token was shelved by the BIGINT pin"
     );
 
-    let dry = match h
-        .schema_admin
-        .schema_repin("lvl", "severity", None, true, true)
-        .await
-        .expect("dry run")
-    {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
+    let dry = dry_run(&h.schema_admin, "lvl", "severity", None, true).await;
     assert_eq!(
         dry.resurrectable, 1,
         "the shelved `error` is recoverable from _raw under a case-variant key"
@@ -1690,7 +1784,14 @@ async fn resurrection_recovers_a_shelved_token_under_a_case_variant_key() {
 
     let started = match h
         .schema_admin
-        .schema_repin("lvl", "severity", None, false, true)
+        .schema_repin(
+            "lvl",
+            "severity",
+            None,
+            false,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1718,7 +1819,14 @@ async fn post_repin_severity_binds_in_every_lane_including_live_ingest() {
     h.ingest_and_compact(&severity_corpus()).await;
     let started = match h
         .schema_admin
-        .schema_repin("level", "severity", None, false, true)
+        .schema_repin(
+            "level",
+            "severity",
+            None,
+            false,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1805,7 +1913,14 @@ async fn a_catch_up_pass_rides_the_jobs_dialect_while_live_ingest_stays_otel() {
 
     let started = match h
         .schema_admin
-        .schema_repin("level", "severity", Some("syslog"), false, true)
+        .schema_repin(
+            "level",
+            "severity",
+            Some("syslog"),
+            false,
+            true,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -1997,7 +2112,14 @@ async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
 
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -2126,7 +2248,14 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
     let client = h.schema_admin.clone();
     let dry = tokio::spawn(async move {
         client
-            .schema_repin("status", "VARCHAR", None, true, false)
+            .schema_repin(
+                "status",
+                "VARCHAR",
+                None,
+                true,
+                false,
+                RepinCeilings::default(),
+            )
             .await
     });
     await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
@@ -2201,7 +2330,14 @@ async fn a_cancel_past_the_point_of_no_return_is_refused_and_the_job_completes()
 
     let started = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -2268,6 +2404,8 @@ async fn a_crash_between_a_cancel_request_and_its_effect_recovers_as_failed() {
         dialect: None,
         dry_run: false,
         force: false,
+        max_nulled_rows: None,
+        max_ambiguous_rows: None,
         requested_by: Some("op"),
     };
     let job_id = store.claim(claim).await.expect("claim");
@@ -2375,7 +2513,14 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
     TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
     let cancelled = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -2429,7 +2574,14 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
     TEST_HOLD_AFTER_NO_RETURN.store(true, Ordering::SeqCst);
     let completing = match h
         .schema_admin
-        .schema_repin("status", "VARCHAR", None, false, false)
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -2464,6 +2616,8 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
             dialect: None,
             dry_run: false,
             force: true,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
             requested_by: Some("op"),
         })
         .await
@@ -2538,7 +2692,14 @@ async fn start_a_repin_the_finished_shadow_will_refuse(h: &Harness) -> RepinJobR
     TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
     let started = match h
         .schema_admin
-        .schema_repin("dur", "BIGINT", None, false, false)
+        .schema_repin(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            false,
+            RepinCeilings::default(),
+        )
         .await
         .expect("execute")
     {
@@ -2740,4 +2901,624 @@ mod audit_capture {
             self.events.lock().unwrap().push(Captured { fields });
         }
     }
+}
+
+// -- force ceilings (#111) ---------------------------------------------------
+//
+// Force used to be a blank check: whatever the finished shadow lost, force
+// covered it, however far the corpus had moved since the operator read the
+// plan. A forced job now carries a number per dimension and both gates hold
+// it to that number. These drive the engine directly — the request surface
+// carries the ceilings from a later milestone, and the engine API is where
+// the values are enforced.
+
+impl Harness {
+    fn engine(&self) -> std::sync::Arc<RepinEngine> {
+        self.server
+            .state
+            .repin
+            .clone()
+            .expect("an ingest-enabled node owns a repin engine")
+    }
+
+    /// The job row itself. The accepted ceilings are persisted state, not
+    /// wire state, until the wire carries them.
+    async fn job_row(&self, id: i64) -> trawl_server::store::RepinJob {
+        self.server
+            .state
+            .storage
+            .repin
+            .get(id)
+            .await
+            .expect("job read")
+            .expect("job row")
+    }
+}
+
+/// A field pinned VARCHAR whose values are `numeric` text plus `lossy`
+/// unreadable ones. Returns nothing; the pin is asserted here.
+async fn varchar_corpus(h: &Harness, numeric: &[&str], lossy: &[&str]) {
+    let mut events = Vec::new();
+    for v in numeric {
+        events.push(event("api", &json!({ "dur": v })));
+    }
+    for v in lossy {
+        events.push(event("api", &json!({ "dur": v })));
+    }
+    h.ingest_and_compact(&events).await;
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+}
+
+/// The ceilings travel over HTTP, both ways (issue #111 M5).
+///
+/// Every other ceiling test drives the engine directly, so nothing yet
+/// proves the request fields reach it or that the resolved pair comes back.
+/// This one goes through the client: a forced dry run stating zero comes
+/// back refused, echoing what it asked for beside what the job was held to.
+/// The CLI reads exactly those two fields to restate a preview's numbers.
+#[tokio::test(flavor = "multi_thread")]
+async fn stated_ceilings_travel_over_the_wire_and_the_accepted_pair_returns() {
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops"]).await;
+
+    let report = match h
+        .schema_admin
+        .schema_repin(
+            "dur",
+            "BIGINT",
+            None,
+            true,
+            true,
+            RepinCeilings {
+                max_nulled_rows: Some(0),
+                max_ambiguous_rows: None,
+            },
+        )
+        .await
+        .expect("dry run")
+    {
+        RepinStart::Report(job) => job,
+        other => panic!("expected a report, got {other:?}"),
+    };
+    assert_eq!(report.max_nulled_rows, Some(0), "the request echoes back");
+    assert_eq!(report.max_ambiguous_rows, None, "unstated stays absent");
+    assert_eq!(report.accepted_max_nulled_rows, Some(0), "explicit wins");
+    // The unstated half is the scan-derived default, never "unlimited".
+    assert!(
+        report.accepted_max_ambiguous_rows.is_some(),
+        "an unstated ceiling still resolves: {report:?}"
+    );
+    // One unreadable row against a ceiling of zero: the executing request
+    // would refuse, and the dry run says so through the same decision.
+    assert_eq!(report.requires_force, Some(true));
+    let reason = report.requires_force_reason.expect("a reason");
+    assert!(reason.contains("accepted 0"), "{reason}");
+
+    // A ceiling without force is a request that means nothing: 400.
+    let err = h
+        .schema_admin
+        .schema_repin(
+            "dur",
+            "BIGINT",
+            None,
+            true,
+            false,
+            RepinCeilings {
+                max_nulled_rows: Some(5),
+                max_ambiguous_rows: None,
+            },
+        )
+        .await
+        .expect_err("a ceiling without force is a bad request");
+    assert!(format!("{err}").contains("400"), "{err}");
+}
+
+/// The accepted number itself passes. One unreadable row against a ceiling
+/// of exactly one is what force said it would tolerate, so the cutover runs
+/// and the accepted pair is on the job row for anyone auditing it later.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forced_repin_proceeds_at_exactly_the_ceiling_it_accepted() {
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops"]).await;
+
+    let engine = h.engine();
+    let started = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings {
+                max_nulled: Some(1),
+                max_ambiguous: None,
+            },
+            Some("op"),
+        )
+        .await
+        .expect("forced start")
+    {
+        StartOutcome::Started(job) => job,
+        other => panic!("expected a started job, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(done.rows_nulled, 1, "the loss is exactly what was accepted");
+    assert_eq!(h.pinned_type("dur").await, "BIGINT");
+
+    let row = h.job_row(started.id).await;
+    assert_eq!(row.max_nulled_rows, Some(1), "the request's own number");
+    assert_eq!(
+        row.accepted_max_nulled_rows,
+        Some(1),
+        "an explicit ceiling is what the job is held to"
+    );
+    assert_eq!(
+        row.accepted_max_ambiguous_rows,
+        Some(10),
+        "the unstated dimension keeps its scan-derived default"
+    );
+}
+
+/// One row past the accepted ceiling is a refusal, and it names both
+/// numbers: an operator whose next move is to re-run with a corrected flag
+/// needs to see what the corpus actually holds, not just that it was too
+/// much.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ceiling_below_the_corpus_refuses_naming_accepted_and_actual() {
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops", "nah"]).await;
+
+    let engine = h.engine();
+    let refused = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings {
+                max_nulled: Some(1),
+                max_ambiguous: None,
+            },
+            Some("op"),
+        )
+        .await
+        .expect("a refusal is an outcome, not an error")
+    {
+        StartOutcome::Refused(job) => job,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(
+        refused.status,
+        trawl_server::store::RepinJobStatus::RefusedNeedsForce
+    );
+    let reason = refused.error.expect("the refusal carries its reason");
+    assert!(reason.contains("accepted 1"), "{reason}");
+    assert!(reason.contains("2 nulled row(s)"), "{reason}");
+
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR", "corpus untouched");
+    assert_eq!(
+        h.count("last=1h | where dur == \"nah\" | stats count()")
+            .await,
+        1
+    );
+}
+
+/// `--max-nulled-rows 0` is a statement, not a mistake: force the ambiguity,
+/// accept no loss. It refuses at the SCAN gate, so the job never stages a
+/// byte — the whole point of asking the question before the build.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_zero_ceiling_refuses_before_anything_is_staged() {
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops"]).await;
+
+    let engine = h.engine();
+    let refused = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings {
+                max_nulled: Some(0),
+                max_ambiguous: Some(0),
+            },
+            Some("op"),
+        )
+        .await
+        .expect("a refusal is an outcome, not an error")
+    {
+        StartOutcome::Refused(job) => job,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let reason = refused.error.expect("the refusal carries its reason");
+    assert!(reason.contains("accepted 0"), "{reason}");
+
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+
+    let row = h.job_row(refused.id).await;
+    assert_eq!(row.accepted_max_nulled_rows, Some(0));
+}
+
+/// Force with no numbers attached resolves the ceiling from this job's own
+/// scan: 10% headroom over a floor of ten rows. On a corpus this small the
+/// floor is the binding term (one projected null buys eleven), and it is
+/// what lets the ordinary "read the plan, accept it" path survive the drift
+/// a live install produces while the build runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn boolean_force_resolves_the_ceiling_from_the_scan() {
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops"]).await;
+
+    let engine = h.engine();
+    let dry = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            true,
+            true,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .expect("forced dry run")
+    {
+        StartOutcome::DryRun(job) => job,
+        other => panic!("expected a dry-run report, got {other:?}"),
+    };
+    assert_eq!(dry.projected_nulls, 1, "`oops` has no BIGINT reading");
+    let row = h.job_row(dry.id).await;
+    assert_eq!(row.max_nulled_rows, None, "the request stated nothing");
+    assert_eq!(
+        row.accepted_max_nulled_rows,
+        Some(11),
+        "one projected null plus the floor of ten"
+    );
+    assert_eq!(
+        row.accepted_max_ambiguous_rows,
+        Some(10),
+        "a zero-count dimension is still the floor, never unlimited"
+    );
+
+    // And the resolved ceiling is a ceiling that works: the same repin,
+    // executed, is well inside it.
+    let started = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .expect("forced execute")
+    {
+        StartOutcome::Started(job) => job,
+        other => panic!("expected a started job, got {other:?}"),
+    };
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(done.rows_nulled, 1);
+    assert_eq!(h.pinned_type("dur").await, "BIGINT");
+}
+
+/// The ceiling is enforced at the finished shadow too, which is the case it
+/// exists for. A lossless plan is forced with the default ceiling of ten;
+/// eleven unreadable rows land while the build runs, the catch-up folds them
+/// in, and the cutover is refused with the corpus at its old generation.
+#[tokio::test(flavor = "multi_thread")]
+async fn mid_build_growth_past_the_default_ceiling_refuses_the_cutover() {
+    let h = harness().await;
+
+    // Pin VARCHAR on a text value, then retire that file: what is left is an
+    // all-numeric corpus, so the scan projects no loss and the ceiling is
+    // the bare floor of ten.
+    h.ingest_and_compact(&[event("seed", &json!({"dur": "oops"}))])
+        .await;
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+    let seed_file = walk(&h.data_dir)
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "seed.parquet"))
+        .expect("seed.parquet exists");
+    std::fs::remove_file(&seed_file).unwrap();
+
+    // Enough affected files that the build is still running when the late
+    // batch lands.
+    for svc in ["api", "web", "worker", "edge", "db", "cache"] {
+        h.ingest_and_compact(&[event(svc, &json!({"dur": "12"}))])
+            .await;
+    }
+
+    let engine = h.engine();
+    trawl_server::repin::engine::TEST_FILE_DELAY_MS
+        .store(400, std::sync::atomic::Ordering::Relaxed);
+    let started = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .expect("forced execute")
+    {
+        StartOutcome::Started(job) => job,
+        other => panic!("expected a started job, got {other:?}"),
+    };
+    assert_eq!(
+        h.job_row(started.id).await.accepted_max_nulled_rows,
+        Some(10),
+        "a lossless scan accepts the floor and nothing more"
+    );
+
+    // Eleven values the new pin cannot read, ingested and compacted during
+    // the build: one row past what force accepted.
+    let late: Vec<_> = (0..11)
+        .map(|i| event("late", &json!({ "dur": format!("nope{i}") })))
+        .collect();
+    h.ingest_and_compact(&late).await;
+
+    let done = h.wait_terminal(started.id).await;
+    trawl_server::repin::engine::TEST_FILE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        done.status, "refused_needs_force",
+        "force covers the plan it was shown, not whatever arrives later \
+         (error: {:?})",
+        done.error
+    );
+    let reason = done.error.expect("the refusal carries its reason");
+    assert!(reason.contains("accepted 10"), "{reason}");
+    assert!(reason.contains("11 nulled row(s)"), "{reason}");
+    assert!(
+        reason.contains("force it with ceilings"),
+        "an operator who already passed force is told to raise the number, \
+         not to pass force: {reason}"
+    );
+    assert_eq!(
+        done.rows_nulled, 11,
+        "the terminal write carries the tallies the gate refused on, so the \
+         verdict and its evidence cannot disagree on the wire"
+    );
+
+    // Corpus untouched: old pin, every row, no staging left behind.
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+    assert_eq!(h.count("last=1h | stats count()").await, 17);
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+}
+
+/// A forced cutover leaves an audit record naming both pairs: what force
+/// accepted, and what the rewrite actually did. It is emitted only for a
+/// forced job that reached the cutover, so an unforced repin and a refused
+/// one leave nothing.
+#[tokio::test(flavor = "multi_thread")]
+// Three jobs in one body: the capture layer is a global subscriber, so the
+// forced, refused and unforced cases have to share a process to prove the
+// record fires for exactly one of them.
+#[allow(clippy::too_many_lines)]
+async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
+    use common::audit_capture::Capture;
+    use tracing_subscriber::prelude::*;
+
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::registry().with(
+        capture
+            .clone()
+            .with_filter(tracing_subscriber::EnvFilter::new("trawl_server=info")),
+    );
+    // Global, not thread-local: the job runs detached on other workers.
+    tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
+
+    let h = harness().await;
+    varchar_corpus(&h, &["12"], &["oops"]).await;
+    let engine = h.engine();
+
+    // A refusal reaches no cutover, so it records nothing.
+    let refused = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings {
+                max_nulled: Some(0),
+                max_ambiguous: None,
+            },
+            Some("op"),
+        )
+        .await
+        .expect("refusal")
+    {
+        StartOutcome::Refused(job) => job,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+
+    // The forced repin that does cut over.
+    let forced = match engine
+        .start(
+            "dur",
+            "BIGINT",
+            None,
+            false,
+            true,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .expect("forced execute")
+    {
+        StartOutcome::Started(job) => job,
+        other => panic!("expected a started job, got {other:?}"),
+    };
+    let done = h.wait_terminal(forced.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+
+    // An unforced, lossless repin of a different field.
+    h.ingest_and_compact(&[event("api", &json!({"code": 200}))])
+        .await;
+    assert_eq!(h.pinned_type("code").await, "BIGINT");
+    let unforced = match engine
+        .start(
+            "code",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .expect("unforced execute")
+    {
+        StartOutcome::Started(job) => job,
+        other => panic!("expected a started job, got {other:?}"),
+    };
+    let done = h.wait_terminal(unforced.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+
+    let accepted = capture.of_type("repin_force_accepted", "field", "dur");
+    assert_eq!(
+        accepted.len(),
+        1,
+        "one forced cutover, one record (refused and unforced jobs leave \
+         none): {accepted:?}"
+    );
+    let record = &accepted[0];
+    let field = |name: &str| {
+        record
+            .fields
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} missing from {record:?}"))
+            .clone()
+    };
+    assert_eq!(field("job_id"), forced.id.to_string());
+    assert!(field("field").contains("dur"));
+    assert!(field("from").contains("VARCHAR"));
+    assert!(field("to").contains("BIGINT"));
+    assert_eq!(field("accepted_max_nulled_rows"), "11");
+    assert_eq!(field("accepted_max_ambiguous_rows"), "10");
+    assert_eq!(field("rows_nulled"), "1", "what the rewrite actually did");
+    assert_eq!(field("ambiguous_numerals"), "0");
+    assert_eq!(field("scanned_projected_nulls"), "1");
+    assert_eq!(field("scanned_ambiguous_numerals"), "0");
+    assert!(field("requested_by").contains("op"));
+    assert!(
+        !record.fields.contains_key("unmapped_samples"),
+        "the record is counts only, never sample values: {record:?}"
+    );
+    assert!(refused.error.is_some(), "the refused job kept its reason");
+
+    // The other place a cutover completes: boot recovery. A crash between
+    // the swap and the pin flip leaves the marker, and the replay finishes
+    // the flip — including the ack clear, which owes the same audit record
+    // the live path emits. `code` stands at VARCHAR, where the unforced
+    // repin above left it, and the claim proves that pin (#110), so the
+    // recovered job is the trip back to BIGINT.
+    let catalog = &h.server.state.storage.catalog;
+    for _ in 0..3 {
+        catalog
+            .record_conflicts(&[trawl_server::store::FieldConflict {
+                field: "code".to_owned(),
+                service: "api".to_owned(),
+                observed_type: "VARCHAR".to_owned(),
+                expected_type: trawl_core::schema::CanonicalType::BigInt,
+                rows_nulled: 3,
+                samples: Vec::new(),
+            }])
+            .await
+            .unwrap();
+    }
+    let mut conn =
+        <sqlx::postgres::PgConnection as sqlx::Connection>::connect(&h.server.app_db_url)
+            .await
+            .expect("connect app db");
+    sqlx::query(
+        "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+         WHERE field = 'code'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("backdate the evidence");
+    catalog
+        .acknowledge_degraded_field("code", "key-aaa", None)
+        .await
+        .unwrap();
+
+    let recovered_job = h
+        .server
+        .state
+        .storage
+        .repin
+        .claim(trawl_server::store::RepinClaim {
+            field: "code",
+            from_type: trawl_core::schema::CanonicalType::Varchar,
+            to_type: trawl_core::schema::CanonicalType::BigInt,
+            dialect: None,
+            dry_run: false,
+            force: false,
+            requested_by: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
+        })
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(data.join("prod")).unwrap();
+    let replay_marker = trawl_server::repin::RepinMarker {
+        job_id: recovered_job,
+        field: "code".to_owned(),
+        from_type: "VARCHAR".to_owned(),
+        to_type: "BIGINT".to_owned(),
+        phase: trawl_server::repin::RepinPhase::Cutover,
+    };
+    let replay = |marker: trawl_server::repin::RepinMarker| {
+        let data = data.clone();
+        let storage = h.server.state.storage.clone();
+        let cache = h.server.state.query.field_catalog.clone();
+        async move {
+            trawl_server::repin::marker::write_marker(&data, &marker).unwrap();
+            let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
+                .unwrap()
+                .expect("marker present");
+            trawl_server::repin::recover::reconcile_store(&storage, &cache, &data, Some(recovered))
+                .await
+                .expect("store reconciliation");
+        }
+    };
+    replay(replay_marker.clone()).await;
+
+    let cleared = capture.of_type("field_degraded_ack_cleared", "field", "code");
+    assert_eq!(
+        cleared.len(),
+        1,
+        "the recovered cutover audits the ack it cleared: {cleared:?}"
+    );
+    assert!(cleared[0].field("reason").contains("repin"));
+    assert_eq!(cleared[0].field("job_id"), recovered_job.to_string());
+    assert!(catalog.degraded_ack("code").await.unwrap().is_none());
+
+    // The replay: the job is already `succeeded`, so the flip completes
+    // nothing, clears nothing and announces nothing.
+    replay(replay_marker).await;
+    assert_eq!(
+        capture
+            .of_type("field_degraded_ack_cleared", "field", "code")
+            .len(),
+        1,
+        "a boot replay must not re-announce a clear that happened once"
+    );
 }

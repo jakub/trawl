@@ -41,6 +41,7 @@ use crate::repin::cancel::{
     STAGE_FINAL_GATE, STAGE_SCAN, Settlement, audit_cancel_refused, audit_cancel_requested,
     audit_cancelled,
 };
+use crate::repin::ceiling::{self, ForceTerms, RequestedCeilings};
 use crate::repin::cutover::{
     finish_post_swap_staging, prepare_shadow_root, swap_envs, sweep_pre_swap_staging,
 };
@@ -50,7 +51,7 @@ use crate::repin::marker::{
 };
 use crate::repin::plan::{ScanCounts, ScanTallies, scan};
 use crate::repin::rewrite::{FileSig, ProcessTally, process_file, snapshot_env_files};
-use crate::store::{CatalogStore, FieldConflict, RepinJob, RepinJobStatus, RepinStore};
+use crate::store::{CatalogStore, FieldConflict, JobTotals, RepinJob, RepinJobStatus, RepinStore};
 
 /// Catch-up passes before the job gives up (steadily-shrinking deltas
 /// converge in two or three; a delta that refuses to shrink under real
@@ -224,6 +225,39 @@ pub enum StartOutcome {
     Cancelled(RepinJob),
 }
 
+/// What the REQUEST stated, carried from `start` into the detached ladder.
+///
+/// The ceilings here are the operator's numbers, not the job's: resolution
+/// needs the scan, which has not run yet at claim time.
+#[derive(Debug, Clone)]
+struct RequestTerms {
+    /// Whether the request passed force.
+    force: bool,
+    /// The ceilings the request stated, each dimension separately.
+    ceilings: RequestedCeilings,
+    /// The requesting key's display name, as the claim recorded it. This is
+    /// the only actor identity that reaches the engine: the handler passes
+    /// `verified.name` and no key prefix, so the audit event names what the
+    /// job row names.
+    requested_by: Option<String>,
+}
+
+/// The force decision a running job carries, settled once in `decide`.
+///
+/// The build reads its terms from here and never from postgres: the numbers
+/// were resolved from this job's own scan, and re-reading the row at cutover
+/// would let a concurrent write change what the operator agreed to.
+#[derive(Debug, Clone)]
+struct JobTerms {
+    /// The flag plus the ceilings it accepted.
+    force: ForceTerms,
+    /// What the pre-build scan projected, for the audit record: the whole
+    /// point of the finished-shadow gate is that these two can differ.
+    scanned: ceiling::Counts,
+    /// Who asked (audit only).
+    requested_by: Option<String>,
+}
+
 /// The repin engine — one per ingest-enabled daemon.
 #[derive(Debug, Clone)]
 pub struct RepinEngine {
@@ -286,11 +320,13 @@ impl RepinEngine {
         dialect: Option<&str>,
         dry_run: bool,
         force: bool,
+        requested: RequestedCeilings,
         requested_by: Option<&str>,
     ) -> Result<StartOutcome, ServerError> {
         let field = field.to_ascii_lowercase();
         let to = parse_target(to)?;
         let dialect = resolve_dialect(to, dialect)?;
+        let (max_nulled_rows, max_ambiguous_rows) = validate_ceilings(force, requested)?;
         // A predicate, not a list of envelope names: the whole `_` prefix
         // is trawl's (`schema::is_contract_typed`), so a contract slot
         // added later is refused the day it exists rather than the day
@@ -325,6 +361,8 @@ impl RepinEngine {
                 dialect,
                 dry_run,
                 force,
+                max_nulled_rows,
+                max_ambiguous_rows,
                 requested_by,
             })
             .await?;
@@ -376,9 +414,14 @@ impl RepinEngine {
         // a dialect from the target.
         let reading = RepinReading::new(from, to, dialect.unwrap_or_default());
         let engine = Arc::clone(self);
+        let req = RequestTerms {
+            force,
+            ceilings: requested,
+            requested_by: requested_by.map(str::to_owned),
+        };
         let decided = tokio::spawn(async move {
             engine
-                .decide(job_id, field, from, reading, dry_run, force, cancel)
+                .decide(job_id, field, from, reading, dry_run, req, cancel)
                 .await
         });
         let outcome = match decided.await {
@@ -441,7 +484,7 @@ impl RepinEngine {
                     }
                 }
                 let msg = format!("repin job task failed: {e}");
-                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                self.finish(job_id, RepinJobStatus::Failed, Some(&msg), None)
                     .await;
                 Err(ServerError::Internal(msg))
             }
@@ -534,7 +577,7 @@ impl RepinEngine {
         from: CanonicalType,
         reading: RepinReading,
         dry_run: bool,
-        force: bool,
+        req: RequestTerms,
         cancel: CancelHandle,
     ) -> Result<StartOutcome, ServerError> {
         // Layout pre-flight, ahead of the minutes-long scan: the staging
@@ -594,6 +637,22 @@ impl RepinEngine {
         };
         let liveness = self.field_liveness(&field).await;
         let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+        // The one resolution point. A job's ceilings can only come from its
+        // own scan, so they are settled here, once, and persisted in the same
+        // statement as the counts they were derived from. Both gates and the
+        // audit record read this value; nothing re-reads the row.
+        let ceilings = ceiling::resolve(
+            counts.projected_nulls,
+            counts.ambiguous_numerals,
+            req.ceilings,
+        );
+        let terms = if req.force {
+            ForceTerms::forced(ceilings)
+        } else {
+            // An unforced job refuses on any loss at all, so there is no
+            // number to hold it to and none is persisted.
+            ForceTerms::unforced()
+        };
         if let Err(e) = self
             .store
             .record_plan(
@@ -608,6 +667,8 @@ impl RepinEngine {
                     unmapped_samples: samples,
                     field_last_seen: liveness.as_ref().map(|(at, _)| *at),
                     field_last_service: liveness.map(|(_, service)| service),
+                    accepted_max_nulled_rows: terms.ceilings.map(|c| clamp(c.max_nulled)),
+                    accepted_max_ambiguous_rows: terms.ceilings.map(|c| clamp(c.max_ambiguous)),
                 },
             )
             .await
@@ -653,7 +714,7 @@ impl RepinEngine {
             Some(reading.written.raw),
             counts.projected_nulls,
             counts.ambiguous_numerals,
-            force,
+            terms,
         ) {
             if self
                 .settle_pre_cutover(
@@ -733,9 +794,17 @@ impl RepinEngine {
 
         let engine = Arc::clone(&self);
         let tallies = Arc::new(tallies);
+        let job_terms = JobTerms {
+            force: terms,
+            scanned: ceiling::Counts {
+                nulled: counts.projected_nulls,
+                ambiguous: counts.ambiguous_numerals,
+            },
+            requested_by: req.requested_by,
+        };
         tokio::spawn(async move {
             engine
-                .run_job(job_id, field, from, reading, force, tallies, cancel)
+                .run_job(job_id, field, from, reading, job_terms, tallies, cancel)
                 .await;
         });
         Ok(StartOutcome::Started(job))
@@ -809,10 +878,20 @@ impl RepinEngine {
     /// reconciliation. The outcome counter increments only when the write
     /// lands: a row still `running` must not be metered as a terminal
     /// outcome.
-    async fn finish(&self, job_id: i64, status: RepinJobStatus, error: Option<&str>) {
+    async fn finish(
+        &self,
+        job_id: i64,
+        status: RepinJobStatus,
+        error: Option<&str>,
+        totals: Option<JobTotals>,
+    ) {
         const FAST_ATTEMPTS: u32 = 3;
         for attempt in 1..=FAST_ATTEMPTS {
-            match self.store.finish_if_running(job_id, status, error).await {
+            match self
+                .store
+                .finish_if_running(job_id, status, error, totals)
+                .await
+            {
                 // The write is conditional (never clobber a terminal
                 // verdict), but the metric is not gated on it: the success
                 // path arrives here with the row ALREADY `succeeded`,
@@ -852,7 +931,7 @@ impl RepinEngine {
             loop {
                 tokio::time::sleep(FINISH_RETRY_INTERVAL).await;
                 match store
-                    .finish_if_running(job_id, status, error.as_deref())
+                    .finish_if_running(job_id, status, error.as_deref(), totals)
                     .await
                 {
                     Ok(_) => {
@@ -908,7 +987,7 @@ impl RepinEngine {
         error: Option<&str>,
     ) -> bool {
         let Some(actor) = self.settle_cancel(job_id, stage) else {
-            self.finish(job_id, candidate, error).await;
+            self.finish(job_id, candidate, error, None).await;
             return false;
         };
         self.finish_cancelled(job_id, stage, Some(actor)).await;
@@ -963,14 +1042,14 @@ impl RepinEngine {
                  request could no longer be read; the live corpus was \
                  never touched"
             );
-            self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+            self.finish(job_id, RepinJobStatus::Failed, Some(&msg), None)
                 .await;
             return;
         };
         match self.store.record_cancel_request(job_id, actor.name()).await {
             Ok(_) => {
                 let msg = cancelled_error(actor.name(), stage);
-                self.finish(job_id, RepinJobStatus::Cancelled, Some(&msg))
+                self.finish(job_id, RepinJobStatus::Cancelled, Some(&msg), None)
                     .await;
             }
             Err(e) => {
@@ -989,7 +1068,7 @@ impl RepinEngine {
                      corpus was never touched",
                     actor.name()
                 );
-                self.finish(job_id, RepinJobStatus::Failed, Some(&msg))
+                self.finish(job_id, RepinJobStatus::Failed, Some(&msg), None)
                     .await;
             }
         }
@@ -1007,7 +1086,7 @@ impl RepinEngine {
         field: String,
         from: CanonicalType,
         reading: RepinReading,
-        force: bool,
+        terms: JobTerms,
         scanned: Arc<ScanTallies>,
         cancel: CancelHandle,
     ) {
@@ -1017,7 +1096,7 @@ impl RepinEngine {
 
         let to = reading.written.pin;
         let outcome = self
-            .run_job_inner(job_id, &field, from, reading, force, &scanned, &cancel)
+            .run_job_inner(job_id, &field, from, reading, &terms, &scanned, &cancel)
             .await;
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(0.0);
         metrics::histogram!(crate::metrics::CATALOG_REPIN_DURATION_SECONDS)
@@ -1025,7 +1104,8 @@ impl RepinEngine {
 
         match outcome {
             Ok(()) => {
-                self.finish(job_id, RepinJobStatus::Succeeded, None).await;
+                self.finish(job_id, RepinJobStatus::Succeeded, None, None)
+                    .await;
                 tracing::info!(
                     event_type = "repin_complete",
                     job_id,
@@ -1045,16 +1125,28 @@ impl RepinEngine {
             // operator who asked for a stop gets one. The refusal costs
             // that operator nothing — it was protecting a corpus the cancel
             // leaves untouched anyway.
-            Err(JobAbort::RefusedNeedsForce(msg)) => {
-                self.abandon_build(job_id, RepinJobStatus::RefusedNeedsForce, &msg)
-                    .await;
+            Err(JobAbort::RefusedNeedsForce { msg, totals }) => {
+                // The refusal decided on these numbers, so they ride the
+                // terminal write: the periodic progress write is
+                // best-effort, and a store blip just before the gate would
+                // otherwise leave the wire reporting the refusal beside a
+                // stale `rows_nulled`. A cancel that wins the settlement
+                // drops them — the verdict is then `cancelled`, and those
+                // tallies are progress, not the evidence behind a refusal.
+                self.abandon_build(
+                    job_id,
+                    RepinJobStatus::RefusedNeedsForce,
+                    &msg,
+                    Some(totals),
+                )
+                .await;
             }
             Err(JobAbort::Blocked(msg)) => {
-                self.abandon_build(job_id, RepinJobStatus::Blocked, &msg)
+                self.abandon_build(job_id, RepinJobStatus::Blocked, &msg, None)
                     .await;
             }
             Err(JobAbort::Failed(msg)) => {
-                self.abandon_build(job_id, RepinJobStatus::Failed, &msg)
+                self.abandon_build(job_id, RepinJobStatus::Failed, &msg, None)
                     .await;
             }
         }
@@ -1109,14 +1201,20 @@ impl RepinEngine {
     /// shadow generation takes minutes on a real archive, and had the
     /// verdict been chosen first, a cancel landing during those minutes
     /// would be answered 202 and then lose to a decision already made.
-    async fn abandon_build(&self, job_id: i64, candidate: RepinJobStatus, msg: &str) {
+    async fn abandon_build(
+        &self,
+        job_id: i64,
+        candidate: RepinJobStatus,
+        msg: &str,
+        totals: Option<JobTotals>,
+    ) {
         if let Some(actor) = self.settle_cancel(job_id, STAGE_BUILD) {
             self.abandon_cancelled(job_id, STAGE_BUILD, Some(actor))
                 .await;
             return;
         }
         self.unwind_staging(job_id, candidate, msg).await;
-        self.finish(job_id, candidate, Some(msg)).await;
+        self.finish(job_id, candidate, Some(msg), totals).await;
     }
 
     /// The disk half of abandoning a build, without the terminal write.
@@ -1168,7 +1266,7 @@ impl RepinEngine {
         field: &str,
         from: CanonicalType,
         reading: RepinReading,
-        force: bool,
+        terms: &JobTerms,
         scanned: &Arc<ScanTallies>,
         cancel: &CancelHandle,
     ) -> Result<(), JobAbort> {
@@ -1288,7 +1386,7 @@ impl RepinEngine {
             Some(reading.written.raw),
             totals.nulled,
             totals.ambiguous,
-            force,
+            terms.force,
         ) {
             // Test-only: pin the window between a decided refusal and its
             // settlement (see `TEST_HOLD_AT_FORCE_REFUSAL`). Bounded, and
@@ -1303,13 +1401,27 @@ impl RepinEngine {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
-            return Err(JobAbort::RefusedNeedsForce(format!(
-                "the completed rewrite is not what the pre-build scan \
-                 projected — data ingested after the scan carries values the \
-                 plan never saw: {reason}. The cutover is refused and the \
-                 corpus stands at its pre-repin generation; re-run the dry \
-                 run for the current plan, then pass force to accept it"
-            )));
+            // Both refusals name the same cause — the corpus moved under the
+            // build — and differ only in what the operator does next. Without
+            // force there is a plan to re-read; with it there is a number to
+            // raise, and telling them to "pass force" when they already did
+            // would be advice they have taken.
+            let remedy = if terms.force.force {
+                "re-run the dry run for the current plan and force it with \
+                 ceilings that cover it"
+            } else {
+                "re-run the dry run for the current plan, then pass force to \
+                 accept it"
+            };
+            return Err(JobAbort::RefusedNeedsForce {
+                msg: format!(
+                    "the completed rewrite is not what the pre-build scan \
+                     projected — data ingested after the scan carries values \
+                     the plan never saw: {reason}. The cutover is refused and \
+                     the corpus stands at its pre-repin generation; {remedy}"
+                ),
+                totals: job_totals(totals),
+            });
         }
 
         // The point of no return: refusing a pending cancel, publishing the
@@ -1339,6 +1451,37 @@ impl RepinEngine {
                 });
             }
             Commit::Failed(msg) => return Err(JobAbort::Failed(msg)),
+        }
+
+        // The audit record of a forced cutover, emitted once the latch is
+        // held and before the swap. The latched Cutover marker is the
+        // durable point where force licensed the mutation: past it the
+        // corpus becomes the new generation one way or another, by this
+        // process or by the boot replay. A marker write that fails takes the
+        // cutover with it, and a cancel that won the latch stops it, so
+        // neither reaches this line — announcing an acceptance that never
+        // licensed anything would leave a record of a mutation that did not
+        // happen. It carries what force accepted beside what the rewrite
+        // actually did, so the pair an operator agreed to is legible after
+        // the fact without reading a job row that later columns overwrite.
+        // Counts only — no sample values, no free text.
+        if terms.force.force {
+            tracing::info!(
+                event_type = "repin_force_accepted",
+                job_id,
+                field = %field,
+                from = from.as_catalog(),
+                to = to.as_catalog(),
+                dialect = reading.written.raw.token(),
+                accepted_max_nulled_rows = terms.force.ceilings.map(|c| c.max_nulled),
+                accepted_max_ambiguous_rows = terms.force.ceilings.map(|c| c.max_ambiguous),
+                rows_nulled = totals.nulled,
+                ambiguous_numerals = totals.ambiguous,
+                scanned_projected_nulls = terms.scanned.nulled,
+                scanned_ambiguous_numerals = terms.scanned.ambiguous,
+                requested_by = terms.requested_by.as_deref(),
+                "forced repin cutover within the ceilings it accepted"
+            );
         }
 
         // Test-only: pin the window a cancel can only be refused in (see
@@ -1377,7 +1520,30 @@ impl RepinEngine {
         let mut flipped_ok = false;
         for attempt in 1..=FLIP_ATTEMPTS {
             match self.store.finish_cutover(job_id, field, to).await {
-                Ok(()) => {
+                Ok(outcome) => {
+                    // `cleared_ack` is true only on the call that completed
+                    // the job, so a boot replay of an already-finished
+                    // cutover never re-announces a clear that happened once.
+                    //
+                    // One event per OBSERVED clear, which is not the same as
+                    // one per clear. The DELETE commits with the pin flip; a
+                    // crash between that commit and this line loses the
+                    // event, and the row is gone, so nothing is left to
+                    // replay it from. Closing that gap needs the durable
+                    // outbox ADR-0019 rejected as a receipts table, so the
+                    // residual is documented rather than mechanised: the ack
+                    // is gone either way, and the audit trail is one line
+                    // short.
+                    if outcome.cleared_ack {
+                        tracing::info!(
+                            event_type = "field_degraded_ack_cleared",
+                            field = %field,
+                            reason = "repin",
+                            job_id,
+                            "the acknowledged pin was repinned; the \
+                             acknowledgement went with the evidence"
+                        );
+                    }
                     flipped_ok = true;
                     break;
                 }
@@ -1482,19 +1648,7 @@ impl RepinEngine {
 
     async fn publish_progress(&self, job_id: i64, state: &BuildState) {
         let totals = state.totals();
-        let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
-        if let Err(e) = self
-            .store
-            .record_progress(
-                job_id,
-                clamp(totals.files_done),
-                clamp(totals.rows),
-                clamp(totals.nulled),
-                clamp(totals.resurrected),
-                clamp(totals.ambiguous),
-            )
-            .await
-        {
+        if let Err(e) = self.store.record_progress(job_id, job_totals(totals)).await {
             tracing::warn!(event_type = "repin_store_error", job_id, error = %e, "progress write failed");
         }
         #[allow(clippy::cast_precision_loss)]
@@ -1571,13 +1725,32 @@ where
         .map_err(|e| format!("repin {what} task panicked: {e}"))
 }
 
+/// The store's shape for what the build has tallied so far. Saturating
+/// rather than wrapping: a count past `i64::MAX` is not a corpus anyone has,
+/// and the honest ceiling beats a negative row count.
+fn job_totals(totals: BuildTotals) -> JobTotals {
+    let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    JobTotals {
+        files_done: clamp(totals.files_done),
+        rows_rewritten: clamp(totals.rows),
+        rows_nulled: clamp(totals.nulled),
+        rows_resurrected: clamp(totals.resurrected),
+        ambiguous_numerals: clamp(totals.ambiguous),
+    }
+}
+
 /// Why a job stopped short of the swap.
 enum JobAbort {
     Failed(String),
     Blocked(String),
     /// The finished shadow nulled values the pre-build scan did not
-    /// project (concurrent ingest), and the request carried no force.
-    RefusedNeedsForce(String),
+    /// project (concurrent ingest), or more than the accepted ceilings
+    /// allow. Carries the tallies the gate decided on so the terminal
+    /// write can persist the verdict and its evidence together.
+    RefusedNeedsForce {
+        msg: String,
+        totals: JobTotals,
+    },
     /// An operator cancelled the job and a boundary observed the request
     /// before the point of no return (#109).
     Cancelled {
@@ -1779,15 +1952,25 @@ fn run_pass_blocking(
 ///
 /// The count is taken whatever the dialect, since the report says what is
 /// there; only the gate is conditional.
+///
+/// Force is not a blank check (#111): `terms` carries the flag and the
+/// numbers it accepted, so a forced job is still refused when the finished
+/// rewrite is worse than the plan the operator read. A forced job with no
+/// ceilings is a row written before those numbers were persisted, and keeps
+/// the old blank-check behaviour, because there is no honest bound to hold
+/// it to.
 pub(crate) fn force_refusal(
     pin: CanonicalType,
     dialect: Option<trawl_core::severity::Dialect>,
     nulled: u64,
     ambiguous: u64,
-    force: bool,
+    terms: ForceTerms,
 ) -> Option<String> {
-    if force {
-        return None;
+    if terms.force {
+        return terms
+            .ceilings
+            .and_then(|c| ceiling::exceeds(pin, dialect, c, nulled, ambiguous))
+            .map(|over| over.to_string());
     }
     if nulled > 0 {
         return Some(format!(
@@ -1796,10 +1979,7 @@ pub(crate) fn force_refusal(
             pin.as_catalog()
         ));
     }
-    let ambiguous_gate = pin == CanonicalType::Severity
-        && dialect != Some(trawl_core::severity::Dialect::Syslog)
-        && ambiguous > 0;
-    if ambiguous_gate {
+    if ceiling::ambiguity_binds(pin, dialect) && ambiguous > 0 {
         return Some(format!(
             "{ambiguous} row(s) carry a numeral 1-7, which the OTel ladder \
              and syslog PRI read as DIFFERENT severities (3 is trace3 to \
@@ -1846,6 +2026,48 @@ fn resolve_dialect(
             to.as_catalog()
         ))),
     }
+}
+
+/// Check the requested ceilings against the request that carries them, and
+/// hand back the pair the claim persists.
+///
+/// A ceiling without force is refused rather than quietly ignored: it is an
+/// operator saying "accept up to this much loss" on a request that accepts
+/// none, so the two halves contradict each other and only the operator can
+/// say which they meant. Values above `i64::MAX` are refused for the same
+/// reason a silent clamp is wrong — the column is a BIGINT, and a ceiling
+/// stored as something other than what was asked for is a bound nobody set.
+/// Every real corpus is many orders of magnitude below that, so this only
+/// ever fires on a typo or a probe.
+fn validate_ceilings(
+    force: bool,
+    requested: RequestedCeilings,
+) -> Result<(Option<i64>, Option<i64>), ServerError> {
+    if !force && (requested.max_nulled.is_some() || requested.max_ambiguous.is_some()) {
+        return Err(ServerError::BadRequest(
+            "a ceiling only means something beside force: max_nulled_rows \
+             and max_ambiguous_rows state what a forced repin accepts, and \
+             an unforced repin accepts no loss at all"
+                .into(),
+        ));
+    }
+    let fit = |value: Option<u64>, name: &str| {
+        value
+            .map(|v| {
+                i64::try_from(v).map_err(|_| {
+                    ServerError::BadRequest(format!(
+                        "{name} of {v} is larger than the largest row count \
+                         trawl can record ({})",
+                        i64::MAX
+                    ))
+                })
+            })
+            .transpose()
+    };
+    Ok((
+        fit(requested.max_nulled, "max_nulled_rows")?,
+        fit(requested.max_ambiguous, "max_ambiguous_rows")?,
+    ))
 }
 
 /// Resolve a requested repin target to a canonical type.
@@ -1914,47 +2136,150 @@ mod tests {
 
         const SEVERITY: CanonicalType = CanonicalType::Severity;
         const VARCHAR: CanonicalType = CanonicalType::Varchar;
+        let unforced = ForceTerms::unforced();
+        let blank_check = ForceTerms {
+            force: true,
+            ceilings: None,
+        };
 
         // Loss: any target, any dialect, cleared only by force.
         assert!(
-            force_refusal(VARCHAR, None, 3, 0, false)
+            force_refusal(VARCHAR, None, 3, 0, unforced)
                 .is_some_and(|m| m.contains("cannot be read as VARCHAR")),
         );
-        assert_eq!(force_refusal(VARCHAR, None, 3, 0, true), None);
-        assert!(force_refusal(SEVERITY, Some(Dialect::Syslog), 3, 0, false).is_some());
+        assert_eq!(force_refusal(VARCHAR, None, 3, 0, blank_check), None);
+        assert!(force_refusal(SEVERITY, Some(Dialect::Syslog), 3, 0, unforced).is_some());
 
         // Ambiguity: refused under OTel, silent under an explicit syslog
         // assertion, and cleared by force either way.
-        let refusal = force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, false)
+        let refusal = force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, unforced)
             .expect("an OTel repin over the 1-7 overlap must refuse");
         assert!(refusal.contains("2 row(s)"), "{refusal}");
         assert!(refusal.contains("dialect=syslog"), "{refusal}");
         assert_eq!(
-            force_refusal(SEVERITY, Some(Dialect::Syslog), 0, 2, false),
+            force_refusal(SEVERITY, Some(Dialect::Syslog), 0, 2, unforced),
             None,
             "asserting syslog IS the answer to the ambiguity"
         );
         assert_eq!(
-            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, true),
+            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, blank_check),
             None
         );
         // A row with no recorded dialect at all reads as the OTel default:
         // the gate must not go silent because a column is NULL.
-        assert!(force_refusal(SEVERITY, None, 0, 2, false).is_some());
+        assert!(force_refusal(SEVERITY, None, 0, 2, unforced).is_some());
 
         // Nothing to refuse, and a non-severity target has no ambiguity
         // notion at all (its count is a constant zero upstream, but the gate
         // must not fire even if one were handed in).
         assert_eq!(
-            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 0, false),
+            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 0, unforced),
             None
         );
-        assert_eq!(force_refusal(VARCHAR, None, 0, 5, false), None);
+        assert_eq!(force_refusal(VARCHAR, None, 0, 5, unforced), None);
 
         // Loss is reported first: it is the larger hazard, and a plan
         // carrying both needs one force flag, not a ladder of them.
-        let both = force_refusal(SEVERITY, Some(Dialect::Otel), 1, 1, false).unwrap();
+        let both = force_refusal(SEVERITY, Some(Dialect::Otel), 1, 1, unforced).unwrap();
         assert!(both.contains("cannot be read as SEVERITY"), "{both}");
+    }
+
+    /// Force with ceilings is force held to a number (#111): the same one
+    /// function decides, so the scan gate, the finished-shadow gate and the
+    /// wire all report the overrun in the same sentence. Ceiling-less force
+    /// stays the pre-migration blank check, and the syslog exemption carries
+    /// into the ceiling arm through the shared `ambiguity_binds` predicate.
+    #[test]
+    fn a_forced_job_is_held_to_the_ceilings_it_accepted() {
+        use crate::repin::ceiling::Ceilings;
+        use trawl_core::severity::Dialect;
+
+        const SEVERITY: CanonicalType = CanonicalType::Severity;
+        const VARCHAR: CanonicalType = CanonicalType::Varchar;
+        let terms = ForceTerms::forced(Ceilings {
+            max_nulled: 10,
+            max_ambiguous: 2,
+        });
+
+        assert_eq!(
+            force_refusal(VARCHAR, None, 10, 0, terms),
+            None,
+            "the accepted number itself passes"
+        );
+        let over = force_refusal(VARCHAR, None, 11, 0, terms).expect("one row above refuses");
+        assert!(over.contains("accepted 10"), "{over}");
+        assert!(
+            over.contains("11 nulled row(s)"),
+            "the sentence names the actual too: {over}"
+        );
+
+        // Ambiguity has its own ceiling, and asserting syslog still answers
+        // the question rather than spending the budget.
+        assert!(force_refusal(SEVERITY, Some(Dialect::Otel), 0, 3, terms).is_some());
+        assert_eq!(
+            force_refusal(SEVERITY, Some(Dialect::Syslog), 0, 3, terms),
+            None
+        );
+
+        // Without ceilings, force covers everything — the shape of a job row
+        // written before the ceilings were persisted.
+        let blank_check = ForceTerms {
+            force: true,
+            ceilings: None,
+        };
+        assert_eq!(
+            force_refusal(SEVERITY, Some(Dialect::Otel), 9_999, 9_999, blank_check),
+            None
+        );
+    }
+
+    /// A ceiling is a statement about what force accepts, so it is refused
+    /// without force rather than ignored, and refused above the column's
+    /// domain rather than clamped. Both are 400s: only the operator can say
+    /// what they meant.
+    #[test]
+    fn a_ceiling_needs_force_and_must_fit_the_column() {
+        let stated = RequestedCeilings {
+            max_nulled: Some(5),
+            max_ambiguous: None,
+        };
+        let err = validate_ceilings(false, stated).expect_err("a ceiling without force is refused");
+        assert!(
+            matches!(&err, ServerError::BadRequest(m) if m.contains("max_nulled_rows")),
+            "{err:?}"
+        );
+        assert!(
+            matches!(
+                validate_ceilings(
+                    false,
+                    RequestedCeilings {
+                        max_nulled: None,
+                        max_ambiguous: Some(0),
+                    }
+                ),
+                Err(ServerError::BadRequest(_))
+            ),
+            "either dimension alone is enough to contradict an unforced request"
+        );
+
+        assert_eq!(
+            validate_ceilings(true, stated).expect("forced and in range"),
+            (Some(5), None)
+        );
+        assert_eq!(
+            validate_ceilings(true, RequestedCeilings::default()).expect("nothing stated"),
+            (None, None)
+        );
+
+        let huge = RequestedCeilings {
+            max_nulled: Some(u64::MAX),
+            max_ambiguous: None,
+        };
+        let err = validate_ceilings(true, huge).expect_err("past i64 is refused, never clamped");
+        assert!(
+            matches!(&err, ServerError::BadRequest(m) if m.contains("larger than")),
+            "{err:?}"
+        );
     }
 
     /// The dialect is a `SEVERITY`-only assertion: a severity target

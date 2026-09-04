@@ -663,6 +663,8 @@ async fn a_repin_in_flight_refuses_gc_four_ways() {
             dialect: None,
             dry_run: false,
             force: false,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
             requested_by: Some("test"),
         })
         .await
@@ -685,6 +687,7 @@ async fn a_repin_in_flight_refuses_gc_four_ways() {
             job,
             trawl_server::store::RepinJobStatus::Failed,
             Some("test"),
+            None,
         )
         .await
         .expect("finish the job");

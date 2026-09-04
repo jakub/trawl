@@ -848,6 +848,14 @@ pub struct CatalogFieldResponse {
     /// The analyzer's verdict, present only when the pin is degraded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<DegradedVerdict>,
+    /// The operator's acknowledgement of the badge, if one stands.
+    ///
+    /// Independent of `verdict`, and deliberately so: an ack that has been
+    /// overtaken by newer evidence appears here beside a re-raised verdict.
+    /// The two together are the story ("acknowledged on Tuesday, still
+    /// shelving values on Thursday"), and filtering one out would hide it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack: Option<FieldAck>,
 }
 
 /// One service's observation of a field.
@@ -894,6 +902,27 @@ pub struct CatalogConflictRow {
     pub at: String,
 }
 
+/// An operator's acknowledgement of a degraded verdict (issue #111): the
+/// body of a successful `POST /api/v1/schema/field/ack`, and the `ack` key
+/// on the field detail.
+///
+/// Acknowledging suppresses the badge for the evidence that existed when it
+/// was written, and nothing further: `evidence_through` is the episode count
+/// the ack covers, so the next conflict episode raises the badge again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldAck {
+    /// When the acknowledgement was written or last advanced (ISO 8601 UTC).
+    pub acked_at: String,
+    /// The acknowledging key's stable prefix. Not its display name: this row
+    /// outlives renames and rotations.
+    pub acked_by: String,
+    /// The operator's note, verbatim as they wrote it (≤1024 bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Conflict episodes the acknowledgement covers.
+    pub evidence_through: u64,
+}
+
 // -- repin (ADR-0011) --------------------------------------------------------
 
 /// Request body for `POST /api/v1/schema/repin`.
@@ -918,6 +947,17 @@ pub struct RepinRequest {
     /// resurrection-only pass when `to` equals the current pin.
     #[serde(default)]
     pub force: bool,
+    /// The most rows the forced rewrite may null before the cutover is
+    /// refused. Absent means the server derives one from this job's own
+    /// scan (10% headroom over a floor of 10 rows), which is the ordinary
+    /// case: an operator forcing a repin accepts roughly the plan they read,
+    /// not a number they computed. A ceiling without `force` is a 400.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nulled_rows: Option<u64>,
+    /// The same bound for dialect-ambiguous numerals, consulted only where
+    /// ambiguity binds (a `SEVERITY` target that did not assert `syslog`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ambiguous_rows: Option<u64>,
 }
 
 /// One repin job — the dry-run report and the progress/outcome record are
@@ -1014,6 +1054,23 @@ pub struct RepinJobResponse {
     /// `requested_by`, so the row is coherent about who did what.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancelled_by: Option<String>,
+    /// The loss ceiling the request stated, echoed back. Absent when the
+    /// request stated none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nulled_rows: Option<u64>,
+    /// The ambiguity ceiling the request stated, echoed back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ambiguous_rows: Option<u64>,
+    /// The loss ceiling the job is held to: the stated value when there was
+    /// one, else the scan-derived default. Resolved once, at plan time, so
+    /// it is absent on a claimed job that has not scanned yet, on an
+    /// unforced one (which accepts no loss at all), and on a job row written
+    /// before ceilings existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_max_nulled_rows: Option<u64>,
+    /// The ambiguity ceiling the job is held to, resolved the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_max_ambiguous_rows: Option<u64>,
 }
 
 /// Evidence that a repin's subject is still being written.
@@ -1461,6 +1518,12 @@ mod tests {
                 samples: vec!["n/a".into(), "pending".into()],
                 suggested_to: "VARCHAR".into(),
             }),
+            ack: Some(FieldAck {
+                acked_at: "2026-08-03T09:00:00Z".into(),
+                acked_by: "tkl_abc123".into(),
+                note: Some("sender is being fixed".into()),
+                evidence_through: 4,
+            }),
         };
         let rt = roundtrip(&resp);
         assert_eq!(rt.name, "duration");
@@ -1477,6 +1540,118 @@ mod tests {
         let verdict = rt.verdict.expect("the verdict survives the wire");
         assert_eq!(verdict.rows_shelved, 120);
         assert_eq!(verdict.suggested_to, "VARCHAR");
+        // Verdict and ack ride together: an acknowledgement overtaken by
+        // new evidence is exactly this shape.
+        let ack = rt.ack.expect("the acknowledgement survives the wire");
+        assert_eq!(ack.acked_by, "tkl_abc123");
+        assert_eq!(ack.evidence_through, 4);
+        assert_eq!(ack.note.as_deref(), Some("sender is being fixed"));
+    }
+
+    /// An unacknowledged field carries no `ack` key at all, and an ack
+    /// without a note carries no `note` key: absent is the encoding, so an
+    /// install that never acknowledges anything reads byte-identically to
+    /// one from before the routes shipped.
+    #[test]
+    fn an_unacknowledged_field_carries_no_ack_key() {
+        let resp = CatalogFieldResponse {
+            name: "duration".into(),
+            data_type: "BIGINT".into(),
+            pinned_from: None,
+            pinned_at: "2026-08-01T10:00:00Z".into(),
+            services: Vec::new(),
+            services_cursor: None,
+            conflicts: Vec::new(),
+            verdict: None,
+            ack: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("\"ack\""), "{json}");
+
+        let json = serde_json::to_string(&FieldAck {
+            acked_at: "2026-08-03T09:00:00Z".into(),
+            acked_by: "tkl_abc123".into(),
+            note: None,
+            evidence_through: 4,
+        })
+        .unwrap();
+        assert!(!json.contains("\"note\""), "{json}");
+    }
+
+    /// A repin request states its ceilings or states nothing. A body from a
+    /// client that predates them deserializes with both absent, and one
+    /// written without them puts no key on the wire, so the server reads
+    /// "derive from the scan" rather than a zero somebody meant as
+    /// "unlimited".
+    #[test]
+    fn repin_ceilings_are_absent_unless_the_request_states_them() {
+        let older: RepinRequest =
+            serde_json::from_str(r#"{"field":"status","to":"VARCHAR","force":true}"#).unwrap();
+        assert_eq!(older.max_nulled_rows, None);
+        assert_eq!(older.max_ambiguous_rows, None);
+
+        let json = serde_json::to_string(&older).unwrap();
+        assert!(!json.contains("max_nulled_rows"), "{json}");
+        assert!(!json.contains("max_ambiguous_rows"), "{json}");
+
+        let stated = RepinRequest {
+            max_nulled_rows: Some(500),
+            ..older
+        };
+        let rt: RepinRequest = serde_json::from_str(&serde_json::to_string(&stated).unwrap())
+            .expect("the stated ceiling survives the wire");
+        assert_eq!(rt.max_nulled_rows, Some(500));
+        assert_eq!(rt.max_ambiguous_rows, None);
+    }
+
+    /// The job row carries both pairs: what the request asked for, and what
+    /// the job is held to. The accepted pair is what the CLI binds a second
+    /// request to, so it has to survive the round trip intact.
+    #[test]
+    fn repin_job_reports_requested_and_accepted_ceilings() {
+        let json = serde_json::to_string(&RepinJobResponse {
+            id: 7,
+            field: "status".into(),
+            from_type: "BIGINT".into(),
+            to_type: "VARCHAR".into(),
+            dry_run: true,
+            force: true,
+            status: "succeeded".into(),
+            requested_by: Some("ops".into()),
+            started_at: "2026-09-01T10:00:00Z".into(),
+            finished_at: Some("2026-09-01T10:00:04Z".into()),
+            error: None,
+            files_total: 2,
+            rows_carrying: 400,
+            projected_nulls: 12,
+            resurrectable: 0,
+            affected_bytes: 8192,
+            files_done: 0,
+            rows_rewritten: 0,
+            rows_nulled: 0,
+            rows_resurrected: 0,
+            dialect: None,
+            ambiguous_numerals: 0,
+            unmapped_samples: Vec::new(),
+            liveness: None,
+            requires_force: Some(false),
+            requires_force_reason: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: Some(3),
+            accepted_max_nulled_rows: Some(22),
+            accepted_max_ambiguous_rows: Some(3),
+            cancel_requested_at: None,
+            cancelled_by: None,
+        })
+        .unwrap();
+        // An unstated request ceiling is absent, not zero.
+        assert!(!json.contains("\"max_nulled_rows\""), "{json}");
+
+        let rt: RepinJobResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt.max_nulled_rows, None);
+        assert_eq!(rt.max_ambiguous_rows, Some(3));
+        assert_eq!(rt.accepted_max_nulled_rows, Some(22));
+        assert_eq!(rt.accepted_max_ambiguous_rows, Some(3));
     }
 
     /// A healthy field carries no `verdict` key and no `samples` key at all:

@@ -37,6 +37,14 @@ pub(crate) struct ExportRequestRef<'a> {
     pub limit: Option<usize>,
 }
 
+/// Body for `POST /api/v1/schema/field/ack`. The note is the operator's
+/// own prose, so it travels borrowed and verbatim.
+#[derive(Serialize)]
+pub(crate) struct FieldAckRequestRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'a str>,
+}
+
 #[derive(Serialize)]
 pub(crate) struct SetScheduleRequestRef<'a> {
     pub interval: &'a str,
@@ -75,8 +83,8 @@ pub use trawl_api::{
     CatalogFieldResponse, CatalogFieldServiceRow, CatalogFieldSummary, CatalogFieldsResponse,
     CompletedQuerySnapshot, CreateSavedRequest, DashboardSnapshot, DegradedVerdict,
     DeleteSavedResponse, DeleteScheduleResponse, ErrorCode, ErrorDetail, ErrorEnvelope,
-    ErrorResponse, ErrorSpan, ExportFormat, ExportRequest, FieldValuesResponse, GcPinCandidate,
-    GcPinsRequest, GcPinsResponse, GlobalRunSummary, HealthResponse, HealthStatus,
+    ErrorResponse, ErrorSpan, ExportFormat, ExportRequest, FieldAck, FieldValuesResponse,
+    GcPinCandidate, GcPinsRequest, GcPinsResponse, GlobalRunSummary, HealthResponse, HealthStatus,
     HistoryEntryResponse, HistoryResponse, IngestEventError, IngestResponse, ListAllRunsResponse,
     ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
     QueryResponse, QueryStatus, RepinCancelOutcome, RepinCancelResponse, RepinJobResponse,
