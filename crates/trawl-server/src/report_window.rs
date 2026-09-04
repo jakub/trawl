@@ -10,12 +10,17 @@
 //! `window = "since_last"`, or takes a fixed trailing span under
 //! `window = "<duration>"`. This module owns the types, the two spellings
 //! of an instant, and the pure policy over them: [`plan_due_run`] turns a
-//! schedule plus a clock reading into the window a run covers. The
-//! scheduler wiring that persists those answers lives elsewhere.
+//! schedule plus a clock reading into the window a run covers, and
+//! [`materialize_window`] puts that window onto the saved DSL as absolute
+//! bounds. The scheduler wiring that persists those answers lives
+//! elsewhere.
 
 use std::fmt;
 
 use chrono::{DateTime, SecondsFormat, SubsecRound as _, TimeDelta, Utc};
+
+use trawl_core::ast::{PipeStage, Query, TimeClause};
+use trawl_core::format::format_query;
 
 use crate::store::{StoreError, format_interval, parse_interval};
 
@@ -384,6 +389,150 @@ fn plan_delta(secs: i64) -> Result<TimeDelta, PlanError> {
     TimeDelta::try_seconds(secs).ok_or(PlanError::Arithmetic)
 }
 
+// ---------------------------------------------------------------------------
+// The window materializer (ADR-0018 ruling 11)
+// ---------------------------------------------------------------------------
+
+/// Why a planned window could not be put onto a saved query.
+///
+/// The variants name the check that refused, because the caller's only
+/// sensible move is to fail the run and say which one: every one of these
+/// means the schedule and the query text disagree in a way the write-time
+/// compatibility check is supposed to have made impossible.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MaterializeError {
+    /// The saved text does not parse, so there is nothing to splice onto.
+    #[error("the saved query does not parse: {message}")]
+    SourceUnparseable {
+        /// The parser's first message.
+        message: String,
+    },
+    /// The saved text owns its own window. Two spellings of one interval
+    /// never coexist (ruling 7).
+    #[error(
+        "the saved query carries a {}= time clause, which a schedule window cannot be spliced onto",
+        .clause.keyword()
+    )]
+    SourceTimeClause {
+        /// The clause the query carries.
+        clause: TimeClause,
+    },
+    /// The saved text reads stored report rows, which no `_time` window
+    /// applies to (ruling 12).
+    #[error("the saved query reads stored report rows ('from saved'), which take no _time window")]
+    SourceFromSaved,
+    /// The spliced text does not parse. The prefix is machine-written, so
+    /// this means the saved text parses on its own but not behind two
+    /// bounds, and executing it anyway would run something nobody wrote.
+    #[error("the query with its window spliced on does not parse: {message}")]
+    OutputUnparseable {
+        /// The parser's first message.
+        message: String,
+    },
+    /// The spliced text parses, but its bounds are not the planned ones.
+    #[error("the spliced query's bounds did not read back as earliest={start} latest={end}")]
+    BoundsNotReadBack {
+        /// The lower bound the splice wrote.
+        start: String,
+        /// The upper bound the splice wrote.
+        end: String,
+    },
+    /// The spliced text parses with the right bounds, but the rest of it
+    /// is no longer the saved query.
+    #[error("splicing the window changed the query itself, not just its bounds")]
+    BodyChanged,
+}
+
+/// Put a planned window onto a saved query as absolute bounds, returning
+/// the text the run executes and stores (ADR-0018 ruling 11).
+///
+/// The output is a PREFIX SPLICE: `earliest="<start>" latest="<end>" `
+/// followed by the saved text byte for byte. The three time keywords are
+/// read before anything else in the search stage, so the prefix is valid
+/// ahead of a field filter, a bare word, a comment or a leading `|`.
+///
+/// Rebuilding the text from the AST instead was rejected: the formatter
+/// drops the operator's `#` comments and normalizes spelling, and
+/// `report_runs.query` is an audit artefact a human is meant to paste back
+/// and get the same report from. A prefix keeps the saved text intact.
+///
+/// A splice on text is only as good as its guard, so every result is
+/// checked before it is returned:
+///
+/// 1. the saved text parses, owns no time clause, and carries no
+///    `from saved` stage ANYWHERE in its pipeline (the emitter refuses one
+///    that is not the first stage, but it parses, so a first-stage-only
+///    check would let it through here);
+/// 2. the spliced text parses;
+/// 3. the spliced text's `earliest`/`latest` read back as exactly the two
+///    rendered bounds, with no `last=` beside them;
+/// 4. everything else about the spliced query is the saved query.
+///
+/// Check 4 compares the two through [`trawl_core::format::format_query`]
+/// rather than by `PartialEq`: the AST carries source spans, and the
+/// prefix moves every byte of the original, so a direct comparison would
+/// report a difference for every query. Formatting both sides is a
+/// projection that drops spans by construction.
+pub fn materialize_window(dsl: &str, window: &ReportWindow) -> Result<String, MaterializeError> {
+    let original =
+        parse_dsl(dsl).map_err(|message| MaterializeError::SourceUnparseable { message })?;
+    if let Some(clause) = original.time_clause() {
+        return Err(MaterializeError::SourceTimeClause { clause });
+    }
+    if carries_from_saved(&original) {
+        return Err(MaterializeError::SourceFromSaved);
+    }
+
+    let start = format_window_bound(window.start);
+    let end = format_window_bound(window.end);
+    let spliced = format!("earliest=\"{start}\" latest=\"{end}\" {dsl}");
+
+    let reparsed =
+        parse_dsl(&spliced).map_err(|message| MaterializeError::OutputUnparseable { message })?;
+
+    let bounds_read_back = reparsed.search.time_filter.is_none()
+        && reparsed.search.earliest.as_ref().map(|b| b.node.as_str()) == Some(start.as_str())
+        && reparsed.search.latest.as_ref().map(|b| b.node.as_str()) == Some(end.as_str());
+    if !bounds_read_back {
+        return Err(MaterializeError::BoundsNotReadBack { start, end });
+    }
+
+    let mut body = reparsed;
+    body.search.earliest = None;
+    body.search.latest = None;
+    if format_query(&body) != format_query(&original) {
+        return Err(MaterializeError::BodyChanged);
+    }
+
+    Ok(spliced)
+}
+
+/// Parse DSL, reducing a parse failure to its first message.
+///
+/// The message quotes the operator's own tokens, so it is fine to show a
+/// client and never fine to persist: callers put it in an error the HTTP
+/// layer redacts, and telemetry logs the class instead.
+fn parse_dsl(dsl: &str) -> Result<Query, String> {
+    trawl_core::parser::parse(dsl).map_err(|errors| {
+        errors
+            .first()
+            .map_or_else(|| "parse error".to_owned(), |e| e.message.clone())
+    })
+}
+
+/// Whether any stage of the pipeline reads stored report rows.
+///
+/// Deliberately not [`trawl_core::ast::Query::from_saved_stage`], which
+/// reports only a FIRST stage. A `from saved` further along parses fine
+/// and is refused later by the emitter, and window policy has to see it
+/// here: a query it cannot execute must not be handed a window either.
+fn carries_from_saved(query: &Query) -> bool {
+    query
+        .pipeline
+        .iter()
+        .any(|stage| matches!(stage.node, PipeStage::FromSaved(_)))
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone as _;
@@ -734,5 +883,127 @@ mod tests {
         ] {
             assert_eq!(bound.timestamp_subsec_nanos() % 1000, 0, "{bound}");
         }
+    }
+
+    // -- The window materializer (ADR-0018 ruling 11) ----------------------
+
+    /// The window every materializer test splices: 02:00 to 03:00 UTC.
+    fn spliceable_window() -> ReportWindow {
+        ReportWindow {
+            start: at(2, 0),
+            end: at(3, 0),
+            truncated: false,
+            kind: WindowKind::SinceLast,
+        }
+    }
+
+    const SPLICED_PREFIX: &str =
+        "earliest=\"2026-03-14T02:00:00.000000Z\" latest=\"2026-03-14T03:00:00.000000Z\" ";
+
+    /// The saved text survives the splice byte for byte, including a
+    /// comment the formatter would have dropped, and the result is the
+    /// same query with bounds on it.
+    #[test]
+    fn materializing_prefixes_the_saved_text_verbatim() {
+        let cases = [
+            "service=nginx | stats count() by host",
+            "| stats count()",
+            "service=nginx # nightly rollup, do not touch",
+            "service=nginx OR service=apache | head 5",
+        ];
+        for dsl in cases {
+            let out = materialize_window(dsl, &spliceable_window()).unwrap();
+            assert_eq!(out, format!("{SPLICED_PREFIX}{dsl}"), "for {dsl}");
+            assert!(out.ends_with(dsl), "saved text not verbatim: {out}");
+
+            let reparsed = trawl_core::parser::parse(&out).unwrap();
+            let original = trawl_core::parser::parse(dsl).unwrap();
+            assert!(reparsed.search.earliest.is_some() && reparsed.search.latest.is_some());
+            let mut body = reparsed;
+            body.search.earliest = None;
+            body.search.latest = None;
+            assert_eq!(format_query(&body), format_query(&original), "for {dsl}");
+        }
+
+        let commented = materialize_window(
+            "service=nginx # nightly rollup, do not touch",
+            &spliceable_window(),
+        )
+        .unwrap();
+        assert!(commented.contains("# nightly rollup, do not touch"));
+    }
+
+    /// The bounds the splice writes read back as the instants that were
+    /// planned, not as text that merely looks like them.
+    #[test]
+    fn spliced_bounds_reparse_to_the_planned_instants() {
+        let window = spliceable_window();
+        let out = materialize_window("service=nginx", &window).unwrap();
+        let parsed = trawl_core::parser::parse(&out).unwrap();
+
+        let read = |text: &str| {
+            DateTime::parse_from_rfc3339(text)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        assert_eq!(read(&parsed.search.earliest.unwrap().node), window.start);
+        assert_eq!(read(&parsed.search.latest.unwrap().node), window.end);
+    }
+
+    /// Ruling 7: a query that owns its own window is refused rather than
+    /// given a second one. Write-time policy should have stopped this, so
+    /// the refusal names the clause it found.
+    #[test]
+    fn materializing_refuses_a_query_that_owns_its_own_window() {
+        let cases = [
+            ("service=nginx last=1h", TimeClause::Last),
+            (
+                "service=nginx earliest=\"2026-01-01T00:00:00Z\"",
+                TimeClause::Earliest,
+            ),
+            (
+                "service=nginx latest=\"2026-01-01T00:00:00Z\"",
+                TimeClause::Latest,
+            ),
+        ];
+        for (dsl, clause) in cases {
+            assert_eq!(
+                materialize_window(dsl, &spliceable_window()),
+                Err(MaterializeError::SourceTimeClause { clause }),
+                "for {dsl}"
+            );
+        }
+    }
+
+    /// Ruling 12: stored report rows take no `_time` window, wherever the
+    /// `from saved` stage sits in the pipeline.
+    #[test]
+    fn materializing_refuses_a_from_saved_query_anywhere_in_the_pipeline() {
+        for dsl in [
+            "| from saved daily_rollup",
+            "| from saved daily_rollup | head 5",
+            "service=nginx | head 5 | from saved daily_rollup",
+        ] {
+            assert_eq!(
+                materialize_window(dsl, &spliceable_window()),
+                Err(MaterializeError::SourceFromSaved),
+                "for {dsl}"
+            );
+        }
+    }
+
+    /// Text that does not parse is refused before anything is spliced onto
+    /// it, and the parser's own message travels with the refusal.
+    #[test]
+    fn materializing_refuses_an_unparseable_saved_query() {
+        let err = materialize_window("| stats count(", &spliceable_window()).unwrap_err();
+        assert!(
+            matches!(err, MaterializeError::SourceUnparseable { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("the saved query does not parse")
+        );
     }
 }
