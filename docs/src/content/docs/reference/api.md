@@ -370,14 +370,21 @@ Three outcomes:
   `dry_run` and `deleted` are what tell them apart: a dry run mutates
   nothing at all (no delete, no cache eviction, no metric) and returns the
   candidates it would have reclaimed.
-- **409**: refused, nothing mutated. Either a repin owns the data root (a
-  `data/REPIN` marker, a staging or aside root, or a running job row: every
-  footer under a corpus mid-rearrangement is provisional), or the corpus
-  could not be read well enough to prove anything dead. A file that will
-  not open, an unparseable footer, a symlink under an env directory or a
-  file that vanished mid-scan each means one file whose columns are
+- **409**: refused, nothing mutated. Four shapes. A repin owns the data
+  root (a `data/REPIN` marker, a staging or aside root, or a running job
+  row: every footer under a corpus mid-rearrangement is provisional), or a
+  repin claimed one mid-purge, which the purge transaction itself refuses.
+  Another gc run is already in progress; a second one is turned away at
+  once rather than queued behind a scan that holds the corpus gate. The
+  corpus could not be read well enough to prove anything dead: a file that
+  will not open, a `.parquet` that is not a regular file, an unparseable
+  footer, a symlink under an env directory, a file that vanished mid-scan,
+  or a data root that cannot be listed at all (an unmounted volume is
+  UNKNOWN, never an empty corpus). Each is a file whose columns are
   unknown, and the whole run fails closed rather than deleting on partial
-  evidence. The message names the count and up to three paths.
+  evidence; the message names the count and up to three paths. Or the
+  catalog store stopped answering while the corpus gate was held, which is
+  bounded at five seconds per statement and reported as UNKNOWN.
 - **503**: a query-only node, or the store is down.
 
 The deletion is metadata only: catalog rows and the in-process pin cache,

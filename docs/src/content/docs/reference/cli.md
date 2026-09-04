@@ -292,9 +292,11 @@ what ran.
 
 There is no `--yes`. The deletion is catalog metadata only, and a field
 reclaimed by mistake pins again from scratch the next time a sender writes
-it, so `--dry-run` is the whole safety story. A refusal (a repin owns the
-data root, or a file under the data root could not be read) prints the
-server's message and exits non-zero without deleting anything.
+it, so `--dry-run` is the whole safety story. A refusal prints the server's message and
+exits non-zero without deleting anything: a repin owns the data root or
+claimed it mid-run, another gc run is already going, or something under
+the data root could not be read (including the root itself, which is
+UNKNOWN rather than an empty corpus).
 
 The summary lines go to stdout for a table and to stderr under `-f json`
 or `-f csv`, so a piped run is one rectangular record set of candidate
