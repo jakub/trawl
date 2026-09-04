@@ -499,8 +499,15 @@ impl RepinEngine {
     async fn finish(&self, job_id: i64, status: RepinJobStatus, error: Option<&str>) {
         const FAST_ATTEMPTS: u32 = 3;
         for attempt in 1..=FAST_ATTEMPTS {
-            match self.store.finish(job_id, status, error).await {
-                Ok(()) => {
+            match self.store.finish_if_running(job_id, status, error).await {
+                // The write is conditional (never clobber a terminal
+                // verdict), but the metric is not gated on it: the success
+                // path arrives here with the row ALREADY `succeeded`,
+                // terminalized inside `finish_cutover`'s transaction, so
+                // counting only the rows this statement changed would stop
+                // metering every completed repin. One increment per landed
+                // terminal write, exactly as before.
+                Ok(_) => {
                     count_outcome(status);
                     return;
                 }
@@ -531,8 +538,11 @@ impl RepinEngine {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(FINISH_RETRY_INTERVAL).await;
-                match store.finish(job_id, status, error.as_deref()).await {
-                    Ok(()) => {
+                match store
+                    .finish_if_running(job_id, status, error.as_deref())
+                    .await
+                {
+                    Ok(_) => {
                         count_outcome(status);
                         tracing::info!(
                             event_type = "repin_store_recovered",

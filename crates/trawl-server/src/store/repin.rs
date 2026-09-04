@@ -34,6 +34,12 @@ pub enum RepinJobStatus {
     RefusedNeedsForce,
     /// Terminal: the cutover could not drain queries within its budget.
     Blocked,
+    /// Terminal: an operator cancelled the job and a file boundary observed
+    /// the request before the point of no return, so the unwind ran and the
+    /// live corpus was never touched. Live-process-only: a daemon that dies
+    /// between the request and its effect leaves a `running` row that boot
+    /// reconciliation terminalizes as [`Self::Failed`], never this.
+    Cancelled,
 }
 
 impl RepinJobStatus {
@@ -46,6 +52,7 @@ impl RepinJobStatus {
             Self::Failed => "failed",
             Self::RefusedNeedsForce => "refused_needs_force",
             Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -59,6 +66,7 @@ impl RepinJobStatus {
             "failed" => Some(Self::Failed),
             "refused_needs_force" => Some(Self::RefusedNeedsForce),
             "blocked" => Some(Self::Blocked),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -131,6 +139,16 @@ pub struct RepinJob {
     /// report", which is why the force verdict is absent rather than false
     /// before this is set.
     pub planned_at: Option<DateTime<Utc>>,
+    /// When a cancel request was accepted for this job, if one was. Set
+    /// together with [`Self::cancelled_by`] and never overwritten, so a
+    /// second request over a job already cancelling reads the first asker's
+    /// instant. A populated pair on a non-`Cancelled` row is not a
+    /// contradiction: the job crashed before the request took effect, or
+    /// the cancel lost its race with the point of no return.
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+    /// The cancelling key's display name (audit), from the same identity
+    /// source as [`Self::requested_by`].
+    pub cancelled_by: Option<String>,
 }
 
 /// What a repin job is claimed for: the row's immutable half.
@@ -219,6 +237,8 @@ fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
         field_last_seen: row.try_get("field_last_seen")?,
         field_last_service: row.try_get("field_last_service")?,
         planned_at: row.try_get("planned_at")?,
+        cancel_requested_at: row.try_get("cancel_requested_at")?,
+        cancelled_by: row.try_get("cancelled_by")?,
     })
 }
 
@@ -226,7 +246,7 @@ const JOB_COLS: &str = "id, field, from_type, to_type, dry_run, force, status, r
      started_at, finished_at, error, files_total, rows_carrying, projected_nulls, \
      resurrectable, affected_bytes, files_done, rows_rewritten, rows_nulled, rows_resurrected, \
      dialect, ambiguous_numerals, unmapped_samples, field_last_seen, field_last_service, \
-     planned_at";
+     planned_at, cancel_requested_at, cancelled_by";
 
 /// Postgres-backed repin job store. Cheap to clone (shared pool).
 #[derive(Debug, Clone)]
@@ -323,26 +343,73 @@ impl RepinStore {
         Ok(())
     }
 
-    /// Move a job to a terminal status (never `running`), stamping
-    /// `finished_at` once.
-    pub async fn finish(
+    /// Move a *running* job to a terminal status, stamping `finished_at`
+    /// once. Returns whether this call is the one that terminalized the row.
+    ///
+    /// Conditional on purpose: a terminal row is a verdict something already
+    /// published, and once cancellation exists there are two writers racing
+    /// for it (the job's own ladder and the cancel path's unwind). An
+    /// unconditional write would let the loser rewrite the winner's status,
+    /// so a job reported `cancelled` could turn back into `succeeded`. It
+    /// also makes a redundant retry harmless: `false` means someone else got
+    /// there first, not that the write failed.
+    ///
+    /// `finish_cutover` terminalizes under the same `status = 'running'`
+    /// condition, so a job whose cutover completed reads `false` here.
+    pub async fn finish_if_running(
         &self,
         id: i64,
         status: RepinJobStatus,
         error: Option<&str>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         debug_assert_ne!(status, RepinJobStatus::Running);
-        sqlx::query(
+        let done = sqlx::query(
             "UPDATE repin_jobs
              SET status = $2, error = $3, finished_at = COALESCE(finished_at, now())
-             WHERE id = $1",
+             WHERE id = $1 AND status = 'running'",
         )
         .bind(id)
         .bind(status.as_str())
         .bind(error)
         .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(done == 1)
+    }
+
+    /// Record an accepted cancel request against the running job, returning
+    /// the row it landed on (`None` when the job is no longer running: it
+    /// terminalized between the in-process decision and this write).
+    ///
+    /// Idempotent and first-writer-preserving. A second operator asking to
+    /// cancel a job already cancelling changes nothing — the row keeps the
+    /// instant and the actor of the request that actually took effect, which
+    /// is what the audit trail and the job's error sentence name. Both
+    /// columns move together, as the migration's paired CHECK requires.
+    ///
+    /// This is a record of the request, not of its effect: the terminal
+    /// status is written later, by whichever file boundary observes the
+    /// cancel token.
+    pub async fn record_cancel_request(
+        &self,
+        id: i64,
+        actor: &str,
+    ) -> Result<Option<RepinJob>, StoreError> {
+        let row = sqlx::query(AssertSqlSafe(format!(
+            "UPDATE repin_jobs
+             SET cancel_requested_at = COALESCE(cancel_requested_at, now()),
+                 cancelled_by = COALESCE(cancelled_by, $2)
+             WHERE id = $1 AND status = 'running'
+             RETURNING {JOB_COLS}"
+        )))
+        .bind(id)
+        .bind(actor)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        row.as_ref()
+            .map(row_to_job)
+            .transpose()
+            .map_err(StoreError::from)
     }
 
     /// The cutover's pin flip: `field_types` takes the new type and the job
@@ -458,5 +525,79 @@ impl RepinStore {
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every status arm, listed once. `index_of` below is an exhaustive
+    /// match, so a new arm cannot be added without landing in this array
+    /// (and, through the test, in the migration's CHECK).
+    const ALL_STATUSES: [RepinJobStatus; 6] = [
+        RepinJobStatus::Running,
+        RepinJobStatus::Succeeded,
+        RepinJobStatus::Failed,
+        RepinJobStatus::RefusedNeedsForce,
+        RepinJobStatus::Blocked,
+        RepinJobStatus::Cancelled,
+    ];
+
+    const fn index_of(status: RepinJobStatus) -> usize {
+        match status {
+            RepinJobStatus::Running => 0,
+            RepinJobStatus::Succeeded => 1,
+            RepinJobStatus::Failed => 2,
+            RepinJobStatus::RefusedNeedsForce => 3,
+            RepinJobStatus::Blocked => 4,
+            RepinJobStatus::Cancelled => 5,
+        }
+    }
+
+    /// The spellings inside the status CHECK's `IN (...)` list, in the
+    /// migration that last re-created it. The extractor is deliberately
+    /// dumb — first `CHECK (status IN (` to the next `)` — which is why
+    /// that list stays on its own lines with nothing but quoted spellings
+    /// in it.
+    fn migration_status_spellings() -> Vec<String> {
+        const SQL: &str = include_str!("../../migrations/0014_repin_cancel.sql");
+        const OPEN: &str = "CHECK (status IN (";
+        let start = SQL.find(OPEN).expect("0014 re-creates the status CHECK") + OPEN.len();
+        let rest = &SQL[start..];
+        let end = rest.find(')').expect("the IN list closes");
+        rest[..end]
+            .split(',')
+            .map(|s| s.trim().trim_matches('\'').to_owned())
+            .collect()
+    }
+
+    /// The enum and the CHECK are one vocabulary. A status the database
+    /// refuses is a job the engine cannot terminalize — the running slot
+    /// wedges until a restart — and a spelling only the database knows is
+    /// a row `row_to_job` decodes as corruption.
+    #[test]
+    fn status_vocabulary_matches_the_migration_check() {
+        for status in ALL_STATUSES {
+            assert_eq!(
+                ALL_STATUSES[index_of(status)],
+                status,
+                "ALL_STATUSES must list every arm at its own index"
+            );
+        }
+
+        let sql: std::collections::BTreeSet<String> =
+            migration_status_spellings().into_iter().collect();
+        let rust: std::collections::BTreeSet<String> =
+            ALL_STATUSES.iter().map(|s| s.as_str().to_owned()).collect();
+        assert_eq!(sql, rust, "repin_jobs status CHECK vs RepinJobStatus");
+    }
+
+    #[test]
+    fn parse_round_trips_every_stored_spelling() {
+        for status in ALL_STATUSES {
+            assert_eq!(RepinJobStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(RepinJobStatus::parse("cancelling"), None);
     }
 }
