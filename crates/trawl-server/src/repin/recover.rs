@@ -197,8 +197,10 @@ pub async fn reconcile_store(
                     .map_err(|e| format!("failed to complete recovered repin flip: {e}"))?;
                 // The clear is audited wherever it happens. `cleared_ack` is
                 // true only on the call that completed the job, so a boot
-                // that replays an already-finished cutover stays silent and
-                // the event still fires exactly once per acknowledgement.
+                // that replays an already-finished cutover stays silent.
+                // Same contract as the live path: one line per OBSERVED
+                // clear, and a crash between the commit above and this emit
+                // loses it for good.
                 if outcome.cleared_ack {
                     tracing::info!(
                         event_type = "field_degraded_ack_cleared",

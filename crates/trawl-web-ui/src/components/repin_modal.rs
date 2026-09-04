@@ -18,12 +18,15 @@
 //!    be checked before the forced run can be started.
 //! 3. **Force accepts a printed number, and binds that number.** The
 //!    ceilings a forced run is held to are resolved server-side from a
-//!    FORCED scan, so a refusal off an unforced run carries none: the
-//!    dialog asks for a forced plan, shows the pair that plan resolved,
-//!    and the execution restates it as explicit ceilings. Sending none
-//!    and letting the server re-derive would bind a limit nobody read,
-//!    which is what ceilings exist to stop (issue #111). It is the same
-//!    rule the CLI's `--yes --force` preview keeps.
+//!    FORCED scan, so the dialog asks for a forced plan, shows the pair
+//!    that plan resolved, and the execution restates it as explicit
+//!    ceilings. Sending none and letting the server re-derive would bind
+//!    a limit nobody read, which is what ceilings exist to stop (issue
+//!    #111). It is the same rule the CLI's `--yes --force` preview
+//!    keeps. The acceptance opens for a forced scan this dialog asked
+//!    for and nothing else: a refusal carrying ceilings is a run that
+//!    busted them, not a consent to run it again, and a refusal for a
+//!    target the strip does not offer is not this dialog's plan at all.
 //! 4. **The plan is a snapshot, not a reservation.** Ingest keeps
 //!    running; the real run rescans, and its numbers can differ.
 //! 5. **An indeterminate outcome never offers to run again.** A real run
@@ -45,7 +48,7 @@ use crate::api::{self, ApiError, RepinOutcome};
 use crate::repin_flow::{
     BoundCeilings, ForceStep, LostRun, ProbedJob, Recovery, SlotCheck, StatusProbe, Unproven,
     default_target, force_step, indeterminate_text, is_pre_claim_failure, recovery_verdict,
-    repin_targets, slot_check,
+    refusal_is_reusable, repin_targets, slot_check,
 };
 use crate::service_card_fmt::{format_bytes, format_exact};
 use fleet_ui::{Btn, Icon, Modal, Segmented, SegmentedOption, Variant};
@@ -170,10 +173,12 @@ struct Handles {
     phase: RwSignal<Phase>,
     probing: RwSignal<bool>,
     force: RwSignal<bool>,
-    /// Whether a FORCED scan has already answered for the plan on
-    /// screen. A forced report that resolved no ceilings has nothing
-    /// more to give, so this stops the dialog offering a rescan that
-    /// would read the whole corpus for the same answer.
+    /// Whether a FORCED scan has answered in this dialog for the plan on
+    /// screen. It is what opens the acceptance, and it survives nothing:
+    /// a target change, a refusal, an adopted job all clear it. A forced
+    /// report that resolved no ceilings has nothing more to give, so it
+    /// also stops the dialog offering a rescan that would read the whole
+    /// corpus for the same answer.
     previewed: RwSignal<bool>,
     busy_field: RwSignal<Option<String>>,
     slot_note: RwSignal<Option<String>>,
@@ -213,14 +218,23 @@ pub fn RepinModal(
 ) -> impl IntoView {
     let shown_field = sanitize_display_text(&field);
     let targets = repin_targets(&current_type);
+    // A refusal is the scan of ONE target. Re-presenting it under any
+    // other rung would put its counts, and the ceilings a forced run
+    // restates, against a cast that produced none of them — so a target
+    // this dialog does not offer (a CLI-started `SEVERITY` or
+    // resurrection repin) drops the plan here and the dialog starts from
+    // a fresh scan. The refusal itself is not lost: the case file keeps
+    // it as a receipt and points at the CLI.
+    let refused = refused.filter(|job| refusal_is_reusable(&current_type, &job.to_type));
     let initial = refused.as_ref().map_or_else(
         || default_target(&current_type, &suggested_to).as_catalog(),
         |job| {
             // The refusal's own target, so the re-presented numbers and
-            // the selected rung cannot disagree.
-            repin_targets(&current_type)
-                .into_iter()
-                .find(|c| c.as_catalog() == job.to_type)
+            // the selected rung cannot disagree. Offered by the filter
+            // above, so the lookup always finds it.
+            targets
+                .iter()
+                .find(|c| c.as_catalog().eq_ignore_ascii_case(&job.to_type))
                 .map_or_else(
                     || default_target(&current_type, &suggested_to).as_catalog(),
                     |c| c.as_catalog(),
@@ -349,7 +363,13 @@ pub fn RepinModal(
                     // Re-arm the acceptance: a refusal must be accepted
                     // for the plan actually shown, never carried over.
                     force.set(false);
-                    previewed.set(forced);
+                    // And a refusal is never itself a preview, however it
+                    // was reached. An unforced run has no ceilings to
+                    // show; a FORCED run refused at the cutover gate has
+                    // the pair it just exceeded, which is the last thing
+                    // to re-offer. Either way the next forced run buys a
+                    // fresh scan first.
+                    previewed.set(false);
                     phase.set(Phase::NeedsForce(Box::new(job)));
                 }
                 Ok(RepinOutcome::Busy(msg)) => {
@@ -603,10 +623,10 @@ pub fn RepinModal(
                     view! {
                         {plan_block(&job, true)}
                         {match step {
-                            // No ceilings resolved yet: the refusal came
-                            // off an unforced scan, and only a forced one
-                            // settles the numbers. Nothing to accept, so
-                            // no acceptance is offered.
+                            // No forced scan has answered here yet, and
+                            // only a forced scan settles the numbers.
+                            // Nothing to accept, so no acceptance is
+                            // offered.
                             ForceStep::NeedsPreview => view! {
                                 <p class="rp-note">
                                     "A forced repin is held to a limit per dimension — rows the \
@@ -854,9 +874,9 @@ fn probe_recovery(
             Recovery::Adopt => {
                 if let Some(job) = found {
                     handles.force.set(false);
-                    // The adopted row's own ceilings decide the rung: a
-                    // job the operator never saw a forced scan for has
-                    // none to accept.
+                    // No forced scan has answered in this dialog for the
+                    // adopted row, whatever ceilings it carries, so the
+                    // forced rung starts at the preview.
                     handles.previewed.set(false);
                     handles.phase.set(Phase::NeedsForce(Box::new(job)));
                 }

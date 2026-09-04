@@ -86,6 +86,23 @@ pub fn repin_targets(current: &str) -> Vec<CanonicalType> {
         .collect()
 }
 
+/// Whether a refused job's plan can be re-presented for a field pinned
+/// `current`, instead of being read as a receipt only.
+///
+/// The plan is a scan of ONE target, so it means nothing for any other
+/// rung: its counts, and the ceilings a forced run would restate, were
+/// resolved by casting the corpus to `job.to_type` and to nothing else.
+/// The two targets the modal never offers are exactly the two a refusal
+/// can carry from elsewhere: `SEVERITY` (started from the CLI, since the
+/// dialect assertion is not a modal's to make) and the same-type
+/// resurrection pass. Both stay CLI work, so their refusals stay
+/// receipts.
+#[must_use]
+pub fn refusal_is_reusable(current: &str, to_type: &str) -> bool {
+    let to = to_type.to_ascii_uppercase();
+    repin_targets(current).iter().any(|c| c.as_catalog() == to)
+}
+
 /// The rung the target selector starts on: the analyzer's suggestion
 /// when it is a real rung and not the current pin, else VARCHAR — the
 /// honest fallback that keeps every value — else the first rung on
@@ -402,13 +419,12 @@ pub fn accepted_ceilings(job: &RepinJobResponse) -> Option<BoundCeilings> {
 /// What the forced rung of the ladder can do with the job on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForceStep {
-    /// The numbers a forced run would be held to are not known yet: the
-    /// refusal on screen came off an UNFORCED scan, and the server
-    /// resolves ceilings only for a forced job. A forced dry run is what
-    /// produces them, and it is the operator's click to make.
+    /// No forced scan has answered for the plan on screen, so there are
+    /// no numbers to accept yet. A forced dry run produces them, and it
+    /// is the operator's click to make.
     NeedsPreview,
-    /// The report resolved a pair, so the forced run restates it and the
-    /// bound the server enforces is the bound on screen.
+    /// The forced scan resolved a pair, so the forced run restates it
+    /// and the bound the server enforces is the bound on screen.
     Bound(BoundCeilings),
     /// A forced scan came back with no resolved pair. Nothing to
     /// restate; the execution derives its own ceilings, exactly as a
@@ -419,15 +435,23 @@ pub enum ForceStep {
 
 /// Which of the three [`ForceStep`] cases the dialog is in.
 ///
-/// `previewed` is whether a FORCED scan has already answered for this
-/// plan. Without it an unbound report would park the dialog on a button
-/// that rescans the whole corpus forever.
+/// `previewed` is whether a FORCED scan has answered in this dialog for
+/// the plan on screen, and it alone opens the acceptance. Reading the
+/// ceilings off the job row instead would re-open it for a refusal that
+/// already busted them: a forced execution refused at the cutover gate
+/// comes back carrying the very pair it exceeded, and offering that pair
+/// again would send the same run at the same ceilings for the same
+/// answer. Every forced refusal therefore costs a fresh forced scan,
+/// whose report is the corpus as it stands now — which is the point,
+/// since ingest kept running while the refused job read it.
 #[must_use]
 pub fn force_step(job: &RepinJobResponse, previewed: bool) -> ForceStep {
+    if !previewed {
+        return ForceStep::NeedsPreview;
+    }
     match accepted_ceilings(job) {
         Some(bound) => ForceStep::Bound(bound),
-        None if previewed => ForceStep::Unbound,
-        None => ForceStep::NeedsPreview,
+        None => ForceStep::Unbound,
     }
 }
 
@@ -459,8 +483,8 @@ mod tests {
         BoundCeilings, ConflictBody, ForceStep, LostRun, MAX_POLL_ERRORS, PollAction, ProbedJob,
         REPIN_BUSY_FALLBACK, Recovery, RepinJobResponse, SlotCheck, StatusProbe, Unproven,
         accepted_ceilings, claim_toast, classify_conflict, default_target, force_step,
-        indeterminate_text, is_pre_claim_failure, poll_decide, recovery_verdict, repin_targets,
-        slot_check,
+        indeterminate_text, is_pre_claim_failure, poll_decide, recovery_verdict,
+        refusal_is_reusable, repin_targets, slot_check,
     };
     use trawl_core::schema::CanonicalType;
 
@@ -557,10 +581,10 @@ mod tests {
     }
 
     /// The three rungs of the forced step, and the one that must not be
-    /// reachable twice: an unforced refusal has no ceilings to restate,
-    /// so it asks for a forced scan; a report that resolved them binds
-    /// them; and a forced scan that resolved none stops asking rather
-    /// than reading the corpus again for the same answer.
+    /// reachable twice: without a forced scan there is nothing to
+    /// accept, so the dialog asks for one; a forced scan that resolved
+    /// the pair binds it; and a forced scan that resolved none stops
+    /// asking rather than reading the corpus again for the same answer.
     #[test]
     fn the_forced_rung_asks_for_numbers_once_and_then_binds_what_it_has() {
         let unforced = job_with("");
@@ -568,16 +592,48 @@ mod tests {
         assert_eq!(force_step(&unforced, true), ForceStep::Unbound);
 
         let forced = job_with(r#","accepted_max_nulled_rows":18,"accepted_max_ambiguous_rows":0"#);
-        let bound = ForceStep::Bound(BoundCeilings {
-            max_nulled: 18,
-            max_ambiguous: 0,
-        });
-        assert_eq!(force_step(&forced, true), bound);
         assert_eq!(
-            force_step(&forced, false),
-            bound,
-            "a refusal that already carries the pair needs no second scan"
+            force_step(&forced, true),
+            ForceStep::Bound(BoundCeilings {
+                max_nulled: 18,
+                max_ambiguous: 0,
+            })
         );
+    }
+
+    /// A forced execution refused at the cutover gate comes back
+    /// carrying the ceilings it exceeded. Re-offering those is offering
+    /// the run that just failed: the acceptance stays shut until a fresh
+    /// forced scan answers.
+    #[test]
+    fn a_refusal_that_carries_ceilings_still_needs_a_fresh_forced_scan() {
+        let refused_forced =
+            job_with(r#","accepted_max_nulled_rows":18,"accepted_max_ambiguous_rows":4"#);
+        assert_eq!(
+            force_step(&refused_forced, false),
+            ForceStep::NeedsPreview,
+            "the pair on a refused row is the one it busted, not a new consent"
+        );
+    }
+
+    /// A refusal is a scan of one target, so it may only be re-presented
+    /// as a plan for that same target — and only when the modal offers
+    /// it at all. The two it never offers are the two a refusal can
+    /// carry in from the CLI.
+    #[test]
+    fn only_a_refusal_for_an_offered_target_is_a_reusable_plan() {
+        assert!(refusal_is_reusable("BIGINT", "VARCHAR"));
+        // The catalog spells pins uppercase; a lowercase wire spelling
+        // is the same rung.
+        assert!(refusal_is_reusable("BIGINT", "varchar"));
+        // The severity ladder needs a dialect asserted, so the modal
+        // offers no such rung and the refusal stays a receipt.
+        assert!(!refusal_is_reusable("BIGINT", "SEVERITY"));
+        // The resurrection pass repins to the pin the field already has.
+        assert!(!refusal_is_reusable("BIGINT", "BIGINT"));
+        assert!(!refusal_is_reusable("VARCHAR", "varchar"));
+        // A target this build cannot name is not invented into a rung.
+        assert!(!refusal_is_reusable("BIGINT", "HUGEINT"));
     }
 
     #[test]

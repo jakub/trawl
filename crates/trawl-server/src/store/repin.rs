@@ -453,7 +453,11 @@ impl RepinStore {
     /// the same transaction and under the same gate: an ack suppresses a
     /// verdict about a pin, and that pin is gone. Whether the DELETE removed
     /// anything comes back on [`CutoverOutcome::cleared_ack`], so the audit
-    /// event fires exactly once and never on a boot replay.
+    /// event fires for the clear that happened and never for a boot replay
+    /// of it. One line per OBSERVED clear, which is weaker than one per
+    /// clear: the DELETE commits here, and a crash before the caller emits
+    /// loses the line with nothing left to replay it from
+    /// (`repin::engine`).
     ///
     /// Both clears are gated on this call being the one that completed the
     /// job, the only part of the flip that is not naturally idempotent. A

@@ -43,7 +43,8 @@ use crate::api;
 use crate::api::ApiError;
 use crate::components::repin_modal::RepinModal;
 use crate::repin_flow::{
-    PollAction, ProbedJob, REPIN_POLL_MS, StatusProbe, claim_toast, poll_decide,
+    PollAction, ProbedJob, REPIN_POLL_MS, StatusProbe, accepted_ceilings, claim_toast, poll_decide,
+    refusal_is_reusable,
 };
 use crate::repin_hint::{REPIN_HINT_REFUSED, hint_segments, repin_command_hint, repin_is_running};
 use crate::service_card_fmt::format_exact;
@@ -262,7 +263,14 @@ pub fn FieldCaseDrawer(
         // values under a reader who asked for none is not their decision
         // to be handed. That case renders as a receipt with an explicit
         // "review" button instead (`job_block`).
-        if status == STATUS_REFUSED && job_initiated.try_get_untracked() == Some(true) {
+        // …and only for a target the modal offers. A refusal for any
+        // other one carries a plan the dialog cannot re-present, so
+        // opening it would buy a fresh full-corpus scan for a target
+        // nobody asked about.
+        if status == STATUS_REFUSED
+            && job_initiated.try_get_untracked() == Some(true)
+            && refusal_is_reusable(&finished.from_type, &finished.to_type)
+        {
             // The refusal is a plan, scanned by the run that just
             // stopped. Re-present it rather than asking for another
             // full-corpus pass.
@@ -746,11 +754,33 @@ pub fn FieldCaseDrawer(
                 // An adopted refusal offers the ladder rather than
                 // opening it: a button the reader can take, and only
                 // when the session may actually repin.
+                // A refusal for a target the modal does not offer — a
+                // CLI-started severity or resurrection repin — has no
+                // dialog to go back into: its plan is a scan of that
+                // target and means nothing under any other rung. It
+                // stays a receipt, with the shell as the way on.
+                let off_ladder =
+                    j.status == STATUS_REFUSED && !refusal_is_reusable(&j.from_type, &j.to_type);
                 let review = (j.status == STATUS_REFUSED
                     && !job_initiated.get()
-                    && can_repin.get())
-                .then_some(review_refused);
-                job_block(&j, review)
+                    && can_repin.get()
+                    && !off_ladder)
+                    .then_some(review_refused);
+                view! {
+                    {job_block(&j, review)}
+                    {off_ladder.then(|| view! {
+                        <p class="fc-note">
+                            "This refusal is for a target this page does not offer: putting a \
+                             field on the severity ladder needs a dialect asserted, and \
+                             re-extracting shelved values under the pin it already has is a \
+                             resurrection pass. Both stay shell decisions — "
+                            <span class="mono">"trawl schema repin"</span>
+                            " re-runs the plan and "
+                            <span class="mono">"--force"</span>
+                            " accepts it."
+                        </p>
+                    })}
+                }
             })}
             {move || poll_warning.get().map(|msg| view! {
                 <div class="fc-note" role="status">{msg}</div>
@@ -816,12 +846,36 @@ fn job_outcome_line(job: &RepinJobResponse) -> String {
             format_exact(job.rows_nulled),
             format_exact(job.rows_resurrected),
         ),
-        STATUS_REFUSED => format!(
-            "{field}: refused \u{2014} {} stored values cannot be kept as {}, and no force was \
-             given. The corpus is untouched.",
-            format_exact(job.projected_nulls),
-            job.to_type,
-        ),
+        // Two refusals wear this status, and they are not the same news.
+        // An unforced run is refused because nothing accepted the loss;
+        // a FORCED one is refused because the finished rewrite came out
+        // worse than the ceilings the operator did accept, so those are
+        // the numbers to name.
+        STATUS_REFUSED => {
+            let projected = format_exact(job.projected_nulls);
+            match (job.force, accepted_ceilings(job)) {
+                (true, Some(bound)) => format!(
+                    "{field}: refused \u{2014} {projected} stored values cannot be kept as {}, \
+                     past the {} row(s) and {} dialect-ambiguous numeral(s) accepted. The corpus \
+                     is untouched.",
+                    job.to_type,
+                    format_exact(bound.max_nulled),
+                    format_exact(bound.max_ambiguous),
+                ),
+                // Forced, but the row carries no resolved pair to name —
+                // a job a server older than the ceiling columns wrote.
+                (true, None) => format!(
+                    "{field}: refused \u{2014} {projected} stored values cannot be kept as {}, \
+                     past what the forced run was held to. The corpus is untouched.",
+                    job.to_type,
+                ),
+                (false, _) => format!(
+                    "{field}: refused \u{2014} {projected} stored values cannot be kept as {}, \
+                     and no force was given. The corpus is untouched.",
+                    job.to_type,
+                ),
+            }
+        }
         // Including `blocked`, `failed`, and any status a later server
         // adds: the wire word verbatim, plus whatever it said went wrong.
         other => {
@@ -873,8 +927,10 @@ fn job_block(job: &RepinJobResponse, on_review: Option<Callback<()>>) -> AnyView
     let error = job.error.as_deref().map(sanitize_display_text);
     let lagging = job.status == STATUS_SUCCEEDED && !job.dry_run;
     // What the refusal was about. `projected_nulls`, not `rows_nulled`:
-    // a refused job wrote nothing, so its outcome counters are zero by
-    // construction and the projection is the number it declined over.
+    // the projection is the number the server declined over. A forced
+    // refusal does carry outcome counters (its shadow rewrite finished
+    // before the cutover gate turned it down), but those describe a
+    // generation that was thrown away, never the live corpus.
     let projected_nulls = format_exact(job.projected_nulls);
     view! {
         <div class="fc-sec fc-job">
