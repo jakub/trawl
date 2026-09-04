@@ -1722,7 +1722,9 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
             dialect,
             nulled,
             clamp(job.ambiguous_numerals),
-            job.force,
+            // M3 reads the row's persisted ceilings here; a row without
+            // them is the legacy blank check.
+            crate::repin::ceiling::ForceTerms::blank_check(job.force),
         )
     });
     trawl_api::RepinJobResponse {

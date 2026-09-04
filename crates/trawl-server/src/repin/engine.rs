@@ -36,6 +36,7 @@ use crate::catalog::conform::open_bounded_connection;
 use crate::error::ServerError;
 use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
+use crate::repin::ceiling::{self, ForceTerms};
 use crate::repin::cutover::{
     finish_post_swap_staging, prepare_shadow_root, swap_envs, sweep_pre_swap_staging,
 };
@@ -379,12 +380,14 @@ impl RepinEngine {
         // reason rides with it, because a refusal over ambiguity with zero
         // projected nulls is otherwise a plan an operator cannot read the
         // verdict off.
+        // M3 resolves this job's ceilings here; until then a forced job is
+        // the pre-migration blank check it has always been.
         if let Some(reason) = force_refusal(
             reading.written.pin,
             Some(reading.written.raw),
             counts.projected_nulls,
             counts.ambiguous_numerals,
-            force,
+            ForceTerms::blank_check(force),
         ) {
             self.finish(job_id, RepinJobStatus::RefusedNeedsForce, Some(&reason))
                 .await;
@@ -775,7 +778,7 @@ impl RepinEngine {
             Some(reading.written.raw),
             totals.nulled,
             totals.ambiguous,
-            force,
+            ForceTerms::blank_check(force),
         ) {
             return Err(JobAbort::RefusedNeedsForce(format!(
                 "the completed rewrite is not what the pre-build scan \
@@ -1177,15 +1180,25 @@ fn run_pass_blocking(
 ///
 /// The count is taken whatever the dialect, since the report says what is
 /// there; only the gate is conditional.
+///
+/// Force is not a blank check (#111): `terms` carries the flag and the
+/// numbers it accepted, so a forced job is still refused when the finished
+/// rewrite is worse than the plan the operator read. A forced job with no
+/// ceilings is a row written before those numbers were persisted, and keeps
+/// the old blank-check behaviour, because there is no honest bound to hold
+/// it to.
 pub(crate) fn force_refusal(
     pin: CanonicalType,
     dialect: Option<trawl_core::severity::Dialect>,
     nulled: u64,
     ambiguous: u64,
-    force: bool,
+    terms: ForceTerms,
 ) -> Option<String> {
-    if force {
-        return None;
+    if terms.force {
+        return terms
+            .ceilings
+            .and_then(|c| ceiling::exceeds(pin, dialect, c, nulled, ambiguous))
+            .map(|over| over.to_string());
     }
     if nulled > 0 {
         return Some(format!(
@@ -1194,10 +1207,7 @@ pub(crate) fn force_refusal(
             pin.as_catalog()
         ));
     }
-    let ambiguous_gate = pin == CanonicalType::Severity
-        && dialect != Some(trawl_core::severity::Dialect::Syslog)
-        && ambiguous > 0;
-    if ambiguous_gate {
+    if ceiling::ambiguity_binds(pin, dialect) && ambiguous > 0 {
         return Some(format!(
             "{ambiguous} row(s) carry a numeral 1-7, which the OTel ladder \
              and syslog PRI read as DIFFERENT severities (3 is trace3 to \
@@ -1312,47 +1322,101 @@ mod tests {
 
         const SEVERITY: CanonicalType = CanonicalType::Severity;
         const VARCHAR: CanonicalType = CanonicalType::Varchar;
+        let unforced = ForceTerms::unforced();
+        let blank_check = ForceTerms {
+            force: true,
+            ceilings: None,
+        };
 
         // Loss: any target, any dialect, cleared only by force.
         assert!(
-            force_refusal(VARCHAR, None, 3, 0, false)
+            force_refusal(VARCHAR, None, 3, 0, unforced)
                 .is_some_and(|m| m.contains("cannot be read as VARCHAR")),
         );
-        assert_eq!(force_refusal(VARCHAR, None, 3, 0, true), None);
-        assert!(force_refusal(SEVERITY, Some(Dialect::Syslog), 3, 0, false).is_some());
+        assert_eq!(force_refusal(VARCHAR, None, 3, 0, blank_check), None);
+        assert!(force_refusal(SEVERITY, Some(Dialect::Syslog), 3, 0, unforced).is_some());
 
         // Ambiguity: refused under OTel, silent under an explicit syslog
         // assertion, and cleared by force either way.
-        let refusal = force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, false)
+        let refusal = force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, unforced)
             .expect("an OTel repin over the 1-7 overlap must refuse");
         assert!(refusal.contains("2 row(s)"), "{refusal}");
         assert!(refusal.contains("dialect=syslog"), "{refusal}");
         assert_eq!(
-            force_refusal(SEVERITY, Some(Dialect::Syslog), 0, 2, false),
+            force_refusal(SEVERITY, Some(Dialect::Syslog), 0, 2, unforced),
             None,
             "asserting syslog IS the answer to the ambiguity"
         );
         assert_eq!(
-            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, true),
+            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, blank_check),
             None
         );
         // A row with no recorded dialect at all reads as the OTel default:
         // the gate must not go silent because a column is NULL.
-        assert!(force_refusal(SEVERITY, None, 0, 2, false).is_some());
+        assert!(force_refusal(SEVERITY, None, 0, 2, unforced).is_some());
 
         // Nothing to refuse, and a non-severity target has no ambiguity
         // notion at all (its count is a constant zero upstream, but the gate
         // must not fire even if one were handed in).
         assert_eq!(
-            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 0, false),
+            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 0, unforced),
             None
         );
-        assert_eq!(force_refusal(VARCHAR, None, 0, 5, false), None);
+        assert_eq!(force_refusal(VARCHAR, None, 0, 5, unforced), None);
 
         // Loss is reported first: it is the larger hazard, and a plan
         // carrying both needs one force flag, not a ladder of them.
-        let both = force_refusal(SEVERITY, Some(Dialect::Otel), 1, 1, false).unwrap();
+        let both = force_refusal(SEVERITY, Some(Dialect::Otel), 1, 1, unforced).unwrap();
         assert!(both.contains("cannot be read as SEVERITY"), "{both}");
+    }
+
+    /// Force with ceilings is force held to a number (#111): the same one
+    /// function decides, so the scan gate, the finished-shadow gate and the
+    /// wire all report the overrun in the same sentence. Ceiling-less force
+    /// stays the pre-migration blank check, and the syslog exemption carries
+    /// into the ceiling arm through the shared `ambiguity_binds` predicate.
+    #[test]
+    fn a_forced_job_is_held_to_the_ceilings_it_accepted() {
+        use crate::repin::ceiling::Ceilings;
+        use trawl_core::severity::Dialect;
+
+        const SEVERITY: CanonicalType = CanonicalType::Severity;
+        const VARCHAR: CanonicalType = CanonicalType::Varchar;
+        let terms = ForceTerms::forced(Ceilings {
+            max_nulled: 10,
+            max_ambiguous: 2,
+        });
+
+        assert_eq!(
+            force_refusal(VARCHAR, None, 10, 0, terms),
+            None,
+            "the accepted number itself passes"
+        );
+        let over = force_refusal(VARCHAR, None, 11, 0, terms).expect("one row above refuses");
+        assert!(over.contains("accepted 10"), "{over}");
+        assert!(
+            over.contains("11 nulled row(s)"),
+            "the sentence names the actual too: {over}"
+        );
+
+        // Ambiguity has its own ceiling, and asserting syslog still answers
+        // the question rather than spending the budget.
+        assert!(force_refusal(SEVERITY, Some(Dialect::Otel), 0, 3, terms).is_some());
+        assert_eq!(
+            force_refusal(SEVERITY, Some(Dialect::Syslog), 0, 3, terms),
+            None
+        );
+
+        // Without ceilings, force covers everything — the shape of a job row
+        // written before the ceilings were persisted.
+        let blank_check = ForceTerms {
+            force: true,
+            ceilings: None,
+        };
+        assert_eq!(
+            force_refusal(SEVERITY, Some(Dialect::Otel), 9_999, 9_999, blank_check),
+            None
+        );
     }
 
     /// The dialect is a `SEVERITY`-only assertion: a severity target

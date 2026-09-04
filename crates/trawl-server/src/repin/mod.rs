@@ -11,7 +11,7 @@
 //! document + sibling staging layout), `plan` (the scan every job runs),
 //! `rewrite` (per-file hardlink-or-rewrite), `cutover` (the idempotent
 //! per-env swap), `engine` (the job lifecycle), `recover` (the boot
-//! decision table).
+//! decision table), `ceiling` (the numbers a forced job accepted).
 
 /// How recently the field must have been observed for a repin's report to
 /// call it live (ADR-0013 ruling 10).
@@ -31,6 +31,7 @@
 /// window over which "still writing" is a fact rather than a coincidence.
 pub const LIVENESS_WINDOW: std::time::Duration = std::time::Duration::from_hours(24);
 
+pub mod ceiling;
 pub mod cutover;
 pub mod engine;
 pub mod gate;
