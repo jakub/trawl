@@ -29,7 +29,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row as _};
 use trawl_core::schema::CanonicalType;
 
-use super::error::StoreError;
+use super::error::{PgViolation, StoreError, classify_violation};
 use crate::catalog::analyzer::{ConflictAggregate, is_degraded};
 
 /// A proposed pin for a field absent from the catalog.
@@ -101,6 +101,51 @@ pub struct ConflictServicePair {
     pub field: String,
     /// Service whose batches contributed the conflict evidence.
     pub service: String,
+}
+
+/// One operator acknowledgement of a degraded pin: a `field_degraded_ack`
+/// row (migration 0015, issue #111).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedAck {
+    /// The acknowledged field (a catalog key).
+    pub field: String,
+    /// When the acknowledgement was written or last advanced.
+    pub acked_at: DateTime<Utc>,
+    /// The acknowledging key's stable prefix — never its display name: this
+    /// row outlives renames and rotations.
+    pub acked_by: String,
+    /// Operator prose, capped at 1024 bytes by the migration's CHECK.
+    pub note: Option<String>,
+    /// The acknowledged episode high-water: the field's summed
+    /// `field_conflict_stats.episodes` at the instant of the ack. Evidence
+    /// up to and including this count is suppressed; the next episode
+    /// re-raises the verdict.
+    pub evidence_through: i64,
+}
+
+/// What [`CatalogStore::acknowledge_degraded_field`] did, or why it refused.
+///
+/// A typed outcome rather than an error: neither refusal is a fault. The
+/// caller (an HTTP handler) turns them into 404 and 409, and nothing else
+/// distinguishes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// The acknowledgement is stored. `created` distinguishes a fresh row
+    /// from an advanced one, which is the only difference the audit event
+    /// cares about.
+    Acked {
+        /// The stored row, as postgres returned it.
+        ack: DegradedAck,
+        /// True when this call inserted the row rather than advancing one.
+        created: bool,
+    },
+    /// No pin by that name: there is nothing to acknowledge.
+    Unpinned,
+    /// The field's evidence does not meet the degraded threshold, so there
+    /// is no verdict to suppress. Acknowledging it would install a
+    /// high-water that silently swallows the evidence that would have
+    /// raised the badge for the first time.
+    NotDegraded,
 }
 
 /// A `field_services` observation row.
@@ -1013,14 +1058,24 @@ impl CatalogStore {
 
     /// [`Self::conflict_aggregates`], page-keyed shape: `$1` field names.
     /// See the method docs for why this is its own SQL text.
+    ///
+    /// The ack join hangs off the GROUPED rows, not the raw ones: one row
+    /// per field either way (`field_degraded_ack` is keyed on `field`), but
+    /// joining after the aggregation keeps the page's key pushed into the
+    /// primary key scan, and the join then runs over at most a page of rows.
     const CONFLICT_AGGREGATES_KEYED_SQL: &'static str = "\
-        SELECT field, min(first_at) AS first_at, max(last_at) AS last_at,
-               count(*)::bigint                      AS services,
-               COALESCE(sum(episodes), 0)::bigint    AS episodes,
-               COALESCE(sum(rows_nulled_total), 0)::bigint AS rows_nulled_total
-        FROM field_conflict_stats
-        WHERE field = ANY($1)
-        GROUP BY field";
+        SELECT s.field, s.first_at, s.last_at, s.services, s.episodes,
+               s.rows_nulled_total, a.evidence_through AS ack_evidence_through
+        FROM (
+            SELECT field, min(first_at) AS first_at, max(last_at) AS last_at,
+                   count(*)::bigint                      AS services,
+                   COALESCE(sum(episodes), 0)::bigint    AS episodes,
+                   COALESCE(sum(rows_nulled_total), 0)::bigint AS rows_nulled_total
+            FROM field_conflict_stats
+            WHERE field = ANY($1)
+            GROUP BY field
+        ) s
+        LEFT JOIN field_degraded_ack a ON a.field = s.field";
 
     /// [`Self::conflict_aggregates`], whole-catalog shape.
     ///
@@ -1033,12 +1088,17 @@ impl CatalogStore {
     /// costs it a parquet file per hour per name, while what this returns is
     /// one row per field, pin-capped.
     const CONFLICT_AGGREGATES_ALL_SQL: &'static str = "\
-        SELECT field, min(first_at) AS first_at, max(last_at) AS last_at,
-               count(*)::bigint                      AS services,
-               COALESCE(sum(episodes), 0)::bigint    AS episodes,
-               COALESCE(sum(rows_nulled_total), 0)::bigint AS rows_nulled_total
-        FROM field_conflict_stats
-        GROUP BY field";
+        SELECT s.field, s.first_at, s.last_at, s.services, s.episodes,
+               s.rows_nulled_total, a.evidence_through AS ack_evidence_through
+        FROM (
+            SELECT field, min(first_at) AS first_at, max(last_at) AS last_at,
+                   count(*)::bigint                      AS services,
+                   COALESCE(sum(episodes), 0)::bigint    AS episodes,
+                   COALESCE(sum(rows_nulled_total), 0)::bigint AS rows_nulled_total
+            FROM field_conflict_stats
+            GROUP BY field
+        ) s
+        LEFT JOIN field_degraded_ack a ON a.field = s.field";
 
     /// Aggregate the durable conflict evidence per field: the input the
     /// degraded-field analyzer judges ([`crate::catalog::analyzer`]).
@@ -1095,6 +1155,7 @@ impl CatalogStore {
                     services: row.try_get("services")?,
                     episodes: row.try_get("episodes")?,
                     rows_nulled_total: row.try_get("rows_nulled_total")?,
+                    ack_evidence_through: row.try_get("ack_evidence_through")?,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
@@ -1293,6 +1354,146 @@ impl CatalogStore {
             .execute(&mut *tx)
             .await?;
         Ok(())
+    }
+
+    /// Acknowledge one field's degraded verdict up to the evidence that
+    /// exists right now (issue #111).
+    ///
+    /// The whole method is one transaction, and it opens with `SELECT 1 FROM
+    /// field_types WHERE field = $1 FOR SHARE`. That row lock is the
+    /// serialization point against the repin cutover, whose transaction
+    /// UPDATEs the same `field_types` row and DELETEs the ack. Without it
+    /// the two interleave in a way that is silently wrong: this method reads
+    /// the episode sum, the cutover then clears the evidence and the ack,
+    /// and this method's upsert lands afterwards — installing a high-water
+    /// over a field whose conflict counters have just been reset to zero,
+    /// which suppresses the NEW pin's first several episodes. `FOR SHARE`
+    /// is enough because the cutover takes a row-exclusive lock on the same
+    /// row, so the two orders are the only two outcomes: either the ack
+    /// commits first and the cutover deletes it, or the cutover commits
+    /// first and this method reads the post-clear evidence, finds nothing
+    /// degraded and refuses.
+    ///
+    /// Refusals are typed, not errors: an unpinned field and a field whose
+    /// evidence never met the threshold are both ordinary answers.
+    ///
+    /// The upsert ADVANCES: `evidence_through` never moves backwards, so a
+    /// second ack racing a concurrent evidence clear cannot lower a
+    /// high-water another one just raised.
+    pub async fn acknowledge_degraded_field(
+        &self,
+        field: &str,
+        acked_by: &str,
+        note: Option<&str>,
+    ) -> Result<AckOutcome, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let pinned = sqlx::query("SELECT 1 FROM field_types WHERE field = $1 FOR SHARE")
+            .bind(field)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if pinned.is_none() {
+            tx.rollback().await?;
+            return Ok(AckOutcome::Unpinned);
+        }
+
+        let aggregates = Self::conflict_aggregates_tx(&mut tx, Some(&[field.to_owned()])).await?;
+        let Some(agg) = aggregates.into_iter().find(|a| a.field == field) else {
+            tx.rollback().await?;
+            return Ok(AckOutcome::NotDegraded);
+        };
+        if !is_degraded(&agg) {
+            tx.rollback().await?;
+            return Ok(AckOutcome::NotDegraded);
+        }
+
+        // `xmax = 0` on a RETURNING row of an upsert is postgres' own tell
+        // for "this tuple was inserted, not updated": an updated tuple
+        // carries the deleting transaction's id in xmax, an inserted one
+        // carries zero.
+        let row = sqlx::query(
+            "INSERT INTO field_degraded_ack (field, acked_by, note, evidence_through)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (field) DO UPDATE
+                SET acked_by         = EXCLUDED.acked_by,
+                    note             = EXCLUDED.note,
+                    acked_at         = now(),
+                    evidence_through = GREATEST(field_degraded_ack.evidence_through,
+                                                EXCLUDED.evidence_through)
+             RETURNING field, acked_at, acked_by, note, evidence_through, (xmax = 0) AS created",
+        )
+        .bind(field)
+        .bind(acked_by)
+        .bind(note)
+        .bind(agg.episodes)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| match classify_violation(&e) {
+            Some(PgViolation::Check) => {
+                StoreError::Validation("acknowledgement note is too long".to_owned())
+            }
+            _ => StoreError::from(e),
+        })?;
+        let outcome = AckOutcome::Acked {
+            ack: DegradedAck {
+                field: row.try_get("field")?,
+                acked_at: row.try_get("acked_at")?,
+                acked_by: row.try_get("acked_by")?,
+                note: row.try_get("note")?,
+                evidence_through: row.try_get("evidence_through")?,
+            },
+            created: row.try_get("created")?,
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// One field's acknowledgement, if it has one.
+    pub async fn degraded_ack(&self, field: &str) -> Result<Option<DegradedAck>, StoreError> {
+        let row = sqlx::query(
+            "SELECT field, acked_at, acked_by, note, evidence_through
+             FROM field_degraded_ack WHERE field = $1",
+        )
+        .bind(field)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| -> Result<DegradedAck, sqlx::Error> {
+            Ok(DegradedAck {
+                field: row.try_get("field")?,
+                acked_at: row.try_get("acked_at")?,
+                acked_by: row.try_get("acked_by")?,
+                note: row.try_get("note")?,
+                evidence_through: row.try_get("evidence_through")?,
+            })
+        })
+        .transpose()
+        .map_err(StoreError::from)
+    }
+
+    /// Drop one field's acknowledgement, inside a caller's transaction; the
+    /// answer says whether a row was actually removed.
+    ///
+    /// Public and transaction-taking for the reason
+    /// [`Self::clear_conflict_evidence`] is: the repin cutover
+    /// ([`crate::store::RepinStore::finish_cutover`]) has to clear the ack
+    /// atomically with the pin flip it invalidates, and only a caller
+    /// holding that transaction can express it.
+    pub async fn clear_degraded_ack(
+        tx: &mut sqlx::PgConnection,
+        field: &str,
+    ) -> Result<bool, StoreError> {
+        let done = sqlx::query("DELETE FROM field_degraded_ack WHERE field = $1")
+            .bind(field)
+            .execute(&mut *tx)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// [`Self::clear_degraded_ack`] on its own connection: the operator's
+    /// own "un-acknowledge", which needs no wider atomicity than the DELETE.
+    pub async fn clear_degraded_ack_owned(&self, field: &str) -> Result<bool, StoreError> {
+        let mut conn = self.pool.acquire().await?;
+        Self::clear_degraded_ack(&mut conn, field).await
     }
 
     /// Read the conflict rows for one field, most recent first.

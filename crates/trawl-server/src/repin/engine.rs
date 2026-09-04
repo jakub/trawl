@@ -245,6 +245,11 @@ impl RepinEngine {
                 dialect,
                 dry_run,
                 force,
+                // No ceiling reaches this far yet: the request surface
+                // carries them from the next milestone, and until it does
+                // every job records the blank check it actually got.
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
                 requested_by,
             })
             .await?;
@@ -300,6 +305,7 @@ impl RepinEngine {
     ///
     /// Runs detached from the request (see `start`), so every exit path
     /// terminalizes the job row itself.
+    #[allow(clippy::too_many_lines)] // One claim-to-launch ladder; splitting it hides an exit path.
     async fn decide(
         self: Arc<Self>,
         job_id: i64,
@@ -359,6 +365,11 @@ impl RepinEngine {
                     unmapped_samples: samples,
                     field_last_seen: liveness.as_ref().map(|(at, _)| *at),
                     field_last_service: liveness.map(|(_, service)| service),
+                    // Resolution happens here from the next milestone: the
+                    // scan's counts are in hand, which is the only place a
+                    // job's own ceilings can honestly come from.
+                    accepted_max_nulled_rows: None,
+                    accepted_max_ambiguous_rows: None,
                 },
             )
             .await
@@ -817,8 +828,11 @@ impl RepinEngine {
         // exit: the corpus already is the new generation.
         let mut flipped_ok = false;
         for attempt in 1..=FLIP_ATTEMPTS {
+            // The outcome's `cleared_ack` is deliberately unread here: the
+            // audit event for a repin clearing an operator's acknowledgement
+            // lands with the ack routes.
             match self.store.finish_cutover(job_id, field, to).await {
-                Ok(()) => {
+                Ok(_) => {
                     flipped_ok = true;
                     break;
                 }

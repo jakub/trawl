@@ -1020,6 +1020,8 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
             dry_run: false,
             force: false,
             requested_by: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
         })
         .await
         .unwrap();
@@ -1149,6 +1151,8 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
             dry_run: false,
             force: false,
             requested_by: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
         })
         .await
         .unwrap();
@@ -1243,6 +1247,8 @@ async fn boot_reconciliation_replays_a_severity_cutover() {
             dry_run: false,
             force: true,
             requested_by: None,
+            max_nulled_rows: None,
+            max_ambiguous_rows: None,
         })
         .await
         .unwrap();

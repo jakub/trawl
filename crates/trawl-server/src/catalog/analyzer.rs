@@ -71,6 +71,14 @@ pub struct ConflictAggregate {
     /// Rows nulled summed across those services — lifetime, unlike the
     /// `field_conflicts` window's sum.
     pub rows_nulled_total: i64,
+    /// The episode high-water an operator has acknowledged for this field
+    /// (`field_degraded_ack.evidence_through`), or `None` when nobody has.
+    ///
+    /// Carried, not yet judged: [`is_degraded`] still reads the evidence
+    /// alone. The suppression rule that consumes this (`episodes <=
+    /// evidence_through`) lands with the ack routes, which is also where
+    /// this gate splits into a threshold half and a suppression half.
+    pub ack_evidence_through: Option<i64>,
 }
 
 /// Whether the evidence indicts the pin: sustained AND consequential.
@@ -167,6 +175,7 @@ mod tests {
             services: 1,
             episodes,
             rows_nulled_total: rows,
+            ack_evidence_through: None,
         }
     }
 
