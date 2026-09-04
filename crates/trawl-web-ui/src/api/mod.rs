@@ -19,7 +19,7 @@ use trawl_api::{
     ServiceSchemaResponse, SetScheduleRequest, UpdateSavedRequest,
 };
 
-use crate::repin_flow::{ConflictBody, classify_conflict};
+use crate::repin_flow::{BoundCeilings, ConflictBody, classify_conflict};
 
 /// Rows per page for the snapshot results table.
 pub const PAGE_SIZE: usize = 50;
@@ -274,6 +274,7 @@ pub async fn repin(
     to: &str,
     dry_run: bool,
     force: bool,
+    ceilings: Option<BoundCeilings>,
 ) -> Result<RepinOutcome, ApiError> {
     let body = RepinRequest {
         // The exact name, never the sanitised display copy: the catalog
@@ -286,10 +287,12 @@ pub async fn repin(
         dialect: None,
         dry_run,
         force,
-        // The SPA offers no ceiling controls, so the server resolves both
-        // from the job's own scan.
-        max_nulled_rows: None,
-        max_ambiguous_rows: None,
+        // A forced execution restates the pair the operator was shown, so
+        // the bound the server enforces is the bound on screen. `None` is
+        // every other rung of the ladder: the scans (which resolve their
+        // own) and the unforced run (which accepts no loss at all).
+        max_nulled_rows: ceilings.map(|c| c.max_nulled),
+        max_ambiguous_rows: ceilings.map(|c| c.max_ambiguous),
     };
     let resp = Request::post("/api/v1/schema/repin")
         .header("content-type", "application/json")

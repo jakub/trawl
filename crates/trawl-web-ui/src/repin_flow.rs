@@ -367,6 +367,70 @@ pub fn slot_check(probe: &StatusProbe) -> SlotCheck {
     }
 }
 
+/// The ceilings a forced repin is held to, both resolved.
+///
+/// The pair travels together because a request that states one dimension
+/// and leaves the other to the server would bind a number nobody was
+/// shown, which is the whole thing ceilings exist to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundCeilings {
+    /// Rows the new pin may fail to read before the cutover refuses.
+    pub max_nulled: u64,
+    /// Dialect-ambiguous numerals allowed before the cutover refuses.
+    pub max_ambiguous: u64,
+}
+
+/// The ceilings a report resolved, when it resolved both.
+///
+/// Absent for an unforced job (which accepts no loss at all), for a
+/// claimed job that has not scanned yet, and for a job row a server
+/// older than the ceiling columns wrote. The modal has nothing honest to
+/// show or to restate in those cases, so it asks for a forced plan
+/// instead of guessing the formula — the arithmetic lives on the server,
+/// and a copy of it here would be a second one to keep in step.
+///
+/// This is the SPA's half of the CLI's `schema::accepted_ceilings`. Both
+/// read the same two wire fields and both refuse a half-filled pair.
+#[must_use]
+pub fn accepted_ceilings(job: &RepinJobResponse) -> Option<BoundCeilings> {
+    Some(BoundCeilings {
+        max_nulled: job.accepted_max_nulled_rows?,
+        max_ambiguous: job.accepted_max_ambiguous_rows?,
+    })
+}
+
+/// What the forced rung of the ladder can do with the job on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceStep {
+    /// The numbers a forced run would be held to are not known yet: the
+    /// refusal on screen came off an UNFORCED scan, and the server
+    /// resolves ceilings only for a forced job. A forced dry run is what
+    /// produces them, and it is the operator's click to make.
+    NeedsPreview,
+    /// The report resolved a pair, so the forced run restates it and the
+    /// bound the server enforces is the bound on screen.
+    Bound(BoundCeilings),
+    /// A forced scan came back with no resolved pair. Nothing to
+    /// restate; the execution derives its own ceilings, exactly as a
+    /// repin did before ceilings existed. Rescanning would only produce
+    /// the same answer, so the forced run is offered.
+    Unbound,
+}
+
+/// Which of the three [`ForceStep`] cases the dialog is in.
+///
+/// `previewed` is whether a FORCED scan has already answered for this
+/// plan. Without it an unbound report would park the dialog on a button
+/// that rescans the whole corpus forever.
+#[must_use]
+pub fn force_step(job: &RepinJobResponse, previewed: bool) -> ForceStep {
+    match accepted_ceilings(job) {
+        Some(bound) => ForceStep::Bound(bound),
+        None if previewed => ForceStep::Unbound,
+        None => ForceStep::NeedsPreview,
+    }
+}
+
 thread_local! {
     /// Repin job ids that have already raised a toast, for the life of
     /// the page.
@@ -392,8 +456,9 @@ pub fn claim_toast(job_id: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConflictBody, LostRun, MAX_POLL_ERRORS, PollAction, ProbedJob, REPIN_BUSY_FALLBACK,
-        Recovery, SlotCheck, StatusProbe, Unproven, claim_toast, classify_conflict, default_target,
+        BoundCeilings, ConflictBody, ForceStep, LostRun, MAX_POLL_ERRORS, PollAction, ProbedJob,
+        REPIN_BUSY_FALLBACK, Recovery, RepinJobResponse, SlotCheck, StatusProbe, Unproven,
+        accepted_ceilings, claim_toast, classify_conflict, default_target, force_step,
         indeterminate_text, is_pre_claim_failure, poll_decide, recovery_verdict, repin_targets,
         slot_check,
     };
@@ -432,6 +497,87 @@ mod tests {
              "resurrectable":5,"affected_bytes":4096,"files_done":0,"rows_rewritten":0,
              "rows_nulled":0,"rows_resurrected":0}}}}"#
         )
+    }
+
+    /// A job as the wire carries it, with whatever ceiling keys the
+    /// caller wants spliced in. Built by decoding, not by struct
+    /// literal, so a job that simply omits the keys — the pre-ceiling
+    /// server — is one of the cases under test.
+    fn job_with(extra: &str) -> RepinJobResponse {
+        let body = job_body(1, "refused_needs_force").replace(
+            r#""rows_resurrected":0}}"#,
+            &format!(r#""rows_resurrected":0{extra}}}}}"#),
+        );
+        match classify_conflict(&body) {
+            ConflictBody::Plan(job) => *job,
+            ConflictBody::Busy(m) => panic!("test fixture failed to decode: {m}"),
+        }
+    }
+
+    /// The modal may only restate a pair the report actually resolved.
+    /// A half-filled pair is not half a consent: it means the other
+    /// number would come from the server's own derivation, and the
+    /// operator would be confirming a bound nobody printed.
+    #[test]
+    fn only_a_complete_ceiling_pair_can_be_restated() {
+        assert_eq!(
+            accepted_ceilings(&job_with(
+                r#","accepted_max_nulled_rows":18,"accepted_max_ambiguous_rows":10"#
+            )),
+            Some(BoundCeilings {
+                max_nulled: 18,
+                max_ambiguous: 10,
+            })
+        );
+        assert_eq!(
+            accepted_ceilings(&job_with(r#","accepted_max_nulled_rows":18"#)),
+            None,
+            "half a pair binds nothing"
+        );
+        assert_eq!(
+            accepted_ceilings(&job_with(r#","accepted_max_ambiguous_rows":10"#)),
+            None
+        );
+        assert_eq!(
+            accepted_ceilings(&job_with("")),
+            None,
+            "an unforced plan resolves no ceilings at all"
+        );
+        // Zero is a real ceiling — "force the ambiguity, not one row of
+        // loss" — and must not read as absent.
+        assert_eq!(
+            accepted_ceilings(&job_with(
+                r#","accepted_max_nulled_rows":0,"accepted_max_ambiguous_rows":0"#
+            )),
+            Some(BoundCeilings {
+                max_nulled: 0,
+                max_ambiguous: 0,
+            })
+        );
+    }
+
+    /// The three rungs of the forced step, and the one that must not be
+    /// reachable twice: an unforced refusal has no ceilings to restate,
+    /// so it asks for a forced scan; a report that resolved them binds
+    /// them; and a forced scan that resolved none stops asking rather
+    /// than reading the corpus again for the same answer.
+    #[test]
+    fn the_forced_rung_asks_for_numbers_once_and_then_binds_what_it_has() {
+        let unforced = job_with("");
+        assert_eq!(force_step(&unforced, false), ForceStep::NeedsPreview);
+        assert_eq!(force_step(&unforced, true), ForceStep::Unbound);
+
+        let forced = job_with(r#","accepted_max_nulled_rows":18,"accepted_max_ambiguous_rows":0"#);
+        let bound = ForceStep::Bound(BoundCeilings {
+            max_nulled: 18,
+            max_ambiguous: 0,
+        });
+        assert_eq!(force_step(&forced, true), bound);
+        assert_eq!(
+            force_step(&forced, false),
+            bound,
+            "a refusal that already carries the pair needs no second scan"
+        );
     }
 
     #[test]
