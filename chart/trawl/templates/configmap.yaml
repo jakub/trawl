@@ -91,11 +91,18 @@ data:
     {{- /* Per-env age overrides. These sub-tables must follow the three
          scalars above: in TOML a scalar after a sub-table header lands
          inside that sub-table. Helm ranges a map in key order, so the
-         rendered config is stable across upgrades. */}}
+         rendered config is stable across upgrades.
+         Key and value render through toJson, never `int`: this is a
+         deletion policy, and trawld's boot-fatal validation is the one
+         validator. `int` would launder `1.9` into a one-day limit and
+         `"typo"` into 0 (keep forever), and a raw key such as `prod] #`
+         would end the table header early and read as an override for
+         `prod`. As a quoted key and a typed value, every one of those is
+         a refused boot instead. */}}
     {{- range $name, $days := .Values.config.retention.envs }}
 
-    [retention.env.{{ $name }}]
-    max_age_days = {{ $days | int }}
+    [retention.env.{{ $name | toJson }}]
+    max_age_days = {{ $days | toJson }}
     {{- end }}
 
     [syslog]

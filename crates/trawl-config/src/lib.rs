@@ -2984,6 +2984,47 @@ max_age_days = 30
         }
     }
 
+    /// The helm chart renders `config.retention.envs` through `toJson`, so a
+    /// values file's `1.9`, a `--set-string`'s `"1.9"`, a `"typo"` and a key
+    /// like `prod] #` reach trawld typed and quoted rather than laundered by
+    /// `int` into a one-day limit, a keep-forever 0, or an override for
+    /// `prod`. This pins the other half of that contract: every one of
+    /// those is a refused boot here.
+    #[test]
+    fn retention_env_refuses_what_the_chart_passes_through_typed() {
+        for (label, table) in [
+            ("float value", "[retention.env.prod]\nmax_age_days = 1.9"),
+            (
+                "string value",
+                "[retention.env.prod]\nmax_age_days = \"1.9\"",
+            ),
+            (
+                "typo value",
+                "[retention.env.prod]\nmax_age_days = \"not-a-number\"",
+            ),
+            ("negative value", "[retention.env.prod]\nmax_age_days = -1"),
+            (
+                "quoted bad key",
+                "[retention.env.\"prod] #\"]\nmax_age_days = 365",
+            ),
+        ] {
+            let err = config_with_retention(&format!("max_age_days = 90\n{table}\n"))
+                .expect_err(label)
+                .to_string();
+            assert!(
+                !err.is_empty(),
+                "{label}: must name the refusal; got: {err}"
+            );
+        }
+        // And the quoted GOOD key is the same env as the bare spelling, so
+        // the chart's quoting changes nothing for a valid name.
+        let config = config_with_retention(
+            "max_age_days = 90\n[retention.env.\"prod\"]\nmax_age_days = 365\n",
+        )
+        .expect("a quoted valid key loads");
+        assert_eq!(config.retention.max_age_days_for("prod"), 365);
+    }
+
     #[test]
     fn env_name_charset_helper() {
         assert!(is_valid_env_name("prod"));
