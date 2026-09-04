@@ -39,9 +39,10 @@ use crate::store::CatalogStore;
 pub struct FieldCatalog {
     pins: RwLock<HashMap<String, CanonicalType>>,
     /// Non-additive catalog mutation generation: bumped by
-    /// [`FieldCatalog::repin`], [`FieldCatalog::evict_many`] and
-    /// [`FieldCatalog::touch_generation`], the paths that make a served
-    /// answer wrong rather than incomplete. It is
+    /// [`FieldCatalog::repin`] and [`FieldCatalog::touch_generation`], the
+    /// paths that make a served answer wrong rather than incomplete
+    /// ([`FieldCatalog::evict_many`] deliberately does NOT stamp; the gc
+    /// engine bumps per outcome, following what the store deleted). It is
     /// a stamp readers hold beside a cached derivation of the pin set, so
     /// those paths invalidate that cache without knowing it exists.
     ///

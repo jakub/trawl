@@ -2057,10 +2057,11 @@ impl CatalogStore {
 
     /// Which of `fields` `field_types` still holds.
     ///
-    /// The reconcile read behind a failed purge: an error from
-    /// [`Self::delete_pins`] leaves the caller unable to say whether the
-    /// transaction committed, and this is the question that settles it for
-    /// the pin cache.
+    /// The reconcile read behind a purge that failed BEFORE its commit was
+    /// sent: those errors prove a rollback, and this read settles the pin
+    /// cache against the surviving rows. A commit-phase failure never
+    /// reaches this read (the outcome is unknown and the engine over-evicts
+    /// instead, because this read could race a still-landing commit).
     pub async fn pins_present(&self, fields: &[String]) -> Result<BTreeSet<String>, StoreError> {
         if fields.is_empty() {
             return Ok(BTreeSet::new());
