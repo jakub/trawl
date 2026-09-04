@@ -172,19 +172,47 @@ trawl schema repin status --to varchar --yes       # execute (background job)
 trawl schema repin status --to varchar --yes --wait  # poll to completion
 trawl schema repin dur --to bigint --yes --force   # accept a lossy projection
 trawl schema repin-status                          # the running/last job
+trawl schema repin-cancel                          # ask the running job to stop
 ```
 
 An executing repin confirms interactively; off a TTY it refuses without
 `--yes`. A repin whose dry run projects nulled values refuses without
 `--force` and prints the plan (the values it would null stay findable in
 `_raw`). `--to <current type> --force` runs a resurrection-only pass.
-Both commands honour `-f table|json|csv`.
+All three commands honour `-f table|json|csv`.
 
 Every report — dry run, running job, terminal job — carries
 `requires_force`: whether the *identical executing* request would be
 refused. A dry run succeeds by design, so without that column a plan
 carrying loss or dialect ambiguity would read as a clean pass and the
 refusal would arrive with the request that was meant to do the work.
+
+#### Stopping a running repin
+
+`schema repin-cancel` asks the running job to stop. It needs
+`schema_write` and takes no confirmation prompt, because cancelling only
+ever leaves the corpus as it already is. There are three answers, and the
+exit code carries the verdict:
+
+- accepted (exit 0): the job stops at the next file boundary of its scan or
+  build loop, sweeps its staging, and ends `cancelled` with the live corpus
+  and the pin unchanged. The snapshot walk and the filesystem preflight are
+  not checkpointed, so a job inside one of those stops when it leaves it.
+- past the point of no return (exit non-zero): the job is already swapping
+  the corpus. The request is refused rather than queued, and the job
+  completes.
+- no job running (exit non-zero): nothing to stop on this node.
+
+Acceptance is not a promise of a terminal `cancelled` status. A job that
+finishes first finishes, and a trawld that dies between the request and any
+boundary acting on it leaves the job `failed` with `cancel_requested_at`
+and `cancelled_by` set. A restart is the stronger cancel: killing trawld
+before the cutover leaves the live corpus untouched, and boot recovery
+sweeps the shadow generation.
+
+`repin --wait` exits non-zero when another actor cancels the job mid-wait.
+The row prints as usual and the message names who asked; a script that read
+that exit as success would go on to trust a rewrite that never happened.
 
 #### Putting a sender's own field on the severity ladder
 

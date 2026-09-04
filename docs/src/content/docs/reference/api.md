@@ -293,6 +293,43 @@ The running job if any, else the newest job of any status —
 `schema_read`-gated (read-only surfaces show repin state without offering
 the trigger) and served on query-only nodes too.
 
+The job row also carries `cancel_requested_at` and `cancelled_by` when
+someone asked the job to stop: a `running` row carrying them is a cancel in
+flight, and a `failed` row carrying them is a process that died between the
+request and any boundary observing it.
+
+```
+POST /api/v1/schema/repin/cancel
+```
+
+Ask the running repin to stop. `schema_write`-gated, no request body, and
+a query-only node answers 503 like the trigger route. The HTTP status
+carries the verdict and the body repeats it as `outcome`, with `detail` in
+words and the job row under `job` when there is one:
+
+- **202** `cancelling`: the request is accepted. The job stops at the next
+  file boundary of its scan or build loop, sweeps any staging it had built,
+  and ends `cancelled` with the live corpus untouched.
+- **409** `past_point_of_no_return`: the job latched its cutover before the
+  request arrived. The corpus is being swapped and there is nothing left to
+  unwind, so the request is refused rather than queued, and the job
+  completes normally.
+- **404** `no_job_running`: no repin job is running on this node.
+
+The latency contract is a boundary, not an instant. The scan and build
+loops check before and after each file, but the whole-corpus snapshot walk
+and the filesystem preflight are not checkpointed, so a job inside one of
+those stops only when it leaves it. Early-phase cancels can therefore take
+longer than one file.
+
+A 202 accepts the request; it does not promise a terminal `cancelled`
+status. The job's own completion can win the race, and a process that dies
+between the request and any boundary acting on it lands `failed` with
+`cancel_requested_at` and `cancelled_by` preserved (recovery never infers
+`cancelled` from a request nothing acted on). Restarting trawld is the
+stronger cancel: a killed job leaves the live corpus untouched and boot
+recovery sweeps its staging. Read the outcome from the status route.
+
 ```
 GET /api/v1/schema/services
 ```
