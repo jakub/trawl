@@ -97,8 +97,9 @@ impl DeadWindow {
 ///
 /// `older_than` is the operator's request, `None` meaning
 /// [`DEFAULT_DEAD_WINDOW`]. `floor_secs` is the retention floor from
-/// [`crate::retention::maximum_enabled_age_secs`]: `None` when age
-/// retention is disabled, which imposes no floor at all.
+/// [`crate::retention::maximum_enabled_age_secs`] — the longest age any
+/// env still keeps data for: `None` when some env keeps its data forever,
+/// which imposes no floor at all.
 ///
 /// The rule is one `max`. A window shorter than the corpus trawl still
 /// keeps would call a field dead while its data sits on disk under a live
@@ -934,8 +935,9 @@ fn log_deleted(pin: &PurgedPin, r: &trawl_api::GcPinsResponse, actor: &GcActor) 
 
 /// `decided_at` minus the window, clamped at the unix epoch.
 ///
-/// `max_age_days` is an unvalidated operator number, so an "effectively
-/// never" retention floor lands here as a window no subtraction can hold.
+/// `max_age_days` is an unvalidated operator number, in the global and in
+/// every `[retention.env.*]` override, so an "effectively never" retention
+/// floor lands here as a window no subtraction can hold.
 /// Going as far back as the arithmetic allows makes every OBSERVED pin
 /// alive, which is the direction that deletes nothing.
 ///

@@ -72,11 +72,17 @@ pub struct QueryState {
     pub tracker: Arc<QueryTracker>,
     /// Schema cache TTL in seconds.
     pub schema_cache_ttl_secs: u64,
-    /// Retention window in days (`[retention] max_age_days`; 0 disables).
-    /// `/api/v1/schema` windows catalog fields on `last_seen` against it so
-    /// autocomplete stops offering fields whose data has aged out
-    /// (`?all=true` lifts the window).
-    pub retention_max_age_days: u64,
+    /// The longest age any env still keeps data for, in seconds
+    /// ([`crate::retention::maximum_enabled_age_secs`]); `None` when some
+    /// env keeps its data forever. `/api/v1/schema` windows catalog fields
+    /// on `last_seen` against it so autocomplete stops offering fields
+    /// whose data has aged out everywhere (`?all=true` lifts the window).
+    ///
+    /// Resolved once at construction: retention config is fixed for the
+    /// process, and the schema column cache's two slots are keyed on
+    /// whether the window applied, which only holds while the horizon is
+    /// constant.
+    pub retention_horizon_secs: Option<u64>,
     /// Maximum rows for export responses (bypasses `max_result_rows`).
     pub max_export_rows: usize,
     /// Cached corpus facts (dates/bytes/services/file count from the
@@ -642,6 +648,11 @@ impl AppState {
             (None, None, None, None)
         };
 
+        // One horizon feeds the `/api/v1/schema` window and the pin-gc
+        // floor: two readers of the same retention config must not answer
+        // differently about how far back the corpus still reaches.
+        let retention_horizon_secs = crate::retention::maximum_enabled_age_secs(&config.retention);
+
         let state = Self {
             query: QueryState {
                 pool: ExecutorPool::new(
@@ -657,7 +668,7 @@ impl AppState {
                 timeout_secs: config.server.timeout_secs,
                 tracker: Arc::new(QueryTracker::with_capacity(config.server.max_query_history)),
                 schema_cache_ttl_secs: config.server.schema_cache_ttl_secs,
-                retention_max_age_days: config.retention.max_age_days,
+                retention_horizon_secs,
                 max_export_rows: config.server.max_export_rows,
                 schema_cache: Arc::new(tokio::sync::Mutex::new(None)),
                 schema_columns_cache: Arc::new(tokio::sync::Mutex::new([None, None])),
@@ -715,9 +726,10 @@ impl AppState {
                     config.retention.min_free_disk_bytes,
                 ))
             });
-            // The retention floor is resolved once here: retention config
-            // is fixed for the process, and the gc engine reports the
-            // window it applied rather than recomputing it per request.
+            // The retention floor is the same horizon the schema window
+            // reads, resolved once above: retention config is fixed for the
+            // process, and the gc engine reports the window it applied
+            // rather than recomputing it per request.
             state.gc = repin_coordinator.map(|coordinator| {
                 Arc::new(crate::catalog::gc::PinGc::new(
                     state.storage.catalog.clone(),
@@ -725,7 +737,7 @@ impl AppState {
                     Arc::clone(&state.query.field_catalog),
                     coordinator,
                     config.data.base_dir(),
-                    crate::retention::maximum_enabled_age_secs(&config.retention),
+                    retention_horizon_secs,
                 ))
             });
             state

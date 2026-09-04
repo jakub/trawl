@@ -101,30 +101,47 @@ pub fn spawn_retention(
 }
 
 /// The longest age this install still keeps data for, in seconds, or
-/// `None` when age retention is disabled.
+/// `None` when any env keeps its data forever.
 ///
-/// Pin garbage collection ([`crate::catalog::gc`]) floors its dead window
-/// here: calling a field dead over a span shorter than the corpus trawl
-/// still stores would reclaim a pin whose data is right there on disk.
-/// Disk-pressure retention contributes nothing: it deletes by free space
-/// rather than by age, so it names no window a pin could be judged
-/// against.
+/// The set is the global `max_age_days` plus every `[retention.env.*]`
+/// entry. The global always participates: an env with no entry inherits
+/// it, and an install always has envs the config never names. A single 0
+/// anywhere is `None` — that env keeps everything, so no finite span
+/// bounds what the corpus still holds. Otherwise the answer is the
+/// maximum, never the minimum: the shortest-lived env says nothing about
+/// data a longer-lived one still stores.
+///
+/// Config domain only. Which env directories exist on disk never enters
+/// it: a horizon that read the filesystem would move as data landed and
+/// aged out, and both callers want a per-process constant.
+///
+/// Two callers ask the same question. `/api/v1/schema` windows catalog
+/// fields on `last_seen` against it, so autocomplete stops offering
+/// fields whose data has aged out everywhere. Pin garbage collection
+/// ([`crate::catalog::gc`]) floors its dead window here: calling a field
+/// dead over a span shorter than the corpus trawl still stores would
+/// reclaim a pin whose data is right there on disk. Disk-pressure
+/// retention contributes nothing: it deletes by free space rather than by
+/// age, so it names no window a pin could be judged against.
 ///
 /// `max_age_days` is an unvalidated operator `u64`, so the multiply
 /// saturates; an "effectively never" setting floors the window at
 /// "effectively never", which refuses every candidate. That is the right
 /// answer for an install that keeps everything.
-///
-/// This is the one function per-env retention (#108) changes: the floor
-/// becomes the maximum enabled age across all envs, and every caller keeps
-/// asking the same question.
 #[must_use]
 pub fn maximum_enabled_age_secs(config: &RetentionConfig) -> Option<u64> {
     const SECS_PER_DAY: u64 = 86_400;
-    if config.max_age_days == 0 {
+    let mut longest = config.max_age_days;
+    if longest == 0 {
         return None;
     }
-    Some(config.max_age_days.saturating_mul(SECS_PER_DAY))
+    for env in config.env.values() {
+        if env.max_age_days == 0 {
+            return None;
+        }
+        longest = longest.max(env.max_age_days);
+    }
+    Some(longest.saturating_mul(SECS_PER_DAY))
 }
 
 /// A single retention tick. Testable via injectable `free_space_fn`.
@@ -455,6 +472,74 @@ mod tests {
             retention_interval_secs: 3600,
             env: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// A config with a global age and `[retention.env.*]` overrides.
+    fn config_with_envs(max_age_days: u64, envs: &[(&str, u64)]) -> RetentionConfig {
+        RetentionConfig {
+            env: envs
+                .iter()
+                .map(|(name, days)| {
+                    (
+                        (*name).to_owned(),
+                        crate::config::EnvRetention {
+                            max_age_days: *days,
+                        },
+                    )
+                })
+                .collect(),
+            ..make_config(max_age_days, 0)
+        }
+    }
+
+    /// The horizon is the LONGEST age anything still keeps, and a single
+    /// keep-forever setting lifts it entirely. A minimum would tell the
+    /// schema window and the pin-gc floor that data is gone while a
+    /// long-retention env still stores it.
+    #[test]
+    fn maximum_enabled_age_is_the_longest_age_any_env_keeps() {
+        const DAY: u64 = 86_400;
+
+        assert_eq!(
+            maximum_enabled_age_secs(&config_with_envs(90, &[("prod", 365), ("lab", 7)])),
+            Some(365 * DAY),
+            "the longest-lived env sets the horizon"
+        );
+        assert_eq!(
+            maximum_enabled_age_secs(&config_with_envs(90, &[("prod", 0)])),
+            None,
+            "one env keeping data forever leaves no finite horizon"
+        );
+        assert_eq!(
+            maximum_enabled_age_secs(&config_with_envs(0, &[("prod", 365)])),
+            None,
+            "the global always participates — envs without an entry inherit it"
+        );
+        assert_eq!(
+            maximum_enabled_age_secs(&config_with_envs(90, &[])),
+            Some(90 * DAY),
+            "no entries: the global alone, exactly as before per-env retention"
+        );
+    }
+
+    /// `max_age_days` is an unvalidated operator `u64` in the global and in
+    /// every override, and "effectively never" values are what an operator
+    /// reaches for. The multiply saturates rather than wrapping; the
+    /// `/api/v1/schema` end of the same value is covered by
+    /// `handlers::tests::since_from_secs_saturates_instead_of_panicking`,
+    /// which lands `u64::MAX` seconds on the unix epoch.
+    #[test]
+    fn maximum_enabled_age_saturates_instead_of_wrapping() {
+        assert_eq!(
+            maximum_enabled_age_secs(&config_with_envs(90, &[("archive", u64::MAX)])),
+            Some(u64::MAX),
+            "an effectively-never override saturates at u64::MAX seconds"
+        );
+        assert_eq!(
+            maximum_enabled_age_secs(&make_config(u64::MAX, 0)),
+            Some(u64::MAX),
+            "the global saturates the same way"
+        );
     }
 
     #[test]

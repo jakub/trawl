@@ -366,6 +366,52 @@ async fn gc_floors_a_short_request_at_the_retention_window() {
     );
 }
 
+/// With per-env retention (#108), the floor is the LONGEST age any env
+/// keeps, not the shortest. A minimum would call a field dead over a span
+/// during which a long-retention env still stores its data on disk, and
+/// reclaim a pin whose carrier is right there.
+#[tokio::test(flavor = "multi_thread")]
+async fn gc_floors_at_the_longest_age_any_env_keeps() {
+    let h = harness().await;
+    h.pin_without_carrier("gone", "dead").await;
+
+    // lab ages out in a week, prod keeps a year: the corpus still reaches
+    // back a year.
+    let mut per_env = trawl_server::config::RetentionConfig {
+        max_age_days: 30,
+        ..Default::default()
+    };
+    for (env, days) in [("prod", 365), ("lab", 7)] {
+        per_env.env.insert(
+            env.to_owned(),
+            trawl_server::config::EnvRetention { max_age_days: days },
+        );
+    }
+
+    let floor = trawl_server::retention::maximum_enabled_age_secs(&per_env);
+    assert_eq!(floor, Some(365 * DAY));
+
+    let report = h
+        .gc(floor)
+        .run(
+            Some(Duration::from_secs(7 * DAY)),
+            false,
+            GcActor::default(),
+        )
+        .await
+        .expect("gc runs");
+
+    assert_eq!(report.requested_older_than_secs, 7 * DAY);
+    assert_eq!(report.retention_floor_secs, Some(365 * DAY));
+    assert_eq!(
+        report.effective_older_than_secs,
+        365 * DAY,
+        "the reported floor is the maximum age, never the minimum"
+    );
+    assert_eq!(report.deleted, 0);
+    assert!(h.pinned("dead"), "nothing is a year unobserved here");
+}
+
 /// An empty parquet still declares its schema, and the schema is the
 /// evidence: a file with zero rows is a carrier.
 #[tokio::test(flavor = "multi_thread")]

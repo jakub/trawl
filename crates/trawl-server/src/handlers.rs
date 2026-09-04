@@ -505,10 +505,11 @@ pub struct SchemaParams {
 /// Columns are a `SELECT` over `field_types` LEFT JOIN `field_services`
 /// (ADR-0009) — the write-time type authority, never a `DESCRIBE`.
 /// By default fields whose most recent observation predates the retention
-/// window (`[retention] max_age_days`; 0 disables) are hidden; `?all=true`
-/// lifts the window, and a never-observed pin (e.g. the envelope seed) is
-/// always shown. `?service=` scopes the listing to fields that service has
-/// carried.
+/// horizon (the longest age any env still keeps data for, per
+/// [`crate::retention::maximum_enabled_age_secs`]; an env that keeps its
+/// data forever lifts it) are hidden; `?all=true` lifts the window, and a
+/// never-observed pin (e.g. the envelope seed) is always shown.
+/// `?service=` scopes the listing to fields that service has carried.
 ///
 /// Corpus facts (dates, sizes, services, file count) stay a TTL-cached
 /// filesystem walk; `cached` reports whether those came from the cache,
@@ -538,7 +539,7 @@ pub async fn schema(
     let since = if params.all == Some(true) {
         None
     } else {
-        since_from_days(state.query.retention_max_age_days)
+        since_from_secs(state.query.retention_horizon_secs)
     };
 
     let columns = if params.service.is_some() {
@@ -1033,22 +1034,6 @@ fn since_from_secs(since_secs: Option<u64>) -> Option<chrono::DateTime<chrono::U
                 dt.max(chrono::DateTime::UNIX_EPOCH)
             })
     })
-}
-
-/// Convert the `[retention] max_age_days` window into an absolute instant.
-///
-/// `max_age_days` is a plain `u64` that nothing range-validates, and
-/// "effectively never" values (`max_age_days = 999999999999`) are what an
-/// operator reaches for, so this must be total: `TimeDelta::days` panics
-/// out of bounds (~1.07e11 days) and would 500 every `/api/v1/schema`
-/// request until the config was edited. `0` disables the window; anything
-/// reaching past the unix epoch saturates there, like [`since_from_secs`].
-fn since_from_days(window_days: u64) -> Option<chrono::DateTime<chrono::Utc>> {
-    const SECS_PER_DAY: u64 = 86_400;
-    if window_days == 0 {
-        return None;
-    }
-    since_from_secs(Some(window_days.saturating_mul(SECS_PER_DAY)))
 }
 
 /// Query parameters for `GET /api/v1/schema/fields`.
@@ -3242,6 +3227,25 @@ pub struct StreamParams {
 mod tests {
     use super::*;
 
+    /// A retention config with a global age and per-env overrides.
+    fn retention_config(max_age_days: u64, envs: &[(&str, u64)]) -> crate::config::RetentionConfig {
+        crate::config::RetentionConfig {
+            max_age_days,
+            env: envs
+                .iter()
+                .map(|(name, days)| {
+                    (
+                        (*name).to_owned(),
+                        crate::config::EnvRetention {
+                            max_age_days: *days,
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn since_from_secs_saturates_instead_of_panicking() {
         // `?since_secs=` is request-controlled: no value may panic the
@@ -3271,26 +3275,40 @@ mod tests {
         }
     }
 
+    /// The `/api/v1/schema` window is the retention horizon, per-env
+    /// entries included. This is the handler's own line
+    /// (`since_from_secs(state.query.retention_horizon_secs)`) with the
+    /// horizon resolved from a config instead of from `AppState`, which
+    /// needs a live postgres to build.
     #[test]
-    fn since_from_days_saturates_instead_of_panicking() {
-        // `[retention] max_age_days` is an unvalidated operator-set u64 on
-        // the `/api/v1/schema` path: no value may panic the handler.
-        assert_eq!(since_from_days(0), None, "0 disables the window");
+    fn schema_window_is_the_retention_horizon() {
+        let mixed = retention_config(90, &[("prod", 365), ("lab", 7)]);
+        let horizon = crate::retention::maximum_enabled_age_secs(&mixed);
+        let since = since_from_secs(horizon).expect("every env ages out");
+        let elapsed = chrono::Utc::now() - since;
+        assert!(
+            elapsed >= chrono::TimeDelta::days(365),
+            "the window is the LONGEST age any env keeps, not the shortest"
+        );
+        assert!(elapsed < chrono::TimeDelta::days(366));
 
-        let week = since_from_days(7).expect("finite window");
-        let elapsed = chrono::Utc::now() - week;
-        assert!(elapsed >= chrono::TimeDelta::days(7));
-        assert!(elapsed < chrono::TimeDelta::days(8));
+        let keeps_forever = retention_config(90, &[("prod", 0)]);
+        assert_eq!(
+            since_from_secs(crate::retention::maximum_enabled_age_secs(&keeps_forever)),
+            None,
+            "one env keeping its data forever lifts the window for everyone"
+        );
 
-        // `chrono::TimeDelta::days` panics past ~1.07e11 days; the seconds
-        // multiplication overflows u64 well before that.
-        for d in [200_000_000_000_u64, u64::MAX] {
-            assert_eq!(
-                since_from_days(d),
-                Some(chrono::DateTime::UNIX_EPOCH),
-                "max_age_days={d} must saturate at the epoch"
-            );
-        }
+        // An "effectively never" override is what an operator reaches for
+        // instead of 0, and no value of it may panic the handler.
+        let effectively_never = retention_config(90, &[("archive", u64::MAX)]);
+        assert_eq!(
+            since_from_secs(crate::retention::maximum_enabled_age_secs(
+                &effectively_never
+            )),
+            Some(chrono::DateTime::UNIX_EPOCH),
+            "a horizon past the epoch saturates there, hiding nothing"
+        );
     }
 
     #[test]
