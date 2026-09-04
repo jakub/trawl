@@ -781,6 +781,7 @@ async fn gc_refuses_a_data_root_that_is_not_there() {
 
 /// A symlink under a live env is refused for the same reason: its target
 /// is a file trawl does not own.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_refuses_the_whole_run_on_a_symlink_under_a_live_env() {
     let h = harness().await;
