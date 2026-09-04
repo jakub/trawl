@@ -467,6 +467,130 @@ async fn gc_waits_for_the_compaction_batch_and_sees_what_it_published() {
     assert!(h.pinned("slow"));
 }
 
+/// One run at a time. A second caller is refused immediately rather than
+/// queued behind a scan that holds the corpus gate — two operators on the
+/// route must not add up to an ingest stall.
+///
+/// Deterministic by construction: the first run is held at the corpus gate
+/// by a compaction batch, so it provably still owns the admission lock when
+/// the second one asks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_concurrent_gc_run_is_refused_immediately() {
+    let h = harness().await;
+    h.ingest_and_compact(&[event("api", &json!({"kept": 1}))])
+        .await;
+    h.pin_without_carrier("gone", "dead").await;
+    let gc = h.gc(None);
+
+    // A compaction batch holds the corpus gate, so the first run cannot get
+    // past it and cannot release the admission lock.
+    let batch = h.coordinator().compaction_guard().await;
+    let first = {
+        let gc = Arc::clone(&gc);
+        tokio::spawn(async move {
+            gc.run(Some(Duration::ZERO), false, GcActor::default())
+                .await
+        })
+    };
+
+    // The first run has to reach the gate before the admission lock is
+    // observable; it cannot finish while the batch is held, so this loop
+    // ends on the refusal rather than on a timer.
+    let mut refusal = None;
+    for _ in 0..200 {
+        match gc.run(Some(Duration::ZERO), true, GcActor::default()).await {
+            Err(e)
+                if e.error_class() == "conflict"
+                    && e.to_string().contains("already in progress") =>
+            {
+                refusal = Some(e);
+                break;
+            }
+            other => {
+                assert!(
+                    !first.is_finished(),
+                    "the first run answered while the corpus gate was held: {other:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+    let refusal = refusal.expect("a second run must be refused while the first holds admission");
+    assert!(refusal.to_string().contains("pin gc run"), "{refusal}");
+    assert!(h.pinned("dead"), "a refused second run deletes nothing");
+
+    drop(batch);
+    let report = first
+        .await
+        .expect("gc task")
+        .expect("the first run finishes");
+    assert_eq!(report.deleted, 1, "report: {report:?}");
+
+    // And the lock is released with the run: the next caller is admitted.
+    let again = gc
+        .run(Some(Duration::ZERO), true, GcActor::default())
+        .await
+        .expect("admission is free once the first run is done");
+    assert!(again.candidates.is_empty(), "report: {again:?}");
+}
+
+/// The report and the audit name what postgres deleted, never what the walk
+/// projected. A candidate whose row goes away underneath the run — a
+/// concurrent purge, an operator with psql — is not a pin this run
+/// reclaimed, and an audit record claiming otherwise is a lie in the one
+/// place an operator has to trust.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_report_names_only_the_pins_the_purge_returned() {
+    let h = harness().await;
+    h.ingest_and_compact(&[event("api", &json!({"kept": 1}))])
+        .await;
+    h.pin_without_carrier("gone", "dead").await;
+    h.pin_without_carrier("also_gone", "deader").await;
+
+    // Hold the run at the corpus gate: its candidate set is already read.
+    let batch = h.coordinator().compaction_guard().await;
+    let gc = h.gc(None);
+    let run = {
+        let gc = Arc::clone(&gc);
+        tokio::spawn(async move {
+            gc.run(Some(Duration::ZERO), false, GcActor::default())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!run.is_finished(), "the batch holds the gate");
+
+    // One candidate is reclaimed by somebody else while the run waits.
+    h.server
+        .state
+        .storage
+        .catalog
+        .delete_pins(&["deader".to_owned()])
+        .await
+        .expect("a concurrent purge");
+
+    drop(batch);
+    let report = run.await.expect("gc task").expect("gc runs");
+
+    assert_eq!(
+        report.pins_examined, 4,
+        "`deader` was still a candidate when the run read the observation \
+         axis: {report:?}"
+    );
+    assert_eq!(
+        report
+            .candidates
+            .iter()
+            .map(|c| c.field.as_str())
+            .collect::<Vec<_>>(),
+        vec!["dead"],
+        "`deader` was proved dead by the walk but deleted by somebody else, \
+         so it is not this run's deletion: {report:?}"
+    );
+    assert_eq!(report.deleted, 1, "report: {report:?}");
+    assert!(!h.pinned_in_store("deader").await, "it is gone either way");
+}
+
 /// Every way a repin can own the data root refuses the same way, and
 /// deletes nothing.
 #[tokio::test(flavor = "multi_thread")]

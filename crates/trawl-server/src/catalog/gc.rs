@@ -200,6 +200,15 @@ pub struct PinGc {
     /// ([`crate::retention::maximum_enabled_age_secs`]), resolved once at
     /// construction because retention config is fixed for the process.
     retention_floor_secs: Option<u64>,
+    /// Admission: one run at a time, per engine.
+    ///
+    /// Try-lock, never await. A queued second run would hold nothing while
+    /// it waited and then take the corpus gate for another full footer
+    /// scan, so two operators hammering the route would stall compaction
+    /// for as long as they kept it up. It is also a run whose candidate set
+    /// was read before the first run deleted anything, which has no useful
+    /// answer to give. The honest reply is 409 now.
+    admission: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// What the footer scan proved, and what it cost.
@@ -263,6 +272,7 @@ impl PinGc {
             coordinator,
             data_dir,
             retention_floor_secs,
+            admission: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -276,9 +286,10 @@ impl PinGc {
     /// always finishes; a caller that walked away only loses the response.
     ///
     /// # Errors
-    /// [`ServerError::Conflict`] when a repin owns the data root, when the
-    /// corpus cannot be proved (unreadable path, foreign parquet), or when
-    /// the purge times out; [`ServerError::Store`] for a postgres failure;
+    /// [`ServerError::Conflict`] when another run is already in progress,
+    /// when a repin owns the data root, when the corpus cannot be proved
+    /// (unreadable path, foreign parquet), or when a gated store call times
+    /// out; [`ServerError::Store`] for a postgres failure;
     /// [`ServerError::Internal`] if the scan task panics.
     pub async fn run(
         self: &Arc<Self>,
@@ -301,6 +312,17 @@ impl PinGc {
         dry_run: bool,
         actor: GcActor,
     ) -> Result<trawl_api::GcPinsResponse, ServerError> {
+        // 0. Admission: this engine runs one collection at a time, and a
+        //    second caller is told so immediately rather than queued behind
+        //    a gate-holding scan.
+        let Ok(_admitted) = self.admission.try_lock() else {
+            return Err(ServerError::Conflict(
+                "a pin gc run is already in progress; wait for it to finish \
+                 and read its report rather than starting a second scan"
+                    .to_owned(),
+            ));
+        };
+
         // 1. Entry checks, before any work: a repin rearranging the corpus
         //    makes every footer proof provisional.
         self.refuse_if_repin_owns_the_corpus().await?;
@@ -457,9 +479,15 @@ impl PinGc {
             .evict_many(purged.deleted.iter().map(String::as_str));
         self.store.publish_fill_gauges(purged.pinned_now);
 
-        let deleted = u64::try_from(purged.deleted.len()).unwrap_or(u64::MAX);
+        // The purge's own RETURNING set replaces the walk's projection from
+        // here on, so the report and the audit records can only name pins
+        // this run actually deleted. The two differ when a candidate loses
+        // its row underneath the run (a concurrent purge, an operator with
+        // psql): the walk still believes in it, postgres does not.
+        let dead: BTreeSet<String> = purged.deleted.into_iter().collect();
+        let deleted = u64::try_from(dead.len()).unwrap_or(u64::MAX);
         Ok(Purged {
-            dead: walk.dead,
+            dead,
             files_scanned: walk.files_scanned,
             deleted,
         })
