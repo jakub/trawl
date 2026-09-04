@@ -394,9 +394,14 @@ impl RepinEngine {
             }
         };
         // The registry stays armed for exactly as long as a job is doing
-        // work: `run_job` disarms itself at the end of the background half
-        // (through the post-cutover sweep), and every other outcome ends
-        // here.
+        // work, and the party that owns the outcome is the party that
+        // disarms. `run_job` owns the background half and disarms itself at
+        // its end (through the post-cutover sweep); every other outcome is
+        // owned here, and by construction there is no detached work left
+        // when it is: `decide` spawns `run_job` as its last act and cannot
+        // fail after that spawn. These are the only two disarm call sites,
+        // which is what keeps a running job from being disarmed by somebody
+        // who merely failed to describe it.
         if !matches!(outcome, Ok(StartOutcome::Started(_))) {
             self.cancel.disarm(job_id);
         }
@@ -650,6 +655,29 @@ impl RepinEngine {
             return Err(ServerError::BadRequest(msg));
         }
 
+        // Read the row the caller is answered with BEFORE any detached work
+        // exists. The row is stable here — nothing past the claim has
+        // rewritten it — and reading it after the spawn made a transient
+        // postgres error indistinguishable from a synchronous failure: the
+        // caller returned `Err`, `start` treated that as "no background half"
+        // and disarmed the registry, and the running job was left
+        // uncancellable, its own terminal write landing on an empty slot. A
+        // read failure here settles like any other pre-cutover candidate,
+        // with nothing detached to strand.
+        let job = match self.job(job_id).await {
+            Ok(job) => job,
+            Err(e) => {
+                let msg = format!("could not read the claimed repin job row: {e}");
+                if self
+                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&msg))
+                    .await
+                {
+                    return self.cancelled_outcome(job_id).await;
+                }
+                return Err(e);
+            }
+        };
+
         let engine = Arc::clone(&self);
         let tallies = Arc::new(tallies);
         tokio::spawn(async move {
@@ -657,7 +685,7 @@ impl RepinEngine {
                 .run_job(job_id, field, from, reading, force, tallies, cancel)
                 .await;
         });
-        Ok(StartOutcome::Started(self.job(job_id).await?))
+        Ok(StartOutcome::Started(job))
     }
 
     async fn run_scan(
@@ -1916,6 +1944,52 @@ mod tests {
                 "{pin:?}: {err:?}"
             );
         }
+    }
+
+    /// `decide` reads the response row BEFORE it spawns the background half.
+    ///
+    /// The ordering is the whole fix. Reading it after the spawn made a
+    /// transient postgres error look exactly like a synchronous failure:
+    /// `decide` returned `Err`, `start` saw a non-`Started` outcome and
+    /// disarmed the registry, and the job that was already rewriting the
+    /// corpus could no longer be cancelled — its own terminal write then
+    /// landed on an empty slot and recorded `failed` with no actor.
+    ///
+    /// This is a shape assertion over the source, not a behavioural one:
+    /// `RepinEngine` holds a concrete `RepinStore` over a real postgres
+    /// pool, so there is no seam to inject a failing row read through, and
+    /// inventing one would be a mock where the rest of this crate uses the
+    /// database. What is covered is the ordering that makes the failure
+    /// unreachable. What is not covered is the store error itself: no test
+    /// here observes a failed row read and its terminal write.
+    #[test]
+    fn decide_fetches_the_response_row_before_spawning_the_background_half() {
+        const SOURCE: &str = include_str!("engine.rs");
+        let start = SOURCE
+            .find("    async fn decide(")
+            .expect("decide is still a method on the engine");
+        let end = SOURCE[start..]
+            .find("    async fn run_scan(")
+            .expect("run_scan still follows decide")
+            + start;
+        let body = &SOURCE[start..end];
+
+        let spawn = body
+            .find(".run_job(job_id")
+            .expect("decide still spawns the background half");
+        let fetch = body
+            .find("self.job(job_id).await")
+            .expect("decide still reads the response row");
+        assert!(
+            fetch < spawn,
+            "the response row must be read before the background half is \
+             spawned, so a failed read has no detached job to strand"
+        );
+        assert!(
+            !body[spawn..].contains("self.job("),
+            "nothing may read the job row after the spawn: a failure there \
+             is reported as a synchronous one and disarms a running job"
+        );
     }
 
     /// A stopped pass keeps its two meanings apart all the way to the
