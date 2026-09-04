@@ -646,6 +646,18 @@ are read before any field filter, wherever they appear, and they apply to
 the query globally. Fields of those three names are reachable with
 backticks (`` `last`=5 ``).
 
+The pair is half-open, `[earliest, latest)`: `earliest=` includes an event
+stamped exactly at the bound, `latest=` excludes it. An event at
+`2026-03-14T03:00:00Z` matches `earliest="2026-03-14T03:00:00Z"` and does
+not match `latest="2026-03-14T03:00:00Z"`.
+
+That is what makes windows tile. Run one query over
+`[03:00, 03:15)` and the next over `[03:15, 03:30)` and every event is
+counted once, in exactly one of them. A closed upper bound would put an
+event landing on 03:15 in both. Scheduled reports lean on this: the
+scheduler hands consecutive runs consecutive windows and the coverage
+neither gaps nor double-counts.
+
 ### OR grouping
 
 ```

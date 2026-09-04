@@ -1599,4 +1599,39 @@ mod tests {
         let future_now = now + chrono::Duration::hours(2);
         assert!(!filter.matches_at(&event, &EvalContext::at(future_now)));
     }
+
+    // ── absolute bounds are half-open ───────────────────────────────
+
+    /// The live-lane half of
+    /// `duckdb_probe::the_absolute_time_window_is_half_open_at_the_microsecond`:
+    /// `earliest=` is inclusive, `latest=` is exclusive, and the event
+    /// stamped exactly at the bound is what tells them apart (ADR-0018
+    /// ruling 10). Tiled report windows `[a, b)`, `[b, c)` count the
+    /// event at `b` once, in the second window, and a live tail has to
+    /// agree with the batch query event for event.
+    #[test]
+    fn absolute_bounds_are_half_open_at_the_microsecond() {
+        // T and its two microsecond neighbours.
+        let before = r#"{"_time": "2026-03-14T03:00:00.123455Z"}"#;
+        let at = r#"{"_time": "2026-03-14T03:00:00.123456Z"}"#;
+        let after = r#"{"_time": "2026-03-14T03:00:00.123457Z"}"#;
+
+        let earliest = r#"earliest="2026-03-14T03:00:00.123456Z""#;
+        assert!(!matches_event(earliest, before));
+        assert!(matches_event(earliest, at), "earliest= is inclusive");
+        assert!(matches_event(earliest, after));
+
+        let latest = r#"latest="2026-03-14T03:00:00.123456Z""#;
+        assert!(matches_event(latest, before));
+        assert!(!matches_event(latest, at), "latest= is exclusive");
+        assert!(!matches_event(latest, after));
+
+        let window = concat!(
+            r#"earliest="2026-03-14T03:00:00.123456Z" "#,
+            r#"latest="2026-03-14T03:00:00.123457Z""#
+        );
+        assert!(!matches_event(window, before));
+        assert!(matches_event(window, at));
+        assert!(!matches_event(window, after));
+    }
 }

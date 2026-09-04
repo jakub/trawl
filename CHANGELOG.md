@@ -358,6 +358,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   in flight. This retires the documented stop-trawld-and-do-surgery
   escape hatch.
 
+### Documentation
+- **`latest=` is an exclusive bound.** The absolute time window is half-open,
+  `[earliest, latest)`: an event stamped exactly at `T` matches
+  `earliest="T"` and does not match `latest="T"`. It has behaved this way
+  since the bounds landed, and is now written down in the DSL reference and
+  pinned by two tests: a DuckDB execution probe that runs the emitter's own
+  SQL over parquet holding events at `T-1µs`, `T` and `T+1µs`, and a live-tail
+  parity test over the same three events. Half-open is the shape that lets
+  consecutive windows tile without an event on the boundary being counted
+  twice (ADR-0018 ruling 10).
+
 ### Removed
 - **The orphaned Intel surface is retired (ADR-0020, #112).** The coastwatch
   API it targeted does not exist, and its write controls gated on the wrong
