@@ -1095,14 +1095,45 @@ async fn wait_for_terminal(
     while latest.status == "running" {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         let status = client.schema_repin_status().await?;
-        match status.job {
-            Some(j) if j.id == id => latest = j,
-            // A different (or no) job means ours got reconciled away by a
-            // restart; report what we last saw.
-            _ => break,
-        }
+        latest = same_job(id, status.job)?;
     }
     Ok(latest)
+}
+
+/// One poll of the status surface, checked against the job `--wait` is
+/// following.
+///
+/// The status route answers with the running job, else the newest one, and
+/// there is no way to ask it for a job by id. So a poll that comes back
+/// naming a different job is not an answer about ours: our job terminalized
+/// (cancelled by another operator, say, or failed) and a second job claimed
+/// the freed slot before this poll ran.
+///
+/// Returning the last copy we held would be worse than useless, because
+/// that copy still says `running` — the caller's cancelled and refused
+/// checks would both read false and the command would exit 0 over a rewrite
+/// that never happened. The outcome is genuinely unknown here, so it is an
+/// error that says so and names the job it is about (#109 review F1).
+fn same_job(
+    id: i64,
+    seen: Option<trawl_client::RepinJobResponse>,
+) -> Result<trawl_client::RepinJobResponse, CliError> {
+    match seen {
+        Some(job) if job.id == id => Ok(job),
+        other => {
+            let now = other.map_or_else(
+                || "the status surface now reports no job at all".to_owned(),
+                |job| format!("repin job {} now occupies the status surface", job.id),
+            );
+            Err(CliError::Usage(format!(
+                "repin job {id} could not be followed to its end: {now}, and \
+                 the status surface cannot be asked for a job by id. This \
+                 job's outcome is unknown — it was not observed to succeed. \
+                 Check `trawl schema repin-status` and the server log for \
+                 job {id}"
+            )))
+        }
+    }
 }
 
 /// `trawl schema repin-status`.
@@ -1550,6 +1581,36 @@ mod repin_tests {
                 let text = String::from_utf8(out).unwrap();
                 assert!(text.contains(spelling), "{format:?}: {text}");
             }
+        }
+    }
+
+    /// `--wait` follows one job, and a poll that comes back about another
+    /// one is an unknown outcome, never an answer.
+    ///
+    /// The race: job A is started under `--wait`, another operator cancels
+    /// it, A terminalizes, and job B claims the freed slot before A's next
+    /// poll. The status surface then names B. Handing back the caller's
+    /// stale copy of A would hand back a row still saying `running`, which
+    /// reads as neither cancelled nor refused, and the command would exit 0
+    /// over a rewrite that never ran.
+    #[test]
+    fn a_successor_job_on_the_status_surface_is_not_an_answer() {
+        let mut ours = sample_job();
+        ours.id = 7;
+        ours.status = "running".into();
+
+        assert_eq!(same_job(7, Some(ours.clone())).unwrap().id, 7);
+
+        let mut successor = sample_job();
+        successor.id = 8;
+        for seen in [Some(successor), None] {
+            let err = same_job(7, seen).expect_err("a poll about another job is not an answer");
+            let CliError::Usage(msg) = err else {
+                panic!("expected a usage error, got {err:?}")
+            };
+            assert!(msg.contains("repin job 7"), "{msg}");
+            assert!(msg.contains("unknown"), "{msg}");
+            assert!(msg.contains("repin-status"), "{msg}");
         }
     }
 
