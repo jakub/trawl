@@ -33,7 +33,10 @@ use super::error::{PgViolation, StoreError, classify_violation};
 use super::history::{bind_u64, bind_usize};
 use super::saved::{SavedQuery, row_to_saved_query_at};
 use super::status::{RunStatus, decode_status};
-use crate::report_window::{ReportWindow, ScheduleWindow, WindowKind};
+use crate::report_window::{
+    Due, MaterializeError, PlanError, PlanInput, ReportWindow, ScheduleWindow, WindowKind,
+    WindowPolicyError, materialize_window, plan_due_run, validate_window_compatibility,
+};
 
 const MIN_INTERVAL_SECS: u64 = 60;
 
@@ -111,6 +114,112 @@ pub enum RunClaim {
     AlreadyRunning,
     /// The schedule has reached its `max_runs` cap.
     MaxRunsReached,
+}
+
+/// Outcome of a scheduler tick's due-run decision
+/// ([`ScheduleStore::claim_due_run`]).
+///
+/// Only [`DueClaim::Started`] carries work. Everything else is a reason the
+/// tick moves on, and each one differs in what it left behind: `Advanced`
+/// moved the fire cursor over coverage that already exists, while
+/// `AlreadyRunning` and `MaxRunsReached` deliberately leave the cursor
+/// where it was, so the boundary they refused is claimed again on the next
+/// poll once the run finishes or the cap is raised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DueClaim {
+    /// The fire cursor is in the future, or the schedule is disabled or
+    /// gone. Nothing was written.
+    NotDue,
+    /// The cursor moved past a window already covered by the watermark; no
+    /// run was claimed (ADR-0018 [`Due::Advance`]).
+    Advanced,
+    /// A run row was created; execute it.
+    Started(ClaimedRun),
+    /// A run for this schedule is still in flight. The cursor stays put:
+    /// the boundary is claimed at the next poll after that run finishes,
+    /// and the missed ones coalesce into its window (ruling 9).
+    AlreadyRunning,
+    /// The schedule hit its `max_runs` cap. The cursor stays put, so
+    /// raising the cap resumes from the boundary that was refused.
+    MaxRunsReached,
+}
+
+/// The run a due claim created, with everything executing it needs.
+///
+/// `resolved_query` is what the run executes AND what `report_runs.query`
+/// stores. It is deliberately not the saved DSL the enumeration handed the
+/// scheduler: the saved text is read inside the claim transaction, under
+/// the saved-query row lock, and a window is spliced onto it there (ADR-0018
+/// ruling 11). Executing the enumeration's copy would run text nobody
+/// recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedRun {
+    /// The `report_runs` row id.
+    pub run_id: i64,
+    /// The saved query this run belongs to.
+    pub saved_query_id: i64,
+    /// The saved query's name, which names the `scheduled/{name}/` result
+    /// directory.
+    pub query_name: String,
+    /// The resolved DSL: the saved text with `earliest=`/`latest=` spliced
+    /// on, or the saved text verbatim in query mode.
+    pub resolved_query: String,
+    /// The window this run covers, or `None` in query mode.
+    pub window: Option<ReportWindow>,
+}
+
+/// Why a due-run claim failed.
+///
+/// Four distinct causes, kept apart because they mean different things
+/// about the install: the store is down, the schedule's own numbers cannot
+/// be planned, or the schedule's window and its saved DSL disagree in one
+/// of the two ways write-time validation exists to prevent. Every one of
+/// them leaves the fire cursor alone, so the tick fails loudly on every
+/// poll until the state is repaired instead of skipping a schedule
+/// silently.
+///
+/// It is deliberately NOT a [`StoreError`] variant. `ServerError` already
+/// wraps these three window errors directly, with a considered wire
+/// treatment for each (the policy refusal is the operator's own input and
+/// keeps its text; a plan or materialize failure is broken stored state and
+/// is redacted). Re-wrapping them in `StoreError` would give each leaf a
+/// second, differently-mapped route to the same wire.
+#[derive(Debug, thiserror::Error)]
+pub enum DueClaimError {
+    /// The app-state store failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The fire cursor or a window bound could not be computed.
+    #[error(transparent)]
+    Plan(#[from] PlanError),
+    /// The schedule's window may not be attached to this query text
+    /// (ADR-0018 rulings 7 and 12).
+    #[error(transparent)]
+    Policy(#[from] WindowPolicyError),
+    /// The planned window could not be put onto the saved DSL (ruling 11).
+    #[error(transparent)]
+    Materialize(#[from] MaterializeError),
+}
+
+impl From<sqlx::Error> for DueClaimError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Store(StoreError::from(e))
+    }
+}
+
+impl DueClaimError {
+    /// A closed-set class label for log events, for the same reason
+    /// [`StoreError::class`] has one: a window failure's Display can quote
+    /// the saved DSL and the parser's message, and a scheduler event lands
+    /// in the retained `service=trawld` corpus.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::Store(e) => e.class(),
+            Self::Plan(_) => "window_plan",
+            Self::Policy(_) => "window_policy",
+            Self::Materialize(_) => "window_materialize",
+        }
+    }
 }
 
 /// Outcome of [`ScheduleStore::finish_run`], naming the file-cleanup obligation
@@ -752,22 +861,8 @@ impl ScheduleStore {
             }
         }
 
-        let inserted = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO report_runs
-                 (schedule_id, saved_query_id, query, status, started_at,
-                  window_start, window_end, window_truncated, window_kind)
-             VALUES ($1, $2, $3, 'running', now(), $4, $5, $6, $7)
-             RETURNING id",
-        )
-        .bind(schedule_id)
-        .bind(saved_query_id)
-        .bind(query)
-        .bind(window.map(|w| w.start))
-        .bind(window.map(|w| w.end))
-        .bind(window.map(|w| w.truncated))
-        .bind(window.map(|w| w.kind.as_str()))
-        .fetch_one(&mut *tx)
-        .await;
+        let inserted =
+            insert_running_run(&mut tx, schedule_id, saved_query_id, query, window).await;
 
         match inserted {
             Ok(id) => {
@@ -789,6 +884,156 @@ impl ScheduleStore {
                 }
             }
         }
+    }
+
+    /// Plan, materialize and claim one schedule's due run in a single
+    /// transaction (ADR-0018 rulings 6-14).
+    ///
+    /// This is the scheduler tick's whole decision. It reads the schedule's
+    /// cadence, asks [`plan_due_run`] what the instant `now` owes, splices
+    /// the planned window onto the saved DSL, and inserts the `running` row
+    /// carrying that resolved text — then, and only then, moves the fire
+    /// cursor. One transaction is what makes the cursor and the run row one
+    /// fact: a crash between them would either lose a boundary forever or
+    /// claim it twice.
+    ///
+    /// `now` is a value, never a clock reading taken here: the tick samples
+    /// one instant and every schedule in it is judged against that same
+    /// instant, so two schedules cannot land on either side of a boundary
+    /// that passed mid-poll.
+    ///
+    /// LOCK ORDER: `saved_queries` -> `schedules` -> `report_runs`, the
+    /// order every multi-row path in this module takes, extended one level
+    /// up. The saved-query row is locked FIRST because the DSL read below
+    /// is what this run executes and stores: a concurrent edit either lands
+    /// entirely before the claim or waits for it, so no run can execute
+    /// text that was never recorded. [`Self::delete_schedule`] and
+    /// [`Self::finish_run`] start at `schedules` and never reach for
+    /// `saved_queries`, which skips a level of the same order rather than
+    /// inverting it.
+    ///
+    /// Three outcomes deliberately leave `next_fire_at` alone:
+    /// [`DueClaim::NotDue`], [`DueClaim::AlreadyRunning`] and
+    /// [`DueClaim::MaxRunsReached`]. A boundary refused because the
+    /// previous run is still going is claimed at the next poll once it
+    /// finishes, and the coverage it owed folds into that window; a
+    /// boundary refused by the cap is claimed when the cap is raised. An
+    /// error leaves it alone for the same reason, and is loud on every poll
+    /// until the operator repairs the schedule.
+    pub async fn claim_due_run(
+        &self,
+        schedule_id: i64,
+        now: DateTime<Utc>,
+        max_catchup_intervals: u32,
+    ) -> Result<DueClaim, DueClaimError> {
+        let mut tx = self.pool.begin().await?;
+
+        let Some(locked) = lock_for_claim(&mut tx, schedule_id).await? else {
+            tx.rollback().await?;
+            return Ok(DueClaim::NotDue);
+        };
+        let LockedSchedule {
+            saved_query_id,
+            query_name,
+            dsl,
+            schedule,
+        } = locked;
+
+        let plan = match plan_due_run(&PlanInput {
+            now,
+            next_fire_at: schedule.next_fire_at,
+            interval_secs: schedule.interval_secs,
+            window: schedule.window,
+            lag_secs: schedule.lag_secs,
+            covered_through: schedule.covered_through,
+            max_catchup_intervals,
+        }) {
+            Ok(Due::NotYet) => {
+                tx.rollback().await?;
+                return Ok(DueClaim::NotDue);
+            }
+            Ok(Due::Advance { next_fire_at }) => {
+                set_next_fire_at(&mut tx, schedule_id, next_fire_at).await?;
+                tx.commit().await?;
+                tracing::info!(
+                    event_type = "schedule_cursor_advanced",
+                    schedule_id,
+                    "fire cursor advanced over a window the watermark already covers"
+                );
+                return Ok(DueClaim::Advanced);
+            }
+            Ok(Due::Run(plan)) => plan,
+            Err(e) => {
+                tx.rollback().await?;
+                return Err(e.into());
+            }
+        };
+
+        // Ruling 11: what the run executes is what it stores. A window
+        // failure rolls back with the cursor untouched, so the schedule is
+        // refused again on the next poll instead of quietly skipping a
+        // boundary.
+        let resolved_query = match plan.window {
+            Some(window) => match resolve_window_text(schedule.window, &dsl, &window) {
+                Ok(text) => text,
+                Err(e) => {
+                    tx.rollback().await?;
+                    return Err(e);
+                }
+            },
+            None => dsl,
+        };
+
+        if let Some(max) = schedule.max_runs {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM report_runs WHERE schedule_id = $1")
+                    .bind(schedule_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if u64::try_from(count).unwrap_or_default() >= max {
+                tx.rollback().await?;
+                return Ok(DueClaim::MaxRunsReached);
+            }
+        }
+
+        // Level 3: the run row.
+        let run_id = match insert_running_run(
+            &mut tx,
+            schedule_id,
+            saved_query_id,
+            &resolved_query,
+            plan.window.as_ref(),
+        )
+        .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tx.rollback().await?;
+                return match classify_violation(&e) {
+                    Some(PgViolation::RunAlreadyRunning) => Ok(DueClaim::AlreadyRunning),
+                    _ => Err(StoreError::from(e).into()),
+                };
+            }
+        };
+
+        set_next_fire_at(&mut tx, schedule_id, plan.next_fire_at).await?;
+        tx.commit().await?;
+
+        tracing::info!(
+            event_type = "report_run_started",
+            run_id,
+            schedule_id,
+            saved_query_id,
+            "Report run started"
+        );
+
+        Ok(DueClaim::Started(ClaimedRun {
+            run_id,
+            saved_query_id,
+            query_name,
+            resolved_query,
+            window: plan.window,
+        }))
     }
 
     /// Finish a run with status, timing, and optional result path or blob.
@@ -1279,6 +1524,144 @@ impl ScheduleStore {
             avg_ms,
         ))
     }
+}
+
+/// The rows one due-run claim reads before it decides anything.
+struct LockedSchedule {
+    saved_query_id: i64,
+    /// The saved query's name (its `scheduled/{name}/` result directory).
+    query_name: String,
+    /// The saved DSL, read under the saved-query row lock.
+    dsl: String,
+    /// The schedule, re-read under its own lock.
+    schedule: Schedule,
+}
+
+/// Take the claim's locks in order and read what the plan needs.
+///
+/// `saved_queries` FOR UPDATE, then `schedules` FOR UPDATE: the order every
+/// multi-row path in this module takes, extended one level up. Both rows are
+/// re-read here rather than trusted from the caller's enumeration snapshot,
+/// because an operator can edit the DSL, disable the schedule or delete
+/// either one between the list and the claim.
+///
+/// `None` means there is nothing to run — the schedule or its saved query
+/// was deleted, or the schedule is disabled — and the caller answers
+/// [`DueClaim::NotDue`] for all three.
+async fn lock_for_claim(
+    conn: &mut sqlx::PgConnection,
+    schedule_id: i64,
+) -> Result<Option<LockedSchedule>, DueClaimError> {
+    // Which saved query to lock. Unlocked on purpose: it is the lookup that
+    // decides which row the FIRST lock is taken on, and a schedule never
+    // changes its saved query (the pair is created together and
+    // `schedules_saved_query_unique` keeps it 1:1).
+    let saved_query_id: Option<i64> =
+        sqlx::query_scalar("SELECT saved_query_id FROM schedules WHERE id = $1")
+            .bind(schedule_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some(saved_query_id) = saved_query_id else {
+        return Ok(None);
+    };
+
+    // Level 1: the saved query. The lock and the DSL read are one statement
+    // — the text this returns is the text the run executes and stores.
+    let saved = sqlx::query("SELECT name, query FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(saved_query_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some(saved) = saved else {
+        return Ok(None);
+    };
+
+    // Level 2: the schedule.
+    let locked = sqlx::query(AssertSqlSafe(format!(
+        "SELECT {SCHEDULE_COLS} FROM schedules WHERE id = $1 FOR UPDATE"
+    )))
+    .bind(schedule_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(locked) = locked else {
+        return Ok(None);
+    };
+    let schedule = row_to_schedule(&locked)?;
+    if !schedule.enabled {
+        return Ok(None);
+    }
+
+    Ok(Some(LockedSchedule {
+        saved_query_id,
+        query_name: saved.try_get("name")?,
+        dsl: saved.try_get("query")?,
+        schedule,
+    }))
+}
+
+/// Insert one `running` row for a claim, returning its id.
+///
+/// ONE spelling of the statement for the two claimants: the manual trigger
+/// ([`ScheduleStore::claim_run`]) and the scheduler tick
+/// ([`ScheduleStore::claim_due_run`]). Both write the same nine columns,
+/// and a second copy would be a second place for the window columns to be
+/// forgotten. The raw `sqlx::Error` comes back so each caller classifies
+/// the `report_runs_one_running` 23505 into its own answer.
+async fn insert_running_run(
+    conn: &mut sqlx::PgConnection,
+    schedule_id: i64,
+    saved_query_id: i64,
+    query: &str,
+    window: Option<&ReportWindow>,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO report_runs
+             (schedule_id, saved_query_id, query, status, started_at,
+              window_start, window_end, window_truncated, window_kind)
+         VALUES ($1, $2, $3, 'running', now(), $4, $5, $6, $7)
+         RETURNING id",
+    )
+    .bind(schedule_id)
+    .bind(saved_query_id)
+    .bind(query)
+    .bind(window.map(|w| w.start))
+    .bind(window.map(|w| w.end))
+    .bind(window.map(|w| w.truncated))
+    .bind(window.map(|w| w.kind.as_str()))
+    .fetch_one(conn)
+    .await
+}
+
+/// Move a schedule's fire cursor.
+///
+/// `updated_at` is deliberately not touched: it records operator edits, and
+/// a tick moving its own cursor is not one.
+async fn set_next_fire_at(
+    conn: &mut sqlx::PgConnection,
+    schedule_id: i64,
+    next_fire_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE schedules SET next_fire_at = $1 WHERE id = $2")
+        .bind(next_fire_at)
+        .bind(schedule_id)
+        .execute(conn)
+        .await
+        .map(|_| ())
+}
+
+/// The text a windowed run executes and stores, or why it has none.
+///
+/// Both halves of ADR-0018's write-time rule are asked again here, at
+/// execution time. The schedule and the saved DSL are two rows an operator
+/// can edit independently, and a pair that was written past the gate (a
+/// direct UPDATE, an older binary) would otherwise execute a query whose
+/// own `last=` silently overrides the window the run row claims to cover.
+fn resolve_window_text(
+    mode: Option<ScheduleWindow>,
+    dsl: &str,
+    window: &ReportWindow,
+) -> Result<String, DueClaimError> {
+    validate_window_compatibility(mode, dsl)?;
+    Ok(materialize_window(dsl, window)?)
 }
 
 /// Build a prefixed run column list (e.g. `r.id, r.schedule_id, …`).

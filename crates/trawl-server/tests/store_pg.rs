@@ -23,8 +23,8 @@ mod common;
 use sqlx::PgPool;
 use trawl_server::report_window::{ReportWindow, ScheduleWindow, WindowKind, truncate_to_micros};
 use trawl_server::store::{
-    FinishOutcome, FlipOutcome, HistoryStore, RunClaim, RunStatus, SavedQueryStore, ScheduleStore,
-    StorageState, StoreError,
+    DueClaim, DueClaimError, FinishOutcome, FlipOutcome, HistoryStore, RunClaim, RunStatus,
+    SavedQueryStore, ScheduleStore, StorageState, StoreError,
 };
 
 fn history(pool: &PgPool) -> HistoryStore {
@@ -1069,6 +1069,340 @@ async fn fixed_and_legacy_schedules_keep_no_watermark(pool: PgPool) {
         );
         assert_eq!(run.window_kind, window.map(ScheduleWindow::kind));
     }
+}
+
+// ---------------------------------------------------------------------------
+// claim_due_run: plan, materialize and claim in one transaction
+// ---------------------------------------------------------------------------
+
+/// How many intervals of catch-up these tests allow. Large enough that
+/// nothing here is truncated by accident; the clamp itself is covered by
+/// the planner's own tests and by `tests/scheduler_windows.rs`.
+const CATCHUP: u32 = 24;
+
+/// Read a schedule back through its saved query.
+async fn reread(store: &ScheduleStore, sq_id: i64) -> trawl_server::store::Schedule {
+    store
+        .get_schedule_for_saved_query(sq_id, 1)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// The fire cursor is the whole due test: before it, nothing happens and
+/// nothing is written.
+#[sqlx::test]
+async fn claim_due_run_is_not_due_before_the_cursor(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "early").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 3600, None, None, 0, now)
+        .await
+        .unwrap();
+
+    let a_second_early = now - chrono::Duration::seconds(1);
+    assert_eq!(
+        store
+            .claim_due_run(sched.id, a_second_early, CATCHUP)
+            .await
+            .unwrap(),
+        DueClaim::NotDue
+    );
+    assert_eq!(store.count_runs(sched.id).await.unwrap(), 0);
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        now,
+        "a not-due tick writes nothing at all"
+    );
+
+    // The cursor instant itself IS due: a schedule created at T fires at T.
+    assert!(matches!(
+        store.claim_due_run(sched.id, now, CATCHUP).await.unwrap(),
+        DueClaim::Started(_)
+    ));
+}
+
+/// A watermark at or past the window the cursor would produce is coverage
+/// that already exists. The cursor moves so the tick stops asking, and no
+/// run is claimed.
+#[sqlx::test]
+async fn claim_due_run_advances_over_ground_the_watermark_covers(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "covered").await;
+    let sched = store
+        .create_schedule(
+            sq_id,
+            1,
+            3600,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+
+    // Only an edit can produce this shape, so plant it the way an edit would.
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(now + chrono::Duration::hours(10))
+        .bind(sched.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.claim_due_run(sched.id, now, CATCHUP).await.unwrap(),
+        DueClaim::Advanced
+    );
+    assert_eq!(store.count_runs(sched.id).await.unwrap(), 0);
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        now + chrono::Duration::hours(1),
+        "the cursor moves one interval so the tick stops re-asking"
+    );
+}
+
+/// A run still in flight blocks the claim and LEAVES the cursor, so the
+/// boundary is claimed again at the next poll after that run finishes and
+/// the coverage it owed folds into one window (ADR-0018 ruling 9).
+#[sqlx::test]
+async fn claim_due_run_leaves_the_cursor_while_a_run_is_in_flight(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "inflight").await;
+    let sched = store
+        .create_schedule(
+            sq_id,
+            1,
+            3600,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store.claim_due_run(sched.id, now, CATCHUP).await.unwrap(),
+        DueClaim::Started(_)
+    ));
+    let after_first = reread(&store, sq_id).await.next_fire_at;
+    assert_eq!(after_first, now + chrono::Duration::hours(1));
+
+    // The first run never finishes; the next boundary arrives anyway.
+    assert_eq!(
+        store
+            .claim_due_run(sched.id, after_first, CATCHUP)
+            .await
+            .unwrap(),
+        DueClaim::AlreadyRunning
+    );
+    assert_eq!(store.count_runs(sched.id).await.unwrap(), 1);
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        after_first,
+        "a refused boundary must stay claimable"
+    );
+}
+
+/// The `max_runs` cap refuses the claim and leaves the cursor too: raising
+/// the cap resumes from the boundary that was refused rather than from
+/// wherever the clock has got to.
+#[sqlx::test]
+async fn claim_due_run_leaves_the_cursor_at_the_max_runs_cap(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "capped").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 3600, Some(1), None, 0, now)
+        .await
+        .unwrap();
+
+    let DueClaim::Started(first) = store.claim_due_run(sched.id, now, CATCHUP).await.unwrap()
+    else {
+        panic!("the first run is under the cap");
+    };
+    store
+        .finish_run(
+            first.run_id,
+            RunStatus::Success,
+            5,
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let after_first = reread(&store, sq_id).await.next_fire_at;
+
+    assert_eq!(
+        store
+            .claim_due_run(sched.id, after_first, CATCHUP)
+            .await
+            .unwrap(),
+        DueClaim::MaxRunsReached
+    );
+    assert_eq!(store.count_runs(sched.id).await.unwrap(), 1);
+    assert_eq!(reread(&store, sq_id).await.next_fire_at, after_first);
+}
+
+/// A disabled schedule is not due whatever the clock says, and neither is
+/// one whose rows are gone.
+#[sqlx::test]
+async fn claim_due_run_is_not_due_when_disabled_or_deleted(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "paused").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 3600, None, None, 0, now)
+        .await
+        .unwrap();
+    store
+        .update_schedule(sched.id, 1, 3600, None, false, None, 0, now)
+        .await
+        .unwrap();
+
+    let later = now + chrono::Duration::hours(5);
+    assert_eq!(
+        store.claim_due_run(sched.id, later, CATCHUP).await.unwrap(),
+        DueClaim::NotDue,
+        "a disabled schedule owes nothing"
+    );
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        now,
+        "and its cursor is not moved while it is off"
+    );
+
+    store.delete_schedule(sq_id, 1).await.unwrap();
+    assert_eq!(
+        store.claim_due_run(sched.id, later, CATCHUP).await.unwrap(),
+        DueClaim::NotDue,
+        "a deleted schedule is not an error, just nothing to do"
+    );
+}
+
+/// The claim returns the text it stored, and it is the saved DSL with the
+/// planned bounds spliced on (ADR-0018 ruling 11) — not the saved text and
+/// not something the caller has to rebuild.
+#[sqlx::test]
+async fn claim_due_run_stores_the_resolved_query_it_returns(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = saved(&pool)
+        .create(1, "resolved", "service=fx | table _time")
+        .await
+        .unwrap()
+        .id;
+    let sched = store
+        .create_schedule(
+            sq_id,
+            1,
+            3600,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+
+    let DueClaim::Started(claimed) = store.claim_due_run(sched.id, now, CATCHUP).await.unwrap()
+    else {
+        panic!("the schedule is due at its own creation instant");
+    };
+
+    let window = claimed.window.expect("a windowed schedule claims a window");
+    assert_eq!(window.kind, WindowKind::SinceLast);
+    assert_eq!(window.end, now, "no lag, so the window ends at the fire");
+    assert_eq!(
+        window.start,
+        now - chrono::Duration::hours(1),
+        "the first since_last run covers one interval (ruling 14)"
+    );
+    assert!(!window.truncated);
+    assert!(
+        claimed.resolved_query.ends_with("service=fx | table _time"),
+        "the saved text survives verbatim: {}",
+        claimed.resolved_query
+    );
+    assert!(claimed.resolved_query.starts_with("earliest="));
+    assert_eq!(claimed.query_name, "resolved");
+    assert_eq!(claimed.saved_query_id, sq_id);
+
+    let run = store.get_run(claimed.run_id, 1).await.unwrap().unwrap();
+    assert_eq!(
+        run.query, claimed.resolved_query,
+        "the stored text and the executed text are one string"
+    );
+    assert_eq!(
+        (run.window_start, run.window_end),
+        (Some(window.start), Some(window.end))
+    );
+    assert_eq!(run.window_truncated, Some(false));
+    assert_eq!(run.window_kind, Some(WindowKind::SinceLast));
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        now + chrono::Duration::hours(1)
+    );
+}
+
+/// A windowed schedule whose saved DSL grew its own time clause is refused,
+/// loudly, with the cursor left alone (rulings 7 and 11). Write-time
+/// validation is supposed to prevent the pair; if it is there anyway, the
+/// tick must not execute a query whose `last=` overrides the window the run
+/// row would claim to cover.
+#[sqlx::test]
+async fn claim_due_run_refuses_a_query_that_owns_its_own_window(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = saved(&pool)
+        .create(1, "conflicted", "service=fx | table _time")
+        .await
+        .unwrap()
+        .id;
+    let sched = store
+        .create_schedule(
+            sq_id,
+            1,
+            3600,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+    // The plain store update M4 puts the compatibility gate on.
+    saved(&pool)
+        .update(sq_id, 1, "service=fx last=1h | table _time", None)
+        .await
+        .unwrap();
+
+    let err = store
+        .claim_due_run(sched.id, now, CATCHUP)
+        .await
+        .expect_err("a windowed schedule cannot execute a query that owns its own window");
+    assert!(
+        matches!(err, DueClaimError::Policy(_)),
+        "expected the window-policy refusal, got {err:?}"
+    );
+    assert_eq!(err.class(), "window_policy");
+    assert!(
+        err.to_string().contains("last="),
+        "the message names the clause it found: {err}"
+    );
+
+    assert_eq!(store.count_runs(sched.id).await.unwrap(), 0);
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        now,
+        "a refused claim leaves the cursor, so the state is loud every poll"
+    );
 }
 
 /// A CHECK accepts NULL as readily as TRUE, so a shape constraint written
