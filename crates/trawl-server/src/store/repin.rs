@@ -430,6 +430,19 @@ impl RepinStore {
     /// replay of an already-succeeded job would delete evidence describing
     /// the new pin, which nothing would ever write again — and an ack an
     /// operator wrote after the flip would go the same way.
+    ///
+    /// The transaction OPENS with `SELECT 1 FROM field_types WHERE field =
+    /// $1 FOR UPDATE`, and that lock is not incidental to the pin flip. The
+    /// flip's own UPDATE is predicated `duckdb_type IS DISTINCT FROM $2`, so
+    /// a resurrection-only repin (`to == current`) matches no row and takes
+    /// no lock at all. `acknowledge_degraded_field` serializes against this
+    /// transaction by taking `FOR SHARE` on that same row, so without the
+    /// explicit lock a same-type cutover has nothing for the ack to wait on:
+    /// the ack reads the episode sum, this transaction clears the evidence
+    /// and the ack row, and the ack's upsert lands afterwards as a
+    /// high-water over counters that were just reset — suppressing the new
+    /// pin's first episodes. Locking unconditionally makes the two orders
+    /// the only two outcomes for every repin, not just the retyping ones.
     pub async fn finish_cutover(
         &self,
         id: i64,
@@ -437,6 +450,10 @@ impl RepinStore {
         to_type: CanonicalType,
     ) -> Result<CutoverOutcome, StoreError> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT 1 FROM field_types WHERE field = $1 FOR UPDATE")
+            .bind(field)
+            .fetch_optional(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE field_types
              SET duckdb_type = $2, pinned_from = '_repin', pinned_at = now()

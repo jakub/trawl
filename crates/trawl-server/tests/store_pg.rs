@@ -4066,6 +4066,104 @@ mod repin_store {
         );
     }
 
+    /// A resurrection-only repin (`to == current`) writes no new type, so
+    /// the pin flip's `IS DISTINCT FROM` UPDATE matches no row and used to
+    /// take no lock. `acknowledge_degraded_field` serializes against the
+    /// cutover by taking `FOR SHARE` on the pin row, so with nothing to wait
+    /// on, an ack that had already read the episode sum could commit its
+    /// high-water after the cutover cleared the counters and suppress the
+    /// new pin's first episodes.
+    ///
+    /// The blocker holds exactly the lock the ack takes. Before the fix the
+    /// same-type cutover sailed past it; now it waits, and once the ack
+    /// releases, the cutover deletes the row the ack just wrote.
+    #[sqlx::test]
+    async fn same_type_cutover_waits_on_a_racing_ack(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        for _ in 0..3 {
+            catalog
+                .record_conflicts(&[trawl_server::store::FieldConflict {
+                    field: "host".to_owned(),
+                    service: "svc-a".to_owned(),
+                    observed_type: "VARCHAR".to_owned(),
+                    expected_type: CanonicalType::Varchar,
+                    rows_nulled: 3,
+                    samples: Vec::new(),
+                }])
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE field_conflict_stats SET first_at = now() - interval '48 hours'
+             WHERE field = 'host'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        catalog
+            .acknowledge_degraded_field("host", "key-aaa", None)
+            .await
+            .unwrap();
+
+        // A resurrection-only job: same type in and out.
+        let id = s
+            .claim(RepinClaim {
+                field: "host",
+                from_type: CanonicalType::Varchar,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: false,
+                force: true,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
+                requested_by: None,
+            })
+            .await
+            .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM field_types WHERE field = 'host' FOR SHARE")
+            .fetch_optional(&mut *blocker)
+            .await
+            .unwrap();
+
+        let cutover_store = store(&pool);
+        let mut cutover = tokio::spawn(async move {
+            cutover_store
+                .finish_cutover(id, "host", CanonicalType::Varchar)
+                .await
+        });
+
+        let stalled = tokio::time::timeout(std::time::Duration::from_millis(500), &mut cutover)
+            .await
+            .is_err();
+        assert!(
+            stalled,
+            "the cutover must wait for the ack's row lock even when the type does not change"
+        );
+
+        blocker.rollback().await.unwrap();
+        let outcome = cutover.await.unwrap().unwrap();
+        assert!(outcome.completed);
+        assert!(
+            outcome.cleared_ack,
+            "the cutover that ran second removes the ack the racing operator wrote"
+        );
+        assert_eq!(catalog.degraded_ack("host").await.unwrap(), None);
+
+        // The other order: the cutover has cleared the evidence, so the next
+        // ack finds no verdict to suppress and refuses rather than
+        // installing a high-water over the new pin's counters.
+        assert_eq!(
+            catalog
+                .acknowledge_degraded_field("host", "key-aaa", None)
+                .await
+                .unwrap(),
+            trawl_server::store::AckOutcome::NotDegraded
+        );
+    }
+
     /// The re-arm switch for boot recovery: a recovered cutover clears
     /// `conformed_at` so the next conformance pass re-proves the corpus.
     #[sqlx::test]

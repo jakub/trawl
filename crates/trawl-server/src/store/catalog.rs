@@ -1368,8 +1368,10 @@ impl CatalogStore {
     /// and this method's upsert lands afterwards — installing a high-water
     /// over a field whose conflict counters have just been reset to zero,
     /// which suppresses the NEW pin's first several episodes. `FOR SHARE`
-    /// is enough because the cutover takes a row-exclusive lock on the same
-    /// row, so the two orders are the only two outcomes: either the ack
+    /// is enough because `RepinStore::finish_cutover` opens by taking `FOR
+    /// UPDATE` on that same row unconditionally (its pin-flip UPDATE alone
+    /// would miss a resurrection-only cutover, where the new type equals the
+    /// old one), so the two orders are the only two outcomes: either the ack
     /// commits first and the cutover deletes it, or the cutover commits
     /// first and this method reads the post-clear evidence, finds nothing
     /// degraded and refuses.
