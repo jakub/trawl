@@ -569,6 +569,52 @@ fn format_run_window(start: &str, end: &str) -> String {
     format!("[{from_text} .. {to_text})")
 }
 
+/// Render an RFC 3339 instant as a whole-minute UTC wall clock. A value that
+/// does not parse is passed through so an unexpected wire shape is visible.
+fn format_instant_utc(iso: &str) -> String {
+    use chrono::{DateTime, Utc};
+
+    iso.parse::<DateTime<Utc>>().map_or_else(
+        |_| iso.to_owned(),
+        |t| format!("{} UTC", t.format("%Y-%m-%d %H:%M")),
+    )
+}
+
+/// The schedule's window mode as a badge suffix for the saved-query list:
+/// `[1h]` in query mode, `[1h since_last]` or `[1h window 2h]` when the
+/// schedule owns the report window (ADR-0018 ruling 6).
+fn format_schedule_badge(sched: &trawl_api::ScheduleResponse) -> String {
+    match sched.window.as_deref() {
+        None => format!(" [{}]", sched.interval),
+        Some("since_last") => format!(" [{} since_last]", sched.interval),
+        Some(window) => format!(" [{} window {window}]", sched.interval),
+    }
+}
+
+/// The schedule's report-window detail line, or `None` in query mode, where
+/// the saved DSL carries its own time bounds and the scheduler owns nothing.
+///
+/// A zero lag is left out: it is the default and printing `lag 0s` would spend
+/// a line saying nothing. `covered through` is the `since_last` watermark, so
+/// it is absent for a fixed window and for a schedule that has not yet had a
+/// successful run.
+fn format_schedule_window(sched: &trawl_api::ScheduleResponse) -> Option<String> {
+    let window = sched.window.as_deref()?;
+    let mut parts = vec![format!("window {window}")];
+
+    if let Some(lag) = sched.lag.as_deref()
+        && sched.lag_secs != Some(0)
+    {
+        parts.push(format!("lag {lag}"));
+    }
+
+    if let Some(covered) = sched.covered_through.as_deref() {
+        parts.push(format!("covered through {}", format_instant_utc(covered)));
+    }
+
+    Some(parts.join(", "))
+}
+
 // ---------------------------------------------------------------------------
 // Saved queries list
 // ---------------------------------------------------------------------------
@@ -616,7 +662,7 @@ fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect
             let mut suffixes = Vec::new();
             if let Some(ref sched) = entry.schedule {
                 suffixes.push(Span::styled(
-                    format!(" [{}]", sched.interval),
+                    format_schedule_badge(sched),
                     Style::default().fg(theme.text_accent),
                 ));
                 if let Some(ref last_run) = sched.last_run {
@@ -753,6 +799,21 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
             Span::styled("sched  ", label_style),
             Span::styled(
                 format!("every {} ({})", sched.interval, enabled_str),
+                value_style,
+            ),
+        ]));
+        // Continuation lines under the `sched` label: what the scheduler owns
+        // of the report window, then the fire cursor every schedule has.
+        if let Some(window) = format_schedule_window(sched) {
+            lines.push(Line::from(vec![
+                Span::styled("       ", label_style),
+                Span::styled(window, value_style),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("       ", label_style),
+            Span::styled(
+                format!("next fire {}", format_instant_utc(&sched.next_fire_at)),
                 value_style,
             ),
         ]));
@@ -1132,6 +1193,86 @@ mod tests {
             format_run_window("2026-03-14T02:00:00Z", ""),
             "[2026-03-14T02:00:00Z .. )"
         );
+    }
+
+    /// A schedule on a one-hour interval, with the ADR-0018 window fields
+    /// under the test's control.
+    fn schedule(
+        window: Option<&str>,
+        lag: Option<(&str, u64)>,
+        covered_through: Option<&str>,
+    ) -> trawl_api::ScheduleResponse {
+        trawl_api::ScheduleResponse {
+            id: 1,
+            saved_query_id: 1,
+            interval: "1h".to_owned(),
+            interval_secs: 3600,
+            max_runs: None,
+            enabled: true,
+            created_at: "2026-03-01T00:00:00Z".to_owned(),
+            updated_at: "2026-03-01T00:00:00Z".to_owned(),
+            last_run: None,
+            total_runs: 0,
+            window: window.map(ToOwned::to_owned),
+            lag: lag.map(|(text, _)| text.to_owned()),
+            lag_secs: lag.map(|(_, secs)| secs),
+            covered_through: covered_through.map(ToOwned::to_owned),
+            next_fire_at: "2026-03-14T04:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn schedule_window_tiled_with_lag_and_watermark() {
+        let sched = schedule(
+            Some("since_last"),
+            Some(("5m", 300)),
+            Some("2026-03-14T03:00:00Z"),
+        );
+        assert_eq!(
+            format_schedule_window(&sched).unwrap(),
+            "window since_last, lag 5m, covered through 2026-03-14 03:00 UTC"
+        );
+    }
+
+    /// A zero lag is the default in force, not a value worth a line.
+    #[test]
+    fn schedule_window_omits_a_zero_lag() {
+        let sched = schedule(Some("2h"), Some(("0s", 0)), None);
+        assert_eq!(format_schedule_window(&sched).unwrap(), "window 2h");
+    }
+
+    /// A fixed window keeps no watermark, so there is nothing to print.
+    #[test]
+    fn schedule_window_omits_an_absent_watermark() {
+        let sched = schedule(Some("2h"), Some(("5m", 300)), None);
+        assert_eq!(format_schedule_window(&sched).unwrap(), "window 2h, lag 5m");
+    }
+
+    #[test]
+    fn schedule_window_is_none_in_query_mode() {
+        assert!(format_schedule_window(&schedule(None, None, None)).is_none());
+    }
+
+    #[test]
+    fn schedule_badge_names_the_window_mode() {
+        assert_eq!(format_schedule_badge(&schedule(None, None, None)), " [1h]");
+        assert_eq!(
+            format_schedule_badge(&schedule(Some("since_last"), None, None)),
+            " [1h since_last]"
+        );
+        assert_eq!(
+            format_schedule_badge(&schedule(Some("2h"), None, None)),
+            " [1h window 2h]"
+        );
+    }
+
+    #[test]
+    fn instant_utc_passes_through_an_unparseable_value() {
+        assert_eq!(
+            format_instant_utc("2026-03-14T04:00:00Z"),
+            "2026-03-14 04:00 UTC"
+        );
+        assert_eq!(format_instant_utc("soon"), "soon");
     }
 
     #[test]

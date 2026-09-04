@@ -228,7 +228,10 @@ mod tests {
     /// A schedule on a one-hour interval. `window`/`lag` are the ADR-0018
     /// report-window fields: both absent is query mode, where the saved DSL
     /// owns its own time bounds.
-    fn make_schedule(window: Option<&str>, lag: Option<&str>) -> trawl_api::ScheduleResponse {
+    fn make_schedule(
+        window: Option<&str>,
+        lag: Option<(&str, u64)>,
+    ) -> trawl_api::ScheduleResponse {
         trawl_api::ScheduleResponse {
             id: 3,
             saved_query_id: 7,
@@ -241,8 +244,8 @@ mod tests {
             last_run: None,
             total_runs: 3,
             window: window.map(ToOwned::to_owned),
-            lag: lag.map(ToOwned::to_owned),
-            lag_secs: lag.map(|l| if l == "5m" { 300 } else { 0 }),
+            lag: lag.map(|(text, _)| text.to_owned()),
+            lag_secs: lag.map(|(_, secs)| secs),
             covered_through: window.map(|_| "2026-03-14T03:00:00Z".to_owned()),
             next_fire_at: "2026-03-14T04:00:00Z".to_owned(),
         }
@@ -288,6 +291,13 @@ mod tests {
         runs: Vec<trawl_api::ReportRunSummary>,
     ) -> crate::tui::App {
         use crate::tui::state::{MainTab, SavedDetailState, SavedFocus};
+
+        // Keep the pane self-consistent: the schedule's run total is the same
+        // count the run list below it renders.
+        let schedule = schedule.map(|mut sched| {
+            sched.total_runs = u64::try_from(runs.len()).unwrap();
+            sched
+        });
 
         let mut app = test_app();
         app.main_tab = MainTab::Saved;
@@ -335,6 +345,74 @@ mod tests {
         );
         // Wide enough that the whole run line lands: the window trails the
         // row, so a narrower pane cuts the bounds and then the marker.
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// A run carrying the bounds of the window it covered.
+    fn windowed_run(
+        id: i64,
+        minutes_ago: i64,
+        kind: &str,
+        start: &str,
+        end: &str,
+    ) -> trawl_api::ReportRunSummary {
+        let mut run = make_run(id, minutes_ago);
+        run.window_kind = Some(kind.to_owned());
+        run.window_start = Some(start.to_owned());
+        run.window_end = Some(end.to_owned());
+        run.window_truncated = Some(false);
+        run
+    }
+
+    /// A tiling schedule with a late-arrival allowance: the detail pane names
+    /// the mode, the lag and the watermark the next window starts from.
+    #[test]
+    fn render_saved_schedule_windowed_with_lag() {
+        let run = windowed_run(
+            41,
+            45,
+            "since_last",
+            "2026-03-14T02:00:00Z",
+            "2026-03-14T03:00:00Z",
+        );
+        let mut app = saved_app(
+            Some(make_schedule(Some("since_last"), Some(("5m", 300)))),
+            vec![run],
+        );
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// A fixed trailing window with no lag: no `lag 0s`, and no watermark,
+    /// because a fixed window keeps none.
+    #[test]
+    fn render_saved_schedule_windowed_without_lag() {
+        let run = windowed_run(
+            41,
+            45,
+            "fixed",
+            "2026-03-14T01:00:00Z",
+            "2026-03-14T03:00:00Z",
+        );
+        let mut schedule = make_schedule(Some("2h"), Some(("0s", 0)));
+        schedule.covered_through = None;
+        let mut app = saved_app(Some(schedule), vec![run]);
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// Query mode: the saved DSL owns its own time bounds, so there is no
+    /// window line at all, only the fire cursor every schedule has.
+    #[test]
+    fn render_saved_schedule_query_mode() {
+        let mut app = saved_app(Some(make_schedule(None, None)), vec![make_run(41, 45)]);
         let backend = TestBackend::new(160, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();
