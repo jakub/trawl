@@ -160,6 +160,21 @@ impl Harness {
         panic!("repin job {id} did not reach a terminal state in time");
     }
 
+    /// Poll until the `data/REPIN` marker is gone. On the SUCCESS path the
+    /// row terminalizes inside `finish_cutover`'s transaction while the
+    /// detached task is still sweeping staging, so `wait_terminal` is not a
+    /// barrier for filesystem cleanup; the marker is removed last (it is
+    /// what licenses deleting the staging roots), so its absence is.
+    async fn wait_cleanup(&self) {
+        for _ in 0..600 {
+            if !trawl_server::repin::marker_path(&self.data_dir).exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("repin marker still present after cleanup budget");
+    }
+
     /// The type `/api/v1/schema` advertises for a field, read off the
     /// TTL-cached column listing. [`Harness::pinned_type`] reads
     /// `/schema/fields`, which has no cache in front of it.
@@ -2221,6 +2236,7 @@ async fn a_cancel_past_the_point_of_no_return_is_refused_and_the_job_completes()
     assert_eq!(h.pinned_type("status").await, "VARCHAR");
     assert_eq!(h.count("last=1h | stats count()").await, 2);
     assert_eq!(h.count("status>=400 last=1h | stats count()").await, 1);
+    h.wait_cleanup().await;
     assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
     assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
     assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
