@@ -921,11 +921,21 @@ impl RepinEngine {
         // exit: the corpus already is the new generation.
         let mut flipped_ok = false;
         for attempt in 1..=FLIP_ATTEMPTS {
-            // The outcome's `cleared_ack` is deliberately unread here: the
-            // audit event for a repin clearing an operator's acknowledgement
-            // lands with the ack routes.
             match self.store.finish_cutover(job_id, field, to).await {
-                Ok(_) => {
+                Ok(outcome) => {
+                    // `cleared_ack` is true only on the call that completed
+                    // the job, so a boot replay of an already-finished
+                    // cutover never re-announces a clear that happened once.
+                    if outcome.cleared_ack {
+                        tracing::info!(
+                            event_type = "field_degraded_ack_cleared",
+                            field = %field,
+                            reason = "repin",
+                            job_id,
+                            "the acknowledged pin was repinned; the \
+                             acknowledgement went with the evidence"
+                        );
+                    }
                     flipped_ok = true;
                     break;
                 }

@@ -2195,7 +2195,7 @@ async fn mid_build_growth_past_the_default_ceiling_refuses_the_cutover() {
 // record fires for exactly one of them.
 #[allow(clippy::too_many_lines)]
 async fn a_forced_cutover_records_what_it_accepted_and_what_it_did() {
-    use audit_capture::Capture;
+    use common::audit_capture::Capture;
     use tracing_subscriber::prelude::*;
 
     let capture = Capture::default();
@@ -2314,50 +2314,4 @@ async fn a_forced_cutover_records_what_it_accepted_and_what_it_did() {
         "the record is counts only, never sample values: {record:?}"
     );
     assert!(refused.error.is_some(), "the refused job kept its reason");
-}
-
-mod audit_capture {
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
-
-    /// One captured tracing event's fields, stringified.
-    #[derive(Debug, Clone)]
-    pub struct Captured {
-        pub fields: BTreeMap<String, String>,
-    }
-
-    /// Capture layer recording every event's fields as strings.
-    #[derive(Clone, Default)]
-    pub struct Capture {
-        events: Arc<Mutex<Vec<Captured>>>,
-    }
-
-    impl Capture {
-        pub fn events(&self) -> Vec<Captured> {
-            self.events.lock().unwrap().clone()
-        }
-    }
-
-    struct Visitor<'a>(&'a mut BTreeMap<String, String>);
-
-    impl tracing::field::Visit for Visitor<'_> {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0.insert(field.name().to_owned(), format!("{value:?}"));
-        }
-    }
-
-    impl<S> tracing_subscriber::Layer<S> for Capture
-    where
-        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut fields = BTreeMap::new();
-            event.record(&mut Visitor(&mut fields));
-            self.events.lock().unwrap().push(Captured { fields });
-        }
-    }
 }

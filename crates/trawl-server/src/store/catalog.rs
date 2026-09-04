@@ -30,7 +30,7 @@ use sqlx::{PgPool, Row as _};
 use trawl_core::schema::CanonicalType;
 
 use super::error::{PgViolation, StoreError, classify_violation};
-use crate::catalog::analyzer::{ConflictAggregate, is_degraded};
+use crate::catalog::analyzer::{ConflictAggregate, is_degraded, meets_degraded_threshold};
 
 /// A proposed pin for a field absent from the catalog.
 #[derive(Debug, Clone)]
@@ -1402,7 +1402,12 @@ impl CatalogStore {
             tx.rollback().await?;
             return Ok(AckOutcome::NotDegraded);
         };
-        if !is_degraded(&agg) {
+        // The RAW rule, not the suppressed one: a field this operator has
+        // already acknowledged still meets the threshold, and re-acking it
+        // is how the high-water advances over evidence that re-raised the
+        // badge. Reading `is_degraded` here would refuse exactly the ack
+        // that answers a re-raise.
+        if !meets_degraded_threshold(&agg) {
             tx.rollback().await?;
             return Ok(AckOutcome::NotDegraded);
         }

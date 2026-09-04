@@ -848,6 +848,14 @@ pub struct CatalogFieldResponse {
     /// The analyzer's verdict, present only when the pin is degraded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<DegradedVerdict>,
+    /// The operator's acknowledgement of the badge, if one stands.
+    ///
+    /// Independent of `verdict`, and deliberately so: an ack that has been
+    /// overtaken by newer evidence appears here beside a re-raised verdict.
+    /// The two together are the story ("acknowledged on Tuesday, still
+    /// shelving values on Thursday"), and filtering one out would hide it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack: Option<FieldAck>,
 }
 
 /// One service's observation of a field.
@@ -892,6 +900,27 @@ pub struct CatalogConflictRow {
     pub samples: Vec<String>,
     /// When the conflict was recorded (ISO 8601 UTC).
     pub at: String,
+}
+
+/// An operator's acknowledgement of a degraded verdict (issue #111): the
+/// body of a successful `POST /api/v1/schema/field/ack`, and the `ack` key
+/// on the field detail.
+///
+/// Acknowledging suppresses the badge for the evidence that existed when it
+/// was written, and nothing further: `evidence_through` is the episode count
+/// the ack covers, so the next conflict episode raises the badge again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldAck {
+    /// When the acknowledgement was written or last advanced (ISO 8601 UTC).
+    pub acked_at: String,
+    /// The acknowledging key's stable prefix. Not its display name: this row
+    /// outlives renames and rotations.
+    pub acked_by: String,
+    /// The operator's note, verbatim as they wrote it (≤1024 bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Conflict episodes the acknowledgement covers.
+    pub evidence_through: u64,
 }
 
 // -- repin (ADR-0011) --------------------------------------------------------
@@ -1348,6 +1377,12 @@ mod tests {
                 samples: vec!["n/a".into(), "pending".into()],
                 suggested_to: "VARCHAR".into(),
             }),
+            ack: Some(FieldAck {
+                acked_at: "2026-08-03T09:00:00Z".into(),
+                acked_by: "tkl_abc123".into(),
+                note: Some("sender is being fixed".into()),
+                evidence_through: 4,
+            }),
         };
         let rt = roundtrip(&resp);
         assert_eq!(rt.name, "duration");
@@ -1364,6 +1399,42 @@ mod tests {
         let verdict = rt.verdict.expect("the verdict survives the wire");
         assert_eq!(verdict.rows_shelved, 120);
         assert_eq!(verdict.suggested_to, "VARCHAR");
+        // Verdict and ack ride together: an acknowledgement overtaken by
+        // new evidence is exactly this shape.
+        let ack = rt.ack.expect("the acknowledgement survives the wire");
+        assert_eq!(ack.acked_by, "tkl_abc123");
+        assert_eq!(ack.evidence_through, 4);
+        assert_eq!(ack.note.as_deref(), Some("sender is being fixed"));
+    }
+
+    /// An unacknowledged field carries no `ack` key at all, and an ack
+    /// without a note carries no `note` key: absent is the encoding, so an
+    /// install that never acknowledges anything reads byte-identically to
+    /// one from before the routes shipped.
+    #[test]
+    fn an_unacknowledged_field_carries_no_ack_key() {
+        let resp = CatalogFieldResponse {
+            name: "duration".into(),
+            data_type: "BIGINT".into(),
+            pinned_from: None,
+            pinned_at: "2026-08-01T10:00:00Z".into(),
+            services: Vec::new(),
+            services_cursor: None,
+            conflicts: Vec::new(),
+            verdict: None,
+            ack: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("\"ack\""), "{json}");
+
+        let json = serde_json::to_string(&FieldAck {
+            acked_at: "2026-08-03T09:00:00Z".into(),
+            acked_by: "tkl_abc123".into(),
+            note: None,
+            evidence_through: 4,
+        })
+        .unwrap();
+        assert!(!json.contains("\"note\""), "{json}");
     }
 
     /// A healthy field carries no `verdict` key and no `samples` key at all:

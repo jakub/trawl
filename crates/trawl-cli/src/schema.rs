@@ -681,6 +681,7 @@ mod tests {
             services_cursor: None,
             conflicts: sample_conflicts().conflicts,
             verdict: None,
+            ack: None,
         };
         let (cols, rows) = field_services_to_rows(&resp);
         assert_eq!(cols, vec!["service", "first_seen", "last_seen", "rows"]);
