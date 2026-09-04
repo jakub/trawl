@@ -336,6 +336,36 @@ fn ensure_lag_has_window(window: Option<ScheduleWindow>, lag_secs: u64) -> Resul
     Ok(())
 }
 
+/// The instant a `since_last` schedule starts owing coverage from.
+///
+/// A schedule anchored at `next_fire_at` fires there first, and ruling 14
+/// makes that first window `[next_fire_at - lag - interval, next_fire_at -
+/// lag)`. Writing its lower bound down as the watermark at creation makes
+/// the owed interval durable BEFORE any run exists, which is the whole
+/// point: if the first run FAILS, an unset watermark sends the planner back
+/// to the same ruling-14 fallback and the next run re-covers one interval
+/// ending at its own fire, so the failed interval is dropped with nothing
+/// recording the loss. Seeded, the failure leaves the origin standing and
+/// the next success covers both intervals, exactly as every later failure
+/// already behaved.
+///
+/// The arithmetic is checked. [`parse_duration_secs`] caps both numbers at
+/// ten years, so an overflow here needs a caller that bypassed the grammar.
+fn seed_covered_through(
+    next_fire_at: DateTime<Utc>,
+    interval_secs: u64,
+    lag_secs: u64,
+) -> Result<DateTime<Utc>, StoreError> {
+    let owed = interval_secs
+        .checked_add(lag_secs)
+        .and_then(|secs| i64::try_from(secs).ok())
+        .and_then(chrono::TimeDelta::try_seconds)
+        .and_then(|delta| next_fire_at.checked_sub_signed(delta));
+    owed.ok_or(StoreError::DurationTooLong {
+        secs: interval_secs.saturating_add(lag_secs),
+    })
+}
+
 /// Format seconds into a human-readable duration string (e.g. "5m", "1h").
 pub fn format_interval(secs: u64) -> String {
     // Zero first: every modulus divides it, so the ladder below would render
@@ -546,11 +576,23 @@ impl ScheduleStore {
         ensure_min_interval(interval_secs)?;
         ensure_lag_has_window(window, lag_secs)?;
 
+        // A `since_last` schedule owes coverage from its first window's
+        // start, so that instant is written down now rather than inferred
+        // from an absent watermark after the first run (see
+        // [`seed_covered_through`]). Every other mode keeps none.
+        let covered_through = match window {
+            Some(ScheduleWindow::SinceLast) => {
+                Some(seed_covered_through(now, interval_secs, lag_secs)?)
+            }
+            Some(ScheduleWindow::Fixed { .. }) | None => None,
+        };
+
         let row = sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO schedules
                  (saved_query_id, key_id, interval_secs, max_runs, enabled,
-                  window_kind, window_secs, lag_secs, next_fire_at, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7, $8, now(), now())
+                  window_kind, window_secs, lag_secs, covered_through, next_fire_at,
+                  created_at, updated_at)
+             VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7, $8, $9, now(), now())
              RETURNING {SCHEDULE_COLS}"
         )))
         .bind(saved_query_id)
@@ -560,6 +602,7 @@ impl ScheduleStore {
         .bind(window.map(|w| w.kind().as_str()))
         .bind(window.and_then(ScheduleWindow::secs).map(bind_u64))
         .bind(bind_u64(lag_secs))
+        .bind(covered_through)
         .bind(now)
         .fetch_one(&self.pool)
         .await
@@ -591,9 +634,15 @@ impl ScheduleStore {
     /// Two cursor rules, both about not moving coverage the operator did not
     /// ask to move:
     ///
-    /// - `covered_through` is never touched. Editing a schedule (or its saved
-    ///   DSL) does not reset the watermark — the per-run resolved snapshot is
-    ///   the audit trail (ADR-0018 ruling 14).
+    /// - An existing `covered_through` is never touched. Editing a schedule
+    ///   (or its saved DSL) does not reset the watermark — the per-run
+    ///   resolved snapshot is the audit trail (ADR-0018 ruling 14). An
+    ///   ABSENT one is seeded when the edit re-anchors a `since_last`
+    ///   schedule, for the reason [`seed_covered_through`] gives: the
+    ///   re-anchored cursor is a fresh origin of owed coverage, and a first
+    ///   run that fails under it must not drop its interval. The SQL is a
+    ///   `COALESCE`, so "seed only when absent" is one statement rather than
+    ///   a read followed by a decision.
     /// - `next_fire_at` is re-anchored to `now` only when the cadence itself
     ///   changed: a different `interval_secs` or a different window. Editing
     ///   `max_runs` or flipping `enabled` leaves the planned cursor alone, so
@@ -635,12 +684,19 @@ impl ScheduleStore {
         };
         let current = row_to_schedule(&current)?;
         let reanchor = current.interval_secs != interval_secs || current.window != window;
+        let seed = match (reanchor, window) {
+            (true, Some(ScheduleWindow::SinceLast)) => {
+                Some(seed_covered_through(now, interval_secs, lag_secs)?)
+            }
+            _ => None,
+        };
 
         let row = sqlx::query(AssertSqlSafe(format!(
             "UPDATE schedules
              SET interval_secs = $1, max_runs = $2, enabled = $3,
                  window_kind = $4, window_secs = $5, lag_secs = $6,
                  next_fire_at = CASE WHEN $7 THEN $8 ELSE next_fire_at END,
+                 covered_through = COALESCE(covered_through, $11),
                  updated_at = now()
              WHERE id = $9 AND key_id = $10
              RETURNING {SCHEDULE_COLS}"
@@ -655,6 +711,7 @@ impl ScheduleStore {
         .bind(now)
         .bind(id)
         .bind(key_id)
+        .bind(seed)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(StoreError::NotFound {

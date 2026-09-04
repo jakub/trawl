@@ -495,6 +495,71 @@ async fn a_failed_run_holds_the_watermark_and_the_next_success_covers_both_inter
     assert_eq!(h.cursor(sq).await, (at(hours(3)), Some(at(hours(2)))));
 }
 
+/// A FIRST run that fails must not cost its interval either.
+///
+/// The watermark is seeded at creation with the origin the schedule owes
+/// coverage from, so a failed first run leaves that origin standing and the
+/// next success covers both intervals. Without the seed the watermark would
+/// still be unset here, the planner would fall back to ruling 14, and run 2
+/// would cover only `[T0, T0+1h)`: the first hour dropped, `truncated`
+/// false, nothing anywhere admitting the loss.
+#[tokio::test]
+async fn first_failed_since_last_run_is_healed_by_next_success() {
+    let h = harness().await;
+    let sq = h
+        .schedule("first-fail", DSL, Some(ScheduleWindow::SinceLast), 3600, 0)
+        .await;
+    assert_eq!(
+        h.cursor(sq).await,
+        (t0(), Some(at(hours(-1)))),
+        "a since_last schedule owes coverage from its first window's start"
+    );
+
+    // Parses and materializes, then the emitter refuses it: `count` is both
+    // the group key and the aggregate's output name.
+    h.saved
+        .update(sq, h.key_id, "service=fx | stats count() by count", None)
+        .await
+        .expect("break the saved DSL before the first run");
+    h.tick(at(Duration::seconds(3))).await;
+
+    let runs = h.runs(sq).await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, RunStatus::Error, "the first run fails");
+    assert_eq!(
+        h.cursor(sq).await,
+        (at(hours(1)), Some(at(hours(-1)))),
+        "the cursor moved past the failed boundary; the origin did not"
+    );
+
+    h.saved
+        .update(sq, h.key_id, DSL, None)
+        .await
+        .expect("restore the saved DSL");
+    h.tick(at(hours(1) + Duration::seconds(7))).await;
+
+    let runs = h.runs(sq).await;
+    assert_eq!(
+        runs.len(),
+        2,
+        "the missed interval coalesces, never backfills"
+    );
+    let healed = &runs[1];
+    assert_eq!(healed.status, RunStatus::Success);
+    assert_eq!(
+        window_of(healed),
+        (Some(at(hours(-1))), Some(at(hours(1))), Some(false)),
+        "one complete window over the failed interval and its own"
+    );
+    let rows = h.run_rows(healed);
+    assert!(
+        rows.contains(&at(mins(-30))),
+        "the interval the failed run owed is covered, not dropped: {rows:?}"
+    );
+    assert_eq!(rows, expected_rows(at(hours(-1)), at(hours(1))));
+    assert_eq!(h.cursor(sq).await, (at(hours(2)), Some(at(hours(1)))));
+}
+
 /// A gap wider than `max_catchup_intervals` clamps forward and says so, on
 /// the run row and on the counter, rather than handing one run a day and a
 /// half of corpus or wedging the schedule (ruling 9).
@@ -688,12 +753,13 @@ async fn a_materialize_failure_is_loud_and_leaves_the_cursor() {
     assert!(h.runs(sq).await.is_empty(), "nothing may be claimed");
     assert_eq!(
         h.cursor(sq).await,
-        (t0(), None),
-        "the cursor stays on the refused boundary"
+        (t0(), Some(at(hours(-1)))),
+        "the cursor stays on the refused boundary, and so does the origin \
+         the schedule was created owing coverage from"
     );
 
     // Still refused on the next poll, and still with nothing written.
     h.tick(at(hours(5))).await;
     assert!(h.runs(sq).await.is_empty());
-    assert_eq!(h.cursor(sq).await, (t0(), None));
+    assert_eq!(h.cursor(sq).await, (t0(), Some(at(hours(-1)))));
 }

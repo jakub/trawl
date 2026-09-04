@@ -281,7 +281,11 @@ pub enum PlanError {
 ///   It never reads `covered_through`, so a fixed schedule cannot heal a
 ///   gap and cannot be truncated either.
 /// - `since_last` with no watermark covers `[end - interval, end)`
-///   (ruling 14).
+///   (ruling 14). The store seeds that same instant as the watermark when
+///   it creates or re-anchors a `since_last` schedule, so this branch is
+///   the fallback for a row that predates the seed, never the path a fresh
+///   schedule takes. It stays because a schedule with no watermark still
+///   has to answer something, and one interval is what ruling 14 says.
 /// - `since_last` with a watermark starts AT the watermark, so
 ///   consecutive windows tile: one run's `end` is the next run's `start`,
 ///   and the half-open shape (ruling 10) keeps the shared instant in

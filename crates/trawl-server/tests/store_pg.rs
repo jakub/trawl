@@ -593,8 +593,14 @@ async fn schedule_window_round_trips(pool: PgPool) {
         assert_eq!(created.window, window, "{name}: created window");
         assert_eq!(created.lag_secs, lag, "{name}: created lag");
         assert_eq!(
-            created.covered_through, None,
-            "{name}: watermark starts unset"
+            created.covered_through,
+            match window {
+                // A since_last schedule owes coverage from its first
+                // window's start, and says so before it has ever run.
+                Some(ScheduleWindow::SinceLast) => Some(now - chrono::Duration::seconds(600)),
+                _ => None,
+            },
+            "{name}: the created watermark"
         );
 
         let fetched = store
@@ -742,6 +748,126 @@ async fn schedule_update_preserves_covered_through(pool: PgPool) {
     }
 }
 
+/// A `since_last` schedule records where it starts owing coverage BEFORE it
+/// has ever run, and an edit that re-anchors the cursor records the new
+/// origin the same way.
+///
+/// Without the seed, a first run that FAILS leaves the watermark unset, the
+/// planner falls back to ruling 14, and the next run covers one interval
+/// ending at its own fire. The failed interval is dropped, silently, with
+/// no `window_truncated` to admit it. Seeded, the failure leaves the origin
+/// standing and the next success covers both intervals.
+#[sqlx::test]
+async fn since_last_watermark_is_seeded_at_the_origin_of_owed_coverage(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let back = |secs: i64| Some(now - chrono::Duration::seconds(secs));
+
+    // Create: interval plus lag back from the cursor for since_last,
+    // nothing for the two modes that keep no watermark.
+    for (name, window, lag, expected) in [
+        ("tiled", Some(ScheduleWindow::SinceLast), 0, back(3600)),
+        ("lagged", Some(ScheduleWindow::SinceLast), 300, back(3900)),
+        (
+            "trailing",
+            Some(ScheduleWindow::Fixed { secs: 7200 }),
+            0,
+            None,
+        ),
+        ("query", None, 0, None),
+    ] {
+        let sq_id = seed_saved(&pool, 1, name).await;
+        let created = store
+            .create_schedule(sq_id, 1, 3600, None, window, lag, now)
+            .await
+            .unwrap();
+        assert_eq!(created.covered_through, expected, "{name}: created origin");
+    }
+
+    // An edit that re-anchors a query-mode schedule into since_last is a
+    // fresh origin, and gets one.
+    let sq_id = seed_saved(&pool, 1, "retyped").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 3600, None, None, 0, now)
+        .await
+        .unwrap();
+    assert_eq!(sched.covered_through, None);
+
+    let retyped_at = now + chrono::Duration::hours(2);
+    let retyped = store
+        .update_schedule(
+            sched.id,
+            1,
+            3600,
+            None,
+            true,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            retyped_at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retyped.next_fire_at, retyped_at);
+    assert_eq!(
+        retyped.covered_through,
+        Some(retyped_at - chrono::Duration::hours(1)),
+        "retyping into since_last seeds the new origin"
+    );
+
+    // A watermark that already exists is never overwritten, re-anchor or not.
+    let advanced = retyped_at + chrono::Duration::hours(3);
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(advanced)
+        .bind(sched.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let re_edited = store
+        .update_schedule(
+            sched.id,
+            1,
+            900,
+            None,
+            true,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            retyped_at + chrono::Duration::hours(4),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        re_edited.covered_through,
+        Some(advanced),
+        "coverage a run earned survives every later edit"
+    );
+
+    // An edit that does NOT re-anchor seeds nothing. Nothing this code
+    // writes leaves a since_last schedule watermark-less, so the row is
+    // forced back to that state to pin the rule.
+    sqlx::query("UPDATE schedules SET covered_through = NULL WHERE id = $1")
+        .bind(sched.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let untouched = store
+        .update_schedule(
+            sched.id,
+            1,
+            900,
+            Some(7),
+            false,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            retyped_at + chrono::Duration::hours(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        untouched.covered_through, None,
+        "max_runs and enabled are not a new origin"
+    );
+}
+
 /// A lag with no window is refused at the store boundary, on both write
 /// paths, with the typed error the handler renders as a 400.
 #[sqlx::test]
@@ -850,10 +976,23 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "tiling").await;
     let now = truncate_to_micros(chrono::Utc::now());
+    // Anchored well before the windows below, so every one of them ends
+    // after the seeded origin and the only thing under test is which
+    // completion moves the watermark.
+    let created_at = now - chrono::Duration::hours(10);
     let sched = store
-        .create_schedule(sq_id, 1, 300, None, Some(ScheduleWindow::SinceLast), 0, now)
+        .create_schedule(
+            sq_id,
+            1,
+            300,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            created_at,
+        )
         .await
         .unwrap();
+    let seed = created_at - chrono::Duration::seconds(300);
 
     let covered = async || {
         store
@@ -884,7 +1023,11 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
         .finish_run(failed, RunStatus::Error, 5, None, Some("boom"), None, None)
         .await
         .unwrap();
-    assert_eq!(covered().await, None, "a failed run advances nothing");
+    assert_eq!(
+        covered().await,
+        Some(seed),
+        "a failed run leaves the seeded origin standing"
+    );
 
     // Nor does a timeout.
     let timed_out = run(&window(4, 3)).await;
@@ -892,7 +1035,11 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
         .finish_run(timed_out, RunStatus::Timeout, 5, None, None, None, None)
         .await
         .unwrap();
-    assert_eq!(covered().await, None, "a timed-out run advances nothing");
+    assert_eq!(
+        covered().await,
+        Some(seed),
+        "a timed-out run leaves the seeded origin standing"
+    );
 
     // A success advances the watermark to exactly its window_end.
     let ok = window(4, 3);
@@ -1004,13 +1151,22 @@ async fn finish_and_window_mode_edit_are_order_independent(pool: PgPool) {
     );
     assert_eq!(finish_then_edit, Some(now), "and it must be the run's end");
 
-    // A fixed run retyped to since_last advances nothing, in either order.
+    // A fixed run retyped to since_last contributes nothing to the
+    // watermark in either order. The value that ends up there is the edit's
+    // own seed, the origin the new since_last mode starts owing coverage
+    // from, and never the fixed run's end.
     let finish_then_edit = covered_after("trailing-a", fixed, since_last, true).await;
     let edit_then_finish = covered_after("trailing-b", fixed, since_last, false).await;
+    let seed = now - chrono::Duration::seconds(300);
     assert_eq!(
         (finish_then_edit, edit_then_finish),
-        (None, None),
-        "a fixed run never seeds a watermark, whichever commit lands first"
+        (Some(seed), Some(seed)),
+        "a fixed run never moves a watermark, whichever commit lands first"
+    );
+    assert_ne!(
+        finish_then_edit,
+        Some(now),
+        "and the fixed run's own end is not what landed there"
     );
 }
 
