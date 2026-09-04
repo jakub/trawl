@@ -17,6 +17,28 @@
 //! candidate on the first axis is a candidate to be disproved by a footer,
 //! never a decision to delete.
 //!
+//! # Threat model
+//!
+//! The negative proof ("no footer declares this column") is sound against
+//! the data root trawld owns, and that is the whole model. Under ADR-0009
+//! trawld is the single writer of `data/`: compaction publishes files, the
+//! repin engine and retention move or delete them, and nothing else is
+//! supposed to write there at all. Against that root the walk cannot be
+//! fooled, because everything it might read was put there by this process.
+//!
+//! An actor with write access INSIDE a live env directory is outside the
+//! model, deliberately. Such an actor does not need to race the walk: they
+//! plant a one-column parquet and every pin they name is proved alive
+//! forever, or they delete files and prove pins dead. The check-to-open
+//! window (lstat a path, then open it, with a replacement possible in
+//! between) grants nothing that write access does not already grant, so
+//! closing it — handle-relative opens, `O_NOFOLLOW` on every step — would
+//! buy real complexity against an attacker who has already won. The lstat
+//! checks that do exist are correctness, not a security boundary: they
+//! catch a stray symlink, a FIFO left by tooling, a directory named
+//! `x.parquet`, and they fail the run closed instead of hanging an open or
+//! following a link out of the corpus.
+//!
 //! The first half of the file is pure: no clock, no pool, no filesystem.
 //! [`PinGc`] is the engine over it, and it samples one `decided_at` for the
 //! whole run and hands the derived cutoff down, so the report, the SQL
