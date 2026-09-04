@@ -2557,9 +2557,7 @@ fn gc_summary_lines(resp: &trawl_client::GcPinsResponse) -> Vec<String> {
             human_secs(floor),
             floor
         ),
-        None => {
-            "retention floor:  none (no env ages out, or one keeps its data forever)".to_owned()
-        }
+        None => "retention floor:  none (the global or a per-env max_age_days is 0)".to_owned(),
     });
     lines.push(format!(
         "effective window: {} ({}s)",
@@ -2748,7 +2746,7 @@ mod gc_tests {
         assert!(gc_summary_lines(&report)[2].contains("did not apply"));
 
         report.retention_floor_secs = None;
-        assert!(gc_summary_lines(&report)[2].contains("keeps its data forever"));
+        assert!(gc_summary_lines(&report)[2].contains("max_age_days is 0"));
     }
 
     #[test]

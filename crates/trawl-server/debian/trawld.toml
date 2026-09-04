@@ -135,7 +135,9 @@ database_url = "postgres://trawl:CHANGE_ME@db.example.internal:5432/trawl"
 # re-derives stored events.
 
 [retention]
-# Delete date directories older than this many days. 0 = disabled.
+# Delete date directories older than this many days in every env without a
+# [retention.env.<name>] entry. 0 = keep forever for those envs (an env with
+# its own finite entry still ages out).
 # max_age_days = 90
 
 # If free disk space drops below this threshold, delete date directories

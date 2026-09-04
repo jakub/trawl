@@ -1076,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_pressure_deletes_oldest_first() {
+    fn disk_pressure_breaks_equal_ranks_oldest_first() {
         let tmp = tempfile::tempdir().unwrap();
         let oldest = tmp.path().join("prod/2026-01-01");
         let middle = tmp.path().join("prod/2026-01-15");

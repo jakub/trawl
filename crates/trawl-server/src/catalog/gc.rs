@@ -79,9 +79,10 @@ pub struct DeadWindow {
     /// The requested window in seconds, after the server default applied.
     pub requested_secs: u64,
     /// The retention floor in seconds, when a finite retention horizon
-    /// exists. `None` when no env ages out at all, or when one of them
-    /// keeps its data forever: either way no span is long enough to be
-    /// sure the corpus has moved past a pin.
+    /// exists. `None` when the global `max_age_days` or any
+    /// `[retention.env.*]` entry is 0: no finite age then bounds what the
+    /// corpus still holds, so nothing floors the request and it applies as
+    /// given (the standing-parquet footer axis is what still guards a pin).
     /// Reported whenever it exists, whether or not it bound the answer.
     pub floor_secs: Option<u64>,
     /// The window applied: the larger of the request and the floor.

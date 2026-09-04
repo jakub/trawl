@@ -64,10 +64,12 @@ HTTPS listener, query limits, TLS, and rate limiting.
 
 For size, duration, and retention knobs, `0` disables the limit only where
 the field says so. In particular, `server.query_log_max_bytes = 0` disables
-query-log rollover and `retention.max_age_days = 0` disables the age sweep.
-A per-env `retention.env.<name>.max_age_days = 0` keeps that env's data forever
-as far as age goes, and, like a global `0`, it leaves the `/api/v1/schema`
-listing with no retention window at all.
+query-log rollover. A global `retention.max_age_days = 0` keeps data forever
+in every env that has no `[retention.env.<name>]` entry of its own; an env
+with a finite entry still ages out under it. A per-env
+`retention.env.<name>.max_age_days = 0` keeps that one env's data forever as
+far as age goes. Either `0` leaves the `/api/v1/schema` listing with no
+retention window at all.
 `ingest.telemetry_buffer_max_bytes` is the deliberate exception: it must be a
 positive byte count because an unbounded buffer can grow without limit behind
 a wedged WAL write. To turn that pipeline off, set `internal_telemetry = false`.
