@@ -237,7 +237,7 @@ Changing either list is **forward-only**. There is no policy history and nothing
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_age_days` | integer | `90` | Delete data older than N days in every env without an override; `0` disables |
+| `max_age_days` | integer | `90` | Delete data older than N days in every env without an override; `0` keeps data forever for those envs only (an env with a finite override still ages out) |
 | `min_free_disk_bytes` | byte size | `"1G"` | When free disk drops below, delete date directories highest expiry ratio first (age over that env's limit); `0` disables |
 | `retention_interval_secs` | integer | `3600` | Retention check frequency (default: 1 hour) |
 
