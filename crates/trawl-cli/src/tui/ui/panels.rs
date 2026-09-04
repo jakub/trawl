@@ -543,6 +543,32 @@ fn format_relative_time(iso_timestamp: &str) -> String {
     format!("{label:>4}")
 }
 
+/// Render a report run's covered window as `[start .. end)` in UTC.
+///
+/// Bounds are half-open, so the closing bracket is deliberate. Both bounds are
+/// cut to whole minutes: a planned boundary never carries seconds, and the run
+/// list has no room for them. When both bounds fall on the same UTC day the end
+/// bound drops its date, which is the common case for a tiled window.
+///
+/// A bound that does not parse is passed through verbatim rather than guessed
+/// at, so an unexpected wire value is visible instead of silently formatted.
+fn format_run_window(start: &str, end: &str) -> String {
+    use chrono::{DateTime, Utc};
+
+    let (Ok(from), Ok(to)) = (start.parse::<DateTime<Utc>>(), end.parse::<DateTime<Utc>>()) else {
+        return format!("[{start} .. {end})");
+    };
+
+    let from_text = from.format("%Y-%m-%d %H:%M").to_string();
+    let to_text = if from.date_naive() == to.date_naive() {
+        to.format("%H:%M").to_string()
+    } else {
+        to.format("%Y-%m-%d %H:%M").to_string()
+    };
+
+    format!("[{from_text} .. {to_text})")
+}
+
 // ---------------------------------------------------------------------------
 // Saved queries list
 // ---------------------------------------------------------------------------
@@ -815,7 +841,7 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
                 .map(|d| format!(" {d}ms"))
                 .unwrap_or_default();
 
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!("{icon} "), Style::default().fg(icon_color)),
                 Span::styled(
                     format!("#{:<5}", run.id),
@@ -824,7 +850,34 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
                 Span::styled(time_str, Style::default().fg(theme.text_muted)),
                 Span::styled(dur_str, Style::default().fg(theme.text_primary)),
                 Span::styled(rows_str, Style::default().fg(theme.text_muted)),
-            ]))
+            ];
+
+            // The window trails everything else: a narrow pane truncates the
+            // Line from the right, and the status, id and time are what an
+            // operator scans first. A run with no window (query mode, or one
+            // from before the schedule grew a window) renders nothing here —
+            // silence is how "no window" differs from `window_truncated:
+            // Some(false)`, which shows its bounds with no marker.
+            if let Some(ref kind) = run.window_kind {
+                spans.push(Span::styled(
+                    format!("  {kind}"),
+                    Style::default().fg(theme.text_muted),
+                ));
+            }
+            if let (Some(start), Some(end)) = (&run.window_start, &run.window_end) {
+                spans.push(Span::styled(
+                    format!(" {}", format_run_window(start, end)),
+                    Style::default().fg(theme.text_muted),
+                ));
+            }
+            if run.window_truncated == Some(true) {
+                spans.push(Span::styled(
+                    " TRUNCATED",
+                    Style::default().fg(theme.status_warning),
+                ));
+            }
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -1041,6 +1094,44 @@ mod tests {
     #[test]
     fn relative_time_invalid_fallback() {
         assert_eq!(format_relative_time("garbage"), "????");
+    }
+
+    #[test]
+    fn run_window_same_day_drops_the_end_date() {
+        assert_eq!(
+            format_run_window("2026-03-14T02:00:00Z", "2026-03-14T03:00:00Z"),
+            "[2026-03-14 02:00 .. 03:00)"
+        );
+    }
+
+    #[test]
+    fn run_window_across_midnight_keeps_the_end_date() {
+        assert_eq!(
+            format_run_window("2026-03-14T23:30:00Z", "2026-03-15T00:30:00Z"),
+            "[2026-03-14 23:30 .. 2026-03-15 00:30)"
+        );
+    }
+
+    /// An offset-bearing bound is read as the instant it names and rendered in
+    /// UTC, so two runs are always comparable on the same clock.
+    #[test]
+    fn run_window_normalizes_an_offset_to_utc() {
+        assert_eq!(
+            format_run_window("2026-03-14T09:00:00+05:30", "2026-03-14T10:00:00+05:30"),
+            "[2026-03-14 03:30 .. 04:30)"
+        );
+    }
+
+    #[test]
+    fn run_window_passes_through_an_unparseable_bound() {
+        assert_eq!(
+            format_run_window("garbage", "2026-03-14T03:00:00Z"),
+            "[garbage .. 2026-03-14T03:00:00Z)"
+        );
+        assert_eq!(
+            format_run_window("2026-03-14T02:00:00Z", ""),
+            "[2026-03-14T02:00:00Z .. )"
+        );
     }
 
     #[test]

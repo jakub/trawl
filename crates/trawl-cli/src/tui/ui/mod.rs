@@ -225,6 +225,122 @@ mod tests {
         }
     }
 
+    /// A schedule on a one-hour interval. `window`/`lag` are the ADR-0018
+    /// report-window fields: both absent is query mode, where the saved DSL
+    /// owns its own time bounds.
+    fn make_schedule(window: Option<&str>, lag: Option<&str>) -> trawl_api::ScheduleResponse {
+        trawl_api::ScheduleResponse {
+            id: 3,
+            saved_query_id: 7,
+            interval: "1h".to_owned(),
+            interval_secs: 3600,
+            max_runs: None,
+            enabled: true,
+            created_at: "2026-03-01T00:00:00Z".to_owned(),
+            updated_at: "2026-03-01T00:00:00Z".to_owned(),
+            last_run: None,
+            total_runs: 3,
+            window: window.map(ToOwned::to_owned),
+            lag: lag.map(ToOwned::to_owned),
+            lag_secs: lag.map(|l| if l == "5m" { 300 } else { 0 }),
+            covered_through: window.map(|_| "2026-03-14T03:00:00Z".to_owned()),
+            next_fire_at: "2026-03-14T04:00:00Z".to_owned(),
+        }
+    }
+
+    /// A saved query with an optional schedule, for the Saved tab renders.
+    fn make_saved(schedule: Option<trawl_api::ScheduleResponse>) -> trawl_api::SavedQueryResponse {
+        trawl_api::SavedQueryResponse {
+            id: 7,
+            name: "nightly errors".to_owned(),
+            query: "_severity>=error | stats count() by service".to_owned(),
+            created_at: "2026-03-01T00:00:00Z".to_owned(),
+            updated_at: "2026-03-01T00:00:00Z".to_owned(),
+            schedule,
+        }
+    }
+
+    /// A report run whose `started_at` is `minutes_ago` behind the clock, so
+    /// the list's relative time column renders the same string on every run.
+    fn make_run(id: i64, minutes_ago: i64) -> trawl_api::ReportRunSummary {
+        let started = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
+        trawl_api::ReportRunSummary {
+            id,
+            query: "_severity>=error | stats count() by service".to_owned(),
+            status: "success".to_owned(),
+            started_at: started.to_rfc3339(),
+            finished_at: None,
+            duration_ms: Some(120),
+            row_count: Some(12),
+            error_message: None,
+            result_path: None,
+            window_start: None,
+            window_end: None,
+            window_truncated: None,
+            window_kind: None,
+        }
+    }
+
+    /// Put the app on the Saved tab with one saved query selected and its run
+    /// history loaded, which is the state the detail pane renders from.
+    fn saved_app(
+        schedule: Option<trawl_api::ScheduleResponse>,
+        runs: Vec<trawl_api::ReportRunSummary>,
+    ) -> crate::tui::App {
+        use crate::tui::state::{MainTab, SavedDetailState, SavedFocus};
+
+        let mut app = test_app();
+        app.main_tab = MainTab::Saved;
+        app.saved_cache = Some(trawl_api::ListSavedResponse {
+            queries: vec![make_saved(schedule)],
+        });
+        app.panel.saved_selected = 0;
+        app.panel.saved_focus = SavedFocus::Detail;
+        app.panel.saved_detail = Some(SavedDetailState {
+            saved_id: 7,
+            total_runs: runs.len(),
+            runs,
+            run_selected: 0,
+            run_scroll: 0,
+            result: None,
+            result_scroll: 0,
+            loading: false,
+        });
+        app
+    }
+
+    /// A run list carrying all three window shapes at once: a tiled run that
+    /// covered everything it owed, a run clamped past a catch-up gap, and a
+    /// legacy/query-mode run that has no window at all. `Some(false)` shows
+    /// its bounds bare; `None` shows nothing.
+    #[test]
+    fn render_saved_runs_with_windows() {
+        let mut normal = make_run(41, 45);
+        normal.window_start = Some("2026-03-14T02:00:00Z".to_owned());
+        normal.window_end = Some("2026-03-14T03:00:00Z".to_owned());
+        normal.window_truncated = Some(false);
+        normal.window_kind = Some("since_last".to_owned());
+
+        let mut truncated = make_run(40, 105);
+        truncated.window_start = Some("2026-03-13T23:00:00Z".to_owned());
+        truncated.window_end = Some("2026-03-14T01:00:00Z".to_owned());
+        truncated.window_truncated = Some(true);
+        truncated.window_kind = Some("fixed".to_owned());
+
+        let legacy = make_run(39, 165);
+
+        let mut app = saved_app(
+            Some(make_schedule(None, None)),
+            vec![normal, truncated, legacy],
+        );
+        // Wide enough that the whole run line lands: the window trails the
+        // row, so a narrower pane cuts the bounds and then the marker.
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
     #[test]
     fn render_empty_app() {
         let mut app = test_app();
