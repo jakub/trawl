@@ -405,7 +405,11 @@ The deletion is metadata only: catalog rows and the in-process pin cache,
 in one transaction, `repin_jobs` history untouched. Being wrong is cheap.
 A reclaimed field that a sender writes again simply pins again from
 scratch. Envelope and sender-asserted contract fields (`_time`, `service`
-and the rest) are never candidates.
+and the rest) are never candidates. One staleness residual: the unscoped
+`/api/v1/schema` column listing is TTL-cached, so a reclaimed field can
+still appear there for up to `schema_cache_ttl_secs` after the purge —
+the same window that endpoint already carries for newly pinned fields. A
+`?service=` request is served fresh.
 
 ```
 GET /api/v1/schema/services

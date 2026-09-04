@@ -579,6 +579,11 @@ impl PinGc {
             // and over-evict every candidate.
             Err(crate::store::StoreError::PurgeCommitUnknown) => {
                 self.cache.evict_many(fields.iter().map(String::as_str));
+                // The same over-correction the eviction makes: postgres may
+                // have deleted the rows, so every cached derivation of the
+                // pin set has to be rebuilt whether or not this map held
+                // them.
+                self.cache.touch_generation();
                 return Err(ServerError::ServiceUnavailable(format!(
                     "pin gc's purge could not confirm its commit, so whether {} pin(s) \
                      were reclaimed is unknown: the commit either outstayed its {}s \
@@ -621,6 +626,14 @@ impl PinGc {
         // eviction, never precede it.
         self.cache
             .evict_many(purged.deleted.iter().map(|pin| pin.field.as_str()));
+        if !purged.deleted.is_empty() {
+            // The STORE decides whether this was a change, not the map. A
+            // run retrying after an earlier over-eviction finds the map
+            // already empty, so a bump conditioned on what `evict_many`
+            // removed would be skipped and the schema cache would go on
+            // listing a field postgres just deleted until its TTL ran out.
+            self.cache.touch_generation();
+        }
         self.store.publish_fill_gauges(purged.pinned_now);
 
         // The purge's own RETURNING set replaces the walk's projection from
@@ -677,12 +690,17 @@ impl PinGc {
             .await
         {
             Ok(present) => {
-                self.cache.evict_many(
+                let evicted = self.cache.evict_many(
                     fields
                         .iter()
                         .map(String::as_str)
                         .filter(|field| !present.contains(*field)),
                 );
+                // Nothing committed on this path, so the map IS the change:
+                // stamp only when the cache actually gave a pin up.
+                if evicted > 0 {
+                    self.cache.touch_generation();
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -692,7 +710,9 @@ impl PinGc {
                     "pin gc could not re-read the catalog after a failed purge; \
                      evicting every candidate from the pin cache"
                 );
-                self.cache.evict_many(fields.iter().map(String::as_str));
+                if self.cache.evict_many(fields.iter().map(String::as_str)) > 0 {
+                    self.cache.touch_generation();
+                }
             }
         }
     }
@@ -1280,6 +1300,35 @@ mod tests {
 
     fn ordinary_failure_arm() -> &'static str {
         purge_failure_arms().1
+    }
+
+    /// The generation follows what the STORE deleted, never what the map
+    /// happened to hold.
+    ///
+    /// Source-shape: the wiring is what can rot. "How many entries did the
+    /// map lose" is the wrong question after an earlier run over-evicted —
+    /// the map is empty, the store still has rows to delete, and a cached
+    /// `/api/v1/schema` listing would outlive the deletion by a TTL. Both
+    /// purge outcomes that may have changed postgres stamp the generation
+    /// off the STORE's answer.
+    #[test]
+    fn the_generation_follows_the_store_not_the_map() {
+        let body = gated_section();
+        let committed = body
+            .split("self.store.publish_fill_gauges(")
+            .next()
+            .expect("the success path publishes the gauges last");
+        assert!(
+            committed.contains("if !purged.deleted.is_empty() {")
+                && committed.contains("self.cache.touch_generation();"),
+            "a non-empty RETURNING set bumps the generation, whatever \
+             evict_many found"
+        );
+        let (unknown, _) = purge_failure_arms();
+        assert!(
+            unknown.contains("self.cache.touch_generation();"),
+            "an unknown outcome bumps too: postgres may have deleted the rows"
+        );
     }
 
     /// A purge whose commit outcome is unknown must NOT re-read postgres.
