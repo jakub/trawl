@@ -19,8 +19,10 @@ helm install trawl oci://ghcr.io/jakub/charts/trawl \
   --set storage.database.existingSecret=trawl-db \
   --set-string 'web.publicOrigins[0]=http://localhost:8090'
 
-# Port-forward for local access
-kubectl port-forward svc/trawl 5514:5514
+# Port-forward for local access: 5514 for the API, 8090 for the web UI.
+# The 8090 mapping is what makes http://localhost:8090 above the origin the
+# browser actually sends, so the two have to name the same port.
+kubectl port-forward svc/trawl 5514:5514 8090:8090
 
 # Query via CLI (self-signed cert; mint tokens with fleet-admin)
 trawl query --url https://localhost:5514 --insecure --token <TOKEN> "* | head 5"

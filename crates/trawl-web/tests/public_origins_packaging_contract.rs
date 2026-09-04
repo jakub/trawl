@@ -230,3 +230,44 @@ fn the_chart_refuses_an_enabled_sidecar_with_no_origins() {
         "the refusal must name the knob to set; got: {error}"
     );
 }
+
+#[test]
+fn the_chart_quick_start_forwards_the_port_its_origin_names() {
+    // The quick start tells the operator to allow http://localhost:8090
+    // and then hands them a port-forward command. If that command does not
+    // map 8090 locally, the browser never reaches the UI on the origin the
+    // allowlist just authorized, and the first thing a new install does is
+    // fail in a way that looks like the CSRF guard misfiring.
+    let readme = read("chart/trawl/README.md");
+    let quick_start = readme
+        .split("## Quick Start")
+        .nth(1)
+        .expect("the README must have a quick start")
+        .split("\n## ")
+        .next()
+        .expect("splitting always yields a first piece");
+
+    let origin = quick_start
+        .lines()
+        .find_map(|line| line.split("web.publicOrigins[0]=").nth(1))
+        .map(|rest| rest.trim().trim_end_matches(['\'', '"', '\\', ' ']))
+        .expect("the quick start must set web.publicOrigins");
+    PublicOrigins::parse([origin]).expect("the quick start's origin must load");
+    let port = origin
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .filter(|port| port.chars().all(|c| c.is_ascii_digit()))
+        .expect("the quick start states a loopback origin with an explicit port");
+
+    let forward = quick_start
+        .lines()
+        .find(|line| line.contains("kubectl port-forward"))
+        .expect("the quick start must show a port-forward");
+    assert!(
+        forward
+            .split_whitespace()
+            .any(|arg| arg.starts_with(&format!("{port}:"))),
+        "the quick start allows {origin} but forwards {forward:?}, which never binds {port} \
+         locally"
+    );
+}

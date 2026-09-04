@@ -408,6 +408,7 @@ The proxy reads these at startup. Each overrides its `[web]` counterpart, and th
 | `FLEET_SESSION_AEAD_KEY` | Base64 session AEAD key. Overrides `cookie_secret_path` / `cookie_secret_env` |
 | `FLEET_SESSION_COOKIE_DOMAIN` | Cookie `Domain=`. An empty value means a host-only cookie |
 | `FLEET_SESSION_COOKIE_SECURE` | `true` or `false`. Setting `false` clears `Secure` on the session cookie |
+| `FLEET_SESSION_COOKIE_PATH` | Cookie `Path=`. The only accepted value is `/`; anything else fails startup rather than issuing a cookie at one scope and clearing it at another. There is no `[web]` counterpart, so this variable can only agree with the proxy or stop it |
 | `TRAWL_WEB_BIND_ADDR` | Overrides `[web] bind_addr` |
 | `TRAWL_WEB_INSECURE_UPSTREAM` | Skip TLS verification of the upstream trawld cert. Loopback only |
 
