@@ -1290,6 +1290,27 @@ pub struct WebConfig {
     #[serde(default)]
     pub allow_insecure_cookies: bool,
 
+    /// Browser-visible origins the proxy accepts cookie-authenticated
+    /// requests from, e.g. `["https://trawl.example.com"]` (ADR-0016).
+    ///
+    /// This is the CSRF allowlist: `trawl-web` compares a request's whole
+    /// `Origin` header (scheme, host and port) against these entries and
+    /// consults no forwarding header, so an operator states the origin
+    /// their browser shows rather than trusting whatever a proxy put in
+    /// `Host`. There is deliberately no derived default. The proxy refuses
+    /// to start with an empty list, because a guessed origin is either
+    /// wrong (every browser request 403s) or right by accident.
+    /// The two spellings of loopback are different origins to a browser,
+    /// so `http://127.0.0.1:8090` and `http://localhost:8090` must both
+    /// be listed if both are used.
+    ///
+    /// Kept as raw strings: this crate is trawld's dependency-light config
+    /// surface and never links fleet-auth, so validation happens in
+    /// `trawl-web` where the one origin parser lives. `#[serde(default)]`
+    /// keeps a trawld-only config with no `[web]` section parsing.
+    #[serde(default)]
+    pub public_origins: Vec<String>,
+
     /// Parent domain for the shared `fleet_session` SSO cookie — the SSO
     /// knob shared by every fleet app so operator docs can say "set the same
     /// value in every app" (ADR-0004).
@@ -2389,6 +2410,9 @@ path = "/data/*.parquet"
         assert!(config.web.cookie_secret_env.is_none());
         assert!(config.web.session_ttl_secs.is_none());
         assert!(!config.web.allow_insecure_cookies);
+        // The proxy's own boot refusal is what turns an empty list into an
+        // error; trawld must still parse the file without one.
+        assert!(config.web.public_origins.is_empty());
     }
 
     // -- fleet-auth keystore: [auth] database_url (ADR-0004) -----------------
@@ -2501,6 +2525,26 @@ path = "/data"
 
         let config: Config = toml::from_str(&toml).unwrap();
         assert!(config.web.shared_domain.is_none());
+    }
+
+    #[test]
+    fn web_public_origins_parse_as_written() {
+        // This crate stores the entries verbatim; trawl-web is where they
+        // reach the origin parser, so the only contract here is that the
+        // list survives TOML in order and unmodified.
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[web]
+public_origins = ["https://trawl.example.com", "http://localhost:8090"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.web.public_origins,
+            ["https://trawl.example.com", "http://localhost:8090"]
+        );
     }
 
     // -- [storage] database_url (ADR-0004) ------------------------------------

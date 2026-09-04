@@ -8,7 +8,7 @@ use std::process::Output;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use clap::Parser;
-use fleet_dev::cli::{App, Cli};
+use fleet_dev::cli::{App, Cli, Exposure};
 use fleet_dev::command::{CommandRunner, CommandSpec};
 use fleet_dev::config::{MachineProfile, TRAWL_DEV_PERMISSIONS, load_manifest};
 use fleet_dev::error::Result;
@@ -17,6 +17,7 @@ use fleet_dev::plan;
 use fleet_dev::resolver::SecretValue;
 use fleet_dev::runtime::{self, RuntimeValues};
 use fleet_dev::selection;
+use fleet_dev::topology::TailscaleNode;
 
 fn trawl_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -259,6 +260,7 @@ fn rendered_runtime_is_private_isolated_and_ephemeral() {
     assert_eq!(web["FLEET_SESSION_COOKIE_DOMAIN"], "");
     assert_eq!(web["FLEET_SESSION_COOKIE_PATH"], "/");
     assert_eq!(web["FLEET_SESSION_COOKIE_SECURE"], "false");
+    assert_eq!(web["FLEET_SESSION_PUBLIC_ORIGINS"], "http://localhost:8081");
     assert!(!web.contains_key("FLEET_DATABASE_URL"));
     assert!(!web.contains_key("TRAWL_DATABASE_URL"));
 
@@ -285,4 +287,86 @@ fn rendered_runtime_is_private_isolated_and_ephemeral() {
 
     drop(runtime);
     assert!(!runtime_dir.exists());
+}
+
+/// The dev stack is what states trawl-web's CSRF allowlist (ADR-0016): the
+/// browser origin is a property of the exposure mode, so a committed
+/// `[web] public_origins` could only be wrong in one of the two modes.
+/// Pinned for both, because the tailscale value is the one nobody notices
+/// is broken until a login 403s on a tailnet.
+#[test]
+fn the_browser_origin_is_published_as_the_csrf_allowlist_in_both_modes() {
+    let local = rendered_web_environment(&MachineProfile::default(), None);
+    assert_eq!(
+        local["FLEET_SESSION_PUBLIC_ORIGINS"], "http://localhost:8081",
+        "localhost exposure publishes the Trunk origin the browser uses"
+    );
+
+    let profile = MachineProfile {
+        exposure: Exposure::Tailscale,
+        ..MachineProfile::default()
+    };
+    let node = TailscaleNode {
+        hostname: "fractal.example.ts.net".to_owned(),
+        ipv4: "100.64.0.10".to_owned(),
+    };
+    let tailnet = rendered_web_environment(&profile, Some(&node));
+    assert_eq!(
+        tailnet["FLEET_SESSION_PUBLIC_ORIGINS"], "https://fractal.example.ts.net:8444",
+        "tailscale exposure publishes the Serve origin, scheme and port included"
+    );
+    // The allowlist is compared whole, so the mode's cookie flag and its
+    // origin must agree: an https origin with a non-Secure cookie would be
+    // a stack that logs in and then drops the session.
+    assert_eq!(tailnet["FLEET_SESSION_COOKIE_SECURE"], "true");
+}
+
+/// Render one app plan and hand back the `trawl-web` process environment.
+///
+/// Goes through the real `selection` -> `plan` -> `runtime` path rather
+/// than calling the topology directly: the thing under test is what lands
+/// in the mprocs file, and an env var can go missing anywhere along that
+/// route.
+fn rendered_web_environment(
+    profile: &MachineProfile,
+    tailscale: Option<&TailscaleNode>,
+) -> BTreeMap<String, String> {
+    let selection = selection::discover(&trawl_cli(&["plan", "trawl"]), profile).unwrap();
+    let plan = plan::build(profile, &selection, tailscale).unwrap();
+    let values = RuntimeValues {
+        fleet: BTreeMap::from([
+            (
+                "database_url".to_owned(),
+                SecretValue::new("postgres://fleet-secret".to_owned()),
+            ),
+            (
+                "session_aead_key".to_owned(),
+                SecretValue::new("session-secret".to_owned()),
+            ),
+        ]),
+        apps: BTreeMap::from([(
+            App::Trawl,
+            BTreeMap::from([(
+                "database_url".to_owned(),
+                SecretValue::new("postgres://trawl-secret".to_owned()),
+            )]),
+        )]),
+    };
+    let key = DeveloperKey {
+        token: SecretValue::new("flt_plaintext_developer_key".to_owned()),
+        prefix: "flt_prefix".to_owned(),
+    };
+    let state = tempfile::tempdir().unwrap();
+    let key_file = state.path().join("dev-api-key");
+    std::fs::write(&key_file, key.token.expose()).unwrap();
+
+    let runtime = runtime::render(&plan, &values, &key, &key_file).unwrap();
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&runtime.mprocs_config).unwrap()).unwrap();
+    document["procs"]["trawl-trawl-web"]["env"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(name, value)| (name.clone(), value.as_str().unwrap().to_owned()))
+        .collect()
 }

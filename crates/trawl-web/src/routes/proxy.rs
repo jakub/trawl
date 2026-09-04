@@ -78,7 +78,7 @@ async fn do_forward(
     // writes, query cancels or exports. Bearer clients (CLI/API) hold no
     // cookie and are not CSRF targets, so the guard skips that branch.
     if matches!(auth, Auth::Session(_)) {
-        crate::routes::auth::check_origin(&parts.headers, &parts.uri, "proxy")?;
+        crate::routes::auth::check_origin(state, &parts.headers, "proxy")?;
     }
 
     let upstream_uri = build_upstream_uri(state.upstream_url(), &parts.uri)?;
@@ -204,10 +204,16 @@ mod tests {
     use crate::config::ResolvedConfig;
     use crate::routes;
 
+    /// The browser origin these fixtures answer on. The CSRF tests below
+    /// send it verbatim; anything else is a foreign origin by definition,
+    /// which is the whole of ADR-0016's policy.
+    const TEST_ORIGIN: &str = "https://trawl.fleet.test";
+
     fn state_pointing_at(upstream: &MockServer) -> AppState {
         let web = WebConfig {
             upstream_url: Some(upstream.uri()),
             allow_insecure_cookies: true,
+            public_origins: vec![TEST_ORIGIN.to_owned()],
             ..WebConfig::default()
         };
         let cfg = ResolvedConfig::from_parsed(&web, None).unwrap();

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use axum::http::HeaderValue;
 use axum::http::header::InvalidHeaderValue;
 use fleet_auth::{
-    DEFAULT_COOKIE_NAME, SameSite, SessionKey, build_clear_cookie_header,
+    DEFAULT_COOKIE_NAME, PublicOrigins, SameSite, SessionKey, build_clear_cookie_header,
     build_session_cookie_header,
 };
 use reqwest::Client;
@@ -40,6 +40,7 @@ struct Inner {
     session_ttl_secs: u64,
     allow_insecure_cookies: bool,
     shared_domain: Option<String>,
+    public_origins: PublicOrigins,
 }
 
 impl AppState {
@@ -65,6 +66,7 @@ impl AppState {
                 session_ttl_secs: cfg.session_ttl_secs,
                 allow_insecure_cookies: cfg.allow_insecure_cookies,
                 shared_domain: cfg.shared_domain,
+                public_origins: cfg.public_origins,
             }),
         })
     }
@@ -79,6 +81,17 @@ impl AppState {
     #[must_use]
     pub fn cookie_name(&self) -> &'static str {
         DEFAULT_COOKIE_NAME
+    }
+
+    /// The deployment's browser-visible origins, the CSRF allowlist a
+    /// present `Origin` header is compared against (ADR-0016).
+    ///
+    /// State owns it because the guard runs per request and the list is
+    /// resolved once at startup; it is non-empty by construction, so there
+    /// is no "not configured" case for a handler to interpret.
+    #[must_use]
+    pub fn public_origins(&self) -> &PublicOrigins {
+        &self.inner.public_origins
     }
 
     /// Parent domain for the SSO cookie's `Domain=` attribute, or `None`
@@ -176,6 +189,8 @@ mod tests {
             insecure_upstream_tls: false,
             cookie_key: SessionKey::from_bytes([0x42; fleet_auth::KEY_LEN]),
             shared_domain: None,
+            public_origins: PublicOrigins::parse(["http://127.0.0.1:8090"])
+                .expect("fixture origin parses"),
         })
         .unwrap()
     }

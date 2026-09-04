@@ -16,6 +16,8 @@ use trawl_web::state::AppState;
 fn test_state() -> AppState {
     let web = WebConfig {
         allow_insecure_cookies: true,
+        // Required since ADR-0016: resolution refuses an empty allowlist.
+        public_origins: vec!["https://trawl.example.com".to_owned()],
         ..WebConfig::default()
     };
     AppState::from_config(ResolvedConfig::from_parsed(&web, None).unwrap()).unwrap()
