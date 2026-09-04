@@ -4,7 +4,15 @@
 
 //! Postgres-backed storage for scheduled queries and report runs.
 //!
-//! Concurrency rests on the database, not on a process-wide lock:
+//! Concurrency rests on the database, not on a process-wide lock. ONE lock
+//! order runs through all of it, `saved_queries` -> `schedules` ->
+//! `report_runs`, and a path that does not need a level skips it rather
+//! than reordering around it: [`ScheduleStore::claim_due_run`] takes all
+//! three, [`super::SavedQueryStore::delete`] takes all three because its
+//! cascade reaches every one of them, [`ScheduleStore::delete_schedule`]
+//! and [`ScheduleStore::finish_run`] start at `schedules` and never touch
+//! `saved_queries`. A path that took the run rows before the schedule would
+//! deadlock against any of the others.
 //!
 //! - the no-concurrent-run guard is the partial unique index
 //!   `report_runs_one_running`; [`ScheduleStore::claim_run`] maps the named

@@ -266,16 +266,26 @@ impl SavedQueryStore {
     /// Delete a saved query, collecting the parquet result paths of its runs
     /// in the same transaction as the delete.
     ///
-    /// Lock order (shared with [`super::ScheduleStore::claim_run`]): the parent
-    /// row first, then its `report_runs`. Locking the parent `FOR UPDATE` blocks
-    /// a concurrent run INSERT (which needs a `FOR KEY SHARE` on the same row via
-    /// the FK), so no new run can slip in after we collect paths. Locking every
-    /// run row, not just those with a non-null `result_path`, forces a
-    /// concurrent `finish_run` to either commit its path before us (we collect it
-    /// here) or block until our cascade deletes its row (it then updates zero rows
-    /// and the caller unlinks the file it wrote). Filtering on
-    /// `result_path IS NOT NULL` would skip still-running rows and reopen that
-    /// race, orphaning the parquet file.
+    /// LOCK ORDER: `saved_queries` -> `schedules` -> `report_runs`, the one
+    /// order every multi-row path takes (stated in
+    /// [`super::schedule`]'s module docs). Locking the parent `FOR UPDATE`
+    /// blocks a concurrent run INSERT (which needs a `FOR KEY SHARE` on the
+    /// same row via the FK), so no new run can slip in after we collect
+    /// paths. Locking every run row, not just those with a non-null
+    /// `result_path`, forces a concurrent `finish_run` to either commit its
+    /// path before us (we collect it here) or block until our cascade
+    /// deletes its row (it then updates zero rows and the caller unlinks the
+    /// file it wrote). Filtering on `result_path IS NOT NULL` would skip
+    /// still-running rows and reopen that race, orphaning the parquet file.
+    ///
+    /// The middle level is not decoration. This transaction ends by deleting
+    /// the saved query, and the cascade to `schedules` needs that row, so
+    /// without taking it here the delete reaches for `schedules` while
+    /// holding the run rows. A `since_last` [`super::ScheduleStore::finish_run`]
+    /// goes the other way, `schedules` then `report_runs`, and the pair
+    /// deadlocks: postgres kills one, and if the victim is the finish, this
+    /// delete has already read that run's `result_path` as NULL and nobody
+    /// unlinks the parquet the finish wrote.
     ///
     /// Returns the relative parquet paths for the caller to unlink, or
     /// `NotFound` if the query doesn't exist or isn't owned by the user.
@@ -296,6 +306,15 @@ impl SavedQueryStore {
                 resource: "saved query",
             });
         }
+
+        // Level 2. A saved query has at most one schedule
+        // (`schedules_saved_query_unique`), but the lock is taken as a set
+        // because that is what the cascade below deletes.
+        let _schedules: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM schedules WHERE saved_query_id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
 
         let paths: Vec<String> = sqlx::query_scalar::<_, Option<String>>(
             "SELECT result_path FROM report_runs WHERE saved_query_id = $1 FOR UPDATE",

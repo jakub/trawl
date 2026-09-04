@@ -2482,6 +2482,91 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
 }
 
+/// The same delete against a `since_last` finish, which reaches for the
+/// schedule row that the delete's cascade also needs.
+///
+/// This is a lock CYCLE, not just a race. `SavedQueryStore::delete` ends by
+/// deleting the saved query, and that cascade needs the `schedules` row; a
+/// `since_last` `finish_run` locks `schedules` first and then updates the
+/// run row. With the delete holding the run rows and the finish holding the
+/// schedule, each waits on what the other holds and postgres kills one with
+/// 40P01. If the victim is the finish, the delete has already read that
+/// run's `result_path` as NULL, and the parquet the finish wrote is
+/// orphaned with nobody left to unlink it.
+///
+/// The blocker pins that interleaving by holding the run row: the delete
+/// queues for it first, the finish queues behind, and the rollback releases
+/// them in that order. The fix is the delete taking the schedule lock at
+/// level 2, so both sides walk saved -> schedules -> runs and neither can
+/// wait on a lock the other already holds out of order.
+#[sqlx::test]
+async fn delete_saved_racing_since_last_finish_never_orphans_path(pool: PgPool) {
+    const PATH: &str = "scheduled/race/tiled.parquet";
+    let saved_store = saved(&pool);
+    let sched_store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq = saved_store.create(1, "tiled-race", "q").await.unwrap();
+    let sched = sched_store
+        .create_schedule(sq.id, 1, 300, None, Some(ScheduleWindow::SinceLast), 0, now)
+        .await
+        .unwrap();
+    let window = ReportWindow {
+        start: now - chrono::Duration::seconds(300),
+        end: now,
+        truncated: false,
+        kind: WindowKind::SinceLast,
+    };
+    let rid = match sched_store
+        .claim_run(sched.id, sq.id, "q", None, Some(&window))
+        .await
+        .unwrap()
+    {
+        RunClaim::Started(id) => id,
+        other => panic!("expected a started run, got {other:?}"),
+    };
+
+    // Hold the run row: both sides end up wanting it, and the delete asks
+    // first.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_scalar::<_, i64>("SELECT id FROM report_runs WHERE id = $1 FOR UPDATE")
+        .bind(rid)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let delete_store = saved_store.clone();
+    let sq_id = sq.id;
+    let delete_task = tokio::spawn(async move { delete_store.delete(sq_id, 1).await });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let finish_store = sched_store.clone();
+    let finish_task = tokio::spawn(async move {
+        finish_store
+            .finish_run(rid, RunStatus::Success, 10, Some(1), None, None, Some(PATH))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    blocker.rollback().await.unwrap();
+
+    let delete_paths = delete_task
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("the delete must not be a deadlock victim: {e}"));
+    let finished = finish_task
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("the finish must not be a deadlock victim: {e}"));
+
+    assert_eq!(
+        delete_paths.contains(&PATH.to_string()),
+        finished == FinishOutcome::Persisted,
+        "exactly one side must own the parquet cleanup: delete returned {delete_paths:?}, \
+         finish returned {finished:?}"
+    );
+    assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
+}
+
 /// The same race for `ScheduleStore::delete_schedule`: the blocker holds the
 /// schedule row, `finish_run` commits its path mid-delete, and
 /// `delete_schedule` must collect that path rather than cascade it away while
