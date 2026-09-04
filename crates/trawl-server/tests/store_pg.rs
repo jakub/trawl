@@ -4237,8 +4237,11 @@ mod repin_store {
         assert!(!catalog.is_conformed().await.unwrap());
     }
 
-    /// A claimed job to cancel, with nothing else asserted.
-    async fn claim_running(s: &RepinStore) -> i64 {
+    /// A claimed job to cancel, with nothing else asserted. The claim
+    /// proves its `from` pin against `field_types`, so the pin is seeded
+    /// first.
+    async fn claim_running(pool: &PgPool, s: &RepinStore) -> i64 {
+        pin(pool, "status", CanonicalType::BigInt).await;
         s.claim(RepinClaim {
             field: "status",
             from_type: CanonicalType::BigInt,
@@ -4257,7 +4260,7 @@ mod repin_store {
     #[sqlx::test]
     async fn a_cancelled_job_keeps_its_request_fields(pool: PgPool) {
         let s = store(&pool);
-        let id = claim_running(&s).await;
+        let id = claim_running(&pool, &s).await;
 
         let job = s
             .record_cancel_request(id, "key-op")
@@ -4297,7 +4300,7 @@ mod repin_store {
     #[sqlx::test]
     async fn a_second_cancel_request_preserves_the_first(pool: PgPool) {
         let s = store(&pool);
-        let id = claim_running(&s).await;
+        let id = claim_running(&pool, &s).await;
 
         let first = s
             .record_cancel_request(id, "key-op")
@@ -4333,7 +4336,7 @@ mod repin_store {
     #[sqlx::test]
     async fn finish_if_running_never_overwrites_a_terminal_row(pool: PgPool) {
         let s = store(&pool);
-        let id = claim_running(&s).await;
+        let id = claim_running(&pool, &s).await;
 
         // The request has to be on the row before the verdict: the
         // migration refuses a `cancelled` status with no recorded asker.
@@ -4368,7 +4371,7 @@ mod repin_store {
     #[sqlx::test]
     async fn a_failed_job_may_carry_cancel_request_fields(pool: PgPool) {
         let s = store(&pool);
-        let id = claim_running(&s).await;
+        let id = claim_running(&pool, &s).await;
         s.record_cancel_request(id, "key-op")
             .await
             .unwrap()
@@ -4389,7 +4392,7 @@ mod repin_store {
     #[sqlx::test]
     async fn cancelled_without_a_request_is_refused(pool: PgPool) {
         let s = store(&pool);
-        let id = claim_running(&s).await;
+        let id = claim_running(&pool, &s).await;
 
         let err = sqlx::query("UPDATE repin_jobs SET status = 'cancelled' WHERE id = $1")
             .bind(id)
