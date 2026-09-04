@@ -1681,8 +1681,13 @@ impl CatalogStore {
     /// a report that claims a field they still have. Nothing is deleted:
     /// the check runs before the transaction opens.
     ///
-    /// `repin_jobs` is untouched. A repin's history says what an operator
-    /// did to the corpus, which stays true after the field is gone.
+    /// `repin_jobs` is READ and never written. A repin's history says what
+    /// an operator did to the corpus, which stays true after the field is
+    /// gone — but a `running` row means a job that will later flip a pin,
+    /// so the transaction takes
+    /// [`super::CATALOG_LIFECYCLE_LOCK_KEY`], re-checks for one, and
+    /// refuses with [`StoreError::RepinAlreadyRunning`] rather than delete
+    /// the row that job is about to update.
     ///
     /// The fill gauges are re-published from the post-commit count, so the
     /// headroom an operator alerts on reflects the reclaim immediately
@@ -1702,6 +1707,21 @@ impl CatalogStore {
         }
 
         let mut tx = self.pool.begin().await?;
+        // The lock, then the re-check, then the delete: this transaction is
+        // the authority on "no repin owns a pin I am about to reclaim", and
+        // the caller's earlier checks are courtesy fast-paths. A repin claim
+        // takes the same lock (`RepinStore::claim`), so a claim that lands
+        // after gc's last look is either still waiting here or already
+        // visible to the SELECT below.
+        super::lock_catalog_lifecycle(&mut tx).await?;
+        let running: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM repin_jobs WHERE status = 'running' LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?;
+        if running.is_some() {
+            // Dropping the transaction rolls it back; nothing was deleted.
+            return Err(StoreError::RepinAlreadyRunning);
+        }
         for sql in [
             "DELETE FROM field_conflict_stats WHERE field = ANY($1)",
             "DELETE FROM field_conflicts WHERE field = ANY($1)",

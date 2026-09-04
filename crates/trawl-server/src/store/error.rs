@@ -82,6 +82,39 @@ pub enum StoreError {
     /// — one shadow rewrite at a time, install-wide.
     #[error("a repin job is already running (one at a time, install-wide)")]
     RepinAlreadyRunning,
+
+    /// The claim's `from` pin was not in `field_types` when the claim
+    /// transaction looked, under the catalog lifecycle lock.
+    ///
+    /// The engine reads the pin from the in-process cache, so between that
+    /// read and the claim a pin gc purge can have reclaimed the slot (or an
+    /// earlier repin retyped it). Claiming anyway would leave the cutover
+    /// updating a row that no longer exists.
+    #[error("{}", repin_pin_message(field, expected, found.as_deref()))]
+    RepinPinVanished {
+        /// The field the claim named (catalog key).
+        field: String,
+        /// The pin the caller read, in catalog spelling.
+        expected: &'static str,
+        /// The pin `field_types` actually holds, when it holds one.
+        found: Option<String>,
+    },
+}
+
+/// The sentence for [`StoreError::RepinPinVanished`].
+///
+/// A vanished pin reads exactly as the engine's own unpinned-field refusal,
+/// because from the operator's side it is the same fact: the field is not
+/// pinned, so there is nothing to repin. A pin that merely CHANGED gets its
+/// own sentence, since retrying against the current pin is the remedy.
+fn repin_pin_message(field: &str, expected: &str, found: Option<&str>) -> String {
+    match found {
+        None => format!("{field:?} is not a pinned field, so there is nothing to repin"),
+        Some(actual) => format!(
+            "{field:?} is pinned {actual}, not the {expected} this request was prepared \
+             against; re-read the field's pin and retry"
+        ),
+    }
 }
 
 impl StoreError {

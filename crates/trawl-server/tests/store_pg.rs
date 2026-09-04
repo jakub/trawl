@@ -3359,6 +3359,109 @@ mod catalog {
         assert_eq!(reborn.conflict_count, 0, "old evidence did not survive");
     }
 
+    /// The purge's own half of the pin-gc race: the running-row check
+    /// lives INSIDE the transaction, under the catalog lifecycle lock, so
+    /// a claim that landed after gc's gated courtesy look still stops the
+    /// delete. Nothing is deleted, and the slot is free again once the job
+    /// is terminal.
+    #[sqlx::test]
+    async fn delete_pins_refuses_in_the_transaction_while_a_repin_runs(pool: PgPool) {
+        let store = catalog(&pool);
+        store
+            .pin_missing(&[proposal("dead", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO repin_jobs (field, from_type, to_type, dry_run, status, requested_by)
+             VALUES ('host', 'VARCHAR', 'BIGINT', FALSE, 'running', 'ops')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = store
+            .delete_pins(&["dead".to_owned()])
+            .await
+            .expect_err("a running repin job refuses the purge");
+        assert!(
+            matches!(err, trawl_server::store::StoreError::RepinAlreadyRunning),
+            "unexpected error {err:?}"
+        );
+        assert!(
+            store
+                .load_pins()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(f, _)| f == "dead"),
+            "a refused purge deletes nothing"
+        );
+
+        sqlx::query("UPDATE repin_jobs SET status = 'failed', finished_at = now()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        store
+            .delete_pins(&["dead".to_owned()])
+            .await
+            .expect("a terminal job frees the purge");
+    }
+
+    /// The interleaving the lock closes, run for real: a purge and a claim
+    /// for the same field, concurrently. Whichever transaction takes
+    /// `CATALOG_LIFECYCLE_LOCK_KEY` first, exactly one succeeds — and the
+    /// corrupt outcome (the pin deleted AND a job claimed against it, whose
+    /// cutover would then restore the pin in memory only) is unreachable.
+    #[sqlx::test]
+    async fn a_concurrent_purge_and_claim_never_both_win(pool: PgPool) {
+        let store = catalog(&pool);
+        let repin = trawl_server::store::RepinStore::new(pool.clone());
+        store
+            .pin_missing(&[proposal("dur", CanonicalType::BigInt)])
+            .await
+            .unwrap();
+
+        let purger = store.clone();
+        let purge = tokio::spawn(async move { purger.delete_pins(&["dur".to_owned()]).await });
+        let claim = tokio::spawn(async move {
+            repin
+                .claim(trawl_server::store::RepinClaim {
+                    field: "dur",
+                    from_type: CanonicalType::BigInt,
+                    to_type: CanonicalType::Varchar,
+                    dialect: None,
+                    dry_run: false,
+                    force: false,
+                    requested_by: Some("ops"),
+                })
+                .await
+        });
+        let purged = purge.await.expect("purge task");
+        let claimed = claim.await.expect("claim task");
+
+        let pin_gone = !store
+            .load_pins()
+            .await
+            .unwrap()
+            .iter()
+            .any(|(f, _)| f == "dur");
+        assert!(
+            !(pin_gone && claimed.is_ok()),
+            "the corrupt outcome: pin deleted and a claim taken against it \
+             (purge={purged:?}, claim={claimed:?})"
+        );
+        assert_eq!(
+            usize::from(purged.is_ok()) + usize::from(claimed.is_ok()),
+            1,
+            "exactly one of the two commits: purge={purged:?}, claim={claimed:?}"
+        );
+        assert_eq!(
+            pin_gone,
+            purged.is_ok(),
+            "the pin is gone exactly when the purge won"
+        );
+    }
+
     /// A repin's history is what an operator did to the corpus, and it
     /// stays true after the field is gone.
     #[sqlx::test]
@@ -3402,11 +3505,32 @@ mod repin_store {
         RepinStore::new(pool.clone())
     }
 
+    /// Seed the `field_types` row a claim revalidates against.
+    ///
+    /// `claim` refuses a field whose pin is not the one the caller prepared
+    /// against, which is what closes the pin-gc race: the engine reads the
+    /// pin from its cache, so the claim transaction proves it is still
+    /// there. Every claim in these tests therefore needs the pin it names.
+    async fn pin(pool: &PgPool, field: &str, ty: CanonicalType) {
+        sqlx::query(
+            "INSERT INTO field_types (field, duckdb_type, pinned_from)
+             VALUES ($1, $2, '_test')
+             ON CONFLICT (field) DO UPDATE SET duckdb_type = EXCLUDED.duckdb_type",
+        )
+        .bind(field)
+        .bind(ty.as_catalog())
+        .execute(pool)
+        .await
+        .expect("seed a pin");
+    }
+
     /// One repin at a time, enforced by the partial unique index — the
     /// second claim maps the named violation, never a raw pg error.
     #[sqlx::test]
     async fn second_claim_is_repin_already_running(pool: PgPool) {
         let s = store(&pool);
+        pin(&pool, "status", CanonicalType::BigInt).await;
+        pin(&pool, "dur", CanonicalType::Varchar).await;
         let id = s
             .claim(RepinClaim {
                 field: "status",
@@ -3458,6 +3582,7 @@ mod repin_store {
     /// domain error rather than a raw pg violation.
     #[sqlx::test]
     async fn concurrent_claims_admit_exactly_one(pool: PgPool) {
+        pin(&pool, "status", CanonicalType::BigInt).await;
         let s1 = store(&pool);
         let s2 = store(&pool);
         let (a, b) = tokio::join!(
@@ -3548,6 +3673,7 @@ mod repin_store {
             .record_conflicts(&[conflict("severity"), conflict("message")])
             .await
             .unwrap();
+        pin(&pool, "severity", CanonicalType::BigInt).await;
 
         let id = s
             .claim(RepinClaim {
@@ -3603,6 +3729,7 @@ mod repin_store {
     async fn finish_cutover_replay_keeps_evidence_recorded_after_the_flip(pool: PgPool) {
         let s = store(&pool);
         let catalog = CatalogStore::new(pool.clone());
+        pin(&pool, "severity", CanonicalType::BigInt).await;
         let id = s
             .claim(RepinClaim {
                 field: "severity",
@@ -3656,6 +3783,7 @@ mod repin_store {
     /// marker) fails; the marker's own job — mid-recovery — is kept.
     #[sqlx::test]
     async fn reconcile_orphans_fails_running_rows_except_the_kept_one(pool: PgPool) {
+        pin(&pool, "status", CanonicalType::BigInt).await;
         let s = store(&pool);
         let id = s
             .claim(RepinClaim {
@@ -3687,6 +3815,7 @@ mod repin_store {
     /// and falls back to the newest terminal one.
     #[sqlx::test]
     async fn plan_progress_and_latest(pool: PgPool) {
+        pin(&pool, "status", CanonicalType::BigInt).await;
         let s = store(&pool);
         assert!(s.latest().await.unwrap().is_none());
 
@@ -3790,6 +3919,7 @@ mod repin_store {
         use trawl_core::severity::Dialect;
 
         let s = store(&pool);
+        pin(&pool, "level", CanonicalType::Varchar).await;
         let claim = |to, dialect, dry_run| RepinClaim {
             field: "level",
             from_type: CanonicalType::Varchar,
@@ -3814,7 +3944,8 @@ mod repin_store {
         );
 
         // And back off the severity pin, which 0012's widened `from_type`
-        // CHECK admits.
+        // CHECK admits. The pin itself moved with the succeeded job.
+        pin(&pool, "level", CanonicalType::Severity).await;
         let back = s
             .claim(RepinClaim {
                 field: "level",
@@ -3838,13 +3969,77 @@ mod repin_store {
 
         // The scope CHECK, both directions: a severity target with no
         // dialect, and a dialect on any other target, are corruption the
-        // store refuses rather than stores.
+        // store refuses rather than stores. Both go through the VARCHAR
+        // pin the closure names.
+        pin(&pool, "level", CanonicalType::Varchar).await;
         s.claim(claim(CanonicalType::Severity, None, true))
             .await
             .expect_err("a SEVERITY job must carry a dialect");
         s.claim(claim(CanonicalType::BigInt, Some(Dialect::Otel), true))
             .await
             .expect_err("only a SEVERITY job may carry a dialect");
+    }
+
+    /// The claim's half of the pin-gc race: the engine reads a field's pin
+    /// from the in-process cache, so the claim transaction proves — under
+    /// the catalog lifecycle lock — that `field_types` still carries it. A
+    /// pin gc purge that got there first leaves the claim refusing with the
+    /// engine's own unpinned-field sentence, and no job row behind.
+    #[sqlx::test]
+    async fn claim_refuses_when_the_from_pin_vanished(pool: PgPool) {
+        let s = store(&pool);
+        let catalog = CatalogStore::new(pool.clone());
+        pin(&pool, "dur", CanonicalType::BigInt).await;
+        catalog
+            .delete_pins(&["dur".to_owned()])
+            .await
+            .expect("gc reclaims the slot");
+
+        let taken = |from| RepinClaim {
+            field: "dur",
+            from_type: from,
+            to_type: CanonicalType::Varchar,
+            dialect: None,
+            dry_run: false,
+            force: false,
+            requested_by: Some("ops"),
+        };
+        let err = s
+            .claim(taken(CanonicalType::BigInt))
+            .await
+            .expect_err("a vanished pin refuses the claim");
+        assert!(
+            matches!(&err, StoreError::RepinPinVanished { field, found, .. }
+                if field == "dur" && found.is_none()),
+            "unexpected error {err:?}"
+        );
+        assert!(
+            err.to_string().contains("is not a pinned field"),
+            "the operator reads the engine's own sentence: {err}"
+        );
+        let jobs: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM repin_jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(jobs, 0, "a refused claim leaves no job row");
+
+        // A pin that merely CHANGED under the caller refuses too, with its
+        // own sentence: retrying against the current pin is the remedy.
+        pin(&pool, "dur", CanonicalType::Varchar).await;
+        let err = s
+            .claim(taken(CanonicalType::BigInt))
+            .await
+            .expect_err("a changed pin refuses the claim");
+        assert!(
+            matches!(&err, StoreError::RepinPinVanished { found, .. }
+                if found.as_deref() == Some("VARCHAR")),
+            "unexpected error {err:?}"
+        );
+
+        // Against the pin it actually holds, the same claim goes through.
+        s.claim(taken(CanonicalType::Varchar))
+            .await
+            .expect("the current pin is claimable");
     }
 
     /// The re-arm switch for boot recovery: a recovered cutover clears

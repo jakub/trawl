@@ -263,6 +263,7 @@ impl IntoResponse for ServerError {
                     ),
                 ),
                 StoreError::Validation(_)
+                | StoreError::RepinPinVanished { .. }
                 | StoreError::InvalidInterval { .. }
                 | StoreError::IntervalTooShort { .. }
                 | StoreError::InvalidName { .. } => (

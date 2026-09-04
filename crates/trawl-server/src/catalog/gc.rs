@@ -380,8 +380,12 @@ impl PinGc {
         dry_run: bool,
     ) -> Result<Purged, ServerError> {
         // The same two questions as the entry check, asked again with the
-        // gate held. A repin cutover needs this very gate, so it cannot
-        // start between here and the commit.
+        // gate held. A courtesy fast-path only: a repin CLAIM takes no
+        // corpus gate, so this look is still check-then-act. The authority
+        // is the purge transaction, which asks the same question under the
+        // catalog lifecycle lock a claim also takes
+        // ([`crate::store::CATALOG_LIFECYCLE_LOCK_KEY`]) — asking here
+        // merely saves a full footer scan in the common case.
         self.refuse_if_repin_owns_the_corpus().await?;
 
         let candidates: BTreeSet<String> = rows.iter().map(|row| row.field.clone()).collect();
@@ -407,6 +411,17 @@ impl PinGc {
         let fields: Vec<String> = walk.dead.iter().cloned().collect();
         let deleted =
             match tokio::time::timeout(PURGE_TIMEOUT, self.store.delete_pins(&fields)).await {
+                // The purge transaction's own running-row check is the
+                // authority on the claim race, and it refuses inside the
+                // transaction, so nothing was deleted.
+                Ok(Err(crate::store::StoreError::RepinAlreadyRunning)) => {
+                    return Err(ServerError::Conflict(
+                        "a repin job claimed the catalog while pin gc was proving its \
+                         candidates dead, so the purge refused and deleted nothing; \
+                         re-run pin gc once the repin finishes"
+                            .to_owned(),
+                    ));
+                }
                 Ok(result) => result?,
                 Err(_elapsed) => {
                     // The statement was already sent, so postgres may have

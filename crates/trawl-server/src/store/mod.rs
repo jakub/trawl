@@ -64,6 +64,35 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// `cleanup_stale_runs` stomp a live sibling's runs.
 const ADVISORY_LOCK_KEY: i64 = 0x0074_7261_776c_2131; // "trawl!1"
 
+/// Advisory lock key serialising the two transactions that change which
+/// fields the catalog pins: a repin's claim ([`RepinStore::claim`]) and pin
+/// gc's purge ([`CatalogStore::delete_pins`]).
+///
+/// Both are check-then-act across process boundaries. gc reads its
+/// candidates, proves them dead against the corpus, then deletes; a repin
+/// reads a field's pin from the in-process cache, then claims a job that
+/// will later flip that very row. Without a shared lock the two interleave:
+/// a claim landing after gc's last look leaves `finish_cutover` updating a
+/// `field_types` row gc has deleted, a zero-row UPDATE that restores the pin
+/// in memory only, so the type authority dies with the process. Taken as an
+/// `xact` lock, postgres releases it at commit or rollback, so neither side
+/// can strand it.
+///
+/// A DIFFERENT key from [`ADVISORY_LOCK_KEY`] on purpose: session and
+/// transaction advisory locks share one lock space, and trawld holds the
+/// session lock for its whole life, so reusing that key would deadlock
+/// every claim and every purge.
+pub(crate) const CATALOG_LIFECYCLE_LOCK_KEY: i64 = 0x0074_7261_776c_2143; // "trawl!C"
+
+/// Take [`CATALOG_LIFECYCLE_LOCK_KEY`] for the rest of `tx`.
+pub(crate) async fn lock_catalog_lifecycle(tx: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(CATALOG_LIFECYCLE_LOCK_KEY)
+        .execute(tx)
+        .await
+        .map(|_| ())
+}
+
 /// Maximum connections in the app-state pool. Small on purpose: trawld is
 /// the sole writer and the workload is light CRUD.
 const MAX_CONNECTIONS: u32 = 8;
