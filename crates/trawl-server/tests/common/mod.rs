@@ -132,6 +132,83 @@ use trawl_server::config::{
 use trawl_server::state::AppState;
 use trawl_server::transport::http;
 
+/// Scrape `trawl_catalog_bookkeeping_timeouts_total` off a running server,
+/// keyed by its `write` label. A label with no series reads 0.
+///
+/// Read DELTAS only, never absolute values: the prometheus recorder is
+/// process-global (see `test_metrics_handle`), so under plain `cargo test`
+/// every test in the binary contributes to the same counter. The difference
+/// across one test's own window is the only part that belongs to it.
+pub async fn bookkeeping_timeouts(url: &str) -> std::collections::BTreeMap<String, f64> {
+    let name = trawl_server::metrics::CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL;
+    let body = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("client")
+        .get(format!("{url}/metrics"))
+        .send()
+        .await
+        .expect("GET /metrics")
+        .text()
+        .await
+        .expect("metrics body");
+
+    let mut counts: std::collections::BTreeMap<String, f64> =
+        trawl_server::metrics::BookkeepingWrite::ALL
+            .iter()
+            .map(|w| (w.label().to_owned(), 0.0))
+            .collect();
+    for line in body.lines() {
+        let Some(rest) = line.strip_prefix(name) else {
+            continue;
+        };
+        let Some((labels, value)) = rest
+            .strip_prefix("{write=\"")
+            .and_then(|r| r.split_once("\"}"))
+        else {
+            continue;
+        };
+        if let Ok(n) = value.trim().parse::<f64>() {
+            counts.insert(labels.to_owned(), n);
+        }
+    }
+    counts
+}
+
+/// Assert that no catalog bookkeeping write was abandoned during the window
+/// the two scrapes bracket.
+///
+/// A test that reads conflict rows or per-service observations is reading
+/// what compaction's phase-4 bookkeeping wrote, and that write is
+/// best-effort under a two-second budget. When postgres is slow enough on a
+/// loaded machine, the budget expires, the evidence never lands, and the
+/// test fails on a value assertion that says nothing about the code under
+/// test. This turns that into a sentence naming the cause.
+///
+/// The recorder is process-global, so under plain `cargo test` (which runs
+/// tests as threads of one process) a SIBLING test's timeout inside this
+/// window trips the assertion too. That is deliberate slack, not a defect:
+/// either way the failure names bookkeeping starvation rather than a
+/// mystery value, and nextest (the repo's runner everywhere) isolates
+/// per-process, where the window can only see its own test.
+pub fn assert_bookkeeping_quiet(
+    before: &std::collections::BTreeMap<String, f64>,
+    after: &std::collections::BTreeMap<String, f64>,
+) {
+    for (write, now) in after {
+        let then = before.get(write).copied().unwrap_or(0.0);
+        assert!(
+            *now <= then,
+            "catalog bookkeeping starvation: the {write} write was abandoned at its \
+             budget during this test's window ({then} -> {now} on {}), so evidence \
+             is missing and the assertion below is measuring a slow postgres, not \
+             the product (under plain `cargo test` the abandoning test may be a \
+             concurrent sibling; nextest isolates per-process)",
+            trawl_server::metrics::CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL,
+        );
+    }
+}
+
 /// Create a `PrometheusHandle` for test contexts.
 ///
 /// The prometheus recorder is process-global: `metrics::counter!` always

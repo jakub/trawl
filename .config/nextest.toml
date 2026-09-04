@@ -37,7 +37,8 @@ max-threads = 8
 # serialize a suite that has no reason to be serial.
 filter = '''
   (package(trawl-server) & kind(lib)
-    & (test(/^from_saved::/) | test(/^scheduler::/)))
+    & (test(/^from_saved::/) | test(/^scheduler::/)
+      | test(/^store::catalog::pg_tests::/)))
   | (package(trawl-server) & (binary(auth_pg) | binary(catalog_surface)
     | binary(connection_budget) | binary(field_catalog) | binary(gc_pins)
     | binary(hot_query) | binary(http_api) | binary(repin) | binary(store_pg)

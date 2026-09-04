@@ -21,6 +21,7 @@ use trawl_core::severity::Dialect;
 use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs};
 use crate::hot_buffer::HotBuffer;
+use crate::metrics::BookkeepingWrite;
 use crate::repin::RepinCoordinator;
 use crate::state::CompactionStats;
 use crate::store::{FieldConflict, MAX_CONFLICT_SAMPLE_BYTES, MAX_CONFLICT_SAMPLES, PinProposal};
@@ -1382,7 +1383,7 @@ const BOOKKEEPING_BUDGET: Duration = Duration::from_secs(2);
 /// which over-counts a `row_count` that is already an approximation or
 /// re-appends conflict evidence the per-field trim bounds anyway — both
 /// strictly better than the gap the retry exists to prevent.
-async fn retry_bookkeeping<F, Fut>(what: &'static str, service: &str, mut attempt: F)
+async fn retry_bookkeeping<F, Fut>(write: BookkeepingWrite, service: &str, mut attempt: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(), crate::store::StoreError>>,
@@ -1395,7 +1396,7 @@ where
             tracing::warn!(
                 event_type = "catalog_bookkeeping_error",
                 compact_service = %service,
-                write = what,
+                write = write.table(),
                 attempts = n,
                 error = %e,
                 "catalog bookkeeping write failed and was given up on"
@@ -1405,7 +1406,7 @@ where
         tracing::debug!(
             event_type = "catalog_bookkeeping_retry",
             compact_service = %service,
-            write = what,
+            write = write.table(),
             attempt = n,
             error = %e,
             "catalog bookkeeping write failed; retrying"
@@ -1423,17 +1424,51 @@ async fn record_batch_bookkeeping(cat: &CatalogContext, service: &str, report: &
     let conflicts = &report.conflicts;
     let observed = &report.observed_fields;
     let rows = report.batch_rows;
-    let writes = async move {
-        retry_bookkeeping("field_conflicts", service, move || {
+    let in_flight = InFlight::new();
+    let writes = async {
+        in_flight.set(BookkeepingWrite::Conflicts);
+        retry_bookkeeping(BookkeepingWrite::Conflicts, service, move || {
             store.record_conflicts(conflicts)
         })
         .await;
-        retry_bookkeeping("field_services", service, move || {
+        in_flight.set(BookkeepingWrite::Observations);
+        retry_bookkeeping(BookkeepingWrite::Observations, service, move || {
             store.touch_services(service, observed, rows)
         })
         .await;
     };
-    budgeted_bookkeeping(service, writes).await;
+    budgeted_bookkeeping(service, &in_flight, writes).await;
+}
+
+/// Which of the two bookkeeping writes is running right now, so the budget's
+/// timeout can name the one it abandoned.
+///
+/// The two writes share ONE budget, so the timeout fires on the composed
+/// future and has no idea by itself which half was still going. An atomic
+/// rather than a `Cell` because that composed future is held across awaits
+/// by `tokio::time::timeout` inside a compaction task, and it must stay
+/// `Send`.
+struct InFlight(std::sync::atomic::AtomicU8);
+
+impl InFlight {
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(0))
+    }
+
+    fn set(&self, write: BookkeepingWrite) {
+        let code = match write {
+            BookkeepingWrite::Conflicts => 0,
+            BookkeepingWrite::Observations => 1,
+        };
+        self.0.store(code, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> BookkeepingWrite {
+        match self.0.load(Ordering::Relaxed) {
+            1 => BookkeepingWrite::Observations,
+            _ => BookkeepingWrite::Conflicts,
+        }
+    }
 }
 
 /// Run a batch's bookkeeping writes under [`BOOKKEEPING_BUDGET`], dropping
@@ -1442,14 +1477,33 @@ async fn record_batch_bookkeeping(cat: &CatalogContext, service: &str, report: &
 /// Cancelling mid-write is safe for the same reason the retry is: an
 /// abandoned write is at worst a lost ack on an idempotent upsert or an
 /// atomic, per-field-trimmed conflict insert.
-async fn budgeted_bookkeeping<Fut: std::future::Future<Output = ()>>(service: &str, writes: Fut) {
+///
+/// The counter fires ONLY here, on the elapsed budget. A write that fails
+/// fast and exhausts its three attempts is a different failure with a
+/// different remedy, and it keeps the `catalog_bookkeeping_error` warning it
+/// has always had. One consequence worth stating: because the two writes
+/// share one budget, a first write that hangs forever means the second never
+/// starts, so a full outage costs one increment on `conflicts` per batch and
+/// none at all on `observations`.
+async fn budgeted_bookkeeping<Fut: std::future::Future<Output = ()>>(
+    service: &str,
+    in_flight: &InFlight,
+    writes: Fut,
+) {
     if tokio::time::timeout(BOOKKEEPING_BUDGET, writes)
         .await
         .is_err()
     {
+        let write = in_flight.get();
+        metrics::counter!(
+            crate::metrics::CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL,
+            "write" => write.label(),
+        )
+        .increment(1);
         tracing::warn!(
             event_type = "catalog_bookkeeping_timeout",
             compact_service = %service,
+            write = write.table(),
             budget_ms = BOOKKEEPING_BUDGET.as_millis(),
             "catalog bookkeeping exceeded its budget and was abandoned so \
              compaction keeps draining the WAL"
@@ -7162,7 +7216,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn bookkeeping_budget_bounds_a_hung_write() {
         let start = tokio::time::Instant::now();
-        budgeted_bookkeeping("svc", std::future::pending::<()>()).await;
+        budgeted_bookkeeping("svc", &InFlight::new(), std::future::pending::<()>()).await;
         assert_eq!(
             tokio::time::Instant::now() - start,
             BOOKKEEPING_BUDGET,
@@ -7178,7 +7232,8 @@ mod tests {
         let start = tokio::time::Instant::now();
         budgeted_bookkeeping(
             "svc",
-            retry_bookkeeping("field_services", "svc", || {
+            &InFlight::new(),
+            retry_bookkeeping(BookkeepingWrite::Observations, "svc", || {
                 calls.set(calls.get() + 1);
                 std::future::ready(Err(crate::store::StoreError::Unavailable(
                     sqlx::Error::PoolTimedOut,
@@ -7194,6 +7249,120 @@ mod tests {
         assert!(
             tokio::time::Instant::now() - start < BOOKKEEPING_BUDGET,
             "the full backoff ladder must fit inside the budget"
+        );
+    }
+
+    /// A one-thread runtime with time paused, so a budget window costs no
+    /// wall clock and the whole test stays on the recorder's thread.
+    fn paused_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("current-thread runtime")
+    }
+
+    /// Run `body` against a LOCAL prometheus recorder and return the scrape.
+    ///
+    /// `metrics::with_local_recorder` installs on the current thread only,
+    /// which is why the runtime above is current-thread: increments made
+    /// inside `block_on` land in this recorder rather than the process-wide
+    /// one another test may have installed.
+    fn under_local_recorder(body: impl FnOnce()) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, body);
+        handle.render()
+    }
+
+    fn timeout_series(write: BookkeepingWrite, count: u64) -> String {
+        format!(
+            "{}{{write=\"{}\"}} {count}",
+            crate::metrics::CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL,
+            write.label()
+        )
+    }
+
+    /// The budget covers both writes, so the counter is only useful if it
+    /// says which one was in flight. A hung conflicts write is the first
+    /// half.
+    #[test]
+    fn a_hung_conflicts_write_counts_against_conflicts() {
+        let rendered = under_local_recorder(|| {
+            paused_runtime().block_on(async {
+                let in_flight = InFlight::new();
+                let writes = async {
+                    in_flight.set(BookkeepingWrite::Conflicts);
+                    std::future::pending::<()>().await;
+                };
+                budgeted_bookkeeping("svc", &in_flight, writes).await;
+            });
+        });
+        assert!(
+            rendered.contains(&timeout_series(BookkeepingWrite::Conflicts, 1)),
+            "the abandoned write must name itself: {rendered}"
+        );
+        assert!(
+            !rendered.contains("write=\"observations\""),
+            "the write that never started must not be blamed: {rendered}"
+        );
+    }
+
+    /// And the second half: conflicts finishes, observations hangs, and the
+    /// cursor has moved.
+    #[test]
+    fn a_hung_observations_write_counts_against_observations() {
+        let rendered = under_local_recorder(|| {
+            paused_runtime().block_on(async {
+                let in_flight = InFlight::new();
+                let writes = async {
+                    in_flight.set(BookkeepingWrite::Conflicts);
+                    retry_bookkeeping(BookkeepingWrite::Conflicts, "svc", || {
+                        std::future::ready(Ok(()))
+                    })
+                    .await;
+                    in_flight.set(BookkeepingWrite::Observations);
+                    std::future::pending::<()>().await;
+                };
+                budgeted_bookkeeping("svc", &in_flight, writes).await;
+            });
+        });
+        assert!(
+            rendered.contains(&timeout_series(BookkeepingWrite::Observations, 1)),
+            "the cursor must follow the writes: {rendered}"
+        );
+        assert!(
+            !rendered.contains("write=\"conflicts\""),
+            "a write that succeeded must not be blamed: {rendered}"
+        );
+    }
+
+    /// Retry exhaustion is not a timeout. Both writes fail fast, spend
+    /// every attempt, and finish well inside the budget: that failure has
+    /// its own log line and must leave this counter alone, or an alert on
+    /// it fires for a failure whose remedy is different.
+    #[test]
+    fn fast_retry_exhaustion_counts_no_timeout() {
+        let rendered = under_local_recorder(|| {
+            paused_runtime().block_on(async {
+                let in_flight = InFlight::new();
+                let fail = || {
+                    std::future::ready(Err(crate::store::StoreError::Unavailable(
+                        sqlx::Error::PoolTimedOut,
+                    )))
+                };
+                let writes = async {
+                    in_flight.set(BookkeepingWrite::Conflicts);
+                    retry_bookkeeping(BookkeepingWrite::Conflicts, "svc", fail).await;
+                    in_flight.set(BookkeepingWrite::Observations);
+                    retry_bookkeeping(BookkeepingWrite::Observations, "svc", fail).await;
+                };
+                budgeted_bookkeeping("svc", &in_flight, writes).await;
+            });
+        });
+        assert!(
+            !rendered.contains(crate::metrics::CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL),
+            "no series at all, on either label: {rendered}"
         );
     }
 }

@@ -16,6 +16,7 @@ use sqlx::{AssertSqlSafe, PgPool, Row as _};
 use trawl_core::schema::CanonicalType;
 use trawl_core::severity::Dialect;
 
+use super::catalog::{FieldConflict, MAX_CONFLICTS_PER_FIELD, record_conflicts_in};
 use super::error::{PgViolation, StoreError, classify_violation};
 
 /// Closed job status vocabulary (mirrors the migration CHECK).
@@ -234,8 +235,9 @@ pub struct RepinPlan {
 /// The rewrite's running tallies: what the shadow generation holds so far.
 ///
 /// One struct rather than five positional `i64`s, because the periodic
-/// progress write and the terminal write that carries a refusal's numbers
-/// stamp the same five columns and must not drift apart in their order.
+/// progress write, the terminal write that carries a refusal's numbers and
+/// the cutover's staging write ([`RepinStore::stage_cutover_input`]) stamp
+/// the same five columns and must not drift apart in their order.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JobTotals {
     /// Affected files rewritten so far.
@@ -265,6 +267,56 @@ pub struct CutoverOutcome {
     /// This call removed the field's degraded acknowledgement. False when
     /// there was none, and always false on a replay.
     pub cleared_ack: bool,
+}
+
+/// The conflict evidence a completing cutover owes, read off the tallies
+/// the rewrite staged (`nulled_services` / `nulled_service_rows`, paired
+/// positionally and kept equal in length by a CHECK).
+///
+/// `None` means the columns are NULL: staging never ran for this job, which
+/// is a different fact from staging having proved the repin lossless (empty
+/// arrays, `Some(vec![])`). Only the caller can act on that difference, so
+/// the distinction rides out rather than collapsing here.
+///
+/// The evidence names the pin the values were stored under, in the CATALOG
+/// spelling: `as_duckdb` is not injective, so a SEVERITY source would indict
+/// itself as BIGINT, a pin the field never had.
+fn staged_conflicts(
+    field: &str,
+    to_type: CanonicalType,
+    row: &PgRow,
+) -> Result<Option<Vec<FieldConflict>>, sqlx::Error> {
+    let Some(services): Option<Vec<String>> = row.try_get("nulled_services")? else {
+        return Ok(None);
+    };
+    let rows: Vec<i64> = row
+        .try_get::<Option<Vec<i64>>, _>("nulled_service_rows")?
+        .unwrap_or_default();
+    let observed_type: String = row.try_get("from_type")?;
+    Ok(Some(
+        services
+            .into_iter()
+            .zip(rows)
+            // A tally of zero is not a conflict — a cast that nulls nothing
+            // is convergence, and recording it would add an episode to the
+            // degraded verdict's count for a service that lost nothing. The
+            // engine stages only positive tallies; this keeps that true of
+            // the rows regardless.
+            .filter(|(_, nulled)| *nulled > 0)
+            .map(|(service, nulled)| FieldConflict {
+                field: field.to_owned(),
+                service,
+                observed_type: observed_type.clone(),
+                expected_type: to_type,
+                rows_nulled: u64::try_from(nulled).unwrap_or_default(),
+                // The rewrite counts what it nulled per service; it never
+                // materialises the values. Carrying them back would be a
+                // second full pass over the corpus for evidence the operator
+                // asked for this repin in spite of.
+                samples: Vec::new(),
+            })
+            .collect(),
+    ))
 }
 
 fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
@@ -451,6 +503,78 @@ impl RepinStore {
         Ok(())
     }
 
+    /// Freeze the finished shadow's tallies on the job row: the five final
+    /// counts and the per-service rows the rewrite nulled, in one statement.
+    ///
+    /// This is the evidence barrier (issue #137). The cutover materialises
+    /// `field_conflicts` rows from these tallies in the same transaction
+    /// that flips the pin, so the read that first sees `succeeded` also sees
+    /// the evidence. That only works if the tallies are durable before the
+    /// `data/REPIN` Cutover marker goes down, because past that marker the
+    /// engine is forward-only and a crash completes the flip from the marker
+    /// alone, with no shadow left to re-count.
+    ///
+    /// One UPDATE, not one per column set: the counts and the per-service
+    /// tallies are one reading of the finished shadow, and a row carrying
+    /// totals from the last pass beside tallies from the one before would
+    /// describe a corpus that never existed. `services` is
+    /// `(service, rows_nulled)` pairs, already ordered and capped by the
+    /// caller.
+    ///
+    /// Zero rows updated is an invariant violation, never a quiet success:
+    /// the `WHERE` demands a `running`, non-dry-run row, so no match means
+    /// the job was already terminal (an orphan reconciliation, a concurrent
+    /// finish) or is a dry run that has no rewrite to stage. Either way the
+    /// caller is about to write a Cutover marker for a job postgres does not
+    /// agree is running, and it must not.
+    ///
+    /// Re-staging the same job while it is still `running` is fine: the
+    /// statement is a plain overwrite, so a retried staging call lands the
+    /// same row.
+    pub async fn stage_cutover_input(
+        &self,
+        id: i64,
+        totals: JobTotals,
+        services: &[(String, i64)],
+    ) -> Result<(), StoreError> {
+        let names: Vec<&str> = services.iter().map(|(s, _)| s.as_str()).collect();
+        let rows: Vec<i64> = services.iter().map(|(_, n)| *n).collect();
+
+        let mut tx = self.pool.begin().await?;
+        // The staging commit is the durability barrier the Cutover marker
+        // depends on, so it is flushed to disk before this call returns,
+        // whatever `synchronous_commit` the session or the server default
+        // otherwise carries.
+        sqlx::query("SET LOCAL synchronous_commit = on")
+            .execute(&mut *tx)
+            .await?;
+        let staged = sqlx::query_scalar::<_, i64>(
+            "UPDATE repin_jobs
+             SET files_done = $2, rows_rewritten = $3, rows_nulled = $4,
+                 rows_resurrected = $5, ambiguous_numerals = $6,
+                 nulled_services = $7, nulled_service_rows = $8
+             WHERE id = $1 AND status = 'running' AND NOT dry_run
+             RETURNING id",
+        )
+        .bind(id)
+        .bind(totals.files_done)
+        .bind(totals.rows_rewritten)
+        .bind(totals.rows_nulled)
+        .bind(totals.rows_resurrected)
+        .bind(totals.ambiguous_numerals)
+        .bind(&names)
+        .bind(&rows)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if staged.is_none() {
+            return Err(StoreError::Validation(format!(
+                "repin job id={id} is not a running execution: cutover tallies cannot be staged"
+            )));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Move a *running* job to a terminal status, stamping `finished_at`
     /// once. Returns whether this call is the one that terminalized the row.
     ///
@@ -542,19 +666,32 @@ impl RepinStore {
             .map_err(StoreError::from)
     }
 
-    /// The cutover's pin flip: `field_types` takes the new type and the job
-    /// completes, in one transaction, so a crash between the two cannot
-    /// leave a flipped pin with a `running` job or vice versa.
+    /// The cutover's pin flip: `field_types` takes the new type, the job
+    /// completes, and the loss the rewrite staged becomes `field_conflicts`
+    /// evidence — one transaction, so a crash between any two of them cannot
+    /// leave a flipped pin with a `running` job, or a `succeeded` job whose
+    /// losses nothing has recorded.
+    ///
+    /// That last part is the evidence barrier (issue #137): the read that
+    /// first sees `succeeded` also sees the conflicts the repin caused.
+    /// Materialising here rather than in the engine after the flip is what
+    /// makes it true for boot recovery too — recovery replays this call and
+    /// nothing else, so evidence written by the engine would simply never
+    /// exist for a job that died between the swap and the flip.
     ///
     /// Idempotent on purpose: boot recovery replays this after a crash in
     /// the cutover or cleanup window, and a redo must neither error nor
     /// restamp `finished_at`.
     ///
-    /// The field's conflict evidence is cleared in the same transaction: it
-    /// indicts a pin that no longer exists, and the analyzer's gate is
-    /// span-based, so evidence left behind would badge the field as degraded
-    /// forever and the operator's remedy would not clear the sign that told
-    /// them to apply it.
+    /// The completing UPDATE gates and pays out in one locked statement —
+    /// it returns the staged tallies only when this call is the one that
+    /// moved the row out of `running`. Both writes that are not naturally
+    /// idempotent hang off that: clearing the old evidence (it indicts a pin
+    /// that no longer exists, and the analyzer's gate is span-based, so
+    /// leaving it would badge the field as degraded forever and the
+    /// operator's remedy would not clear the sign that told them to apply
+    /// it) and inserting the new. A replay of an already-succeeded job gets
+    /// no row back and therefore touches neither.
     ///
     /// The operator's acknowledgement of the degraded badge goes with it, in
     /// the same transaction and under the same gate: an ack suppresses a
@@ -566,13 +703,10 @@ impl RepinStore {
     /// loses the line with nothing left to replay it from
     /// (`repin::engine`).
     ///
-    /// Both clears are gated on this call being the one that completed the
-    /// job, the only part of the flip that is not naturally idempotent. A
-    /// forced lossy repin records fresh evidence after `finish_cutover`
-    /// returns (`repin::engine`'s `record_outcome`), so an ungated boot
-    /// replay of an already-succeeded job would delete evidence describing
-    /// the new pin, which nothing would ever write again — and an ack an
-    /// operator wrote after the flip would go the same way.
+    /// The ack clear rides the same gate as the evidence writes: a replay
+    /// of an already-succeeded job gets no row back, so it neither deletes
+    /// the evidence this flip inserted for the new pin nor an ack an
+    /// operator wrote after the flip.
     ///
     /// The transaction OPENS with `SELECT 1 FROM field_types WHERE field =
     /// $1 FOR UPDATE`, and that lock is not incidental to the pin flip. The
@@ -586,6 +720,12 @@ impl RepinStore {
     /// high-water over counters that were just reset — suppressing the new
     /// pin's first episodes. Locking unconditionally makes the two orders
     /// the only two outcomes for every repin, not just the retyping ones.
+    ///
+    /// The job row's own `field`/`from_type`/`to_type` must agree with the
+    /// call's arguments. They are the same facts by two routes — the caller
+    /// passes what the `data/REPIN` marker or the engine holds, the row
+    /// carries what was claimed — and a disagreement means the wrong job is
+    /// about to complete a flip, so the transaction is abandoned untouched.
     pub async fn finish_cutover(
         &self,
         id: i64,
@@ -593,6 +733,31 @@ impl RepinStore {
         to_type: CanonicalType,
     ) -> Result<CutoverOutcome, StoreError> {
         let mut tx = self.pool.begin().await?;
+
+        // Fails closed before anything is mutated: `field`, `from_type` and
+        // `to_type` are immutable for the row's whole life, so reading them
+        // unlocked here and completing below cannot race.
+        let identity = sqlx::query("SELECT field, to_type FROM repin_jobs WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(identity) = identity else {
+            return Err(StoreError::NotFound {
+                id,
+                resource: "repin job",
+            });
+        };
+        let claimed_field: String = identity.try_get("field")?;
+        let claimed_to: String = identity.try_get("to_type")?;
+        if claimed_field != field || claimed_to != to_type.as_catalog() {
+            return Err(StoreError::Validation(format!(
+                "repin job id={id} was claimed to repin {claimed_field:?} to {claimed_to}, \
+                 but the cutover names {field:?} to {}: refusing to flip a pin this job \
+                 never planned",
+                to_type.as_catalog()
+            )));
+        }
+
         sqlx::query("SELECT 1 FROM field_types WHERE field = $1 FOR UPDATE")
             .bind(field)
             .fetch_optional(&mut *tx)
@@ -606,23 +771,52 @@ impl RepinStore {
         .bind(to_type.as_catalog())
         .execute(&mut *tx)
         .await?;
+
         let completed = sqlx::query(
             "UPDATE repin_jobs
              SET status = 'succeeded', finished_at = COALESCE(finished_at, now())
-             WHERE id = $1 AND status = 'running'",
+             WHERE id = $1 AND status = 'running'
+             RETURNING from_type, rows_nulled, nulled_services, nulled_service_rows",
         )
         .bind(id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        .fetch_optional(&mut *tx)
+        .await?;
+
         let mut cleared_ack = false;
-        if completed > 0 {
+        if let Some(row) = &completed {
             super::CatalogStore::clear_conflict_evidence(&mut tx, field).await?;
             cleared_ack = super::CatalogStore::clear_degraded_ack(&mut tx, field).await?;
+            match staged_conflicts(field, to_type, row)? {
+                Some(conflicts) if !conflicts.is_empty() => {
+                    record_conflicts_in(&mut tx, &conflicts, MAX_CONFLICTS_PER_FIELD).await?;
+                }
+                Some(_) => {}
+                None => {
+                    // Forward, never a refusal: the caller is past the
+                    // Cutover marker, where the corpus is already the new
+                    // generation and the only direction is done. NULL is
+                    // precise rather than heuristic — it can only mean the
+                    // staging write never ran, so this is a job from before
+                    // the barrier existed, or one whose engine died between
+                    // the marker and the flip. Its losses are unrecorded and
+                    // unrecoverable (the shadow that counted them is gone),
+                    // which is worth exactly one line of ops signal.
+                    let rows_nulled: i64 = row.try_get("rows_nulled")?;
+                    tracing::warn!(
+                        event_type = "repin_evidence_unstaged",
+                        job_id = id,
+                        field,
+                        rows_nulled,
+                        "completing a repin whose cutover tallies were never staged; \
+                         any loss it wrote is absent from the conflict evidence"
+                    );
+                }
+            }
         }
+
         tx.commit().await?;
         Ok(CutoverOutcome {
-            completed: completed > 0,
+            completed: completed.is_some(),
             cleared_ack,
         })
     }

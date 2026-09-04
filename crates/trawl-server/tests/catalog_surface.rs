@@ -15,7 +15,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestServer, setup_in_dir_with_data};
+use common::{TestServer, assert_bookkeeping_quiet, bookkeeping_timeouts, setup_in_dir_with_data};
 use serde_json::json;
 use sqlx::Connection as _;
 use trawl_client::HttpClient;
@@ -339,6 +339,7 @@ async fn aged_out_field_windowed_away_unless_all() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_freshly_conflicting_field_carries_no_verdict() {
     let h = harness().await;
+    let timeouts_before = bookkeeping_timeouts(&h.server.url).await;
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     for _ in 0..4 {
         ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "N/A"}))]).await;
@@ -347,6 +348,7 @@ async fn a_freshly_conflicting_field_carries_no_verdict() {
     let (status, body) = h.get(&h.server.analyst_token, "/schema/fields").await;
     assert_eq!(status, 200);
     let row = field_row(&body, "duration");
+    assert_bookkeeping_quiet(&timeouts_before, &bookkeeping_timeouts(&h.server.url).await);
     assert!(
         row.get("verdict").is_none(),
         "volume without span is not degraded: {row}"
@@ -365,6 +367,7 @@ async fn a_freshly_conflicting_field_carries_no_verdict() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_degraded_field_carries_the_verdict_and_its_samples() {
     let h = harness().await;
+    let timeouts_before = bookkeeping_timeouts(&h.server.url).await;
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     for value in ["N/A", "pending", "N/A"] {
         ingest_and_compact(&h, &[event("svc-b", &json!({"duration": value}))]).await;
@@ -386,6 +389,7 @@ async fn a_degraded_field_carries_the_verdict_and_its_samples() {
     let (status, fields) = h.get(&h.server.analyst_token, "/schema/fields").await;
     assert_eq!(status, 200);
     let verdict = field_row(&fields, "duration")["verdict"].clone();
+    assert_bookkeeping_quiet(&timeouts_before, &bookkeeping_timeouts(&h.server.url).await);
     assert_eq!(verdict["services"], 1, "one sender is enough: {verdict}");
     assert_eq!(verdict["episodes"], 3, "{verdict}");
     assert_eq!(verdict["rows_shelved"], 3, "{verdict}");
@@ -445,6 +449,7 @@ async fn a_degraded_field_carries_the_verdict_and_its_samples() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_query_binding_a_degraded_field_is_stamped() {
     let h = harness().await;
+    let timeouts_before = bookkeeping_timeouts(&h.server.url).await;
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     for value in ["N/A", "pending", "N/A"] {
         ingest_and_compact(&h, &[event("svc-b", &json!({"duration": value}))]).await;
@@ -486,6 +491,7 @@ async fn a_query_binding_a_degraded_field_is_stamped() {
         )
         .await;
     assert_eq!(status, 200);
+    assert_bookkeeping_quiet(&timeouts_before, &bookkeeping_timeouts(&h.server.url).await);
     assert_eq!(
         body["degraded_fields"],
         json!(["duration"]),
@@ -524,6 +530,7 @@ async fn a_query_binding_a_degraded_field_is_stamped() {
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_services_badges_only_the_service_that_conflicted() {
     let h = harness().await;
+    let timeouts_before = bookkeeping_timeouts(&h.server.url).await;
     // svc-a pins duration BIGINT and never disagrees with it again; svc-b
     // sends strings under that pin, which the conform shelves.
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
@@ -588,6 +595,7 @@ async fn schema_services_badges_only_the_service_that_conflicted() {
         );
     }
 
+    assert_bookkeeping_quiet(&timeouts_before, &bookkeeping_timeouts(&h.server.url).await);
     assert_eq!(
         svc("svc-b")["degraded_fields"],
         json!(["duration"]),
@@ -646,6 +654,7 @@ async fn schema_services_badges_only_the_service_that_conflicted() {
 #[tokio::test(flavor = "multi_thread")]
 async fn conflict_evidence_surfaces_on_the_read_routes() {
     let h = harness().await;
+    let timeouts_before = bookkeeping_timeouts(&h.server.url).await;
     // svc-a pins duration BIGINT; svc-b disagrees with a string.
     ingest_and_compact(&h, &[event("svc-a", &json!({"duration": 4200}))]).await;
     ingest_and_compact(&h, &[event("svc-b", &json!({"duration": "N/A"}))]).await;
@@ -654,6 +663,7 @@ async fn conflict_evidence_surfaces_on_the_read_routes() {
     let (status, body) = h.get(&h.server.analyst_token, "/schema/conflicts").await;
     assert_eq!(status, 200);
     let conflicts = body["conflicts"].as_array().expect("conflicts array");
+    assert_bookkeeping_quiet(&timeouts_before, &bookkeeping_timeouts(&h.server.url).await);
     let row = conflicts
         .iter()
         .find(|c| c["field"] == "duration" && c["service"] == "svc-b")
@@ -892,6 +902,7 @@ async fn read_commands_render_populated_output() {
     use trawl_cli::cli::{ConnectionParams, OutputFormat};
 
     let h = harness().await;
+    let timeouts_before = bookkeeping_timeouts(&h.server.url).await;
     // svc-a pins `duration` and `latency` BIGINT; svc-b's strings disagree,
     // so the catalog carries two pins, two service observations each, and a
     // conflict per field — two, so `--field` has something to exclude.
@@ -930,6 +941,7 @@ async fn read_commands_render_populated_output() {
     .await
     .expect("schema fields");
     let text = String::from_utf8(out).expect("utf8");
+    assert_bookkeeping_quiet(&timeouts_before, &bookkeeping_timeouts(&h.server.url).await);
     assert!(text.contains("duration"), "{text}");
     assert!(text.contains("BIGINT"), "{text}");
     assert!(

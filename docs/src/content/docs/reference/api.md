@@ -356,7 +356,10 @@ accepted.
 
 A forced lossy repin records its losses as `field_conflicts` evidence and
 in `trawl_catalog_repin_rows_nulled_total`; the originals stay findable
-in `_raw`. Queries never observe a mixed-type corpus (the cutover holds
+in `_raw`. That evidence is written in the same transaction that flips the
+pin and completes the job, so the status reading `succeeded` is a barrier:
+the first read after it already sees the conflict rows, and a client that
+polls the status route never has to poll `/schema/conflicts` behind it. Queries never observe a mixed-type corpus (the cutover holds
 every query slot for its final seconds), events ingested during the
 rewrite land exactly once, and a crash at any point is finished by the
 next boot's marker replay.

@@ -58,6 +58,17 @@ pub const CATALOG_CONFORM_SKIPPED_TOTAL: &str = "trawl_catalog_conform_skipped_t
 pub const CATALOG_PINS_REJECTED_TOTAL: &str = "trawl_catalog_pins_rejected_total";
 pub const CATALOG_SAMPLE_CAPTURE_FAILURES_TOTAL: &str =
     "trawl_catalog_sample_capture_failures_total";
+/// Batches whose catalog bookkeeping ran out of its wall-clock budget and
+/// was abandoned, labelled by the write that was in flight when the budget
+/// expired ([`BookkeepingWrite`]).
+///
+/// The log line that goes with it (`catalog_bookkeeping_timeout`) says the
+/// same thing once per batch; this is the series to alert on, because a
+/// sustained postgres outage costs one budget per batch and the evidence it
+/// abandons never comes back on its own. Retry exhaustion that fails FAST
+/// is a different failure and does not count here: it stays on
+/// `catalog_bookkeeping_error`.
+pub const CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL: &str = "trawl_catalog_bookkeeping_timeouts_total";
 pub const CATALOG_PINNED_FIELDS: &str = "trawl_catalog_pinned_fields";
 pub const CATALOG_PIN_CAPACITY: &str = "trawl_catalog_pin_capacity";
 pub const CATALOG_DEGRADED_FIELDS: &str = "trawl_catalog_degraded_fields";
@@ -76,6 +87,48 @@ pub const TELEMETRY_EVENTS_DROPPED_TOTAL: &str = "trawl_telemetry_events_dropped
 pub const TELEMETRY_BYTES_DROPPED_TOTAL: &str = "trawl_telemetry_bytes_dropped_total";
 pub const TELEMETRY_BUFFER_EVENTS: &str = "trawl_telemetry_buffer_events";
 pub const TELEMETRY_BUFFER_BYTES: &str = "trawl_telemetry_buffer_bytes";
+
+// -- bookkeeping write identity ----------------------------------------------
+
+/// The two catalog bookkeeping writes one compacted batch makes, in the
+/// order it makes them.
+///
+/// One enum, two spellings, because the metric and the log answer different
+/// questions. [`Self::label`] is the closed `write` label value on
+/// [`CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL`], named for what the write is FOR;
+/// [`Self::table`] is the postgres table the log line has always named, kept
+/// verbatim so an operator's existing search for `write="field_services"`
+/// still finds its lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookkeepingWrite {
+    /// `record_conflicts`: the values this batch's pins shelved.
+    Conflicts,
+    /// `touch_services`: which service was seen carrying which field.
+    Observations,
+}
+
+impl BookkeepingWrite {
+    /// Every variant, for zero-initializing the label matrix.
+    pub const ALL: [BookkeepingWrite; 2] = [Self::Conflicts, Self::Observations];
+
+    /// The metric label value.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Conflicts => "conflicts",
+            Self::Observations => "observations",
+        }
+    }
+
+    /// The postgres table, as the log field spells it.
+    #[must_use]
+    pub fn table(self) -> &'static str {
+        match self {
+            Self::Conflicts => "field_conflicts",
+            Self::Observations => "field_services",
+        }
+    }
+}
 
 // -- description registration ------------------------------------------------
 
@@ -165,6 +218,16 @@ pub fn describe_metrics() {
          on a column with pathological misfit cardinality). The conflict COUNTS \
          are still recorded and the values remain in _raw — only the sample \
          evidence is missing"
+    );
+    describe_counter!(
+        CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL,
+        "Compacted batches whose catalog bookkeeping was abandoned at its \
+         two-second budget, labelled by the write in flight (conflicts = \
+         the shelved-value evidence, observations = the per-service field \
+         sightings). Compaction keeps draining the WAL, so nothing stalls, \
+         but the abandoned write is a permanent hole: a lost observation \
+         is re-made only when that service next sends that field. A rising \
+         series means postgres is too slow for the budget"
     );
     describe_gauge!(
         CATALOG_PINNED_FIELDS,
@@ -288,6 +351,18 @@ pub fn describe_metrics() {
     // "not scraped" and 0 means "none". The refresh's error path keeps the
     // previous value for the same reason.
     gauge!(CATALOG_DEGRADED_FIELDS).set(0.0);
+
+    // Same reasoning for the bookkeeping timeouts, and one step stronger:
+    // a test that asserts bookkeeping stayed quiet reads a DELTA, and a
+    // delta over an absent series cannot tell "no timeouts" from "never
+    // wired up". Publish both label values at zero here.
+    for write in BookkeepingWrite::ALL {
+        metrics::counter!(
+            CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL,
+            "write" => write.label(),
+        )
+        .increment(0);
+    }
 }
 
 // -- bounded label values ----------------------------------------------------

@@ -51,7 +51,9 @@ use crate::repin::marker::{
 };
 use crate::repin::plan::{ScanCounts, ScanTallies, scan};
 use crate::repin::rewrite::{FileSig, ProcessTally, process_file, snapshot_env_files};
-use crate::store::{CatalogStore, FieldConflict, JobTotals, RepinJob, RepinJobStatus, RepinStore};
+use crate::store::{
+    CatalogStore, JobTotals, MAX_CONFLICTS_PER_FIELD, RepinJob, RepinJobStatus, RepinStore,
+};
 
 /// Catch-up passes before the job gives up (steadily-shrinking deltas
 /// converge in two or three; a delta that refuses to shrink under real
@@ -1371,7 +1373,42 @@ impl RepinEngine {
         // dropping them on the unwind costs the corpus nothing.
         self.run_pass(field, reading, &flipped, scanned, &mut state, cancel)
             .await?;
-        self.publish_progress(job_id, &state).await;
+
+        // Freeze what the finished shadow holds — the five counts and the
+        // per-service null tallies — durably, before the Cutover marker and
+        // before the force gate that may still refuse. This replaces the
+        // final progress write: it stores the same counts and, unlike that
+        // write, is not best-effort. `finish_cutover` turns these tallies
+        // into the conflict evidence in the transaction that completes the
+        // job (issue #137), so a job that reaches the marker without them is
+        // a job whose losses nothing will ever record.
+        let staged_totals = staged_totals(&state).map_err(JobAbort::Failed)?;
+        let staged_tallies = staged_tallies(&state).map_err(JobAbort::Failed)?;
+        self.store
+            .stage_cutover_input(job_id, staged_totals, &staged_tallies)
+            .await
+            .map_err(|e| {
+                // The full error stays server-side: the abort message is
+                // persisted on the job row and served to SchemaRead via the
+                // status route, and a StoreError's Display can carry raw
+                // postgres diagnostics the wire contract redacts.
+                tracing::error!(
+                    event_type = "repin_store_error",
+                    job_id,
+                    error = %e,
+                    "staging the cutover tallies failed; aborting before the marker"
+                );
+                JobAbort::Failed(
+                    "could not stage the cutover tallies (app-state store \
+                     error; details in the server log). Nothing has moved — \
+                     the corpus stands at its pre-repin generation; retry \
+                     the repin"
+                        .to_owned(),
+                )
+            })?;
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!(crate::metrics::CATALOG_REPIN_FILES_DONE)
+            .set(staged_totals.files_done as f64);
 
         // The authoritative loss gate. The pre-build scan only describes
         // the corpus as it stood before the build; ingest and compaction
@@ -1583,8 +1620,9 @@ impl RepinEngine {
         drop(pool_guard);
         drop(corpus_gate);
 
-        // Evidence + metrics for what the rewrite actually did.
-        self.record_outcome(job_id, field, from, to, &state).await;
+        // Counters for what the rewrite actually did. The evidence itself
+        // went in with the flip.
+        Self::record_outcome(&state);
 
         // Sweep: disk-only from here, and infallible by type. A failed
         // sweep of either staging root keeps the marker so the boot replay
@@ -1646,6 +1684,11 @@ impl RepinEngine {
         Ok(changed?)
     }
 
+    /// Mid-build progress, best effort and deliberately lossy at the top of
+    /// the range: this row is a display, so a count too large to store is
+    /// better shown clamped than not shown at all. The staging write that
+    /// freezes the same counts at the end refuses instead — see
+    /// [`staged_totals`].
     async fn publish_progress(&self, job_id: i64, state: &BuildState) {
         let totals = state.totals();
         if let Err(e) = self.store.record_progress(job_id, job_totals(totals)).await {
@@ -1655,52 +1698,21 @@ impl RepinEngine {
         metrics::gauge!(crate::metrics::CATALOG_REPIN_FILES_DONE).set(totals.files_done as f64);
     }
 
-    /// Final tallies: counters, and — for a forced lossy repin — the same
-    /// `field_conflicts` evidence rows a lossy conform writes (best
-    /// effort, like compaction's bookkeeping).
-    async fn record_outcome(
-        &self,
-        job_id: i64,
-        field: &str,
-        from: CanonicalType,
-        to: CanonicalType,
-        state: &BuildState,
-    ) {
+    /// What is left to do once the pin is flipped: increment the two
+    /// lifetime counters.
+    ///
+    /// Everything durable was written before the Cutover marker (the counts
+    /// and the per-service tallies, staged) or by the flip itself (the
+    /// `field_conflicts` evidence those tallies become, inside
+    /// `finish_cutover`'s transaction). Nothing may be written here: a
+    /// post-terminal write is exactly the window issue #137 closed, where a
+    /// client reading `succeeded` sees a repin whose losses are not yet
+    /// recorded, and boot recovery never runs this code at all.
+    fn record_outcome(state: &BuildState) {
         let totals = state.totals();
         metrics::counter!(crate::metrics::CATALOG_REPIN_ROWS_NULLED_TOTAL).increment(totals.nulled);
         metrics::counter!(crate::metrics::CATALOG_REPIN_ROWS_RESURRECTED_TOTAL)
             .increment(totals.resurrected);
-        self.publish_progress(job_id, state).await;
-
-        let conflicts: Vec<FieldConflict> = state
-            .nulled_by_service()
-            .into_iter()
-            .map(|(service, rows_nulled)| FieldConflict {
-                field: field.to_owned(),
-                service,
-                // The catalog spelling: evidence a repin authors must name
-                // the pin the values were stored under, and `as_duckdb` is
-                // not injective, so a SEVERITY source would indict itself
-                // as BIGINT, a pin the field never had.
-                observed_type: from.as_catalog().to_owned(),
-                expected_type: to,
-                rows_nulled,
-                // The rewrite counts what it nulled per service; it never
-                // materialises the values (a rewrite that carried them back
-                // would be a second full pass over the corpus for evidence
-                // the operator asked for this repin in spite of).
-                samples: Vec::new(),
-            })
-            .collect();
-        if !conflicts.is_empty()
-            && let Err(e) = self.catalog_store.record_conflicts(&conflicts).await
-        {
-            tracing::warn!(
-                event_type = "catalog_bookkeeping_error",
-                error = %e,
-                "repin failed to record field_conflicts evidence"
-            );
-        }
     }
 }
 
@@ -1831,6 +1843,56 @@ impl BuildState {
         }
         out
     }
+}
+
+/// One count as the job row stores it, refusing rather than clamping.
+///
+/// The staged numbers are the cutover's input, not a display: they become
+/// the report an operator reads and the conflict evidence the flip writes.
+/// A count too large for `BIGINT` is unreachable in any real corpus, so
+/// meeting one means something upstream is wrong — and failing here costs
+/// nothing, because the marker is not down yet and the corpus is untouched.
+fn checked_count(what: &str, value: u64) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| {
+        format!("the rewrite's {what} count ({value}) does not fit the job row; refusing to stage")
+    })
+}
+
+/// The five final counts, from the shadow's CURRENT results.
+fn staged_totals(state: &BuildState) -> Result<JobTotals, String> {
+    let totals = state.totals();
+    Ok(JobTotals {
+        files_done: checked_count("files_done", totals.files_done)?,
+        rows_rewritten: checked_count("rows_rewritten", totals.rows)?,
+        rows_nulled: checked_count("rows_nulled", totals.nulled)?,
+        rows_resurrected: checked_count("rows_resurrected", totals.resurrected)?,
+        ambiguous_numerals: checked_count("ambiguous_numerals", totals.ambiguous)?,
+    })
+}
+
+/// The per-service null tallies the cutover stages, worst first.
+///
+/// Read off the state's CURRENT results, never accumulated across passes: a
+/// caught-up file replaces its earlier tally, so summing deltas would count
+/// a reprocessed file twice — the same rule [`BuildState::totals`] follows,
+/// and the reason these two must be read from one state.
+///
+/// Ordered rows DESC then service ASC, and capped at
+/// [`MAX_CONFLICTS_PER_FIELD`]: the per-field conflict trim would drop the
+/// overflow anyway, and dropping it here makes which rows survive a
+/// decision (the services that lost the most) rather than an accident of
+/// insertion order. Documented residual: a repin lossy across more than 100
+/// services records evidence for the worst 100.
+fn staged_tallies(state: &BuildState) -> Result<Vec<(String, i64)>, String> {
+    let mut tallies: Vec<(String, u64)> = state.nulled_by_service().into_iter().collect();
+    tallies.sort_by(|(a_service, a_rows), (b_service, b_rows)| {
+        b_rows.cmp(a_rows).then_with(|| a_service.cmp(b_service))
+    });
+    tallies.truncate(usize::try_from(MAX_CONFLICTS_PER_FIELD).unwrap_or(usize::MAX));
+    tallies
+        .into_iter()
+        .map(|(service, rows)| Ok((service, checked_count("per-service rows_nulled", rows)?)))
+        .collect()
 }
 
 /// One pass, blocking: diff the source tree against what the shadow
