@@ -12,8 +12,10 @@
 //! of an instant, and the pure policy over them: [`plan_due_run`] turns a
 //! schedule plus a clock reading into the window a run covers, and
 //! [`materialize_window`] puts that window onto the saved DSL as absolute
-//! bounds. The scheduler wiring that persists those answers lives
-//! elsewhere.
+//! bounds. [`validate_window_compatibility`] is the write-time half: the
+//! one rule both write directions ask before a window and a query text are
+//! attached to each other. The scheduler wiring that persists those
+//! answers lives elsewhere.
 
 use std::fmt;
 
@@ -397,8 +399,8 @@ fn plan_delta(secs: i64) -> Result<TimeDelta, PlanError> {
 ///
 /// The variants name the check that refused, because the caller's only
 /// sensible move is to fail the run and say which one: every one of these
-/// means the schedule and the query text disagree in a way the write-time
-/// compatibility check is supposed to have made impossible.
+/// means the schedule and the query text disagree in a way
+/// [`validate_window_compatibility`] is supposed to have made impossible.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MaterializeError {
     /// The saved text does not parse, so there is nothing to splice onto.
@@ -531,6 +533,89 @@ fn carries_from_saved(query: &Query) -> bool {
         .pipeline
         .iter()
         .any(|stage| matches!(stage.node, PipeStage::FromSaved(_)))
+}
+
+// ---------------------------------------------------------------------------
+// The write-time compatibility rule (ADR-0018 rulings 7 and 12)
+// ---------------------------------------------------------------------------
+
+/// Why a window and a saved query may not be attached to each other.
+///
+/// Every message names BOTH sides, because the operator has to remove one
+/// of them and the server has no basis for choosing which.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WindowPolicyError {
+    /// A window was attached to text that does not parse. A window is a
+    /// claim about what the query covers, and there is no query yet.
+    #[error(
+        "schedule window \"{window}\" cannot be attached to a query that does not parse: {message}"
+    )]
+    Unparseable {
+        /// The window that was being attached.
+        window: ScheduleWindow,
+        /// The parser's first message.
+        message: String,
+    },
+    /// The query already spells its own interval (ruling 7).
+    #[error(
+        "schedule window \"{window}\" conflicts with the saved query's {}= time clause; remove one side",
+        .clause.keyword()
+    )]
+    TimeClause {
+        /// The window that was being attached.
+        window: ScheduleWindow,
+        /// The clause the query carries.
+        clause: TimeClause,
+    },
+    /// The query reads stored report rows, not ingest events (ruling 12).
+    #[error(
+        "schedule window \"{window}\" conflicts with the saved query's \"from saved\" source; \
+         stored report rows cannot receive a _time window"
+    )]
+    FromSaved {
+        /// The window that was being attached.
+        window: ScheduleWindow,
+    },
+}
+
+/// Decide whether a window may be attached to this query text (ADR-0018
+/// rulings 7 and 12).
+///
+/// This is ONE function for both write directions: putting a window on a
+/// schedule, and editing the DSL of a saved query that already has one.
+/// Two rules that agreed today would drift, and the drift would be a saved
+/// query whose schedule window and whose `last=` both claim to say what
+/// the report covers.
+///
+/// No window is always fine, whatever the text. Query mode executes the
+/// DSL verbatim and never reaches this check, and saved-query creation has
+/// never validated DSL at all, so refusing unparseable text here would be
+/// a new rejection wearing a window's name.
+///
+/// With a window, the text must parse (a window over text nothing can run
+/// is a claim about nothing), must own no `last=`/`earliest=`/`latest=`,
+/// and must carry no `from saved` stage. The time-clause check reads the
+/// parsed AST through [`trawl_core::ast::Query::time_clause`] rather than
+/// scanning the source: a backticked `` `last`=5 `` is an ordinary field
+/// filter and keeps its schedule window, while `service=x OR last=1h`
+/// carries a clause that a per-group text scan would miss.
+pub fn validate_window_compatibility(
+    window: Option<ScheduleWindow>,
+    dsl: &str,
+) -> Result<(), WindowPolicyError> {
+    let Some(window) = window else {
+        return Ok(());
+    };
+
+    let query =
+        parse_dsl(dsl).map_err(|message| WindowPolicyError::Unparseable { window, message })?;
+    if let Some(clause) = query.time_clause() {
+        return Err(WindowPolicyError::TimeClause { window, clause });
+    }
+    if carries_from_saved(&query) {
+        return Err(WindowPolicyError::FromSaved { window });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1005,5 +1090,107 @@ mod tests {
             err.to_string()
                 .starts_with("the saved query does not parse")
         );
+    }
+
+    // -- Window/query compatibility (ADR-0018 rulings 7 and 12) ------------
+
+    /// Ruling 7: two spellings of one interval never coexist, and the
+    /// refusal names both so the operator can drop one.
+    #[test]
+    fn a_window_and_a_time_clause_refuse_each_other_by_name() {
+        let window = ScheduleWindow::SinceLast;
+        let cases = [
+            ("service=nginx last=1h", TimeClause::Last, "last="),
+            (
+                "earliest=\"2026-01-01T00:00:00Z\" service=nginx",
+                TimeClause::Earliest,
+                "earliest=",
+            ),
+            (
+                "latest=\"2026-01-01T00:00:00Z\" service=nginx",
+                TimeClause::Latest,
+                "latest=",
+            ),
+        ];
+        for (dsl, clause, spelling) in cases {
+            let err = validate_window_compatibility(Some(window), dsl).unwrap_err();
+            assert_eq!(err, WindowPolicyError::TimeClause { window, clause });
+            let message = err.to_string();
+            assert!(message.contains("since_last"), "{message}");
+            assert!(message.contains(spelling), "{message}");
+        }
+    }
+
+    /// Ruling 12: a `from saved` query reads stored report rows, so it can
+    /// never be given a `_time` window. The refusal names the window's own
+    /// spelling and the source it clashes with.
+    #[test]
+    fn a_window_and_a_from_saved_source_refuse_each_other_by_name() {
+        let window = ScheduleWindow::Fixed { secs: 7200 };
+        for dsl in [
+            "| from saved daily_rollup",
+            "service=nginx | head 5 | from saved daily_rollup",
+        ] {
+            let err = validate_window_compatibility(Some(window), dsl).unwrap_err();
+            assert_eq!(err, WindowPolicyError::FromSaved { window });
+            let message = err.to_string();
+            assert!(message.contains("\"2h\""), "{message}");
+            assert!(message.contains("from saved"), "{message}");
+        }
+    }
+
+    /// A backticked keyword is an ordinary field name, so a query filtering
+    /// a column called `last` keeps its schedule window. This is why the
+    /// check reads the AST instead of scanning the text.
+    #[test]
+    fn a_backticked_keyword_is_a_field_and_keeps_its_window() {
+        assert_eq!(
+            validate_window_compatibility(Some(ScheduleWindow::SinceLast), "`last`=5"),
+            Ok(())
+        );
+        assert_eq!(
+            validate_window_compatibility(
+                Some(ScheduleWindow::SinceLast),
+                "service=nginx `earliest`=x | head 5"
+            ),
+            Ok(())
+        );
+    }
+
+    /// A hoisted clause is still a clause: `service=x OR last=1h` applies
+    /// its window to both groups, and a per-group text scan would miss it.
+    #[test]
+    fn a_time_clause_hoisted_out_of_an_or_group_is_still_refused() {
+        let window = ScheduleWindow::SinceLast;
+        assert_eq!(
+            validate_window_compatibility(Some(window), "service=x OR last=1h"),
+            Err(WindowPolicyError::TimeClause {
+                window,
+                clause: TimeClause::Last
+            })
+        );
+    }
+
+    /// No window means no claim about coverage, so the text is not this
+    /// check's business: saved-query creation has never validated DSL and
+    /// this rule does not start.
+    #[test]
+    fn no_window_accepts_any_text_while_a_window_needs_a_parseable_query() {
+        assert_eq!(
+            validate_window_compatibility(None, "| stats count( |||"),
+            Ok(())
+        );
+        assert_eq!(validate_window_compatibility(None, "last=1h"), Ok(()));
+
+        let err = validate_window_compatibility(
+            Some(ScheduleWindow::Fixed { secs: 7200 }),
+            "| stats count( |||",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, WindowPolicyError::Unparseable { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("\"2h\""), "{err}");
     }
 }

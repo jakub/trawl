@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use trawl_engine::error::EngineError;
 
+use crate::report_window::{MaterializeError, PlanError, WindowPolicyError};
 use crate::store::StoreError;
 
 /// Server errors, mapped to HTTP responses via [`IntoResponse`].
@@ -49,6 +50,26 @@ pub enum ServerError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// A schedule window and a saved query's own text cannot both say
+    /// what a report covers (ADR-0018 rulings 7 and 12). A 400 whose
+    /// message names both sides: the operator picks which one to drop,
+    /// and the server has no basis for choosing.
+    #[error("{0}")]
+    WindowPolicy(#[from] WindowPolicyError),
+
+    /// A due schedule could not be planned into a window. The numbers
+    /// come from a schedule row and the daemon's own config, never from
+    /// the request, so this is broken state and not bad input: 500, with
+    /// the detail logged rather than returned.
+    #[error("{0}")]
+    WindowPlan(#[from] PlanError),
+
+    /// A planned window could not be put onto the saved query. Write-time
+    /// policy exists to make this unreachable, so reaching it means a
+    /// stored schedule and its saved DSL disagree: 500, same treatment.
+    #[error("{0}")]
+    WindowMaterialize(#[from] MaterializeError),
+
     /// Query execution exceeded the configured timeout.
     #[error("query timed out")]
     Timeout,
@@ -86,6 +107,12 @@ impl ServerError {
                 "app-state store unavailable".to_owned()
             }
             Self::Internal(_) => "internal error".to_owned(),
+            // The two 500-class window errors can quote the saved DSL and
+            // the parser's message; the policy refusal below them is the
+            // operator's own input and keeps its text.
+            Self::WindowPlan(_) | Self::WindowMaterialize(_) => {
+                "report window could not be resolved".to_owned()
+            }
             Self::Ingest(_) => "ingest error".to_owned(),
             Self::BadRequest(_) => "bad request".to_owned(),
             Self::NotFound(_) => "not found".to_owned(),
@@ -121,6 +148,9 @@ impl ServerError {
             Self::BadRequest(_) => "bad_request",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
+            Self::WindowPolicy(_) => "window_policy",
+            Self::WindowPlan(_) => "window_plan",
+            Self::WindowMaterialize(_) => "window_materialize",
             Self::Timeout => "timeout",
             Self::Ingest(_) => "ingest",
             Self::RateLimited => "rate_limited",
@@ -314,6 +344,24 @@ impl IntoResponse for ServerError {
                 StatusCode::CONFLICT,
                 ErrorEnvelope::simple(ErrorCode::BadRequest, msg.clone()),
             ),
+            // Both sides of the conflict are in the message, and both are
+            // the operator's: nothing to redact.
+            Self::WindowPolicy(e) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::BadRequest, e.to_string()),
+            ),
+            // Planning and materialization read stored state, so a failure
+            // here is the server's to fix. The detail goes to the log.
+            Self::WindowPlan(_) | Self::WindowMaterialize(_) => {
+                tracing::error!(event_type = "report_window_error", error = %self, "report window could not be resolved");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorEnvelope::simple(
+                        ErrorCode::InternalError,
+                        "report window could not be resolved",
+                    ),
+                )
+            }
             Self::Timeout => (
                 StatusCode::GATEWAY_TIMEOUT,
                 ErrorEnvelope::simple(ErrorCode::Timeout, "query timed out"),
@@ -529,5 +577,52 @@ mod tests {
     fn safe_message_redacts_store_backend_errors() {
         let err = ServerError::Store(StoreError::Unavailable(sqlx::Error::PoolTimedOut));
         assert_eq!(err.safe_message(), "app-state store unavailable");
+    }
+
+    /// ADR-0018 ruling 7: the conflict is the operator's to resolve, so
+    /// the refusal is a 400 that keeps both sides on the wire.
+    #[tokio::test]
+    async fn a_window_policy_refusal_is_a_400_naming_both_sides() {
+        let err = ServerError::from(WindowPolicyError::TimeClause {
+            window: crate::report_window::ScheduleWindow::SinceLast,
+            clause: trawl_core::ast::TimeClause::Last,
+        });
+        assert_eq!(err.error_class(), "window_policy");
+        let message = err.safe_message();
+        assert!(
+            message.contains("since_last") && message.contains("last="),
+            "got: {message}"
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(response).await;
+        assert!(body.contains("since_last"), "got: {body}");
+    }
+
+    /// Planning and materialization read a schedule row and the saved DSL,
+    /// never the request, so their failures are 500s and the DSL text they
+    /// can quote stays off the wire.
+    #[tokio::test]
+    async fn window_plan_and_materialize_failures_are_redacted_500s() {
+        let plan = ServerError::from(PlanError::Arithmetic);
+        assert_eq!(plan.error_class(), "window_plan");
+        assert_eq!(plan.safe_message(), "report window could not be resolved");
+        assert_eq!(
+            plan.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let materialize = ServerError::from(MaterializeError::SourceUnparseable {
+            message: "unexpected 'zz_secret_token'".to_owned(),
+        });
+        assert_eq!(materialize.error_class(), "window_materialize");
+        assert_eq!(
+            materialize.safe_message(),
+            "report window could not be resolved"
+        );
+        let response = materialize.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_string(response).await;
+        assert!(!body.contains("zz_secret_token"), "got: {body}");
     }
 }
