@@ -306,19 +306,29 @@ fn parse_port(text: &str) -> Result<u16, OriginParseError> {
 /// satisfy all of this already, which is why no IDNA step is needed to
 /// state an internationalized origin.
 ///
-/// The final rule is the interesting one: a last label that is entirely
-/// digits is refused. Such a name cannot be a hostname (RFC 1123 §2.1),
-/// and admitting it would let IP-shaped text that is not a valid IP
-/// address into the allowlist as a DNS name — `010.1.1.1`, which a browser
-/// reads as octal `8.1.1.1`, `127.1`, or the integer form `2130706433`.
-/// Each of those would be a name this parser never compares equal to the
-/// address it denotes, which is precisely the kind of two-readings-one-text
-/// gap a CSRF bypass is built from.
+/// The final rule is the interesting one, and it is WHATWG's rather than
+/// RFC 1123's: a host that *ends in a number* must be an IPv4 address or
+/// nothing. Per the spec's ends-in-a-number checker
+/// (<https://url.spec.whatwg.org/#ends-in-a-number-checker>) the last
+/// label is a number when it is all ASCII decimal digits, or when it
+/// matches `0[xX][0-9a-fA-F]*` — the empty hex part included, because
+/// `0x` parses as the number 0 there. Such a label reaches this function
+/// only after `Ipv4Addr::from_str` has already refused the whole host, so
+/// a number-final host arriving here is exactly a text this parser and a
+/// browser read differently, and that is the shape a bypass is built
+/// from. A browser reads `http://0x7f000001:8090` and
+/// `http://127.0.0.0x1:8090` as IPv4 and serializes both as
+/// `http://127.0.0.1:8090`; admitting either as a DNS name would give the
+/// operator an allowlist entry that boots fine and can never match, and
+/// would let one browser origin be spelled two ways in one list, where
+/// the derived equality this module rests on sees two values. The same
+/// rule keeps `010.1.1.1` (octal `8.1.1.1` to a browser), `127.1` and the
+/// integer form `2130706433` out.
 fn parse_dns_host(text: &str) -> Result<String, OriginParseError> {
     if text.len() > MAX_DNS_HOST_BYTES {
         return Err(OriginParseError::InvalidHost);
     }
-    let mut last_label_all_digits = false;
+    let mut last_label_is_number = false;
     for label in text.split('.') {
         if label.is_empty() || label.len() > MAX_DNS_LABEL_BYTES {
             return Err(OriginParseError::InvalidHost);
@@ -332,12 +342,35 @@ fn parse_dns_host(text: &str) -> Result<String, OriginParseError> {
         {
             return Err(OriginParseError::InvalidHost);
         }
-        last_label_all_digits = label.bytes().all(|b| b.is_ascii_digit());
+        last_label_is_number = label_is_number(label);
     }
-    if last_label_all_digits {
+    if last_label_is_number {
         return Err(OriginParseError::InvalidHost);
     }
     Ok(text.to_ascii_lowercase())
+}
+
+/// WHATWG's "is this label a number" test, the half of the ends-in-a-number
+/// checker that looks at one label
+/// (<https://url.spec.whatwg.org/#ends-in-a-number-checker>).
+///
+/// A label is a number when it is all ASCII decimal digits (which covers
+/// the spec's octal `0…` form), or when it opens `0x`/`0X` and the rest is
+/// hex digits or empty. The hex half is why this is a function and not an
+/// `is_ascii_digit` call: `0x7f000001` is alphanumeric, so every DNS label
+/// rule above accepts it, and only this test catches that a browser would
+/// have sent `127.0.0.1` instead.
+fn label_is_number(label: &str) -> bool {
+    if label.is_empty() {
+        return false;
+    }
+    if label.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    match label.as_bytes() {
+        [b'0', b'x' | b'X', hex @ ..] => hex.iter().all(u8::is_ascii_hexdigit),
+        _ => false,
+    }
 }
 
 impl FromStr for Origin {
@@ -800,7 +833,7 @@ mod tests {
         // Hyphen may not lead or trail a label.
         assert_eq!(error("https://-trawl.example.com"), InvalidHost);
         assert_eq!(error("https://trawl-.example.com"), InvalidHost);
-        // An all-numeric final label is either an IP literal or nothing:
+        // A host that ends in a number is an IPv4 address or nothing:
         // this is what keeps `010.1.1.1` (octal to a browser, a DNS name to
         // a naive parser) and `2130706433` out of the allowlist.
         assert_eq!(error("http://010.1.1.1"), InvalidHost);
@@ -808,6 +841,20 @@ mod tests {
         assert_eq!(error("http://2130706433"), InvalidHost);
         assert_eq!(error("http://0x7f.0.0.1"), InvalidHost);
         assert_eq!(error("http://1.2.3.4.5"), InvalidHost);
+        // The hexadecimal spellings a browser also reads as IPv4. Each of
+        // these serializes as `http://127.0.0.1:8090` on the wire, so
+        // admitting one as a DNS name would be an allowlist entry that can
+        // never match and a second spelling of an origin already in the
+        // list.
+        assert_eq!(error("http://0x7f000001:8090"), InvalidHost);
+        assert_eq!(error("http://127.0.0.0x1:8090"), InvalidHost);
+        assert_eq!(error("http://0X7F.0.0.1"), InvalidHost);
+        // `0x` with no hex digits is the number 0 to the spec's parser.
+        assert_eq!(error("http://0x:80"), InvalidHost);
+        // A label that merely opens with digit-ish text is not a number,
+        // so an ordinary name keeps working.
+        assert!(Origin::parse("http://x0a.example").is_ok());
+        assert!(Origin::parse("http://0x7f.example").is_ok());
         // Single-label names are fine — `localhost` is one.
         assert!(Origin::parse("http://localhost:8090").is_ok());
         assert!(Origin::parse("http://trawl-01:5514").is_ok());

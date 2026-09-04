@@ -118,6 +118,8 @@ const REFUSED: &[(&str, OriginParseError)] = &[
     ("http://::1", OriginParseError::InvalidHost),
     ("http://[fe80::1%eth0]", OriginParseError::InvalidHost),
     ("http://010.1.1.1", OriginParseError::InvalidHost),
+    ("http://0x7f000001:8090", OriginParseError::InvalidHost),
+    ("http://127.0.0.0x1:8090", OriginParseError::InvalidHost),
     ("https://trawl.example.com:0", OriginParseError::InvalidPort),
     (
         "https://trawl.example.com:65536",
