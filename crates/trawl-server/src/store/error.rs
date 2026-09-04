@@ -188,6 +188,9 @@ impl StoreError {
             Self::IntervalTooShort { .. } => "interval_too_short",
             Self::InvalidName { .. } => "invalid_name",
             Self::RepinAlreadyRunning => "repin_already_running",
+            Self::PurgeCommitUnknown => "purge_commit_unknown",
+            Self::PurgePrepareTimeout => "purge_prepare_timeout",
+            Self::RepinPinVanished { .. } => "repin_pin_vanished",
         }
     }
 }
