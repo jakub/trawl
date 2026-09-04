@@ -705,6 +705,7 @@ async fn scheduler_runs_after(
             report_max_rows: 1000,
             max_runs_per_schedule: 100,
             report_retention_days: 30,
+            max_catchup_intervals: 24,
         },
         10,
         shutdown_rx,

@@ -147,6 +147,7 @@ data:
     report_max_rows = {{ .Values.config.scheduler.reportMaxRows | int }}
     max_runs_per_schedule = {{ .Values.config.scheduler.maxRunsPerSchedule | int }}
     report_retention_days = {{ .Values.config.scheduler.reportRetentionDays | int }}
+    max_catchup_intervals = {{ .Values.config.scheduler.maxCatchupIntervals | int }}
     {{- if .Values.web.enabled }}
 
     [web]

@@ -715,6 +715,18 @@ pub struct SchedulerConfig {
     /// Delete report runs older than this many days.
     #[serde(default = "default_scheduler_report_retention_days")]
     pub report_retention_days: u64,
+
+    /// How many intervals of missed coverage a `since_last` report window
+    /// may swallow in one catch-up run (ADR-0018 ruling 9).
+    ///
+    /// Missed runs coalesce into one window rather than backfilling one run
+    /// each. A daemon down for a week would otherwise hand the next run a
+    /// week-wide window and one enormous query, so a gap beyond this many
+    /// intervals clamps the window forward and flags the run
+    /// (`window_truncated` plus `trawl_scheduler_window_truncated_total`).
+    /// It never wedges the schedule and never drops the gap silently.
+    #[serde(default = "default_scheduler_max_catchup_intervals")]
+    pub max_catchup_intervals: u32,
 }
 
 const DEFAULT_SCHEDULER_ENABLED: bool = true;
@@ -722,6 +734,8 @@ const DEFAULT_SCHEDULER_POLL_INTERVAL_SECS: u64 = 10;
 const DEFAULT_SCHEDULER_REPORT_MAX_ROWS: usize = 10_000;
 const DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE: u64 = 100;
 const DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS: u64 = 30;
+/// A day of missed coverage at the common hourly cadence.
+pub const DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS: u32 = 24;
 
 fn default_scheduler_enabled() -> bool {
     DEFAULT_SCHEDULER_ENABLED
@@ -738,6 +752,9 @@ fn default_scheduler_max_runs_per_schedule() -> u64 {
 fn default_scheduler_report_retention_days() -> u64 {
     DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS
 }
+fn default_scheduler_max_catchup_intervals() -> u32 {
+    DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -747,6 +764,7 @@ impl Default for SchedulerConfig {
             report_max_rows: DEFAULT_SCHEDULER_REPORT_MAX_ROWS,
             max_runs_per_schedule: DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE,
             report_retention_days: DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS,
+            max_catchup_intervals: DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS,
         }
     }
 }
@@ -1477,6 +1495,23 @@ fn validate_telemetry_buffer_max_bytes(bytes: usize) -> Result<(), ConfigError> 
     Ok(())
 }
 
+/// Validate the catch-up ceiling, the other budget whose zero is invalid.
+///
+/// A catch-up window is measured in whole schedule intervals, so a ceiling
+/// of zero would clamp every `since_last` window to nothing and produce
+/// empty reports forever. Unlike the caps that use zero as an off switch,
+/// "do not clamp" is spelled with a large number here, not with none.
+fn validate_max_catchup_intervals(intervals: u32) -> Result<(), ConfigError> {
+    if intervals == 0 {
+        return Err(ConfigError::Validation(
+            "scheduler.max_catchup_intervals must be >= 1 (it is a count of whole \
+             schedule intervals a since_last window may cover in one catch-up run)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Config {
     /// Parse configuration from a TOML string.
     ///
@@ -1627,6 +1662,7 @@ impl Config {
         }
 
         validate_telemetry_buffer_max_bytes(self.ingest.telemetry_buffer_max_bytes)?;
+        validate_max_catchup_intervals(self.scheduler.max_catchup_intervals)?;
 
         if self.server.tls_cert_path.is_some() != self.server.tls_key_path.is_some() {
             return Err(ConfigError::Validation(
@@ -2135,6 +2171,45 @@ telemetry_buffer_max_bytes = 0
             err.to_string(),
             "config validation error: ingest.telemetry_buffer_max_bytes must be a positive byte \
              count; set ingest.internal_telemetry = false to disable internal telemetry"
+        );
+    }
+
+    #[test]
+    fn scheduler_max_catchup_intervals_defaults_to_a_day_of_hourly_runs() {
+        let config = Config::from_toml(
+            r#"
+[server]
+[data]
+path = "/data"
+[auth]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.scheduler.max_catchup_intervals, 24);
+        assert_eq!(
+            SchedulerConfig::default().max_catchup_intervals,
+            DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS
+        );
+    }
+
+    #[test]
+    fn scheduler_max_catchup_intervals_zero_is_boot_fatal() {
+        let err = Config::from_toml(
+            r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[scheduler]
+max_catchup_intervals = 0
+"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "config validation error: scheduler.max_catchup_intervals must be >= 1 (it is a \
+             count of whole schedule intervals a since_last window may cover in one catch-up run)"
         );
     }
 
