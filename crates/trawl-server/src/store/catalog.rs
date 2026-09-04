@@ -243,6 +243,10 @@ pub struct GcPinRow {
     /// Pinned `DuckDB` type spelling, carried so the report and the audit
     /// event can say what was deleted without a second read.
     pub duckdb_type: String,
+    /// When the pin was taken. Read for the same reason as the type: the
+    /// catalog row is gone by the time the audit event is written, so the
+    /// record has to carry the pin's age itself.
+    pub pinned_at: DateTime<Utc>,
     /// The newest observation of the field across every service, `None`
     /// when it was never observed at all.
     pub last_seen: Option<DateTime<Utc>>,
@@ -1625,7 +1629,7 @@ impl CatalogStore {
     ) -> Result<Vec<GcPinRow>, StoreError> {
         let rows = sqlx::query(
             "WITH candidate AS MATERIALIZED (
-                 SELECT t.field, t.duckdb_type, n.last_seen
+                 SELECT t.field, t.duckdb_type, t.pinned_at, n.last_seen
                  FROM field_types t
                  LEFT JOIN LATERAL (
                      SELECT fs.last_seen
@@ -1636,7 +1640,7 @@ impl CatalogStore {
                  ) n ON TRUE
                  WHERE n.last_seen IS NULL OR n.last_seen < $1
              )
-             SELECT c.field, c.duckdb_type, c.last_seen,
+             SELECT c.field, c.duckdb_type, c.pinned_at, c.last_seen,
                     (SELECT count(*) FROM field_services fs
                      WHERE fs.field = c.field)::bigint AS services
              FROM candidate c
@@ -1651,6 +1655,7 @@ impl CatalogStore {
                 Ok(GcPinRow {
                     field: row.try_get("field")?,
                     duckdb_type: row.try_get("duckdb_type")?,
+                    pinned_at: row.try_get("pinned_at")?,
                     last_seen: row.try_get("last_seen")?,
                     services: row.try_get("services")?,
                 })

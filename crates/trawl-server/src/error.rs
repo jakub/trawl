@@ -40,6 +40,15 @@ pub enum ServerError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// The request cannot run against the state the server is in right
+    /// now, and would be fine once that changes (409). Pin gc raises it
+    /// when a repin owns the data root, when the corpus cannot be read
+    /// well enough to prove a pin dead, and when the purge's outcome is
+    /// unknown. The message is the operator's instruction, so unlike a
+    /// store error it reaches the wire intact.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// Query execution exceeded the configured timeout.
     #[error("query timed out")]
     Timeout,
@@ -111,6 +120,7 @@ impl ServerError {
             Self::Forbidden(_) => "forbidden",
             Self::BadRequest(_) => "bad_request",
             Self::NotFound(_) => "not_found",
+            Self::Conflict(_) => "conflict",
             Self::Timeout => "timeout",
             Self::Ingest(_) => "ingest",
             Self::RateLimited => "rate_limited",
@@ -280,6 +290,13 @@ impl IntoResponse for ServerError {
                 StatusCode::NOT_FOUND,
                 ErrorEnvelope::simple(ErrorCode::NotFound, msg.clone()),
             ),
+            // 409 with the domain message, the same rendering the store's
+            // own conflicts get: there is no ErrorCode::Conflict, and the
+            // status is what a client branches on.
+            Self::Conflict(msg) => (
+                StatusCode::CONFLICT,
+                ErrorEnvelope::simple(ErrorCode::BadRequest, msg.clone()),
+            ),
             Self::Timeout => (
                 StatusCode::GATEWAY_TIMEOUT,
                 ErrorEnvelope::simple(ErrorCode::Timeout, "query timed out"),
@@ -348,6 +365,11 @@ mod tests {
         assert!(!db.to_string().is_empty());
 
         assert_eq!(ServerError::Timeout.error_class(), "timeout");
+        // Pin gc's refusals carry an operator instruction and data-root
+        // paths; the class stays a literal either way.
+        let conflict = ServerError::Conflict("/var/lib/trawl/data/prod/x.parquet".into());
+        assert_eq!(conflict.error_class(), "conflict");
+        assert!(conflict.safe_message().contains("x.parquet"));
         assert_eq!(
             ServerError::Internal("dsn leaked".into()).error_class(),
             "internal"
@@ -377,6 +399,17 @@ mod tests {
     fn safe_message_redacts_internal_errors() {
         let err = ServerError::Internal("db connection string leaked".into());
         assert_eq!(err.safe_message(), "internal error");
+    }
+
+    /// A conflict is the state, not the request: 409 with the message
+    /// intact, because it tells the operator what to do about it.
+    #[tokio::test]
+    async fn conflict_maps_to_409_with_its_message() {
+        let err = ServerError::Conflict("a repin owns the data root".into());
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_string(response).await;
+        assert!(body.contains("a repin owns the data root"), "got: {body}");
     }
 
     #[test]
