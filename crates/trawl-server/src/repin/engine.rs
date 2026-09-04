@@ -38,7 +38,8 @@ use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
 use crate::repin::cancel::{
     CancelActor, CancelHandle, CancelRegistry, CancelVerdict, PassStop, STAGE_BUILD,
-    STAGE_FINAL_GATE, STAGE_SCAN, audit_cancel_refused, audit_cancel_requested, audit_cancelled,
+    STAGE_FINAL_GATE, STAGE_SCAN, Settlement, audit_cancel_refused, audit_cancel_requested,
+    audit_cancelled,
 };
 use crate::repin::cutover::{
     finish_post_swap_staging, prepare_shadow_root, swap_envs, sweep_pre_swap_staging,
@@ -310,6 +311,17 @@ impl RepinEngine {
         // which the one-running slot is held by a job nothing can cancel:
         // the request would answer "no job running" while the scan burns
         // through the corpus.
+        //
+        // The window is narrowed, not closed: the claim commits in
+        // postgres and the registry is armed in this process, two
+        // synchronisation domains that no lock spans. A status or cancel
+        // request landing between the claim's commit and this line sees a
+        // running row and an empty registry, and answers 404. We accept
+        // that. It is microseconds of straight-line code with no I/O, the
+        // 404 is recoverable by retrying (the next request finds the armed
+        // entry), and the alternative — reserving a registry slot for a job
+        // that has no id yet, then reconciling it against a claim that may
+        // fail — buys a correctness property nothing here needs.
         let cancel = self.cancel.arm(job_id);
 
         tracing::info!(
@@ -479,7 +491,7 @@ impl RepinEngine {
             // and no marker exists, so the whole unwind is the terminal
             // write.
             Err(PassStop::Cancelled { stage }) => {
-                let actor = self.observe_cancel(job_id, stage);
+                let actor = self.settle_cancel(job_id, stage);
                 self.finish_cancelled(job_id, stage, actor).await;
                 return self.cancelled_outcome(job_id).await;
             }
@@ -785,7 +797,7 @@ impl RepinEngine {
         candidate: RepinJobStatus,
         error: Option<&str>,
     ) -> bool {
-        let Some(actor) = self.observe_cancel(job_id, stage) else {
+        let Some(actor) = self.settle_cancel(job_id, stage) else {
             self.finish(job_id, candidate, error).await;
             return false;
         };
@@ -793,13 +805,24 @@ impl RepinEngine {
         true
     }
 
-    /// The effect site's first act: read who asked and say so in the audit
-    /// trail, before any unwinding starts. `None` means no cancel is
-    /// pending for this job and the caller's own verdict stands.
-    fn observe_cancel(&self, job_id: i64, stage: &'static str) -> Option<CancelActor> {
-        let actor = self.cancel.pending(job_id)?;
-        audit_cancelled(job_id, &actor, stage);
-        Some(actor)
+    /// Latch this job's pre-cutover outcome and, when a cancel already
+    /// holds it, audit that before any unwinding starts. `None` means the
+    /// caller's own verdict stands and no later request can contradict it.
+    ///
+    /// The latch is the point. Reading the pending request and then acting
+    /// on the answer are two steps, and the unwind between them can take
+    /// minutes (a whole shadow generation to sweep); a cancel landing in
+    /// that gap used to be told 202 while the sampled verdict won the row.
+    /// [`CancelRegistry::settle`] makes the choice under the same lock the
+    /// request takes, so the two answers cannot disagree.
+    fn settle_cancel(&self, job_id: i64, stage: &'static str) -> Option<CancelActor> {
+        match self.cancel.settle(job_id) {
+            Settlement::Cancelled(actor) => {
+                audit_cancelled(job_id, &actor, stage);
+                Some(actor)
+            }
+            Settlement::Candidate => None,
+        }
     }
 
     /// The cancel effect site: record the request, then write the terminal
@@ -903,7 +926,8 @@ impl RepinEngine {
                 );
             }
             Err(JobAbort::Cancelled { stage }) => {
-                self.abandon_cancelled(job_id, stage).await;
+                let actor = self.settle_cancel(job_id, stage);
+                self.abandon_cancelled(job_id, stage, actor).await;
             }
             // The finished-shadow force gate keeps its verdict even against
             // a pending cancel (design decision 7): both leave the corpus
@@ -935,9 +959,15 @@ impl RepinEngine {
     /// Abandon the build, letting a pending cancel take the verdict over
     /// `candidate`. The unwind is identical either way; only the word the
     /// job row carries differs.
+    ///
+    /// The choice is settled under the registry lock before the sweep
+    /// starts, so the minutes the sweep spends deleting a shadow
+    /// generation are not a window in which a cancel is accepted and then
+    /// loses to the candidate that was already chosen.
     async fn abandon_arbitrated(&self, job_id: i64, candidate: RepinJobStatus, msg: &str) {
-        if self.cancel.pending(job_id).is_some() {
-            self.abandon_cancelled(job_id, STAGE_BUILD).await;
+        if let Some(actor) = self.settle_cancel(job_id, STAGE_BUILD) {
+            self.abandon_cancelled(job_id, STAGE_BUILD, Some(actor))
+                .await;
         } else {
             self.abandon_build(job_id, candidate, msg).await;
         }
@@ -947,12 +977,19 @@ impl RepinEngine {
     /// the marker, then terminalize through the persist-before-terminal
     /// path.
     ///
-    /// The audit comes first so the log reads request, effect, sweep. A
+    /// `actor` comes from [`Self::settle_cancel`], which audited it before
+    /// any unwinding started, so the log reads request, effect, sweep. A
     /// sweep of a whole shadow generation takes minutes on a real archive,
     /// and an operator watching the log should see their cancel land before
-    /// the cleanup it caused.
-    async fn abandon_cancelled(&self, job_id: i64, stage: &'static str) {
-        let actor = self.observe_cancel(job_id, stage);
+    /// the cleanup it caused. `None` means the registry stopped naming this
+    /// job between the boundary that observed the cancel and the
+    /// settlement, which [`Self::finish_cancelled`] records as `failed`.
+    async fn abandon_cancelled(
+        &self,
+        job_id: i64,
+        stage: &'static str,
+        actor: Option<CancelActor>,
+    ) {
         let msg = actor.as_ref().map_or_else(
             || format!("cancelled during {stage}"),
             |actor| cancelled_error(actor.name(), stage),

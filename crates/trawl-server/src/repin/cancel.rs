@@ -90,8 +90,29 @@ pub enum CancelVerdict {
     },
     /// The job latched its point of no return before this request arrived.
     PastPointOfNoReturn { job_id: i64 },
-    /// Nothing is running (or the running job's task has fully ended).
+    /// Nothing is running: no job is armed, the running job's task has
+    /// fully ended, or its outcome is already settled and there is no
+    /// cancellable work left to stop.
     NoJobRunning,
+}
+
+/// What [`CancelRegistry::settle`] decided for a job that is about to write
+/// a terminal status short of the point of no return.
+///
+/// The two arms are exclusive by construction, because the choice is made
+/// under the same lock a cancel request takes. That is the whole point:
+/// sampling "is a cancel pending?" and then writing a terminal row are two
+/// steps, and a request landing between them used to be answered 202 while
+/// the already-chosen verdict won the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Settlement {
+    /// No cancel held the job, so the caller's own verdict stands. The
+    /// registry is latched settled: every later request answers
+    /// [`CancelVerdict::NoJobRunning`].
+    Candidate,
+    /// A cancel was already pending. The caller must drop its candidate and
+    /// terminalize as cancelled, naming this actor.
+    Cancelled(CancelActor),
 }
 
 impl CancelVerdict {
@@ -178,6 +199,11 @@ struct Entry {
     /// Latched by [`CancelRegistry::commit`] immediately before the
     /// Cutover marker write. Past it every request is refused.
     committed: bool,
+    /// Latched by [`CancelRegistry::settle`] when a pre-cutover terminal
+    /// verdict is chosen. Past it there is no work left to cancel, so a
+    /// request answers `NoJobRunning` rather than accepting a stop that
+    /// nothing would ever act on.
+    settled: bool,
 }
 
 /// The armed job's cancel state: one slot, one mutex, one truth.
@@ -215,6 +241,7 @@ impl CancelRegistry {
             job_id,
             cancelled_by: None,
             committed: false,
+            settled: false,
         });
         CancelHandle {
             registry: Arc::clone(self),
@@ -228,10 +255,19 @@ impl CancelRegistry {
         let Some(entry) = slot.as_mut() else {
             return CancelVerdict::NoJobRunning;
         };
+        // The two latches are asked in this order because they mean
+        // different things to an operator. `committed` is "too late, the
+        // corpus is being swapped" and earns the 409 the docs describe.
+        // `settled` is "the job already has its answer", which reads the
+        // same as nothing running: there is no work left to stop, and a
+        // 409 would tell the operator the corpus is moving when it is not.
         if entry.committed {
             return CancelVerdict::PastPointOfNoReturn {
                 job_id: entry.job_id,
             };
+        }
+        if entry.settled {
+            return CancelVerdict::NoJobRunning;
         }
         let already_requested = entry.cancelled_by.is_some();
         if !already_requested {
@@ -259,6 +295,39 @@ impl CancelRegistry {
             }
             _ => false,
         }
+    }
+
+    /// Choose, under the one lock, between a pending cancel and the
+    /// terminal verdict a job short of the point of no return is about to
+    /// write.
+    ///
+    /// This is [`Self::commit`]'s pre-cutover twin, and it exists for the
+    /// same reason: reading the pending request and then acting on the
+    /// answer is two steps, and the request that lands between them is
+    /// exactly the one an operator is watching. Before this, a cancel
+    /// arriving after the sample was told 202 while the sampled verdict
+    /// (`failed`, `blocked`, or a dry run's `succeeded`) won the row, and
+    /// the operator was left with an accepted cancel that nothing acted on.
+    ///
+    /// A job that no longer owns the registry settles nothing and gets
+    /// [`Settlement::Candidate`]: its own verdict is all it can write, and
+    /// its successor's entry must not be touched.
+    pub fn settle(&self, job_id: i64) -> Settlement {
+        let mut slot = self.slot.lock();
+        let Some(entry) = slot.as_mut().filter(|entry| entry.job_id == job_id) else {
+            return Settlement::Candidate;
+        };
+        // A latched job is past the point of no return and is not settling
+        // a pre-cutover verdict; leave `committed` answering 409 rather
+        // than downgrading it to 404.
+        if entry.committed {
+            return Settlement::Candidate;
+        }
+        entry.settled = true;
+        entry
+            .cancelled_by
+            .clone()
+            .map_or(Settlement::Candidate, Settlement::Cancelled)
     }
 
     /// The pending request for `job_id`, if the job is still armed, has
@@ -481,6 +550,75 @@ mod tests {
             })
         ));
         assert_eq!(handle.cancelled_by(), Some(actor("alice")));
+    }
+
+    /// Settle first, then ask: the verdict is already written, so there is
+    /// no cancellable work and the answer is 404, not the 409 that means
+    /// "the corpus is being swapped".
+    #[test]
+    fn a_settled_job_has_nothing_left_to_cancel() {
+        let (registry, _handle) = armed(5);
+        assert_eq!(registry.settle(5), Settlement::Candidate);
+        for _ in 0..3 {
+            assert_eq!(
+                registry.request(&actor("operator")),
+                CancelVerdict::NoJobRunning
+            );
+        }
+        assert_eq!(
+            registry.settle(5),
+            Settlement::Candidate,
+            "settling twice is the same answer; a request cannot slip in \
+             between two terminal writes"
+        );
+    }
+
+    /// Ask first, then settle: the cancel wins, and the settlement hands
+    /// the caller the actor it must name so it aborts its own candidate
+    /// instead of writing it.
+    #[test]
+    fn a_pending_request_beats_a_terminal_candidate() {
+        let (registry, handle) = armed(5);
+        assert!(matches!(
+            registry.request(&actor("alice")),
+            CancelVerdict::Cancelling { .. }
+        ));
+        assert_eq!(registry.settle(5), Settlement::Cancelled(actor("alice")));
+        // The effect site still reads the actor it audits and records.
+        assert_eq!(handle.cancelled_by(), Some(actor("alice")));
+        // And the job is settled either way: a second asker is not told
+        // their cancel was accepted when the first one already took it.
+        assert_eq!(registry.request(&actor("bob")), CancelVerdict::NoJobRunning);
+    }
+
+    /// Settling is per job. A job whose task is ending must not latch the
+    /// entry its successor armed, or the successor would answer 404 while
+    /// it rewrites the corpus.
+    #[test]
+    fn a_stale_settle_does_not_latch_a_live_entry() {
+        let registry = Arc::new(CancelRegistry::default());
+        let _first = registry.arm(1);
+        let _second = registry.arm(2);
+        assert_eq!(registry.settle(1), Settlement::Candidate);
+        assert!(matches!(
+            registry.request(&actor("operator")),
+            CancelVerdict::Cancelling { job_id: 2, .. }
+        ));
+    }
+
+    /// A latched job keeps its 409. Settling one is not a thing the engine
+    /// does — past the point of no return the job completes — but the two
+    /// latches must stay distinct answers rather than one shadowing the
+    /// other.
+    #[test]
+    fn settling_never_downgrades_the_point_of_no_return() {
+        let (registry, _handle) = armed(9);
+        assert!(registry.commit(9));
+        assert_eq!(registry.settle(9), Settlement::Candidate);
+        assert_eq!(
+            registry.request(&actor("operator")),
+            CancelVerdict::PastPointOfNoReturn { job_id: 9 }
+        );
     }
 
     /// A second asker changes nothing but the audit trail. The row's actor

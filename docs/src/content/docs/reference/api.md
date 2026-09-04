@@ -314,7 +314,10 @@ words and the job row under `job` when there is one:
   request arrived. The corpus is being swapped and there is nothing left to
   unwind, so the request is refused rather than queued, and the job
   completes normally.
-- **404** `no_job_running`: no repin job is running on this node.
+- **404** `no_job_running`: no repin job is running on this node, or the one
+  that was running has already chosen its outcome and there is nothing left
+  to stop. The two read the same to a caller: nothing was cancelled, and the
+  status route says how the job actually ended.
 
 The latency contract is a boundary, not an instant. The scan and build
 loops check before and after each file, but the whole-corpus snapshot walk
