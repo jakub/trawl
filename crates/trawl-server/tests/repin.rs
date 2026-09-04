@@ -465,19 +465,33 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     assert_eq!(done.rows_nulled, 1);
     assert_eq!(h.pinned_type("dur").await, "BIGINT");
 
-    let conflicts = h
-        .query
-        .catalog_conflicts(Some("dur"), None, None, None)
-        .await
-        .expect("conflicts");
-    assert!(
-        conflicts
+    // The evidence lands AFTER the flip: the job row reads `succeeded` the
+    // moment the pin flip commits, and `record_outcome` writes the conflict
+    // rows once the cutover's guards are released. So poll for it rather
+    // than read once — on a loaded machine the single read raced the write
+    // and reported an empty list.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let conflicts = loop {
+        let conflicts = h
+            .query
+            .catalog_conflicts(Some("dur"), None, None, None)
+            .await
+            .expect("conflicts");
+        if conflicts
             .conflicts
             .iter()
-            .any(|c| c.expected_type == "BIGINT" && c.rows_nulled == 1),
-        "a forced lossy repin records its losses: {:?}",
-        conflicts.conflicts
-    );
+            .any(|c| c.expected_type == "BIGINT" && c.rows_nulled == 1)
+        {
+            break conflicts;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a forced lossy repin records its losses: {:?}",
+            conflicts.conflicts
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(conflicts.conflicts.len(), 1, "{:?}", conflicts.conflicts);
 
     // The numeric survivor still answers.
     assert_eq!(
