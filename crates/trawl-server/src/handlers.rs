@@ -1906,6 +1906,50 @@ pub async fn schema_repin_status(
     }))
 }
 
+/// `POST /api/v1/schema/gc-pins` reclaims pin slots held by fields
+/// nothing writes any more (#110). `SchemaWrite`-gated, like the repin
+/// trigger: both mutate the catalog, and neither is a read.
+///
+/// Dry and real runs both answer 200 with the same report; `dry_run` and
+/// `deleted` tell them apart. A refusal is a 409 through the ordinary
+/// error envelope: a repin owns the data root, or the corpus could not be
+/// read well enough to prove any pin dead. A query-only node answers 503,
+/// because proving a pin dead means reading parquet footers and it owns
+/// none.
+///
+/// The engine's `run` spawns its own task internally (a disconnect must
+/// not split the postgres commit from the cache eviction), so this handler
+/// awaits it directly rather than spawning a second time.
+pub async fn schema_gc_pins(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+    Json(req): Json<trawl_api::GcPinsRequest>,
+) -> Result<Json<trawl_api::GcPinsResponse>, ServerError> {
+    if !verified.has_permission(Permission::SchemaWrite) {
+        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+    }
+    let Some(engine) = state.gc.as_ref() else {
+        return Err(ServerError::ServiceUnavailable(
+            "pin gc requires an ingest-enabled node (this node does not own \
+             the data root)"
+                .into(),
+        ));
+    };
+
+    let actor = crate::catalog::gc::GcActor {
+        name: Some(verified.name.clone()),
+        key_prefix: Some(verified.prefix.clone()),
+    };
+    let report = engine
+        .run(
+            req.older_than_secs.map(std::time::Duration::from_secs),
+            req.dry_run,
+            actor,
+        )
+        .await?;
+    Ok(Json(report))
+}
+
 // -- schedule handlers -------------------------------------------------------
 
 /// Remove parquet files for deleted report runs (best-effort, logs warnings on failure).

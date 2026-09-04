@@ -2160,6 +2160,53 @@ async fn repin_validation_refusals_are_side_effect_free() {
     assert!(status.job.is_none(), "validation refusals claim no job");
 }
 
+// ---------------------------------------------------------------------------
+// pin gc surface
+// ---------------------------------------------------------------------------
+
+/// `SchemaWrite` gates pin gc exactly as it gates the repin trigger: it
+/// deletes catalog rows, so a reader may not reach it and neither may the
+/// admin role, which never gained the permission. The schema-admin key
+/// runs it and gets a report.
+#[tokio::test(flavor = "multi_thread")]
+async fn gc_pins_permission_matrix() {
+    let server = setup().await;
+
+    for (who, token) in [
+        ("admin", &server.admin_token),
+        ("reader", &server.reader_token),
+        ("analyst", &server.analyst_token),
+        ("ingest", &server.ingest_token),
+    ] {
+        let client = HttpClient::new_insecure(&server.url, token).unwrap();
+        let err = client
+            .schema_gc_pins(true, Some(0))
+            .await
+            .expect_err("only schema_write may reclaim pins");
+        match err {
+            trawl_client::ClientError::Server { status, .. } => {
+                assert_eq!(status, 401, "{who} must be refused");
+            }
+            other => panic!("expected an auth refusal for {who}, got {other:?}"),
+        }
+    }
+
+    let ops = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
+    let report = ops
+        .schema_gc_pins(true, Some(0))
+        .await
+        .expect("schema_write runs a dry gc");
+    assert!(report.dry_run);
+    assert_eq!(report.deleted, 0, "a dry run deletes nothing: {report:?}");
+    // The window numbers are the server's own: a zero request is accepted
+    // literally and then floored at the packaged retention window.
+    assert_eq!(report.requested_older_than_secs, 0);
+    assert_eq!(
+        report.effective_older_than_secs,
+        report.retention_floor_secs.unwrap_or(0)
+    );
+}
+
 /// Read from an open SSE response until `needle` shows up, or fail loud.
 async fn read_sse_until(resp: &mut reqwest::Response, needle: &str) -> String {
     let mut bytes: Vec<u8> = Vec::new();

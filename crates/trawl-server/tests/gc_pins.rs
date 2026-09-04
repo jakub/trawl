@@ -4,13 +4,14 @@
 
 //! End-to-end pin garbage collection (#110): a real TLS server over a
 //! per-test data root, pins taken by real ingest and compaction, and the
-//! engine run directly (the route lands in M4).
+//! engine run both directly and over the route.
 //!
-//! Every test builds its own [`PinGc`] rather than reaching for
+//! Most tests build their own [`PinGc`] rather than reaching for
 //! `state.gc`, because the retention floor is the one input the harness
 //! cannot vary: the packaged default is 90 days, which floors every window
-//! a test would otherwise ask for. One test does use the wired engine, to
-//! prove the wiring and the floor at once.
+//! a test would otherwise ask for. The tests that go through the route (or
+//! through the wired engine) therefore assert the floor and the report
+//! rather than a deletion.
 
 mod common;
 
@@ -527,17 +528,19 @@ async fn a_repin_in_flight_refuses_gc_four_ways() {
     assert!(h.pinned("dead"));
 
     // With the job finished, the same request goes through.
-    h.server
+    let finished = h
+        .server
         .state
         .storage
         .repin
-        .finish(
+        .finish_if_running(
             job,
             trawl_server::store::RepinJobStatus::Failed,
             Some("test"),
         )
         .await
         .expect("finish the job");
+    assert!(finished, "the claimed job was still running");
     let report = gc
         .run(Some(Duration::ZERO), false, GcActor::default())
         .await
@@ -790,4 +793,74 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
         3,
         "but still says what it did"
     );
+}
+
+/// The route reports the server's own three window numbers, and a
+/// `schema_write` key is what reaches it. This one goes through the real
+/// wired engine, so the packaged 90-day retention floor applies: nothing
+/// in a freshly started test is 90 days unobserved, and the honest answer
+/// is a report with no candidates.
+#[tokio::test(flavor = "multi_thread")]
+async fn gc_pins_route_reports_the_window_the_server_decided() {
+    let h = harness().await;
+    h.pin_without_carrier("gone", "dead").await;
+    let ops = HttpClient::new_insecure(&h.server.url, &h.server.schema_admin_token).unwrap();
+
+    let dry = ops
+        .schema_gc_pins(true, Some(7 * DAY))
+        .await
+        .expect("dry run over the route");
+    assert!(dry.dry_run);
+    assert_eq!(dry.requested_older_than_secs, 7 * DAY);
+    assert_eq!(dry.retention_floor_secs, Some(90 * DAY));
+    assert_eq!(dry.effective_older_than_secs, 90 * DAY);
+    assert_eq!(dry.deleted, 0);
+    assert!(dry.candidates.is_empty(), "report: {dry:?}");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&dry.decided_at).is_ok(),
+        "decided_at must be RFC 3339: {}",
+        dry.decided_at
+    );
+
+    // The default window is the server's, not the client's: an omitted
+    // `older_than_secs` still comes back floored and named.
+    let real = ops
+        .schema_gc_pins(false, None)
+        .await
+        .expect("execute over the route");
+    assert!(!real.dry_run);
+    assert_eq!(real.requested_older_than_secs, 30 * DAY);
+    assert_eq!(real.effective_older_than_secs, 90 * DAY);
+    assert_eq!(real.deleted, 0);
+    assert!(h.pinned("dead"), "nothing was 90 days unobserved");
+}
+
+/// The engine's refusals reach the wire as 409s carrying the server's own
+/// sentence, because that sentence is the operator's instruction.
+#[tokio::test(flavor = "multi_thread")]
+async fn gc_pins_route_surfaces_a_refusal_as_a_409() {
+    let h = harness().await;
+    h.pin_without_carrier("gone", "dead").await;
+    let ops = HttpClient::new_insecure(&h.server.url, &h.server.schema_admin_token).unwrap();
+
+    let marker = trawl_server::repin::marker_path(&h.data_dir);
+    std::fs::write(&marker, b"{}").unwrap();
+    let err = ops
+        .schema_gc_pins(true, Some(0))
+        .await
+        .expect_err("a repin owning the data root refuses gc");
+    match err {
+        trawl_client::ClientError::Server { status, error } => {
+            assert_eq!(status, 409);
+            assert!(error.message.contains("repin"), "{error:?}");
+        }
+        other => panic!("expected a 409, got {other:?}"),
+    }
+    assert!(h.pinned("dead"), "a refusal deletes nothing");
+
+    // Cleared, the same request is served again.
+    std::fs::remove_file(&marker).unwrap();
+    ops.schema_gc_pins(true, Some(0))
+        .await
+        .expect("the route works once nothing owns the corpus");
 }

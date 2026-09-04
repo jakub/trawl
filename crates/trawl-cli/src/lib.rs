@@ -225,6 +225,26 @@ enum SchemaSubcommand {
         #[arg(long, short, value_enum)]
         format: Option<cli::OutputFormat>,
     },
+
+    /// Reclaim pin slots held by fields nothing writes any more: no
+    /// observation inside the window and no standing parquet declares the
+    /// column.
+    #[command(name = "gc-pins")]
+    GcPins {
+        /// Scan and report only, no deletion.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// How long a field must have gone unobserved to count as dead
+        /// (e.g. "30d", "12w"). Defaults server-side to 30 days, and the
+        /// server raises it to the retention window when that is longer.
+        #[arg(long)]
+        older_than: Option<String>,
+
+        /// Output format (auto-detected if omitted).
+        #[arg(long, short, value_enum)]
+        format: Option<cli::OutputFormat>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -525,6 +545,20 @@ async fn run_schema(
         }
         SchemaSubcommand::RepinCancel { format } => {
             schema::run_repin_cancel(&mut out, conn(token)?, format).await
+        }
+        SchemaSubcommand::GcPins {
+            dry_run,
+            older_than,
+            format,
+        } => {
+            schema::run_gc_pins(
+                &mut out,
+                conn(token)?,
+                dry_run,
+                older_than.as_deref(),
+                format,
+            )
+            .await
         }
     }
 }

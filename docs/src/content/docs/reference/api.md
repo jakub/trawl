@@ -337,6 +337,56 @@ stronger cancel: a killed job leaves the live corpus untouched and boot
 recovery sweeps its staging. Read the outcome from the status route.
 
 ```
+POST /api/v1/schema/gc-pins
+```
+
+Reclaim pin slots held by fields nothing writes any more.
+`schema_write`-gated, like the repin trigger; a query-only node answers
+503, because proving a pin dead means reading parquet footers and it owns
+none of them.
+
+```json
+{ "dry_run": true, "older_than_secs": 2592000 }
+```
+
+A pin is reclaimed only when **both** axes agree it is dead: no
+`field_services` observation at or after the cutoff, **and** no standing
+parquet under any live env directory declares the column. One axis alone
+is not enough. Observations can lapse while a file still carries the
+column, and a file can carry a column no live sender writes. The footer
+scan runs under the compaction corpus gate, so nothing publishes between
+the proof and the deletion.
+
+`older_than_secs` defaults to 30 days and is accepted literally, `0`
+included. The server then raises it to the retention window when that is
+longer: a pin cannot be called dead over a span shorter than the corpus
+trawl still keeps. The report names all three numbers
+(`requested_older_than_secs`, `retention_floor_secs`,
+`effective_older_than_secs`), and no client recomputes the window.
+
+Three outcomes:
+
+- **200**: the report, identical in shape for a dry run and a real one.
+  `dry_run` and `deleted` are what tell them apart: a dry run mutates
+  nothing at all (no delete, no cache eviction, no metric) and returns the
+  candidates it would have reclaimed.
+- **409**: refused, nothing mutated. Either a repin owns the data root (a
+  `data/REPIN` marker, a staging or aside root, or a running job row: every
+  footer under a corpus mid-rearrangement is provisional), or the corpus
+  could not be read well enough to prove anything dead. A file that will
+  not open, an unparseable footer, a symlink under an env directory or a
+  file that vanished mid-scan each means one file whose columns are
+  unknown, and the whole run fails closed rather than deleting on partial
+  evidence. The message names the count and up to three paths.
+- **503**: a query-only node, or the store is down.
+
+The deletion is metadata only: catalog rows and the in-process pin cache,
+in one transaction, `repin_jobs` history untouched. Being wrong is cheap.
+A reclaimed field that a sender writes again simply pins again from
+scratch. Envelope and sender-asserted contract fields (`_time`, `service`
+and the rest) are never candidates.
+
+```
 GET /api/v1/schema/services
 ```
 
