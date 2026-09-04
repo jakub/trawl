@@ -189,7 +189,7 @@ Once per day, hourly parquets are merged into a single daily parquet per service
 
 ### Retention
 
-Age-based (default 90 days) + disk pressure (minimum 1 GiB free). The unit of deletion is a full date directory inside one env (`data/{env}/{date}/`) — per-env deletion is O(1) and never touches sibling envs. Disk-pressure candidates are merged oldest-first across envs.
+Age-based (default 90 days) + disk pressure (minimum 1 GiB free). The unit of deletion is a full date directory inside one env (`data/{env}/{date}/`) — per-env deletion is O(1) and never touches sibling envs. Disk-pressure candidates are ranked across envs by expiry ratio: the directory that has used up the largest fraction of its env's age limit is deleted first.
 
 ## Storage layout
 

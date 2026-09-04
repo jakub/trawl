@@ -236,7 +236,7 @@ Changing either list is **forward-only**. There is no policy history and nothing
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_age_days` | integer | `90` | Delete data older than N days in every env without an override; `0` disables |
-| `min_free_disk_bytes` | byte size | `"1G"` | Delete oldest data when free disk drops below; `0` disables |
+| `min_free_disk_bytes` | byte size | `"1G"` | When free disk drops below, delete date directories highest expiry ratio first (age over that env's limit); `0` disables |
 | `retention_interval_secs` | integer | `3600` | Retention check frequency (default: 1 hour) |
 
 Both sweeps stand down while a repin job's marker or staging roots exist
@@ -311,8 +311,8 @@ global scalars first, the per-env tables after them.
 ##### How disk pressure ranks envs
 
 Under pressure trawl deletes by expiry ratio, not by date. A date directory's
-ratio is its age divided by its env's effective `max_age_days`, and the highest
-ratio goes first, and equal ratios break on the older date, then on the path.
+ratio is its age divided by its env's effective `max_age_days`. The highest
+ratio goes first; equal ratios break on the older date, then on the path.
 With `prod` at 365 days and `lab` at 7, a 300-day prod directory sits at 0.82
 and a 6-day lab directory at 0.86, so the sweep takes the lab directory and the
 prod evidence survives. Plain oldest-first would have done the opposite and

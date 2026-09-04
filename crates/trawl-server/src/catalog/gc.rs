@@ -78,7 +78,10 @@ pub const DEFAULT_DEAD_WINDOW: Duration = Duration::from_hours(24 * 30);
 pub struct DeadWindow {
     /// The requested window in seconds, after the server default applied.
     pub requested_secs: u64,
-    /// The retention floor in seconds, when age retention is enabled.
+    /// The retention floor in seconds, when a finite retention horizon
+    /// exists. `None` when no env ages out at all, or when one of them
+    /// keeps its data forever: either way no span is long enough to be
+    /// sure the corpus has moved past a pin.
     /// Reported whenever it exists, whether or not it bound the answer.
     pub floor_secs: Option<u64>,
     /// The window applied: the larger of the request and the floor.

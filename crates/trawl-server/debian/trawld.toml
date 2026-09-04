@@ -138,7 +138,9 @@ database_url = "postgres://trawl:CHANGE_ME@db.example.internal:5432/trawl"
 # Delete date directories older than this many days. 0 = disabled.
 # max_age_days = 90
 
-# Delete oldest data if free disk space drops below this threshold. 0 = disabled.
+# If free disk space drops below this threshold, delete date directories
+# regardless of age, highest expiry ratio first (age over that env's
+# max_age_days). 0 = disabled.
 # min_free_disk_bytes = "1G"
 
 # How often the retention task runs (seconds).

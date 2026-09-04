@@ -177,8 +177,9 @@ config:
     retentionIntervalSecs: 3600
     # Per-env age overrides: env name -> max_age_days. An env with no
     # entry keeps maxAgeDays above; 0 keeps that env's data forever.
-    # Disk pressure stays install-wide and deletes by expiry ratio, so a
-    # short-lived env is reclaimed before a long-lived one.
+    # Disk pressure stays install-wide and deletes by expiry ratio: the
+    # date directory that has used up the largest fraction of its env's
+    # age limit goes first.
     #   envs:
     #     prod: 365
     #     lab: 7

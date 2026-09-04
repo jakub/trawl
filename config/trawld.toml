@@ -220,9 +220,10 @@ database_url = "postgres://fleet:fleet@localhost:5433/trawl"
 # Adjust based on your storage capacity and compliance requirements.
 # max_age_days = 90
 
-# If free disk space drops below this threshold, delete oldest data
-# regardless of age. 0 = disabled. Acts as a safety net independent
-# of max_age_days.
+# If free disk space drops below this threshold, delete date
+# directories regardless of age, taking the one that has used up the
+# largest fraction of its env's age limit first. 0 = disabled. Acts as
+# a safety net independent of max_age_days.
 # min_free_disk_bytes = "1G"
 
 # How often the retention task runs (seconds). More frequent checks
