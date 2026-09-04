@@ -391,6 +391,12 @@ Three outcomes:
   walking away from a commit. The outcome is UNKNOWN either way, so gc
   re-reads the catalog for its candidates and drops from the pin cache
   every one postgres no longer holds, before it releases the corpus gate.
+  One 503 says more: a commit that has not confirmed within thirty
+  seconds. Postgres stops honouring cancellation once a commit is durable,
+  so trawl detaches that commit rather than abandoning it, stops waiting,
+  and drops every candidate from the pin cache without re-reading (a read
+  would race the commit still in flight). Re-run with `dry_run` to see
+  which way it went.
 
 The deletion is metadata only: catalog rows and the in-process pin cache,
 in one transaction, `repin_jobs` history untouched. Being wrong is cheap.

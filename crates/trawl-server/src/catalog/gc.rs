@@ -567,6 +567,25 @@ impl PinGc {
         // every reader's cache kept them.
         let purged = match self.store.delete_pins(&fields).await {
             Ok(purged) => purged,
+            // The commit outstayed its bound and is STILL RUNNING on a task
+            // of its own. This is the one error where the reconcile read is
+            // wrong: it would race the in-flight commit and could come back
+            // with either state, and a "still pinned" answer read a
+            // microsecond before the commit lands is a cache left holding
+            // pins postgres is about to delete. So skip the read entirely
+            // and over-evict every candidate.
+            Err(crate::store::StoreError::PurgeCommitUnknown) => {
+                self.cache.evict_many(fields.iter().map(String::as_str));
+                return Err(ServerError::ServiceUnavailable(format!(
+                    "pin gc's purge did not confirm its commit within {}s and is still \
+                     in flight, so whether {} pin(s) were reclaimed is unknown; every \
+                     candidate has been dropped from the pin cache, which is safe \
+                     either way. Run `trawl schema gc-pins --dry-run` to see what the \
+                     catalog actually holds before running it again.",
+                    crate::store::PURGE_COMMIT_BOUND.as_secs(),
+                    fields.len(),
+                )));
+            }
             Err(e) => {
                 // Any error at all, unclassified: by the time one is
                 // visible here the DELETE may or may not have been issued,
@@ -627,6 +646,15 @@ impl PinGc {
     /// The read is bounded by [`IN_GATE_TIMEOUT`] like the other gated
     /// reads: cancelling it is safe, and the timeout arm evicts everything
     /// anyway.
+    ///
+    /// One error never gets here at all.
+    /// [`crate::store::StoreError::PurgeCommitUnknown`] means the commit is
+    /// still in flight on a detached task, and a read racing it can answer
+    /// with the state on either side of it. Reading "still pinned" a
+    /// microsecond before the commit lands would leave the cache holding
+    /// pins postgres is deleting, which is the corruption this whole
+    /// asymmetry exists to prevent, so that arm skips the read and
+    /// over-evicts unconditionally.
     async fn reconcile_cache(&self, fields: &[String]) {
         match self
             .in_gate(
@@ -1202,11 +1230,7 @@ mod tests {
     /// batches under them.
     #[test]
     fn a_failed_purge_reconciles_the_cache_before_it_returns() {
-        let body = gated_section();
-        let arm = body
-            .split("match self.store.delete_pins(&fields).await")
-            .nth(1)
-            .expect("the purge is one match on delete_pins");
+        let arm = ordinary_failure_arm();
         let reconcile = arm
             .find("self.reconcile_cache(&fields).await;")
             .expect("the error arm reconciles the cache");
@@ -1215,6 +1239,59 @@ mod tests {
             reconcile < returns,
             "the reconcile must precede the refusal, so no error path leaves \
              the gate with the cache and the store disagreeing"
+        );
+    }
+
+    /// The purge's two failure arms, split off the one `match`.
+    ///
+    /// Returns (unknown-commit arm, every-other-error arm). The unknown arm
+    /// is written first in the source, so the ordinary one is what follows
+    /// `Err(e) => {`.
+    fn purge_failure_arms() -> (&'static str, &'static str) {
+        let body = gated_section();
+        let tail = body
+            .split("match self.store.delete_pins(&fields).await")
+            .nth(1)
+            .expect("the purge is one match on delete_pins");
+        let unknown = tail
+            .split("Err(crate::store::StoreError::PurgeCommitUnknown) => {")
+            .nth(1)
+            .expect("the purge matches the unknown-commit error by name");
+        let (unknown, ordinary) = unknown
+            .split_once("Err(e) => {")
+            .expect("every other error shares one arm");
+        (unknown, ordinary)
+    }
+
+    fn ordinary_failure_arm() -> &'static str {
+        purge_failure_arms().1
+    }
+
+    /// A purge whose commit is still in flight must NOT re-read postgres.
+    ///
+    /// The commit was detached, not cancelled, so a reconcile read races
+    /// it: "still pinned" answered a microsecond early would leave the
+    /// cache serving pins postgres goes on to delete. The safe move is the
+    /// over-evicting one, so this arm evicts every candidate and asks the
+    /// store nothing.
+    ///
+    /// Source-shape, like its sibling above: no fixture can stall a live
+    /// postgres commit past its bound, so what is guarded is that the arm
+    /// keeps its shape.
+    #[test]
+    fn an_unknown_commit_over_evicts_and_never_reads_the_store() {
+        let (unknown, _) = purge_failure_arms();
+        assert!(
+            unknown.contains("self.cache.evict_many(fields.iter().map(String::as_str));"),
+            "the unknown-commit arm evicts every candidate, not a filtered subset"
+        );
+        assert!(
+            !unknown.contains("reconcile_cache") && !unknown.contains("pins_present"),
+            "the unknown-commit arm must not read postgres; the commit is still in flight"
+        );
+        assert!(
+            unknown.contains("--dry-run"),
+            "the refusal tells the operator how to observe the real state"
         );
     }
 

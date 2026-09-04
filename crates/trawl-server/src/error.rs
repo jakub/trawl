@@ -242,6 +242,15 @@ impl IntoResponse for ServerError {
                         ),
                     )
                 }
+                // The purge is neither committed nor rolled back as far as
+                // this process knows, and 503 is the honest answer: the
+                // request did not complete, and retrying is safe only after
+                // the operator has looked. The message says so; it names no
+                // pg diagnostics.
+                StoreError::PurgeCommitUnknown => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, e.to_string()),
+                ),
                 StoreError::LockHeld => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorEnvelope::simple(
@@ -411,6 +420,21 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = body_string(response).await;
         assert!(body.contains("a repin owns the data root"), "got: {body}");
+    }
+
+    /// An unknown purge commit is a store error like any other as far as
+    /// telemetry is concerned (the class is content-free and stays
+    /// `store`), but on the wire it is a 503 that says what happened: the
+    /// operator has to go and look, and a redacted "store unavailable"
+    /// would not tell them to.
+    #[tokio::test]
+    async fn purge_commit_unknown_is_a_store_class_503_with_its_message() {
+        let err = ServerError::Store(StoreError::PurgeCommitUnknown);
+        assert_eq!(err.error_class(), "store");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_string(response).await;
+        assert!(body.contains("unknown"), "got: {body}");
     }
 
     #[test]

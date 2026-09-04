@@ -39,7 +39,7 @@ pub use catalog::{
     CatalogStore, ConflictListRow, ConflictServicePair, FieldConflict, FieldConflictRow,
     FieldListFilter, FieldPinRow, FieldServiceRow, FieldSummaryRow, GcPinRow,
     MAX_CONFLICT_SAMPLE_BYTES, MAX_CONFLICT_SAMPLES, MAX_CONFLICTS_PER_FIELD, MAX_PINNED_FIELDS,
-    PinProposal, PurgedPin, PurgedPins, ServiceCursor, ServiceObservation,
+    PURGE_COMMIT_BOUND, PinProposal, PurgedPin, PurgedPins, ServiceCursor, ServiceObservation,
 };
 pub use error::StoreError;
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};

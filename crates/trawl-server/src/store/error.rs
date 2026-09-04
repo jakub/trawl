@@ -83,6 +83,20 @@ pub enum StoreError {
     #[error("a repin job is already running (one at a time, install-wide)")]
     RepinAlreadyRunning,
 
+    /// The pin purge's commit outstayed its bound and was detached rather
+    /// than cancelled, so whether the rows are gone is unknown here.
+    ///
+    /// Distinct from [`Self::Unavailable`] because the caller must act
+    /// differently: an ordinary store error can be settled by re-reading
+    /// `field_types`, while this one cannot. The commit is still in flight
+    /// on its own task, so a read would race it and could answer with
+    /// either state. The pin cache is reconciled by over-eviction instead.
+    #[error(
+        "the field-catalog pin purge did not confirm its commit in time; it is still \
+         in flight, so whether the pins were reclaimed is unknown"
+    )]
+    PurgeCommitUnknown,
+
     /// The claim's `from` pin was not in `field_types` when the claim
     /// transaction looked, under the catalog lifecycle lock.
     ///

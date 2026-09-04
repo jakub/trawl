@@ -275,6 +275,73 @@ const PURGE_STATEMENT_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout = '5s'";
 /// [`PURGE_STATEMENT_TIMEOUT_SQL`].
 const PURGE_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '5s'";
 
+/// How long [`CatalogStore::delete_pins`] waits for its own commit before
+/// it stops waiting and reports the outcome as unknown.
+///
+/// The commit is the one step postgres does not bound: once durable commit
+/// processing has begun the backend stops honouring cancellation, so a
+/// commit stuck behind a stalled fsync can outlast every
+/// `statement_timeout` in the transaction. The corpus gate is held across
+/// it and every compaction batch queues behind that, which is why waiting
+/// forever is not an option.
+///
+/// Giving up here does NOT cancel the commit. The future is detached onto
+/// its own task and runs to completion, so postgres decides the outcome
+/// exactly once and the caller merely stops knowing what it was. Thirty
+/// seconds is six times the per-statement bound: long enough that an
+/// ordinary busy checkpoint never trips it, short enough that a wedged
+/// volume costs one gc run instead of an ingest outage.
+pub const PURGE_COMMIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Commit the pin purge, or stop waiting for it after
+/// [`PURGE_COMMIT_BOUND`] without cancelling it.
+///
+/// The distinction is the whole function. A [`tokio::time::timeout`] around
+/// the commit would DROP the future, and a dropped commit is one postgres
+/// may still perform: the caller would report "nothing happened" over a
+/// catalog that lost the rows, and every reader's pin cache would keep
+/// serving them. Here the future is boxed, so the elapsed arm can hand the
+/// same future to a task of its own instead. Postgres decides the outcome
+/// exactly once either way; only this caller stops watching.
+///
+/// `purged` is the candidate count, carried purely so the detached task's
+/// log line says how much is in doubt.
+async fn commit_or_detach(
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    purged: usize,
+) -> Result<(), StoreError> {
+    let mut commit = Box::pin(tx.commit());
+    tokio::select! {
+        // The commit is polled first on every wake, so one that lands in
+        // the same tick as the timer is a commit, not a timeout.
+        biased;
+        result = &mut commit => Ok(result?),
+        () = tokio::time::sleep(PURGE_COMMIT_BOUND) => {
+            tokio::spawn(async move {
+                match commit.await {
+                    Ok(()) => tracing::info!(
+                        event_type = "catalog_pin_purge_commit_late",
+                        fields = purged,
+                        after_secs = PURGE_COMMIT_BOUND.as_secs(),
+                        "a field-catalog pin purge committed after its caller stopped \
+                         waiting; those pins are gone"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "storage.backend",
+                        event_type = "catalog_pin_purge_commit_late_failed",
+                        fields = purged,
+                        after_secs = PURGE_COMMIT_BOUND.as_secs(),
+                        error = %e,
+                        "a field-catalog pin purge failed to commit after its caller \
+                         stopped waiting; those pins survive"
+                    ),
+                }
+            });
+            Err(StoreError::PurgeCommitUnknown)
+        }
+    }
+}
+
 /// One pin a [`CatalogStore::delete_pins`] transaction gave up, with the
 /// metadata that transaction saw.
 ///
@@ -1774,6 +1841,16 @@ impl CatalogStore {
     /// wait, which `lock_timeout` does not cover (it applies to heavyweight
     /// table and row locks, not to `pg_advisory_xact_lock`), so it is set
     /// first; `lock_timeout` then bounds the row locks the deletes take.
+    ///
+    /// The commit is bounded differently, because postgres cannot bound it:
+    /// once durable commit processing starts the backend ignores
+    /// cancellation, so a stalled fsync would hold the corpus gate for as
+    /// long as the volume takes. After [`PURGE_COMMIT_BOUND`] this method
+    /// stops waiting and returns [`StoreError::PurgeCommitUnknown`], having
+    /// first moved the commit future onto a task of its own. The commit is
+    /// never cancelled, only unobserved: postgres still decides it exactly
+    /// once, the detached task logs which way it went, and the caller must
+    /// treat both the catalog rows and its own cache as unknown.
     pub async fn delete_pins(&self, fields: &[String]) -> Result<PurgedPins, StoreError> {
         if fields.is_empty() {
             return Ok(PurgedPins::default());
@@ -1869,7 +1946,7 @@ impl CatalogStore {
         let pinned_now: i64 = sqlx::query_scalar("SELECT count(*) FROM field_types")
             .fetch_one(&mut *tx)
             .await?;
-        tx.commit().await?;
+        commit_or_detach(tx, fields.len()).await?;
 
         Ok(PurgedPins {
             deleted,
@@ -2024,6 +2101,65 @@ mod tests {
                 && PURGE_LOCK_TIMEOUT_SQL.starts_with("SET LOCAL lock_timeout"),
             "both bounds are transaction-local"
         );
+    }
+
+    /// The purge's commit is bounded by a `select!`, and the arm that fires
+    /// hands the future to `tokio::spawn` instead of dropping it.
+    ///
+    /// Source-shape, and it has to be: making a live postgres take longer
+    /// than [`PURGE_COMMIT_BOUND`] to commit means stalling its fsync, which
+    /// no fixture here can do. What the shape guards is the difference
+    /// between "stopped waiting" and "cancelled". A `tokio::time::timeout`
+    /// wrapped around the commit would look almost identical and would drop
+    /// the future, leaving postgres free to commit rows nobody was told
+    /// about. `biased` belongs to the same decision: a commit that lands in
+    /// the same wake as the timer is a commit, not a timeout.
+    #[test]
+    fn the_purge_detaches_its_commit_instead_of_cancelling_it() {
+        let src = include_str!("catalog.rs");
+        let start = src
+            .find("async fn commit_or_detach(")
+            .expect("the commit has one owner");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("the function closes");
+        let body = &body[..end];
+
+        assert!(
+            src.contains("commit_or_detach(tx, fields.len()).await?;"),
+            "delete_pins commits through that owner"
+        );
+        let select = body
+            .find("tokio::select! {")
+            .expect("the commit is raced against a timer, not wrapped in a timeout");
+        assert!(
+            !body.contains("tokio::time::timeout"),
+            "a timeout around the commit would CANCEL it; the commit must be detached"
+        );
+        let biased = body[select..]
+            .find("biased;")
+            .expect("the select polls the commit first");
+        let timer = body[select..]
+            .find("tokio::time::sleep(PURGE_COMMIT_BOUND)")
+            .expect("the other arm is the bound");
+        assert!(biased < timer, "`biased` must precede the arms it orders");
+
+        let elapsed = &body[select + timer..];
+        let spawn = elapsed
+            .find("tokio::spawn(")
+            .expect("the elapsed arm detaches the still-boxed commit future");
+        let returns = elapsed
+            .find("Err(StoreError::PurgeCommitUnknown)")
+            .expect("the elapsed arm reports an unknown outcome");
+        assert!(
+            spawn < returns,
+            "the commit must be detached before the method walks away from it"
+        );
+        for logged in ["tracing::info!", "tracing::warn!"] {
+            assert!(
+                elapsed[spawn..returns].contains(logged),
+                "the detached task logs both outcomes; missing {logged}"
+            );
+        }
     }
 
     /// A malformed cursor is a client error, never a silently dropped
