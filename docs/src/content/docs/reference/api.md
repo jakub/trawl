@@ -246,8 +246,11 @@ several episodes inside one clock tick, so an ack keyed on time would
 suppress evidence nobody had seen. The badge stays down while the field's
 episode count is at or below that high-water and comes back the moment the
 pin shelves another batch. Re-acknowledging advances the high-water and
-replaces the note and the actor. `acked_by` is the key's stable prefix,
-not its display name, because this row outlives renames and rotations.
+replaces the note and the actor, but only when the incoming high-water is
+at least the stored one: two operators acking a moment apart both get 200,
+and the row keeps the name, note and timestamp of the one who covered more
+evidence. `acked_by` is the key's stable prefix, not its display name,
+because this row outlives renames and rotations.
 
 A field whose evidence does not meet the degraded threshold answers **409**:
 there is no verdict to acknowledge, and writing a high-water there would
@@ -260,7 +263,11 @@ The field detail carries a standing ack as `ack`, beside `verdict` rather
 than instead of it: an acknowledgement overtaken by newer evidence appears
 next to a re-raised verdict, and that pair is the story. A successful repin
 of the field clears the ack outright, since the evidence it acknowledged no
-longer describes the pin.
+longer describes the pin. That clear commits with the pin flip and is
+logged as `field_degraded_ack_cleared` once per clear the server observes:
+a crash between the commit and the log line loses the line, and the deleted
+row leaves nothing to replay it from. The acknowledgement is gone either
+way; only the audit trail is a line short.
 
 ```
 POST /api/v1/schema/repin
@@ -327,9 +334,11 @@ case:
   ladder and syslog PRI read as different severities. The job is terminal
   `refused_needs_force`, the body is the plan the refusal is based on, and
   `requires_force_reason` names which of the two it was. Asserting
-  `dialect: "syslog"` answers the ambiguity; `force` accepts either. (A
-  second repin while one runs also 409s, with the ordinary error
-  envelope.)
+  `dialect: "syslog"` answers the ambiguity; `force` accepts either, up to
+  the ceilings it binds, and a forced job over one of those ceilings is
+  refused with the same status and a reason naming the accepted and the
+  actual count. (A second repin while one runs also 409s, with the ordinary
+  error envelope.)
 
 The request holds open for the whole scan, which is a full-corpus pass —
 minutes on a large archive, past most client and proxy timeouts. A
@@ -341,7 +350,9 @@ The same gate is asked again of the finished rewrite: ingest keeps running
 for the whole job, so a file written after the scan can carry values the
 new type cannot read. A job that started with 202 therefore still ends
 `refused_needs_force` — corpus untouched, `rows_nulled` carrying what the
-rewrite would have lost — when that happens without `force`.
+rewrite would have lost — when that happens without `force`, or with
+`force` when the finished rewrite came in over the ceilings that job
+accepted.
 
 A forced lossy repin records its losses as `field_conflicts` evidence and
 in `trawl_catalog_repin_rows_nulled_total`; the originals stay findable

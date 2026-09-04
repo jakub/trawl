@@ -1064,11 +1064,20 @@ fn render_repin_case_file<W: Write>(
     }
 
     match (job.requires_force, &job.requires_force_reason) {
+        // A job that already carried force was not refused for the want of
+        // it: it was refused by the ceilings it accepted, and the remedy is
+        // a higher number, not the flag it passed.
         (Some(true), Some(reason)) => label(
             out,
             human,
             &format!(
-                "\nrequires --force: {}",
+                "\n{}: {}",
+                if job.force {
+                    "over its accepted ceilings (raise --max-nulled-rows / \
+                     --max-ambiguous-rows to accept more)"
+                } else {
+                    "requires --force"
+                },
                 trawl_core::sanitize::sanitize_display_text(reason)
             ),
         )?,
@@ -1226,7 +1235,7 @@ pub async fn run_repin(
     let (verdict, job) = match outcome {
         trawl_client::RepinStart::Report(job) => ("dry run", job),
         trawl_client::RepinStart::Started(job) => ("started", job),
-        trawl_client::RepinStart::Refused(job) => ("refused: needs --force", job),
+        trawl_client::RepinStart::Refused(job) => (refusal_verdict(job.force), job),
     };
 
     let mut job = job;
@@ -1260,6 +1269,21 @@ pub async fn run_repin(
         )));
     }
     Ok(())
+}
+
+/// The one-line verdict above a refused job's row.
+///
+/// `refused_needs_force` is one status covering two different facts. An
+/// unforced job accepted no loss at all, so force is what it wants. A forced
+/// one accepted a number and the finished rewrite came in over it, and
+/// telling that operator they need force reads as though the flag they
+/// passed did nothing.
+fn refusal_verdict(forced: bool) -> &'static str {
+    if forced {
+        "refused: over its ceilings"
+    } else {
+        "refused: needs --force"
+    }
 }
 
 /// The sentence a refused repin ends on: what the server refused, and what
@@ -1809,9 +1833,6 @@ mod repin_tests {
         assert_eq!(accepted_ceilings(&sample_job()), None);
     }
 
-    /// The accepted ceilings are part of the case file and part of the
-    /// machine record: an operator reading a finished job sees the terms it
-    /// ran under without asking postgres.
     /// The remedy a refusal ends on depends on what the invocation already
     /// carried: force is the answer to a refusal that accepted no loss, and
     /// nonsense to one that was refused by a ceiling.
@@ -1845,6 +1866,46 @@ mod repin_tests {
         );
     }
 
+    /// Every place the CLI names a refusal branches on whether the job
+    /// carried force, so an operator who already passed it is never told to
+    /// pass it: the table verdict, and the case file's own line.
+    #[test]
+    fn a_forced_refusal_is_labelled_by_its_ceilings_not_by_the_flag() {
+        assert_eq!(refusal_verdict(false), "refused: needs --force");
+        assert_eq!(refusal_verdict(true), "refused: over its ceilings");
+
+        let mut job = sample_job();
+        job.status = "refused_needs_force".into();
+        job.requires_force = Some(true);
+        job.requires_force_reason = Some("12 nulled row(s) over an accepted 10".into());
+
+        let case_file = |job: &trawl_client::RepinJobResponse| {
+            let mut out = Vec::new();
+            render_repin_case_file(&mut out, true, job).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+
+        let unforced = case_file(&job);
+        assert!(unforced.contains("requires --force:"), "{unforced}");
+        assert!(!unforced.contains("--max-nulled-rows"), "{unforced}");
+
+        job.force = true;
+        let forced = case_file(&job);
+        assert!(forced.contains("over its accepted ceilings"), "{forced}");
+        assert!(forced.contains("--max-nulled-rows"), "{forced}");
+        assert!(
+            !forced.contains("requires --force"),
+            "the flag was already passed: {forced}"
+        );
+        assert!(
+            forced.contains("12 nulled row(s) over an accepted 10"),
+            "the server's own reason survives either label: {forced}"
+        );
+    }
+
+    /// The accepted ceilings are part of the case file and part of the
+    /// machine record: an operator reading a finished job sees the terms it
+    /// ran under without asking postgres.
     #[test]
     fn the_case_file_and_the_row_report_the_accepted_ceilings() {
         let mut job = sample_job();

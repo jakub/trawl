@@ -900,9 +900,20 @@ impl RepinEngine {
             });
         }
 
-        // The audit record of a forced cutover, emitted where the decision is
-        // final and nothing visible has moved yet: the gate has passed and
-        // the Cutover marker is the next write. It carries what force
+        // Point of no return.
+        let marker = RepinMarker {
+            phase: RepinPhase::Cutover,
+            ..marker
+        };
+        write_marker(&self.data_dir, &marker).map_err(JobAbort::Failed)?;
+
+        // The audit record of a forced cutover, emitted after the marker
+        // write returns and before the swap. The marker is the durable point
+        // where force licensed the mutation: past it the corpus becomes the
+        // new generation one way or another, by this process or by the boot
+        // replay. A marker write that fails takes the cutover with it, and
+        // announcing an acceptance that never licensed anything would leave
+        // a record of a mutation that did not happen. It carries what force
         // accepted beside what the rewrite actually did, so the pair an
         // operator agreed to is legible after the fact without reading a job
         // row that later columns overwrite. Counts only — no sample values,
@@ -925,13 +936,6 @@ impl RepinEngine {
                 "forced repin cutover within the ceilings it accepted"
             );
         }
-
-        // Point of no return.
-        let marker = RepinMarker {
-            phase: RepinPhase::Cutover,
-            ..marker
-        };
-        write_marker(&self.data_dir, &marker).map_err(JobAbort::Failed)?;
         if let Err(e) = swap_envs(&self.data_dir, &shadow, &aside_root(&self.data_dir)) {
             // Forward is the only direction past the marker: some envs may
             // already serve the new generation. A process that released
@@ -959,6 +963,16 @@ impl RepinEngine {
                     // `cleared_ack` is true only on the call that completed
                     // the job, so a boot replay of an already-finished
                     // cutover never re-announces a clear that happened once.
+                    //
+                    // One event per OBSERVED clear, which is not the same as
+                    // one per clear. The DELETE commits with the pin flip; a
+                    // crash between that commit and this line loses the
+                    // event, and the row is gone, so nothing is left to
+                    // replay it from. Closing that gap needs the durable
+                    // outbox ADR-0019 rejected as a receipts table, so the
+                    // residual is documented rather than mechanised: the ack
+                    // is gone either way, and the audit trail is one line
+                    // short.
                     if outcome.cleared_ack {
                         tracing::info!(
                             event_type = "field_degraded_ack_cleared",

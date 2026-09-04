@@ -206,7 +206,10 @@ carry; state neither and the server derives both from its own scan, ten
 percent headroom over a floor of ten rows. The headroom is there because
 ingest keeps writing for the whole build, so the finished shadow is never
 quite the corpus the plan photographed, and a cutover refuses only when the
-rewrite comes out worse than what force accepted.
+rewrite comes out worse than what force accepted. That refusal reads
+`refused: over its ceilings`, and the case file names the accepted and the
+actual count: the remedy is a higher `--max-nulled-rows` /
+`--max-ambiguous-rows`, never the `--force` the job already carried.
 
 `--yes --force` prints the ceilings it accepts, resolved from a preview
 scan, and binds them: without explicit flags the run takes a forced dry run
@@ -239,7 +242,8 @@ counts up 1-24, `syslog` counts down 0-7 and is inverted. The two ladders
 overlap over 1-7 with opposite meanings — `3` is `trace3` to OTel and `err`
 to syslog — and no value-shape rule can tell them apart, so trawl refuses
 rather than guesses: a corpus carrying those numerals needs either
-`--dialect syslog` or `--force`. The count of such rows is reported
+`--dialect syslog` or `--force`, and force accepts them only up to
+`--max-ambiguous-rows`. The count of such rows is reported
 whatever you assert (`ambiguous_numerals`); only the refusal depends on it.
 `--dialect` with any other target is an error, not an ignored flag.
 
