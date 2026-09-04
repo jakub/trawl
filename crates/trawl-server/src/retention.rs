@@ -453,6 +453,7 @@ mod tests {
             max_age_days,
             min_free_disk_bytes,
             retention_interval_secs: 3600,
+            env: std::collections::BTreeMap::new(),
         }
     }
 

@@ -2216,6 +2216,7 @@ impl Harness {
                 max_age_days: 90,
                 min_free_disk_bytes: 0,
                 retention_interval_secs: 1,
+                env: std::collections::BTreeMap::new(),
             },
             rx,
         );
