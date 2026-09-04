@@ -821,6 +821,143 @@ async fn claimed_run_round_trips_its_window(pool: PgPool) {
     );
 }
 
+/// The `since_last` watermark advances inside the success transaction, and
+/// only there (ADR-0018 ruling 9). A failed or timed-out run leaves the gap
+/// for the next success to cover, and a slow run finishing after a later one
+/// cannot rewind coverage.
+#[sqlx::test]
+async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "tiling").await;
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, Some(ScheduleWindow::SinceLast), 0, now)
+        .await
+        .unwrap();
+
+    let covered = async || {
+        store
+            .get_schedule_for_saved_query(sq_id, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .covered_through
+    };
+    let window = |from_hours: i64, to_hours: i64| ReportWindow {
+        start: now - chrono::Duration::hours(from_hours),
+        end: now - chrono::Duration::hours(to_hours),
+        truncated: false,
+    };
+    let run = async |w: &ReportWindow| match store
+        .claim_run(sched.id, sq_id, "q", None, Some(w))
+        .await
+        .unwrap()
+    {
+        RunClaim::Started(id) => id,
+        other => panic!("expected a started run, got {other:?}"),
+    };
+
+    // An error completion covers nothing.
+    let failed = run(&window(4, 3)).await;
+    store
+        .finish_run(failed, RunStatus::Error, 5, None, Some("boom"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(covered().await, None, "a failed run advances nothing");
+
+    // Nor does a timeout.
+    let timed_out = run(&window(4, 3)).await;
+    store
+        .finish_run(timed_out, RunStatus::Timeout, 5, None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(covered().await, None, "a timed-out run advances nothing");
+
+    // A success advances the watermark to exactly its window_end.
+    let ok = window(4, 3);
+    let ok_id = run(&ok).await;
+    store
+        .finish_run(ok_id, RunStatus::Success, 5, Some(3), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(covered().await, Some(ok.end));
+
+    // A later window moves it forward.
+    let later = window(3, 2);
+    let later_id = run(&later).await;
+    store
+        .finish_run(later_id, RunStatus::Success, 5, Some(1), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(covered().await, Some(later.end));
+
+    // An out-of-order success carrying an older window does not rewind it.
+    let stale = window(9, 8);
+    let stale_id = run(&stale).await;
+    store
+        .finish_run(stale_id, RunStatus::Success, 5, Some(1), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        covered().await,
+        Some(later.end),
+        "an older window must not rewind coverage"
+    );
+}
+
+/// A fixed trailing window is re-measured from every fire time, so it keeps
+/// no watermark: a success on one leaves `covered_through` untouched. Same
+/// for a legacy schedule, whose runs carry no window at all.
+#[sqlx::test]
+async fn fixed_and_legacy_schedules_keep_no_watermark(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+
+    for (name, window) in [
+        ("trailing", Some(ScheduleWindow::Fixed { secs: 3600 })),
+        ("legacy", None),
+    ] {
+        let sq_id = seed_saved(&pool, 1, name).await;
+        let sched = store
+            .create_schedule(sq_id, 1, 300, None, window, 0, now)
+            .await
+            .unwrap();
+        let covered = ReportWindow {
+            start: now - chrono::Duration::hours(1),
+            end: now,
+            truncated: false,
+        };
+        let rid = match store
+            .claim_run(sched.id, sq_id, "q", None, Some(&covered))
+            .await
+            .unwrap()
+        {
+            RunClaim::Started(id) => id,
+            other => panic!("expected a started run, got {other:?}"),
+        };
+        store
+            .finish_run(rid, RunStatus::Success, 5, Some(1), None, None, None)
+            .await
+            .unwrap();
+
+        let after = store
+            .get_schedule_for_saved_query(sq_id, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.covered_through, None,
+            "{name}: only a since_last schedule keeps a watermark"
+        );
+        let run = store.get_run(rid, 1).await.unwrap().unwrap();
+        assert_eq!(
+            run.window_end,
+            Some(covered.end),
+            "{name}: the run still records what it covered"
+        );
+    }
+}
+
 /// The named CHECKs are the backstop under the typed API: a partial run
 /// window and a `fixed` schedule with no span are both unwritable.
 #[sqlx::test]

@@ -17,7 +17,11 @@
 //!   concurrent `finish_run` either lands its path before the lock or blocks
 //!   until the cascade removes its row — never orphaning the file;
 //! - [`ScheduleStore::finish_run`] reports whether it updated a row so a run
-//!   cascade-deleted mid-flight can have its freshly-written file removed.
+//!   cascade-deleted mid-flight can have its freshly-written file removed. A
+//!   successful completion also advances the schedule's `since_last`
+//!   watermark in that same transaction, and takes the schedule lock FIRST
+//!   for it — same order as the claim and the delete, so the three can never
+//!   deadlock against each other.
 
 use std::collections::HashSet;
 
@@ -751,6 +755,19 @@ impl ScheduleStore {
     /// run was cascade-deleted mid-flight (its saved query or schedule is gone),
     /// and the caller must remove any result file it just wrote — otherwise
     /// [`FinishOutcome::Persisted`].
+    ///
+    /// A SUCCESS also advances the owning schedule's `since_last` watermark
+    /// to the window this run covered, in the same transaction as the row
+    /// update (ADR-0018 ruling 9). One transaction is the whole point: the
+    /// run's own record of what it covered and the schedule's record of what
+    /// is covered are one fact, and a crash between two statements would
+    /// either re-run a covered window or skip an uncovered one forever.
+    ///
+    /// Error and timeout completions update the run alone. That absence is
+    /// how "the watermark advances only on success" is enforced — a failed
+    /// run leaves the gap for the next successful one to cover — and it is
+    /// why [`Self::fail_run_if_running`] and [`Self::cleanup_stale_runs`]
+    /// carry no watermark statement either.
     #[allow(clippy::too_many_arguments)]
     pub async fn finish_run(
         &self,
@@ -762,6 +779,34 @@ impl ScheduleStore {
         result_data: Option<&[u8]>,
         result_path: Option<&str>,
     ) -> Result<FinishOutcome, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Schedule before run, the order every multi-row path here takes:
+        // `claim_run` and `delete_schedule` both lock the schedule first, so
+        // updating the run first and reaching for the schedule afterwards
+        // would let this transaction deadlock against either of them.
+        // `FOR UPDATE OF s` locks the schedule alone — the join reads the
+        // run without locking it, which is what keeps the order intact.
+        //
+        // The lock is taken only when there is an advance to make. A run
+        // that recorded no window cannot move any watermark, and its bounds
+        // are immutable after the claim, so that answer cannot change under
+        // us: a legacy finish keeps exactly the lock footprint it always
+        // had, and never queues behind a schedule someone else is holding.
+        // A cascade-deleted run matches nothing and skips the lock; the run
+        // UPDATE below then reports RunDeleted as it always has.
+        if status == RunStatus::Success {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT s.id FROM schedules s
+                 JOIN report_runs r ON r.schedule_id = s.id
+                 WHERE r.id = $1 AND r.window_end IS NOT NULL
+                 FOR UPDATE OF s",
+            )
+            .bind(run_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        }
+
         let updated = sqlx::query(
             "UPDATE report_runs
              SET status = $1, finished_at = now(), duration_ms = $2, row_count = $3,
@@ -775,7 +820,7 @@ impl ScheduleStore {
         .bind(result_data)
         .bind(result_path)
         .bind(run_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| match classify_violation(&e) {
             // Backstop: unreachable via the typed API, kept so a future raw
@@ -786,6 +831,27 @@ impl ScheduleStore {
             _ => StoreError::from(e),
         })?
         .rows_affected();
+
+        // The watermark advance, and nothing else: the WHERE clause is the
+        // whole policy. It fires only for a `since_last` schedule, only for
+        // a run that recorded a window, and only when that window ends after
+        // what is already covered — so an out-of-order finish (a slow run
+        // completing after a later one) cannot rewind coverage.
+        if status == RunStatus::Success {
+            sqlx::query(
+                "UPDATE schedules s SET covered_through = r.window_end
+                   FROM report_runs r
+                  WHERE r.id = $1 AND s.id = r.schedule_id
+                    AND s.window_kind = 'since_last'
+                    AND r.window_end IS NOT NULL
+                    AND (s.covered_through IS NULL OR r.window_end > s.covered_through)",
+            )
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
 
         tracing::info!(
             event_type = "report_run_finished",
@@ -806,9 +872,11 @@ impl ScheduleStore {
     /// Flip a run to `error`, but only while it is still `running`.
     ///
     /// This is the scheduler's ambiguous-commit recovery path: a prior
-    /// `finish_run("success", …)` returned `Err`, which for a single autocommit
-    /// UPDATE can mean the COMMIT landed server-side while the client's ack was
-    /// lost. An unconditional overwrite would destroy that committed success —
+    /// `finish_run("success", …)` returned `Err`, which can mean the COMMIT
+    /// landed server-side while the client's ack was lost. That is as true of
+    /// the finish transaction as it was of the autocommit UPDATE it replaced:
+    /// the ambiguity is in the lost ack, not in the statement count, and a
+    /// committed finish carries its watermark advance with it. An unconditional overwrite would destroy that committed success —
     /// clearing `row_count`/`result_data`/`result_path` and permanently
     /// orphaning the parquet file the row pointed at. Guarding on
     /// `status = 'running'` makes completion a state transition: the flip lands
