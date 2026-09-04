@@ -49,18 +49,28 @@ ALTER TABLE schedules
     ADD COLUMN covered_through TIMESTAMPTZ,
     ADD COLUMN next_fire_at    TIMESTAMPTZ;
 
--- Backfill the planned cursor so existing schedules keep their cadence
--- instead of all firing at once.
+-- Clamp legacy intervals into the domain the duration grammar now enforces.
 --
--- LEAST caps the multiplication at ten years, the same ceiling the duration
--- grammar now enforces on every new write. Before that cap existed nothing
--- bounded interval_secs above 60, and `interval * INTERVAL '1 second'`
--- overflows postgres' interval type well short of BIGINT: one absurd legacy
--- row would abort this whole migration and leave the daemon unable to boot.
--- A schedule with a nonsense interval gets a far-future cursor, which is
--- what its nonsense interval already meant.
+-- `parse_duration_secs` caps every duration at MAX_DURATION_SECS, 315360000
+-- seconds (ten years), because each one becomes date arithmetic somewhere.
+-- Nothing bounded interval_secs above 60 before that cap existed, and a row
+-- above it is not merely odd. `plan_due_run` cannot represent
+-- `next_fire_at + interval`, so it returns PlanError::Arithmetic: the
+-- schedule is due, nothing advances, and every poll spends a failed
+-- transaction on it forever. Clamping is the repair that leaves the
+-- schedule runnable, and a ten-year cadence is what a nonsense interval
+-- already meant. The backfill below also depends on it: `interval *
+-- INTERVAL '1 second'` overflows postgres' interval type well short of
+-- BIGINT, and one absurd row would abort the whole migration and leave the
+-- daemon unable to boot.
+UPDATE schedules SET interval_secs = 315360000 WHERE interval_secs > 315360000;
+
+-- Backfill the planned cursor so existing schedules keep their cadence
+-- instead of all firing at once. A schedule with no runs has nothing to
+-- extrapolate from and takes now(), which is when it would have become due
+-- anyway.
 UPDATE schedules s SET next_fire_at = COALESCE(
-    (SELECT r.started_at + LEAST(s.interval_secs, 315360000) * INTERVAL '1 second'
+    (SELECT r.started_at + s.interval_secs * INTERVAL '1 second'
        FROM report_runs r
       WHERE r.schedule_id = s.id ORDER BY r.started_at DESC, r.id DESC LIMIT 1),
     now());
@@ -83,7 +93,18 @@ ALTER TABLE schedules
                                                    AND window_secs >= 60
              ELSE FALSE
         END),
-    ADD CONSTRAINT schedules_lag_nonneg CHECK (lag_secs >= 0);
+    ADD CONSTRAINT schedules_lag_nonneg CHECK (lag_secs >= 0),
+    -- The database agrees with MAX_DURATION_SECS rather than trusting the
+    -- grammar to be the only writer. All three columns are seconds that
+    -- end up in date arithmetic — a fire cursor, a window bound, a lag
+    -- applied to both — and the planner has to be able to represent every
+    -- one of them. `migration_0017_spells_the_same_duration_cap` in
+    -- store/schedule.rs reads this file and fails if the literal drifts
+    -- from the constant.
+    ADD CONSTRAINT schedules_interval_within_cap CHECK (interval_secs <= 315360000),
+    ADD CONSTRAINT schedules_window_secs_within_cap CHECK (
+        window_secs IS NULL OR window_secs <= 315360000),
+    ADD CONSTRAINT schedules_lag_within_cap CHECK (lag_secs <= 315360000);
 
 ALTER TABLE report_runs
     ADD COLUMN window_start     TIMESTAMPTZ,

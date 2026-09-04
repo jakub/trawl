@@ -2274,6 +2274,44 @@ mod tests {
         ));
     }
 
+    /// The ten-year cap lives in two places that cannot see each other:
+    /// this constant, which the duration grammar enforces on every write,
+    /// and migration 0017's CHECK constraints, which enforce it in the
+    /// database. Drift either way is a store that accepts what the grammar
+    /// refuses or refuses what it accepts, and neither shows up until a
+    /// real row hits it, so the test reads the migration and compares the
+    /// literal.
+    #[test]
+    fn migration_0017_spells_the_same_duration_cap() {
+        let sql = std::fs::read_to_string("migrations/0017_report_windows.sql")
+            .expect("the crate's own migration file");
+
+        for name in [
+            "schedules_interval_within_cap",
+            "schedules_window_secs_within_cap",
+            "schedules_lag_within_cap",
+        ] {
+            assert!(sql.contains(name), "0017 no longer declares {name}");
+        }
+
+        // Every run of digits long enough to be a second count has to BE
+        // the cap. Matching on the number rather than on one spelling of
+        // the CHECK means a fourth constraint, or the clamp above them,
+        // cannot introduce a different literal unnoticed.
+        let cap = MAX_DURATION_SECS.to_string();
+        let literals: Vec<&str> = sql
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|run| run.len() >= 6)
+            .collect();
+        assert!(!literals.is_empty(), "0017 spells no duration cap at all");
+        for literal in literals {
+            assert_eq!(
+                literal, cap,
+                "0017 spells {literal}, MAX_DURATION_SECS is {cap}"
+            );
+        }
+    }
+
     #[test]
     fn parse_duration_secs_rejects_overflow() {
         // u64 seconds overflow rather than wrapping to a plausible span.

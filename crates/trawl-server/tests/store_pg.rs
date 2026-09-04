@@ -2662,8 +2662,16 @@ async fn boot(url: &str) -> Result<StorageState, StoreError> {
 /// overflows postgres' interval type far below BIGINT, so one absurd legacy
 /// row would abort the migration and wedge boot for everything behind it.
 ///
+/// Surviving the migration is only half of it. A row left above the cap
+/// boots fine and then wedges the SCHEDULER instead: `plan_due_run` cannot
+/// turn `i64::MAX` seconds into a span, so it answers
+/// `PlanError::Arithmetic` and the tick spends a failed transaction on that
+/// schedule every poll, forever, without ever moving its cursor. So the
+/// migration clamps the column, and this test checks the clamp by planning
+/// a run over it.
+///
 /// This drives the real thing: migrate to 0016, plant `i64::MAX`, then
-/// apply 0017 and read the cursor it wrote.
+/// apply 0017 and read back what it wrote.
 #[tokio::test]
 async fn migration_0017_survives_an_absurd_legacy_interval() {
     let url = common::create_app_database().await;
@@ -2700,6 +2708,26 @@ async fn migration_0017_survives_an_absurd_legacy_interval() {
     .await
     .unwrap();
 
+    // A second absurd row with NO runs. The backfill gives it now(), so it
+    // is due on the very first tick after upgrade, which is the shape that
+    // makes an unclamped interval a permanent error rather than a problem
+    // ten years out.
+    let due_saved_id: i64 = sqlx::query_scalar(
+        "INSERT INTO saved_queries (key_id, name, query, created_at, updated_at)
+         VALUES (1, 'legacy-due', 'q', now(), now()) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let due_schedule_id: i64 = sqlx::query_scalar(
+        "INSERT INTO schedules (saved_query_id, key_id, interval_secs, created_at, updated_at)
+         VALUES ($1, 1, 9223372036854775807, now(), now()) RETURNING id",
+    )
+    .bind(due_saved_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
     migrator.run(&pool).await.expect("0017 must not abort");
 
     let next: chrono::DateTime<chrono::Utc> =
@@ -2714,6 +2742,27 @@ async fn migration_0017_survives_an_absurd_legacy_interval() {
     assert!(
         next > now + ten_years - slack && next < now + ten_years + slack,
         "the cursor is the capped extrapolation, not an overflow: {next}"
+    );
+
+    let clamped: i64 = sqlx::query_scalar("SELECT interval_secs FROM schedules WHERE id = $1")
+        .bind(schedule_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        clamped, 315_360_000,
+        "the column itself is clamped, not just the arithmetic that read it"
+    );
+
+    // The whole point of the clamp: a due legacy schedule plans. Unclamped
+    // this is Err(Plan(Arithmetic)) on this poll and on every poll after it.
+    let claimed = ScheduleStore::new(pool.clone())
+        .claim_due_run(due_schedule_id, chrono::Utc::now(), 24)
+        .await
+        .expect("a clamped interval must be plannable");
+    assert!(
+        matches!(claimed, DueClaim::Started(_)),
+        "the backfilled cursor is now(), so the schedule is due: got {claimed:?}"
     );
 }
 
