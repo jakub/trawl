@@ -51,6 +51,12 @@ pub(crate) struct SetScheduleRequestRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_runs: Option<u64>,
     pub enabled: bool,
+    /// `"since_last"` or a duration; omitted for query mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<&'a str>,
+    /// Late-arrival allowance; only meaningful beside a window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lag: Option<&'a str>,
 }
 
 // -- streaming types ---------------------------------------------------------

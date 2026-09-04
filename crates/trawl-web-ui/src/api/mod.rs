@@ -453,6 +453,8 @@ pub async fn set_schedule(
         interval: interval.to_owned(),
         max_runs,
         enabled,
+        window: None,
+        lag: None,
     };
     let resp = Request::put(&format!("/api/v1/saved/{saved_id}/schedule"))
         .header("content-type", "application/json")

@@ -1297,6 +1297,29 @@ pub struct ScheduleResponse {
     pub last_run: Option<ReportRunSummary>,
     /// Total number of runs executed.
     pub total_runs: u64,
+    /// The report window this schedule covers, normalized: the literal
+    /// `"since_last"` or a duration such as `"2h"`. Absent means query
+    /// mode, where the saved DSL runs verbatim (ADR-0018 ruling 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// Late-arrival allowance as a duration string, present exactly when
+    /// `window` is. A windowed schedule with no lag reports `"0s"`, which
+    /// is the value in force, not an absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag: Option<String>,
+    /// The same allowance in seconds, for a client that does arithmetic on
+    /// it rather than printing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag_secs: Option<u64>,
+    /// The `since_last` watermark: the end of the newest window a
+    /// successful run covered (RFC 3339, UTC, microseconds). Absent for a
+    /// fixed window and for query mode, neither of which keeps one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_through: Option<String>,
+    /// The planned next fire instant (RFC 3339, UTC, microseconds). Always
+    /// present: every schedule has a fire cursor, windowed or not, and it
+    /// is what an operator watches when manual runs are refused.
+    pub next_fire_at: String,
 }
 
 /// Request body to create or update a schedule (`PUT /api/v1/saved/{id}/schedule`).
@@ -1310,6 +1333,29 @@ pub struct SetScheduleRequest {
     /// Whether the schedule is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// The report window this schedule should cover (ADR-0018 ruling 6).
+    ///
+    /// Two spellings. `"since_last"` tiles: each run covers
+    /// `[the previous run's window end, this fire - lag)`, so consecutive
+    /// runs cover consecutive intervals and a failed run's gap is healed by
+    /// the next success. A duration such as `"2h"` is a fixed trailing
+    /// span, re-measured from every fire and never healing anything.
+    ///
+    /// Absent is query mode: the saved DSL runs verbatim and the run row
+    /// records no bounds. A window against a saved query that carries its
+    /// own `last=`/`earliest=`/`latest=`, or reads `from saved`, is a 400
+    /// naming both sides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// Late-arrival allowance, a duration such as `"5m"` (default `"0s"`).
+    ///
+    /// It shifts BOTH window bounds back, so it delays coverage rather than
+    /// widening it: an event that landed after the boundary it belongs to
+    /// is still inside the window that covers it. Only meaningful with a
+    /// `window` — a lag without one is a 400, since query mode has no
+    /// bounds to shift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -1342,6 +1388,24 @@ pub struct ReportRunSummary {
     /// Filesystem path to the parquet result file (relative to data dir).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_path: Option<String>,
+    /// Inclusive lower bound of the window this run covered (RFC 3339, UTC,
+    /// microseconds). All four `window_*` fields are absent together for a
+    /// run that had no window: a query-mode run, or one from before the
+    /// schedule grew one. They are never backfilled (ADR-0018 ruling 11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_start: Option<String>,
+    /// Exclusive upper bound of the covered window. Windows are half-open
+    /// `[start, end)`, so tiled runs cannot double-count a boundary event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_end: Option<String>,
+    /// Whether the window was clamped forward past an uncovered catch-up
+    /// gap. `Some(false)` is the positive claim that the run covers
+    /// everything it owed; absent means there was no window to owe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_truncated: Option<bool>,
+    /// The mode the run was claimed under: `"since_last"` or `"fixed"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_kind: Option<String>,
 }
 
 /// Paginated list of report runs.

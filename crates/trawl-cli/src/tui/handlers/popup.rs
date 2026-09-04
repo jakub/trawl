@@ -266,7 +266,7 @@ impl App {
                         let mutation_tx = self.mutation_tx.clone();
                         tokio::spawn(async move {
                             let result = match client
-                                .set_schedule(saved_id_copy, &interval, None, true)
+                                .set_schedule(saved_id_copy, &interval, None, true, None, None)
                                 .await
                             {
                                 Ok(_) => MutationResult::ScheduleSet {

@@ -1833,7 +1833,7 @@ async fn trigger_run_starts_execution() {
         .await
         .unwrap();
     client
-        .set_schedule(saved.id, "1h", None, true)
+        .set_schedule(saved.id, "1h", None, true, None, None)
         .await
         .unwrap();
 
@@ -1877,7 +1877,7 @@ async fn trigger_run_rejects_when_max_runs_reached() {
         .await
         .unwrap();
     let schedule = client
-        .set_schedule(saved.id, "1h", Some(1), true)
+        .set_schedule(saved.id, "1h", Some(1), true, None, None)
         .await
         .unwrap();
 
@@ -1923,7 +1923,7 @@ async fn trigger_run_rejects_when_already_running() {
         .unwrap();
     // No max_runs cap, so the in-progress guard is what rejects the trigger.
     let schedule = client
-        .set_schedule(saved.id, "1h", None, true)
+        .set_schedule(saved.id, "1h", None, true, None, None)
         .await
         .unwrap();
 

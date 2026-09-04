@@ -316,18 +316,26 @@ impl HttpClient {
     }
 
     /// Create or update a schedule for a saved query.
+    ///
+    /// `window` is `"since_last"` or a duration such as `"2h"`; `None` is
+    /// query mode, where the saved DSL runs verbatim. `lag` is the
+    /// late-arrival allowance and is only meaningful beside a window.
     pub async fn set_schedule(
         &self,
         saved_id: i64,
         interval: &str,
         max_runs: Option<u64>,
         enabled: bool,
+        window: Option<&str>,
+        lag: Option<&str>,
     ) -> Result<ScheduleResponse, ClientError> {
         let url = self.endpoint(&format!("/api/v1/saved/{saved_id}/schedule"));
         let body = SetScheduleRequestRef {
             interval,
             max_runs,
             enabled,
+            window,
+            lag,
         };
         let req = self.client.put(&url).json(&body);
         self.send_authenticated(req).await

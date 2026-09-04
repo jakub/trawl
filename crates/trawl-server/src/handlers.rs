@@ -33,6 +33,7 @@ use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::PoolDebugInfo;
 use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
+use crate::report_window::format_window_bound;
 use crate::scheduler::execute_scheduled_query;
 use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
@@ -1809,6 +1810,16 @@ fn build_schedule_response(
         updated_at: schedule.updated_at.to_rfc3339(),
         last_run: latest_run.map(report_run_summary),
         total_runs,
+        window: schedule.window.map(|w| w.to_string()),
+        // The lag pair rides the window, not the stored number: query mode
+        // stores a zero that changes no answer, and reporting "0s" there
+        // would read as an allowance in force. `ensure_lag_has_window`
+        // refuses the other combination, so the stored zero is the only
+        // thing being hidden.
+        lag: schedule.window.map(|_| format_interval(schedule.lag_secs)),
+        lag_secs: schedule.window.map(|_| schedule.lag_secs),
+        covered_through: schedule.covered_through.map(format_window_bound),
+        next_fire_at: format_window_bound(schedule.next_fire_at),
     }
 }
 
@@ -1832,6 +1843,10 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
         row_count: run.row_count,
         error_message: run.error_message,
         result_path: run.result_path,
+        window_start: run.window_start.map(format_window_bound),
+        window_end: run.window_end.map(format_window_bound),
+        window_truncated: run.window_truncated,
+        window_kind: run.window_kind.map(|k| k.as_str().to_owned()),
     }
 }
 
@@ -2478,6 +2493,13 @@ pub async fn trigger_run(
         row_count: None,
         error_message: None,
         result_path: None,
+        // A manual run is query mode by construction: a schedule that owns
+        // a window refuses one (ADR-0018 ruling 6), so there are no bounds
+        // to report here.
+        window_start: None,
+        window_end: None,
+        window_truncated: None,
+        window_kind: None,
     };
 
     let schedule_store = state.storage.schedule.clone();
