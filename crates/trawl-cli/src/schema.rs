@@ -910,6 +910,8 @@ pub fn repin_job_to_rows(
         "field_last_service",
         "requires_force",
         "requires_force_reason",
+        "max_nulled_rows",
+        "max_ambiguous_rows",
         "accepted_max_nulled_rows",
         "accepted_max_ambiguous_rows",
         "error",
@@ -954,6 +956,12 @@ pub fn repin_job_to_rows(
         job.requires_force_reason
             .clone()
             .map_or(Json::Null, Json::from),
+        // The request's own numbers beside the ones the job is held to: a
+        // stated ceiling and a resolved one differ whenever the operator
+        // stated none, and a machine consumer that cannot see both cannot
+        // tell a default apart from an instruction.
+        job.max_nulled_rows.map_or(Json::Null, Json::from),
+        job.max_ambiguous_rows.map_or(Json::Null, Json::from),
         job.accepted_max_nulled_rows.map_or(Json::Null, Json::from),
         job.accepted_max_ambiguous_rows
             .map_or(Json::Null, Json::from),
@@ -1240,27 +1248,44 @@ pub async fn run_repin(
     // the operator still reads the evidence.
     render_repin_case_file(out, format == OutputFormat::Table, &job)?;
     if refused {
-        // A pre-scan refusal reports its projection; a cutover refusal
-        // reports what the finished rewrite actually nulled. The server's own
-        // reason is the authoritative one when it sent it — the two gates and
-        // the wire all ask one function, and it names ambiguity as well as
-        // loss.
-        if let Some(reason) = job.requires_force_reason {
-            return Err(CliError::Usage(format!(
-                "repin refused: {reason} — re-run with --force to accept it"
-            )));
-        }
         let lost = if job.rows_nulled > 0 {
             job.rows_nulled
         } else {
             job.projected_nulls
         };
-        return Err(CliError::Usage(format!(
-            "repin would null {lost} stored value(s); re-run with --force to \
-             accept the loss (originals remain findable in _raw)"
+        return Err(CliError::Usage(repin_refusal(
+            job.requires_force_reason.as_deref(),
+            flags.force,
+            lost,
         )));
     }
     Ok(())
+}
+
+/// The sentence a refused repin ends on: what the server refused, and what
+/// the operator does about it.
+///
+/// The remedy branches on the flags this invocation actually carried. An
+/// unforced run is refused because it accepted no loss at all, so the answer
+/// is `--force`; a forced one already passed it and was refused by a
+/// ceiling, so telling it to pass force again is advice it has taken. The
+/// server's own reason is authoritative when it sent one — the two gates and
+/// the wire all ask one function, and it names ambiguity as well as loss —
+/// and only the fallback has to guess at the shape of the loss.
+fn repin_refusal(reason: Option<&str>, forced: bool, lost: u64) -> String {
+    let remedy = if forced {
+        "review the loss and raise --max-nulled-rows/--max-ambiguous-rows to \
+         accept it"
+    } else {
+        "re-run with --force to accept it"
+    };
+    match reason {
+        Some(reason) => format!("repin refused: {reason} — {remedy}"),
+        None => format!(
+            "repin would null {lost} stored value(s); {remedy} (originals \
+             remain findable in _raw)"
+        ),
+    }
 }
 
 /// Poll the status surface until the job leaves `running`.
@@ -1787,10 +1812,44 @@ mod repin_tests {
     /// The accepted ceilings are part of the case file and part of the
     /// machine record: an operator reading a finished job sees the terms it
     /// ran under without asking postgres.
+    /// The remedy a refusal ends on depends on what the invocation already
+    /// carried: force is the answer to a refusal that accepted no loss, and
+    /// nonsense to one that was refused by a ceiling.
+    #[test]
+    fn a_refusal_names_the_remedy_the_operator_has_not_tried() {
+        let reason = "12 nulled row(s) over an accepted 10";
+
+        let unforced = repin_refusal(Some(reason), false, 12);
+        assert!(unforced.contains(reason), "{unforced}");
+        assert!(unforced.contains("re-run with --force"), "{unforced}");
+        assert!(!unforced.contains("--max-nulled-rows"), "{unforced}");
+
+        let forced = repin_refusal(Some(reason), true, 12);
+        assert!(forced.contains(reason), "{forced}");
+        assert!(
+            forced.contains("raise --max-nulled-rows/--max-ambiguous-rows"),
+            "{forced}"
+        );
+        assert!(
+            !forced.contains("re-run with --force"),
+            "an operator who passed force is not told to pass it: {forced}"
+        );
+
+        // The fallback, for a refusal the server sent no reason with.
+        let bare = repin_refusal(None, false, 7);
+        assert!(bare.contains("would null 7 stored value(s)"), "{bare}");
+        assert!(bare.contains("re-run with --force"), "{bare}");
+        assert!(
+            repin_refusal(None, true, 7).contains("raise --max-nulled-rows"),
+            "the fallback branches too"
+        );
+    }
+
     #[test]
     fn the_case_file_and_the_row_report_the_accepted_ceilings() {
         let mut job = sample_job();
         job.force = true;
+        job.max_nulled_rows = Some(25);
         job.accepted_max_nulled_rows = Some(22);
         job.accepted_max_ambiguous_rows = Some(10);
 
@@ -1807,6 +1866,16 @@ mod repin_tests {
             serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
         assert_eq!(parsed["accepted_max_nulled_rows"], 22);
         assert_eq!(parsed["accepted_max_ambiguous_rows"], 10);
+        // The request's echo rides beside the accepted pair: the operator
+        // asked for 25 and the job is held to 22, and a machine format that
+        // showed only one of the two could not tell that apart from a
+        // default nobody stated.
+        assert_eq!(parsed["max_nulled_rows"], 25);
+        assert_eq!(
+            parsed["max_ambiguous_rows"],
+            Json::Null,
+            "an unstated ceiling echoes as null, not as the resolved one"
+        );
 
         // An unforced job accepts no loss, so it states no ceilings.
         let (_, rows) = repin_job_to_rows(&sample_job(), OutputFormat::Json);

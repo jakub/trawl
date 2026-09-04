@@ -273,7 +273,7 @@ and one job at a time install-wide. `schema_write`-gated; a query-only
 node (ingest disabled) answers 503 — it does not own the data root.
 
 ```json
-{ "field": "status", "to": "VARCHAR", "dry_run": true, "force": false,
+{ "field": "status", "to": "VARCHAR", "dry_run": true, "force": true,
   "max_nulled_rows": 250, "max_ambiguous_rows": 0 }
 ```
 
