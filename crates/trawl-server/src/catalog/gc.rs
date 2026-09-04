@@ -151,12 +151,16 @@ pub fn candidacy(
     }
 }
 
-/// How long the purge transaction may take before the run gives up on it.
+/// How long ANY postgres operation performed under the corpus gate may take
+/// before the run gives up on it.
 ///
-/// The corpus gate is held across it, and while it is held no compaction
-/// batch can publish, so a postgres that has stopped answering must not
-/// translate into an ingest stall of unbounded length.
-const PURGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The gate is held across every one of them, and while it is held no
+/// compaction batch can publish, so a postgres that has stopped answering
+/// must not translate into an ingest stall of unbounded length. One budget
+/// per operation rather than one for the whole gated section: each is a
+/// single round trip, and a per-call bound is the one an operator can read
+/// off the refusal.
+const IN_GATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many offending paths a fail-closed refusal names. The rest are a
 /// count: an operator needs a place to start, not a directory listing.
@@ -386,7 +390,14 @@ impl PinGc {
         // catalog lifecycle lock a claim also takes
         // ([`crate::store::CATALOG_LIFECYCLE_LOCK_KEY`]) — asking here
         // merely saves a full footer scan in the common case.
-        self.refuse_if_repin_owns_the_corpus().await?;
+        self.refuse_if_repin_owns_the_root()?;
+        let latest = self
+            .in_gate(
+                "re-checking for a running repin job",
+                self.repin_store.latest(),
+            )
+            .await?;
+        Self::refuse_if_repin_job_running(latest.as_ref())?;
 
         let candidates: BTreeSet<String> = rows.iter().map(|row| row.field.clone()).collect();
         let data_dir = self.data_dir.clone();
@@ -409,39 +420,33 @@ impl PinGc {
         }
 
         let fields: Vec<String> = walk.dead.iter().cloned().collect();
-        let purged =
-            match tokio::time::timeout(PURGE_TIMEOUT, self.store.delete_pins(&fields)).await {
-                // The purge transaction's own running-row check is the
-                // authority on the claim race, and it refuses inside the
-                // transaction, so nothing was deleted.
-                Ok(Err(crate::store::StoreError::RepinAlreadyRunning)) => {
-                    return Err(ServerError::Conflict(
-                        "a repin job claimed the catalog while pin gc was proving its \
-                         candidates dead, so the purge refused and deleted nothing; \
-                         re-run pin gc once the repin finishes"
-                            .to_owned(),
-                    ));
-                }
-                Ok(result) => result?,
-                Err(_elapsed) => {
-                    // The statement was already sent, so postgres may have
-                    // committed it after we stopped waiting. The honest answer
-                    // is UNKNOWN: refuse loudly, evict nothing (an eviction
-                    // over rows that survived would hide a pin the store still
-                    // has), and let the operator observe the real state.
-                    // Retrying blind would delete a second time or report a
-                    // deletion that never happened.
-                    return Err(ServerError::Conflict(format!(
-                        "pin gc lost contact with the catalog store while \
-                         deleting {} pin(s) after {}s; whether the purge \
-                         committed is unknown. Re-run `trawl schema gc-pins \
-                         --dry-run` to see which pins are still there before \
-                         running it again.",
-                        fields.len(),
-                        PURGE_TIMEOUT.as_secs()
-                    )));
-                }
-            };
+        // A timeout here is the sharpest UNKNOWN of the lot: the statement
+        // was already sent, so postgres may have committed it after we
+        // stopped waiting. Refusing evicts nothing (an eviction over rows
+        // that survived would hide a pin the store still has) and retrying
+        // blind would delete a second time or report a deletion that never
+        // happened, so the operator's dry run is the way out.
+        let purged = match self
+            .in_gate(
+                "deleting the proved-dead pins",
+                self.store.delete_pins(&fields),
+            )
+            .await
+        {
+            Ok(purged) => purged,
+            // The purge transaction's own running-row check is the
+            // authority on the claim race, and it refuses inside the
+            // transaction, so nothing was deleted.
+            Err(ServerError::Store(crate::store::StoreError::RepinAlreadyRunning)) => {
+                return Err(ServerError::Conflict(
+                    "a repin job claimed the catalog while pin gc was proving its \
+                     candidates dead, so the purge refused and deleted nothing; \
+                     re-run pin gc once the repin finishes"
+                        .to_owned(),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
         // Committed, so the cache may lose them — and must, before the gate
         // opens: infallible, one lock, one generation bump, nothing
         // fallible between it and the commit. The store hands back the
@@ -461,37 +466,74 @@ impl PinGc {
     }
 
     /// Refuse while a repin owns the data root: marker, shadow or aside
-    /// root present, or a `running` job row.
+    /// root present.
     ///
     /// Unreadable evidence is evidence. `in_flight_evidence` is fallible
     /// exactly so that an I/O error cannot read as "go ahead", and gc is
     /// one of the two callers that must not proceed on a maybe.
-    async fn refuse_if_repin_owns_the_corpus(&self) -> Result<(), ServerError> {
+    fn refuse_if_repin_owns_the_root(&self) -> Result<(), ServerError> {
         match crate::repin::in_flight_evidence(&self.data_dir) {
-            Ok(None) => {}
-            Ok(Some(what)) => {
-                return Err(ServerError::Conflict(format!(
-                    "a repin owns the data root (its {what} is present), so no \
-                     parquet footer proves anything right now; pin gc stands \
-                     down until the repin finishes"
-                )));
-            }
-            Err(e) => {
-                return Err(ServerError::Conflict(format!(
-                    "pin gc cannot tell whether a repin owns the data root \
-                     ({e}), so it refuses rather than delete on a guess"
-                )));
-            }
+            Ok(None) => Ok(()),
+            Ok(Some(what)) => Err(ServerError::Conflict(format!(
+                "a repin owns the data root (its {what} is present), so no \
+                 parquet footer proves anything right now; pin gc stands \
+                 down until the repin finishes"
+            ))),
+            Err(e) => Err(ServerError::Conflict(format!(
+                "pin gc cannot tell whether a repin owns the data root \
+                 ({e}), so it refuses rather than delete on a guess"
+            ))),
         }
-        if let Some(job) = self.repin_store.latest().await?
-            && job.status == RepinJobStatus::Running
-        {
-            return Err(ServerError::Conflict(format!(
-                "repin job {} is running; pin gc stands down until it finishes",
-                job.id
-            )));
+    }
+
+    /// The postgres half of the same question, over a job row already read.
+    ///
+    /// Split from the read so the gated caller can put the read behind
+    /// [`Self::in_gate`] without a second copy of the verdict.
+    fn refuse_if_repin_job_running(
+        job: Option<&crate::store::RepinJob>,
+    ) -> Result<(), ServerError> {
+        match job {
+            Some(job) if job.status == RepinJobStatus::Running => {
+                Err(ServerError::Conflict(format!(
+                    "repin job {} is running; pin gc stands down until it finishes",
+                    job.id
+                )))
+            }
+            _ => Ok(()),
         }
-        Ok(())
+    }
+
+    /// Both halves, off the gate: the entry check.
+    async fn refuse_if_repin_owns_the_corpus(&self) -> Result<(), ServerError> {
+        self.refuse_if_repin_owns_the_root()?;
+        Self::refuse_if_repin_job_running(self.repin_store.latest().await?.as_ref())
+    }
+
+    /// Run one postgres operation under the corpus gate, bounded by
+    /// [`IN_GATE_TIMEOUT`].
+    ///
+    /// Every gated store call goes through here, not just the purge. The
+    /// gate excludes whole compaction batches, so a postgres that stops
+    /// answering during the re-check stalls ingest exactly as one that
+    /// stops answering during the delete would. A timeout is UNKNOWN, never
+    /// a pass: `what` names the operation and the remedy is always the same
+    /// one, a dry run that reports the catalog's real state.
+    async fn in_gate<T>(
+        &self,
+        what: &str,
+        op: impl Future<Output = Result<T, crate::store::StoreError>>,
+    ) -> Result<T, ServerError> {
+        match tokio::time::timeout(IN_GATE_TIMEOUT, op).await {
+            Ok(result) => result.map_err(ServerError::from),
+            Err(_elapsed) => Err(ServerError::Conflict(format!(
+                "pin gc lost contact with the catalog store while {what} after \
+                 {}s, with the corpus gate held; it deleted nothing it can \
+                 account for. Re-run `trawl schema gc-pins --dry-run` to see \
+                 the catalog's real state before running it again.",
+                IN_GATE_TIMEOUT.as_secs()
+            ))),
+        }
     }
 }
 
@@ -861,6 +903,45 @@ mod tests {
             candidacy("duration", Some(at(999_999)), cutoff),
             Candidacy::Candidate
         );
+    }
+
+    /// Every postgres call made with the corpus gate held rides
+    /// [`IN_GATE_TIMEOUT`], not just the purge.
+    ///
+    /// Source-shape, and deliberately so: no fixture can make a live
+    /// postgres stop answering in the middle of a gated transaction, so
+    /// what is worth asserting is that a gated statement cannot be ADDED
+    /// without the bound. The gate excludes whole compaction batches, and
+    /// an unbounded wait there is an ingest stall of unbounded length.
+    #[test]
+    fn every_gated_store_call_rides_the_timeout() {
+        let src = include_str!("gc.rs");
+        let start = src
+            .find("    async fn prove_and_purge(")
+            .expect("the gated section is one function");
+        let body = &src[start..];
+        let end = body.find("\n    }\n").expect("the function closes");
+        let body = &body[..end];
+
+        assert!(
+            body.contains(".in_gate("),
+            "the gated section makes its store calls through in_gate"
+        );
+        for call in ["self.store.", "self.repin_store."] {
+            for (idx, _) in body.match_indices(call) {
+                // The statement the call sits in: from the previous `;` to
+                // the next one. An AWAITED store call is a round trip that
+                // can hang; `publish_fill_gauges` and friends are local.
+                let head = body[..idx].rsplit(';').next().unwrap_or_default();
+                let tail = body[idx..].split(';').next().unwrap_or_default();
+                let statement = format!("{head}{tail}");
+                assert!(
+                    !statement.contains(".await") || statement.contains(".in_gate("),
+                    "an awaited `{call}` call under the corpus gate must ride \
+                     in_gate: {statement}"
+                );
+            }
+        }
     }
 
     /// The divergence from the schema listing, asserted so a later "make
