@@ -19,9 +19,14 @@
 //!
 //! Precedence, and the reasons for it:
 //! - A valid `Authorization: Bearer` header wins outright and skips the
-//!   guard. Bearer clients hold no cookie, so they are not CSRF targets,
-//!   and no foreign page can make a browser attach someone else's bearer
-//!   token.
+//!   guard. The browser may well be holding a cookie and sending it on the
+//!   same request (`fetch` with `credentials: 'include'` plus an
+//!   `Authorization` header sends both), but this branch never reads the
+//!   cookie, so no session is spendable on it. What the foreign page
+//!   cannot do is supply the bearer token: a custom `Authorization` header
+//!   makes the request preflight, trawl-web sends no
+//!   `Access-Control-Allow-*` headers, and the browser drops the real
+//!   request when the preflight is not granted.
 //! - Otherwise the guard runs BEFORE the cookie is looked up, decrypted or
 //!   checked for expiry. The verdict must not depend on what the browser
 //!   happens to be holding: a foreign origin sent with an expired cookie
@@ -145,11 +150,14 @@ impl FromRequestParts<AppState> for Auth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // A valid bearer header wins before the origin guard is consulted:
-        // a client that authenticates by header carries no cookie for a
-        // foreign page to spend, so its `Origin` is not a verdict. Every
-        // other request falls through to the cookie branch, where the
-        // guard runs first.
+        // A valid bearer header wins before the origin guard is consulted.
+        // This branch never reads the cookie, so a session the browser
+        // happens to be sending alongside is not spendable here, and a
+        // foreign page cannot supply the token itself: a custom
+        // `Authorization` header makes the request preflight, and
+        // trawl-web grants no preflight (it sends no
+        // `Access-Control-Allow-*` header anywhere). Every other request
+        // falls through to the cookie branch, where the guard runs first.
         if let Some(token) = extract_bearer(parts.headers.get(header::AUTHORIZATION)) {
             return Ok(Self::Bearer(token));
         }

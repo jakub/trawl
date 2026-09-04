@@ -176,7 +176,7 @@ fn a_non_utf8_origin_is_rejected() {
     let mut headers = http::HeaderMap::new();
     headers.insert(
         http::header::ORIGIN,
-        http::HeaderValue::from_bytes(&[0xff, 0xfe, 0x00_u8.wrapping_add(0x41)]).unwrap(),
+        http::HeaderValue::from_bytes(&[0xff, 0xfe, 0x41]).unwrap(),
     );
     assert!(check_origin(&headers, &test_origins(), "login").is_err());
 }

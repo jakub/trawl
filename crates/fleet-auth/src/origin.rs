@@ -634,7 +634,7 @@ pub const REASON_NON_UTF8: &str = "non_utf8_origin";
 ///
 /// One vocabulary, one place. The reason is a `&'static str` from a closed
 /// set; the origin text is `Some` only when the header actually parsed, in
-/// which case it is [`Origin`]'s canonical form — at most 267 bytes drawn
+/// which case it is [`Origin`]'s canonical form — at most 268 bytes drawn
 /// from `[a-z0-9.:/\[\]-]`, so no CRLF, no ANSI escape, no control byte
 /// and no attacker-chosen length can reach the log. When the header did
 /// not parse there is no text at all, because the only text available
@@ -1030,7 +1030,7 @@ mod tests {
         "invalid_port",
     ];
 
-    /// `[a-z0-9.:/\[\]-]{1,267}` — the only bytes a canonical origin can
+    /// `[a-z0-9.:/\[\]-]{1,268}` — the only bytes a canonical origin can
     /// contain. No CR, no LF, no ESC, no NUL, no attacker-chosen length.
     fn is_bounded_log_text(text: &str) -> bool {
         !text.is_empty()

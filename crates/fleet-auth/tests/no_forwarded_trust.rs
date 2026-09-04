@@ -22,6 +22,17 @@
 //! line, which means an `#[cfg(test)] mod tests;` declaration near the top
 //! would have hidden every production item below it.
 //!
+//! Nothing outside this crate is scanned, and trawl-web in particular is
+//! not. That is the same ruling as the paragraph below: the scan catches
+//! an honest reintroduction where the code is dense enough for a text rule
+//! to be worth its false positives. trawl-web's session code has one guard
+//! call site, in `middleware/session_extractor.rs`, and review reads it
+//! whole. A scan pointed at that crate would also have to accept
+//! `proxy.rs`, which names `host` in its hop-by-hop strip list on purpose:
+//! the browser's `Host` must not travel to trawld, so the correct code
+//! spells the header out and a naive scan would fire on it every time,
+//! having found the opposite of a trust bug.
+//!
 //! Whole-file scanning costs one thing: a unit test may no longer plant a
 //! `Host` or `X-Forwarded-*` header, because a scanner cannot tell a
 //! planted header from a trusted one. Those tests moved to

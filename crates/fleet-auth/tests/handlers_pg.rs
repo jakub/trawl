@@ -505,7 +505,9 @@ async fn login_allows_the_configured_origin_with_no_host_header(pool: sqlx::PgPo
 }
 
 #[sqlx::test]
-async fn logout_rejects_a_sibling_origin_whatever_the_host_says(pool: sqlx::PgPool) {
+async fn logout_rejects_a_foreign_origin_whatever_the_host_and_forwarding_headers_say(
+    pool: sqlx::PgPool,
+) {
     let store = KeyStore::from_pool(pool);
 
     let (state, _) = session_state(store, "trawl");
