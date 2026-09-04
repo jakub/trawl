@@ -21,7 +21,7 @@
 mod common;
 
 use sqlx::PgPool;
-use trawl_server::report_window::{ReportWindow, ScheduleWindow, truncate_to_micros};
+use trawl_server::report_window::{ReportWindow, ScheduleWindow, WindowKind, truncate_to_micros};
 use trawl_server::store::{
     FinishOutcome, FlipOutcome, HistoryStore, RunClaim, RunStatus, SavedQueryStore, ScheduleStore,
     StorageState, StoreError,
@@ -593,7 +593,11 @@ async fn schedule_window_round_trips(pool: PgPool) {
         assert_eq!(fetched.lag_secs, lag, "{name}: refetched lag");
 
         let (kind, secs, ..) = raw_cursors(&pool, created.id).await;
-        assert_eq!(kind.as_deref(), window.map(ScheduleWindow::kind));
+        assert_eq!(
+            kind.as_deref(),
+            window.map(|w| w.kind().as_str()),
+            "{name}: persisted kind"
+        );
         assert_eq!(
             secs,
             window
@@ -792,6 +796,7 @@ async fn claimed_run_round_trips_its_window(pool: PgPool) {
         start: now - chrono::Duration::hours(2),
         end: now,
         truncated: true,
+        kind: WindowKind::SinceLast,
     };
     let rid = match store
         .claim_run(sched.id, windowed_sq, "q", None, Some(&window))
@@ -805,6 +810,7 @@ async fn claimed_run_round_trips_its_window(pool: PgPool) {
     assert_eq!(run.window_start, Some(window.start));
     assert_eq!(run.window_end, Some(window.end));
     assert_eq!(run.window_truncated, Some(true));
+    assert_eq!(run.window_kind, Some(WindowKind::SinceLast));
 
     let legacy_sq = seed_saved(&pool, 1, "legacy-run").await;
     let legacy_sched = store
@@ -819,6 +825,7 @@ async fn claimed_run_round_trips_its_window(pool: PgPool) {
         legacy.window_truncated, None,
         "a run with no window claims nothing, not completeness"
     );
+    assert_eq!(legacy.window_kind, None);
 }
 
 /// The `since_last` watermark advances inside the success transaction, and
@@ -847,6 +854,7 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
         start: now - chrono::Duration::hours(from_hours),
         end: now - chrono::Duration::hours(to_hours),
         truncated: false,
+        kind: WindowKind::SinceLast,
     };
     let run = async |w: &ReportWindow| match store
         .claim_run(sched.id, sq_id, "q", None, Some(w))
@@ -905,6 +913,94 @@ async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
     );
 }
 
+/// The watermark decision belongs to the run, not to the schedule's current
+/// mode: finishing a run and retyping its schedule's window must give the
+/// same coverage whichever commits first.
+///
+/// The run records the mode it was CLAIMED under, so both orders answer from
+/// that one fact. Reading the schedule at finish time instead would make an
+/// operator's edit racing an in-flight run decide whether the window counts.
+#[sqlx::test]
+async fn finish_and_window_mode_edit_are_order_independent(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let bounds = |kind: WindowKind| ReportWindow {
+        start: now - chrono::Duration::hours(1),
+        end: now,
+        truncated: false,
+        kind,
+    };
+
+    // Claim a run under `claimed`, then finish it and retype the schedule to
+    // `edited_to` in the requested order. Answers the resulting watermark.
+    let covered_after = async |name: &str,
+                               claimed: ScheduleWindow,
+                               edited_to: ScheduleWindow,
+                               finish_first: bool| {
+        let sq_id = seed_saved(&pool, 1, name).await;
+        let sched = store
+            .create_schedule(sq_id, 1, 300, None, Some(claimed), 0, now)
+            .await
+            .unwrap();
+        let window = bounds(claimed.kind());
+        let rid = match store
+            .claim_run(sched.id, sq_id, "q", None, Some(&window))
+            .await
+            .unwrap()
+        {
+            RunClaim::Started(id) => id,
+            other => panic!("expected a started run, got {other:?}"),
+        };
+
+        let finish = async || {
+            store
+                .finish_run(rid, RunStatus::Success, 5, Some(1), None, None, None)
+                .await
+                .unwrap();
+        };
+        let edit = async || {
+            store
+                .update_schedule(sched.id, 1, 300, None, true, Some(edited_to), 0, now)
+                .await
+                .unwrap();
+        };
+        if finish_first {
+            finish().await;
+            edit().await;
+        } else {
+            edit().await;
+            finish().await;
+        }
+
+        store
+            .get_schedule_for_saved_query(sq_id, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .covered_through
+    };
+
+    // A since_last run retyped to fixed still advances, in either order.
+    let since_last = ScheduleWindow::SinceLast;
+    let fixed = ScheduleWindow::Fixed { secs: 3600 };
+    let finish_then_edit = covered_after("tiled-a", since_last, fixed, true).await;
+    let edit_then_finish = covered_after("tiled-b", since_last, fixed, false).await;
+    assert_eq!(
+        finish_then_edit, edit_then_finish,
+        "a since_last run's coverage must not depend on commit order"
+    );
+    assert_eq!(finish_then_edit, Some(now), "and it must be the run's end");
+
+    // A fixed run retyped to since_last advances nothing, in either order.
+    let finish_then_edit = covered_after("trailing-a", fixed, since_last, true).await;
+    let edit_then_finish = covered_after("trailing-b", fixed, since_last, false).await;
+    assert_eq!(
+        (finish_then_edit, edit_then_finish),
+        (None, None),
+        "a fixed run never seeds a watermark, whichever commit lands first"
+    );
+}
+
 /// A fixed trailing window is re-measured from every fire time, so it keeps
 /// no watermark: a success on one leaves `covered_through` untouched. Same
 /// for a legacy schedule, whose runs carry no window at all.
@@ -922,13 +1018,16 @@ async fn fixed_and_legacy_schedules_keep_no_watermark(pool: PgPool) {
             .create_schedule(sq_id, 1, 300, None, window, 0, now)
             .await
             .unwrap();
-        let covered = ReportWindow {
+        // The run is claimed the way the planner will claim it: a windowed
+        // schedule hands down its own mode, a legacy one hands down nothing.
+        let covered = window.map(|w| ReportWindow {
             start: now - chrono::Duration::hours(1),
             end: now,
             truncated: false,
-        };
+            kind: w.kind(),
+        });
         let rid = match store
-            .claim_run(sched.id, sq_id, "q", None, Some(&covered))
+            .claim_run(sched.id, sq_id, "q", None, covered.as_ref())
             .await
             .unwrap()
         {
@@ -947,14 +1046,15 @@ async fn fixed_and_legacy_schedules_keep_no_watermark(pool: PgPool) {
             .unwrap();
         assert_eq!(
             after.covered_through, None,
-            "{name}: only a since_last schedule keeps a watermark"
+            "{name}: only a since_last run keeps a watermark"
         );
         let run = store.get_run(rid, 1).await.unwrap().unwrap();
         assert_eq!(
             run.window_end,
-            Some(covered.end),
+            covered.map(|w| w.end),
             "{name}: the run still records what it covered"
         );
+        assert_eq!(run.window_kind, window.map(ScheduleWindow::kind));
     }
 }
 

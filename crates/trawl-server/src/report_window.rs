@@ -18,6 +18,48 @@ use chrono::{DateTime, SecondsFormat, SubsecRound as _, Utc};
 
 use crate::store::{StoreError, format_interval, parse_interval};
 
+/// The window mode, without the span a fixed window carries.
+///
+/// This is what a RUN records. A schedule's mode can be edited while a run
+/// is in flight, so the mode a run was claimed under has to travel with the
+/// run: it decides whether finishing that run advances the watermark, and
+/// reading it off the schedule at finish time would make the answer depend
+/// on which of the two commits landed first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowKind {
+    /// Tiling: the run's end becomes the schedule's watermark.
+    SinceLast,
+    /// A fixed trailing span, re-measured from every fire time.
+    Fixed,
+}
+
+impl WindowKind {
+    /// The persisted spelling, matched by the `window_kind` CHECKs on both
+    /// `schedules` and `report_runs`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SinceLast => "since_last",
+            Self::Fixed => "fixed",
+        }
+    }
+
+    /// Read a persisted spelling back. `None` for anything else, so the
+    /// caller decides what an unreadable value means where it is read.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "since_last" => Some(Self::SinceLast),
+            "fixed" => Some(Self::Fixed),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for WindowKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The window mode configured on a schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduleWindow {
@@ -31,12 +73,12 @@ pub enum ScheduleWindow {
 }
 
 impl ScheduleWindow {
-    /// The persisted `schedules.window_kind` spelling, matched by the
-    /// migration's `schedules_window_kind` CHECK.
-    pub fn kind(self) -> &'static str {
+    /// The mode alone, which is what `schedules.window_kind` stores and
+    /// what a claimed run records.
+    pub fn kind(self) -> WindowKind {
         match self {
-            Self::SinceLast => "since_last",
-            Self::Fixed { .. } => "fixed",
+            Self::SinceLast => WindowKind::SinceLast,
+            Self::Fixed { .. } => WindowKind::Fixed,
         }
     }
 
@@ -89,6 +131,9 @@ pub struct ReportWindow {
     pub end: DateTime<Utc>,
     /// Whether `start` was clamped forward past an uncovered gap.
     pub truncated: bool,
+    /// The mode this window was planned under, recorded on the run so a
+    /// mid-flight edit to the schedule cannot change what finishing it means.
+    pub kind: WindowKind,
 }
 
 /// Render a window bound as the DSL/wire text: RFC 3339, UTC, microseconds.
@@ -148,15 +193,25 @@ mod tests {
     }
 
     #[test]
+    fn window_kind_spellings_round_trip() {
+        for kind in [WindowKind::SinceLast, WindowKind::Fixed] {
+            assert_eq!(WindowKind::parse(kind.as_str()), Some(kind));
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
+        assert_eq!(WindowKind::parse("SinceLast"), None);
+        assert_eq!(WindowKind::parse(""), None);
+    }
+
+    #[test]
     fn kind_secs_and_display_round_trip() {
         let fixed = ScheduleWindow::Fixed { secs: 7200 };
-        assert_eq!(fixed.kind(), "fixed");
+        assert_eq!(fixed.kind(), WindowKind::Fixed);
         assert_eq!(fixed.secs(), Some(7200));
         assert_eq!(fixed.to_string(), "2h");
         assert_eq!(ScheduleWindow::parse(&fixed.to_string()).unwrap(), fixed);
 
         let since = ScheduleWindow::SinceLast;
-        assert_eq!(since.kind(), "since_last");
+        assert_eq!(since.kind(), WindowKind::SinceLast);
         assert_eq!(since.secs(), None);
         assert_eq!(since.to_string(), "since_last");
         assert_eq!(ScheduleWindow::parse(&since.to_string()).unwrap(), since);

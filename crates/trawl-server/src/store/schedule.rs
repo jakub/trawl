@@ -33,7 +33,7 @@ use super::error::{PgViolation, StoreError, classify_violation};
 use super::history::{bind_u64, bind_usize};
 use super::saved::{SavedQuery, row_to_saved_query_at};
 use super::status::{RunStatus, decode_status};
-use crate::report_window::{ReportWindow, ScheduleWindow};
+use crate::report_window::{ReportWindow, ScheduleWindow, WindowKind};
 
 const MIN_INTERVAL_SECS: u64 = 60;
 
@@ -87,6 +87,10 @@ pub struct ReportRun {
     /// catch-up gap. `None` (not `Some(false)`) for a run with no window:
     /// `Some(false)` is the positive claim that the window is complete.
     pub window_truncated: Option<bool>,
+    /// The mode the run was CLAIMED under. Read instead of the schedule's
+    /// current mode wherever finishing the run has to know, so an edit
+    /// racing the run cannot change what the run means.
+    pub window_kind: Option<WindowKind>,
 }
 
 /// Outcome of a transactional run claim ([`ScheduleStore::claim_run`]).
@@ -258,15 +262,32 @@ fn decode_window(row: &PgRow, prefix: &str) -> Result<Option<ScheduleWindow>, sq
     let kind: Option<String> = row.try_get(format!("{prefix}window_kind").as_str())?;
     let secs: Option<i64> = row.try_get(format!("{prefix}window_secs").as_str())?;
     let decode_err = |msg: String| sqlx::Error::Decode(msg.into());
-    match (kind.as_deref(), secs) {
+    match (kind.as_deref().map(WindowKind::parse), secs) {
         (None, None) => Ok(None),
-        (Some("since_last"), None) => Ok(Some(ScheduleWindow::SinceLast)),
-        (Some("fixed"), Some(secs)) => Ok(Some(ScheduleWindow::Fixed {
+        (Some(Some(WindowKind::SinceLast)), None) => Ok(Some(ScheduleWindow::SinceLast)),
+        (Some(Some(WindowKind::Fixed)), Some(secs)) => Ok(Some(ScheduleWindow::Fixed {
             secs: u64::try_from(secs).unwrap_or_default(),
         })),
-        (kind, secs) => Err(decode_err(format!(
+        _ => Err(decode_err(format!(
             "schedule window_kind={kind:?} with window_secs={secs:?} is not a valid window"
         ))),
+    }
+}
+
+/// Decode a run's claim-time `window_kind`.
+///
+/// Absent is a run with no window. Present but unreadable means the row was
+/// written past the `report_runs_window_kind` CHECK, and reading it as
+/// "no window" would silently drop a watermark advance, so it fails instead.
+fn decode_run_window_kind(row: &PgRow, prefix: &str) -> Result<Option<WindowKind>, sqlx::Error> {
+    let kind: Option<String> = row.try_get(format!("{prefix}window_kind").as_str())?;
+    match kind {
+        None => Ok(None),
+        Some(kind) => WindowKind::parse(&kind).map(Some).ok_or_else(|| {
+            sqlx::Error::Decode(
+                format!("report run window_kind={kind:?} is not a window mode").into(),
+            )
+        }),
     }
 }
 
@@ -292,6 +313,7 @@ pub(crate) fn row_to_report_run_at(row: &PgRow, prefix: &str) -> Result<ReportRu
         window_start: row.try_get(col("window_start").as_str())?,
         window_end: row.try_get(col("window_end").as_str())?,
         window_truncated: row.try_get(col("window_truncated").as_str())?,
+        window_kind: decode_run_window_kind(row, prefix)?,
     })
 }
 
@@ -321,6 +343,7 @@ pub(crate) const LATEST_RUN_COLS: &str = "lr.id             AS r_id,
      lr.window_start   AS r_window_start,
      lr.window_end     AS r_window_end,
      lr.window_truncated AS r_window_truncated,
+     lr.window_kind    AS r_window_kind,
      rc.run_count      AS run_count";
 
 /// LEFT JOIN LATERAL fragment resolving the single latest run (`lr`, tie-broken
@@ -356,7 +379,7 @@ const SCHEDULE_COLS: &str = "id, saved_query_id, key_id, interval_secs, max_runs
 
 const RUN_COLS: &str = "id, schedule_id, saved_query_id, query, status, started_at, finished_at, \
      duration_ms, row_count, error_message, result_path, window_start, window_end, \
-     window_truncated";
+     window_truncated, window_kind";
 
 /// Postgres-backed storage for schedules and report runs. Cheap to clone.
 #[derive(Debug, Clone)]
@@ -407,7 +430,7 @@ impl ScheduleStore {
         .bind(key_id)
         .bind(bind_u64(interval_secs))
         .bind(max_runs.map(bind_u64))
-        .bind(window.map(ScheduleWindow::kind))
+        .bind(window.map(|w| w.kind().as_str()))
         .bind(window.and_then(ScheduleWindow::secs).map(bind_u64))
         .bind(bind_u64(lag_secs))
         .bind(now)
@@ -498,7 +521,7 @@ impl ScheduleStore {
         .bind(bind_u64(interval_secs))
         .bind(max_runs.map(bind_u64))
         .bind(enabled)
-        .bind(window.map(ScheduleWindow::kind))
+        .bind(window.map(|w| w.kind().as_str()))
         .bind(window.and_then(ScheduleWindow::secs).map(bind_u64))
         .bind(bind_u64(lag_secs))
         .bind(reanchor)
@@ -714,8 +737,8 @@ impl ScheduleStore {
         let inserted = sqlx::query_scalar::<_, i64>(
             "INSERT INTO report_runs
                  (schedule_id, saved_query_id, query, status, started_at,
-                  window_start, window_end, window_truncated)
-             VALUES ($1, $2, $3, 'running', now(), $4, $5, $6)
+                  window_start, window_end, window_truncated, window_kind)
+             VALUES ($1, $2, $3, 'running', now(), $4, $5, $6, $7)
              RETURNING id",
         )
         .bind(schedule_id)
@@ -724,6 +747,7 @@ impl ScheduleStore {
         .bind(window.map(|w| w.start))
         .bind(window.map(|w| w.end))
         .bind(window.map(|w| w.truncated))
+        .bind(window.map(|w| w.kind.as_str()))
         .fetch_one(&mut *tx)
         .await;
 
@@ -758,7 +782,10 @@ impl ScheduleStore {
     ///
     /// A SUCCESS also advances the owning schedule's `since_last` watermark
     /// to the window this run covered, in the same transaction as the row
-    /// update (ADR-0018 ruling 9). One transaction is the whole point: the
+    /// update (ADR-0018 ruling 9). Whether this run is a `since_last` one is
+    /// read off the RUN's own claim-time `window_kind`, so an operator
+    /// retyping the schedule's window mid-run cannot make the answer depend
+    /// on commit order. One transaction is the whole point: the
     /// run's own record of what it covered and the schedule's record of what
     /// is covered are one fact, and a crash between two statements would
     /// either re-run a covered window or skip an uncovered one forever.
@@ -788,18 +815,19 @@ impl ScheduleStore {
         // `FOR UPDATE OF s` locks the schedule alone — the join reads the
         // run without locking it, which is what keeps the order intact.
         //
-        // The lock is taken only when there is an advance to make. A run
-        // that recorded no window cannot move any watermark, and its bounds
-        // are immutable after the claim, so that answer cannot change under
-        // us: a legacy finish keeps exactly the lock footprint it always
-        // had, and never queues behind a schedule someone else is holding.
-        // A cascade-deleted run matches nothing and skips the lock; the run
+        // The lock is taken only when there is an advance to make, and the
+        // test is the same one the advance itself uses: a run claimed as
+        // `since_last`. Everything it reads is written at claim time and
+        // never updated, so the answer cannot change under us. A legacy
+        // finish keeps exactly the lock footprint it always had and never
+        // queues behind a schedule someone else is holding. A
+        // cascade-deleted run matches nothing and skips the lock; the run
         // UPDATE below then reports RunDeleted as it always has.
         if status == RunStatus::Success {
             sqlx::query_scalar::<_, i64>(
                 "SELECT s.id FROM schedules s
                  JOIN report_runs r ON r.schedule_id = s.id
-                 WHERE r.id = $1 AND r.window_end IS NOT NULL
+                 WHERE r.id = $1 AND r.window_kind = 'since_last'
                  FOR UPDATE OF s",
             )
             .bind(run_id)
@@ -833,16 +861,20 @@ impl ScheduleStore {
         .rows_affected();
 
         // The watermark advance, and nothing else: the WHERE clause is the
-        // whole policy. It fires only for a `since_last` schedule, only for
-        // a run that recorded a window, and only when that window ends after
-        // what is already covered — so an out-of-order finish (a slow run
-        // completing after a later one) cannot rewind coverage.
+        // whole policy. It fires only for a run CLAIMED as `since_last`,
+        // only when that run recorded a window, and only when the window
+        // ends after what is already covered — so an out-of-order finish (a
+        // slow run completing after a later one) cannot rewind coverage.
+        //
+        // The mode is read off the RUN, never off the schedule. Reading the
+        // schedule would make a run finishing while an operator retypes the
+        // window answer differently depending on which commit landed first.
         if status == RunStatus::Success {
             sqlx::query(
                 "UPDATE schedules s SET covered_through = r.window_end
                    FROM report_runs r
                   WHERE r.id = $1 AND s.id = r.schedule_id
-                    AND s.window_kind = 'since_last'
+                    AND r.window_kind = 'since_last'
                     AND r.window_end IS NOT NULL
                     AND (s.covered_through IS NULL OR r.window_end > s.covered_through)",
             )
@@ -1348,7 +1380,7 @@ mod tests {
     fn run_cols_prefixes_every_column() {
         let cols = run_cols("r.");
         assert!(cols.starts_with("r.id, r.schedule_id"));
-        assert!(cols.ends_with("r.window_truncated"));
+        assert!(cols.ends_with("r.window_kind"));
         assert!(!cols.contains(" ,"));
         assert_eq!(cols.split(", ").count(), RUN_COLS.split(',').count());
     }

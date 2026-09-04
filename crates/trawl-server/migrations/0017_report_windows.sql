@@ -27,10 +27,18 @@
 -- extrapolate from and takes `now()`, which is when it would have become
 -- due anyway.
 --
--- `report_runs` gains the three bound columns, all nullable and never
--- backfilled (ruling 11): a legacy run has no window, and inventing one
--- would claim coverage nothing proves. `window_truncated` is NULL for the
--- same reason FALSE is wrong there — FALSE means "windowed and complete".
+-- `report_runs` gains the two bounds, the truncation flag and the MODE the
+-- run was claimed under, all nullable and never backfilled (ruling 11): a
+-- legacy run has no window, and inventing one would claim coverage nothing
+-- proves. `window_truncated` is NULL for the same reason FALSE is wrong
+-- there — FALSE means "windowed and complete".
+--
+-- The run carries its own `window_kind` because the schedule's can be
+-- edited while the run is in flight. `finish_run` advances the watermark
+-- for a `since_last` run, and asking the SCHEDULE at finish time makes the
+-- answer depend on whether the operator's edit committed before or after
+-- the run finished. The mode a run was CLAIMED under is a fact about that
+-- run; the schedule's current mode is not.
 --
 -- Every constraint is NAMED, per the 0001 convention.
 
@@ -62,12 +70,18 @@ ALTER TABLE schedules
 ALTER TABLE report_runs
     ADD COLUMN window_start     TIMESTAMPTZ,
     ADD COLUMN window_end       TIMESTAMPTZ,
-    ADD COLUMN window_truncated BOOLEAN;
+    ADD COLUMN window_truncated BOOLEAN,
+    ADD COLUMN window_kind      TEXT;
 
--- The three columns are one fact: a run either carries a half-open window
--- or carries none. A partial bound would be a window nothing can read.
+-- The four columns are one fact: a run either carries a half-open window
+-- claimed under a named mode, or carries none. A partial bound would be a
+-- window nothing can read.
 ALTER TABLE report_runs
+    ADD CONSTRAINT report_runs_window_kind CHECK (
+        window_kind IS NULL OR window_kind IN ('since_last', 'fixed')),
     ADD CONSTRAINT report_runs_window_shape CHECK (
-         (window_start IS NULL AND window_end IS NULL AND window_truncated IS NULL)
-      OR (window_start IS NOT NULL AND window_end IS NOT NULL
-          AND window_truncated IS NOT NULL AND window_start < window_end));
+        CASE WHEN window_start IS NULL
+             THEN window_end IS NULL AND window_truncated IS NULL AND window_kind IS NULL
+             ELSE window_end IS NOT NULL AND window_truncated IS NOT NULL
+                  AND window_kind IS NOT NULL AND window_start < window_end
+        END);
