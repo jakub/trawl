@@ -432,9 +432,12 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
     };
     let done = h.wait_terminal(started.id).await;
     assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
-    assert_eq!(done.rows_nulled, 1);
-    assert_eq!(h.pinned_type("dur").await, "BIGINT");
 
+    // The barrier (issue #137). `wait_terminal` returns on the FIRST status
+    // that is not `running`, and this is the very next request the test
+    // makes: no poll, no retry, no second chance. A repin that records its
+    // losses after the flip would fail here, which is exactly the window a
+    // client polling the status route lives in.
     let conflicts = h
         .query
         .catalog_conflicts(Some("dur"), None, None, None)
@@ -445,9 +448,12 @@ async fn lossy_repin_refuses_without_force_and_accounts_with_it() {
             .conflicts
             .iter()
             .any(|c| c.expected_type == "BIGINT" && c.rows_nulled == 1),
-        "a forced lossy repin records its losses: {:?}",
+        "the read that first sees `succeeded` sees the loss: {:?}",
         conflicts.conflicts
     );
+
+    assert_eq!(done.rows_nulled, 1);
+    assert_eq!(h.pinned_type("dur").await, "BIGINT");
 
     // The numeric survivor still answers.
     assert_eq!(
@@ -1170,6 +1176,157 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
         .unwrap()
         .unwrap();
     assert_eq!(orphan.status, trawl_server::store::RepinJobStatus::Failed);
+}
+
+/// A repin killed between the Cutover marker and the pin flip loses its
+/// engine, its shadow and every tally it held in memory — and still owes the
+/// operator an account of what it nulled. Boot recovery pays it: the tallies
+/// were staged on the job row before the marker went down, so the replayed
+/// flip materialises the same evidence the live path does, and the first
+/// read that sees `succeeded` sees it (issue #137).
+#[tokio::test(flavor = "multi_thread")]
+// The crash state has to be built by hand (claim, stage, plant marker and
+// shadow), and both boot halves run twice.
+#[allow(clippy::too_many_lines)]
+async fn boot_reconciliation_materialises_the_staged_evidence() {
+    let h = harness().await;
+
+    // A half-numeric text field pins VARCHAR, exactly as in the live lossy
+    // repin this replays.
+    h.ingest_and_compact(&[
+        event("api", &json!({"dur": "12"})),
+        event("api", &json!({"dur": "oops"})),
+    ])
+    .await;
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+
+    let job_id = h
+        .server
+        .state
+        .storage
+        .repin
+        .claim(trawl_server::store::RepinClaim {
+            field: "dur",
+            from_type: trawl_core::schema::CanonicalType::Varchar,
+            to_type: trawl_core::schema::CanonicalType::BigInt,
+            dialect: None,
+            dry_run: false,
+            force: true,
+            requested_by: None,
+        })
+        .await
+        .unwrap();
+
+    // The state a crash in the flip window leaves behind: tallies staged,
+    // Cutover marker down, envs half swapped. Everything after this point
+    // is what the next boot does with it.
+    h.server
+        .state
+        .storage
+        .repin
+        .stage_cutover_input(
+            job_id,
+            trawl_server::store::RepinTotals {
+                files_done: 1,
+                rows_rewritten: 2,
+                rows_nulled: 1,
+                rows_resurrected: 0,
+                ambiguous_numerals: 0,
+            },
+            &[("api".to_owned(), 1)],
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let dir = data.join("prod/2026-01-01/10");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("api.parquet"), b"old generation").unwrap();
+    let sdir = trawl_server::repin::shadow_root(&data).join("prod/2026-01-01/10");
+    std::fs::create_dir_all(&sdir).unwrap();
+    std::fs::write(sdir.join("api.parquet"), b"new generation").unwrap();
+    let plant_marker = |phase| {
+        trawl_server::repin::marker::write_marker(
+            &data,
+            &trawl_server::repin::RepinMarker {
+                job_id,
+                field: "dur".to_owned(),
+                from_type: "VARCHAR".to_owned(),
+                to_type: "BIGINT".to_owned(),
+                phase,
+            },
+        )
+        .unwrap();
+    };
+    plant_marker(trawl_server::repin::RepinPhase::Cutover);
+
+    let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
+        .unwrap()
+        .expect("marker present");
+    trawl_server::repin::recover::reconcile_store(
+        &h.server.state.storage,
+        &h.server.state.query.field_catalog,
+        &data,
+        Some(recovered),
+    )
+    .await
+    .expect("store reconciliation");
+
+    let job = h
+        .server
+        .state
+        .storage
+        .repin
+        .get(job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, trawl_server::store::RepinJobStatus::Succeeded);
+
+    // The same rows the live path writes: one per lossy service, naming the
+    // pin the values were stored under. They are the same by construction —
+    // both lanes reach `finish_cutover` and nothing else writes them.
+    let conflicts = h
+        .query
+        .catalog_conflicts(Some("dur"), None, None, None)
+        .await
+        .expect("conflicts");
+    let rows: Vec<_> = conflicts
+        .conflicts
+        .iter()
+        .filter(|c| c.field == "dur")
+        .collect();
+    assert_eq!(rows.len(), 1, "one row per lossy service: {rows:?}");
+    assert_eq!(rows[0].service, "api");
+    assert_eq!(rows[0].rows_nulled, 1);
+    assert_eq!(rows[0].observed_type, "VARCHAR");
+    assert_eq!(rows[0].expected_type, "BIGINT");
+
+    // And a second boot over the same marker adds nothing: the replay's
+    // completing UPDATE finds a job that is no longer `running`.
+    plant_marker(trawl_server::repin::RepinPhase::Cleanup);
+    let recovered = trawl_server::repin::recover::recover_filesystem(&data, true)
+        .unwrap()
+        .expect("marker present");
+    trawl_server::repin::recover::reconcile_store(
+        &h.server.state.storage,
+        &h.server.state.query.field_catalog,
+        &data,
+        Some(recovered),
+    )
+    .await
+    .expect("store reconciliation");
+    let again = h
+        .query
+        .catalog_conflicts(Some("dur"), None, None, None)
+        .await
+        .expect("conflicts");
+    assert_eq!(
+        again.conflicts.iter().filter(|c| c.field == "dur").count(),
+        1,
+        "a replayed flip must not double-insert the staged evidence"
+    );
 }
 
 /// A resurrection-only pass (`to == current`, force): the shelved value
