@@ -298,7 +298,7 @@ someone asked the job to stop: a `running` row carrying them is a cancel in
 flight, and a `failed` row carrying them is a process that died between the
 request and any boundary observing it.
 
-```
+```text
 POST /api/v1/schema/repin/cancel
 ```
 

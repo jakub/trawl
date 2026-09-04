@@ -433,7 +433,7 @@ impl RepinEngine {
                         tracing::error!(
                             event_type = "repin_store_error",
                             job_id,
-                            error = %store_err,
+                            error_class = store_err.class(),
                             "the pending cancel request could not be recorded \
                              before the failed terminal; the job row will not \
                              name who asked"
@@ -503,7 +503,7 @@ impl RepinEngine {
                         tracing::error!(
                             event_type = "repin_store_error",
                             job_id,
-                            error = %e,
+                            error_class = e.class(),
                             "failed to record the repin cancel request; the \
                              cancellation itself is unaffected"
                         );
@@ -977,7 +977,7 @@ impl RepinEngine {
                 tracing::error!(
                     event_type = "repin_store_error",
                     job_id,
-                    error = %e,
+                    error_class = e.class(),
                     "the cancel request could not be recorded, so the job \
                      cannot be terminalized as cancelled; recording it as \
                      failed instead"

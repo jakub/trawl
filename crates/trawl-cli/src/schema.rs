@@ -1095,6 +1095,7 @@ fn repin_completion(job: &trawl_client::RepinJobResponse) -> Result<(), CliError
             // gates and the wire all ask one function, and it names ambiguity
             // as well as loss.
             if let Some(reason) = job.requires_force_reason.as_deref() {
+                let reason = trawl_core::sanitize::sanitize_display_text(reason);
                 return Err(CliError::Usage(format!(
                     "repin refused: {reason} — re-run with --force to accept it"
                 )));

@@ -1872,7 +1872,7 @@ pub async fn schema_repin_cancel(
             Err(e) => tracing::error!(
                 event_type = "repin_store_error",
                 job_id,
-                error = %e,
+                error_class = e.class(),
                 "failed to read the repin job row for a cancel receipt; the \
                  verdict is unaffected"
             ),
