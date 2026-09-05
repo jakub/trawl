@@ -37,6 +37,7 @@ export default defineConfig({
             { slug: 'reference/api' },
             { slug: 'reference/web-ui' },
             { slug: 'reference/configuration' },
+            { slug: 'reference/crash-dumps' },
             { slug: 'reference/fleet-auth-cutover' },
           ],
         },

@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Crash-dump capture on the Debian channel (#19).** The `trawl-server`
+  package now ships an inactive systemd drop-in at
+  `/usr/share/doc/trawl-server/examples/crashdump.conf`, and postinst
+  pre-creates `/var/lib/trawl/cores` owned `trawl:trawl` mode `0700` on
+  every install. Copying the drop-in into
+  `/etc/systemd/system/trawld.service.d/` and restarting trawld grants it
+  `CAP_SYS_PTRACE` and sets the dump directory and retention count, which
+  is what the helm chart's `crashDump.enabled` has always done on
+  kubernetes. It ships inert because a minidump is raw process memory and
+  can hold tokens, TLS keys and database credentials. Both channels are now
+  documented in the new [Crash dumps](https://trawl.sh/reference/crash-dumps/)
+  reference page, including the yama `ptrace_scope` table and the fact that
+  a denied ptrace attach shows up only as a missing dump at crash time
+  (#21 tracks a startup warning).
 - **Scheduler-owned report windows (ADR-0018 rulings 6-14, #107).** A
   schedule now says what its runs cover, instead of leaving it to whatever
   time clause the saved query happened to carry. `PUT

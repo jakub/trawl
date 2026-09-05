@@ -347,7 +347,7 @@ The postgres DSNs still arrive via the `FLEET_DATABASE_URL` / `TRAWL_DATABASE_UR
 | `persistence.enabled` | bool | `true` | Enable persistent storage |
 | `persistence.size` | string | `50Gi` | PVC size |
 | `persistence.storageClass` | string | `""` | StorageClass (empty = default) |
-| `crashDump.enabled` | bool | `false` | Enable minidump capture; requires `persistence.enabled=true` |
+| `crashDump.enabled` | bool | `false` | Enable minidump capture; requires `persistence.enabled=true`. For what a dump contains, the yama `ptrace_scope` limits, and the equivalent Debian procedure, see [Crash dumps](https://trawl.sh/reference/crash-dumps/) |
 | `crashDump.size` | string | `2Gi` | Crash-dump PVC size |
 | `crashDump.storageClass` | string | `""` | Crash-dump StorageClass (empty = default) |
 | `crashDump.mountPath` | string | `/var/lib/trawl/cores` | Crash-dump PVC mount path |
