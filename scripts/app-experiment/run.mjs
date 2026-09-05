@@ -99,7 +99,8 @@ async function command(exe, argv, { cwd = root, env = {}, timeout = 120000, log 
   const logStream = log ? createWriteStream(path.join(runDir, log), { mode: 0o600 }) : null;
   const child = spawn(exe, argv, { cwd, env: { ...baseEnv, ...env }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
   children.add(child);
-  let stdout = '', stderr = '', exceeded = false;
+  let stdout = '', stderr = '', exceeded = false, logError;
+  logStream?.once('error', error => { logError = error; killGroup(child, 'SIGKILL'); });
   const append = (current, chunk) => (current + chunk.toString()).slice(-2 * 1024 * 1024);
   child.stdout.on('data', c => { stdout = append(stdout, c); logStream?.write(clean(c)); });
   child.stderr.on('data', c => { stderr = append(stderr, c); logStream?.write(clean(c)); });
@@ -110,6 +111,7 @@ async function command(exe, argv, { cwd = root, env = {}, timeout = 120000, log 
       child.once('error', reject);
       child.once('close', resolve);
     });
+    if (logError) throw logError;
     if (logStream) await new Promise((resolve, reject) => { logStream.once('error', reject); logStream.end(resolve); });
     checkInterrupted();
     assert.equal(code, 0, `${path.basename(exe)} failed${exceeded ? ' (deadline)' : ''}${log ? `; see ${log}` : `: ${clean(stderr).slice(-1500)}`}`);
@@ -201,7 +203,7 @@ async function fingerprint() {
 async function prepare() {
   const sourceHash = await fingerprint();
   const stampPath = path.join(root, 'target/app-experiment-build.json');
-  const binaryNames = ['trawld', 'trawl-web', 'fleet-admin'];
+  const binaryNames = ['trawld', 'trawl-web', 'fleet-admin', 'deps/libduckdb.so'];
   const hashes = async () => Object.fromEntries(await Promise.all(binaryNames.map(async name =>
     [name, createHash('sha256').update(await fs.readFile(path.join(target, 'debug', name))).digest('hex')])));
   if (args['skip-build']) {
@@ -445,6 +447,9 @@ async function experiment() {
     assert.equal(afterRestartResponse.status(), 200, 'browser query failed; see browser-restarted-response.json');
     assert.ok(restartedPage.pagination.returned > 0, 'browser search returned no rows after restart');
     verifyRows(restartedPage, events.slice(0, restartedPage.pagination.returned));
+    await page.locator('.results table tbody tr').first().waitFor();
+    const restartedCells = await page.locator('.results table tbody tr').first().locator('td').allTextContents();
+    assert.deepEqual(restartedCells.slice(1).map(c => c.trim()), restartedPage.rows[0].map(String), 'rendered cells differ after restart');
     await page.screenshot({ path: path.join(runDir, 'restarted.png') });
     assert.deepEqual(pageErrors, [], 'browser JavaScript errors');
     report.phases.push({ name: 'browser-session-after-restart', verifiedEvents: restartedPage.pagination.returned });
@@ -489,7 +494,14 @@ try {
       // that exact random name and ownership label before removing anything.
       const owner = await command('docker', ['inspect', '--format', '{{index .Config.Labels "trawl.experiment"}}', container]);
       assert.equal(owner, runId, 'container owner mismatch');
-      await command('docker', ['logs', container], { log: 'postgres.log', timeout: 10000 });
+      try {
+        await command('docker', ['logs', container], { log: 'postgres.log', timeout: 10000 });
+      } catch (error) {
+        // Diagnostic failure must never skip removal of an owned container.
+        report.diagnosticError = clean(error.message);
+        report.status = 'failed';
+        process.exitCode = 1;
+      }
       await command('docker', ['rm', '--force', container], { timeout: 30000 });
       report.cleanup.container = true;
     } catch (error) {
